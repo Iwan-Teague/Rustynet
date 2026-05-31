@@ -19,7 +19,8 @@ pub(super) static WINDOWS_BOOTSTRAP_PROVIDER: WindowsBootstrapProvider = Windows
 fn phase_requires_proven_access(phase: BootstrapPhase) -> bool {
     matches!(
         phase,
-        BootstrapPhase::InstallRelease
+        BootstrapPhase::BuildRelease
+            | BootstrapPhase::InstallRelease
             | BootstrapPhase::RestartRuntime
             | BootstrapPhase::VerifyRuntime
     )
@@ -38,23 +39,16 @@ fn render_windows_access_gate_error(
     )
 }
 
-fn local_utm_result_file_supported_for_phase(phase: BootstrapPhase, target: &RemoteTarget) -> bool {
-    // The result-file path uses utmctl exec + utm_staging_dir to run a
-    // wrapper that writes captured output and rc to files inside the
-    // staging directory. Both halves work because the staging dir is
-    // SYSTEM-writable (lives under C:\Users\<user>\, outside the
-    // hardened state tree) — see remote_target_windows_utm_staging_dir
-    // in vm_lab/mod.rs.
-    matches!(
-        windows_local_utm_execution_authority(target, false),
-        Some(WindowsLocalUtmExecutionAuthority::StatusProbeResultFile)
-    ) && matches!(
-        phase,
-        BootstrapPhase::BuildRelease
-            | BootstrapPhase::InstallRelease
-            | BootstrapPhase::RestartRuntime
-            | BootstrapPhase::VerifyRuntime
-    )
+fn local_utm_result_file_supported_for_phase(
+    _phase: BootstrapPhase,
+    _target: &RemoteTarget,
+) -> bool {
+    // Runtime phases run through pinned SSH after access is proven. UTM
+    // result-file execution is still useful for initial access recovery,
+    // but it is not reliable enough for post-bootstrap phase completion:
+    // a healthy guest can write the result and still leave host-side UTM
+    // file pulls sleeping until the phase timeout.
+    false
 }
 
 fn build_windows_build_release_report_paths(
@@ -176,6 +170,7 @@ fn build_windows_bootstrap_build_release_result_script(
            }} | ConvertTo-Json -Compress) \
          }}; \
          Set-Content -LiteralPath $probePath -Value $body -Encoding UTF8; \
+         Write-Output $body; \
          if (-not [string]::IsNullOrWhiteSpace($validationFailure)) {{ exit 1 }}",
         manifest_path = powershell_quote(remote_manifest_path)?,
         probe_path = powershell_quote(remote_probe_path)?,
@@ -339,10 +334,52 @@ fn build_windows_restart_runtime_script() -> Result<String, String> {
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
          $serviceName = {service_name}; \
+         $expectedBinary = {expected_binary}; \
+         function Get-RustyNetServicePid {{ \
+           $query = (& sc.exe queryex $serviceName 2>&1 | Out-String); \
+           foreach ($line in ($query -split \"`r?`n\")) {{ \
+             if ($line -match '^\\s*PID\\s*:\\s*(\\d+)\\s*$') {{ return [int]$Matches[1] }} \
+           }}; \
+           return 0 \
+         }}; \
+         function Wait-RustyNetStopped([int]$Seconds) {{ \
+           $deadline = (Get-Date).AddSeconds($Seconds); \
+           while ((Get-Date) -lt $deadline) {{ \
+             $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue; \
+             if (-not $current -or $current.Status -eq 'Stopped') {{ return $true }}; \
+             Start-Sleep -Milliseconds 250 \
+           }}; \
+           return $false \
+         }}; \
+         function Stop-RustyNetServiceBounded {{ \
+           $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue; \
+           if (-not $current) {{ throw \"Windows runtime service is not installed: $serviceName\" }}; \
+           if ($current.Status -eq 'Stopped') {{ return }}; \
+           if ($current.Status -ne 'StopPending') {{ \
+             $stopOutput = (& sc.exe stop $serviceName 2>&1 | Out-String); \
+             if ($LASTEXITCODE -ne 0 -and $stopOutput -notmatch '1062') {{ throw \"sc.exe stop failed: $stopOutput\" }} \
+           }}; \
+           if (Wait-RustyNetStopped 20) {{ return }}; \
+           $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue; \
+           if ($current -and $current.Status -eq 'StopPending') {{ \
+             $servicePid = Get-RustyNetServicePid; \
+             if ($servicePid -le 0) {{ throw \"RustyNet service is StopPending with no process id\" }}; \
+             $process = Get-Process -Id $servicePid -ErrorAction Stop; \
+             $actual = [System.IO.Path]::GetFullPath([string]$process.Path); \
+             $expected = [System.IO.Path]::GetFullPath($expectedBinary); \
+             if ($actual -ine $expected) {{ throw \"refusing to kill StopPending service pid=$servicePid actual=$actual expected=$expected\" }}; \
+             Stop-Process -Id $servicePid -Force -ErrorAction Stop; \
+             if (Wait-RustyNetStopped 10) {{ return }} \
+           }}; \
+           $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue; \
+           if ($current -and $current.Status -ne 'Stopped') {{ throw \"RustyNet service did not stop; status=$($current.Status)\" }} \
+         }}; \
          $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue; \
          if (-not $service) {{ throw \"Windows runtime service is not installed: $serviceName\" }}; \
          try {{ \
-           if ($service.Status -eq 'Running') {{ Restart-Service -Name $serviceName -ErrorAction Stop }} else {{ Start-Service -Name $serviceName -ErrorAction Stop }} \
+           Stop-RustyNetServiceBounded; \
+           $startOutput = (& sc.exe start $serviceName 2>&1 | Out-String); \
+           if ($LASTEXITCODE -ne 0 -and $startOutput -notmatch '1056|already running') {{ throw \"sc.exe start failed: $startOutput\" }} \
          }} catch {{ \
            Write-Output (\"service-control-error=\" + $_.Exception.Message) \
          }}; \
@@ -350,6 +387,7 @@ fn build_windows_restart_runtime_script() -> Result<String, String> {
          $refreshed = Get-Service -Name $serviceName -ErrorAction Stop; \
          Write-Output (\"service-status=\" + [string]$refreshed.Status)",
         service_name = powershell_quote(WINDOWS_SERVICE_NAME)?,
+        expected_binary = powershell_quote(r"C:\Program Files\RustyNet\rustynetd.exe")?,
     ))
 }
 
@@ -929,6 +967,16 @@ impl WindowsInstallReportView {
     }
 }
 
+fn parse_runtime_helper_report_shape(helper_file_name: &str, body: &str) -> Result<(), String> {
+    match helper_file_name {
+        WINDOWS_SERVICE_INSTALL_HELPER_FILE => WindowsInstallReportView::parse(body).map(|_| ()),
+        WINDOWS_VERIFY_HELPER_FILE => WindowsVerifyReportView::parse(body).map(|_| ()),
+        other => Err(format!(
+            "no typed Windows runtime report parser registered for helper {other}"
+        )),
+    }
+}
+
 /// Typed view of the JSON report written by
 /// `scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1` for the
 /// `prepare-transport` phase. The helper builds the same field set on
@@ -1020,6 +1068,8 @@ pub(crate) struct WindowsBuildReleaseReportView {
     pub exit_code_path: String,
     pub toolchain_path: String,
     pub toolchain_scope: String,
+    #[serde(default)]
+    pub cargo_build_jobs: String,
     pub manifest_path: String,
     pub complete_marker_path: String,
     pub exit_code: i32,
@@ -1209,14 +1259,243 @@ impl WindowsBootstrapProvider {
         invocation: WindowsHelperScriptSpec,
         label: &str,
     ) -> Result<String, String> {
+        self.capture_helper_output_with_phase(
+            target,
+            context,
+            invocation,
+            label,
+            RemoteTransportPhase::AccessEstablishment,
+        )
+    }
+
+    fn capture_helper_output_with_phase(
+        &self,
+        target: &RemoteTarget,
+        context: &BootstrapPhaseContext<'_>,
+        invocation: WindowsHelperScriptSpec,
+        label: &str,
+        phase: RemoteTransportPhase,
+    ) -> Result<String, String> {
         let helper_context = self.helper_context(target, context);
-        capture_windows_helper_script_output_for_target(
+        if phase == RemoteTransportPhase::PostBootstrap
+            && matches!(
+                invocation.helper_file_name,
+                WINDOWS_SERVICE_INSTALL_HELPER_FILE | WINDOWS_VERIFY_HELPER_FILE
+            )
+        {
+            return self.capture_runtime_helper_report_via_ssh_poll(
+                target,
+                &helper_context,
+                invocation,
+                label,
+            );
+        }
+        capture_windows_helper_script_output_for_target_with_phase(
             &helper_context,
             invocation.helper_file_name,
             invocation.remote_file_name,
             invocation.args.as_slice(),
+            phase,
         )
         .map_err(|err| format!("{label} failed for {}: {err}", target.label))
+    }
+
+    fn capture_runtime_helper_report_via_ssh_poll(
+        &self,
+        target: &RemoteTarget,
+        helper_context: &RemoteFallbackContext<'_>,
+        invocation: WindowsHelperScriptSpec,
+        label: &str,
+    ) -> Result<String, String> {
+        let local_path = match invocation.helper_file_name {
+            WINDOWS_SERVICE_INSTALL_HELPER_FILE => {
+                windows_service_install_helper_script_local_path()
+            }
+            WINDOWS_VERIFY_HELPER_FILE => windows_verify_helper_script_local_path(),
+            _ => windows_helper_script_local_path(invocation.helper_file_name),
+        };
+        let remote_path = stage_windows_helper_script_from_path_with_phase(
+            helper_context,
+            local_path.as_path(),
+            invocation.remote_file_name,
+            RemoteTransportPhase::PostBootstrap,
+        )?;
+        let remote_result_name = format!(
+            "{}.result.{}.json",
+            sanitize_label_for_path(invocation.remote_file_name),
+            unique_suffix()
+        );
+        let remote_result_path =
+            windows_helper_script_remote_path(helper_context.target, remote_result_name.as_str())?;
+        let mut args = invocation.args.clone();
+        args.push("-OutputPath".to_owned());
+        args.push(remote_result_path.clone());
+        let helper_command = build_windows_helper_command(remote_path.as_str(), args.as_slice())?;
+        let result_script = format!(
+            "Set-StrictMode -Version Latest; \
+             $ErrorActionPreference = 'Stop'; \
+             $ProgressPreference = 'SilentlyContinue'; \
+             $resultPath = {result_path}; \
+             $resultParent = Split-Path -Path $resultPath -Parent; \
+             if ($resultParent -and -not (Test-Path -LiteralPath $resultParent)) {{ \
+               New-Item -ItemType Directory -Path $resultParent -Force | Out-Null \
+             }}; \
+             if (Test-Path -LiteralPath $resultPath) {{ \
+               Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue \
+             }}; \
+             {helper_command}; \
+             if (-not (Test-Path -LiteralPath $resultPath)) {{ \
+               throw ('{label} did not write result file: {{0}}' -f $resultPath) \
+             }}",
+            result_path = powershell_quote(remote_result_path.as_str())?,
+            helper_command = helper_command,
+            label = label,
+        );
+        let ssh_script =
+            remote_script_for_ssh_transport(helper_context.target, result_script.as_str())?;
+        self.run_runtime_helper_ssh_report_command_with_poll(
+            target,
+            helper_context,
+            ssh_script.as_str(),
+            remote_result_path.as_str(),
+            invocation.helper_file_name,
+            label,
+        )
+    }
+
+    fn run_runtime_helper_ssh_report_command_with_poll(
+        &self,
+        target: &RemoteTarget,
+        helper_context: &RemoteFallbackContext<'_>,
+        ssh_script: &str,
+        remote_result_path: &str,
+        helper_file_name: &str,
+        label: &str,
+    ) -> Result<String, String> {
+        let ssh_user = helper_context
+            .ssh_user_override
+            .or(helper_context.target.ssh_user.as_deref());
+        validate_target_user_combination(helper_context.target.ssh_target.as_str(), ssh_user)?;
+        let mut command = std::process::Command::new("ssh");
+        command.args([
+            "-n",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=15",
+            "-o",
+            "ServerAliveInterval=20",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "IdentitiesOnly=yes",
+        ]);
+        append_ssh_transport_options(
+            &mut command,
+            helper_context.ssh_identity_file,
+            helper_context.known_hosts_path,
+        )?;
+        if let Some(ssh_user) = ssh_user {
+            command.arg("-l").arg(ssh_user);
+        }
+        command.arg("--").arg(&helper_context.target.ssh_target);
+        command.arg(ssh_script);
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("spawn {label} SSH command failed: {err}"))?;
+        let started_at = std::time::Instant::now();
+        let mut last_report_read_error = format!("{label} report not read yet");
+        loop {
+            match self.read_runtime_helper_report_via_ssh(helper_context, remote_result_path) {
+                Ok(report) => match parse_runtime_helper_report_shape(helper_file_name, &report) {
+                    Ok(()) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Ok(report);
+                    }
+                    Err(err) => {
+                        last_report_read_error = err;
+                    }
+                },
+                Err(err) => {
+                    last_report_read_error = err;
+                }
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|err| format!("wait for {label} SSH command failed: {err}"))?
+            {
+                let report =
+                    self.read_runtime_helper_report_via_ssh(helper_context, remote_result_path)?;
+                return parse_runtime_helper_report_shape(helper_file_name, &report)
+                    .map(|()| report)
+                    .map_err(|err| {
+                        format!(
+                            "{label} SSH command exited with status {}; report parse failed for {}: {err}",
+                            status_code(status),
+                            target.label
+                        )
+                    });
+            }
+            if started_at.elapsed() >= helper_context.timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Ok(report) =
+                    self.read_runtime_helper_report_via_ssh(helper_context, remote_result_path)
+                    && parse_runtime_helper_report_shape(helper_file_name, &report).is_ok()
+                {
+                    return Ok(report);
+                }
+                return Err(format!(
+                    "{label} SSH command timed out after {} seconds for {}; last report read error: {}",
+                    helper_context.timeout.as_secs(),
+                    target.label,
+                    last_report_read_error
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+
+    fn read_runtime_helper_report_via_ssh(
+        &self,
+        helper_context: &RemoteFallbackContext<'_>,
+        remote_result_path: &str,
+    ) -> Result<String, String> {
+        let script = format!(
+            "Set-StrictMode -Version Latest; \
+             $ErrorActionPreference = 'Stop'; \
+             $reportPath = {result_path}; \
+             if (-not (Test-Path -LiteralPath $reportPath)) {{ \
+               throw ('Windows runtime helper report not found: {{0}}' -f $reportPath) \
+             }}; \
+             Get-Content -Raw -LiteralPath $reportPath -Encoding UTF8",
+            result_path = powershell_quote(remote_result_path)?,
+        );
+        let ssh_script = remote_script_for_ssh_transport(helper_context.target, script.as_str())?;
+        capture_remote_shell_command(
+            helper_context.target.ssh_target.as_str(),
+            helper_context
+                .ssh_user_override
+                .or(helper_context.target.ssh_user.as_deref()),
+            helper_context.ssh_identity_file,
+            helper_context.known_hosts_path,
+            ssh_script.as_str(),
+            helper_context.timeout.min(Duration::from_secs(30)),
+        )
+        .map_err(|err| {
+            format!(
+                "Windows runtime helper report read failed for {}: {err}",
+                helper_context.target.label
+            )
+        })
     }
 
     fn run_helper_via_local_utm_result_file(
@@ -1265,51 +1544,194 @@ impl WindowsBootstrapProvider {
         parse_windows_runtime_report_output(output.as_str(), label, target.label.as_str())
     }
 
-    fn run_build_release_via_local_utm_report(
+    fn run_build_release_via_ssh_report(
         &self,
         target: &RemoteTarget,
         context: &BootstrapPhaseContext<'_>,
         invocation: WindowsHelperScriptSpec,
     ) -> Result<(), String> {
         let helper_context = self.helper_context(target, context);
-        let (utm_name, _) = remote_target_local_utm(helper_context.target).ok_or_else(|| {
-            format!(
-                "Windows bootstrap build-release requested local UTM report mode for non-UTM target {}",
-                target.label
-            )
-        })?;
-        stage_windows_helper_support_files(&helper_context, invocation.helper_file_name)?;
+        stage_windows_helper_support_files_with_phase(
+            &helper_context,
+            invocation.helper_file_name,
+            RemoteTransportPhase::PostBootstrap,
+        )?;
         let unique_bootstrap_name = format!("Bootstrap-RustyNetWindows.{}.ps1", unique_suffix());
         let remote_path = stage_windows_helper_script_from_path_with_phase(
             &helper_context,
             windows_bootstrap_helper_script_local_path().as_path(),
             unique_bootstrap_name.as_str(),
-            RemoteTransportPhase::AccessEstablishment,
+            RemoteTransportPhase::PostBootstrap,
         )?;
         let (_report_root, remote_manifest_path, remote_probe_path) =
             build_windows_build_release_report_paths(helper_context.target)?;
         let manifest_path = remote_manifest_path.clone();
-        let output = execute_windows_local_utm_result_file_probe(
-            utm_name,
-            "Windows bootstrap build-release",
-            helper_context.timeout,
+        let result_script = build_windows_bootstrap_build_release_result_script(
+            remote_path.as_str(),
+            invocation.args.as_slice(),
+            manifest_path.as_str(),
             remote_probe_path.as_str(),
-            |remote_probe_path| {
-                build_windows_bootstrap_build_release_result_script(
-                    remote_path.as_str(),
-                    invocation.args.as_slice(),
-                    manifest_path.as_str(),
+        )?;
+        let ssh_script =
+            remote_script_for_ssh_transport(helper_context.target, result_script.as_str())?;
+        let output = self.run_build_release_ssh_report_command_with_poll(
+            &helper_context,
+            ssh_script.as_str(),
+            remote_probe_path.as_str(),
+            remote_manifest_path.as_str(),
+        )?;
+        parse_windows_build_release_report_output(output.as_str(), target.label.as_str())
+    }
+
+    fn run_build_release_ssh_report_command_with_poll(
+        &self,
+        helper_context: &RemoteFallbackContext<'_>,
+        ssh_script: &str,
+        remote_probe_path: &str,
+        remote_manifest_path: &str,
+    ) -> Result<String, String> {
+        let ssh_user = helper_context
+            .ssh_user_override
+            .or(helper_context.target.ssh_user.as_deref());
+        validate_target_user_combination(helper_context.target.ssh_target.as_str(), ssh_user)?;
+        let mut command = std::process::Command::new("ssh");
+        command.args([
+            "-n",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=15",
+            "-o",
+            "ServerAliveInterval=20",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "IdentitiesOnly=yes",
+        ]);
+        append_ssh_transport_options(
+            &mut command,
+            helper_context.ssh_identity_file,
+            helper_context.known_hosts_path,
+        )?;
+        if let Some(ssh_user) = ssh_user {
+            command.arg("-l").arg(ssh_user);
+        }
+        command.arg("--").arg(&helper_context.target.ssh_target);
+        command.arg(ssh_script);
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("spawn Windows build-release SSH command failed: {err}"))?;
+        let started_at = std::time::Instant::now();
+        let mut last_report_read_error: String;
+        loop {
+            match self.read_build_release_report_via_ssh(
+                helper_context,
+                remote_probe_path,
+                remote_manifest_path,
+            ) {
+                Ok(report) => match WindowsBuildReleaseReportView::parse(report.as_str()) {
+                    Ok(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Ok(report);
+                    }
+                    Err(err) => {
+                        last_report_read_error = err;
+                    }
+                },
+                Err(err) => {
+                    last_report_read_error = err;
+                }
+            }
+            if let Some(status) = child.try_wait().map_err(|err| {
+                format!("wait for Windows build-release SSH command failed: {err}")
+            })? {
+                let report = self.read_build_release_report_via_ssh(
+                    helper_context,
                     remote_probe_path,
+                    remote_manifest_path,
+                )?;
+                return parse_windows_build_release_report_output(
+                    report.as_str(),
+                    helper_context.target.label.as_str(),
                 )
-            },
+                .map(|()| report)
+                .map_err(|err| {
+                    format!(
+                        "Windows build-release SSH command exited with status {}; report parse failed: {err}",
+                        status_code(status)
+                    )
+                });
+            }
+            if started_at.elapsed() >= helper_context.timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Ok(report) = self.read_build_release_report_via_ssh(
+                    helper_context,
+                    remote_probe_path,
+                    remote_manifest_path,
+                ) && parse_windows_build_release_report_output(
+                    report.as_str(),
+                    helper_context.target.label.as_str(),
+                )
+                .is_ok()
+                {
+                    return Ok(report);
+                }
+                return Err(format!(
+                    "Windows build-release SSH command timed out after {} seconds; last report read error: {}",
+                    helper_context.timeout.as_secs(),
+                    last_report_read_error
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+
+    fn read_build_release_report_via_ssh(
+        &self,
+        helper_context: &RemoteFallbackContext<'_>,
+        remote_probe_path: &str,
+        remote_manifest_path: &str,
+    ) -> Result<String, String> {
+        let script = format!(
+            "Set-StrictMode -Version Latest; \
+             $ErrorActionPreference = 'Stop'; \
+             $reportPath = {probe_path}; \
+             if (-not (Test-Path -LiteralPath $reportPath)) {{ \
+               $reportPath = {manifest_path} \
+             }}; \
+             if (-not (Test-Path -LiteralPath $reportPath)) {{ \
+               throw ('Windows build-release report not found: {{0}}' -f $reportPath) \
+             }}; \
+             Get-Content -Raw -LiteralPath $reportPath -Encoding UTF8",
+            probe_path = powershell_quote(remote_probe_path)?,
+            manifest_path = powershell_quote(remote_manifest_path)?,
+        );
+        let ssh_script = remote_script_for_ssh_transport(helper_context.target, script.as_str())?;
+        capture_remote_shell_command(
+            helper_context.target.ssh_target.as_str(),
+            helper_context
+                .ssh_user_override
+                .or(helper_context.target.ssh_user.as_deref()),
+            helper_context.ssh_identity_file,
+            helper_context.known_hosts_path,
+            ssh_script.as_str(),
+            helper_context.timeout.min(Duration::from_secs(30)),
         )
         .map_err(|err| {
             format!(
-                "Windows bootstrap build-release failed for {}: {err}",
-                target.label
+                "Windows bootstrap build-release fallback report read failed for {}: {err}",
+                helper_context.target.label
             )
-        })?;
-        parse_windows_build_release_report_output(output.as_str(), target.label.as_str())
+        })
     }
 
     fn collect_failure_diagnostics(
@@ -1318,6 +1740,12 @@ impl WindowsBootstrapProvider {
         target: &RemoteTarget,
         context: &BootstrapPhaseContext<'_>,
     ) -> Result<String, String> {
+        if phase_requires_proven_access(phase) {
+            return Err(
+                "post-bootstrap diagnostics use pinned SSH failure output; local UTM diagnostics disabled"
+                    .to_owned(),
+            );
+        }
         if matches!(
             windows_local_utm_execution_authority(target, false),
             Some(WindowsLocalUtmExecutionAuthority::StatusProbeResultFile)
@@ -1438,9 +1866,7 @@ impl WindowsBootstrapProvider {
         target: &RemoteTarget,
         context: &BootstrapPhaseContext<'_>,
     ) -> Result<(), String> {
-        if !phase_requires_proven_access(phase)
-            || local_utm_result_file_supported_for_phase(phase, target)
-        {
+        if !phase_requires_proven_access(phase) {
             return Ok(());
         }
         ensure_windows_runtime_access_ready_for_target(
@@ -1474,16 +1900,7 @@ impl WindowsBootstrapProvider {
             BootstrapPhase::BuildRelease => {
                 let invocation =
                     build_bootstrap_script_invocation(phase, target.label.as_str(), context)?;
-                if local_utm_result_file_supported_for_phase(BootstrapPhase::BuildRelease, target) {
-                    self.run_build_release_via_local_utm_report(target, context, invocation)
-                } else {
-                    self.invoke_helper_status(
-                        target,
-                        context,
-                        invocation,
-                        "Windows bootstrap build-release",
-                    )
-                }
+                self.run_build_release_via_ssh_report(target, context, invocation)
             }
             BootstrapPhase::SmokeServiceHost => {
                 let invocation = build_windows_service_host_smoke_invocation(context);
@@ -1558,11 +1975,12 @@ impl WindowsBootstrapProvider {
                         "Windows service install helper",
                     )
                 } else {
-                    let output = self.capture_helper_output(
+                    let output = self.capture_helper_output_with_phase(
                         target,
                         context,
                         invocation,
                         "Windows service install helper",
+                        RemoteTransportPhase::PostBootstrap,
                     )?;
                     parse_windows_runtime_report_output(
                         output.as_str(),
@@ -1592,11 +2010,12 @@ impl WindowsBootstrapProvider {
                 .map_err(|err| {
                     format!("Windows restart-runtime failed for {}: {err}", target.label)
                 })?;
-                let output = self.capture_helper_output(
+                let output = self.capture_helper_output_with_phase(
                     target,
                     context,
                     build_windows_verify_invocation(context, false),
                     "Windows verify helper after restart-runtime",
+                    RemoteTransportPhase::PostBootstrap,
                 )?;
                 parse_windows_runtime_report_output(
                     output.as_str(),
@@ -1615,11 +2034,12 @@ impl WindowsBootstrapProvider {
                         "Windows verify helper",
                     )
                 } else {
-                    let output = self.capture_helper_output(
+                    let output = self.capture_helper_output_with_phase(
                         target,
                         context,
                         invocation,
                         "Windows verify helper",
+                        RemoteTransportPhase::PostBootstrap,
                     )?;
                     parse_windows_runtime_report_output(
                         output.as_str(),
@@ -1888,12 +2308,15 @@ mod tests {
     }
 
     #[test]
-    fn windows_restart_runtime_script_uses_powershell_service_control() {
+    fn windows_restart_runtime_script_uses_bounded_sc_service_control() {
         let script =
             build_windows_restart_runtime_script().expect("restart-runtime script should build");
-        assert!(script.contains("Restart-Service -Name $serviceName -ErrorAction Stop"));
-        assert!(script.contains("Start-Service -Name $serviceName -ErrorAction Stop"));
+        assert!(script.contains("Stop-RustyNetServiceBounded"));
+        assert!(script.contains("sc.exe stop $serviceName"));
+        assert!(script.contains("sc.exe start $serviceName"));
+        assert!(script.contains("refusing to kill StopPending service"));
         assert!(script.contains("service-status="));
+        assert!(!script.contains("Restart-Service"));
         assert!(!script.contains("WaitForStatus('Running'"));
         assert!(!script.contains("systemctl"));
     }
@@ -1926,7 +2349,7 @@ mod tests {
     #[test]
     fn windows_runtime_phases_require_proven_access() {
         assert!(!phase_requires_proven_access(BootstrapPhase::SyncSource));
-        assert!(!phase_requires_proven_access(BootstrapPhase::BuildRelease));
+        assert!(phase_requires_proven_access(BootstrapPhase::BuildRelease));
         assert!(!phase_requires_proven_access(
             BootstrapPhase::SmokeServiceHost
         ));
@@ -1937,10 +2360,11 @@ mod tests {
     }
 
     #[test]
-    fn local_utm_result_file_supported_for_runtime_phases_on_windows_local_utm() {
-        // Result-file path is enabled for BuildRelease, InstallRelease,
-        // RestartRuntime, VerifyRuntime when the target is a Windows
-        // local-UTM guest with a SYSTEM-writable staging directory.
+    fn local_utm_result_file_disabled_for_post_bootstrap_phases_on_windows_local_utm() {
+        // Post-bootstrap phases use pinned SSH after access is proven.
+        // Local UTM result-file pulls can block even after the guest has
+        // written a complete report, so they are kept out of the normal
+        // runtime phase path.
         let target = RemoteTarget {
             label: "windows-utm-1".to_owned(),
             ssh_target: "192.168.64.14".to_owned(),
@@ -1955,19 +2379,19 @@ mod tests {
             utm_staging_dir: Some(r"C:\Users\windows\rustynet-utm-stage".to_owned()),
         };
 
-        assert!(local_utm_result_file_supported_for_phase(
+        assert!(!local_utm_result_file_supported_for_phase(
             BootstrapPhase::BuildRelease,
             &target
         ));
-        assert!(local_utm_result_file_supported_for_phase(
+        assert!(!local_utm_result_file_supported_for_phase(
             BootstrapPhase::InstallRelease,
             &target
         ));
-        assert!(local_utm_result_file_supported_for_phase(
+        assert!(!local_utm_result_file_supported_for_phase(
             BootstrapPhase::RestartRuntime,
             &target
         ));
-        assert!(local_utm_result_file_supported_for_phase(
+        assert!(!local_utm_result_file_supported_for_phase(
             BootstrapPhase::VerifyRuntime,
             &target
         ));
@@ -2768,6 +3192,7 @@ mod tests {
           "exit_code_path": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release\\exit_code.txt",
           "toolchain_path": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release\\toolchain.txt",
           "toolchain_scope": "machine",
+          "cargo_build_jobs": "1",
           "manifest_path": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release\\manifest.json",
           "complete_marker_path": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release\\complete.marker",
           "exit_code": 0,
@@ -2784,6 +3209,7 @@ mod tests {
         assert_eq!(view.phase, "build-release");
         assert_eq!(view.status, "pass");
         assert_eq!(view.toolchain_scope, "machine");
+        assert_eq!(view.cargo_build_jobs, "1");
         assert_eq!(view.exit_code, 0);
     }
 
@@ -2954,6 +3380,7 @@ mod tests {
         assert!(script.contains("manifest missing field"));
         assert!(script.contains("missing report file"));
         assert!(script.contains("probe.json"));
+        assert!(script.contains("Write-Output $body"));
     }
 
     #[test]

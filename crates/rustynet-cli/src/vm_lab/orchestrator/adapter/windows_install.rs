@@ -1044,6 +1044,14 @@ mod tests {
             "bootstrap script must contain its own filename"
         );
         assert!(
+            BOOTSTRAP_SCRIPT.contains("Ensure-CargoBuildJobsForWindowsLab"),
+            "bootstrap build-release must cap cargo parallelism by default for low-memory Windows lab guests"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("cargo_build_jobs"),
+            "bootstrap build-release report must record effective cargo parallelism"
+        );
+        assert!(
             !INSTALL_SERVICE_SCRIPT.is_empty(),
             "Install-RustyNetWindowsService.ps1 must not be empty"
         );

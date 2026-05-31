@@ -156,6 +156,28 @@ function Ensure-Directory {
     }
 }
 
+function Set-InstallProgressStep {
+    param([Parameter(Mandatory = $true)][string]$Step)
+    $script:InstallFailureStep = $Step
+    if (-not $OutputPath -or $OutputPath.Trim().Length -eq 0) {
+        return
+    }
+    try {
+        $progressPath = $OutputPath + '.progress'
+        $progressDirectory = Split-Path -Parent $progressPath
+        if ($progressDirectory) {
+            Ensure-Directory -Path $progressDirectory
+        }
+        ([ordered]@{
+            captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+            step = $Step
+        } | ConvertTo-Json -Compress) | Set-Content -Encoding utf8 -LiteralPath $progressPath
+    }
+    catch {
+        # Progress telemetry must never mask the install result.
+    }
+}
+
 function Get-NativeCommandText {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -307,15 +329,36 @@ function Get-ServiceRuntimeState {
     param([Parameter(Mandatory = $true)][string]$ServiceName)
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     $serviceStatus = if ($service) { [string]$service.Status } else { 'missing' }
-    $cimService = Get-CimInstance -ClassName Win32_Service -Filter "Name = '$ServiceName'" -ErrorAction SilentlyContinue
+    $queryEx = (& sc.exe queryex "$ServiceName" 2>&1 | Out-String)
+    $queryConfig = (& sc.exe qc "$ServiceName" 2>&1 | Out-String)
+    $state = 'missing'
+    $startMode = ''
+    $exitCode = $null
+    $processId = $null
+    foreach ($line in ($queryEx -split "`r?`n")) {
+        if ($line -match '^\s*STATE\s*:\s*\d+\s+([A-Z_]+)\s*$') {
+            $state = [string]$Matches[1]
+        }
+        elseif ($line -match '^\s*WIN32_EXIT_CODE\s*:\s*(\d+)\s+') {
+            $exitCode = [int]$Matches[1]
+        }
+        elseif ($line -match '^\s*PID\s*:\s*(\d+)\s*$') {
+            $processId = [int]$Matches[1]
+        }
+    }
+    foreach ($line in ($queryConfig -split "`r?`n")) {
+        if ($line -match '^\s*START_TYPE\s*:\s*\d+\s+([A-Z_]+)\s*$') {
+            $startMode = [string]$Matches[1]
+        }
+    }
     $imagePath = Get-ServiceImagePath -ServiceName $ServiceName
     return [ordered]@{
         present = [bool]$service
         status = $serviceStatus
-        state = if ($cimService) { [string]$cimService.State } else { 'missing' }
-        start_mode = if ($cimService) { [string]$cimService.StartMode } else { '' }
-        exit_code = if ($cimService) { [int]$cimService.ExitCode } else { $null }
-        process_id = if ($cimService) { [int]$cimService.ProcessId } else { $null }
+        state = $state
+        start_mode = $startMode
+        exit_code = $exitCode
+        process_id = $processId
         image_path = $imagePath
     }
 }
@@ -590,52 +633,39 @@ function Set-RustyNetDnsFailClosedPosture {
     $changes = New-Object System.Collections.Generic.List[string]
     $errors = New-Object System.Collections.Generic.List[string]
 
-    $dnsRows = @(Get-DnsClientServerAddress -ErrorAction Stop)
-    $seen = @{}
-    foreach ($row in $dnsRows) {
-        $key = ('{0}' -f [int]$row.InterfaceIndex)
-        if ($seen.ContainsKey($key)) {
+    $interfaceOutput = (& netsh interface ipv4 show interfaces 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "netsh interface ipv4 show interfaces failed: $interfaceOutput"
+    }
+    $seenInterfaces = @{}
+    foreach ($line in ($interfaceOutput -split "`r?`n")) {
+        if ($line -notmatch '^\s*(\d+)\s+\d+\s+\d+\s+\S+\s+(.+?)\s*$') {
             continue
         }
-        $seen[$key] = $true
-        $servers = @('127.0.0.1', '::1')
-        try {
-            Set-DnsClientServerAddress `
-                -InterfaceIndex ([int]$row.InterfaceIndex) `
-                -ServerAddresses $servers `
-                -ErrorAction Stop
-            $changes.Add(('interface={0} servers={1}' -f [string]$row.InterfaceAlias, ($servers -join ',')))
+        $index = [int]$Matches[1]
+        $name = [string]$Matches[2]
+        if ($name -eq 'Name' -or $seenInterfaces.ContainsKey($name)) {
+            continue
         }
-        catch {
-            $errors.Add(('failed to set DNS interface={0}: {1}' -f [string]$row.InterfaceAlias, $_.Exception.Message))
+        $seenInterfaces[$name] = $true
+
+        $ipv4Output = (& netsh interface ipv4 set dnsservers name="$name" static 127.0.0.1 primary validate=no 2>&1 | Out-String)
+        if ($LASTEXITCODE -eq 0) {
+            $changes.Add(('interface={0} ipv4_dns=127.0.0.1' -f $name))
+        } else {
+            $errors.Add(('failed to set IPv4 DNS interface={0} index={1}: {2}' -f $name, $index, $ipv4Output.Trim()))
+        }
+
+        $ipv6Output = (& netsh interface ipv6 set dnsservers name="$name" static ::1 primary validate=no 2>&1 | Out-String)
+        if ($LASTEXITCODE -eq 0) {
+            $changes.Add(('interface={0} ipv6_dns=::1' -f $name))
+        } else {
+            $errors.Add(('failed to set IPv6 DNS interface={0} index={1}: {2}' -f $name, $index, $ipv6Output.Trim()))
         }
     }
 
-    $removedRootRules = 0
-    $existingRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue)
-    foreach ($rule in $existingRules) {
-        $namespaces = @($rule.Namespace)
-        if ($namespaces -contains '.') {
-            try {
-                Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop
-                $removedRootRules += 1
-            }
-            catch {
-                $errors.Add(('failed to remove stale root NRPT rule {0}: {1}' -f [string]$rule.Name, $_.Exception.Message))
-            }
-        }
-    }
-
-    try {
-        Add-DnsClientNrptRule `
-            -Namespace '.' `
-            -NameServers '127.0.0.1' `
-            -Comment 'RustyNet fail-closed root DNS' `
-            -ErrorAction Stop | Out-Null
-        $changes.Add('nrpt_root=127.0.0.1')
-    }
-    catch {
-        $errors.Add(('failed to add root NRPT loopback rule: {0}' -f $_.Exception.Message))
+    if ($changes.Count -eq 0) {
+        $errors.Add('no Windows interfaces accepted loopback DNS settings via netsh')
     }
 
     if ($errors.Count -gt 0) {
@@ -645,20 +675,20 @@ function Set-RustyNetDnsFailClosedPosture {
     return [ordered]@{
         status = 'pass'
         interface_updates = $changes.ToArray()
-        removed_root_nrpt_rules = $removedRootRules
-        root_nrpt_name_server = '127.0.0.1'
+        removed_root_nrpt_rules = 0
+        root_nrpt_name_server = 'not-configured-netsh-only'
     }
 }
 
 $wireGuardProbe = [ordered]@{ present = $false; path = ''; detection = 'not-checked' }
 
-$script:InstallFailureStep = 'ensure-runtime-layout'
+Set-InstallProgressStep 'ensure-runtime-layout'
 Ensure-RustyNetRuntimeLayout -InstallRoot $InstallRoot -StateRoot $StateRoot
 
-$script:InstallFailureStep = 'check-wireguard-driver'
+Set-InstallProgressStep 'check-wireguard-driver'
 $wireGuardProbe = Test-WireGuardDriverPresence
 
-$script:InstallFailureStep = 'locate-build-artifacts'
+Set-InstallProgressStep 'locate-build-artifacts'
 $daemonCandidates = @(
     Join-Path $RustyNetRoot 'target\release\rustynetd.exe'
 )
@@ -698,29 +728,95 @@ if (-not $cliSource) {
 
 $daemonDest = Join-Path $InstallRoot 'rustynetd.exe'
 
-# On idempotent re-runs the service from a previous install may already be
-# running and holding rustynetd.exe open, which would block Copy-Item below
-# with "the process cannot access the file". Stop it first; configure-service-
-# registration further down still deletes and recreates the service entry, so
-# this only changes the lifecycle ordering, not the end state.
-$script:InstallFailureStep = 'stop-existing-service-for-binary-replace'
-$existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($existingService -and $existingService.Status -ne 'Stopped') {
-    Write-Host ("[install-helper] stopping existing {0} service (status={1}) before replacing daemon binary" -f $ServiceName, $existingService.Status)
-    Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+function Get-RustyNetServiceProcessId {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $query = (& sc.exe queryex "$Name" 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        return 0
+    }
+    foreach ($line in ($query -split "`r?`n")) {
+        if ($line -match '^\s*PID\s*:\s*(\d+)\s*$') {
+            return [int]$Matches[1]
+        }
+    }
+    return 0
+}
+
+function Stop-RustyNetExistingServiceForBinaryReplace {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$ExpectedDaemonPath
+    )
+
+    $existingService = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $existingService -or $existingService.Status -eq 'Stopped') {
+        return
+    }
+
+    Write-Host ("[install-helper] stopping existing {0} service (status={1}) before replacing daemon binary" -f $Name, $existingService.Status)
+    if ($existingService.Status -ne 'StopPending') {
+        $stopOutput = (& sc.exe stop "$Name" 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -and $stopOutput -notmatch '1062') {
+            $existingService = Get-Service -Name $Name -ErrorAction SilentlyContinue
+            if (-not $existingService -or $existingService.Status -ne 'StopPending') {
+                throw "sc.exe stop failed for ${Name}: $stopOutput"
+            }
+        }
+    }
+    else {
+        Write-Host ("[install-helper] existing {0} service already stop-pending; waiting before forced process cleanup" -f $Name)
+    }
+
     $stopDeadline = (Get-Date).AddSeconds(15)
     while ((Get-Date) -lt $stopDeadline) {
-        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        if (-not $svc -or $svc.Status -eq 'Stopped') { break }
+        $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -eq 'Stopped') { return }
         Start-Sleep -Milliseconds 250
     }
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq 'StopPending') {
+        $servicePid = Get-RustyNetServiceProcessId -Name $Name
+        if ($servicePid -gt 0) {
+            $process = Get-Process -Id $servicePid -ErrorAction SilentlyContinue
+            $processPath = ''
+            if ($process -and $process.Path) {
+                $processPath = [string]$process.Path
+            }
+            $expected = [System.IO.Path]::GetFullPath($ExpectedDaemonPath)
+            $actual = if ($processPath) { [System.IO.Path]::GetFullPath($processPath) } else { '' }
+            if ($actual -and ($actual -ieq $expected)) {
+                Write-Host ("[install-helper] forcing stuck {0} service process pid={1}" -f $Name, $servicePid)
+                Stop-Process -Id $servicePid -Force -ErrorAction Stop
+                $killDeadline = (Get-Date).AddSeconds(10)
+                while ((Get-Date) -lt $killDeadline) {
+                    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+                    if (-not $svc -or $svc.Status -eq 'Stopped') { return }
+                    Start-Sleep -Milliseconds 250
+                }
+            }
+            else {
+                throw "RustyNet service is StopPending but pid=$servicePid path did not match reviewed daemon path (actual=$actual expected=$expected)"
+            }
+        }
+    }
+
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if ($svc -and $svc.Status -ne 'Stopped') {
         throw "RustyNet service did not transition to Stopped within 15s (current=$($svc.Status))"
     }
 }
 
-$script:InstallFailureStep = 'copy-daemon-binary'
+# On idempotent re-runs the service from a previous install may already be
+# running and holding rustynetd.exe open, which would block Copy-Item below
+# with "the process cannot access the file". Stop it first; configure-service-
+# registration further down still deletes and recreates the service entry, so
+# this only changes the lifecycle ordering, not the end state.
+Set-InstallProgressStep 'stop-existing-service-for-binary-replace'
+Stop-RustyNetExistingServiceForBinaryReplace -Name $ServiceName -ExpectedDaemonPath $daemonDest
+
+Set-InstallProgressStep 'copy-daemon-binary'
 # Even after Stop-Service returns, SCM may briefly retain the file handle while
 # the process tears down. Retry the copy for up to ~10 seconds before giving
 # up so a normal idempotent re-run is not racy.
@@ -741,7 +837,7 @@ if (-not $copyOk) {
 }
 
 if ($cliSource) {
-    $script:InstallFailureStep = 'copy-cli-binary'
+    Set-InstallProgressStep 'copy-cli-binary'
     Copy-Item -LiteralPath $cliSource -Destination (Join-Path $InstallRoot 'rustynet.exe') -Force
 }
 
@@ -765,7 +861,7 @@ if ($cliSource) {
 #
 # Idempotent: an existing non-expired cert with the same subject is
 # reused; signtool re-signing replaces the prior signature in place.
-$script:InstallFailureStep = 'sign-installed-binaries-for-authenticode'
+Set-InstallProgressStep 'sign-installed-binaries-for-authenticode'
 $signtoolCandidatePatterns = @(
     'C:\Program Files (x86)\Windows Kits\10\bin\*\arm64\signtool.exe',
     'C:\Program Files\Windows Kits\10\bin\*\arm64\signtool.exe',
@@ -858,9 +954,24 @@ foreach ($binPath in $binariesToSign) {
         '/v',
         $binPath
     )
-    $signOutput = (& $signtoolPath @signtoolArgs 2>&1) -join "`n"
-    if ($LASTEXITCODE -ne 0) {
-        throw "signtool sign failed for $binPath (exit $LASTEXITCODE): $signOutput"
+    $signDeadline = (Get-Date).AddSeconds(20)
+    $signOk = $false
+    $signOutput = ''
+    $signExitCode = 0
+    while (-not $signOk -and (Get-Date) -lt $signDeadline) {
+        $signOutput = (& $signtoolPath @signtoolArgs 2>&1) -join "`n"
+        $signExitCode = $LASTEXITCODE
+        if ($signExitCode -eq 0) {
+            $signOk = $true
+            break
+        }
+        if ($signOutput -notmatch 'being used by another process') {
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $signOk) {
+        throw "signtool sign failed for $binPath (exit $signExitCode): $signOutput"
     }
     Write-Host "[install-helper] authenticode: signed $binPath"
 }
@@ -875,13 +986,13 @@ foreach ($binPath in $binariesToSign) {
 # `key init --force` + `key store-passphrase` here aligns the encryption
 # identity with the runtime identity (SYSTEM service), so the daemon's
 # subsequent decrypt at startup matches.  Idempotent: re-runs are safe.
-$script:InstallFailureStep = 'rekey-wireguard-under-runtime-identity'
+Set-InstallProgressStep 'rekey-wireguard-under-runtime-identity'
 $wgPassphrasePath = Join-Path $StateRoot 'secrets\wireguard.passphrase.dpapi'
 $wgPassphraseDir = Split-Path -Parent $wgPassphrasePath
 if (-not (Test-Path -LiteralPath $wgPassphraseDir)) {
     New-Item -ItemType Directory -Force -Path $wgPassphraseDir | Out-Null
 }
-$script:InstallFailureStep = 'repair-key-custody-acls-before-rekey'
+Set-InstallProgressStep 'repair-key-custody-acls-before-rekey'
 $preServiceAdministratorsName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-32-544'
 $preServiceLocalSystemName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-18'
 foreach ($preServiceDirectory in @(
@@ -893,7 +1004,7 @@ foreach ($preServiceDirectory in @(
     Ensure-Directory -Path $preServiceDirectory
     Repair-RustyNetPreServiceAcl -Path $preServiceDirectory -AdministratorsName $preServiceAdministratorsName -LocalSystemName $preServiceLocalSystemName -Directory
 }
-$script:InstallFailureStep = 'rekey-wireguard-under-runtime-identity'
+Set-InstallProgressStep 'rekey-wireguard-under-runtime-identity'
 $rekeyPlaintext = -join ((1..48 | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) }))
 [System.IO.File]::WriteAllText($wgPassphrasePath, $rekeyPlaintext)
 $keyInit = Invoke-RustyNetNativeCommand -Path $daemonDest -Arguments @('key', 'init', '--passphrase-file', $wgPassphrasePath, '--force')
@@ -919,7 +1030,7 @@ Write-Host "[install-helper] rekey: passphrase blob written under SYSTEM DPAPI s
 # attestation: the verifier key written here is the same one the daemon
 # loads at startup, so rotating both signing and verifier together is
 # safe — no other peer relies on this verifier key.
-$script:InstallFailureStep = 'reissue-trust-evidence-under-runtime-identity'
+Set-InstallProgressStep 'reissue-trust-evidence-under-runtime-identity'
 $trustDir = Join-Path $StateRoot 'trust'
 if (-not (Test-Path -LiteralPath $trustDir)) {
     New-Item -ItemType Directory -Force -Path $trustDir | Out-Null
@@ -973,7 +1084,7 @@ finally {
 }
 
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
-$script:InstallFailureStep = 'write-reviewed-env-file'
+Set-InstallProgressStep 'write-reviewed-env-file'
 $backendLabel = Resolve-ReviewedBackendLabel `
     -WireGuardProbe $wireGuardProbe `
     -ForceUnsupported ([bool]$ForceUnsupportedBackend)
@@ -981,11 +1092,11 @@ Write-Host ("[install-helper] selected backend label: {0} (wireguard.present={1}
     $backendLabel, [bool]$wireGuardProbe.present, [bool]$ForceUnsupportedBackend)
 Write-ReviewedEnvFile -Path $configPath -BackendLabel $backendLabel -AutoTunnelEnforce ([bool]$EnforceAutoTunnel)
 
-$script:InstallFailureStep = 'configure-dns-failclosed'
+Set-InstallProgressStep 'configure-dns-failclosed'
 $dnsFailClosedPosture = Set-RustyNetDnsFailClosedPosture
 Write-Host "[install-helper] DNS fail-closed posture configured (interface DNS + NRPT root loopback)"
 
-$script:InstallFailureStep = 'probe-runtime-support'
+Set-InstallProgressStep 'probe-runtime-support'
 $runtimeSignals = Test-RustyNetWindowsRuntimeSupport -DaemonPath $daemonDest
 $script:InstallRuntimeSignals = $runtimeSignals
 $serviceConfigError = ''
@@ -1008,7 +1119,7 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
     $binPath = "$quotedDaemon --windows-service --service-name $quotedServiceName --env-file $quotedConfig"
     $serviceDescription = 'RustyNet secure mesh runtime service host'
     try {
-        $script:InstallFailureStep = 'configure-service-registration'
+        Set-InstallProgressStep 'configure-service-registration'
         $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if ($existing) {
             if ($existing.Status -eq 'Running') {
@@ -1026,11 +1137,11 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
             }
         }
         New-Service -Name $ServiceName -BinaryPathName $binPath -DisplayName 'RustyNet' -Description $serviceDescription -StartupType Automatic -ErrorAction Stop | Out-Null
-        $script:InstallFailureStep = 'configure-service-sid'
+        Set-InstallProgressStep 'configure-service-sid'
         Ensure-ServiceSidTypeUnrestricted -ServiceName $ServiceName
         $serviceSidConfigured = $true
 
-        $script:InstallFailureStep = 'repair-runtime-acls'
+        Set-InstallProgressStep 'repair-runtime-acls'
         $administratorsName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-32-544'
         $localSystemName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-18'
         $serviceIdentity = Get-ServiceIdentityName -ServiceName $ServiceName
@@ -1049,11 +1160,11 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
         }
         Repair-RustyNetRuntimeAcl -Path $configPath -AdministratorsName $administratorsName -LocalSystemName $localSystemName -ServiceIdentity $serviceIdentity
 
-        $script:InstallFailureStep = 'repair-binary-acl'
+        Set-InstallProgressStep 'repair-binary-acl'
         Repair-RustyNetServiceBinaryAcl -Path $daemonDest -AdministratorsName $administratorsName -LocalSystemName $localSystemName -ServiceIdentity $serviceIdentity
         $runtimeAclApplied = $true
 
-        $script:InstallFailureStep = 'configure-failure-actions'
+        Set-InstallProgressStep 'configure-failure-actions'
         Set-RustyNetServiceFailureActions -ServiceName $ServiceName
     }
     catch {
@@ -1067,7 +1178,7 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
         # bootstrap completes.  Stale bundles without matching verifier
         # keys (or vice versa) cause the daemon's startup preflight to
         # fail closed on the *next* install attempt.
-        $script:InstallFailureStep = 'purge-stale-distribute-state'
+        Set-InstallProgressStep 'purge-stale-distribute-state'
         $membershipDir = Join-Path $StateRoot 'membership'
         foreach ($stalePath in @(
             (Join-Path $trustDir 'rustynetd.traversal'),
@@ -1091,13 +1202,14 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
 
         $serviceStartAttempted = $true
         try {
-            $script:InstallFailureStep = 'start-runtime-service'
+            Set-InstallProgressStep 'start-runtime-service'
             $service = Get-Service -Name $ServiceName -ErrorAction Stop
             if ($service.Status -eq 'Running') {
-                Restart-Service -Name $ServiceName -ErrorAction Stop
+                Stop-RustyNetExistingServiceForBinaryReplace -Name $ServiceName -ExpectedDaemonPath $daemonDest
             }
-            else {
-                Start-Service -Name $ServiceName -ErrorAction Stop
+            $startResult = Invoke-Sc -Arguments @('start', $ServiceName)
+            if ($startResult.exit_code -ne 0 -and $startResult.output -notmatch '1056|already running') {
+                throw "sc.exe start failed: $($startResult.output)"
             }
         }
         catch {
@@ -1107,7 +1219,7 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
     }
 }
 
-$script:InstallFailureStep = 'observe-runtime-service'
+Set-InstallProgressStep 'observe-runtime-service'
 $serviceRuntime = Get-ServiceRuntimeState -ServiceName $ServiceName
 $imagePath = [string]$serviceRuntime.image_path
 $serviceImagePathUsesWindowsService = Test-ImagePathContainsToken -ImagePath $imagePath -Token '--windows-service'

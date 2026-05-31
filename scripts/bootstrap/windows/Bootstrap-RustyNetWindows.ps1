@@ -229,6 +229,10 @@ function New-BuildReleaseReport {
     $cargoPathForScope = ''
     try { $cargoPathForScope = [string](Resolve-CargoExePath) } catch { $cargoPathForScope = '' }
     $toolchainScope = Get-ToolchainScope -ResolvedExePath $cargoPathForScope
+    $cargoBuildJobsForReport = ''
+    if ($env:CARGO_BUILD_JOBS) {
+        $cargoBuildJobsForReport = [string]$env:CARGO_BUILD_JOBS
+    }
 
     return [ordered]@{
         schema_version = 2
@@ -243,6 +247,7 @@ function New-BuildReleaseReport {
         exit_code_path = $Layout.exit_code_path
         toolchain_path = $Layout.toolchain_path
         toolchain_scope = $toolchainScope
+        cargo_build_jobs = $cargoBuildJobsForReport
         manifest_path = $Layout.manifest_path
         complete_marker_path = $Layout.complete_marker_path
         exit_code = $ExitCode
@@ -282,9 +287,28 @@ function Write-BuildReleaseReport {
 function Write-BuildReleaseToolchainReport {
     param([Parameter(Mandatory = $true)]$Layout)
 
-    $toolingState = Get-WindowsBootstrapToolingState
-    $content = Format-WindowsBootstrapToolingStateReport -State $toolingState
+    if ($env:RUSTYNET_BOOTSTRAP_FULL_TOOLING_REPORT -eq '1') {
+        $toolingState = Get-WindowsBootstrapToolingState
+        $content = Format-WindowsBootstrapToolingStateReport -State $toolingState
+    }
+    else {
+        $content = [string]::Join("`r`n", @(
+            '## bootstrap-tooling-state',
+            ('cargo_path=' + [string](Resolve-CargoExePath)),
+            ('rustc_path=' + [string](Resolve-RustcExePath)),
+            ('rustup_path=' + [string](Resolve-RustupExePath)),
+            ('vsdevcmd_path=' + [string](Resolve-VsDevCmdPath)),
+            ('cargo_build_jobs=' + [string]$env:CARGO_BUILD_JOBS),
+            'full_tooling_report=disabled'
+        ))
+    }
     Write-TextFileAtomically -Path $Layout.toolchain_path -Content $content
+}
+
+function Ensure-CargoBuildJobsForWindowsLab {
+    if ([string]::IsNullOrWhiteSpace($env:CARGO_BUILD_JOBS)) {
+        $env:CARGO_BUILD_JOBS = '1'
+    }
 }
 
 function Invoke-CargoBuildForReport {
@@ -1294,6 +1318,17 @@ function Resolve-GitExePath {
     return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
 }
 
+function Test-RunningAsAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
 # Add Windows Defender real-time-scan exclusions for the build paths the
 # RustyNet bootstrap touches. Defender scanning every cargo intermediate
 # (.rmeta / .rlib / .d / .obj / link.exe outputs) under real-time monitoring
@@ -1307,6 +1342,14 @@ function Resolve-GitExePath {
 # why subsequent runs may be slow. Setup-RustyNetWindowsHost.ps1 handles the
 # elevated first-time install.
 function Ensure-DefenderExclusionsForBuildPaths {
+    if ($env:RUSTYNET_BOOTSTRAP_ENABLE_DEFENDER_EXCLUSIONS -ne '1') {
+        Write-Output '[bootstrap] Defender exclusions skipped (opt-in disabled).'
+        return
+    }
+    if (-not (Test-RunningAsAdministrator)) {
+        Write-Output '[bootstrap] Defender exclusions skipped (not elevated).'
+        return
+    }
     if (-not (Get-Command Add-MpPreference -ErrorAction SilentlyContinue)) {
         Write-Output '[bootstrap] Add-MpPreference unavailable; skipping Defender exclusions.'
         return
@@ -1448,6 +1491,7 @@ function Build-RustyNet {
             }
         }
     }
+    Ensure-CargoBuildJobsForWindowsLab
     Ensure-CargoOnPath
     # Add Defender exclusions for $RustyNetRoot, ~\.cargo, the orchestrator
     # staging dir, and the daemon state/install roots. Best-effort; non-
@@ -1592,12 +1636,78 @@ function Restart-RustyNetRuntime {
     if (-not $service) {
         throw "Windows runtime service is not installed: $ServiceName"
     }
-    try {
-        if ($service.Status -eq 'Running') {
-            Restart-Service -Name $ServiceName -ErrorAction Stop
+
+    $expectedBinary = Join-Path $InstallRoot 'rustynetd.exe'
+    function Get-RustyNetRuntimeServicePid {
+        $query = (& sc.exe queryex "$ServiceName" 2>&1 | Out-String)
+        foreach ($line in ($query -split "`r?`n")) {
+            if ($line -match '^\s*PID\s*:\s*(\d+)\s*$') {
+                return [int]$Matches[1]
+            }
         }
-        else {
-            Start-Service -Name $ServiceName -ErrorAction Stop
+        return 0
+    }
+
+    function Wait-RustyNetRuntimeStopped {
+        param([Parameter(Mandatory = $true)][int]$Seconds)
+        $deadline = (Get-Date).AddSeconds($Seconds)
+        while ((Get-Date) -lt $deadline) {
+            $current = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            if (-not $current -or $current.Status -eq 'Stopped') {
+                return $true
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        return $false
+    }
+
+    function Stop-RustyNetRuntimeBounded {
+        $current = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $current) {
+            throw "Windows runtime service is not installed: $ServiceName"
+        }
+        if ($current.Status -eq 'Stopped') {
+            return
+        }
+        if ($current.Status -ne 'StopPending') {
+            $stopOutput = (& sc.exe stop "$ServiceName" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0 -and $stopOutput -notmatch '1062') {
+                throw "sc.exe stop failed: $stopOutput"
+            }
+        }
+        if (Wait-RustyNetRuntimeStopped -Seconds 20) {
+            return
+        }
+
+        $current = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($current -and $current.Status -eq 'StopPending') {
+            $servicePid = Get-RustyNetRuntimeServicePid
+            if ($servicePid -le 0) {
+                throw 'RustyNet service is StopPending with no process id'
+            }
+            $process = Get-Process -Id $servicePid -ErrorAction Stop
+            $actual = [System.IO.Path]::GetFullPath([string]$process.Path)
+            $expected = [System.IO.Path]::GetFullPath($expectedBinary)
+            if ($actual -ine $expected) {
+                throw "refusing to kill StopPending service pid=$servicePid actual=$actual expected=$expected"
+            }
+            Stop-Process -Id $servicePid -Force -ErrorAction Stop
+            if (Wait-RustyNetRuntimeStopped -Seconds 10) {
+                return
+            }
+        }
+
+        $current = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($current -and $current.Status -ne 'Stopped') {
+            throw "RustyNet service did not stop; status=$($current.Status)"
+        }
+    }
+
+    try {
+        Stop-RustyNetRuntimeBounded
+        $startOutput = (& sc.exe start "$ServiceName" 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -and $startOutput -notmatch '1056|already running') {
+            throw "sc.exe start failed: $startOutput"
         }
     }
     catch {

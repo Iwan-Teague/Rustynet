@@ -600,8 +600,8 @@ mod tests {
     use super::*;
     use crate::windows_backend_readiness::{
         REVIEWED_NETSH_EXE_PATH, REVIEWED_POWERSHELL_EXE_PATH, REVIEWED_SC_EXE_PATH,
-        REVIEWED_WG_EXE_PATH, REVIEWED_WIREGUARD_DLL_PATH, REVIEWED_WIREGUARD_EXE_PATH,
-        WindowsBackendReadinessEntry, build_windows_backend_readiness_report,
+        REVIEWED_WG_EXE_PATH, REVIEWED_WIREGUARD_EXE_PATH, WindowsBackendReadinessEntry,
+        build_windows_backend_readiness_report,
     };
 
     fn good_backend_readiness_report() -> WindowsBackendReadinessReport {
@@ -616,13 +616,6 @@ mod tests {
             WindowsBackendReadinessEntry {
                 label: "wg.exe".to_owned(),
                 path: REVIEWED_WG_EXE_PATH.to_owned(),
-                present: true,
-                probed: true,
-                reason: None,
-            },
-            WindowsBackendReadinessEntry {
-                label: "wireguard.dll".to_owned(),
-                path: REVIEWED_WIREGUARD_DLL_PATH.to_owned(),
                 present: true,
                 probed: true,
                 reason: None,

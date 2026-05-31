@@ -268,8 +268,9 @@ mod imp {
     use std::ptr::{null, null_mut};
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA,
-        ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, NO_ERROR,
+        CloseHandle, ERROR_BROKEN_PIPE, ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER,
+        ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+        LocalFree, NO_ERROR,
     };
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
@@ -282,17 +283,17 @@ mod imp {
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
         ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-        SDDL_REVISION_1, SE_KERNEL_OBJECT,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
         CryptProtectData, CryptUnprotectData,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetFileSecurityW, GetKernelObjectSecurity, GetTokenInformation,
-        LookupAccountNameW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, RevertToSelf,
-        SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
-        TokenGroups, TokenUser,
+        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityW,
+        GetKernelObjectSecurity, GetTokenInformation, LookupAccountNameW,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, RevertToSelf, SECURITY_ATTRIBUTES,
+        SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FlushFileBuffers,
@@ -412,7 +413,10 @@ mod imp {
                 unsafe { GetLastError() }
             ));
         }
-        security_descriptor_to_sddl(buffer.as_mut_ptr().cast::<c_void>())
+        security_descriptor_to_sddl(
+            buffer.as_mut_ptr().cast::<c_void>(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        )
     }
 
     /// W4 — registry-key SDDL extractor. Opens the requested
@@ -489,7 +493,10 @@ mod imp {
                 "RegGetKeySecurity failed with Windows error {status}"
             ));
         }
-        security_descriptor_to_sddl(buffer.as_mut_ptr().cast::<c_void>())
+        security_descriptor_to_sddl(
+            buffer.as_mut_ptr().cast::<c_void>(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        )
     }
 
     /// Split an operator-visible registry-key path into its root
@@ -623,8 +630,16 @@ mod imp {
         let status = unsafe {
             GetNamedSecurityInfoW(
                 wide_path.as_ptr(),
-                SE_KERNEL_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                // Named pipes are resolved by their `\\.\pipe\...` *path* through
+                // the file-object provider; `SE_KERNEL_OBJECT` is for open
+                // HANDLEs (GetSecurityInfo) and makes GetNamedSecurityInfoW
+                // return ERROR_BAD_PATHNAME (161) for a path lookup.
+                SE_FILE_OBJECT,
+                // Request the group too: the reviewed pipe SDDL pins the group
+                // to LocalSystem (`G:SY`), and the ACL evaluator requires that
+                // field. Without GROUP_SECURITY_INFORMATION the round-tripped
+                // SDDL omits `G:` and the pipe reads as drifted.
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                 &mut owner,
                 &mut group,
                 &mut dacl,
@@ -642,7 +657,10 @@ mod imp {
                 "GetNamedSecurityInfoW returned a null security descriptor for named pipe {path}"
             ));
         }
-        let result = security_descriptor_to_sddl(descriptor);
+        let result = security_descriptor_to_sddl(
+            descriptor,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        );
         unsafe {
             LocalFree(descriptor.cast::<c_void>());
         }
@@ -714,6 +732,16 @@ mod imp {
             }
         }
 
+        // Read the client's request BEFORE impersonating it. Windows rejects
+        // `ImpersonateNamedPipeClient` with ERROR_CANNOT_IMPERSONATE (1368)
+        // until the server has read a message the client wrote on the pipe:
+        // the client's security context is not delivered to the server end
+        // until that first read completes. The request is size-bounded and is
+        // NOT passed to `handler` until authorization passes below, so reading
+        // first never processes untrusted input from an unauthorized caller
+        // (the pipe's security descriptor already gates who may connect).
+        let request = read_pipe_message(handle.raw(), max_message_bytes)?;
+
         let facts = connected_client_facts(handle.raw(), service_sid)?;
         if !named_pipe_client_authorized(&facts) {
             unsafe {
@@ -728,7 +756,6 @@ mod imp {
             ));
         }
 
-        let request = read_pipe_message(handle.raw(), max_message_bytes)?;
         let response = handler(request)?;
         if response.len() > max_message_bytes {
             return Err(format!(
@@ -737,9 +764,15 @@ mod imp {
             ));
         }
         write_pipe_message(handle.raw(), &response)?;
-        unsafe {
-            DisconnectNamedPipe(handle.raw());
-        }
+        // Do NOT force `DisconnectNamedPipe` on the success path. On the
+        // server end of a named pipe, `write_pipe_message` already issued
+        // `FlushFileBuffers`, which blocks until the client has drained the
+        // response. A forced disconnect can still race an in-flight client
+        // read and surface `ERROR_BROKEN_PIPE` (109) on the client's
+        // `CallNamedPipeW`. Letting `handle` drop below performs a graceful
+        // `CloseHandle`, which lets the client finish reading the reply. The
+        // unauthorized-client path above keeps its forced disconnect on
+        // purpose: there we want to drop the peer immediately.
         Ok(())
     }
 
@@ -1130,21 +1163,31 @@ mod imp {
         }
         let flushed = unsafe { FlushFileBuffers(handle) };
         if flushed == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_BROKEN_PIPE {
+                return Ok(());
+            }
             return Err(format!(
-                "FlushFileBuffers on named pipe failed with Windows error {}",
-                unsafe { GetLastError() }
+                "FlushFileBuffers on named pipe failed with Windows error {err}"
             ));
         }
         Ok(())
     }
 
-    fn security_descriptor_to_sddl(security_descriptor: *mut c_void) -> Result<String, String> {
+    fn security_descriptor_to_sddl(
+        security_descriptor: *mut c_void,
+        security_info: u32,
+    ) -> Result<String, String> {
         let mut sddl_ptr = null_mut();
         let ok = unsafe {
             ConvertSecurityDescriptorToStringSecurityDescriptorW(
                 security_descriptor,
                 SDDL_REVISION_1,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                // Serialize exactly the parts the caller read from the object;
+                // serializing a component the descriptor never received (e.g.
+                // GROUP for a file read with OWNER+DACL only) would emit a stray
+                // field that the ACL evaluators do not expect.
+                security_info,
                 &mut sddl_ptr,
                 null_mut(),
             )
@@ -1354,7 +1397,10 @@ mod imp {
                 unsafe { GetLastError() }
             ));
         }
-        security_descriptor_to_sddl(buffer.as_mut_ptr().cast::<c_void>())
+        security_descriptor_to_sddl(
+            buffer.as_mut_ptr().cast::<c_void>(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        )
     }
 
     /// Authenticode chain validation via `WinVerifyTrust`. Wraps the

@@ -8916,6 +8916,11 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             "socket path must not be empty".to_owned(),
         ));
     }
+    log::info!(
+        "rustynetd startup: run_daemon entered (node_id={}, backend={:?})",
+        config.node_id,
+        config.backend_mode
+    );
     resolve_configured_egress_interface(&mut config)?;
     validate_daemon_config(&config)?;
     #[cfg(windows)]
@@ -8923,11 +8928,14 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         crate::windows_paths::validate_windows_runtime_startup_acls()
             .map_err(DaemonError::InvalidConfig)?;
     }
+    log::info!("rustynetd startup: configuration and runtime ACLs validated");
     prepare_runtime_wireguard_key(&config)?;
+    log::info!("rustynetd startup: runtime key material prepared");
     if let Err(err) = run_preflight_checks(&config) {
         let _ = scrub_runtime_wireguard_key_after_bootstrap(&config);
         return Err(err);
     }
+    log::info!("rustynetd startup: preflight checks passed");
 
     let mut runtime = match DaemonRuntime::new(&config) {
         Ok(runtime) => runtime,
@@ -8936,7 +8944,9 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             return Err(err);
         }
     };
+    log::info!("rustynetd startup: daemon runtime constructed");
     runtime.bootstrap();
+    log::info!("rustynetd startup: runtime bootstrap complete");
     scrub_runtime_wireguard_key_after_bootstrap(&config)?;
     // Port-mapping bring-up is owned by the reconcile loop's
     // `maybe_refresh_port_mapping()` — it performs the initial bring-up on
@@ -8980,14 +8990,20 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         dns_socket
             .set_nonblocking(true)
             .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
+        log::info!(
+            "rustynetd startup: dns resolver bound to {}",
+            config.dns_resolver_bind_addr
+        );
 
         // Daemon control pipe: spawn a background thread that accepts one named-pipe connection
         // at a time. The thread forwards (request_bytes, response_sender) to the main loop via
         // an mpsc channel so DaemonRuntime stays single-threaded.
         let (cmd_tx, cmd_rx) = mpsc::channel::<(Vec<u8>, mpsc::SyncSender<Vec<u8>>)>();
         let pipe_path_str = config.socket_path.to_string_lossy().to_string();
+        log::info!("rustynetd startup: spawning control pipe server (path={pipe_path_str})");
         let service_sid =
             rustynet_windows_native::lookup_account_sid_string(r"NT SERVICE\RustyNet").ok();
+        let privileged_service_sid = service_sid.clone();
 
         std::thread::Builder::new()
             .name("rustynetd-control-pipe".to_string())
@@ -9020,6 +9036,66 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             .map_err(|err| {
                 DaemonError::Io(format!("failed to spawn control pipe thread: {err}"))
             })?;
+
+        // Privileged-helper pipe: a second background thread serves the
+        // persistent reviewed privileged-helper pipe one connection at a time.
+        // The pipe is created with the hardened privileged-helper security
+        // descriptor (SYSTEM / Administrators / service SID only) inside
+        // `serve_windows_privileged_request_once`, and the handler answers the
+        // protocol probe and reviewed-runtime-path ACL inspection (the path is
+        // constrained to the reviewed runtime layout). This makes the daemon
+        // expose the same hardened privileged IPC surface the runtime-boundary
+        // self-check exercises.
+        std::thread::Builder::new()
+            .name("rustynetd-privileged-pipe".to_string())
+            .spawn(move || {
+                let privileged_pipe_path = std::path::PathBuf::from(
+                    crate::windows_ipc::DEFAULT_WINDOWS_PRIVILEGED_HELPER_PIPE_PATH,
+                );
+                loop {
+                    if let Err(err) = crate::windows_ipc::serve_windows_privileged_request_once(
+                        privileged_pipe_path.as_path(),
+                        WindowsLocalIpcRole::PrivilegedHelper,
+                        privileged_service_sid.as_deref(),
+                        |request| match request {
+                            crate::windows_ipc::WindowsPrivilegedRequest::Probe {
+                                protocol_version,
+                            } => Ok(crate::windows_ipc::WindowsPrivilegedResponse::ProbeAck {
+                                protocol_version,
+                            }),
+                            crate::windows_ipc::WindowsPrivilegedRequest::InspectRuntimePathAcl {
+                                path,
+                            } => {
+                                let request_path = std::path::PathBuf::from(&path);
+                                crate::windows_paths::validate_windows_runtime_file_path(
+                                    request_path.as_path(),
+                                    "inspect-runtime-path-acl path",
+                                )?;
+                                let sddl =
+                                    rustynet_windows_native::inspect_file_sddl(request_path.as_path())
+                                        .map_err(|err| {
+                                            format!(
+                                                "inspect-runtime-path-acl failed for {}: {err}",
+                                                request_path.display()
+                                            )
+                                        })?;
+                                Ok(crate::windows_ipc::WindowsPrivilegedResponse::RuntimePathAcl {
+                                    path,
+                                    sddl,
+                                })
+                            }
+                        },
+                    ) {
+                        log::warn!("daemon privileged helper pipe iteration error: {err}");
+                    }
+                }
+            })
+            .map_err(|err| {
+                DaemonError::Io(format!("failed to spawn privileged helper pipe thread: {err}"))
+            })?;
+        log::info!(
+            "rustynetd startup: control + privileged pipe servers spawned; entering reconcile loop"
+        );
 
         let mut processed = 0usize;
         let reconcile_interval = Duration::from_millis(config.reconcile_interval_ms.get().max(100));
@@ -10245,15 +10321,48 @@ fn parse_windows_default_egress_interface_output(
     Ok(alias)
 }
 
-/// PowerShell script that returns the lowest-metric non-tunnel IPv4 default-route interface
-/// alias.  The tunnel alias is passed as a script parameter so it is never interpolated into
-/// the script body.
-#[cfg(windows)]
-const WINDOWS_PS_DETECT_DEFAULT_EGRESS_INTERFACE: &str = "& { param($TunnelAlias) $ErrorActionPreference = 'Stop'; \
-     $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | \
-         Where-Object { $_.InterfaceAlias -ne $TunnelAlias } | \
-         Sort-Object -Property RouteMetric | Select-Object -First 1; \
-     if ($null -ne $route) { $route.InterfaceAlias } }";
+/// Select the default-route (egress) interface alias from a
+/// `GetAdaptersAddresses` snapshot: the operational adapter that advertises a
+/// default gateway, has the lowest IPv4 interface metric, and is not the
+/// WireGuard tunnel adapter. This mirrors the
+/// `Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric`
+/// selection but reads it from the in-process adapter snapshot, so it cannot
+/// hang on WMI/CIM. Pure so it can be unit-tested on any host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn select_windows_default_egress_interface(
+    adapters: &[rustynet_windows_native::WindowsNetworkAdapterSnapshot],
+    tunnel_alias: &str,
+) -> Result<String, String> {
+    // IfOperStatusUp from the Win32 `IF_OPER_STATUS` enum — the adapter is
+    // operational and can carry traffic.
+    const IF_OPER_STATUS_UP: u32 = 1;
+    let mut best: Option<(u32, &str)> = None;
+    for adapter in adapters {
+        let alias = adapter.friendly_name.as_str();
+        if alias.is_empty() || alias.eq_ignore_ascii_case(tunnel_alias) {
+            continue;
+        }
+        if adapter.oper_status != IF_OPER_STATUS_UP {
+            continue;
+        }
+        // Only an interface that advertises a default gateway routes to
+        // 0.0.0.0/0 — i.e. is a default-route / egress interface.
+        if adapter.default_gateways.is_empty() {
+            continue;
+        }
+        let replace = match best {
+            None => true,
+            Some((best_metric, _)) => adapter.ipv4_metric < best_metric,
+        };
+        if replace {
+            best = Some((adapter.ipv4_metric, alias));
+        }
+    }
+    best.map(|(_, alias)| alias.to_owned()).ok_or_else(|| {
+        "egress interface auto-detect found no operational, non-tunnel interface advertising a default gateway"
+            .to_owned()
+    })
+}
 
 #[cfg(target_os = "linux")]
 fn detect_default_egress_interface(_tunnel_alias: &str) -> Result<String, String> {
@@ -10267,35 +10376,19 @@ fn detect_default_egress_interface(_tunnel_alias: &str) -> Result<String, String
 
 #[cfg(windows)]
 fn detect_default_egress_interface(tunnel_alias: &str) -> Result<String, String> {
-    // Use PowerShell Get-NetRoute to find the lowest-metric default-route interface
-    // that is not the WireGuard tunnel adapter.  The tunnel alias is passed as a
-    // PowerShell script parameter so it is never interpolated into the script body.
-    //
-    // Resolve `powershell.exe` from an absolute path under `\Windows\System32\`
-    // rather than letting Win32's PATH search find it. A daemon running as
-    // SYSTEM with a permissive PATH (e.g., user-writable directory injected
-    // by an installer) would otherwise execute an attacker-controlled
-    // `powershell.exe` with the daemon's elevated token.
-    let output = Command::new(crate::phase10::DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            WINDOWS_PS_DETECT_DEFAULT_EGRESS_INTERFACE,
-            tunnel_alias,
-        ])
-        .output()
-        .map_err(|err| format!("spawn powershell for egress detection failed: {err}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!(
-            "powershell egress detection failed: status={} stderr={stderr}",
-            output.status
-        ));
-    }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| "powershell egress detection returned non-utf8 output".to_string())?;
-    parse_windows_default_egress_interface_output(stdout.trim(), tunnel_alias)
+    // Enumerate adapters via the in-process `GetAdaptersAddresses` Win32 API
+    // instead of shelling out to `powershell.exe Get-NetRoute`. The PowerShell
+    // path was a WMI/CIM query run synchronously with no timeout at the very
+    // first step of daemon startup: on a host whose WMI is wedged it blocks
+    // `Command::output()` indefinitely, hanging the daemon before it validates
+    // config or spawns its control pipe (and leaking one stuck `powershell.exe`
+    // per service start). The native enumeration needs no subprocess and cannot
+    // hang on WMI.
+    let adapters = rustynet_windows_native::get_adapters_addresses().map_err(|err| {
+        format!("egress interface auto-detect failed to enumerate adapters: {err}")
+    })?;
+    let alias = select_windows_default_egress_interface(&adapters, tunnel_alias)?;
+    parse_windows_default_egress_interface_output(alias.as_str(), tunnel_alias)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -19631,22 +19724,66 @@ mod tests {
             .expect("empty tunnel alias must disable the exclusion check");
     }
 
-    #[test]
-    fn parse_windows_egress_output_script_uses_param_not_interpolation() {
-        // The PowerShell script for egress detection must bind the tunnel alias as a
-        // script parameter, never concatenate it into the script body.
-        #[cfg(windows)]
-        {
-            use super::WINDOWS_PS_DETECT_DEFAULT_EGRESS_INTERFACE;
-            assert!(
-                WINDOWS_PS_DETECT_DEFAULT_EGRESS_INTERFACE.contains("param($TunnelAlias)"),
-                "script must bind TunnelAlias as a parameter, not interpolate it"
-            );
-            assert!(
-                !WINDOWS_PS_DETECT_DEFAULT_EGRESS_INTERFACE.contains("rustynet"),
-                "script body must not contain hard-coded tunnel alias values"
-            );
+    fn egress_adapter(
+        friendly: &str,
+        oper_status: u32,
+        ipv4_metric: u32,
+        has_gateway: bool,
+    ) -> rustynet_windows_native::WindowsNetworkAdapterSnapshot {
+        rustynet_windows_native::WindowsNetworkAdapterSnapshot {
+            adapter_name: format!("{friendly}-name"),
+            friendly_name: friendly.to_owned(),
+            description: format!("{friendly} description"),
+            if_index: 1,
+            ipv6_if_index: 1,
+            if_type: 6,
+            oper_status,
+            ipv4_metric,
+            ipv6_metric: ipv4_metric,
+            unicast_addresses: Vec::new(),
+            default_gateways: if has_gateway {
+                vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    192, 168, 0, 1,
+                ))]
+            } else {
+                Vec::new()
+            },
         }
+    }
+
+    #[test]
+    fn select_windows_egress_picks_lowest_metric_up_gateway_interface() {
+        let high = egress_adapter("Ethernet", 1, 25, true);
+        let low = egress_adapter("Wi-Fi", 1, 5, true);
+        let tunnel = egress_adapter("rustynet0", 1, 1, true);
+        let selected =
+            super::select_windows_default_egress_interface(&[high, low, tunnel], "rustynet0")
+                .expect("an egress interface");
+        assert_eq!(selected, "Wi-Fi");
+    }
+
+    #[test]
+    fn select_windows_egress_skips_down_and_gatewayless_interfaces() {
+        let down = egress_adapter("Ethernet", 2, 1, true); // down, lowest metric -> skip
+        let no_gateway = egress_adapter("Wi-Fi", 1, 2, false); // up, no gateway -> skip
+        let usable = egress_adapter("Ethernet 2", 1, 30, true);
+        let selected = super::select_windows_default_egress_interface(
+            &[down, no_gateway, usable],
+            "rustynet0",
+        )
+        .expect("an egress interface");
+        assert_eq!(selected, "Ethernet 2");
+    }
+
+    #[test]
+    fn select_windows_egress_errors_when_only_tunnel_has_default_gateway() {
+        // A stale tunnel default route after a crash must not select the tunnel
+        // as its own egress; with no other gateway interface this fails closed.
+        let tunnel = egress_adapter("rustynet0", 1, 1, true);
+        let down_phys = egress_adapter("Ethernet", 2, 5, true);
+        let err = super::select_windows_default_egress_interface(&[tunnel, down_phys], "rustynet0")
+            .expect_err("must not select the tunnel as its own egress");
+        assert!(err.contains("no operational, non-tunnel interface"));
     }
 
     #[test]

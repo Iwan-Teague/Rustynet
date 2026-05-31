@@ -192,7 +192,7 @@
       "guest_exec_mode": "windows_powershell",
       "include_in_all": false,
       "lab_role": "windows_client",
-      "last_known_ip": "192.168.65.8",
+      "last_known_ip": "192.168.0.45",
       "last_known_network": "utm-shared-192.168.65.0/24",
       "mesh_ip": "100.64.0.6",
       "network_group": "utm-shared-192.168.65.0/24",
@@ -204,7 +204,7 @@
       "rustynet_src_dir": "C:\\Rustynet",
       "service_manager": "windows_service",
       "ssh_password": "tempo",
-      "ssh_target": "192.168.65.8",
+      "ssh_target": "192.168.0.45",
       "ssh_user": "windows",
       "utm_staging_dir": "C:\\Users\\windows\\rustynet-utm-stage"
     }
