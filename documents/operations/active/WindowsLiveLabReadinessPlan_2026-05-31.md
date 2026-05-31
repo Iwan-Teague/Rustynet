@@ -125,12 +125,28 @@ spine of this plan.
   Windows `rollback_firewall` (netsh) exists, but rollback-on-failure and
   fail-closed persistence across a daemon crash/restart are unvalidated. A
   failed killswitch apply or rollback can leave default-block-outbound active
-  and **lock SSH out of the guest mid-run** — and unlike Linux guests,
-  `scripts/vm_lab/probe_and_recover_local_utm.sh` **cannot auto-recover
-  Windows** (UTM's Apple Virtualization backend exposes no `utmctl exec`);
-  recovery is manual via the UTM serial console (`sc.exe stop RustyNet`).
-  Validate rollback/restart fail-closed before any unattended run, and
-  consider an automated Windows recover path.
+  and **lock SSH out of the guest mid-run**. **This lockout was observed and
+  recovered on 2026-05-31**: the `RustyNet` service was left RUNNING with the
+  Windows Firewall at `AllowInbound,BlockOutbound` on all profiles, so inbound
+  SSH was accepted but the (outbound) SSH/ICMP replies were dropped → host saw
+  TCP/22 + ping timeouts.
+  - **Recovery is NOT manual-only.** Contrary to the earlier assumption,
+    `windows-utm-1` is a **QEMU/VirtIO guest with a working guest agent** (NOT
+    Apple Virtualization), so `utmctl exec` / `utmctl file pull|push` work and
+    allow full host-side diagnosis + recovery **without SSH**. Proven recovery
+    recipe (run via `utmctl exec "Windows" --cmd cmd.exe /c "..."`):
+    `sc stop RustyNet` → `sc config RustyNet start= demand` (stop auto-relock on
+    reboot) → `netsh advfirewall set allprofiles firewallpolicy
+    allowinbound,allowoutbound`. After this, host ping + TCP/22 recovered and
+    the service read `STOPPED`.
+  - `scripts/vm_lab/probe_and_recover_local_utm.sh` still **skips** Windows
+    guests (its header repeats the stale Apple-Virt/no-exec claim); extending it
+    to drive this `utmctl exec` recipe for `windows-utm-1` is the open
+    automation follow-up. Until then, recovery is a one-liner from the host, not
+    a UTM-console session.
+  - Still validate rollback/restart fail-closed before any unattended run — the
+    recipe recovers a *locked* guest, but the daemon should not lock it in the
+    first place.
 
 ---
 
@@ -183,14 +199,16 @@ Progress (2026-05-31):
   → `ops vm-lab-bootstrap-phase --phase tunnel-smoke --vm windows-utm-1`. The
   smoke runs the freshly built `target\release\rustynetd.exe` directly; it does
   **not** require `install-release`/`restart-runtime`.
-- **BLOCKED:** `windows-utm-1` is currently unreachable (UTM reports the VM
-  `started`, but no ping/ARP/TCP-22 at `192.168.0.45`; it is an Apple-Virt guest
-  on `bridge100`, which has no host IPv4 right now — the QEMU debian guests on
-  the en0 bridge remain reachable). `probe_and_recover` cannot recover Apple-Virt
-  Windows guests; recovery is **manual via the UTM console** (confirm booted +
-  networked, capture the live IP, and `sc.exe stop RustyNet` if a stale
-  killswitch is blocking inbound SSH — the G9 lockout scenario). N1.1 (guest
-  compile) and the live N1.3 bring-up are gated on that recovery.
+- **Guest recovered (2026-05-31), N1.1/N1.3 unblocked.** `windows-utm-1` had
+  been unreachable from the host (ping/TCP-22 timeouts at `192.168.0.45`) — root
+  cause was the **G9 killswitch lockout**, not a network/IP problem: the
+  `RustyNet` service was RUNNING with the firewall at `AllowInbound,BlockOutbound`
+  (see G9 for the recovery recipe). Recovered from the host via `utmctl exec`
+  (the guest is QEMU/VirtIO with a working guest agent, not Apple-Virt — earlier
+  assumption corrected). The guest is now reachable (host ping + TCP/22 stable),
+  the service is STOPPED + set to demand-start, and its IPv4 is still
+  `192.168.0.45` (inventory unchanged). N1.1 (guest compile) and the live N1.3
+  bring-up can proceed via the orchestrator.
 
 ### N2 — Killswitch + protected-mode exercise on the single node 🔴 (covers G2)
 With a tunnel up, apply the killswitch and verify default-deny + the tunnel /
