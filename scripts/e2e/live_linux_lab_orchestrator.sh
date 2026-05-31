@@ -3277,15 +3277,24 @@ stage_membership_setup() {
   live_lab_run_root "$exit_target" "root test -f /var/lib/rustynet/membership.snapshot && root test -f /var/lib/rustynet/membership.log && root test -f /var/lib/rustynet/membership.watermark && root chown rustynetd:rustynetd /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark && root chmod 0600 /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark" || return 1
   while IFS=$'\t' read -r _label target node_id pub_hex; do
     [[ "$node_id" == "$exit_node_id" ]] && continue
-    # aux gets blind_exit; other clients get baseline client caps without
-    # anchor.  anchor and blind_exit cannot coexist in one membership entry.
-    # anchor is added to the admin-role test nodes (client, entry, extra) by
-    # stage_upgrade_admin_node_membership after live_anchor completes, so that
-    # live_anchor can verify the correct lex-min authority without interference
-    # from client-1 (which sorts before client-2/exit-1 and would otherwise
-    # become the lex-min, breaking the validate_lex_min_anchor_authority check).
+    # aux and fifth_client get blind_exit; other clients get baseline client
+    # caps without anchor.  anchor and blind_exit cannot coexist in one
+    # membership entry.  anchor is added to the admin-role test nodes (client,
+    # entry, extra) by stage_upgrade_admin_node_membership after live_anchor
+    # completes, so that live_anchor can verify the correct lex-min authority
+    # without interference from client-1 (which sorts before client-2/exit-1
+    # and would otherwise become the lex-min, breaking the
+    # validate_lex_min_anchor_authority check).
+    #
+    # aux carries blind_exit for live_role_switch_matrix (which switches the
+    # aux node into a serving blind_exit role). fifth_client carries blind_exit
+    # as the Linux blind_exit host for live_lan_toggle: in mixed-OS profiles
+    # aux is macOS and the Linux lan_toggle validator cannot drive it, so a
+    # Linux node needs the blind_exit capability too. Neither aux nor
+    # fifth_client is promoted to anchor by upgrade_admin, so the
+    # anchor/blind_exit exclusivity holds.
     local node_caps
-    if [[ "$_label" == "aux" ]]; then
+    if [[ "$_label" == "aux" || "$_label" == "fifth_client" ]]; then
       node_caps="client,relay_host,exit_server,blind_exit"
     else
       node_caps="client,relay_host,exit_server"
@@ -5070,19 +5079,21 @@ stage_run_live_lan_toggle() {
 
   # The Linux lan_toggle validator makes Linux-specific (systemd / nftables /
   # iproute2) assertions on the blind_exit node, so the blind_exit must be a
-  # Linux host. Historically this was the aux label, but in mixed-OS profiles
-  # aux can be macOS. macOS blind-exit serving is validated separately by
-  # live_role_switch_matrix, which drives the mac node into a serving
-  # blind_exit role. Pick the first available Linux node (distinct from the
-  # exit/client roles) for the blind_exit here.
-  for cand in extra fifth_client entry aux; do
+  # Linux host that also carries the blind_exit membership capability. Only the
+  # aux and fifth_client nodes are granted blind_exit in stage_membership_setup
+  # (and neither is promoted to anchor, which is mutually exclusive with
+  # blind_exit). In a Linux-only profile aux is Linux and is the blind_exit; in
+  # a mixed-OS profile aux is macOS (its blind-exit serving is validated by
+  # live_role_switch_matrix instead) so fall back to fifth_client, the Linux
+  # blind_exit host. Pick the first of those two that is present and Linux.
+  for cand in aux fifth_client; do
     if has_label "$cand" && [[ "$(node_platform_for_label "$cand")" == "linux" ]]; then
       blind_exit_label="$cand"
       break
     fi
   done
   if [[ -z "$blind_exit_label" ]]; then
-    printf 'LAN toggle requires a Linux blind_exit node (none available among extra/fifth_client/entry/aux)\n' >&2
+    printf 'LAN toggle requires a Linux blind_exit node with blind_exit capability (aux or fifth_client)\n' >&2
     return 1
   fi
 
