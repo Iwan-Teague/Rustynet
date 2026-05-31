@@ -3558,8 +3558,12 @@ impl DataplaneSystem for WindowsCommandSystem {
     fn block_all_egress(&mut self) -> Result<(), SystemError> {
         // Apply killswitch first to set the block-all default policy.
         self.apply_firewall_killswitch()?;
-        // FailClosed: remove tunnel and egress allow rules so even WireGuard traffic
-        // is blocked. Only loopback survives.
+        // FailClosed: remove the tunnel + egress allows so even WireGuard traffic
+        // is blocked — only loopback survives. The tunnel allow is now a native WFP
+        // filter (not the WINDOWS_KS_RULE_TUNNEL netsh rule), so it MUST be removed
+        // via remove_wfp_tunnel_permit; deleting the (now-absent) netsh rule alone
+        // would leave the WFP permit in place and fail OPEN.
+        let _ = rustynet_windows_native::remove_wfp_tunnel_permit();
         let _ = self.run_netsh_success(&[
             "advfirewall".to_owned(),
             "firewall".to_owned(),
