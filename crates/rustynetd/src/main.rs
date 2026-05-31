@@ -73,7 +73,7 @@ use rustynetd::windows_service_hardening::{
 };
 use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV: &str =
     "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_PATH";
@@ -147,11 +147,8 @@ fn run() -> Result<(), String> {
                 Ok(())
             }
             [cmd, rest @ ..] if cmd == "daemon" => {
-                env_logger::Builder::new()
-                    .filter_level(log::LevelFilter::Info)
-                    .parse_default_env()
-                    .init();
                 let config = parse_daemon_config(rest)?;
+                init_daemon_logging(daemon_log_file_path(&config).as_deref());
                 run_daemon(config).map_err(|err| err.to_string())
             }
             [cmd, rest @ ..] if cmd == "privileged-helper" => run_privileged_helper_command(rest),
@@ -252,8 +249,78 @@ fn run() -> Result<(), String> {
     }
 }
 
+/// Log sink that writes records to a file and mirrors them to stderr. The
+/// Windows service host runs with its stderr discarded by the SCM, so without
+/// a file sink the daemon produces no runtime log at all; a foreground
+/// `rustynetd daemon` run keeps its stderr output too.
+struct TeeLogWriter {
+    file: std::fs::File,
+}
+
+impl std::io::Write for TeeLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // The file is the authoritative sink; the stderr mirror is best-effort.
+        let _ = std::io::stderr().write_all(buf);
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stderr().flush();
+        self.file.flush()
+    }
+}
+
+/// Derive the daemon log file path (`<state-root>/logs/rustynetd.log`) from the
+/// configured state path. Returns `None` only when the state path has no parent.
+fn daemon_log_file_path(config: &DaemonConfig) -> Option<PathBuf> {
+    config
+        .state_path
+        .parent()
+        .map(|root| root.join("logs").join("rustynetd.log"))
+}
+
+/// Initialise daemon logging. When `log_file` is provided and can be opened,
+/// records are written to that file (truncated at startup) and mirrored to
+/// stderr; otherwise logging falls back to stderr only. Honours `RUST_LOG`
+/// (default level: info). Safe to call once per process.
+fn init_daemon_logging(log_file: Option<&Path>) {
+    let mut builder = env_logger::Builder::new();
+    builder
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .format(|buf, record| {
+            use std::io::Write as _;
+            let unix_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or(0);
+            writeln!(
+                buf,
+                "{unix_millis} [{}] {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        });
+    if let Some(path) = log_file {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+        {
+            builder.target(env_logger::Target::Pipe(Box::new(TeeLogWriter { file })));
+        }
+    }
+    let _ = builder.try_init();
+}
+
 fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
     let config = parse_daemon_config(args)?;
+    init_daemon_logging(daemon_log_file_path(&config).as_deref());
     run_daemon(config).map_err(|err| err.to_string())
 }
 

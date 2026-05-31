@@ -155,15 +155,36 @@ function Get-ServiceRuntimeState {
     param([Parameter(Mandatory = $true)][string]$ServiceName)
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     $serviceStatus = if ($service) { [string]$service.Status } else { 'missing' }
-    $cimService = Get-CimInstance -ClassName Win32_Service -Filter "Name = '$ServiceName'" -ErrorAction SilentlyContinue
+    $queryEx = (& sc.exe queryex "$ServiceName" 2>&1 | Out-String)
+    $queryConfig = (& sc.exe qc "$ServiceName" 2>&1 | Out-String)
+    $state = 'missing'
+    $startMode = ''
+    $exitCode = $null
+    $processId = $null
+    foreach ($line in ($queryEx -split "`r?`n")) {
+        if ($line -match '^\s*STATE\s*:\s*\d+\s+([A-Z_]+)\s*$') {
+            $state = [string]$Matches[1]
+        }
+        elseif ($line -match '^\s*WIN32_EXIT_CODE\s*:\s*(\d+)\s+') {
+            $exitCode = [int]$Matches[1]
+        }
+        elseif ($line -match '^\s*PID\s*:\s*(\d+)\s*$') {
+            $processId = [int]$Matches[1]
+        }
+    }
+    foreach ($line in ($queryConfig -split "`r?`n")) {
+        if ($line -match '^\s*START_TYPE\s*:\s*\d+\s+([A-Z_]+)\s*$') {
+            $startMode = [string]$Matches[1]
+        }
+    }
     $imagePath = Get-ServiceImagePath -ServiceName $ServiceName
     return [ordered]@{
         present = [bool]$service
         status = $serviceStatus
-        state = if ($cimService) { [string]$cimService.State } else { 'missing' }
-        start_mode = if ($cimService) { [string]$cimService.StartMode } else { '' }
-        exit_code = if ($cimService) { [int]$cimService.ExitCode } else { $null }
-        process_id = if ($cimService) { [int]$cimService.ProcessId } else { $null }
+        state = $state
+        start_mode = $startMode
+        exit_code = $exitCode
+        process_id = $processId
         image_path = $imagePath
     }
 }
@@ -178,14 +199,15 @@ function Invoke-Sc {
 }
 
 function Get-WindowsTargetFacts {
-    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
-    $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
-    $buildNumber = if ($os) { [int]$os.BuildNumber } else { 0 }
+    $version = [Environment]::OSVersion.Version
+    $buildNumber = [int]$version.Build
+    $caption = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name ProductName -ErrorAction SilentlyContinue).ProductName
+    $arch = if ($env:PROCESSOR_ARCHITECTURE) { [string]$env:PROCESSOR_ARCHITECTURE } else { '' }
     return [ordered]@{
-        caption = if ($os) { [string]$os.Caption } else { '' }
-        version = if ($os) { [string]$os.Version } else { '' }
+        caption = if ($caption) { [string]$caption } else { '' }
+        version = [string]$version
         build_number = $buildNumber
-        architecture = if ($os) { [string]$os.OSArchitecture } elseif ($computer) { [string]$computer.SystemType } else { '' }
+        architecture = $arch
         windows_11_target = [bool]($buildNumber -ge 22000)
         elevated_admin = [bool]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     }
@@ -204,6 +226,39 @@ function Get-NativeCommandText {
             return ''
         }
         return [string]$output
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
+function Invoke-RustyNetDaemonCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string[]]$Arguments = @()
+    )
+    # Run a daemon self-check under ErrorActionPreference='Continue'. The
+    # script-level preference is 'Stop', under which a native command that
+    # writes to stderr AND exits non-zero raises a terminating
+    # NativeCommandError. Without this guard a *failed* self-check would trip
+    # the top-level trap and emit a fail-closed placeholder report
+    # (service_status='missing', notes=verify-helper-trap) instead of a clean
+    # 'fail' result carrying the real daemon error and the true service state.
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $Path @Arguments 2>&1 | Out-String)
+        $exitCode = $LASTEXITCODE
+        if ($null -eq $output) {
+            $output = ''
+        }
+        if ($null -eq $exitCode) {
+            $exitCode = 0
+        }
+        return [ordered]@{
+            exit_code = $exitCode
+            output = ([string]$output).Trim()
+        }
     }
     finally {
         $ErrorActionPreference = $previousPreference
@@ -266,11 +321,12 @@ function Invoke-WindowsRuntimeBoundaryCheck {
     if (-not (Test-Path -LiteralPath $DaemonPath)) {
         return $null
     }
-    $output = (& $DaemonPath windows-runtime-boundary-check --state-root $StateRoot 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0) {
+    $result = Invoke-RustyNetDaemonCommand -Path $DaemonPath -Arguments @('windows-runtime-boundary-check', '--state-root', $StateRoot)
+    $output = $result.output
+    if ($result.exit_code -ne 0) {
         return [ordered]@{
             status = 'fail'
-            reason = $output.Trim()
+            reason = $output
         }
     }
     try {
@@ -284,21 +340,40 @@ function Invoke-WindowsRuntimeBoundaryCheck {
         return [ordered]@{
             status = 'fail'
             reason = ('invalid-runtime-boundary-json: ' + $_.Exception.Message)
-            raw = $output.Trim()
+            raw = $output
         }
     }
 }
 
 function Invoke-WindowsNamedPipeAclCheck {
-    param([Parameter(Mandatory = $true)][string]$DaemonPath)
+    param(
+        [Parameter(Mandatory = $true)][string]$DaemonPath,
+        [string]$ServiceName = 'RustyNet'
+    )
     if (-not (Test-Path -LiteralPath $DaemonPath)) {
         return $null
     }
-    $output = (& $DaemonPath windows-named-pipe-acls-check 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0) {
+    $aclArgs = @('windows-named-pipe-acls-check')
+    # The daemon builds each reviewed pipe DACL with an allow-ACE for the service
+    # identity (NT SERVICE\<ServiceName>). Pass that SID so the ACL check expects
+    # it as a reviewed principal instead of flagging it as drift; without it the
+    # check would only accept SYSTEM + Administrators and reject the service ACE.
+    try {
+        $serviceSid = (New-Object System.Security.Principal.NTAccount("NT SERVICE\$ServiceName")).Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($serviceSid) {
+            $aclArgs += @('--service-sid', $serviceSid)
+        }
+    }
+    catch {
+        # Service SID could not be resolved; fall back to the SYSTEM +
+        # Administrators-only expectation.
+    }
+    $result = Invoke-RustyNetDaemonCommand -Path $DaemonPath -Arguments $aclArgs
+    $output = $result.output
+    if ($result.exit_code -ne 0) {
         return [ordered]@{
             status = 'fail'
-            reason = $output.Trim()
+            reason = $output
         }
     }
     try {
@@ -539,7 +614,7 @@ $script:VerifyFailureStep = 'runtime-boundary-check'
 $runtimeBoundary = Invoke-WindowsRuntimeBoundaryCheck -DaemonPath $daemonInstallPath -StateRoot $StateRoot
 $script:VerifyFailureStep = 'named-pipe-acl-check'
 $namedPipeAcl = if ($serviceRuntime.status -eq 'Running') {
-    Invoke-WindowsNamedPipeAclCheck -DaemonPath $daemonInstallPath
+    Invoke-WindowsNamedPipeAclCheck -DaemonPath $daemonInstallPath -ServiceName $ServiceName
 }
 else {
     $null

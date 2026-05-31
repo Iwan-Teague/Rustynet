@@ -5,8 +5,58 @@ use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+/// Upper bound on how long the daemon waits for a Windows helper subprocess
+/// (`netsh`, `powershell`) before killing it. A daemon must never block its
+/// startup / reconcile path indefinitely on an external tool: a CIM cmdlet
+/// (`Get-NetRoute`, `New-NetFirewallRule`) stuck on a wedged WMI provider would
+/// otherwise hang `Command::output()` forever AND leak the child process —
+/// exactly the failure that previously accumulated stuck `powershell.exe`
+/// instances and wedged WMI. The bound is generous (these commands normally
+/// complete in well under a second) but finite, so a hang fails closed and is
+/// recovered instead of stalling the daemon.
+const WINDOWS_HELPER_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run `command`, capturing its output, but never block longer than `timeout`.
+/// If the child does not exit in time it is killed and reaped and a timeout
+/// error is returned, so a hung helper cannot stall the daemon or leak a
+/// process. Output is collected with `wait_with_output` only after the child
+/// exits, so callers must keep combined stdout+stderr under the OS pipe buffer
+/// (~64 KiB); every daemon helper invocation (netsh / firewall cmdlets)
+/// produces small output, so this holds.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn run_helper_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<Output, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().map_err(|err| err.to_string())? {
+            Some(_status) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|err| format!("collect command output failed: {err}"));
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "command timed out after {}ms and was killed",
+                    timeout.as_millis()
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -2904,9 +2954,12 @@ impl WindowsCommandSystem {
 
     fn run_netsh(&self, args: &[String]) -> Result<PrivilegedCommandOutput, SystemError> {
         let binary = Self::resolve_netsh_binary()?;
-        let output = Command::new(&binary).args(args).output().map_err(|err| {
-            SystemError::Io(format!("netsh spawn failed ({}): {err}", binary.display()))
-        })?;
+        let mut command = Command::new(&binary);
+        command.args(args);
+        let output = run_helper_command_with_timeout(command, WINDOWS_HELPER_COMMAND_TIMEOUT)
+            .map_err(|err| {
+                SystemError::Io(format!("netsh run failed ({}): {err}", binary.display()))
+            })?;
         Ok(PrivilegedCommandOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -2932,12 +2985,12 @@ impl WindowsCommandSystem {
     ) -> Result<PrivilegedCommandOutput, SystemError> {
         let binary = Self::resolve_powershell_binary()?;
         let command_args = windows_powershell_command_args(script, args);
-        let output = Command::new(&binary)
-            .args(&command_args)
-            .output()
+        let mut command = Command::new(&binary);
+        command.args(&command_args);
+        let output = run_helper_command_with_timeout(command, WINDOWS_HELPER_COMMAND_TIMEOUT)
             .map_err(|err| {
                 SystemError::Io(format!(
-                    "powershell spawn failed ({}): {err}",
+                    "powershell run failed ({}): {err}",
                     binary.display()
                 ))
             })?;
@@ -5564,6 +5617,37 @@ pub fn write_phase10_perf_report(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn helper_command_timeout_kills_a_hung_command() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let started = Instant::now();
+        let result = super::run_helper_command_with_timeout(command, Duration::from_millis(300));
+        let elapsed = started.elapsed();
+        let err = result.expect_err("a hung command must time out");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout did not kill the child promptly: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_command_timeout_returns_fast_command_output() {
+        use std::process::Command;
+        use std::time::Duration;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf hello"]);
+        let output = super::run_helper_command_with_timeout(command, Duration::from_secs(5))
+            .expect("fast command output");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "hello");
+    }
+
     #[cfg(target_os = "linux")]
     use std::io::{BufRead, BufReader, Write};
     use std::net::IpAddr;

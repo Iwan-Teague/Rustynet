@@ -14,10 +14,11 @@
 //! * `wg.exe` from the same installer at
 //!   `C:\Program Files\WireGuard\wg.exe`. Used for low-level peer
 //!   sync + transfer-stat queries.
-//! * `wireguard.dll` from the same installer. This is the reviewed
-//!   WireGuardNT provider surface the official tunnel-service path
-//!   depends on; probing the library avoids a false blocker on hosts
-//!   where no Rustynet tunnel service exists yet.
+//! The current command adapter does not load a separate WireGuardNT
+//! provider DLL directly; it delegates tunnel lifecycle to the official
+//! `wireguard.exe` tunnel-service path and low-level inspection to `wg.exe`.
+//! Some supported WireGuard for Windows installs no longer expose
+//! `wireguard.dll` as a standalone file, so readiness must not require it.
 //! * `netsh.exe`, `sc.exe`, and `powershell.exe` from `System32`.
 //!   Used for route / DNS lifecycle, service-control visibility, and
 //!   fixed-shape host readiness probes. Always present on reviewed
@@ -38,7 +39,6 @@ use serde::{Deserialize, Serialize};
 
 pub const REVIEWED_WIREGUARD_EXE_PATH: &str = r"C:\Program Files\WireGuard\wireguard.exe";
 pub const REVIEWED_WG_EXE_PATH: &str = r"C:\Program Files\WireGuard\wg.exe";
-pub const REVIEWED_WIREGUARD_DLL_PATH: &str = r"C:\Program Files\WireGuard\wireguard.dll";
 pub const REVIEWED_NETSH_EXE_PATH: &str = r"C:\Windows\System32\netsh.exe";
 pub const REVIEWED_SC_EXE_PATH: &str = r"C:\Windows\System32\sc.exe";
 pub const REVIEWED_POWERSHELL_EXE_PATH: &str =
@@ -127,10 +127,6 @@ pub fn collect_windows_backend_readiness_report() -> WindowsBackendReadinessRepo
             REVIEWED_WIREGUARD_EXE_PATH,
         ),
         probe_canonical_binary("wg.exe (from WireGuard for Windows)", REVIEWED_WG_EXE_PATH),
-        probe_canonical_binary(
-            "wireguard.dll (WireGuardNT provider)",
-            REVIEWED_WIREGUARD_DLL_PATH,
-        ),
         probe_canonical_binary("netsh.exe", REVIEWED_NETSH_EXE_PATH),
         probe_canonical_binary("sc.exe", REVIEWED_SC_EXE_PATH),
         probe_canonical_binary("PowerShell.exe", REVIEWED_POWERSHELL_EXE_PATH),
@@ -401,13 +397,6 @@ mod tests {
                 reason: None,
             },
             WindowsBackendReadinessEntry {
-                label: "wireguard.dll".to_owned(),
-                path: REVIEWED_WIREGUARD_DLL_PATH.to_owned(),
-                present: true,
-                probed: true,
-                reason: None,
-            },
-            WindowsBackendReadinessEntry {
                 label: "netsh.exe".to_owned(),
                 path: REVIEWED_NETSH_EXE_PATH.to_owned(),
                 present: true,
@@ -511,7 +500,7 @@ mod tests {
         let report = build_windows_backend_readiness_report(reviewed_present_entries());
         assert!(report.overall_ok);
         assert!(report.drift_reasons.is_empty());
-        assert_eq!(report.entries.len(), 9);
+        assert_eq!(report.entries.len(), 8);
     }
 
     #[test]
@@ -591,6 +580,6 @@ mod tests {
                 entry.reason
             );
         }
-        assert_eq!(report.entries.len(), 9);
+        assert_eq!(report.entries.len(), 8);
     }
 }

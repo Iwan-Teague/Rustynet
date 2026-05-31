@@ -3004,6 +3004,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
         let mut inventory_mesh_ip = None;
         let mut inventory_controller_bundle_path = None;
         let mut inventory_controller_utm_name = None;
+        let mut inventory_utm_staging_dir = None;
         let discovery_platform_profile = if let Some(entry) = inventory_match {
             matched_inventory_count += 1;
             inventory_alias = Some(entry.alias.clone());
@@ -3013,6 +3014,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             inventory_ssh_user = entry.ssh_user.clone();
             inventory_last_known_ip = entry.last_known_ip.clone();
             inventory_mesh_ip = entry.mesh_ip.clone();
+            inventory_utm_staging_dir = entry.utm_staging_dir.clone();
             if let Some(VmController::LocalUtm {
                 utm_name: entry_utm_name,
                 bundle_path: entry_bundle_path,
@@ -3133,6 +3135,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             } else if live_ip.is_some() {
                 Some(probe_windows_local_utm_ssh_readiness(
                     utm_name.as_str(),
+                    inventory_utm_staging_dir.as_deref(),
                     timeout,
                 ))
             } else {
@@ -17854,57 +17857,36 @@ where
     Ok(output)
 }
 
-fn build_windows_ssh_readiness_probe_script() -> String {
-    r#"
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$programData = [Environment]::GetFolderPath('CommonApplicationData')
-$sshdPath = Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe'
-$hostKeyPath = Join-Path $programData 'ssh\ssh_host_ed25519_key.pub'
-$service = Get-Service -Name 'sshd' -ErrorAction SilentlyContinue
-$firewallRule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
-$listenerReady = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().
-    GetActiveTcpListeners() |
-    Where-Object { $_.Port -eq 22 } |
-    Select-Object -First 1
-$result = [ordered]@{
-  openssh_installed = ((Test-Path -LiteralPath $sshdPath) -or $null -ne $service)
-  service_running = ($null -ne $service -and $service.Status -eq 'Running')
-  firewall_rule_enabled = ($null -ne $firewallRule -and $firewallRule.Enabled -eq 'True' -and $firewallRule.Direction -eq 'Inbound' -and $firewallRule.Action -eq 'Allow')
-  host_key_present = ((Test-Path -LiteralPath $hostKeyPath) -and ((Get-Item -LiteralPath $hostKeyPath).Length -gt 0))
-  listener_ready = ($null -ne $listenerReady)
-}
-$result | ConvertTo-Json -Compress
-"#
-    .trim().to_owned()
-}
-
 fn build_windows_ssh_readiness_result_script(remote_result_path: &str) -> Result<String, String> {
-    let encoded_body =
-        encode_powershell_command(build_windows_ssh_readiness_probe_script().as_str())?;
     Ok(format!(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
          $resultPath = {result_path}; \
-         $resultParent = Split-Path -Path $resultPath -Parent; \
-         if ($resultParent -and -not (Test-Path -LiteralPath $resultParent)) {{ \
-           New-Item -ItemType Directory -Path $resultParent -Force | Out-Null \
-         }}; \
-         if (Test-Path -LiteralPath $resultPath) {{ \
-           Remove-Item -LiteralPath $resultPath -Force \
-         }}; \
          $body = ''; \
          $probeExit = 0; \
          try {{ \
-           $decoded = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String({encoded_body})); \
-           $scriptBlock = [ScriptBlock]::Create($decoded); \
-           $body = (& $scriptBlock *>&1 | Out-String); \
-           $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
-           if ($null -ne $lastExitCode) {{ \
-             $probeExit = [int]$lastExitCode.Value \
-           }} elseif (-not $?) {{ \
-             $probeExit = 1 \
-           }} \
+           $resultParent = Split-Path -Path $resultPath -Parent; \
+           if ($resultParent -and -not (Test-Path -LiteralPath $resultParent)) {{ \
+             New-Item -ItemType Directory -Path $resultParent -Force | Out-Null \
+           }}; \
+           if (Test-Path -LiteralPath $resultPath) {{ \
+             Remove-Item -LiteralPath $resultPath -Force \
+           }}; \
+           $programData = [Environment]::GetFolderPath('CommonApplicationData'); \
+           $sshdPath = Join-Path $env:WINDIR 'System32\\OpenSSH\\sshd.exe'; \
+           $hostKeyPath = Join-Path $programData 'ssh\\ssh_host_ed25519_key.pub'; \
+           $service = Get-Service -Name 'sshd' -ErrorAction SilentlyContinue; \
+           $firewallRule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue; \
+           $listenerReady = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object {{ $_.Port -eq 22 }} | Select-Object -First 1; \
+           $report = [ordered]@{{ \
+             openssh_installed = ((Test-Path -LiteralPath $sshdPath) -or $null -ne $service); \
+             service_running = ($null -ne $service -and $service.Status -eq 'Running'); \
+             firewall_rule_enabled = ($null -ne $firewallRule -and $firewallRule.Enabled -eq 'True' -and $firewallRule.Direction -eq 'Inbound' -and $firewallRule.Action -eq 'Allow'); \
+             host_key_present = ((Test-Path -LiteralPath $hostKeyPath) -and ((Get-Item -LiteralPath $hostKeyPath).Length -gt 0)); \
+             listener_ready = ($null -ne $listenerReady) \
+           }}; \
+           $body = ($report | ConvertTo-Json -Compress) \
          }} catch {{ \
            $probeExit = 1; \
            $body = (@{{ status = 'error'; reason = ('windows-ssh-readiness-probe-exception: ' + $_.ToString().Trim()) }} | ConvertTo-Json -Compress) \
@@ -17919,9 +17901,45 @@ fn build_windows_ssh_readiness_result_script(remote_result_path: &str) -> Result
          }}; \
          Set-Content -LiteralPath $resultPath -Value $body -Encoding utf8; \
          exit $probeExit",
-        encoded_body = powershell_quote(encoded_body.as_str())?,
         result_path = powershell_quote(remote_result_path)?,
     ))
+}
+
+fn build_windows_ssh_readiness_probe_script() -> String {
+    "Set-StrictMode -Version Latest; \
+     $ErrorActionPreference = 'Stop'; \
+     $ProgressPreference = 'SilentlyContinue'; \
+     try { \
+       $programData = [Environment]::GetFolderPath('CommonApplicationData'); \
+       $sshdPath = Join-Path $env:WINDIR 'System32\\OpenSSH\\sshd.exe'; \
+       $hostKeyPath = Join-Path $programData 'ssh\\ssh_host_ed25519_key.pub'; \
+       $service = Get-Service -Name 'sshd' -ErrorAction SilentlyContinue; \
+       $firewallRule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue; \
+       $listenerReady = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq 22 } | Select-Object -First 1; \
+       [ordered]@{ \
+         openssh_installed = ((Test-Path -LiteralPath $sshdPath) -or $null -ne $service); \
+         service_running = ($null -ne $service -and $service.Status -eq 'Running'); \
+         firewall_rule_enabled = ($null -ne $firewallRule -and $firewallRule.Enabled -eq 'True' -and $firewallRule.Direction -eq 'Inbound' -and $firewallRule.Action -eq 'Allow'); \
+         host_key_present = ((Test-Path -LiteralPath $hostKeyPath) -and ((Get-Item -LiteralPath $hostKeyPath).Length -gt 0)); \
+         listener_ready = ($null -ne $listenerReady) \
+       } | ConvertTo-Json -Compress \
+     } catch { \
+       @{ status = 'error'; reason = ('windows-ssh-readiness-probe-exception: ' + $_.ToString().Trim()) } | ConvertTo-Json -Compress; \
+       exit 1 \
+     }"
+        .to_owned()
+}
+
+fn windows_ssh_readiness_result_path(staging_dir: Option<&str>) -> Result<String, String> {
+    let file_name = format!("windows-ssh-readiness.{}.json", unique_suffix());
+    if let Some(staging_dir) = staging_dir.filter(|value| !value.trim().is_empty()) {
+        return windows_guest_path_join(staging_dir, file_name.as_str());
+    }
+    Ok(format!(r"C:\ProgramData\Rustynet\vm-lab\{file_name}"))
+}
+
+fn windows_ssh_readiness_probe_timeout(timeout: Duration) -> Duration {
+    timeout.max(Duration::from_secs(30))
 }
 
 fn parse_windows_ssh_readiness_probe_output(
@@ -17969,12 +17987,35 @@ fn best_effort_remove_windows_local_utm_guest_file(
 
 fn probe_windows_local_utm_ssh_readiness(
     utm_name: &str,
+    staging_dir: Option<&str>,
     timeout: Duration,
 ) -> ProbeState<WindowsSshReadinessProbe> {
-    let remote_result_path = format!(
-        r"C:\ProgramData\Rustynet\vm-lab\windows-ssh-readiness.{}.json",
-        unique_suffix()
-    );
+    let timeout = windows_ssh_readiness_probe_timeout(timeout);
+    if let Some(staging_dir) = staging_dir.filter(|value| !value.trim().is_empty()) {
+        let output = match execute_utm_remote_powershell_capture(
+            utm_name,
+            staging_dir,
+            build_windows_ssh_readiness_probe_script().as_str(),
+            timeout,
+        ) {
+            Ok((0, output)) => output,
+            Ok((rc, output)) => {
+                return ProbeState::Error {
+                    reason: format_remote_capture_exit_error(rc, output.as_str()),
+                };
+            }
+            Err(err) => return ProbeState::Error { reason: err },
+        };
+        return match parse_windows_ssh_readiness_probe_output(output.as_str(), utm_name) {
+            Ok(report) => ProbeState::Ok { value: report },
+            Err(err) => ProbeState::Error { reason: err },
+        };
+    }
+
+    let remote_result_path = match windows_ssh_readiness_result_path(staging_dir) {
+        Ok(path) => path,
+        Err(err) => return ProbeState::Error { reason: err },
+    };
     let output = match execute_windows_local_utm_result_file_probe(
         utm_name,
         "Windows SSH readiness probe",
@@ -17993,6 +18034,51 @@ fn probe_windows_local_utm_ssh_readiness(
     match parse_windows_ssh_readiness_probe_output(output.as_str(), utm_name) {
         Ok(report) => ProbeState::Ok { value: report },
         Err(err) => ProbeState::Error { reason: err },
+    }
+}
+
+fn push_windows_ssh_port_transport_reason(
+    reason_codes: &mut Vec<String>,
+    ssh_port_state: &ProbeState<PortStatus>,
+) {
+    match ssh_port_state {
+        ProbeState::Ok {
+            value: PortStatus::TimedOut | PortStatus::Unreachable,
+        }
+        | ProbeState::Fallback {
+            value: PortStatus::TimedOut | PortStatus::Unreachable,
+            ..
+        }
+        | ProbeState::Error { .. } => {
+            push_unique_reason_code(reason_codes, "ssh-firewall-not-open");
+        }
+        ProbeState::Ok {
+            value: PortStatus::Refused,
+        }
+        | ProbeState::Fallback {
+            value: PortStatus::Refused,
+            ..
+        } => {
+            push_unique_reason_code(reason_codes, "ssh-service-not-running");
+            push_unique_reason_code(reason_codes, "ssh-listener-not-ready");
+        }
+        ProbeState::Missing { .. }
+        | ProbeState::Ok {
+            value: PortStatus::Unknown,
+        }
+        | ProbeState::Fallback {
+            value: PortStatus::Unknown,
+            ..
+        } => {
+            push_unique_reason_code(reason_codes, "ssh-listener-not-ready");
+        }
+        ProbeState::Ok {
+            value: PortStatus::Open,
+        }
+        | ProbeState::Fallback {
+            value: PortStatus::Open,
+            ..
+        } => {}
     }
 }
 
@@ -18043,35 +18129,16 @@ fn build_windows_utm_reason_codes(
         if !value.host_key_present {
             push_unique_reason_code(&mut reason_codes, "ssh-host-key-not-ready");
         }
-    } else if !tcp_ready {
-        match ssh_port_state {
-            ProbeState::Fallback {
-                value: PortStatus::TimedOut | PortStatus::Unreachable,
-                ..
-            }
-            | ProbeState::Error { .. } => {
-                push_unique_reason_code(&mut reason_codes, "ssh-firewall-not-open");
-            }
-            ProbeState::Fallback {
-                value: PortStatus::Refused,
-                ..
-            } => {
-                push_unique_reason_code(&mut reason_codes, "ssh-service-not-running");
-                push_unique_reason_code(&mut reason_codes, "ssh-listener-not-ready");
-            }
-            ProbeState::Missing { .. }
-            | ProbeState::Fallback {
-                value: PortStatus::Unknown,
-                ..
-            } => {
-                push_unique_reason_code(&mut reason_codes, "ssh-listener-not-ready");
-            }
-            ProbeState::Fallback {
-                value: PortStatus::Open,
-                ..
-            }
-            | ProbeState::Ok { .. } => {}
+        if !tcp_ready
+            && value.openssh_installed
+            && value.service_running
+            && value.firewall_rule_enabled
+            && value.listener_ready
+        {
+            push_windows_ssh_port_transport_reason(&mut reason_codes, ssh_port_state);
         }
+    } else if !tcp_ready {
+        push_windows_ssh_port_transport_reason(&mut reason_codes, ssh_port_state);
     }
     if let Some(state) = known_hosts_state {
         match state {
@@ -18158,14 +18225,8 @@ fn build_utm_readiness(inputs: UtmReadinessInputs<'_>) -> VmLabReadiness {
         }
         reason_codes
     };
-    // Windows VMs participate in the lab but SSH may not be configured or may be
-    // firewalled. Execution-ready for Windows means the VM is booted and reachable
-    // on the network; SSH readiness is advisory and does not gate orchestration.
-    let execution_ready = if inputs.platform == VmGuestPlatform::Windows {
-        powered && networked
-    } else {
-        powered && networked && tcp_ready && auth_ready && inputs.authoritative_target_present
-    };
+    let execution_ready =
+        powered && networked && tcp_ready && auth_ready && inputs.authoritative_target_present;
     VmLabReadiness {
         powered,
         networked,
@@ -20065,9 +20126,9 @@ fn wait_for_local_utm_targets_ready(
 fn ssh_auth_probe_command(profile: VmPlatformProfile) -> Result<&'static str, String> {
     match profile.remote_shell {
         VmRemoteShell::Posix => Ok("true"),
-        VmRemoteShell::Powershell => Ok(
-            "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"$PSVersionTable.PSVersion.ToString() | Out-Null; exit 0\"",
-        ),
+        VmRemoteShell::Powershell => {
+            Ok("powershell.exe -NoLogo -NoProfile -NonInteractive -Command exit 0")
+        }
         VmRemoteShell::Unsupported => Err(format!(
             "vm-lab SSH readiness probing is not yet implemented for platform {}",
             profile.platform.as_str()
@@ -22780,15 +22841,13 @@ fn remote_target_windows_utm_staging_dir(target: &RemoteTarget) -> Result<String
         })
 }
 
-fn ssh_fallback_allowed_for_target(_target: &RemoteTarget, _phase: RemoteTransportPhase) -> bool {
-    // SSH SCP and SSH exec fallback are always permitted. The original
-    // restriction (blocking AccessEstablishment + Windows UTM) was intended to
-    // prevent a circular dependency, but utmctl file push exits 0 even when it
-    // fails to write the file (OSStatus -2700 / Access is denied), making the
-    // UTM path unreliable. Allowing SCP fallback is safe: if SSH auth is not
-    // yet configured the SCP will fail with a clear auth error; if it is
-    // configured (as on this lab VM) the SCP succeeds and unblocks bootstrap.
-    true
+fn ssh_fallback_allowed_for_target(target: &RemoteTarget, phase: RemoteTransportPhase) -> bool {
+    !(target.platform_profile.platform == VmGuestPlatform::Windows
+        && phase == RemoteTransportPhase::AccessEstablishment)
+}
+
+fn windows_local_utm_transport_allowed_for_phase(phase: RemoteTransportPhase) -> bool {
+    phase == RemoteTransportPhase::AccessEstablishment
 }
 
 fn format_windows_access_establishment_transport_error(
@@ -22808,7 +22867,10 @@ fn run_remote_shell_command_for_target_with_phase(
     timeout: Duration,
     phase: RemoteTransportPhase,
 ) -> Result<ExitStatus, String> {
-    if let Some((utm_name, _)) = remote_target_local_utm(target) {
+    if let Some((utm_name, _)) = remote_target_local_utm(target)
+        && (target.platform_profile.platform != VmGuestPlatform::Windows
+            || windows_local_utm_transport_allowed_for_phase(phase))
+    {
         return match target.platform_profile.platform {
             VmGuestPlatform::Linux => {
                 let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
@@ -22838,7 +22900,7 @@ fn run_remote_shell_command_for_target_with_phase(
             VmGuestPlatform::Windows => {
                 // Primary path: utmctl exec + result-file (network-independent;
                 // survives WireGuard interface up/down mid-orchestration).
-                // SSH fallback only on transport failure.
+                // SSH fallback is allowed only after access establishment.
                 let staging_dir = remote_target_windows_utm_staging_dir(target)?;
                 match execute_utm_remote_powershell_capture(
                     utm_name,
@@ -22923,7 +22985,10 @@ fn capture_remote_shell_command_for_target_with_phase(
     timeout: Duration,
     phase: RemoteTransportPhase,
 ) -> Result<String, String> {
-    if let Some((utm_name, _)) = remote_target_local_utm(target) {
+    if let Some((utm_name, _)) = remote_target_local_utm(target)
+        && (target.platform_profile.platform != VmGuestPlatform::Windows
+            || windows_local_utm_transport_allowed_for_phase(phase))
+    {
         return match target.platform_profile.platform {
             VmGuestPlatform::Linux => {
                 let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
@@ -23090,18 +23155,20 @@ fn scp_to_remote_for_target_with_phase(
                 //   SSH user and the SYSTEM-level guest agent can read+write.
                 // - During access establishment, SSH may be down by
                 //   definition, so use utmctl push for helper/support files
-                //   under staging and fall back to SCP only if the guest
-                //   agent path fails.
+                //   under staging. Do not fall back to SCP here: SSH is the
+                //   thing being established, and fallback would hide the
+                //   broken layer.
                 // - Post-bootstrap paths keep using SCP so ordinary Windows
                 //   targets and SSH-only lab paths exercise the same operator
                 //   transport after access has been proven.
                 //
-                // SCP needs the staging directory to exist (it does not
-                // create intermediate directories). utmctl push also needs
-                // it. Use `utmctl exec` to mkdir it — that's
-                // network-independent and idempotent — before either copy
-                // path runs.
-                if let Some(staging_dir) = context.target.utm_staging_dir.as_deref() {
+                // During access establishment, use `utmctl exec` to mkdir
+                // the staging directory before UTM push. Post-bootstrap SCP
+                // avoids UTM exec entirely; if the directory is missing, the
+                // SSH/SCP error is the authoritative transport failure.
+                if phase == RemoteTransportPhase::AccessEstablishment
+                    && let Some(staging_dir) = context.target.utm_staging_dir.as_deref()
+                {
                     let parent = windows_guest_parent_dir(dst.as_str()).unwrap_or_default();
                     let needs_mkdir =
                         parent.is_empty() || windows_path_is_within(parent.as_str(), staging_dir);
@@ -23127,21 +23194,19 @@ fn scp_to_remote_for_target_with_phase(
                     match utm_push_raw(utm_name, src, dst.as_str(), context.timeout) {
                         Ok(status) if status.success() => return Ok(status),
                         Ok(status) => {
-                            return fallback_scp_to_remote(
-                                context,
-                                src,
-                                dst.as_str(),
+                            return Err(format_windows_access_establishment_transport_error(
+                                context.target.label.as_str(),
+                                "UTM Windows file push",
                                 format!("UTM push failed with status {}", status_code(status))
                                     .as_str(),
-                            );
+                            ));
                         }
                         Err(err) => {
-                            return fallback_scp_to_remote(
-                                context,
-                                src,
-                                dst.as_str(),
+                            return Err(format_windows_access_establishment_transport_error(
+                                context.target.label.as_str(),
+                                "UTM Windows file push",
                                 err.as_str(),
-                            );
+                            ));
                         }
                     }
                 }
@@ -24359,6 +24424,19 @@ fn stage_windows_helper_support_files(
     context: &RemoteFallbackContext<'_>,
     helper_file_name: &str,
 ) -> Result<(), String> {
+    let phase = if windows_local_utm_execution_authority(context.target, false).is_some() {
+        RemoteTransportPhase::AccessEstablishment
+    } else {
+        RemoteTransportPhase::PostBootstrap
+    };
+    stage_windows_helper_support_files_with_phase(context, helper_file_name, phase)
+}
+
+fn stage_windows_helper_support_files_with_phase(
+    context: &RemoteFallbackContext<'_>,
+    helper_file_name: &str,
+    phase: RemoteTransportPhase,
+) -> Result<(), String> {
     if helper_file_name != WINDOWS_BOOTSTRAP_HELPER_FILE
         && helper_file_name != WINDOWS_ENABLE_ACCESS_HELPER_FILE
     {
@@ -24366,10 +24444,11 @@ fn stage_windows_helper_support_files(
     }
     if helper_file_name == WINDOWS_ENABLE_ACCESS_HELPER_FILE {
         let local_path = windows_bootstrap_helper_script_local_path();
-        stage_windows_helper_script_from_path(
+        stage_windows_helper_script_from_path_with_phase(
             context,
             local_path.as_path(),
             WINDOWS_BOOTSTRAP_HELPER_FILE,
+            phase,
         )?;
     }
     for support_file_name in [
@@ -24383,7 +24462,12 @@ fn stage_windows_helper_support_files(
         WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE,
     ] {
         let local_path = windows_helper_script_local_path(support_file_name);
-        stage_windows_helper_script_from_path(context, local_path.as_path(), support_file_name)?;
+        stage_windows_helper_script_from_path_with_phase(
+            context,
+            local_path.as_path(),
+            support_file_name,
+            phase,
+        )?;
     }
     Ok(())
 }
@@ -24563,18 +24647,20 @@ fn build_windows_helper_command(remote_path: &str, args: &[String]) -> Result<St
     Ok(command)
 }
 
-fn capture_windows_helper_script_output_for_target(
+fn capture_windows_helper_script_output_for_target_with_phase(
     context: &RemoteFallbackContext<'_>,
     helper_file_name: &str,
     remote_file_name: &str,
     args: &[String],
+    phase: RemoteTransportPhase,
 ) -> Result<String, String> {
     let local_path = windows_helper_script_local_path(helper_file_name);
-    capture_windows_helper_script_output_from_path(
+    capture_windows_helper_script_output_from_path_with_phase(
         context,
         local_path.as_path(),
         remote_file_name,
         args,
+        phase,
     )
 }
 
@@ -24589,6 +24675,22 @@ fn capture_windows_helper_script_output_from_path(
     } else {
         RemoteTransportPhase::PostBootstrap
     };
+    capture_windows_helper_script_output_from_path_with_phase(
+        context,
+        local_path,
+        remote_file_name,
+        args,
+        phase,
+    )
+}
+
+fn capture_windows_helper_script_output_from_path_with_phase(
+    context: &RemoteFallbackContext<'_>,
+    local_path: &Path,
+    remote_file_name: &str,
+    args: &[String],
+    phase: RemoteTransportPhase,
+) -> Result<String, String> {
     let remote_path = stage_windows_helper_script_from_path_with_phase(
         context,
         local_path,
@@ -24850,54 +24952,13 @@ fn bootstrap_windows_access_for_target(
                 remote_result_path.as_str(),
                 Duration::from_secs(20),
             );
-            match report_output {
-                Ok(output) => output,
-                Err(utm_err) => {
-                    // UTM file operations are broken on this Windows guest
-                    // (push exits 0 but writes nothing; pull fails with
-                    // -2700). Stage the bootstrap script via SCP and run it
-                    // directly over SSH instead. sshd restart inside the
-                    // bootstrap does not kill the existing SSH session on
-                    // Windows OpenSSH (child sshd processes outlive service
-                    // restarts).
-                    let ssh_user = context.ssh_user_override.or(target.ssh_user.as_deref());
-                    let scp_dst = remote_copy_destination_for_target(target, remote_path.as_str());
-                    let scp_status = scp_to_remote(
-                        local_path.as_path(),
-                        target.ssh_target.as_str(),
-                        ssh_user,
-                        context.ssh_identity_file,
-                        context.known_hosts_path,
-                        scp_dst.as_str(),
-                        Duration::from_secs(60),
-                    )
-                    .map_err(|scp_err| {
-                        format!("{utm_err}; SCP staging for SSH fallback failed: {scp_err}")
-                    })?;
-                    if !scp_status.success() {
-                        return Err(format!(
-                            "{utm_err}; SCP staging for SSH fallback failed with status {}",
-                            status_code(scp_status)
-                        ));
-                    }
-                    let ssh_args =
-                        build_windows_access_bootstrap_args(automation_public_key, None)?;
-                    let script = build_windows_helper_invocation_script(
-                        remote_path.as_str(),
-                        ssh_args.as_slice(),
-                    )?;
-                    let ssh_script = remote_script_for_ssh_transport(target, script.as_str())?;
-                    capture_remote_shell_command(
-                        target.ssh_target.as_str(),
-                        ssh_user,
-                        context.ssh_identity_file,
-                        context.known_hosts_path,
-                        ssh_script.as_str(),
-                        context.timeout,
-                    )
-                    .map_err(|ssh_err| format!("{utm_err}; SSH fallback also failed: {ssh_err}"))?
-                }
-            }
+            report_output.map_err(|utm_err| {
+                format_windows_access_establishment_transport_error(
+                    target.label.as_str(),
+                    "UTM Windows access bootstrap probe",
+                    utm_err.as_str(),
+                )
+            })?
         }
         _ => {
             let args = build_windows_access_bootstrap_args(automation_public_key, None)?;
@@ -25041,6 +25102,19 @@ fn ensure_windows_runtime_access_ready_for_target(
             "Windows runtime access proof requested for non-Windows target: {}",
             target.label
         ));
+    }
+    match prove_windows_ssh_access_for_target(
+        target,
+        ssh_user_override,
+        ssh_identity_file,
+        known_hosts_path,
+        timeout,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(first_ssh_err) if remote_target_local_utm(target).is_none() => {
+            return Err(format!("ssh-access-not-ready: {first_ssh_err}"));
+        }
+        Err(_) => {}
     }
     if remote_target_local_utm(target).is_some() {
         bootstrap_windows_access_for_target(
@@ -27070,7 +27144,7 @@ mod tests {
         assert_eq!(
             ssh_auth_probe_command(default_platform_profile(VmGuestPlatform::Windows))
                 .expect("windows probe should exist"),
-            "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"$PSVersionTable.PSVersion.ToString() | Out-Null; exit 0\""
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -Command exit 0"
         );
     }
 
@@ -27529,6 +27603,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_access_establishment_disables_ssh_fallback() {
+        let (_inventory_path, windows_target) = resolve_windows_remote_target();
+        assert!(!super::ssh_fallback_allowed_for_target(
+            &windows_target,
+            super::RemoteTransportPhase::AccessEstablishment
+        ));
+        assert!(super::ssh_fallback_allowed_for_target(
+            &windows_target,
+            super::RemoteTransportPhase::PostBootstrap
+        ));
+
+        let (_linux_inventory_path, linux_target) = resolve_platform_remote_target("linux");
+        assert!(super::ssh_fallback_allowed_for_target(
+            &linux_target,
+            super::RemoteTransportPhase::AccessEstablishment
+        ));
+    }
+
+    #[test]
+    fn windows_local_utm_transport_is_access_establishment_only() {
+        assert!(super::windows_local_utm_transport_allowed_for_phase(
+            super::RemoteTransportPhase::AccessEstablishment
+        ));
+        assert!(!super::windows_local_utm_transport_allowed_for_phase(
+            super::RemoteTransportPhase::PostBootstrap
+        ));
+    }
+
     // Note: tests for `resolve_local_utm_status_result` were removed in the
     // commit that restored the UTM control channel.  The SSH-fallback logic
     // that helper used to wrap is now inlined directly in
@@ -27546,6 +27649,48 @@ mod tests {
         assert!(script.contains("windows-ssh-readiness-probe-produced-no-output"));
         assert!(!script.contains("__RUSTYNET_CAPTURE_RC__="));
         assert!(!script.contains("__RUSTYNET_CAPTURE_STDOUT_BASE64__="));
+    }
+
+    #[test]
+    fn windows_ssh_readiness_probe_script_is_direct_json_probe() {
+        let script = super::build_windows_ssh_readiness_probe_script();
+        assert!(script.contains("Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP'"));
+        assert!(script.contains("GetActiveTcpListeners()"));
+        assert!(script.contains("ConvertTo-Json -Compress"));
+        assert!(!script.contains("[ScriptBlock]::Create"));
+        assert!(!script.contains("FromBase64String"));
+    }
+
+    #[test]
+    fn windows_ssh_readiness_result_path_prefers_utm_staging_dir() {
+        let path =
+            super::windows_ssh_readiness_result_path(Some(r"C:\Users\windows\rustynet-utm-stage"))
+                .expect("readiness path should build");
+        assert!(path.starts_with(r"C:\Users\windows\rustynet-utm-stage\"));
+        assert!(path.contains("windows-ssh-readiness."));
+        assert!(path.ends_with(".json"));
+        assert!(!path.starts_with(r"C:\ProgramData\Rustynet\vm-lab\"));
+    }
+
+    #[test]
+    fn windows_ssh_readiness_result_path_falls_back_to_program_data() {
+        let path = super::windows_ssh_readiness_result_path(None)
+            .expect("fallback readiness path should build");
+        assert!(path.starts_with(r"C:\ProgramData\Rustynet\vm-lab\"));
+        assert!(path.contains("windows-ssh-readiness."));
+        assert!(path.ends_with(".json"));
+    }
+
+    #[test]
+    fn windows_ssh_readiness_probe_timeout_has_safe_floor() {
+        assert_eq!(
+            super::windows_ssh_readiness_probe_timeout(Duration::from_secs(5)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            super::windows_ssh_readiness_probe_timeout(Duration::from_secs(45)),
+            Duration::from_secs(45)
+        );
     }
 
     #[test]
@@ -28991,6 +29136,79 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
                 "ssh-host-key-not-ready".to_owned(),
                 "ssh-auth-timeout".to_owned(),
             ]
+        );
+        assert!(!readiness.execution_ready);
+    }
+
+    #[test]
+    fn windows_utm_readiness_requires_ssh_for_execution_ready() {
+        let readiness = build_utm_readiness(UtmReadinessInputs {
+            platform: VmGuestPlatform::Windows,
+            process_state: &ProbeState::Ok { value: true },
+            live_ip_state: &ProbeState::Ok {
+                value: "192.168.64.14".to_owned(),
+            },
+            ssh_port_state: &ProbeState::Ok {
+                value: PortStatus::Refused,
+            },
+            ssh_auth_state: &ProbeState::Missing {
+                reason: "ssh-port-status=closed".to_owned(),
+            },
+            authoritative_target_present: true,
+            known_hosts_state: None,
+            windows_ssh_probe_state: Some(&ProbeState::Ok {
+                value: WindowsSshReadinessProbe {
+                    openssh_installed: true,
+                    service_running: true,
+                    firewall_rule_enabled: true,
+                    host_key_present: true,
+                    listener_ready: false,
+                },
+            }),
+        });
+        assert!(readiness.powered);
+        assert!(readiness.networked);
+        assert!(!readiness.tcp_ready);
+        assert!(!readiness.auth_ready);
+        assert!(!readiness.execution_ready);
+        assert_eq!(
+            readiness.reason_codes,
+            vec!["ssh-listener-not-ready".to_owned()]
+        );
+    }
+
+    #[test]
+    fn windows_utm_readiness_keeps_host_transport_reason_when_guest_ssh_is_ready() {
+        let readiness = build_utm_readiness(UtmReadinessInputs {
+            platform: VmGuestPlatform::Windows,
+            process_state: &ProbeState::Ok { value: true },
+            live_ip_state: &ProbeState::Ok {
+                value: "192.168.64.14".to_owned(),
+            },
+            ssh_port_state: &ProbeState::Fallback {
+                value: PortStatus::TimedOut,
+                reason: "Operation timed out".to_owned(),
+            },
+            ssh_auth_state: &ProbeState::Missing {
+                reason: "ssh-port-status=closed".to_owned(),
+            },
+            authoritative_target_present: true,
+            known_hosts_state: None,
+            windows_ssh_probe_state: Some(&ProbeState::Ok {
+                value: WindowsSshReadinessProbe {
+                    openssh_installed: true,
+                    service_running: true,
+                    firewall_rule_enabled: true,
+                    host_key_present: true,
+                    listener_ready: true,
+                },
+            }),
+        });
+        assert!(!readiness.tcp_ready);
+        assert!(!readiness.execution_ready);
+        assert_eq!(
+            readiness.reason_codes,
+            vec!["ssh-firewall-not-open".to_owned()]
         );
     }
 
