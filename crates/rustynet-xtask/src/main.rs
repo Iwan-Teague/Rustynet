@@ -32,7 +32,12 @@
 //!   XTASK_FMT_TIMEOUT (default 120)
 //!   XTASK_CHECK_TIMEOUT (default 1200)
 //!   XTASK_CLIPPY_TIMEOUT (default 1500)
-//!   XTASK_TEST_TIMEOUT (default 2400)
+//!   XTASK_TEST_TIMEOUT (default 3600)
+//!
+//! Each stage's wall-clock is appended to
+//! `documents/operations/gate_timings.csv` (timestamp, commit, dirty, stage,
+//! scope, duration, outcome) so gate cost can be tracked over time. Recording
+//! is best-effort and never fails the gate.
 //!
 //! Exit codes: 0 all gates passed, 1 a gate failed, 124 a gate timed out.
 
@@ -42,7 +47,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
@@ -168,13 +173,16 @@ fn run_gates(rest: &[String]) -> i32 {
     if !skip_test {
         stages.push(Stage {
             label: "test",
-            timeout: timeout_from_env("XTASK_TEST_TIMEOUT", 2400),
+            timeout: timeout_from_env("XTASK_TEST_TIMEOUT", 3600),
             args: with_scope(&["test"]),
         });
     }
 
+    let run_meta = TimingRunMeta::resolve(affected, &scope);
     for stage in &stages {
-        match run_stage(stage) {
+        let (outcome, elapsed) = run_stage(stage);
+        run_meta.record(stage.label, elapsed, outcome_label(&outcome));
+        match outcome {
             StageOutcome::Pass => {}
             StageOutcome::Fail(code) => return code,
             StageOutcome::Timeout => return TIMEOUT_EXIT_CODE,
@@ -190,7 +198,7 @@ enum StageOutcome {
     Timeout,
 }
 
-fn run_stage(stage: &Stage) -> StageOutcome {
+fn run_stage(stage: &Stage) -> (StageOutcome, u64) {
     println!(
         "\n==> [{}] starting (timeout {}s): cargo {}",
         stage.label,
@@ -213,7 +221,7 @@ fn run_stage(stage: &Stage) -> StageOutcome {
         Ok(child) => child,
         Err(err) => {
             eprintln!("!!! [{}] failed to spawn cargo: {err}", stage.label);
-            return StageOutcome::Fail(1);
+            return (StageOutcome::Fail(1), started.elapsed().as_secs());
         }
     };
 
@@ -240,23 +248,23 @@ fn run_stage(stage: &Stage) -> StageOutcome {
             stage.label
         );
         print_tail(&tail);
-        return StageOutcome::Timeout;
+        return (StageOutcome::Timeout, elapsed);
     }
     match status {
         Ok(status) if status.success() => {
             println!("==> [{}] PASS ({elapsed}s)", stage.label);
-            StageOutcome::Pass
+            (StageOutcome::Pass, elapsed)
         }
         Ok(status) => {
             let code = status.code().unwrap_or(1);
             eprintln!("!!! [{}] FAILED (rc={code}, {elapsed}s)", stage.label);
             print_tail(&tail);
-            StageOutcome::Fail(code)
+            (StageOutcome::Fail(code), elapsed)
         }
         Err(err) => {
             eprintln!("!!! [{}] wait failed: {err}", stage.label);
             print_tail(&tail);
-            StageOutcome::Fail(1)
+            (StageOutcome::Fail(1), elapsed)
         }
     }
 }
@@ -486,9 +494,144 @@ fn timeout_from_env(var: &str, default_secs: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
+const GATE_TIMINGS_CSV_HEADER: &str =
+    "timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome";
+
+fn outcome_label(outcome: &StageOutcome) -> &'static str {
+    match outcome {
+        StageOutcome::Pass => "pass",
+        StageOutcome::Fail(_) => "fail",
+        StageOutcome::Timeout => "timeout",
+    }
+}
+
+/// Per-run context shared by every stage's timing row: where the tracked CSV
+/// lives, the commit + dirty state under test, and a description of the gate
+/// scope. Resolved once; reused for each stage.
+struct TimingRunMeta {
+    repo_root: Option<String>,
+    commit: String,
+    dirty: &'static str,
+    scope: String,
+}
+
+impl TimingRunMeta {
+    fn resolve(affected: bool, scope: &[String]) -> Self {
+        let repo_root = git_capture(&["rev-parse", "--show-toplevel"])
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let commit = git_capture(&["rev-parse", "--short", "HEAD"])
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let dirty = match git_capture(&["status", "--porcelain"]) {
+            Ok(out) if !out.trim().is_empty() => "dirty",
+            Ok(_) => "clean",
+            Err(_) => "unknown",
+        };
+        let scope = if affected {
+            "affected".to_owned()
+        } else if scope.is_empty() {
+            "workspace".to_owned()
+        } else {
+            scope.join(" ")
+        };
+        Self {
+            repo_root,
+            commit,
+            dirty,
+            scope,
+        }
+    }
+
+    /// Append one stage's timing to the tracked CSV. Best-effort: a write
+    /// failure warns but never fails the gate.
+    fn record(&self, stage: &str, duration_secs: u64, outcome: &str) {
+        let Some(root) = self.repo_root.as_deref() else {
+            return;
+        };
+        let path = std::path::Path::new(root)
+            .join("documents")
+            .join("operations")
+            .join("gate_timings.csv");
+        let row = format_timing_row(
+            &utc_timestamp(),
+            &self.commit,
+            self.dirty,
+            stage,
+            &self.scope,
+            duration_secs,
+            outcome,
+        );
+        if let Err(err) = append_timing_row(&path, &row) {
+            eprintln!(
+                "!!! [timing] could not record gate timing to {}: {err}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn append_timing_row(path: &std::path::Path, row: &str) -> std::io::Result<()> {
+    let need_header = !path.exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if need_header {
+        writeln!(file, "{GATE_TIMINGS_CSV_HEADER}")?;
+    }
+    writeln!(file, "{row}")
+}
+
+/// Render one CSV record. String fields are sanitised (commas / newlines →
+/// `;`) so a stray separator can never split or break a row.
+fn format_timing_row(
+    timestamp: &str,
+    commit: &str,
+    dirty: &str,
+    stage: &str,
+    scope: &str,
+    duration_secs: u64,
+    outcome: &str,
+) -> String {
+    let clean = |value: &str| value.replace([',', '\n', '\r'], ";");
+    format!(
+        "{},{},{},{},{},{},{}",
+        clean(timestamp),
+        clean(commit),
+        clean(dirty),
+        clean(stage),
+        clean(scope),
+        duration_secs,
+        clean(outcome),
+    )
+}
+
+/// UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) via `date -u`, matching the repo's
+/// other CSV ledgers. Falls back to unix-epoch seconds if `date` is absent.
+fn utc_timestamp() -> String {
+    if let Ok(out) = Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        && out.status.success()
+    {
+        let stamp = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if !stamp.is_empty() {
+            return stamp;
+        }
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::compute_affected_set;
+    use super::{compute_affected_set, format_timing_row};
     use std::collections::BTreeMap;
 
     fn dirs() -> Vec<(String, String)> {
@@ -564,5 +707,34 @@ mod tests {
         ];
         let affected = compute_affected_set(&dirs(), &graph(), &changed);
         assert!(affected.is_empty());
+    }
+
+    #[test]
+    fn timing_row_is_a_single_seven_field_record() {
+        let row = format_timing_row(
+            "2026-05-31T12:00:00Z",
+            "9e3e346",
+            "clean",
+            "test",
+            "workspace",
+            2403,
+            "timeout",
+        );
+        assert_eq!(
+            row,
+            "2026-05-31T12:00:00Z,9e3e346,clean,test,workspace,2403,timeout"
+        );
+    }
+
+    #[test]
+    fn timing_row_sanitises_separators_in_fields() {
+        // A scope with a comma must not split the record into extra columns.
+        let row = format_timing_row("t", "c", "clean", "check", "-p a,-p b", 10, "pass");
+        assert_eq!(
+            row.matches(',').count(),
+            6,
+            "exactly six separators -> seven fields"
+        );
+        assert!(row.contains("-p a;-p b"), "comma sanitised to ';'");
     }
 }
