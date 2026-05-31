@@ -512,10 +512,15 @@ fn run() -> Result<(), String> {
         },
         skip_assignment_refresh: false,
     };
-    logger
-        .line("Issuing and distributing fresh signed traversal bundles for LAN-toggle topology")?;
-    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
-
+    // Enforce runtime roles BEFORE the first signed-state refresh. The
+    // blind_exit node transitions from its prior client role into blind_exit
+    // here, and `rustynet state refresh` validates the freshly distributed
+    // assignment intent against the daemon's CURRENT enforced role. If the
+    // refresh ran first, the still-client blind_exit daemon would reject its
+    // blind_exit-intent assignment ("assignment target intent lacks required
+    // local capability client"). enforce_host installs each node's target role
+    // (reading the bundles distributed above), so the subsequent refresh
+    // validates against the correct roles.
     logger.line("Enforcing runtime roles")?;
     enforce_host(&ctx, &exit_host, "admin", &exit_node_id, &ssh_allow_cidrs)?;
     enforce_host(
@@ -535,6 +540,10 @@ fn run() -> Result<(), String> {
     ensure_daemon_services_ready(&ctx, &exit_host)?;
     ensure_daemon_services_ready(&ctx, &client_host)?;
     ensure_daemon_services_ready(&ctx, &blind_exit_host)?;
+
+    logger
+        .line("Issuing and distributing fresh signed traversal bundles for LAN-toggle topology")?;
+    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
 
     // After enforce_host the daemons come up cold and stay in
     // restricted-safe mode until they ingest fresh signed trust
