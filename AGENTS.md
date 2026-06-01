@@ -29,7 +29,7 @@ Read in this order before touching code:
 8. Relevant runbooks under `documents/operations/`
 
 Current primary execution ledgers:
-- `documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md` for the cross-network dataplane track (D2-D10): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding. Source of truth for "what are we building and why" when working on traversal, relay, gossip, enrollment, or cellular reliability.
+- `documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md` for the cross-network dataplane track (D2-D12): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding. Source of truth for "what are we building and why" when working on traversal, relay, gossip, enrollment, or cellular reliability.
 - `documents/operations/active/MasterWorkPlan_2026-03-22.md` for repo-wide remaining work
 - `documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md` for traversal, relay, and live-lab readiness (the defects it documents drive D2/D3/D4 in the dataplane execution plan)
 

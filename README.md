@@ -177,7 +177,8 @@ Current VM-lab Windows truth on this branch:
   `scripts/bootstrap/windows/Smoke-RustyNetWindowsServiceHost.ps1`, and Windows
   `vm-lab-bootstrap-phase` entrypoints for `sync-source`, `build-release`,
   `smoke-service-host`, `install-release`, `restart-runtime`, `verify-runtime`,
-  and `all`.
+  the single-node live smokes `tunnel-smoke`, `killswitch-smoke`, `dns-smoke`,
+  and `ipv6-smoke`, and `all`.
 - Mixed Linux/Windows inventories dispatch bootstrap helpers by target platform;
   Windows targets are not sent into the Linux `live_linux_*` stage scripts.
 - The live-lab wrapper family `vm-lab-validate-live-lab-profile`,
@@ -206,15 +207,23 @@ Current VM-lab Windows truth on this branch:
   build report. That path fails closed if there is no logged-in interactive
   administrator session or if the user-scoped App Installer/WinGet bootstrap
   still cannot be proven. The Windows install/restart/verify entrypoints must
-  not be treated as dataplane-capable or release-gated proof. The latest
-  measured local Windows UTM attempt on 2026-04-19 showed App Installer
-  present on the guest but no interactive Windows user session available, so
-  `build-release` now fails honestly on that prerequisite instead of reporting
-  a generic missing-`winget.exe` state from Local System. There is still no
-  fresh Windows install/runtime/node evidence for current `HEAD`.
+  not be treated as dataplane-capable or release-gated proof. As of 2026-06-01,
+  fresh single-node live evidence DOES exist on the guest `windows-utm-1`:
+  `build-release` compiles `rustynetd` on the guest, the daemon runs and serves
+  its named-pipe IPC, and the `tunnel-smoke` (N1.3), `killswitch-smoke` (N2),
+  and `dns-smoke` (N3) bootstrap phases pass live (first WireGuard-NT tunnel
+  bring-up, plus killswitch and DNS fail-closed in protected mode). The
+  `ipv6-smoke` (G8) phase validated the IPv6-block mechanism live (it applies,
+  blocks egress, and rolls back under the killswitch); its full leak-proof is
+  deferred pending an IPv6-capable lab network. See
+  [WindowsLiveLabReadinessPlan_2026-05-31.md](./documents/operations/active/WindowsLiveLabReadinessPlan_2026-05-31.md)
+  for the authoritative per-gate status.
 - Windows is not `release-gated and evidenced` on the current branch. The
   required fresh-install/release-gate OS set remains Debian, Ubuntu, Fedora,
-  Mint, and macOS until measured Windows evidence exists.
+  Mint, and macOS until measured Windows **fresh-install/release-gate** evidence
+  exists; the single-node live smokes above are iteration evidence, not a
+  release-gate fresh-install proof, and a multi-node Windows mesh (N4) is still
+  pending.
 
 ## Release Readiness
 
