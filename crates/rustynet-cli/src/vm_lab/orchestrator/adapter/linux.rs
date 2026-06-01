@@ -169,6 +169,10 @@ impl NodeAdapter for LinuxNodeAdapter {
         linux_traffic::collect_daemon_failure_reason(&self.conn)
     }
 
+    fn assert_node_clean(&self) -> Result<(), AdapterError> {
+        linux_traffic::assert_node_clean(&self.conn)
+    }
+
     fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
         linux_traffic::check_ssh_reachable(&self.conn)
     }
