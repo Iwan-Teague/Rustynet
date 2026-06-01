@@ -35,10 +35,12 @@ passed: the first-ever WireGuard tunnel bring-up on `windows-utm-1` succeeded vi
 it active (netsh default-block-outbound + WFP tunnel permit), and it rolls back
 cleanly (WFP permit absent→present→absent; firewall restored; SSH never lost) —
 backed by a dead-man's-switch so an unattended run can't brick SSH, and a
-unit-proven fail-closed-on-apply-error path. The remaining unproven surface —
-DNS fail-closed (N3), multi-node mesh + traffic (N4), NetNat/role forwarding
-(N5), and the full matrix (N6) — is what N3→N6 close. IPv6-leak (G8) is still
-open before protected-mode can be called *secure*.
+unit-proven fail-closed-on-apply-error path. `N3` then passed via `--phase
+dns-smoke`: with the killswitch active, the netsh port-53 LAN-block applies,
+asserts, and rolls back (no plaintext-DNS leak in protected mode). The remaining
+unproven surface — multi-node mesh + traffic (N4), NetNat/role forwarding (N5),
+and the full matrix (N6) — is what N4→N6 close. IPv6-leak (G8) is still open
+before protected-mode can be called *secure*.
 
 ---
 
@@ -110,8 +112,17 @@ open before protected-mode can be called *secure*.
   `apply_firewall_killswitch` drives `block_all_egress`/FailClosed and never
   commits the tunnel). **E2 go/defer decision: E2 is shipped + live-validated** —
   no remaining CIM-cmdlet timing concern to defer.
-- **G3 — DNS fail-closed unvalidated on Windows (🔴).** netsh-based DNS
-  lockdown exists but has not been exercised live.
+- **G3 — DNS fail-closed — ✅ proven (2026-06-01).** The netsh port-53 LAN-block
+  was exercised live in protected mode (`--phase dns-smoke`): while the killswitch
+  was active, `apply_dns_protection` → `assert_dns_protection` (both
+  `RustyNetDNS-BlockLanUdp`/`-BlockLanTcp` rules present, Outbound/Block/Enabled) →
+  rollback → assert inactive, then the killswitch rolled back. Post-run there are
+  **no residual `RustyNetKS-*`/`RustyNetDNS-*` rules** and the firewall is back to
+  `AllowOutbound`. The Block rule overrides the killswitch's egress-allow for
+  port 53, so plaintext DNS to a LAN/ISP resolver is dropped while the tunnel is
+  up. The opt-in loopback-resolver/NRPT enforcement remains a deferred, stronger
+  control (a separate design decision); the firewall block is the baseline parity
+  control with Linux/macOS.
 - **G4 — No multi-node mesh with a Windows node (🔴).** The live-lab
   orchestrator/matrix is Linux-first (macOS recently added). `live_mixed_topology`
   currently **skips when no Windows host is in the mix**. Windows is not yet a
@@ -180,7 +191,7 @@ N6 (full matrix) are beyond the first run.
 | ---- | ------ | --------------- |
 | N1 single-node tunnel smoke ✅ | M | **yes** |
 | N2 killswitch + fail-closed ✅ | M | **yes** (safety) |
-| N3 DNS fail-closed | S–M | before "secure" |
+| N3 DNS fail-closed ✅ | S–M | before "secure" |
 | N4 two-node mesh w/ Windows | L | **yes** |
 | N5 roles (blind_exit → anchor) | L | no |
 | N6 full matrix incl. Windows | M | no |
@@ -280,10 +291,28 @@ Progress (2026-06-01) — **N2 PASSED**:
   off by default because it cuts the LAN SSH session until rollback; reserved
   for an explicit operator run behind the dead-man's-switch.
 
-### N3 — DNS fail-closed validation 🔴 (covers G3)
+### N3 — DNS fail-closed validation ✅ (2026-06-01, covers G3)
 Exercise the netsh DNS lockdown under a live tunnel; confirm no plaintext DNS
 leak in protected mode.
 - **Done when:** DNS fail-closed verified live on Windows.
+
+Progress (2026-06-01) — **N3 PASSED**:
+- Rather than a third standalone smoke, the N2 `killswitch-smoke` was extended
+  with an opt-in DNS leg (`--exercise-dns`) and a `dns-smoke` bootstrap phase
+  drives it. While the killswitch is active, the sequence runs
+  `apply_dns_protection` → `assert_dns_protection` (active) → `rollback_dns_protection`
+  → assert (inactive); `overall_ok` now also gates on the DNS signals. This is the
+  most faithful "DNS fail-closed *in protected mode*" proof: the netsh port-53
+  Block rule must hold while the killswitch's egress-allow is in force.
+- **Live result on `windows-utm-1`:** `--phase dns-smoke` → `status=pass` /
+  `overall_ok=true`. Post-run: firewall `AllowInbound,AllowOutbound`, zero
+  residual `RustyNetKS-*`/`RustyNetDNS-*` rules, no `rustynet*` adapter, the
+  dead-man's-switch task auto-deleted, and TCP/22 never lost (the DNS block is
+  port-53 only; SSH is port 22).
+- **Follow-up (minor, non-blocking):** the smoke gates on `apply`/`assert`/`rollback`
+  returning Ok + the assert-active OS query; it does not separately OS-assert
+  post-rollback rule *absence* (that was confirmed manually here). A future
+  hardening could add a post-rollback absence assertion to the verdict.
 
 ### N4 — Two-node mesh: Windows guest + one peer 🔴 (covers G4)
 Drive enrollment + signed-state + dataplane reconcile so the Windows guest and
