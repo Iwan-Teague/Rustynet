@@ -329,7 +329,15 @@ pub fn enforce_daemon(
          $updated | Out-File -Encoding ASCII $envPath",
     );
     run_remote_ps(conn, &patch_script, SHORT_TIMEOUT)?;
-    // Restart service with full probe so daemon reads new config.
+    // The daemon was started during bootstrap with --auto-tunnel-enforce false and
+    // is still running. sc.exe start no-ops on an already-running service (exit
+    // 1056), so start_daemon alone would never reload the env we just patched and
+    // the daemon would stay in non-enforcing mode (auto_tunnel_enforce=false ->
+    // reconcile applies an empty dataplane, no mesh adapter). Stop it first
+    // (Stop-Service is synchronous: the process is gone before we restart) so
+    // start_daemon does a clean start that reads --auto-tunnel-enforce true and
+    // applies the signed assignment on the first reconcile tick.
+    stop_daemon(conn)?;
     start_daemon(conn)?;
     // Wait for the WireGuard tunnel adapter to receive its IPv4 mesh address.
     // The SCM reports Running before the daemon thread begins its first
