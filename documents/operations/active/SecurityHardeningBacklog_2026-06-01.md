@@ -55,34 +55,61 @@ deviations from the codebase's own hardening discipline.
 
 ---
 
-## B. Highest-priority OPEN items (from SecurityReview_2026-05-24.md — pointers, not duplicates)
+## B. Highest-priority OPEN items (SecurityReview_2026-05-24.md) — re-verified on `main` `e01dd64` (2026-06-01)
 
-These outrank everything in section A. Full detail, attacker model, and
-remediation design are in the review; status re-confirm before fixing.
+These outrank everything in Section A. The review holds the full attacker model +
+remediation design; the status + `file:line` below were **re-confirmed
+first-hand this pass** against current code (the items marked *not re-verified*
+are relayed from the review and should be reproduced before fixing).
 
-- **P0 · RN-03 + RN-04** — `force_fail_closed(...)` results are discarded at ~10 sites, and the tunnel/routes come up *before* the killswitch is programmed: a failed killswitch on first bootstrap leaves the host **open**. (Review §3, §11.)
-- **P0 · RN-06** — **Windows killswitch allows ALL non-DNS outbound on the physical LAN** (`interfacetype=lan action=allow`); only port-53 is forced through the tunnel. Real IPv4 traffic leak if the WireGuard default-route injection flaps. **Not yet fixed.** The G8 work below closes only the IPv6 dimension. (Review RN-06.)
-- **P0 · RN-07** — **Windows IPv6 leak.** *In progress (2026-06-01):* `hard_disable_ipv6_egress` now adds a netsh IPv6 LAN Block rule (`RustyNetKS-BlockIpv6Lan`) and `ipv6-smoke` exercises leak→block→restore live. **Residual:** (a) the IPv6 block is not yet re-verified in `assert_killswitch` (the review's prescribed remediation), and (b) autoconfigured/static global IPv6 addresses are not flushed (the firewall block is the primary control, flush is defense-in-depth).
-- **P0 · RN-05 + RN-11** — policy engine **default-allows** selectors not prefixed `node:` (revocation bypass), and **allow-all when the membership directory is empty**. (Review RN-05/RN-11.)
-- **P1 · RN-02** — the audited `dataplane.rs` is dead code; the live path is `phase10`. Resolve the split so the audited control is the one that runs.
-- **P1 · RN-10** — corrupt rotation ledger silently resets to genesis instead of failing closed.
-- **P1 · RN-08 / RN-09** — encrypted-key envelope doesn't bind salt/nonce/version via AAD; systemd-credential passphrase files may be group-readable (gated only by a path prefix).
-- **P2** — RN-12 (Linux exit-node DNS ordering leak), RN-13 (`HandshakeFloodGuard` unbounded + not run in prod), RN-16 (SHA-pin GitHub Actions), and the remaining Low/Info (RN-17..RN-38).
+- **P0 · RN-03 — discarded `force_fail_closed` (fail-open) · OPEN [verified e01dd64].** 10 of 44 call sites still swallow the result with `let _ = …force_fail_closed(…)` (e.g. `daemon.rs:6449,6523,6590,6597`). If `block_all_egress` fails at one of these, the code proceeds as if failed-closed when it did not. **Fix:** propagate/handle every site; on a `block_all_egress` failure the dataplane must not serve (no interface/route up), not just log.
+- **P0 · RN-04 — bootstrap leak window · OPEN [verified e01dd64].** The killswitch is programmed *after* backend start in `apply_dataplane_generation` (`phase10.rs` ~4167, after `BackendStarted`), and the pre-protective boot killswitch (`linux_killswitch_boot.rs`) is **opt-in (`--install-boot-killswitch`) and Linux-only** — so by default every platform has a window where the interface is up before the killswitch. **Best-practice fix:** a *mandatory, cross-platform* default-deny applied *before* any interface/route.
+- **P0 · RN-05 — non-`node:` selectors bypass revocation · OPEN [verified e01dd64].** `selector_membership_allowed` ([policy/lib.rs:305-308](../../../crates/rustynet-policy/src/lib.rs)) `return true` for any selector whose prefix is not `node:`, so `group:`/`tag:`/`user:`/`cidr:` rules are allowed regardless of membership status. **Fix:** resolve such selectors to their member node set and deny if any is revoked/unknown, or forbid trust-sensitive rules whose source can't map to a membership-checked node (fail-closed on unresolvable identity).
+- **P0 · RN-06 — Windows killswitch allows ALL non-DNS LAN egress · OPEN [verified e01dd64].** `windows_firewall_allow_interfacetype_args` ([phase10.rs:5467](../../../crates/rustynetd/src/phase10.rs)) emits an unscoped `interfacetype=lan action=allow` (no proto/port/IP); only port-53 is forced through the tunnel. If the WireGuard default-route injection flaps/tears down, TCP/QUIC/etc. egress cleartext out the LAN NIC. The G8 work below only adds an IPv6 block on top — **the IPv4 leak is unaddressed.**
+- **P0 · RN-07 — Windows IPv6 leak · IN PROGRESS (G8, uncommitted).** `hard_disable_ipv6_egress` now purges + adds a netsh IPv6 LAN Block rule (`RustyNetKS-BlockIpv6Lan`), and `--phase ipv6-smoke` exercises leak→block→restore live. **Gaps vs the review's prescribed remediation:** (a) the IPv6 block is **not** re-verified in `assert_killswitch` (no drift detection); (b) existing autoconfigured/static global IPv6 addresses are **not** flushed (the firewall block is the primary control, flush is defense-in-depth); (c) it uses a netsh rule, not WFP (see best-practice note).
+- **P0 · RN-11 — permissive-on-empty defaults · PRESENT [verified e01dd64].** When the membership directory is empty the enforcement gate skips the check by design (`if !membership.is_populated()` at [phase10.rs:5005](../../../crates/rustynetd/src/phase10.rs); doc-comment calls it a "pre-membership" escape hatch); separately, an empty `allowed_contexts` matches *all* contexts ([policy/lib.rs:289](../../../crates/rustynet-policy/src/lib.rs)). Both are fail-open-on-empty, contradicting the default-deny mandate. **Fix:** deny on empty membership/empty context, with an explicit, logged, opt-in bootstrap mode if a pre-governance window is genuinely required.
+- **P1 / P2 (review-owned, *not* re-verified this pass)** — RN-02 (audited `dataplane.rs` is dead code; live path is `phase10`), RN-10 (corrupt rotation ledger resets to genesis instead of failing closed), RN-08/RN-09 (key envelope doesn't bind salt/nonce/version via AAD; systemd-credential group-read gate), RN-12/RN-13/RN-16, and the remaining Low/Info RN-17..RN-38. Reproduce against current code before fixing.
+
+### Are these the best patches? (best-practice assessment)
+The review's remediation **directions are sound** and match standard practice:
+default-deny, fail-closed on a control failure, narrow allow-lists, kill-switch-
+before-interface, and deny-on-unresolvable-identity. Three places where the
+*strongest* patch goes beyond what's written down:
+
+1. **Windows killswitch (RN-06/07): use WFP, not more netsh rules.** The project
+   already established (E2) that netsh cannot reliably scope the wintun adapter
+   and that the robust mechanism is the Windows Filtering Platform (a dedicated
+   max-weight RustyNet sublayer + explicit hard-permit filters). The strongest
+   fix implements the egress policy as WFP filters — permit only loopback + the
+   tunnel LUID + UDP to the **specific** peer/relay endpoints + management, block
+   everything else for **both** families — unified with the E2 tunnel permit,
+   rather than scoping netsh `interfacetype=lan` rules (which can be reordered/
+   bypassed and can't bind to the tunnel adapter). The current G8 `remoteip=::/0`
+   netsh block closes the IPv6 leak but is the weaker mechanism.
+2. **RN-04:** the pre-protective killswitch should be **mandatory + cross-platform**,
+   not opt-in + Linux-only.
+3. **RN-11:** empty membership/empty context should **deny** (fail-closed) with an
+   explicit opt-in bootstrap, not a silent permissive default.
 
 ### Windows killswitch parity — the unifying fix (RN-06 + RN-07)
-The complete remediation narrows the killswitch's egress-LAN **allow** to exactly
-the bootstrap essentials (WG UDP to peer/relay endpoints + STUN + management/SSH)
-for **both** address families, so everything else hits the global block —
-matching Linux's narrow allow — and re-verifies both the IPv4 scoping and the
-IPv6 block in `assert_killswitch`. The G8 IPv6 Block rule is the first increment;
-RN-06's IPv4 LAN-egress scoping is the larger remaining piece.
+The complete remediation narrows the killswitch's egress **allow** to exactly the
+bootstrap essentials (WG UDP to the specific peer/relay endpoints + STUN +
+management/SSH) for **both** address families — ideally via WFP (point 1 above) —
+so everything else hits the global block, matching Linux's narrow allow, and
+re-verifies both the IPv4 scoping and the IPv6 block in `assert_killswitch`. The
+G8 IPv6 Block rule is the first increment; RN-06's IPv4 LAN-egress scoping (and
+moving the whole egress policy to WFP) is the larger remaining piece.
 
 ---
 
 ## Notes
 - Section A items are tracked here because they postdate the 2026-05-24 review.
-- Section B items remain owned by `SecurityReview_2026-05-24.md`; this is a
-  convenience index, not a re-assessment — update statuses there on fix.
+- Section B P0s were **re-verified first-hand against `main` `e01dd64` (2026-06-01)**
+  — all confirmed still open. The remediation design + the P1/P2 + not-re-verified
+  items remain owned by `SecurityReview_2026-05-24.md`; update statuses there on fix.
+- The "best patches?" assessment above is this author's view, not a contradiction
+  of the review: the review's directions are correct; the WFP / mandatory-cross-
+  platform-killswitch / deny-on-empty points are *stronger* options, not corrections.
 - Supply-chain gates (`cargo audit --deny warnings`, `cargo deny check`) are part
   of the CLAUDE.md mandatory gates but are **not** in the `rustynet-xtask -- gates`
   fast runner; run them explicitly when touching dependencies.
