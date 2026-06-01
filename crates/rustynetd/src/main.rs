@@ -565,6 +565,13 @@ fn run_windows_killswitch_smoke_command(args: &[String]) -> Result<(), String> {
                     options.exercise_ipv6 = true;
                     index += 1;
                 }
+                Some("--ssh-allow-cidr") => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| "--ssh-allow-cidr requires a value".to_string())?;
+                    options.ssh_allow_cidrs.push(value.clone());
+                    index += 2;
+                }
                 Some(flag) => {
                     return Err(format!("unknown windows-killswitch-smoke argument: {flag}"));
                 }
@@ -3485,7 +3492,7 @@ fn help_text() -> String {
         "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--capabilities <csv>] [--snapshot <path>] [--log <path>]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
         "  rustynetd windows-tunnel-smoke [--tunnel-name <name>] [--address <cidr>] [--mesh-cidr <cidr>] [--listen-port <port>] [--keep]",
-        "  rustynetd windows-killswitch-smoke [--tunnel-name <name>] [--address <cidr>] [--mesh-cidr <cidr>] [--listen-port <port>] [--exercise-full-block] [--exercise-dns] [--exercise-ipv6]",
+        "  rustynetd windows-killswitch-smoke [--tunnel-name <name>] [--address <cidr>] [--mesh-cidr <cidr>] [--listen-port <port>] [--ssh-allow-cidr <cidr>]... [--exercise-full-block] [--exercise-dns] [--exercise-ipv6]",
         "  rustynetd windows-runtime-acls-check [--no-fail-on-drift]",
         "  rustynetd windows-named-pipe-acls-check [--service-sid <sid>] [--no-fail-on-drift]",
         "  rustynetd windows-registry-acls-check [--no-fail-on-drift]",

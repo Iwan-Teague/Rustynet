@@ -46,6 +46,12 @@ pub struct WindowsKillswitchSmokeOptions {
     /// IPv6 block is LAN-IPv6 only, so the (IPv4) SSH session is unaffected. Off
     /// by default; requires guest IPv6 internet to be conclusive.
     pub exercise_ipv6: bool,
+    /// RN-06: management SSH CIDRs the scoped killswitch must permit so the
+    /// (inbound) SSH session survives the global outbound block. Empty → the
+    /// killswitch blocks all non-allowlisted egress (full fail-closed), which on
+    /// a remote guest drops SSH until the dead-man's-switch restores it. The lab
+    /// orchestrator passes the SSH-source subnet (e.g. `192.168.0.0/24`).
+    pub ssh_allow_cidrs: Vec<String>,
 }
 
 impl Default for WindowsKillswitchSmokeOptions {
@@ -58,6 +64,7 @@ impl Default for WindowsKillswitchSmokeOptions {
             exercise_full_block: false,
             exercise_dns: false,
             exercise_ipv6: false,
+            ssh_allow_cidrs: Vec::new(),
         }
     }
 }
@@ -271,7 +278,7 @@ pub fn run_windows_killswitch_smoke(
     let start_result = backend.start(context);
     // The plaintext key is no longer needed once the (now DPAPI-sealed) config
     // has been rendered, whether or not start succeeded.
-    let _ = std::fs::remove_file(key_path.as_path());
+    let _ = crate::key_material::remove_file_if_present(key_path.as_path());
     start_result.map_err(|err| format!("tunnel bring-up failed: {err}"))?;
     let tunnel_started = backend.stats().is_ok();
 
@@ -288,6 +295,22 @@ pub fn run_windows_killswitch_smoke(
         resolver_addr,
     )
     .map_err(|err| format!("construct WindowsCommandSystem failed: {err:?}"))?;
+    // RN-06: scope the killswitch egress allow to the management SSH CIDRs (so
+    // this inbound SSH session survives the outbound block) + the WG listen port
+    // for the handshake/data path. Without a CIDR the killswitch is fully
+    // fail-closed and would strand SSH until the dead-man's-switch restores it.
+    if !options.ssh_allow_cidrs.is_empty() {
+        let cidrs = options
+            .ssh_allow_cidrs
+            .iter()
+            .map(|c| {
+                c.parse::<crate::phase10::ManagementCidr>()
+                    .map_err(|err| format!("invalid --ssh-allow-cidr {c}: {err}"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        system = system.with_fail_closed_ssh_allow(true, cidrs);
+    }
+    system = system.with_wg_listen_port(options.listen_port);
 
     // In-process panic/error backstop: if the sequence below returns Err or
     // panics, this restores the default allow-outbound policy + removes the WFP
@@ -467,7 +490,7 @@ impl Drop for FirewallRestoreGuard {
             return;
         }
         let _ = rustynet_windows_native::remove_wfp_tunnel_permit();
-        let _ = std::process::Command::new("netsh")
+        let _ = std::process::Command::new(r"C:\Windows\System32\netsh.exe")
             .args([
                 "advfirewall",
                 "set",

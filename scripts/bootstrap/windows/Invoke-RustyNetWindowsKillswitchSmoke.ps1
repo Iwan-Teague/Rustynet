@@ -4,6 +4,7 @@ param(
     [switch]$ExerciseFullBlock,
     [switch]$ExerciseDns,
     [switch]$ExerciseIpv6,
+    [string[]]$SshAllowCidr = @(),
     [int]$TimeoutSeconds = 90,
     [int]$DeadManSeconds = 180,
     [string]$OutputPath = ''
@@ -63,7 +64,7 @@ function Write-FailClosedKillswitchReportIfRequested {
 # SSH session's outbound replies are being dropped.
 function Restore-FirewallOutbound {
     try {
-        & netsh.exe advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound | Out-Null
+        & 'C:\Windows\System32\netsh.exe' advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound | Out-Null
     }
     catch {
         # Nothing else we can do here; the scheduled dead-man's-switch is the backstop.
@@ -72,7 +73,7 @@ function Restore-FirewallOutbound {
 
 function Test-FirewallOutboundAllowed {
     try {
-        $show = (& netsh.exe advfirewall show allprofiles | Out-String)
+        $show = (& 'C:\Windows\System32\netsh.exe' advfirewall show allprofiles | Out-String)
         return ($show -notmatch 'BlockOutbound')
     }
     catch {
@@ -90,7 +91,7 @@ function Register-FirewallDeadMan {
     $delay = [Math]::Max(60, $Seconds)
     $runAt = (Get-Date).AddSeconds($delay)
     $st = $runAt.ToString('HH:mm')
-    $restore = 'netsh advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound'
+    $restore = 'C:\Windows\System32\netsh.exe advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound'
     # /SD is omitted: the run time is only minutes out, so "today" is correct
     # except within a couple of minutes of midnight (acceptable for a lab smoke),
     # and omitting it sidesteps locale-specific date formatting.
@@ -149,6 +150,12 @@ $daemonArgs.Add('windows-killswitch-smoke')
 if ($ExerciseFullBlock.IsPresent) { $daemonArgs.Add('--exercise-full-block') }
 if ($ExerciseDns.IsPresent) { $daemonArgs.Add('--exercise-dns') }
 if ($ExerciseIpv6.IsPresent) { $daemonArgs.Add('--exercise-ipv6') }
+foreach ($cidr in $SshAllowCidr) {
+    if (-not [string]::IsNullOrWhiteSpace($cidr)) {
+        $daemonArgs.Add('--ssh-allow-cidr')
+        $daemonArgs.Add($cidr)
+    }
+}
 
 # Arm the dead-man's-switch BEFORE any killswitch can be applied.
 $script:SmokeFailureStep = 'arm-deadman'
