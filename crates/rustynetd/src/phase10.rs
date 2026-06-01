@@ -2871,6 +2871,10 @@ pub struct WindowsCommandSystem {
     nat_applied: bool,
     nat_name: String,
     previous_forwarding: Vec<(String, WindowsForwardingState)>,
+    fail_closed_ssh_allow: bool,
+    fail_closed_ssh_allow_cidrs: Vec<ManagementCidr>,
+    traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
+    wg_listen_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2927,7 +2931,91 @@ impl WindowsCommandSystem {
             firewall_applied: false,
             nat_applied: false,
             previous_forwarding: Vec::new(),
+            fail_closed_ssh_allow: false,
+            fail_closed_ssh_allow_cidrs: Vec::new(),
+            traversal_bootstrap_allow_endpoints: Vec::new(),
+            wg_listen_port: 0,
         })
+    }
+
+    /// Enable the fail-closed management-SSH allow with the given reviewed
+    /// management CIDRs. Mirrors the Linux/macOS killswitch: the scoped egress
+    /// allow must re-permit SSH so the guest is not locked out under the global
+    /// outbound block.
+    pub fn with_fail_closed_ssh_allow(mut self, allow: bool, cidrs: Vec<ManagementCidr>) -> Self {
+        self.fail_closed_ssh_allow = allow;
+        self.fail_closed_ssh_allow_cidrs = cidrs;
+        self
+    }
+
+    /// Set the traversal bootstrap endpoints (STUN/relay) that the scoped egress
+    /// allow must permit so WireGuard traversal can complete under the killswitch.
+    pub fn with_traversal_bootstrap_allow_endpoints(mut self, endpoints: Vec<SocketAddr>) -> Self {
+        self.traversal_bootstrap_allow_endpoints = endpoints;
+        self
+    }
+
+    /// Set the WireGuard listen port whose outbound handshake the scoped egress
+    /// allow must permit (0 = unset → no port-scoped allow rule).
+    pub fn with_wg_listen_port(mut self, port: u16) -> Self {
+        self.wg_listen_port = port;
+        self
+    }
+
+    /// RN-06 scoped egress allow-list, added under `WINDOWS_KS_RULE_EGRESS`
+    /// (multiple rules deliberately share that one name so `rollback_firewall`
+    /// can delete them all by name). Permits ONLY: management SSH (reply +
+    /// outbound) to the reviewed CIDRs, the WireGuard handshake/data UDP from the
+    /// listen port, and the traversal bootstrap endpoints. Everything else stays
+    /// under the global outbound block. Mirrors the Linux/macOS scoped killswitch
+    /// allow. With no management CIDR / WG port / endpoints configured this adds
+    /// nothing, leaving a full outbound block (fail-closed).
+    fn apply_windows_scoped_egress_allows(&self) -> Result<(), SystemError> {
+        if self.fail_closed_ssh_allow {
+            for cidr in &self.fail_closed_ssh_allow_cidrs {
+                self.run_netsh_success(&windows_firewall_allow_ssh_reply_args(
+                    WINDOWS_KS_RULE_EGRESS,
+                    cidr,
+                ))
+                .map_err(|err| {
+                    SystemError::FirewallApplyFailed(format!(
+                        "management ssh reply allow rule failed for {cidr}: {err}"
+                    ))
+                })?;
+                self.run_netsh_success(&windows_firewall_allow_ssh_out_args(
+                    WINDOWS_KS_RULE_EGRESS,
+                    cidr,
+                ))
+                .map_err(|err| {
+                    SystemError::FirewallApplyFailed(format!(
+                        "management ssh outbound allow rule failed for {cidr}: {err}"
+                    ))
+                })?;
+            }
+        }
+        if self.wg_listen_port != 0 {
+            self.run_netsh_success(&windows_firewall_allow_wg_handshake_args(
+                WINDOWS_KS_RULE_EGRESS,
+                self.wg_listen_port,
+            ))
+            .map_err(|err| {
+                SystemError::FirewallApplyFailed(format!(
+                    "wireguard handshake allow rule failed: {err}"
+                ))
+            })?;
+        }
+        for endpoint in &self.traversal_bootstrap_allow_endpoints {
+            self.run_netsh_success(&windows_firewall_allow_traversal_endpoint_args(
+                WINDOWS_KS_RULE_EGRESS,
+                *endpoint,
+            ))
+            .map_err(|err| {
+                SystemError::FirewallApplyFailed(format!(
+                    "traversal bootstrap allow rule failed for {endpoint}: {err}"
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     fn resolve_netsh_binary() -> Result<PathBuf, SystemError> {
@@ -3212,7 +3300,7 @@ const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { param($Alias) $ErrorActi
 /// global default outbound policy is still `Block`.  Each rule name and the
 /// expected attributes are passed as `PowerShell` parameters so no value is
 /// interpolated into the script body.  Throws on the first drift detected.
-const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $EgressName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($LoopbackName, $EgressName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Allow') { throw \"rule $displayName action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
+const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $EgressName) $ErrorActionPreference = 'Stop'; $loopback = @(Get-NetFirewallRule -DisplayName $LoopbackName -ErrorAction Stop); if ($loopback.Count -ne 1) { throw \"rule $LoopbackName count is $($loopback.Count), expected 1\" }; $egress = @(Get-NetFirewallRule -DisplayName $EgressName -ErrorAction Stop); if ($egress.Count -lt 1) { throw \"rule $EgressName count is $($egress.Count), expected >= 1\" }; foreach ($rule in @($loopback) + @($egress)) { if ($rule.Action -ne 'Allow') { throw \"rule $($rule.DisplayName) action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $($rule.DisplayName) direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $($rule.DisplayName) is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
 
 /// Verify the reviewed DNS-block rules (the baseline plaintext-DNS protection,
 /// parity with the Linux `udp dport 53 oifname != tunnel drop`) are still
@@ -3328,15 +3416,13 @@ impl DataplaneSystem for WindowsCommandSystem {
                 "allow tunnel interface WFP filter failed: {err}"
             ))
         })?;
-        // Allow outbound on the physical egress LAN interface for WireGuard UDP handshakes
-        // and management traffic (SSH, STUN, relay bootstrap).
-        self.run_netsh_success(&windows_firewall_allow_interfacetype_args(
-            WINDOWS_KS_RULE_EGRESS,
-            "lan",
-        ))
-        .map_err(|err| {
-            SystemError::FirewallApplyFailed(format!("allow egress interface rule failed: {err}"))
-        })?;
+        // Allow the SCOPED egress essentials on the underlay (RN-06): management
+        // SSH to the reviewed CIDRs (so an inbound-administered session survives
+        // the global outbound block), the WireGuard handshake/data UDP from the
+        // listen port, and the traversal bootstrap endpoints. This replaces the
+        // prior unscoped `interfacetype=lan` allow that let ALL non-DNS LAN
+        // egress out — a cleartext leak if the tunnel default route flapped.
+        self.apply_windows_scoped_egress_allows()?;
         self.firewall_applied = true;
         Ok(())
     }
@@ -5463,12 +5549,11 @@ fn windows_firewall_allow_loopback_args(rule_name: &str) -> Vec<String> {
     ]
 }
 
-/// Build the netsh argv that adds an outbound allow rule for a Windows
-/// interface type — `ras` for the `WireGuard` tunnel (Remote Access Service
-/// adapters) or `lan` for the physical underlay.  These rules carve specific
-/// holes in the global outbound block; they are intentionally narrow because
-/// any leak past one of them would bypass the killswitch.
-fn windows_firewall_allow_interfacetype_args(rule_name: &str, iface_type: &str) -> Vec<String> {
+/// Management-SSH **reply** allow (RN-06): outbound TCP from local port 22 to the
+/// reviewed management CIDR. This is the rule that keeps an inbound-administered
+/// SSH session alive under the global outbound block — the reply path is
+/// outbound from the guest's port 22, so without it `blockoutbound` strands SSH.
+fn windows_firewall_allow_ssh_reply_args(rule_name: &str, cidr: &ManagementCidr) -> Vec<String> {
     vec![
         "advfirewall".to_owned(),
         "firewall".to_owned(),
@@ -5477,7 +5562,65 @@ fn windows_firewall_allow_interfacetype_args(rule_name: &str, iface_type: &str) 
         format!("name={rule_name}"),
         "dir=out".to_owned(),
         "action=allow".to_owned(),
-        format!("interfacetype={iface_type}"),
+        "protocol=tcp".to_owned(),
+        "localport=22".to_owned(),
+        format!("remoteip={cidr}"),
+    ]
+}
+
+/// Management-SSH **outbound** allow (RN-06): outbound TCP to remote port 22
+/// within the reviewed management CIDR (SSH initiated from this node to a
+/// management host). Mirrors the Linux `daddr <cidr> tcp dport 22 accept` rule.
+fn windows_firewall_allow_ssh_out_args(rule_name: &str, cidr: &ManagementCidr) -> Vec<String> {
+    vec![
+        "advfirewall".to_owned(),
+        "firewall".to_owned(),
+        "add".to_owned(),
+        "rule".to_owned(),
+        format!("name={rule_name}"),
+        "dir=out".to_owned(),
+        "action=allow".to_owned(),
+        "protocol=tcp".to_owned(),
+        "remoteport=22".to_owned(),
+        format!("remoteip={cidr}"),
+    ]
+}
+
+/// WireGuard handshake/data allow (RN-06): outbound UDP from the WG listen port
+/// to any destination, so the tunnel can (re)establish and carry data under the
+/// killswitch. Mirrors the Linux wg-listen-port allow. (Tunnel-internal traffic
+/// on the RAS adapter is permitted separately by the native WFP tunnel filter.)
+fn windows_firewall_allow_wg_handshake_args(rule_name: &str, wg_listen_port: u16) -> Vec<String> {
+    vec![
+        "advfirewall".to_owned(),
+        "firewall".to_owned(),
+        "add".to_owned(),
+        "rule".to_owned(),
+        format!("name={rule_name}"),
+        "dir=out".to_owned(),
+        "action=allow".to_owned(),
+        "protocol=udp".to_owned(),
+        format!("localport={wg_listen_port}"),
+    ]
+}
+
+/// Traversal bootstrap allow (RN-06): outbound UDP to a specific STUN/relay
+/// endpoint (IP:port). Mirrors the Linux traversal bootstrap allow.
+fn windows_firewall_allow_traversal_endpoint_args(
+    rule_name: &str,
+    endpoint: SocketAddr,
+) -> Vec<String> {
+    vec![
+        "advfirewall".to_owned(),
+        "firewall".to_owned(),
+        "add".to_owned(),
+        "rule".to_owned(),
+        format!("name={rule_name}"),
+        "dir=out".to_owned(),
+        "action=allow".to_owned(),
+        "protocol=udp".to_owned(),
+        format!("remoteip={}", endpoint.ip()),
+        format!("remoteport={}", endpoint.port()),
     ]
 }
 
@@ -6030,11 +6173,48 @@ mod tests {
     }
 
     #[test]
-    fn windows_firewall_allow_interfacetype_helper_renders_correct_args() {
-        // Egress LAN allow: `interfacetype=lan`.
-        let lan = windows_firewall_allow_interfacetype_args(WINDOWS_KS_RULE_EGRESS, "lan");
-        assert_eq!(lan[7], "interfacetype=lan");
-        assert_eq!(lan[4], format!("name={WINDOWS_KS_RULE_EGRESS}"));
+    fn windows_scoped_egress_allow_builders_render_reviewed_args() {
+        // RN-06: the killswitch egress allow is now SCOPED — it replaces the
+        // prior unscoped `interfacetype=lan` allow with narrow rules. All scoped
+        // rules share WINDOWS_KS_RULE_EGRESS so rollback deletes them by name.
+        let cidr: ManagementCidr = "192.168.0.0/24".parse().expect("valid management cidr");
+
+        // SSH reply — the lockout-critical rule (outbound TCP from local port 22
+        // to the mgmt CIDR keeps an inbound-administered session alive).
+        let reply = windows_firewall_allow_ssh_reply_args(WINDOWS_KS_RULE_EGRESS, &cidr);
+        assert_eq!(reply[4], format!("name={WINDOWS_KS_RULE_EGRESS}"));
+        assert!(reply.iter().any(|a| a == "dir=out"));
+        assert!(reply.iter().any(|a| a == "action=allow"));
+        assert!(reply.iter().any(|a| a == "protocol=tcp"));
+        assert!(reply.iter().any(|a| a == "localport=22"));
+        assert!(reply.iter().any(|a| a == "remoteip=192.168.0.0/24"));
+
+        // SSH outbound — TCP to remote port 22 within the mgmt CIDR.
+        let out = windows_firewall_allow_ssh_out_args(WINDOWS_KS_RULE_EGRESS, &cidr);
+        assert!(out.iter().any(|a| a == "protocol=tcp"));
+        assert!(out.iter().any(|a| a == "remoteport=22"));
+        assert!(out.iter().any(|a| a == "remoteip=192.168.0.0/24"));
+
+        // WireGuard handshake/data — outbound UDP from the listen port.
+        let wg = windows_firewall_allow_wg_handshake_args(WINDOWS_KS_RULE_EGRESS, 51820);
+        assert!(wg.iter().any(|a| a == "protocol=udp"));
+        assert!(wg.iter().any(|a| a == "localport=51820"));
+
+        // Traversal bootstrap endpoint — outbound UDP to a specific ip:port.
+        let endpoint: SocketAddr = "203.0.113.7:3478".parse().expect("valid endpoint");
+        let ep = windows_firewall_allow_traversal_endpoint_args(WINDOWS_KS_RULE_EGRESS, endpoint);
+        assert!(ep.iter().any(|a| a == "protocol=udp"));
+        assert!(ep.iter().any(|a| a == "remoteip=203.0.113.7"));
+        assert!(ep.iter().any(|a| a == "remoteport=3478"));
+
+        // RN-06 regression guards: no scoped allow may fall back to the unscoped
+        // interfacetype allow or an any-address allow.
+        for args in [&reply, &out, &wg, &ep] {
+            assert!(!args.iter().any(|a| a == "interfacetype=lan"));
+            assert!(!args.iter().any(|a| a == "interfacetype=any"));
+            assert!(!args.iter().any(|a| a == "remoteip=any"));
+            assert!(!args.iter().any(|a| a == "remoteip=0.0.0.0/0"));
+        }
     }
 
     #[test]
@@ -8171,8 +8351,10 @@ mod tests {
         );
         assert!(
             WINDOWS_PS_ASSERT_KILLSWITCH
-                .contains("Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop"),
-            "Get-NetFirewallRule must use -DisplayName and -ErrorAction Stop on the per-rule lookup"
+                .contains("Get-NetFirewallRule -DisplayName $LoopbackName -ErrorAction Stop")
+                && WINDOWS_PS_ASSERT_KILLSWITCH
+                    .contains("Get-NetFirewallRule -DisplayName $EgressName -ErrorAction Stop"),
+            "Get-NetFirewallRule must use -DisplayName and -ErrorAction Stop on the loopback and egress lookups"
         );
         assert!(
             WINDOWS_PS_ASSERT_KILLSWITCH.contains("Get-NetFirewallProfile -ErrorAction Stop"),
@@ -8247,19 +8429,27 @@ mod tests {
     fn windows_assert_killswitch_script_rejects_missing_or_duplicate_display_names() {
         // netsh's `name=` field maps to the firewall rule display name, not
         // the internal PowerShell `Name`/InstanceID.  The verifier must query
-        // that display name and reject anything other than exactly one match,
-        // so missing rules and duplicate/spoofed rules both fail closed.
+        // by display name. The loopback rule must be exactly one match (missing
+        // or duplicate both fail closed); the egress name intentionally covers
+        // MULTIPLE scoped allow rules (RN-06), so it must be present (count >= 1)
+        // rather than exactly one.
         assert!(
-            WINDOWS_PS_ASSERT_KILLSWITCH.contains("-DisplayName $displayName"),
-            "assert_killswitch must verify the netsh-created display name"
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("-DisplayName $LoopbackName")
+                && WINDOWS_PS_ASSERT_KILLSWITCH.contains("-DisplayName $EgressName"),
+            "assert_killswitch must verify the netsh-created display names"
         );
         assert!(
-            !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $displayName"),
+            !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $LoopbackName")
+                && !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $EgressName"),
             "assert_killswitch must not query the internal PowerShell rule Name"
         );
         assert!(
-            WINDOWS_PS_ASSERT_KILLSWITCH.contains("$rules.Count -ne 1"),
-            "assert_killswitch must reject missing or duplicate firewall rules"
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("$loopback.Count -ne 1"),
+            "assert_killswitch must reject a missing or duplicate loopback rule (exactly 1)"
+        );
+        assert!(
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("$egress.Count -lt 1"),
+            "assert_killswitch must require the scoped egress allow rules (count >= 1)"
         );
     }
 

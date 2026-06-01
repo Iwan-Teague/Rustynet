@@ -308,13 +308,20 @@ fn build_windows_tunnel_smoke_invocation(
     }
 }
 
+/// Management SSH CIDR the killswitch-smoke passes to the scoped killswitch
+/// (RN-06) so the inbound SSH session survives the global outbound block. This
+/// is the lab LAN that `windows-utm-1` and the orchestrator host share (the SSH
+/// source); the guest dead-man's-switch is the backstop if it is ever wrong.
+const WINDOWS_SMOKE_SSH_ALLOW_CIDR: &str = "192.168.0.0/24";
+
 fn build_windows_killswitch_smoke_invocation(
     context: &BootstrapPhaseContext<'_>,
 ) -> WindowsHelperScriptSpec {
-    // The standard phase run exercises apply/assert/rollback only (SSH-safe via
-    // the killswitch's egress-allow rule). The full fail-closed block
-    // (`-ExerciseFullBlock`) is deliberately NOT requested here; it cuts a LAN
-    // SSH session until rollback and is reserved for an explicit operator run.
+    // The standard phase run exercises apply/assert/rollback only. SSH stays up
+    // because the killswitch's scoped egress allow (RN-06) permits the mgmt SSH
+    // CIDR. The full fail-closed block (`-ExerciseFullBlock`) is deliberately NOT
+    // requested here; it cuts a LAN SSH session until rollback and is reserved
+    // for an explicit operator run.
     WindowsHelperScriptSpec {
         helper_file_name: WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE,
         remote_file_name: WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE,
@@ -323,6 +330,8 @@ fn build_windows_killswitch_smoke_invocation(
             context.workdir.to_owned(),
             "-StateRoot".to_owned(),
             WINDOWS_STATE_ROOT.to_owned(),
+            "-SshAllowCidr".to_owned(),
+            WINDOWS_SMOKE_SSH_ALLOW_CIDR.to_owned(),
         ],
     }
 }
@@ -342,6 +351,8 @@ fn build_windows_dns_smoke_invocation(
             context.workdir.to_owned(),
             "-StateRoot".to_owned(),
             WINDOWS_STATE_ROOT.to_owned(),
+            "-SshAllowCidr".to_owned(),
+            WINDOWS_SMOKE_SSH_ALLOW_CIDR.to_owned(),
             "-ExerciseDns".to_owned(),
         ],
     }
@@ -362,6 +373,8 @@ fn build_windows_ipv6_smoke_invocation(
             context.workdir.to_owned(),
             "-StateRoot".to_owned(),
             WINDOWS_STATE_ROOT.to_owned(),
+            "-SshAllowCidr".to_owned(),
+            WINDOWS_SMOKE_SSH_ALLOW_CIDR.to_owned(),
             "-ExerciseIpv6".to_owned(),
         ],
     }
@@ -2610,8 +2623,13 @@ mod tests {
                 r"C:\Rustynet",
                 "-StateRoot",
                 WINDOWS_STATE_ROOT,
+                "-SshAllowCidr",
+                WINDOWS_SMOKE_SSH_ALLOW_CIDR,
             ]
         );
+        // RN-06: the scoped killswitch must receive the management SSH CIDR so
+        // the (inbound) SSH session survives the global outbound block.
+        assert!(invocation.args.iter().any(|arg| arg == "-SshAllowCidr"));
         // The standard phase run must NOT request the SSH-cutting full block.
         assert!(
             !invocation

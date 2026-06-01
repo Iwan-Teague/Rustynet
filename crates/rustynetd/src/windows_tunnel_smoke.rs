@@ -128,7 +128,7 @@ pub fn run_windows_tunnel_smoke(
     let start_result = backend.start(context);
     // The plaintext key is no longer needed once the (now DPAPI-sealed) config
     // has been rendered, whether or not start succeeded.
-    let _ = std::fs::remove_file(key_path.as_path());
+    let _ = crate::key_material::remove_file_if_present(key_path.as_path());
     start_result.map_err(|err| format!("tunnel bring-up failed: {err}"))?;
 
     let interface_present = windows_adapter_present(options.tunnel_name.as_str());

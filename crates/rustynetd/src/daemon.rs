@@ -8860,6 +8860,15 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
             config.egress_interface.clone(),
             config.dns_resolver_bind_addr,
         )
+        .map(|system| {
+            system
+                .with_fail_closed_ssh_allow(
+                    config.fail_closed_ssh_allow,
+                    config.fail_closed_ssh_allow_cidrs.clone(),
+                )
+                .with_traversal_bootstrap_allow_endpoints(config.traversal_stun_servers.clone())
+                .with_wg_listen_port(config.wg_listen_port)
+        })
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
         Ok(RuntimeSystem::Windows(system))
     }
