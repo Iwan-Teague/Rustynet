@@ -11104,11 +11104,6 @@ fn is_default_route_cidr(cidr: &str) -> bool {
     matches!(cidr.trim(), "0.0.0.0/0" | "::/0")
 }
 
-fn route_peer_can_carry_signed_traffic(capabilities: &[RoleCapability]) -> bool {
-    capabilities.contains(&RoleCapability::RelayHost)
-        || capabilities.contains(&RoleCapability::ExitServer)
-}
-
 fn validate_signed_auto_tunnel_route_intent(
     mesh_cidr: &str,
     signed_exit_node_id: Option<&str>,
@@ -11152,6 +11147,13 @@ fn validate_signed_auto_tunnel_route_intent(
         ));
     }
 
+    // Capability is gated per route kind below, not by a blanket relay/exit
+    // requirement: a plain-client peer may carry a direct mesh route to its own
+    // mesh host /32 (the control plane signs exactly such bundles — every
+    // policy-allowed peer becomes a `mesh` route to its own assigned cidr). Only
+    // exit/default routes require ExitServer, and a mesh host /32 may be claimed
+    // by at most one peer in the bundle (no transit/interception via a duplicate).
+    let mut claimed_mesh_hosts: BTreeSet<String> = BTreeSet::new();
     for peer in peers {
         let capabilities = peer_capabilities
             .get(peer.node_id.as_str())
@@ -11164,12 +11166,6 @@ fn validate_signed_auto_tunnel_route_intent(
         if capabilities.is_empty() {
             return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
                 "peer {} has no signed capabilities",
-                peer.node_id.as_str()
-            )));
-        }
-        if !route_peer_can_carry_signed_traffic(capabilities) {
-            return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
-                "route peer {} lacks signed relay_host or exit_server capability",
                 peer.node_id.as_str()
             )));
         }
@@ -11207,6 +11203,12 @@ fn validate_signed_auto_tunnel_route_intent(
                         return Err(AutoTunnelBootstrapError::InvalidFormat(
                             "mesh route allowed_ip must be a mesh host cidr".to_owned(),
                         ));
+                    }
+                    if !claimed_mesh_hosts.insert(route.destination_cidr.clone()) {
+                        return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                            "mesh host {} is claimed by multiple peers",
+                            route.destination_cidr
+                        )));
                     }
                 }
                 RouteKind::ExitNodeDefault | RouteKind::ExitNodeLan => {
@@ -15257,7 +15259,13 @@ mod tests {
     }
 
     #[test]
-    fn signed_auto_tunnel_route_intent_rejects_plain_client_route_peer() {
+    fn signed_auto_tunnel_route_intent_allows_plain_client_mesh_self_route() {
+        // A plain-client peer may carry a direct mesh route to its own mesh host
+        // /32. The control plane signs exactly such bundles (every policy-allowed
+        // peer is emitted as a `mesh` route to its own assigned cidr), and the
+        // documented topology is a direct mesh (traffic_route_policy =
+        // mesh_or_relay_or_exit_node). Capability is gated per route kind:
+        // exit/default routes require ExitServer, mesh self-delivery does not.
         let peer_node_id = NodeId::new("node-client").expect("test node id should parse");
         let peers = vec![rustynet_backend_api::PeerConfig {
             node_id: peer_node_id.clone(),
@@ -15274,7 +15282,7 @@ mod tests {
             kind: RouteKind::Mesh,
         }];
 
-        let err = super::validate_signed_auto_tunnel_route_intent(
+        super::validate_signed_auto_tunnel_route_intent(
             "100.64.0.0/10",
             None,
             &[],
@@ -15283,8 +15291,62 @@ mod tests {
             &BTreeMap::from([("node-client".to_owned(), vec![RoleCapability::Client])]),
             &routes,
         )
-        .expect_err("plain client peers must not carry routed traffic");
-        assert!(format!("{err}").contains("lacks signed relay_host or exit_server"));
+        .expect("plain client peers may carry a direct mesh route to their own host");
+    }
+
+    #[test]
+    fn signed_auto_tunnel_route_intent_rejects_duplicate_mesh_host_claim() {
+        // Defense-in-depth: a single mesh host /32 must not be claimed by two
+        // distinct peers (would let a peer intercept another node's mesh traffic).
+        let peer_a = NodeId::new("node-a").expect("test node id should parse");
+        let peer_b = NodeId::new("node-b").expect("test node id should parse");
+        let peers = vec![
+            rustynet_backend_api::PeerConfig {
+                node_id: peer_a.clone(),
+                endpoint: SocketEndpoint {
+                    addr: "203.0.113.31".parse().expect("test ip should parse"),
+                    port: 51820,
+                },
+                public_key: [31u8; 32],
+                allowed_ips: vec!["100.64.0.2/32".to_owned()],
+            },
+            rustynet_backend_api::PeerConfig {
+                node_id: peer_b.clone(),
+                endpoint: SocketEndpoint {
+                    addr: "203.0.113.32".parse().expect("test ip should parse"),
+                    port: 51820,
+                },
+                public_key: [32u8; 32],
+                allowed_ips: vec!["100.64.0.2/32".to_owned()],
+            },
+        ];
+        let routes = vec![
+            Route {
+                destination_cidr: "100.64.0.2/32".to_owned(),
+                via_node: peer_a,
+                kind: RouteKind::Mesh,
+            },
+            Route {
+                destination_cidr: "100.64.0.2/32".to_owned(),
+                via_node: peer_b,
+                kind: RouteKind::Mesh,
+            },
+        ];
+
+        let err = super::validate_signed_auto_tunnel_route_intent(
+            "100.64.0.0/10",
+            None,
+            &[],
+            None,
+            &peers,
+            &BTreeMap::from([
+                ("node-a".to_owned(), vec![RoleCapability::Client]),
+                ("node-b".to_owned(), vec![RoleCapability::Client]),
+            ]),
+            &routes,
+        )
+        .expect_err("a mesh host claimed by two peers must fail closed");
+        assert!(format!("{err}").contains("claimed by multiple peers"));
     }
 
     #[test]
