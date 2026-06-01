@@ -53,6 +53,11 @@ deviations from the codebase's own hardening discipline.
 - **Observation:** Large PowerShell-string-building surface. It is **operator-trust** input (inventory + CLI flags, not remote-attacker), and it does use `powershell_quote` / `ensure_no_control_chars` for interpolated values — but the discipline is by-convention, not enforced. Not a confirmed injection; flagged as an audit/hardening opportunity since this surface grew this session.
 - **Fix (optional):** add a focused test/lint that every operator-derived value interpolated into a PS/cmd string passes through `powershell_quote`/`ensure_no_control_chars`; or centralize PS-script assembly behind a builder that quotes by construction.
 
+### HB-7 — AlgorithmPolicy compatibility-exception path is dead (inverted guard) — fail-*closed*, not the "critical" hole (Low) [verified e01dd64]
+- **Location:** [`AlgorithmPolicy::with_exceptions` (rustynet-crypto/lib.rs:188)](../../../crates/rustynet-crypto/src/lib.rs): `if !exceptions.is_empty() { return Err(InvalidException) }` rejects **any** non-empty exception list, so the intended per-exception denylist validation (the `for` loop immediately below it) is unreachable and no policy with exceptions can be constructed in production.
+- **Observation:** `FullRepoAnalysis_2026-05-24` rated this a **critical crypto bug (inverted guard)**. Verified present on `e01dd64` — **but it fails CLOSED**: `validate()` allowlists only strong algorithms and denies everything denylisted (MD5/SHA1/RC4/DES/3DES/Blowfish/WeakDH) with the exception branch unreachable, plus default-denies unknown algorithms. An attacker **cannot** use it to downgrade to a weak algorithm. Security impact is therefore ~nil; it's an over-strict **correctness** bug (the compatibility-exception feature simply doesn't work).
+- **Fix:** if the exception feature is intended, remove the blanket early-`Err` so the `for` loop runs (reject only exceptions whose algorithm is not denylisted); otherwise delete the dead `exceptions` field/branch and document that exceptions are unsupported. **Recommend the `FullRepoAnalysis` "critical" rating be downgraded** to match the fail-closed reality.
+
 ---
 
 ## B. Highest-priority OPEN items (SecurityReview_2026-05-24.md) — re-verified on `main` `e01dd64` (2026-06-01)
@@ -99,6 +104,48 @@ so everything else hits the global block, matching Linux's narrow allow, and
 re-verifies both the IPv4 scoping and the IPv6 block in `assert_killswitch`. The
 G8 IPv6 Block rule is the first increment; RN-06's IPv4 LAN-egress scoping (and
 moving the whole egress policy to WFP) is the larger remaining piece.
+
+---
+
+## C. Reviewed this pass — clean / re-rated (2026-06-01)
+
+Read-only sweeps run this pass, recorded so they are not re-litigated. Scoped to
+what was actually checked; sites not opened are flagged, not claimed clean.
+
+- **Constant-time secret comparison — clean.** Secret / MAC / token equality goes
+  through `subtle` / `ct_eq`; the raw `==` hits in the tree are non-secret
+  sentinels or enum/string matches (e.g. the SDDL ACE-type match at
+  `crates/rustynetd/src/windows_paths.rs:481`), not secret-byte comparisons.
+- **Untrusted-input size-bounding (paths checked) — bounded.** IPC command 4 KiB
+  (`rustynetd/src/ipc.rs:300`, enforced via `stream.take` at `:315`); pre-issued
+  relay token 4 KiB (`rustynetd/src/relay_client.rs:40`, `:887`); gossip datagram
+  (`gossip_runtime.rs:328` / `gossip_transport.rs`); DNS-zone bundle 256 KiB plus
+  per-line/key/value caps (`rustynet-dns-zone/src/lib.rs:10-14`); the signed-bundle
+  fetch uses a **bounded** `read_to_end` with an explicit anti-DoS comment
+  (`rustynetd/src/fetcher.rs:20,189`). No unbounded growth on these.
+- **No production outbound HTTP client — the "HTTP body unbounded" note does not
+  map to a live path.** `fetcher.rs` simulates the fetch and `port_mapper.rs`
+  deliberately avoids a `hyper`/`reqwest` dependency; the only `read_to_string` on
+  a socket (`rustynet-relay/src/main.rs:3469`) is a **`#[cfg(test)]`
+  health-endpoint helper** reading a self-spawned localhost server, not a
+  production attacker-facing read. `FullRepoAnalysis_2026-05-24`'s "HTTP body
+  unbounded" finding has **no** corresponding production code path.
+- **AlgorithmPolicy "critical" — re-rated Low (fail-closed).** See HB-7: a real
+  inverted-guard correctness bug, but it cannot downgrade to a weak algorithm;
+  net security impact ~nil.
+
+**Not audited this pass (left for a dedicated sweep, NOT claimed clean):** the
+other `read_to_end` sites — macOS utun helper socket
+(`macos_utun_helper_server.rs:177,223`), `daemon.rs:488,988`,
+`port_mapper.rs:1693`, `rustynet-cli/src/main.rs:6206`. These are local/trusted
+privileged-helper or operator-CLI reads rather than network-attacker paths, but
+their byte bounds were not individually confirmed here.
+
+**Review verdict (this pass):** no net-new High/Critical findings. The single
+highest-value security change remains **RN-06** — move the Windows killswitch
+egress policy from unscoped `netsh interfacetype=lan` allow rules to WFP filters
+(unified with the E2 tunnel permit), closing the IPv4 LAN cleartext-egress leak.
+Everything in Section A is Low/Info hygiene.
 
 ---
 
