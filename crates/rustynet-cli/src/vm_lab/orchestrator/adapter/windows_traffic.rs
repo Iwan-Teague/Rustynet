@@ -260,6 +260,22 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     Ok(())
 }
 
+/// Best-effort: the Windows daemon's own fail-closed/startup reason, read from
+/// `rustynetd.log`, so an enforce failure reports the cause rather than only the
+/// "WireGuard adapter did not get an IPv4 address within 90s" symptom.
+pub fn collect_daemon_failure_reason(
+    conn: &NodeConnection,
+) -> Result<Option<String>, AdapterError> {
+    let log_path = format!(r"{WINDOWS_STATE_ROOT}\logs\rustynetd.log");
+    let script = format!(
+        "$ErrorActionPreference = 'SilentlyContinue'; \
+         if (Test-Path {p}) {{ Get-Content -LiteralPath {p} -Tail 200 }}",
+        p = ps_quote(&log_path)?
+    );
+    let tail = run_remote_ps(conn, &script, SHORT_TIMEOUT)?;
+    Ok(crate::vm_lab::orchestrator::adapter::node_adapter::extract_daemon_failure_reason(&tail))
+}
+
 /// Verify SSH/PS connectivity by running a no-op command.
 pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
     run_remote_ps(conn, "Write-Host 'reachable'", Duration::from_secs(10))?;

@@ -10,6 +10,28 @@ use crate::vm_lab::orchestrator::error::{
 };
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
+/// Extract the daemon's own failure reason from a tail of its `rustynetd.log`,
+/// so a stage failure can report the *cause* (e.g. a fail-closed membership
+/// role mismatch) rather than only the downstream symptom (e.g. "WireGuard
+/// adapter did not get an IPv4 address within 90s"). Prefers the most recent
+/// reconcile fail-closed line; falls back to the most recent error line.
+/// Returns `None` when neither marker is present. Result is single-line and
+/// length-bounded so it can be safely appended to a stage error string.
+pub(crate) fn extract_daemon_failure_reason(log_tail: &str) -> Option<String> {
+    const RECONCILE_MARKER: &str = "reconcile fail-closed:";
+    let mut reconcile: Option<String> = None;
+    let mut error_fallback: Option<String> = None;
+    for line in log_tail.lines() {
+        let line = line.trim();
+        if let Some(idx) = line.find(RECONCILE_MARKER) {
+            reconcile = Some(line[idx..].trim().chars().take(400).collect());
+        } else if line.contains("[ERROR]") {
+            error_fallback = Some(line.chars().take(400).collect());
+        }
+    }
+    reconcile.or(error_fallback)
+}
+
 /// Per-node, per-OS interface for the orchestration pipeline.
 /// Connection details are injected at construction via `NodeConnection`;
 /// no transport argument appears in any method signature.
@@ -106,6 +128,14 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
 
     fn cleanup_runtime_state(&self) -> Result<(), AdapterError>;
 
+    /// Best-effort: the daemon's own fail-closed/startup error reason, read from
+    /// the guest `rustynetd.log`, so a stage failure surfaces the cause and not
+    /// just the symptom. `Ok(None)` when no daemon-side reason is found (the
+    /// default, for adapters with no host-side daemon log).
+    fn collect_daemon_failure_reason(&self) -> Result<Option<String>, AdapterError> {
+        Ok(None)
+    }
+
     // ── SSH reachability probe ────────────────────────────────────
 
     fn check_ssh_reachable(&self) -> Result<(), AdapterError>;
@@ -127,4 +157,41 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         env_content: &str,
         local_out_dir: &Path,
     ) -> Result<(), AdapterError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_daemon_failure_reason;
+
+    #[test]
+    fn extract_reason_prefers_reconcile_fail_closed_line() {
+        let log = "1780341076 [INFO] rustynetd::daemon: entering reconcile loop\n\
+             1780341077 [WARN] rustynetd::daemon: rustynetd reconcile fail-closed: membership reconcile failed: membership role mismatch: local node_role admin requires signed membership capability anchor\n";
+        let reason = extract_daemon_failure_reason(log).expect("reason");
+        assert!(reason.starts_with("reconcile fail-closed:"));
+        assert!(reason.contains("node_role admin requires signed membership capability anchor"));
+    }
+
+    #[test]
+    fn extract_reason_returns_last_reconcile_line() {
+        let log = "[WARN] rustynetd reconcile fail-closed: trust reconcile failed: stale\n\
+             [WARN] rustynetd reconcile fail-closed: membership reconcile failed: role mismatch\n";
+        let reason = extract_daemon_failure_reason(log).expect("reason");
+        assert!(reason.contains("membership reconcile failed: role mismatch"));
+        assert!(!reason.contains("trust reconcile failed"));
+    }
+
+    #[test]
+    fn extract_reason_falls_back_to_error_line() {
+        let log = "[INFO] starting\n[ERROR] rustynetd: dns resolver bind failed: address in use\n[INFO] x\n";
+        let reason = extract_daemon_failure_reason(log).expect("reason");
+        assert!(reason.contains("[ERROR]"));
+        assert!(reason.contains("dns resolver bind failed"));
+    }
+
+    #[test]
+    fn extract_reason_none_when_no_markers() {
+        let log = "[INFO] entering reconcile loop\n[INFO] all good\n";
+        assert!(extract_daemon_failure_reason(log).is_none());
+    }
 }
