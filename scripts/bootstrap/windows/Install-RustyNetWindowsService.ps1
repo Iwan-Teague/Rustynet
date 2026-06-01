@@ -4,6 +4,11 @@ param(
     [string]$StateRoot = 'C:\ProgramData\RustyNet',
     [string]$ServiceName = 'RustyNet',
     [string]$NodeId = 'windows-client-1',
+    # Daemon node role (--node-role). Must match the node's signed membership
+    # capabilities: a node enrolled as a client fails reconcile closed if the
+    # daemon runs as `admin` (which is the daemon default when the flag is
+    # omitted). Threaded explicitly so it can never be dropped on this platform.
+    [string]$NodeRole = 'client',
     [string]$OutputPath = '',
     # Operator override: pin the daemon to the explicit fail-closed
     # `windows-unsupported` backend even when WireGuard for Windows
@@ -554,6 +559,7 @@ function Build-ReviewedDaemonArgsJson {
     param(
         [Parameter(Mandatory = $true)][string]$BackendLabel,
         [Parameter(Mandatory = $true)][string]$NodeId,
+        [Parameter(Mandatory = $true)][string]$NodeRole,
         [bool]$AutoTunnelEnforce = $false
     )
     if ($BackendLabel -ne 'windows-unsupported' -and
@@ -605,6 +611,7 @@ function Build-ReviewedDaemonArgsJson {
         '--auto-tunnel-max-age-secs', '86400',
         '--trust-max-age-secs', '86400',
         '--traversal-max-age-secs', '86400',
+        '--node-role', $NodeRole,
         '--node-id', $NodeId
     ) | ConvertTo-Json -Compress)
 }
@@ -625,7 +632,7 @@ function Write-ReviewedEnvFile {
     }
     @(
         $banner
-        ('RUSTYNETD_DAEMON_ARGS_JSON=' + (Build-ReviewedDaemonArgsJson -BackendLabel $BackendLabel -NodeId $NodeId -AutoTunnelEnforce $AutoTunnelEnforce))
+        ('RUSTYNETD_DAEMON_ARGS_JSON=' + (Build-ReviewedDaemonArgsJson -BackendLabel $BackendLabel -NodeId $NodeId -NodeRole $NodeRole -AutoTunnelEnforce $AutoTunnelEnforce))
     ) | Out-File -Encoding ascii $Path
 }
 

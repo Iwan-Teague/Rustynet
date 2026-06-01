@@ -248,11 +248,24 @@ pub fn install_daemon(
 
     // Install the service.
     let node_id = windows_lab_node_id(alias, ctx);
+    // Resolve the daemon node role from the assignment so the install script
+    // passes --node-role. The daemon defaults to `admin` when the flag is
+    // omitted, which fails reconcile closed for a client-enrolled node
+    // (membership role mismatch); threading it explicitly prevents that drift.
+    let node_role = ctx
+        .assignments
+        .iter()
+        .find(|a| a.alias == alias)
+        .map(|a| &a.role)
+        .unwrap_or(&NodeRole::Client)
+        .daemon_node_role_for_platform(&VmGuestPlatform::Windows)
+        .map_err(|message| AdapterError::Protocol { message })?;
     let install_script = build_windows_service_install_script(
         workdir,
         &remote_install_svc,
         WINDOWS_SERVICE_NAME,
         &node_id,
+        node_role,
     )?;
     run_remote_ps(conn, &install_script, Duration::from_secs(120))?;
 
@@ -450,6 +463,7 @@ fn build_windows_service_install_script(
     remote_install_svc: &str,
     service_name: &str,
     node_id: &str,
+    node_role: &str,
 ) -> Result<String, AdapterError> {
     Ok(format!(
         "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
@@ -459,13 +473,15 @@ fn build_windows_service_install_script(
            -InstallRoot {install_root_q} \
            -StateRoot {state_root_q} \
            -ServiceName {svc_q} \
-           -NodeId {node_id_q}",
+           -NodeId {node_id_q} \
+           -NodeRole {node_role_q}",
         install_q = ps_quote(remote_install_svc)?,
         workdir_q = ps_quote(workdir)?,
         install_root_q = ps_quote(WINDOWS_INSTALL_ROOT)?,
         state_root_q = ps_quote(WINDOWS_STATE_ROOT)?,
         svc_q = ps_quote(service_name)?,
         node_id_q = ps_quote(node_id)?,
+        node_role_q = ps_quote(node_role)?,
     ))
 }
 
@@ -1276,25 +1292,42 @@ mod tests {
     }
 
     #[test]
-    fn build_windows_service_install_script_threads_lab_node_id() {
+    fn build_windows_service_install_script_threads_node_id_and_role() {
         let script = build_windows_service_install_script(
             r"C:\Rustynet",
             r"C:\Windows\Temp\rustynet-stage\Install-RustyNetWindowsService.ps1",
             "RustyNet",
             "windows-utm-1",
+            "client",
         )
         .expect("install script should render");
 
         assert!(script.contains("-ServiceName 'RustyNet'"));
         assert!(script.contains("-NodeId 'windows-utm-1'"));
         assert!(
+            script.contains("-NodeRole 'client'"),
+            "orchestrator must pass --node-role to the Windows install helper \
+             (the daemon defaults to admin otherwise → membership role mismatch \
+             fails reconcile closed for a client node — the N4 fix-3 bug)"
+        );
+        assert!(
             INSTALL_SERVICE_SCRIPT.contains("[string]$NodeId"),
             "Windows install helper must accept the node id passed by the orchestrator"
         );
         assert!(
-            INSTALL_SERVICE_SCRIPT.contains("'--node-id', $NodeId"),
-            "Windows install helper must not hardcode a stale service node id"
+            INSTALL_SERVICE_SCRIPT.contains("[string]$NodeRole"),
+            "Windows install helper must accept the node role passed by the orchestrator"
         );
+        // Parity: the reviewed install helper's daemon-arg builder must emit
+        // every required launch flag, so this platform can never silently drop
+        // one (the class of bug behind the N4 failures).
+        for flag in crate::vm_lab::orchestrator::adapter::node_adapter::REQUIRED_DAEMON_LAUNCH_FLAGS
+        {
+            assert!(
+                INSTALL_SERVICE_SCRIPT.contains(&format!("'{flag}'")),
+                "Windows daemon-args builder is missing required launch flag {flag}"
+            );
+        }
         assert!(
             INSTALL_SERVICE_SCRIPT.contains("(Join-Path $StateRoot 'rustynetd.state')"),
             "fresh Windows installs must purge stale daemon state before service start"

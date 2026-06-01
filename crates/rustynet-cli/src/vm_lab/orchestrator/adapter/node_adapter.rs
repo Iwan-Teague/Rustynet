@@ -32,6 +32,19 @@ pub(crate) fn extract_daemon_failure_reason(log_tail: &str) -> Option<String> {
     reconcile.or(error_fallback)
 }
 
+/// The daemon launch flags every platform's bring-up path MUST pass, so the
+/// node's runtime identity / role / backend / enforce-mode can never silently
+/// drift between platforms. This is the contract behind the N4 failure class: a
+/// dropped `--node-role` defaulted the Windows daemon to `admin` and fail-closed
+/// a client-enrolled node. Per-platform parity tests assert each platform's
+/// daemon-arg construction includes every flag listed here.
+pub(crate) const REQUIRED_DAEMON_LAUNCH_FLAGS: &[&str] = &[
+    "--backend",
+    "--node-id",
+    "--node-role",
+    "--auto-tunnel-enforce",
+];
+
 /// Per-node, per-OS interface for the orchestration pipeline.
 /// Connection details are injected at construction via `NodeConnection`;
 /// no transport argument appears in any method signature.
