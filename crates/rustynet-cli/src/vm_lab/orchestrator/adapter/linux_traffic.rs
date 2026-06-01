@@ -8,6 +8,18 @@ use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, Tunnel
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Flush every `rustynet*` nftables table (the bootstrap killswitch
+/// `rustynet_boot` AND any runtime generation table such as `rustynet_g1` a
+/// crashed daemon left behind). Their default OUTPUT policy is drop, which would
+/// block the next bootstrap's outbound traffic (incl. cargo registry downloads).
+/// Enumerated (not a fixed name) so an unanticipated table cannot leave egress
+/// blocked; idempotent (no matching tables → no-op) and best-effort.
+const LINUX_NFT_KILLSWITCH_RESET_COMMAND: &str = "if command -v nft >/dev/null 2>&1; then \
+         sudo -n nft list tables 2>/dev/null \
+             | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}' \
+             | while read t; do sudo -n nft delete table inet \"$t\" 2>/dev/null || true; done; \
+     fi";
+
 /// Collect `WireGuard` public key from `/var/lib/rustynet/keys/wireguard.pub`.
 /// Returns the base64-encoded key as a hex string (32-byte decode → hex).
 pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, AdapterError> {
@@ -158,22 +170,24 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &std::path::Path) -> Result
 
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
-    // Stop daemon first (best-effort).
+    // Stop daemon first (best-effort), then clear any failed-unit latch so the
+    // next bootstrap can start the service cleanly (a unit left in `failed`
+    // refuses to start until reset).
     let _ = ssh::run_remote(
         conn,
         "sudo -n systemctl stop rustynetd 2>/dev/null || true",
         Duration::from_secs(30),
     );
-    // Flush the rustynet_boot nftables table installed by the daemon's
-    // ExecStartPre. Its default OUTPUT policy is drop, which blocks outbound
-    // traffic (including cargo registry downloads) during the next bootstrap
-    // run if it is not removed here. The table is re-created on daemon start
-    // so removing it at cleanup is safe and idempotent.
     let _ = ssh::run_remote(
         conn,
-        "if command -v nft >/dev/null 2>&1; then \
-             sudo -n nft delete table inet rustynet_boot 2>/dev/null || true; \
-         fi",
+        "sudo -n systemctl reset-failed rustynetd 2>/dev/null || true",
+        Duration::from_secs(30),
+    );
+    // Flush every rustynet nftables table the daemon may have left behind so the
+    // next bootstrap is not blocked by a leftover default-deny killswitch.
+    let _ = ssh::run_remote(
+        conn,
+        LINUX_NFT_KILLSWITCH_RESET_COMMAND,
         Duration::from_secs(30),
     );
     // Restart systemd-resolved so the next bootstrap inherits a clean DNS
@@ -459,6 +473,22 @@ fn verify_no_key_material(path: &std::path::Path) -> Result<(), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_nft_killswitch_reset_enumerates_all_rustynet_tables() {
+        let cmd = LINUX_NFT_KILLSWITCH_RESET_COMMAND;
+        // Guards on nft presence so a node without nft is a no-op.
+        assert!(cmd.contains("command -v nft"));
+        // Enumerates rustynet inet tables rather than a single fixed name, so a
+        // leftover runtime table (e.g. rustynet_g1) cannot leave egress blocked.
+        assert!(cmd.contains("nft list tables"));
+        assert!(cmd.contains("$3 ~ /^rustynet/"));
+        assert!(cmd.contains("nft delete table inet"));
+        // Best-effort: tolerates absence at every privileged step.
+        assert!(cmd.contains("|| true"));
+        // Must NOT regress to deleting only the fixed `rustynet_boot` table.
+        assert!(!cmd.contains("delete table inet rustynet_boot"));
+    }
 
     #[test]
     fn validate_ip_arg_accepts_valid_ipv4() {
