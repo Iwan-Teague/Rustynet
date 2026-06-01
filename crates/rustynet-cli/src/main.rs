@@ -824,6 +824,9 @@ enum OpsCommand {
     VmLabList {
         config: vm_lab::VmLabListConfig,
     },
+    VmLabDiagnose {
+        config: vm_lab::VmLabDiagnoseConfig,
+    },
     VmLabDiscoverLocalUtm {
         config: vm_lab::VmLabDiscoverLocalUtmConfig,
     },
@@ -3012,6 +3015,23 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .path_or_default("--inventory", vm_lab::default_inventory_path()),
             },
         }),
+        "vm-lab-diagnose" => Ok(OpsCommand::VmLabDiagnose {
+            config: vm_lab::VmLabDiagnoseConfig {
+                inventory_path: parser
+                    .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                vm_alias: parser
+                    .value("--vm")
+                    .ok_or_else(|| "--vm <alias> is required".to_owned())?,
+                ssh_identity_file: parser.path_or_default(
+                    "--ssh-identity-file",
+                    vm_lab::default_lab_ssh_identity_path(),
+                ),
+                known_hosts_path: parser
+                    .path_or_default("--known-hosts-file", vm_lab::default_known_hosts_path()),
+                ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
+                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_owned())?,
+            },
+        }),
         "vm-lab-discover-local-utm" => Ok(OpsCommand::VmLabDiscoverLocalUtm {
             config: vm_lab::VmLabDiscoverLocalUtmConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -3270,6 +3290,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 report_dir: parser.required_path("--report-dir")?,
                 source_mode: parser.value("--source-mode"),
                 repo_ref: parser.value("--repo-ref"),
+                rebuild_nodes: parser.value("--rebuild-nodes").map(split_csv),
                 max_parallel_node_workers: match parser.value("--max-parallel-node-workers") {
                     Some(value) => Some(value.parse::<usize>().map_err(|err| {
                         format!("invalid value for --max-parallel-node-workers: {err}")
@@ -6994,6 +7015,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             ops_live_lab_failure_digest::execute_ops_generate_live_linux_lab_failure_digest(config)
         }
         OpsCommand::VmLabList { config } => vm_lab::execute_ops_vm_lab_list(config),
+        OpsCommand::VmLabDiagnose { config } => vm_lab::execute_ops_vm_lab_diagnose(config),
         OpsCommand::VmLabDiscoverLocalUtm { config } => {
             vm_lab::execute_ops_vm_lab_discover_local_utm(config)
         }
@@ -17801,6 +17823,7 @@ fn help_text() -> String {
         "  ops validate-network-discovery-bundle [--bundle <path>]... [--bundles <path[,path...]>] [--max-age-seconds <secs>] [--require-verifier-keys] [--require-daemon-active] [--require-socket-present] [--output <path>]",
         "  ops generate-live-linux-lab-failure-digest --nodes-tsv <path> --stages-tsv <path> --report-dir <path> --run-id <id> --network-id <id> --overall-status <status> --output-json <path> --output-md <path>",
         "  ops vm-lab-list [--inventory <path>]",
+        "  ops vm-lab-diagnose --vm <alias> [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>]",
         "  ops vm-lab-discover-local-utm [--inventory <path>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>] [--timeout-secs <secs>] [--update-inventory-live-ips] [--report-dir <path>]",
         "  ops vm-lab-discover-local-utm-summary [--inventory <path>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>] [--timeout-secs <secs>] [--update-inventory-live-ips] [--report-dir <path>]",
         "  ops vm-lab-start [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
@@ -17810,7 +17833,7 @@ fn help_text() -> String {
         "  ops vm-lab-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
         "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--dry-run]",
-        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--legacy-bash-orchestrator] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>]",
+        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--legacy-bash-orchestrator] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--script <path>] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>]",
         "  ops vm-lab-validate-windows-security --inventory <path> --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] [--ssh-port <port>] [--utm-documents-root <path>] [--utmctl-path <path>] --report-dir <path> [--dry-run] [--skip-access-bootstrap] [--skip-install] [--no-fail-on-authenticode] [--distribute-windows-membership-bundle <path>] [--distribute-windows-assignment-bundle <path>] [--distribute-windows-traversal-bundle <path>] [--distribute-windows-dns-zone-bundle <path>]",
         "  ops vm-lab-validate-linux-security [--inventory <path>] --linux-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--mesh-status-state-path <path>] [--mesh-status-expected-peer-ids <id[,id...]>] [--mesh-status-max-age-seconds <secs>]",
         "  ops vm-lab-distribute-windows-state [--inventory <path>] --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--membership-bundle <path>] [--assignment-bundle <path>] [--traversal-bundle <path>] [--dns-zone-bundle <path>]",
@@ -22013,6 +22036,24 @@ mod tests {
         let vm_lab_list = parse_command(&["ops".to_owned(), "vm-lab-list".to_owned()]);
         assert!(format!("{vm_lab_list:?}").contains("VmLabList"));
 
+        let vm_lab_diagnose = parse_command(&[
+            "ops".to_owned(),
+            "vm-lab-diagnose".to_owned(),
+            "--vm".to_owned(),
+            "windows-utm-1".to_owned(),
+            "--inventory".to_owned(),
+            "/tmp/vm_lab_inventory.json".to_owned(),
+            "--ssh-port".to_owned(),
+            "2222".to_owned(),
+        ]);
+        assert!(format!("{vm_lab_diagnose:?}").contains("VmLabDiagnose"));
+        assert!(format!("{vm_lab_diagnose:?}").contains("windows-utm-1"));
+        assert!(format!("{vm_lab_diagnose:?}").contains("2222"));
+        // --vm is required: omitting it must fall through to Help (ops parse error).
+        let vm_lab_diagnose_missing_vm =
+            parse_command(&["ops".to_owned(), "vm-lab-diagnose".to_owned()]);
+        assert!(!format!("{vm_lab_diagnose_missing_vm:?}").contains("VmLabDiagnose"));
+
         let vm_lab_discover_local_utm = parse_command(&[
             "ops".to_owned(),
             "vm-lab-discover-local-utm".to_owned(),
@@ -22235,6 +22276,29 @@ mod tests {
         assert!(format!("{vm_lab_orchestrate:?}").contains("ready_timeout_secs: 180"));
         assert!(format!("{vm_lab_orchestrate:?}").contains("collect_artifacts_on_failure: true"));
         assert!(format!("{vm_lab_orchestrate:?}").contains("stop_after_ready: true"));
+        // Default: no --rebuild-nodes => rebuild_nodes is None (rebuild all).
+        assert!(format!("{vm_lab_orchestrate:?}").contains("rebuild_nodes: None"));
+
+        // D1/D2 — --rebuild-nodes (csv) + --source-mode on the Rust-native path.
+        let vm_lab_orchestrate_rebuild = parse_command(&[
+            "ops".to_owned(),
+            "vm-lab-orchestrate-live-lab".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab/orchestrate_rebuild".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_owned(),
+            "--node".to_owned(),
+            "debian-headless-1:exit".to_owned(),
+            "--node".to_owned(),
+            "windows-utm-1:client".to_owned(),
+            "--rebuild-nodes".to_owned(),
+            "windows-utm-1".to_owned(),
+            "--source-mode".to_owned(),
+            "worktree".to_owned(),
+        ]);
+        assert!(format!("{vm_lab_orchestrate_rebuild:?}").contains("rebuild_nodes: Some"));
+        assert!(format!("{vm_lab_orchestrate_rebuild:?}").contains("windows-utm-1"));
+        assert!(format!("{vm_lab_orchestrate_rebuild:?}").contains("worktree"));
 
         let vm_lab_validate_profile = parse_command(&[
             "ops".to_owned(),

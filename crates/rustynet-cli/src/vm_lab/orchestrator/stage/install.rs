@@ -4,7 +4,34 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-pub struct BootstrapHostsStage;
+/// Pure predicate: is `alias` part of this run's active build set?
+///
+/// `None` (no `--rebuild-nodes`) means every node is active — the default.
+/// `Some` limits the active set to the listed aliases. A node NOT in the active
+/// set is **left entirely intact**: both `cleanup_hosts` and `bootstrap_hosts`
+/// skip it, so it keeps its already-installed, already-running daemon from a
+/// prior run. (The two stages must agree — `cleanup_hosts` wipes runtime state,
+/// so cleaning a node we then refuse to rebuild would strand it without a
+/// daemon.) This lets a single-node daemon fix be retested without a full
+/// multi-node rebuild.
+pub fn node_in_rebuild_set(rebuild_only: Option<&[String]>, alias: &str) -> bool {
+    match rebuild_only {
+        None => true,
+        Some(list) => list.iter().any(|a| a == alias),
+    }
+}
+
+pub struct BootstrapHostsStage {
+    /// When `Some`, only these aliases are (re)built; others reuse their
+    /// existing daemon. `None` = rebuild every node (the default).
+    rebuild_only: Option<Vec<String>>,
+}
+
+impl BootstrapHostsStage {
+    pub fn new(rebuild_only: Option<Vec<String>>) -> Self {
+        BootstrapHostsStage { rebuild_only }
+    }
+}
 
 impl OrchestrationStage for BootstrapHostsStage {
     fn id(&self) -> StageId {
@@ -28,10 +55,18 @@ impl OrchestrationStage for BootstrapHostsStage {
             Some(s) => s,
             None => return StageOutcome::Failed("no source archive in context".to_owned()),
         };
+        let rebuild_only = self.rebuild_only.as_deref();
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
         let results: Vec<(String, Result<(), String>)> = aliases
             .iter()
             .map(|alias| {
+                if !node_in_rebuild_set(rebuild_only, alias) {
+                    // Not in --rebuild-nodes: leave the node intact (cleanup_hosts
+                    // skipped it too), reusing its existing daemon build.
+                    // Downstream stages re-collect this node's identity from the
+                    // live host over SSH, so no rebuild is required.
+                    return (alias.clone(), Ok(()));
+                }
                 let r = match ctx.adapters.get(alias.as_str()) {
                     Some(adapter) => adapter
                         .install_daemon(&source, ctx)
@@ -76,8 +111,29 @@ mod tests {
             endpoints: HashMap::new(),
         };
         assert!(matches!(
-            BootstrapHostsStage.execute(&mut ctx),
+            BootstrapHostsStage::new(None).execute(&mut ctx),
             StageOutcome::Failed(_)
         ));
+    }
+
+    #[test]
+    fn node_in_rebuild_set_none_includes_all() {
+        // Default (no --rebuild-nodes): every node rebuilds.
+        assert!(node_in_rebuild_set(None, "windows-utm-1"));
+        assert!(node_in_rebuild_set(None, "debian-headless-1"));
+    }
+
+    #[test]
+    fn node_in_rebuild_set_some_limits_to_listed() {
+        let only = vec!["windows-utm-1".to_owned()];
+        assert!(node_in_rebuild_set(Some(&only), "windows-utm-1"));
+        assert!(!node_in_rebuild_set(Some(&only), "debian-headless-1"));
+    }
+
+    #[test]
+    fn node_in_rebuild_set_empty_list_includes_nothing() {
+        // An explicit empty set rebuilds no node (every node is reused as-is).
+        let none: Vec<String> = vec![];
+        assert!(!node_in_rebuild_set(Some(&none), "windows-utm-1"));
     }
 }

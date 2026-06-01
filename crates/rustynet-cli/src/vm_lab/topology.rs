@@ -871,6 +871,7 @@ mod tests {
             report_dir: PathBuf::from("/dev/null"),
             source_mode: None,
             repo_ref: None,
+            rebuild_nodes: None,
             max_parallel_node_workers: None,
             skip_gates: false,
             skip_soak: false,
