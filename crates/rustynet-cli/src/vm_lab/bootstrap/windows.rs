@@ -25,6 +25,7 @@ fn phase_requires_proven_access(phase: BootstrapPhase) -> bool {
             | BootstrapPhase::VerifyRuntime
             | BootstrapPhase::TunnelSmoke
             | BootstrapPhase::KillswitchSmoke
+            | BootstrapPhase::DnsSmoke
     )
 }
 
@@ -237,6 +238,7 @@ fn build_bootstrap_script_invocation(
         | BootstrapPhase::VerifyRuntime
         | BootstrapPhase::TunnelSmoke
         | BootstrapPhase::KillswitchSmoke
+        | BootstrapPhase::DnsSmoke
         | BootstrapPhase::All => {
             return Err(format!(
                 "bootstrap script invocation is not used for Windows phase {} on {}",
@@ -319,6 +321,26 @@ fn build_windows_killswitch_smoke_invocation(
             context.workdir.to_owned(),
             "-StateRoot".to_owned(),
             WINDOWS_STATE_ROOT.to_owned(),
+        ],
+    }
+}
+
+fn build_windows_dns_smoke_invocation(
+    context: &BootstrapPhaseContext<'_>,
+) -> WindowsHelperScriptSpec {
+    // N3 reuses the killswitch smoke harness with its DNS leg enabled: while the
+    // killswitch is active, exercise the netsh port-53 LAN-block (apply / assert /
+    // rollback). Still SSH-safe — the full fail-closed block is not requested, and
+    // the DNS block is port-53 only.
+    WindowsHelperScriptSpec {
+        helper_file_name: WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE,
+        remote_file_name: WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE,
+        args: vec![
+            "-RustyNetRoot".to_owned(),
+            context.workdir.to_owned(),
+            "-StateRoot".to_owned(),
+            WINDOWS_STATE_ROOT.to_owned(),
+            "-ExerciseDns".to_owned(),
         ],
     }
 }
@@ -813,6 +835,11 @@ fn parse_windows_killswitch_smoke_output(output: &str, target_label: &str) -> Re
     let permit_absent_after = report_flag("permit_absent_after_rollback");
     let full_block_exercised = report_flag("full_block_exercised");
     let full_block_permit_removed = report_flag("full_block_permit_removed");
+    let dns_exercised = report_flag("dns_protection_exercised");
+    let dns_applied = report_flag("dns_protection_applied");
+    let dns_asserted_active = report_flag("dns_protection_asserted_active");
+    let dns_rolled_back = report_flag("dns_protection_rolled_back");
+    let dns_asserted_inactive = report_flag("dns_protection_asserted_inactive");
     let torn_down = report_flag("tunnel_torn_down");
 
     if status == "pass" && overall_ok {
@@ -823,7 +850,7 @@ fn parse_windows_killswitch_smoke_output(output: &str, target_label: &str) -> Re
         .map(|code| code.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     Err(format!(
-        "Windows killswitch smoke helper reported status={status} overall_ok={overall_ok} reason={reason} failure_step={failure_step} daemon_exit_code={exit_code} permit_absent_before={permit_absent_before} killswitch_applied={applied} asserted_active={asserted_active} permit_present_under_killswitch={permit_present} rolled_back={rolled_back} asserted_inactive_after_rollback={asserted_inactive} permit_absent_after_rollback={permit_absent_after} full_block_exercised={full_block_exercised} full_block_permit_removed={full_block_permit_removed} tunnel_torn_down={torn_down} for {target_label}"
+        "Windows killswitch smoke helper reported status={status} overall_ok={overall_ok} reason={reason} failure_step={failure_step} daemon_exit_code={exit_code} permit_absent_before={permit_absent_before} killswitch_applied={applied} asserted_active={asserted_active} permit_present_under_killswitch={permit_present} rolled_back={rolled_back} asserted_inactive_after_rollback={asserted_inactive} permit_absent_after_rollback={permit_absent_after} full_block_exercised={full_block_exercised} full_block_permit_removed={full_block_permit_removed} dns_protection_exercised={dns_exercised} dns_protection_applied={dns_applied} dns_protection_asserted_active={dns_asserted_active} dns_protection_rolled_back={dns_rolled_back} dns_protection_asserted_inactive={dns_asserted_inactive} tunnel_torn_down={torn_down} for {target_label}"
     ))
 }
 
@@ -2255,6 +2282,20 @@ impl WindowsBootstrapProvider {
                 )?;
                 parse_windows_killswitch_smoke_output(output.as_str(), target.label.as_str())
             }
+            BootstrapPhase::DnsSmoke => {
+                // N3 DNS fail-closed in protected mode: the killswitch smoke with
+                // its DNS leg enabled. Same pinned-SSH capture + dead-man's-switch
+                // as the killswitch smoke; the same envelope/parser applies (the
+                // verdict gates on overall_ok, which includes the DNS signals).
+                let invocation = build_windows_dns_smoke_invocation(context);
+                let output = self.capture_helper_output(
+                    target,
+                    context,
+                    invocation,
+                    "Windows DNS smoke helper",
+                )?;
+                parse_windows_killswitch_smoke_output(output.as_str(), target.label.as_str())
+            }
             BootstrapPhase::All => {
                 for subphase in [
                     BootstrapPhase::SyncSource,
@@ -2620,6 +2661,54 @@ mod tests {
         assert!(helper.contains("schtasks.exe"));
         assert!(helper.contains("Register-FirewallDeadMan"));
         assert!(helper.contains("allowinbound,allowoutbound"));
+        // N3: the harness forwards the DNS leg when requested.
+        assert!(helper.contains("ExerciseDns"));
+        assert!(helper.contains("--exercise-dns"));
+    }
+
+    #[test]
+    fn windows_dns_smoke_invocation_reuses_killswitch_helper_with_exercise_dns() {
+        let invocation = build_windows_dns_smoke_invocation(&sample_context(None));
+        // N3 reuses the killswitch smoke helper, adding only the DNS leg.
+        assert_eq!(
+            invocation.helper_file_name,
+            WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE
+        );
+        assert!(invocation.args.iter().any(|arg| arg == "-ExerciseDns"));
+        // It must NOT request the SSH-cutting full block.
+        assert!(
+            !invocation
+                .args
+                .iter()
+                .any(|arg| arg == "-ExerciseFullBlock")
+        );
+    }
+
+    #[test]
+    fn windows_killswitch_smoke_parser_surfaces_dns_flags_on_failure() {
+        let err = parse_windows_killswitch_smoke_output(
+            r#"{
+                "status": "fail",
+                "overall_ok": false,
+                "reason": "killswitch did not apply/rollback cleanly (overall_ok=False, exit=1)",
+                "daemon_exit_code": 1,
+                "killswitch_report": {
+                    "killswitch_applied": true,
+                    "asserted_active": true,
+                    "rolled_back": true,
+                    "dns_protection_exercised": true,
+                    "dns_protection_applied": true,
+                    "dns_protection_asserted_active": false,
+                    "dns_protection_rolled_back": true,
+                    "dns_protection_asserted_inactive": true,
+                    "overall_ok": false
+                }
+            }"#,
+            "windows-utm-1",
+        )
+        .expect_err("a DNS-leg failure must fail closed");
+        assert!(err.contains("dns_protection_exercised=true"));
+        assert!(err.contains("dns_protection_asserted_active=false"));
     }
 
     #[test]

@@ -32,6 +32,12 @@ pub struct WindowsKillswitchSmokeOptions {
     /// session until the subsequent rollback — only safe behind the harness
     /// dead-man's-switch. Off by default so the standard run stays SSH-safe.
     pub exercise_full_block: bool,
+    /// Opt-in (readiness plan N3): while the killswitch is active, also exercise
+    /// the DNS fail-closed control — `apply_dns_protection` → assert → rollback →
+    /// assert. This proves the netsh port-53 LAN-block (a Block rule) holds in
+    /// protected mode, overriding the killswitch's egress-allow for DNS. Port-53
+    /// only, so it does not affect the (port-22) SSH session. Off by default.
+    pub exercise_dns: bool,
 }
 
 impl Default for WindowsKillswitchSmokeOptions {
@@ -42,6 +48,7 @@ impl Default for WindowsKillswitchSmokeOptions {
             mesh_cidr: "100.64.0.0/10".to_owned(),
             listen_port: 51820,
             exercise_full_block: false,
+            exercise_dns: false,
         }
     }
 }
@@ -70,6 +77,15 @@ pub struct WindowsKillswitchSmokeSignals {
     /// fail-OPEN fix: full block leaves no tunnel egress).
     pub full_block_permit_removed: bool,
     pub full_block_rolled_back: bool,
+    /// Whether the N3 DNS fail-closed control was exercised this run.
+    pub dns_protection_exercised: bool,
+    pub dns_protection_applied: bool,
+    /// `assert_dns_protection` confirms both netsh port-53 LAN-block rules are
+    /// present (Outbound/Block/Enabled) while the killswitch is active.
+    pub dns_protection_asserted_active: bool,
+    pub dns_protection_rolled_back: bool,
+    /// After DNS rollback `assert_dns_protection` reports inactive (expected Err).
+    pub dns_protection_asserted_inactive: bool,
     pub tunnel_torn_down: bool,
 }
 
@@ -89,6 +105,11 @@ pub struct WindowsKillswitchSmokeReport {
     pub full_block_applied: bool,
     pub full_block_permit_removed: bool,
     pub full_block_rolled_back: bool,
+    pub dns_protection_exercised: bool,
+    pub dns_protection_applied: bool,
+    pub dns_protection_asserted_active: bool,
+    pub dns_protection_rolled_back: bool,
+    pub dns_protection_asserted_inactive: bool,
     pub tunnel_torn_down: bool,
     pub overall_ok: bool,
 }
@@ -121,6 +142,14 @@ impl WindowsKillswitchSmokeReport {
         } else {
             true
         };
+        let dns_ok = if signals.dns_protection_exercised {
+            signals.dns_protection_applied
+                && signals.dns_protection_asserted_active
+                && signals.dns_protection_rolled_back
+                && signals.dns_protection_asserted_inactive
+        } else {
+            true
+        };
         Self {
             tunnel_name: options.tunnel_name.clone(),
             tunnel_started: signals.tunnel_started,
@@ -135,8 +164,13 @@ impl WindowsKillswitchSmokeReport {
             full_block_applied: signals.full_block_applied,
             full_block_permit_removed: signals.full_block_permit_removed,
             full_block_rolled_back: signals.full_block_rolled_back,
+            dns_protection_exercised: signals.dns_protection_exercised,
+            dns_protection_applied: signals.dns_protection_applied,
+            dns_protection_asserted_active: signals.dns_protection_asserted_active,
+            dns_protection_rolled_back: signals.dns_protection_rolled_back,
+            dns_protection_asserted_inactive: signals.dns_protection_asserted_inactive,
             tunnel_torn_down: signals.tunnel_torn_down,
-            overall_ok: core_ok && full_block_ok,
+            overall_ok: core_ok && full_block_ok && dns_ok,
         }
     }
 }
@@ -264,6 +298,25 @@ fn run_killswitch_sequence(
     // assertion is a recorded signal, not a hard error (we still roll back).
     signals.asserted_active = system.assert_killswitch().is_ok();
     signals.permit_present_under_killswitch = wfp_tunnel_permit_present()?;
+
+    // N3 — DNS fail-closed in protected mode: while the killswitch is active,
+    // exercise the netsh port-53 LAN-block. Block rules override the killswitch's
+    // egress-allow, so this proves plaintext DNS to a LAN/ISP resolver is dropped
+    // while the tunnel is up. Port-53 only — does not touch the (port-22) SSH
+    // session. Rolled back here, before the killswitch rollback.
+    if options.exercise_dns {
+        signals.dns_protection_exercised = true;
+        system
+            .apply_dns_protection()
+            .map_err(|err| format!("apply_dns_protection failed: {err:?}"))?;
+        signals.dns_protection_applied = true;
+        signals.dns_protection_asserted_active = system.assert_dns_protection().is_ok();
+        system
+            .rollback_dns_protection()
+            .map_err(|err| format!("rollback_dns_protection failed: {err:?}"))?;
+        signals.dns_protection_rolled_back = true;
+        signals.dns_protection_asserted_inactive = system.assert_dns_protection().is_err();
+    }
 
     system
         .rollback_firewall()
@@ -420,5 +473,56 @@ mod tests {
         );
         assert!(report.overall_ok);
         assert!(report.full_block_exercised);
+    }
+
+    #[test]
+    fn dns_run_passes_when_all_dns_signals_true() {
+        let mut signals = all_core_true();
+        signals.dns_protection_exercised = true;
+        signals.dns_protection_applied = true;
+        signals.dns_protection_asserted_active = true;
+        signals.dns_protection_rolled_back = true;
+        signals.dns_protection_asserted_inactive = true;
+        let report = WindowsKillswitchSmokeReport::from_signals(
+            &WindowsKillswitchSmokeOptions::default(),
+            &signals,
+        );
+        assert!(report.overall_ok);
+        assert!(report.dns_protection_exercised);
+    }
+
+    #[test]
+    fn dns_run_fails_when_dns_not_asserted_active() {
+        // The DNS-block did not assert active under the killswitch (e.g. the
+        // port-53 LAN-block rules were missing) = no proven DNS fail-closed = fail.
+        let mut signals = all_core_true();
+        signals.dns_protection_exercised = true;
+        signals.dns_protection_applied = true;
+        signals.dns_protection_asserted_active = false;
+        signals.dns_protection_rolled_back = true;
+        signals.dns_protection_asserted_inactive = true;
+        let report = WindowsKillswitchSmokeReport::from_signals(
+            &WindowsKillswitchSmokeOptions::default(),
+            &signals,
+        );
+        assert!(!report.overall_ok);
+    }
+
+    #[test]
+    fn dns_run_fails_when_dns_not_rolled_back() {
+        let mut signals = all_core_true();
+        signals.dns_protection_exercised = true;
+        signals.dns_protection_applied = true;
+        signals.dns_protection_asserted_active = true;
+        signals.dns_protection_rolled_back = false;
+        signals.dns_protection_asserted_inactive = false;
+        let report = WindowsKillswitchSmokeReport::from_signals(
+            &WindowsKillswitchSmokeOptions::default(),
+            &signals,
+        );
+        assert!(
+            !report.overall_ok,
+            "a DNS-block left applied after the run is a leak and must fail"
+        );
     }
 }

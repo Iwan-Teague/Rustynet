@@ -23,6 +23,11 @@ pub(super) enum BootstrapPhase {
     /// (privileged + checkpoint-gated, can momentarily affect egress). Windows-
     /// only; other platforms fail closed.
     KillswitchSmoke,
+    /// Single-node DNS fail-closed exercise in protected mode (readiness plan
+    /// N3). Runs the killswitch smoke with its DNS leg enabled: while the
+    /// killswitch is active it applies/asserts/rolls back the netsh port-53
+    /// LAN-block. Standalone, never part of `All`; Windows-only.
+    DnsSmoke,
     All,
 }
 
@@ -37,9 +42,10 @@ impl BootstrapPhase {
             "verify-runtime" => Ok(Self::VerifyRuntime),
             "tunnel-smoke" => Ok(Self::TunnelSmoke),
             "killswitch-smoke" => Ok(Self::KillswitchSmoke),
+            "dns-smoke" => Ok(Self::DnsSmoke),
             "all" => Ok(Self::All),
             other => Err(format!(
-                "unsupported vm-lab bootstrap phase: {other} (expected sync-source|build-release|smoke-service-host|install-release|restart-runtime|verify-runtime|tunnel-smoke|killswitch-smoke|all)"
+                "unsupported vm-lab bootstrap phase: {other} (expected sync-source|build-release|smoke-service-host|install-release|restart-runtime|verify-runtime|tunnel-smoke|killswitch-smoke|dns-smoke|all)"
             )),
         }
     }
@@ -54,6 +60,7 @@ impl BootstrapPhase {
             Self::VerifyRuntime => "verify-runtime",
             Self::TunnelSmoke => "tunnel-smoke",
             Self::KillswitchSmoke => "killswitch-smoke",
+            Self::DnsSmoke => "dns-smoke",
             Self::All => "all",
         }
     }

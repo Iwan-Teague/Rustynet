@@ -26235,7 +26235,8 @@ TMPDIR={tmpdir} RUSTUP_SKIP_UPDATE_CHECK=yes exec \"$cargo_bin\" build --locked 
         }
         bootstrap::BootstrapPhase::SmokeServiceHost
         | bootstrap::BootstrapPhase::TunnelSmoke
-        | bootstrap::BootstrapPhase::KillswitchSmoke => {
+        | bootstrap::BootstrapPhase::KillswitchSmoke
+        | bootstrap::BootstrapPhase::DnsSmoke => {
             return Err(format!(
                 "bootstrap phase {} is currently Windows-only: {}",
                 phase.as_str(),
@@ -28057,6 +28058,22 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_phase_registry_accepts_dns_smoke_phase() {
+        assert_eq!(
+            super::bootstrap::BootstrapPhase::parse("dns-smoke")
+                .expect("dns-smoke phase name should parse")
+                .as_str(),
+            "dns-smoke"
+        );
+        assert_eq!(
+            super::bootstrap::BootstrapPhase::parse("dns_smoke")
+                .expect("underscored dns-smoke phase name should normalize")
+                .as_str(),
+            "dns-smoke"
+        );
+    }
+
+    #[test]
     fn bootstrap_phase_registry_routes_linux_to_legacy_executor() {
         let (inventory, target) = resolve_platform_remote_target("linux");
         let context = super::bootstrap::BootstrapPhaseContext {
@@ -28198,6 +28215,26 @@ mod tests {
             &context,
         )
         .expect_err("linux targets must reject the Windows killswitch-smoke phase");
+        assert!(err.contains("currently Windows-only"));
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn linux_bootstrap_rejects_dns_smoke_phase() {
+        let (inventory, target) = resolve_platform_remote_target("linux");
+        let context = super::bootstrap::BootstrapPhaseContext {
+            ssh_user: target.ssh_user.as_deref(),
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            workdir: "/home/debian/Rustynet",
+            repo_url: None,
+            branch: "main",
+            remote: "origin",
+            timeout: Duration::from_secs(1),
+        };
+        let err =
+            super::bootstrap::execute_bootstrap_phase_for_target("dns-smoke", &target, &context)
+                .expect_err("linux targets must reject the Windows dns-smoke phase");
         assert!(err.contains("currently Windows-only"));
         cleanup_temp_inventory(inventory.as_path());
     }
