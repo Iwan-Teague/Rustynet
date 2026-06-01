@@ -234,6 +234,29 @@ pub fn collect_daemon_failure_reason(
     Ok(crate::vm_lab::orchestrator::adapter::node_adapter::extract_daemon_failure_reason(&tail))
 }
 
+/// nftables probe used by [`assert_node_clean`]: prints any leftover `rustynet*`
+/// inet table names (space-separated); empty output means the node is clean.
+const LINUX_NFT_LEFTOVER_PROBE: &str = "sudo -n nft list tables 2>/dev/null \
+     | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}' | tr '\\n' ' '";
+
+/// After cleanup, assert no leftover RustyNet nftables killswitch table remains
+/// (a default-deny `rustynet*` table would starve the next bootstrap's egress).
+/// Fails loudly so a reset that did not take is caught here, not as a cargo DNS
+/// timeout five stages later.
+pub fn assert_node_clean(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let leftover = ssh::run_remote(conn, LINUX_NFT_LEFTOVER_PROBE, SHORT_TIMEOUT)?;
+    let leftover = leftover.trim();
+    if leftover.is_empty() {
+        Ok(())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!(
+                "node still dirty: leftover rustynet nftables table(s) after cleanup: {leftover}"
+            ),
+        })
+    }
+}
+
 /// Verify SSH connectivity by running a no-op command.
 pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
     ssh::run_remote(conn, "echo reachable", Duration::from_secs(10))?;
@@ -502,6 +525,13 @@ mod tests {
         assert!(cmd.contains("|| true"));
         // Must NOT regress to deleting only the fixed `rustynet_boot` table.
         assert!(!cmd.contains("delete table inet rustynet_boot"));
+    }
+
+    #[test]
+    fn linux_node_clean_probe_targets_rustynet_nft_tables() {
+        let p = LINUX_NFT_LEFTOVER_PROBE;
+        assert!(p.contains("nft list tables"));
+        assert!(p.contains("$3 ~ /^rustynet/"));
     }
 
     #[test]

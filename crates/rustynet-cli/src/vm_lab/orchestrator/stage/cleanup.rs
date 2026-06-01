@@ -29,7 +29,14 @@ impl OrchestrationStage for CleanupHostsStage {
             .iter()
             .filter_map(|alias| {
                 match ctx.adapters.get(alias.as_str()) {
-                    Some(adapter) => adapter.cleanup_runtime_state().map_err(|e| e.to_string()),
+                    // Reset the node, then assert it is actually clean — a reset
+                    // that silently did not take (leftover killswitch / NRPT)
+                    // must fail the stage here, not surface as a cargo DNS
+                    // timeout in bootstrap five stages later.
+                    Some(adapter) => adapter
+                        .cleanup_runtime_state()
+                        .and_then(|()| adapter.assert_node_clean())
+                        .map_err(|e| e.to_string()),
                     // An assigned node with no adapter is a construction bug, not
                     // "nothing to clean": its prior runtime state (incl. a
                     // default-deny killswitch) would be left in place and could

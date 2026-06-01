@@ -276,6 +276,35 @@ pub fn collect_daemon_failure_reason(
     Ok(crate::vm_lab::orchestrator::adapter::node_adapter::extract_daemon_failure_reason(&tail))
 }
 
+/// PowerShell used by [`assert_node_clean`]: emits `CLEAN`, `DIRTY-RULES:<n>`, or
+/// `DIRTY-OUTBOUND-BLOCKED`. Checks no RustyNet killswitch/DNS/IPv6 firewall rules
+/// remain and the default outbound policy is not left blocking.
+fn windows_node_clean_assert_script() -> &'static str {
+    "$ErrorActionPreference = 'SilentlyContinue'; \
+     $rules = @(& netsh advfirewall firewall show rule name=all dir=out | Select-String 'RustyNet'); \
+     $pol = @(& netsh advfirewall show allprofiles | Select-String 'Firewall Policy'); \
+     $blocked = @($pol | Where-Object { $_ -match 'BlockOutbound' }); \
+     if ($rules.Count -gt 0) { Write-Output ('DIRTY-RULES:' + $rules.Count) } \
+     elseif ($blocked.Count -gt 0) { Write-Output 'DIRTY-OUTBOUND-BLOCKED' } \
+     else { Write-Output 'CLEAN' }"
+}
+
+/// After cleanup, assert no leftover RustyNet killswitch firewall rules remain
+/// and the default outbound policy is not left blocking (a residual
+/// default-block-outbound killswitch would starve the next bootstrap). Fails
+/// loudly so a reset that did not take is caught at cleanup.
+pub fn assert_node_clean(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let out = run_remote_ps(conn, windows_node_clean_assert_script(), SHORT_TIMEOUT)?;
+    let out = out.trim();
+    if out.contains("CLEAN") {
+        Ok(())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!("node still dirty after cleanup: {out}"),
+        })
+    }
+}
+
 /// Verify SSH/PS connectivity by running a no-op command.
 pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
     run_remote_ps(conn, "Write-Host 'reachable'", Duration::from_secs(10))?;
@@ -542,6 +571,15 @@ fn verify_no_key_material_zip(path: &Path) -> Result<(), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_node_clean_assert_script_checks_rules_and_outbound_policy() {
+        let s = windows_node_clean_assert_script();
+        assert!(s.contains("Select-String 'RustyNet'"));
+        assert!(s.contains("BlockOutbound"));
+        assert!(s.contains("CLEAN"));
+        assert!(s.contains("DIRTY-RULES"));
+    }
 
     #[test]
     fn windows_dataplane_reset_script_clears_killswitch_dns_and_nrpt() {

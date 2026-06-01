@@ -149,6 +149,15 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
+    /// After cleanup, assert the node carries no leftover RustyNet dataplane
+    /// artifacts that would break the next bootstrap (a default-deny killswitch
+    /// blocking egress). Fails loudly with "node still dirty: …" so a reset that
+    /// did not take is caught at cleanup, not five stages later as a cargo DNS
+    /// timeout. Default `Ok(())` for adapters with no host-side killswitch.
+    fn assert_node_clean(&self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+
     // ── SSH reachability probe ────────────────────────────────────
 
     fn check_ssh_reachable(&self) -> Result<(), AdapterError>;
