@@ -7827,6 +7827,9 @@ impl DaemonRuntime {
         if let Err(err) = self.enforce_blind_exit_invariants() {
             self.reconcile_failures = self.reconcile_failures.saturating_add(1);
             let message = format!("blind-exit role invariants failed during reconcile: {err}");
+            if self.last_reconcile_error.as_deref() != Some(message.as_str()) {
+                log::warn!("rustynetd reconcile fail-closed: {message}");
+            }
             self.last_reconcile_error = Some(message.clone());
             self.restrict_permanent(message);
             let _ = self
@@ -7840,6 +7843,9 @@ impl DaemonRuntime {
             Err(err) => {
                 self.reconcile_failures = self.reconcile_failures.saturating_add(1);
                 let message = format!("trust reconcile failed: {err}");
+                if self.last_reconcile_error.as_deref() != Some(message.as_str()) {
+                    log::warn!("rustynetd reconcile fail-closed: {message}");
+                }
                 self.last_reconcile_error = Some(message.clone());
                 self.restrict_recoverable(message);
                 let _ = self.controller.force_fail_closed("trust_reconcile_failed");
@@ -7853,6 +7859,9 @@ impl DaemonRuntime {
             Err(err) => {
                 self.reconcile_failures = self.reconcile_failures.saturating_add(1);
                 let message = format!("membership reconcile failed: {err}");
+                if self.last_reconcile_error.as_deref() != Some(message.as_str()) {
+                    log::warn!("rustynetd reconcile fail-closed: {message}");
+                }
                 self.last_reconcile_error = Some(message.clone());
                 self.restrict_recoverable(message);
                 let _ = self
@@ -7870,6 +7879,9 @@ impl DaemonRuntime {
                 Err(err) => {
                     self.reconcile_failures = self.reconcile_failures.saturating_add(1);
                     let message = format!("auto-tunnel reconcile failed: {err}");
+                    if self.last_reconcile_error.as_deref() != Some(message.as_str()) {
+                        log::warn!("rustynetd reconcile fail-closed: {message}");
+                    }
                     self.last_reconcile_error = Some(message.clone());
                     self.restrict_recoverable(message);
                     let _ = self
