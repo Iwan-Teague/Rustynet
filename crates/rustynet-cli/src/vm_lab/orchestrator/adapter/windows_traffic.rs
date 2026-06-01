@@ -169,6 +169,47 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
     Ok(())
 }
 
+/// Build the best-effort PowerShell that clears leftover RustyNet dataplane
+/// artifacts before a fresh bootstrap on a node a prior run left dirty: the
+/// killswitch firewall rules, the DNS fail-closed NRPT catch-all, and managed
+/// adapter-DNS overrides. Idempotent (absent artifacts are a no-op) and
+/// fail-safe — it first restores the default-allow outbound firewall policy so a
+/// leftover killswitch can never leave the node with egress blocked (which would
+/// break the next bootstrap's cargo registry downloads). Rule names mirror the
+/// reviewed contract in rustynetd `phase10` (`WINDOWS_KS_RULE_*` /
+/// `WINDOWS_DNS_RULE_*`); the NRPT match targets the DNS fail-closed rule that
+/// points the root namespace at the loopback resolver (`windows_dns_failclosed`).
+fn windows_dataplane_reset_script() -> String {
+    const RUSTYNET_FIREWALL_RULES: [&str; 6] = [
+        "RustyNetKS-AllowLoopback",
+        "RustyNetKS-AllowTunnel",
+        "RustyNetKS-AllowEgress",
+        "RustyNetDNS-BlockLanUdp",
+        "RustyNetDNS-BlockLanTcp",
+        "RustyNetKS-BlockIpv6Lan",
+    ];
+    let delete_rules = RUSTYNET_FIREWALL_RULES
+        .iter()
+        .map(|name| {
+            format!("& netsh advfirewall firewall delete rule name=\"{name}\" 2>$null | Out-Null;")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "$ErrorActionPreference = 'Continue'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         & netsh advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound 2>$null | Out-Null; \
+         {delete_rules} \
+         try {{ Get-DnsClientNrptRule -ErrorAction SilentlyContinue \
+             | Where-Object {{ ($_.NameServers -contains '127.0.0.1') -or ($_.NameServers -contains '::1') }} \
+             | ForEach-Object {{ Remove-DnsClientNrptRule -Name $_.Name -Force -ErrorAction SilentlyContinue }} }} catch {{ }}; \
+         try {{ Get-NetAdapter -Physical -ErrorAction SilentlyContinue \
+             | Where-Object {{ $_.Status -eq 'Up' }} \
+             | ForEach-Object {{ & netsh interface ipv4 set dnsservers name=\"$($_.Name)\" source=dhcp 2>$null | Out-Null }} }} catch {{ }}; \
+         exit 0"
+    )
+}
+
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
     // Stop service first (best-effort).
@@ -177,6 +218,13 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
         ps_quote(WINDOWS_SERVICE_NAME)?
     );
     let _ = run_remote_ps(conn, &stop_script, SHORT_TIMEOUT);
+
+    // Best-effort reset of leftover RustyNet dataplane artifacts (killswitch
+    // firewall rules + default-deny outbound policy, the DNS fail-closed NRPT
+    // catch-all, and managed adapter-DNS overrides). Without this a prior run's
+    // killswitch/managed-DNS state blocks the next bootstrap's DNS resolution and
+    // cargo downloads. Non-fatal + idempotent: a clean node is a no-op.
+    let _ = run_remote_ps(conn, &windows_dataplane_reset_script(), SHORT_TIMEOUT);
 
     // Remove runtime state but keep keys and installation. Best-effort:
     // mirrors the Linux `rm -rf … 2>/dev/null; true` pattern. We deliberately
@@ -478,6 +526,36 @@ fn verify_no_key_material_zip(path: &Path) -> Result<(), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_dataplane_reset_script_clears_killswitch_dns_and_nrpt() {
+        let s = windows_dataplane_reset_script();
+        // Fail-safe: restore default-allow outbound first, so a leftover
+        // killswitch can never leave the node with egress blocked.
+        assert!(s.contains("firewallpolicy allowinbound,allowoutbound"));
+        // Purge every reviewed RustyNet firewall rule (phase10 contract).
+        for name in [
+            "RustyNetKS-AllowLoopback",
+            "RustyNetKS-AllowTunnel",
+            "RustyNetKS-AllowEgress",
+            "RustyNetDNS-BlockLanUdp",
+            "RustyNetDNS-BlockLanTcp",
+            "RustyNetKS-BlockIpv6Lan",
+        ] {
+            assert!(
+                s.contains(&format!("delete rule name=\"{name}\"")),
+                "reset script missing firewall delete for {name}"
+            );
+        }
+        // Clear the DNS fail-closed NRPT catch-all (root namespace -> loopback).
+        assert!(s.contains("Get-DnsClientNrptRule"));
+        assert!(s.contains("Remove-DnsClientNrptRule"));
+        assert!(s.contains("127.0.0.1"));
+        // Reset managed adapter DNS back to DHCP.
+        assert!(s.contains("set dnsservers") && s.contains("source=dhcp"));
+        // Best-effort: never abort on a clean node.
+        assert!(s.contains("$ErrorActionPreference = 'Continue'"));
+    }
 
     #[test]
     fn validate_ip_arg_accepts_valid_ipv4() {
