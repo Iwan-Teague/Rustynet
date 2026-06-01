@@ -32,7 +32,7 @@
 //!   XTASK_FMT_TIMEOUT (default 120)
 //!   XTASK_CHECK_TIMEOUT (default 1200)
 //!   XTASK_CLIPPY_TIMEOUT (default 1500)
-//!   XTASK_TEST_TIMEOUT (default 3600)
+//!   XTASK_TEST_TIMEOUT (default 5400 — full --all-targets suite is ~48-60min)
 //!
 //! Each stage's wall-clock is appended to
 //! `documents/operations/gate_timings.csv` (timestamp, commit, dirty, stage,
@@ -173,7 +173,13 @@ fn run_gates(rest: &[String]) -> i32 {
     if !skip_test {
         stages.push(Stage {
             label: "test",
-            timeout: timeout_from_env("XTASK_TEST_TIMEOUT", 3600),
+            // The full --all-targets workspace suite (compile + run) is ~48min
+            // warm and tips past 60min on a cold cache, so 3600 was too tight —
+            // a slightly-slow run had the whole process group killed mid-suite
+            // (the binary "Running" at the cutoff, e.g. the 0-test
+            // real_wireguard_exitnode_e2e harness, looked like the culprit but
+            // wasn't). 5400 (90min) gives headroom while still catching a hang.
+            timeout: timeout_from_env("XTASK_TEST_TIMEOUT", 5400),
             args: with_scope(&["test"]),
         });
     }
