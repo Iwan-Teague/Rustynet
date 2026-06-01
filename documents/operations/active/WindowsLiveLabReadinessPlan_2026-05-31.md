@@ -126,7 +126,7 @@ provides none).
   up. The opt-in loopback-resolver/NRPT enforcement remains a deferred, stronger
   control (a separate design decision); the firewall block is the baseline parity
   control with Linux/macOS.
-- **G4 — Multi-node mesh with a Windows node: code-wired, never run (🟡, was 🔴).**
+- **G4 — Multi-node mesh with a Windows node: daemon mesh-validator bug fixed, live retry running (🟡, was 🔴).**
   Recon (2026-06-01) corrects the earlier "not a first-class node" read. The
   **Rust-native** orchestrator (`--node <alias>:<role>` →
   `execute_rust_native_orchestration`) builds a real `WindowsNodeAdapter`
@@ -145,11 +145,28 @@ provides none).
   trust-evidence **refresh is a no-op** ("skipped on windows — DPAPI signer-key
   unwrap pending") → a long run or trust rotation may surface staleness, but a
   short run with a wide `--trust-max-age-secs` should carry the bootstrap-issued
-  evidence. **Actual blocker to running N4 = lab networking:** the Windows guest
-  is LAN-only (`192.168.0.45`, no STUN/relay) and no peer shares its subnet (the
-  UTM mesh VMs are on unroutable internal nets; `debian-lan-11` is down + not
-  utmctl-controllable). Needs an operator decision to put Windows + a peer on one
-  subnet.
+  evidence. **Lab-networking blocker RESOLVED (2026-06-01):** the UTM VMs are all
+  bridged onto the host LAN, so the Linux exit (`debian-headless-1`,
+  `192.168.0.200`) and the Windows client (`192.168.0.45`) share
+  `192.168.0.0/24` — no topology change was needed (inventory corrected to match,
+  commit `7db2991`). **The real blocker was a daemon bug, now fixed (commit
+  `820e223`):** `validate_signed_auto_tunnel_route_intent` (rustynetd) rejected
+  any auto-tunnel peer lacking `relay_host`/`exit_server`, but the signed
+  control-plane producer (`signed_auto_tunnel_bundle`, rustynet-control) emits a
+  `mesh` route to *every* policy-allowed peer incl. plain clients (the bundle's
+  signed `traffic_route_policy` is literally `mesh_or_relay_or_exit_node`). On a
+  two-node mesh the **exit's** bundle lists the plain-client peer → the exit
+  daemon failed closed (`config_error`, `rustynetd.sock` never appeared) → the
+  Windows client never got a tunnel IPv4 (run4 `enforce_baseline_runtime`; the
+  "WireGuard adapter did not get an IPv4 address within 90s" was the downstream
+  symptom). The fix gates capability **per route kind** (mesh self-delivery to a
+  peer's own `/32` needs no capability; exit/default routes still require
+  `ExitServer` + the signed selected exit) and adds a single-claimant `/32` guard
+  (strictly stronger than the blunt gate it replaces). Host-validated
+  (fmt/clippy clean; 31 rustynetd `auto_tunnel` unit tests incl. new
+  `allows_plain_client_mesh_self_route` + `rejects_duplicate_mesh_host_claim`; 12
+  rustynet-control `auto_tunnel` tests). **Live two-node retry in progress**
+  (`/tmp/rn_n4_run5`); not yet green.
 - **G5 — Single-node smoke harness — ✅ landed.** `ops vm-lab-bootstrap-phase
   --phase tunnel-smoke` (N1) and `--phase killswitch-smoke` (N2) provide minimal
   bring-up-and-assert paths for fast iteration without a full dataplane
@@ -365,10 +382,42 @@ Progress (2026-06-01) — **N3 PASSED**:
   post-rollback rule *absence* (that was confirmed manually here). A future
   hardening could add a post-rollback absence assertion to the verdict.
 
-### N4 — Two-node mesh: Windows guest + one peer 🔴 (covers G4)
+### N4 — Two-node mesh: Windows guest + one peer 🟡 (covers G4) — daemon fix in, live retry running
 Drive enrollment + signed-state + dataplane reconcile so the Windows guest and
 one Linux/macOS peer form a tunnel and pass traffic both ways. Promote Windows
 to a first-class node in the orchestrator path.
+- **2026-06-01 status:** lab networking is **not** the blocker — the UTM VMs are
+  LAN-bridged, so the exit (`debian-headless-1`, `192.168.0.200`) and the Windows
+  client (`192.168.0.45`) share `192.168.0.0/24`. Four orchestrate runs walked the
+  failure forward: `bootstrap_hosts` (dirty-node Linux `inet rustynet_boot` nft
+  killswitch / Windows NRPT-DNS leftover / DPAPI `Add-Type`, all fixed) →
+  `enforce_baseline_runtime`, where the **root cause** surfaced: the daemon's
+  signed-auto-tunnel route-intent validator rejected the plain-client mesh peer
+  that the control plane legitimately signs (see G4). Fixed in commit `820e223`,
+  host-validated. **Live run5 confirmed the exit fix** (dh-1 now passes
+  `enforce_baseline_runtime`) and narrowed the remaining failure to the **Windows
+  client** ("WG adapter did not get an IPv4 address within 90s"). Two further root
+  causes found + fixed: (a) `enforce_daemon` patched `--auto-tunnel-enforce true`
+  but `start_daemon` (sc.exe start) no-ops on the already-running daemon, so it
+  stayed `enforce=false` → empty dataplane, no mesh adapter — fixed to stop+start
+  (commit `4393133`); (b) reconcile fail-closes were `eprintln`-only (stderr,
+  discarded by the Windows service) so the reason was invisible — now durably
+  logged (commit `1626215`). **run6 then surfaced the third root cause** via that
+  new log line: `membership reconcile failed: membership role mismatch: local
+  node_role admin requires signed membership capability anchor`. The Windows
+  daemon runs as `node_role admin` (the default when `--node-role` is omitted from
+  its env) but joined membership only as a client, so it fail-closes. **Fix-3
+  (pending):** `run_windows_e2e_bootstrap` (windows_install.rs) computes the
+  node role then discards it (`let _ = role_str;`) instead of passing
+  `--node-role` into the daemon env — wire it through, then re-run. N4 progression:
+  run4 exit-bundle-rejection (fixed) → run5 enforce-no-restart (fixed) → run6
+  node-role-admin-vs-client (fix-3 pending) — each a distinct layer.
+- **Recurring lab-hygiene gap to fix separately:** the orchestrator's
+  `cleanup_hosts` stage does not reset leftover RustyNet artifacts (Linux
+  `inet rustynet_boot` nft table, Windows NRPT/DNS/killswitch rules) before
+  `bootstrap_hosts`, so a fresh run on a dirty node fails its build/bring-up until
+  the node is hand-cleaned (recovery: `sudo nft delete table inet rustynet_boot`
+  on Linux; clear the NRPT catch-all + reset DNS to DHCP on Windows).
 - **Done when:** bidirectional ping/throughput across the mesh with a Windows
   node, with a row appended to `live_lab_run_matrix.csv`.
 
