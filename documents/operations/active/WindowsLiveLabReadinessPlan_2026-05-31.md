@@ -28,13 +28,17 @@ is **GREEN** (`RESTART_EXIT=0`, `completed bootstrap phase=restart-runtime`)
 driven over pinned SSH through `sync-source → build-release →
 install-release → restart-runtime`.
 
-**Update 2026-06-01 — the tunnel has now come up.** `N1.3` passed: the
-first-ever WireGuard tunnel bring-up on `windows-utm-1` succeeded via
-`ops vm-lab-bootstrap-phase --phase tunnel-smoke` (`overall_ok=true`, daemon
-exit 0, clean teardown — `netsh interface show interface` reports no residual
-`rustynet*` adapter). The remaining unproven surface downstream of a bare
-tunnel — killswitch *in anger*, DNS fail-closed, NetNat/role forwarding, and
-multi-node mesh connectivity — is now what N2→N6 close.
+**Update 2026-06-01 — the tunnel comes up AND the killswitch holds.** `N1.3`
+passed: the first-ever WireGuard tunnel bring-up on `windows-utm-1` succeeded via
+`--phase tunnel-smoke` (`overall_ok=true`, clean teardown). `N2` then passed via
+`--phase killswitch-smoke`: the killswitch applies, `assert_killswitch` confirms
+it active (netsh default-block-outbound + WFP tunnel permit), and it rolls back
+cleanly (WFP permit absent→present→absent; firewall restored; SSH never lost) —
+backed by a dead-man's-switch so an unattended run can't brick SSH, and a
+unit-proven fail-closed-on-apply-error path. The remaining unproven surface —
+DNS fail-closed (N3), multi-node mesh + traffic (N4), NetNat/role forwarding
+(N5), and the full matrix (N6) — is what N3→N6 close. IPv6-leak (G8) is still
+open before protected-mode can be called *secure*.
 
 ---
 
@@ -94,22 +98,29 @@ multi-node mesh connectivity — is now what N2→N6 close.
   interface was created, reported by `wg show`, and torn down cleanly on the
   guest via the `tunnel-smoke` phase (`overall_ok=true`). The foundational
   data-plane question is closed; passing *traffic* across a mesh is N4.
-- **G2 — Killswitch has one remaining CIM cmdlet + untested fail-closed
-  (🔴/⚙️).** The per-tunnel allow rule still uses `New-NetFirewallRule`
-  (CIM). It is now mitigated (leak fixed + 20s watchdog) and fails in the
-  safe direction (allow rule absent → traffic stays blocked), but it is not
-  natively reliable, and the protected-mode killswitch has never been
-  exercised on Windows. Need: live exercise + confirm the daemon fails
-  **closed** if killswitch apply fails, and decide on a native WFP rule (E2).
+- **G2 — Killswitch + fail-closed — ✅ proven (2026-06-01).** The per-tunnel
+  allow rule is now a native WFP filter (E2), so the last `New-NetFirewallRule`
+  (CIM) cmdlet is gone from the apply path. The `killswitch-smoke` phase
+  exercised it live on `windows-utm-1`: apply → `assert_killswitch` active
+  (netsh default-block-outbound policy + WFP tunnel permit present) → rollback →
+  assert inactive, with the WFP permit observed absent→present→absent and the
+  firewall restored to `AllowInbound,AllowOutbound` (no residual block; SSH
+  never lost — the egress-allow rule kept it up). Fail-closed-on-apply-error is
+  unit-proven (`killswitch_apply_failure_fails_closed_before_exit_mode`: a failed
+  `apply_firewall_killswitch` drives `block_all_egress`/FailClosed and never
+  commits the tunnel). **E2 go/defer decision: E2 is shipped + live-validated** —
+  no remaining CIM-cmdlet timing concern to defer.
 - **G3 — DNS fail-closed unvalidated on Windows (🔴).** netsh-based DNS
   lockdown exists but has not been exercised live.
 - **G4 — No multi-node mesh with a Windows node (🔴).** The live-lab
   orchestrator/matrix is Linux-first (macOS recently added). `live_mixed_topology`
   currently **skips when no Windows host is in the mix**. Windows is not yet a
   first-class node in an end-to-end run.
-- **G5 — No single-node tunnel smoke harness (🔴).** Tunnel bring-up only
-  happens via a full dataplane generation; there is no minimal "bring up one
-  tunnel and assert it" path for fast iteration.
+- **G5 — Single-node smoke harness — ✅ landed.** `ops vm-lab-bootstrap-phase
+  --phase tunnel-smoke` (N1) and `--phase killswitch-smoke` (N2) provide minimal
+  bring-up-and-assert paths for fast iteration without a full dataplane
+  generation. The killswitch smoke arms a guest-side dead-man's-switch
+  (schtasks firewall-restore) so a wedged apply cannot strand SSH.
 - **G6 — Roles never run on Windows (🔴).** blind_exit / anchor / exit_server
   on a Windows host are untested; an earlier `windows-exit-topology` attempt
   recorded `overall_status: failed`.
@@ -168,7 +179,7 @@ N6 (full matrix) are beyond the first run.
 | Step | Effort | In minimum bar? |
 | ---- | ------ | --------------- |
 | N1 single-node tunnel smoke ✅ | M | **yes** |
-| N2 killswitch + fail-closed | M | **yes** (safety) |
+| N2 killswitch + fail-closed ✅ | M | **yes** (safety) |
 | N3 DNS fail-closed | S–M | before "secure" |
 | N4 two-node mesh w/ Windows | L | **yes** |
 | N5 roles (blind_exit → anchor) | L | no |
@@ -232,14 +243,42 @@ Progress (2026-05-31):
   sibling); regression test
   `windows_helper_invocation_script_preseeds_lastexitcode_under_strictmode`.
 
-### N2 — Killswitch + protected-mode exercise on the single node 🔴 (covers G2)
+### N2 — Killswitch + protected-mode exercise on the single node ✅ (2026-06-01, covers G2)
 With a tunnel up, apply the killswitch and verify default-deny + the tunnel /
 egress allowances behave. Confirm **fail-closed**: if killswitch apply fails,
-the daemon must not serve a protected tunnel. Capture timing of the
-`New-NetFirewallRule` allow rule on a healthy (non-wedged) guest to decide
-whether E2 (native WFP) is required now or can be deferred.
+the daemon must not serve a protected tunnel.
 - **Done when:** killswitch verified active under a live tunnel, fail-closed
   proven, and a go/defer decision recorded for E2.
+
+Progress (2026-06-01) — **N2 PASSED**:
+- A dedicated single-node smoke verb `rustynetd windows-killswitch-smoke`
+  (`crates/rustynetd/src/windows_killswitch_smoke.rs`) + bootstrap phase
+  `killswitch-smoke` + admin-gated harness
+  `scripts/bootstrap/windows/Invoke-RustyNetWindowsKillswitchSmoke.ps1` were
+  built (mirrors the N1 tunnel-smoke). It brings up a self-only tunnel, then
+  drives the real `WindowsCommandSystem`: `apply_firewall_killswitch` →
+  `assert_killswitch` (active) → `rollback_firewall` → assert (inactive),
+  gating the verdict on the WFP tunnel-permit observed **absent → present →
+  absent** plus the netsh default-block-outbound policy asserted active.
+- **Live result on `windows-utm-1`:** `status=pass` / `overall_ok=true`. Post-run
+  the firewall is back to `AllowInbound,AllowOutbound` on all profiles (no
+  residual block), no `rustynet*` adapter remains, and TCP/22 stayed up
+  throughout — the killswitch's egress-allow rule keeps the LAN SSH session
+  alive by design, now verified.
+- **Lockout safety net (covers G9):** the harness arms a guest-side
+  dead-man's-switch (a one-shot SYSTEM `schtasks` task that restores
+  allow-outbound at T+180s) **before** any killswitch is applied, plus a
+  finally-block inline restore and an in-process Rust `Drop` guard. After the
+  clean run the dead-man's-switch task was confirmed deleted (it never had to
+  fire). So an unattended killswitch run can no longer brick SSH.
+- **Fail-closed-on-apply-error** is unit-proven (OS-agnostic reconcile):
+  `killswitch_apply_failure_fails_closed_before_exit_mode` injects an
+  `apply_firewall_killswitch` failure and asserts the generation drops to
+  `FailClosed` via `block_all_egress`, with exit mode never committing.
+- **`--exercise-full-block`** (opt-in) additionally runs `block_all_egress` and
+  asserts the WFP permit is removed (the 295d780 fail-OPEN fix) — deliberately
+  off by default because it cuts the LAN SSH session until rollback; reserved
+  for an explicit operator run behind the dead-man's-switch.
 
 ### N3 — DNS fail-closed validation 🔴 (covers G3)
 Exercise the netsh DNS lockdown under a live tunnel; confirm no plaintext DNS
@@ -280,19 +319,19 @@ role-switch matrix include a Windows node.
   headers for `cc`); those still rely on the guest build for the full compile.
   So the gate covers the FFI crates directly and the rest via the host build
   (against the non-windows stubs) + the guest build.
-- **E2 — Native WFP killswitch (G2) — 🟡 implemented + locally compile-validated,
-  pending guest end-to-end.** `apply_wfp_tunnel_permit` / `remove_wfp_tunnel_permit`
-  in `rustynet-windows-native` replace the last `New-NetFirewallRule` (CIM) allow
-  rule with a native WFP filter keyed on the tunnel interface LUID — no CIM,
-  cannot hang. A persistent max-weight RustyNet sublayer wins arbitration over the
-  netsh default-block-outbound policy; hard-permit filters at ALE_AUTH_CONNECT_V4/V6
-  permit outbound on the tunnel LUID. `phase10.rs` `apply_firewall_killswitch`
-  now calls it (rollback removes it). Validated: `windows-native` **cross-compiles
-  for msvc** (E1); phase10 wiring host-compiles against the stub (identical
-  signature). Remaining: the overnight guest `build-release` for the full
-  rustynetd Windows compile, then N2 exercises it live (fail-closed + the WFP
-  permit actually overriding the block). Decouples E2 from N2's timing question:
-  the cmdlet is simply gone.
+- **E2 — Native WFP killswitch (G2) — ✅ landed + guest-validated + live (2026-06-01).**
+  `apply_wfp_tunnel_permit` / `remove_wfp_tunnel_permit` in `rustynet-windows-native`
+  replace the last `New-NetFirewallRule` (CIM) allow rule with a native WFP filter
+  keyed on the tunnel interface LUID — no CIM, cannot hang. A persistent max-weight
+  RustyNet sublayer wins arbitration over the netsh default-block-outbound policy;
+  hard-permit filters at ALE_AUTH_CONNECT_V4/V6 permit outbound on the tunnel LUID.
+  `phase10.rs` `apply_firewall_killswitch` calls it (rollback removes it). Validated:
+  `windows-native` cross-compiles for msvc (E1); the full `rustynetd` Windows compile
+  succeeded on the guest `build-release`; and **N2's `killswitch-smoke` exercised it
+  live** — `wfp_tunnel_permit_present()` observed absent → present (under the
+  killswitch) → absent (after rollback), with `assert_killswitch` confirming the
+  permit while the netsh default-block-outbound policy was active. The CIM cmdlet is
+  gone from the apply path.
 - **E3 — Gate stage-timing CSV.** Record per-stage wall-clock from the xtask
   gates runner to `documents/operations/gate_timings.csv` (separate, queued).
 

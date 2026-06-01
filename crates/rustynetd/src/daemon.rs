@@ -10375,7 +10375,7 @@ fn detect_default_egress_interface(_tunnel_alias: &str) -> Result<String, String
 }
 
 #[cfg(windows)]
-fn detect_default_egress_interface(tunnel_alias: &str) -> Result<String, String> {
+pub(crate) fn detect_default_egress_interface(tunnel_alias: &str) -> Result<String, String> {
     // Enumerate adapters via the in-process `GetAdaptersAddresses` Win32 API
     // instead of shelling out to `powershell.exe Get-NetRoute`. The PowerShell
     // path was a WMI/CIM query run synchronously with no timeout at the very

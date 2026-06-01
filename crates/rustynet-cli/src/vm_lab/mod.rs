@@ -69,6 +69,7 @@ const WINDOWS_VERIFY_HELPER_FILE: &str = "Verify-RustyNetWindowsBootstrap.ps1";
 const WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE: &str = "Collect-RustyNetWindowsDiagnostics.ps1";
 const WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE: &str = "Smoke-RustyNetWindowsServiceHost.ps1";
 const WINDOWS_TUNNEL_SMOKE_HELPER_FILE: &str = "Invoke-RustyNetWindowsTunnelSmoke.ps1";
+const WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE: &str = "Invoke-RustyNetWindowsKillswitchSmoke.ps1";
 const SETUP_MANIFEST_RELATIVE_PATH: &str = "state/setup_manifest.json";
 const REPORT_STATE_RELATIVE_PATH: &str = "state/report_state.json";
 const RELEASE_GATE_COMPLETENESS_RELATIVE_PATH: &str = "state/release_gate_completeness.json";
@@ -26232,7 +26233,9 @@ TMPDIR={tmpdir} RUSTUP_SKIP_UPDATE_CHECK=yes exec \"$cargo_bin\" build --locked 
                 ));
             }
         }
-        bootstrap::BootstrapPhase::SmokeServiceHost | bootstrap::BootstrapPhase::TunnelSmoke => {
+        bootstrap::BootstrapPhase::SmokeServiceHost
+        | bootstrap::BootstrapPhase::TunnelSmoke
+        | bootstrap::BootstrapPhase::KillswitchSmoke => {
             return Err(format!(
                 "bootstrap phase {} is currently Windows-only: {}",
                 phase.as_str(),
@@ -28038,6 +28041,22 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_phase_registry_accepts_killswitch_smoke_phase() {
+        assert_eq!(
+            super::bootstrap::BootstrapPhase::parse("killswitch-smoke")
+                .expect("killswitch-smoke phase name should parse")
+                .as_str(),
+            "killswitch-smoke"
+        );
+        assert_eq!(
+            super::bootstrap::BootstrapPhase::parse("killswitch_smoke")
+                .expect("underscored killswitch-smoke phase name should normalize")
+                .as_str(),
+            "killswitch-smoke"
+        );
+    }
+
+    #[test]
     fn bootstrap_phase_registry_routes_linux_to_legacy_executor() {
         let (inventory, target) = resolve_platform_remote_target("linux");
         let context = super::bootstrap::BootstrapPhaseContext {
@@ -28156,6 +28175,29 @@ mod tests {
         let err =
             super::bootstrap::execute_bootstrap_phase_for_target("tunnel-smoke", &target, &context)
                 .expect_err("linux targets must reject the Windows tunnel-smoke phase");
+        assert!(err.contains("currently Windows-only"));
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn linux_bootstrap_rejects_killswitch_smoke_phase() {
+        let (inventory, target) = resolve_platform_remote_target("linux");
+        let context = super::bootstrap::BootstrapPhaseContext {
+            ssh_user: target.ssh_user.as_deref(),
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            workdir: "/home/debian/Rustynet",
+            repo_url: None,
+            branch: "main",
+            remote: "origin",
+            timeout: Duration::from_secs(1),
+        };
+        let err = super::bootstrap::execute_bootstrap_phase_for_target(
+            "killswitch-smoke",
+            &target,
+            &context,
+        )
+        .expect_err("linux targets must reject the Windows killswitch-smoke phase");
         assert!(err.contains("currently Windows-only"));
         cleanup_temp_inventory(inventory.as_path());
     }

@@ -17,6 +17,12 @@ pub(super) enum BootstrapPhase {
     /// performs a privileged live tunnel bring-up that requires an operator
     /// checkpoint. Windows-only; other platforms fail closed.
     TunnelSmoke,
+    /// Single-node killswitch + fail-closed exercise (readiness plan N2). Like
+    /// `TunnelSmoke` but additionally drives the killswitch through
+    /// apply/assert/rollback on the live tunnel. Standalone, never part of `All`
+    /// (privileged + checkpoint-gated, can momentarily affect egress). Windows-
+    /// only; other platforms fail closed.
+    KillswitchSmoke,
     All,
 }
 
@@ -30,9 +36,10 @@ impl BootstrapPhase {
             "restart-runtime" => Ok(Self::RestartRuntime),
             "verify-runtime" => Ok(Self::VerifyRuntime),
             "tunnel-smoke" => Ok(Self::TunnelSmoke),
+            "killswitch-smoke" => Ok(Self::KillswitchSmoke),
             "all" => Ok(Self::All),
             other => Err(format!(
-                "unsupported vm-lab bootstrap phase: {other} (expected sync-source|build-release|smoke-service-host|install-release|restart-runtime|verify-runtime|tunnel-smoke|all)"
+                "unsupported vm-lab bootstrap phase: {other} (expected sync-source|build-release|smoke-service-host|install-release|restart-runtime|verify-runtime|tunnel-smoke|killswitch-smoke|all)"
             )),
         }
     }
@@ -46,6 +53,7 @@ impl BootstrapPhase {
             Self::RestartRuntime => "restart-runtime",
             Self::VerifyRuntime => "verify-runtime",
             Self::TunnelSmoke => "tunnel-smoke",
+            Self::KillswitchSmoke => "killswitch-smoke",
             Self::All => "all",
         }
     }
