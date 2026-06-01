@@ -29,7 +29,17 @@ impl OrchestrationStage for EnforceBaselineRuntimeStage {
             .iter()
             .map(|alias| {
                 let r = match ctx.adapters.get(alias.as_str()) {
-                    Some(adapter) => adapter.enforce_runtime(ctx).map_err(|e| e.to_string()),
+                    Some(adapter) => adapter.enforce_runtime(ctx).map_err(|e| {
+                        // The adapter's enforce wait reports only the symptom
+                        // (e.g. "WireGuard adapter did not get an IPv4 address
+                        // within 90s"). Append the daemon's own fail-closed
+                        // reason from its log so the failure digest names the
+                        // cause (e.g. a membership role mismatch). Best-effort.
+                        match adapter.collect_daemon_failure_reason() {
+                            Ok(Some(reason)) => format!("{e} | daemon: {reason}"),
+                            _ => e.to_string(),
+                        }
+                    }),
                     None => Err(format!("no adapter for '{alias}'")),
                 };
                 (alias.clone(), r)

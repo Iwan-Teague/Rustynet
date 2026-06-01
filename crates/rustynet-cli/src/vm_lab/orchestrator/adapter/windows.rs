@@ -180,6 +180,10 @@ impl NodeAdapter for WindowsNodeAdapter {
         windows_traffic::cleanup_runtime_state(&self.conn)
     }
 
+    fn collect_daemon_failure_reason(&self) -> Result<Option<String>, AdapterError> {
+        windows_traffic::collect_daemon_failure_reason(&self.conn)
+    }
+
     fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
         windows_traffic::check_ssh_reachable(&self.conn)
     }

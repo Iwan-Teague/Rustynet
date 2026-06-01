@@ -190,6 +190,20 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     Ok(())
 }
 
+/// Best-effort: the macOS daemon's own fail-closed/startup reason, read from
+/// `<state-root>/logs/rustynetd.log`, so an enforce failure reports the cause
+/// rather than just the downstream symptom.
+pub fn collect_daemon_failure_reason(
+    conn: &NodeConnection,
+) -> Result<Option<String>, AdapterError> {
+    let tail = ssh::run_remote(
+        conn,
+        &format!("sudo -n tail -n 200 '{MACOS_STATE_ROOT}/logs/rustynetd.log' 2>/dev/null || true"),
+        SHORT_TIMEOUT,
+    )?;
+    Ok(crate::vm_lab::orchestrator::adapter::node_adapter::extract_daemon_failure_reason(&tail))
+}
+
 /// Verify SSH connectivity by running a no-op command.
 pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
     ssh::run_remote(conn, "echo reachable", Duration::from_secs(10))?;
