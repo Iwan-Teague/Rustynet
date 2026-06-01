@@ -7082,6 +7082,70 @@ mod tests {
     }
 
     #[test]
+    fn killswitch_apply_failure_fails_closed_before_exit_mode() {
+        // The OS-agnostic guarantee behind the Windows N2 fail-closed criterion:
+        // if the killswitch cannot be applied, the daemon must NOT serve a
+        // protected tunnel. The WindowsCommandSystem's apply_firewall_killswitch
+        // returning Err flows through this same reconcile path, so injecting the
+        // failure on the DryRun system proves the fail-closed wiring for Windows
+        // too (block_all_egress fires, exit mode never commits).
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default().fail_on("apply_firewall_killswitch"),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let err = controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    protected_dns: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect_err("killswitch apply failure must fail closed before exit mode");
+
+        assert!(matches!(err, Phase10Error::System(_)));
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert_eq!(controller.current_exit_mode(), ExitMode::Off);
+        assert_eq!(controller.backend.exit_mode, ExitMode::Off);
+        assert!(
+            controller
+                .system
+                .operations
+                .contains(&"block_all_egress".to_owned()),
+            "killswitch apply failure must drive force_fail_closed/block_all_egress; ops={:?}",
+            controller.system.operations
+        );
+        assert!(
+            !controller
+                .system
+                .operations
+                .contains(&"apply_dns_protection".to_owned()),
+            "DNS protection must not apply after killswitch apply failure; ops={:?}",
+            controller.system.operations
+        );
+        assert!(
+            !controller
+                .system
+                .operations
+                .contains(&"assert_exit_policy:full_tunnel".to_owned()),
+            "exit policy must not commit after killswitch apply failure; ops={:?}",
+            controller.system.operations
+        );
+    }
+
+    #[test]
     fn full_tunnel_exit_policy_failure_rolls_backend_exit_mode_back_to_off() {
         let policy = allow_shared_exit_policy();
         let mut controller = Phase10Controller::new(

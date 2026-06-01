@@ -24,6 +24,7 @@ fn phase_requires_proven_access(phase: BootstrapPhase) -> bool {
             | BootstrapPhase::RestartRuntime
             | BootstrapPhase::VerifyRuntime
             | BootstrapPhase::TunnelSmoke
+            | BootstrapPhase::KillswitchSmoke
     )
 }
 
@@ -235,6 +236,7 @@ fn build_bootstrap_script_invocation(
         | BootstrapPhase::RestartRuntime
         | BootstrapPhase::VerifyRuntime
         | BootstrapPhase::TunnelSmoke
+        | BootstrapPhase::KillswitchSmoke
         | BootstrapPhase::All => {
             return Err(format!(
                 "bootstrap script invocation is not used for Windows phase {} on {}",
@@ -293,6 +295,25 @@ fn build_windows_tunnel_smoke_invocation(
     WindowsHelperScriptSpec {
         helper_file_name: WINDOWS_TUNNEL_SMOKE_HELPER_FILE,
         remote_file_name: WINDOWS_TUNNEL_SMOKE_HELPER_FILE,
+        args: vec![
+            "-RustyNetRoot".to_owned(),
+            context.workdir.to_owned(),
+            "-StateRoot".to_owned(),
+            WINDOWS_STATE_ROOT.to_owned(),
+        ],
+    }
+}
+
+fn build_windows_killswitch_smoke_invocation(
+    context: &BootstrapPhaseContext<'_>,
+) -> WindowsHelperScriptSpec {
+    // The standard phase run exercises apply/assert/rollback only (SSH-safe via
+    // the killswitch's egress-allow rule). The full fail-closed block
+    // (`-ExerciseFullBlock`) is deliberately NOT requested here; it cuts a LAN
+    // SSH session until rollback and is reserved for an explicit operator run.
+    WindowsHelperScriptSpec {
+        helper_file_name: WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE,
+        remote_file_name: WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE,
         args: vec![
             "-RustyNetRoot".to_owned(),
             context.workdir.to_owned(),
@@ -730,6 +751,79 @@ fn parse_windows_tunnel_smoke_output(output: &str, target_label: &str) -> Result
         .unwrap_or_else(|| "unknown".to_owned());
     Err(format!(
         "Windows tunnel smoke helper reported status={status} overall_ok={overall_ok} reason={reason} failure_step={failure_step} daemon_exit_code={exit_code} started={started} interface_present={interface_present} wg_show_ok={wg_show_ok} torn_down={torn_down} for {target_label}"
+    ))
+}
+
+/// Parse the JSON envelope emitted by `Invoke-RustyNetWindowsKillswitchSmoke.ps1`.
+///
+/// The helper runs `rustynetd windows-killswitch-smoke` on the guest, captures
+/// the daemon's own killswitch-smoke report, and wraps it in a fixed envelope
+/// that surfaces `status` (`pass`/`fail`) and the daemon's `overall_ok` verdict
+/// at the top level. A smoke passes only when the wrapper reports `status=pass`
+/// **and** the daemon reported `overall_ok=true`; any other shape is a
+/// fail-closed error that preserves the daemon's per-stage flags for triage.
+fn parse_windows_killswitch_smoke_output(output: &str, target_label: &str) -> Result<(), String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "Windows killswitch smoke helper produced no output for {target_label}"
+        ));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+        format!("Windows killswitch smoke helper did not emit valid JSON for {target_label}: {err}")
+    })?;
+    let status = parsed
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("fail");
+    let reason = parsed
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let failure_step = parsed
+        .get("failure_step")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let overall_ok = parsed
+        .get("overall_ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let daemon_exit_code = parsed
+        .get("daemon_exit_code")
+        .and_then(serde_json::Value::as_i64);
+    // Surface the daemon's per-stage flags (when present) so a failed smoke names
+    // exactly which control step regressed instead of a bare overall_ok=false.
+    let report = parsed.get("killswitch_report");
+    let report_flag = |key: &str| -> &'static str {
+        match report
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unknown",
+        }
+    };
+    let permit_absent_before = report_flag("permit_absent_before");
+    let applied = report_flag("killswitch_applied");
+    let asserted_active = report_flag("asserted_active");
+    let permit_present = report_flag("permit_present_under_killswitch");
+    let rolled_back = report_flag("rolled_back");
+    let asserted_inactive = report_flag("asserted_inactive_after_rollback");
+    let permit_absent_after = report_flag("permit_absent_after_rollback");
+    let full_block_exercised = report_flag("full_block_exercised");
+    let full_block_permit_removed = report_flag("full_block_permit_removed");
+    let torn_down = report_flag("tunnel_torn_down");
+
+    if status == "pass" && overall_ok {
+        return Ok(());
+    }
+
+    let exit_code = daemon_exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    Err(format!(
+        "Windows killswitch smoke helper reported status={status} overall_ok={overall_ok} reason={reason} failure_step={failure_step} daemon_exit_code={exit_code} permit_absent_before={permit_absent_before} killswitch_applied={applied} asserted_active={asserted_active} permit_present_under_killswitch={permit_present} rolled_back={rolled_back} asserted_inactive_after_rollback={asserted_inactive} permit_absent_after_rollback={permit_absent_after} full_block_exercised={full_block_exercised} full_block_permit_removed={full_block_permit_removed} tunnel_torn_down={torn_down} for {target_label}"
     ))
 }
 
@@ -2146,6 +2240,21 @@ impl WindowsBootstrapProvider {
                 )?;
                 parse_windows_tunnel_smoke_output(output.as_str(), target.label.as_str())
             }
+            BootstrapPhase::KillswitchSmoke => {
+                // Privileged single-node killswitch exercise on the live tunnel.
+                // Access is already proven (phase_requires_proven_access), so this
+                // runs over the pinned-SSH capture path. The helper arms a
+                // dead-man's-switch around the killswitch so a wedged apply cannot
+                // strand SSH on the guest.
+                let invocation = build_windows_killswitch_smoke_invocation(context);
+                let output = self.capture_helper_output(
+                    target,
+                    context,
+                    invocation,
+                    "Windows killswitch smoke helper",
+                )?;
+                parse_windows_killswitch_smoke_output(output.as_str(), target.label.as_str())
+            }
             BootstrapPhase::All => {
                 for subphase in [
                     BootstrapPhase::SyncSource,
@@ -2398,6 +2507,119 @@ mod tests {
         assert!(helper.contains("rustynetd.exe"));
         // Defense-in-depth: the canonical state root is enforced.
         assert!(helper.contains(r"state root must be C:\ProgramData\RustyNet"));
+    }
+
+    #[test]
+    fn windows_killswitch_smoke_invocation_uses_canonical_helper_and_runtime_roots() {
+        let invocation = build_windows_killswitch_smoke_invocation(&sample_context(None));
+        assert_eq!(
+            invocation.helper_file_name,
+            WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE
+        );
+        assert_eq!(
+            invocation.remote_file_name,
+            WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE
+        );
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-RustyNetRoot",
+                r"C:\Rustynet",
+                "-StateRoot",
+                WINDOWS_STATE_ROOT,
+            ]
+        );
+        // The standard phase run must NOT request the SSH-cutting full block.
+        assert!(
+            !invocation
+                .args
+                .iter()
+                .any(|arg| arg == "-ExerciseFullBlock")
+        );
+    }
+
+    #[test]
+    fn windows_killswitch_smoke_parser_accepts_pass() {
+        parse_windows_killswitch_smoke_output(
+            r#"{
+                "status": "pass",
+                "overall_ok": true,
+                "daemon_exit_code": 0,
+                "killswitch_report": {
+                    "tunnel_name": "rustynet0",
+                    "tunnel_started": true,
+                    "permit_absent_before": true,
+                    "killswitch_applied": true,
+                    "asserted_active": true,
+                    "permit_present_under_killswitch": true,
+                    "rolled_back": true,
+                    "asserted_inactive_after_rollback": true,
+                    "permit_absent_after_rollback": true,
+                    "full_block_exercised": false,
+                    "tunnel_torn_down": true,
+                    "overall_ok": true
+                }
+            }"#,
+            "windows-utm-1",
+        )
+        .expect("a clean pass envelope must parse as success");
+    }
+
+    #[test]
+    fn windows_killswitch_smoke_parser_rejects_overall_ok_false() {
+        let err = parse_windows_killswitch_smoke_output(
+            r#"{
+                "status": "fail",
+                "overall_ok": false,
+                "reason": "killswitch did not apply/rollback cleanly (overall_ok=False, exit=1)",
+                "daemon_exit_code": 1,
+                "failure_step": "run-daemon",
+                "killswitch_report": {
+                    "permit_absent_before": true,
+                    "killswitch_applied": true,
+                    "asserted_active": false,
+                    "permit_present_under_killswitch": true,
+                    "rolled_back": true,
+                    "permit_absent_after_rollback": true,
+                    "tunnel_torn_down": true,
+                    "overall_ok": false
+                }
+            }"#,
+            "windows-utm-1",
+        )
+        .expect_err("overall_ok=false must fail closed");
+        assert!(err.contains("status=fail"));
+        assert!(err.contains("overall_ok=false"));
+        assert!(err.contains("asserted_active=false"));
+        assert!(err.contains("daemon_exit_code=1"));
+    }
+
+    #[test]
+    fn windows_killswitch_smoke_parser_rejects_empty_output() {
+        let err = parse_windows_killswitch_smoke_output("   ", "windows-utm-1")
+            .expect_err("empty output must fail closed");
+        assert!(err.contains("produced no output"));
+    }
+
+    #[test]
+    fn windows_killswitch_smoke_helper_arms_deadman_and_runs_the_subcommand() {
+        let helper = include_str!(
+            "../../../../../scripts/bootstrap/windows/Invoke-RustyNetWindowsKillswitchSmoke.ps1"
+        );
+        // Privileged exercise must be admin-gated and fail closed off the happy path.
+        assert!(helper.contains("WindowsBuiltInRole]::Administrator"));
+        assert!(helper.contains("trap {"));
+        // It must invoke the daemon killswitch-smoke subcommand and gate on overall_ok.
+        assert!(helper.contains("windows-killswitch-smoke"));
+        assert!(helper.contains("overall_ok"));
+        assert!(helper.contains("rustynetd.exe"));
+        // Defense-in-depth: the canonical state root is enforced.
+        assert!(helper.contains(r"state root must be C:\ProgramData\RustyNet"));
+        // The lockout safety net: a scheduled dead-man's-switch must be armed
+        // before any killswitch is applied, and outbound restored on every path.
+        assert!(helper.contains("schtasks.exe"));
+        assert!(helper.contains("Register-FirewallDeadMan"));
+        assert!(helper.contains("allowinbound,allowoutbound"));
     }
 
     #[test]

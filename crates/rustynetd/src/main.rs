@@ -193,6 +193,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "windows-tunnel-smoke" => {
                 run_windows_tunnel_smoke_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "windows-killswitch-smoke" => {
+                run_windows_killswitch_smoke_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "linux-runtime-acls-check" => {
                 run_linux_runtime_acls_check_command(rest)
             }
@@ -497,6 +500,80 @@ fn run_windows_tunnel_smoke_command(args: &[String]) -> Result<(), String> {
         if !report.overall_ok {
             return Err(
                 "windows-tunnel-smoke reported the tunnel did not come up cleanly".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn run_windows_killswitch_smoke_command(args: &[String]) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        Err("windows-killswitch-smoke is only available on Windows hosts".to_owned())
+    }
+
+    #[cfg(windows)]
+    {
+        use rustynetd::windows_killswitch_smoke::{
+            WindowsKillswitchSmokeOptions, run_windows_killswitch_smoke,
+        };
+
+        let mut options = WindowsKillswitchSmokeOptions::default();
+        let mut index = 0usize;
+        while index < args.len() {
+            match args.get(index).map(String::as_str) {
+                Some("--tunnel-name") => {
+                    options.tunnel_name = args
+                        .get(index + 1)
+                        .ok_or_else(|| "--tunnel-name requires a value".to_string())?
+                        .clone();
+                    index += 2;
+                }
+                Some("--address") => {
+                    options.address = args
+                        .get(index + 1)
+                        .ok_or_else(|| "--address requires a value".to_string())?
+                        .clone();
+                    index += 2;
+                }
+                Some("--mesh-cidr") => {
+                    options.mesh_cidr = args
+                        .get(index + 1)
+                        .ok_or_else(|| "--mesh-cidr requires a value".to_string())?
+                        .clone();
+                    index += 2;
+                }
+                Some("--listen-port") => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| "--listen-port requires a value".to_string())?;
+                    options.listen_port = value
+                        .parse::<u16>()
+                        .map_err(|err| format!("--listen-port must be a valid port: {err}"))?;
+                    index += 2;
+                }
+                Some("--exercise-full-block") => {
+                    options.exercise_full_block = true;
+                    index += 1;
+                }
+                Some(flag) => {
+                    return Err(format!("unknown windows-killswitch-smoke argument: {flag}"));
+                }
+                None => break,
+            }
+        }
+
+        let report = run_windows_killswitch_smoke(&options)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|err| format!("serialize killswitch-smoke report failed: {err}"))?
+        );
+        if !report.overall_ok {
+            return Err(
+                "windows-killswitch-smoke reported the killswitch did not apply/rollback cleanly"
+                    .to_owned(),
             );
         }
         Ok(())
@@ -3400,6 +3477,7 @@ fn help_text() -> String {
         "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--capabilities <csv>] [--snapshot <path>] [--log <path>]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
         "  rustynetd windows-tunnel-smoke [--tunnel-name <name>] [--address <cidr>] [--mesh-cidr <cidr>] [--listen-port <port>] [--keep]",
+        "  rustynetd windows-killswitch-smoke [--tunnel-name <name>] [--address <cidr>] [--mesh-cidr <cidr>] [--listen-port <port>] [--exercise-full-block]",
         "  rustynetd windows-runtime-acls-check [--no-fail-on-drift]",
         "  rustynetd windows-named-pipe-acls-check [--service-sid <sid>] [--no-fail-on-drift]",
         "  rustynetd windows-registry-acls-check [--no-fail-on-drift]",

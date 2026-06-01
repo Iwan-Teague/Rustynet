@@ -61,6 +61,7 @@ pub mod windows_dns_failclosed;
 pub mod windows_exit_nat_lifecycle;
 pub mod windows_ipc;
 pub mod windows_key_custody;
+pub mod windows_killswitch_smoke;
 pub mod windows_mesh_status;
 pub mod windows_paths;
 pub mod windows_registry_acls;
