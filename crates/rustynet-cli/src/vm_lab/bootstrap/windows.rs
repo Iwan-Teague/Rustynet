@@ -26,6 +26,7 @@ fn phase_requires_proven_access(phase: BootstrapPhase) -> bool {
             | BootstrapPhase::TunnelSmoke
             | BootstrapPhase::KillswitchSmoke
             | BootstrapPhase::DnsSmoke
+            | BootstrapPhase::Ipv6Smoke
     )
 }
 
@@ -239,6 +240,7 @@ fn build_bootstrap_script_invocation(
         | BootstrapPhase::TunnelSmoke
         | BootstrapPhase::KillswitchSmoke
         | BootstrapPhase::DnsSmoke
+        | BootstrapPhase::Ipv6Smoke
         | BootstrapPhase::All => {
             return Err(format!(
                 "bootstrap script invocation is not used for Windows phase {} on {}",
@@ -341,6 +343,26 @@ fn build_windows_dns_smoke_invocation(
             "-StateRoot".to_owned(),
             WINDOWS_STATE_ROOT.to_owned(),
             "-ExerciseDns".to_owned(),
+        ],
+    }
+}
+
+fn build_windows_ipv6_smoke_invocation(
+    context: &BootstrapPhaseContext<'_>,
+) -> WindowsHelperScriptSpec {
+    // G8 reuses the killswitch smoke harness with its IPv6 leg enabled: while the
+    // killswitch is active, confirm IPv6 egress leaks, apply the IPv6 LAN block,
+    // confirm it is blocked, then roll back. SSH-safe — the IPv6 block is
+    // LAN-IPv6 only (SSH is IPv4) and the full fail-closed block is not requested.
+    WindowsHelperScriptSpec {
+        helper_file_name: WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE,
+        remote_file_name: WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE,
+        args: vec![
+            "-RustyNetRoot".to_owned(),
+            context.workdir.to_owned(),
+            "-StateRoot".to_owned(),
+            WINDOWS_STATE_ROOT.to_owned(),
+            "-ExerciseIpv6".to_owned(),
         ],
     }
 }
@@ -840,6 +862,12 @@ fn parse_windows_killswitch_smoke_output(output: &str, target_label: &str) -> Re
     let dns_asserted_active = report_flag("dns_protection_asserted_active");
     let dns_rolled_back = report_flag("dns_protection_rolled_back");
     let dns_asserted_inactive = report_flag("dns_protection_asserted_inactive");
+    let ipv6_exercised = report_flag("ipv6_protection_exercised");
+    let ipv6_baseline_egress_ok = report_flag("ipv6_baseline_egress_ok");
+    let ipv6_control_applied = report_flag("ipv6_control_applied");
+    let ipv6_egress_blocked = report_flag("ipv6_egress_blocked");
+    let ipv6_control_rolled_back = report_flag("ipv6_control_rolled_back");
+    let ipv6_egress_restored = report_flag("ipv6_egress_restored");
     let torn_down = report_flag("tunnel_torn_down");
 
     if status == "pass" && overall_ok {
@@ -850,7 +878,7 @@ fn parse_windows_killswitch_smoke_output(output: &str, target_label: &str) -> Re
         .map(|code| code.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     Err(format!(
-        "Windows killswitch smoke helper reported status={status} overall_ok={overall_ok} reason={reason} failure_step={failure_step} daemon_exit_code={exit_code} permit_absent_before={permit_absent_before} killswitch_applied={applied} asserted_active={asserted_active} permit_present_under_killswitch={permit_present} rolled_back={rolled_back} asserted_inactive_after_rollback={asserted_inactive} permit_absent_after_rollback={permit_absent_after} full_block_exercised={full_block_exercised} full_block_permit_removed={full_block_permit_removed} dns_protection_exercised={dns_exercised} dns_protection_applied={dns_applied} dns_protection_asserted_active={dns_asserted_active} dns_protection_rolled_back={dns_rolled_back} dns_protection_asserted_inactive={dns_asserted_inactive} tunnel_torn_down={torn_down} for {target_label}"
+        "Windows killswitch smoke helper reported status={status} overall_ok={overall_ok} reason={reason} failure_step={failure_step} daemon_exit_code={exit_code} permit_absent_before={permit_absent_before} killswitch_applied={applied} asserted_active={asserted_active} permit_present_under_killswitch={permit_present} rolled_back={rolled_back} asserted_inactive_after_rollback={asserted_inactive} permit_absent_after_rollback={permit_absent_after} full_block_exercised={full_block_exercised} full_block_permit_removed={full_block_permit_removed} dns_protection_exercised={dns_exercised} dns_protection_applied={dns_applied} dns_protection_asserted_active={dns_asserted_active} dns_protection_rolled_back={dns_rolled_back} dns_protection_asserted_inactive={dns_asserted_inactive} ipv6_protection_exercised={ipv6_exercised} ipv6_baseline_egress_ok={ipv6_baseline_egress_ok} ipv6_control_applied={ipv6_control_applied} ipv6_egress_blocked={ipv6_egress_blocked} ipv6_control_rolled_back={ipv6_control_rolled_back} ipv6_egress_restored={ipv6_egress_restored} tunnel_torn_down={torn_down} for {target_label}"
     ))
 }
 
@@ -2296,6 +2324,20 @@ impl WindowsBootstrapProvider {
                 )?;
                 parse_windows_killswitch_smoke_output(output.as_str(), target.label.as_str())
             }
+            BootstrapPhase::Ipv6Smoke => {
+                // G8 IPv6 fail-closed in protected mode: the killswitch smoke with
+                // its IPv6 leg enabled. Same pinned-SSH capture + dead-man's-switch
+                // + envelope/parser as the killswitch smoke (the verdict gates on
+                // overall_ok, which includes the IPv6 signals).
+                let invocation = build_windows_ipv6_smoke_invocation(context);
+                let output = self.capture_helper_output(
+                    target,
+                    context,
+                    invocation,
+                    "Windows IPv6 smoke helper",
+                )?;
+                parse_windows_killswitch_smoke_output(output.as_str(), target.label.as_str())
+            }
             BootstrapPhase::All => {
                 for subphase in [
                     BootstrapPhase::SyncSource,
@@ -2664,6 +2706,55 @@ mod tests {
         // N3: the harness forwards the DNS leg when requested.
         assert!(helper.contains("ExerciseDns"));
         assert!(helper.contains("--exercise-dns"));
+        // G8: the harness forwards the IPv6 leg when requested.
+        assert!(helper.contains("ExerciseIpv6"));
+        assert!(helper.contains("--exercise-ipv6"));
+    }
+
+    #[test]
+    fn windows_ipv6_smoke_invocation_reuses_killswitch_helper_with_exercise_ipv6() {
+        let invocation = build_windows_ipv6_smoke_invocation(&sample_context(None));
+        // G8 reuses the killswitch smoke helper, adding only the IPv6 leg.
+        assert_eq!(
+            invocation.helper_file_name,
+            WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE
+        );
+        assert!(invocation.args.iter().any(|arg| arg == "-ExerciseIpv6"));
+        // It must NOT request the SSH-cutting full block.
+        assert!(
+            !invocation
+                .args
+                .iter()
+                .any(|arg| arg == "-ExerciseFullBlock")
+        );
+    }
+
+    #[test]
+    fn windows_killswitch_smoke_parser_surfaces_ipv6_flags_on_failure() {
+        let err = parse_windows_killswitch_smoke_output(
+            r#"{
+                "status": "fail",
+                "overall_ok": false,
+                "reason": "killswitch did not apply/rollback cleanly (overall_ok=False, exit=1)",
+                "daemon_exit_code": 1,
+                "killswitch_report": {
+                    "killswitch_applied": true,
+                    "asserted_active": true,
+                    "rolled_back": true,
+                    "ipv6_protection_exercised": true,
+                    "ipv6_baseline_egress_ok": true,
+                    "ipv6_control_applied": true,
+                    "ipv6_egress_blocked": false,
+                    "ipv6_control_rolled_back": true,
+                    "ipv6_egress_restored": true,
+                    "overall_ok": false
+                }
+            }"#,
+            "windows-utm-1",
+        )
+        .expect_err("an IPv6-leg failure must fail closed");
+        assert!(err.contains("ipv6_protection_exercised=true"));
+        assert!(err.contains("ipv6_egress_blocked=false"));
     }
 
     #[test]

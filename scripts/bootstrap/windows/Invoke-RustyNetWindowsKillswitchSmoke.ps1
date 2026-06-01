@@ -3,6 +3,7 @@ param(
     [string]$StateRoot = 'C:\ProgramData\RustyNet',
     [switch]$ExerciseFullBlock,
     [switch]$ExerciseDns,
+    [switch]$ExerciseIpv6,
     [int]$TimeoutSeconds = 90,
     [int]$DeadManSeconds = 180,
     [string]$OutputPath = ''
@@ -147,6 +148,7 @@ $daemonArgs = [System.Collections.Generic.List[string]]::new()
 $daemonArgs.Add('windows-killswitch-smoke')
 if ($ExerciseFullBlock.IsPresent) { $daemonArgs.Add('--exercise-full-block') }
 if ($ExerciseDns.IsPresent) { $daemonArgs.Add('--exercise-dns') }
+if ($ExerciseIpv6.IsPresent) { $daemonArgs.Add('--exercise-ipv6') }
 
 # Arm the dead-man's-switch BEFORE any killswitch can be applied.
 $script:SmokeFailureStep = 'arm-deadman'

@@ -38,6 +38,14 @@ pub struct WindowsKillswitchSmokeOptions {
     /// protected mode, overriding the killswitch's egress-allow for DNS. Port-53
     /// only, so it does not affect the (port-22) SSH session. Off by default.
     pub exercise_dns: bool,
+    /// Opt-in (readiness plan G8): while the killswitch is active, also exercise
+    /// IPv6 fail-closed. First probes that IPv6 egress LEAKS under the bare
+    /// killswitch (the unscoped egress-LAN allow re-permits IPv6 + the tunnel is
+    /// IPv4-only), then `hard_disable_ipv6_egress` (now incl. the IPv6 LAN Block
+    /// rule) → re-probe blocked → `rollback_ipv6_egress` → re-probe restored. The
+    /// IPv6 block is LAN-IPv6 only, so the (IPv4) SSH session is unaffected. Off
+    /// by default; requires guest IPv6 internet to be conclusive.
+    pub exercise_ipv6: bool,
 }
 
 impl Default for WindowsKillswitchSmokeOptions {
@@ -49,6 +57,7 @@ impl Default for WindowsKillswitchSmokeOptions {
             listen_port: 51820,
             exercise_full_block: false,
             exercise_dns: false,
+            exercise_ipv6: false,
         }
     }
 }
@@ -86,6 +95,18 @@ pub struct WindowsKillswitchSmokeSignals {
     pub dns_protection_rolled_back: bool,
     /// After DNS rollback `assert_dns_protection` reports inactive (expected Err).
     pub dns_protection_asserted_inactive: bool,
+    /// Whether the G8 IPv6 fail-closed control was exercised this run.
+    pub ipv6_protection_exercised: bool,
+    /// Baseline: IPv6 egress to an off-LAN target reachable under the BARE
+    /// killswitch (before the IPv6 block) — demonstrates the leak + that the
+    /// guest has IPv6 internet (so the test is conclusive).
+    pub ipv6_baseline_egress_ok: bool,
+    pub ipv6_control_applied: bool,
+    /// Under the IPv6 block, the same IPv6 egress is now blocked (the fix).
+    pub ipv6_egress_blocked: bool,
+    pub ipv6_control_rolled_back: bool,
+    /// After rollback, IPv6 egress is reachable again.
+    pub ipv6_egress_restored: bool,
     pub tunnel_torn_down: bool,
 }
 
@@ -110,6 +131,12 @@ pub struct WindowsKillswitchSmokeReport {
     pub dns_protection_asserted_active: bool,
     pub dns_protection_rolled_back: bool,
     pub dns_protection_asserted_inactive: bool,
+    pub ipv6_protection_exercised: bool,
+    pub ipv6_baseline_egress_ok: bool,
+    pub ipv6_control_applied: bool,
+    pub ipv6_egress_blocked: bool,
+    pub ipv6_control_rolled_back: bool,
+    pub ipv6_egress_restored: bool,
     pub tunnel_torn_down: bool,
     pub overall_ok: bool,
 }
@@ -150,6 +177,20 @@ impl WindowsKillswitchSmokeReport {
         } else {
             true
         };
+        // ipv6_ok requires the baseline probe to succeed (proves the guest has
+        // IPv6 internet + the leak exists under the bare killswitch) AND the
+        // block to take (egress_blocked) AND clean rollback/restore. A guest with
+        // no IPv6 internet makes the baseline fail → ipv6_ok=false rather than a
+        // false pass; the report's ipv6_baseline_egress_ok flag explains why.
+        let ipv6_ok = if signals.ipv6_protection_exercised {
+            signals.ipv6_baseline_egress_ok
+                && signals.ipv6_control_applied
+                && signals.ipv6_egress_blocked
+                && signals.ipv6_control_rolled_back
+                && signals.ipv6_egress_restored
+        } else {
+            true
+        };
         Self {
             tunnel_name: options.tunnel_name.clone(),
             tunnel_started: signals.tunnel_started,
@@ -169,8 +210,14 @@ impl WindowsKillswitchSmokeReport {
             dns_protection_asserted_active: signals.dns_protection_asserted_active,
             dns_protection_rolled_back: signals.dns_protection_rolled_back,
             dns_protection_asserted_inactive: signals.dns_protection_asserted_inactive,
+            ipv6_protection_exercised: signals.ipv6_protection_exercised,
+            ipv6_baseline_egress_ok: signals.ipv6_baseline_egress_ok,
+            ipv6_control_applied: signals.ipv6_control_applied,
+            ipv6_egress_blocked: signals.ipv6_egress_blocked,
+            ipv6_control_rolled_back: signals.ipv6_control_rolled_back,
+            ipv6_egress_restored: signals.ipv6_egress_restored,
             tunnel_torn_down: signals.tunnel_torn_down,
-            overall_ok: core_ok && full_block_ok && dns_ok,
+            overall_ok: core_ok && full_block_ok && dns_ok && ipv6_ok,
         }
     }
 }
@@ -318,6 +365,32 @@ fn run_killswitch_sequence(
         signals.dns_protection_asserted_inactive = system.assert_dns_protection().is_err();
     }
 
+    // G8 — IPv6 fail-closed in protected mode: while the killswitch is active,
+    // (1) confirm IPv6 egress to an off-LAN target LEAKS under the bare killswitch
+    // (the unscoped egress-LAN allow re-permits IPv6 and the tunnel is IPv4-only),
+    // (2) hard_disable_ipv6_egress (now incl. the IPv6 LAN Block rule) and confirm
+    // the same egress is now blocked, (3) rollback and confirm it is restored.
+    // The probe is a bounded TCP connect to a public IPv6; the IPv6 block is
+    // LAN-IPv6 only, so the (IPv4) SSH session is unaffected throughout.
+    if options.exercise_ipv6 {
+        signals.ipv6_protection_exercised = true;
+        signals.ipv6_baseline_egress_ok = ipv6_egress_reachable();
+        // On ANY apply failure, attempt rollback before propagating: a partial
+        // apply (router-discovery disabled but the block rule failed) must not
+        // leave router-discovery disabled on the egress NIC.
+        if let Err(err) = system.hard_disable_ipv6_egress() {
+            let _ = system.rollback_ipv6_egress();
+            return Err(format!("hard_disable_ipv6_egress failed: {err:?}"));
+        }
+        signals.ipv6_control_applied = true;
+        signals.ipv6_egress_blocked = !ipv6_egress_reachable();
+        system
+            .rollback_ipv6_egress()
+            .map_err(|err| format!("rollback_ipv6_egress failed: {err:?}"))?;
+        signals.ipv6_control_rolled_back = true;
+        signals.ipv6_egress_restored = ipv6_egress_reachable();
+    }
+
     system
         .rollback_firewall()
         .map_err(|err| format!("rollback_firewall failed: {err:?}"))?;
@@ -346,6 +419,24 @@ fn run_killswitch_sequence(
 fn wfp_tunnel_permit_present() -> Result<bool, String> {
     rustynet_windows_native::wfp_tunnel_permit_present()
         .map_err(|err| format!("WFP tunnel-permit presence check failed: {err}"))
+}
+
+/// Best-effort IPv6 egress reachability probe: a bounded TCP connect to a public
+/// IPv6 address (Cloudflare DNS, `2606:4700:4700::1111`) off the local LAN.
+/// Returns `true` when the connect succeeds (IPv6 egress reachable) and `false`
+/// when it is blocked / unreachable / times out. The target is off-LAN so it
+/// must route via the IPv6 default gateway on the underlay — exactly the egress
+/// path the killswitch must fail closed. Used to demonstrate the leak (baseline,
+/// before the block) and that the IPv6 LAN block closes it.
+#[cfg(windows)]
+fn ipv6_egress_reachable() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let target: SocketAddr = "[2606:4700:4700::1111]:443"
+        .parse()
+        .expect("static Cloudflare IPv6 socket address parses");
+    TcpStream::connect_timeout(&target, Duration::from_secs(3)).is_ok()
 }
 
 /// Restores the default allow-outbound firewall policy + removes the WFP tunnel
@@ -435,6 +526,61 @@ mod tests {
     fn fails_when_assert_did_not_report_active() {
         let mut signals = all_core_true();
         signals.asserted_active = false;
+        let report = WindowsKillswitchSmokeReport::from_signals(
+            &WindowsKillswitchSmokeOptions::default(),
+            &signals,
+        );
+        assert!(!report.overall_ok);
+    }
+
+    #[test]
+    fn ipv6_run_passes_when_leak_then_blocked_then_restored() {
+        let mut signals = all_core_true();
+        signals.ipv6_protection_exercised = true;
+        signals.ipv6_baseline_egress_ok = true; // leaked under the bare killswitch
+        signals.ipv6_control_applied = true;
+        signals.ipv6_egress_blocked = true; // block closed the leak
+        signals.ipv6_control_rolled_back = true;
+        signals.ipv6_egress_restored = true;
+        let report = WindowsKillswitchSmokeReport::from_signals(
+            &WindowsKillswitchSmokeOptions::default(),
+            &signals,
+        );
+        assert!(report.overall_ok);
+        assert!(report.ipv6_protection_exercised);
+    }
+
+    #[test]
+    fn ipv6_run_fails_when_egress_not_blocked() {
+        // The IPv6 block did NOT close the leak = still leaking = fail.
+        let mut signals = all_core_true();
+        signals.ipv6_protection_exercised = true;
+        signals.ipv6_baseline_egress_ok = true;
+        signals.ipv6_control_applied = true;
+        signals.ipv6_egress_blocked = false;
+        signals.ipv6_control_rolled_back = true;
+        signals.ipv6_egress_restored = true;
+        let report = WindowsKillswitchSmokeReport::from_signals(
+            &WindowsKillswitchSmokeOptions::default(),
+            &signals,
+        );
+        assert!(
+            !report.overall_ok,
+            "IPv6 egress still reachable under the block is an unclosed leak and must fail"
+        );
+    }
+
+    #[test]
+    fn ipv6_run_fails_when_baseline_inconclusive() {
+        // No baseline IPv6 egress (e.g. no IPv6 internet) = inconclusive; must not
+        // falsely pass even though the block "succeeded".
+        let mut signals = all_core_true();
+        signals.ipv6_protection_exercised = true;
+        signals.ipv6_baseline_egress_ok = false;
+        signals.ipv6_control_applied = true;
+        signals.ipv6_egress_blocked = true;
+        signals.ipv6_control_rolled_back = true;
+        signals.ipv6_egress_restored = false;
         let report = WindowsKillswitchSmokeReport::from_signals(
             &WindowsKillswitchSmokeOptions::default(),
             &signals,

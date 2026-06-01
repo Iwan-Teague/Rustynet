@@ -39,8 +39,11 @@ unit-proven fail-closed-on-apply-error path. `N3` then passed via `--phase
 dns-smoke`: with the killswitch active, the netsh port-53 LAN-block applies,
 asserts, and rolls back (no plaintext-DNS leak in protected mode). The remaining
 unproven surface — multi-node mesh + traffic (N4), NetNat/role forwarding (N5),
-and the full matrix (N6) — is what N4→N6 close. IPv6-leak (G8) is still open
-before protected-mode can be called *secure*.
+and the full matrix (N6) — is what N4→N6 close. IPv6-leak (G8) is now
+**mechanism-validated live** (the netsh IPv6 block applies / blocks / rolls back
+under the killswitch; a `::/0`→all-IPv6-range netsh fix landed); its end-to-end
+*leak*-proof is deferred until the lab has a global IPv6 (the guest LAN currently
+provides none).
 
 ---
 
@@ -123,10 +126,30 @@ before protected-mode can be called *secure*.
   up. The opt-in loopback-resolver/NRPT enforcement remains a deferred, stronger
   control (a separate design decision); the firewall block is the baseline parity
   control with Linux/macOS.
-- **G4 — No multi-node mesh with a Windows node (🔴).** The live-lab
-  orchestrator/matrix is Linux-first (macOS recently added). `live_mixed_topology`
-  currently **skips when no Windows host is in the mix**. Windows is not yet a
-  first-class node in an end-to-end run.
+- **G4 — Multi-node mesh with a Windows node: code-wired, never run (🟡, was 🔴).**
+  Recon (2026-06-01) corrects the earlier "not a first-class node" read. The
+  **Rust-native** orchestrator (`--node <alias>:<role>` →
+  `execute_rust_native_orchestration`) builds a real `WindowsNodeAdapter`
+  (`vm_lab/orchestrator/adapter/windows.rs`) and runs every node through the same
+  17-stage `PlanBuilder` pipeline — membership init/distribute, assignment /
+  traversal / DNS-zone distribution, runtime enforce+validate, the real
+  **`TrafficTestMatrixStage`** (`ping_mesh_peer` / `probe_denied_peer`),
+  role-switch, exit-handoff. So Windows **is** wired as a first-class node in
+  code; it has simply **never been run** end-to-end. (The *legacy bash* path's
+  `live_mixed_topology` / `validate_windows_mesh_join` is signed-state-only and
+  still skips without a Windows host — use the `--node` engine, not that.)
+  **Known Windows constraints to expect on the first run:** (1) the adapter cannot
+  *issue* membership bundles (`issue_bundles_to_dir(Membership)` → `Err`; the
+  Windows trust CLI only supports `trust` subcommands) → Windows must join as
+  **client**, with a Linux/macOS peer as the membership owner; (2) Windows
+  trust-evidence **refresh is a no-op** ("skipped on windows — DPAPI signer-key
+  unwrap pending") → a long run or trust rotation may surface staleness, but a
+  short run with a wide `--trust-max-age-secs` should carry the bootstrap-issued
+  evidence. **Actual blocker to running N4 = lab networking:** the Windows guest
+  is LAN-only (`192.168.0.45`, no STUN/relay) and no peer shares its subnet (the
+  UTM mesh VMs are on unroutable internal nets; `debian-lan-11` is down + not
+  utmctl-controllable). Needs an operator decision to put Windows + a peer on one
+  subnet.
 - **G5 — Single-node smoke harness — ✅ landed.** `ops vm-lab-bootstrap-phase
   --phase tunnel-smoke` (N1) and `--phase killswitch-smoke` (N2) provide minimal
   bring-up-and-assert paths for fast iteration without a full dataplane
@@ -138,14 +161,42 @@ before protected-mode can be called *secure*.
 - **G7 — No Windows compile/lint/test gate (⚙️).** `cfg(windows)` code cannot
   be `clippy`/`test`-gated on the macOS host (Windows-target std unavailable);
   the guest `build-release` is the only Windows compile gate today.
-- **G8 — IPv6 leak / fail-closed unvalidated on Windows (🔴, security).** The
-  dataplane abstraction has `hard_disable_ipv6_egress` / `rollback_ipv6_egress`,
-  but `ipv6_parity_supported` defaults `false` and Windows IPv6-leak behaviour
-  in protected mode has never been verified. Flagged as an open **P0** in
+- **G8 — IPv6 leak / fail-closed on Windows (🟡, security — mechanism validated,
+  live leak-proof deferred).** The dataplane abstraction has
+  `hard_disable_ipv6_egress` / `rollback_ipv6_egress`, but
+  `ipv6_parity_supported` defaults `false` and Windows IPv6-leak behaviour in
+  protected mode had never been verified. Flagged as an open **P0** in
   [SecurityReview_2026-05-24.md](./SecurityReview_2026-05-24.md) ("Windows
   killswitch/IPv6 leaks") and as **W4** in
   [HomelabConnectivityParityDeltaPlan_2026-05-21.md](./HomelabConnectivityParityDeltaPlan_2026-05-21.md).
   Must confirm no IPv4 **or IPv6** leak under a live tunnel.
+
+  **Progress (2026-06-01) — mechanism validated live; end-to-end leak-proof
+  deferred (operator decision).** `--phase ipv6-smoke` exercises the IPv6 control
+  while the killswitch is active. Root-caused + fixed a blocker that would have
+  broken the control on every apply: netsh **rejects `remoteip=::/0`** ("One or
+  more of the address prefixes is invalid", exit 1). The block rule now uses the
+  all-IPv6 range `::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff` (IPv6-family only,
+  so the IPv4 SSH/WireGuard-handshake paths are untouched), verified accepted on
+  the guest. **Live on `windows-utm-1`:** under the active killswitch the IPv6
+  block **applies, blocks egress, and rolls back cleanly**
+  (`ipv6_control_applied` / `ipv6_egress_blocked` / `ipv6_control_rolled_back`
+  all true), with the full killswitch apply/assert/WFP-permit/rollback around it;
+  compiles on the guest `build-release`. Also closed a fail-closed-cleanup gap:
+  `hard_disable_ipv6_egress` now sets `ipv6_disabled` **before** the block-rule
+  step, so a partial-apply failure still re-enables router-discovery on rollback
+  (and the smoke sequence rolls back on an apply error before propagating).
+  **Deferred:** the end-to-end *leak* proof needs the guest to have a global IPv6
+  (egress reachable at baseline, then blocked); the lab LAN currently provides
+  **no IPv6** (Ethernet has only a link-local `fe80::`, no `::/0` route, ping6
+  fails), so the smoke **fails closed** (`ipv6_baseline_egress_ok=false`,
+  `overall_ok=false`) rather than false-pass. Per operator decision, the
+  validated fix is merged now; the live leak-proof is revisited on an
+  IPv6-capable network. **Residuals:** RN-06 — the IPv4 LAN-egress allow is still
+  unscoped (`interfacetype=lan`); the stronger fix moves the whole killswitch
+  egress policy to WFP (per E2) for both families. HB-4 — the smoke Drop guard /
+  cross-process dead-man's-switch still don't delete the named IPv6 rule on a
+  hard-kill (self-heals on the next run / reboot).
 - **G9 — Rollback-on-failure + guest-lockout recovery (🔴, operational).**
   Windows `rollback_firewall` (netsh) exists, but rollback-on-failure and
   fail-closed persistence across a daemon crash/restart are unvalidated. A

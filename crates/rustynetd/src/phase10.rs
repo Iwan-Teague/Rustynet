@@ -3192,6 +3192,14 @@ const WINDOWS_DNS_RULE_BLOCK_LAN_UDP: &str = "RustyNetDNS-BlockLanUdp";
 /// Block TCP/53 outbound on non-tunnel (LAN) interfaces.  Symmetric to the UDP
 /// rule above; without it, an app that opted into TCP DNS could still leak.
 const WINDOWS_DNS_RULE_BLOCK_LAN_TCP: &str = "RustyNetDNS-BlockLanTcp";
+/// Block ALL IPv6 outbound on non-tunnel (LAN) interfaces (G8).  The killswitch's
+/// default-block-outbound is version-agnostic, but its egress-LAN *allow* is
+/// unscoped and re-permits IPv6 on the underlay; since the tunnel is IPv4-only
+/// (`ipv6_parity_supported=false`), IPv6 with a default route on the LAN would
+/// otherwise egress the physical interface and bypass the tunnel.  A Block rule
+/// overrides the allow, failing IPv6 closed.  The WireGuard handshake + SSH are
+/// IPv4, so they are unaffected.
+const WINDOWS_IPV6_RULE_BLOCK_LAN: &str = "RustyNetKS-BlockIpv6Lan";
 const WINDOWS_PS_REQUIRE_EXIT_CMDLETS: &str = "& { $ErrorActionPreference = 'Stop'; Get-Command Set-NetIPInterface | Out-Null; Get-Command Get-NetIPInterface | Out-Null; Get-Command New-NetNat | Out-Null; Get-Command Get-NetNat | Out-Null; Get-Command Remove-NetNat | Out-Null }";
 const WINDOWS_PS_PREFLIGHT_EXIT_SERVING: &str = "& { param($TunnelAlias, $EgressAlias) $ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $principal = New-Object Security.Principal.WindowsPrincipal($identity); if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'RustyNet exit serving requires an elevated administrator or service token' }; foreach ($cmd in @('Set-NetIPInterface','Get-NetIPInterface','New-NetNat','Get-NetNat','Remove-NetNat','Get-NetRoute')) { Get-Command $cmd -ErrorAction Stop | Out-Null }; if ($TunnelAlias -eq $EgressAlias) { throw 'RustyNet tunnel and outbound interface aliases must be distinct' }; Get-NetIPInterface -InterfaceAlias $TunnelAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetIPInterface -InterfaceAlias $EgressAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $EgressAlias -ErrorAction Stop | Out-Null }";
 const WINDOWS_PS_GET_FORWARDING: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding }";
@@ -3513,7 +3521,28 @@ impl DataplaneSystem for WindowsCommandSystem {
             self.egress_interface.as_str(),
         ))
         .map_err(|err| SystemError::Io(format!("IPv6 disable on egress failed: {err}")))?;
+        // Mark disabled as soon as router-discovery is off, BEFORE the block
+        // rule below: if that step fails, rollback_ipv6_egress must still
+        // re-enable router-discovery — otherwise a partial apply leaves the
+        // egress NIC with router-discovery disabled and no cleanup.
         self.ipv6_disabled = true;
+        // Disabling router-discovery/advertise only stops NEW SLAAC; an
+        // already-configured global IPv6 + its LAN default route would still
+        // egress the underlay and bypass the IPv4-only tunnel (the G8 leak).
+        // Add a Block rule on non-tunnel (LAN) interfaces that overrides the
+        // killswitch's unscoped egress-allow, so all IPv6 outbound on the
+        // underlay is dropped — failing IPv6 closed. The WireGuard handshake and
+        // SSH are IPv4, so they are unaffected. Purge any stale rule first for
+        // idempotent re-apply.
+        let _ = self.run_netsh_success(&windows_firewall_delete_rule_args(
+            WINDOWS_IPV6_RULE_BLOCK_LAN,
+        ));
+        self.run_netsh_success(&windows_ipv6_egress_block_lan_args(
+            WINDOWS_IPV6_RULE_BLOCK_LAN,
+        ))
+        .map_err(|err| {
+            SystemError::FirewallApplyFailed(format!("IPv6 egress block on LAN failed: {err}"))
+        })?;
         Ok(())
     }
 
@@ -3521,6 +3550,10 @@ impl DataplaneSystem for WindowsCommandSystem {
         if !self.ipv6_disabled {
             return Ok(());
         }
+        // Remove the IPv6 LAN block first (best-effort; a missing rule is fine).
+        let _ = self.run_netsh_success(&windows_firewall_delete_rule_args(
+            WINDOWS_IPV6_RULE_BLOCK_LAN,
+        ));
         self.run_netsh_success(&windows_ipv6_egress_rollback_args(
             self.egress_interface.as_str(),
         ))
@@ -5501,6 +5534,31 @@ fn windows_ipv6_egress_disable_args(egress_interface: &str) -> Vec<String> {
     ]
 }
 
+/// Build the netsh argv that adds an outbound Block rule covering ALL IPv6 on
+/// non-tunnel (`interfacetype=lan`) interfaces.  A Block rule wins over the
+/// killswitch's unscoped egress-LAN allow, so IPv6 cannot egress the underlay
+/// and bypass the IPv4-only tunnel (G8 fail-closed).  The rule is scoped to
+/// `lan` so the WireGuard tunnel (RAS interface type) is untouched; the
+/// WireGuard handshake and SSH are IPv4 and therefore unaffected.
+///
+/// All-IPv6 is expressed as the explicit range `::`-`ffff:…:ffff`, NOT `::/0`:
+/// netsh rejects a `/0` prefix ("One or more of the address prefixes is
+/// invalid", exit 1 — verified live on the guest).  The range is IPv6-family
+/// only, so it never matches the IPv4 SSH / WireGuard-handshake paths.
+fn windows_ipv6_egress_block_lan_args(rule_name: &str) -> Vec<String> {
+    vec![
+        "advfirewall".to_owned(),
+        "firewall".to_owned(),
+        "add".to_owned(),
+        "rule".to_owned(),
+        format!("name={rule_name}"),
+        "dir=out".to_owned(),
+        "action=block".to_owned(),
+        "remoteip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".to_owned(),
+        "interfacetype=lan".to_owned(),
+    ]
+}
+
 /// Build the netsh argv that re-enables IPv6 router-discovery and advertise on
 /// the underlay egress adapter during rollback.  Symmetric to
 /// [`windows_ipv6_egress_disable_args`] except the two `*=disabled` flags become
@@ -6080,6 +6138,32 @@ mod tests {
                 "store=active".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn windows_ipv6_egress_block_rule_blocks_all_ipv6_on_lan() {
+        // G8: the IPv6 LAN block must be an outbound BLOCK covering all IPv6
+        // scoped to non-tunnel (lan) interfaces, so it overrides the
+        // killswitch's egress-LAN allow without touching the tunnel.  All-IPv6
+        // is the explicit `::`-`ffff:..:ffff` range, NOT `::/0`: netsh rejects a
+        // /0 prefix ("address prefixes is invalid", exit 1), verified live.
+        let args = windows_ipv6_egress_block_lan_args(WINDOWS_IPV6_RULE_BLOCK_LAN);
+        assert_eq!(
+            args,
+            vec![
+                "advfirewall".to_owned(),
+                "firewall".to_owned(),
+                "add".to_owned(),
+                "rule".to_owned(),
+                "name=RustyNetKS-BlockIpv6Lan".to_owned(),
+                "dir=out".to_owned(),
+                "action=block".to_owned(),
+                "remoteip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".to_owned(),
+                "interfacetype=lan".to_owned(),
+            ]
+        );
+        // netsh rejects the /0 prefix form; guard against a regression to it.
+        assert!(!args.iter().any(|a| a == "remoteip=::/0"));
     }
 
     #[test]

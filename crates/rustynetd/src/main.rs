@@ -561,6 +561,10 @@ fn run_windows_killswitch_smoke_command(args: &[String]) -> Result<(), String> {
                     options.exercise_dns = true;
                     index += 1;
                 }
+                Some("--exercise-ipv6") => {
+                    options.exercise_ipv6 = true;
+                    index += 1;
+                }
                 Some(flag) => {
                     return Err(format!("unknown windows-killswitch-smoke argument: {flag}"));
                 }
@@ -3481,7 +3485,7 @@ fn help_text() -> String {
         "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--capabilities <csv>] [--snapshot <path>] [--log <path>]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
         "  rustynetd windows-tunnel-smoke [--tunnel-name <name>] [--address <cidr>] [--mesh-cidr <cidr>] [--listen-port <port>] [--keep]",
-        "  rustynetd windows-killswitch-smoke [--tunnel-name <name>] [--address <cidr>] [--mesh-cidr <cidr>] [--listen-port <port>] [--exercise-full-block] [--exercise-dns]",
+        "  rustynetd windows-killswitch-smoke [--tunnel-name <name>] [--address <cidr>] [--mesh-cidr <cidr>] [--listen-port <port>] [--exercise-full-block] [--exercise-dns] [--exercise-ipv6]",
         "  rustynetd windows-runtime-acls-check [--no-fail-on-drift]",
         "  rustynetd windows-named-pipe-acls-check [--service-sid <sid>] [--no-fail-on-drift]",
         "  rustynetd windows-registry-acls-check [--no-fail-on-drift]",

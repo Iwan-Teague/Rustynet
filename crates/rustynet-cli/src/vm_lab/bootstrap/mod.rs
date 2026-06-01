@@ -28,6 +28,12 @@ pub(super) enum BootstrapPhase {
     /// killswitch is active it applies/asserts/rolls back the netsh port-53
     /// LAN-block. Standalone, never part of `All`; Windows-only.
     DnsSmoke,
+    /// Single-node IPv6 fail-closed exercise in protected mode (readiness plan
+    /// G8). Runs the killswitch smoke with its IPv6 leg enabled: while the
+    /// killswitch is active it confirms IPv6 egress leaks, applies the IPv6 LAN
+    /// block, confirms it is blocked, then rolls back. Standalone, never part of
+    /// `All`; Windows-only.
+    Ipv6Smoke,
     All,
 }
 
@@ -43,9 +49,10 @@ impl BootstrapPhase {
             "tunnel-smoke" => Ok(Self::TunnelSmoke),
             "killswitch-smoke" => Ok(Self::KillswitchSmoke),
             "dns-smoke" => Ok(Self::DnsSmoke),
+            "ipv6-smoke" => Ok(Self::Ipv6Smoke),
             "all" => Ok(Self::All),
             other => Err(format!(
-                "unsupported vm-lab bootstrap phase: {other} (expected sync-source|build-release|smoke-service-host|install-release|restart-runtime|verify-runtime|tunnel-smoke|killswitch-smoke|dns-smoke|all)"
+                "unsupported vm-lab bootstrap phase: {other} (expected sync-source|build-release|smoke-service-host|install-release|restart-runtime|verify-runtime|tunnel-smoke|killswitch-smoke|dns-smoke|ipv6-smoke|all)"
             )),
         }
     }
@@ -61,6 +68,7 @@ impl BootstrapPhase {
             Self::TunnelSmoke => "tunnel-smoke",
             Self::KillswitchSmoke => "killswitch-smoke",
             Self::DnsSmoke => "dns-smoke",
+            Self::Ipv6Smoke => "ipv6-smoke",
             Self::All => "all",
         }
     }
