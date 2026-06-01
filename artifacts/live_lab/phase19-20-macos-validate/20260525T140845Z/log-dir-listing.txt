@@ -1,7 +1,0 @@
-total 20600
-drwxr-x---  6 rustynetd  rustynetd      192 May 21 14:01 .
-drwxr-xr-x  3 root       wheel           96 May 21 13:20 ..
--rw-r--r--  1 rustynetd  rustynetd  9586313 May 25 07:09 rustynetd-error.log
--rw-r--r--  1 root       rustynetd        0 May 21 14:03 rustynetd-helper-error.log
--rw-r--r--  1 root       rustynetd        0 May 21 14:02 rustynetd-helper.log
--rw-r--r--  1 rustynetd  rustynetd        0 May 21 14:04 rustynetd.log
