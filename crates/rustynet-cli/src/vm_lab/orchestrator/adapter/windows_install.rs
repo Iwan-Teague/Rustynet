@@ -801,6 +801,7 @@ fn run_windows_e2e_bootstrap(
     let bootstrap_script = format!(
         "$ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
+         Add-Type -AssemblyName System.Security; \
          try {{ if (Get-Module -Name PSReadLine) {{ Set-PSReadLineOption -HistorySaveStyle SaveNothing -ErrorAction SilentlyContinue }} }} catch {{}}; \
          {native_helper}; \
          $env:RUSTYNET_WG_BINARY_PATH = {wg_binary_q}; \
@@ -1238,6 +1239,13 @@ mod tests {
         assert!(
             source.contains("[System.Security.Cryptography.ProtectedData]::Protect"),
             "bootstrap script must invoke ProtectedData::Protect on the in-memory plaintext (HIGH 1)"
+        );
+        // The ProtectedData type lives in System.Security.dll, which is NOT
+        // auto-loaded under `powershell.exe -NoProfile -NonInteractive`; the
+        // bootstrap must Add-Type it first or the call fails with TypeNotFound.
+        assert!(
+            source.contains("Add-Type -AssemblyName System.Security"),
+            "bootstrap script must load System.Security before using ProtectedData"
         );
     }
 
