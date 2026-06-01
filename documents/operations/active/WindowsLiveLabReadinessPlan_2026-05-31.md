@@ -28,11 +28,13 @@ is **GREEN** (`RESTART_EXIT=0`, `completed bootstrap phase=restart-runtime`)
 driven over pinned SSH through `sync-source → build-release →
 install-release → restart-runtime`.
 
-**The one thing that has never happened on Windows: a WireGuard tunnel has
-not yet been brought up.** Everything downstream of "daemon runs and serves
-IPC" — killswitch in anger, DNS fail-closed, NetNat/role forwarding, and any
-mesh connectivity — is therefore **unproven on Windows**. Closing that is the
-spine of this plan.
+**Update 2026-06-01 — the tunnel has now come up.** `N1.3` passed: the
+first-ever WireGuard tunnel bring-up on `windows-utm-1` succeeded via
+`ops vm-lab-bootstrap-phase --phase tunnel-smoke` (`overall_ok=true`, daemon
+exit 0, clean teardown — `netsh interface show interface` reports no residual
+`rustynet*` adapter). The remaining unproven surface downstream of a bare
+tunnel — killswitch *in anger*, DNS fail-closed, NetNat/role forwarding, and
+multi-node mesh connectivity — is now what N2→N6 close.
 
 ---
 
@@ -88,9 +90,10 @@ spine of this plan.
 
 ## 3. Gaps blocking a Windows live-lab run (🔴 / ⚙️)
 
-- **G1 — Tunnel bring-up unproven (🔴, foundational).** No `rustynet0`
-  WireGuard interface has ever been created on the guest. Until a single
-  tunnel comes up and passes traffic, nothing downstream can be trusted.
+- **G1 — Tunnel bring-up — ✅ proven (2026-06-01).** A `rustynet0` WireGuard
+  interface was created, reported by `wg show`, and torn down cleanly on the
+  guest via the `tunnel-smoke` phase (`overall_ok=true`). The foundational
+  data-plane question is closed; passing *traffic* across a mesh is N4.
 - **G2 — Killswitch has one remaining CIM cmdlet + untested fail-closed
   (🔴/⚙️).** The per-tunnel allow rule still uses `New-NetFirewallRule`
   (CIM). It is now mitigated (leak fixed + 20s watchdog) and fails in the
@@ -164,7 +167,7 @@ N6 (full matrix) are beyond the first run.
 
 | Step | Effort | In minimum bar? |
 | ---- | ------ | --------------- |
-| N1 single-node tunnel smoke | M | **yes** |
+| N1 single-node tunnel smoke ✅ | M | **yes** |
 | N2 killswitch + fail-closed | M | **yes** (safety) |
 | N3 DNS fail-closed | S–M | before "secure" |
 | N4 two-node mesh w/ Windows | L | **yes** |
@@ -173,7 +176,7 @@ N6 (full matrix) are beyond the first run.
 | G8 IPv6 leak validation | S–M | before "secure" |
 | G9 rollback/recover hardening | S–M | **yes** (safety) |
 
-### N1 — Single-node WG-NT tunnel bring-up smoke 🔴 → first proof of data-plane
+### N1 — Single-node WG-NT tunnel bring-up smoke ✅ (N1.3 passed 2026-06-01)
 Bring up one tunnel on the guest through `WindowsWireguardBackend`: generate a
 keypair, write the DPAPI-encrypted config, `/installtunnelservice`, assign the
 address via netsh, verify the interface via `GetAdaptersAddresses` + `wg show`,
@@ -212,6 +215,22 @@ Progress (2026-05-31):
   the service is STOPPED + set to demand-start, and its IPv4 is still
   `192.168.0.45` (inventory unchanged). N1.1 (guest compile) and the live N1.3
   bring-up can proceed via the orchestrator.
+- **N1.3 PASSED (2026-06-01) — first-ever live tunnel bring-up.** After a fresh
+  `sync-source` → `build-release` (the first guest compile to include the E2 WFP
+  killswitch code; exit 0), `ops vm-lab-bootstrap-phase --phase tunnel-smoke`
+  reported `status=pass` / `overall_ok=true`, daemon exit 0, clean teardown.
+  Post-run `netsh interface show interface` shows no residual `rustynet*`
+  adapter (no leak/leftover). **One orchestrator bug was fixed to get here**
+  (not a daemon/data-plane defect): the shared Windows helper-invocation wrapper
+  (`build_windows_helper_invocation_script`, `vm_lab/mod.rs`) read
+  `[string]$LASTEXITCODE` raw under `Set-StrictMode -Version Latest`. The smoke
+  `.ps1` returns via `Start-Process` and falls off its end without ever invoking
+  an external `.exe`, so `$LASTEXITCODE` was never set → strict-mode threw "cannot
+  be retrieved because it has not been set", discarding the helper's own
+  `overall_ok` JSON *after* the tunnel had already come up and torn down. Fix:
+  seed `$LASTEXITCODE = 0` before the helper runs (mirrors the result-file
+  sibling); regression test
+  `windows_helper_invocation_script_preseeds_lastexitcode_under_strictmode`.
 
 ### N2 — Killswitch + protected-mode exercise on the single node 🔴 (covers G2)
 With a tunnel up, apply the killswitch and verify default-deny + the tunnel /

@@ -24484,8 +24484,15 @@ fn build_windows_helper_invocation_script(
     args: &[String],
 ) -> Result<String, String> {
     let helper_command = build_windows_helper_command(remote_path, args)?;
+    // Pre-seed $LASTEXITCODE: it is only defined after an external .exe runs, and
+    // a helper .ps1 that returns via Start-Process / falling off the end never
+    // sets it. Under Set-StrictMode -Version Latest the later raw [string]$LASTEXITCODE
+    // read would then throw "cannot be retrieved because it has not been set",
+    // discarding the helper's own JSON verdict. Seeding 0 = "no native failure";
+    // any native command the helper runs overwrites it. Mirrors the result-file
+    // sibling (build_windows_result_file_helper_invocation_script).
     let mut script = format!(
-        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; {helper_command}"
+        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; $LASTEXITCODE = 0; {helper_command}"
     );
     script.push_str("; if (-not $?) { throw 'Windows helper invocation failed' }; $_helperExitCodeParsed = 0; if ([int]::TryParse([string]$LASTEXITCODE, [ref]$_helperExitCodeParsed) -and $_helperExitCodeParsed -ne 0) { throw (\"Windows helper invocation failed with exit code {0}\" -f $_helperExitCodeParsed) }");
     Ok(script)
@@ -27744,6 +27751,34 @@ mod tests {
         assert!(script.contains("$encodedHelper"));
         assert!(script.contains("[ScriptBlock]::Create($decodedHelper)"));
         assert!(script.contains("& $helperBlock *>&1 | Out-String"));
+    }
+
+    #[test]
+    fn windows_helper_invocation_script_preseeds_lastexitcode_under_strictmode() {
+        // Regression (tunnel-smoke N1.3): the helper .ps1 returns via Start-Process
+        // and falls off the end without ever invoking an external .exe, so
+        // $LASTEXITCODE stays undefined. Under Set-StrictMode -Version Latest the
+        // wrapper's later raw `[string]$LASTEXITCODE` read then threw "cannot be
+        // retrieved because it has not been set", discarding the helper's own JSON
+        // verdict. The wrapper must seed $LASTEXITCODE = 0 before the helper runs.
+        let script = super::build_windows_helper_invocation_script(
+            r"C:\ProgramData\Rustynet\vm-lab\Invoke-RustyNetWindowsTunnelSmoke.ps1",
+            &[
+                "-RustyNetRoot".to_owned(),
+                r"C:\Rustynet".to_owned(),
+                "-StateRoot".to_owned(),
+                r"C:\ProgramData\RustyNet".to_owned(),
+            ],
+        )
+        .expect("helper invocation script should build");
+        assert!(script.contains("Set-StrictMode -Version Latest"));
+        let seed = script
+            .find("$LASTEXITCODE = 0;")
+            .expect("wrapper must pre-seed $LASTEXITCODE = 0");
+        let read = script
+            .find("[string]$LASTEXITCODE")
+            .expect("wrapper still reads $LASTEXITCODE");
+        assert!(seed < read, "seed must precede the strict-mode read");
     }
 
     #[test]
