@@ -1,11 +1,106 @@
 #![allow(dead_code)]
+use std::path::Path;
+
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-pub struct PrepareSourceArchiveStage;
+/// Which tree the source archive shipped to the guests is built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArchiveSourceMode {
+    /// Package the committed tree at `HEAD` — reproducible, the default.
+    #[default]
+    Head,
+    /// Package the working tree *including uncommitted tracked changes*
+    /// (via `git stash create`), so a fix can be guest-tested before it is
+    /// committed. Untracked files are not captured.
+    WorkingTree,
+}
+
+/// Map a `--source-mode` CLI value onto the archive mode the Rust-native
+/// orchestrator supports.
+///
+/// `None`, the empty string, and the committed-tree aliases select `Head`;
+/// `working-tree`/`worktree` select `WorkingTree`. Any other recognised
+/// source mode (`commit-ref`, `repo-url`, `local-source`) is **rejected**:
+/// the Rust-native archive path only builds from the local repo, so silently
+/// falling back to `HEAD` would mis-report provenance. Fail closed instead.
+pub fn parse_archive_source_mode(value: Option<&str>) -> Result<ArchiveSourceMode, String> {
+    match value.map(str::trim) {
+        None | Some("") | Some("head") | Some("local-head") => Ok(ArchiveSourceMode::Head),
+        Some("worktree") | Some("working-tree") => Ok(ArchiveSourceMode::WorkingTree),
+        Some(other) => Err(format!(
+            "unsupported --source-mode '{other}' for the Rust-native orchestrator; \
+             use 'local-head' (default) or 'working-tree'"
+        )),
+    }
+}
+
+/// Resolve the git tree-ish the archive is built from for `mode`, run in
+/// `repo_dir`.
+///
+/// `Head` → `"HEAD"`. `WorkingTree` → the SHA produced by `git stash create`,
+/// which snapshots the working tree (staged + unstaged *tracked* changes) into
+/// a dangling commit **without** touching the index, working tree, or stash
+/// list. When the tree is clean, `git stash create` prints nothing, so we fall
+/// back to `HEAD`.
+fn resolve_source_tree_ish(repo_dir: &Path, mode: ArchiveSourceMode) -> Result<String, String> {
+    match mode {
+        ArchiveSourceMode::Head => Ok("HEAD".to_owned()),
+        ArchiveSourceMode::WorkingTree => {
+            let out = std::process::Command::new("git")
+                .args(["stash", "create"])
+                .current_dir(repo_dir)
+                .output()
+                .map_err(|e| format!("git stash create spawn failed: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("git stash create exited with {}", out.status));
+            }
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if sha.is_empty() {
+                // Clean tree (nothing to stash) — equivalent to HEAD.
+                Ok("HEAD".to_owned())
+            } else {
+                Ok(sha)
+            }
+        }
+    }
+}
+
+/// Build a `tar.gz` source archive at `out_path` from `repo_dir` for `mode`.
+fn build_source_tarball(
+    repo_dir: &Path,
+    mode: ArchiveSourceMode,
+    out_path: &Path,
+) -> Result<(), String> {
+    let tree_ish = resolve_source_tree_ish(repo_dir, mode)?;
+    let status = std::process::Command::new("git")
+        .args(["archive", "--format=tar.gz", "-o"])
+        .arg(out_path)
+        .arg(&tree_ish)
+        .current_dir(repo_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("git archive spawn failed: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("git archive exited with {status}"))
+    }
+}
+
+pub struct PrepareSourceArchiveStage {
+    source_mode: ArchiveSourceMode,
+}
+
+impl PrepareSourceArchiveStage {
+    pub fn new(source_mode: ArchiveSourceMode) -> Self {
+        PrepareSourceArchiveStage { source_mode }
+    }
+}
 
 impl OrchestrationStage for PrepareSourceArchiveStage {
     fn id(&self) -> StageId {
@@ -33,23 +128,17 @@ impl OrchestrationStage for PrepareSourceArchiveStage {
             p.push(format!("rn_source_{}.tar.gz", std::process::id()));
             p
         };
-        let status = std::process::Command::new("git")
-            .args(["archive", "--format=tar.gz", "-o"])
-            .arg(&archive_path)
-            .arg("HEAD")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        match status {
-            Ok(s) if s.success() => match SourceArchive::from_existing(archive_path) {
+        // The orchestrator runs from the repo root, so the working dir is the
+        // source tree we want to package.
+        match build_source_tarball(Path::new("."), self.source_mode, &archive_path) {
+            Ok(()) => match SourceArchive::from_existing(archive_path) {
                 Ok(archive) => {
                     ctx.source_archive = Some(archive);
                     StageOutcome::Passed
                 }
                 Err(e) => StageOutcome::Failed(format!("source archive validation failed: {e}")),
             },
-            Ok(s) => StageOutcome::Failed(format!("git archive exited with {s}")),
-            Err(e) => StageOutcome::Failed(format!("git archive spawn failed: {e}")),
+            Err(e) => StageOutcome::Failed(e),
         }
     }
 }
@@ -60,6 +149,7 @@ mod tests {
     use crate::vm_lab::orchestrator::source_archive::SourceArchive;
     use std::collections::HashMap;
     use std::io::Write;
+    use std::process::Command;
     use tempfile::NamedTempFile;
 
     fn make_ctx_with_archive() -> (OrchestrationContext, NamedTempFile) {
@@ -86,7 +176,115 @@ mod tests {
     #[test]
     fn already_present_archive_passes_immediately() {
         let (mut ctx, _f) = make_ctx_with_archive();
-        let outcome = PrepareSourceArchiveStage.execute(&mut ctx);
+        let outcome = PrepareSourceArchiveStage::new(ArchiveSourceMode::Head).execute(&mut ctx);
         assert_eq!(outcome, StageOutcome::Passed);
+    }
+
+    #[test]
+    fn parse_archive_source_mode_maps_known_values() {
+        assert_eq!(parse_archive_source_mode(None), Ok(ArchiveSourceMode::Head));
+        assert_eq!(
+            parse_archive_source_mode(Some("")),
+            Ok(ArchiveSourceMode::Head)
+        );
+        assert_eq!(
+            parse_archive_source_mode(Some("local-head")),
+            Ok(ArchiveSourceMode::Head)
+        );
+        assert_eq!(
+            parse_archive_source_mode(Some("working-tree")),
+            Ok(ArchiveSourceMode::WorkingTree)
+        );
+        assert_eq!(
+            parse_archive_source_mode(Some("worktree")),
+            Ok(ArchiveSourceMode::WorkingTree)
+        );
+        assert!(parse_archive_source_mode(Some("repo-url")).is_err());
+        assert!(parse_archive_source_mode(Some("garbage")).is_err());
+    }
+
+    // ── git-backed archive content tests ──────────────────────────────────────
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {repo:?}");
+    }
+
+    /// Build an *uncompressed* tar for `mode` (so the test can scan the bytes
+    /// for file content without an extraction step) using the same tree-ish
+    /// resolution the real `.tar.gz` path uses.
+    fn archive_tar_bytes(repo: &Path, mode: ArchiveSourceMode) -> Vec<u8> {
+        let tree_ish = resolve_source_tree_ish(repo, mode).unwrap();
+        let out = Command::new("git")
+            .args(["archive", "--format=tar", &tree_ish])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git archive {tree_ish} failed");
+        out.stdout
+    }
+
+    fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn worktree_mode_includes_dirty_tracked_file_head_omits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        let tracked = repo.join("tracked.txt");
+        std::fs::write(&tracked, b"committed-content-marker\n").unwrap();
+        git(repo, &["add", "tracked.txt"]);
+        git(repo, &["commit", "-q", "-m", "initial"]);
+
+        // Dirty the tracked file (uncommitted working-tree change).
+        std::fs::write(&tracked, b"dirty-worktree-content-marker\n").unwrap();
+
+        let head = archive_tar_bytes(repo, ArchiveSourceMode::Head);
+        let worktree = archive_tar_bytes(repo, ArchiveSourceMode::WorkingTree);
+
+        // HEAD carries the committed content and omits the uncommitted change.
+        assert!(
+            bytes_contain(&head, b"committed-content-marker"),
+            "HEAD archive must contain the committed content"
+        );
+        assert!(
+            !bytes_contain(&head, b"dirty-worktree-content-marker"),
+            "HEAD archive must NOT contain the uncommitted change"
+        );
+        // WorkingTree carries the uncommitted change.
+        assert!(
+            bytes_contain(&worktree, b"dirty-worktree-content-marker"),
+            "worktree archive must contain the uncommitted change"
+        );
+    }
+
+    #[test]
+    fn worktree_mode_on_clean_tree_falls_back_to_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), b"only-committed\n").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-q", "-m", "initial"]);
+
+        // Clean tree: `git stash create` prints nothing, so resolve to HEAD.
+        let tree_ish = resolve_source_tree_ish(repo, ArchiveSourceMode::WorkingTree).unwrap();
+        assert_eq!(tree_ish, "HEAD");
     }
 }

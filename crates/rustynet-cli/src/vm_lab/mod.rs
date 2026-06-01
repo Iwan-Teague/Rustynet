@@ -95,6 +95,17 @@ pub struct VmLabListConfig {
     pub inventory_path: PathBuf,
 }
 
+/// One-shot per-node diagnostic dump for `ops vm-lab-diagnose --vm <alias>`.
+/// Reuses the `NodeAdapter` trait so no new per-platform method is needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabDiagnoseConfig {
+    pub inventory_path: PathBuf,
+    pub vm_alias: String,
+    pub ssh_identity_file: PathBuf,
+    pub known_hosts_path: PathBuf,
+    pub ssh_port: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabDiscoverLocalUtmConfig {
     pub inventory_path: Option<PathBuf>,
@@ -810,6 +821,12 @@ pub struct VmLabOrchestrateLiveLabConfig {
     pub report_dir: PathBuf,
     pub source_mode: Option<String>,
     pub repo_ref: Option<String>,
+    /// D1 — `--rebuild-nodes <alias[,alias]>`: when `Some`, only these aliases
+    /// rebuild their daemon in `bootstrap_hosts` (Rust-native `--node` path);
+    /// every other node reuses its already-installed daemon. `None` (the
+    /// default) rebuilds all nodes. Lets a single-node daemon fix be retested
+    /// without a full multi-node rebuild.
+    pub rebuild_nodes: Option<Vec<String>>,
     pub max_parallel_node_workers: Option<usize>,
     pub skip_gates: bool,
     pub skip_soak: bool,
@@ -2901,6 +2918,88 @@ pub fn execute_ops_vm_lab_list(config: VmLabListConfig) -> Result<String, String
             controller_summary
         ));
     }
+    Ok(lines.join("\n"))
+}
+
+/// One-shot per-node diagnostic dump. Builds the same `NodeAdapter` the
+/// orchestrator uses, then prints the node's mesh IP, active tunnels, the
+/// daemon's own fail-closed reason (from `rustynetd.log`, via A1), and the
+/// `assert_node_clean` verdict. Each sub-probe is best-effort: a probe error
+/// is reported inline and does not abort the dump, so a partially-wedged node
+/// still yields whatever state is reachable.
+pub fn execute_ops_vm_lab_diagnose(config: VmLabDiagnoseConfig) -> Result<String, String> {
+    use orchestrator::adapter::factory::node_adapter_for;
+    use orchestrator::connection::NodeConnection;
+
+    let inventory = load_inventory(config.inventory_path.as_path())?;
+    let entry = inventory
+        .iter()
+        .find(|e| e.alias == config.vm_alias)
+        .ok_or_else(|| {
+            format!(
+                "alias '{}' not found in inventory ({})",
+                config.vm_alias,
+                config.inventory_path.display()
+            )
+        })?;
+
+    let host = entry
+        .last_known_ip
+        .as_deref()
+        .unwrap_or(entry.ssh_target.as_str())
+        .to_owned();
+    let platform = entry.platform.unwrap_or(VmGuestPlatform::Linux);
+
+    let conn = NodeConnection::ssh(
+        host.clone(),
+        config.ssh_port,
+        entry.ssh_user.clone(),
+        config.ssh_identity_file.clone(),
+        config.known_hosts_path.clone(),
+    )
+    .map_err(|err| {
+        format!(
+            "build SSH connection for alias '{}' ({host}): {err}",
+            config.vm_alias
+        )
+    })?;
+
+    let adapter = node_adapter_for(
+        config.vm_alias.clone(),
+        platform,
+        conn,
+        entry.rustynet_src_dir.clone(),
+    )
+    .map_err(|err| {
+        format!(
+            "create adapter for alias '{}' (platform {platform:?}): {err}",
+            config.vm_alias
+        )
+    })?;
+
+    let mut lines = vec![format!(
+        "vm_lab_diagnose alias={} platform={platform:?} host={host} ssh_port={}",
+        config.vm_alias, config.ssh_port
+    )];
+
+    match adapter.collect_mesh_ip() {
+        Ok(mesh_ip) => lines.push(format!("mesh_ip={mesh_ip}")),
+        Err(err) => lines.push(format!("mesh_ip=<error: {err}>")),
+    }
+    match adapter.collect_active_tunnels() {
+        Ok(tunnels) => lines.push(format!("active_tunnels=[{}]", tunnels.tunnels.join(", "))),
+        Err(err) => lines.push(format!("active_tunnels=<error: {err}>")),
+    }
+    match adapter.collect_daemon_failure_reason() {
+        Ok(Some(reason)) => lines.push(format!("daemon_failure_reason={reason}")),
+        Ok(None) => lines.push("daemon_failure_reason=<none>".to_owned()),
+        Err(err) => lines.push(format!("daemon_failure_reason=<error: {err}>")),
+    }
+    match adapter.assert_node_clean() {
+        Ok(()) => lines.push("node_clean=true".to_owned()),
+        Err(err) => lines.push(format!("node_clean=false reason={err}")),
+    }
+
     Ok(lines.join("\n"))
 }
 
@@ -6574,7 +6673,30 @@ fn execute_rust_native_orchestration(
         ctx.adapters.insert(assignment.alias.clone(), adapter);
     }
 
-    let stages = build_rust_native_orchestration_stages();
+    // D2 — select the source archive mode (committed HEAD vs working tree).
+    // Fail closed on an unsupported mode rather than silently shipping HEAD.
+    let source_mode = orchestrator::stage::source_archive::parse_archive_source_mode(
+        config.source_mode.as_deref(),
+    )?;
+
+    // D1 — `--rebuild-nodes`: limit the bootstrap rebuild to the named
+    // alias(es). Validate every requested alias is part of this run so a typo
+    // fails fast instead of silently rebuilding nothing.
+    let rebuild_only = match config.rebuild_nodes.as_ref() {
+        Some(rebuild) => {
+            for alias in rebuild {
+                if !config.node_assignments.iter().any(|a| &a.alias == alias) {
+                    return Err(format!(
+                        "--rebuild-nodes alias '{alias}' is not one of the --node aliases for this run"
+                    ));
+                }
+            }
+            Some(rebuild.clone())
+        }
+        None => None,
+    };
+
+    let stages = build_rust_native_orchestration_stages(rebuild_only, source_mode);
 
     let runner = StateMachineRunner::new(stages);
     let results = runner.run(&mut ctx);
@@ -6676,17 +6798,25 @@ fn execute_rust_native_orchestration(
     if failed > 0 { Err(out) } else { Ok(out) }
 }
 
-fn build_rust_native_orchestration_stages() -> Vec<Box<dyn orchestrator::stage::OrchestrationStage>>
-{
-    orchestrator::plan::PlanBuilder::new().build()
+fn build_rust_native_orchestration_stages(
+    rebuild_only: Option<Vec<String>>,
+    source_mode: orchestrator::stage::source_archive::ArchiveSourceMode,
+) -> Vec<Box<dyn orchestrator::stage::OrchestrationStage>> {
+    orchestrator::plan::PlanBuilder::new()
+        .with_rebuild_only(rebuild_only)
+        .with_source_mode(source_mode)
+        .build()
 }
 
 #[cfg(test)]
 fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::StageId> {
-    build_rust_native_orchestration_stages()
-        .iter()
-        .map(|stage| stage.id())
-        .collect()
+    build_rust_native_orchestration_stages(
+        None,
+        orchestrator::stage::source_archive::ArchiveSourceMode::Head,
+    )
+    .iter()
+    .map(|stage| stage.id())
+    .collect()
 }
 
 pub fn execute_ops_vm_lab_orchestrate_live_lab(
@@ -35464,6 +35594,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             report_dir: PathBuf::from("/dev/null"),
             source_mode: None,
             repo_ref: None,
+            rebuild_nodes: None,
             max_parallel_node_workers: None,
             skip_gates: false,
             skip_soak: false,

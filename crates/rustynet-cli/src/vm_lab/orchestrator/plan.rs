@@ -13,26 +13,54 @@ use crate::vm_lab::orchestrator::stage::install::BootstrapHostsStage;
 use crate::vm_lab::orchestrator::stage::membership_init::MembershipInitStage;
 use crate::vm_lab::orchestrator::stage::preflight::PreflightStage;
 use crate::vm_lab::orchestrator::stage::role_switch_matrix::RoleSwitchMatrixStage;
-use crate::vm_lab::orchestrator::stage::source_archive::PrepareSourceArchiveStage;
+use crate::vm_lab::orchestrator::stage::source_archive::{
+    ArchiveSourceMode, PrepareSourceArchiveStage,
+};
 use crate::vm_lab::orchestrator::stage::traffic_test_matrix::TrafficTestMatrixStage;
 use crate::vm_lab::orchestrator::stage::validate_runtime::ValidateBaselineRuntimeStage;
 use crate::vm_lab::orchestrator::stage::verify_ssh::VerifySshReachabilityStage;
 
 /// Builds the ordered list of stages for a lab run.
-pub struct PlanBuilder;
+#[derive(Default)]
+pub struct PlanBuilder {
+    /// `--rebuild-nodes`: when `Some`, only these aliases rebuild in
+    /// `bootstrap_hosts`; `None` rebuilds every node (the default).
+    rebuild_only: Option<Vec<String>>,
+    /// `--source-mode`: which tree the shipped source archive is built from.
+    source_mode: ArchiveSourceMode,
+}
 
 impl PlanBuilder {
     pub fn new() -> Self {
-        PlanBuilder
+        PlanBuilder::default()
+    }
+
+    /// Limit `bootstrap_hosts` rebuilds to the named aliases (fast single-node
+    /// iteration). `None` keeps the default rebuild-all behaviour.
+    pub fn with_rebuild_only(mut self, rebuild_only: Option<Vec<String>>) -> Self {
+        self.rebuild_only = rebuild_only;
+        self
+    }
+
+    /// Select the source archive mode (committed `HEAD` vs working tree).
+    pub fn with_source_mode(mut self, source_mode: ArchiveSourceMode) -> Self {
+        self.source_mode = source_mode;
+        self
     }
 
     pub fn build(self) -> Vec<Box<dyn OrchestrationStage>> {
+        let PlanBuilder {
+            rebuild_only,
+            source_mode,
+        } = self;
         vec![
             Box::new(PreflightStage),
-            Box::new(PrepareSourceArchiveStage),
+            Box::new(PrepareSourceArchiveStage::new(source_mode)),
             Box::new(VerifySshReachabilityStage),
-            Box::new(CleanupHostsStage),
-            Box::new(BootstrapHostsStage),
+            // cleanup + bootstrap must share the same rebuild set: a node we
+            // refuse to clean must also be refused a rebuild (and vice versa).
+            Box::new(CleanupHostsStage::new(rebuild_only.clone())),
+            Box::new(BootstrapHostsStage::new(rebuild_only)),
             Box::new(CollectPubkeysStage),
             Box::new(MembershipInitStage),
             Box::new(DistributeMembershipStage),
@@ -46,12 +74,6 @@ impl PlanBuilder {
             Box::new(ExitHandoffStage),
             Box::new(FinalCleanupStage),
         ]
-    }
-}
-
-impl Default for PlanBuilder {
-    fn default() -> Self {
-        PlanBuilder::new()
     }
 }
 
