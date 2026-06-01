@@ -1,7 +1,0 @@
-====HELPER STDERR====
-====HELPER STDOUT====
-====PROCESS INFO====
-  PID USER  ELAPSED COMMAND
-19433 root 04:41:17 /usr/local/bin/rustynetd privileged-helper --socket /private/var/run/rustynet/rustynetd-privileged.sock --allowed-uid 500 --allowed-gid 500 --timeout-ms 30000
-====OPEN SOCKETS====
-rustynetd 19433 root    3u  unix 0x2147ee6d3e91a3c9      0t0                     /private/var/run/rustynet/rustynetd-privileged.sock

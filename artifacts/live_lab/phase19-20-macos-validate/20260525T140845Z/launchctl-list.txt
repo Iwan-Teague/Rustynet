@@ -1,2 +1,0 @@
-59075	-15	com.rustynet.daemon
-59065	-15	com.rustynet.privileged-helper

@@ -1,6 +1,0 @@
-exit	debian@192.168.0.200	exit-1	admin
-client	debian@192.168.0.201	client-1	client
-entry	debian@192.168.0.202	client-2	client
-aux	mac@192.168.0.210	client-3	client
-extra	debian@192.168.0.203	client-4	client
-fifth_client	debian@192.168.0.204	client-5	client

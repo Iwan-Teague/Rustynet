@@ -1,3 +1,0 @@
-tail: /usr/local/var/log/rustynet/rustynetd.stderr.log: No such file or directory
-====STDOUT====
-tail: /usr/local/var/log/rustynet/rustynetd.stdout.log: No such file or directory

@@ -1,7 +1,0 @@
-====IFCONFIG UTUN3912====
-ifconfig: interface utun3912 does not exist
-====ALL UTUN====
-====WG STATE====
-Unable to access interface: No such file or directory
-====TRUST EVIDENCE AGE====
-May 25 06:00:14 2026 /usr/local/var/rustynet/trust/rustynetd.trust
