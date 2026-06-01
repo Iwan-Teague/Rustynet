@@ -4831,8 +4831,6 @@ mod tests {
         // Regression: live_anchor (rc 78) — genesis membership for the exit/
         // anchor node was missing anchor.* sub-capabilities, causing
         // policy_reject at the live_anchor stage.
-        // Artifact: artifacts/live_lab/phase24-macos-smoke/
-        //   20260527T224355Z_origin_main_live_macos_ssh_full_retry39
         let src = include_str!("main.rs");
         for sub_cap in [
             "RoleCapability::AnchorGossipSeed",
