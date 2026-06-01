@@ -14,10 +14,18 @@ const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 /// block the next bootstrap's outbound traffic (incl. cargo registry downloads).
 /// Enumerated (not a fixed name) so an unanticipated table cannot leave egress
 /// blocked; idempotent (no matching tables → no-op) and best-effort.
+///
+/// The table list is captured into `$rn_tables` FIRST, then iterated with a
+/// `for` loop. The obvious `nft list tables | awk … | while read t; do sudo
+/// nft delete …; done` is BROKEN: the `sudo` inside the loop shares the loop's
+/// stdin (the awk pipe) and drains it, so `read` never sees the table names and
+/// nothing is deleted. That silent no-op left `rustynet_boot` behind on every
+/// run; `assert_node_clean` (C2) is what surfaced it. Capture-then-`for` has no
+/// pipe for the inner `sudo` to consume.
 const LINUX_NFT_KILLSWITCH_RESET_COMMAND: &str = "if command -v nft >/dev/null 2>&1; then \
-         sudo -n nft list tables 2>/dev/null \
-             | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}' \
-             | while read t; do sudo -n nft delete table inet \"$t\" 2>/dev/null || true; done; \
+         rn_tables=$(sudo -n nft list tables 2>/dev/null \
+             | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}'); \
+         for t in $rn_tables; do sudo -n nft delete table inet \"$t\" 2>/dev/null || true; done; \
      fi";
 
 /// Collect `WireGuard` public key from `/var/lib/rustynet/keys/wireguard.pub`.
@@ -525,6 +533,24 @@ mod tests {
         assert!(cmd.contains("|| true"));
         // Must NOT regress to deleting only the fixed `rustynet_boot` table.
         assert!(!cmd.contains("delete table inet rustynet_boot"));
+        // Regression guard for the silent-no-op bug: the table list MUST be
+        // captured into a variable first, then iterated with `for`. Piping
+        // `… | while read t; do sudo nft delete …; done` is broken — the inner
+        // `sudo` shares and drains the loop's stdin (the awk pipe), so `read`
+        // sees nothing and no table is deleted. That left `rustynet_boot`
+        // behind on every run until C2's assert_node_clean surfaced it.
+        assert!(
+            !cmd.contains("while read"),
+            "reset must not pipe into `while read` (inner sudo drains the pipe)"
+        );
+        assert!(
+            cmd.contains("rn_tables=$("),
+            "reset must capture the table list into a variable first"
+        );
+        assert!(
+            cmd.contains("for t in $rn_tables"),
+            "reset must iterate the captured list with a `for` loop"
+        );
     }
 
     #[test]
