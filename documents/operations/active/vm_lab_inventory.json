@@ -9,10 +9,10 @@
       },
       "exit_capable": true,
       "lab_role": "exit",
-      "last_known_ip": "192.168.65.3",
-      "last_known_network": "utm-shared-192.168.65.0/24",
+      "last_known_ip": "192.168.0.200",
+      "last_known_network": "lan-192.168.0.0/24",
       "live_ips": [
-        "192.168.65.3",
+        "192.168.0.200",
         "192.168.64.8",
         "192.168.64.3",
         "fd21:69d4:6afd:fa50:3cae:a9ff:fe5a:6182",
@@ -20,14 +20,14 @@
         "fe80::6023:d956:36c2:c94e"
       ],
       "mesh_ip": "100.64.0.1",
-      "network_group": "utm-shared-192.168.65.0/24",
+      "network_group": "lan-192.168.0.0/24",
       "node_id": "exit-1",
       "os": "Debian/Linux",
       "parent_device": "iwan's MacBook Pro",
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "192.168.65.3",
+      "ssh_target": "192.168.0.200",
       "ssh_user": "debian"
     },
     {
