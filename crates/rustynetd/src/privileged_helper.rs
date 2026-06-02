@@ -1082,6 +1082,32 @@ fn is_owned_nat_table_token(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 }
 
+/// True ONLY for the dedicated protected-mode DNS-redirect table
+/// (`rustynet_g<gen>_dns`, built by `linux_dns_protect`). Deliberately distinct
+/// from `is_owned_failclosed_table_token` (the filter-drop killswitch tables)
+/// and `is_owned_nat_table_token` (the exit masquerade tables): the
+/// `nat`/`redirect` chain+rule are permitted ONLY on this table, so a redirect
+/// can never be slipped into the killswitch's default-deny filter table.
+fn is_owned_dns_redirect_table_token(value: &str) -> bool {
+    value.starts_with("rustynet_g")
+        && value.ends_with("_dns")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+/// True for an nft `redirect to :<port>` target that stays on the local host:
+/// a bare `:<port>` with a non-zero port and no address. The protected-mode DNS
+/// redirect points loopback `:53` at the rustynet resolver's unprivileged bind
+/// port; an address-bearing target (e.g. `1.2.3.4:53`) is rejected so the rule
+/// can only ever redirect to a local socket.
+fn is_loopback_dns_redirect_target(value: &str) -> bool {
+    value
+        .strip_prefix(':')
+        .and_then(|port| port.parse::<u16>().ok())
+        .is_some_and(|port| port != 0)
+}
+
 fn is_nft_family_token(value: &str) -> bool {
     matches!(value, "inet" | "ip" | "ip6")
 }
@@ -1181,6 +1207,29 @@ fn validate_nft_add_chain_args(args: &[&str]) -> Result<(), String> {
             ";",
             "}",
         ] if is_owned_nat_table_token(table) => Ok(()),
+        // Protected-mode DNS fail-closed: a nat/output chain on the dedicated
+        // DNS-redirect table ONLY (scoped by is_owned_dns_redirect_table_token).
+        // Lets `linux_dns_protect`'s loopback :53 -> resolver redirect install
+        // without permitting nat on the filter-drop killswitch tables.
+        [
+            "add",
+            "chain",
+            "inet",
+            table,
+            "dns_redirect",
+            "{",
+            "type",
+            "nat",
+            "hook",
+            "output",
+            "priority",
+            "dstnat",
+            ";",
+            "policy",
+            "accept",
+            ";",
+            "}",
+        ] if is_owned_dns_redirect_table_token(table) => Ok(()),
         _ => Err("unsupported nft add chain argument schema".to_owned()),
     }
 }
@@ -1392,6 +1441,36 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         ] if is_owned_nat_table_token(table)
             && is_interface_name(incoming_interface)
             && is_interface_name(outgoing_interface) =>
+        {
+            Ok(())
+        }
+        // Protected-mode DNS fail-closed redirect: loopback (127.0.0.1) :53 ->
+        // the rustynet resolver's local bind port, udp+tcp, on the dedicated DNS
+        // table ONLY. Tightly bounded: fixed daddr 127.0.0.1, fixed dport 53,
+        // matching l4proto, and a local-only `:<port>` redirect target — so it
+        // can only ever divert loopback DNS to a local socket.
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "dns_redirect",
+            "meta",
+            "l4proto",
+            proto,
+            "ip",
+            "daddr",
+            "127.0.0.1",
+            proto2,
+            "dport",
+            "53",
+            "redirect",
+            "to",
+            target,
+        ] if is_owned_dns_redirect_table_token(table)
+            && matches!(*proto, "udp" | "tcp")
+            && proto == proto2
+            && is_loopback_dns_redirect_target(target) =>
         {
             Ok(())
         }
@@ -1728,6 +1807,201 @@ mod tests {
         let (a, _b) = UnixStream::pair().expect("socket pair");
         let me = nix::unistd::getuid().as_raw();
         assert_eq!(peer_uid(&a), Some(me));
+    }
+
+    #[test]
+    fn dns_redirect_commands_from_linux_dns_protect_are_all_permitted() {
+        // The privileged helper must permit EXACTLY the nft commands the daemon
+        // builds for the protected-mode DNS redirect (and the teardown).
+        let table = crate::linux_dns_protect::dns_redirect_table_name(1);
+        for argv in crate::linux_dns_protect::dns_redirect_nft_apply_argvs(&table, 53535) {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            assert!(
+                super::validate_nft_args(&refs).is_ok(),
+                "helper must permit DNS-redirect apply command: {refs:?}"
+            );
+        }
+        let teardown = crate::linux_dns_protect::dns_redirect_nft_teardown_argv(&table);
+        let refs: Vec<&str> = teardown.iter().map(String::as_str).collect();
+        assert!(
+            super::validate_nft_args(&refs).is_ok(),
+            "helper must permit DNS-redirect teardown: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn dns_redirect_validation_is_tightly_scoped() {
+        use super::validate_nft_args;
+        // nat/output chain permitted ONLY on a *_dns table — never the
+        // filter-drop killswitch table (a redirect must not be slippable into
+        // default-deny).
+        assert!(
+            validate_nft_args(&[
+                "add",
+                "chain",
+                "inet",
+                "rustynet_g1",
+                "dns_redirect",
+                "{",
+                "type",
+                "nat",
+                "hook",
+                "output",
+                "priority",
+                "dstnat",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ])
+            .is_err(),
+            "nat chain on the killswitch table must be rejected"
+        );
+        // redirect rule on a non-_dns table -> rejected.
+        assert!(
+            validate_nft_args(&[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "dns_redirect",
+                "meta",
+                "l4proto",
+                "udp",
+                "ip",
+                "daddr",
+                "127.0.0.1",
+                "udp",
+                "dport",
+                "53",
+                "redirect",
+                "to",
+                ":53535",
+            ])
+            .is_err(),
+            "redirect on a non-_dns table must be rejected"
+        );
+        // off-loopback destination -> rejected (can't capture arbitrary DNS).
+        assert!(
+            validate_nft_args(&[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1_dns",
+                "dns_redirect",
+                "meta",
+                "l4proto",
+                "udp",
+                "ip",
+                "daddr",
+                "8.8.8.8",
+                "udp",
+                "dport",
+                "53",
+                "redirect",
+                "to",
+                ":53535",
+            ])
+            .is_err(),
+            "off-loopback daddr must be rejected"
+        );
+        // non-DNS destination port -> rejected.
+        assert!(
+            validate_nft_args(&[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1_dns",
+                "dns_redirect",
+                "meta",
+                "l4proto",
+                "udp",
+                "ip",
+                "daddr",
+                "127.0.0.1",
+                "udp",
+                "dport",
+                "80",
+                "redirect",
+                "to",
+                ":53535",
+            ])
+            .is_err(),
+            "non-53 dport must be rejected"
+        );
+        // redirect target carrying an address (not a local socket) -> rejected.
+        assert!(
+            validate_nft_args(&[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1_dns",
+                "dns_redirect",
+                "meta",
+                "l4proto",
+                "udp",
+                "ip",
+                "daddr",
+                "127.0.0.1",
+                "udp",
+                "dport",
+                "53",
+                "redirect",
+                "to",
+                "1.2.3.4:53",
+            ])
+            .is_err(),
+            "address-bearing redirect target must be rejected"
+        );
+        // l4proto / dport protocol mismatch -> rejected.
+        assert!(
+            validate_nft_args(&[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1_dns",
+                "dns_redirect",
+                "meta",
+                "l4proto",
+                "udp",
+                "ip",
+                "daddr",
+                "127.0.0.1",
+                "tcp",
+                "dport",
+                "53",
+                "redirect",
+                "to",
+                ":53535",
+            ])
+            .is_err(),
+            "proto mismatch must be rejected"
+        );
+        // Regression: the killswitch filter-drop chain still validates.
+        assert!(
+            validate_nft_args(&[
+                "add",
+                "chain",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "output",
+                "priority",
+                "0",
+                ";",
+                "policy",
+                "drop",
+                ";",
+                "}",
+            ])
+            .is_ok(),
+            "existing killswitch chain must still validate"
+        );
     }
 
     fn helper_request_frame_bytes(payload: &[u8], version: u8) -> Vec<u8> {
