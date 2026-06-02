@@ -146,8 +146,14 @@ pub fn collect_linux_service_hardening_report() -> LinuxServiceHardeningReport {
 #[cfg(target_os = "linux")]
 fn run_systemctl_show_probe() -> LinuxServiceHardeningReport {
     use std::process::Command;
+    // `--all` is REQUIRED: without it `systemctl show` omits properties whose
+    // value is the empty string, so the reviewed `CapabilityBoundingSet=` and
+    // `AmbientCapabilities=` (empty in the hardened unit) are absent from the
+    // dump and the evaluator falsely reports them "missing from systemctl show
+    // output". `--all` forces empty-valued properties to be emitted.
     let output = match Command::new("systemctl")
         .arg("show")
+        .arg("--all")
         .arg(REVIEWED_SERVICE_NAME)
         .output()
     {
