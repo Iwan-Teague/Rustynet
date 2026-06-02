@@ -820,23 +820,28 @@ generate_wireguard_keys() {
   # nodes cannot cross-read. Runs as root because the service account may not
   # create System.keychain items.
   #
-  # --keychain-allow-any-app is REQUIRED: the passphrase is stored here (root,
-  # bootstrap) and read back by the rustynetd LaunchDaemon at startup. On macOS
-  # 26 the SecKeychain *framework* read fails for headless / service-account
-  # (launchd) contexts — the daemon has no user-session default keychain — so
-  # the default framework-bound ACL leaves the daemon unable to load the
-  # passphrase (observed live: `os secure store unavailable` -> wg key decrypt
-  # failed -> daemon exit 65, keepalive crash-loop). The allow-any-application
-  # ACL on the System keychain (via `/usr/bin/security`, the same pattern the
-  # trust signing passphrase below already uses for its cross-binary reader)
-  # lets the root daemon read it. Still per-node-scoped by account; single-
-  # tenant service-account install layout. OS-secure keychain storage is
-  # preserved — this is the read-ACL, not a downgrade to a plaintext file.
+  # NO --keychain-allow-any-app here. The passphrase is stored AND read by the
+  # same binary: rustynetd (`key store-passphrase` as root at bootstrap, then the
+  # LaunchDaemon at startup as the uid-500 service account). `key store-passphrase`
+  # therefore custodies it via the owned-identity System-keychain path
+  # (`SecItemAdd`), which binds read access to rustynetd's own code-signing
+  # identity (Rust binaries are ad-hoc linker-signed on macOS arm64 -> stable
+  # cdhash across both invocations). The same signed binary reads it back across
+  # the login-session boundary, as any uid; nothing else can — not even
+  # `/usr/bin/security`.
+  #
+  # This replaces the previous `-A` (allow-any-app) CLI path, which was the
+  # actual root cause of the daemon crash-loop: on macOS 26 the `-A` item's
+  # secret is gated by a code-signing partition list and is unreadable
+  # cross-session even by root (observed live: `os secure store unavailable` ->
+  # wg key decrypt failed -> daemon exit 65, keepalive crash-loop). The owned
+  # path is strictly tighter than `-A` AND actually readable by the daemon.
+  # Per-node-scoped by account (`wg-passphrase-${NODE_ID}`); OS-secure keychain
+  # storage preserved — a tighter read-ACL, not a downgrade to a plaintext file.
   local keychain_account="wg-passphrase-${NODE_ID}"
   if ! sudo "${RUSTYNETD_BIN}" key store-passphrase \
       --passphrase-file "${passphrase_file}" \
-      --keychain-account "${keychain_account}" \
-      --keychain-allow-any-app; then
+      --keychain-account "${keychain_account}"; then
     echo "[bootstrap] rustynetd key store-passphrase failed; daemon cannot resolve passphrase from keychain" >&2
     exit 1
   fi
