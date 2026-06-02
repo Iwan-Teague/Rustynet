@@ -285,19 +285,39 @@ fn wait_for_macos_daemon_socket(conn: &NodeConnection) -> Result<(), AdapterErro
     // the Linux install-systemd timeout.  Probe via `test -S`
     // (Unix-domain socket) to avoid false positives on placeholder
     // files left by a crashed previous run.
+    // Probe in short bursts over SEPARATE SSH connections rather than one long
+    // 40 s connection. The daemon perturbs the host network as it comes up
+    // (binding the userspace-shared utun, reconcile touching routes), which can
+    // drop a single in-flight SSH session (observed: bootstrap_hosts failing
+    // with ssh `exit 255` even though the daemon was healthy and the socket
+    // present). Re-establishing the connection each burst means one transient
+    // drop no longer fails the whole wait. ~8 bursts × (8 s probe + 2 s pause)
+    // ≈ 80 s budget, comfortably longer than observed daemon startup.
     let probe = format!(
-        "for i in $(seq 1 40); do \
+        "for i in $(seq 1 8); do \
             if sudo test -S {socket}; then echo socket-ready; exit 0; fi; \
             sleep 1; \
          done; \
          echo socket-missing; exit 1"
     );
-    ssh::run_remote(conn, &probe, Duration::from_secs(60)).map_err(|err| AdapterError::Protocol {
+    let mut last_status = String::from("no probe attempt completed");
+    for attempt in 1..=8 {
+        match ssh::run_remote(conn, &probe, Duration::from_secs(30)) {
+            Ok(output) if output.contains("socket-ready") => return Ok(()),
+            Ok(_) => last_status = "socket not present yet".to_string(),
+            // Transient SSH failure (e.g. exit 255 while the daemon briefly
+            // perturbs the network) — re-establish the connection and retry.
+            Err(err) => last_status = format!("ssh probe error: {err}"),
+        }
+        if attempt < 8 {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    Err(AdapterError::Protocol {
         message: format!(
-            "macOS daemon socket {socket} failed to appear within 40 s after launchd bootstrap: {err}"
+            "macOS daemon socket {socket} failed to appear after 8 retried probes (~80 s) post launchd bootstrap: {last_status}"
         ),
-    })?;
-    Ok(())
+    })
 }
 
 /// Start the launchd service.
