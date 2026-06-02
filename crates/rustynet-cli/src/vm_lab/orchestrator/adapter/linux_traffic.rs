@@ -178,18 +178,20 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &std::path::Path) -> Result
 
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
-    // Stop daemon first (best-effort), then clear any failed-unit latch so the
-    // next bootstrap can start the service cleanly (a unit left in `failed`
-    // refuses to start until reset).
+    // Disable + stop the daemon and WAIT until it is fully inactive BEFORE the
+    // nft reset below. A daemon still shutting down in enforce mode re-applies
+    // the `rustynet_boot` fail-closed killswitch *after* the reset deletes it
+    // (fail-closed-on-exit), which then trips assert_node_clean — observed when
+    // re-running over a node still running a prior mesh. `disable --now` also
+    // prevents it auto-starting before bootstrap; reset-failed clears any
+    // failed-unit latch so the next bootstrap can start cleanly. Best-effort:
+    // a host without the unit is a no-op.
     let _ = ssh::run_remote(
         conn,
-        "sudo -n systemctl stop rustynetd 2>/dev/null || true",
-        Duration::from_secs(30),
-    );
-    let _ = ssh::run_remote(
-        conn,
-        "sudo -n systemctl reset-failed rustynetd 2>/dev/null || true",
-        Duration::from_secs(30),
+        "sudo -n systemctl disable --now rustynetd 2>/dev/null || true; \
+         for _ in $(seq 1 30); do systemctl is-active --quiet rustynetd || break; sleep 0.5; done; \
+         sudo -n systemctl reset-failed rustynetd 2>/dev/null || true",
+        Duration::from_secs(45),
     );
     // Flush every rustynet nftables table the daemon may have left behind so the
     // next bootstrap is not blocked by a leftover default-deny killswitch.
