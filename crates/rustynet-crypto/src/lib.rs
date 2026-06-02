@@ -735,8 +735,18 @@ pub fn load_macos_generic_password(service: &str, account: &str) -> Result<Vec<u
     if let Ok(pw) = get_generic_password(service, account) {
         return Ok(pw);
     }
+    // Next: the System keychain, scoped and read via `SecItemCopyMatching` as
+    // the calling binary's own code-signing identity. This is where
+    // `store_macos_generic_password_system_keychain_owned` places items (e.g.
+    // the WG key passphrase). Required for the launchd daemon, whose default
+    // search list does not reliably include the System keychain and which cannot
+    // read legacy `-A` items cross-session.
+    if let Ok(pw) = load_macos_generic_password_system_keychain_owned(service, account) {
+        return Ok(pw);
+    }
     // Fallback: query the System keychain explicitly via the security CLI.
-    // Required for system launch daemons that run without a user keychain session.
+    // Required for legacy `-A` items stored by `store_macos_generic_password_allow_any_app`
+    // (e.g. the trust signing-key passphrase, read by the `rustynet` CLI).
     // service/account are validated upstream (normalize_macos_keychain_account).
     let output = std::process::Command::new("/usr/bin/security")
         .args([
@@ -760,6 +770,134 @@ pub fn load_macos_generic_password(service: &str, account: &str) -> Result<Vec<u
         return Ok(bytes);
     }
     Err(CryptoError::OsStoreUnavailable)
+}
+
+/// Store a generic password into the macOS **System** keychain via the modern
+/// `SecItemAdd` API ([`security_framework::item::ItemAddOptions`]), owned by the
+/// *calling binary's* code-signing identity. The same signed binary reads it
+/// back cross-session via [`load_macos_generic_password_system_keychain_owned`];
+/// no other binary — not even `/usr/bin/security` — can read it.
+///
+/// This is the correct, tightest custody for a secret that is both written and
+/// read by `rustynetd`: the WireGuard key passphrase is stored at bootstrap by
+/// `rustynetd key store-passphrase` (running as root) and read at daemon startup
+/// by the same `rustynetd` binary (running as the uid-500 service account).
+/// Rust binaries are ad-hoc linker-signed on macOS arm64, giving `rustynetd` a
+/// stable code identity across both invocations.
+///
+/// **Why not the other write paths** (all verified live on macOS 26.5):
+/// - The deprecated `SecKeychainAddGenericPassword` family (used by
+///   [`store_macos_generic_password_system_keychain`]) fails opaquely for the
+///   System keychain even as root with the keychain unlocked.
+/// - The `-A` `security`-CLI path
+///   ([`store_macos_generic_password_allow_any_app`]) writes an item whose
+///   secret is **not** readable across a login-session boundary — the launchd
+///   daemon (and even root in a fresh session) gets `errSecAuthFailed`, because
+///   macOS gates generic-password secret reads by a partition list keyed on
+///   code-signing identity and `-A` does not place a usable entry on it.
+/// - This `SecItemAdd` path makes the storing binary's stable-cdhash identity
+///   the partition owner; the same binary reads it back in any later session and
+///   as any uid (proven: cross-session read succeeds for root *and* the uid-500
+///   daemon, while the `security` CLI is correctly denied).
+#[cfg(target_os = "macos")]
+pub fn store_macos_generic_password_system_keychain_owned(
+    service: &str,
+    account: &str,
+    secret: &[u8],
+) -> Result<(), CryptoError> {
+    use core_foundation::data::CFData;
+    use security_framework::item::{ItemAddOptions, ItemAddValue, ItemClass, Location};
+    validate_macos_keychain_label("service", service)?;
+    validate_macos_keychain_label("account", account)?;
+    // Reject embedded NULs: the delete helper below passes account/service as
+    // argv to `security`, where C-string handling would truncate at a NUL.
+    if secret.contains(&0) || service.as_bytes().contains(&0) || account.as_bytes().contains(&0) {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    let mut keychain = SecKeychain::open(MACOS_SYSTEM_KEYCHAIN_PATH)
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    // The System keychain is auto-unlocked via /var/db/SystemKey; this is a
+    // best-effort no-op when it is already unlocked.
+    let _ = keychain.unlock(Some(""));
+    // Remove any prior item so the fresh `SecItemAdd` re-establishes ownership
+    // by *this* binary's identity. A previous bootstrap may have stored the item
+    // via the legacy `-A` CLI path (partition owned by `apple-tool:`) or under a
+    // different identity; without the delete, `SecItemAdd` returns
+    // `errSecDuplicateItem` and the stale ACL/partition survives. The delete
+    // carries no secret in argv (only the validated service/account attributes),
+    // so it does not share the `-A` add path's argv-exposure trade-off, and root
+    // can delete an item regardless of its read partition.
+    delete_macos_system_keychain_generic_password_via_cli(service, account);
+    let mut opts = ItemAddOptions::new(ItemAddValue::Data {
+        class: ItemClass::generic_password(),
+        data: CFData::from_buffer(secret),
+    });
+    opts.set_service(service)
+        .set_account_name(account)
+        .set_location(Location::FileKeychain(keychain));
+    opts.add().map_err(|_| CryptoError::OsStoreUnavailable)?;
+    // Fail-closed read-back through the *same* `SecItemCopyMatching` path the
+    // daemon's loader uses, so a silent store failure surfaces here at
+    // provisioning time rather than as an opaque daemon crash-loop hours later.
+    match load_macos_generic_password_system_keychain_owned(service, account) {
+        Ok(got) if got.as_slice() == secret => Ok(()),
+        _ => Err(CryptoError::OsStoreUnavailable),
+    }
+}
+
+/// Read a generic password owned by the calling binary from the macOS System
+/// keychain via `SecItemCopyMatching`
+/// ([`security_framework::item::ItemSearchOptions`]) scoped explicitly to
+/// `/Library/Keychains/System.keychain`. Counterpart to
+/// [`store_macos_generic_password_system_keychain_owned`]; see that function for
+/// the macOS-26 rationale.
+#[cfg(target_os = "macos")]
+pub fn load_macos_generic_password_system_keychain_owned(
+    service: &str,
+    account: &str,
+) -> Result<Vec<u8>, CryptoError> {
+    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
+    if service.trim().is_empty() || account.trim().is_empty() {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    let keychain = SecKeychain::open(MACOS_SYSTEM_KEYCHAIN_PATH)
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    let keychains = [keychain];
+    let results = ItemSearchOptions::new()
+        .keychains(&keychains)
+        .class(ItemClass::generic_password())
+        .service(service)
+        .account(account)
+        .load_data(true)
+        .limit(1i64)
+        .search()
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    for result in results {
+        if let SearchResult::Data(data) = result {
+            return Ok(data);
+        }
+    }
+    Err(CryptoError::OsStoreUnavailable)
+}
+
+/// `/usr/bin/security delete-generic-password` against the System keychain.
+/// Used to clear a prior item before an owned `SecItemAdd` re-store. Carries no
+/// secret in argv; service/account are validated by the caller.
+#[cfg(target_os = "macos")]
+fn delete_macos_system_keychain_generic_password_via_cli(service: &str, account: &str) {
+    let _ = std::process::Command::new("/usr/bin/security")
+        .args([
+            "delete-generic-password",
+            "-a",
+            account,
+            "-s",
+            service,
+            "/Library/Keychains/System.keychain",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(target_os = "linux")]
@@ -2161,6 +2299,109 @@ mod tests {
         assert!(
             window.contains("store_macos_generic_password_system_keychain("),
             "fallback to System.keychain must be wired (Gap H)"
+        );
+    }
+
+    /// Fail-closed: the owned-identity System-keychain store MUST validate
+    /// service/account labels and reject embedded NULs *before* touching the
+    /// keychain or spawning the delete helper. An injection-shaped or
+    /// NUL-bearing label must never reach `security delete-generic-password`'s
+    /// argv nor `SecItemAdd`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_macos_generic_password_system_keychain_owned_rejects_invalid_input_fail_closed() {
+        use super::store_macos_generic_password_system_keychain_owned;
+        let cases: &[(&str, &str, &[u8])] = &[
+            ("svc;rm -rf /", "acct", b"secret"),
+            ("svc", "acct\0name", b"secret"),
+            ("", "acct", b"secret"),
+            ("svc", "", b"secret"),
+            // valid labels but NUL in the secret — rejected before keychain I/O
+            ("net.rustynet.test", "acct", b"sec\0ret"),
+        ];
+        for (service, account, secret) in cases {
+            assert_eq!(
+                store_macos_generic_password_system_keychain_owned(service, account, secret).err(),
+                Some(CryptoError::OsStoreUnavailable),
+                "owned store must fail closed for service={service:?} account={account:?}"
+            );
+        }
+    }
+
+    /// Pin the security properties of the owned-identity custody path:
+    /// the WireGuard passphrase is stored and read by the *same* signed
+    /// `rustynetd` binary, so it uses `SecItemAdd`/`SecItemCopyMatching`
+    /// (framework) bound to that binary's code-signing identity — NOT the
+    /// `-A` `security`-CLI path, whose item is unreadable by the launchd
+    /// daemon across the login-session boundary on macOS 26. Critically, the
+    /// secret must NEVER appear in argv on this path (no `-w`): it flows only
+    /// through `CFData`/`SecItemAdd`. Verified live on macOS 26.5.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_macos_generic_password_system_keychain_owned_uses_framework_no_argv_secret() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body =
+            std::fs::read_to_string(crate_root.join("src/lib.rs")).expect("crypto source readable");
+
+        let start = body
+            .find("pub fn store_macos_generic_password_system_keychain_owned(")
+            .expect("owned store must remain present");
+        let rel_end = body[start..]
+            .find("\n}\n")
+            .expect("owned store must have a closing brace");
+        let window = &body[start..start + rel_end + 3];
+
+        assert!(
+            window.contains("validate_macos_keychain_label")
+                && window.contains("secret.contains(&0)"),
+            "owned store must validate labels and reject NUL secrets before keychain I/O"
+        );
+        assert!(
+            window.contains("ItemAddOptions::new(") && window.contains(".add()"),
+            "owned store must use the modern SecItemAdd framework API"
+        );
+        assert!(
+            window.contains("Location::FileKeychain")
+                && window.contains("MACOS_SYSTEM_KEYCHAIN_PATH"),
+            "owned store must target the System keychain explicitly"
+        );
+        assert!(
+            window.contains("CFData::from_buffer(secret)"),
+            "owned store must pass the secret as CFData (never as argv)"
+        );
+        assert!(
+            !window.contains("\"-w\""),
+            "owned store must NEVER place the secret in argv (`-w`) — the SecItemAdd path keeps it in-process"
+        );
+        assert!(
+            window.contains("load_macos_generic_password_system_keychain_owned(service, account)"),
+            "owned store must fail-closed read-back through the same SecItemCopyMatching path the daemon uses"
+        );
+
+        // Owned READ side: SecItemCopyMatching scoped to the System keychain.
+        let lstart = body
+            .find("pub fn load_macos_generic_password_system_keychain_owned(")
+            .expect("owned load must remain present");
+        let lrel_end = body[lstart..].find("\n}\n").expect("owned load brace");
+        let lwindow = &body[lstart..lstart + lrel_end + 3];
+        assert!(
+            lwindow.contains("ItemSearchOptions::new()")
+                && lwindow.contains(".keychains(")
+                && lwindow.contains("SearchResult::Data"),
+            "owned load must read via SecItemCopyMatching scoped to the explicit keychain"
+        );
+
+        // Delete helper carries no secret in argv.
+        let dstart = body
+            .find("fn delete_macos_system_keychain_generic_password_via_cli(")
+            .expect("owned delete helper must remain present");
+        let drel_end = body[dstart..].find("\n}\n").expect("delete helper brace");
+        let dwindow = &body[dstart..dstart + drel_end + 3];
+        assert!(
+            dwindow.contains("delete-generic-password")
+                && dwindow.contains("/Library/Keychains/System.keychain")
+                && !dwindow.contains("\"-w\""),
+            "delete helper must target the System keychain and carry no secret in argv"
         );
     }
 }

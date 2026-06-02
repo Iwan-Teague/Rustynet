@@ -27,7 +27,9 @@ use rustynet_crypto::{
     KeyCustodyManager, KeyCustodyPermissionPolicy, PlatformOsSecureStore, write_encrypted_key_file,
 };
 #[cfg(target_os = "macos")]
-use rustynet_crypto::{load_macos_generic_password, store_macos_generic_password};
+use rustynet_crypto::{
+    load_macos_generic_password, store_macos_generic_password_system_keychain_owned,
+};
 #[cfg(windows)]
 use rustynet_windows_native::{WindowsDpapiScope, dpapi_protect, dpapi_unprotect};
 use sha2::{Digest, Sha256};
@@ -117,11 +119,17 @@ pub fn store_passphrase_in_os_secure_store(
             None => MACOS_PASSPHRASE_KEYCHAIN_SERVICE.to_owned(),
         };
         let passphrase = read_passphrase_file_explicit(passphrase_path)?;
-        // `allow_any_app` forces the allow-any-application ACL, required when a
-        // *different* binary reads the secret back (the trust signing-key
-        // passphrase is stored by rustynetd but read by `rustynet ops
-        // refresh-signed-trust`). The default framework path binds read access
-        // to the storing binary's identity.
+        // `allow_any_app` forces the allow-any-application (`-A`) ACL, required
+        // only when a *different* binary reads the secret back: the trust
+        // signing-key passphrase is stored by rustynetd but read by `rustynet
+        // ops refresh-signed-trust`. Otherwise (the default, e.g. the WireGuard
+        // key passphrase) the secret is both stored and read by rustynetd, so we
+        // use the owned-identity System-keychain path (`SecItemAdd`), which binds
+        // read access to rustynetd's own code-signing identity. That is strictly
+        // tighter than `-A` and — unlike `-A` — is actually readable by the
+        // launchd daemon across the login-session boundary on macOS 26 (the `-A`
+        // CLI path stores an item the daemon cannot read; see the rustynet-crypto
+        // rationale on `store_macos_generic_password_system_keychain_owned`).
         if allow_any_app {
             rustynet_crypto::store_macos_generic_password_allow_any_app(
                 service.as_str(),
@@ -129,7 +137,11 @@ pub fn store_passphrase_in_os_secure_store(
                 passphrase.as_bytes(),
             )
         } else {
-            store_macos_generic_password(service.as_str(), account.as_str(), passphrase.as_bytes())
+            store_macos_generic_password_system_keychain_owned(
+                service.as_str(),
+                account.as_str(),
+                passphrase.as_bytes(),
+            )
         }
         .map_err(|err| format!("store macOS keychain passphrase failed: {err}"))?;
         Ok(())
@@ -1259,6 +1271,42 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}-{stamp}"));
         std::fs::create_dir_all(&dir).expect("test directory should be creatable");
         dir
+    }
+
+    /// Pin the macOS passphrase custody routing: the cross-binary case
+    /// (`allow_any_app == true`, e.g. the trust signing passphrase read by the
+    /// `rustynet` CLI) uses the `-A` allow-any-app path, while the same-binary
+    /// case (`allow_any_app == false`, e.g. the WireGuard passphrase stored and
+    /// read by rustynetd) uses the owned-identity `SecItemAdd` path — NOT the
+    /// legacy default-keychain `store_macos_generic_password`, whose `-A` CLI
+    /// fallback produces an item the launchd daemon cannot read cross-session on
+    /// macOS 26. A regression here re-opens the daemon crash-loop.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_passphrase_routes_owned_identity_for_same_binary_custody() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(crate_root.join("src/key_material.rs"))
+            .expect("key_material source readable");
+        let start = body
+            .find("pub fn store_passphrase_in_os_secure_store(")
+            .expect("store_passphrase_in_os_secure_store must remain present");
+        let rel_end = body[start..]
+            .find("\n}\n")
+            .expect("store_passphrase_in_os_secure_store must have a closing brace");
+        let window = &body[start..start + rel_end + 3];
+        assert!(
+            window.contains("store_macos_generic_password_allow_any_app("),
+            "cross-binary custody must keep the -A allow-any-app path"
+        );
+        assert!(
+            window.contains("store_macos_generic_password_system_keychain_owned("),
+            "same-binary custody (WG passphrase) must use the owned-identity SecItemAdd path"
+        );
+        assert!(
+            !window.contains("store_macos_generic_password(service.as_str()"),
+            "WG passphrase must NOT route through the legacy default-keychain store \
+             (its -A CLI fallback is unreadable by the launchd daemon on macOS 26)"
+        );
     }
 
     #[test]
