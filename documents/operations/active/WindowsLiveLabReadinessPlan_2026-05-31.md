@@ -425,9 +425,25 @@ security-reviewed killswitch ruleset + the hardened privileged-helper allowlist
 (needs a validated resolv.conf/NM file-write op) + protected-mode apply/teardown
 + rollback + Windows NRPT parity; to be done as a focused, fully-tested effort.
 
-**3-node follow-up:** macOS discovered on the LAN at `192.168.0.210` (inventory
-fixed `661053b`); the run_validator `sudo` fix still needs porting to the macOS
-adapter before the 3-node run.
+**3-node follow-up (first live macOS run, 2026-06-02):** macOS discovered on the
+LAN at `192.168.0.210` (inventory fixed `661053b`), run_validator sudo ported to
+macOS (`d053dfd`). First 3-node run (`debian:exit + windows:client +
+macos:client`) at `8c30e16`: `cleanup_hosts` PASS (after a cleanup-wait fix
+`8c30e16` — a mid-shutdown enforce-mode daemon was re-applying `rustynet_boot`
+after the nft reset; cleanup now `disable --now` + waits for inactive first),
+`bootstrap_hosts` PASS — **macOS's first-ever `rustynetd` compile + install
+succeeded** (builds via `rustup run stable cargo build`). **Blocked at
+`collect_pubkeys`:** the macOS daemon crash-loops `exit 65 (EX_DATAERR)` —
+`wg key decrypt failed: load macOS keychain passphrase … os secure store
+unavailable`. Root cause: the macOS WG-passphrase load hits the Keychain
+(`PlatformOsSecureStore`) directly, but as a **LaunchDaemon (no user login
+session) the keychain is unreachable**, and that path has no encrypted-file
+fallback. The privileged helper runs; only the main daemon is stuck. **Fix
+(focused, security-sensitive, NOT done):** coordinate bootstrap-store +
+daemon-load onto a daemon-accessible store — root can reach
+`/Library/Keychains/System.keychain`, or route the passphrase through
+`KeyCustodyManager`'s encrypted-file fallback. This is the macOS key-custody
+control the brief flagged as never-validated-live; now it has a concrete repro.
 - **2026-06-01 status:** lab networking is **not** the blocker — the UTM VMs are
   LAN-bridged, so the exit (`debian-headless-1`, `192.168.0.200`) and the Windows
   client (`192.168.0.45`) share `192.168.0.0/24`. Four orchestrate runs walked the
