@@ -149,7 +149,12 @@ impl NodeAdapter for MacosNodeAdapter {
         let op_label = argv.get(1).cloned().unwrap_or_default();
         // All argv elements come from `MacosDaemonProbe::build_argv`, which produces
         // a fixed set of known-safe strings. No user-controlled input reaches argv.
-        let script = argv.join(" ");
+        //
+        // Run with `sudo -n`: the validators inspect root-owned state
+        // (`/usr/local/var/rustynet/keys`, launchd config). Without sudo the
+        // checks report false "permission denied" drift. Same fix as the Linux
+        // adapter; the lab macOS guest has passwordless sudo.
+        let script = format!("sudo -n {}", argv.join(" "));
         let output = ssh::run_remote(&self.conn, &script, VALIDATOR_TIMEOUT)?;
         let passed = ssh::validator_report_ok(&output);
         Ok(ValidatorReport {
