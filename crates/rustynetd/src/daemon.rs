@@ -10343,12 +10343,25 @@ fn parse_windows_default_egress_interface_output(
 }
 
 /// Select the default-route (egress) interface alias from a
-/// `GetAdaptersAddresses` snapshot: the operational adapter that advertises a
-/// default gateway, has the lowest IPv4 interface metric, and is not the
-/// WireGuard tunnel adapter. This mirrors the
-/// `Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric`
-/// selection but reads it from the in-process adapter snapshot, so it cannot
-/// hang on WMI/CIM. Pure so it can be unit-tested on any host.
+/// `GetAdaptersAddresses` snapshot.
+///
+/// Preferred selection: the operational, non-tunnel adapter that advertises a
+/// default gateway with the lowest IPv4 interface metric. This mirrors
+/// `Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric` but
+/// reads it from the in-process adapter snapshot, so it cannot hang on WMI/CIM.
+///
+/// Fallback selection: when **no** interface advertises a default gateway, the
+/// lowest-metric operational, non-tunnel, non-loopback adapter that carries a
+/// routable IPv4 unicast address. A same-LAN-only client (no STUN/relay) on an
+/// isolated subnet legitimately has no default route, yet still reaches its
+/// mesh peers directly over this underlay interface; without the fallback the
+/// daemon refuses to start on such a host (it failed closed at egress
+/// auto-detect right after `run_daemon entered`). The fallback never overrides
+/// a real gateway interface and never selects loopback / link-local-only
+/// adapters, so it does not weaken egress scoping — it just picks the genuine
+/// underlay when there is no internet-facing route.
+///
+/// Pure so it can be unit-tested on any host.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn select_windows_default_egress_interface(
     adapters: &[rustynet_windows_native::WindowsNetworkAdapterSnapshot],
@@ -10357,7 +10370,12 @@ fn select_windows_default_egress_interface(
     // IfOperStatusUp from the Win32 `IF_OPER_STATUS` enum — the adapter is
     // operational and can carry traffic.
     const IF_OPER_STATUS_UP: u32 = 1;
-    let mut best: Option<(u32, &str)> = None;
+    // Preferred: an interface that advertises a default gateway (routes to
+    // 0.0.0.0/0) — the true internet-facing egress when one exists.
+    let mut best_gateway: Option<(u32, &str)> = None;
+    // Fallback: an interface with a routable IPv4 but no default gateway — the
+    // underlay of a same-LAN-only client on a subnet with no default route.
+    let mut best_lan: Option<(u32, &str)> = None;
     for adapter in adapters {
         let alias = adapter.friendly_name.as_str();
         if alias.is_empty() || alias.eq_ignore_ascii_case(tunnel_alias) {
@@ -10366,23 +10384,45 @@ fn select_windows_default_egress_interface(
         if adapter.oper_status != IF_OPER_STATUS_UP {
             continue;
         }
-        // Only an interface that advertises a default gateway routes to
-        // 0.0.0.0/0 — i.e. is a default-route / egress interface.
-        if adapter.default_gateways.is_empty() {
+        if adapter.is_loopback() {
             continue;
         }
-        let replace = match best {
-            None => true,
-            Some((best_metric, _)) => adapter.ipv4_metric < best_metric,
-        };
-        if replace {
-            best = Some((adapter.ipv4_metric, alias));
+        if !adapter.default_gateways.is_empty() {
+            let replace = match best_gateway {
+                None => true,
+                Some((best_metric, _)) => adapter.ipv4_metric < best_metric,
+            };
+            if replace {
+                best_gateway = Some((adapter.ipv4_metric, alias));
+            }
+            continue;
+        }
+        // Gateway-less: eligible only as a same-LAN fallback, and only if it
+        // carries a routable IPv4 (not loopback / link-local / unspecified).
+        let has_routable_ipv4 = adapter.unicast_addresses.iter().any(|ip| match ip {
+            std::net::IpAddr::V4(v4) => {
+                !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(_) => false,
+        });
+        if has_routable_ipv4 {
+            let replace = match best_lan {
+                None => true,
+                Some((best_metric, _)) => adapter.ipv4_metric < best_metric,
+            };
+            if replace {
+                best_lan = Some((adapter.ipv4_metric, alias));
+            }
         }
     }
-    best.map(|(_, alias)| alias.to_owned()).ok_or_else(|| {
-        "egress interface auto-detect found no operational, non-tunnel interface advertising a default gateway"
-            .to_owned()
-    })
+    best_gateway
+        .or(best_lan)
+        .map(|(_, alias)| alias.to_owned())
+        .ok_or_else(|| {
+            "egress interface auto-detect found no operational, non-tunnel interface with a \
+             default gateway or a routable IPv4 address"
+                .to_owned()
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -14384,7 +14424,7 @@ mod tests {
     use std::io::Write;
     #[cfg(feature = "test-harness")]
     use std::net::UdpSocket;
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
@@ -19866,6 +19906,74 @@ mod tests {
         let down_phys = egress_adapter("Ethernet", 2, 5, true);
         let err = super::select_windows_default_egress_interface(&[tunnel, down_phys], "rustynet0")
             .expect_err("must not select the tunnel as its own egress");
+        assert!(err.contains("no operational, non-tunnel interface"));
+    }
+
+    fn egress_adapter_with_ipv4(
+        friendly: &str,
+        oper_status: u32,
+        ipv4_metric: u32,
+        has_gateway: bool,
+        ipv4: &[std::net::Ipv4Addr],
+    ) -> rustynet_windows_native::WindowsNetworkAdapterSnapshot {
+        let mut adapter = egress_adapter(friendly, oper_status, ipv4_metric, has_gateway);
+        adapter.unicast_addresses = ipv4.iter().copied().map(std::net::IpAddr::V4).collect();
+        adapter
+    }
+
+    #[test]
+    fn select_windows_egress_falls_back_to_lan_interface_without_gateway() {
+        // Same-LAN-only client: the only up, non-tunnel interface has a routable
+        // IPv4 but no default gateway (an isolated subnet with no default route).
+        // It must still be selectable as egress so the daemon can start.
+        let lan =
+            egress_adapter_with_ipv4("Ethernet", 1, 15, false, &[Ipv4Addr::new(192, 168, 0, 45)]);
+        let tunnel = egress_adapter("rustynet0", 1, 1, false);
+        let selected = super::select_windows_default_egress_interface(&[lan, tunnel], "rustynet0")
+            .expect("the gateway-less LAN interface is a valid egress for a same-LAN client");
+        assert_eq!(selected, "Ethernet");
+    }
+
+    #[test]
+    fn select_windows_egress_prefers_gateway_over_lan_fallback() {
+        // A real gateway interface always wins over a gateway-less fallback, even
+        // when the fallback advertises a lower metric.
+        let lan = egress_adapter_with_ipv4("Wi-Fi", 1, 5, false, &[Ipv4Addr::new(192, 168, 0, 45)]);
+        let gateway =
+            egress_adapter_with_ipv4("Ethernet", 1, 50, true, &[Ipv4Addr::new(10, 0, 0, 9)]);
+        let selected = super::select_windows_default_egress_interface(&[lan, gateway], "rustynet0")
+            .expect("an egress interface");
+        assert_eq!(selected, "Ethernet");
+    }
+
+    #[test]
+    fn select_windows_egress_fallback_picks_lowest_metric_lan_interface() {
+        let high =
+            egress_adapter_with_ipv4("Ethernet", 1, 40, false, &[Ipv4Addr::new(192, 168, 0, 45)]);
+        let low = egress_adapter_with_ipv4(
+            "Ethernet 2",
+            1,
+            10,
+            false,
+            &[Ipv4Addr::new(192, 168, 1, 45)],
+        );
+        let selected = super::select_windows_default_egress_interface(&[high, low], "rustynet0")
+            .expect("an egress interface");
+        assert_eq!(selected, "Ethernet 2");
+    }
+
+    #[test]
+    fn select_windows_egress_fallback_rejects_loopback_and_link_local() {
+        // Neither a loopback (127/8) nor an APIPA link-local (169.254/16) address
+        // is a routable underlay; with no gateway and no routable IPv4 this fails
+        // closed rather than picking a non-routable interface as egress.
+        let loopbackish =
+            egress_adapter_with_ipv4("Ethernet", 1, 10, false, &[Ipv4Addr::new(127, 0, 0, 1)]);
+        let link_local =
+            egress_adapter_with_ipv4("Wi-Fi", 1, 20, false, &[Ipv4Addr::new(169, 254, 3, 4)]);
+        let err =
+            super::select_windows_default_egress_interface(&[loopbackish, link_local], "rustynet0")
+                .expect_err("a non-routable-only host has no valid egress");
         assert!(err.contains("no operational, non-tunnel interface"));
     }
 

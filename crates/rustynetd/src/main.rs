@@ -149,7 +149,10 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "daemon" => {
                 let config = parse_daemon_config(rest)?;
                 init_daemon_logging(daemon_log_file_path(&config).as_deref());
-                run_daemon(config).map_err(|err| err.to_string())
+                run_daemon(config).map_err(|err| {
+                    log::error!("rustynetd startup: daemon exited fatally: {err}");
+                    err.to_string()
+                })
             }
             [cmd, rest @ ..] if cmd == "privileged-helper" => run_privileged_helper_command(rest),
             [cmd, rest @ ..] if cmd == "key" => run_key_command(rest),
@@ -327,7 +330,13 @@ fn init_daemon_logging(log_file: Option<&Path>) {
 fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
     let config = parse_daemon_config(args)?;
     init_daemon_logging(daemon_log_file_path(&config).as_deref());
-    run_daemon(config).map_err(|err| err.to_string())
+    run_daemon(config).map_err(|err| {
+        // A fatal startup error is otherwise returned only to the SCM (and lost
+        // — the Windows service discards stderr), leaving the durable log
+        // ending at "run_daemon entered" with no reason. Record it here.
+        log::error!("rustynetd startup: daemon exited fatally: {err}");
+        err.to_string()
+    })
 }
 
 fn run_key_command(args: &[String]) -> Result<(), String> {
