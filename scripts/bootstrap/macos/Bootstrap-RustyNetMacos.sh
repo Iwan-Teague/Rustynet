@@ -814,17 +814,29 @@ generate_wireguard_keys() {
     exit 1
   fi
 
-  # Push the passphrase into the macOS keychain so the daemon resolves it
-  # via Security framework at runtime (per
-  # RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT in the launchd plist). The
-  # keychain account is per-node so concurrent tenants on the same host
-  # cannot cross-read each other's passphrase. This write also runs as root
-  # because the service account is intentionally not allowed to create
-  # System.keychain items.
+  # Push the passphrase into the macOS System keychain so the daemon resolves
+  # it at startup (per RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT in the launchd
+  # plist). The account is per-node (`wg-passphrase-${NODE_ID}`) so co-tenant
+  # nodes cannot cross-read. Runs as root because the service account may not
+  # create System.keychain items.
+  #
+  # --keychain-allow-any-app is REQUIRED: the passphrase is stored here (root,
+  # bootstrap) and read back by the rustynetd LaunchDaemon at startup. On macOS
+  # 26 the SecKeychain *framework* read fails for headless / service-account
+  # (launchd) contexts — the daemon has no user-session default keychain — so
+  # the default framework-bound ACL leaves the daemon unable to load the
+  # passphrase (observed live: `os secure store unavailable` -> wg key decrypt
+  # failed -> daemon exit 65, keepalive crash-loop). The allow-any-application
+  # ACL on the System keychain (via `/usr/bin/security`, the same pattern the
+  # trust signing passphrase below already uses for its cross-binary reader)
+  # lets the root daemon read it. Still per-node-scoped by account; single-
+  # tenant service-account install layout. OS-secure keychain storage is
+  # preserved — this is the read-ACL, not a downgrade to a plaintext file.
   local keychain_account="wg-passphrase-${NODE_ID}"
   if ! sudo "${RUSTYNETD_BIN}" key store-passphrase \
       --passphrase-file "${passphrase_file}" \
-      --keychain-account "${keychain_account}"; then
+      --keychain-account "${keychain_account}" \
+      --keychain-allow-any-app; then
     echo "[bootstrap] rustynetd key store-passphrase failed; daemon cannot resolve passphrase from keychain" >&2
     exit 1
   fi
