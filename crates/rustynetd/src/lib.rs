@@ -17,6 +17,7 @@ pub mod key_material;
 pub mod key_rotation;
 pub mod linux_authenticode;
 pub mod linux_dns_failclosed;
+pub mod linux_dns_protect;
 pub mod linux_exit_dns_failclosed;
 pub mod linux_exit_nat_lifecycle;
 pub mod linux_key_custody;
