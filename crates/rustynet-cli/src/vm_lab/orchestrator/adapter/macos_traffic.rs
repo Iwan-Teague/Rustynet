@@ -169,7 +169,18 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
         SHORT_TIMEOUT,
     );
 
-    // Remove runtime state but keep keys and installation.
+    // Remove runtime state but keep WG keys and the installation. This now
+    // includes the seed trust evidence (`rustynetd.trust`) and its anti-replay
+    // watermark: the macOS bootstrap's `seed_trust_evidence` skips when
+    // `rustynetd.trust` already exists, so without removing it on a rebuild the
+    // node reuses the *previous* run's seed. That seed goes stale past the
+    // daemon's `--trust-max-age-secs` (24h) and fails startup trust-preflight
+    // ("trust evidence is stale"), which surfaces only as a bootstrap
+    // socket-never-appeared hang. Purging it forces a fresh, current-dated seed
+    // on every rebuild — the orchestrator's distribute_* stages then layer the
+    // real signed trust/membership over it — matching the clean-slate intent of
+    // `--rebuild-nodes`. The watermark is cleared too so the fresh seed is not
+    // rejected as a rollback/replay.
     ssh::run_remote(
         conn,
         &format!(
@@ -177,6 +188,8 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
              '{MACOS_STATE_ROOT}/membership/membership.snapshot' \
              '{MACOS_STATE_ROOT}/membership/membership.log' \
              '{MACOS_STATE_ROOT}/membership/membership.watermark' \
+             '{MACOS_STATE_ROOT}/trust/rustynetd.trust' \
+             '{MACOS_STATE_ROOT}/trust/rustynetd.trust.watermark' \
              '{MACOS_STATE_ROOT}/trust/rustynetd.assignment' \
              '{MACOS_STATE_ROOT}/trust/rustynetd.assignment.watermark' \
              '{MACOS_STATE_ROOT}/trust/rustynetd.traversal' \
