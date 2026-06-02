@@ -130,7 +130,14 @@ impl NodeAdapter for LinuxNodeAdapter {
         // All argv elements come from `LinuxDaemonProbe::build_argv`, which produces
         // a fixed set of known-safe strings: binary path + a `linux-*-check` subcommand
         // + `--no-fail-on-drift`. No user-controlled input reaches argv.
-        let script = argv.join(" ");
+        //
+        // Run with `sudo -n`: the validators inspect root-owned security state
+        // (`/var/lib/rustynet/keys` 0700 root, `/etc/rustynet/credentials` 0700
+        // root). Without sudo every key-custody/service-hardening probe reports
+        // false "permission denied" drift, so validate_baseline_runtime fails on
+        // a node whose posture is actually correct. Passwordless sudo is already
+        // a precondition of the bootstrap + cleanup paths.
+        let script = format!("sudo -n {}", argv.join(" "));
         let op_label = argv.get(1).cloned().unwrap_or_default();
         let output = ssh::run_remote(&self.conn, &script, SHORT_TIMEOUT)?;
         let passed = ssh::validator_report_ok(&output);

@@ -748,7 +748,10 @@ pub fn write_public_key(path: &Path, public_key: &str) -> Result<(), String> {
         return Err("public key must not be empty".to_owned());
     }
     let value = format!("{}\n", public_key.trim());
-    write_atomic(path, value.as_bytes(), 0o644)
+    // 0o640 (owner rw, group r, no world): the reviewed key-custody posture for
+    // the WireGuard public key (linux_key_custody expects 0o640). World-read is
+    // unnecessary even for a public key and is flagged as drift.
+    write_atomic(path, value.as_bytes(), 0o640)
 }
 
 pub fn generate_wireguard_keypair() -> Result<(Vec<u8>, String), String> {
