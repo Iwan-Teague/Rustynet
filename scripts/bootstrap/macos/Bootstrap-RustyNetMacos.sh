@@ -682,8 +682,22 @@ build_rustynet() {
   # the current workspace.  `-p rustynet-cli` builds the rustynet-cli
   # binary at target/release/rustynet-cli, which install_binaries below
   # renames to /usr/local/bin/rustynet on the way out.
-  wait_for_cargo_registry_endpoint || exit 1
-  as_user "${brew_rustup}" run stable cargo build --release -p rustynetd -p rustynet-cli
+  # Offline-first build. When the dependency cache is already warm (an
+  # orchestrator re-run on a previously-bootstrapped VM, or a relocated VM that
+  # kept its ~/.cargo cache but lost upstream internet — e.g. moved to a LAN
+  # segment with no gateway), build straight from the local cache with no
+  # network. `cargo build --offline` fails fast during dependency resolution if
+  # anything is missing, so a genuinely cold cache / newly-added dependency
+  # falls through to the online path, which requires the registry and fetches.
+  # This keeps fresh-VM provisioning working while no longer making a transient
+  # or absent upstream route a hard bootstrap failure when the cache suffices.
+  if as_user "${brew_rustup}" run stable cargo build --release --offline -p rustynetd -p rustynet-cli; then
+    echo "[bootstrap] built rustynetd + rustynet-cli from warm cargo cache (offline)"
+  else
+    echo "[bootstrap] offline build unavailable (cold cache or new dependency); fetching from registry" >&2
+    wait_for_cargo_registry_endpoint || exit 1
+    as_user "${brew_rustup}" run stable cargo build --release -p rustynetd -p rustynet-cli
+  fi
 
   popd >/dev/null
 }
@@ -704,6 +718,23 @@ install_binaries() {
   fi
   install -m 0755 -o root -g wheel \
     "${BUILD_DIR}/target/release/rustynetd" "${RUSTYNETD_BIN}"
+  # Re-sign rustynetd with a *proper* ad-hoc signature. The Rust toolchain emits
+  # a "linker-signed" ad-hoc signature (codesign flags 0x20002); macOS does NOT
+  # treat linker-signed binaries as having a stable code identity for keychain
+  # ACLs across processes. As a result an item stored by `rustynetd key
+  # store-passphrase` (owned-identity System-keychain path) is unreadable by the
+  # daemon at startup — "os secure store unavailable" -> wg key decrypt failed ->
+  # launchd exit 65 crash-loop. A real ad-hoc signature (`codesign --force -s -`,
+  # flags 0x2) gives a stable cdhash that the owned-item ACL honors, so the same
+  # rustynetd binary that stores the WG passphrase reads it back at startup.
+  # Verified live on macOS 26.5: under the linker signature both the launchd
+  # daemon and a `sudo -u rustynetd` run fail the keychain read; after
+  # `codesign --force -s -` + re-store both reach "runtime key material
+  # prepared". Must run before `key store-passphrase` so the keychain item is
+  # owned by the re-signed identity. (rustynet-cli is not re-signed: it only
+  # reads the trust passphrase via the allow-any-app `-A` path, which is not
+  # bound to the reader's code identity.)
+  codesign --force -s - "${RUSTYNETD_BIN}"
   # The CLI bin is built as `rustynet-cli` by the rustynet-cli package and
   # installed system-wide as `rustynet` (the launchd plist and operator
   # documentation expect the short name).
