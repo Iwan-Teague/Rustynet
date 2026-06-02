@@ -691,7 +691,35 @@ fn store_macos_generic_password_system_keychain_via_security_cli(
         .stderr(std::process::Stdio::null())
         .status()
         .map_err(|_| CryptoError::OsStoreUnavailable)?;
-    if status.success() {
+    if !status.success() {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    // Read-back verification, fail-closed. On macOS 26 `add-generic-password`
+    // can exit 0 without leaving a *readable* System.keychain item — the daemon
+    // (launchd, no user session) then fails its WG-key decrypt at startup with
+    // `os secure store unavailable` and crash-loops, with no signal at
+    // provisioning time. Confirm the secret reads back through the SAME CLI path
+    // the daemon's loader uses (`security find-generic-password -w … System.keychain`)
+    // so a silent custody-store failure is caught here, not hours later as an
+    // opaque daemon exit. `-w` exercises the read ACL (a write-but-unreadable
+    // item fails this), which a bare attribute lookup would not.
+    let verified = std::process::Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-a",
+            account,
+            "-s",
+            service,
+            "-w",
+            "/Library/Keychains/System.keychain",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if verified {
         Ok(())
     } else {
         Err(CryptoError::OsStoreUnavailable)
