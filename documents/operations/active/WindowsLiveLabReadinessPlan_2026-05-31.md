@@ -382,10 +382,52 @@ Progress (2026-06-01) — **N3 PASSED**:
   post-rollback rule *absence* (that was confirmed manually here). A future
   hardening could add a post-rollback absence assertion to the verdict.
 
-### N4 — Two-node mesh: Windows guest + one peer 🟡 (covers G4) — daemon fix in, live retry running
+### N4 — Two-node mesh: Windows guest + one peer ✅ MESH+TRAFFIC PROVEN (2026-06-02) (covers G4)
 Drive enrollment + signed-state + dataplane reconcile so the Windows guest and
 one Linux/macOS peer form a tunnel and pass traffic both ways. Promote Windows
 to a first-class node in the orchestrator path.
+
+**2026-06-02 — N4 core goal ACHIEVED.** `vm-lab-orchestrate-live-lab --node
+debian-headless-1:exit --node windows-utm-1:client` brought up a real WireGuard
+mesh; **bidirectional traffic verified** (debian `100.104.252.105` ↔ windows
+`100.87.239.6`, manual ping 0% loss both ways). The orchestrator's own
+`traffic_test_matrix` was only cascade-skipped because the stage before it,
+`validate_baseline_runtime`, failed — a posture gate, not a connectivity
+blocker. Two root causes had to be fixed first:
+- **`cleanup_hosts` (`1a82763`)** — the Linux nft killswitch reset
+  `nft list tables | awk … | while read t; do sudo nft delete …; done` silently
+  deleted nothing: the inner `sudo` drains the loop's piped stdin so `read`
+  never sees the table names. It had no-op'd since it was written; C2's
+  `assert_node_clean` (`2bb283b`) is what finally surfaced it (`node still
+  dirty: … rustynet_boot`). Fixed to capture-then-`for`; verified live on debian
+  (1 table → 0). Diagnosed end-to-end with the new A2 `ops vm-lab-diagnose`.
+- **`enforce_baseline_runtime`** — B1's `--node-role` threading (`ee58f5c`)
+  cleared the long-standing `node_role admin requires anchor` fail-closed; the
+  Windows client now enforces and gets a mesh IP.
+
+**`validate_baseline_runtime` posture validators — 3 of 4 Linux fixed
+(`56b8220`):** run_validator ran the daemon checks as the SSH user (no sudo) →
+false permission-denied drift (fixed `sudo -n`); `wireguard.pub` 0o644 vs the
+reviewed 0o640 (fixed in `key_material.rs`); `linux-service-hardening-check` ran
+`systemctl show` without `--all` so the empty `CapabilityBoundingSet=` /
+`AmbientCapabilities=` (the unit is correct) were omitted → false "missing"
+(fixed `--all`). The 4th, **dns-failclosed**, is the open item — see below.
+
+**DNS fail-closed (open, operator chose the most-secure path).** The validator
+expects the rustynet resolver to OWN a loopback:53 with resolv.conf pointing at
+it; the dataplane implements systemd-resolved split-DNS (rustynet resolver at
+`127.0.0.1:53535` as a mesh upstream). Operator decision: implement Option 2
+(rustynet resolver owns loopback DNS — defense-in-depth, no off-host nameserver
+in the config path, single project-controlled resolver). Mechanism **proven
+live** on debian: an nft `127.0.0.1:53 redirect to :53535` lets the empty-caps
+daemon's resolver answer on :53. Build pending — it modifies the
+security-reviewed killswitch ruleset + the hardened privileged-helper allowlist
+(needs a validated resolv.conf/NM file-write op) + protected-mode apply/teardown
++ rollback + Windows NRPT parity; to be done as a focused, fully-tested effort.
+
+**3-node follow-up:** macOS discovered on the LAN at `192.168.0.210` (inventory
+fixed `661053b`); the run_validator `sudo` fix still needs porting to the macOS
+adapter before the 3-node run.
 - **2026-06-01 status:** lab networking is **not** the blocker — the UTM VMs are
   LAN-bridged, so the exit (`debian-headless-1`, `192.168.0.200`) and the Windows
   client (`192.168.0.45`) share `192.168.0.0/24`. Four orchestrate runs walked the
