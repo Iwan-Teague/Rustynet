@@ -8830,6 +8830,7 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
             system
                 .with_traversal_bootstrap_allow_endpoints(config.traversal_stun_servers.clone())
                 .with_wg_listen_port(config.wg_listen_port)
+                .with_dns_resolver_port(config.dns_resolver_bind_addr.port())
         })
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
         Ok(RuntimeSystem::Linux(system))

@@ -679,6 +679,10 @@ pub struct LinuxCommandSystem {
     allow_tunnel_relay_forward: bool,
     traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
     wg_listen_port: u16,
+    /// Port the rustynet resolver binds on loopback (default 53535). The
+    /// protected-mode DNS redirect maps loopback `:53` to this port; 0 means
+    /// "not configured" and loopback DNS ownership refuses to apply.
+    dns_resolver_port: u16,
     dns_protected: bool,
     expected_management_bypass_routes: BTreeSet<ExpectedBypassRoute>,
     expected_peer_endpoint_bypass_routes: BTreeSet<ExpectedBypassRoute>,
@@ -739,6 +743,7 @@ impl LinuxCommandSystem {
             allow_tunnel_relay_forward: false,
             traversal_bootstrap_allow_endpoints: Vec::new(),
             wg_listen_port: 0,
+            dns_resolver_port: 0,
             dns_protected: false,
             expected_management_bypass_routes: BTreeSet::new(),
             expected_peer_endpoint_bypass_routes: BTreeSet::new(),
@@ -752,6 +757,13 @@ impl LinuxCommandSystem {
 
     pub fn with_wg_listen_port(mut self, port: u16) -> Self {
         self.wg_listen_port = port;
+        self
+    }
+
+    /// Thread the rustynet resolver's loopback bind port so protected-mode DNS
+    /// can redirect loopback `:53` to it.
+    pub fn with_dns_resolver_port(mut self, port: u16) -> Self {
+        self.dns_resolver_port = port;
         self
     }
 
@@ -781,6 +793,16 @@ impl LinuxCommandSystem {
             return client.run_capture(program, args).map_err(SystemError::Io);
         }
 
+        // In-helper builtins (the DNS fail-closed file-write) are not external
+        // binaries. On the helper-less direct path execute the same in-process
+        // handler the helper would, after the identical allowlist validation —
+        // so the builtin behaves symmetrically with or without privilege
+        // separation. Non-builtin programs return None here and fall through to
+        // the exec path below.
+        if let Some(result) = crate::privileged_helper::try_execute_builtin_program(program, args) {
+            return result.map_err(SystemError::Io);
+        }
+
         // RN-19: the helper-less direct path must enforce the same argv-schema
         // allowlist as the IPC helper, so the validating gate is symmetric
         // across both execution paths and cannot be bypassed by running the
@@ -805,6 +827,44 @@ impl LinuxCommandSystem {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         })
+    }
+
+    /// Install the loopback `:53` -> resolver redirect, point
+    /// `/etc/resolv.conf` at the loopback resolver (backing up the original),
+    /// and — when NetworkManager is present — drop in `dns=none` so NM cannot
+    /// reintroduce off-loopback nameservers on a link change. Every file write
+    /// goes through the privileged helper's fixed-path/fixed-content builtin.
+    fn apply_loopback_dns_ownership(&mut self) -> Result<(), SystemError> {
+        if self.dns_resolver_port == 0 {
+            return Err(SystemError::DnsApplyFailed(
+                "dns resolver port is not configured; refusing to apply loopback DNS ownership"
+                    .to_owned(),
+            ));
+        }
+        let table = crate::linux_dns_protect::dns_redirect_table_name(self.generation);
+        for argv in
+            crate::linux_dns_protect::dns_redirect_nft_apply_argvs(&table, self.dns_resolver_port)
+        {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            self.run(PrivilegedCommandProgram::Nft, &refs)
+                .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+        }
+        // Back up & rewrite /etc/resolv.conf to the loopback resolver.
+        self.run(
+            PrivilegedCommandProgram::DnsFailclosedFile,
+            &[crate::linux_dns_protect::DNS_FILE_SELECTOR_RESOLV_APPLY],
+        )
+        .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+        // Disable NetworkManager resolv.conf management only when NM is present;
+        // on a host without NM the drop-in would be meaningless.
+        if std::path::Path::new(crate::linux_dns_failclosed::NETWORK_MANAGER_CONF_PATH).exists() {
+            self.run(
+                PrivilegedCommandProgram::DnsFailclosedFile,
+                &[crate::linux_dns_protect::DNS_FILE_SELECTOR_NM_APPLY],
+            )
+            .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+        }
+        Ok(())
     }
 
     fn apply_fail_closed_management_allow_rules(&self, table: &str) -> Result<(), SystemError> {
@@ -2144,11 +2204,31 @@ impl DataplaneSystem for LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+        // Option 2: the rustynet resolver owns loopback DNS. The killswitch
+        // rules above are defense-in-depth (drop off-tunnel :53); this is what
+        // makes the dns-failclosed verifier pass — every resolv.conf nameserver
+        // becomes loopback, reached via the redirect to the local resolver.
+        self.apply_loopback_dns_ownership()?;
         self.dns_protected = true;
         Ok(())
     }
 
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
+        // Best-effort teardown in reverse order. Rollback must not itself fail
+        // closed and strand the node, so each step tolerates already-absent
+        // state (restore/remove are no-ops when nothing was applied).
+        self.run_allow_failure(
+            PrivilegedCommandProgram::DnsFailclosedFile,
+            &[crate::linux_dns_protect::DNS_FILE_SELECTOR_RESOLV_RESTORE],
+        );
+        self.run_allow_failure(
+            PrivilegedCommandProgram::DnsFailclosedFile,
+            &[crate::linux_dns_protect::DNS_FILE_SELECTOR_NM_REMOVE],
+        );
+        let table = crate::linux_dns_protect::dns_redirect_table_name(self.generation);
+        let teardown = crate::linux_dns_protect::dns_redirect_nft_teardown_argv(&table);
+        let refs: Vec<&str> = teardown.iter().map(String::as_str).collect();
+        self.run_allow_failure(PrivilegedCommandProgram::Nft, &refs);
         self.dns_protected = false;
         Ok(())
     }
@@ -2304,6 +2384,16 @@ impl MacosCommandSystem {
     ) -> Result<PrivilegedCommandOutput, SystemError> {
         if let Some(client) = self.privileged_client.as_ref() {
             return client.run_capture(program, args).map_err(SystemError::Io);
+        }
+
+        // In-helper builtins (the DNS fail-closed file-write) are not external
+        // binaries. On the helper-less direct path execute the same in-process
+        // handler the helper would, after the identical allowlist validation —
+        // so the builtin behaves symmetrically with or without privilege
+        // separation. Non-builtin programs return None here and fall through to
+        // the exec path below.
+        if let Some(result) = crate::privileged_helper::try_execute_builtin_program(program, args) {
+            return result.map_err(SystemError::Io);
         }
 
         // RN-19: the helper-less direct path must enforce the same argv-schema
@@ -5196,6 +5286,11 @@ fn resolve_binary_path_for_program(
             DEFAULT_KILL_BINARY_PATH,
             PrivilegedCommandProgram::Kill,
         ),
+        // In-process builtin: handled before binary resolution. Fail closed if
+        // it ever reaches here.
+        PrivilegedCommandProgram::DnsFailclosedFile => Err(SystemError::PrerequisiteCheckFailed(
+            "dns-failclosed-file is an in-process builtin and has no external binary".to_owned(),
+        )),
     }
 }
 
