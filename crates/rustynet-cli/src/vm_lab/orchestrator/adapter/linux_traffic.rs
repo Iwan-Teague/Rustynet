@@ -191,22 +191,41 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &std::path::Path) -> Result
 
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
-    // Disable + stop the daemon and WAIT until it is fully inactive BEFORE the
-    // nft reset below. A daemon still shutting down in enforce mode re-applies
-    // the `rustynet_boot` fail-closed killswitch *after* the reset deletes it
-    // (fail-closed-on-exit), which then trips assert_node_clean — observed when
-    // re-running over a node still running a prior mesh. `disable --now` also
-    // prevents it auto-starting before bootstrap; reset-failed clears any
-    // failed-unit latch so the next bootstrap can start cleanly. Best-effort:
-    // a host without the unit is a no-op.
+    // Disable + stop the ENTIRE rustynet systemd footprint and WAIT until no
+    // rustynetd process remains BEFORE the nft reset below. A daemon still
+    // shutting down in enforce mode re-applies the `rustynet_boot` fail-closed
+    // killswitch *after* the reset deletes it (fail-closed-on-exit), which then
+    // trips assert_node_clean. Two refinements over stopping `rustynetd` alone:
+    //   1. A node re-provisioned into a new role can still be running units from
+    //      a PRIOR role (`rustynet-relay`, `rustynetd-privileged-helper`,
+    //      `rustynetd-managed-dns`, the refresh timers). Leaving them up is an
+    //      incomplete teardown, and a stray daemon launched outside
+    //      `rustynetd.service` keeps re-applying `rustynet_boot` — observed live
+    //      as assert_node_clean finding `rustynet_boot` after cleanup on a node
+    //      whose `rustynetd.service` already read inactive while a prior-run
+    //      daemon process was still alive.
+    //   2. The wait now keys on the actual PROCESS (`pgrep -x rustynetd`), not
+    //      the systemd unit state, so a daemon NOT managed by `rustynetd.service`
+    //      is still waited out. A `pkill` backstop terminates any stray daemon
+    //      the units do not own (disable --now runs first, so systemd will not
+    //      restart it). reset-failed clears failed-unit latches.
+    // Best-effort: a host without a given unit is a no-op.
     let _ = ssh::run_remote(
         conn,
-        "sudo -n systemctl disable --now rustynetd 2>/dev/null || true; \
-         for _ in $(seq 1 60); do \
-             state=$(systemctl is-active rustynetd 2>/dev/null || true); \
-             case \"$state\" in active|activating|deactivating|reloading) sleep 0.5;; *) break;; esac; \
+        "for unit in rustynetd rustynet-relay rustynetd-privileged-helper \
+                     rustynetd-managed-dns rustynetd-assignment-refresh \
+                     rustynetd-trust-refresh rustynetd-assignment-refresh.timer \
+                     rustynetd-trust-refresh.timer; do \
+             sudo -n systemctl disable --now \"$unit\" 2>/dev/null || true; \
          done; \
-         sudo -n systemctl reset-failed rustynetd 2>/dev/null || true",
+         sudo -n pkill -x rustynetd 2>/dev/null || true; \
+         for _ in $(seq 1 60); do \
+             pgrep -x rustynetd >/dev/null 2>&1 && sleep 0.5 || break; \
+         done; \
+         for unit in rustynetd rustynet-relay rustynetd-privileged-helper \
+                     rustynetd-managed-dns; do \
+             sudo -n systemctl reset-failed \"$unit\" 2>/dev/null || true; \
+         done",
         Duration::from_secs(60),
     );
     // Flush every rustynet nftables table the daemon may have left behind so the
