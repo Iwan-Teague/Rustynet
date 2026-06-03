@@ -432,8 +432,21 @@ rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 # and revert nameservers to the broken 127.0.0.53 stub.
 echo "[bootstrap] pinning nameservers for cargo build" >&2
 run_root bash -c 'rm -f /etc/resolv.conf; printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" > /etc/resolv.conf' 2>/dev/null || true
-wait_for_cargo_registry_endpoint || exit 1
-run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
+# Build rustynetd + rustynet-cli. Prefer an online build against a fresh
+# registry, but fall back to an offline build from the cargo cache when the
+# registry is unreachable. A node with a warm ${HOME}/.cargo cache — e.g. a lab
+# guest whose mesh underlay works bridge-local but whose internet egress does
+# not, or a deliberately air-gapped host — can still bootstrap. The offline
+# fallback is accepted ONLY if it actually succeeds: cargo --offline errors
+# during dependency resolution on a cache miss, so the bootstrap still fails
+# loudly for a genuine network problem and never silently builds stale/partial
+# state. Mirrors the macOS bootstrap's existing `cargo build --offline` path.
+if wait_for_cargo_registry_endpoint; then
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
+else
+  echo "[bootstrap] cargo registry unreachable; falling back to offline build from cargo cache" >&2
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynetd -p rustynet-cli
+fi
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
 backend_env=()
