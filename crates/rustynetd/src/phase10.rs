@@ -3469,16 +3469,22 @@ const WINDOWS_PS_ASSERT_DNS: &str = "& { param($UdpName, $TcpName) $ErrorActionP
 /// Loopback name servers the NRPT root rule and the tunnel adapter point at:
 /// IPv4 `127.0.0.1` (the rustynet resolver) and IPv6 `::1`. The
 /// `windows-dns-failclosed` verifier requires every resolver to be loopback.
-const WINDOWS_NRPT_LOOPBACK_SERVERS: &str = "127.0.0.1,::1";
+/// Semicolon-separated to match the `GenericDNSServers` NRPT registry value.
+const WINDOWS_NRPT_LOOPBACK_SERVERS: &str = "127.0.0.1;::1";
 
 /// Add (idempotently) an NRPT rule covering the root namespace `.` that points
-/// every unqualified lookup at the loopback resolver(s). Removing-then-adding
-/// keeps it idempotent across re-applies; the `-Comment` tag scopes teardown.
-const WINDOWS_PS_ADD_NRPT_LOOPBACK: &str = "& { param($Servers) $ErrorActionPreference = 'Stop'; Get-Command Add-DnsClientNrptRule -ErrorAction Stop | Out-Null; $list = @($Servers.Split(',')); Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Comment -eq 'RustyNet-failclosed' } | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; Add-DnsClientNrptRule -Namespace '.' -NameServers $list -Comment 'RustyNet-failclosed' -ErrorAction Stop }";
+/// every unqualified lookup at the loopback resolver(s) — written DIRECTLY to
+/// the NRPT REGISTRY (Version/Name/GenericDNSServers/ConfigOptions). The earlier
+/// `Add-DnsClientNrptRule` CIM cmdlet hangs the daemon's reconcile path under the
+/// guest's wedged WMI (fresh PowerShell per call, service account, bounded
+/// timeout) → fail-close; `New-ItemProperty` on HKLM is a native registry write
+/// (no CIM, no DnsClient module load) that `Get-DnsClientNrptRule` reads back, so
+/// the verifier passes without the WMI hazard. Idempotent via `-Force`.
+const WINDOWS_PS_ADD_NRPT_LOOPBACK: &str = "& { param($Servers) $ErrorActionPreference = 'Stop'; $k = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters\\DnsPolicyConfig\\{A0B1C2D3-4E5F-46A7-B8C9-0D1E2F3A4B5C}'; if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }; New-ItemProperty -Path $k -Name Version -PropertyType DWord -Value 2 -Force | Out-Null; New-ItemProperty -Path $k -Name Name -PropertyType MultiString -Value @('.') -Force | Out-Null; New-ItemProperty -Path $k -Name GenericDNSServers -PropertyType String -Value $Servers -Force | Out-Null; New-ItemProperty -Path $k -Name ConfigOptions -PropertyType DWord -Value 8 -Force | Out-Null; New-ItemProperty -Path $k -Name Comment -PropertyType String -Value 'RustyNet-failclosed' -Force | Out-Null }";
 
-/// Remove the rustynet NRPT rule on teardown (best-effort; a missing rule is not
-/// an error). Scoped to our `-Comment` tag so operator NRPT policy is untouched.
-const WINDOWS_PS_REMOVE_NRPT: &str = "& { $ErrorActionPreference = 'SilentlyContinue'; Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Comment -eq 'RustyNet-failclosed' } | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue }";
+/// Remove the rustynet NRPT rule on teardown — a native registry delete of our
+/// fixed key (best-effort; a missing key is not an error). No CIM.
+const WINDOWS_PS_REMOVE_NRPT: &str = "& { $ErrorActionPreference = 'SilentlyContinue'; Remove-Item -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters\\DnsPolicyConfig\\{A0B1C2D3-4E5F-46A7-B8C9-0D1E2F3A4B5C}' -Recurse -Force -ErrorAction SilentlyContinue }";
 
 impl DataplaneSystem for WindowsCommandSystem {
     fn set_generation(&mut self, generation: u64) {
@@ -6330,20 +6336,27 @@ mod tests {
     }
 
     #[test]
-    fn windows_nrpt_constants_are_loopback_only_and_scoped() {
+    fn windows_nrpt_constants_are_loopback_only_and_native_registry() {
         use std::net::IpAddr;
-        // Every NRPT/adapter name server must be loopback — the verifier rejects
-        // a single off-loopback resolver.
-        for server in WINDOWS_NRPT_LOOPBACK_SERVERS.split(',') {
+        // Every NRPT name server must be loopback (verifier rejects one off-
+        // loopback). Semicolon-separated to match the GenericDNSServers value.
+        for server in WINDOWS_NRPT_LOOPBACK_SERVERS.split(';') {
             let ip: IpAddr = server.parse().expect("reviewed NRPT server must parse");
             assert!(ip.is_loopback(), "NRPT server {server} must be loopback");
         }
-        // The add template targets the root namespace and tags the rule so
-        // teardown removes exactly ours; the remove template is scoped likewise.
-        assert!(WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("-Namespace '.'"));
+        // The add/remove templates use NATIVE registry ops (no CIM DnsClient
+        // cmdlet, which wedges the reconcile path) against the fixed rustynet
+        // NRPT key, writing the reviewed root-namespace rule.
+        assert!(WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("DnsPolicyConfig"));
+        assert!(WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("New-ItemProperty"));
+        assert!(WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("GenericDNSServers"));
         assert!(WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("RustyNet-failclosed"));
-        assert!(WINDOWS_PS_REMOVE_NRPT.contains("RustyNet-failclosed"));
-        assert!(WINDOWS_PS_REMOVE_NRPT.contains("Remove-DnsClientNrptRule"));
+        assert!(
+            !WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("DnsClientNrptRule"),
+            "must not use the CIM NRPT cmdlet on the reconcile path"
+        );
+        assert!(WINDOWS_PS_REMOVE_NRPT.contains("Remove-Item"));
+        assert!(WINDOWS_PS_REMOVE_NRPT.contains("DnsPolicyConfig"));
     }
 
     #[test]
