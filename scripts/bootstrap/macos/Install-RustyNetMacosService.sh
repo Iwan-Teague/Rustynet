@@ -337,7 +337,14 @@ ${TRAVERSAL_MAX_AGE_PLIST_FRAGMENT}
         <string>${STATE_ROOT}/trust/rustynetd.dns-zone.watermark</string>
 ${DNS_ZONE_MAX_AGE_PLIST_FRAGMENT}
         <string>--wg-private-key</string>
-        <string>${STATE_ROOT}/keys/wireguard.key</string>
+        <!-- Runtime (decrypted) key lives in the ephemeral runtime dir, NOT the
+             persistent keys/ dir: macos_key_custody forbids a plaintext private
+             key at rest (Phase E encrypted-at-rest), mirroring Linux's
+             /run/rustynet/wireguard.key. The daemon re-derives it from
+             wireguard.key.enc + the keychain passphrase on every start; the
+             privileged-helper recreates /private/var/run/rustynet (root:0o770)
+             each boot so the rustynetd group can write here. -->
+        <string>/private/var/run/rustynet/wireguard.key</string>
 ${WG_ENCRYPTED_KEY_PLIST_FRAGMENT}
         <string>--wg-public-key</string>
         <string>${STATE_ROOT}/keys/wireguard.pub</string>

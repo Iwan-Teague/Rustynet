@@ -221,6 +221,7 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
              '{MACOS_STATE_ROOT}/trust/rustynetd.dns-zone' \
              '{MACOS_STATE_ROOT}/trust/rustynetd.dns-zone.watermark' \
              '{MACOS_STATE_ROOT}/rustynetd.state' \
+             '{MACOS_STATE_ROOT}/keys/wireguard.key' \
              2>/dev/null || true"
         ),
         SHORT_TIMEOUT,
