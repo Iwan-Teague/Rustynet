@@ -524,6 +524,18 @@ enum StageMarker {
     Ipv6Blocked,
 }
 
+/// Why a generation is being unwound, so security controls (DNS) can choose
+/// fail-closed vs. restore behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackIntent {
+    /// Unwinding a FAILED apply. Security controls stay closed (DNS held
+    /// loopback/mesh-only); `force_fail_closed` follows. Never fail open.
+    FailClosed,
+    /// Intentional teardown (daemon shutdown). Restore the host's original
+    /// pre-protected configuration (e.g. resolv.conf).
+    CleanShutdown,
+}
+
 #[derive(Debug, Default)]
 pub struct DryRunSystem {
     pub operations: Vec<String>,
@@ -4259,7 +4271,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         if options.serve_exit_node
             && let Err(err) = self.system.preflight_exit_serving(mesh_cidr.as_str())
         {
-            let rollback_result = self.rollback_generation_best_effort(applied_stages);
+            let rollback_result =
+                self.rollback_generation_best_effort(applied_stages, RollbackIntent::FailClosed);
             let fail_closed_result = self.force_fail_closed("exit_serving_preflight_failed");
             if let Err(rollback_err) = rollback_result {
                 let _ = fail_closed_result;
@@ -4270,7 +4283,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         }
 
         if let Err(err) = self.system.prune_owned_tables() {
-            let rollback_result = self.rollback_generation_best_effort(applied_stages);
+            let rollback_result =
+                self.rollback_generation_best_effort(applied_stages, RollbackIntent::FailClosed);
             let fail_closed_result = self.force_fail_closed("owned_table_prune_failed");
             if let Err(rollback_err) = rollback_result {
                 let _ = fail_closed_result;
@@ -4280,7 +4294,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             return Err(err.into());
         }
         if let Err(err) = self.rollback_obsolete_controls(options) {
-            let rollback_result = self.rollback_generation_best_effort(applied_stages);
+            let rollback_result =
+                self.rollback_generation_best_effort(applied_stages, RollbackIntent::FailClosed);
             let fail_closed_result = self.force_fail_closed("obsolete_control_rollback_failed");
             if let Err(rollback_err) = rollback_result {
                 let _ = fail_closed_result;
@@ -4300,7 +4315,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
 
         if let Err(err) = result {
             self.current_serve_exit_node = false;
-            let rollback_result = self.rollback_generation_best_effort(applied_stages);
+            let rollback_result =
+                self.rollback_generation_best_effort(applied_stages, RollbackIntent::FailClosed);
             let fail_closed_result = self.force_fail_closed("apply_failed");
             if let Err(rollback_err) = rollback_result {
                 let _ = fail_closed_result;
@@ -4453,6 +4469,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     fn rollback_generation_best_effort(
         &mut self,
         applied_stages: Vec<StageMarker>,
+        intent: RollbackIntent,
     ) -> Result<(), Phase10Error> {
         let mut rollback_errors = Vec::new();
         for stage in applied_stages.into_iter().rev() {
@@ -4471,11 +4488,25 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                         rollback_errors.push(format!("rollback ipv6 egress: {err}"));
                     }
                 }
-                StageMarker::DnsApplied => {
-                    if let Err(err) = self.system.rollback_dns_protection() {
-                        rollback_errors.push(format!("rollback dns protection: {err}"));
+                StageMarker::DnsApplied => match intent {
+                    // Intentional teardown: restore the host's original resolver
+                    // configuration (resolv.conf, NM drop-in, redirect table).
+                    RollbackIntent::CleanShutdown => {
+                        if let Err(err) = self.system.rollback_dns_protection() {
+                            rollback_errors.push(format!("rollback dns protection: {err}"));
+                        }
                     }
-                }
+                    // Unwinding a FAILED apply: HOLD DNS fail-closed. Restoring
+                    // resolv.conf to its off-loopback original (or tearing down
+                    // the loopback redirect / the off-tunnel :53 drop) would fail
+                    // OPEN — a DNS leak — during a transient failure, exactly when
+                    // fail-closed matters most. DNS stays applied (loopback
+                    // resolv.conf + mesh-only resolution), mirroring how the
+                    // killswitch is held closed through a failed apply;
+                    // `force_fail_closed` then blocks all egress and the next
+                    // successful generation re-asserts DNS.
+                    RollbackIntent::FailClosed => {}
+                },
                 StageMarker::NatApplied => {
                     if let Err(err) = self.system.rollback_nat_forwarding() {
                         rollback_errors.push(format!("rollback nat forwarding: {err}"));
@@ -5102,7 +5133,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     pub fn shutdown(&mut self) -> Result<(), Phase10Error> {
         let active_stages = std::mem::take(&mut self.active_stages);
         let rollback_stopped_backend = active_stages.contains(&StageMarker::BackendStarted);
-        let rollback_result = self.rollback_generation_best_effort(active_stages);
+        let rollback_result =
+            self.rollback_generation_best_effort(active_stages, RollbackIntent::CleanShutdown);
         let backend_shutdown_result = if rollback_stopped_backend {
             Ok(())
         } else {
@@ -7410,7 +7442,7 @@ mod tests {
     }
 
     #[test]
-    fn full_tunnel_dns_assert_failure_rolls_back_dns_and_blocks_exit_mode() {
+    fn full_tunnel_dns_assert_failure_holds_dns_fail_closed_and_blocks_exit_mode() {
         let policy = allow_shared_exit_policy();
         let mut controller = Phase10Controller::new(
             RecordingBackend::default(),
@@ -7441,12 +7473,24 @@ mod tests {
         assert_eq!(controller.state(), DataplaneState::FailClosed);
         assert_eq!(controller.current_exit_mode(), ExitMode::Off);
         assert_eq!(controller.backend.exit_mode, ExitMode::Off);
+        // Fail-closed-sticky: a transient DNS-assert failure must NOT roll back
+        // DNS protection (that would restore resolv.conf to its off-loopback
+        // original — a fail-OPEN DNS leak). DNS stays applied (loopback) and the
+        // daemon blocks all egress instead.
+        assert!(
+            !controller
+                .system
+                .operations
+                .contains(&"rollback_dns_protection".to_owned()),
+            "DNS must be HELD fail-closed on an error rollback, never restored; ops={:?}",
+            controller.system.operations
+        );
         assert!(
             controller
                 .system
                 .operations
-                .contains(&"rollback_dns_protection".to_owned()),
-            "DNS assertion failure must rollback applied DNS protection; ops={:?}",
+                .contains(&"block_all_egress".to_owned()),
+            "fail-closed must block all egress; ops={:?}",
             controller.system.operations
         );
         assert!(
@@ -7554,12 +7598,22 @@ mod tests {
         assert_eq!(controller.state(), DataplaneState::FailClosed);
         assert_eq!(controller.current_exit_mode(), ExitMode::Off);
         assert_eq!(controller.backend.exit_mode, ExitMode::Off);
+        // Fail-closed-sticky: DNS is HELD applied (loopback) on the error
+        // rollback — never restored to off-loopback — and egress is blocked.
+        assert!(
+            !controller
+                .system
+                .operations
+                .contains(&"rollback_dns_protection".to_owned()),
+            "DNS must be held fail-closed after exit-policy failure, not unwound; ops={:?}",
+            controller.system.operations
+        );
         assert!(
             controller
                 .system
                 .operations
-                .contains(&"rollback_dns_protection".to_owned()),
-            "rollback must unwind DNS after exit-policy failure; ops={:?}",
+                .contains(&"block_all_egress".to_owned()),
+            "fail-closed must block all egress; ops={:?}",
             controller.system.operations
         );
     }
