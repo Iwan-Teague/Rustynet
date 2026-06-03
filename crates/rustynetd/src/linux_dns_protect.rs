@@ -33,12 +33,14 @@
 //!    ([`RESOLV_CONF_PATH`], [`NETWORK_MANAGER_DNS_DROPIN_PATH`]). The caller
 //!    passes only a fixed *selector*; the helper owns the path→content mapping,
 //!    so no path or file content ever crosses the privileged boundary. Every
-//!    write is symlink-safe: the NM drop-in (and the backup) use an atomic
-//!    `O_EXCL` temp + `rename` in a writable directory, while resolv.conf is
-//!    rewritten in place with `O_NOFOLLOW` (its parent `/etc` is read-only under
-//!    the helper's `ProtectSystem=strict` sandbox, so a temp sibling is
-//!    impossible — see the helper unit's narrow `ReadWritePaths`). The change is
-//!    reversible: the original resolv.conf is backed up to
+//!    write is symlink-safe. The resolv.conf write strategy is OS-specific: on
+//!    Linux the helper's `ProtectSystem=strict` sandbox keeps `/etc` read-only
+//!    (only the resolv.conf inode is writable via a narrow `ReadWritePaths`), so
+//!    it writes in place with `O_NOFOLLOW`; on macOS `/etc` is writable and
+//!    resolv.conf is a configd symlink, so it uses an atomic `O_EXCL` temp +
+//!    `rename` (which swaps the symlink for a regular file). The NM drop-in and
+//!    the backup always use the atomic temp+rename in a writable dir. The change
+//!    is reversible: the original resolv.conf is backed up to
 //!    [`RESOLV_CONF_FAILCLOSED_BACKUP_PATH`] for teardown.
 //!
 //! # Wiring status
@@ -49,7 +51,9 @@
 //!   installs the redirect, backs up & rewrites resolv.conf, and writes the NM
 //!   drop-in (when NM is present); teardown restores both files and deletes the
 //!   table, tied to the killswitch lifecycle so DNS protection rolls back
-//!   together.
+//!   together. `phase10::MacosCommandSystem` reuses the same `resolv-conf-apply`
+//!   /`resolv-conf-restore` builtin alongside its pf DNS rules (macOS has no NM
+//!   and uses pf, not nft, for the egress block).
 //! - **Validator interaction**: the redirect table `rustynet_g<gen>_dns` is a
 //!   benign owned table — `is_owned_nft_table_token` permits add/delete, the
 //!   cleanup sweep (`/^rustynet/`) removes it, and `linux_runtime_nftables`
@@ -198,12 +202,19 @@ pub const DNS_FILE_SELECTOR_NM_REMOVE: &str = "nm-dropin-remove";
 
 /// Fixed path where the pre-fail-closed resolv.conf is stashed so teardown can
 /// restore the host's original resolver configuration. Root-only (0o600). Lives
-/// under `/run/rustynet` — the privileged helper's writable runtime directory —
-/// because the helper's `ProtectSystem=strict` sandbox keeps `/etc` read-only
-/// except the single `resolv.conf` inode, so a backup sibling in `/etc` is not
-/// writable. `/run` is tmpfs (session-scoped), which is the right lifetime: the
-/// backup only feeds same-boot teardown; a reboot re-runs bootstrap + enforce.
+/// in the privileged helper's writable runtime directory (session-scoped tmpfs,
+/// the right lifetime — the backup only feeds same-boot teardown; a reboot
+/// re-runs bootstrap + enforce). On Linux that dir is `/run/rustynet` (the
+/// helper's `ProtectSystem=strict` sandbox keeps `/etc` read-only except the
+/// single `resolv.conf` inode, so a backup sibling in `/etc` is not writable);
+/// on macOS it is `/private/var/run/rustynet`.
+#[cfg(target_os = "linux")]
 pub const RESOLV_CONF_FAILCLOSED_BACKUP_PATH: &str = "/run/rustynet/resolv.conf.failclosed.bak";
+#[cfg(target_os = "macos")]
+pub const RESOLV_CONF_FAILCLOSED_BACKUP_PATH: &str =
+    "/private/var/run/rustynet/resolv.conf.failclosed.bak";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub const RESOLV_CONF_FAILCLOSED_BACKUP_PATH: &str = "/tmp/rustynet-resolv.conf.failclosed.bak";
 
 /// The complete, fixed set of selectors the builtin accepts. Anything outside
 /// this set is rejected at the privileged boundary, so callers can never name a
@@ -233,32 +244,33 @@ pub(crate) fn apply_dns_failclosed_file(selector: &str) -> Result<(), String> {
             "unsupported dns-failclosed-file selector: {selector:?}"
         ));
     }
-    // The fail-closed resolver posture is a Linux-only concept (resolv.conf +
-    // NetworkManager). The builtin compiles on every Unix (so the primitives can
-    // be unit-tested on the macOS dev host) but refuses to mutate host files
-    // anywhere but Linux — the helper is the privileged boundary.
-    if !cfg!(target_os = "linux") {
-        return Err("dns-failclosed-file operations are only supported on Linux".to_owned());
+    // The fail-closed resolver posture (loopback resolv.conf, optionally a
+    // NetworkManager drop-in) applies to Linux and macOS. The builtin compiles
+    // on every Unix (so the primitives can be unit-tested on the dev host) but
+    // refuses to mutate host files on any other OS — the helper is the
+    // privileged boundary.
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err(
+            "dns-failclosed-file operations are only supported on Linux and macOS".to_owned(),
+        );
     }
     match selector {
         DNS_FILE_SELECTOR_RESOLV_APPLY => {
-            // Back up the current resolv.conf to /run (a writable dir, so the
-            // atomic backup works), then rewrite /etc/resolv.conf IN PLACE: the
-            // helper's strict sandbox makes only the resolv.conf inode writable,
-            // not its parent dir, so an atomic temp+rename in /etc is impossible.
+            // Back up the current resolv.conf into the helper runtime dir (a
+            // writable dir, so the atomic backup works), then rewrite
+            // /etc/resolv.conf to the loopback resolver.
             backup_file_once(
                 Path::new(RESOLV_CONF_PATH),
                 Path::new(RESOLV_CONF_FAILCLOSED_BACKUP_PATH),
             )?;
-            write_file_in_place_no_symlink(
-                Path::new(RESOLV_CONF_PATH),
-                loopback_resolv_conf_contents().as_bytes(),
-            )
+            write_loopback_resolv_conf(Path::new(RESOLV_CONF_PATH))
         }
-        DNS_FILE_SELECTOR_RESOLV_RESTORE => restore_in_place_from_backup(
+        DNS_FILE_SELECTOR_RESOLV_RESTORE => restore_resolv_conf_from_backup(
             Path::new(RESOLV_CONF_PATH),
             Path::new(RESOLV_CONF_FAILCLOSED_BACKUP_PATH),
         ),
+        // NetworkManager exists only on Linux; on macOS the daemon never
+        // requests these (no NM), and they are a no-op-with-error if it does.
         DNS_FILE_SELECTOR_NM_APPLY => write_network_manager_dropin(),
         DNS_FILE_SELECTOR_NM_REMOVE => {
             remove_file_if_present(Path::new(NETWORK_MANAGER_DNS_DROPIN_PATH))
@@ -393,20 +405,48 @@ fn backup_file_once(src: &Path, backup: &Path) -> Result<(), String> {
     }
 }
 
-/// Restore `path` in place from `backup`, then remove the backup. A missing
-/// backup is a no-op (fail-closed: never disturb a resolver config we did not
-/// create). An empty backup means the original was absent at apply time; under
-/// the read-only-/etc sandbox the managed file cannot be unlinked, so the
-/// loopback file is left in place (still fail-closed — mesh DNS only).
+/// Write the loopback-resolver contents to `path` (the protected-mode
+/// resolv.conf rewrite). Delegates to the OS-appropriate write strategy.
 #[cfg(unix)]
-fn restore_in_place_from_backup(path: &Path, backup: &Path) -> Result<(), String> {
+fn write_loopback_resolv_conf(path: &Path) -> Result<(), String> {
+    write_resolv_conf_bytes(path, loopback_resolv_conf_contents().as_bytes())
+}
+
+/// Write `bytes` to the resolv.conf `path`. The strategy differs by the helper's
+/// OS sandbox: Linux runs `ProtectSystem=strict` with only the resolv.conf inode
+/// writable (its parent `/etc` is read-only → no temp sibling for a rename), so
+/// it writes in place with `O_NOFOLLOW`; macOS has a writable `/etc` and a
+/// configd `resolv.conf` symlink, so an atomic temp+rename (which swaps the
+/// symlink for a regular file, never writing through it) is both possible and
+/// preferable.
+#[cfg(target_os = "linux")]
+fn write_resolv_conf_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_file_in_place_no_symlink(path, bytes)
+}
+#[cfg(target_os = "macos")]
+fn write_resolv_conf_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomically_replace_file(path, bytes, 0o644)
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn write_resolv_conf_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let _ = (path, bytes);
+    Err("resolv.conf write is only supported on Linux and macOS".to_owned())
+}
+
+/// Restore `path` from `backup`, then remove the backup. A missing backup is a
+/// no-op (fail-closed: never disturb a resolver config we did not create). An
+/// empty backup means the original was absent at apply time; the loopback file
+/// is left in place (still fail-closed — mesh DNS only). Uses the same
+/// OS-appropriate write strategy as the apply.
+#[cfg(unix)]
+fn restore_resolv_conf_from_backup(path: &Path, backup: &Path) -> Result<(), String> {
     if backup.symlink_metadata().is_err() {
         return Ok(());
     }
     let bytes =
         std::fs::read(backup).map_err(|err| format!("read backup {}: {err}", backup.display()))?;
     if !bytes.is_empty() {
-        write_file_in_place_no_symlink(path, &bytes)?;
+        write_resolv_conf_bytes(path, &bytes)?;
     }
     remove_file_if_present(backup)
 }
@@ -419,7 +459,12 @@ fn restore_in_place_from_backup(path: &Path, backup: &Path) -> Result<(), String
 /// file must already exist (the bootstrap pins a regular-file resolv.conf), and
 /// `O_NOFOLLOW` fail-closes rather than write through an unexpected symlink.
 /// The single truncate+write of a tiny buffer is effectively atomic for readers.
+///
+/// Used by the Linux resolv.conf write path; on macOS the atomic temp+rename is
+/// used instead, so this is exercised only by tests there (hence the dead-code
+/// allow off-Linux).
 #[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn write_file_in_place_no_symlink(path: &Path, contents: &[u8]) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -603,7 +648,7 @@ mod tests {
     mod fs_primitives {
         use super::super::{
             atomically_replace_file, backup_file_once, remove_file_if_present,
-            restore_in_place_from_backup, write_file_in_place_no_symlink,
+            restore_resolv_conf_from_backup, write_file_in_place_no_symlink,
         };
         use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
@@ -731,7 +776,7 @@ mod tests {
 
             backup_file_once(&target, &backup).expect("backup");
             write_file_in_place_no_symlink(&target, b"nameserver 127.0.0.1\n").expect("apply");
-            restore_in_place_from_backup(&target, &backup).expect("restore");
+            restore_resolv_conf_from_backup(&target, &backup).expect("restore");
 
             assert_eq!(std::fs::read(&target).unwrap(), b"nameserver 1.1.1.1\n");
             assert!(!backup.exists(), "backup removed after restore");
@@ -743,7 +788,7 @@ mod tests {
             let target = dir.path().join("resolv.conf");
             let backup = dir.path().join("resolv.conf.bak");
             std::fs::write(&target, b"nameserver 127.0.0.1\n").unwrap();
-            restore_in_place_from_backup(&target, &backup).expect("no-op restore");
+            restore_resolv_conf_from_backup(&target, &backup).expect("no-op restore");
             assert_eq!(std::fs::read(&target).unwrap(), b"nameserver 127.0.0.1\n");
         }
 
@@ -754,7 +799,7 @@ mod tests {
             let backup = dir.path().join("resolv.conf.bak");
             std::fs::write(&backup, b"").unwrap(); // original was absent at apply
             std::fs::write(&target, b"nameserver 127.0.0.1\n").unwrap();
-            restore_in_place_from_backup(&target, &backup).expect("restore");
+            restore_resolv_conf_from_backup(&target, &backup).expect("restore");
             // Under read-only /etc the managed file cannot be unlinked, so the
             // loopback file is left (fail-closed); the backup is cleaned up.
             assert_eq!(std::fs::read(&target).unwrap(), b"nameserver 127.0.0.1\n");

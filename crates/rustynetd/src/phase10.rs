@@ -2814,6 +2814,19 @@ impl DataplaneSystem for MacosCommandSystem {
             self.dns_protected = false;
             return Err(SystemError::DnsApplyFailed(err.to_string()));
         }
+        // Option-2 parity with Linux: point /etc/resolv.conf at the loopback
+        // resolver (backing up the original) so the macos-dns-failclosed verifier
+        // passes — every resolv.conf nameserver becomes loopback. The pf rules
+        // above are the defense-in-depth egress block; this owns resolv.conf. The
+        // write goes through the privileged helper's fixed-path/fixed-content
+        // builtin (macOS /etc is writable, so it uses the atomic temp+rename).
+        if let Err(err) = self.run(
+            PrivilegedCommandProgram::DnsFailclosedFile,
+            &[crate::linux_dns_protect::DNS_FILE_SELECTOR_RESOLV_APPLY],
+        ) {
+            self.dns_protected = false;
+            return Err(SystemError::DnsApplyFailed(err.to_string()));
+        }
         Ok(())
     }
 
@@ -2842,6 +2855,12 @@ impl DataplaneSystem for MacosCommandSystem {
 
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
         self.dns_protected = false;
+        // Restore the original resolv.conf (best-effort; teardown must not fail
+        // closed and strand the node — a missing backup is a no-op).
+        self.run_allow_failure(
+            PrivilegedCommandProgram::DnsFailclosedFile,
+            &[crate::linux_dns_protect::DNS_FILE_SELECTOR_RESOLV_RESTORE],
+        );
         self.apply_pf_rules(false)
             .map_err(|err| SystemError::RollbackFailed(err.to_string()))
     }
