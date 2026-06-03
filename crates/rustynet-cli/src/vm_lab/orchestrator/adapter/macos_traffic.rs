@@ -45,17 +45,30 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
 /// `rustynet` CLI binary is absent (e.g. a SKIP_BUILD bootstrap that only
 /// installed `rustynetd`).
 pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
+    // Read node_id from the launchd plist (--node-id) FIRST — it is the
+    // authoritative value the daemon was configured with and needs no IPC
+    // socket. `rustynet status` queries the daemon socket, which is unreliable
+    // at bootstrap (enforce=false): the reconcile loop fail-closes on the
+    // not-yet-distributed membership ("membership snapshot is missing") and
+    // escalates to restrict_permanent within max_reconcile_failures, tearing
+    // the socket down before collect_pubkeys runs (observed live: collect_pubkeys
+    // "node_id: daemon unreachable: …rustynetd.sock: Connection refused"). The
+    // restrict_permanent state is transient — the enforce_baseline_runtime
+    // restart clears it once membership is distributed — so node_id collection
+    // must not depend on the socket. Fall back to `rustynet status` only if the
+    // plist read yields nothing.
     let output = ssh::run_remote(
         conn,
-        "if test -x /usr/local/bin/rustynet; then \
+        "nid=$(sudo -n /usr/libexec/PlistBuddy \
+                 -c 'Print :ProgramArguments' \
+                 /Library/LaunchDaemons/com.rustynet.daemon.plist 2>/dev/null \
+               | awk '/--node-id/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/, \"\"); print}'); \
+         if test -n \"$nid\"; then \
+             echo \"$nid\"; \
+         elif test -x /usr/local/bin/rustynet; then \
              sudo -n env \
                RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock \
                /usr/local/bin/rustynet status 2>&1; \
-         else \
-             sudo -n /usr/libexec/PlistBuddy \
-               -c 'Print :ProgramArguments' \
-               /Library/LaunchDaemons/com.rustynet.daemon.plist 2>/dev/null \
-               | awk '/--node-id/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/, \"\"); print}'; \
          fi",
         SHORT_TIMEOUT,
     )?;
