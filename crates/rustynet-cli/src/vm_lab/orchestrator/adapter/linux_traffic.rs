@@ -231,6 +231,11 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     // Privileged: state files are root:rustynetd, mode 600/640.
     ssh::run_remote(
         conn,
+        // rustynetd.state persists operational state (incl. selected_exit_node)
+        // across restarts; purge it on rebuild so the daemon re-derives its exit
+        // selection from the freshly distributed auto-tunnel bundle rather than
+        // a stale prior-topology value (see macos_traffic::cleanup_runtime_state
+        // for the live failure mode). No anti-replay watermark lives in it.
         "sudo -n rm -rf /run/rustynet \
          /var/lib/rustynet/membership.snapshot \
          /var/lib/rustynet/membership.log \
@@ -240,6 +245,7 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
          /var/lib/rustynet/rustynetd.traversal \
          /var/lib/rustynet/rustynetd.traversal.watermark \
          /var/lib/rustynet/rustynetd.dns-zone \
+         /var/lib/rustynet/rustynetd.state \
          /var/lib/rustynet/rustynetd.trust 2>/dev/null; true",
         Duration::from_secs(30),
     )?;
