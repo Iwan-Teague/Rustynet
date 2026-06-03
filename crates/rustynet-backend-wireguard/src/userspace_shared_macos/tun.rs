@@ -1367,10 +1367,53 @@ fn apply_macos_endpoint_bypass_delta(
         if endpoint_bypass_hosts.contains(endpoint) {
             continue;
         }
+        if !macos_endpoint_needs_gateway_bypass(runner, *endpoint)? {
+            // On-link (same-subnet) peer endpoint: the intact connected route
+            // already reaches it directly on the physical interface. A
+            // /32-via-gateway bypass would be MORE specific than the connected
+            // route and shadow it, sending the underlay to the LAN gateway —
+            // which cannot hairpin a same-subnet destination, so the WireGuard
+            // underlay would never arrive. Skip it; the connected route handles
+            // this peer. (Under the wg-quick split-default the connected LAN /24
+            // stays intact, so same-subnet peers need no bypass at all.)
+            continue;
+        }
         add_macos_endpoint_bypass_route(runner, default_route, *endpoint)?;
         endpoint_bypass_hosts.insert(*endpoint);
     }
     Ok(())
+}
+
+/// Whether a peer underlay endpoint needs a `/32`-via-gateway bypass under the
+/// wg-quick split-default. Only OFF-subnet endpoints (reachable via the default
+/// gateway, hence captured by the `0.0.0.0/1`+`128.0.0.0/1` tunnel halves) need
+/// one; an on-link (same-subnet) endpoint is delivered directly by the intact
+/// connected route, and a via-gateway bypass would actively break it. Decided
+/// from the pre-enforce routing table: a `gateway:` line in `route -n get`
+/// output means the endpoint is reached via a gateway (off-subnet). On any query
+/// failure, default to NOT needing a bypass (skip) — the safe choice for the
+/// common same-subnet topology, since a wrongly-added gateway bypass breaks the
+/// underlay whereas a missing one merely leaves a genuinely off-subnet peer to
+/// the tunnel halves.
+fn macos_endpoint_needs_gateway_bypass(
+    runner: &mut dyn WireguardCommandRunner,
+    endpoint: IpAddr,
+) -> Result<bool, BackendError> {
+    match runner.run_capture(
+        "route",
+        &[
+            "-n".to_owned(),
+            "get".to_owned(),
+            macos_route_family_arg(endpoint),
+            endpoint.to_string(),
+        ],
+    ) {
+        Ok(output) => Ok(output
+            .stdout
+            .lines()
+            .any(|line| line.trim().starts_with("gateway:"))),
+        Err(_) => Ok(false),
+    }
 }
 
 fn add_macos_endpoint_bypass_route(
@@ -1444,32 +1487,55 @@ fn remove_macos_endpoint_bypass_routes(
     }
 }
 
+/// The two halves that together cover all of `0.0.0.0/0` while remaining MORE
+/// specific than the system `default` route (the standard wg-quick trick).
+const MACOS_SPLIT_DEFAULT_HALVES: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
+
 fn change_macos_default_route_to_tunnel(
     runner: &mut dyn WireguardCommandRunner,
     interface_name: &str,
 ) -> Result<(), BackendError> {
-    let args = vec![
-        "-n".to_owned(),
-        "change".to_owned(),
-        "-inet".to_owned(),
-        "default".to_owned(),
-        "-interface".to_owned(),
-        interface_name.to_owned(),
-    ];
-    match runner.run("route", &args) {
-        Ok(()) => Ok(()),
-        Err(_) => runner.run(
-            "route",
-            &[
-                "-n".to_owned(),
-                "add".to_owned(),
-                "-inet".to_owned(),
-                "default".to_owned(),
-                "-interface".to_owned(),
-                interface_name.to_owned(),
-            ],
-        ),
+    // wg-quick split-default: route ALL of 0.0.0.0/0 through the tunnel via the
+    // two halves 0.0.0.0/1 + 128.0.0.0/1 instead of repointing `default`.
+    //
+    // Why not `route change default -interface utun`: repointing the system
+    // default at the utun makes the utun the PRIMARY interface, so macOS source
+    // address selection picks the utun's address as the source for
+    // LAN-destined packets and the strong-host / scoped-routing check then drops
+    // them, so the WireGuard underlay cannot reach a same-subnet peer's
+    // endpoint. The /1 halves keep `default` AND the connected LAN /24 intact,
+    // so the physical interface stays primary and the underlay egresses it with
+    // the correct source, while every internet address still matches a /1 half
+    // and is fully tunneled — the killswitch posture is preserved (fail-closed:
+    // if the utun drops, the /1 routes blackhole the traffic rather than leaking
+    // it onto the physical link).
+    for half in MACOS_SPLIT_DEFAULT_HALVES {
+        let add_args = vec![
+            "-n".to_owned(),
+            "add".to_owned(),
+            "-inet".to_owned(),
+            "-net".to_owned(),
+            half.to_owned(),
+            "-interface".to_owned(),
+            interface_name.to_owned(),
+        ];
+        if runner.run("route", &add_args).is_err() {
+            // Already present from a prior partial apply — converge it.
+            runner.run(
+                "route",
+                &[
+                    "-n".to_owned(),
+                    "change".to_owned(),
+                    "-inet".to_owned(),
+                    "-net".to_owned(),
+                    half.to_owned(),
+                    "-interface".to_owned(),
+                    interface_name.to_owned(),
+                ],
+            )?;
+        }
     }
+    Ok(())
 }
 
 fn restore_macos_default_route(
@@ -1477,19 +1543,26 @@ fn restore_macos_default_route(
     default_route: &mut Option<MacosDefaultRoute>,
     endpoint_bypass_hosts: &mut BTreeSet<IpAddr>,
 ) -> Result<(), BackendError> {
-    let Some(captured) = default_route.clone() else {
-        return remove_macos_endpoint_bypass_routes(runner, endpoint_bypass_hosts);
-    };
-    runner.run(
-        "route",
-        &[
-            "-n".to_owned(),
-            "change".to_owned(),
-            "-inet".to_owned(),
-            "default".to_owned(),
-            captured.gateway.to_string(),
-        ],
-    )?;
+    // wg-quick split-default teardown: remove the 0.0.0.0/1 + 128.0.0.0/1 tunnel
+    // halves. The system `default` route was never repointed (see
+    // change_macos_default_route_to_tunnel), so there is nothing to restore
+    // there — just drop the halves and the per-peer bypass routes.
+    for half in MACOS_SPLIT_DEFAULT_HALVES {
+        match runner.run(
+            "route",
+            &[
+                "-n".to_owned(),
+                "delete".to_owned(),
+                "-inet".to_owned(),
+                "-net".to_owned(),
+                half.to_owned(),
+            ],
+        ) {
+            Ok(()) => {}
+            Err(err) if is_missing_route_error(&err) => {}
+            Err(err) => return Err(err),
+        }
+    }
     remove_macos_endpoint_bypass_routes(runner, endpoint_bypass_hosts)?;
     *default_route = None;
     Ok(())
@@ -1813,6 +1886,13 @@ mod tests {
                 vec![
                     "route".to_owned(),
                     "-n".to_owned(),
+                    "get".to_owned(),
+                    "-inet".to_owned(),
+                    "203.0.113.10".to_owned(),
+                ],
+                vec![
+                    "route".to_owned(),
+                    "-n".to_owned(),
                     "add".to_owned(),
                     "-inet".to_owned(),
                     "-host".to_owned(),
@@ -1822,9 +1902,20 @@ mod tests {
                 vec![
                     "route".to_owned(),
                     "-n".to_owned(),
-                    "change".to_owned(),
+                    "add".to_owned(),
                     "-inet".to_owned(),
-                    "default".to_owned(),
+                    "-net".to_owned(),
+                    "0.0.0.0/1".to_owned(),
+                    "-interface".to_owned(),
+                    "utun9".to_owned(),
+                ],
+                vec![
+                    "route".to_owned(),
+                    "-n".to_owned(),
+                    "add".to_owned(),
+                    "-inet".to_owned(),
+                    "-net".to_owned(),
+                    "128.0.0.0/1".to_owned(),
                     "-interface".to_owned(),
                     "utun9".to_owned(),
                 ],
@@ -1879,10 +1970,18 @@ mod tests {
                 vec![
                     "route".to_owned(),
                     "-n".to_owned(),
-                    "change".to_owned(),
+                    "delete".to_owned(),
                     "-inet".to_owned(),
-                    "default".to_owned(),
-                    "192.0.2.1".to_owned(),
+                    "-net".to_owned(),
+                    "0.0.0.0/1".to_owned(),
+                ],
+                vec![
+                    "route".to_owned(),
+                    "-n".to_owned(),
+                    "delete".to_owned(),
+                    "-inet".to_owned(),
+                    "-net".to_owned(),
+                    "128.0.0.0/1".to_owned(),
                 ],
                 vec![
                     "route".to_owned(),
@@ -1899,9 +1998,9 @@ mod tests {
     }
 
     #[test]
-    fn restore_macos_default_route_preserves_state_when_default_change_fails() {
+    fn restore_macos_default_route_preserves_state_when_split_default_delete_fails() {
         let mut runner = RecordingRunner {
-            fail_on_cidr: Some("192.0.2.1".to_owned()),
+            fail_on_cidr: Some("0.0.0.0/1".to_owned()),
             ..RecordingRunner::default()
         };
         let mut default_route = Some(MacosDefaultRoute {
@@ -2054,6 +2153,7 @@ mod tests {
     fn install_macos_endpoint_bypass_routes_rolls_back_on_add_failure() {
         let mut runner = RecordingRunner {
             fail_on_cidr: Some("203.0.113.11".to_owned()),
+            capture_stdout: "gateway: 192.0.2.1\ninterface: en0\n".to_owned(),
             ..RecordingRunner::default()
         };
         let default_route = MacosDefaultRoute {
@@ -2193,8 +2293,8 @@ mod tests {
             self.calls.push(call);
 
             let default_restore = program == "route"
-                && args.get(1).map(String::as_str) == Some("change")
-                && args.iter().any(|arg| arg == "default");
+                && args.get(1).map(String::as_str) == Some("delete")
+                && args.iter().any(|arg| arg == "0.0.0.0/1");
             if self.fail_default_restore && default_restore {
                 return Err(BackendError::internal("default restore failed"));
             }
@@ -2248,7 +2348,11 @@ mod tests {
             self.calls.push(call);
 
             let default_route_to_tunnel = program == "route"
-                && args.iter().any(|arg| arg == "default")
+                && matches!(
+                    args.get(1).map(String::as_str),
+                    Some("add") | Some("change")
+                )
+                && args.iter().any(|arg| arg == "0.0.0.0/1")
                 && args.iter().any(|arg| arg == "-interface")
                 && args.iter().any(|arg| arg == "utun9");
             if default_route_to_tunnel {
