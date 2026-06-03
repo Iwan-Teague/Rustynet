@@ -427,7 +427,10 @@ fn write_resolv_conf_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
 fn write_resolv_conf_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     atomically_replace_file(path, bytes, 0o644)
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+// Other Unix (e.g. BSD): `Path` is in scope via the `#[cfg(unix)]` import, but
+// resolv.conf ownership is unsupported. NOT compiled on Windows (non-Unix), where
+// the whole builtin chain is the non-Unix stub and `Path` is not imported.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn write_resolv_conf_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let _ = (path, bytes);
     Err("resolv.conf write is only supported on Linux and macOS".to_owned())
