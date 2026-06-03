@@ -28,8 +28,8 @@ use crate::ipc::{
 use crate::key_material::read_passphrase_file;
 use crate::key_material::{
     apply_interface_private_key, decrypt_private_key, encrypt_private_key,
-    generate_wireguard_keypair, remove_file_if_present, set_interface_down, write_public_key,
-    write_runtime_private_key,
+    generate_wireguard_keypair, remove_file_if_present, set_interface_down,
+    tighten_public_key_permissions, write_public_key, write_runtime_private_key,
 };
 use crate::key_rotation::{
     DEFAULT_ROTATION_DRAIN_TIMEOUT_SECS, InFlightHandshakeTracker, LocalKeyRotationLedger,
@@ -9785,7 +9785,23 @@ fn prepare_runtime_wireguard_key(config: &DaemonConfig) -> Result<(), DaemonErro
         config.wg_encrypted_private_key_path.as_deref(),
         config.wg_key_passphrase_path.as_deref(),
     )
-    .map_err(DaemonError::InvalidConfig)
+    .map_err(DaemonError::InvalidConfig)?;
+
+    // Self-heal the public-key custody posture on startup: older builds wrote
+    // `wireguard.pub` world-readable (0o644) and the keypair is preserved
+    // across rebuilds rather than regenerated, so a stale loose mode would
+    // persist and fail the key-custody validator. New writes are already
+    // 0o640; tighten any pre-existing file in place.
+    if config
+        .backend_mode
+        .requires_runtime_wireguard_key_material()
+    {
+        if let Some(public_key_path) = config.wg_public_key_path.as_deref() {
+            tighten_public_key_permissions(public_key_path).map_err(DaemonError::InvalidConfig)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn prepare_runtime_wireguard_key_material(

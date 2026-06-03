@@ -766,6 +766,55 @@ pub fn write_public_key(path: &Path, public_key: &str) -> Result<(), String> {
     write_atomic(path, value.as_bytes(), 0o640)
 }
 
+/// Self-heal an existing WireGuard public-key file to the reviewed `0o640`
+/// custody posture (owner rw, group r, no world).
+///
+/// Older builds wrote the public key world-readable (`0o644`). On rebuild the
+/// keypair is preserved rather than regenerated (see
+/// [`initialize_encrypted_key_material`], which refuses to overwrite existing
+/// key material), so a stale loose mode persists indefinitely and trips the
+/// Linux key-custody validator. New writes already use `0o640`; this repairs
+/// pre-existing files at daemon startup. No-op when the file is absent or
+/// already `0o640`; refuses to follow a symlink. World-read is unnecessary even
+/// for a public key, so removing it is always the secure default.
+#[cfg(unix)]
+pub fn tighten_public_key_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("inspect public key {} failed: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "public key {} must not be a symlink",
+            path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "public key {} must be a regular file",
+            path.display()
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 == 0o640 {
+        return Ok(());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o640)).map_err(|err| {
+        format!(
+            "tighten public key {} to 0o640 failed: {err}",
+            path.display()
+        )
+    })
+}
+
+/// Windows lacks Unix file modes; the custody posture is enforced via ACLs
+/// elsewhere, so this is a no-op on non-Unix targets.
+#[cfg(not(unix))]
+pub fn tighten_public_key_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 pub fn generate_wireguard_keypair() -> Result<(Vec<u8>, String), String> {
     let wg_binary = resolve_wireguard_binary_path()?;
     let private = Command::new(&wg_binary)
@@ -1271,6 +1320,54 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}-{stamp}"));
         std::fs::create_dir_all(&dir).expect("test directory should be creatable");
         dir
+    }
+
+    /// Verification for the public-key custody self-heal: a stale world-readable
+    /// (`0o644`) `wireguard.pub` is tightened to the reviewed `0o640` posture,
+    /// the operation is idempotent on an already-`0o640` file and a no-op when
+    /// absent, and a symlinked path is refused (never chmod through a symlink).
+    #[test]
+    #[cfg(unix)]
+    fn tighten_public_key_permissions_self_heals_world_readable_pub() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_test_dir("rn-pubkey-perms");
+        let pub_path = dir.join("wireguard.pub");
+
+        // Absent file is a no-op (not an error).
+        super::tighten_public_key_permissions(&pub_path)
+            .expect("absent public key should be a no-op");
+
+        // The stale legacy world-readable mode is tightened to 0o640.
+        std::fs::write(&pub_path, b"deadbeef\n").expect("write pub");
+        std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o644))
+            .expect("set 0o644");
+        super::tighten_public_key_permissions(&pub_path).expect("tighten should succeed");
+        let mode = std::fs::metadata(&pub_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "world-readable pub must be tightened to 0o640");
+
+        // Idempotent on an already-0o640 file.
+        super::tighten_public_key_permissions(&pub_path).expect("idempotent tighten");
+        let mode = std::fs::metadata(&pub_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640);
+
+        // A symlinked path must be refused.
+        let link_path = dir.join("wireguard.pub.link");
+        std::os::unix::fs::symlink(&pub_path, &link_path).expect("symlink");
+        assert!(
+            super::tighten_public_key_permissions(&link_path).is_err(),
+            "symlinked public key path must be refused"
+        );
+
+        let _ = remove_file_if_present(&pub_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Pin the macOS passphrase custody routing: the cross-binary case
