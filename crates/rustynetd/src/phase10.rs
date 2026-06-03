@@ -134,6 +134,7 @@ const WIREGUARD_GO_BINARY_PATH_ENV: &str = "RUSTYNET_WIREGUARD_GO_BINARY_PATH";
 const KILL_BINARY_PATH_ENV: &str = "RUSTYNET_KILL_BINARY_PATH";
 const WINDOWS_NETSH_BINARY_PATH_ENV: &str = "RUSTYNET_NETSH_BINARY_PATH";
 const WINDOWS_POWERSHELL_BINARY_PATH_ENV: &str = "RUSTYNET_POWERSHELL_BINARY_PATH";
+const WINDOWS_REG_BINARY_PATH_ENV: &str = "RUSTYNET_REG_BINARY_PATH";
 const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
 const DEFAULT_NFT_BINARY_PATH: &str = "/usr/sbin/nft";
 const DEFAULT_WG_BINARY_PATH: &str = "/usr/bin/wg";
@@ -146,6 +147,7 @@ const DEFAULT_KILL_BINARY_PATH: &str = "/bin/kill";
 const DEFAULT_WINDOWS_NETSH_BINARY_PATH: &str = r"C:\Windows\System32\netsh.exe";
 pub(crate) const DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH: &str =
     r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+const DEFAULT_WINDOWS_REG_BINARY_PATH: &str = r"C:\Windows\System32\reg.exe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ManagementCidr {
@@ -3161,6 +3163,17 @@ impl WindowsCommandSystem {
         Ok(PathBuf::from(raw))
     }
 
+    fn resolve_reg_binary() -> Result<PathBuf, SystemError> {
+        let configured = std::env::var(WINDOWS_REG_BINARY_PATH_ENV).ok();
+        let raw = configured
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_WINDOWS_REG_BINARY_PATH);
+        validate_windows_binary_path(raw, "reg")?;
+        Ok(PathBuf::from(raw))
+    }
+
     fn run_netsh(&self, args: &[String]) -> Result<PrivilegedCommandOutput, SystemError> {
         let binary = Self::resolve_netsh_binary()?;
         let mut command = Command::new(&binary);
@@ -3183,6 +3196,35 @@ impl WindowsCommandSystem {
         }
         Err(SystemError::Io(format!(
             "netsh exited unsuccessfully: status={} stderr={}",
+            output.status, output.stderr
+        )))
+    }
+
+    /// Run `reg.exe` with argv-bound arguments (no shell, no PowerShell parser).
+    /// Used for the NRPT registry writes so the loopback server list's `;` is
+    /// inert literal data rather than a statement separator.
+    fn run_reg(&self, args: &[String]) -> Result<PrivilegedCommandOutput, SystemError> {
+        let binary = Self::resolve_reg_binary()?;
+        let mut command = Command::new(&binary);
+        command.args(args);
+        let output = run_helper_command_with_timeout(command, WINDOWS_HELPER_COMMAND_TIMEOUT)
+            .map_err(|err| {
+                SystemError::Io(format!("reg run failed ({}): {err}", binary.display()))
+            })?;
+        Ok(PrivilegedCommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
+    }
+
+    fn run_reg_success(&self, args: &[String]) -> Result<(), SystemError> {
+        let output = self.run_reg(args)?;
+        if output.success() {
+            return Ok(());
+        }
+        Err(SystemError::Io(format!(
+            "reg exited unsuccessfully: status={} stderr={}",
             output.status, output.stderr
         )))
     }
@@ -3263,13 +3305,11 @@ impl WindowsCommandSystem {
         .map_err(|err| {
             SystemError::DnsApplyFailed(format!("set tunnel IPv6 DNS loopback: {err}"))
         })?;
-        self.run_powershell_success(
-            WINDOWS_PS_ADD_NRPT_LOOPBACK,
-            &[WINDOWS_NRPT_LOOPBACK_SERVERS.to_owned()],
-        )
-        .map_err(|err| {
-            SystemError::DnsApplyFailed(format!("add loopback NRPT root rule: {err}"))
-        })?;
+        for arg_set in windows_nrpt_reg_add_arg_sets() {
+            self.run_reg_success(&arg_set).map_err(|err| {
+                SystemError::DnsApplyFailed(format!("add loopback NRPT root rule: {err}"))
+            })?;
+        }
         Ok(())
     }
 
@@ -3278,8 +3318,24 @@ impl WindowsCommandSystem {
     /// rule is not one). Does not touch `dns_protected` — the caller owns it.
     fn clear_dns_loopback(&mut self) -> Result<(), SystemError> {
         let mut errors: Vec<String> = Vec::new();
-        if let Err(err) = self.run_powershell_success(WINDOWS_PS_REMOVE_NRPT, &[]) {
-            errors.push(format!("remove NRPT rule: {err}"));
+        match self.run_reg(&windows_nrpt_reg_delete_args()) {
+            Ok(output) => {
+                // `reg delete` of an absent key exits non-zero with "unable to
+                // find …" — idempotent teardown treats that as success, but a
+                // real failure (e.g. access denied) is surfaced.
+                if !output.success()
+                    && !output
+                        .stderr
+                        .to_ascii_lowercase()
+                        .contains("unable to find")
+                {
+                    errors.push(format!(
+                        "remove NRPT rule: reg exited {} stderr={}",
+                        output.status, output.stderr
+                    ));
+                }
+            }
+            Err(err) => errors.push(format!("remove NRPT rule: {err}")),
         }
         if let Err(err) =
             self.run_netsh_success(&windows_dns_clear_args(self.interface_name.as_str()))
@@ -3466,25 +3522,16 @@ const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $EgressName
 /// first drift detected.
 const WINDOWS_PS_ASSERT_DNS: &str = "& { param($UdpName, $TcpName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($UdpName, $TcpName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Block') { throw \"rule $displayName action is not Block\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } } }";
 
-/// Loopback name servers the NRPT root rule and the tunnel adapter point at:
-/// IPv4 `127.0.0.1` (the rustynet resolver) and IPv6 `::1`. The
-/// `windows-dns-failclosed` verifier requires every resolver to be loopback.
-/// Semicolon-separated to match the `GenericDNSServers` NRPT registry value.
+/// Loopback name servers as the NRPT `GenericDNSServers` value expects them:
+/// IPv4 `127.0.0.1` (the rustynet resolver) + IPv6 `::1`, semicolon-separated.
+/// The `windows-dns-failclosed` verifier requires every resolver to be loopback.
 const WINDOWS_NRPT_LOOPBACK_SERVERS: &str = "127.0.0.1;::1";
 
-/// Add (idempotently) an NRPT rule covering the root namespace `.` that points
-/// every unqualified lookup at the loopback resolver(s) — written DIRECTLY to
-/// the NRPT REGISTRY (Version/Name/GenericDNSServers/ConfigOptions). The earlier
-/// `Add-DnsClientNrptRule` CIM cmdlet hangs the daemon's reconcile path under the
-/// guest's wedged WMI (fresh PowerShell per call, service account, bounded
-/// timeout) → fail-close; `New-ItemProperty` on HKLM is a native registry write
-/// (no CIM, no DnsClient module load) that `Get-DnsClientNrptRule` reads back, so
-/// the verifier passes without the WMI hazard. Idempotent via `-Force`.
-const WINDOWS_PS_ADD_NRPT_LOOPBACK: &str = "& { param($Servers) $ErrorActionPreference = 'Stop'; $k = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters\\DnsPolicyConfig\\{A0B1C2D3-4E5F-46A7-B8C9-0D1E2F3A4B5C}'; if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }; New-ItemProperty -Path $k -Name Version -PropertyType DWord -Value 2 -Force | Out-Null; New-ItemProperty -Path $k -Name Name -PropertyType MultiString -Value @('.') -Force | Out-Null; New-ItemProperty -Path $k -Name GenericDNSServers -PropertyType String -Value $Servers -Force | Out-Null; New-ItemProperty -Path $k -Name ConfigOptions -PropertyType DWord -Value 8 -Force | Out-Null; New-ItemProperty -Path $k -Name Comment -PropertyType String -Value 'RustyNet-failclosed' -Force | Out-Null }";
-
-/// Remove the rustynet NRPT rule on teardown — a native registry delete of our
-/// fixed key (best-effort; a missing key is not an error). No CIM.
-const WINDOWS_PS_REMOVE_NRPT: &str = "& { $ErrorActionPreference = 'SilentlyContinue'; Remove-Item -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters\\DnsPolicyConfig\\{A0B1C2D3-4E5F-46A7-B8C9-0D1E2F3A4B5C}' -Recurse -Force -ErrorAction SilentlyContinue }";
+/// The fixed NRPT registry key the rustynet root rule lives in, in `reg.exe`
+/// (`HKLM\…`, not the PowerShell `HKLM:\…` PSDrive) form. NRPT rules are stored
+/// under `…\Dnscache\Parameters\DnsPolicyConfig\{GUID}`; the fixed GUID keeps
+/// add/remove deterministic and never disturbs operator NRPT policy.
+const WINDOWS_NRPT_REG_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig\{A0B1C2D3-4E5F-46A7-B8C9-0D1E2F3A4B5C}";
 
 impl DataplaneSystem for WindowsCommandSystem {
     fn set_generation(&mut self, generation: u64) {
@@ -3494,6 +3541,7 @@ impl DataplaneSystem for WindowsCommandSystem {
     fn check_prerequisites(&mut self) -> Result<(), SystemError> {
         let _ = Self::resolve_netsh_binary()?;
         let _ = Self::resolve_powershell_binary()?;
+        let _ = Self::resolve_reg_binary()?;
         Ok(())
     }
 
@@ -5764,6 +5812,50 @@ fn windows_dns_clear_ipv6_args(interface_name: &str) -> Vec<String> {
     ]
 }
 
+/// Build the ordered `reg.exe add` argument vectors that install the NRPT root
+/// rule directly into the registry (one invocation per value):
+/// `Version`=2, `Name`=`.` (`REG_MULTI_SZ`), `GenericDNSServers`=`127.0.0.1;::1`,
+/// `ConfigOptions`=8, `Comment`. `reg.exe` binds every `/d` value as a literal
+/// argv element, so the loopback server list's `;` (a PowerShell statement
+/// separator) is inert data — unlike `powershell.exe -Command "<script>" <arg>`,
+/// which CONCATENATES the trailing arg into the command line and splits on `;`,
+/// silently dropping `::1` and failing the parse. This is also how
+/// WireGuard-for-Windows installs NRPT (direct registry writes, no PowerShell,
+/// no `Add-DnsClientNrptRule` CIM cmdlet that wedges under the guest's WMI).
+fn windows_nrpt_reg_add_arg_sets() -> Vec<Vec<String>> {
+    let add = |name: &str, ty: &str, data: &str| -> Vec<String> {
+        vec![
+            "add".to_owned(),
+            WINDOWS_NRPT_REG_KEY.to_owned(),
+            "/v".to_owned(),
+            name.to_owned(),
+            "/t".to_owned(),
+            ty.to_owned(),
+            "/d".to_owned(),
+            data.to_owned(),
+            "/f".to_owned(),
+        ]
+    };
+    vec![
+        add("Version", "REG_DWORD", "2"),
+        add("Name", "REG_MULTI_SZ", "."),
+        add("GenericDNSServers", "REG_SZ", WINDOWS_NRPT_LOOPBACK_SERVERS),
+        add("ConfigOptions", "REG_DWORD", "8"),
+        add("Comment", "REG_SZ", "RustyNet-failclosed"),
+    ]
+}
+
+/// Build the `reg.exe delete` argument vector that removes the rustynet NRPT key
+/// on teardown. A missing key exits non-zero; the caller treats that as success
+/// (idempotent teardown).
+fn windows_nrpt_reg_delete_args() -> Vec<String> {
+    vec![
+        "delete".to_owned(),
+        WINDOWS_NRPT_REG_KEY.to_owned(),
+        "/f".to_owned(),
+    ]
+}
+
 /// Build the netsh argv that sets the global Windows advfirewall policy to
 /// "allow inbound, block outbound" across all profiles.  This is the foundation
 /// of the Windows killswitch — every allow rule layered on top must explicitly
@@ -6336,7 +6428,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_nrpt_constants_are_loopback_only_and_native_registry() {
+    fn windows_nrpt_reg_args_are_loopback_only_and_argv_bound() {
         use std::net::IpAddr;
         // Every NRPT name server must be loopback (verifier rejects one off-
         // loopback). Semicolon-separated to match the GenericDNSServers value.
@@ -6344,19 +6436,74 @@ mod tests {
             let ip: IpAddr = server.parse().expect("reviewed NRPT server must parse");
             assert!(ip.is_loopback(), "NRPT server {server} must be loopback");
         }
-        // The add/remove templates use NATIVE registry ops (no CIM DnsClient
-        // cmdlet, which wedges the reconcile path) against the fixed rustynet
-        // NRPT key, writing the reviewed root-namespace rule.
-        assert!(WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("DnsPolicyConfig"));
-        assert!(WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("New-ItemProperty"));
-        assert!(WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("GenericDNSServers"));
-        assert!(WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("RustyNet-failclosed"));
-        assert!(
-            !WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("DnsClientNrptRule"),
-            "must not use the CIM NRPT cmdlet on the reconcile path"
+
+        let add_sets = windows_nrpt_reg_add_arg_sets();
+        // One `reg add` per registry value: Version, Name, GenericDNSServers,
+        // ConfigOptions, Comment.
+        assert_eq!(add_sets.len(), 5, "one reg add per NRPT value");
+        for set in &add_sets {
+            assert_eq!(set[0], "add", "each set must be a `reg add`");
+            assert_eq!(
+                set[1], WINDOWS_NRPT_REG_KEY,
+                "must target the rustynet NRPT key"
+            );
+            assert!(set.contains(&"/f".to_owned()), "must be forced/idempotent");
+            // No CIM cmdlet, no PowerShell script anywhere in the argv — this is
+            // the whole point: native registry writes, like WireGuard-for-Windows.
+            for token in set {
+                assert!(
+                    !token.contains("DnsClientNrptRule"),
+                    "must not use the CIM NRPT cmdlet on the reconcile path"
+                );
+                assert!(
+                    !token.contains("New-ItemProperty") && !token.contains("Test-Path"),
+                    "must not shell out to PowerShell for the registry write"
+                );
+            }
+        }
+        // The fixed key lives under the NRPT policy hive.
+        assert!(WINDOWS_NRPT_REG_KEY.contains("DnsPolicyConfig"));
+        // reg.exe uses the `HKLM\…` hive form, NOT the PowerShell `HKLM:\…`
+        // PSDrive form (that would make reg.exe create a literal `HKLM:` key).
+        assert!(WINDOWS_NRPT_REG_KEY.starts_with(r"HKLM\"));
+        assert!(!WINDOWS_NRPT_REG_KEY.contains("HKLM:"));
+
+        // The CRITICAL regression guard: the loopback server list (which
+        // contains a `;`) must be passed as ONE argv element to `/d`, never
+        // split. Passing it as a trailing `powershell.exe -Command` positional
+        // arg concatenated it into the command line, where `;` is a statement
+        // separator — silently dropping `::1` and failing the parse.
+        let servers_set = add_sets
+            .iter()
+            .find(|set| set.contains(&"GenericDNSServers".to_owned()))
+            .expect("an arg set must write GenericDNSServers");
+        let data_idx = servers_set
+            .iter()
+            .position(|t| t == "/d")
+            .expect("reg add must carry a /d data flag")
+            + 1;
+        assert_eq!(
+            servers_set[data_idx], WINDOWS_NRPT_LOOPBACK_SERVERS,
+            "the full `127.0.0.1;::1` list must be a single argv element"
         );
-        assert!(WINDOWS_PS_REMOVE_NRPT.contains("Remove-Item"));
-        assert!(WINDOWS_PS_REMOVE_NRPT.contains("DnsPolicyConfig"));
+        assert!(
+            servers_set[data_idx].contains(';'),
+            "regression guard: the `;` stays inside one argv element"
+        );
+
+        // The Name value is the root namespace `.` written as REG_MULTI_SZ.
+        let name_set = add_sets
+            .iter()
+            .find(|set| set.contains(&"Name".to_owned()))
+            .expect("an arg set must write Name");
+        assert!(name_set.contains(&"REG_MULTI_SZ".to_owned()));
+        assert!(name_set.contains(&".".to_owned()));
+
+        // Teardown is a forced `reg delete` of the same key.
+        let del = windows_nrpt_reg_delete_args();
+        assert_eq!(del[0], "delete");
+        assert_eq!(del[1], WINDOWS_NRPT_REG_KEY);
+        assert!(del.contains(&"/f".to_owned()));
     }
 
     #[test]
