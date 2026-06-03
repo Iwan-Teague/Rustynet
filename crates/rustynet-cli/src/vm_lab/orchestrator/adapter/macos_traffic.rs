@@ -181,6 +181,17 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     // real signed trust/membership over it — matching the clean-slate intent of
     // `--rebuild-nodes`. The watermark is cleared too so the fresh seed is not
     // rejected as a rollback/replay.
+    // Also purge the daemon runtime state file (`rustynetd.state`). It persists
+    // operational state — including `selected_exit_node` — across restarts.
+    // Without removing it on a rebuild the daemon reloads a STALE
+    // `selected_exit_node` from an earlier topology (observed live: a May-31
+    // `selected_exit_node=exit-1` survived a clean rebuild), and the reconcile
+    // loop fails closed — "selected exit node is not active: exit-1" — because
+    // that node is absent from the freshly distributed membership, escalating to
+    // restrict_permanent and tearing the mesh IP down. Purging it forces the
+    // daemon to re-derive its exit selection from the current signed
+    // auto-tunnel bundle. It carries no anti-replay watermark (those are the
+    // separate `*.watermark` files cleared above), so removal is safe.
     ssh::run_remote(
         conn,
         &format!(
@@ -196,6 +207,7 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
              '{MACOS_STATE_ROOT}/trust/rustynetd.traversal.watermark' \
              '{MACOS_STATE_ROOT}/trust/rustynetd.dns-zone' \
              '{MACOS_STATE_ROOT}/trust/rustynetd.dns-zone.watermark' \
+             '{MACOS_STATE_ROOT}/rustynetd.state' \
              2>/dev/null || true"
         ),
         SHORT_TIMEOUT,
