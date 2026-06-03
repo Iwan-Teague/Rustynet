@@ -146,7 +146,54 @@ pub fn collect_active_tunnels(conn: &NodeConnection) -> Result<TunnelsList, Adap
         .filter(|line| !line.is_empty())
         .map(std::string::ToString::to_string)
         .collect();
+
+    // Kernel WireGuard backends expose peers via `wg show`. The
+    // `linux-wireguard-userspace-shared` backend (boringtun on a TUN device)
+    // registers nothing with kernel `wg`, so `wg show` is empty (or `wg` is
+    // absent) even with a live tunnel carrying traffic. Fall back to the
+    // daemon's own status, which is backend-agnostic: a non-fail-closed daemon
+    // with at least one programmed peer tunnel is an active tunnel.
+    let kernel_wg_unusable =
+        tunnels.is_empty() || tunnels.iter().all(|l| l.contains("wg-not-installed"));
+    if kernel_wg_unusable {
+        let status = ssh::run_remote(
+            conn,
+            "sudo -n rustynet status 2>/dev/null || rustynet status 2>/dev/null || true",
+            SHORT_TIMEOUT,
+        )?;
+        let derived = tunnels_from_daemon_status(&status);
+        if !derived.is_empty() {
+            return Ok(TunnelsList { tunnels: derived });
+        }
+    }
     Ok(TunnelsList { tunnels })
+}
+
+/// Derive the active-tunnel list from `rustynet status` (space-separated
+/// `key=value` tokens) for backends `wg show` cannot see. Returns one synthetic
+/// line per programmed peer when the daemon is NOT fail-closed
+/// (`restriction_mode=None`) and has at least one programmed peer tunnel
+/// (`path_programmed_peer_count>=1`); otherwise empty (fail-closed: a restricted
+/// daemon or a zero-peer dataplane is not an active tunnel).
+fn tunnels_from_daemon_status(status: &str) -> Vec<String> {
+    let value = |key: &str| {
+        status
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix(key))
+    };
+    let not_restricted = value("restriction_mode=") == Some("None");
+    let programmed = value("path_programmed_peer_count=")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    if !not_restricted || programmed == 0 {
+        return Vec::new();
+    }
+    let mode = value("path_programmed_mode=").unwrap_or("programmed");
+    (0..programmed)
+        .map(|i| {
+            format!("userspace-shared peer {i}: {mode} (dataplane applied, restriction_mode=None)")
+        })
+        .collect()
 }
 
 /// Collect diagnostic artifacts from the remote host to `dst`.
@@ -718,5 +765,44 @@ mod tests {
 
         let result = verify_no_key_material(archive.path());
         assert!(result.is_ok(), "must allow non-key archive: {result:?}");
+    }
+
+    // ── userspace-shared tunnel liveness (wg show is empty for boringtun) ──────
+
+    #[test]
+    fn daemon_status_derives_active_tunnels_when_programmed_and_unrestricted() {
+        // A healthy client (the r33 shape): not fail-closed, one programmed peer.
+        let status = "node_id=debian-3 state=ExitActive restriction_mode=None \
+                      path_programmed_mode=direct_programmed path_programmed_peer_count=1 \
+                      reconcile_failures=0";
+        let tunnels = super::tunnels_from_daemon_status(status);
+        assert_eq!(tunnels.len(), 1, "one programmed peer -> one tunnel line");
+        assert!(tunnels[0].contains("direct_programmed"));
+    }
+
+    #[test]
+    fn daemon_status_derives_one_line_per_programmed_peer() {
+        let status = "restriction_mode=None path_programmed_peer_count=3";
+        assert_eq!(super::tunnels_from_daemon_status(status).len(), 3);
+    }
+
+    #[test]
+    fn daemon_status_is_empty_when_fail_closed() {
+        // restriction_mode != None means the daemon tore the dataplane down.
+        let status = "state=FailClosed restriction_mode=Permanent path_programmed_peer_count=1";
+        assert!(super::tunnels_from_daemon_status(status).is_empty());
+    }
+
+    #[test]
+    fn daemon_status_is_empty_when_no_programmed_peers() {
+        let status = "restriction_mode=None path_programmed_peer_count=0";
+        assert!(super::tunnels_from_daemon_status(status).is_empty());
+    }
+
+    #[test]
+    fn daemon_status_is_empty_when_keys_absent() {
+        // An unparseable / empty status must fail closed, never a phantom tunnel.
+        assert!(super::tunnels_from_daemon_status("").is_empty());
+        assert!(super::tunnels_from_daemon_status("garbage output").is_empty());
     }
 }
