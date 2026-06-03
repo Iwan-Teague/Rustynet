@@ -3292,6 +3292,11 @@ impl WindowsCommandSystem {
     /// defense-in-depth. Does not touch `dns_protected` — the caller owns it.
     fn apply_dns_loopback(&mut self) -> Result<(), SystemError> {
         validate_windows_dns_bind_addr(self.dns_resolver_bind_addr)?;
+        log::info!(
+            "windows dns loopback apply: tunnel interface='{}' resolver={}",
+            self.interface_name,
+            self.dns_resolver_bind_addr
+        );
         self.run_netsh_success(&windows_dns_set_args(
             self.interface_name.as_str(),
             self.dns_resolver_bind_addr.ip(),
@@ -4433,6 +4438,12 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         );
 
         if let Err(err) = result {
+            // Surface WHY the dataplane is about to fail closed. Without this the
+            // generation-apply error (e.g. a DNS-protection or assert failure) is
+            // swallowed here and the daemon goes silent after "entering reconcile
+            // loop", leaving operators to reverse-engineer a fail-closed posture
+            // from downstream validator drift alone.
+            log::warn!("phase10 generation apply failed; rolling back fail-closed: {err}");
             self.current_serve_exit_node = false;
             let rollback_result =
                 self.rollback_generation_best_effort(applied_stages, RollbackIntent::FailClosed);
