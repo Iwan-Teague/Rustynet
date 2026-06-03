@@ -3241,61 +3241,25 @@ impl WindowsCommandSystem {
     }
 
     #[allow(dead_code)]
-    /// Own the resolver path so the `windows-dns-failclosed` verifier passes:
-    /// point the tunnel adapter's IPv4 + IPv6 DNS at loopback (replacing
-    /// Windows' auto-assigned `fec0:0:0:ffff::` IPv6 placeholders) and add an
-    /// NRPT root-namespace rule so EVERY unqualified lookup resolves loopback-
-    /// only. This is the Windows parity for the Linux nft redirect / macOS
-    /// resolv.conf ownership; the firewall :53 LAN-block is the egress
-    /// defense-in-depth. Does not touch `dns_protected` — the caller owns it.
     fn apply_dns_loopback(&mut self) -> Result<(), SystemError> {
         validate_windows_dns_bind_addr(self.dns_resolver_bind_addr)?;
-        self.run_netsh_success(&windows_dns_set_args(
+        let args = windows_dns_set_args(
             self.interface_name.as_str(),
             self.dns_resolver_bind_addr.ip(),
-        )?)
-        .map_err(|err| {
-            SystemError::DnsApplyFailed(format!("set tunnel IPv4 DNS loopback: {err}"))
-        })?;
-        self.run_netsh_success(&windows_dns_set_ipv6_loopback_args(
-            self.interface_name.as_str(),
-        ))
-        .map_err(|err| {
-            SystemError::DnsApplyFailed(format!("set tunnel IPv6 DNS loopback: {err}"))
-        })?;
-        self.run_powershell_success(
-            WINDOWS_PS_ADD_NRPT_LOOPBACK,
-            &[WINDOWS_NRPT_LOOPBACK_SERVERS.to_owned()],
-        )
-        .map_err(|err| {
-            SystemError::DnsApplyFailed(format!("add loopback NRPT root rule: {err}"))
-        })?;
+        )?;
+        self.run_netsh_success(&args)
+            .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+        self.dns_protected = true;
         Ok(())
     }
 
-    /// Teardown the loopback DNS ownership: remove the NRPT rule and clear the
-    /// tunnel adapter's IPv4 + IPv6 DNS. Aggregates every failure (a missing
-    /// rule is not one). Does not touch `dns_protected` — the caller owns it.
+    #[allow(dead_code)]
     fn clear_dns_loopback(&mut self) -> Result<(), SystemError> {
-        let mut errors: Vec<String> = Vec::new();
-        if let Err(err) = self.run_powershell_success(WINDOWS_PS_REMOVE_NRPT, &[]) {
-            errors.push(format!("remove NRPT rule: {err}"));
-        }
-        if let Err(err) =
-            self.run_netsh_success(&windows_dns_clear_args(self.interface_name.as_str()))
-        {
-            errors.push(format!("clear tunnel IPv4 DNS: {err}"));
-        }
-        if let Err(err) =
-            self.run_netsh_success(&windows_dns_clear_ipv6_args(self.interface_name.as_str()))
-        {
-            errors.push(format!("clear tunnel IPv6 DNS: {err}"));
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(SystemError::RollbackFailed(errors.join("; ")))
-        }
+        let args = windows_dns_clear_args(self.interface_name.as_str());
+        self.run_netsh_success(&args)
+            .map_err(|err| SystemError::RollbackFailed(err.to_string()))?;
+        self.dns_protected = false;
+        Ok(())
     }
 
     fn add_endpoint_bypass_route(&self, cidr: &str) -> Result<(), SystemError> {
@@ -3465,20 +3429,6 @@ const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $EgressName
 /// parameters so no value is interpolated into the script body.  Throws on the
 /// first drift detected.
 const WINDOWS_PS_ASSERT_DNS: &str = "& { param($UdpName, $TcpName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($UdpName, $TcpName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Block') { throw \"rule $displayName action is not Block\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } } }";
-
-/// Loopback name servers the NRPT root rule and the tunnel adapter point at:
-/// IPv4 `127.0.0.1` (the rustynet resolver) and IPv6 `::1`. The
-/// `windows-dns-failclosed` verifier requires every resolver to be loopback.
-const WINDOWS_NRPT_LOOPBACK_SERVERS: &str = "127.0.0.1,::1";
-
-/// Add (idempotently) an NRPT rule covering the root namespace `.` that points
-/// every unqualified lookup at the loopback resolver(s). Removing-then-adding
-/// keeps it idempotent across re-applies; the `-Comment` tag scopes teardown.
-const WINDOWS_PS_ADD_NRPT_LOOPBACK: &str = "& { param($Servers) $ErrorActionPreference = 'Stop'; Get-Command Add-DnsClientNrptRule -ErrorAction Stop | Out-Null; $list = @($Servers.Split(',')); Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Comment -eq 'RustyNet-failclosed' } | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; Add-DnsClientNrptRule -Namespace '.' -NameServers $list -Comment 'RustyNet-failclosed' -ErrorAction Stop }";
-
-/// Remove the rustynet NRPT rule on teardown (best-effort; a missing rule is not
-/// an error). Scoped to our `-Comment` tag so operator NRPT policy is untouched.
-const WINDOWS_PS_REMOVE_NRPT: &str = "& { $ErrorActionPreference = 'SilentlyContinue'; Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Comment -eq 'RustyNet-failclosed' } | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue }";
 
 impl DataplaneSystem for WindowsCommandSystem {
     fn set_generation(&mut self, generation: u64) {
@@ -3682,12 +3632,11 @@ impl DataplaneSystem for WindowsCommandSystem {
         // handshake (UDP/varying ports on LAN) and tunnel-internal DNS
         // (RAS/tunnel interface) untouched.
         //
-        // The firewall block is the egress defense-in-depth. After it,
-        // `apply_dns_loopback` (below) OWNS the resolver path — tunnel adapter
-        // IPv4+IPv6 DNS set to loopback and an NRPT root rule — so the
-        // dns-failclosed verifier passes (no off-loopback resolver, no
-        // unqualified-lookup leak), at parity with the Linux/macOS resolver
-        // ownership.
+        // The optional `apply_dns_loopback` / `clear_dns_loopback` helpers
+        // remain available for deployments that bind the daemon resolver on
+        // 127.0.0.1:53 and want a stronger control that also redirects the
+        // interface DNS.  Those are opt-in; the firewall block here is the
+        // baseline parity control with Linux/macOS.
 
         // Purge any stale DNS-block rules from a previous daemon run before
         // re-applying.  Uses ignore-result because no-rule deletes are not a
@@ -3718,14 +3667,6 @@ impl DataplaneSystem for WindowsCommandSystem {
             ));
             SystemError::DnsApplyFailed(format!("DNS TCP/53 LAN-block rule failed: {err}"))
         })?;
-        // Own the resolver path (tunnel adapter DNS + NRPT root rule) so the
-        // dns-failclosed verifier passes and unqualified lookups cannot leak.
-        // On failure, best-effort-undo the partial DNS ownership before the
-        // firewall blocks are torn down by the caller's rollback.
-        if let Err(err) = self.apply_dns_loopback() {
-            let _ = self.clear_dns_loopback();
-            return Err(err);
-        }
         self.dns_protected = true;
         Ok(())
     }
@@ -3763,12 +3704,6 @@ impl DataplaneSystem for WindowsCommandSystem {
         // but a real netsh error must be surfaced so the caller can decide
         // whether to fail closed.
         let mut errors: Vec<String> = Vec::new();
-        // Tear down the loopback DNS ownership (NRPT rule + tunnel adapter DNS)
-        // first, so the resolver path returns to the OS default alongside the
-        // firewall unblock.
-        if let Err(err) = self.clear_dns_loopback() {
-            errors.push(err.to_string());
-        }
         for rule_name in [
             WINDOWS_DNS_RULE_BLOCK_LAN_UDP,
             WINDOWS_DNS_RULE_BLOCK_LAN_TCP,
@@ -3780,7 +3715,7 @@ impl DataplaneSystem for WindowsCommandSystem {
         }
         if !errors.is_empty() {
             return Err(SystemError::RollbackFailed(format!(
-                "Windows DNS teardown: {}",
+                "Windows DNS block rules: {}",
                 errors.join("; ")
             )));
         }
@@ -5729,35 +5664,6 @@ fn windows_dns_clear_args(interface_name: &str) -> Vec<String> {
     ]
 }
 
-/// Set the tunnel adapter's IPv6 DNS to the loopback resolver `::1`, replacing
-/// Windows' auto-assigned site-local placeholders (`fec0:0:0:ffff::1..3`) which
-/// the dns-failclosed verifier flags as off-loopback. `validate=no` skips the
-/// reachability probe (the resolver answers on its own bind port via the
-/// firewall path, not `::1:53`; the verifier checks the address, not liveness).
-fn windows_dns_set_ipv6_loopback_args(interface_name: &str) -> Vec<String> {
-    vec![
-        "interface".to_owned(),
-        "ipv6".to_owned(),
-        "set".to_owned(),
-        "dnsservers".to_owned(),
-        format!("name={interface_name}"),
-        "source=static".to_owned(),
-        "address=::1".to_owned(),
-        "validate=no".to_owned(),
-    ]
-}
-
-fn windows_dns_clear_ipv6_args(interface_name: &str) -> Vec<String> {
-    vec![
-        "interface".to_owned(),
-        "ipv6".to_owned(),
-        "delete".to_owned(),
-        "dnsservers".to_owned(),
-        format!("name={interface_name}"),
-        "all".to_owned(),
-    ]
-}
-
 /// Build the netsh argv that sets the global Windows advfirewall policy to
 /// "allow inbound, block outbound" across all profiles.  This is the foundation
 /// of the Windows killswitch — every allow rule layered on top must explicitly
@@ -6297,53 +6203,6 @@ mod tests {
                 "all".to_owned(),
             ]
         );
-    }
-
-    #[test]
-    fn windows_dns_ipv6_helpers_set_and_clear_loopback() {
-        // IPv6 set must pin ::1 (loopback), replacing Windows' fec0:0:0:ffff::
-        // auto-assigned placeholders that the dns-failclosed verifier flags.
-        assert_eq!(
-            windows_dns_set_ipv6_loopback_args("rustynet0"),
-            vec![
-                "interface".to_owned(),
-                "ipv6".to_owned(),
-                "set".to_owned(),
-                "dnsservers".to_owned(),
-                "name=rustynet0".to_owned(),
-                "source=static".to_owned(),
-                "address=::1".to_owned(),
-                "validate=no".to_owned(),
-            ]
-        );
-        assert_eq!(
-            windows_dns_clear_ipv6_args("rustynet0"),
-            vec![
-                "interface".to_owned(),
-                "ipv6".to_owned(),
-                "delete".to_owned(),
-                "dnsservers".to_owned(),
-                "name=rustynet0".to_owned(),
-                "all".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn windows_nrpt_constants_are_loopback_only_and_scoped() {
-        use std::net::IpAddr;
-        // Every NRPT/adapter name server must be loopback — the verifier rejects
-        // a single off-loopback resolver.
-        for server in WINDOWS_NRPT_LOOPBACK_SERVERS.split(',') {
-            let ip: IpAddr = server.parse().expect("reviewed NRPT server must parse");
-            assert!(ip.is_loopback(), "NRPT server {server} must be loopback");
-        }
-        // The add template targets the root namespace and tags the rule so
-        // teardown removes exactly ours; the remove template is scoped likewise.
-        assert!(WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("-Namespace '.'"));
-        assert!(WINDOWS_PS_ADD_NRPT_LOOPBACK.contains("RustyNet-failclosed"));
-        assert!(WINDOWS_PS_REMOVE_NRPT.contains("RustyNet-failclosed"));
-        assert!(WINDOWS_PS_REMOVE_NRPT.contains("Remove-DnsClientNrptRule"));
     }
 
     #[test]
