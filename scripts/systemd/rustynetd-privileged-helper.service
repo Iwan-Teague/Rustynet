@@ -41,7 +41,15 @@ SystemCallArchitectures=native
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN
 DeviceAllow=/dev/net/tun rw
-ReadWritePaths=-/run/rustynet -/proc/sys/net/ipv4 -/proc/sys/net/ipv6
+# ProtectSystem=strict makes the whole filesystem read-only; these narrow
+# ReadWritePaths punch the minimum holes the helper needs. The two DNS entries
+# let the protected-mode `dns-failclosed-file` builtin write the loopback
+# resolv.conf and the NetworkManager `dns=none` drop-in (Option 2: the rustynet
+# resolver owns loopback DNS). They are file/dir-scoped — NOT `/etc`-wide — so
+# the helper still cannot touch any other /etc file. resolv.conf is rewritten in
+# place (O_NOFOLLOW); its pre-failclosed backup lives under /run/rustynet, so no
+# extra writable /etc path is required for teardown.
+ReadWritePaths=-/run/rustynet -/proc/sys/net/ipv4 -/proc/sys/net/ipv6 -/etc/resolv.conf -/etc/NetworkManager/conf.d
 UMask=0077
 
 [Install]

@@ -66,6 +66,11 @@ pub enum PrivilegedCommandProgram {
     Pfctl,
     WireguardGo,
     Kill,
+    /// In-helper file-write builtin for protected-mode DNS fail-closed
+    /// (`linux_dns_protect`). NOT an external binary: the single argument is a
+    /// fixed selector and the helper owns the path→content mapping, so no path
+    /// or file content ever crosses the privileged boundary.
+    DnsFailclosedFile,
 }
 
 impl PrivilegedCommandProgram {
@@ -80,6 +85,9 @@ impl PrivilegedCommandProgram {
             PrivilegedCommandProgram::Pfctl => "pfctl",
             PrivilegedCommandProgram::WireguardGo => "wireguard-go",
             PrivilegedCommandProgram::Kill => "kill",
+            PrivilegedCommandProgram::DnsFailclosedFile => {
+                crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM
+            }
         }
     }
 
@@ -94,8 +102,18 @@ impl PrivilegedCommandProgram {
             "pfctl" => Some(PrivilegedCommandProgram::Pfctl),
             "wireguard-go" => Some(PrivilegedCommandProgram::WireguardGo),
             "kill" => Some(PrivilegedCommandProgram::Kill),
+            _ if value == crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM => {
+                Some(PrivilegedCommandProgram::DnsFailclosedFile)
+            }
             _ => None,
         }
+    }
+
+    /// True for in-helper builtins that have no external binary to exec. The
+    /// exec path (`resolve_binary` / `run_privileged_subprocess`) must never run
+    /// for these — the dispatcher routes them to their in-process handler.
+    fn is_builtin(self) -> bool {
+        matches!(self, PrivilegedCommandProgram::DnsFailclosedFile)
     }
 
     fn binary_candidates(self) -> &'static [&'static str] {
@@ -119,10 +137,19 @@ impl PrivilegedCommandProgram {
                 "/usr/bin/wireguard-go",
             ],
             PrivilegedCommandProgram::Kill => &["/bin/kill", "/usr/bin/kill"],
+            // In-helper builtin: no external binary. Routed to its in-process
+            // handler before exec; the empty candidate set fails closed if it
+            // ever reaches binary resolution.
+            PrivilegedCommandProgram::DnsFailclosedFile => &[],
         }
     }
 
     fn resolve_binary(self) -> Result<PathBuf, String> {
+        if self.is_builtin() {
+            return Err(format!(
+                "{self} is an in-helper builtin and has no external binary to execute"
+            ));
+        }
         for candidate in self.binary_candidates() {
             let candidate_path = Path::new(candidate);
             if !candidate_path.exists() {
@@ -817,6 +844,16 @@ fn handle_request_with_timeout(request: HelperRequest, timeout: Duration) -> Hel
         return HelperResponse::error(err);
     }
 
+    // In-helper builtins do not exec an external binary. They are dispatched to
+    // their in-process handler after the same allowlist validation as every
+    // exec'd command.
+    if program.is_builtin() {
+        return match execute_builtin(program, &args) {
+            Ok(output) => HelperResponse::success(output.status, output.stdout, output.stderr),
+            Err(err) => HelperResponse::error(err),
+        };
+    }
+
     let binary = match program.resolve_binary() {
         Ok(path) => path,
         Err(err) => return HelperResponse::error(err),
@@ -834,6 +871,49 @@ fn handle_request_with_timeout(request: HelperRequest, timeout: Duration) -> Hel
             binary.display(),
         )),
     }
+}
+
+/// Run an in-helper builtin (no external binary). The caller must have already
+/// validated `args` via [`validate_request`]. Returns a captured-output value so
+/// both the IPC helper and the helper-less direct path can surface the result
+/// uniformly.
+fn execute_builtin(
+    program: PrivilegedCommandProgram,
+    args: &[&str],
+) -> Result<PrivilegedCommandOutput, String> {
+    match program {
+        PrivilegedCommandProgram::DnsFailclosedFile => {
+            // `args` validated as exactly `[selector]`; the executor owns the
+            // path→content mapping and re-validates the selector defensively.
+            crate::linux_dns_protect::apply_dns_failclosed_file(args[0]).map(|()| {
+                PrivilegedCommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }
+            })
+        }
+        // No other builtins exist; fail closed if one is added without a handler.
+        _ => Err(format!("no in-process handler for builtin {program}")),
+    }
+}
+
+/// If `program` is an in-helper builtin, validate its arguments and run the
+/// in-process handler, returning the captured output. Returns `None` for
+/// programs that exec an external binary, so the helper-less direct path can
+/// fall through to its exec logic. This keeps the builtin behaving identically
+/// whether or not a privilege-separated helper is in use.
+pub(crate) fn try_execute_builtin_program(
+    program: PrivilegedCommandProgram,
+    args: &[&str],
+) -> Option<Result<PrivilegedCommandOutput, String>> {
+    if !program.is_builtin() {
+        return None;
+    }
+    if let Err(err) = validate_request(program, args) {
+        return Some(Err(err));
+    }
+    Some(execute_builtin(program, args))
 }
 
 #[cfg(not(windows))]
@@ -960,6 +1040,23 @@ pub(crate) fn validate_request(
         PrivilegedCommandProgram::Pfctl => validate_pfctl_args(args),
         PrivilegedCommandProgram::WireguardGo => validate_wireguard_go_args(args),
         PrivilegedCommandProgram::Kill => validate_kill_args(args),
+        PrivilegedCommandProgram::DnsFailclosedFile => validate_dns_failclosed_file_args(args),
+    }
+}
+
+/// Validate the `dns-failclosed-file` builtin: EXACTLY one argument, and that
+/// argument must be one of the four reviewed selectors. The selector is the only
+/// value that crosses the privileged boundary — the helper supplies the path and
+/// content — so this is the entire attack surface of the builtin.
+fn validate_dns_failclosed_file_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        [selector] if crate::linux_dns_protect::is_valid_dns_failclosed_file_selector(selector) => {
+            Ok(())
+        }
+        _ => Err(
+            "unsupported dns-failclosed-file argument schema (expected exactly one reviewed selector)"
+                .to_owned(),
+        ),
     }
 }
 
@@ -1826,6 +1923,134 @@ mod tests {
         assert!(
             super::validate_nft_args(&refs).is_ok(),
             "helper must permit DNS-redirect teardown: {refs:?}"
+        );
+    }
+
+    // ---- dns-failclosed-file builtin: privileged-boundary negative tests ----
+
+    #[test]
+    fn dns_failclosed_file_builtin_permits_exactly_the_reviewed_selectors() {
+        for selector in crate::linux_dns_protect::DNS_FAILCLOSED_FILE_SELECTORS {
+            assert!(
+                validate_request(PrivilegedCommandProgram::DnsFailclosedFile, &[selector]).is_ok(),
+                "helper must permit reviewed selector {selector:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dns_failclosed_file_builtin_rejects_every_non_selector_argument() {
+        // The selector is the entire attack surface: no path, no content, no
+        // traversal, no shell metacharacters, no second argument may pass.
+        for bad in [
+            "",
+            "resolv-conf",
+            "resolv-conf-apply ",
+            " resolv-conf-apply",
+            "RESOLV-CONF-APPLY",
+            "/etc/resolv.conf",
+            "/etc/shadow",
+            "../../etc/passwd",
+            "resolv-conf-apply\n",
+            "resolv-conf-apply;rm -rf /",
+            "nameserver 8.8.8.8",
+            "dns-failclosed-file",
+        ] {
+            assert!(
+                validate_request(PrivilegedCommandProgram::DnsFailclosedFile, &[bad]).is_err(),
+                "helper must reject non-selector argument {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dns_failclosed_file_builtin_requires_exactly_one_argument() {
+        // Zero args (empty) is caught by the generic arity guard; two args and a
+        // second-path smuggling attempt must both be rejected.
+        assert!(
+            validate_request(PrivilegedCommandProgram::DnsFailclosedFile, &[]).is_err(),
+            "no argument must be rejected"
+        );
+        assert!(
+            validate_request(
+                PrivilegedCommandProgram::DnsFailclosedFile,
+                &["resolv-conf-apply", "resolv-conf-restore"],
+            )
+            .is_err(),
+            "two selectors must be rejected"
+        );
+        assert!(
+            validate_request(
+                PrivilegedCommandProgram::DnsFailclosedFile,
+                &["resolv-conf-apply", "/etc/passwd"],
+            )
+            .is_err(),
+            "a smuggled path as a second argument must be rejected"
+        );
+    }
+
+    #[test]
+    fn dns_failclosed_file_builtin_never_resolves_an_external_binary() {
+        // The builtin must never reach the exec path; resolve_binary must fail
+        // closed and is_builtin must classify it as in-process.
+        assert!(PrivilegedCommandProgram::DnsFailclosedFile.is_builtin());
+        let err = PrivilegedCommandProgram::DnsFailclosedFile
+            .resolve_binary()
+            .expect_err("builtin must have no external binary");
+        assert!(err.contains("builtin"), "{err}");
+    }
+
+    #[test]
+    fn dns_failclosed_file_program_token_round_trips() {
+        let program = PrivilegedCommandProgram::DnsFailclosedFile;
+        assert_eq!(
+            program.as_str(),
+            crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM
+        );
+        assert_eq!(
+            PrivilegedCommandProgram::parse(program.as_str()),
+            Some(program)
+        );
+    }
+
+    #[test]
+    fn handle_request_rejects_bad_selector_before_any_side_effect() {
+        // A bad selector is rejected at validation — it never reaches the
+        // in-process executor, so no file is ever touched.
+        let response = handle_request(HelperRequest {
+            program: crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM.to_owned(),
+            args: vec!["/etc/resolv.conf".to_owned()],
+        });
+        assert!(!response.ok, "bad selector must fail");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("dns-failclosed-file argument schema"),
+            "must be the validation rejection, not an executor/exec error: {:?}",
+            response.error
+        );
+    }
+
+    #[test]
+    fn handle_request_dispatches_valid_selector_to_in_process_executor() {
+        // `resolv-conf-restore` with no backup present is a no-op, so this is
+        // side-effect-free everywhere. The point is that a VALID selector is
+        // dispatched to the builtin executor rather than rejected at validation
+        // or sent down the binary-exec path.
+        let response = handle_request(HelperRequest {
+            program: crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM.to_owned(),
+            args: vec!["resolv-conf-restore".to_owned()],
+        });
+        let error = response.error.clone().unwrap_or_default();
+        assert!(
+            !error.contains("argument schema"),
+            "valid selector must pass validation and dispatch: {error:?}"
+        );
+        assert!(
+            !error.contains("binary") && !error.contains("no supported binary path"),
+            "builtin must never attempt to exec an external binary: {error:?}"
         );
     }
 
