@@ -747,18 +747,25 @@ install_binaries() {
 #
 # Mirrors the Linux key-custody pipeline so the macOS daemon's runtime
 # key material is identical in shape to systemd hosts:
-#   - ${KEYS_DIR}/wireguard.key       — plaintext runtime key (mode 0600)
-#   - ${KEYS_DIR}/wireguard.key.enc   — passphrase-encrypted blob (mode 0600)
-#   - ${KEYS_DIR}/wireguard.pub       — public key (mode 0640)
-#   - ${KEYS_DIR}/wireguard.passphrase — passphrase credential (mode 0600)
+#   - ${KEYS_DIR}/wireguard.key.enc   — passphrase-encrypted blob (mode 0600, AT REST)
+#   - ${KEYS_DIR}/wireguard.pub       — public key (mode 0640, AT REST)
+#   - ${KEYS_DIR}/wireguard.passphrase — passphrase credential (mode 0600, AT REST)
+#   - /private/var/run/rustynet/wireguard.key — plaintext runtime key, EPHEMERAL
+#       (daemon-written each start; deliberately NOT in keys/ — custody note below)
 #
-# The plaintext path is what the daemon's `--wg-private-key` plist arg
-# references. The encrypted blob + passphrase are what the daemon decrypts
-# at every startup (see `prepare_runtime_wireguard_key_material` in
-# crates/rustynetd/src/daemon.rs); the result is rewritten to the plaintext
-# path because the macOS userspace-shared backend re-reads the runtime
-# key on boringtun worker recovery (`retains_runtime_key_at_rest` is true
-# and the daemon never scrubs the file).
+# Custody (macos_key_custody / Phase E encrypted-at-rest): the plaintext runtime
+# key must NOT persist in the at-rest keys/ dir. `key init` writes it under keys/
+# transiently (root can create there), then generate_wireguard_keys removes it.
+# The daemon re-derives it from wireguard.key.enc + the keychain passphrase into
+# the EPHEMERAL runtime dir (/private/var/run/rustynet/wireguard.key, the
+# `--wg-private-key` plist arg) at every startup (see
+# `prepare_runtime_wireguard_key_material` in crates/rustynetd/src/daemon.rs).
+# The macOS userspace-shared backend re-reads that runtime key on boringtun
+# worker recovery (`retains_runtime_key_at_rest` is true), so it persists in the
+# runtime dir for the daemon's lifetime but is GC'd between reboots — matching
+# Linux's /run/rustynet/wireguard.key. The privileged-helper plist recreates
+# /private/var/run/rustynet (root:0o770) each boot so the rustynetd group can
+# write the runtime key there.
 #
 # After `key init` we push the passphrase into the macOS keychain via
 # `rustynetd key store-passphrase`. The launchd plist exports
@@ -780,8 +787,12 @@ generate_wireguard_keys() {
   local passphrase_file="${KEYS_DIR}/wireguard.passphrase"
   local keychain_account="wg-passphrase-${NODE_ID}"
 
-  if [[ -f "${public_key}" && -f "${runtime_key}" && -f "${encrypted_key}" \
-        && -f "${passphrase_file}" ]]; then
+  # Detect existing key material via the PERSISTENT artifacts only (encrypted
+  # blob + public key + passphrase). The plaintext runtime key is intentionally
+  # NOT a sentinel: it is removed from keys/ after init (custody — see below) and
+  # re-derived by the daemon into the ephemeral runtime dir on each start, so its
+  # absence must NOT trigger a re-key (which would rotate identity every rebuild).
+  if [[ -f "${public_key}" && -f "${encrypted_key}" && -f "${passphrase_file}" ]]; then
     echo "[bootstrap] WireGuard key material already present; skipping key generation"
     # Re-store the passphrase into the keychain even on the skip path.
     # install_binaries re-signs rustynetd on EVERY bootstrap, and macOS ad-hoc
@@ -904,11 +915,21 @@ generate_wireguard_keys() {
 
   # Final ownership/perms tightening — defence in depth against any race
   # between key init's atomic write and a concurrent process.
-  chown rustynetd:rustynetd "${runtime_key}" "${encrypted_key}" "${public_key}" "${passphrase_file}"
-  chmod 0600 "${runtime_key}" "${encrypted_key}" "${passphrase_file}"
+  chown rustynetd:rustynetd "${encrypted_key}" "${public_key}" "${passphrase_file}"
+  chmod 0600 "${encrypted_key}" "${passphrase_file}"
   chmod 0640 "${public_key}"
 
-  echo "[bootstrap] WireGuard keys generated (runtime=${runtime_key} encrypted=${encrypted_key} public=${public_key})"
+  # Custody: remove the plaintext runtime key from the PERSISTENT keys/ dir.
+  # `key init` wrote it there (root can create files under keys/), but
+  # macos_key_custody forbids a plaintext private key at rest (Phase E
+  # encrypted-at-rest), mirroring Linux which keeps its runtime key on tmpfs
+  # (/run/rustynet/wireguard.key). The daemon re-derives the runtime key from
+  # wireguard.key.enc + the keychain passphrase into the ephemeral runtime dir
+  # (/private/var/run/rustynet/wireguard.key, the --wg-private-key plist arg) on
+  # every start, so the at-rest copy is unnecessary and must not linger.
+  rm -f "${runtime_key}"
+
+  echo "[bootstrap] WireGuard keys generated (encrypted=${encrypted_key} public=${public_key}); runtime key re-derived by daemon into the ephemeral runtime dir"
   echo "[bootstrap] WireGuard passphrase stored in macOS keychain (account=${keychain_account})"
 }
 
