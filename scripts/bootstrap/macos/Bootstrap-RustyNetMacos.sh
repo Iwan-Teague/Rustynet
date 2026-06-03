@@ -778,10 +778,35 @@ generate_wireguard_keys() {
   local encrypted_key="${KEYS_DIR}/wireguard.key.enc"
   local public_key="${KEYS_DIR}/wireguard.pub"
   local passphrase_file="${KEYS_DIR}/wireguard.passphrase"
+  local keychain_account="wg-passphrase-${NODE_ID}"
 
   if [[ -f "${public_key}" && -f "${runtime_key}" && -f "${encrypted_key}" \
         && -f "${passphrase_file}" ]]; then
-    echo "[bootstrap] WireGuard key material already present; skipping generation"
+    echo "[bootstrap] WireGuard key material already present; skipping key generation"
+    # Re-store the passphrase into the keychain even on the skip path.
+    # install_binaries re-signs rustynetd on EVERY bootstrap, and macOS ad-hoc
+    # signatures are NON-DETERMINISTIC: `codesign --force -s -` yields a fresh
+    # cdhash each run (verified live — re-signing the same bytes twice produced
+    # different CDHashes). The owned System-keychain item's read ACL is bound to
+    # the storing binary's cdhash, so a rebuild that keeps the existing WG key
+    # (cleanup_runtime_state preserves it) but re-signs the binary leaves the
+    # item bound to a PREVIOUS build's cdhash -> the freshly-signed daemon hits
+    # "os secure store unavailable" -> wg decrypt fails -> launchd exit 65
+    # crash-loop (observed live: item cdhash 89dd09… vs daemon cdhash e28b76…).
+    # Re-binding here keeps the stable WG identity while making the passphrase
+    # readable by the current binary. The store reader runs as root and the
+    # daemon's secret-file guard requires owner==reader, so present the
+    # passphrase file root-owned for the store, then restore daemon ownership.
+    chown root:wheel "${passphrase_file}"
+    if ! sudo "${RUSTYNETD_BIN}" key store-passphrase \
+        --passphrase-file "${passphrase_file}" \
+        --keychain-account "${keychain_account}"; then
+      echo "[bootstrap] rustynetd key store-passphrase (cdhash re-bind) failed; daemon cannot resolve passphrase from keychain" >&2
+      exit 1
+    fi
+    chown rustynetd:rustynetd "${passphrase_file}"
+    chmod 0600 "${passphrase_file}"
+    echo "[bootstrap] WireGuard passphrase re-stored in macOS keychain (account=${keychain_account}) to rebind to the current rustynetd cdhash"
     return 0
   fi
 
@@ -869,7 +894,7 @@ generate_wireguard_keys() {
   # path is strictly tighter than `-A` AND actually readable by the daemon.
   # Per-node-scoped by account (`wg-passphrase-${NODE_ID}`); OS-secure keychain
   # storage preserved — a tighter read-ACL, not a downgrade to a plaintext file.
-  local keychain_account="wg-passphrase-${NODE_ID}"
+  # (keychain_account is set at the top of this function.)
   if ! sudo "${RUSTYNETD_BIN}" key store-passphrase \
       --passphrase-file "${passphrase_file}" \
       --keychain-account "${keychain_account}"; then
