@@ -22,10 +22,23 @@ const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 /// nothing is deleted. That silent no-op left `rustynet_boot` behind on every
 /// run; `assert_node_clean` (C2) is what surfaced it. Capture-then-`for` has no
 /// pipe for the inner `sudo` to consume.
+///
+/// Wrapped in a bounded retry-until-clean loop: the `rustynet_boot` L8 boot
+/// killswitch is installed at the daemon's `ExecStartPre` and survives teardown
+/// by design, and a daemon torn down mid-shutdown (or a restart that fires
+/// inside `RestartSec` right as cleanup disables it) can re-program a table
+/// after a single delete pass — observed live as `assert_node_clean` finding
+/// `rustynet_boot` after cleanup. Re-deleting until no `rustynet*` table remains
+/// converges once the daemon is actually down (nothing re-applies the table with
+/// the unit stopped, verified live).
 const LINUX_NFT_KILLSWITCH_RESET_COMMAND: &str = "if command -v nft >/dev/null 2>&1; then \
-         rn_tables=$(sudo -n nft list tables 2>/dev/null \
-             | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}'); \
-         for t in $rn_tables; do sudo -n nft delete table inet \"$t\" 2>/dev/null || true; done; \
+         for _ in $(seq 1 10); do \
+             rn_tables=$(sudo -n nft list tables 2>/dev/null \
+                 | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}'); \
+             [ -z \"$rn_tables\" ] && break; \
+             for t in $rn_tables; do sudo -n nft delete table inet \"$t\" 2>/dev/null || true; done; \
+             sleep 0.5; \
+         done; \
      fi";
 
 /// Collect `WireGuard` public key from `/var/lib/rustynet/keys/wireguard.pub`.
@@ -189,9 +202,12 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     let _ = ssh::run_remote(
         conn,
         "sudo -n systemctl disable --now rustynetd 2>/dev/null || true; \
-         for _ in $(seq 1 30); do systemctl is-active --quiet rustynetd || break; sleep 0.5; done; \
+         for _ in $(seq 1 60); do \
+             state=$(systemctl is-active rustynetd 2>/dev/null || true); \
+             case \"$state\" in active|activating|deactivating|reloading) sleep 0.5;; *) break;; esac; \
+         done; \
          sudo -n systemctl reset-failed rustynetd 2>/dev/null || true",
-        Duration::from_secs(45),
+        Duration::from_secs(60),
     );
     // Flush every rustynet nftables table the daemon may have left behind so the
     // next bootstrap is not blocked by a leftover default-deny killswitch.
