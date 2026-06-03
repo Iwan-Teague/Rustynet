@@ -21,6 +21,10 @@
 //! Wired through the CLI as `rustynetd macos-exit-nat-lifecycle-snapshot`.
 
 use serde::{Deserialize, Serialize};
+// `Command` is only used by the macOS-gated capture fns below; gating the import
+// avoids an unused-import warning on non-macOS builds (which would fail the
+// `clippy -D warnings` gate on Linux).
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
