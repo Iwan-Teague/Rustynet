@@ -192,38 +192,40 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &std::path::Path) -> Result
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
     // Disable + stop the ENTIRE rustynet systemd footprint and WAIT until no
-    // rustynetd process remains BEFORE the nft reset below. A daemon still
-    // shutting down in enforce mode re-applies the `rustynet_boot` fail-closed
-    // killswitch *after* the reset deletes it (fail-closed-on-exit), which then
-    // trips assert_node_clean. Two refinements over stopping `rustynetd` alone:
-    //   1. A node re-provisioned into a new role can still be running units from
-    //      a PRIOR role (`rustynet-relay`, `rustynetd-privileged-helper`,
-    //      `rustynetd-managed-dns`, the refresh timers). Leaving them up is an
-    //      incomplete teardown, and a stray daemon launched outside
-    //      `rustynetd.service` keeps re-applying `rustynet_boot` — observed live
-    //      as assert_node_clean finding `rustynet_boot` after cleanup on a node
-    //      whose `rustynetd.service` already read inactive while a prior-run
-    //      daemon process was still alive.
-    //   2. The wait now keys on the actual PROCESS (`pgrep -x rustynetd`), not
-    //      the systemd unit state, so a daemon NOT managed by `rustynetd.service`
-    //      is still waited out. A `pkill` backstop terminates any stray daemon
-    //      the units do not own (disable --now runs first, so systemd will not
-    //      restart it). reset-failed clears failed-unit latches.
-    // Best-effort: a host without a given unit is a no-op.
+    // rustynetd process remains BEFORE the nft reset below. A daemon — or a
+    // timer-driven service — re-applies the `rustynet_boot` fail-closed
+    // killswitch after the reset deletes it, which then trips assert_node_clean.
+    // Three refinements over stopping `rustynetd` alone:
+    //   1. The unit set is ENUMERATED dynamically (`systemctl list-unit-files`
+    //      filtered to `rustynet*`), not a fixed list. A node re-provisioned
+    //      into a new role can be running units from a prior role —
+    //      `rustynet-relay`, `rustynetd-privileged-helper`,
+    //      `rustynetd-managed-dns`, the refresh timers, and crucially the
+    //      `rustynet-push-all.timer` bundle-distribution timer, which fires
+    //      periodically and re-applies `rustynet_boot` minutes after cleanup.
+    //      Observed live as assert_node_clean finding `rustynet_boot` on the
+    //      exit node even after a clean reset, because the enabled push-all
+    //      timer re-installed it between the reset and the assertion. Enumerating
+    //      catches every unit, including any added later.
+    //   2. The wait keys on the actual PROCESS (`pgrep -x rustynetd`), not the
+    //      systemd unit state, so a daemon launched outside `rustynetd.service`
+    //      (or still mid-shutdown re-applying the boot table) is waited out.
+    //   3. A `sudo pkill -x rustynetd` backstop terminates any stray daemon the
+    //      units do not own (after `disable --now`, so systemd will not restart
+    //      it). reset-failed clears failed-unit latches.
+    // Best-effort: a host without any rustynet unit is a no-op.
     let _ = ssh::run_remote(
         conn,
-        "for unit in rustynetd rustynet-relay rustynetd-privileged-helper \
-                     rustynetd-managed-dns rustynetd-assignment-refresh \
-                     rustynetd-trust-refresh rustynetd-assignment-refresh.timer \
-                     rustynetd-trust-refresh.timer; do \
+        "rn_units=$(systemctl list-unit-files 2>/dev/null \
+             | awk '$1 ~ /^rustynet/ {print $1}'); \
+         for unit in $rn_units; do \
              sudo -n systemctl disable --now \"$unit\" 2>/dev/null || true; \
          done; \
          sudo -n pkill -x rustynetd 2>/dev/null || true; \
          for _ in $(seq 1 60); do \
              pgrep -x rustynetd >/dev/null 2>&1 && sleep 0.5 || break; \
          done; \
-         for unit in rustynetd rustynet-relay rustynetd-privileged-helper \
-                     rustynetd-managed-dns; do \
+         for unit in $rn_units; do \
              sudo -n systemctl reset-failed \"$unit\" 2>/dev/null || true; \
          done",
         Duration::from_secs(60),
