@@ -2272,7 +2272,6 @@ pub fn verify_signed_traversal_state_artifact(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MembershipBootstrapError {
     MissingSnapshot,
-    MissingLog,
     SnapshotLoad(String),
     LogLoad(String),
     Replay(String),
@@ -2290,7 +2289,6 @@ impl fmt::Display for MembershipBootstrapError {
             MembershipBootstrapError::MissingSnapshot => {
                 f.write_str("membership snapshot is missing")
             }
-            MembershipBootstrapError::MissingLog => f.write_str("membership log is missing"),
             MembershipBootstrapError::SnapshotLoad(msg) => {
                 write!(f, "membership snapshot load failed: {msg}")
             }
@@ -3798,14 +3796,25 @@ impl DaemonRuntime {
         if !self.membership_snapshot_path.exists() {
             return Err(MembershipBootstrapError::MissingSnapshot);
         }
-        if !self.membership_log_path.exists() {
-            return Err(MembershipBootstrapError::MissingLog);
-        }
 
         let snapshot = load_membership_snapshot(&self.membership_snapshot_path)
             .map_err(|err| MembershipBootstrapError::SnapshotLoad(err.to_string()))?;
-        let entries = load_membership_log(&self.membership_log_path)
-            .map_err(|err| MembershipBootstrapError::LogLoad(err.to_string()))?;
+        // The membership log is the owner's append-only transition record. The
+        // orchestrator distributes a current-state snapshot (its node_count
+        // reflects every active member) and does NOT ship the owner's log to
+        // client nodes, so a freshly provisioned client legitimately has only
+        // the snapshot. Treat a missing log as empty: replaying the
+        // owner-signed current-state snapshot against zero entries yields that
+        // snapshot's state. This mirrors `handle_membership_apply`, which
+        // already tolerates a missing log for the same reason. Anti-rollback is
+        // unaffected — the watermark below is derived from the replayed state,
+        // so a stale snapshot is still rejected on epoch/state-root.
+        let entries = if self.membership_log_path.exists() {
+            load_membership_log(&self.membership_log_path)
+                .map_err(|err| MembershipBootstrapError::LogLoad(err.to_string()))?
+        } else {
+            Vec::new()
+        };
         let replayed = replay_membership_snapshot_and_log(&snapshot, &entries, unix_now())
             .map_err(|err| MembershipBootstrapError::Replay(err.to_string()))?;
         let state_root = replayed
