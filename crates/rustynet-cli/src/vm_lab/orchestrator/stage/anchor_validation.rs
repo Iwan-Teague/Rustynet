@@ -2,33 +2,47 @@
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
-use crate::vm_lab::orchestrator::role_validation::anchor::validate_anchor_capability_advertisement;
+use crate::vm_lab::orchestrator::role_validation::anchor::{
+    AnchorRuntimeParams, validate_anchor_capability_advertisement,
+    validate_bundle_pull_log_redaction, validate_bundle_pull_loopback,
+    validate_invalid_token_rejected,
+};
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 /// Machine-readable note appended to every passing anchor-validation
 /// run, naming the anchor substages this stage intentionally does NOT
 /// exercise yet. It is written to `<report_dir>/anchor_validation.reported_skips.json`
-/// so the deferral is recorded as evidence rather than silently dropped.
+/// so every deferral is recorded as evidence rather than silently dropped.
 ///
 /// Scope today is the anchor CAPABILITY-ADVERTISEMENT surface (the six
 /// `anchor.*` capabilities + `relay_host`, advertised identically on
-/// every OS — see `role::NodeRole::product_capabilities_for_platform`),
-/// which is a pure parser over `rustynet anchor list` and needs no
-/// runtime listener, enrollment token, or membership mutation.
+/// every OS) PLUS the bundle-pull runtime substages (loopback,
+/// invalid-token, log-redaction), which run live on Linux anchors.
 ///
-/// The deferred substages split into two buckets, each blocked on a
-/// concrete follow-up:
+/// The remaining substages split into buckets, each blocked on a concrete
+/// follow-up:
 ///
-///   * runtime-dependent (need anchor bundle-pull / enrollment runtime
-///     setup wired into the orchestrator install path): `bundle_pull`
-///     loopback, `invalid_token`, `log_redaction`, `enrollment_endpoint`.
-///   * mutation (need the Windows membership-mutation backend, which
-///     `set_membership_capabilities` does not yet implement for Windows):
-///     `gossip_priority`, `downgrade_revocation`.
+///   * bundle-pull runtime (PORTED): `bundle_pull_loopback`,
+///     `invalid_token`, `log_redaction` run live on Linux anchors;
+///     macOS/Windows anchors are reported-skipped on the
+///     `is_supported_for_platform` posture gate (per-node, recorded in
+///     `runtime_skipped_nodes`), pending cross-OS Phase 8 wiring of their
+///     bundle-pull token/listener provisioning.
+///   * runtime-dependent (DEFERRED): `enrollment_endpoint` — enrollment
+///     admit signs a membership update with the owner signing key +
+///     passphrase, which the orchestrator provisions only on the
+///     Exit/membership-owner, not on standalone anchors (a trust-model
+///     decision, not just wiring).
+///   * mutation (DEFERRED): `gossip_priority`, `downgrade_revocation` —
+///     need the Windows membership-mutation backend.
 pub const ANCHOR_REPORTED_SKIPS_NOTE: &str = concat!(
-    "anchor_validation scope=capability_advertisement; ",
-    "reported_skipped_runtime_dependent=[bundle_pull_loopback,invalid_token,log_redaction,enrollment_endpoint] ",
-    "(pending anchor bundle-pull/enrollment runtime setup in the orchestrator install path); ",
+    "anchor_validation scope=capability_advertisement+bundle_pull; ",
+    "ported_runtime_dependent=[bundle_pull_loopback,invalid_token,log_redaction] ",
+    "(run live on Linux anchors; macOS/Windows reported-skipped on the is_supported_for_platform gate, ",
+    "pending cross-OS Phase 8 wiring of bundle-pull token/listener provisioning); ",
+    "reported_skipped_runtime_dependent=[enrollment_endpoint] ",
+    "(pending a trust-model decision — enrollment admit signs a membership update with the owner signing key ",
+    "+ passphrase, which the orchestrator provisions only on the Exit/membership-owner, not on standalone anchors); ",
     "reported_skipped_mutation=[gossip_priority,downgrade_revocation] ",
     "(pending the Windows membership-mutation backend); ",
     "these substages are NOT silently dropped"
@@ -57,14 +71,21 @@ const REPORTED_SKIPS_FILENAME: &str = "anchor_validation.reported_skips.json";
 /// skip-noop: the stage passes without touching any host, mirroring the
 /// empty-assignment case in `relay_validation`.
 ///
-/// The runtime-dependent substages (bundle-pull loopback, invalid-token,
-/// log-redaction, enrollment-endpoint) and the mutation substages
-/// (gossip-priority, downgrade-revocation) from the bin are reported as
-/// explicit skips via [`ANCHOR_REPORTED_SKIPS_NOTE`] (written to
+/// After capability advertisement, each Linux anchor also runs the
+/// bundle-pull runtime substages (loopback / invalid-token / log-redaction)
+/// over the same seam — proving the daemon's bundle-pull listener serves
+/// the signed snapshot to an authorised token, rejects an unauthorised
+/// one, and redacts the raw token from its journal. macOS/Windows anchors
+/// are reported-skipped for these on the `is_supported_for_platform`
+/// posture gate (recorded per-node), pending cross-OS Phase 8 wiring.
+///
+/// The remaining substages — `enrollment_endpoint` (needs the owner
+/// signing key + passphrase, provisioned only on the Exit) and the
+/// mutation substages (gossip-priority, downgrade-revocation, needing the
+/// Windows membership-mutation backend) — are reported as explicit skips
+/// via [`ANCHOR_REPORTED_SKIPS_NOTE`] (written to
 /// `<report_dir>/anchor_validation.reported_skips.json` on a pass) rather
-/// than silently dropped — they are blocked on anchor bundle-pull /
-/// enrollment runtime setup in the orchestrator install path and on the
-/// Windows membership-mutation backend.
+/// than silently dropped.
 pub struct AnchorValidationStage;
 
 impl OrchestrationStage for AnchorValidationStage {
@@ -101,6 +122,10 @@ impl OrchestrationStage for AnchorValidationStage {
         }
 
         let mut failures: Vec<String> = Vec::new();
+        // (alias, platform) anchors whose runtime bundle-pull substages were
+        // reported-skipped because they are not yet live-supported there
+        // (macOS/Windows). Named, never a silent pass.
+        let mut runtime_skips: Vec<(String, String)> = Vec::new();
         for alias in &anchor_aliases {
             let adapter = match ctx.adapters.get(alias.as_str()) {
                 Some(adapter) => adapter,
@@ -126,21 +151,51 @@ impl OrchestrationStage for AnchorValidationStage {
                     continue;
                 }
             };
-            if let Err(e) = validate_anchor_capability_advertisement(
-                &*shell,
-                adapter.platform(),
-                anchor_node_id.as_str(),
-            ) {
+            let platform = adapter.platform();
+
+            // Capability advertisement (cross-OS, parser-only). If it fails the
+            // node's anchor view is broken, so don't bother probing its runtime.
+            if let Err(e) =
+                validate_anchor_capability_advertisement(&*shell, platform, anchor_node_id.as_str())
+            {
                 failures.push(format!("{alias}: {e}"));
+                continue;
+            }
+
+            // Runtime bundle-pull substages: live on Linux anchors today
+            // (the daemon binds the loopback listener + `ops install-systemd`
+            // seeds the token for admin-role nodes). macOS/Windows anchors are
+            // reported-skipped — named, never a silent pass — on the same
+            // is_supported_for_platform posture gate, pending cross-OS Phase 8
+            // wiring of their bundle-pull token/listener provisioning.
+            if NodeRole::Anchor.is_supported_for_platform(&platform) {
+                let params = match AnchorRuntimeParams::for_platform(platform) {
+                    Ok(params) => params,
+                    Err(e) => {
+                        failures.push(format!("{alias}: anchor runtime params: {e}"));
+                        continue;
+                    }
+                };
+                if let Err(e) = validate_bundle_pull_loopback(&*shell, &params) {
+                    failures.push(format!("{alias}: {e}"));
+                }
+                if let Err(e) = validate_invalid_token_rejected(&*shell, &params) {
+                    failures.push(format!("{alias}: {e}"));
+                }
+                if let Err(e) = validate_bundle_pull_log_redaction(&*shell, &params) {
+                    failures.push(format!("{alias}: {e}"));
+                }
+            } else {
+                runtime_skips.push((alias.clone(), format!("{platform:?}")));
             }
         }
 
         if failures.is_empty() {
-            // Record the deferred-substage note as evidence on a pass.
-            // Best-effort: a write failure does not fail the stage (the
-            // capability-advertisement proof itself passed), but the
-            // common path leaves a machine-readable artifact behind.
-            write_reported_skips_note(ctx);
+            // Record the deferred-substage note + any per-node runtime skips as
+            // evidence on a pass. Best-effort: a write failure does not fail the
+            // stage (the proofs that ran already passed), but the common path
+            // leaves a machine-readable artifact behind.
+            write_reported_skips_note(ctx, &runtime_skips);
             StageOutcome::Passed
         } else {
             StageOutcome::Failed(failures.join("; "))
@@ -152,28 +207,39 @@ impl OrchestrationStage for AnchorValidationStage {
 /// (no I/O) so a unit test can assert the content without depending on
 /// the filesystem. `to_vec_pretty` on this fixed `serde_json::Value`
 /// cannot fail, so the `unwrap_or_default` is unreachable in practice.
-fn reported_skips_json_bytes() -> Vec<u8> {
+fn reported_skips_json_bytes(runtime_skips: &[(String, String)]) -> Vec<u8> {
+    let runtime_skipped_nodes: Vec<serde_json::Value> = runtime_skips
+        .iter()
+        .map(|(alias, platform)| serde_json::json!({ "alias": alias, "platform": platform }))
+        .collect();
     let body = serde_json::json!({
         "stage": "anchor_validation",
-        "scope": "capability_advertisement",
-        "reported_skipped_runtime_dependent": [
+        "scope": "capability_advertisement+bundle_pull",
+        // Now ported + run live on Linux anchors (reported-skipped per-node on
+        // macOS/Windows — see `runtime_skipped_nodes`).
+        "ported_runtime_dependent": [
             "bundle_pull_loopback",
             "invalid_token",
             "log_redaction",
-            "enrollment_endpoint",
         ],
+        // Still deferred (named, never silently dropped).
+        "reported_skipped_runtime_dependent": ["enrollment_endpoint"],
         "reported_skipped_mutation": ["gossip_priority", "downgrade_revocation"],
+        // Per-run: anchors whose runtime bundle-pull substages were skipped
+        // because their platform is not yet live-supported (macOS/Windows).
+        "runtime_skipped_nodes": runtime_skipped_nodes,
         "note": ANCHOR_REPORTED_SKIPS_NOTE,
     });
     serde_json::to_vec_pretty(&body).unwrap_or_default()
 }
 
 /// Write the reported-skip note to `<report_dir>/anchor_validation.reported_skips.json`
-/// so the deferred substages are recorded as evidence. Best-effort: a
-/// write failure is ignored (the stage's own proof already passed).
-fn write_reported_skips_note(ctx: &OrchestrationContext) {
+/// so the deferred substages (and any per-node runtime skips) are recorded as
+/// evidence. Best-effort: a write failure is ignored (the stage's own proofs
+/// already passed).
+fn write_reported_skips_note(ctx: &OrchestrationContext, runtime_skips: &[(String, String)]) {
     let path = ctx.report_dir.join(REPORTED_SKIPS_FILENAME);
-    let _ = std::fs::write(&path, reported_skips_json_bytes());
+    let _ = std::fs::write(&path, reported_skips_json_bytes(runtime_skips));
 }
 
 #[cfg(test)]
@@ -286,25 +352,34 @@ mod tests {
     fn reported_skips_json_bytes_is_valid_json_naming_every_substage() {
         // Pure (no FS): the serialized note must parse back and name
         // every deferred substage in its structured fields.
-        let bytes = reported_skips_json_bytes();
+        // Two macOS/Windows anchors whose runtime substages were skipped.
+        let runtime_skips = vec![
+            ("anchor-mac".to_owned(), "Macos".to_owned()),
+            ("anchor-win".to_owned(), "Windows".to_owned()),
+        ];
+        let bytes = reported_skips_json_bytes(&runtime_skips);
         let parsed: serde_json::Value =
             serde_json::from_slice(&bytes).expect("reported-skip note must be valid JSON");
         assert_eq!(parsed["stage"], "anchor_validation");
-        assert_eq!(parsed["scope"], "capability_advertisement");
+        assert_eq!(parsed["scope"], "capability_advertisement+bundle_pull");
+        // The three bundle-pull substages are now ported (run live on Linux).
+        let ported = parsed["ported_runtime_dependent"]
+            .as_array()
+            .expect("ported list");
+        for substage in ["bundle_pull_loopback", "invalid_token", "log_redaction"] {
+            assert!(
+                ported.iter().any(|v| v == substage),
+                "ported list must name {substage}: {parsed}"
+            );
+        }
+        // enrollment_endpoint is still deferred (named, never silently dropped).
         let runtime = parsed["reported_skipped_runtime_dependent"]
             .as_array()
             .expect("runtime-dependent list");
-        for substage in [
-            "bundle_pull_loopback",
-            "invalid_token",
-            "log_redaction",
-            "enrollment_endpoint",
-        ] {
-            assert!(
-                runtime.iter().any(|v| v == substage),
-                "runtime-dependent list must name {substage}: {parsed}"
-            );
-        }
+        assert!(
+            runtime.iter().any(|v| v == "enrollment_endpoint"),
+            "runtime-dependent list must still name enrollment_endpoint: {parsed}"
+        );
         let mutation = parsed["reported_skipped_mutation"]
             .as_array()
             .expect("mutation list");
@@ -314,6 +389,16 @@ mod tests {
                 "mutation list must name {substage}: {parsed}"
             );
         }
+        // Per-node runtime skips are recorded (named, never a silent pass).
+        let skipped_nodes = parsed["runtime_skipped_nodes"]
+            .as_array()
+            .expect("runtime_skipped_nodes list");
+        assert_eq!(skipped_nodes.len(), 2);
+        assert!(
+            skipped_nodes
+                .iter()
+                .any(|v| v["alias"] == "anchor-mac" && v["platform"] == "Macos")
+        );
     }
 
     #[test]
