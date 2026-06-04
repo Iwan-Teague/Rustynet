@@ -10,6 +10,8 @@ use rustynet_control::roles::RoleCapability;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeRole {
     Exit,
+    Anchor,
+    Relay,
     Client,
     Entry,
     Aux,
@@ -30,11 +32,17 @@ impl NodeRole {
 
     /// Role-platform matrix currently enforced by the Rust-native path.
     /// Windows Exit remains fail-closed until W5.4 live evidence is recorded.
-    /// macOS Exit maps to the reviewed `blind_exit` PF posture.
+    /// macOS Exit maps to the reviewed `blind_exit` PF posture. Anchor and
+    /// Relay are supported on Linux today (live-evidenced) and remain
+    /// fail-closed on macOS + Windows until a green standard-orchestrator run
+    /// is archived (cross-OS role-testing Phase 8); they are still
+    /// lab-assignable everywhere so that evidence can be generated.
     ///
     /// | Role   | Linux | Windows | macOS | iOS | Android |
     /// |--------|-------|---------|-------|-----|---------|
     /// | Exit   | ✓     | ✗       | ✓     | ✗   | ✗       |
+    /// | Anchor | ✓     | ✗       | ✗     | ✗   | ✗       |
+    /// | Relay  | ✓     | ✗       | ✗     | ✗   | ✗       |
     /// | Client | ✓     | ✓       | ✓     | ✗   | ✗       |
     /// | Entry  | ✓     | ✓       | ✓     | ✗   | ✗       |
     /// | Aux    | ✓     | ✓       | ✓     | ✗   | ✗       |
@@ -43,10 +51,19 @@ impl NodeRole {
     /// iOS and Android adapters fail closed with security-specific rejection
     /// messages (unreviewed key custody + connection model + daemon coverage).
     pub fn is_supported_for_platform(&self, platform: &VmGuestPlatform) -> bool {
-        match platform {
-            VmGuestPlatform::Ios | VmGuestPlatform::Android => false,
-            VmGuestPlatform::Linux | VmGuestPlatform::Macos => true,
-            VmGuestPlatform::Windows => !self.is_membership_owner(),
+        match self {
+            // New cross-OS control-plane roles: live evidence exists on Linux
+            // today. macOS + Windows are lab-assignable for evidence
+            // generation (see `is_lab_assignable_for_platform`) and are
+            // promoted to supported here only once a green run is archived,
+            // mirroring the Windows-Exit posture-promotion gate. Strictest
+            // secure default until then: fail closed.
+            NodeRole::Anchor | NodeRole::Relay => matches!(platform, VmGuestPlatform::Linux),
+            _ => match platform {
+                VmGuestPlatform::Ios | VmGuestPlatform::Android => false,
+                VmGuestPlatform::Linux | VmGuestPlatform::Macos => true,
+                VmGuestPlatform::Windows => !self.is_membership_owner(),
+            },
         }
     }
 
@@ -64,6 +81,8 @@ impl NodeRole {
     pub fn as_str(&self) -> &str {
         match self {
             NodeRole::Exit => "exit",
+            NodeRole::Anchor => "anchor",
+            NodeRole::Relay => "relay",
             NodeRole::Client => "client",
             NodeRole::Entry => "entry",
             NodeRole::Aux => "aux",
@@ -79,6 +98,10 @@ impl NodeRole {
         match platform {
             VmGuestPlatform::Linux | VmGuestPlatform::Windows => match self {
                 NodeRole::Exit => Ok("admin"),
+                // Anchor + Relay run as the `admin` daemon role plus their
+                // signed capabilities (anchor.* / relay_host); they are
+                // control-plane roles, not blind exits.
+                NodeRole::Anchor | NodeRole::Relay => Ok("admin"),
                 NodeRole::Client | NodeRole::Entry | NodeRole::Aux | NodeRole::Extra => {
                     Ok("client")
                 }
@@ -88,6 +111,9 @@ impl NodeRole {
             },
             VmGuestPlatform::Macos => match self {
                 NodeRole::Exit => Ok("blind_exit"),
+                // Anchor + Relay are admin control-plane roles on macOS too
+                // (not blind exits): they run as `admin` plus signed caps.
+                NodeRole::Anchor | NodeRole::Relay => Ok("admin"),
                 NodeRole::Client | NodeRole::Entry | NodeRole::Aux | NodeRole::Extra => {
                     Ok("client")
                 }
@@ -124,6 +150,24 @@ impl NodeRole {
                     Ok(vec![RoleCapability::Client])
                 }
                 NodeRole::Entry => Ok(vec![RoleCapability::Client, RoleCapability::EntryRelay]),
+                // Anchor advertises the full set of five composable anchor
+                // capabilities plus the Anchor marker; the daemon + gossip /
+                // bundle-pull / enrollment / port-mapping paths read these
+                // from the signed membership snapshot. Platform-independent:
+                // the same capability set is advertised on every OS; the
+                // per-OS work is in the live-validation backends, not here.
+                NodeRole::Anchor => Ok(vec![
+                    RoleCapability::Anchor,
+                    RoleCapability::AnchorGossipSeed,
+                    RoleCapability::AnchorBundlePull,
+                    RoleCapability::AnchorEnrollmentEndpoint,
+                    RoleCapability::AnchorRelayColocation,
+                    RoleCapability::AnchorPortMappingAuthoritative,
+                ]),
+                // Relay is a relay-host that also participates as a client
+                // peer (matches the `client,relay_host` capability CSV the
+                // relay/anchor harnesses use as the downgrade/restore target).
+                NodeRole::Relay => Ok(vec![RoleCapability::Client, RoleCapability::RelayHost]),
                 NodeRole::Custom(label) => Err(format!(
                     "custom lab role '{label}' has no explicit product capability mapping"
                 )),
@@ -135,6 +179,8 @@ impl NodeRole {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim() {
             "exit" => Ok(NodeRole::Exit),
+            "anchor" => Ok(NodeRole::Anchor),
+            "relay" => Ok(NodeRole::Relay),
             "client" => Ok(NodeRole::Client),
             "entry" => Ok(NodeRole::Entry),
             "aux" => Ok(NodeRole::Aux),
@@ -147,7 +193,7 @@ impl NodeRole {
                     Ok(NodeRole::Custom(label.to_owned()))
                 } else {
                     Err(format!(
-                        "unknown role '{other}'; expected one of: exit, client, entry, aux, extra, custom-<label>"
+                        "unknown role '{other}'; expected one of: exit, anchor, relay, client, entry, aux, extra, custom-<label>"
                     ))
                 }
             }
@@ -352,5 +398,135 @@ mod tests {
                 .unwrap(),
             vec![RoleCapability::Client, RoleCapability::EntryRelay]
         );
+    }
+
+    // ── Anchor + Relay: first-class cross-OS roles ──────────────────────────
+
+    #[test]
+    fn parse_anchor_and_relay_roles() {
+        assert_eq!(NodeRole::parse("anchor").unwrap(), NodeRole::Anchor);
+        assert_eq!(NodeRole::parse("relay").unwrap(), NodeRole::Relay);
+        // Round-trips back to the same wire string.
+        assert_eq!(NodeRole::Anchor.as_str(), "anchor");
+        assert_eq!(NodeRole::Relay.as_str(), "relay");
+    }
+
+    #[test]
+    fn anchor_relay_are_not_owners_and_not_unique() {
+        // Multiple anchors/relays are valid (gossip-priority needs >=2
+        // anchors); neither is the membership owner (Exit signs bundles).
+        for role in [NodeRole::Anchor, NodeRole::Relay] {
+            assert!(!role.is_unique_per_lab(), "{role:?} must not be unique");
+            assert!(!role.is_membership_owner(), "{role:?} must not be owner");
+        }
+    }
+
+    #[test]
+    fn anchor_relay_lab_assignable_on_all_desktop_os() {
+        // The lab gate (mod.rs) keys on is_lab_assignable_for_platform; anchor
+        // and relay must be assignable on every desktop OS so cross-OS live
+        // evidence can be generated.
+        for role in [NodeRole::Anchor, NodeRole::Relay] {
+            for platform in [
+                VmGuestPlatform::Linux,
+                VmGuestPlatform::Macos,
+                VmGuestPlatform::Windows,
+            ] {
+                assert!(
+                    role.is_lab_assignable_for_platform(&platform),
+                    "{role:?} must be lab-assignable on {platform:?}"
+                );
+            }
+            for platform in [VmGuestPlatform::Ios, VmGuestPlatform::Android] {
+                assert!(
+                    !role.is_lab_assignable_for_platform(&platform),
+                    "{role:?} must not be lab-assignable on {platform:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anchor_relay_supported_on_linux_failclosed_elsewhere_until_evidence() {
+        // Strictest-secure default: supported only where live evidence exists
+        // (Linux today). macOS + Windows are fail-closed until a green
+        // standard-orchestrator run is archived (Phase 8 promotes them),
+        // mirroring the Windows-Exit posture gate.
+        for role in [NodeRole::Anchor, NodeRole::Relay] {
+            assert!(
+                role.is_supported_for_platform(&VmGuestPlatform::Linux),
+                "{role:?} is live-evidenced + supported on Linux"
+            );
+            for platform in [
+                VmGuestPlatform::Macos,
+                VmGuestPlatform::Windows,
+                VmGuestPlatform::Ios,
+                VmGuestPlatform::Android,
+            ] {
+                assert!(
+                    !role.is_supported_for_platform(&platform),
+                    "{role:?} must be fail-closed-unsupported on {platform:?} until evidence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anchor_relay_daemon_role_is_admin_on_every_os() {
+        for role in [NodeRole::Anchor, NodeRole::Relay] {
+            for platform in [
+                VmGuestPlatform::Linux,
+                VmGuestPlatform::Macos,
+                VmGuestPlatform::Windows,
+            ] {
+                assert_eq!(
+                    role.daemon_node_role_for_platform(&platform).unwrap(),
+                    "admin",
+                    "{role:?} on {platform:?} runs as the admin daemon role"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anchor_capabilities_are_the_full_five_plus_marker() {
+        let expected = vec![
+            RoleCapability::Anchor,
+            RoleCapability::AnchorGossipSeed,
+            RoleCapability::AnchorBundlePull,
+            RoleCapability::AnchorEnrollmentEndpoint,
+            RoleCapability::AnchorRelayColocation,
+            RoleCapability::AnchorPortMappingAuthoritative,
+        ];
+        for platform in [
+            VmGuestPlatform::Linux,
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+        ] {
+            assert_eq!(
+                NodeRole::Anchor
+                    .product_capabilities_for_platform(&platform)
+                    .unwrap(),
+                expected,
+                "anchor advertises the full capability set on {platform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_capabilities_are_client_plus_relay_host() {
+        for platform in [
+            VmGuestPlatform::Linux,
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+        ] {
+            assert_eq!(
+                NodeRole::Relay
+                    .product_capabilities_for_platform(&platform)
+                    .unwrap(),
+                vec![RoleCapability::Client, RoleCapability::RelayHost],
+                "relay advertises client+relay_host on {platform:?}"
+            );
+        }
     }
 }
