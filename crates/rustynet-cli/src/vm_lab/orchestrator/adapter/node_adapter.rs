@@ -164,6 +164,32 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// From a CLIENT node, drive sustained external (non-mesh) traffic that — when
+    /// the client is full-tunnel through the exit — egresses via the exit's NAT.
+    /// Runs in the background so the connection window overlaps the exit's NAT
+    /// session check. Default: not applicable (only the client platform drives it).
+    fn drive_exit_egress_probe(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::UnsupportedPlatform {
+            platform: self.platform(),
+            message: "exit egress probe is implemented only for the Linux client adapter"
+                .to_owned(),
+        })
+    }
+
+    /// On the EXIT node, assert a NAT session translates a mesh-sourced
+    /// (`100.64.0.0/10`) client address outbound — direct proof that client
+    /// traffic egresses *via this exit's NAT*, the W1/D7 "client mesh traffic
+    /// egresses via the exit" evidence. Retries internally for convergence.
+    /// Default: not applicable to this platform.
+    fn assert_mesh_client_nat_session(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::UnsupportedPlatform {
+            platform: self.platform(),
+            message:
+                "mesh-client NAT-session egress assertion is implemented only for the Windows exit adapter"
+                    .to_owned(),
+        })
+    }
+
     // ── Diagnostics + cleanup ─────────────────────────────────────
 
     /// Collect diagnostic artifacts to `dst`.

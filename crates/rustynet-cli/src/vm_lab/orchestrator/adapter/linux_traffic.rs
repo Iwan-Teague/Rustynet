@@ -196,6 +196,26 @@ fn tunnels_from_daemon_status(status: &str) -> Vec<String> {
         .collect()
 }
 
+/// Drive sustained external (non-mesh) traffic from a Linux client so that —
+/// when the client is full-tunnel through the exit — it egresses via the exit's
+/// NAT, surfacing as a NAT session on the exit. Starts a backgrounded burst of
+/// TCP connects to a stable external anycast IP (`1.1.1.1:443`, Cloudflare; a
+/// bare connect, no payload) and returns immediately so the connection window
+/// overlaps the exit's NAT-session check.
+pub fn drive_exit_egress_probe(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let cmd = "nohup sh -c 'for i in $(seq 1 30); do \
+         timeout 2 bash -c \"exec 3<>/dev/tcp/1.1.1.1/443\" 2>/dev/null; \
+         sleep 0.4; done' >/dev/null 2>&1 & echo probe_started";
+    let out = ssh::run_remote(conn, cmd, SHORT_TIMEOUT)?;
+    if out.contains("probe_started") {
+        Ok(())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!("failed to start client exit-egress probe: {}", out.trim()),
+        })
+    }
+}
+
 /// Collect diagnostic artifacts from the remote host to `dst`.
 /// Key material paths (`*/keys/*`, `*.priv`, `*.pem`) MUST NOT appear in
 /// the archive. This is enforced by the `--exclude` arguments to tar and

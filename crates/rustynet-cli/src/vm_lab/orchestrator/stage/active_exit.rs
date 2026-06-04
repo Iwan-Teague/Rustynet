@@ -46,7 +46,13 @@ impl OrchestrationStage for ActiveExitStage {
                 return StageOutcome::Failed("active_exit: no Exit node in assignments".to_owned());
             }
         };
-        let adapter = match ctx.adapters.get(exit_alias.as_str()) {
+        // The client whose traffic should egress via the exit: any non-Exit node.
+        let client_alias = ctx
+            .assignments
+            .iter()
+            .find(|a| a.role != NodeRole::Exit)
+            .map(|a| a.alias.clone());
+        let exit_adapter = match ctx.adapters.get(exit_alias.as_str()) {
             Some(a) => a,
             None => {
                 return StageOutcome::Failed(format!(
@@ -59,8 +65,8 @@ impl OrchestrationStage for ActiveExitStage {
         //    which triggers apply IP forwarding + NAT. Fails closed (with the
         //    daemon's own reason) on a host that cannot serve — e.g. one missing
         //    the WinNAT/HNS stack reports a clear remediation message.
-        if let Err(e) = adapter.activate_exit_serving() {
-            let daemon = adapter
+        if let Err(e) = exit_adapter.activate_exit_serving() {
+            let daemon = exit_adapter
                 .collect_daemon_failure_reason()
                 .ok()
                 .flatten()
@@ -71,12 +77,32 @@ impl OrchestrationStage for ActiveExitStage {
             ));
         }
 
-        // 2. Assert the exit is actually NATing client traffic: IP forwarding
-        //    enabled on the tunnel adapter AND a RustyNet NAT instance present.
-        if let Err(e) = adapter.assert_exit_actively_serving() {
+        // 2. Assert the exit is actually NATing: IP forwarding enabled on the
+        //    tunnel adapter AND a RustyNet NAT instance present.
+        if let Err(e) = exit_adapter.assert_exit_actively_serving() {
             return StageOutcome::Failed(format!(
                 "active_exit: exit '{exit_alias}' did not come up as an active full-tunnel exit: {e}"
             ));
+        }
+
+        // 3 + 4. Prove client egress VIA the exit: drive sustained external
+        //    traffic from the client (which, full-tunnel through the exit,
+        //    egresses via the exit's NAT) and assert the exit shows a NAT session
+        //    translating a mesh-sourced client address. This is the W1/D7
+        //    "client mesh traffic egresses via the exit" evidence.
+        if let Some(client_alias) = client_alias
+            && let Some(client_adapter) = ctx.adapters.get(client_alias.as_str())
+        {
+            if let Err(e) = client_adapter.drive_exit_egress_probe() {
+                return StageOutcome::Failed(format!(
+                    "active_exit: driving exit-egress traffic from client '{client_alias}' failed: {e}"
+                ));
+            }
+            if let Err(e) = exit_adapter.assert_mesh_client_nat_session() {
+                return StageOutcome::Failed(format!(
+                    "active_exit: client '{client_alias}' traffic did not egress via exit '{exit_alias}' NAT: {e}"
+                ));
+            }
         }
 
         StageOutcome::Passed
