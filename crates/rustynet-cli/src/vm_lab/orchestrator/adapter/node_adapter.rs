@@ -132,6 +132,38 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
 
     fn collect_active_tunnels(&self) -> Result<TunnelsList, AdapterError>;
 
+    // ── Active full-tunnel exit serving ───────────────────────────
+
+    /// Activate full-tunnel exit-serving on this (exit) node: instruct the live
+    /// daemon to advertise the default route (`0.0.0.0/0`), which makes it apply
+    /// IP forwarding + source-NAT for client mesh traffic. This is the operator
+    /// "become an exit node" action; the lab's standard flow never sends it, so
+    /// the exit only validates its role/posture/mesh, never active NAT egress.
+    /// Returns the daemon's own failure reason on rejection (so a host missing
+    /// the WinNAT/HNS stack surfaces a clear remediation message, not a bare
+    /// error). Default: not applicable to this platform's adapter.
+    fn activate_exit_serving(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::UnsupportedPlatform {
+            platform: self.platform(),
+            message:
+                "active full-tunnel exit-serving activation is implemented only for the Windows exit adapter"
+                    .to_owned(),
+        })
+    }
+
+    /// Assert this node is ACTIVELY serving as a full-tunnel exit: IP forwarding
+    /// enabled on the tunnel + egress interfaces AND a NAT mapping the mesh
+    /// present. Distinct from holding the exit role — proves the dataplane
+    /// actually NATs client traffic. Default: not applicable to this platform.
+    fn assert_exit_actively_serving(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::UnsupportedPlatform {
+            platform: self.platform(),
+            message:
+                "active full-tunnel exit-serving assertion is implemented only for the Windows exit adapter"
+                    .to_owned(),
+        })
+    }
+
     // ── Diagnostics + cleanup ─────────────────────────────────────
 
     /// Collect diagnostic artifacts to `dst`.

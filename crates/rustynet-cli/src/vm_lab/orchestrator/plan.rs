@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::stage::OrchestrationStage;
+use crate::vm_lab::orchestrator::stage::active_exit::ActiveExitStage;
 use crate::vm_lab::orchestrator::stage::cleanup::CleanupHostsStage;
 use crate::vm_lab::orchestrator::stage::collect_pubkeys::CollectPubkeysStage;
 use crate::vm_lab::orchestrator::stage::distribute_assignments::DistributeAssignmentsStage;
@@ -72,6 +73,7 @@ impl PlanBuilder {
             Box::new(TrafficTestMatrixStage),
             Box::new(RoleSwitchMatrixStage),
             Box::new(ExitHandoffStage),
+            Box::new(ActiveExitStage),
             Box::new(FinalCleanupStage),
         ]
     }
@@ -82,9 +84,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_17_stages() {
+    fn build_returns_18_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 17, "plan must contain exactly 17 stages");
+        assert_eq!(stages.len(), 18, "plan must contain exactly 18 stages");
+    }
+
+    #[test]
+    fn active_exit_runs_after_exit_handoff_and_before_cleanup() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new().build();
+        let pos = |id: StageId| stages.iter().position(|s| s.id() == id).unwrap();
+        assert!(pos(StageId::ActiveExit) > pos(StageId::ExitHandoff));
+        assert!(pos(StageId::ActiveExit) < pos(StageId::Cleanup));
     }
 
     #[test]

@@ -170,6 +170,14 @@ impl NodeAdapter for WindowsNodeAdapter {
         windows_traffic::collect_active_tunnels(&self.conn)
     }
 
+    fn activate_exit_serving(&self) -> Result<(), AdapterError> {
+        windows_traffic::activate_exit_serving(&self.conn)
+    }
+
+    fn assert_exit_actively_serving(&self) -> Result<(), AdapterError> {
+        windows_traffic::assert_exit_actively_serving(&self.conn)
+    }
+
     // ── Diagnostics + cleanup ─────────────────────────────────────────────────
 
     fn collect_artifacts(&self, dst: &Path) -> Result<(), AdapterError> {
