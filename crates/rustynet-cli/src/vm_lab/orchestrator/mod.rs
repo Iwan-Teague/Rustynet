@@ -5,6 +5,7 @@ pub mod context;
 pub mod error;
 pub mod parity;
 pub mod plan;
+pub mod remote_shell;
 pub mod report;
 pub mod role;
 pub mod role_assignment;
