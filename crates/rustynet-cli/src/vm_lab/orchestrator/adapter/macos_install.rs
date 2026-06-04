@@ -659,8 +659,26 @@ mod tests {
             "bootstrap passphrase must be root-owned while root reads it for secure-store provisioning"
         );
         assert!(
-            BOOTSTRAP_SCRIPT.contains("chown rustynetd:rustynetd \"${runtime_key}\" \"${encrypted_key}\" \"${public_key}\" \"${passphrase_file}\""),
-            "root-created key files must be handed back to the daemon service account"
+            BOOTSTRAP_SCRIPT.contains(
+                "chown rustynetd:rustynetd \"${encrypted_key}\" \"${public_key}\" \"${passphrase_file}\""
+            ),
+            "root-created PERSISTENT key files (encrypted key, public key, passphrase) must be handed back to the daemon service account"
+        );
+        // Encrypted-at-rest custody (Phase E): `key init` writes a plaintext
+        // runtime key under keys/, but a plaintext private key MUST NOT persist
+        // at rest on macOS. The bootstrap removes it (the daemon re-derives it
+        // from wireguard.key.enc + the keychain passphrase into the ephemeral
+        // runtime dir on every start, mirroring Linux's tmpfs runtime key).
+        // These two assertions GUARD that custody: a regression that chowned /
+        // kept the plaintext runtime key at rest (the pre-relocation behaviour
+        // this test previously asserted) would fail here.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("rm -f \"${runtime_key}\""),
+            "macOS bootstrap must remove the plaintext runtime key from the persistent keys/ dir (no plaintext private key at rest)"
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("chown rustynetd:rustynetd \"${runtime_key}\""),
+            "the plaintext runtime key must be removed, never chowned/persisted at rest"
         );
         assert!(
             !BOOTSTRAP_SCRIPT
