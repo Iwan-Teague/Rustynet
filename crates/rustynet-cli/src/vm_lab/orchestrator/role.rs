@@ -150,14 +150,20 @@ impl NodeRole {
                     Ok(vec![RoleCapability::Client])
                 }
                 NodeRole::Entry => Ok(vec![RoleCapability::Client, RoleCapability::EntryRelay]),
-                // Anchor advertises the full set of five composable anchor
-                // capabilities plus the Anchor marker; the daemon + gossip /
-                // bundle-pull / enrollment / port-mapping paths read these
-                // from the signed membership snapshot. Platform-independent:
-                // the same capability set is advertised on every OS; the
-                // per-OS work is in the live-validation backends, not here.
+                // Anchor advertises the canonical anchor capability set: the
+                // Anchor marker + relay_host + the five composable anchor
+                // sub-capabilities, exactly matching
+                // `rustynet_control::roles::anchor_role_capabilities()`.
+                // relay_host is REQUIRED, not optional: anchors co-locate a
+                // relay, and the daemon's membership-format validation rejects
+                // `anchor.relay_colocation` without `relay_host`
+                // (membership.rs `validate_membership_node_capabilities`). The
+                // daemon + gossip / bundle-pull / enrollment / port-mapping
+                // paths read these from the signed membership snapshot.
+                // Platform-independent: the same set is advertised on every OS.
                 NodeRole::Anchor => Ok(vec![
                     RoleCapability::Anchor,
+                    RoleCapability::RelayHost,
                     RoleCapability::AnchorGossipSeed,
                     RoleCapability::AnchorBundlePull,
                     RoleCapability::AnchorEnrollmentEndpoint,
@@ -489,9 +495,15 @@ mod tests {
     }
 
     #[test]
-    fn anchor_capabilities_are_the_full_five_plus_marker() {
+    fn anchor_capabilities_include_relay_host_and_the_five_subcaps() {
+        // relay_host is REQUIRED alongside the anchor sub-caps: the daemon's
+        // membership-format validation rejects anchor.relay_colocation without
+        // relay_host (a live membership_init failed exactly this way before
+        // relay_host was added here). Matches the set of
+        // rustynet_control::roles::anchor_role_capabilities().
         let expected = vec![
             RoleCapability::Anchor,
+            RoleCapability::RelayHost,
             RoleCapability::AnchorGossipSeed,
             RoleCapability::AnchorBundlePull,
             RoleCapability::AnchorEnrollmentEndpoint,
@@ -503,12 +515,18 @@ mod tests {
             VmGuestPlatform::Macos,
             VmGuestPlatform::Windows,
         ] {
+            let caps = NodeRole::Anchor
+                .product_capabilities_for_platform(&platform)
+                .unwrap();
             assert_eq!(
-                NodeRole::Anchor
-                    .product_capabilities_for_platform(&platform)
-                    .unwrap(),
-                expected,
-                "anchor advertises the full capability set on {platform:?}"
+                caps, expected,
+                "anchor advertises the full set on {platform:?}"
+            );
+            // Daemon invariant: relay_colocation implies relay_host.
+            assert!(
+                caps.contains(&RoleCapability::AnchorRelayColocation)
+                    && caps.contains(&RoleCapability::RelayHost),
+                "anchor.relay_colocation requires relay_host on {platform:?}"
             );
         }
     }
