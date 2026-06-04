@@ -4,6 +4,7 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 
 pub mod active_exit;
+pub mod anchor_validation;
 pub mod cleanup;
 pub mod collect_pubkeys;
 pub mod distribute_assignments;
@@ -35,6 +36,7 @@ pub enum StageId {
     CollectPubkeys,
     MembershipInit,
     DistributeMembership,
+    AnchorValidation,
     DistributeAssignments,
     DistributeTraversal,
     DistributeDnsZone,
@@ -59,6 +61,7 @@ impl StageId {
             StageId::CollectPubkeys => "collect_pubkeys",
             StageId::MembershipInit => "membership_init",
             StageId::DistributeMembership => "distribute_membership",
+            StageId::AnchorValidation => "anchor_validation",
             StageId::DistributeAssignments => "distribute_assignments",
             StageId::DistributeTraversal => "distribute_traversal",
             StageId::DistributeDnsZone => "distribute_dns_zone",

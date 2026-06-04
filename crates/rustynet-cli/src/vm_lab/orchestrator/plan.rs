@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::stage::OrchestrationStage;
 use crate::vm_lab::orchestrator::stage::active_exit::ActiveExitStage;
+use crate::vm_lab::orchestrator::stage::anchor_validation::AnchorValidationStage;
 use crate::vm_lab::orchestrator::stage::cleanup::CleanupHostsStage;
 use crate::vm_lab::orchestrator::stage::collect_pubkeys::CollectPubkeysStage;
 use crate::vm_lab::orchestrator::stage::distribute_assignments::DistributeAssignmentsStage;
@@ -66,6 +67,12 @@ impl PlanBuilder {
             Box::new(CollectPubkeysStage),
             Box::new(MembershipInitStage),
             Box::new(DistributeMembershipStage),
+            // Anchor capability-advertisement proof for any Anchor node —
+            // folds the capability-advertisement surface of the formerly
+            // Linux-only anchor test bin in, cross-OS. Runs after the
+            // membership snapshot is distributed (so the daemon can derive
+            // the anchor view) and before assignments are distributed.
+            Box::new(AnchorValidationStage),
             Box::new(DistributeAssignmentsStage),
             Box::new(DistributeTraversalStage),
             Box::new(DistributeDnsZoneStage),
@@ -89,9 +96,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_19_stages() {
+    fn build_returns_20_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 19, "plan must contain exactly 19 stages");
+        assert_eq!(stages.len(), 20, "plan must contain exactly 20 stages");
     }
 
     #[test]
@@ -101,6 +108,15 @@ mod tests {
         let pos = |id: StageId| stages.iter().position(|s| s.id() == id).unwrap();
         assert!(pos(StageId::ActiveExit) > pos(StageId::ExitHandoff));
         assert!(pos(StageId::ActiveExit) < pos(StageId::Cleanup));
+    }
+
+    #[test]
+    fn anchor_validation_runs_after_distribute_membership_and_before_distribute_assignments() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new().build();
+        let pos = |id: StageId| stages.iter().position(|s| s.id() == id).unwrap();
+        assert!(pos(StageId::AnchorValidation) > pos(StageId::DistributeMembership));
+        assert!(pos(StageId::AnchorValidation) < pos(StageId::DistributeAssignments));
     }
 
     #[test]
