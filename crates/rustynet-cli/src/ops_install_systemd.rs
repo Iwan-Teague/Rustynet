@@ -31,6 +31,11 @@ const SERVICE_SIGNING_CREDENTIAL_BLOB_PATH: &str =
 const RUNTIME_WIREGUARD_PASSPHRASE_CREDENTIAL_NAME: &str = concat!("w", "g", "_key_passphrase");
 const ASSIGNMENT_REFRESH_ENV_DST: &str = "/etc/rustynet/assignment-refresh.env";
 const ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str = "/var/lib/rustynet/anchor-bundle-pull.token";
+/// Anchor enrollment HMAC secret path. Matches the `RUSTYNET_ENROLLMENT_SECRET`
+/// default the systemd unit template already declares + passes to the daemon.
+/// `enrollment_token::load_secret` requires this file to be EXACTLY 32 raw
+/// bytes (not hex/base64) with no group/world permission bits.
+const ENROLLMENT_SECRET_PATH: &str = "/var/lib/rustynet/keys/enrollment.secret";
 const DEFAULT_EXIT_ROUTE_CIDR: &str = "0.0.0.0/0";
 const MAX_ASSIGNMENT_ROUTE_SCAN: usize = 4096;
 const MAX_ASSIGNMENT_PEER_SCAN: usize = 4096;
@@ -784,6 +789,65 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     } else {
         String::new()
     };
+
+    // Seed the anchor enrollment secret for admin nodes, mirroring the
+    // bundle-pull token above. The daemon's enrollment IPC (mint/verify/
+    // admit) HMACs tokens with this 32-byte secret. The systemd unit
+    // template already points `--enrollment-secret` at ENROLLMENT_SECRET_PATH
+    // (a built-in `Environment=` default in scripts/systemd/rustynetd.service),
+    // but nothing created the file, so the enrollment subsystem fail-closed
+    // with "enrollment subsystem not configured" on any node. Written once at
+    // install time and preserved across re-installs (content kept so
+    // previously-minted tokens stay verifiable; mode/owner corrected).
+    // Non-admin nodes leave it absent so the daemon's enrollment IPC stays
+    // fail-closed — a security boundary, not an optimisation. The consumed-
+    // token ledger is daemon-managed (enrollment_token::load_ledger tolerates
+    // an absent file and write_ledger creates it on first consume), so it is
+    // intentionally not seeded here.
+    if node_role == "admin" {
+        let secret_path = Path::new(ENROLLMENT_SECRET_PATH);
+        let secret_exists = match fs::symlink_metadata(secret_path) {
+            Ok(_) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                return Err(format!(
+                    "inspect enrollment secret at {} failed: {err}",
+                    secret_path.display()
+                ));
+            }
+        };
+        if !secret_exists {
+            // 32 RAW bytes (not hex): load_secret requires the file to be
+            // exactly ENROLLMENT_SECRET_LEN (32) raw bytes.
+            let mut random_bytes = [0u8; 32];
+            fill_os_random_bytes(&mut random_bytes, "anchor enrollment secret")?;
+            let parent = secret_path
+                .parent()
+                .expect("enrollment secret path has parent");
+            let tmp = create_secure_temp_file(parent, "rustynetd.enroll.tmp.")?;
+            {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(tmp.as_path())
+                    .map_err(|err| {
+                        format!("open enrollment secret tmp {} failed: {err}", tmp.display())
+                    })?;
+                file.write_all(&random_bytes)
+                    .map_err(|err| format!("write enrollment secret content failed: {err}"))?;
+            }
+            publish_file_with_owner_mode(
+                tmp.as_path(),
+                secret_path,
+                daemon_uid,
+                daemon_gid,
+                0o600,
+                "anchor enrollment secret",
+            )?;
+        } else {
+            set_owner_mode_if_exists(secret_path, daemon_uid, daemon_gid, 0o600)?;
+        }
+    }
 
     let mut env_entries = vec![
         ("RUSTYNET_NODE_ID".to_owned(), node_id),
@@ -2835,6 +2899,30 @@ mod tests {
                 "--traversal-stun-gather-timeout-ms ${RUSTYNET_TRAVERSAL_STUN_GATHER_TIMEOUT_MS}"
             ),
             "rustynetd service template must pass traversal stun gather timeout to the daemon"
+        );
+    }
+
+    #[test]
+    fn enrollment_secret_install_path_matches_service_template_default() {
+        // The install seeds ENROLLMENT_SECRET_PATH for admin nodes; the daemon
+        // reads --enrollment-secret from the template's built-in Environment=
+        // default. If the two drift, the install would create a 32-byte secret
+        // the daemon never reads and enrollment would still fail-closed despite
+        // the file existing.
+        let secret_path = super::ENROLLMENT_SECRET_PATH;
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let service_template =
+            std::fs::read_to_string(repo_root.join("scripts/systemd/rustynetd.service"))
+                .expect("rustynetd service template should be readable");
+        assert!(
+            service_template.contains(&format!(
+                "Environment=RUSTYNET_ENROLLMENT_SECRET={secret_path}"
+            )),
+            "service template enrollment-secret default must match the install path {secret_path}"
+        );
+        assert!(
+            service_template.contains("--enrollment-secret ${RUSTYNET_ENROLLMENT_SECRET}"),
+            "service template must pass the enrollment secret to the daemon"
         );
     }
 
