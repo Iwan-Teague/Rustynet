@@ -188,6 +188,34 @@ pub fn assert_exit_actively_serving(conn: &NodeConnection) -> Result<(), Adapter
     }
 }
 
+/// On the Windows exit, assert a WinNAT session is translating a mesh-sourced
+/// (`100.64.0.0/10`, i.e. first octet 100, second 64–127) client address
+/// outbound — direct proof that a client's full-tunnel traffic egresses via THIS
+/// exit's NAT (the W1/D7 "client mesh traffic egresses via the exit" evidence).
+/// Retries internally to cover the client's full-tunnel convergence + the probe
+/// window.
+pub fn assert_mesh_client_nat_session(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let script = "$found = $false; $seen = ''; \
+         for ($i = 0; $i -lt 10 -and -not $found; $i++) { \
+             $s = @(Get-NetNatSession -EA SilentlyContinue | Where-Object { \
+                 $p = $_.InternalSourceAddress.Split('.'); \
+                 ($p.Count -eq 4) -and ([int]$p[0] -eq 100) -and ([int]$p[1] -ge 64) -and ([int]$p[1] -le 127) }); \
+             if ($s.Count -ge 1) { $found = $true; $seen = $s[0].InternalSourceAddress + ' -> ' + $s[0].ExternalDestinationAddress } \
+             else { Start-Sleep -Milliseconds 1500 } \
+         }; \
+         if ($found) { Write-Output ('OK nat_session ' + $seen) } \
+         else { Write-Output 'FAIL: no WinNAT session translating a mesh-sourced (100.64.0.0/10) client address' }";
+    let out = run_remote_ps(conn, script, MEDIUM_TIMEOUT)?;
+    let out = out.trim();
+    if out.starts_with("OK") {
+        Ok(())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!("Windows exit shows no client-egress NAT session: {out}"),
+        })
+    }
+}
+
 /// Collect diagnostic artifacts from the Windows host to `dst`.
 /// Key material paths (`keys\*`, `*.priv`) MUST NOT appear in the collected set.
 pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), AdapterError> {

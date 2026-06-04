@@ -178,6 +178,10 @@ impl NodeAdapter for WindowsNodeAdapter {
         windows_traffic::assert_exit_actively_serving(&self.conn)
     }
 
+    fn assert_mesh_client_nat_session(&self) -> Result<(), AdapterError> {
+        windows_traffic::assert_mesh_client_nat_session(&self.conn)
+    }
+
     // ── Diagnostics + cleanup ─────────────────────────────────────────────────
 
     fn collect_artifacts(&self, dst: &Path) -> Result<(), AdapterError> {

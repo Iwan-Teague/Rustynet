@@ -162,6 +162,10 @@ impl NodeAdapter for LinuxNodeAdapter {
         linux_traffic::collect_active_tunnels(&self.conn)
     }
 
+    fn drive_exit_egress_probe(&self) -> Result<(), AdapterError> {
+        linux_traffic::drive_exit_egress_probe(&self.conn)
+    }
+
     // ── Diagnostics + cleanup ─────────────────────────────────────────────────
 
     fn collect_artifacts(&self, dst: &Path) -> Result<(), AdapterError> {
