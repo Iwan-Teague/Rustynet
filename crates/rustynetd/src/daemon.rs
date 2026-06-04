@@ -8953,6 +8953,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         config.backend_mode
     );
     resolve_configured_egress_interface(&mut config)?;
+    normalize_windows_dns_resolver_bind_addr(&mut config);
     validate_daemon_config(&config)?;
     #[cfg(windows)]
     {
@@ -10297,6 +10298,36 @@ fn resolve_configured_egress_interface(config: &mut DaemonConfig) -> Result<(), 
         })
         .map_err(DaemonError::InvalidConfig)?;
     Ok(())
+}
+
+/// Pin the loopback DNS resolver to port 53 for the Windows backend.
+///
+/// Windows points host DNS at a resolver through interface settings that encode
+/// only an IP address, not a port — and Windows advfirewall cannot redirect a
+/// port the way Linux `nft` and macOS `pf` send `:53`→`:53535`. So the rustynet
+/// loopback resolver MUST listen on `:53` for Windows DNS ownership to work at
+/// all; `apply_dns_loopback` enforces this and otherwise fail-closes the whole
+/// dataplane on every reconcile (which is exactly what happened when the Windows
+/// backend was left on the cross-platform default `127.0.0.1:53535`). When the
+/// resolver bind address is the untouched cross-platform default, rebind it to
+/// `:53`. An operator who explicitly configures some other non-`:53` Windows
+/// port is still surfaced the fail-closed error by `validate_windows_dns_bind_addr`,
+/// rather than being silently overridden.
+fn normalize_windows_dns_resolver_bind_addr(config: &mut DaemonConfig) {
+    if config.backend_mode != DaemonBackendMode::WindowsWireguardNt {
+        return;
+    }
+    let default_addr: SocketAddr = DEFAULT_DNS_RESOLVER_BIND_ADDR
+        .parse()
+        .expect("default dns resolver bind addr must parse");
+    if config.dns_resolver_bind_addr == default_addr {
+        let pinned = SocketAddr::new(config.dns_resolver_bind_addr.ip(), 53);
+        log::info!(
+            "rustynetd startup: windows backend resolver port pinned to {pinned} (was default {}); windows interface DNS is IP-only with no :53 redirect",
+            config.dns_resolver_bind_addr
+        );
+        config.dns_resolver_bind_addr = pinned;
+    }
 }
 
 fn resolve_egress_interface_value<F>(configured: &str, detect: F) -> Result<String, String>
@@ -25954,6 +25985,50 @@ mod tests {
         let _ = std::fs::remove_file(dns_zone_verifier_path);
         let _ = std::fs::remove_file(dns_zone_watermark_path);
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn windows_backend_pins_default_dns_resolver_to_port_53() {
+        let default_addr: std::net::SocketAddr =
+            super::DEFAULT_DNS_RESOLVER_BIND_ADDR.parse().unwrap();
+        assert_eq!(
+            default_addr.port(),
+            53535,
+            "precondition: cross-platform default is :53535"
+        );
+
+        // Windows + untouched default → pinned to :53 (Windows interface DNS is
+        // IP-only; there is no nft/pf :53→:53535 redirect, so the resolver must
+        // own :53 directly or apply_dns_loopback fail-closes the dataplane).
+        let mut win = DaemonConfig {
+            backend_mode: DaemonBackendMode::WindowsWireguardNt,
+            dns_resolver_bind_addr: default_addr,
+            ..DaemonConfig::default()
+        };
+        super::normalize_windows_dns_resolver_bind_addr(&mut win);
+        assert_eq!(win.dns_resolver_bind_addr.port(), 53);
+        assert!(win.dns_resolver_bind_addr.ip().is_loopback());
+
+        // Windows + an explicitly-configured non-:53 port → left untouched so
+        // validate_windows_dns_bind_addr surfaces the fail-closed error instead
+        // of the daemon silently overriding an explicit operator choice.
+        let explicit: std::net::SocketAddr = "127.0.0.1:8053".parse().unwrap();
+        let mut win_explicit = DaemonConfig {
+            backend_mode: DaemonBackendMode::WindowsWireguardNt,
+            dns_resolver_bind_addr: explicit,
+            ..DaemonConfig::default()
+        };
+        super::normalize_windows_dns_resolver_bind_addr(&mut win_explicit);
+        assert_eq!(win_explicit.dns_resolver_bind_addr, explicit);
+
+        // Non-Windows backend → default left at :53535 (Linux/macOS redirect :53).
+        let mut other = DaemonConfig {
+            backend_mode: DaemonBackendMode::InMemory,
+            dns_resolver_bind_addr: default_addr,
+            ..DaemonConfig::default()
+        };
+        super::normalize_windows_dns_resolver_bind_addr(&mut other);
+        assert_eq!(other.dns_resolver_bind_addr, default_addr);
     }
 
     #[test]
