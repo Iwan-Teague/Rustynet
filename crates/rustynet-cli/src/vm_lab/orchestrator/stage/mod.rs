@@ -3,6 +3,7 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 
+pub mod active_exit;
 pub mod cleanup;
 pub mod collect_pubkeys;
 pub mod distribute_assignments;
@@ -41,6 +42,7 @@ pub enum StageId {
     TrafficTestMatrix,
     RoleSwitchMatrix,
     ExitHandoff,
+    ActiveExit,
     Cleanup,
 }
 
@@ -63,6 +65,7 @@ impl StageId {
             StageId::TrafficTestMatrix => "traffic_test_matrix",
             StageId::RoleSwitchMatrix => "role_switch_matrix",
             StageId::ExitHandoff => "exit_handoff",
+            StageId::ActiveExit => "active_exit",
             StageId::Cleanup => "cleanup",
         }
     }

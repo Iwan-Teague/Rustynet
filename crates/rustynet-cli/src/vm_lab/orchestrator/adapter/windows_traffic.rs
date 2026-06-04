@@ -125,6 +125,69 @@ pub fn collect_active_tunnels(conn: &NodeConnection) -> Result<TunnelsList, Adap
     Ok(TunnelsList { tunnels })
 }
 
+/// Activate full-tunnel exit-serving on the Windows exit: send
+/// `route advertise 0.0.0.0/0` to the live daemon over its control named pipe.
+///
+/// The daemon's local IPC is a plain-text line over a message-mode named pipe
+/// (`as_wire()` is literally `route advertise 0.0.0.0/0`), so a
+/// `NamedPipeClientStream` sends it without the full operator CLI — the guest's
+/// `rustynet.exe` is only the trust CLI and has no route-advertise command. The
+/// `IpcResponse` wire form is `ok|<message>` / `err|<message>`; on rejection the
+/// daemon's own reason is surfaced (e.g. a host lacking the WinNAT/HNS stack
+/// reports a clear remediation message from the exit preflight).
+pub fn activate_exit_serving(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let script = "$resp = ''; \
+         try { \
+             $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'RustyNet\\rustynetd', [System.IO.Pipes.PipeDirection]::InOut); \
+             $pipe.Connect(5000); \
+             try { $pipe.ReadMode = [System.IO.Pipes.PipeTransmissionMode]::Message } catch {}; \
+             $b = [System.Text.Encoding]::ASCII.GetBytes('route advertise 0.0.0.0/0') + [byte]10; \
+             $pipe.Write($b, 0, $b.Length); $pipe.Flush(); \
+             $buf = New-Object byte[] 8192; $n = $pipe.Read($buf, 0, 8192); \
+             $resp = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n).Trim(); \
+             $pipe.Dispose() \
+         } catch { $resp = 'PIPE_ERR: ' + $_.Exception.Message }; \
+         Write-Output $resp";
+    let resp = run_remote_ps(conn, script, SHORT_TIMEOUT)?;
+    let resp = resp.trim();
+    if resp.strip_prefix("ok|").is_some() {
+        Ok(())
+    } else if let Some(reason) = resp.strip_prefix("err|") {
+        Err(AdapterError::Protocol {
+            message: format!(
+                "daemon rejected exit-serving route advertisement: {}",
+                reason.trim()
+            ),
+        })
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!("unexpected route-advertise response from daemon: {resp}"),
+        })
+    }
+}
+
+/// Assert the Windows exit is ACTIVELY serving as a full-tunnel exit: IPv4
+/// forwarding `Enabled` on the tunnel adapter (`rustynet0`) AND a RustyNet NAT
+/// instance present. Proves the dataplane actually NATs client mesh traffic, not
+/// merely that the exit role is held.
+pub fn assert_exit_actively_serving(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let script = "$ErrorActionPreference = 'SilentlyContinue'; \
+         $fwd = @(Get-NetIPInterface -AddressFamily IPv4 | Where-Object { $_.Forwarding -eq 'Enabled' } | ForEach-Object { $_.InterfaceAlias }); \
+         $nat = @(Get-NetNat | Where-Object { $_.Name -like '*rusty*' }); \
+         if ($fwd -notcontains 'rustynet0') { Write-Output 'FAIL: rustynet0 IPv4 forwarding is not Enabled' } \
+         elseif ($nat.Count -lt 1) { Write-Output 'FAIL: no RustyNet NAT instance present' } \
+         else { Write-Output ('OK forwarding=[' + ($fwd -join ',') + '] nat=' + $nat[0].Name) }";
+    let out = run_remote_ps(conn, script, SHORT_TIMEOUT)?;
+    let out = out.trim();
+    if out.starts_with("OK") {
+        Ok(())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!("Windows exit is not actively serving as a full-tunnel exit: {out}"),
+        })
+    }
+}
+
 /// Collect diagnostic artifacts from the Windows host to `dst`.
 /// Key material paths (`keys\*`, `*.priv`) MUST NOT appear in the collected set.
 pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), AdapterError> {
