@@ -4,6 +4,7 @@ use crate::vm_lab::orchestrator::stage::active_exit::ActiveExitStage;
 use crate::vm_lab::orchestrator::stage::anchor_validation::AnchorValidationStage;
 use crate::vm_lab::orchestrator::stage::cleanup::CleanupHostsStage;
 use crate::vm_lab::orchestrator::stage::collect_pubkeys::CollectPubkeysStage;
+use crate::vm_lab::orchestrator::stage::deploy_relay::DeployRelayServiceStage;
 use crate::vm_lab::orchestrator::stage::distribute_assignments::DistributeAssignmentsStage;
 use crate::vm_lab::orchestrator::stage::distribute_dns_zone::DistributeDnsZoneStage;
 use crate::vm_lab::orchestrator::stage::distribute_membership::DistributeMembershipStage;
@@ -78,9 +79,16 @@ impl PlanBuilder {
             Box::new(DistributeDnsZoneStage),
             Box::new(EnforceBaselineRuntimeStage),
             Box::new(ValidateBaselineRuntimeStage),
+            // Deploy the rustynet-relay sibling service onto every Relay node
+            // (verifier key + `ops install-systemd-relay`) so relay_validation
+            // has a live relay to prove. Closes the gap where the standard
+            // orchestrator advertised relay_host in membership but never
+            // installed the relay runtime. Runs after baseline-runtime
+            // validation (no network needed) and before relay_validation.
+            Box::new(DeployRelayServiceStage),
             // Relay-service-lifecycle proof for any Relay node — folds the
             // formerly Linux-only relay test bin in, cross-OS. Runs after
-            // baseline-runtime validation, before the traffic matrix.
+            // the relay runtime is deployed, before the traffic matrix.
             Box::new(RelayValidationStage),
             Box::new(TrafficTestMatrixStage),
             Box::new(RoleSwitchMatrixStage),
@@ -96,9 +104,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_20_stages() {
+    fn build_returns_21_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 20, "plan must contain exactly 20 stages");
+        assert_eq!(stages.len(), 21, "plan must contain exactly 21 stages");
     }
 
     #[test]
@@ -126,6 +134,16 @@ mod tests {
         let pos = |id: StageId| stages.iter().position(|s| s.id() == id).unwrap();
         assert!(pos(StageId::RelayValidation) > pos(StageId::ValidateBaselineRuntime));
         assert!(pos(StageId::RelayValidation) < pos(StageId::TrafficTestMatrix));
+    }
+
+    #[test]
+    fn deploy_relay_service_runs_after_baseline_runtime_and_before_relay_validation() {
+        // The relay runtime must be deployed before relay_validation probes it.
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new().build();
+        let pos = |id: StageId| stages.iter().position(|s| s.id() == id).unwrap();
+        assert!(pos(StageId::DeployRelayService) > pos(StageId::ValidateBaselineRuntime));
+        assert!(pos(StageId::DeployRelayService) < pos(StageId::RelayValidation));
     }
 
     #[test]

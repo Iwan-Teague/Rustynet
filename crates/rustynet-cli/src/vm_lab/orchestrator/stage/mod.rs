@@ -7,6 +7,7 @@ pub mod active_exit;
 pub mod anchor_validation;
 pub mod cleanup;
 pub mod collect_pubkeys;
+pub mod deploy_relay;
 pub mod distribute_assignments;
 pub mod distribute_dns_zone;
 pub mod distribute_membership;
@@ -42,6 +43,7 @@ pub enum StageId {
     DistributeDnsZone,
     EnforceBaselineRuntime,
     ValidateBaselineRuntime,
+    DeployRelayService,
     RelayValidation,
     TrafficTestMatrix,
     RoleSwitchMatrix,
@@ -67,6 +69,7 @@ impl StageId {
             StageId::DistributeDnsZone => "distribute_dns_zone",
             StageId::EnforceBaselineRuntime => "enforce_baseline_runtime",
             StageId::ValidateBaselineRuntime => "validate_baseline_runtime",
+            StageId::DeployRelayService => "deploy_relay_service",
             StageId::RelayValidation => "relay_validation",
             StageId::TrafficTestMatrix => "traffic_test_matrix",
             StageId::RoleSwitchMatrix => "role_switch_matrix",

@@ -18,10 +18,19 @@ use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageI
 /// stages inherit a serving relay. Everything is driven through the
 /// adapter's cross-OS [`RemoteShellHost`] seam with argv-only probes.
 ///
-/// It runs after `validate_baseline_runtime` (the relay daemon is up and
-/// its role posture validated) and before the traffic matrix. A run with
-/// no Relay nodes is a skip-noop: the stage passes without touching any
-/// host, mirroring the empty-assignment case in `role_switch_matrix`.
+/// It runs after `deploy_relay_service` (which installs the relay verifier
+/// key + the `rustynet-relay.service` unit and starts it) and before the
+/// traffic matrix. Depending on the deploy stage means a deploy failure
+/// skip-cascades here rather than re-surfacing as a confusing
+/// "relay role not deployed?" probe failure. A run with no Relay nodes is a
+/// skip-noop: the stage passes without touching any host, mirroring the
+/// empty-assignment case in `role_switch_matrix`.
+///
+/// macOS / Windows relay nodes are **reported-skipped** (named in
+/// `relay_validation.reported_skips.json`, never a silent pass) on the same
+/// [`NodeRole::is_supported_for_platform`] posture gate `deploy_relay_service`
+/// uses — so a flag flip on archived cross-OS evidence (Phase 8) lights up
+/// deploy and validation together.
 pub struct RelayValidationStage;
 
 impl OrchestrationStage for RelayValidationStage {
@@ -32,7 +41,7 @@ impl OrchestrationStage for RelayValidationStage {
         "relay_validation"
     }
     fn dependencies(&self) -> &[StageId] {
-        &[StageId::ValidateBaselineRuntime]
+        &[StageId::DeployRelayService]
     }
     fn applies_to_roles(&self) -> &[NodeRole] {
         &[NodeRole::Relay]
@@ -58,6 +67,9 @@ impl OrchestrationStage for RelayValidationStage {
         }
 
         let mut failures: Vec<String> = Vec::new();
+        // (alias, platform) pairs reported-skipped because relay runtime
+        // validation is not yet live-supported on their platform.
+        let mut reported_skips: Vec<(String, String)> = Vec::new();
         for alias in &relay_aliases {
             let adapter = match ctx.adapters.get(alias.as_str()) {
                 Some(adapter) => adapter,
@@ -66,6 +78,17 @@ impl OrchestrationStage for RelayValidationStage {
                     continue;
                 }
             };
+            let platform = adapter.platform();
+            // Posture gate (shared with DeployRelayService): the relay runtime
+            // is deployed + validated live on Linux today. macOS/Windows relay
+            // nodes are reported-skipped — named, never a silent pass — until
+            // is_supported_for_platform is promoted on archived cross-OS
+            // evidence (Phase 8). Skipping here keeps a mixed-OS run honest
+            // rather than hard-failing a relay we intentionally did not deploy.
+            if !NodeRole::Relay.is_supported_for_platform(&platform) {
+                reported_skips.push((alias.clone(), format!("{platform:?}")));
+                continue;
+            }
             let shell = match adapter.shell_host() {
                 Ok(shell) => shell,
                 Err(e) => {
@@ -73,9 +96,16 @@ impl OrchestrationStage for RelayValidationStage {
                     continue;
                 }
             };
-            if let Err(e) = validate_relay_lifecycle(&*shell, adapter.platform()) {
+            if let Err(e) = validate_relay_lifecycle(&*shell, platform) {
                 failures.push(format!("{alias}: {e}"));
             }
+        }
+
+        // Record the reported skips as evidence (best-effort write); not
+        // failures, but they MUST be named on disk so a macOS/Windows relay
+        // node is never silently treated as validated.
+        if !reported_skips.is_empty() {
+            write_reported_skips_note(ctx, &reported_skips);
         }
 
         if failures.is_empty() {
@@ -84,6 +114,36 @@ impl OrchestrationStage for RelayValidationStage {
             StageOutcome::Failed(failures.join("; "))
         }
     }
+}
+
+/// File name (under `ctx.report_dir`) the reported-skip note is written to
+/// when a Relay node's platform is not yet live-supported for relay
+/// validation (macOS / Windows, pending cross-OS Phase 8 evidence).
+const REPORTED_SKIPS_FILENAME: &str = "relay_validation.reported_skips.json";
+
+/// Serialize the reported-skip note as pretty JSON bytes. Pure (no I/O) so a
+/// unit test can assert the content without touching the filesystem.
+fn reported_skips_json_bytes(reported_skips: &[(String, String)]) -> Vec<u8> {
+    let skipped: Vec<serde_json::Value> = reported_skips
+        .iter()
+        .map(|(alias, platform)| serde_json::json!({ "alias": alias, "platform": platform }))
+        .collect();
+    let body = serde_json::json!({
+        "stage": "relay_validation",
+        "reported_skipped_relay_validation": skipped,
+        "reason": "relay runtime validation is live-supported on Linux only; macOS/Windows \
+                   relay nodes are reported-skipped (named, never a silent pass) until a green \
+                   standard-orchestrator run promotes is_supported_for_platform (cross-OS Phase 8)",
+    });
+    serde_json::to_vec_pretty(&body).unwrap_or_default()
+}
+
+/// Write the reported-skip note to `<report_dir>/relay_validation.reported_skips.json`.
+/// Best-effort: a write failure does not fail the stage, but the common path
+/// leaves a machine-readable artifact naming every skipped relay node.
+fn write_reported_skips_note(ctx: &OrchestrationContext, reported_skips: &[(String, String)]) {
+    let path = ctx.report_dir.join(REPORTED_SKIPS_FILENAME);
+    let _ = std::fs::write(&path, reported_skips_json_bytes(reported_skips));
 }
 
 #[cfg(test)]
@@ -114,9 +174,37 @@ mod tests {
         assert_eq!(stage.id(), StageId::RelayValidation);
         assert_eq!(stage.name(), "relay_validation");
         assert_eq!(stage.id().as_str(), "relay_validation");
-        assert_eq!(stage.dependencies(), &[StageId::ValidateBaselineRuntime]);
+        assert_eq!(stage.dependencies(), &[StageId::DeployRelayService]);
         assert!(matches!(stage.fanout(), StageFanout::PerNode));
         assert_eq!(stage.applies_to_roles(), &[NodeRole::Relay]);
+    }
+
+    #[test]
+    fn reported_skips_note_names_every_skipped_relay() {
+        // A macOS/Windows relay must be named in the skip note, never silently
+        // treated as validated.
+        let skips = vec![
+            ("relay-mac".to_owned(), "Macos".to_owned()),
+            ("relay-win".to_owned(), "Windows".to_owned()),
+        ];
+        let bytes = reported_skips_json_bytes(&skips);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("reported-skip note must be valid JSON");
+        assert_eq!(parsed["stage"], "relay_validation");
+        let listed = parsed["reported_skipped_relay_validation"]
+            .as_array()
+            .expect("skip list");
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .any(|v| v["alias"] == "relay-mac" && v["platform"] == "Macos")
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|v| v["alias"] == "relay-win" && v["platform"] == "Windows")
+        );
     }
 
     #[test]
