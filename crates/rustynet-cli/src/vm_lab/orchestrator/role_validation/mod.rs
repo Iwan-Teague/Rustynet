@@ -7,7 +7,8 @@
 //! seam, so the standard orchestrator's role-validation stages run the
 //! same proof on Linux, macOS, and Windows.
 //!
-//! The `anchor` submodule is added by a later change; only `relay` is
-//! wired here today.
+//! The `anchor` submodule validates the anchor capability-advertisement
+//! surface (cross-OS); `relay` validates the relay service lifecycle.
 
+pub mod anchor;
 pub mod relay;
