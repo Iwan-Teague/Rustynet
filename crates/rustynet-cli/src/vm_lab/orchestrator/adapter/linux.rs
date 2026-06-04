@@ -45,6 +45,21 @@ impl NodeAdapter for LinuxNodeAdapter {
         &self.alias
     }
 
+    /// Build a cross-OS RemoteShellHost from this node's SSH connection, so the
+    /// anchor / relay role-validation stages can drive OS-agnostic primitives
+    /// over the same hardened transport the adapter already uses.
+    fn shell_host(
+        &self,
+    ) -> Result<
+        std::sync::Arc<dyn crate::vm_lab::orchestrator::remote_shell::RemoteShellHost>,
+        AdapterError,
+    > {
+        crate::vm_lab::orchestrator::remote_shell::new_remote_shell_host(
+            self.platform(),
+            self.conn.clone(),
+        )
+    }
+
     // ── Install lifecycle ─────────────────────────────────────────────────────
 
     fn install_daemon(

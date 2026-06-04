@@ -16,6 +16,7 @@ pub mod final_cleanup;
 pub mod install;
 pub mod membership_init;
 pub mod preflight;
+pub mod relay_validation;
 pub mod role_switch_matrix;
 pub mod source_archive;
 pub mod traffic_test_matrix;
@@ -39,6 +40,7 @@ pub enum StageId {
     DistributeDnsZone,
     EnforceBaselineRuntime,
     ValidateBaselineRuntime,
+    RelayValidation,
     TrafficTestMatrix,
     RoleSwitchMatrix,
     ExitHandoff,
@@ -62,6 +64,7 @@ impl StageId {
             StageId::DistributeDnsZone => "distribute_dns_zone",
             StageId::EnforceBaselineRuntime => "enforce_baseline_runtime",
             StageId::ValidateBaselineRuntime => "validate_baseline_runtime",
+            StageId::RelayValidation => "relay_validation",
             StageId::TrafficTestMatrix => "traffic_test_matrix",
             StageId::RoleSwitchMatrix => "role_switch_matrix",
             StageId::ExitHandoff => "exit_handoff",

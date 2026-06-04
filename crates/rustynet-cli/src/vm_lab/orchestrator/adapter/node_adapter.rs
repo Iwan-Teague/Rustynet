@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::vm_lab::DaemonProbeOp;
 use crate::vm_lab::VmGuestPlatform;
@@ -8,6 +9,7 @@ use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, InstallReport, MembershipOwnerKey, MembershipSnapshot, NodeId,
     NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
 };
+use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
 /// Extract the daemon's own failure reason from a tail of its `rustynetd.log`,
@@ -186,6 +188,24 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
             platform: self.platform(),
             message:
                 "mesh-client NAT-session egress assertion is implemented only for the Windows exit adapter"
+                    .to_owned(),
+        })
+    }
+
+    // ── Cross-OS remote shell (role-validation stages) ────────────
+
+    /// Build a cross-OS [`RemoteShellHost`] for this node from its SSH
+    /// connection, so role-validation stages (anchor / relay) can drive the
+    /// OS-agnostic primitives (read_file / write_file / run_argv /
+    /// tcp_send_recv) without re-threading identity / known-hosts through the
+    /// call tree. The returned backend dispatches per the adapter's platform.
+    /// Default: not available — only the SSH-backed Linux / macOS / Windows
+    /// adapters implement it (fail closed otherwise).
+    fn shell_host(&self) -> Result<Arc<dyn RemoteShellHost>, AdapterError> {
+        Err(AdapterError::UnsupportedPlatform {
+            platform: self.platform(),
+            message:
+                "remote shell host is only available on the SSH-backed Linux/macOS/Windows adapters"
                     .to_owned(),
         })
     }
