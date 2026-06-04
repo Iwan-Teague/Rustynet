@@ -17,11 +17,18 @@ serde_json = { version = "1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 rustynet-windows-native = { path = "../rustynet-windows-native" }
-windows-service = { version = "0.8", optional = true }
+# Windows-only crate (SCM host). Declared as a plain cfg(windows) target
+# dependency — NOT an optional dep behind the `daemon` feature — so it is
+# never pulled into the dependency graph on Linux/macOS. Every use site is
+# `#[cfg(windows)]`, so the relay binary still builds with `--features daemon`
+# on non-Windows without it. (A prior `daemon = [..., "windows-service"]`
+# feature edge made `cargo build --features daemon` try to download it on
+# Linux, breaking offline guest bootstraps where it was never cached.)
+windows-service = "0.8"
 
 [features]
 default = []
-daemon = ["tokio", "tracing", "serde", "serde_json", "windows-service"]
+daemon = ["tokio", "tracing", "serde", "serde_json"]
 
 [[bin]]
 name = "rustynet-relay"
