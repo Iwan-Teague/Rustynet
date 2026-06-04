@@ -181,6 +181,20 @@ impl NodeAdapter for LinuxNodeAdapter {
         linux_traffic::drive_exit_egress_probe(&self.conn)
     }
 
+    // ── Active full-tunnel exit serving ───────────────────────────────────────
+
+    fn activate_exit_serving(&self) -> Result<(), AdapterError> {
+        linux_traffic::activate_exit_serving(&self.conn)
+    }
+
+    fn assert_exit_actively_serving(&self) -> Result<(), AdapterError> {
+        linux_traffic::assert_exit_actively_serving(&self.conn)
+    }
+
+    fn assert_mesh_client_nat_session(&self) -> Result<(), AdapterError> {
+        linux_traffic::assert_mesh_client_nat_session(&self.conn)
+    }
+
     // ── Diagnostics + cleanup ─────────────────────────────────────────────────
 
     fn collect_artifacts(&self, dst: &Path) -> Result<(), AdapterError> {

@@ -148,7 +148,7 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         Err(AdapterError::UnsupportedPlatform {
             platform: self.platform(),
             message:
-                "active full-tunnel exit-serving activation is implemented only for the Windows exit adapter"
+                "active full-tunnel exit-serving activation is implemented for the Windows and Linux exit adapters"
                     .to_owned(),
         })
     }
@@ -161,7 +161,7 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         Err(AdapterError::UnsupportedPlatform {
             platform: self.platform(),
             message:
-                "active full-tunnel exit-serving assertion is implemented only for the Windows exit adapter"
+                "active full-tunnel exit-serving assertion is implemented for the Windows and Linux exit adapters"
                     .to_owned(),
         })
     }
@@ -187,7 +187,7 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         Err(AdapterError::UnsupportedPlatform {
             platform: self.platform(),
             message:
-                "mesh-client NAT-session egress assertion is implemented only for the Windows exit adapter"
+                "mesh-client NAT-session egress assertion is implemented for the Windows and Linux exit adapters"
                     .to_owned(),
         })
     }
