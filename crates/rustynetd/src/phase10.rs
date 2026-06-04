@@ -3506,8 +3506,8 @@ const WINDOWS_DNS_RULE_BLOCK_LAN_TCP: &str = "RustyNetDNS-BlockLanTcp";
 /// overrides the allow, failing IPv6 closed.  The WireGuard handshake + SSH are
 /// IPv4, so they are unaffected.
 const WINDOWS_IPV6_RULE_BLOCK_LAN: &str = "RustyNetKS-BlockIpv6Lan";
-const WINDOWS_PS_REQUIRE_EXIT_CMDLETS: &str = "& { $ErrorActionPreference = 'Stop'; Get-Command Set-NetIPInterface | Out-Null; Get-Command Get-NetIPInterface | Out-Null; Get-Command New-NetNat | Out-Null; Get-Command Get-NetNat | Out-Null; Get-Command Remove-NetNat | Out-Null }";
-const WINDOWS_PS_PREFLIGHT_EXIT_SERVING: &str = "& { param($TunnelAlias, $EgressAlias) $ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $principal = New-Object Security.Principal.WindowsPrincipal($identity); if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'RustyNet exit serving requires an elevated administrator or service token' }; foreach ($cmd in @('Set-NetIPInterface','Get-NetIPInterface','New-NetNat','Get-NetNat','Remove-NetNat','Get-NetRoute')) { Get-Command $cmd -ErrorAction Stop | Out-Null }; if ($TunnelAlias -eq $EgressAlias) { throw 'RustyNet tunnel and outbound interface aliases must be distinct' }; Get-NetIPInterface -InterfaceAlias $TunnelAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetIPInterface -InterfaceAlias $EgressAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $EgressAlias -ErrorAction Stop | Out-Null }";
+const WINDOWS_PS_REQUIRE_EXIT_CMDLETS: &str = "& { $ErrorActionPreference = 'Stop'; Get-Command Set-NetIPInterface | Out-Null; Get-Command Get-NetIPInterface | Out-Null; Get-Command New-NetNat | Out-Null; Get-Command Get-NetNat | Out-Null; Get-Command Remove-NetNat | Out-Null; try { Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat -ErrorAction Stop | Out-Null } catch { throw 'RustyNet exit serving requires the Windows WinNAT WMI provider (MSFT_NetNat in root/standardcimv2); this host lacks the Host Network Service / WinNAT networking stack, so New-NetNat fails with Invalid class. Install the WinNAT/HNS networking component to serve as a full-tunnel exit.' } }";
+const WINDOWS_PS_PREFLIGHT_EXIT_SERVING: &str = "& { param($TunnelAlias, $EgressAlias) $ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $principal = New-Object Security.Principal.WindowsPrincipal($identity); if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'RustyNet exit serving requires an elevated administrator or service token' }; foreach ($cmd in @('Set-NetIPInterface','Get-NetIPInterface','New-NetNat','Get-NetNat','Remove-NetNat','Get-NetRoute')) { Get-Command $cmd -ErrorAction Stop | Out-Null }; try { Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat -ErrorAction Stop | Out-Null } catch { throw 'RustyNet exit serving requires the Windows WinNAT WMI provider (MSFT_NetNat in root/standardcimv2); this host lacks the Host Network Service / WinNAT networking stack, so New-NetNat fails with Invalid class. Install the WinNAT/HNS networking component to serve as a full-tunnel exit.' }; if ($TunnelAlias -eq $EgressAlias) { throw 'RustyNet tunnel and outbound interface aliases must be distinct' }; Get-NetIPInterface -InterfaceAlias $TunnelAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetIPInterface -InterfaceAlias $EgressAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $EgressAlias -ErrorAction Stop | Out-Null }";
 const WINDOWS_PS_GET_FORWARDING: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding }";
 const WINDOWS_PS_SET_FORWARDING: &str = "& { param($Alias, $State) $ErrorActionPreference = 'Stop'; Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -Forwarding $State -ErrorAction Stop }";
 const WINDOWS_PS_REMOVE_NAT: &str = "& { param($Name) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction SilentlyContinue; if ($null -ne $nat) { $nat | Remove-NetNat -Confirm:$false -ErrorAction Stop } }";
@@ -8656,6 +8656,16 @@ mod tests {
             WINDOWS_PS_REQUIRE_EXIT_CMDLETS.contains("$ErrorActionPreference = 'Stop'"),
             "exit cmdlet pre-flight script must use $ErrorActionPreference = 'Stop'"
         );
+        // The cmdlet being present is not enough: New-NetNat fails with
+        // `Invalid class` on hosts that lack the WinNAT WMI provider (no Host
+        // Network Service). Verify the MSFT_NetNat class itself is usable so the
+        // daemon fails closed early with a clear message instead of an opaque
+        // mid-reconcile NAT-apply failure.
+        assert!(
+            WINDOWS_PS_REQUIRE_EXIT_CMDLETS
+                .contains("Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat"),
+            "exit cmdlet pre-flight must verify the WinNAT WMI class is registered/usable"
+        );
     }
 
     #[test]
@@ -8690,6 +8700,18 @@ mod tests {
         assert!(
             WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("$ErrorActionPreference = 'Stop'"),
             "preflight must fail closed on PowerShell errors"
+        );
+        // Fail closed early (with a clear remediation message) on hosts missing
+        // the WinNAT WMI provider, where New-NetNat otherwise fails opaquely with
+        // `Invalid class` only once NAT apply is attempted mid-reconcile.
+        assert!(
+            WINDOWS_PS_PREFLIGHT_EXIT_SERVING
+                .contains("Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat"),
+            "preflight must verify the WinNAT WMI class (MSFT_NetNat) is usable"
+        );
+        assert!(
+            WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("Host Network Service / WinNAT"),
+            "preflight must surface an actionable WinNAT/HNS remediation message"
         );
     }
 
