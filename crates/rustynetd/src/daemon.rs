@@ -879,18 +879,28 @@ impl DaemonBackendMode {
     // disk for the daemon's lifetime; scrubbing it after the first apply would
     // break subsequent recovery attempts.
     //
-    // The Windows WireGuard-NT backend calls sync_persistent_config() on every
-    // peer/route change (configure_peer, update_peer_endpoint, apply_routes,
-    // set_exit_mode), which reads the private key to re-render the DPAPI-encrypted
-    // config file. Scrubbing the key after the first apply breaks subsequent
-    // sync_persistent_config() calls triggered by traversal probe path changes.
+    // The Windows WireGuard-NT backend is NOT in this set: it receives the
+    // decrypted runtime key in process memory (see
+    // `decrypts_runtime_key_in_memory`) and re-renders the DPAPI-encrypted config
+    // from that in-memory copy, so the plaintext key file is scrubbed (and never
+    // written) — encrypted-at-rest custody requires the plaintext form to be
+    // absent.
     fn retains_runtime_key_at_rest(self) -> bool {
         matches!(
             self,
             DaemonBackendMode::LinuxWireguardUserspaceShared
                 | DaemonBackendMode::MacosWireguardUserspaceShared
-                | DaemonBackendMode::WindowsWireguardNt
         )
+    }
+
+    // The Windows WireGuard-NT backend takes the runtime private key in process
+    // memory (decrypted by the daemon from the `.enc` + DPAPI passphrase custody)
+    // instead of reading a plaintext key file, so the plaintext form is never
+    // written to disk and any stale copy is scrubbed. This matches
+    // WireGuard-for-Windows, which keeps the key DPAPI-encrypted at rest and only
+    // in memory + the kernel driver.
+    fn decrypts_runtime_key_in_memory(self) -> bool {
+        matches!(self, DaemonBackendMode::WindowsWireguardNt)
     }
 }
 
@@ -2696,7 +2706,29 @@ impl DaemonBackend {
                                 .to_string(),
                         )
                     })?;
-                    validate_private_key_permissions(private_key)?;
+                    // Encrypted-at-rest custody: when the `.enc` key + DPAPI
+                    // passphrase are provisioned, the daemon decrypts the runtime
+                    // key in process memory and hands it to the backend, and the
+                    // plaintext key file is scrubbed (never read, never required)
+                    // — matching WireGuard-for-Windows. Only fall back to the
+                    // plaintext key path before key init has provisioned custody.
+                    let in_memory_custody = match (
+                        config.wg_encrypted_private_key_path.as_deref(),
+                        config.wg_key_passphrase_path.as_deref(),
+                    ) {
+                        (Some(encrypted_path), Some(passphrase_path))
+                            if encrypted_path.exists() =>
+                        {
+                            Some((encrypted_path, passphrase_path))
+                        }
+                        _ => None,
+                    };
+                    // The plaintext key file is only required (and permission-
+                    // checked) when no in-memory custody is active; with custody
+                    // it is intentionally absent (scrubbed after bootstrap).
+                    if in_memory_custody.is_none() {
+                        validate_private_key_permissions(private_key)?;
+                    }
                     let config_path =
                         default_windows_tunnel_service_config_path(config.wg_interface.as_str());
                     validate_runtime_file_path(config_path.as_path(), "windows tunnel config")?;
@@ -2711,6 +2743,26 @@ impl DaemonBackend {
                         config.wg_listen_port,
                     )
                     .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+                    let backend = if let Some((encrypted_path, passphrase_path)) = in_memory_custody
+                    {
+                        let mut decrypted = decrypt_private_key(encrypted_path, passphrase_path)
+                            .map_err(|err| {
+                                DaemonError::InvalidConfig(format!(
+                                    "windows runtime key in-memory decrypt failed: {err}"
+                                ))
+                            })?;
+                        let parsed =
+                            std::str::from_utf8(&decrypted).map(|key| key.trim().to_owned());
+                        decrypted.fill(0);
+                        let key = parsed.map_err(|err| {
+                            DaemonError::InvalidConfig(format!(
+                                "decrypted windows runtime key is not valid UTF-8: {err}"
+                            ))
+                        })?;
+                        backend.with_runtime_private_key(zeroize::Zeroizing::new(key))
+                    } else {
+                        backend
+                    };
                     Ok(Self::Windows(backend))
                 }
                 #[cfg(not(windows))]
@@ -8954,6 +9006,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     );
     resolve_configured_egress_interface(&mut config)?;
     normalize_windows_dns_resolver_bind_addr(&mut config);
+    normalize_windows_key_custody_paths(&mut config);
     validate_daemon_config(&config)?;
     #[cfg(windows)]
     {
@@ -9830,6 +9883,15 @@ fn prepare_runtime_wireguard_key_material(
         })?;
         let mut decrypted = decrypt_private_key(encrypted_path, passphrase_path)
             .map_err(|err| format!("wg key decrypt failed: {err}"))?;
+        if backend_mode.decrypts_runtime_key_in_memory() {
+            // Encrypted-at-rest custody with an in-memory backend (Windows
+            // WireGuard-NT): the decrypt above proves the key + passphrase are
+            // valid (fail-fast at startup), but the plaintext is NOT persisted —
+            // the backend receives it in memory at construction and any stale
+            // plaintext file is scrubbed after bootstrap.
+            decrypted.fill(0);
+            return Ok(());
+        }
         let write_result = write_runtime_private_key(runtime_path, &decrypted);
         decrypted.fill(0);
         if let Err(err) = write_result {
@@ -10330,6 +10392,46 @@ fn normalize_windows_dns_resolver_bind_addr(config: &mut DaemonConfig) {
     }
 }
 
+/// Default the Windows backend's encrypted-at-rest key custody paths.
+///
+/// The Windows service env-file passes only the backend + policy flags, not the
+/// key paths, so `wg_encrypted_private_key_path` / `wg_key_passphrase_path` would
+/// stay `None` and the daemon would read the *plaintext* runtime key — failing
+/// the key-custody validator ("plaintext runtime private key must not exist at
+/// rest"). Point them at the reviewed Windows custody locations so the daemon
+/// decrypts the key in memory from the `.enc` + LocalMachine DPAPI passphrase and
+/// the plaintext form is scrubbed and never written. Only fills unset paths
+/// (an explicit operator value is preserved) and only for the Windows backend, so
+/// Linux/macOS key handling is untouched.
+fn normalize_windows_key_custody_paths(config: &mut DaemonConfig) {
+    if config.backend_mode != DaemonBackendMode::WindowsWireguardNt {
+        return;
+    }
+    if config.wg_encrypted_private_key_path.is_none() {
+        config.wg_encrypted_private_key_path =
+            Some(PathBuf::from(DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH));
+    }
+    if config.wg_key_passphrase_path.is_none() {
+        config.wg_key_passphrase_path = Some(PathBuf::from(DEFAULT_WG_KEY_PASSPHRASE_PATH));
+    }
+}
+
+/// Whether the (Windows) backend sources its runtime private key from the
+/// in-memory encrypted-at-rest custody rather than a plaintext key file. True
+/// only when the backend decrypts in memory and both custody artifacts are
+/// configured with the `.enc` file present — in which case the plaintext key is
+/// intentionally absent (decrypted on demand, scrubbed after bootstrap) and must
+/// not be required by permission checks.
+fn windows_in_memory_key_custody_active(config: &DaemonConfig) -> bool {
+    config.backend_mode.decrypts_runtime_key_in_memory()
+        && config
+            .wg_encrypted_private_key_path
+            .as_deref()
+            .map(|path| path.exists())
+            .unwrap_or(false)
+        && config.wg_key_passphrase_path.is_some()
+}
+
 fn resolve_egress_interface_value<F>(configured: &str, detect: F) -> Result<String, String>
 where
     F: FnOnce() -> Result<String, String>,
@@ -10659,7 +10761,12 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
         .requires_runtime_wireguard_key_material()
     {
         if let Some(path) = config.wg_private_key_path.as_ref() {
-            validate_private_key_permissions(path)?;
+            // With encrypted-at-rest custody (Windows) the plaintext key is
+            // intentionally absent — decrypted in memory and scrubbed — so only
+            // permission-check it when it is actually the runtime key source.
+            if !windows_in_memory_key_custody_active(config) {
+                validate_private_key_permissions(path)?;
+            }
         }
         if let Some(path) = config.wg_encrypted_private_key_path.as_ref() {
             validate_private_key_permissions(path)?;
@@ -26029,6 +26136,60 @@ mod tests {
         };
         super::normalize_windows_dns_resolver_bind_addr(&mut other);
         assert_eq!(other.dns_resolver_bind_addr, default_addr);
+    }
+
+    #[test]
+    fn windows_backend_defaults_in_memory_key_custody_paths() {
+        use std::path::Path;
+        // Windows backend with unset custody paths → defaulted to the reviewed
+        // Windows custody locations so the daemon decrypts the key in memory
+        // rather than reading a plaintext key file.
+        let mut win = DaemonConfig {
+            backend_mode: DaemonBackendMode::WindowsWireguardNt,
+            wg_encrypted_private_key_path: None,
+            wg_key_passphrase_path: None,
+            ..DaemonConfig::default()
+        };
+        super::normalize_windows_key_custody_paths(&mut win);
+        assert_eq!(
+            win.wg_encrypted_private_key_path.as_deref(),
+            Some(Path::new(super::DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH))
+        );
+        assert_eq!(
+            win.wg_key_passphrase_path.as_deref(),
+            Some(Path::new(super::DEFAULT_WG_KEY_PASSPHRASE_PATH))
+        );
+
+        // Explicit operator custody paths are preserved, never overridden.
+        let mut win_explicit = DaemonConfig {
+            backend_mode: DaemonBackendMode::WindowsWireguardNt,
+            wg_encrypted_private_key_path: Some(std::path::PathBuf::from("X:\\custom.enc")),
+            wg_key_passphrase_path: Some(std::path::PathBuf::from("X:\\custom.dpapi")),
+            ..DaemonConfig::default()
+        };
+        super::normalize_windows_key_custody_paths(&mut win_explicit);
+        assert_eq!(
+            win_explicit.wg_encrypted_private_key_path.as_deref(),
+            Some(Path::new("X:\\custom.enc"))
+        );
+
+        // Non-Windows backend → custody paths left untouched (Linux/macOS use
+        // their own key handling).
+        let mut other = DaemonConfig {
+            backend_mode: DaemonBackendMode::InMemory,
+            wg_encrypted_private_key_path: None,
+            wg_key_passphrase_path: None,
+            ..DaemonConfig::default()
+        };
+        super::normalize_windows_key_custody_paths(&mut other);
+        assert!(other.wg_encrypted_private_key_path.is_none());
+        assert!(other.wg_key_passphrase_path.is_none());
+
+        // In-memory custody requires the `.enc` to actually exist on disk; the
+        // defaulted Windows path does not exist on the test host, so the helper
+        // reports inactive (the daemon would fall back to the plaintext key).
+        assert!(!super::windows_in_memory_key_custody_active(&win));
+        assert!(!super::windows_in_memory_key_custody_active(&other));
     }
 
     #[test]

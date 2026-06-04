@@ -9,6 +9,7 @@ use rustynet_backend_api::{
 };
 #[cfg(windows)]
 use rustynet_windows_native::{WindowsDpapiScope, dpapi_protect};
+use zeroize::Zeroizing;
 
 use crate::linux_command::{
     WireguardCommandOutput, WireguardCommandRunner, encode_wg_public_key_base64,
@@ -27,6 +28,14 @@ pub struct WindowsWireguardBackend<R: WireguardCommandRunner> {
     tunnel_name: String,
     config_path: PathBuf,
     private_key_path: PathBuf,
+    /// The runtime private key held in process memory, decrypted by the daemon
+    /// from the encrypted-at-rest custody (`.enc` + DPAPI passphrase) and handed
+    /// to the backend via [`Self::with_runtime_private_key`]. When present it is
+    /// the sole source of the `PrivateKey` rendered into the DPAPI-encrypted
+    /// tunnel config — `private_key_path` is never read — so the plaintext key
+    /// never has to exist on disk (matching WireGuard-for-Windows, which keeps
+    /// the key DPAPI-encrypted at rest and only in memory + the kernel driver).
+    runtime_private_key: Option<Zeroizing<String>>,
     wireguard_exe_path: PathBuf,
     wg_exe_path: PathBuf,
     netsh_exe_path: PathBuf,
@@ -70,6 +79,7 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
             tunnel_name,
             config_path,
             private_key_path,
+            runtime_private_key: None,
             wireguard_exe_path,
             wg_exe_path,
             netsh_exe_path,
@@ -82,6 +92,18 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         })
     }
 
+    /// Provide the runtime private key in process memory so the backend never
+    /// reads a plaintext key file. The daemon decrypts the encrypted-at-rest key
+    /// (`.enc` via the DPAPI passphrase) and hands the result here; the value is
+    /// held in a [`Zeroizing`] buffer and scrubbed on drop. With this set,
+    /// `render_config` sources the `PrivateKey` from memory and `ensure_prerequisites`
+    /// no longer requires the plaintext key file to exist on disk.
+    #[must_use]
+    pub fn with_runtime_private_key(mut self, private_key: Zeroizing<String>) -> Self {
+        self.runtime_private_key = Some(private_key);
+        self
+    }
+
     fn ensure_running(&self) -> Result<(), BackendError> {
         if self.running {
             return Ok(());
@@ -92,7 +114,13 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
     }
 
     fn ensure_prerequisites(&self) -> Result<(), BackendError> {
-        ensure_host_file_exists(self.private_key_path.as_path(), "windows private key file")?;
+        // The plaintext key file is only required when no in-memory runtime key
+        // was provided. With encrypted-at-rest custody (Windows), the daemon
+        // hands the decrypted key in via `with_runtime_private_key` and the
+        // plaintext file is intentionally absent, so do not demand it here.
+        if self.runtime_private_key.is_none() {
+            ensure_host_file_exists(self.private_key_path.as_path(), "windows private key file")?;
+        }
         ensure_host_file_exists(
             self.wireguard_exe_path.as_path(),
             "windows wireguard.exe binary",
@@ -232,7 +260,15 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
             BackendError::not_running("windows wireguard backend has no runtime context")
         })?;
         validate_cidr(context.local_cidr.as_str())?;
-        let private_key = read_private_key_value(self.private_key_path.as_path())?;
+        // Prefer the in-memory runtime key (encrypted-at-rest custody); only fall
+        // back to a plaintext key file when no in-memory key was provided.
+        let private_key = match self.runtime_private_key.as_ref() {
+            Some(key) => Zeroizing::new(validate_private_key_value(
+                key.as_str(),
+                "windows in-memory private key",
+            )?),
+            None => Zeroizing::new(read_private_key_value(self.private_key_path.as_path())?),
+        };
         let mut rendered = String::new();
         rendered.push_str("[Interface]\n");
         rendered.push_str("PrivateKey = ");
@@ -521,6 +557,7 @@ impl<R: WireguardCommandRunner + Clone> WindowsWireguardBackend<R> {
             tunnel_name: self.tunnel_name.clone(),
             config_path: self.config_path.clone(),
             private_key_path: self.private_key_path.clone(),
+            runtime_private_key: self.runtime_private_key.clone(),
             wireguard_exe_path: self.wireguard_exe_path.clone(),
             wg_exe_path: self.wg_exe_path.clone(),
             netsh_exe_path: self.netsh_exe_path.clone(),
@@ -612,19 +649,25 @@ fn read_private_key_value(path: &Path) -> Result<String, BackendError> {
             path.display()
         ))
     })?;
-    let key = contents.trim();
+    validate_private_key_value(contents.trim(), "windows private key file")
+}
+
+/// Validate a WireGuard private key value (base64, non-empty) regardless of
+/// whether it came from a plaintext file or the in-memory custody decrypt.
+fn validate_private_key_value(key: &str, source_label: &str) -> Result<String, BackendError> {
+    let key = key.trim();
     if key.is_empty() {
-        return Err(BackendError::invalid_input(
-            "windows private key file must not be empty",
-        ));
+        return Err(BackendError::invalid_input(format!(
+            "{source_label} must not be empty"
+        )));
     }
     if !key
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '='))
     {
-        return Err(BackendError::invalid_input(
-            "windows private key file contains invalid characters",
-        ));
+        return Err(BackendError::invalid_input(format!(
+            "{source_label} contains invalid characters"
+        )));
     }
     Ok(key.to_owned())
 }
