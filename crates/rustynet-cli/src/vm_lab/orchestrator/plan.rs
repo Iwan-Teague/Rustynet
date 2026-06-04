@@ -13,6 +13,7 @@ use crate::vm_lab::orchestrator::stage::final_cleanup::FinalCleanupStage;
 use crate::vm_lab::orchestrator::stage::install::BootstrapHostsStage;
 use crate::vm_lab::orchestrator::stage::membership_init::MembershipInitStage;
 use crate::vm_lab::orchestrator::stage::preflight::PreflightStage;
+use crate::vm_lab::orchestrator::stage::relay_validation::RelayValidationStage;
 use crate::vm_lab::orchestrator::stage::role_switch_matrix::RoleSwitchMatrixStage;
 use crate::vm_lab::orchestrator::stage::source_archive::{
     ArchiveSourceMode, PrepareSourceArchiveStage,
@@ -70,6 +71,10 @@ impl PlanBuilder {
             Box::new(DistributeDnsZoneStage),
             Box::new(EnforceBaselineRuntimeStage),
             Box::new(ValidateBaselineRuntimeStage),
+            // Relay-service-lifecycle proof for any Relay node — folds the
+            // formerly Linux-only relay test bin in, cross-OS. Runs after
+            // baseline-runtime validation, before the traffic matrix.
+            Box::new(RelayValidationStage),
             Box::new(TrafficTestMatrixStage),
             Box::new(RoleSwitchMatrixStage),
             Box::new(ExitHandoffStage),
@@ -84,9 +89,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_18_stages() {
+    fn build_returns_19_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 18, "plan must contain exactly 18 stages");
+        assert_eq!(stages.len(), 19, "plan must contain exactly 19 stages");
     }
 
     #[test]
@@ -96,6 +101,15 @@ mod tests {
         let pos = |id: StageId| stages.iter().position(|s| s.id() == id).unwrap();
         assert!(pos(StageId::ActiveExit) > pos(StageId::ExitHandoff));
         assert!(pos(StageId::ActiveExit) < pos(StageId::Cleanup));
+    }
+
+    #[test]
+    fn relay_validation_runs_after_baseline_runtime_and_before_traffic_matrix() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new().build();
+        let pos = |id: StageId| stages.iter().position(|s| s.id() == id).unwrap();
+        assert!(pos(StageId::RelayValidation) > pos(StageId::ValidateBaselineRuntime));
+        assert!(pos(StageId::RelayValidation) < pos(StageId::TrafficTestMatrix));
     }
 
     #[test]
