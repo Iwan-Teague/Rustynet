@@ -195,6 +195,12 @@ impl NodeAdapter for LinuxNodeAdapter {
         linux_traffic::assert_mesh_client_nat_session(&self.conn)
     }
 
+    // ── Relay runtime deploy ───────────────────────────────────────────────────
+
+    fn deploy_relay_service(&self) -> Result<(), AdapterError> {
+        linux_install::deploy_relay_service(&self.conn)
+    }
+
     // ── Diagnostics + cleanup ─────────────────────────────────────────────────
 
     fn collect_artifacts(&self, dst: &Path) -> Result<(), AdapterError> {

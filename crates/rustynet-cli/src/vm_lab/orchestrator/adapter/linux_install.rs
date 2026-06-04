@@ -14,6 +14,11 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 pub const LINUX_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
 /// Canonical path of `rustynet` CLI on Linux targets.
 pub const LINUX_RUSTYNET_PATH: &str = "/usr/local/bin/rustynet";
+/// Canonical path of the `rustynet-relay` sibling binary on Linux targets.
+/// Built + installed by the bootstrap script (alongside rustynetd / rustynet)
+/// so a node assigned (or later role-switched to) Relay always has it; the
+/// relay *service* is only enabled on Relay nodes by `DeployRelayServiceStage`.
+pub const LINUX_RUSTYNET_RELAY_PATH: &str = "/usr/local/bin/rustynet-relay";
 /// Canonical systemd service name.
 pub const LINUX_SERVICE_NAME: &str = "rustynetd";
 /// Daemon UNIX socket path.
@@ -100,6 +105,7 @@ pub fn install_daemon(
     // already a precondition of the bootstrap path.
     let verify_script = format!(
         "test -x {LINUX_RUSTYNETD_PATH} && test -x {LINUX_RUSTYNET_PATH} && \
+         test -x {LINUX_RUSTYNET_RELAY_PATH} && \
          sudo -n test -f /var/lib/rustynet/keys/wireguard.pub && \
          getent group rustynetd >/dev/null 2>&1",
     );
@@ -198,6 +204,120 @@ pub fn enforce_daemon(
     Ok(())
 }
 
+/// Deploy the `rustynet-relay` sibling service onto this Relay node so the
+/// `relay_validation` stage has a live relay to prove.
+///
+/// The relay binary is already present at [`LINUX_RUSTYNET_RELAY_PATH`] (built +
+/// installed by the bootstrap script while the network was open). This step
+/// supplies the two things the unit needs that the baseline install does not:
+///
+///   1. The relay `--verifier-key`: `rustynet-relay` loads it as raw 32 bytes,
+///      and its systemd unit fail-closes (`ExecStartPre`) if the file is absent.
+///      We derive it from the assignment authority public key the orchestrator
+///      already distributed to this node as `/etc/rustynet/assignment.pub` (hex)
+///      — the same control-plane verifier the relay must trust, and a PUBLIC key
+///      (never secret), so it is safe to read, decode, and re-place. Decoding to
+///      raw bytes happens in Rust (fail-closed on a short / non-hex key); the
+///      bytes are shipped via scp + `install` so no data is ever interpolated
+///      into a shell string and the guest needs no `xxd`.
+///   2. The installed + enabled `rustynet-relay.service`, via the shared
+///      `ops install-systemd-relay` helper — the one hardened relay-install path
+///      (also used by the role-transition orchestrator). It reads the unit from
+///      `scripts/systemd/rustynet-relay.service` relative to the source root the
+///      bootstrap extracted to (`$HOME/Rustynet`), so it runs with that cwd.
+///
+/// Fail-closed throughout: a missing assignment key, a malformed key, or a
+/// failed install all surface as `Err`.
+pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let short_timeout = Duration::from_secs(30);
+
+    // 1. Read the already-distributed assignment authority pubkey (hex). It
+    //    lives at /etc/rustynet/assignment.pub (placed by
+    //    distribute_verifier_key(Assignment) during DistributeAssignments).
+    //    /etc/rustynet is 0750 root:rustynetd, so read it with sudo -n.
+    let assignment_hex = ssh::run_remote(
+        conn,
+        "sudo -n cat /etc/rustynet/assignment.pub",
+        short_timeout,
+    )?;
+
+    // 2. Decode hex -> raw 32 bytes (fail-closed); the relay --verifier-key
+    //    loader requires exactly 32 raw bytes.
+    let verifier_bytes = decode_assignment_pubkey_hex(&assignment_hex)
+        .map_err(|message| AdapterError::Protocol { message })?;
+
+    // 3. Ship the raw verifier key to the host and install it at the unit's
+    //    fail-closed-checked path (mode 0644). scp the bytes (no shell data
+    //    interpolation), then install with a constant command.
+    let tmp = write_temp_file("rn_relay_verifier_", ".pub", &verifier_bytes)?;
+    let ship = ssh::scp_to(
+        conn,
+        tmp.as_path(),
+        "/tmp/rn-relay-verifier.pub",
+        short_timeout,
+    );
+    let _ = std::fs::remove_file(&tmp);
+    ship?;
+    ssh::run_remote(
+        conn,
+        "sudo -n sh -c 'install -d -m 0750 /etc/rustynet && \
+         install -m 0644 /tmp/rn-relay-verifier.pub /etc/rustynet/relay-verifier.pub && \
+         rm -f /tmp/rn-relay-verifier.pub'",
+        short_timeout,
+    )?;
+
+    // 4. Install + enable + start rustynet-relay.service via the shared helper.
+    //    It reads scripts/systemd/rustynet-relay.service relative to cwd, so run
+    //    from the source root the bootstrap extracted to ($HOME/Rustynet). The
+    //    source dir is passed only inside a single-quoted env assignment; the
+    //    executed shell body is a compile-time constant.
+    let home = ssh::run_remote(conn, "echo $HOME", Duration::from_secs(10))?
+        .trim()
+        .to_owned();
+    if home.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "could not determine $HOME on remote for install-systemd-relay".to_owned(),
+        });
+    }
+    let src_dir = format!("{home}/Rustynet");
+    let src_dir_esc = src_dir.replace('\'', "'\\''");
+    // Absolute CLI path (not bare `rustynet`) so the install never depends on
+    // sudo's PATH inside the root `sh -c`. The executed shell body stays a
+    // compile-time constant; only the source dir is a (single-quoted) value.
+    let install_cmd = format!(
+        "sudo -n env RN_SRC='{src_dir_esc}' sh -c 'cd \"$RN_SRC\" && {LINUX_RUSTYNET_PATH} ops install-systemd-relay'"
+    );
+    ssh::run_remote(conn, &install_cmd, Duration::from_secs(120))?;
+    Ok(())
+}
+
+/// Decode the hex-encoded ed25519 assignment authority public key (as stored at
+/// `/etc/rustynet/assignment.pub`: 64 hex chars, optionally newline-terminated)
+/// into the raw 32-byte form the `rustynet-relay --verifier-key` loader
+/// requires. Fail-closed: rejects short or non-hex input rather than shipping a
+/// malformed trust key. Mirrors the proven bash `head -c 64 | xxd -r -p`, done
+/// in Rust so the guest needs no `xxd`.
+fn decode_assignment_pubkey_hex(raw: &str) -> Result<Vec<u8>, String> {
+    let hex64: Vec<char> = raw.trim().chars().take(64).collect();
+    if hex64.len() < 64 {
+        return Err(format!(
+            "assignment.pub too short to be a 32-byte ed25519 key: {} hex chars (need >= 64)",
+            hex64.len()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(32);
+    for pair in hex64.chunks(2) {
+        let hi = pair[0]
+            .to_digit(16)
+            .ok_or_else(|| format!("assignment.pub contains a non-hex character: {:?}", pair[0]))?;
+        let lo = pair[1]
+            .to_digit(16)
+            .ok_or_else(|| format!("assignment.pub contains a non-hex character: {:?}", pair[1]))?;
+        bytes.push((hi * 16 + lo) as u8);
+    }
+    Ok(bytes)
+}
+
 /// Start the rustynetd systemd service.
 ///
 /// In the orchestration pipeline, prefer `enforce_daemon` over this function:
@@ -235,10 +355,21 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
         "sudo ip link delete rustynet0 2>/dev/null || true",
         Duration::from_secs(10),
     );
+    // Tear down the rustynet-relay sibling service first (best-effort — most
+    // nodes never had it). Then remove both binaries, both unit files, the
+    // relay env file, and all state dirs (incl the relay replay store under
+    // /var/lib/rustynet and the relay runtime dir). Leaving a stranded relay
+    // unit/binary would let a prior run's relay keep binding :4500 across runs.
     ssh::run_remote(
         conn,
         &format!(
-            "sudo rm -f {LINUX_RUSTYNETD_PATH} {LINUX_RUSTYNET_PATH} /etc/systemd/system/rustynetd.service && sudo systemctl daemon-reload 2>/dev/null || true && sudo rm -rf /etc/rustynet /var/lib/rustynet /run/rustynet",
+            "sudo systemctl stop rustynet-relay.service 2>/dev/null || true; \
+             sudo systemctl disable rustynet-relay.service 2>/dev/null || true; \
+             sudo rm -f {LINUX_RUSTYNETD_PATH} {LINUX_RUSTYNET_PATH} {LINUX_RUSTYNET_RELAY_PATH} \
+                        /etc/systemd/system/rustynetd.service /etc/systemd/system/rustynet-relay.service \
+                        /etc/default/rustynet-relay && \
+             sudo systemctl daemon-reload 2>/dev/null || true && \
+             sudo rm -rf /etc/rustynet /var/lib/rustynet /run/rustynet /run/rustynet-relay",
         ),
         timeout,
     )?;
@@ -364,5 +495,60 @@ mod tests {
             BOOTSTRAP_SCRIPT.contains("rn_bootstrap.sh"),
             "embedded script must contain its own name"
         );
+    }
+
+    #[test]
+    fn bootstrap_script_builds_and_installs_the_relay_binary() {
+        // The relay runtime deploy stage assumes the bootstrap built + installed
+        // rustynet-relay (the deploy stage only places the verifier key + unit).
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("-p rustynet-relay --features daemon"),
+            "bootstrap must build the rustynet-relay binary"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("install -m 0755 target/release/rustynet-relay"),
+            "bootstrap must install rustynet-relay to /usr/local/bin"
+        );
+    }
+
+    #[test]
+    fn decode_assignment_pubkey_hex_decodes_64_hex_to_32_bytes() {
+        let hex = "ff".repeat(32); // 64 hex chars
+        let bytes = decode_assignment_pubkey_hex(&hex).expect("valid 64-hex key");
+        assert_eq!(bytes.len(), 32);
+        assert!(bytes.iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn decode_assignment_pubkey_hex_tolerates_trailing_newline() {
+        // assignment.pub is newline-terminated on disk.
+        let hex = format!("{}\n", "00".repeat(32));
+        let bytes = decode_assignment_pubkey_hex(&hex).expect("trailing newline tolerated");
+        assert_eq!(bytes, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn decode_assignment_pubkey_hex_decodes_mixed_case() {
+        // Upper + lower hex must both decode (0x0a, 0xb1, then 30 zero bytes).
+        let hex = format!("0aB1{}", "00".repeat(30));
+        let bytes = decode_assignment_pubkey_hex(&hex).expect("mixed-case hex");
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[0], 0x0a);
+        assert_eq!(bytes[1], 0xb1);
+    }
+
+    #[test]
+    fn decode_assignment_pubkey_hex_rejects_short_key_fail_closed() {
+        // Fewer than 64 hex chars must fail closed rather than ship a short key.
+        let err = decode_assignment_pubkey_hex("deadbeef").expect_err("short key must fail");
+        assert!(err.contains("too short"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_assignment_pubkey_hex_rejects_non_hex_fail_closed() {
+        // 64 chars but not all hex (leading 'z') must fail closed.
+        let bad = format!("zz{}", "00".repeat(31)); // 64 chars, leading non-hex
+        let err = decode_assignment_pubkey_hex(&bad).expect_err("non-hex must fail");
+        assert!(err.contains("non-hex"), "got: {err}");
     }
 }

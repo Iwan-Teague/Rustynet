@@ -192,6 +192,31 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         })
     }
 
+    // ── Relay runtime deploy (relay role) ─────────────────────────
+
+    /// Deploy + enable + start the `rustynet-relay` sibling service on this
+    /// (relay) node so the downstream `relay_validation` stage has a live relay
+    /// to prove. Mirrors the proven bash relay-deploy: derive the relay
+    /// verifier key (raw 32 bytes) from the assignment authority public key the
+    /// orchestrator already distributed to the node, install it at the unit's
+    /// fail-closed-checked path, then install + enable + start the service via
+    /// the shared `ops install-systemd-relay` helper. The relay binary itself is
+    /// built + installed by the bootstrap script while the network is still open.
+    ///
+    /// Default: not implemented for this platform's adapter (fail closed). The
+    /// `DeployRelayService` stage reports macOS/Windows relay nodes as named
+    /// skips, gated on [`NodeRole::is_supported_for_platform`], pending cross-OS
+    /// Phase 8 evidence — so this default is reached only via an internal bug,
+    /// never on a normally-gated run.
+    fn deploy_relay_service(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::UnsupportedPlatform {
+            platform: self.platform(),
+            message:
+                "relay runtime deploy is implemented for the Linux relay adapter (macOS/Windows pending cross-OS Phase 8 evidence)"
+                    .to_owned(),
+        })
+    }
+
     // ── Cross-OS remote shell (role-validation stages) ────────────
 
     /// Build a cross-OS [`RemoteShellHost`] for this node from its SSH

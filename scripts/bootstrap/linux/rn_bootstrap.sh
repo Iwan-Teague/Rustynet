@@ -443,12 +443,22 @@ run_root bash -c 'rm -f /etc/resolv.conf; printf "nameserver 1.1.1.1\nnameserver
 # state. Mirrors the macOS bootstrap's existing `cargo build --offline` path.
 if wait_for_cargo_registry_endpoint; then
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
+  # rustynet-relay is a separate binary whose bin target requires the `daemon`
+  # feature, so it builds as its own invocation. Built on every node (cheap —
+  # its deps are already compiled for rustynetd) so a node assigned, or later
+  # role-switched, to the relay/anchor preset always has the binary; the relay
+  # *service* is only enabled on Relay nodes by the orchestrator's
+  # DeployRelayService stage. Built here while the registry is reachable —
+  # later stages run behind the killswitch where a cargo build cannot.
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-relay --features daemon
 else
   echo "[bootstrap] cargo registry unreachable; falling back to offline build from cargo cache" >&2
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynetd -p rustynet-cli
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-relay --features daemon
 fi
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
+run_root install -m 0755 target/release/rustynet-relay /usr/local/bin/rustynet-relay
 backend_env=()
 if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
   backend_env+=(RUSTYNET_BACKEND="${RUSTYNET_BACKEND}")
