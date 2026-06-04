@@ -20,6 +20,17 @@ use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageI
 /// final cleanup tears the mesh down. A host lacking the WinNAT/HNS networking
 /// stack fails closed here with a clear remediation message from the exit
 /// preflight, rather than passing a split-tunnel-only run as if the exit served.
+///
+/// The stage body is platform-agnostic: it drives the `NodeAdapter` exit-serving
+/// methods, so it exercises a Windows exit (WinNAT) and a Linux exit (nftables
+/// MASQUERADE) identically. On Linux the activation advertises `0.0.0.0/0` over
+/// the daemon's UNIX control socket, the daemon applies IPv4 forwarding + a
+/// `rustynet_nat_g<N>` masquerade table, and the NAT-session assertion matches a
+/// `100.64.0.0/10`-sourced translated conntrack entry. macOS Exit maps to the
+/// `blind_exit` role, whose pf NAT is applied at enforce-time (not via route
+/// advertise) and whose pf anchor is hard-locked across cleanup; that does not
+/// fit this activate→assert→nat-session shape, so the macOS adapter keeps the
+/// fail-closed default here (scoped follow-up).
 pub struct ActiveExitStage;
 
 impl OrchestrationStage for ActiveExitStage {

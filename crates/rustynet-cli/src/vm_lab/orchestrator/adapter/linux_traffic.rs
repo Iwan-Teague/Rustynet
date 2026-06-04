@@ -216,6 +216,138 @@ pub fn drive_exit_egress_probe(conn: &NodeConnection) -> Result<(), AdapterError
     }
 }
 
+/// The Linux daemon's local control socket (a UNIX-domain socket, mode 770
+/// root:rustynetd). Mirrors `rustynetd::daemon::DEFAULT_SOCKET_PATH` for the
+/// Linux build; the orchestrator's SSH user is non-root, so every command that
+/// talks to it is wrapped in `sudo -n`. Kept as a single constant so the
+/// route-advertise activation and any future socket-bound probe stay in sync
+/// with the daemon.
+const LINUX_DAEMON_SOCKET: &str = "/run/rustynet/rustynetd.sock";
+
+/// Activate full-tunnel exit-serving on the Linux exit: advertise the default
+/// route (`0.0.0.0/0`) to the live daemon over its control socket. This is the
+/// operator "become an exit node" action — the daemon responds by applying IPv4
+/// forwarding + an nftables MASQUERADE NAT table (`apply_nat_forwarding` in
+/// rustynetd `phase10`) for mesh client traffic. The lab's standard flow never
+/// sends it, so an exit otherwise only validates its role/posture/mesh, never
+/// active NAT egress.
+///
+/// The invocation is the same one the live bash orchestrator drives:
+/// `sudo -n env RUSTYNET_DAEMON_SOCKET=<sock> rustynet route advertise
+/// 0.0.0.0/0` — every token is a compile-time constant (no untrusted
+/// interpolation), so it is argv-only-safe. On the daemon rejecting the
+/// advertisement (e.g. a node not permitted to serve / restricted / safe-mode),
+/// `rustynet` exits non-zero and prints the daemon's own reason
+/// (`route advertise denied: <reason>`); that surfaces here as the returned
+/// error so a host that cannot serve fails closed with a clear message. The
+/// stage additionally appends `collect_daemon_failure_reason` for defence in
+/// depth.
+pub fn activate_exit_serving(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let script = format!(
+        "sudo -n env RUSTYNET_DAEMON_SOCKET={LINUX_DAEMON_SOCKET} \
+         rustynet route advertise 0.0.0.0/0"
+    );
+    match ssh::run_remote(conn, &script, SHORT_TIMEOUT) {
+        Ok(_) => Ok(()),
+        // A non-zero exit carries the daemon's own rejection reason. `rustynet`
+        // prints its error to stdout (`error [..]: route advertise denied: ..`);
+        // run_remote folds that stdout tail into the Command stderr when the
+        // process stderr is empty, so the captured text holds the cause.
+        Err(AdapterError::Command { stderr, .. }) => Err(AdapterError::Protocol {
+            message: format!(
+                "daemon rejected exit-serving route advertisement: {}",
+                stderr.trim()
+            ),
+        }),
+        Err(other) => Err(other),
+    }
+}
+
+/// Assert the Linux exit is ACTIVELY serving as a full-tunnel exit — proving the
+/// dataplane actually came up, not merely that the exit role is held. Asserts
+/// BOTH:
+///   (a) IPv4 forwarding is enabled (`/proc/sys/net/ipv4/ip_forward` == `1`), and
+///   (b) an nftables MASQUERADE rule exists in the rustynet NAT table
+///       (`table ip rustynet_nat_g<N>`, chain `postrouting`, a `… masquerade`
+///       rule on the egress interface), built by `apply_nat_forwarding` in
+///       rustynetd `phase10` (the `rustynet_nat_g{generation}` ip table with a
+///       `oifname <egress> masquerade` rule under the postrouting nat chain).
+///
+/// Fails closed: an empty/missing ruleset, forwarding disabled, or no masquerade
+/// rule => `Err`. A non-NATing exit must NOT pass.
+pub fn assert_exit_actively_serving(conn: &NodeConnection) -> Result<(), AdapterError> {
+    // (a) IPv4 forwarding. Read the sysctl directly; trim because the file is
+    // newline-terminated. `cat` of a world-readable proc file needs no sudo.
+    let fwd = ssh::run_remote(
+        conn,
+        "cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo MISSING",
+        SHORT_TIMEOUT,
+    )?;
+    if fwd.trim() != "1" {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "Linux exit is not actively serving: IPv4 forwarding not enabled \
+                 (/proc/sys/net/ipv4/ip_forward = {})",
+                fwd.trim()
+            ),
+        });
+    }
+
+    // (b) nftables MASQUERADE rule in the rustynet NAT table. /run + nft state
+    // are root-only, so the ruleset dump needs sudo.
+    let ruleset = ssh::run_remote(
+        conn,
+        "sudo -n nft list ruleset 2>/dev/null || true",
+        SHORT_TIMEOUT,
+    )?;
+    if !ruleset_has_rustynet_masquerade(&ruleset) {
+        return Err(AdapterError::Protocol {
+            message:
+                "Linux exit is not actively serving: no rustynet NAT masquerade rule found in \
+                 nft ruleset (expected `table ip rustynet_nat_g<N>` with a masquerade rule)"
+                    .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// On the Linux exit, assert a conntrack entry shows a mesh-sourced
+/// (`100.64.0.0/10`) client flow being NAT-translated outbound — direct proof
+/// that a client's full-tunnel traffic egresses via THIS exit's NAT (the W1/D7
+/// "client mesh traffic egresses via the exit" evidence). Retries internally to
+/// cover the client's full-tunnel convergence + the egress-probe window.
+///
+/// Reads conntrack via `conntrack -L`, falling back to `/proc/net/nf_conntrack`
+/// when the `conntrack` tool is absent, and matches a line whose ORIGINAL `src`
+/// is in `100.64.0.0/10` AND whose reply tuple is translated (the reply `dst`
+/// differs from the original `src`, i.e. SNAT/masquerade rewrote the source).
+///
+/// Fails closed: no matching translated mesh flow => `Err`.
+pub fn assert_mesh_client_nat_session(conn: &NodeConnection) -> Result<(), AdapterError> {
+    // conntrack -L is the canonical view; if the userspace tool is missing fall
+    // back to the kernel's /proc/net/nf_conntrack. Both are root-readable only.
+    let probe = "if command -v conntrack >/dev/null 2>&1; then \
+             sudo -n conntrack -L 2>/dev/null; \
+         else \
+             sudo -n cat /proc/net/nf_conntrack 2>/dev/null; \
+         fi || true";
+    for attempt in 0..10 {
+        let out = ssh::run_remote(conn, probe, MEDIUM_TIMEOUT)?;
+        if out.lines().any(conntrack_line_is_translated_mesh) {
+            return Ok(());
+        }
+        if attempt < 9 {
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+    }
+    Err(AdapterError::Protocol {
+        message:
+            "Linux exit shows no conntrack session translating a mesh-sourced (100.64.0.0/10) \
+             client address outbound (no client-egress NAT session converged)"
+                .to_owned(),
+    })
+}
+
 /// Collect diagnostic artifacts from the remote host to `dst`.
 /// Key material paths (`*/keys/*`, `*.priv`, `*.pem`) MUST NOT appear in
 /// the archive. This is enforced by the `--exclude` arguments to tar and
@@ -535,6 +667,91 @@ fn validate_ip_arg(ip: &str) -> Result<(), AdapterError> {
     }
 }
 
+/// True when `addr` (a bare IPv4 dotted-quad) is in the mesh CGNAT range
+/// `100.64.0.0/10` — first octet 100, second octet 64–127. Mirrors the Windows
+/// adapter's mesh-source classification so the cross-OS NAT-session evidence is
+/// defined identically. Non-IPv4 / malformed input returns false (fail closed).
+fn is_mesh_source_addr(addr: &str) -> bool {
+    let mut octets = addr.split('.');
+    let (Some(a), Some(b), Some(c), Some(d), None) = (
+        octets.next(),
+        octets.next(),
+        octets.next(),
+        octets.next(),
+        octets.next(),
+    ) else {
+        return false;
+    };
+    let parse = |s: &str| s.parse::<u8>().ok();
+    match (parse(a), parse(b), parse(c), parse(d)) {
+        (Some(a), Some(b), Some(_), Some(_)) => a == 100 && (64..=127).contains(&b),
+        _ => false,
+    }
+}
+
+/// True when the nft ruleset dump contains the rustynet exit NAT masquerade
+/// rule: a `table ip rustynet_nat_g<N>` AND a `masquerade` verb somewhere in the
+/// dump. Built by `apply_nat_forwarding` in rustynetd `phase10` (the
+/// `rustynet_nat_g{generation}` ip table whose postrouting nat chain carries an
+/// `oifname <egress> masquerade` rule). This matches the same two anchors the
+/// live bash orchestrator asserts for an exit/admin firewall snapshot
+/// (`table ip rustynet_nat_g[0-9]+` + `masquerade`). Fail closed: a dump with
+/// the table but no masquerade verb, or vice-versa, returns false — a
+/// non-NATing exit must not pass.
+fn ruleset_has_rustynet_masquerade(ruleset: &str) -> bool {
+    let has_nat_table = ruleset.lines().any(|line| {
+        let t = line.trim();
+        // `table ip rustynet_nat_g<N> {` — require a trailing digit so a bare
+        // `rustynet_nat_g` prefix without a generation cannot match.
+        if let Some(rest) = t.strip_prefix("table ip rustynet_nat_g") {
+            rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+        } else {
+            false
+        }
+    });
+    let has_masquerade = ruleset
+        .lines()
+        .any(|line| line.split_whitespace().any(|tok| tok == "masquerade"));
+    has_nat_table && has_masquerade
+}
+
+/// True when a single conntrack line (`conntrack -L` or `/proc/net/nf_conntrack`
+/// row) shows a mesh-sourced (`100.64.0.0/10`) flow that has been NAT-translated
+/// outbound. A conntrack row carries two tuples: the ORIGINAL direction
+/// (`src=<client> dst=<dest> …`) and the REPLY direction (`src=<dest>
+/// dst=<post-SNAT-src> …`). Under source-NAT/masquerade the reply `dst` (where
+/// return traffic is sent — the exit's WAN address) differs from the original
+/// `src` (the mesh client). We therefore require:
+///   - the FIRST `src=` (original source) is a mesh address, AND
+///   - a later `dst=` value (the reply destination) exists that differs from
+///     that original source — i.e. the source was rewritten (translated).
+///
+/// Fail closed: a mesh-sourced but UNtranslated flow (reply dst == original src,
+/// e.g. `[UNREPLIED]` with no SNAT yet, or intra-mesh traffic) returns false, as
+/// does any non-mesh-sourced line.
+fn conntrack_line_is_translated_mesh(line: &str) -> bool {
+    // Collect the ordered list of src= and dst= values across both tuples.
+    let mut srcs: Vec<&str> = Vec::new();
+    let mut dsts: Vec<&str> = Vec::new();
+    for tok in line.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("src=") {
+            srcs.push(v);
+        } else if let Some(v) = tok.strip_prefix("dst=") {
+            dsts.push(v);
+        }
+    }
+    // Need both directions present (original + reply): >=2 src and >=2 dst.
+    let (Some(orig_src), Some(reply_dst)) = (srcs.first(), dsts.get(1)) else {
+        return false;
+    };
+    if !is_mesh_source_addr(orig_src) {
+        return false;
+    }
+    // Translated iff the reply destination (post-SNAT source) differs from the
+    // original source. Equal => no SNAT was applied (untranslated) => reject.
+    orig_src != reply_dst
+}
+
 fn decode_wireguard_pubkey_to_hex(value: &str) -> Result<String, String> {
     let decoded = base64_decode_simple(value.as_bytes())
         .map_err(|err| format!("base64 decode of WireGuard public key failed: {err}"))?;
@@ -693,6 +910,138 @@ mod tests {
         assert!(validate_ip_arg("10.0.0.1; rm -rf /").is_err());
         assert!(validate_ip_arg("$(whoami)").is_err());
         assert!(validate_ip_arg("10.0.0.1 && id").is_err());
+    }
+
+    // ── Active full-tunnel exit serving ────────────────────────────────────────
+
+    #[test]
+    fn activate_exit_serving_uses_constant_argv_over_daemon_socket() {
+        // Argv-only safety + parity with the live bash orchestrator: the
+        // advertise command must be all compile-time constants (no untrusted
+        // interpolation), target the Linux daemon socket, and advertise the
+        // default route over `sudo -n`.
+        assert_eq!(LINUX_DAEMON_SOCKET, "/run/rustynet/rustynetd.sock");
+        let script = format!(
+            "sudo -n env RUSTYNET_DAEMON_SOCKET={LINUX_DAEMON_SOCKET} \
+             rustynet route advertise 0.0.0.0/0"
+        );
+        assert!(script.contains("sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock"));
+        assert!(script.contains("rustynet route advertise 0.0.0.0/0"));
+    }
+
+    #[test]
+    fn is_mesh_source_addr_accepts_cgnat_range_only() {
+        // In-range: 100.64.0.0 – 100.127.255.255.
+        assert!(is_mesh_source_addr("100.64.0.1"));
+        assert!(is_mesh_source_addr("100.100.5.9"));
+        assert!(is_mesh_source_addr("100.127.255.254"));
+        // Out of range: second octet below 64 or above 127, or wrong first octet.
+        assert!(!is_mesh_source_addr("100.63.0.1"));
+        assert!(!is_mesh_source_addr("100.128.0.1"));
+        assert!(!is_mesh_source_addr("10.0.0.1"));
+        assert!(!is_mesh_source_addr("1.1.1.1"));
+        // Malformed / non-IPv4 fails closed.
+        assert!(!is_mesh_source_addr("100.64.0"));
+        assert!(!is_mesh_source_addr("100.64.0.1.5"));
+        assert!(!is_mesh_source_addr("garbage"));
+        assert!(!is_mesh_source_addr(""));
+        assert!(!is_mesh_source_addr("100.300.0.1"));
+    }
+
+    #[test]
+    fn ruleset_has_rustynet_masquerade_requires_nat_table_and_masquerade() {
+        // Real-shape nft dump from an active Linux exit: the rustynet_nat_g<N> ip
+        // table with a postrouting masquerade rule on the egress interface.
+        let active = "\
+table inet rustynet_g1 {
+\tchain killswitch {
+\t\ttype filter hook output priority filter; policy drop;
+\t}
+}
+table ip rustynet_nat_g1 {
+\tchain postrouting {
+\t\ttype nat hook postrouting priority srcnat; policy accept;
+\t\toifname \"en0\" masquerade
+\t}
+}
+";
+        assert!(ruleset_has_rustynet_masquerade(active));
+    }
+
+    #[test]
+    fn ruleset_has_rustynet_masquerade_fails_closed() {
+        // Empty ruleset (no NAT applied) => not serving.
+        assert!(!ruleset_has_rustynet_masquerade(""));
+        // NAT table present but NO masquerade verb => not actually NATing.
+        let table_no_masq = "\
+table ip rustynet_nat_g2 {
+\tchain postrouting {
+\t\ttype nat hook postrouting priority srcnat; policy accept;
+\t}
+}
+";
+        assert!(!ruleset_has_rustynet_masquerade(table_no_masq));
+        // masquerade present but in a NON-rustynet table => not our exit NAT.
+        let foreign_masq = "\
+table ip other_nat {
+\tchain postrouting {
+\t\toifname \"en0\" masquerade
+\t}
+}
+";
+        assert!(!ruleset_has_rustynet_masquerade(foreign_masq));
+        // The bare prefix without a generation digit must not match.
+        let no_generation = "table ip rustynet_nat_g {\n\t\toifname \"en0\" masquerade\n}";
+        assert!(!ruleset_has_rustynet_masquerade(no_generation));
+    }
+
+    #[test]
+    fn conntrack_line_accepts_translated_mesh_source() {
+        // A real `conntrack -L` line: a mesh client (100.64.0.3) connecting out
+        // to 1.1.1.1; the reply tuple's dst is the exit's WAN address
+        // (192.168.1.50) — i.e. the source was SNAT/masquerade-translated.
+        let line = "tcp      6 117 SYN_SENT src=100.64.0.3 dst=1.1.1.1 sport=54321 \
+            dport=443 [UNREPLIED] src=1.1.1.1 dst=192.168.1.50 sport=443 dport=54321 mark=0 use=1";
+        assert!(conntrack_line_is_translated_mesh(line));
+    }
+
+    #[test]
+    fn conntrack_line_accepts_proc_nf_conntrack_shape() {
+        // /proc/net/nf_conntrack rows carry a leading `ipv4 2 tcp 6 …` prefix but
+        // the same src=/dst= tuple layout.
+        let line = "ipv4     2 tcp      6 431999 ESTABLISHED src=100.100.1.2 dst=8.8.8.8 \
+            sport=40000 dport=443 src=8.8.8.8 dst=203.0.113.7 sport=443 dport=40000 \
+            [ASSURED] mark=0 use=1";
+        assert!(conntrack_line_is_translated_mesh(line));
+    }
+
+    #[test]
+    fn conntrack_line_rejects_non_mesh_source() {
+        // Original source is a LAN address, not a mesh (100.64/10) client.
+        let line = "tcp      6 117 SYN_SENT src=192.168.1.10 dst=1.1.1.1 sport=54321 \
+            dport=443 [UNREPLIED] src=1.1.1.1 dst=203.0.113.7 sport=443 dport=54321 use=1";
+        assert!(!conntrack_line_is_translated_mesh(line));
+    }
+
+    #[test]
+    fn conntrack_line_rejects_untranslated_mesh_flow() {
+        // Mesh-sourced but the reply dst equals the original src (no SNAT applied
+        // — e.g. intra-mesh or a flow the exit is merely routing, not NATing).
+        // Must fail closed: this is NOT proof of egress via the exit's NAT.
+        let line = "tcp      6 117 SYN_SENT src=100.64.0.3 dst=100.64.0.9 sport=54321 \
+            dport=443 [UNREPLIED] src=100.64.0.9 dst=100.64.0.3 sport=443 dport=54321 use=1";
+        assert!(!conntrack_line_is_translated_mesh(line));
+    }
+
+    #[test]
+    fn conntrack_line_rejects_single_tuple_or_empty() {
+        // A line with only the original tuple (no reply) cannot prove translation.
+        let one_tuple = "tcp 6 117 SYN_SENT src=100.64.0.3 dst=1.1.1.1 sport=1 dport=443";
+        assert!(!conntrack_line_is_translated_mesh(one_tuple));
+        assert!(!conntrack_line_is_translated_mesh(""));
+        assert!(!conntrack_line_is_translated_mesh(
+            "garbage line with no tuples"
+        ));
     }
 
     #[test]

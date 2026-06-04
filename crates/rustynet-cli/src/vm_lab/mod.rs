@@ -26789,7 +26789,13 @@ mod tests {
             .collect();
 
         assert_eq!(cli_ids, plan_ids);
-        assert_eq!(cli_ids.len(), 17);
+        // Canonical stage count — must track PlanBuilder::build(). Bump this in
+        // lockstep with plan.rs's `build_returns_N_stages` whenever a stage is
+        // added/removed (the `cli_ids == plan_ids` assert above already proves
+        // the CLI builder and the plan builder stay in sync; this guards the
+        // absolute size). 20 = the 18 baseline + cross-OS relay_validation +
+        // anchor_validation.
+        assert_eq!(cli_ids.len(), 20);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)
