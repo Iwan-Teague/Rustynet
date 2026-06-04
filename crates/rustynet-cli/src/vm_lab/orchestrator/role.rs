@@ -98,25 +98,35 @@ impl NodeRole {
         match platform {
             VmGuestPlatform::Linux | VmGuestPlatform::Windows => match self {
                 NodeRole::Exit => Ok("admin"),
-                // Anchor + Relay run as the `admin` daemon role plus their
-                // signed capabilities (anchor.* / relay_host); they are
-                // control-plane roles, not blind exits.
-                NodeRole::Anchor | NodeRole::Relay => Ok("admin"),
-                NodeRole::Client | NodeRole::Entry | NodeRole::Aux | NodeRole::Extra => {
-                    Ok("client")
-                }
+                // Anchor runs as the `admin` daemon role: it holds the `anchor`
+                // capability the daemon's admin role requires and serves the
+                // control plane. Relay runs as the `client` daemon role — it is
+                // a client that ALSO hosts a relay (relay_host, via a separate
+                // rustynet-relay service). The daemon's admin role requires the
+                // `anchor` capability (membership.rs role↔capability alignment),
+                // which a relay neither holds nor should; running a relay as
+                // admin fail-closes reconcile ("admin requires anchor").
+                NodeRole::Anchor => Ok("admin"),
+                NodeRole::Client
+                | NodeRole::Entry
+                | NodeRole::Aux
+                | NodeRole::Extra
+                | NodeRole::Relay => Ok("client"),
                 NodeRole::Custom(label) => Err(format!(
                     "custom lab role '{label}' has no explicit daemon role mapping"
                 )),
             },
             VmGuestPlatform::Macos => match self {
                 NodeRole::Exit => Ok("blind_exit"),
-                // Anchor + Relay are admin control-plane roles on macOS too
-                // (not blind exits): they run as `admin` plus signed caps.
-                NodeRole::Anchor | NodeRole::Relay => Ok("admin"),
-                NodeRole::Client | NodeRole::Entry | NodeRole::Aux | NodeRole::Extra => {
-                    Ok("client")
-                }
+                // Anchor = admin (holds the `anchor` capability). Relay =
+                // client + relay_host (see the Linux/Windows arm): admin would
+                // fail-close reconcile because admin requires `anchor`.
+                NodeRole::Anchor => Ok("admin"),
+                NodeRole::Client
+                | NodeRole::Entry
+                | NodeRole::Aux
+                | NodeRole::Extra
+                | NodeRole::Relay => Ok("client"),
                 NodeRole::Custom(label) => Err(format!(
                     "custom lab role '{label}' has no explicit daemon role mapping"
                 )),
@@ -478,19 +488,31 @@ mod tests {
     }
 
     #[test]
-    fn anchor_relay_daemon_role_is_admin_on_every_os() {
-        for role in [NodeRole::Anchor, NodeRole::Relay] {
-            for platform in [
-                VmGuestPlatform::Linux,
-                VmGuestPlatform::Macos,
-                VmGuestPlatform::Windows,
-            ] {
-                assert_eq!(
-                    role.daemon_node_role_for_platform(&platform).unwrap(),
-                    "admin",
-                    "{role:?} on {platform:?} runs as the admin daemon role"
-                );
-            }
+    fn anchor_is_admin_relay_is_client_daemon_role_on_every_os() {
+        // Anchor holds the `anchor` capability → admin daemon role. Relay is a
+        // client that hosts a relay (relay_host) → client daemon role; admin
+        // would fail-close reconcile ("admin requires anchor"), which a live
+        // run hit before this split. (A live combined run's membership/baseline
+        // failed with this exact mismatch when relay mapped to admin.)
+        for platform in [
+            VmGuestPlatform::Linux,
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+        ] {
+            assert_eq!(
+                NodeRole::Anchor
+                    .daemon_node_role_for_platform(&platform)
+                    .unwrap(),
+                "admin",
+                "anchor on {platform:?} runs as the admin daemon role"
+            );
+            assert_eq!(
+                NodeRole::Relay
+                    .daemon_node_role_for_platform(&platform)
+                    .unwrap(),
+                "client",
+                "relay on {platform:?} runs as the client daemon role"
+            );
         }
     }
 
