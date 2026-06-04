@@ -43,6 +43,10 @@
 //! * Fail closed: a transport error or a non-zero `anchor list` exit is
 //!   surfaced as `Err`, never a silent pass.
 
+use std::time::Duration;
+
+use sha2::{Digest, Sha256};
+
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
@@ -261,6 +265,354 @@ fn row_has_capability(line: &str, capability: &str) -> bool {
     // boundary check works for the last entry.
     let csv = csv.trim();
     csv.split(',').any(|entry| entry.trim() == capability)
+}
+
+// ── Runtime-dependent bundle-pull substages (cross-OS, gated) ─────────
+//
+// Ported from the formerly Linux-only `live_linux_anchor_test` bin's
+// Phase-29 RemoteShellHost-driven substages. They prove the daemon's
+// anchor bundle-pull listener actually serves the signed membership
+// snapshot to an authorised token, rejects an unauthorised one, and
+// (Linux) redacts the raw token from the journal. Every probe is an
+// explicit RemoteShellHost call (read_file / tcp_send_recv / run_argv)
+// with Rust-side parsing — no shell string is built from a non-constant
+// value. The owning stage runs these only where
+// `NodeRole::Anchor::is_supported_for_platform` holds (Linux today) and
+// reported-skips macOS/Windows, since their bundle-pull token/listener
+// provisioning is not yet wired (cross-OS Phase 8).
+
+/// Linux anchor bundle-pull token path — seeded by `ops install-systemd`
+/// for admin-role nodes (mirrors `ops_install_systemd`'s
+/// `ANCHOR_BUNDLE_PULL_TOKEN_PATH`).
+const LINUX_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str = "/var/lib/rustynet/anchor-bundle-pull.token";
+/// macOS/Windows token paths: best-effort install-layout analogues. The
+/// substages are gated to Linux until Phase 8 wires + evidences the
+/// macOS/Windows bundle-pull token provisioning, so these are not yet
+/// exercised on a live run.
+const MACOS_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str =
+    "/usr/local/var/rustynet/anchor-bundle-pull.token";
+const WINDOWS_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str =
+    "C:\\ProgramData\\RustyNet\\anchor-bundle-pull.token";
+/// Loopback address the daemon binds its bundle-pull listener on (the
+/// `RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR` default in the unit template).
+/// Loopback-only, identical on every OS.
+const ANCHOR_BUNDLE_PULL_ADDR: &str = "127.0.0.1:51822";
+
+/// Per-anchor runtime parameters for the bundle-pull substages, lifted
+/// from the bin's `Config` but carrying only the orchestrator's per-OS
+/// install-path defaults (the SSH transport is the `RemoteShellHost` the
+/// stage already builds). The enrollment-endpoint substage is NOT driven
+/// from here yet: it needs the membership owner signing key + passphrase
+/// credential, which the orchestrator provisions only on the Exit
+/// (membership owner), so it stays a reported-skip pending a trust-model
+/// decision.
+pub struct AnchorRuntimeParams {
+    pub platform: VmGuestPlatform,
+    pub anchor_bundle_pull_addr: String,
+    pub anchor_token_path: String,
+    pub membership_snapshot_path: String,
+}
+
+impl AnchorRuntimeParams {
+    /// Build from the orchestrator's per-OS install-path defaults. The
+    /// membership snapshot path reuses [`anchor_list_invocation`] so it
+    /// stays in lock-step with the capability-advertisement probe.
+    pub fn for_platform(platform: VmGuestPlatform) -> Result<Self, String> {
+        let (_, snapshot, _log) = anchor_list_invocation(platform)?;
+        let anchor_token_path = match platform {
+            VmGuestPlatform::Linux => LINUX_ANCHOR_BUNDLE_PULL_TOKEN_PATH.to_owned(),
+            VmGuestPlatform::Macos => MACOS_ANCHOR_BUNDLE_PULL_TOKEN_PATH.to_owned(),
+            VmGuestPlatform::Windows => WINDOWS_ANCHOR_BUNDLE_PULL_TOKEN_PATH.to_owned(),
+            VmGuestPlatform::Ios | VmGuestPlatform::Android => {
+                return Err(format!(
+                    "anchor runtime validation is only implemented for Linux, macOS, and Windows (got {platform:?})"
+                ));
+            }
+        };
+        Ok(Self {
+            platform,
+            anchor_bundle_pull_addr: ANCHOR_BUNDLE_PULL_ADDR.to_owned(),
+            anchor_token_path,
+            membership_snapshot_path: snapshot,
+        })
+    }
+}
+
+/// Prove the anchor bundle-pull listener returns the signed membership
+/// snapshot byte-for-byte for an authorised token. Copied from the bin's
+/// `validate_bundle_pull_loopback`, re-keyed onto `AnchorRuntimeParams`.
+pub fn validate_bundle_pull_loopback(
+    shell: &dyn RemoteShellHost,
+    params: &AnchorRuntimeParams,
+) -> Result<String, String> {
+    let _ = parse_nc_addr(&params.anchor_bundle_pull_addr)?;
+    let token = read_anchor_token(shell, params)?;
+    let snapshot = shell
+        .read_file(params.membership_snapshot_path.as_str())
+        .map_err(|err| {
+            format!(
+                "anchor bundle-pull loopback: read snapshot {} failed: {err}",
+                params.membership_snapshot_path
+            )
+        })?;
+    let mut request = token.clone();
+    request.push(b'\n');
+    // Retry the TCP probe up to 3 times with a 2s sleep between attempts.
+    // An empty response means the listener wasn't ready (port not yet
+    // bound or daemon briefly between restart cycles) — not a hard failure.
+    let max_attempts = 3u32;
+    let sleep_secs = 2u64;
+    let mut attempt = 0u32;
+    let (header_vec, body_vec) = loop {
+        attempt += 1;
+        let response = shell
+            .tcp_send_recv(
+                &params.anchor_bundle_pull_addr,
+                &request,
+                Duration::from_secs(5),
+            )
+            .map_err(|err| format!("anchor bundle-pull loopback: tcp probe failed: {err}"))?;
+        match split_bundle_pull_response(&response) {
+            Ok((header, body)) => break (header.to_vec(), body.to_vec()),
+            Err(err) => {
+                if attempt >= max_attempts {
+                    return Err(err);
+                }
+                std::thread::sleep(Duration::from_secs(sleep_secs));
+            }
+        }
+    };
+    if !header_vec.starts_with(b"OK ") {
+        return Err(format!(
+            "anchor bundle-pull loopback: unexpected header {:?}",
+            String::from_utf8_lossy(&header_vec)
+        ));
+    }
+    if body_vec != snapshot.as_slice() {
+        return Err(format!(
+            "anchor bundle-pull loopback: response body ({} bytes) does not match snapshot ({} bytes) byte-for-byte",
+            body_vec.len(),
+            snapshot.len()
+        ));
+    }
+    let digest = sha256_hex(&snapshot);
+    Ok(format!(
+        "bundle_digest={digest} bundle_bytes={}",
+        body_vec.len()
+    ))
+}
+
+/// Prove the listener rejects a syntactically well-shaped but
+/// unauthenticated token. Fixed 32-byte printable payload (deterministic,
+/// no RNG). Copied from the bin's `validate_invalid_token_rejected`.
+pub fn validate_invalid_token_rejected(
+    shell: &dyn RemoteShellHost,
+    params: &AnchorRuntimeParams,
+) -> Result<String, String> {
+    let _ = parse_nc_addr(&params.anchor_bundle_pull_addr)?;
+    let payload: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\n";
+    let response = shell
+        .tcp_send_recv(
+            &params.anchor_bundle_pull_addr,
+            payload,
+            Duration::from_secs(5),
+        )
+        .map_err(|err| format!("invalid token rejection: tcp probe failed: {err}"))?;
+    let header = first_line_bytes(&response);
+    if header != b"ERR unauthorized" {
+        return Err(format!(
+            "invalid token was not rejected: header={:?}",
+            String::from_utf8_lossy(header)
+        ));
+    }
+    Ok("invalid_token_rejected=true".to_owned())
+}
+
+/// Linux-only assertion that the daemon's journal contains only the
+/// token's SHA-256 thumbprint, never the raw token bytes. macOS/Windows
+/// return a `log_redaction_check=skipped` summary (journalctl is
+/// Linux-only; the per-OS log surface is a separate substage). Copied from
+/// the bin's `validate_bundle_pull_log_redaction`.
+pub fn validate_bundle_pull_log_redaction(
+    shell: &dyn RemoteShellHost,
+    params: &AnchorRuntimeParams,
+) -> Result<String, String> {
+    if params.platform != VmGuestPlatform::Linux {
+        return Ok(format!(
+            "log_redaction_check=skipped platform={:?} reason=journalctl-linux-only",
+            params.platform
+        ));
+    }
+    let token = read_anchor_token(shell, params)?;
+    let thumbprint = anchor_token_thumbprint(&token);
+    let token_str = std::str::from_utf8(&token)
+        .map_err(|err| format!("anchor token bytes not utf-8: {err}"))?;
+    let thumbprint_marker = format!("token_thumbprint={thumbprint}");
+    // journald indexes entries asynchronously after the daemon writes
+    // them; retry up to 3 times with a 1s sleep. Token-leak detection runs
+    // on every attempt (no retry for leaks).
+    let max_attempts: u8 = 3;
+    for attempt in 1..=max_attempts {
+        let logs = shell
+            .run_argv(
+                &[
+                    "journalctl",
+                    "-u",
+                    "rustynetd",
+                    "--since",
+                    "10 minutes ago",
+                    "--no-pager",
+                ],
+                &[],
+                &[],
+            )
+            .map_err(|err| format!("journalctl run failed: {err}"))?;
+        if !logs.is_success() {
+            return Err(format!(
+                "journalctl exited {}: {}",
+                logs.code,
+                String::from_utf8_lossy(&logs.stderr).trim()
+            ));
+        }
+        let body = String::from_utf8_lossy(&logs.stdout);
+        let filtered: Vec<&str> = body
+            .lines()
+            .filter(|line| line.contains("anchor_bundle_pull:"))
+            .collect();
+        if filtered.iter().any(|line| line.contains(token_str)) {
+            return Err("anchor bundle-pull journal leaked raw token material".to_owned());
+        }
+        if filtered
+            .iter()
+            .any(|line| line.contains(&thumbprint_marker))
+        {
+            return Ok(format!(
+                "token_thumbprint={thumbprint} raw_token_leaked=false"
+            ));
+        }
+        if attempt < max_attempts {
+            let _ = shell.run_argv(&["sleep", "1"], &[], &[]);
+        }
+    }
+    Err(format!(
+        "anchor bundle-pull journal missing token thumbprint {thumbprint}"
+    ))
+}
+
+// ── Bundle-pull helpers (copied verbatim from `live_linux_anchor_test`) ─
+
+/// Read + shape-validate the anchor bundle-pull token from disk
+/// (printable ASCII, >= 32 bytes, trailing CR/LF stripped).
+fn read_anchor_token(
+    shell: &dyn RemoteShellHost,
+    params: &AnchorRuntimeParams,
+) -> Result<Vec<u8>, String> {
+    let raw = shell
+        .read_file(params.anchor_token_path.as_str())
+        .map_err(|err| {
+            format!(
+                "read anchor token at {} failed: {err}",
+                params.anchor_token_path
+            )
+        })?;
+    let trimmed: Vec<u8> = raw
+        .into_iter()
+        .filter(|b| !matches!(b, b'\r' | b'\n'))
+        .collect();
+    if trimmed.is_empty() {
+        return Err("invalid token material shape: empty token".to_owned());
+    }
+    if !trimmed.iter().all(|b| matches!(b, 0x20..=0x7e)) {
+        return Err("invalid token material shape: contains non-printable bytes".to_owned());
+    }
+    if trimmed.len() < 32 {
+        return Err("invalid token material length".to_owned());
+    }
+    Ok(trimmed)
+}
+
+/// SHA-256 thumbprint (first 16 hex chars) of the anchor token — the
+/// daemon emits this in its `anchor_bundle_pull:` journal lines.
+fn anchor_token_thumbprint(token: &[u8]) -> String {
+    let digest = sha256_hex(token);
+    digest[..16].to_owned()
+}
+
+/// Hex-encode the SHA-256 digest of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Split a bundle-pull response into the header line and body bytes. The
+/// server emits `OK <…>\n<bytes>` for success and `ERR <…>\n` for failure.
+fn split_bundle_pull_response(response: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    if response.is_empty() {
+        return Err("bundle-pull response was empty".to_owned());
+    }
+    let header = first_line_bytes(response);
+    let body = if response.len() > header.len() {
+        let mut body_start = header.len();
+        if body_start < response.len() && response[body_start] == b'\r' {
+            body_start += 1;
+        }
+        if body_start < response.len() && response[body_start] == b'\n' {
+            body_start += 1;
+        }
+        &response[body_start..]
+    } else {
+        &[][..]
+    };
+    Ok((header, body))
+}
+
+/// Bytes of the first line (excluding trailing `\r\n` / `\n`).
+fn first_line_bytes(bytes: &[u8]) -> &[u8] {
+    if let Some(idx) = bytes.iter().position(|b| *b == b'\n') {
+        let end = if idx > 0 && bytes[idx - 1] == b'\r' {
+            idx - 1
+        } else {
+            idx
+        };
+        &bytes[..end]
+    } else {
+        bytes
+    }
+}
+
+/// host:port validation for the bundle-pull address. The fields are kept
+/// for parity with the bin (and future use); the substages only need the
+/// format check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NcAddr {
+    host: String,
+    port: String,
+}
+
+fn parse_nc_addr(value: &str) -> Result<NcAddr, String> {
+    let (host, port) = value
+        .rsplit_once(':')
+        .ok_or_else(|| "anchor-bundle-pull-addr must be host:port".to_owned())?;
+    if host.is_empty()
+        || port.is_empty()
+        || !port.bytes().all(|byte| byte.is_ascii_digit())
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return Err("anchor-bundle-pull-addr must be host:port".to_owned());
+    }
+    Ok(NcAddr {
+        host: host.to_owned(),
+        port: port.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -533,5 +885,223 @@ mod tests {
             validate_anchor_capability_advertisement(&mock, VmGuestPlatform::Android, "exit-1")
                 .is_err()
         );
+    }
+
+    // ── Bundle-pull substage + helper coverage (Phase 29 port) ──
+
+    fn linux_params() -> AnchorRuntimeParams {
+        AnchorRuntimeParams::for_platform(VmGuestPlatform::Linux).unwrap()
+    }
+
+    #[test]
+    fn parse_nc_addr_accepts_host_port_and_rejects_malformed() {
+        assert!(parse_nc_addr("127.0.0.1:51822").is_ok());
+        assert!(parse_nc_addr("anchor-host.local:4500").is_ok());
+        assert!(parse_nc_addr("no-port").is_err());
+        assert!(parse_nc_addr("127.0.0.1:").is_err());
+        assert!(parse_nc_addr(":51822").is_err());
+        assert!(parse_nc_addr("127.0.0.1:port").is_err());
+    }
+
+    #[test]
+    fn split_bundle_pull_response_separates_header_body_and_crlf() {
+        let mut resp = b"OK 5\n".to_vec();
+        resp.extend_from_slice(b"hello");
+        let (header, body) = split_bundle_pull_response(&resp).unwrap();
+        assert_eq!(header, b"OK 5");
+        assert_eq!(body, b"hello");
+
+        let mut crlf = b"OK 3\r\n".to_vec();
+        crlf.extend_from_slice(b"abc");
+        let (header, body) = split_bundle_pull_response(&crlf).unwrap();
+        assert_eq!(header, b"OK 3");
+        assert_eq!(body, b"abc");
+
+        assert!(split_bundle_pull_response(b"").is_err());
+    }
+
+    #[test]
+    fn first_line_bytes_strips_terminators() {
+        assert_eq!(first_line_bytes(b"ERR unauthorized\n"), b"ERR unauthorized");
+        assert_eq!(
+            first_line_bytes(b"ERR unauthorized\r\n"),
+            b"ERR unauthorized"
+        );
+        assert_eq!(first_line_bytes(b"no-newline"), b"no-newline");
+    }
+
+    #[test]
+    fn sha256_hex_and_thumbprint_match_known_vector() {
+        // SHA-256("") known digest.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let tp = anchor_token_thumbprint(b"");
+        assert_eq!(tp, "e3b0c44298fc1c14");
+        assert_eq!(tp.len(), 16);
+    }
+
+    #[test]
+    fn for_platform_uses_per_os_token_paths() {
+        assert_eq!(
+            linux_params().anchor_token_path,
+            "/var/lib/rustynet/anchor-bundle-pull.token"
+        );
+        assert_eq!(linux_params().anchor_bundle_pull_addr, "127.0.0.1:51822");
+        assert_eq!(
+            AnchorRuntimeParams::for_platform(VmGuestPlatform::Macos)
+                .unwrap()
+                .anchor_token_path,
+            "/usr/local/var/rustynet/anchor-bundle-pull.token"
+        );
+        assert!(AnchorRuntimeParams::for_platform(VmGuestPlatform::Ios).is_err());
+    }
+
+    #[test]
+    fn read_anchor_token_validates_shape() {
+        let params = linux_params();
+        let mock = MockShellHost::new();
+        mock.write_file(&params.anchor_token_path, &[b'a'; 64], 0o600)
+            .unwrap();
+        assert_eq!(read_anchor_token(&mock, &params).unwrap().len(), 64);
+
+        // Too short → fail closed.
+        let short = MockShellHost::new();
+        short
+            .write_file(&params.anchor_token_path, b"short", 0o600)
+            .unwrap();
+        assert!(
+            read_anchor_token(&short, &params)
+                .unwrap_err()
+                .contains("length")
+        );
+
+        // Non-printable → fail closed.
+        let binv = MockShellHost::new();
+        binv.write_file(&params.anchor_token_path, &[0u8; 64], 0o600)
+            .unwrap();
+        assert!(
+            read_anchor_token(&binv, &params)
+                .unwrap_err()
+                .contains("non-printable")
+        );
+    }
+
+    #[test]
+    fn validate_bundle_pull_loopback_passes_when_body_matches_snapshot() {
+        let params = linux_params();
+        let mock = MockShellHost::new();
+        mock.write_file(&params.anchor_token_path, &[b'a'; 64], 0o600)
+            .unwrap();
+        let snapshot = b"signed-membership-snapshot-bytes";
+        mock.write_file(&params.membership_snapshot_path, snapshot, 0o600)
+            .unwrap();
+        let mut resp = b"OK 32\n".to_vec();
+        resp.extend_from_slice(snapshot);
+        mock.program_tcp_response(&params.anchor_bundle_pull_addr, resp);
+        let summary = validate_bundle_pull_loopback(&mock, &params).expect("loopback must pass");
+        assert!(summary.contains("bundle_digest="), "got: {summary}");
+        assert!(
+            summary.contains(&format!("bundle_bytes={}", snapshot.len())),
+            "got: {summary}"
+        );
+    }
+
+    #[test]
+    fn validate_bundle_pull_loopback_fails_when_body_mismatches_snapshot() {
+        let params = linux_params();
+        let mock = MockShellHost::new();
+        mock.write_file(&params.anchor_token_path, &[b'a'; 64], 0o600)
+            .unwrap();
+        mock.write_file(&params.membership_snapshot_path, b"real-snapshot", 0o600)
+            .unwrap();
+        let mut resp = b"OK 5\n".to_vec();
+        resp.extend_from_slice(b"WRONG");
+        mock.program_tcp_response(&params.anchor_bundle_pull_addr, resp);
+        let err =
+            validate_bundle_pull_loopback(&mock, &params).expect_err("body mismatch must fail");
+        assert!(err.contains("does not match snapshot"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_invalid_token_rejected_passes_on_err_unauthorized() {
+        let params = linux_params();
+        let mock = MockShellHost::new();
+        mock.program_tcp_response(
+            &params.anchor_bundle_pull_addr,
+            b"ERR unauthorized\n".to_vec(),
+        );
+        assert!(validate_invalid_token_rejected(&mock, &params).is_ok());
+    }
+
+    #[test]
+    fn validate_invalid_token_rejected_fails_when_listener_accepts() {
+        // A listener that returns OK for the fixed fake token must fail closed.
+        let params = linux_params();
+        let mock = MockShellHost::new();
+        mock.program_tcp_response(&params.anchor_bundle_pull_addr, b"OK 0\n".to_vec());
+        let err = validate_invalid_token_rejected(&mock, &params)
+            .expect_err("listener accepting a bad token must fail");
+        assert!(err.contains("not rejected"), "got: {err}");
+    }
+
+    #[test]
+    fn log_redaction_skips_on_non_linux() {
+        let params = AnchorRuntimeParams::for_platform(VmGuestPlatform::Macos).unwrap();
+        let mock = MockShellHost::new();
+        let summary = validate_bundle_pull_log_redaction(&mock, &params).unwrap();
+        assert!(summary.contains("skipped"), "got: {summary}");
+        assert!(summary.contains("journalctl-linux-only"), "got: {summary}");
+    }
+
+    #[test]
+    fn log_redaction_passes_when_journal_carries_thumbprint_only() {
+        let params = linux_params();
+        let mock = MockShellHost::new();
+        let token = [b'a'; 64];
+        mock.write_file(&params.anchor_token_path, &token, 0o600)
+            .unwrap();
+        let thumbprint = anchor_token_thumbprint(&token);
+        let journal =
+            format!("Jun 04 anchor_bundle_pull: served bundle token_thumbprint={thumbprint}\n");
+        mock.program_run_response(
+            &[
+                "journalctl",
+                "-u",
+                "rustynetd",
+                "--since",
+                "10 minutes ago",
+                "--no-pager",
+            ],
+            ok(&journal),
+        );
+        let summary = validate_bundle_pull_log_redaction(&mock, &params).expect("must pass");
+        assert!(summary.contains("raw_token_leaked=false"), "got: {summary}");
+    }
+
+    #[test]
+    fn log_redaction_fails_when_journal_leaks_raw_token() {
+        let params = linux_params();
+        let mock = MockShellHost::new();
+        let token = [b'a'; 64];
+        mock.write_file(&params.anchor_token_path, &token, 0o600)
+            .unwrap();
+        let token_str = std::str::from_utf8(&token).unwrap();
+        let journal = format!("Jun 04 anchor_bundle_pull: raw token {token_str} served\n");
+        mock.program_run_response(
+            &[
+                "journalctl",
+                "-u",
+                "rustynetd",
+                "--since",
+                "10 minutes ago",
+                "--no-pager",
+            ],
+            ok(&journal),
+        );
+        let err = validate_bundle_pull_log_redaction(&mock, &params)
+            .expect_err("raw token leak must fail");
+        assert!(err.contains("leaked raw token"), "got: {err}");
     }
 }
