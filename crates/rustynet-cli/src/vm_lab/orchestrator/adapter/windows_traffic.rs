@@ -99,14 +99,27 @@ pub fn probe_denied_peer(
     }
 }
 
-/// Collect active `WireGuard` tunnels via `wireguard.exe` show.
+/// Collect active `WireGuard` tunnels via `wg.exe show all latest-handshakes`.
+///
+/// The Windows backend is WireGuard-NT (a kernel driver), so `wg.exe show`
+/// queries the live tunnel directly. `wireguard.exe /show` is NOT a valid
+/// command (it exits 64), which previously made this always report zero tunnels
+/// and fail `role_switch_matrix` even with a live, traffic-carrying tunnel.
+/// `show all latest-handshakes` emits one tab-separated
+/// `<iface>\t<pubkey>\t<unix-ts>` line per programmed peer, matching the Linux
+/// adapter's active-tunnel semantics (one line per peer tunnel).
 pub fn collect_active_tunnels(conn: &NodeConnection) -> Result<TunnelsList, AdapterError> {
-    let script = "if (Get-Command 'wireguard.exe' -ErrorAction SilentlyContinue) { \
-         & 'wireguard.exe' /show } else { Write-Output 'wg-not-installed' }";
+    let script = "$wg = 'C:\\Program Files\\WireGuard\\wg.exe'; \
+         if (-not (Test-Path -LiteralPath $wg)) { \
+             $cmd = Get-Command 'wg.exe' -ErrorAction SilentlyContinue; \
+             if ($cmd) { $wg = $cmd.Source } \
+         }; \
+         if (Test-Path -LiteralPath $wg) { & $wg show all latest-handshakes } \
+         else { Write-Output 'wg-not-installed' }";
     let output = run_remote_ps(conn, script, SHORT_TIMEOUT)?;
     let tunnels: Vec<String> = output
         .lines()
-        .filter(|l| !l.is_empty())
+        .filter(|line| !line.is_empty() && !line.contains("wg-not-installed"))
         .map(std::string::ToString::to_string)
         .collect();
     Ok(TunnelsList { tunnels })
