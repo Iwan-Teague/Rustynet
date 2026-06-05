@@ -12,6 +12,7 @@ pub mod macos_membership;
 pub mod macos_traffic;
 pub mod node_adapter;
 pub mod ssh;
+pub mod verifier_key;
 pub mod windows;
 pub mod windows_install;
 pub mod windows_membership;

@@ -51,6 +51,26 @@ use rustynetd::windows_service_hardening::{
     REVIEWED_WINDOWS_RELAY_SERVICE_NAME,
 };
 
+/// Whether the Relay role's lab *runtime* — deploying the `rustynet-relay`
+/// sibling service onto a node and driving its live lifecycle validators — is
+/// implemented for `platform`.
+///
+/// This is deliberately distinct from [`NodeRole::is_supported_for_platform`],
+/// which is the conservative posture / promotion flag flipped only once a green
+/// cross-OS run is archived. The `deploy_relay_service` and `relay_validation`
+/// stages gate on THIS predicate so a platform whose relay adapter can actually
+/// deploy + validate the service runs the live loop that *produces* the evidence
+/// `is_supported_for_platform` later promotes on — instead of being skipped
+/// before it can generate that evidence. Platforms without a relay-deploy
+/// adapter implementation are reported-skipped (named, never a silent pass).
+///
+/// Implemented today: Linux (`linux_install::deploy_relay_service`) and macOS
+/// (`macos_install::deploy_relay_service`). Windows is pending its SCM relay
+/// install; iOS / Android do not host a relay service.
+pub fn relay_lab_runtime_implemented(platform: VmGuestPlatform) -> bool {
+    matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
+}
+
 /// Canonical systemd unit for the Linux relay (matches the unit the
 /// `ops install-systemd-relay` role-installation stage deploys).
 const SYSTEMD_RELAY_UNIT: &str = "rustynet-relay.service";
@@ -985,6 +1005,19 @@ mod tests {
         );
         assert_eq!(REVIEWED_WINDOWS_RELAY_BIND_PORT, 4500);
         assert_eq!(REVIEWED_WINDOWS_RELAY_HEALTH_PORT, 9100);
+    }
+
+    #[test]
+    fn relay_lab_runtime_implemented_for_linux_and_macos_only() {
+        // The deploy_relay_service + relay_validation stages gate on this
+        // predicate. Linux + macOS have a relay-deploy adapter and run live;
+        // Windows (no SCM relay install yet) and the mobile platforms are
+        // reported-skipped — named, never a silent pass.
+        assert!(relay_lab_runtime_implemented(VmGuestPlatform::Linux));
+        assert!(relay_lab_runtime_implemented(VmGuestPlatform::Macos));
+        assert!(!relay_lab_runtime_implemented(VmGuestPlatform::Windows));
+        assert!(!relay_lab_runtime_implemented(VmGuestPlatform::Ios));
+        assert!(!relay_lab_runtime_implemented(VmGuestPlatform::Android));
     }
 
     // ── End-to-end validator over the in-process mock shell ──

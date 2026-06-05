@@ -49,6 +49,7 @@ source "$1"
 # ── Constants ─────────────────────────────────────────────────────────────────
 readonly RUSTYNETD_BIN="/usr/local/bin/rustynetd"
 readonly RUSTYNET_BIN="/usr/local/bin/rustynet"
+readonly RUSTYNET_RELAY_BIN="/usr/local/bin/rustynet-relay"
 readonly STATE_ROOT="/usr/local/var/rustynet"
 readonly CONFIG_ROOT="/usr/local/etc/rustynet"
 readonly KEYS_DIR="${STATE_ROOT}/keys"
@@ -699,6 +700,21 @@ build_rustynet() {
     as_user "${brew_rustup}" run stable cargo build --release -p rustynetd -p rustynet-cli
   fi
 
+  # rustynet-relay (sibling relay datapath binary) needs the `daemon` feature
+  # for its service runtime, and is built as a separate invocation because
+  # `--features` does not fan out across multiple `-p` packages. A Relay-role
+  # node needs this binary present for DeployRelayServiceStage to enable the
+  # launchd com.rustynet.relay service; building it on every node also keeps a
+  # later role-switch to Relay possible without a re-bootstrap. Same offline-
+  # first fallback as the daemon/cli build above.
+  if as_user "${brew_rustup}" run stable cargo build --release --offline -p rustynet-relay --features daemon; then
+    echo "[bootstrap] built rustynet-relay from warm cargo cache (offline)"
+  else
+    echo "[bootstrap] offline rustynet-relay build unavailable (cold cache or new dependency); fetching from registry" >&2
+    wait_for_cargo_registry_endpoint || exit 1
+    as_user "${brew_rustup}" run stable cargo build --release -p rustynet-relay --features daemon
+  fi
+
   popd >/dev/null
 }
 
@@ -740,6 +756,13 @@ install_binaries() {
   # documentation expect the short name).
   install -m 0755 -o root -g wheel \
     "${BUILD_DIR}/target/release/rustynet-cli" "${RUSTYNET_BIN}"
+  # rustynet-relay: the sibling relay datapath binary. Installed on every node
+  # so a Relay-role assignment (or later role-switch to Relay) can be activated
+  # by DeployRelayServiceStage without a re-bootstrap. Not re-signed — unlike
+  # rustynetd it never performs a keychain `key store-passphrase`; it loads its
+  # ed25519 verifier key from a file (--verifier-key) and serves the datapath.
+  install -m 0755 -o root -g wheel \
+    "${BUILD_DIR}/target/release/rustynet-relay" "${RUSTYNET_RELAY_BIN}"
   rm -rf "${BUILD_DIR}"
 }
 

@@ -109,6 +109,10 @@ impl NodeAdapter for MacosNodeAdapter {
         macos_install::uninstall_daemon(&self.conn)
     }
 
+    fn deploy_relay_service(&self) -> Result<(), AdapterError> {
+        macos_install::deploy_relay_service(&self.conn, self.workdir.as_deref())
+    }
+
     // ── Membership owner ──────────────────────────────────────────────────────
 
     fn issue_membership_owner_key(&self) -> Result<MembershipOwnerKey, AdapterError> {

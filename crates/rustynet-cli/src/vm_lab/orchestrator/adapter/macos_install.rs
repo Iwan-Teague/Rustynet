@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
@@ -12,6 +13,12 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
 pub const MACOS_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
 pub const MACOS_RUSTYNET_PATH: &str = "/usr/local/bin/rustynet";
+/// Canonical path of the `rustynet-relay` sibling binary on macOS targets.
+/// Built + installed by `Bootstrap-RustyNetMacos.sh` alongside rustynetd /
+/// rustynet so a Relay-role node always has it; the relay *service* is only
+/// enabled on Relay nodes by `DeployRelayServiceStage` via
+/// [`deploy_relay_service`].
+pub const MACOS_RUSTYNET_RELAY_PATH: &str = "/usr/local/bin/rustynet-relay";
 pub const MACOS_SERVICE_LABEL: &str = "com.rustynet.daemon";
 pub const MACOS_STATE_ROOT: &str = "/usr/local/var/rustynet";
 pub const MACOS_KEYS_DIR: &str = "/usr/local/var/rustynet/keys";
@@ -540,6 +547,107 @@ fn build_bootstrap_env(node_id: &str, role: &NodeRole, ctx: &OrchestrationContex
     )
 }
 
+/// Deploy the `rustynet-relay` sibling service onto this macOS Relay node so the
+/// `relay_validation` stage has a live relay to prove — the macOS analogue of
+/// `linux_install::deploy_relay_service`, sharing its security posture.
+///
+/// The relay binary is already present at [`MACOS_RUSTYNET_RELAY_PATH`] (built +
+/// installed by `Bootstrap-RustyNetMacos.sh` while the network was open). This
+/// step supplies the two things the launchd unit needs that the baseline
+/// install does not:
+///
+///   1. The relay `--verifier-key` at
+///      `/usr/local/var/rustynet/relay-verifier.pub` — the path hardcoded in the
+///      reviewed `com.rustynet.relay.plist`. `rustynet-relay` loads it as raw 32
+///      bytes and fail-closes if it is absent. We derive it from the assignment
+///      authority public key the orchestrator already distributed to this node
+///      as `{MACOS_STATE_ROOT}/trust/assignment.pub` (hex) — the same control-
+///      plane verifier the relay must trust, and a PUBLIC key (never secret), so
+///      it is safe to read, decode, and re-place. Decoding to raw bytes happens
+///      in Rust (fail-closed on a short / non-hex key); the bytes are shipped via
+///      scp + `install` so no key data is interpolated into a shell string and
+///      the guest needs no `xxd`.
+///   2. The installed + bootstrapped `com.rustynet.relay` launchd service, via
+///      the shared `ops install-macos-relay` helper — the one hardened relay-
+///      install path. It copies the reviewed plist from
+///      `scripts/launchd/com.rustynet.relay.plist` relative to the source root,
+///      so it runs from that cwd (the configured workdir, else `$HOME/Rustynet`).
+///
+/// Fail-closed throughout: a missing assignment key, a malformed key, or a
+/// failed install all surface as `Err`.
+pub fn deploy_relay_service(
+    conn: &NodeConnection,
+    workdir: Option<&str>,
+) -> Result<(), AdapterError> {
+    let short_timeout = Duration::from_secs(30);
+
+    // 1. Read the already-distributed assignment authority pubkey (hex). On
+    //    macOS distribute_verifier_key(Assignment) places it at
+    //    {MACOS_STATE_ROOT}/trust/assignment.pub, owned by rustynetd, so read it
+    //    with sudo. The path is a compile-time constant; nothing untrusted is
+    //    interpolated.
+    let assignment_pub = format!("{MACOS_STATE_ROOT}/trust/assignment.pub");
+    let assignment_hex =
+        ssh::run_remote(conn, &format!("sudo cat '{assignment_pub}'"), short_timeout)?;
+
+    // 2. Decode hex -> raw 32 bytes (fail-closed); the relay --verifier-key
+    //    loader requires exactly 32 raw bytes.
+    let verifier_bytes = decode_assignment_pubkey_hex(&assignment_hex)
+        .map_err(|message| AdapterError::Protocol { message })?;
+
+    // 3. Ship the raw verifier key to the host and install it at the plist's
+    //    hardcoded path (mode 0644 — a public key). scp the bytes (no shell data
+    //    interpolation), then install with a constant command. `mkdir -p` keeps
+    //    the existing rustynetd-owned state-root mode (no chmod of an existing
+    //    dir) while fail-closing if the state root is somehow absent.
+    let tmp = write_temp_file("rn_relay_verifier_", ".pub", &verifier_bytes)?;
+    let ship = ssh::scp_to(
+        conn,
+        tmp.as_path(),
+        "/tmp/rn-relay-verifier.pub",
+        short_timeout,
+    );
+    let _ = std::fs::remove_file(&tmp);
+    ship?;
+    ssh::run_remote(
+        conn,
+        &format!(
+            "sudo sh -c 'mkdir -p {MACOS_STATE_ROOT} && \
+             install -m 0644 /tmp/rn-relay-verifier.pub {MACOS_STATE_ROOT}/relay-verifier.pub && \
+             rm -f /tmp/rn-relay-verifier.pub'"
+        ),
+        short_timeout,
+    )?;
+
+    // 4. Install + bootstrap com.rustynet.relay via the shared helper. It reads
+    //    scripts/launchd/com.rustynet.relay.plist relative to cwd, so run from
+    //    the source root (the configured workdir, else $HOME/Rustynet). The
+    //    source dir is passed only inside a single-quoted env assignment; the
+    //    executed shell body is a compile-time constant. Absolute CLI path so
+    //    the install never depends on sudo's PATH inside the root `sh -c`.
+    let src_dir = match workdir {
+        Some(w) if !w.trim().is_empty() => w.trim().to_owned(),
+        _ => {
+            let home = ssh::run_remote(conn, "echo $HOME", Duration::from_secs(10))?
+                .trim()
+                .to_owned();
+            if home.is_empty() {
+                return Err(AdapterError::Protocol {
+                    message: "could not determine $HOME on remote for install-macos-relay"
+                        .to_owned(),
+                });
+            }
+            format!("{home}/Rustynet")
+        }
+    };
+    let src_dir_esc = src_dir.replace('\'', "'\\''");
+    let install_cmd = format!(
+        "sudo env RN_SRC='{src_dir_esc}' sh -c 'cd \"$RN_SRC\" && {MACOS_RUSTYNET_PATH} ops install-macos-relay'"
+    );
+    ssh::run_remote(conn, &install_cmd, Duration::from_secs(120))?;
+    Ok(())
+}
+
 fn write_temp_file(
     prefix: &str,
     suffix: &str,
@@ -689,6 +797,26 @@ mod tests {
             !BOOTSTRAP_SCRIPT
                 .contains("sudo -u rustynetd \"${RUSTYNETD_BIN}\" key store-passphrase"),
             "passphrase keychain provisioning must not run as rustynetd"
+        );
+    }
+
+    #[test]
+    fn bootstrap_builds_and_installs_rustynet_relay() {
+        // A Relay-role macOS node needs the rustynet-relay sibling binary present
+        // for DeployRelayServiceStage (macos_install::deploy_relay_service) to
+        // enable the com.rustynet.relay launchd service. The bootstrap builds it
+        // (with the daemon feature) and installs it to /usr/local/bin alongside
+        // rustynetd / rustynet. A regression dropping either step would leave a
+        // Relay node with no binary for the unit to launch.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("-p rustynet-relay --features daemon"),
+            "macOS bootstrap must build the rustynet-relay binary with the daemon feature"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains(
+                "\"${BUILD_DIR}/target/release/rustynet-relay\" \"${RUSTYNET_RELAY_BIN}\""
+            ),
+            "macOS bootstrap must install rustynet-relay to /usr/local/bin"
         );
     }
 

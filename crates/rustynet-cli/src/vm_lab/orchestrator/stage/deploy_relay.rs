@@ -2,11 +2,12 @@
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::role_validation::relay::relay_lab_runtime_implemented;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 /// File name (under `ctx.report_dir`) the reported-skip note is written to
-/// when a Relay node's platform is not yet live-supported for relay runtime
-/// deploy (macOS / Windows, pending cross-OS Phase 8 evidence).
+/// when a Relay node's platform has no relay-runtime-deploy adapter yet
+/// (Windows, pending its SCM relay install).
 const REPORTED_SKIPS_FILENAME: &str = "relay_deploy.reported_skips.json";
 
 /// Deploy the `rustynet-relay` sibling service onto every Relay-role node so
@@ -109,12 +110,14 @@ impl OrchestrationStage for DeployRelayServiceStage {
             };
             let platform = adapter.platform();
 
-            // Posture gate (single source of truth, shared with
-            // relay_validation): relay runtime deploy is live on Linux today;
-            // macOS/Windows are reported-skipped — named, never a silent pass —
-            // until is_supported_for_platform is promoted on archived cross-OS
-            // evidence (Phase 8).
-            if !NodeRole::Relay.is_supported_for_platform(&platform) {
+            // Runtime-implemented gate (single source of truth, shared with
+            // relay_validation): deploy the relay only where an adapter can.
+            // Linux + macOS deploy live; a platform with no relay-deploy adapter
+            // (Windows today) is reported-skipped — named, never a silent pass.
+            // This is decoupled from is_supported_for_platform on purpose: the
+            // live deploy + validation here is what *produces* the green
+            // evidence that later promotes is_supported_for_platform.
+            if !relay_lab_runtime_implemented(platform) {
                 reported_skips.push((alias.clone(), format!("{platform:?}")));
                 continue;
             }
@@ -149,10 +152,10 @@ fn reported_skips_json_bytes(reported_skips: &[(String, String)]) -> Vec<u8> {
     let body = serde_json::json!({
         "stage": "deploy_relay_service",
         "reported_skipped_relay_deploy": skipped,
-        "reason": "relay runtime deploy is live-supported on Linux only; macOS/Windows \
-                   relay nodes are reported-skipped (named, never a silent pass) until a \
-                   green standard-orchestrator run promotes is_supported_for_platform \
-                   (cross-OS Phase 8)",
+        "reason": "relay runtime deploy is implemented for Linux + macOS; a relay node on a \
+                   platform with no relay-deploy adapter (Windows, pending its SCM relay \
+                   install) is reported-skipped (named, never a silent pass) — gated on \
+                   relay_lab_runtime_implemented, not is_supported_for_platform",
     });
     serde_json::to_vec_pretty(&body).unwrap_or_default()
 }
