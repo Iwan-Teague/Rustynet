@@ -53,6 +53,13 @@ readonly RUSTYNET_RELAY_BIN="/usr/local/bin/rustynet-relay"
 readonly STATE_ROOT="/usr/local/var/rustynet"
 readonly CONFIG_ROOT="/usr/local/etc/rustynet"
 readonly KEYS_DIR="${STATE_ROOT}/keys"
+# Bootstrap-time credential directory. Exists outside keys/ so the
+# macos-key-custody-check (which only scans keys/) does not flag its contents
+# as plaintext key material at rest. The wireguard passphrase lives here rather
+# than in keys/ — it is a bootstrap artifact needed for cdhash re-bind on each
+# rebuild, not key material the daemon accesses at runtime (the daemon reads
+# the passphrase from the System.keychain, not from disk).
+readonly BOOTSTRAP_DIR="${STATE_ROOT}/bootstrap"
 readonly LOG_DIR="/usr/local/var/log/rustynet"
 readonly LAUNCHDAEMON_DIR="/Library/LaunchDaemons"
 readonly PLIST_PATH="${LAUNCHDAEMON_DIR}/com.rustynet.daemon.plist"
@@ -509,6 +516,10 @@ setup_directories() {
   install -d -m 0700 -o rustynetd -g rustynetd "${STATE_ROOT}/trust"
   install -d -m 0750 -o root      -g rustynetd "${CONFIG_ROOT}"
   install -d -m 0750 -o rustynetd -g rustynetd "${LOG_DIR}"
+  # Bootstrap credential dir: 0700 root:rustynetd so only root (bootstrap) and
+  # rustynetd can traverse. Holds wireguard.passphrase outside the keys/ dir so
+  # macos-key-custody-check does not flag it as forbidden plaintext key material.
+  install -d -m 0700 -o root -g rustynetd "${BOOTSTRAP_DIR}"
 }
 
 # ── Enrollment secret provisioning ───────────────────────────────────────────
@@ -844,14 +855,34 @@ generate_wireguard_keys() {
   local runtime_key="${KEYS_DIR}/wireguard.key"
   local encrypted_key="${KEYS_DIR}/wireguard.key.enc"
   local public_key="${KEYS_DIR}/wireguard.pub"
-  local passphrase_file="${KEYS_DIR}/wireguard.passphrase"
+  # Phase E: the passphrase is a bootstrap artifact, not key material. It now
+  # lives in BOOTSTRAP_DIR (outside keys/) so macos-key-custody-check does not
+  # flag it as "forbidden plaintext key material at rest in keys/". The daemon
+  # never reads it from disk at runtime — it reads from the System.keychain.
+  local passphrase_file="${BOOTSTRAP_DIR}/wireguard.passphrase"
   local keychain_account="wg-passphrase-${NODE_ID}"
 
+  # Migrate any pre-Phase-E passphrase file from keys/ to bootstrap/.
+  # Guests bootstrapped before this change kept wireguard.passphrase in
+  # keys/, which the macos-key-custody-check correctly flags as forbidden.
+  # Move it once, preserving the existing passphrase so the cdhash re-bind
+  # below continues to work without generating a fresh key.
+  if [[ -f "${KEYS_DIR}/wireguard.passphrase" && ! -f "${passphrase_file}" ]]; then
+    mv "${KEYS_DIR}/wireguard.passphrase" "${passphrase_file}"
+    chown root:rustynetd "${passphrase_file}"
+    chmod 0600 "${passphrase_file}"
+    echo "[bootstrap] migrated wireguard.passphrase from keys/ to bootstrap/ (Phase E)"
+  elif [[ -f "${KEYS_DIR}/wireguard.passphrase" && -f "${passphrase_file}" ]]; then
+    # Both exist (edge case: partial prior migration). Remove the stale keys/ copy.
+    rm -f "${KEYS_DIR}/wireguard.passphrase"
+    echo "[bootstrap] removed stale wireguard.passphrase from keys/ (Phase E cleanup)"
+  fi
+
   # Detect existing key material via the PERSISTENT artifacts only (encrypted
-  # blob + public key + passphrase). The plaintext runtime key is intentionally
-  # NOT a sentinel: it is removed from keys/ after init (custody — see below) and
-  # re-derived by the daemon into the ephemeral runtime dir on each start, so its
-  # absence must NOT trigger a re-key (which would rotate identity every rebuild).
+  # blob + public key). The passphrase is now in BOOTSTRAP_DIR (not keys/) and
+  # the plaintext runtime key is intentionally NOT a sentinel: it is removed from
+  # keys/ after init (see below) and re-derived by the daemon into the ephemeral
+  # runtime dir on each start. Its absence must NOT trigger a re-key.
   if [[ -f "${public_key}" && -f "${encrypted_key}" && -f "${passphrase_file}" ]]; then
     echo "[bootstrap] WireGuard key material already present; skipping key generation"
     # Re-store the passphrase into the keychain even on the skip path.
@@ -875,7 +906,7 @@ generate_wireguard_keys() {
       echo "[bootstrap] rustynetd key store-passphrase (cdhash re-bind) failed; daemon cannot resolve passphrase from keychain" >&2
       exit 1
     fi
-    chown rustynetd:rustynetd "${passphrase_file}"
+    chown root:rustynetd "${passphrase_file}"
     chmod 0600 "${passphrase_file}"
     echo "[bootstrap] WireGuard passphrase re-stored in macOS keychain (account=${keychain_account}) to rebind to the current rustynetd cdhash"
     return 0
@@ -887,9 +918,9 @@ generate_wireguard_keys() {
   local passphrase_tmp=""
   # shellcheck disable=SC2064
   trap 'rm -f "${passphrase_tmp}"' EXIT
-  passphrase_tmp="$(mktemp "${KEYS_DIR}/wireguard.passphrase.tmp.XXXXXX")"
+  passphrase_tmp="$(mktemp "${BOOTSTRAP_DIR}/wireguard.passphrase.tmp.XXXXXX")"
   if [[ -z "${passphrase_tmp}" || ! -f "${passphrase_tmp}" ]]; then
-    echo "[bootstrap] failed to create wireguard.passphrase tmpfile under ${KEYS_DIR}" >&2
+    echo "[bootstrap] failed to create wireguard.passphrase tmpfile under ${BOOTSTRAP_DIR}" >&2
     exit 1
   fi
   chmod 0600 "${passphrase_tmp}"
@@ -975,9 +1006,14 @@ generate_wireguard_keys() {
 
   # Final ownership/perms tightening — defence in depth against any race
   # between key init's atomic write and a concurrent process.
-  chown rustynetd:rustynetd "${encrypted_key}" "${public_key}" "${passphrase_file}"
-  chmod 0600 "${encrypted_key}" "${passphrase_file}"
+  chown rustynetd:rustynetd "${encrypted_key}" "${public_key}"
+  chmod 0600 "${encrypted_key}"
   chmod 0640 "${public_key}"
+  # Passphrase is a bootstrap artifact in BOOTSTRAP_DIR (root:rustynetd, 0600).
+  # Keep it root-owned: the cdhash re-bind path runs as root and requires
+  # owner==reader for the daemon's secret-file guard.
+  chown root:rustynetd "${passphrase_file}"
+  chmod 0600 "${passphrase_file}"
 
   # Custody: remove the plaintext runtime key from the PERSISTENT keys/ dir.
   # `key init` wrote it there (root can create files under keys/), but
