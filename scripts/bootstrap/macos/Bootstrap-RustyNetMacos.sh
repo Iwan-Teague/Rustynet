@@ -320,9 +320,16 @@ install_brew_packages() {
 
 # ── 4. Rust toolchain ─────────────────────────────────────────────────────────
 install_rust_toolchain_hardened() {
-  # With brew's keg-only rustup formula, rustup lives at opt/rustup/bin/rustup.
-  # It does NOT create ~/.cargo/bin/ shims — toolchain bins live in ~/.rustup/toolchains/.
-  # We use `rustup run stable <cmd>` everywhere rather than relying on shim paths.
+  # Brew's keg-only rustup formula lives at opt/rustup/bin/rustup and does NOT
+  # create the ~/.cargo/bin/ proxy shims. We invoke it as `rustup run stable
+  # <cmd>`, but that alone is NOT sufficient for `cargo build`: with
+  # RUSTUP_TOOLCHAIN set, the toolchain cargo invokes `rustc` through the rustup
+  # PROXY (resolved on PATH, where ${REAL_HOME}/.cargo/bin is first — see
+  # setup_bootstrap_path), not the toolchain's own bin. With no shim the build
+  # dies with "could not execute process `rustc -vV` ... No such file or
+  # directory" even though `rustup run stable rustc --version` works. So we must
+  # ensure the shims exist (offline-safe: a shim is just the rustup multi-call
+  # binary under each tool name, dispatching via argv[0] — no download).
   local brew_rustup="${BREW_PREFIX}/opt/rustup/bin/rustup"
   if [[ ! -x "${brew_rustup}" ]]; then
     echo "[prereqs] rustup not found at ${brew_rustup}" >&2
@@ -338,13 +345,42 @@ install_rust_toolchain_hardened() {
   fi
   as_user "${brew_rustup}" default stable 2>&1 | tail -3 || true
 
+  # Ensure the ~/.cargo/bin shims the build path depends on, pointing them
+  # DIRECTLY at the stable toolchain's own binaries (resolved via `rustup
+  # which`), NOT at the brew rustup wrapper. brew's keg-only
+  # opt/rustup/bin/rustup is a thin wrapper that does NOT multi-call dispatch on
+  # argv[0] — invoked as `rustc` it prints rustup's own version instead of
+  # compiling — so a shim pointing at it would never run the compiler. A direct
+  # link is robust to that and matches the force-stable build below. Idempotent
+  # (ln -sf), so it also repairs a guest whose shims went missing (the failure
+  # mode that surfaced live: the toolchain rustc was intact but cargo could not
+  # exec a `rustc` proxy, dying with "could not execute process `rustc -vV`").
+  local cargo_bin="${REAL_HOME}/.cargo/bin"
+  as_user mkdir -p "${cargo_bin}"
+  local real_rustc real_cargo
+  real_rustc="$(as_user "${brew_rustup}" which --toolchain stable rustc 2>/dev/null)"
+  real_cargo="$(as_user "${brew_rustup}" which --toolchain stable cargo 2>/dev/null)"
+  if [[ -z "${real_rustc}" || -z "${real_cargo}" ]]; then
+    echo "[prereqs] could not resolve stable toolchain rustc/cargo via 'rustup which'" >&2
+    exit 1
+  fi
+  as_user ln -sf "${real_rustc}" "${cargo_bin}/rustc"
+  as_user ln -sf "${real_cargo}" "${cargo_bin}/cargo"
+
   local rustc_ver
   rustc_ver="$(as_user "${brew_rustup}" run stable rustc --version 2>/dev/null)"
   if [[ -z "${rustc_ver}" ]]; then
     echo "[prereqs] rustc not found via 'rustup run stable rustc' after install" >&2
     exit 1
   fi
-  echo "[prereqs] Rust toolchain: ${rustc_ver}"
+  # Verify the path `cargo build` actually takes: a bare `rustc` resolved through
+  # the ~/.cargo/bin shim on PATH (first entry per setup_bootstrap_path), which
+  # is what previously failed despite the direct-toolchain check above passing.
+  if ! as_user env "PATH=${cargo_bin}:${PATH}" rustc --version &>/dev/null; then
+    echo "[prereqs] shim rustc invocation (cargo build path) failed after ensuring ~/.cargo/bin shims" >&2
+    exit 1
+  fi
+  echo "[prereqs] Rust toolchain: ${rustc_ver} (shims ensured at ${cargo_bin})"
 }
 
 # ── 5. Final prerequisite verification ───────────────────────────────────────
@@ -365,7 +401,8 @@ verify_prereqs() {
       missing=1
     fi
   done
-  # Rust toolchain via brew's keg-only rustup (no ~/.cargo/bin shims).
+  # Rust toolchain via brew's keg-only rustup, with the ~/.cargo/bin proxy shims
+  # ensured by install_rust_toolchain_hardened (the build path needs them).
   local brew_rustup="${BREW_PREFIX}/opt/rustup/bin/rustup"
   if [[ ! -x "${brew_rustup}" ]]; then
     echo "[prereqs] still missing: ${brew_rustup}" >&2

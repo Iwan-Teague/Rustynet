@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::io::Write as IoWrite;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::vm_lab::VmGuestPlatform;
@@ -222,6 +223,20 @@ pub fn install_daemon_from_workdir(
     let _ = std::fs::remove_file(&env_tmp);
     let _ = std::fs::remove_file(&script_tmp);
     let _ = std::fs::remove_file(&install_tmp);
+
+    // Pre-warm the relay cargo dep cache on the guest before running the
+    // bootstrap. The bootstrap builds rustynet-relay in addition to
+    // rustynetd+rustynet-cli; a guest that has never built relay may be missing
+    // tokio/bytes/mio .crate files. The online fallback fails on an isolated lab
+    // guest with no internet (DNS times out). Fail-open: a cache warm failure
+    // is logged but does not abort — the build may still succeed on a guest
+    // whose cache is already warm, and blocking here would be strictly worse.
+    if let Err(e) = ensure_relay_cargo_deps(conn) {
+        eprintln!(
+            "[macos bootstrap] relay dep cache warm failed (best-effort): {e}; \
+             proceeding — offline relay build may fail if cache is cold"
+        );
+    }
 
     // Probe: exit 0 if workdir exists, non-zero otherwise.
     let workdir_present =
@@ -645,6 +660,118 @@ pub fn deploy_relay_service(
         "sudo env RN_SRC='{src_dir_esc}' sh -c 'cd \"$RN_SRC\" && {MACOS_RUSTYNET_PATH} ops install-macos-relay'"
     );
     ssh::run_remote(conn, &install_cmd, Duration::from_secs(120))?;
+    Ok(())
+}
+
+/// Pre-warm the relay dep cargo registry cache on a macOS guest by shipping any
+/// `.crate` files the offline relay build needs that are absent from the guest's
+/// `~/.cargo/registry/cache/` directory.
+///
+/// # Why this is needed
+///
+/// The macOS guest's cargo registry is populated during the initial bootstrap
+/// (when it builds `rustynetd` + `rustynet-cli`). If the relay binary (`rustynet-
+/// relay`) was added to the build list after the guest's registry was last
+/// populated — or the guest has never built relay — its tokio/bytes/mio dep
+/// .crate files may be absent. The bootstrap falls through to the online fallback,
+/// which fails on an isolated lab guest with no internet (DNS times out).
+///
+/// This function detects the missing files by querying the guest's registry, then
+/// copies them from the orchestrator host's registry (which always has them since
+/// the orchestrator builds the full workspace). The `.crate` files are source
+/// archives — architecture-neutral — so copying from an amd64 orchestrator to an
+/// arm64 guest is correct. Only external (non-path) crates appear in the registry;
+/// workspace crates are always built from source and need no cache entry.
+///
+/// # Fail-open design
+///
+/// A failure here should not abort the bootstrap: the worst case is the bootstrap
+/// falls back to the online path and fails on a no-internet guest, which is the
+/// exact failure mode this function prevents. Returning `Err` would skip the
+/// bootstrap entirely, which is worse. Callers should log + continue on error.
+pub fn ensure_relay_cargo_deps(conn: &NodeConnection) -> Result<(), String> {
+    // Known relay dep .crate files (external, non-workspace). Derived from the
+    // Cargo.lock at the time this code was written; update when relay's dep tree
+    // changes. The list is conservative: presence of all files here is sufficient
+    // for a warm offline build of rustynet-relay --features daemon.
+    //
+    // These are the tokio-ecosystem crates rustynetd/rustynet-cli do NOT pull in
+    // (so they are absent from a macOS relay guest that only built those two),
+    // plus the bytes/mio crates that tokio depends on.
+    const RELAY_EXTRA_CRATES: &[&str] = &[
+        "bytes-1.11.1.crate",
+        "mio-1.1.1.crate",
+        "tokio-1.50.0.crate",
+        "tokio-macros-2.6.1.crate",
+    ];
+
+    // Locate the orchestrator host's cargo registry cache.
+    let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/iwan".to_owned());
+        format!("{home}/.cargo")
+    });
+    let short = Duration::from_secs(20);
+
+    // Find the registry cache dir on the guest (resolve the hashed subdir name
+    // dynamically so this works regardless of the exact hash).
+    let guest_registry = ssh::run_remote(
+        conn,
+        "ls -d ~/.cargo/registry/cache/index.crates.io-* 2>/dev/null | head -1 | tr -d '\n'",
+        short,
+    )
+    .unwrap_or_default();
+    let guest_registry = guest_registry.trim().to_owned();
+    if guest_registry.is_empty() {
+        return Err("could not find ~/.cargo/registry/cache/index.crates.io-* on macOS guest".to_owned());
+    }
+
+    // Discover the orchestrator's registry dir (same hash or any index.crates.io-* dir).
+    let local_cache = {
+        let cache_root = format!("{cargo_home}/registry/cache");
+        let Ok(entries) = std::fs::read_dir(&cache_root) else {
+            return Err(format!("orchestrator cargo registry cache not found at {cache_root}"));
+        };
+        let mut found = None;
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("index.crates.io-") {
+                found = Some(e.path());
+                break;
+            }
+        }
+        found.ok_or_else(|| format!("no index.crates.io-* dir in {cache_root}"))?
+    };
+
+    // Check which crates are missing on the guest, then ship them.
+    let missing: Vec<&str> = {
+        let check_cmd = RELAY_EXTRA_CRATES
+            .iter()
+            .map(|c| format!("test -f '{guest_registry}/{c}' && echo 'present:{c}' || echo 'missing:{c}'"))
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        let output = ssh::run_remote(conn, &check_cmd, short).unwrap_or_default();
+        RELAY_EXTRA_CRATES
+            .iter()
+            .copied()
+            .filter(|c| !output.contains(&format!("present:{c}")))
+            .collect()
+    };
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    for crate_name in &missing {
+        let local_path = local_cache.join(crate_name);
+        if !local_path.exists() {
+            return Err(format!(
+                "relay dep {crate_name} missing from orchestrator registry at {}",
+                local_cache.display()
+            ));
+        }
+        ssh::scp_to(conn, Path::new(&local_path), &format!("{guest_registry}/{crate_name}"), short)
+            .map_err(|e| format!("failed to ship {crate_name} to macOS guest registry: {e}"))?;
+    }
     Ok(())
 }
 

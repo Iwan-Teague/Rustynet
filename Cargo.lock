@@ -1036,6 +1036,14 @@ name = "rustynet-local-security"
 version = "0.1.0"
 
 [[package]]
+name = "rustynet-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustynet-operator"
 version = "0.1.0"
 
