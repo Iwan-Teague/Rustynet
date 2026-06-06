@@ -722,14 +722,18 @@ pub fn ensure_relay_cargo_deps(conn: &NodeConnection) -> Result<(), String> {
     .unwrap_or_default();
     let guest_registry = guest_registry.trim().to_owned();
     if guest_registry.is_empty() {
-        return Err("could not find ~/.cargo/registry/cache/index.crates.io-* on macOS guest".to_owned());
+        return Err(
+            "could not find ~/.cargo/registry/cache/index.crates.io-* on macOS guest".to_owned(),
+        );
     }
 
     // Discover the orchestrator's registry dir (same hash or any index.crates.io-* dir).
     let local_cache = {
         let cache_root = format!("{cargo_home}/registry/cache");
         let Ok(entries) = std::fs::read_dir(&cache_root) else {
-            return Err(format!("orchestrator cargo registry cache not found at {cache_root}"));
+            return Err(format!(
+                "orchestrator cargo registry cache not found at {cache_root}"
+            ));
         };
         let mut found = None;
         for e in entries.flatten() {
@@ -746,7 +750,11 @@ pub fn ensure_relay_cargo_deps(conn: &NodeConnection) -> Result<(), String> {
     let missing: Vec<&str> = {
         let check_cmd = RELAY_EXTRA_CRATES
             .iter()
-            .map(|c| format!("test -f '{guest_registry}/{c}' && echo 'present:{c}' || echo 'missing:{c}'"))
+            .map(|c| {
+                format!(
+                    "test -f '{guest_registry}/{c}' && echo 'present:{c}' || echo 'missing:{c}'"
+                )
+            })
             .collect::<Vec<_>>()
             .join(" ; ");
         let output = ssh::run_remote(conn, &check_cmd, short).unwrap_or_default();
@@ -769,8 +777,13 @@ pub fn ensure_relay_cargo_deps(conn: &NodeConnection) -> Result<(), String> {
                 local_cache.display()
             ));
         }
-        ssh::scp_to(conn, Path::new(&local_path), &format!("{guest_registry}/{crate_name}"), short)
-            .map_err(|e| format!("failed to ship {crate_name} to macOS guest registry: {e}"))?;
+        ssh::scp_to(
+            conn,
+            Path::new(&local_path),
+            &format!("{guest_registry}/{crate_name}"),
+            short,
+        )
+        .map_err(|e| format!("failed to ship {crate_name} to macOS guest registry: {e}"))?;
     }
     Ok(())
 }
@@ -894,10 +907,18 @@ mod tests {
             "bootstrap passphrase must be root-owned while root reads it for secure-store provisioning"
         );
         assert!(
-            BOOTSTRAP_SCRIPT.contains(
-                "chown rustynetd:rustynetd \"${encrypted_key}\" \"${public_key}\" \"${passphrase_file}\""
-            ),
-            "root-created PERSISTENT key files (encrypted key, public key, passphrase) must be handed back to the daemon service account"
+            BOOTSTRAP_SCRIPT
+                .contains("chown rustynetd:rustynetd \"${encrypted_key}\" \"${public_key}\""),
+            "encrypted key + public key must be handed back to the daemon service account after key init"
+        );
+        // Phase E: wireguard.passphrase lives in BOOTSTRAP_DIR (not keys/) and is
+        // kept root:rustynetd 0600. The cdhash re-bind reads it as root; the daemon
+        // never reads it at runtime (uses System.keychain). Keeping it root-owned
+        // prevents the daemon account from accidentally reading plaintext passphrase
+        // material outside the keychain path.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("chown root:rustynetd \"${passphrase_file}\""),
+            "bootstrap passphrase in BOOTSTRAP_DIR must be root:rustynetd (not daemon-owned)"
         );
         // Encrypted-at-rest custody (Phase E): `key init` writes a plaintext
         // runtime key under keys/, but a plaintext private key MUST NOT persist
