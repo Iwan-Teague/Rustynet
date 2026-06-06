@@ -15,6 +15,7 @@ members = [
   "crates/rustynet-backend-userspace",
   "crates/rustynet-sysinfo",
   "crates/rustynet-operator",
+  "crates/rustynet-mcp",
   "crates/rustynet-xtask",
 ]
 resolver = "2"
