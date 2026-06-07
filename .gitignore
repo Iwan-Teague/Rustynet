@@ -11,6 +11,13 @@
 /.cargo-audit-db..lock
 /.cargo-audit-db*
 
+# MCP server build output (binaries built by scripts/mcp/install.sh into ./bin).
+# Build from source; do not commit the compiled servers.
+/bin/
+
+# Editor-local config (absolute machine paths; wire up via scripts/mcp/install.sh).
+/.zed/
+
 # Local desktop noise
 .DS_Store
 __pycache__/

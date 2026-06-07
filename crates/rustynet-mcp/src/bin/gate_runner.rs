@@ -12,8 +12,8 @@
 #![forbid(unsafe_code)]
 
 use rustynet_mcp::{
-    McpServer, ServerInfo, Tool, ToolCallResult, json_schema_array_string, json_schema_boolean,
-    json_schema_object, json_schema_string, run_server, text_content, tool_error, tool_success,
+    McpServer, ServerInfo, Tool, ToolCallResult, json_schema_boolean, json_schema_object,
+    json_schema_string, run_server, text_content, tool_error, tool_success,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ struct GateRunnerServer {
 impl GateRunnerServer {
     fn new() -> Self {
         Self {
-            repo_root: PathBuf::from("."),
+            repo_root: rustynet_mcp::repo_root(),
         }
     }
 

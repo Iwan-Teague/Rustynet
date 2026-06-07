@@ -1,0 +1,76 @@
+{
+  "description": "Rustynet MCP server manifest — three servers providing repo context, gate running, and lab state management for AI agents.",
+  "servers": [
+    {
+      "name": "rustynet-mcp-repo-context",
+      "description": "Structured access to the Rustynet documentation graph, requirements, security controls, architecture constraints, and codebase structure. 13 tools.",
+      "tools": [
+        "get_read_order",
+        "get_active_ledger",
+        "get_requirements",
+        "get_security_controls",
+        "get_security_findings",
+        "get_architecture_constraints",
+        "get_definition_of_done",
+        "get_role_transition",
+        "get_platform_support",
+        "find_in_docs",
+        "get_document",
+        "get_crate_structure",
+        "get_orchestrator_stages"
+      ],
+      "requires_working_dir": true,
+      "working_dir": "<rustynet_repo_root>"
+    },
+    {
+      "name": "rustynet-mcp-gate-runner",
+      "description": "Runs Rustynet quality gates on demand — cargo fmt, check, clippy, test, audit, deny, and phase-specific CI scripts. 9 tools.",
+      "tools": [
+        "run_gates",
+        "run_check",
+        "run_fmt",
+        "run_clippy",
+        "run_test",
+        "run_build",
+        "run_security_audit",
+        "list_gate_scripts",
+        "run_gate_script"
+      ],
+      "requires_working_dir": true,
+      "working_dir": "<rustynet_repo_root>"
+    },
+    {
+      "name": "rustynet-mcp-lab-state",
+      "description": "Queries and manages the UTM VM lab — discovery, restart, recovery, repo sync, bootstrap, diagnostics, and run matrix evidence. 11 tools.",
+      "tools": [
+        "get_lab_status",
+        "get_lab_status_json",
+        "get_inventory",
+        "validate_inventory",
+        "restart_vm",
+        "recover_stuck_vms",
+        "ensure_lab_ready",
+        "sync_repo_to_vm",
+        "bootstrap_vm",
+        "get_vm_diagnostics",
+        "get_run_matrix"
+      ],
+      "requires_working_dir": true,
+      "working_dir": "<rustynet_repo_root>"
+    }
+  ],
+  "platform_configs": {
+    "zed": {
+      "config_path": ".zed/settings.json",
+      "config_key": "context_servers"
+    },
+    "claude_desktop_macos": {
+      "config_path": "~/Library/Application Support/Claude/claude_desktop_config.json",
+      "config_key": "mcpServers"
+    },
+    "vscode_cursor": {
+      "config_path": ".vscode/mcp.json",
+      "config_key": "servers"
+    }
+  }
+}

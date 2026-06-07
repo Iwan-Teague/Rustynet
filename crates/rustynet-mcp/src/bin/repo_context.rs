@@ -17,12 +17,12 @@
 
 use rustynet_mcp::{
     McpServer, ServerInfo, Tool, ToolCallResult, json_schema_object, json_schema_string,
-    run_server, text_content, tool_error, tool_success,
+    run_server, tool_error, tool_success,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn main() {
     let server = RepoContextServer::new();
@@ -316,7 +316,7 @@ impl RepoContextServer {
 
         Self {
             doc_index,
-            repo_root: PathBuf::from("."),
+            repo_root: rustynet_mcp::repo_root(),
             topic_map,
         }
     }
@@ -994,88 +994,121 @@ struct SecurityFinding {
 
 static SECURITY_FINDINGS: &[SecurityFinding] = &[
     SecurityFinding {
-        id: "RN-03", title: "force_fail_closed discarded — 10/44 sites",
-        severity: "High", status: "open", cwe: "CWE-754",
+        id: "RN-03",
+        title: "force_fail_closed discarded — 10/44 sites",
+        severity: "High",
+        status: "open",
+        cwe: "CWE-754",
         location: "crates/rustynetd/src/daemon.rs and 9 other files",
         priority: "P0",
         description: "The force_fail_closed safety mechanism was discarded at 10 of 44 call sites. When trust/security state is missing, invalid, or stale, these paths do not fail closed as required.",
         remediation: "Restore force_fail_closed at all 44 sites. Audit every path that reads trust state.",
     },
     SecurityFinding {
-        id: "RN-04", title: "Pre-killswitch is opt-in and Linux-only",
-        severity: "High", status: "open", cwe: "CWE-693",
+        id: "RN-04",
+        title: "Pre-killswitch is opt-in and Linux-only",
+        severity: "High",
+        status: "open",
+        cwe: "CWE-693",
         location: "crates/rustynetd/src/killswitch.rs",
         priority: "P0",
         description: "The pre-killswitch (applied before daemon starts) is opt-in via CLI flag and only on Linux (nftables). Windows/macOS have no pre-killswitch, creating a race window.",
         remediation: "Make pre-killswitch mandatory and cross-platform: WFP on Windows, pf anchor on macOS at install time.",
     },
     SecurityFinding {
-        id: "RN-05", title: "Non-node: selectors bypass policy revocation",
-        severity: "High", status: "open", cwe: "CWE-863",
+        id: "RN-05",
+        title: "Non-node: selectors bypass policy revocation",
+        severity: "High",
+        status: "open",
+        cwe: "CWE-863",
         location: "crates/rustynet-policy/src/eval.rs",
         priority: "P0",
         description: "Policy selectors using non-'node:' prefixes can match after a node is revoked. Revocation only removes 'node:' selectors.",
         remediation: "Re-evaluate all selectors against current membership on every policy evaluation.",
     },
     SecurityFinding {
-        id: "RN-06", title: "Windows killswitch allows IPv4 LAN egress",
-        severity: "High", status: "open", cwe: "CWE-284",
+        id: "RN-06",
+        title: "Windows killswitch allows IPv4 LAN egress",
+        severity: "High",
+        status: "open",
+        cwe: "CWE-284",
         location: "crates/rustynetd/src/killswitch.rs (Windows netsh rules)",
         priority: "P0",
         description: "The Windows killswitch uses netsh rules allowing all IPv4 LAN egress. In protected mode this is a leak path.",
         remediation: "Move Windows egress policy to WFP for fine-grained control. Scope IPv4 LAN allowlist to known-safe CIDRs.",
     },
     SecurityFinding {
-        id: "RN-07", title: "IPv6 leak in protected mode",
-        severity: "High", status: "partial", cwe: "CWE-284",
+        id: "RN-07",
+        title: "IPv6 leak in protected mode",
+        severity: "High",
+        status: "partial",
+        cwe: "CWE-284",
         location: "crates/rustynetd/src/killswitch.rs",
         priority: "P0",
         description: "IPv6 traffic can bypass the killswitch. G8 partially remediates with apply/block/rollback but full leak-proof is deferred.",
         remediation: "Complete G8 IPv6 fail-closed: block all IPv6 at WFP/pf/nftables when protected mode active.",
     },
     SecurityFinding {
-        id: "RN-11", title: "Empty membership/context = permissive default",
-        severity: "High", status: "open", cwe: "CWE-276",
+        id: "RN-11",
+        title: "Empty membership/context = permissive default",
+        severity: "High",
+        status: "open",
+        cwe: "CWE-276",
         location: "crates/rustynet-policy/src/eval.rs",
         priority: "P1",
         description: "When membership is empty or context missing, policy defaults to permissive. Violates default-deny requirement.",
         remediation: "Policy must deny by default when membership is empty. Add deny-on-empty guards.",
     },
     SecurityFinding {
-        id: "RN-01", title: "Membership decoder DoS via unbounded allocation",
-        severity: "High", status: "fixed", cwe: "CWE-770",
+        id: "RN-01",
+        title: "Membership decoder DoS via unbounded allocation",
+        severity: "High",
+        status: "fixed",
+        cwe: "CWE-770",
         location: "crates/rustynet-control/src/membership.rs",
         priority: "P0",
         description: "Unbounded allocation on attacker-controlled size fields. Fixed: added size caps (RL-1).",
         remediation: "",
     },
     SecurityFinding {
-        id: "RN-14", title: "Unsafe code lint not enforced workspace-wide",
-        severity: "Medium", status: "fixed", cwe: "CWE-242",
+        id: "RN-14",
+        title: "Unsafe code lint not enforced workspace-wide",
+        severity: "Medium",
+        status: "fixed",
+        cwe: "CWE-242",
         location: "Cargo.toml workspace lints",
         priority: "P1",
         description: "unsafe_code=forbid now in workspace lints. Fixed (RL-2).",
         remediation: "",
     },
     SecurityFinding {
-        id: "RN-22", title: "ed25519 verify_strict not used (malleability)",
-        severity: "Medium", status: "fixed", cwe: "CWE-347",
+        id: "RN-22",
+        title: "ed25519 verify_strict not used (malleability)",
+        severity: "Medium",
+        status: "fixed",
+        cwe: "CWE-347",
         location: "crates/rustynet-crypto/src/verify.rs",
         priority: "P1",
         description: "Switched to verify_strict. Fixed (RL-3).",
         remediation: "",
     },
     SecurityFinding {
-        id: "RN-24", title: "Secret material not zeroized after use",
-        severity: "Medium", status: "fixed", cwe: "CWE-226",
+        id: "RN-24",
+        title: "Secret material not zeroized after use",
+        severity: "Medium",
+        status: "fixed",
+        cwe: "CWE-226",
         location: "Multiple files in rustynet-crypto, rustynetd",
         priority: "P1",
         description: "Added zeroize at all key material drop sites. Fixed (RL-4).",
         remediation: "",
     },
     SecurityFinding {
-        id: "RN-21", title: "Fail-closed path accepted as operational risk",
-        severity: "Low", status: "accepted", cwe: "N/A",
+        id: "RN-21",
+        title: "Fail-closed path accepted as operational risk",
+        severity: "Low",
+        status: "accepted",
+        cwe: "N/A",
         location: "crates/rustynetd/src/daemon.rs",
         priority: "P2",
         description: "Daemon refuses to start without valid membership snapshot — intentional fail-closed. Accepted.",
@@ -1099,7 +1132,10 @@ fn validate_role_transition(from: &str, to: &str, platform: &str) -> String {
         ("windows", &["exit", "blind_exit", "relay", "anchor"]),
         ("macos", &["blind_exit"]),
         ("ios", &["relay", "anchor", "exit", "blind_exit", "admin"]),
-        ("android", &["relay", "anchor", "exit", "blind_exit", "admin"]),
+        (
+            "android",
+            &["relay", "anchor", "exit", "blind_exit", "admin"],
+        ),
     ];
 
     for (bp, br) in platform_blocks {
@@ -1113,7 +1149,9 @@ fn validate_role_transition(from: &str, to: &str, platform: &str) -> String {
 
     if from_lower == "blind_exit" {
         result.push_str("## Result: 🚫 Irreversible\n\n");
-        result.push_str("BlindExit is immutable. Requires factory-reset: wipe identity → re-enroll.\n");
+        result.push_str(
+            "BlindExit is immutable. Requires factory-reset: wipe identity → re-enroll.\n",
+        );
         return result;
     }
 
@@ -1155,31 +1193,166 @@ struct PlatformSupportEntry {
 }
 
 static PLATFORM_SUPPORT: &[PlatformSupportEntry] = &[
-    PlatformSupportEntry { feature: "client role", platform: "linux", status: "supported", note: "Full mesh client with WireGuard kernel backend" },
-    PlatformSupportEntry { feature: "exit role", platform: "linux", status: "supported", note: "Full exit node with NAT/forwarding" },
-    PlatformSupportEntry { feature: "relay role", platform: "linux", status: "supported", note: "Production relay binary, frame forwarding" },
-    PlatformSupportEntry { feature: "anchor role", platform: "linux", status: "supported", note: "Bundle-pull, enrollment endpoint, port mapping authority" },
-    PlatformSupportEntry { feature: "blind_exit role", platform: "linux", status: "supported", note: "Immutable blind exit with factory-reset requirement" },
-    PlatformSupportEntry { feature: "killswitch", platform: "linux", status: "supported", note: "nftables pre-start and post-start" },
-    PlatformSupportEntry { feature: "wireguard kernel", platform: "linux", status: "supported", note: "in-kernel wireguard.ko" },
-    PlatformSupportEntry { feature: "uPnP/NAT-PMP/PCP", platform: "linux", status: "supported", note: "Gateway detection via /proc/net/route" },
-    PlatformSupportEntry { feature: "IPv6 dataplane", platform: "linux", status: "supported", note: "Dual-stack with v6 candidate gathering" },
-    PlatformSupportEntry { feature: "client role", platform: "macos", status: "supported", note: "Userspace WireGuard (boringtun)" },
-    PlatformSupportEntry { feature: "exit role", platform: "macos", status: "fail-closed", note: "Implemented, gated behind live evidence (W5.4)" },
-    PlatformSupportEntry { feature: "relay role", platform: "macos", status: "planned", note: "On roadmap, not yet implemented" },
-    PlatformSupportEntry { feature: "anchor role", platform: "macos", status: "planned", note: "On roadmap, not yet implemented" },
-    PlatformSupportEntry { feature: "blind_exit role", platform: "macos", status: "blocked", note: "Platform limitation" },
-    PlatformSupportEntry { feature: "killswitch", platform: "macos", status: "fail-closed", note: "pf anchor available but pre-killswitch not mandatory" },
-    PlatformSupportEntry { feature: "client role", platform: "windows", status: "supported", note: "WireGuard-NT, WFP killswitch, single-node smoke validated" },
-    PlatformSupportEntry { feature: "exit role", platform: "windows", status: "fail-closed", note: "Implemented, gated behind WinNAT/HNS live evidence" },
-    PlatformSupportEntry { feature: "relay role", platform: "windows", status: "planned", note: "D8 omitted (relay = Linux home server)" },
-    PlatformSupportEntry { feature: "anchor role", platform: "windows", status: "planned", note: "On roadmap" },
-    PlatformSupportEntry { feature: "blind_exit role", platform: "windows", status: "blocked", note: "Platform limitation" },
-    PlatformSupportEntry { feature: "killswitch", platform: "windows", status: "partial", note: "netsh-based, IPv4 LAN egress allow-all (RN-06); WFP migration planned (E2)" },
-    PlatformSupportEntry { feature: "wireguard-nt", platform: "windows", status: "supported", note: "WireGuard-NT kernel driver" },
-    PlatformSupportEntry { feature: "DPAPI secrets", platform: "windows", status: "supported", note: "DPAPI-protected blobs under ProgramData\\RustyNet\\secrets" },
-    PlatformSupportEntry { feature: "client role", platform: "ios", status: "planned", note: "Consumption-only; no hosting" },
-    PlatformSupportEntry { feature: "client role", platform: "android", status: "planned", note: "Consumption-only; no hosting" },
-    PlatformSupportEntry { feature: "all other roles", platform: "ios", status: "blocked", note: "Mobile is client-only by design" },
-    PlatformSupportEntry { feature: "all other roles", platform: "android", status: "blocked", note: "Mobile is client-only by design" },
+    PlatformSupportEntry {
+        feature: "client role",
+        platform: "linux",
+        status: "supported",
+        note: "Full mesh client with WireGuard kernel backend",
+    },
+    PlatformSupportEntry {
+        feature: "exit role",
+        platform: "linux",
+        status: "supported",
+        note: "Full exit node with NAT/forwarding",
+    },
+    PlatformSupportEntry {
+        feature: "relay role",
+        platform: "linux",
+        status: "supported",
+        note: "Production relay binary, frame forwarding",
+    },
+    PlatformSupportEntry {
+        feature: "anchor role",
+        platform: "linux",
+        status: "supported",
+        note: "Bundle-pull, enrollment endpoint, port mapping authority",
+    },
+    PlatformSupportEntry {
+        feature: "blind_exit role",
+        platform: "linux",
+        status: "supported",
+        note: "Immutable blind exit with factory-reset requirement",
+    },
+    PlatformSupportEntry {
+        feature: "killswitch",
+        platform: "linux",
+        status: "supported",
+        note: "nftables pre-start and post-start",
+    },
+    PlatformSupportEntry {
+        feature: "wireguard kernel",
+        platform: "linux",
+        status: "supported",
+        note: "in-kernel wireguard.ko",
+    },
+    PlatformSupportEntry {
+        feature: "uPnP/NAT-PMP/PCP",
+        platform: "linux",
+        status: "supported",
+        note: "Gateway detection via /proc/net/route",
+    },
+    PlatformSupportEntry {
+        feature: "IPv6 dataplane",
+        platform: "linux",
+        status: "supported",
+        note: "Dual-stack with v6 candidate gathering",
+    },
+    PlatformSupportEntry {
+        feature: "client role",
+        platform: "macos",
+        status: "supported",
+        note: "Userspace WireGuard (boringtun)",
+    },
+    PlatformSupportEntry {
+        feature: "exit role",
+        platform: "macos",
+        status: "fail-closed",
+        note: "Implemented, gated behind live evidence (W5.4)",
+    },
+    PlatformSupportEntry {
+        feature: "relay role",
+        platform: "macos",
+        status: "planned",
+        note: "On roadmap, not yet implemented",
+    },
+    PlatformSupportEntry {
+        feature: "anchor role",
+        platform: "macos",
+        status: "planned",
+        note: "On roadmap, not yet implemented",
+    },
+    PlatformSupportEntry {
+        feature: "blind_exit role",
+        platform: "macos",
+        status: "blocked",
+        note: "Platform limitation",
+    },
+    PlatformSupportEntry {
+        feature: "killswitch",
+        platform: "macos",
+        status: "fail-closed",
+        note: "pf anchor available but pre-killswitch not mandatory",
+    },
+    PlatformSupportEntry {
+        feature: "client role",
+        platform: "windows",
+        status: "supported",
+        note: "WireGuard-NT, WFP killswitch, single-node smoke validated",
+    },
+    PlatformSupportEntry {
+        feature: "exit role",
+        platform: "windows",
+        status: "fail-closed",
+        note: "Implemented, gated behind WinNAT/HNS live evidence",
+    },
+    PlatformSupportEntry {
+        feature: "relay role",
+        platform: "windows",
+        status: "planned",
+        note: "D8 omitted (relay = Linux home server)",
+    },
+    PlatformSupportEntry {
+        feature: "anchor role",
+        platform: "windows",
+        status: "planned",
+        note: "On roadmap",
+    },
+    PlatformSupportEntry {
+        feature: "blind_exit role",
+        platform: "windows",
+        status: "blocked",
+        note: "Platform limitation",
+    },
+    PlatformSupportEntry {
+        feature: "killswitch",
+        platform: "windows",
+        status: "partial",
+        note: "netsh-based, IPv4 LAN egress allow-all (RN-06); WFP migration planned (E2)",
+    },
+    PlatformSupportEntry {
+        feature: "wireguard-nt",
+        platform: "windows",
+        status: "supported",
+        note: "WireGuard-NT kernel driver",
+    },
+    PlatformSupportEntry {
+        feature: "DPAPI secrets",
+        platform: "windows",
+        status: "supported",
+        note: "DPAPI-protected blobs under ProgramData\\RustyNet\\secrets",
+    },
+    PlatformSupportEntry {
+        feature: "client role",
+        platform: "ios",
+        status: "planned",
+        note: "Consumption-only; no hosting",
+    },
+    PlatformSupportEntry {
+        feature: "client role",
+        platform: "android",
+        status: "planned",
+        note: "Consumption-only; no hosting",
+    },
+    PlatformSupportEntry {
+        feature: "all other roles",
+        platform: "ios",
+        status: "blocked",
+        note: "Mobile is client-only by design",
+    },
+    PlatformSupportEntry {
+        feature: "all other roles",
+        platform: "android",
+        status: "blocked",
+        note: "Mobile is client-only by design",
+    },
 ];
