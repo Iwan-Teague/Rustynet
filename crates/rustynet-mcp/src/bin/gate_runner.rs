@@ -58,6 +58,38 @@ impl GateRunnerServer {
         args.extend(extra_args);
         self.run_command("cargo", &args, 600)
     }
+
+    /// Crates changed vs HEAD (including staged), as a cargo scope like
+    /// "-p rustynet-control -p rustynet-policy". Empty if no crate changes.
+    fn changed_crate_scope(&self) -> String {
+        let mut crates = std::collections::BTreeSet::new();
+        for diff_args in [
+            ["diff", "--name-only", "HEAD"],
+            ["diff", "--cached", "--name-only"],
+        ] {
+            if let Ok(o) = run_with_timeout(
+                "git",
+                &diff_args,
+                &self.repo_root,
+                &[],
+                Duration::from_secs(30),
+            ) {
+                for line in o.stdout.lines() {
+                    let mut parts = line.split('/');
+                    if parts.next() == Some("crates")
+                        && let Some(name) = parts.next()
+                    {
+                        crates.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        crates
+            .iter()
+            .map(|c| format!("-p {c}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 impl McpServer for GateRunnerServer {
@@ -72,11 +104,12 @@ impl McpServer for GateRunnerServer {
         vec![
             Tool {
                 name: "run_gates".into(),
-                description: "Run the full quality gate suite via xtask: fmt → check → clippy → test. Stops at first failure. Use --skip-test to skip the slow test stage. Specify scope with --scope (e.g. '-p rustynet-cli').".into(),
+                description: "Run the quality gate suite via xtask: fmt → check → clippy → test. Stops at first failure. skip_test skips the slow test stage. scope sets a cargo scope (e.g. '-p rustynet-cli'). changed_only auto-scopes to the crates changed vs HEAD (incl. staged) — fast inner loop after a patch.".into(),
                 input_schema: json_schema_object(
                     json!({
                         "skip_test": json_schema_boolean("Skip the test stage (default: false)"),
                         "scope": json_schema_string("Optional cargo scope, e.g. '-p rustynet-cli' or '--workspace'"),
+                        "changed_only": json_schema_boolean("Auto-scope to crates changed vs HEAD (default: false). Ignored if scope is given."),
                     }),
                     vec![],
                 ),
@@ -159,18 +192,39 @@ impl McpServer for GateRunnerServer {
                     .and_then(|a| a.get("skip_test"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let scope = arguments
+                let explicit_scope = arguments
                     .as_ref()
                     .and_then(|a| a.get("scope"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                let changed_only = arguments
+                    .as_ref()
+                    .and_then(|a| a.get("changed_only"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
 
-                let mut extra_args = Vec::new();
+                // Explicit scope wins; else changed_only computes it from git.
+                let scope: String = if !explicit_scope.is_empty() {
+                    explicit_scope.to_string()
+                } else if changed_only {
+                    self.changed_crate_scope()
+                } else {
+                    String::new()
+                };
+
+                if changed_only && explicit_scope.is_empty() && scope.is_empty() {
+                    return tool_success(
+                        "# run_gates (changed_only)\n\nNo changed crates detected vs HEAD — nothing to gate. Patch some code first, or run without changed_only for the full workspace.",
+                    );
+                }
+
+                let mut extra_args: Vec<&str> = Vec::new();
                 if skip_test {
                     extra_args.push("--skip-test");
                 }
-                if !scope.is_empty() {
-                    extra_args.push(scope);
+                // Split the scope into individual cargo args (supports multiple -p).
+                for tok in scope.split_whitespace() {
+                    extra_args.push(tok);
                 }
                 self.run_xtask(&extra_args)
             }
