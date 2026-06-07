@@ -30,7 +30,7 @@ struct LabStateServer {
 impl LabStateServer {
     fn new() -> Self {
         Self {
-            repo_root: PathBuf::from("."),
+            repo_root: rustynet_mcp::repo_root(),
         }
     }
 
@@ -359,7 +359,9 @@ impl McpServer for LabStateServer {
                     return tool_error("At least one alias is required");
                 }
 
-                let mut args = Vec::new();
+                let ssh_key: String;
+                let kh: String;
+                let mut args: Vec<&str> = Vec::new();
                 if aliases.len() == 1 && aliases[0] == "--all" {
                     args.push("--all");
                 } else {
@@ -371,10 +373,10 @@ impl McpServer for LabStateServer {
                 if wait_ready {
                     args.push("--wait-ready");
                     args.push("--ssh-identity-file");
-                    let ssh_key = expand_tilde("~/.ssh/rustynet_lab_ed25519");
+                    ssh_key = expand_tilde("~/.ssh/rustynet_lab_ed25519");
                     args.push(&ssh_key);
                     args.push("--known-hosts-file");
-                    let kh = expand_tilde("~/.ssh/known_hosts");
+                    kh = expand_tilde("~/.ssh/known_hosts");
                     args.push(&kh);
                 }
 

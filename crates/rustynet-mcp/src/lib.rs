@@ -8,6 +8,36 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+
+// ── Repo root resolution ─────────────────────────────────────────────
+
+/// Resolve the Rustynet repository root directory.
+/// Checks RUSTYNET_REPO_ROOT env, then PWD, falls back to current dir.
+pub fn repo_root() -> PathBuf {
+    // First check explicit env override (for testing)
+    if let Ok(dir) = std::env::var("RUSTYNET_REPO_ROOT") {
+        let p = PathBuf::from(&dir);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    // Use compile-time baked path (set via build.rs or default)
+    if let Ok(dir) = std::env::var("RUSTYNET_REPO_BAKED") {
+        let p = PathBuf::from(&dir);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    // Fallback: try PWD
+    if let Ok(dir) = std::env::var("PWD") {
+        let p = PathBuf::from(&dir);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    PathBuf::from(".")
+}
 
 // ── JSON-RPC 2.0 types ────────────────────────────────────────────────
 
@@ -48,6 +78,7 @@ pub struct EmptyResult {}
 // ── MCP types ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Tool {
     pub name: String,
     pub description: String,
@@ -62,6 +93,7 @@ pub struct ToolCallParams {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolCallResult {
     pub content: Vec<ContentItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,17 +108,20 @@ pub struct ContentItem {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerCapabilities {
     pub tools: ToolsCapability,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolsCapability {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub list_changed: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
     pub protocol_version: String,
     pub capabilities: ServerCapabilities,
@@ -94,6 +129,7 @@ pub struct InitializeResult {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
     pub name: String,
     pub version: String,
@@ -235,6 +271,11 @@ pub trait McpServer {
 /// Run the MCP server main loop. Reads JSON-RPC requests from stdin,
 /// dispatches to the server impl, writes responses to stdout.
 pub fn run_server(server: impl McpServer) {
+    eprintln!(
+        "[rustynet-mcp] starting {} v{}",
+        server.server_info().name,
+        server.server_info().version
+    );
     let stdin = std::io::stdin();
     let reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
@@ -285,10 +326,20 @@ pub fn run_server(server: impl McpServer) {
 }
 
 fn handle_request(server: &impl McpServer, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    eprintln!("[rustynet-mcp] <- {} id={:?}", req.method, req.id);
     match req.method.as_str() {
         "initialize" => {
+            // Negotiate protocol version: use the client's version if provided,
+            // otherwise fall back to our default.
+            let client_version = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(PROTOCOL_VERSION);
+
             let result = serde_json::to_value(InitializeResult {
-                protocol_version: PROTOCOL_VERSION.into(),
+                protocol_version: client_version.to_string(),
                 capabilities: ServerCapabilities {
                     tools: ToolsCapability {
                         list_changed: Some(false),
