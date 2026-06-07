@@ -103,12 +103,13 @@ cat <<EOF
                                 support, crate structure, doc search/list/read).
   rustynet-mcp-gate-runner   —  9 tools (fmt/check/clippy/test/build, security audit,
                                 CI gate scripts) — all kill-on-timeout.
-  rustynet-mcp-lab-state     — 22 tools + overnight-loop prompt. UTM discovery/
+  rustynet-mcp-lab-state     — 24 tools + overnight-loop prompt. UTM discovery/
                                 inventory/restart/recover, sync/bootstrap/diagnostics,
                                 AND the autonomous overnight loop: async background
-                                live-lab runs (start_live_lab_run → get_job_status →
-                                get_run_result → read_report_artifact), prune_jobs,
-                                run matrix. Built for unattended 24h+ loops.
+                                live-lab runs (start_live_lab_run with auto-topology →
+                                wait_for_job → get_run_result → explain_stage →
+                                read_report_artifact), prune_jobs, run matrix. Built
+                                for unattended 24h+ loops.
 
 The repo root is baked into each binary (build.rs); no working_directory needed.
 Override with RUSTYNET_REPO_ROOT if running a binary built from a different checkout.

@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Default machine-readable inventory path (repo-relative).
 const DEFAULT_INVENTORY: &str = "documents/operations/active/vm_lab_inventory.json";
@@ -229,6 +229,20 @@ impl LabStateServer {
         }
         find_digest_recursive(report_dir, 3)
     }
+
+    /// First inventory alias whose `platform` field matches (case-insensitive).
+    /// Linux entries have no `platform` field, so this returns the windows/macos
+    /// aliases used by auto-topology.
+    fn inventory_alias_for_platform(&self, platform: &str) -> Option<String> {
+        let s = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)).ok()?;
+        let inv: Value = serde_json::from_str(&s).ok()?;
+        inv.get("entries")?.as_array()?.iter().find_map(|e| {
+            let p = e.get("platform").and_then(|v| v.as_str())?;
+            p.eq_ignore_ascii_case(platform)
+                .then(|| e.get("alias").and_then(|v| v.as_str()).map(String::from))
+                .flatten()
+        })
+    }
 }
 
 fn now_unix() -> u64 {
@@ -368,24 +382,28 @@ LOOP:
      QEMU killswitch lockouts) → restart_vm or ensure_lab_ready → update_inventory
      (refresh live IPs — NEVER hand-edit the inventory).
 2. START A RUN (non-blocking)
-   - start_live_lab_run mode=orchestrate with windows_vm + macos_vm + Linux nodes
-     for full 3-OS coverage. Note the returned job_id + report_dir.
-3. POLL until done
-   - get_job_status(job_id) every ~5–10 min; tail_job_log(job_id) for progress.
+   - start_live_lab_run mode=orchestrate. Leave windows_vm/macos_vm unset —
+     auto_topology (default on) fills them from the inventory for full 3-OS
+     coverage. Note the returned job_id + report_dir.
+3. WAIT until done (don't busy-poll)
+   - wait_for_job(job_id) — blocks up to ~4 min and returns the instant the job
+     ends; call it in a loop. tail_job_log(job_id) any time for progress.
      State resolves to passed / failed / ended.
 4. CATCH BUGS (on failure)
    - get_run_result(job_id) → overall_result, first_failed_stage, per-OS/per-stage
      map, failure digest (stage / reason / message).
+   - explain_stage(first_failed_stage) → what that stage checks, the owning
+     file/crate, and common causes (turns the failure into a patch target).
    - list_report_artifacts(job_id) then read_report_artifact for the failing stage's
      log; get_vm_diagnostics(alias) on the failing node; diagnose_live_lab_failure
      for deep triage.
 5. PATCH
-   - repo-context which_crate + get_read_order to find the owning crate + rules;
-     get_architecture_constraints (default-deny, fail-closed, no unwrap in prod).
-     Edit the ROOT cause, minimally — not the symptom.
+   - repo-context which_crate (on explain_stage's owning file) + get_read_order to
+     find the owning crate + rules; get_architecture_constraints (default-deny,
+     fail-closed, no unwrap in prod). Edit the ROOT cause, minimally.
 6. VERIFY THE PATCH (fast, before re-running the lab)
-   - gate-runner run_gates (skip_test=true for a fast inner loop, then full). Fix
-     until green.
+   - gate-runner run_gates with changed_only=true (auto-scopes to the crates you
+     touched) for a fast inner loop, then a full run_gates. Fix until green.
 7. RE-VERIFY ON THE LAB
    - start_live_lab_run again with a fresh report_dir (a dirty tree is fine; the run
      records it and builds from the working tree). Back to step 3.
@@ -570,8 +588,9 @@ impl McpServer for LabStateServer {
                     json!({
                         "mode": json_schema_string("orchestrate | run | setup (default: orchestrate)"),
                         "report_dir": json_schema_string("Optional report dir (default: a fresh state/live-lab-<job_id>)"),
-                        "windows_vm": json_schema_string("orchestrate: Windows VM alias"),
-                        "macos_vm": json_schema_string("orchestrate: macOS VM alias"),
+                        "auto_topology": json_schema_boolean("orchestrate: if true (default) and windows_vm/macos_vm are not given, auto-fill them from the inventory so the run covers all 3 OSes. Set false for Linux-only."),
+                        "windows_vm": json_schema_string("orchestrate: Windows VM alias (overrides auto_topology)"),
+                        "macos_vm": json_schema_string("orchestrate: macOS VM alias (overrides auto_topology)"),
                         "nodes": json_schema_array_string("orchestrate: role assignments 'alias:role'"),
                         "profile": json_schema_string("run: profile env file (required for mode=run)"),
                         "profile_output": json_schema_string("setup: where to write the generated profile"),
@@ -592,6 +611,17 @@ impl McpServer for LabStateServer {
                 description: "Poll a background live-lab job: state (running/passed/failed/ended), overall_result, first_failed_stage, report_dir, log path. Fast, non-blocking.".into(),
                 input_schema: json_schema_object(
                     json!({"job_id": json_schema_string("Job id from start_live_lab_run")}),
+                    vec!["job_id"],
+                ),
+            },
+            Tool {
+                name: "wait_for_job".into(),
+                description: "Block until a live-lab job finishes OR up to timeout_secs (default 240, max 270 — kept under client/cache limits), then return its status. Returns the instant the job ends, so you can call this in a loop instead of busy-polling get_job_status. If it returns state=running, the job is still going — call again.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "job_id": json_schema_string("Job id from start_live_lab_run"),
+                        "timeout_secs": json!({"type": "integer", "description": "Max seconds to block (default 240, clamped to 10..270)"}),
+                    }),
                     vec!["job_id"],
                 ),
             },
@@ -628,6 +658,14 @@ impl McpServer for LabStateServer {
                         "report_dir": json_schema_string("Report dir (alternative to job_id)"),
                     }),
                     vec![],
+                ),
+            },
+            Tool {
+                name: "explain_stage".into(),
+                description: "Explain a live-lab stage (the value in first_failed_stage) — what it checks, the owning file/crate, and the most common failure causes. Use right after get_run_result to turn a failed stage into a concrete patch target.".into(),
+                input_schema: json_schema_object(
+                    json!({"stage": json_schema_string("Stage name, e.g. 'validate_baseline_runtime', 'bootstrap_hosts', 'anchor', 'role_switch_matrix' (linux_/macos_/windows_stage_ prefixes are stripped)")}),
+                    vec!["stage"],
                 ),
             },
             Tool {
@@ -879,6 +917,8 @@ impl McpServer for LabStateServer {
 
             "start_live_lab_run" => self.start_live_lab_run(args),
             "get_job_status" => self.get_job_status(args),
+            "wait_for_job" => self.wait_for_job(args),
+            "explain_stage" => explain_stage(arg_str(args, "stage").unwrap_or("")),
             "list_jobs" => self.list_jobs(),
             "tail_job_log" => self.tail_job_log(args),
             "cancel_job" => self.cancel_job(args),
@@ -982,11 +1022,27 @@ impl LabStateServer {
                         cli.push(flag.into());
                     }
                 }
-                if let Some(w) = arg_str(args, "windows_vm") {
-                    cli.extend(["--windows-vm".into(), w.into()]);
+                // Windows/macOS: explicit arg wins; otherwise auto-topology
+                // (default on) fills them from the inventory so a run covers all
+                // three OSes by default. Linux nodes auto-resolve from inventory
+                // lab_role metadata in the CLI, so no Linux handling needed here.
+                let auto = args
+                    .and_then(|a| a.get("auto_topology"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let win = arg_str(args, "windows_vm").map(String::from).or_else(|| {
+                    auto.then(|| self.inventory_alias_for_platform("windows"))
+                        .flatten()
+                });
+                if let Some(w) = win {
+                    cli.extend(["--windows-vm".into(), w]);
                 }
-                if let Some(m) = arg_str(args, "macos_vm") {
-                    cli.extend(["--macos-vm".into(), m.into()]);
+                let mac = arg_str(args, "macos_vm").map(String::from).or_else(|| {
+                    auto.then(|| self.inventory_alias_for_platform("macos"))
+                        .flatten()
+                });
+                if let Some(m) = mac {
+                    cli.extend(["--macos-vm".into(), m]);
                 }
                 for n in string_array(args, "nodes") {
                     cli.extend(["--node".into(), n]);
@@ -1047,11 +1103,19 @@ impl LabStateServer {
         }
 
         let cli_refs: Vec<&str> = cli.iter().map(|s| s.as_str()).collect();
+        // Isolated build dir so the lab job's local cargo build never contends on
+        // the workspace target lock with the gate-runner's builds. Persistent +
+        // gitignored, so it's a warm cache reused across runs (not a rebuild tax).
+        let lab_target = self.repo_root.join("target-livelab");
+        let lab_target_s = lab_target.to_string_lossy().to_string();
         match spawn_logged(
             "cargo",
             &cli_refs,
             &self.repo_root,
-            &[("CARGO_TERM_COLOR", "never")],
+            &[
+                ("CARGO_TERM_COLOR", "never"),
+                ("CARGO_TARGET_DIR", &lab_target_s),
+            ],
             &log_path,
         ) {
             Ok(child) => {
@@ -1078,11 +1142,9 @@ impl LabStateServer {
         }
     }
 
-    fn get_job_status(&self, args: Option<&Value>) -> ToolCallResult {
-        let job_id = arg_str(args, "job_id").unwrap_or("");
-        let Some(rec) = self.read_job_record(job_id) else {
-            return tool_error(&format!("Unknown job_id: {job_id}"));
-        };
+    /// Shared status renderer → (state, markdown). Used by get_job_status +
+    /// wait_for_job so they never drift.
+    fn render_job_status(&self, job_id: &str, rec: &Value) -> (String, String) {
         let report_dir_rel = rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or("");
         let report_dir = self.abs_path(report_dir_rel);
         let pid = rec.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1092,7 +1154,6 @@ impl LabStateServer {
             .unwrap_or(0);
         let state = self.job_state(job_id, pid, &report_dir);
         let elapsed = now_unix().saturating_sub(created);
-
         let mut out = format!(
             "# Job {job_id}\n\n- **state:** {state}\n- **mode:** {}\n- **report_dir:** `{report_dir_rel}`\n- **pid:** {pid}\n- **elapsed:** {elapsed}s\n- **log:** `{}`\n",
             rec.get("mode").and_then(|v| v.as_str()).unwrap_or("?"),
@@ -1107,12 +1168,57 @@ impl LabStateServer {
                     .unwrap_or(""),
             ));
         }
+        (state, out)
+    }
+
+    fn get_job_status(&self, args: Option<&Value>) -> ToolCallResult {
+        let job_id = arg_str(args, "job_id").unwrap_or("");
+        let Some(rec) = self.read_job_record(job_id) else {
+            return tool_error(&format!("Unknown job_id: {job_id}"));
+        };
+        let (state, mut out) = self.render_job_status(job_id, &rec);
         if state == "running" {
-            out.push_str("\nStill running. Poll again later, or tail_job_log for progress.\n");
+            out.push_str(
+                "\nStill running. wait_for_job to block until done, or tail_job_log for progress.\n",
+            );
         } else {
             out.push_str("\nFinished. Use get_run_result for the structured breakdown.\n");
         }
         tool_success(&out)
+    }
+
+    fn wait_for_job(&self, args: Option<&Value>) -> ToolCallResult {
+        let job_id = arg_str(args, "job_id").unwrap_or("");
+        let Some(rec) = self.read_job_record(job_id) else {
+            return tool_error(&format!("Unknown job_id: {job_id}"));
+        };
+        let timeout = args
+            .and_then(|a| a.get("timeout_secs"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(240)
+            .clamp(10, 270);
+        let report_dir_rel = rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or("");
+        let report_dir = self.abs_path(report_dir_rel);
+        let pid = rec.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+        let start = Instant::now();
+        loop {
+            if self.job_state(job_id, pid, &report_dir) != "running" {
+                let (_, mut out) = self.render_job_status(job_id, &rec);
+                out.push_str(&format!(
+                    "\nJob finished after {}s. Use get_run_result for the breakdown.\n",
+                    start.elapsed().as_secs()
+                ));
+                return tool_success(&out);
+            }
+            if start.elapsed() >= Duration::from_secs(timeout) {
+                let (_, mut out) = self.render_job_status(job_id, &rec);
+                out.push_str(&format!(
+                    "\nStill running after {timeout}s — call wait_for_job again, or tail_job_log.\n"
+                ));
+                return tool_success(&out);
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
     }
 
     fn list_jobs(&self) -> ToolCallResult {
@@ -1467,6 +1573,186 @@ fn collect_files(dir: &Path, base: &Path, out: &mut Vec<(String, u64)>, depth: u
     }
 }
 
+// ── Stage knowledge (for explain_stage) ──────────────────────────────
+// Sourced from the orchestrator stage impls + the run-matrix evidence.
+
+struct StageInfo {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    checks: &'static str,
+    owning: &'static str,
+    causes: &'static [&'static str],
+}
+
+static STAGE_INFO: &[StageInfo] = &[
+    StageInfo {
+        name: "bootstrap",
+        aliases: &["bootstrap_hosts", "install"],
+        checks: "Builds rustynetd on each node from the source archive, installs the service, starts the daemon, and waits for the control socket.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/install.rs",
+        causes: &[
+            "cargo registry unreachable during the remote build (network/DNS)",
+            "daemon control socket never appears in the wait window (build failed or daemon crashed)",
+            "macOS: no default egress route after DHCP → node isolated",
+        ],
+    },
+    StageInfo {
+        name: "membership",
+        aliases: &["membership_init", "distribute_membership"],
+        checks: "Exit node (membership owner) signs the initial membership snapshot with the operator key and seeds all peer pubkeys + role capabilities.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/membership_init.rs",
+        causes: &[
+            "missing WireGuard pubkey for a node (collect_pubkeys failed earlier)",
+            "missing/empty node_id for a node",
+            "no Exit node present in the assignments",
+        ],
+    },
+    StageInfo {
+        name: "assignments",
+        aliases: &["distribute_assignments"],
+        checks: "Signs and distributes per-node role-capability bundles (e.g. exit_server for Exit) plus the full-mesh allow list.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/distribute_assignments.rs",
+        causes: &[
+            "missing node_id from a prior stage",
+            "platform capability unavailable for a role",
+            "endpoint resolution failure",
+        ],
+    },
+    StageInfo {
+        name: "baseline_runtime",
+        aliases: &[
+            "validate_baseline_runtime",
+            "enforce_baseline_runtime",
+            "validate_runtime",
+        ],
+        checks: "Each node runs 6 daemon posture probes: RuntimeAcls, ServiceHardening, KeyCustody, Authenticode, MeshStatus, DnsFailclosed.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/validate_runtime.rs",
+        causes: &[
+            "daemon control socket unavailable (node never started after bootstrap, or crashed)",
+            "an individual validator reports not-passed (runtime ACLs not enforced, key not in custody, DNS not fail-closed, …)",
+            "no adapter for the node",
+        ],
+    },
+    StageInfo {
+        name: "anchor",
+        aliases: &["anchor_validation"],
+        checks: "Each Anchor node proves it advertises the required anchor capabilities; the primary must advertise anchor.gossip_seed; Linux anchors run bundle-pull substages (loopback, invalid-token, log-redaction).",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/anchor_validation.rs",
+        causes: &[
+            "an anchor sub-capability missing in membership (e.g. anchor.gossip_seed)",
+            "bundle-pull token path empty or loopback listener disabled",
+            "no adapter / shell host unavailable for the anchor node",
+        ],
+    },
+    StageInfo {
+        name: "relay",
+        aliases: &[
+            "deploy_relay",
+            "deploy_relay_service",
+            "relay_validation",
+            "relay_service_lifecycle",
+        ],
+        checks: "Deploys the rustynet-relay service + verifier key on Relay nodes, then proves lifecycle: running (datapath UDP + health TCP bound, /healthz ok) → stop → restart. Linux/macOS live; Windows skipped.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/{deploy_relay,relay_validation}.rs",
+        causes: &[
+            "relay service fails to start or bind its datapath/health ports",
+            "/healthz endpoint not responding",
+            "service install/enable (systemctl) failure on Linux",
+        ],
+    },
+    StageInfo {
+        name: "traffic",
+        aliases: &["traffic_test_matrix", "two_hop"],
+        checks: "Re-collects mesh IPs (60s retry, detects collisions), then pings every peer from every node (90s retry) to prove baseline reachability.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/traffic_test_matrix.rs",
+        causes: &[
+            "no mesh IPs collected (WireGuard interface never settled)",
+            "duplicate IPs across nodes = assignment bundle not applied",
+            "ping still failing after the retry window (WireGuard/daemon issue)",
+        ],
+    },
+    StageInfo {
+        name: "role_switch",
+        aliases: &["role_switch_matrix"],
+        checks: "Each node enumerates active WireGuard tunnels and verifies the list is non-empty and not the wg-not-installed sentinel — tunnels survived role distribution.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/role_switch_matrix.rs",
+        causes: &[
+            "daemon reports no active tunnels (daemon down or interface dropped)",
+            "WireGuard enumeration tool not installed on the node",
+            "no adapter for the node",
+        ],
+    },
+    StageInfo {
+        name: "exit_handoff",
+        aliases: &[],
+        checks: "Exit node proves it holds the membership owner key AND has active tunnels (serving the mesh). Fails closed if either is false.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/exit_handoff.rs",
+        causes: &[
+            "membership owner key unavailable/corrupted on the exit node",
+            "no active tunnels on the exit after role distribution",
+            "no Exit node in assignments",
+        ],
+    },
+    StageInfo {
+        name: "dns",
+        aliases: &["distribute_dns_zone", "managed_dns"],
+        checks: "Signs and distributes the Magic DNS zone bundle to all nodes.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/distribute_dns_zone.rs",
+        causes: &[
+            "Exit node not found in assignments",
+            "no node_id for a node",
+            "bundle issuance failure",
+        ],
+    },
+];
+
+// `aliases` are &'static str but `norm` is borrowed from a local, so
+// slice::contains() does not typecheck here — iter().any() is required.
+#[allow(clippy::manual_contains)]
+fn explain_stage(stage: &str) -> ToolCallResult {
+    if stage.trim().is_empty() {
+        return tool_error("Missing required parameter: stage");
+    }
+    let lower = stage.trim().to_lowercase();
+    let norm = lower
+        .strip_prefix("linux_stage_")
+        .or_else(|| lower.strip_prefix("macos_stage_"))
+        .or_else(|| lower.strip_prefix("windows_stage_"))
+        .unwrap_or(lower.as_str());
+
+    let found = STAGE_INFO
+        .iter()
+        .find(|s| s.name == norm || s.aliases.iter().any(|a| *a == norm));
+
+    match found {
+        Some(s) => {
+            let mut out = format!(
+                "# Stage: {}\n\n- **What it checks:** {}\n- **Owning file:** `{}`\n\n## Common failure causes\n",
+                s.name, s.checks, s.owning
+            );
+            for c in s.causes {
+                out.push_str(&format!("- {c}\n"));
+            }
+            out.push_str(&format!(
+                "\n## Next\nRead the failing node's log (read_report_artifact / tail_job_log), then `which_crate` on `{}` (repo-context) for the boundary rules before patching the root cause.\n",
+                s.owning
+            ));
+            tool_success(&out)
+        }
+        None => {
+            let known: Vec<&str> = STAGE_INFO.iter().map(|s| s.name).collect();
+            tool_success(&format!(
+                "# Unknown stage: `{stage}`\n\nNo entry for `{norm}`. Known stages:\n{}\n\n(linux_/macos_/windows_stage_ prefixes are stripped automatically; check get_orchestrator_stages in repo-context for the full ordered list.)\n",
+                known
+                    .iter()
+                    .map(|k| format!("- {k}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1564,6 +1850,72 @@ mod tests {
         assert!(srv.job_record_path("j2").exists());
         assert!(!srv.job_record_path("j1").exists());
         assert!(!srv.job_record_path("j0").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn explain_stage_known_alias_and_unknown() {
+        let r = explain_stage("validate_baseline_runtime");
+        assert!(r.content[0].text.contains("baseline_runtime"));
+        assert!(r.content[0].text.contains("validate_runtime.rs"));
+        // os prefix stripped + alias resolved
+        let r2 = explain_stage("linux_stage_anchor");
+        assert!(r2.content[0].text.contains("anchor_validation.rs"));
+        // unknown
+        assert!(
+            explain_stage("nonsense").content[0]
+                .text
+                .contains("Unknown stage")
+        );
+    }
+
+    #[test]
+    fn inventory_alias_for_platform_finds_desktop_vms() {
+        let tmp = std::env::temp_dir().join(format!("mcp-inv-{}", std::process::id()));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1","os":"Debian/Linux"},{"alias":"win-1","platform":"windows"},{"alias":"mac-1","platform":"macos"}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        assert_eq!(
+            srv.inventory_alias_for_platform("windows").as_deref(),
+            Some("win-1")
+        );
+        assert_eq!(
+            srv.inventory_alias_for_platform("macos").as_deref(),
+            Some("mac-1")
+        );
+        assert_eq!(srv.inventory_alias_for_platform("linux"), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wait_for_job_returns_immediately_when_completed() {
+        let tmp = std::env::temp_dir().join(format!("mcp-wait-{}", std::process::id()));
+        let report = tmp.join("rep");
+        std::fs::create_dir_all(report.join("state")).unwrap();
+        std::fs::write(
+            report.join("state/report_state.json"),
+            r#"{"run_complete":true,"run_passed":true}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        let rec = json!({
+            "job_id":"w1","report_dir":report.to_string_lossy(),
+            "pid":999_999_999u64,"log_path":tmp.join("w1.log").to_string_lossy(),"created_unix":1
+        });
+        std::fs::write(
+            srv.job_record_path("w1"),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+        let res = srv.wait_for_job(Some(&json!({"job_id":"w1","timeout_secs":10})));
+        assert!(res.content[0].text.contains("passed"));
+        assert!(res.content[0].text.contains("finished"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
