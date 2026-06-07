@@ -1492,9 +1492,10 @@ fn role_support(role: Preset, platform: &str) -> Support {
 
         // client/admin on macOS + Windows.
         (Preset::Client | Preset::Admin, "macos" | "windows") => Support::Supported,
-        (Preset::Exit, _) => Support::Supported,
 
-        _ => Support::Supported,
+        // Unknown platform: fail closed (default-deny). All known
+        // (role, platform) pairs are covered by the arms above.
+        _ => Support::Blocked("unknown platform; use linux, macos, windows, ios, or android"),
     }
 }
 
@@ -1930,6 +1931,15 @@ mod tests {
         assert!(matches!(
             role_support(Preset::Anchor, "linux"),
             Support::Supported
+        ));
+        // Unknown platform fails closed (default-deny).
+        assert!(matches!(
+            role_support(Preset::Client, "freebsd"),
+            Support::Blocked(_)
+        ));
+        assert!(matches!(
+            role_support(Preset::Exit, "plan9"),
+            Support::Blocked(_)
         ));
     }
 
