@@ -130,3 +130,134 @@ Work is complete only when all are true:
 - required artifacts exist and validate
 - no unresolved in-scope blockers remain
 - no TODO/FIXME/placeholders remain in completed deliverables
+
+## 10) Common Patterns & How To Apply The Rules
+
+This section translates the abstract rules above into concrete code patterns.
+Agents should internalize these — they are the difference between code that
+passes review and code that gets rejected.
+
+### 10.1 Fail-Closed Pattern
+
+Rule §3: "Fail closed when trust/security state is missing, invalid, stale,
+or unavailable."
+
+**Wrong:**
+```rust
+let state = load_trust_state().unwrap_or_default();
+```
+
+**Right:**
+```rust
+let state = match load_trust_state() {
+    Ok(s) => s,
+    Err(e) => {
+        tracing::error!(%e, "trust state unavailable; failing closed");
+        return Err(AdapterError::TrustStateUnavailable);
+    }
+};
+```
+
+Every path that reads trust/security state must handle the None/Err case
+explicitly and return an error — never default, never silently continue.
+
+### 10.2 Error Handling — No unwrap() or expect() in Production Paths
+
+Rule §3: "One hardened execution path per security-sensitive workflow."
+
+unwrap() and expect() are panics. In security-sensitive code, panics are
+denial-of-service vectors. Use proper error propagation:
+
+**Wrong:**
+```rust
+let key = load_key().unwrap();
+let sig = verify(&key, &data).expect("signature verification failed");
+```
+
+**Right:**
+```rust
+let key = load_key().map_err(|e| AdapterError::KeyLoadFailed(e.to_string()))?;
+let sig = verify(&key, &data).map_err(|e| AdapterError::SignatureInvalid(e.to_string()))?;
+```
+
+unwrap() is acceptable ONLY in:
+- Unit tests
+- Build scripts (build.rs)
+- One-shot CLI entry points (not library code)
+- Cases where the invariant is locally provable AND a comment explains why
+
+### 10.3 Backend Abstraction Boundary
+
+Rule §8: "Keep domain models and policy evaluation transport-agnostic.
+Keep backend-specific behavior in backend adapter crates."
+
+**Wrong:** importing wireguard types in rustynet-control or rustynet-policy.
+
+**Right:** domain crates (control, policy, dns-zone) use abstract types.
+Backend crates translate between abstract types and concrete WireGuard types.
+
+Test with: scripts/ci/check_backend_boundary_leakage.sh
+
+### 10.4 Default-Deny Always
+
+Rule §3: "Default-deny policy is mandatory across ACL, routes, and
+trust-sensitive flows."
+
+**Wrong:** empty ACL → allow. Empty membership → allow. Missing context → allow.
+
+**Right:** empty/missing/malformed → deny. The policy evaluator starts from
+a deny-all posture and only adds allows for explicitly present entries.
+
+When adding a new policy or ACL path, the first test you write should be:
+"empty input produces deny."
+
+### 10.5 Signed State — Verify Before Apply
+
+Rule §4: "Enforce signed control/trust state validation before mutation."
+
+**Wrong:** read a bundle, apply it, then check the signature.
+
+**Right:** verify signature FIRST, check epoch/replay-watermark SECOND,
+apply THIRD. Never apply unsigned or stale state.
+
+### 10.6 Secrets Hygiene
+
+Rule §4: "Never log secrets or private key material."
+
+- Use tracing::Span with fields marked for redaction.
+- Never Debug-print a type containing key material unless its Debug impl
+  explicitly redacts.
+- Test with: scripts/ci/secrets_hygiene_gates.sh
+
+### 10.7 Role Transitions Are Not Just String Changes
+
+When implementing a role transition, the side-effects matter more than the
+role field. See get_role_transition in the MCP repo-context server.
+
+Key rules:
+- Adding serves_relay: deploy service BEFORE emitting signed bundle
+- Removing serves_relay: undeploy service BEFORE revocation bundle
+- Exit NAT: tear down BEFORE removing capability (residue = release-blocker)
+- blind_exit is irreversible — requires factory reset
+- All transitions emit append-only audit log entries
+
+### 10.8 Test Location and Naming
+
+- Unit tests: inline, #[cfg(test)] mod tests { ... }
+- Integration tests: crates/<name>/tests/<scenario>.rs
+- Names: descriptive_snake_case (e.g. gossip_three_peer_mesh)
+- Every security control: 1 enforcement point + 1 verification test
+
+### 10.9 Working With The Live Lab
+
+- Check lab state first: ops vm-lab-discover-local-utm-summary
+- If VMs stuck (SSH timeout): scripts/vm_lab/probe_and_recover_local_utm.sh
+- Never hand-edit vm_lab_inventory.json — use --update-inventory-live-ips
+- After every evidence run, verify the row in live_lab_run_matrix.csv
+
+### 10.10 Commit Hygiene
+
+- Small, verifiable increments — one logical change per commit
+- Commit messages: imperative mood, what AND why
+- Never commit generated files, build artifacts, or secrets
+- Run at minimum: cargo fmt --all -- --check && cargo check -p <crate>
