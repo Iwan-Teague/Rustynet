@@ -27,6 +27,7 @@ These define requirements that implementation work must satisfy.
 
 - [Requirements.md](./Requirements.md)
 - [SecurityMinimumBar.md](./SecurityMinimumBar.md)
+- [CODE_MAP.md](./CODE_MAP.md) — symbol-level code map: key types, traits, functions, and where they live across the workspace
 
 ## Phase And Architecture Documents
 
