@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -527,13 +527,53 @@ pub fn spawn_logged(
         .map_err(|e| format!("failed to spawn '{program}': {e}"))
 }
 
-/// Return the last `lines` lines of a UTF-8 (lossy) file.
+/// Return the last `lines` lines of a UTF-8 (lossy) file, reading at most the
+/// final 256 KiB so a multi-GB log (a 24h run) can never blow up memory.
 pub fn tail_file(path: &Path, lines: usize) -> Result<String, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let all: Vec<&str> = content.lines().collect();
-    let start = all.len().saturating_sub(lines);
-    Ok(all[start..].join("\n"))
+    const MAX_TAIL_BYTES: u64 = 256 * 1024;
+    let mut f =
+        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(MAX_TAIL_BYTES);
+    if start > 0 {
+        f.seek(SeekFrom::Start(start))
+            .map_err(|e| format!("seek failed: {e}"))?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)
+        .map_err(|e| format!("read failed: {e}"))?;
+    let text = String::from_utf8_lossy(&buf);
+    // If we started mid-file, drop the leading partial line.
+    let text: &str = if start > 0 {
+        match text.find('\n') {
+            Some(i) => &text[i + 1..],
+            None => &text,
+        }
+    } else {
+        &text
+    };
+    let all: Vec<&str> = text.lines().collect();
+    let from = all.len().saturating_sub(lines);
+    Ok(all[from..].join("\n"))
+}
+
+/// Read at most `max_bytes` of a file as UTF-8 (lossy), appending a note if the
+/// file was longer. Bounds memory for arbitrarily large run artifacts.
+pub fn read_file_capped(path: &Path, max_bytes: usize) -> Result<String, String> {
+    let f =
+        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut buf = Vec::new();
+    f.take(max_bytes as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read failed: {e}"))?;
+    let mut out = String::from_utf8_lossy(&buf).to_string();
+    if len as usize > max_bytes {
+        out.push_str(&format!(
+            "\n... (truncated: read {max_bytes} of {len} bytes; use tail_job_log or a narrower path)"
+        ));
+    }
+    Ok(out)
 }
 
 // ── Server trait ──────────────────────────────────────────────────────
@@ -1040,6 +1080,30 @@ mod tests {
         std::fs::write(&p, "a\nb\nc\nd\ne\n").unwrap();
         assert_eq!(tail_file(&p, 2).unwrap(), "d\ne");
         assert_eq!(tail_file(&p, 100).unwrap(), "a\nb\nc\nd\ne");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn tail_file_is_bounded_on_huge_file() {
+        // ~2 MB of numbered lines; tail must stay bounded + return recent lines.
+        let p = std::env::temp_dir().join(format!("mcp-tail-big-{}.txt", std::process::id()));
+        let body: String = (0..200_000).map(|i| format!("line{i}\n")).collect();
+        assert!(body.len() > 1_000_000);
+        std::fs::write(&p, &body).unwrap();
+        let tail = tail_file(&p, 3).unwrap();
+        assert!(tail.contains("line199999"), "should include the last line");
+        assert!(!tail.contains("line0\n"), "must not load the whole file");
+        assert!(tail.len() < 5_000, "tail output must be small");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn read_file_capped_truncates() {
+        let p = std::env::temp_dir().join(format!("mcp-cap-{}.txt", std::process::id()));
+        std::fs::write(&p, "x".repeat(10_000)).unwrap();
+        let out = read_file_capped(&p, 500).unwrap();
+        assert!(out.contains("truncated"));
+        assert!(out.len() < 700);
         let _ = std::fs::remove_file(&p);
     }
 }

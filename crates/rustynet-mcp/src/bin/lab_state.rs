@@ -15,8 +15,8 @@
 use rustynet_mcp::{
     CommandOutcome, GetPromptResult, McpServer, Prompt, PromptArgument, ServerInfo, Tool,
     ToolCallResult, json_schema_array_string, json_schema_boolean, json_schema_object,
-    json_schema_string, prompt_text, run_server, run_with_timeout, spawn_logged, tail_file,
-    text_content, tool_error, tool_success, truncate_output,
+    json_schema_string, prompt_text, read_file_capped, run_server, run_with_timeout, spawn_logged,
+    tail_file, text_content, tool_error, tool_success, truncate_output,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -154,9 +154,31 @@ impl LabStateServer {
         )
     }
 
-    /// running / passed / failed / ended for a job, using the in-memory child
-    /// if present, else process liveness + the report dir.
+    /// running / passed / failed / ended for a job.
+    ///
+    /// The completion record (report_state.json) is checked FIRST and is
+    /// authoritative — this is immune to PID reuse, which is a real hazard over
+    /// 24h+ runs where a finished job's pid could be recycled by the OS and a
+    /// naive `kill -0` would falsely report "running" forever. Liveness is only
+    /// consulted when there is no completion record yet.
     fn job_state(&self, job_id: &str, pid: u64, report_dir: &Path) -> String {
+        let report_state = self.read_report_state(report_dir);
+        if let Some(rs) = &report_state
+            && rs
+                .get("run_complete")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        {
+            let passed = rs
+                .get("run_passed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            return if passed {
+                "passed".into()
+            } else {
+                "failed".into()
+            };
+        }
         let running = match self.jobs.lock() {
             Ok(mut jobs) => match jobs.get_mut(job_id) {
                 Some(child) => match child.try_wait() {
@@ -169,27 +191,11 @@ impl LabStateServer {
             Err(_) => self.pid_alive(pid),
         };
         if running {
-            return "running".into();
-        }
-        match self.read_report_state(report_dir) {
-            Some(rs) => {
-                let complete = rs
-                    .get("run_complete")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let passed = rs
-                    .get("run_passed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if passed {
-                    "passed".into()
-                } else if complete {
-                    "failed".into()
-                } else {
-                    "ended (setup-only or no run record)".into()
-                }
-            }
-            None => "ended (no completion record — likely crashed; check tail_job_log)".into(),
+            "running".into()
+        } else if report_state.is_some() {
+            "ended (setup-only or stopped before run completion)".into()
+        } else {
+            "ended (no completion record — likely crashed; check tail_job_log)".into()
         }
     }
 
@@ -392,6 +398,18 @@ RULES
 - Never claim green without get_run_result overall_result=pass (or run_passed=true).
 - Commit/push ONLY if the user authorized it; otherwise leave patches in the tree
   and summarize what changed and why.
+
+LONG-RUN (24h+) NOTES
+- Source: start_live_lab_run defaults to source_mode=working-tree, so your
+  UNCOMMITTED edits are deployed. BUT working-tree capture (git stash create) only
+  includes TRACKED changes — if a patch ADDS a new file, `git add` it or it won't
+  reach the VMs.
+- A single run is capped at 24h (CLI default). For a longer soak, pass
+  timeout_secs to start_live_lab_run.
+- Disk: each run writes a report dir + log. Every ~10 iterations call prune_jobs
+  (keeps the most recent; never touches a running job) to reclaim space.
+- Job status is read from the run's completion record first (pid-reuse-safe), so
+  get_job_status stays correct across MCP-server reloads over many hours.
 "#;
 
 impl McpServer for LabStateServer {
@@ -557,6 +575,8 @@ impl McpServer for LabStateServer {
                         "nodes": json_schema_array_string("orchestrate: role assignments 'alias:role'"),
                         "profile": json_schema_string("run: profile env file (required for mode=run)"),
                         "profile_output": json_schema_string("setup: where to write the generated profile"),
+                        "source_mode": json_schema_string("working-tree (default — deploys your uncommitted patch) | local-head | commit-ref | repo-url"),
+                        "timeout_secs": json!({"type": "integer", "description": "Per-run hard cap in seconds (CLI default 86400 = 24h). Raise for a >24h soak."}),
                         "dry_run": json_schema_boolean("Plan only (default: false)"),
                         "stop_after_ready": json_schema_boolean("orchestrate: stop once VMs are ready"),
                         "skip_setup": json_schema_boolean("run: skip setup stages"),
@@ -638,6 +658,17 @@ impl McpServer for LabStateServer {
                 description: "Read the live-lab run matrix (CSV evidence ledger) — recent runs with OS/role/stage coverage and pass/fail.".into(),
                 input_schema: json_schema_object(
                     json!({"limit": json!({"type": "integer", "description": "Recent rows (default: 20)"})}),
+                    vec![],
+                ),
+            },
+            Tool {
+                name: "prune_jobs".into(),
+                description: "Reclaim disk from old FINISHED jobs over a long loop: keep the most recent N job records+logs, delete the rest. Running jobs are never touched. Set delete_report_dirs to also remove their report directories (lab evidence) — off by default.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "keep": json!({"type": "integer", "description": "How many most-recent jobs to keep (default: 10)"}),
+                        "delete_report_dirs": json_schema_boolean("Also delete each pruned job's report dir (default: false)"),
+                    }),
                     vec![],
                 ),
             },
@@ -854,6 +885,7 @@ impl McpServer for LabStateServer {
             "get_run_result" => self.get_run_result(args),
             "list_report_artifacts" => self.list_report_artifacts(args),
             "read_report_artifact" => self.read_report_artifact(args),
+            "prune_jobs" => self.prune_jobs(args),
 
             "get_run_matrix" => {
                 let limit = args
@@ -996,6 +1028,22 @@ impl LabStateServer {
                 }
             }
             _ => unreachable!(),
+        }
+
+        // Source mode applies to all modes. Default to working-tree so an
+        // agent's UNCOMMITTED patch is what gets built/tested on the VMs
+        // (git stash create captures tracked edits; new files must be `git add`ed).
+        let source_mode = arg_str(args, "source_mode").unwrap_or("working-tree");
+        cli.push("--source-mode".into());
+        cli.push(source_mode.into());
+        // Optional per-run timeout cap (CLI default is 24h). Allows a single
+        // soak run to exceed 24h, or a tighter cap for fast iterations.
+        if let Some(t) = args
+            .and_then(|a| a.get("timeout_secs"))
+            .and_then(|v| v.as_u64())
+        {
+            cli.push("--timeout-secs".into());
+            cli.push(t.to_string());
         }
 
         let cli_refs: Vec<&str> = cli.iter().map(|s| s.as_str()).collect();
@@ -1323,13 +1371,70 @@ impl LabStateServer {
         if !target.starts_with(&base) {
             return tool_error("Invalid path: escapes the report directory");
         }
-        match std::fs::read_to_string(&target) {
+        match read_file_capped(&target, 1_000_000) {
             Ok(content) => tool_success(&format!(
                 "# `{rel}`\n\n```\n{}\n```\n",
                 truncate_output(&content, 800, 80_000)
             )),
             Err(e) => tool_error(&format!("Cannot read '{rel}': {e}")),
         }
+    }
+
+    fn prune_jobs(&self, args: Option<&Value>) -> ToolCallResult {
+        let keep = args
+            .and_then(|a| a.get("keep"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10) as usize;
+        let delete_reports = arg_bool(args, "delete_report_dirs");
+        let mut jobs: Vec<(u64, String, Value)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(self.jobs_dir()) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().map(|e| e == "json").unwrap_or(false)
+                    && let Ok(s) = std::fs::read_to_string(&p)
+                    && let Ok(rec) = serde_json::from_str::<Value>(&s)
+                {
+                    let created = rec
+                        .get("created_unix")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let job_id = rec
+                        .get("job_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !job_id.is_empty() {
+                        jobs.push((created, job_id, rec));
+                    }
+                }
+            }
+        }
+        jobs.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+        let mut pruned = 0;
+        let mut skipped_running = 0;
+        for (_, job_id, rec) in jobs.into_iter().skip(keep) {
+            let report_dir_rel = rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or("");
+            let pid = rec.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            if self.job_state(&job_id, pid, &self.abs_path(report_dir_rel)) == "running" {
+                skipped_running += 1;
+                continue;
+            }
+            if let Ok(mut m) = self.jobs.lock() {
+                m.remove(&job_id);
+            }
+            let _ = std::fs::remove_file(self.job_record_path(&job_id));
+            if let Some(log) = rec.get("log_path").and_then(|v| v.as_str()) {
+                let _ = std::fs::remove_file(log);
+            }
+            if delete_reports && !report_dir_rel.is_empty() {
+                let _ = std::fs::remove_dir_all(self.abs_path(report_dir_rel));
+            }
+            pruned += 1;
+        }
+        tool_success(&format!(
+            "# Pruned {pruned} finished job(s)\n\n- kept the {keep} most recent\n- skipped {skipped_running} still-running\n- report dirs {}deleted\n",
+            if delete_reports { "" } else { "NOT " }
+        ))
     }
 }
 
@@ -1385,5 +1490,80 @@ mod tests {
         let v = json!({"aliases": ["a", "b"]});
         assert_eq!(string_array(Some(&v), "aliases"), vec!["a", "b"]);
         assert!(string_array(Some(&v), "missing").is_empty());
+    }
+
+    fn test_server(root: &Path) -> LabStateServer {
+        LabStateServer {
+            repo_root: root.to_path_buf(),
+            jobs: Mutex::new(HashMap::new()),
+            job_seq: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn job_state_completion_record_beats_pid() {
+        // PID 1 (init) — completion record must win regardless, proving the
+        // pid-reuse hazard cannot mask a finished run over a long loop.
+        let tmp = std::env::temp_dir().join(format!("mcp-jobstate-{}", std::process::id()));
+        let report = tmp.join("report");
+        std::fs::create_dir_all(report.join("state")).unwrap();
+        let srv = test_server(&tmp);
+
+        std::fs::write(
+            report.join("state/report_state.json"),
+            r#"{"run_complete":true,"run_passed":false}"#,
+        )
+        .unwrap();
+        assert_eq!(srv.job_state("j", 1, &report), "failed");
+
+        std::fs::write(
+            report.join("state/report_state.json"),
+            r#"{"run_complete":true,"run_passed":true}"#,
+        )
+        .unwrap();
+        assert_eq!(srv.job_state("j", 1, &report), "passed");
+
+        std::fs::remove_file(report.join("state/report_state.json")).unwrap();
+        assert!(
+            srv.job_state("j", 999_999_999, &report)
+                .starts_with("ended")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn prune_jobs_keeps_recent_skips_running() {
+        let tmp = std::env::temp_dir().join(format!("mcp-prune-{}", std::process::id()));
+        let srv = test_server(&tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        // 3 finished jobs (completed report_state + dead pid), created 0,1,2.
+        for i in 0..3u64 {
+            let job_id = format!("j{i}");
+            let rd = tmp.join(format!("rep{i}"));
+            std::fs::create_dir_all(rd.join("state")).unwrap();
+            std::fs::write(
+                rd.join("state/report_state.json"),
+                r#"{"run_complete":true,"run_passed":true}"#,
+            )
+            .unwrap();
+            let rec = json!({
+                "job_id": job_id,
+                "report_dir": rd.to_string_lossy(),
+                "pid": 999_999_990u64 + i,
+                "log_path": tmp.join(format!("{job_id}.log")).to_string_lossy(),
+                "created_unix": i,
+            });
+            std::fs::write(
+                srv.job_record_path(&job_id),
+                serde_json::to_string(&rec).unwrap(),
+            )
+            .unwrap();
+        }
+        let _ = srv.prune_jobs(Some(&json!({"keep": 1})));
+        // Newest (j2) kept; j0, j1 pruned.
+        assert!(srv.job_record_path("j2").exists());
+        assert!(!srv.job_record_path("j1").exists());
+        assert!(!srv.job_record_path("j0").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
