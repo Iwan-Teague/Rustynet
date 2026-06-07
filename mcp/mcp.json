@@ -46,7 +46,7 @@
     },
     {
       "name": "rustynet-mcp-lab-state",
-      "description": "Queries and manages the UTM VM lab — discovery, inventory update, restart, recovery, repo sync, bootstrap, diagnostics, live-lab setup/run/orchestrate/diagnose, and run-matrix evidence. Every command runs under a kill-on-timeout watchdog. 16 tools.",
+      "description": "Queries/manages the UTM VM lab AND drives the autonomous overnight live-lab loop (run → catch bugs → patch → re-verify) via async background jobs. Live-lab runs launch detached (start_live_lab_run returns a job_id instantly, survives an MCP-server reload); poll get_job_status, read structured results with get_run_result, read logs with read_report_artifact. Short ops run under a kill-on-timeout watchdog. 21 tools + an overnight-loop prompt.",
       "tools": [
         "get_lab_status",
         "get_lab_status_json",
@@ -59,12 +59,18 @@
         "sync_repo_to_vm",
         "bootstrap_vm",
         "get_vm_diagnostics",
-        "setup_live_lab",
-        "run_live_lab",
-        "orchestrate_live_lab",
         "diagnose_live_lab_failure",
+        "start_live_lab_run",
+        "get_job_status",
+        "list_jobs",
+        "tail_job_log",
+        "cancel_job",
+        "get_run_result",
+        "list_report_artifacts",
+        "read_report_artifact",
         "get_run_matrix"
       ],
+      "prompts": ["overnight-live-lab-loop"],
       "requires_working_dir": false,
       "working_dir": "<baked at build time via build.rs; CWD-independent>"
     }
