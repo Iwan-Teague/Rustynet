@@ -494,6 +494,48 @@ pub fn outcome_to_result(title: &str, outcome: &CommandOutcome) -> ToolCallResul
     }
 }
 
+// ── Detached background jobs ──────────────────────────────────────────
+
+/// Spawn `program` with `args` in `cwd`, redirecting stdout+stderr to a freshly
+/// created `log_path`, with `extra_env`. Does NOT wait — returns the running
+/// child so the caller can poll/kill it. The child keeps running even if this
+/// process later exits (it is reparented to init), which is what lets a
+/// multi-hour lab run outlive an MCP-server reload. argv-only: no shell, so
+/// arguments can never be interpreted as shell metacharacters.
+pub fn spawn_logged(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    extra_env: &[(&str, &str)],
+    log_path: &Path,
+) -> Result<std::process::Child, String> {
+    let log = std::fs::File::create(log_path)
+        .map_err(|e| format!("cannot create log {}: {e}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| format!("cannot clone log handle: {e}"))?;
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.spawn()
+        .map_err(|e| format!("failed to spawn '{program}': {e}"))
+}
+
+/// Return the last `lines` lines of a UTF-8 (lossy) file.
+pub fn tail_file(path: &Path, lines: usize) -> Result<String, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let all: Vec<&str> = content.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    Ok(all[start..].join("\n"))
+}
+
 // ── Server trait ──────────────────────────────────────────────────────
 
 /// Implement this trait to create an MCP server.
@@ -978,5 +1020,26 @@ mod tests {
         .unwrap();
         assert!(outcome.timed_out, "slow command must be killed");
         assert!(!outcome.success);
+    }
+
+    #[test]
+    fn spawn_logged_runs_detached_and_logs() {
+        let log = std::env::temp_dir().join(format!("mcp-spawn-test-{}.log", std::process::id()));
+        let mut child =
+            spawn_logged("sh", &["-c", "echo detached-ok"], Path::new("."), &[], &log).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        let body = tail_file(&log, 10).unwrap();
+        assert!(body.contains("detached-ok"), "log was: {body}");
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn tail_file_returns_last_lines() {
+        let p = std::env::temp_dir().join(format!("mcp-tail-test-{}.txt", std::process::id()));
+        std::fs::write(&p, "a\nb\nc\nd\ne\n").unwrap();
+        assert_eq!(tail_file(&p, 2).unwrap(), "d\ne");
+        assert_eq!(tail_file(&p, 100).unwrap(), "a\nb\nc\nd\ne");
+        let _ = std::fs::remove_file(&p);
     }
 }
