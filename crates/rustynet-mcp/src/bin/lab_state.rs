@@ -29,6 +29,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_INVENTORY: &str = "documents/operations/active/vm_lab_inventory.json";
 /// Where job records + logs live (repo-relative; under gitignored state/).
 const JOBS_SUBDIR: &str = "state/mcp-jobs";
+/// Timeout for discovery/inventory ops. Generous because the FIRST lab call on a
+/// cold checkout must also build rustynet-cli (the largest crate), which can take
+/// several minutes; warm calls return in seconds. The kill-on-timeout watchdog
+/// still bounds a genuinely hung probe.
+const DISCOVERY_TIMEOUT_SECS: u64 = 600;
 
 fn main() {
     let server = LabStateServer::new();
@@ -716,7 +721,11 @@ impl McpServer for LabStateServer {
     fn call_tool(&self, name: &str, arguments: Option<Value>) -> ToolCallResult {
         let args = arguments.as_ref();
         match name {
-            "get_lab_status" => self.run_ops("vm-lab-discover-local-utm-summary", &[], 180),
+            "get_lab_status" => self.run_ops(
+                "vm-lab-discover-local-utm-summary",
+                &[],
+                DISCOVERY_TIMEOUT_SECS,
+            ),
 
             "get_lab_status_json" => {
                 let mut extra: Vec<&str> = vec!["--json"];
@@ -724,7 +733,7 @@ impl McpServer for LabStateServer {
                     extra.push("--report-dir");
                     extra.push(dir);
                 }
-                self.run_ops("vm-lab-discover-local-utm", &extra, 180)
+                self.run_ops("vm-lab-discover-local-utm", &extra, DISCOVERY_TIMEOUT_SECS)
             }
 
             "get_inventory" => {
@@ -762,7 +771,11 @@ impl McpServer for LabStateServer {
                     "# Inventory Validation\n\n**Inventory entries:** {}\n\n## Live Discovery\n\n",
                     entries.map_or(0, |e| e.len())
                 );
-                let discovery = self.run_ops("vm-lab-discover-local-utm", &["--json"], 180);
+                let discovery = self.run_ops(
+                    "vm-lab-discover-local-utm",
+                    &["--json"],
+                    DISCOVERY_TIMEOUT_SECS,
+                );
                 result.push_str(
                     &discovery
                         .content
@@ -776,7 +789,7 @@ impl McpServer for LabStateServer {
             "update_inventory" => self.run_ops(
                 "vm-lab-discover-local-utm-summary",
                 &["--update-inventory-live-ips"],
-                180,
+                DISCOVERY_TIMEOUT_SECS,
             ),
 
             "restart_vm" => {
@@ -819,7 +832,11 @@ impl McpServer for LabStateServer {
 
             "ensure_lab_ready" => {
                 let mut result = String::from("# Ensure Lab Ready\n\n## Step 1: Discover\n\n");
-                let discover = self.run_ops("vm-lab-discover-local-utm-summary", &[], 180);
+                let discover = self.run_ops(
+                    "vm-lab-discover-local-utm-summary",
+                    &[],
+                    DISCOVERY_TIMEOUT_SECS,
+                );
                 if let Some(c) = discover.content.first() {
                     result.push_str(&c.text);
                     result.push_str("\n\n");
@@ -844,7 +861,11 @@ impl McpServer for LabStateServer {
                     result.push_str("\n\n");
                 }
                 result.push_str("## Step 3: Confirm\n\n");
-                let confirm = self.run_ops("vm-lab-discover-local-utm-summary", &[], 180);
+                let confirm = self.run_ops(
+                    "vm-lab-discover-local-utm-summary",
+                    &[],
+                    DISCOVERY_TIMEOUT_SECS,
+                );
                 if let Some(c) = confirm.content.first() {
                     result.push_str(&c.text);
                 }
