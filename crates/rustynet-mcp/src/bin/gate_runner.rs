@@ -13,12 +13,11 @@
 
 use rustynet_mcp::{
     McpServer, ServerInfo, Tool, ToolCallResult, json_schema_boolean, json_schema_object,
-    json_schema_string, run_server, text_content, tool_error, tool_success,
+    json_schema_string, outcome_to_result, run_server, run_with_timeout, tool_error, tool_success,
+    truncate_output,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::process::Command;
-use std::sync::mpsc;
 use std::time::Duration;
 
 fn main() {
@@ -37,74 +36,20 @@ impl GateRunnerServer {
         }
     }
 
+    /// Run a command in the repo root with a hard timeout. The child is killed
+    /// (and reaped) on timeout so a hung cargo invocation cannot keep holding
+    /// the `target/` build lock and wedge later gate calls.
     fn run_command(&self, program: &str, args: &[&str], timeout_secs: u64) -> ToolCallResult {
-        let mut cmd = Command::new(program);
-        cmd.args(args);
-        cmd.current_dir(&self.repo_root);
-        cmd.env("CARGO_TERM_COLOR", "never");
-
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(cmd.output());
-        });
-
-        let output = match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return tool_error(&format!("Failed to execute '{program}': {e}")),
-            Err(_) => {
-                return tool_error(&format!("'{program}' timed out after {timeout_secs}s"));
-            }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        let mut result = String::new();
-        result.push_str(&format!("# `{} {}`\n\n", program, args.join(" ")));
-        result.push_str(&format!(
-            "**Exit code:** {}\n\n",
-            output.status.code().unwrap_or(-1)
-        ));
-
-        if output.status.success() {
-            result.push_str("## ✅ PASSED\n\n");
-        } else {
-            result.push_str("## ❌ FAILED\n\n");
-        }
-
-        if !stdout.trim().is_empty() {
-            // Truncate very long output
-            if stdout.lines().count() > 200 {
-                let head: String = stdout.lines().take(200).collect::<Vec<_>>().join("\n");
-                result.push_str(&format!(
-                    "### stdout (truncated)\n```\n{head}\n... ({} more lines)\n```\n\n",
-                    stdout.lines().count() - 200
-                ));
-            } else {
-                result.push_str(&format!("### stdout\n```\n{stdout}\n```\n\n"));
-            }
-        }
-
-        if !stderr.trim().is_empty() {
-            if stderr.lines().count() > 100 {
-                let head: String = stderr.lines().take(100).collect::<Vec<_>>().join("\n");
-                result.push_str(&format!(
-                    "### stderr (truncated)\n```\n{head}\n... ({} more lines)\n```\n\n",
-                    stderr.lines().count() - 100
-                ));
-            } else {
-                result.push_str(&format!("### stderr\n```\n{stderr}\n```\n\n"));
-            }
-        }
-
-        if output.status.success() {
-            tool_success(&result)
-        } else {
-            // Return as success with is_error flag so the agent sees the output
-            ToolCallResult {
-                content: text_content(result),
-                is_error: Some(true),
-            }
+        let title = format!("`{} {}`", program, args.join(" "));
+        match run_with_timeout(
+            program,
+            args,
+            &self.repo_root,
+            &[("CARGO_TERM_COLOR", "never")],
+            Duration::from_secs(timeout_secs),
+        ) {
+            Ok(outcome) => outcome_to_result(&title, &outcome),
+            Err(e) => tool_error(&e),
         }
     }
 
@@ -300,52 +245,57 @@ impl McpServer for GateRunnerServer {
             }
 
             "run_security_audit" => {
+                let env = [("CARGO_TERM_COLOR", "never")];
                 let mut results = Vec::new();
+                let mut failed = false;
 
-                // cargo audit
-                let audit = Command::new("cargo")
-                    .args(["audit", "--deny", "warnings"])
-                    .current_dir(&self.repo_root)
-                    .output();
-
-                match audit {
-                    Ok(o) => {
-                        let out = String::from_utf8_lossy(&o.stdout);
-                        results.push(format!("## cargo audit\n```\n{}\n```\n", out.trim()));
-                        if !o.status.success() {
-                            let err = String::from_utf8_lossy(&o.stderr);
-                            results.push(format!("```\n{}\n```\n", err.trim()));
+                for (heading, cmd_args, timeout) in [
+                    ("cargo audit", &["audit", "--deny", "warnings"][..], 300u64),
+                    (
+                        "cargo deny",
+                        &["deny", "check", "bans", "licenses", "sources", "advisories"][..],
+                        300,
+                    ),
+                ] {
+                    match run_with_timeout(
+                        "cargo",
+                        cmd_args,
+                        &self.repo_root,
+                        &env,
+                        Duration::from_secs(timeout),
+                    ) {
+                        Ok(o) => {
+                            if !o.success {
+                                failed = true;
+                            }
+                            let banner = if o.timed_out {
+                                "⏱️ TIMED OUT"
+                            } else if o.success {
+                                "✅"
+                            } else {
+                                "❌"
+                            };
+                            let body = format!("{}\n{}", o.stdout.trim(), o.stderr.trim());
+                            results.push(format!(
+                                "## {heading} {banner}\n```\n{}\n```\n",
+                                truncate_output(body.trim(), 150, 40_000)
+                            ));
+                        }
+                        Err(e) => {
+                            failed = true;
+                            results.push(format!("## {heading} ❌\n{e}\n"));
                         }
                     }
-                    Err(e) => results.push(format!("cargo audit failed: {e}\n")),
                 }
 
-                // cargo deny
-                let deny = Command::new("cargo")
-                    .args(["deny", "check", "bans", "licenses", "sources", "advisories"])
-                    .current_dir(&self.repo_root)
-                    .output();
-
-                match deny {
-                    Ok(o) => {
-                        let out = String::from_utf8_lossy(&o.stdout);
-                        // Truncate if too long
-                        let truncated = if out.lines().count() > 100 {
-                            let head: String = out.lines().take(100).collect::<Vec<_>>().join("\n");
-                            format!("{head}\n... (truncated)")
-                        } else {
-                            out.to_string()
-                        };
-                        results.push(format!("## cargo deny\n```\n{}\n```\n", truncated.trim()));
-                        if !o.status.success() {
-                            let err = String::from_utf8_lossy(&o.stderr);
-                            results.push(format!("```\n{}\n```\n", err.trim()));
-                        }
+                if failed {
+                    ToolCallResult {
+                        content: rustynet_mcp::text_content(results.join("\n")),
+                        is_error: Some(true),
                     }
-                    Err(e) => results.push(format!("cargo deny failed: {e}\n")),
+                } else {
+                    tool_success(&results.join("\n"))
                 }
-
-                tool_success(&results.join("\n"))
             }
 
             "list_gate_scripts" => {
@@ -356,7 +306,7 @@ impl McpServer for GateRunnerServer {
                     Ok(entries) => {
                         let mut scripts: Vec<String> = entries
                             .filter_map(|e| e.ok())
-                            .filter(|e| e.path().extension().map_or(false, |ext| ext == "sh"))
+                            .filter(|e| e.path().extension().is_some_and(|ext| ext == "sh"))
                             .map(|e| {
                                 let name = e.file_name().to_string_lossy().to_string();
                                 // Try to read first comment line as description

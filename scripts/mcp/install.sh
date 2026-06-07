@@ -1,201 +1,112 @@
 #!/usr/bin/env bash
-# Install Rustynet MCP servers for global agent access.
+# Install the Rustynet MCP servers for agent access.
 #
 # Usage:
-#   ./scripts/mcp/install.sh                 # Debug build, register locally
-#   ./scripts/mcp/install.sh --release       # Release build, register globally
-#   ./scripts/mcp/install.sh --print-configs # Only print config snippets
+#   ./scripts/mcp/install.sh                 # debug build → ./bin, print configs
+#   ./scripts/mcp/install.sh --release       # release build → ./bin
+#   ./scripts/mcp/install.sh --print-configs # only print config snippets
 #
-# This script:
-# 1. Builds the three MCP server binaries
-# 2. Copies them to a stable location (~/.local/bin or /usr/local/bin)
-# 3. Prints configuration snippets for each supported platform
+# Builds the three server binaries and copies them to ./bin (repo-local,
+# gitignored — this is what the committed .zed/settings.json references). The
+# repo root is baked into each binary at compile time (build.rs), so the
+# servers work regardless of the client's working directory.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-INSTALL_DIR="${HOME}/.local/bin"
+BIN_DIR="${REPO_ROOT}/bin"
 RELEASE_FLAG=""
+PROFILE_DIR="debug"
 PRINT_ONLY=false
 
 for arg in "$@"; do
     case "$arg" in
-        --release) RELEASE_FLAG="--release" ;;
+        --release) RELEASE_FLAG="--release"; PROFILE_DIR="release" ;;
         --print-configs) PRINT_ONLY=true ;;
         *) echo "Unknown arg: $arg"; exit 1 ;;
     esac
 done
 
+BINARIES=(rustynet-mcp-repo-context rustynet-mcp-gate-runner rustynet-mcp-lab-state)
+
 if [ "$PRINT_ONLY" = false ]; then
     echo "==> Building MCP server binaries..."
-    cd "$REPO_ROOT"
-    cargo build -p rustynet-mcp $RELEASE_FLAG
+    ( cd "$REPO_ROOT" && cargo build -p rustynet-mcp $RELEASE_FLAG )
 
-    PROFILE_DIR="debug"
-    [ -n "$RELEASE_FLAG" ] && PROFILE_DIR="release"
-
-    mkdir -p "$INSTALL_DIR"
-
-    for bin in rustynet-mcp-repo-context rustynet-mcp-gate-runner rustynet-mcp-lab-state; do
-        SRC="target/$PROFILE_DIR/$bin"
-        DST="$INSTALL_DIR/$bin"
+    mkdir -p "$BIN_DIR"
+    for bin in "${BINARIES[@]}"; do
+        SRC="${REPO_ROOT}/target/${PROFILE_DIR}/${bin}"
+        DST="${BIN_DIR}/${bin}"
         if [ -f "$SRC" ]; then
             cp "$SRC" "$DST"
             chmod 755 "$DST"
+            # On Apple Silicon, copying a Mach-O invalidates its code signature
+            # and the kernel SIGKILLs it on exec. Re-sign ad-hoc after copy.
+            if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+                codesign --force --sign - "$DST" >/dev/null 2>&1 || \
+                    echo "  WARNING: codesign failed for $DST (may be SIGKILLed on exec)"
+            fi
             echo "  installed: $DST"
         else
             echo "  WARNING: binary not found at $SRC"
         fi
     done
-
     echo ""
-    echo "==> MCP servers installed to $INSTALL_DIR"
+    echo "==> MCP servers installed to $BIN_DIR"
     echo ""
 fi
 
-# ── Print configuration snippets ────────────────────────────────────
+RC="${BIN_DIR}/rustynet-mcp-repo-context"
+GR="${BIN_DIR}/rustynet-mcp-gate-runner"
+LS="${BIN_DIR}/rustynet-mcp-lab-state"
 
-cat << 'ZEDCONFIG'
+cat <<EOF
 ========================================
  Zed (.zed/settings.json or global settings)
 ========================================
-
-Add to your Zed settings:
-
 {
   "context_servers": {
-    "rustynet-repo-context": {
-      "command": {
-        "path": "ZEDCONFIG
-echo -n "        \"$INSTALL_DIR/rustynet-mcp-repo-context\""
-cat << 'ZEDCONFIG2'
-"
-      },
-      "working_directory": "ZEDCONFIG2
-echo -n "        \"$REPO_ROOT\""
-cat << 'ZEDCONFIG3'
-"
-    },
-    "rustynet-gate-runner": {
-      "command": {
-        "path": "ZEDCONFIG3
-echo -n "        \"$INSTALL_DIR/rustynet-mcp-gate-runner\""
-cat << 'ZEDCONFIG4'
-"
-      },
-      "working_directory": "ZEDCONFIG4
-echo -n "        \"$REPO_ROOT\""
-cat << 'ZEDCONFIG5'
-"
-    },
-    "rustynet-lab-state": {
-      "command": {
-        "path": "ZEDCONFIG5
-echo -n "        \"$INSTALL_DIR/rustynet-mcp-lab-state\""
-cat << 'ZEDCONFIG6'
-"
-      },
-      "working_directory": "ZEDCONFIG6
-echo -n "        \"$REPO_ROOT\""
-cat << 'ZEDCONFIG7'
-"
-    }
+    "rustynet-repo-context": { "command": "${RC}", "args": [], "env": {} },
+    "rustynet-gate-runner":  { "command": "${GR}", "args": [], "env": {} },
+    "rustynet-lab-state":    { "command": "${LS}", "args": [], "env": {} }
   }
 }
 
 ========================================
  Claude Desktop (macOS)
+ ~/Library/Application Support/Claude/claude_desktop_config.json
 ========================================
-
-Edit: ~/Library/Application Support/Claude/claude_desktop_config.json
-
 {
   "mcpServers": {
-    "rustynet-repo-context": {
-      "command": "ZEDCONFIG7
-echo -n "\"$INSTALL_DIR/rustynet-mcp-repo-context\""
-cat << 'CLAUDECONFIG'
-",
-      "cwd": "CLAUDECONFIG
-echo -n "\"$REPO_ROOT\""
-cat << 'CLAUDECONFIG2'
-"
-    },
-    "rustynet-gate-runner": {
-      "command": "CLAUDECONFIG2
-echo -n "\"$INSTALL_DIR/rustynet-mcp-gate-runner\""
-cat << 'CLAUDECONFIG3'
-",
-      "cwd": "CLAUDECONFIG3
-echo -n "\"$REPO_ROOT\""
-cat << 'CLAUDECONFIG4'
-"
-    },
-    "rustynet-lab-state": {
-      "command": "CLAUDECONFIG4
-echo -n "\"$INSTALL_DIR/rustynet-mcp-lab-state\""
-cat << 'CLAUDECONFIG5'
-",
-      "cwd": "CLAUDECONFIG5
-echo -n "\"$REPO_ROOT\""
-cat << 'CLAUDECONFIG6'
-"
-    }
+    "rustynet-repo-context": { "command": "${RC}" },
+    "rustynet-gate-runner":  { "command": "${GR}" },
+    "rustynet-lab-state":    { "command": "${LS}" }
   }
 }
 
 ========================================
- VS Code / Cursor (with MCP extension)
+ VS Code / Cursor (.vscode/mcp.json)
 ========================================
-
-Create .vscode/mcp.json in the project root:
-
 {
   "servers": {
-    "rustynet-repo-context": {
-      "command": "CLAUDECONFIG6
-echo -n "\"$INSTALL_DIR/rustynet-mcp-repo-context\""
-cat << 'VSCODECONFIG'
-",
-      "cwd": "VSCODECONFIG
-echo -n "\"$REPO_ROOT\""
-cat << 'VSCODECONFIG2'
-"
-    },
-    "rustynet-gate-runner": {
-      "command": "VSCODECONFIG2
-echo -n "\"$INSTALL_DIR/rustynet-mcp-gate-runner\""
-cat << 'VSCODECONFIG3'
-",
-      "cwd": "VSCODECONFIG3
-echo -n "\"$REPO_ROOT\""
-cat << 'VSCODECONFIG4'
-"
-    },
-    "rustynet-lab-state": {
-      "command": "VSCODECONFIG4
-echo -n "\"$INSTALL_DIR/rustynet-mcp-lab-state\""
-cat << 'VSCODECONFIG5'
-",
-      "cwd": "VSCODECONFIG5
-echo -n "\"$REPO_ROOT\""
-cat << 'ENDOFFILE'
-"
-    }
+    "rustynet-repo-context": { "command": "${RC}" },
+    "rustynet-gate-runner":  { "command": "${GR}" },
+    "rustynet-lab-state":    { "command": "${LS}" }
   }
 }
 
 ========================================
- Generic / Other MCP Clients
+ Servers
 ========================================
+  rustynet-mcp-repo-context  — 16 tools + resources (docs) + prompts
+                               (read-order, requirements, security controls/findings,
+                                architecture constraints, role transitions, platform
+                                support, crate structure, doc search/list/read).
+  rustynet-mcp-gate-runner   —  9 tools (fmt/check/clippy/test/build, security audit,
+                                CI gate scripts) — all kill-on-timeout.
+  rustynet-mcp-lab-state     — 16 tools (UTM discovery/inventory/restart/recover,
+                                sync/bootstrap/diagnostics, live-lab
+                                setup/run/orchestrate/diagnose, run matrix).
 
-Any MCP-compatible client needs:
-- Command (absolute path to binary)
-- Working directory (the Rustynet repo root)
-
-Server binaries:
-  rustynet-mcp-repo-context  — 10 tools for doc precedence, requirements, security
-  rustynet-mcp-gate-runner   —  9 tools for quality gates, builds, audits
-  rustynet-mcp-lab-state     — 11 tools for VM lab discovery, recovery, diagnostics
-
-All three servers require the working directory to be the Rustynet repo root.
-ENDOFFILE
+The repo root is baked into each binary (build.rs); no working_directory needed.
+Override with RUSTYNET_REPO_ROOT if running a binary built from a different checkout.
+EOF

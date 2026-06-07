@@ -1,33 +1,37 @@
-//! Repo Context MCP Server — provides structured access to the Rustynet
-//! documentation graph, requirements, security controls, and architecture rules.
+//! Repo Context MCP Server — structured access to the Rustynet documentation
+//! graph, requirements, security controls, architecture rules, role taxonomy,
+//! and platform support.
 //!
-//! Tools:
-//! - `get_read_order` — given a task, return the ordered docs to read
-//! - `get_active_ledger` — given a topic, return the owning ledger + status
-//! - `get_requirements` — return matching requirements
-//! - `get_security_controls` — return matching security controls
-//! - `get_architecture_constraints` — return non-negotiable constraints
-//! - `get_definition_of_done` — return the DoD checklist
-//! - `find_in_docs` — full-text search across all documentation
-//! - `get_document` — read a specific document by path
-//! - `get_crate_structure` — return workspace crate summary
-//! - `get_orchestrator_stages` — return the orchestration stage list
+//! Role-transition and platform-support answers are mirrored from the canonical
+//! Rust implementations (cited inline) rather than hand-maintained tables, so
+//! the two never contradict each other:
+//! - transitions: `crates/rustynet-control/src/role_presets.rs::transition_plan`
+//! - platform gate: `crates/rustynet-cli/src/vm_lab/orchestrator/role.rs`
+//!   (`is_supported_for_platform`) + `rustynet-operator/src/role.rs`
+//!   (`is_blind_exit_supported_host`)
+//!
+//! Security findings are parsed live from the SecurityReview §18 tracker, so
+//! the full set is always reflected (never a stale curated subset).
 
 #![forbid(unsafe_code)]
 
 use rustynet_mcp::{
-    McpServer, ServerInfo, Tool, ToolCallResult, json_schema_object, json_schema_string,
-    run_server, tool_error, tool_success,
+    GetPromptResult, McpServer, Prompt, PromptArgument, ReadResourceResult, Resource,
+    ResourceContent, ServerInfo, Tool, ToolCallResult, json_schema_object, json_schema_string,
+    prompt_text, run_server, tool_error, tool_success, truncate_output,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let server = RepoContextServer::new();
     run_server(server);
 }
+
+const DOC_RESOURCE_SCHEME: &str = "rustynet-doc://";
+const SECURITY_REVIEW_DOC: &str = "documents/operations/active/SecurityReview_2026-05-24.md";
 
 // ── Document index ────────────────────────────────────────────────────
 
@@ -47,9 +51,7 @@ struct RepoContextServer {
 
 impl RepoContextServer {
     fn new() -> Self {
-        // ── Canonical document index ────────────────────────────────
         let doc_index = vec![
-            // Normative (read-first)
             DocEntry {
                 path: "AGENTS.md",
                 title: "Agent Operating Contract",
@@ -81,7 +83,7 @@ impl RepoContextServer {
             DocEntry {
                 path: "documents/Requirements.md",
                 title: "Requirements (Brainstorm v0.3)",
-                description: "Functional requirements, non-functional requirements, security requirements, architecture, roadmap, API sketches.",
+                description: "Functional, non-functional, security requirements, architecture, roadmap, API sketches.",
                 priority: 4,
                 category: "normative",
             },
@@ -92,7 +94,6 @@ impl RepoContextServer {
                 priority: 5,
                 category: "normative",
             },
-            // Active ledgers (primary execution)
             DocEntry {
                 path: "documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md",
                 title: "Dataplane Execution Plan (D2-D12)",
@@ -135,9 +136,8 @@ impl RepoContextServer {
                 priority: 6,
                 category: "ledger",
             },
-            // Security
             DocEntry {
-                path: "documents/operations/active/SecurityReview_2026-05-24.md",
+                path: SECURITY_REVIEW_DOC,
                 title: "Firm-Grade Security Review",
                 description: "38 findings (RN-01..RN-38): 7 High, 9 Medium, 17 Low, 5 Info. CWE, file:line, exploit scenarios, P0/P1/P2 roadmap.",
                 priority: 7,
@@ -157,7 +157,6 @@ impl RepoContextServer {
                 priority: 7,
                 category: "security",
             },
-            // Operations & runbooks
             DocEntry {
                 path: "documents/operations/README.md",
                 title: "Operations Docs Index",
@@ -188,7 +187,6 @@ impl RepoContextServer {
             },
         ];
 
-        // ── Topic → relevant document paths ─────────────────────────
         let mut topic_map = BTreeMap::new();
         topic_map.insert(
             "traversal",
@@ -256,7 +254,7 @@ impl RepoContextServer {
             "security",
             vec![
                 "documents/SecurityMinimumBar.md",
-                "documents/operations/active/SecurityReview_2026-05-24.md",
+                SECURITY_REVIEW_DOC,
                 "documents/operations/active/SecurityHardeningBacklog_2026-06-01.md",
                 "documents/operations/active/SecurityHardeningAudit_2026-04-28.md",
             ],
@@ -344,7 +342,7 @@ impl McpServer for RepoContextServer {
         vec![
             Tool {
                 name: "get_read_order".into(),
-                description: "Given a task description, return the ordered list of documents to read before touching code, per the repo's precedence rules. Include requirements, security controls, and relevant active ledgers.".into(),
+                description: "Given a task description, return the ordered list of documents to read before touching code, per the repo's precedence rules. Includes requirements, security controls, and relevant active ledgers.".into(),
                 input_schema: json_schema_object(
                     json!({"task": json_schema_string("Describe what you're about to work on (e.g., 'add a new relay feature', 'fix a Windows killswitch bug', 'implement enrollment token onboarding')")}),
                     vec!["task"],
@@ -381,20 +379,33 @@ impl McpServer for RepoContextServer {
             },
             Tool {
                 name: "get_definition_of_done".into(),
-                description: "Return the Definition of Done checklist from AGENTS.md §9 — what must be true before work is complete (end-to-end impl, security bar, all gates pass, no TODOs, etc.).".into(),
+                description: "Return the Definition of Done checklist from AGENTS.md §9.".into(),
+                input_schema: json_schema_object(json!({}), vec![]),
+            },
+            Tool {
+                name: "get_gate_definitions".into(),
+                description: "Return the exact, authoritative quality-gate commands from AGENTS.md §7 (cargo fmt/clippy/check/test/audit/deny, the xtask fast runner, and scope-specific CI scripts). Use these verbatim before claiming work complete.".into(),
                 input_schema: json_schema_object(json!({}), vec![]),
             },
             Tool {
                 name: "find_in_docs".into(),
-                description: "Full-text search across the documentation tree for a query string. Returns matching documents with relevant excerpts.".into(),
+                description: "Full-text search across the ENTIRE documentation tree (every .md under documents/ plus the root AGENTS/CLAUDE/README) for a query string. Returns matching documents with file:line excerpts.".into(),
                 input_schema: json_schema_object(
                     json!({"query": json_schema_string("Search term or phrase")}),
                     vec!["query"],
                 ),
             },
             Tool {
+                name: "list_documents".into(),
+                description: "Enumerate every Markdown document in the repo (root normative docs + the full documents/ tree), grouped by directory, with each file's title and line count. Use this to discover docs that find_in_docs/get_active_ledger might not surface.".into(),
+                input_schema: json_schema_object(
+                    json!({"filter": json_schema_string("Optional: only list paths containing this substring (e.g. 'windows', 'operations/active')")}),
+                    vec![],
+                ),
+            },
+            Tool {
                 name: "get_document".into(),
-                description: "Read and return a specific document by its repo-relative path. Use the paths returned by get_read_order or get_active_ledger.".into(),
+                description: "Read and return a specific document by its repo-relative path.".into(),
                 input_schema: json_schema_object(
                     json!({"path": json_schema_string("Repo-relative path, e.g. 'documents/Requirements.md' or 'AGENTS.md'")}),
                     vec!["path"],
@@ -402,8 +413,16 @@ impl McpServer for RepoContextServer {
             },
             Tool {
                 name: "get_crate_structure".into(),
-                description: "Return a summary of the workspace crate structure — what each crate does, its dependencies, and its role in the architecture.".into(),
+                description: "Return a summary of the workspace crate structure — what each crate does, its architectural layer, and its boundary rule.".into(),
                 input_schema: json_schema_object(json!({}), vec![]),
+            },
+            Tool {
+                name: "which_crate".into(),
+                description: "Given a repo-relative file path, return the owning crate, its architectural layer, what it does, and the boundary rule that governs it (e.g. domain crates must not import backend/WireGuard types). Use before editing to know the constraints.".into(),
+                input_schema: json_schema_object(
+                    json!({"path": json_schema_string("Repo-relative file path, e.g. 'crates/rustynet-policy/src/eval.rs'")}),
+                    vec!["path"],
+                ),
             },
             Tool {
                 name: "get_orchestrator_stages".into(),
@@ -412,7 +431,7 @@ impl McpServer for RepoContextServer {
             },
             Tool {
                 name: "get_security_findings".into(),
-                description: "Query the firm-grade security review findings (RN-01 through RN-38) by status (open/fixed/accepted), severity (High/Medium/Low/Info), or specific finding ID. Returns CWE, file:line, exploit scenario, and remediation status.".into(),
+                description: "Query the security review findings (RN-01..RN-38), parsed live from the SecurityReview §18 master tracker, by status (open/fixed/accepted), severity (High/Medium/Low/Info), or specific finding ID. For a specific ID also returns the detailed finding block.".into(),
                 input_schema: json_schema_object(
                     json!({
                         "status": json_schema_string("Filter by status: open, fixed, accepted, or 'all' (default)"),
@@ -424,11 +443,11 @@ impl McpServer for RepoContextServer {
             },
             Tool {
                 name: "get_role_transition".into(),
-                description: "Validate whether a role transition is allowed. Given from-role, to-role, and platform, returns whether the transition is allowed, blocked, requires owner signature, or is irreversible. Also returns required side-effects (service deploy/undeploy). Based on the canonical taxonomy in NodeRoleTaxonomy_2026-05-21.md.".into(),
+                description: "Validate whether a node role transition is allowed. Mirrors the canonical Rust validator (rustynet-control role_presets::transition_plan) and the platform gate. Returns kind (identity/local-only/signed/blocked/irreversible), capability deltas, service deploy/undeploy side-effects, and platform eligibility.".into(),
                 input_schema: json_schema_object(
                     json!({
-                        "from": json_schema_string("Current role: relay, anchor, exit, blind_exit, client, admin"),
-                        "to": json_schema_string("Target role: relay, anchor, exit, blind_exit, client, admin"),
+                        "from": json_schema_string("Current role: client, admin, exit, blind_exit, relay, anchor"),
+                        "to": json_schema_string("Target role: client, admin, exit, blind_exit, relay, anchor"),
                         "platform": json_schema_string("Target platform: linux, macos, windows, ios, android"),
                     }),
                     vec!["from", "to"],
@@ -436,10 +455,10 @@ impl McpServer for RepoContextServer {
             },
             Tool {
                 name: "get_platform_support".into(),
-                description: "Return the platform support matrix — which features and roles are supported on which OS. Includes current fail-closed restrictions (e.g., Windows exit requires live evidence before promotion). Based on the live PlatformSupportMatrix and current code state.".into(),
+                description: "Return the platform support matrix — which roles and features are supported on which OS, mirrored from the live code gate (is_supported_for_platform + is_blind_exit_supported_host). Distinguishes supported / fail-closed (lab-assignable, pending live evidence) / planned / blocked.".into(),
                 input_schema: json_schema_object(
                     json!({
-                        "feature": json_schema_string("Optional: filter by feature name (e.g., 'exit', 'relay', 'anchor', 'blind_exit', 'killswitch', 'wireguard-nt')"),
+                        "feature": json_schema_string("Optional: filter by role/feature name (e.g., 'exit', 'relay', 'anchor', 'blind_exit', 'killswitch')"),
                         "platform": json_schema_string("Optional: filter by platform (linux, macos, windows, ios, android)"),
                     }),
                     vec![],
@@ -449,400 +468,539 @@ impl McpServer for RepoContextServer {
     }
 
     fn call_tool(&self, name: &str, arguments: Option<Value>) -> ToolCallResult {
+        let args = arguments.as_ref();
         match name {
-            "get_read_order" => {
-                let task = arguments
-                    .and_then(|a| a.get("task").cloned())
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_default();
-                let task_lower = task.to_lowercase();
-
-                let mut lines = Vec::new();
-                lines.push(format!("# Document Read Order for: \"{task}\"\n"));
-
-                // Always start with the mandatory pre-read docs
-                lines.push("## Mandatory Pre-Read (always read these first)\n".into());
-                for doc in &self.doc_index {
-                    if doc.priority <= 5 {
-                        lines.push(format!(
-                            "{}. **{}** (`{}`) — {}",
-                            doc.priority, doc.title, doc.path, doc.description
-                        ));
-                    }
-                }
-
-                // Find relevant topic-ledgers
-                lines.push("\n## Relevant Active Ledgers\n".into());
-                let mut found_ledgers = Vec::new();
-                for (topic, paths) in &self.topic_map {
-                    if task_lower.contains(&topic.to_lowercase()) {
-                        for path in paths {
-                            if let Some(doc) = self.find_doc(path) {
-                                if !found_ledgers.iter().any(|(p, _)| p == &doc.path) {
-                                    found_ledgers.push((doc.path, doc));
-                                }
-                            }
-                        }
-                    }
-                }
-                // Also add ledgers if the task is broad
-                for doc in &self.doc_index {
-                    if doc.category == "ledger"
-                        && !found_ledgers.iter().any(|(p, _)| p == &doc.path)
-                    {
-                        found_ledgers.push((doc.path, doc));
-                    }
-                }
-                found_ledgers.sort_by_key(|(_, d)| d.priority);
-                for (i, (path, doc)) in found_ledgers.iter().enumerate() {
-                    lines.push(format!(
-                        "{}. **{}** (`{}`) — {}",
-                        i + 1,
-                        doc.title,
-                        path,
-                        doc.description
-                    ));
-                }
-
-                // Add relevant runbooks
-                lines.push("\n## Relevant Runbooks\n".into());
-                let security_topics =
-                    ["security", "killswitch", "anchor", "dns", "keys", "privacy"];
-                let has_security = security_topics.iter().any(|t| task_lower.contains(t));
-                if has_security || found_ledgers.is_empty() {
-                    lines.push("- `documents/operations/README.md` — operations docs index (start here for runbooks)".into());
-                    lines.push("- `documents/operations/ProductionRunbook.md` — service and runtime operation".into());
-                    lines.push("- `documents/operations/ReleaseReadinessGuardrails.md` — release sign-off criteria".into());
-                }
-                if task_lower.contains("lab")
-                    || task_lower.contains("vm")
-                    || task_lower.contains("test")
-                {
-                    lines.push("- `documents/operations/LiveLinuxLabOrchestrator.md` — how the lab orchestration works".into());
-                    lines.push("- `documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md` — VM inventory + probe-and-recover runbook".into());
-                }
-
-                // Always mention gates
-                lines.push("\n## Required Gates\n".into());
-                lines.push(
-                    "After making changes, run: `cargo run -p rustynet-xtask -- gates`".into(),
-                );
-                lines.push("Or individually: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo check --workspace --all-targets --all-features`, `cargo test --workspace --all-targets --all-features`".into());
-
-                tool_success(&lines.join("\n"))
-            }
-
+            "get_read_order" => self.get_read_order(arg_str(args, "task").unwrap_or_default()),
             "get_active_ledger" => {
-                let topic = arguments
-                    .and_then(|a| a.get("topic").cloned())
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_default();
-                let topic_lower = topic.to_lowercase();
-
-                let mut lines = vec![format!("# Active Ledgers for topic: \"{topic}\"\n")];
-
-                if let Some(paths) = self.topic_map.get(topic_lower.as_str()) {
-                    for path in paths {
-                        if let Some(doc) = self.find_doc(path) {
-                            lines.push(format!(
-                                "- **{}** (`{}`) — {}",
-                                doc.title, doc.path, doc.description
-                            ));
-                        } else {
-                            // Try to read the file directly
-                            match self.read_file(path) {
-                                Ok(content) => {
-                                    let title = content
-                                        .lines()
-                                        .next()
-                                        .unwrap_or(path)
-                                        .trim_start_matches("# ")
-                                        .to_string();
-                                    lines.push(format!(
-                                        "- **{title}** (`{path}`) — (not in index, read directly)"
-                                    ));
-                                }
-                                Err(e) => lines.push(format!("- `{path}` — {e}")),
-                            }
-                        }
-                    }
-                } else {
-                    // Fuzzy search in doc_index
-                    lines.push("No exact topic match. Searching document index...\n".into());
-                    for doc in &self.doc_index {
-                        let combined = format!("{} {} {}", doc.title, doc.description, doc.path)
-                            .to_lowercase();
-                        if combined.contains(&topic_lower) {
-                            lines.push(format!(
-                                "- **{}** (`{}`) — {}",
-                                doc.title, doc.path, doc.description
-                            ));
-                        }
-                    }
-                    if lines.len() == 1 {
-                        lines.push("No matching documents found. Try a different topic or use `find_in_docs`.".into());
-                    }
-                }
-
-                tool_success(&lines.join("\n"))
+                self.get_active_ledger(arg_str(args, "topic").unwrap_or_default())
             }
-
             "get_requirements" => {
-                let filter = arguments
-                    .and_then(|a| a.get("filter").cloned())
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_default();
+                let filter = arg_str(args, "filter").unwrap_or_default();
                 let content = self
                     .read_file("documents/Requirements.md")
                     .unwrap_or_else(|e| format!("Error: {e}"));
-                let filtered = filter_sections(&content, &filter, "## ");
-                tool_success(&filtered)
+                tool_success(&filter_sections(&content, filter, "## "))
             }
-
             "get_security_controls" => {
-                let filter = arguments
-                    .and_then(|a| a.get("filter").cloned())
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_default();
+                let filter = arg_str(args, "filter").unwrap_or_default();
                 let content = self
                     .read_file("documents/SecurityMinimumBar.md")
                     .unwrap_or_else(|e| format!("Error: {e}"));
-                let filtered = filter_sections(&content, &filter, "## ");
-                tool_success(&filtered)
+                tool_success(&filter_sections(&content, filter, "## "))
             }
-
-            "get_architecture_constraints" => {
-                let content = self
-                    .read_file("AGENTS.md")
-                    .unwrap_or_else(|e| format!("Error: {e}"));
-                let section =
-                    extract_section(&content, "## 3) Non-Negotiable Engineering Constraints");
-                tool_success(&format!(
-                    "# Non-Negotiable Engineering Constraints\n\n{section}"
-                ))
-            }
-
-            "get_definition_of_done" => {
-                let content = self
-                    .read_file("AGENTS.md")
-                    .unwrap_or_else(|e| format!("Error: {e}"));
-                let section = extract_section(&content, "## 9) Definition of Done");
-                tool_success(&format!("# Definition of Done\n\n{section}"))
-            }
-
-            "find_in_docs" => {
-                let query = arguments
-                    .and_then(|a| a.get("query").cloned())
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_default();
-                let query_lower = query.to_lowercase();
-
-                let mut results = Vec::new();
-                for doc in &self.doc_index {
-                    if let Ok(content) = self.read_file(doc.path) {
-                        if content.to_lowercase().contains(&query_lower) {
-                            // Extract matching lines
-                            let matches: Vec<String> = content
-                                .lines()
-                                .enumerate()
-                                .filter(|(_, line)| line.to_lowercase().contains(&query_lower))
-                                .take(5)
-                                .map(|(i, line)| format!("  L{}: {}", i + 1, line.trim()))
-                                .collect();
-                            results.push(format!(
-                                "## {} (`{}`)\n{}\n",
-                                doc.title,
-                                doc.path,
-                                matches.join("\n")
-                            ));
-                        }
-                    }
-                }
-
-                if results.is_empty() {
+            "get_architecture_constraints" => match self.read_file("AGENTS.md") {
+                Ok(content) => tool_success(&format!(
+                    "# Non-Negotiable Engineering Constraints\n\n{}",
+                    extract_section(&content, "## 3) Non-Negotiable Engineering Constraints")
+                )),
+                Err(e) => tool_error(&e),
+            },
+            "get_definition_of_done" => match self.read_file("AGENTS.md") {
+                Ok(content) => tool_success(&format!(
+                    "# Definition of Done\n\n{}",
+                    extract_section(&content, "## 9) Definition of Done")
+                )),
+                Err(e) => tool_error(&e),
+            },
+            "get_gate_definitions" => match self.read_file("AGENTS.md") {
+                Ok(content) => {
+                    let section = extract_section(&content, "## 7) Validation and CI Gates");
                     tool_success(&format!(
-                        "No matches found for '{query}' in indexed documents."
-                    ))
-                } else {
-                    tool_success(&format!(
-                        "# Search results for: \"{query}\"\n\n{}",
-                        results.join("\n")
+                        "# Quality Gates (authoritative, from AGENTS.md §7)\n\n{section}\n\n\
+                         ## Architecture boundary gate\n- `./scripts/ci/check_backend_boundary_leakage.sh` \
+                         — domain crates must not import backend/WireGuard types.\n\n\
+                         Use the gate-runner MCP server (run_gates / run_fmt / run_clippy / run_check / \
+                         run_test / run_security_audit / run_gate_script) to execute these."
                     ))
                 }
-            }
-
-            "get_document" => {
-                let path = arguments
-                    .and_then(|a| a.get("path").cloned())
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_default();
-
-                // Security: prevent path traversal
-                if path.contains("..") || path.starts_with('/') {
-                    return tool_error("Invalid path: must be a repo-relative path without '..'");
-                }
-
-                match self.read_file(&path) {
-                    Ok(content) => {
-                        // Truncate very large files
-                        let truncated = if content.lines().count() > 500 {
-                            let head: String =
-                                content.lines().take(500).collect::<Vec<_>>().join("\n");
-                            format!(
-                                "{head}\n\n... (truncated at 500 lines; {} total lines. Use a more specific tool for targeted reads.)",
-                                content.lines().count()
-                            )
-                        } else {
-                            content
-                        };
-                        tool_success(&truncated)
-                    }
-                    Err(e) => tool_error(&e),
-                }
-            }
-
-            "get_crate_structure" => tool_success(CRATE_STRUCTURE),
-
+                Err(e) => tool_error(&e),
+            },
+            "find_in_docs" => self.find_in_docs(arg_str(args, "query").unwrap_or_default()),
+            "list_documents" => self.list_documents(arg_str(args, "filter")),
+            "get_document" => self.get_document(arg_str(args, "path").unwrap_or_default()),
+            "get_crate_structure" => tool_success(&render_crate_structure()),
+            "which_crate" => tool_success(&which_crate(arg_str(args, "path").unwrap_or_default())),
             "get_orchestrator_stages" => tool_success(ORCHESTRATOR_STAGES),
-
-            "get_security_findings" => {
-                let status_filter = arguments
-                    .as_ref()
-                    .and_then(|a| a.get("status"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("all");
-                let severity_filter = arguments
-                    .as_ref()
-                    .and_then(|a| a.get("severity"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("all");
-                let id_filter = arguments
-                    .as_ref()
-                    .and_then(|a| a.get("id"))
-                    .and_then(|v| v.as_str());
-
-                let mut result = String::from("# Security Review Findings\n\n");
-
-                for finding in SECURITY_FINDINGS {
-                    if let Some(id) = id_filter {
-                        if finding.id != id {
-                            continue;
-                        }
-                    }
-                    if status_filter != "all"
-                        && finding.status.to_lowercase() != status_filter.to_lowercase()
-                    {
-                        continue;
-                    }
-                    if severity_filter != "all"
-                        && finding.severity.to_lowercase() != severity_filter.to_lowercase()
-                    {
-                        continue;
-                    }
-
-                    result.push_str(&format!(
-                        "## {} — {} ({})\n",
-                        finding.id, finding.title, finding.severity
-                    ));
-                    result.push_str(&format!("- **Status:** {}\n", finding.status));
-                    result.push_str(&format!("- **CWE:** {}\n", finding.cwe));
-                    result.push_str(&format!("- **Location:** {}\n", finding.location));
-                    result.push_str(&format!("- **Priority:** {}\n", finding.priority));
-                    result.push_str(&format!("- **Description:** {}\n", finding.description));
-                    if !finding.remediation.is_empty() {
-                        result.push_str(&format!("- **Remediation:** {}\n", finding.remediation));
-                    }
-                    result.push('\n');
-                }
-
-                if result == "# Security Review Findings\n\n" {
-                    result.push_str("No findings match the specified filters.\n");
-                    result.push_str("Try broader filters or use 'all' for status and severity.\n");
-                }
-
-                tool_success(&result)
-            }
-
+            "get_security_findings" => self.get_security_findings(
+                arg_str(args, "status").unwrap_or("all"),
+                arg_str(args, "severity").unwrap_or("all"),
+                arg_str(args, "id"),
+            ),
             "get_role_transition" => {
-                let from = arguments
-                    .as_ref()
-                    .and_then(|a| a.get("from"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let to = arguments
-                    .as_ref()
-                    .and_then(|a| a.get("to"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let platform = arguments
-                    .as_ref()
-                    .and_then(|a| a.get("platform"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("linux");
-
+                let from = arg_str(args, "from").unwrap_or("");
+                let to = arg_str(args, "to").unwrap_or("");
+                let platform = arg_str(args, "platform").unwrap_or("linux");
                 if from.is_empty() || to.is_empty() {
                     return tool_error("Both 'from' and 'to' role parameters are required");
                 }
-
-                let result = validate_role_transition(from, to, platform);
-                tool_success(&result)
-            }
-
-            "get_platform_support" => {
-                let feature = arguments
-                    .as_ref()
-                    .and_then(|a| a.get("feature"))
-                    .and_then(|v| v.as_str());
-                let platform = arguments
-                    .as_ref()
-                    .and_then(|a| a.get("platform"))
-                    .and_then(|v| v.as_str());
-
-                let mut result = String::from("# Platform Support Matrix\n\n");
-                result.push_str("Current as of 2026-06-06. Based on live code state.\n\n");
-
-                for entry in PLATFORM_SUPPORT {
-                    if let Some(f) = feature {
-                        if !entry.feature.to_lowercase().contains(&f.to_lowercase()) {
-                            continue;
-                        }
-                    }
-                    if let Some(p) = platform {
-                        if !entry.platform.to_lowercase().contains(&p.to_lowercase()) {
-                            continue;
-                        }
-                    }
-
-                    let status_icon = match entry.status {
-                        "supported" => "✅",
-                        "fail-closed" => "⛔",
-                        "blocked" => "🚫",
-                        "planned" => "📋",
-                        "n/a" => "➖",
-                        _ => "❓",
-                    };
-                    result.push_str(&format!(
-                        "- {} **{}** on **{}**: {} ({})\n",
-                        status_icon, entry.feature, entry.platform, entry.status, entry.note
-                    ));
+                match describe_role_transition(from, to, platform) {
+                    Ok(s) => tool_success(&s),
+                    Err(e) => tool_error(&e),
                 }
-
-                result.push_str("\n## Legend\n");
-                result.push_str("- ✅ supported — end-to-end with live evidence\n");
-                result.push_str("- ⛔ fail-closed — implemented but gated behind live evidence\n");
-                result.push_str("- 🚫 blocked — platform limitation prevents implementation\n");
-                result.push_str("- 📋 planned — on roadmap, not yet implemented\n");
-                result.push_str("- ➖ n/a — not applicable to this platform\n");
-
-                tool_success(&result)
             }
-
+            "get_platform_support" => tool_success(&render_platform_support(
+                arg_str(args, "feature"),
+                arg_str(args, "platform"),
+            )),
             _ => tool_error(&format!("Unknown tool: {name}")),
+        }
+    }
+
+    // ── Resources: expose the curated doc index over MCP resources/* ──
+    fn resources(&self) -> Vec<Resource> {
+        self.doc_index
+            .iter()
+            .map(|d| Resource {
+                uri: format!("{DOC_RESOURCE_SCHEME}{}", d.path),
+                name: d.title.to_string(),
+                description: Some(d.description.to_string()),
+                mime_type: Some("text/markdown".to_string()),
+            })
+            .collect()
+    }
+
+    fn read_resource(&self, uri: &str) -> Option<ReadResourceResult> {
+        let rel = uri.strip_prefix(DOC_RESOURCE_SCHEME)?;
+        // Reuse the path-safety checks in get_document's resolver.
+        let content = self.read_safe(rel).ok()?;
+        Some(ReadResourceResult {
+            contents: vec![ResourceContent {
+                uri: uri.to_string(),
+                mime_type: Some("text/markdown".to_string()),
+                text: Some(content),
+            }],
+        })
+    }
+
+    // ── Prompts: inject scoped-task guidance / role-transition analysis ──
+    fn prompts(&self) -> Vec<Prompt> {
+        vec![
+            Prompt {
+                name: "scoped-task".into(),
+                description: Some(
+                    "Assemble the read-order, architecture constraints, gates and Definition of Done for a task before you start.".into(),
+                ),
+                arguments: vec![PromptArgument {
+                    name: "task".into(),
+                    description: Some("What you're about to work on".into()),
+                    required: Some(true),
+                }],
+            },
+            Prompt {
+                name: "role-transition-plan".into(),
+                description: Some(
+                    "Produce the validated plan for a node role transition (kind, side-effects, platform gate).".into(),
+                ),
+                arguments: vec![
+                    PromptArgument {
+                        name: "from".into(),
+                        description: Some("Current role".into()),
+                        required: Some(true),
+                    },
+                    PromptArgument {
+                        name: "to".into(),
+                        description: Some("Target role".into()),
+                        required: Some(true),
+                    },
+                    PromptArgument {
+                        name: "platform".into(),
+                        description: Some("Target platform (default linux)".into()),
+                        required: Some(false),
+                    },
+                ],
+            },
+        ]
+    }
+
+    fn get_prompt(&self, name: &str, arguments: Option<Value>) -> Option<GetPromptResult> {
+        let args = arguments.as_ref();
+        match name {
+            "scoped-task" => {
+                let task = arg_str(args, "task").unwrap_or_default();
+                let read_order = self
+                    .get_read_order(task)
+                    .content
+                    .first()
+                    .map(|c| c.text.clone())
+                    .unwrap_or_default();
+                let constraints = self
+                    .read_file("AGENTS.md")
+                    .map(|c| extract_section(&c, "## 3) Non-Negotiable Engineering Constraints"))
+                    .unwrap_or_default();
+                let dod = self
+                    .read_file("AGENTS.md")
+                    .map(|c| extract_section(&c, "## 9) Definition of Done"))
+                    .unwrap_or_default();
+                let body = format!(
+                    "You are about to work on: \"{task}\".\n\nFollow the repo operating contract.\n\n\
+                     {read_order}\n\n# Non-Negotiable Constraints\n{constraints}\n\n\
+                     # Definition of Done\n{dod}\n"
+                );
+                Some(prompt_text("Scoped task briefing", body))
+            }
+            "role-transition-plan" => {
+                let from = arg_str(args, "from").unwrap_or("");
+                let to = arg_str(args, "to").unwrap_or("");
+                let platform = arg_str(args, "platform").unwrap_or("linux");
+                let body = describe_role_transition(from, to, platform)
+                    .unwrap_or_else(|e| format!("Error: {e}"));
+                Some(prompt_text("Role transition plan", body))
+            }
+            _ => None,
         }
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────
+// ── Tool implementations ──────────────────────────────────────────────
+
+impl RepoContextServer {
+    fn get_read_order(&self, task: &str) -> ToolCallResult {
+        let task_lower = task.to_lowercase();
+        let mut lines = vec![format!("# Document Read Order for: \"{task}\"\n")];
+
+        lines.push("## Mandatory Pre-Read (always read these first)\n".into());
+        for doc in &self.doc_index {
+            if doc.priority <= 5 {
+                lines.push(format!(
+                    "{}. **{}** (`{}`) — {}",
+                    doc.priority, doc.title, doc.path, doc.description
+                ));
+            }
+        }
+
+        lines.push("\n## Relevant Active Ledgers\n".into());
+        let mut found: Vec<&DocEntry> = Vec::new();
+        for (topic, paths) in &self.topic_map {
+            if task_lower.contains(&topic.to_lowercase()) {
+                for path in paths {
+                    if let Some(doc) = self.find_doc(path)
+                        && !found.iter().any(|d| d.path == doc.path)
+                    {
+                        found.push(doc);
+                    }
+                }
+            }
+        }
+        // Only fall back to listing every ledger when nothing matched the task
+        // (broad/unknown task). Otherwise keep the list focused.
+        if found.is_empty() {
+            for doc in &self.doc_index {
+                if doc.category == "ledger" {
+                    found.push(doc);
+                }
+            }
+        }
+        found.sort_by_key(|d| d.priority);
+        for (i, doc) in found.iter().enumerate() {
+            lines.push(format!(
+                "{}. **{}** (`{}`) — {}",
+                i + 1,
+                doc.title,
+                doc.path,
+                doc.description
+            ));
+        }
+
+        let security_topics = ["security", "killswitch", "anchor", "dns", "keys", "privacy"];
+        if security_topics.iter().any(|t| task_lower.contains(t)) {
+            lines.push("\n## Relevant Runbooks\n".into());
+            lines.push("- `documents/operations/README.md` — operations docs index".into());
+            lines.push(
+                "- `documents/operations/ProductionRunbook.md` — service and runtime operation"
+                    .into(),
+            );
+            lines.push("- `documents/operations/ReleaseReadinessGuardrails.md` — release sign-off criteria".into());
+        }
+        if task_lower.contains("lab") || task_lower.contains("vm") || task_lower.contains("test") {
+            lines.push("\n## Lab Runbooks\n".into());
+            lines.push("- `documents/operations/LiveLinuxLabOrchestrator.md` — how the lab orchestration works".into());
+            lines.push("- `documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md` — VM inventory + probe-and-recover".into());
+        }
+
+        lines.push("\n## Required Gates\n".into());
+        lines.push("After changes run: `cargo run -p rustynet-xtask -- gates` (or use get_gate_definitions for the full list).".into());
+
+        tool_success(&lines.join("\n"))
+    }
+
+    fn get_active_ledger(&self, topic: &str) -> ToolCallResult {
+        let topic_lower = topic.to_lowercase();
+        let mut lines = vec![format!("# Active Ledgers for topic: \"{topic}\"\n")];
+
+        if let Some(paths) = self.topic_map.get(topic_lower.as_str()) {
+            for path in paths {
+                if let Some(doc) = self.find_doc(path) {
+                    lines.push(format!(
+                        "- **{}** (`{}`) — {}",
+                        doc.title, doc.path, doc.description
+                    ));
+                } else {
+                    match self.read_file(path) {
+                        Ok(content) => {
+                            let title = content
+                                .lines()
+                                .next()
+                                .unwrap_or(path)
+                                .trim_start_matches("# ")
+                                .to_string();
+                            lines.push(format!(
+                                "- **{title}** (`{path}`) — (not in index, read directly)"
+                            ));
+                        }
+                        Err(e) => lines.push(format!("- `{path}` — {e}")),
+                    }
+                }
+            }
+        } else {
+            lines.push("No exact topic match. Searching document index...\n".into());
+            for doc in &self.doc_index {
+                let combined =
+                    format!("{} {} {}", doc.title, doc.description, doc.path).to_lowercase();
+                if combined.contains(&topic_lower) {
+                    lines.push(format!(
+                        "- **{}** (`{}`) — {}",
+                        doc.title, doc.path, doc.description
+                    ));
+                }
+            }
+            if lines.len() == 2 {
+                lines.push(
+                    "No matching documents found. Try a different topic or use `find_in_docs`."
+                        .into(),
+                );
+            }
+        }
+        tool_success(&lines.join("\n"))
+    }
+
+    fn find_in_docs(&self, query: &str) -> ToolCallResult {
+        if query.trim().is_empty() {
+            return tool_error("Missing required parameter: query");
+        }
+        let query_lower = query.to_lowercase();
+        let files = self.all_doc_paths();
+        let mut results = Vec::new();
+        let mut files_with_matches = 0;
+
+        for rel in &files {
+            if files_with_matches >= 60 {
+                results.push(format!(
+                    "\n... (stopped after {files_with_matches} matching files; narrow the query)"
+                ));
+                break;
+            }
+            let Ok(content) = self.read_file(rel) else {
+                continue;
+            };
+            if !content.to_lowercase().contains(&query_lower) {
+                continue;
+            }
+            let matches: Vec<String> = content
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.to_lowercase().contains(&query_lower))
+                .take(5)
+                .map(|(i, line)| format!("  L{}: {}", i + 1, line.trim()))
+                .collect();
+            results.push(format!("## `{rel}`\n{}\n", matches.join("\n")));
+            files_with_matches += 1;
+        }
+
+        if files_with_matches == 0 {
+            tool_success(&format!(
+                "No matches found for '{query}' across {} documents.",
+                files.len()
+            ))
+        } else {
+            tool_success(&truncate_output(
+                &format!(
+                    "# Search results for \"{query}\" ({files_with_matches} files)\n\n{}",
+                    results.join("\n")
+                ),
+                800,
+                80_000,
+            ))
+        }
+    }
+
+    fn list_documents(&self, filter: Option<&str>) -> ToolCallResult {
+        let files = self.all_doc_paths();
+        let filter_lower = filter.map(|f| f.to_lowercase());
+        let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut count = 0;
+
+        for rel in &files {
+            if let Some(f) = &filter_lower
+                && !rel.to_lowercase().contains(f)
+            {
+                continue;
+            }
+            let (title, line_count) = match self.read_file(rel) {
+                Ok(c) => {
+                    let title = c
+                        .lines()
+                        .find(|l| l.starts_with("# "))
+                        .map(|l| l.trim_start_matches("# ").trim().to_string())
+                        .unwrap_or_else(|| "(no title)".into());
+                    (title, c.lines().count())
+                }
+                Err(_) => ("(unreadable)".into(), 0),
+            };
+            let dir = Path::new(rel)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "(root)".into());
+            let file = Path::new(rel)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| rel.clone());
+            by_dir
+                .entry(dir)
+                .or_default()
+                .push(format!("- `{file}` — {title} ({line_count} lines)"));
+            count += 1;
+        }
+
+        let mut out = format!("# Documents ({count} files)\n");
+        for (dir, items) in &by_dir {
+            out.push_str(&format!("\n## {dir}/\n"));
+            for item in items {
+                out.push_str(item);
+                out.push('\n');
+            }
+        }
+        tool_success(&truncate_output(&out, 1000, 80_000))
+    }
+
+    fn get_document(&self, path: &str) -> ToolCallResult {
+        match self.read_safe(path) {
+            Ok(content) => tool_success(&truncate_output(&content, 600, 80_000)),
+            Err(e) => tool_error(&e),
+        }
+    }
+
+    fn get_security_findings(
+        &self,
+        status_filter: &str,
+        severity_filter: &str,
+        id_filter: Option<&str>,
+    ) -> ToolCallResult {
+        let content = match self.read_file(SECURITY_REVIEW_DOC) {
+            Ok(c) => c,
+            Err(e) => {
+                return tool_error(&format!(
+                    "Cannot read security review (failing closed): {e}"
+                ));
+            }
+        };
+        let findings = parse_findings_table(&content);
+        if findings.is_empty() {
+            return tool_error(
+                "Could not parse the §18 master finding tracker — doc format may have changed.",
+            );
+        }
+
+        let mut out = format!(
+            "# Security Review Findings\n\n_Parsed live from `{SECURITY_REVIEW_DOC}` §18 — {} findings total._\n\n",
+            findings.len()
+        );
+        let mut shown = 0;
+        for f in &findings {
+            if let Some(id) = id_filter
+                && !f.id.eq_ignore_ascii_case(id)
+            {
+                continue;
+            }
+            if status_filter != "all" && !f.status.eq_ignore_ascii_case(status_filter) {
+                continue;
+            }
+            if severity_filter != "all" && !severity_matches(&f.severity, severity_filter) {
+                continue;
+            }
+            out.push_str(&format!(
+                "- **{}** — {} · {} · status: **{}** · ref: {}\n",
+                f.id, f.severity, f.domain, f.status, f.reference
+            ));
+            // For a specific ID, append the detailed finding block if present.
+            if id_filter.is_some()
+                && let Some(block) = extract_finding_block(&content, &f.id)
+            {
+                out.push_str(&format!("\n{block}\n"));
+            }
+            shown += 1;
+        }
+
+        if shown == 0 {
+            out.push_str("\nNo findings match the specified filters.\n");
+        } else {
+            out.push_str(&format!("\n_{shown} finding(s) shown._\n"));
+        }
+        tool_success(&truncate_output(&out, 600, 80_000))
+    }
+
+    // ── Path-safe document read (shared by get_document + resources) ──
+    fn read_safe(&self, path: &str) -> Result<String, String> {
+        if path.contains("..") || path.starts_with('/') {
+            return Err("Invalid path: must be a repo-relative path without '..'".into());
+        }
+        let full = self.repo_root.join(path);
+        let canon = full
+            .canonicalize()
+            .map_err(|e| format!("Cannot read '{path}': {e}"))?;
+        let root_canon = self
+            .repo_root
+            .canonicalize()
+            .map_err(|e| format!("Cannot resolve repo root: {e}"))?;
+        if !canon.starts_with(&root_canon) {
+            return Err("Invalid path: escapes the repository root".into());
+        }
+        fs::read_to_string(&canon).map_err(|e| format!("Cannot read '{path}': {e}"))
+    }
+
+    /// Every Markdown document: the root normative docs + the full
+    /// `documents/` tree (recursive). Returns repo-relative paths, sorted.
+    fn all_doc_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for root_doc in ["AGENTS.md", "CLAUDE.md", "README.md"] {
+            if self.repo_root.join(root_doc).is_file() {
+                out.push(root_doc.to_string());
+            }
+        }
+        collect_md(&self.repo_root.join("documents"), &self.repo_root, &mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+// ── Free helpers ──────────────────────────────────────────────────────
+
+fn arg_str<'a>(args: Option<&'a Value>, key: &str) -> Option<&'a str> {
+    args.and_then(|a| a.get(key)).and_then(|v| v.as_str())
+}
+
+/// Recursively collect `*.md` files under `dir`, pushing repo-relative paths.
+fn collect_md(dir: &Path, repo_root: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            collect_md(&path, repo_root, out);
+        } else if path.extension().is_some_and(|e| e == "md")
+            && let Ok(rel) = path.strip_prefix(repo_root)
+        {
+            out.push(rel.to_string_lossy().to_string());
+        }
+    }
+}
 
 fn filter_sections(content: &str, filter: &str, heading_prefix: &str) -> String {
     if filter.is_empty() {
@@ -855,7 +1013,6 @@ fn filter_sections(content: &str, filter: &str, heading_prefix: &str) -> String 
 
     for line in content.lines() {
         if line.starts_with(heading_prefix) {
-            // Flush previous section
             if in_match && !current_section.is_empty() {
                 result.push(current_section.join("\n"));
                 result.push(String::new());
@@ -866,7 +1023,6 @@ fn filter_sections(content: &str, filter: &str, heading_prefix: &str) -> String 
             current_section.push(line.to_string());
         }
     }
-    // Flush last section
     if in_match && !current_section.is_empty() {
         result.push(current_section.join("\n"));
     }
@@ -893,39 +1049,774 @@ fn extract_section(content: &str, heading: &str) -> String {
             lines.push(line.to_string());
         }
     }
-    lines.join("\n")
+    lines.join("\n").trim().to_string()
+}
+
+// ── Security findings parsing (source of truth: SecurityReview §18) ────
+
+struct Finding {
+    id: String,
+    severity: String,
+    domain: String,
+    status: String,
+    reference: String,
+}
+
+fn normalize_status(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    if lower.contains("fixed") {
+        "Fixed".into()
+    } else if lower.contains("accepted") {
+        "Accepted".into()
+    } else if lower.contains("open") {
+        "Open".into()
+    } else {
+        // Strip markdown emphasis, take the first token.
+        raw.replace('*', "")
+            .split_whitespace()
+            .next()
+            .unwrap_or("Open")
+            .to_string()
+    }
+}
+
+fn normalize_severity(raw: &str) -> String {
+    match raw.to_lowercase().as_str() {
+        "high" => "High".into(),
+        "med" | "medium" => "Medium".into(),
+        "low" => "Low".into(),
+        "info" | "informational" => "Info".into(),
+        other => other.to_string(),
+    }
+}
+
+fn severity_matches(finding_sev: &str, filter: &str) -> bool {
+    normalize_severity(finding_sev).eq_ignore_ascii_case(&normalize_severity(filter))
+}
+
+/// Parse the `| ID | Sev | Domain | Status | Ref |` table under
+/// "## 18. Master finding-status tracker". Expands ranges like `RN-34–38`.
+fn parse_findings_table(content: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with("## 18.") {
+            in_section = true;
+            continue;
+        }
+        if in_section && line.starts_with("## ") {
+            break; // next section
+        }
+        if !in_section {
+            continue;
+        }
+        let trimmed = line.trim();
+        if !trimmed.starts_with("| RN") {
+            continue;
+        }
+        let cells: Vec<String> = trimmed
+            .split('|')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        // Expect: [ID, Sev, Domain, Status, Ref]
+        if cells.len() < 4 {
+            continue;
+        }
+        let id_cell = &cells[0];
+        let severity = normalize_severity(&cells[1]);
+        let domain = cells[2].clone();
+        let status = normalize_status(&cells[3]);
+        let reference = cells.get(4).cloned().unwrap_or_default();
+
+        for id in expand_finding_ids(id_cell) {
+            out.push(Finding {
+                id,
+                severity: severity.clone(),
+                domain: domain.clone(),
+                status: status.clone(),
+                reference: reference.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Expand an ID cell into concrete IDs. `RN-34–38` → RN-34..=RN-38.
+fn expand_finding_ids(cell: &str) -> Vec<String> {
+    let rest = match cell.strip_prefix("RN-") {
+        Some(r) => r,
+        None => return vec![cell.to_string()],
+    };
+    // Range separators: en-dash or hyphen.
+    let parts: Vec<&str> = rest.split(['–', '-']).collect();
+    if parts.len() == 2
+        && let (Ok(start), Ok(end)) = (
+            parts[0].trim().parse::<u32>(),
+            parts[1].trim().parse::<u32>(),
+        )
+        && start <= end
+        && end - start < 100
+    {
+        return (start..=end).map(|n| format!("RN-{n:02}")).collect();
+    }
+    vec![cell.to_string()]
+}
+
+/// Extract the detailed `### RN-NN …` block for a finding, if present.
+fn extract_finding_block(content: &str, id: &str) -> Option<String> {
+    let needle = format!("### {id} ");
+    let needle_exact = format!("### {id}\n");
+    let mut lines = Vec::new();
+    let mut capturing = false;
+    for line in content.lines() {
+        if line.starts_with(&needle) || line == needle_exact.trim_end() {
+            capturing = true;
+            lines.push(line.to_string());
+            continue;
+        }
+        if capturing {
+            if line.starts_with("### ") || line.starts_with("## ") {
+                break;
+            }
+            lines.push(line.to_string());
+        }
+    }
+    if capturing {
+        Some(lines.join("\n").trim().to_string())
+    } else {
+        None
+    }
+}
+
+// ── Role taxonomy mirror ──────────────────────────────────────────────
+// Source of truth: crates/rustynet-control/src/role_presets.rs
+// (RolePreset, ROLE_PRESET_TABLE, transition_plan). Kept in sync via tests.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Preset {
+    Client,
+    Admin,
+    Exit,
+    BlindExit,
+    Relay,
+    Anchor,
+}
+
+impl Preset {
+    fn parse(s: &str) -> Option<Preset> {
+        match s.to_lowercase().as_str() {
+            "client" => Some(Preset::Client),
+            "admin" => Some(Preset::Admin),
+            "exit" => Some(Preset::Exit),
+            "blind_exit" | "blindexit" => Some(Preset::BlindExit),
+            "relay" => Some(Preset::Relay),
+            "anchor" => Some(Preset::Anchor),
+            _ => None,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Preset::Client => "client",
+            Preset::Admin => "admin",
+            Preset::Exit => "exit",
+            Preset::BlindExit => "blind_exit",
+            Preset::Relay => "relay",
+            Preset::Anchor => "anchor",
+        }
+    }
+    /// Axis-1 primary role (Client | Admin | BlindExit).
+    fn primary(self) -> &'static str {
+        match self {
+            Preset::Client => "client",
+            Preset::BlindExit => "blind_exit",
+            _ => "admin",
+        }
+    }
+    /// Axis-2 capabilities (mirror of ROLE_PRESET_TABLE).
+    fn capabilities(self) -> &'static [&'static str] {
+        match self {
+            Preset::Client | Preset::Admin => &[],
+            Preset::Exit | Preset::BlindExit => &["serves_exit"],
+            Preset::Relay => &["serves_relay"],
+            Preset::Anchor => &[
+                "anchor.gossip_seed",
+                "anchor.bundle_pull",
+                "anchor.enrollment_endpoint",
+                "anchor.relay_colocation",
+                "anchor.port_mapping_authoritative",
+            ],
+        }
+    }
+}
+
+fn needs_relay_binary(caps: &[&str]) -> bool {
+    caps.iter()
+        .any(|c| *c == "serves_relay" || *c == "anchor.relay_colocation")
+}
+
+#[derive(PartialEq, Eq, Debug)]
+enum TransitionKind {
+    Identity,
+    LocalOnly,
+    SignedMembership,
+    Blocked,
+    Irreversible,
+}
+
+struct TransitionPlan {
+    kind: TransitionKind,
+    reason: &'static str,
+    adds: Vec<&'static str>,
+    removes: Vec<&'static str>,
+    relay_deploy: bool,
+    relay_undeploy: bool,
+    primary_change: Option<(&'static str, &'static str)>,
+}
+
+/// Faithful mirror of `role_presets::transition_plan`.
+fn plan_transition(from: Preset, to: Preset) -> TransitionPlan {
+    if from == to {
+        return TransitionPlan {
+            kind: TransitionKind::Identity,
+            reason: "from == to; no-op",
+            adds: vec![],
+            removes: vec![],
+            relay_deploy: false,
+            relay_undeploy: false,
+            primary_change: None,
+        };
+    }
+    if from == Preset::BlindExit {
+        return TransitionPlan {
+            kind: TransitionKind::Blocked,
+            reason: "blind_exit is immutable; factory reset + fresh key provisioning required to change role",
+            adds: vec![],
+            removes: vec![],
+            relay_deploy: false,
+            relay_undeploy: false,
+            primary_change: None,
+        };
+    }
+
+    let from_caps = from.capabilities();
+    let to_caps = to.capabilities();
+    let adds: Vec<&'static str> = to_caps
+        .iter()
+        .filter(|c| !from_caps.contains(c))
+        .copied()
+        .collect();
+    let removes: Vec<&'static str> = from_caps
+        .iter()
+        .filter(|c| !to_caps.contains(c))
+        .copied()
+        .collect();
+    let relay_deploy = !needs_relay_binary(from_caps) && needs_relay_binary(to_caps);
+    let relay_undeploy = needs_relay_binary(from_caps) && !needs_relay_binary(to_caps);
+    let primary_change = if from.primary() != to.primary() {
+        Some((from.primary(), to.primary()))
+    } else {
+        None
+    };
+
+    let (kind, reason) = if to == Preset::BlindExit {
+        (
+            TransitionKind::Irreversible,
+            "becoming blind_exit wipes node identity and re-enrolls fresh; this cannot be undone without another factory reset",
+        )
+    } else if !adds.is_empty() || !removes.is_empty() {
+        (
+            TransitionKind::SignedMembership,
+            "capability set changes; requires an owner-signed membership update record",
+        )
+    } else if primary_change.is_some() {
+        (
+            TransitionKind::LocalOnly,
+            "primary role changes (admin ↔ client); local config write + daemon reload, no signed bundle",
+        )
+    } else {
+        (TransitionKind::Identity, "no change")
+    };
+
+    TransitionPlan {
+        kind,
+        reason,
+        adds,
+        removes,
+        relay_deploy,
+        relay_undeploy,
+        primary_change,
+    }
+}
+
+fn describe_role_transition(from: &str, to: &str, platform: &str) -> Result<String, String> {
+    let from_p = Preset::parse(from).ok_or_else(|| {
+        format!("Unknown 'from' role: {from} (use client/admin/exit/blind_exit/relay/anchor)")
+    })?;
+    let to_p = Preset::parse(to).ok_or_else(|| {
+        format!("Unknown 'to' role: {to} (use client/admin/exit/blind_exit/relay/anchor)")
+    })?;
+
+    let mut out = format!("# Role Transition: {from} → {to} on {platform}\n\n");
+
+    // Platform gate on the destination role.
+    let support = role_support(to_p, platform);
+    out.push_str("## Platform eligibility\n");
+    match support {
+        Support::Supported => {
+            out.push_str(&format!("- ✅ `{to}` is supported on `{platform}`.\n\n"));
+        }
+        Support::FailClosed(note) => {
+            out.push_str(&format!(
+                "- ⛔ `{to}` on `{platform}` is **fail-closed** (lab-assignable for evidence, not yet product-supported): {note}\n\n"
+            ));
+        }
+        Support::Planned(note) => {
+            out.push_str(&format!(
+                "- 📋 `{to}` on `{platform}` is **planned**, not yet implemented: {note}\n\n"
+            ));
+        }
+        Support::Blocked(note) => {
+            out.push_str(&format!(
+                "## Result: 🚫 Platform-Blocked\n\n- `{to}` is not available on `{platform}`: {note}\n"
+            ));
+            return Ok(out);
+        }
+    }
+
+    // Transition mechanics (mirror of role_presets::transition_plan).
+    let plan = plan_transition(from_p, to_p);
+    out.push_str("## Transition\n");
+    let banner = match plan.kind {
+        TransitionKind::Identity => "✅ No-op (already in role)",
+        TransitionKind::LocalOnly => "✅ Allowed — local-only (config write + daemon reload)",
+        TransitionKind::SignedMembership => {
+            "✅ Allowed — requires an owner-signed membership update"
+        }
+        TransitionKind::Irreversible => "⚠️ Allowed but IRREVERSIBLE (destructive, one-way)",
+        TransitionKind::Blocked => "🚫 Blocked",
+    };
+    out.push_str(&format!(
+        "- **Kind:** {banner}\n- **Why:** {}\n",
+        plan.reason
+    ));
+    if plan.kind == TransitionKind::Blocked {
+        return Ok(out);
+    }
+    if let Some((f, t)) = plan.primary_change {
+        out.push_str(&format!("- **Primary role change:** {f} → {t}\n"));
+    }
+    if !plan.adds.is_empty() {
+        out.push_str(&format!(
+            "- **Capabilities added:** {}\n",
+            plan.adds.join(", ")
+        ));
+    }
+    if !plan.removes.is_empty() {
+        out.push_str(&format!(
+            "- **Capabilities removed:** {}\n",
+            plan.removes.join(", ")
+        ));
+    }
+
+    out.push_str("\n## Required side-effects (ordered)\n");
+    if plan.kind == TransitionKind::Irreversible {
+        out.push_str("- Requires typed factory-reset acknowledgement before proceeding.\n");
+        out.push_str("- Wipes node identity and re-enrolls fresh.\n");
+    }
+    // Service deploy/undeploy, in the safe order.
+    if plan.relay_deploy {
+        out.push_str("- **Deploy** the `rustynet-relay` sibling service and verify it is Running BEFORE advertising the capability in the signed bundle (deploy-then-advertise).\n");
+    }
+    if plan.adds.contains(&"serves_exit") {
+        out.push_str(
+            "- **Deploy** exit forwarding + NAT BEFORE advertising the exit capability.\n",
+        );
+    }
+    if plan.removes.contains(&"serves_exit") {
+        out.push_str("- **Tear down** exit NAT/forwarding BEFORE revoking the capability (NAT residue after revocation is a release-blocking defect).\n");
+    }
+    if plan.relay_undeploy {
+        out.push_str("- **Undeploy** the `rustynet-relay` service BEFORE the revocation bundle (fail-closed: keep previous state on undeploy failure).\n");
+    }
+    if to_p == Preset::Anchor {
+        out.push_str("- Anchor brings up: bundle-pull listener, enrollment endpoint (loopback by default), gossip seed, and port-mapping authority (lex-min lease).\n");
+    }
+    out.push_str("- Emit an append-only audit log entry (timestamp, from, to, side-effects, outcome, operator).\n");
+
+    if matches!(support, Support::FailClosed(_)) {
+        out.push_str("\n_Note: this role is fail-closed on this platform — the transition validates, but the role will not be product-active until a green standard-orchestrator run is archived._\n");
+    }
+    Ok(out)
+}
+
+// ── Platform support (mirror of is_supported_for_platform) ────────────
+
+enum Support {
+    Supported,
+    FailClosed(&'static str),
+    Planned(&'static str),
+    Blocked(&'static str),
+}
+
+/// Mirror of `vm_lab/orchestrator/role.rs::is_supported_for_platform` +
+/// `rustynet-operator/src/role.rs::is_blind_exit_supported_host`.
+fn role_support(role: Preset, platform: &str) -> Support {
+    let p = platform.to_lowercase();
+    match (role, p.as_str()) {
+        // Mobile is consume-only by OS constraint.
+        (Preset::Client, "ios" | "android") => {
+            Support::Planned("mobile is client-only; adapter not yet shipped")
+        }
+        (_, "ios" | "android") => Support::Blocked("mobile is client-only by design"),
+
+        // Linux: everything is live-evidenced.
+        (_, "linux") => Support::Supported,
+
+        // blind_exit host gate.
+        (Preset::BlindExit, "macos") => Support::Supported,
+        (Preset::BlindExit, "windows") => Support::Blocked("not a supported blind_exit host"),
+
+        // exit: macOS maps to the blind_exit PF posture (supported);
+        // Windows is fail-closed until W5.4 live evidence.
+        (Preset::Exit, "macos") => Support::Supported,
+        (Preset::Exit, "windows") => {
+            Support::FailClosed("gated until W5.4 WinNAT/HNS live evidence")
+        }
+
+        // anchor/relay: Linux-only today; macOS+Windows lab-assignable but
+        // fail-closed pending a Phase-8 green run.
+        (Preset::Relay | Preset::Anchor, "macos" | "windows") => {
+            Support::FailClosed("lab-assignable; pending Phase-8 cross-OS green run")
+        }
+
+        // client/admin on macOS + Windows.
+        (Preset::Client | Preset::Admin, "macos" | "windows") => Support::Supported,
+        (Preset::Exit, _) => Support::Supported,
+
+        _ => Support::Supported,
+    }
+}
+
+fn render_platform_support(feature: Option<&str>, platform: Option<&str>) -> String {
+    let platforms = ["linux", "macos", "windows", "ios", "android"];
+    let roles = [
+        Preset::Client,
+        Preset::Admin,
+        Preset::Exit,
+        Preset::BlindExit,
+        Preset::Relay,
+        Preset::Anchor,
+    ];
+    let feat = feature.map(|f| f.to_lowercase());
+    let plat = platform.map(|p| p.to_lowercase());
+
+    let mut out = String::from("# Platform Support Matrix\n\n");
+    out.push_str("_Mirrored from the live code gate (is_supported_for_platform + is_blind_exit_supported_host)._\n\n## Roles\n");
+    for role in roles {
+        if let Some(f) = &feat
+            && !role.as_str().contains(f.as_str())
+        {
+            continue;
+        }
+        for pf in platforms {
+            if let Some(p) = &plat
+                && pf != p
+            {
+                continue;
+            }
+            let (icon, label, note) = match role_support(role, pf) {
+                Support::Supported => ("✅", "supported", ""),
+                Support::FailClosed(n) => ("⛔", "fail-closed", n),
+                Support::Planned(n) => ("📋", "planned", n),
+                Support::Blocked(n) => ("🚫", "blocked", n),
+            };
+            if note.is_empty() {
+                out.push_str(&format!(
+                    "- {icon} **{}** on **{pf}**: {label}\n",
+                    role.as_str()
+                ));
+            } else {
+                out.push_str(&format!(
+                    "- {icon} **{}** on **{pf}**: {label} ({note})\n",
+                    role.as_str()
+                ));
+            }
+        }
+    }
+
+    // Non-role platform features.
+    out.push_str("\n## Features\n");
+    for entry in PLATFORM_FEATURES {
+        if let Some(f) = &feat
+            && !entry.feature.to_lowercase().contains(f.as_str())
+        {
+            continue;
+        }
+        if let Some(p) = &plat
+            && entry.platform != p.as_str()
+        {
+            continue;
+        }
+        out.push_str(&format!(
+            "- **{}** on **{}**: {} — {}\n",
+            entry.feature, entry.platform, entry.status, entry.note
+        ));
+    }
+
+    out.push_str("\n## Legend\n- ✅ supported (live evidence) · ⛔ fail-closed (implemented, lab-assignable, pending live evidence) · 📋 planned · 🚫 blocked\n");
+    out
+}
+
+struct FeatureSupport {
+    feature: &'static str,
+    platform: &'static str,
+    status: &'static str,
+    note: &'static str,
+}
+
+static PLATFORM_FEATURES: &[FeatureSupport] = &[
+    FeatureSupport {
+        feature: "killswitch",
+        platform: "linux",
+        status: "supported",
+        note: "nftables pre-start and post-start",
+    },
+    FeatureSupport {
+        feature: "killswitch",
+        platform: "macos",
+        status: "fail-closed",
+        note: "pf anchor available; pre-killswitch not yet mandatory",
+    },
+    FeatureSupport {
+        feature: "killswitch",
+        platform: "windows",
+        status: "fail-closed",
+        note: "netsh-based; IPv4 LAN egress allow-all (RN-06); WFP migration planned",
+    },
+    FeatureSupport {
+        feature: "wireguard-kernel",
+        platform: "linux",
+        status: "supported",
+        note: "in-kernel wireguard.ko",
+    },
+    FeatureSupport {
+        feature: "wireguard-userspace",
+        platform: "macos",
+        status: "supported",
+        note: "boringtun userspace backend",
+    },
+    FeatureSupport {
+        feature: "wireguard-nt",
+        platform: "windows",
+        status: "supported",
+        note: "WireGuard-NT kernel driver",
+    },
+    FeatureSupport {
+        feature: "dpapi-secrets",
+        platform: "windows",
+        status: "supported",
+        note: "DPAPI-protected blobs under ProgramData\\RustyNet\\secrets",
+    },
+    FeatureSupport {
+        feature: "keychain-secrets",
+        platform: "macos",
+        status: "supported",
+        note: "macOS keychain key custody",
+    },
+    FeatureSupport {
+        feature: "ipv6-dataplane",
+        platform: "linux",
+        status: "supported",
+        note: "dual-stack with v6 candidate gathering",
+    },
+    FeatureSupport {
+        feature: "upnp-natpmp-pcp",
+        platform: "linux",
+        status: "supported",
+        note: "gateway detection via /proc/net/route",
+    },
+];
+
+// ── Crate structure + which_crate ─────────────────────────────────────
+
+struct CrateInfo {
+    name: &'static str,
+    layer: &'static str,
+    summary: &'static str,
+}
+
+static CRATES: &[CrateInfo] = &[
+    CrateInfo {
+        name: "rustynet-control",
+        layer: "domain",
+        summary: "Signed membership, enrollment, gossip primitives, role presets (role_presets.rs). Transport-agnostic.",
+    },
+    CrateInfo {
+        name: "rustynet-policy",
+        layer: "domain",
+        summary: "ACL and policy evaluation engine. Transport-agnostic.",
+    },
+    CrateInfo {
+        name: "rustynet-crypto",
+        layer: "domain",
+        summary: "Cryptographic primitives (signing, verification, key types). No custom crypto.",
+    },
+    CrateInfo {
+        name: "rustynet-dns-zone",
+        layer: "domain",
+        summary: "Magic DNS signed zone schema and validation.",
+    },
+    CrateInfo {
+        name: "rustynet-local-security",
+        layer: "domain",
+        summary: "Local security verification (runtime ACLs, key custody, service hardening).",
+    },
+    CrateInfo {
+        name: "rustynet-sysinfo",
+        layer: "domain",
+        summary: "Host OS detection, interface enumeration.",
+    },
+    CrateInfo {
+        name: "rustynet-operator",
+        layer: "domain",
+        summary: "Operator UX, config, wizards, role host eligibility (role.rs).",
+    },
+    CrateInfo {
+        name: "rustynet-backend-api",
+        layer: "backend",
+        summary: "Backend trait definitions — what every backend must implement.",
+    },
+    CrateInfo {
+        name: "rustynet-backend-wireguard",
+        layer: "backend",
+        summary: "Production WireGuard backend (kernel + userspace).",
+    },
+    CrateInfo {
+        name: "rustynet-backend-userspace",
+        layer: "backend",
+        summary: "Userspace WireGuard backend (boringtun).",
+    },
+    CrateInfo {
+        name: "rustynet-backend-stub",
+        layer: "backend",
+        summary: "Stub backend for testing.",
+    },
+    CrateInfo {
+        name: "rustynetd",
+        layer: "daemon-cli",
+        summary: "Main daemon: WG management, STUN, gossip, relay client, killswitch, phase10 dataplane.",
+    },
+    CrateInfo {
+        name: "rustynet-cli",
+        layer: "daemon-cli",
+        summary: "CLI + VM-lab orchestrator + live-lab wrappers. Largest crate.",
+    },
+    CrateInfo {
+        name: "rustynet-relay",
+        layer: "daemon-cli",
+        summary: "Production relay binary (frame forwarding between peers).",
+    },
+    CrateInfo {
+        name: "rustynet-windows-native",
+        layer: "platform",
+        summary: "Windows-specific native code (WFP, named pipes, DPAPI).",
+    },
+    CrateInfo {
+        name: "rustynet-mcp",
+        layer: "tooling",
+        summary: "MCP servers for AI agents (this crate).",
+    },
+    CrateInfo {
+        name: "rustynet-xtask",
+        layer: "tooling",
+        summary: "Convenience gate runner (fmt → check → clippy → test).",
+    },
+];
+
+fn layer_boundary(layer: &str) -> &'static str {
+    match layer {
+        "domain" => {
+            "Transport-agnostic. MUST NOT import backend or WireGuard types — keep policy/domain logic backend-free. Enforced by scripts/ci/check_backend_boundary_leakage.sh."
+        }
+        "backend" => {
+            "Backend adapter. WireGuard/transport-specific types live ONLY here, behind rustynet-backend-api traits. Do not leak these types into domain crates."
+        }
+        "daemon-cli" => {
+            "Wires domain crates + backends together via backend interfaces. Do not leak backend types into domain logic; depend on traits, not concrete backends."
+        }
+        "platform" => {
+            "OS-specific native integration boundary. Keep platform calls behind a stable interface; non-Rust only for unavoidable OS boundaries."
+        }
+        "tooling" => "Dev/CI tooling. Not in the production trust path.",
+        _ => "Unknown layer.",
+    }
+}
+
+fn render_crate_structure() -> String {
+    let mut out = String::from("# Workspace Crate Structure\n\n");
+    for layer in ["domain", "backend", "daemon-cli", "platform", "tooling"] {
+        let title = match layer {
+            "domain" => "Core / Domain (transport-agnostic)",
+            "backend" => "Backend Adapters (transport-specific)",
+            "daemon-cli" => "Daemon & CLI",
+            "platform" => "Platform-Specific",
+            "tooling" => "Tooling",
+            _ => layer,
+        };
+        out.push_str(&format!("## {title}\n"));
+        for c in CRATES.iter().filter(|c| c.layer == layer) {
+            out.push_str(&format!("- **`{}`** — {}\n", c.name, c.summary));
+        }
+        out.push_str(&format!("  - _Boundary:_ {}\n", layer_boundary(layer)));
+        out.push('\n');
+    }
+    out
+}
+
+fn which_crate(path: &str) -> String {
+    if path.is_empty() {
+        return "Missing required parameter: path".into();
+    }
+    // Find `crates/<name>/` in the path.
+    let owning = path
+        .split('/')
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|w| {
+            if w[0] == "crates" {
+                CRATES.iter().find(|c| c.name == w[1])
+            } else {
+                None
+            }
+        });
+
+    match owning {
+        Some(c) => format!(
+            "# `{}`\n\n- **Path:** `{}`\n- **Layer:** {}\n- **What it does:** {}\n\n## Boundary rule\n{}\n",
+            c.name,
+            path,
+            c.layer,
+            c.summary,
+            layer_boundary(c.layer)
+        ),
+        None => {
+            let area = if path.starts_with("documents/") {
+                "Documentation (not a crate). Use get_document / find_in_docs / get_active_ledger."
+            } else if path.starts_with("scripts/") {
+                "Scripts (CI gates, vm_lab helpers). Not a crate; run via the gate-runner / lab-state MCP servers."
+            } else {
+                "Not under crates/. No owning crate."
+            };
+            format!(
+                "# No owning crate for `{path}`\n\n{area}\n\nKnown crates: {}",
+                CRATES.iter().map(|c| c.name).collect::<Vec<_>>().join(", ")
+            )
+        }
+    }
 }
 
 // ── Static reference data ─────────────────────────────────────────────
-
-const CRATE_STRUCTURE: &str = r#"# Workspace Crate Structure
-
-## Core / Domain (transport-agnostic)
-- **`rustynet-control`** — Signed membership state, enrollment, gossip primitives, role presets. No transport knowledge.
-- **`rustynet-policy`** — ACL and policy evaluation engine. Transport-agnostic.
-- **`rustynet-crypto`** — Cryptographic primitives (signing, verification, key types). No custom crypto.
-- **`rustynet-dns-zone`** — Magic DNS signed zone schema and validation.
-- **`rustynet-local-security`** — Local security verification (runtime ACLs, key custody, service hardening).
-- **`rustynet-sysinfo`** — System information gathering (host OS detection, interface enumeration).
-- **`rustynet-operator`** — Operator UX, config management, wizards (migrating from shell).
-
-## Backend Adapters (transport-specific)
-- **`rustynet-backend-api`** — Backend trait definitions. What every backend must implement.
-- **`rustynet-backend-wireguard`** — Production WireGuard backend (kernel + userspace).
-- **`rustynet-backend-userspace`** — Userspace WireGuard backend (boringtun).
-- **`rustynet-backend-stub`** — Stub backend for testing.
-
-## Daemon & CLI
-- **`rustynetd`** — The main daemon binary. WireGuard management, STUN, gossip, relay client, port mapping.
-- **`rustynet-cli`** — CLI binary + VM lab orchestrator + live-lab wrappers. Largest crate.
-- **`rustynet-relay`** — Production relay binary (frame forwarding between peers).
-
-## Platform-Specific
-- **`rustynet-windows-native`** — Windows-specific native code (WFP, named pipes, DPAPI).
-
-## Tooling
-- **`rustynet-xtask`** — Convenience runner for quality gates (fmt → check → clippy → test).
-"#;
 
 const ORCHESTRATOR_STAGES: &str = r#"# Live Lab Orchestration Stages
 
@@ -955,404 +1846,161 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 20 | `deploy_relay` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
 | 21 | `final_cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
-## Adapter Structure (per-OS impls)
-- `adapter/node_adapter.rs` — `NodeAdapter` trait
-- `adapter/linux.rs` + `linux_install.rs` + `linux_membership.rs` + `linux_traffic.rs`
-- `adapter/windows.rs` + `windows_install.rs` + `windows_membership.rs` + `windows_traffic.rs`
-- `adapter/macos.rs` + `macos_install.rs` + `macos_membership.rs` + `macos_traffic.rs`
-- `adapter/ios.rs`, `adapter/android.rs` — stubs
-- `adapter/factory.rs` — `node_adapter_for(platform, connection)` factory
-- `adapter/ssh.rs` — SSH transport helpers
-- `adapter/verifier_key.rs` — Verifier key installation
-
-## VM Lab Entry Points (CLI)
+## VM Lab Entry Points (CLI / lab-state MCP)
 - `ops vm-lab-discover-local-utm-summary` — discover VMs, quick summary
-- `ops vm-lab-discover-local-utm` — discover VMs, full JSON
-- `ops vm-lab-restart --all --wait-ready` — restart fleet, wait for SSH
-- `ops vm-lab-setup-live-lab` — generate profile, run setup stages
-- `ops vm-lab-run-live-lab` — run full live-lab suite
 - `ops vm-lab-orchestrate-live-lab` — one-shot: discover → restart → setup → run → diagnose
+- `ops vm-lab-run-live-lab` — run full suite against a profile
 - `ops vm-lab-diagnose-live-lab-failure` — collect failure context
 "#;
 
-// ── Below: data and helpers for new tools ──
-// (appended by MCP server extension)
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-// ── Security findings data ──────────────────────────────────────────
-
-struct SecurityFinding {
-    id: &'static str,
-    title: &'static str,
-    severity: &'static str,
-    status: &'static str,
-    cwe: &'static str,
-    location: &'static str,
-    priority: &'static str,
-    description: &'static str,
-    remediation: &'static str,
-}
-
-static SECURITY_FINDINGS: &[SecurityFinding] = &[
-    SecurityFinding {
-        id: "RN-03",
-        title: "force_fail_closed discarded — 10/44 sites",
-        severity: "High",
-        status: "open",
-        cwe: "CWE-754",
-        location: "crates/rustynetd/src/daemon.rs and 9 other files",
-        priority: "P0",
-        description: "The force_fail_closed safety mechanism was discarded at 10 of 44 call sites. When trust/security state is missing, invalid, or stale, these paths do not fail closed as required.",
-        remediation: "Restore force_fail_closed at all 44 sites. Audit every path that reads trust state.",
-    },
-    SecurityFinding {
-        id: "RN-04",
-        title: "Pre-killswitch is opt-in and Linux-only",
-        severity: "High",
-        status: "open",
-        cwe: "CWE-693",
-        location: "crates/rustynetd/src/killswitch.rs",
-        priority: "P0",
-        description: "The pre-killswitch (applied before daemon starts) is opt-in via CLI flag and only on Linux (nftables). Windows/macOS have no pre-killswitch, creating a race window.",
-        remediation: "Make pre-killswitch mandatory and cross-platform: WFP on Windows, pf anchor on macOS at install time.",
-    },
-    SecurityFinding {
-        id: "RN-05",
-        title: "Non-node: selectors bypass policy revocation",
-        severity: "High",
-        status: "open",
-        cwe: "CWE-863",
-        location: "crates/rustynet-policy/src/eval.rs",
-        priority: "P0",
-        description: "Policy selectors using non-'node:' prefixes can match after a node is revoked. Revocation only removes 'node:' selectors.",
-        remediation: "Re-evaluate all selectors against current membership on every policy evaluation.",
-    },
-    SecurityFinding {
-        id: "RN-06",
-        title: "Windows killswitch allows IPv4 LAN egress",
-        severity: "High",
-        status: "open",
-        cwe: "CWE-284",
-        location: "crates/rustynetd/src/killswitch.rs (Windows netsh rules)",
-        priority: "P0",
-        description: "The Windows killswitch uses netsh rules allowing all IPv4 LAN egress. In protected mode this is a leak path.",
-        remediation: "Move Windows egress policy to WFP for fine-grained control. Scope IPv4 LAN allowlist to known-safe CIDRs.",
-    },
-    SecurityFinding {
-        id: "RN-07",
-        title: "IPv6 leak in protected mode",
-        severity: "High",
-        status: "partial",
-        cwe: "CWE-284",
-        location: "crates/rustynetd/src/killswitch.rs",
-        priority: "P0",
-        description: "IPv6 traffic can bypass the killswitch. G8 partially remediates with apply/block/rollback but full leak-proof is deferred.",
-        remediation: "Complete G8 IPv6 fail-closed: block all IPv6 at WFP/pf/nftables when protected mode active.",
-    },
-    SecurityFinding {
-        id: "RN-11",
-        title: "Empty membership/context = permissive default",
-        severity: "High",
-        status: "open",
-        cwe: "CWE-276",
-        location: "crates/rustynet-policy/src/eval.rs",
-        priority: "P1",
-        description: "When membership is empty or context missing, policy defaults to permissive. Violates default-deny requirement.",
-        remediation: "Policy must deny by default when membership is empty. Add deny-on-empty guards.",
-    },
-    SecurityFinding {
-        id: "RN-01",
-        title: "Membership decoder DoS via unbounded allocation",
-        severity: "High",
-        status: "fixed",
-        cwe: "CWE-770",
-        location: "crates/rustynet-control/src/membership.rs",
-        priority: "P0",
-        description: "Unbounded allocation on attacker-controlled size fields. Fixed: added size caps (RL-1).",
-        remediation: "",
-    },
-    SecurityFinding {
-        id: "RN-14",
-        title: "Unsafe code lint not enforced workspace-wide",
-        severity: "Medium",
-        status: "fixed",
-        cwe: "CWE-242",
-        location: "Cargo.toml workspace lints",
-        priority: "P1",
-        description: "unsafe_code=forbid now in workspace lints. Fixed (RL-2).",
-        remediation: "",
-    },
-    SecurityFinding {
-        id: "RN-22",
-        title: "ed25519 verify_strict not used (malleability)",
-        severity: "Medium",
-        status: "fixed",
-        cwe: "CWE-347",
-        location: "crates/rustynet-crypto/src/verify.rs",
-        priority: "P1",
-        description: "Switched to verify_strict. Fixed (RL-3).",
-        remediation: "",
-    },
-    SecurityFinding {
-        id: "RN-24",
-        title: "Secret material not zeroized after use",
-        severity: "Medium",
-        status: "fixed",
-        cwe: "CWE-226",
-        location: "Multiple files in rustynet-crypto, rustynetd",
-        priority: "P1",
-        description: "Added zeroize at all key material drop sites. Fixed (RL-4).",
-        remediation: "",
-    },
-    SecurityFinding {
-        id: "RN-21",
-        title: "Fail-closed path accepted as operational risk",
-        severity: "Low",
-        status: "accepted",
-        cwe: "N/A",
-        location: "crates/rustynetd/src/daemon.rs",
-        priority: "P2",
-        description: "Daemon refuses to start without valid membership snapshot — intentional fail-closed. Accepted.",
-        remediation: "",
-    },
-];
-
-// ── Role transition validation ──────────────────────────────────────
-
-fn validate_role_transition(from: &str, to: &str, platform: &str) -> String {
-    let from_lower = from.to_lowercase();
-    let to_lower = to.to_lowercase();
-    let mut result = format!("# Role Transition: {from} → {to} on {platform}\n\n");
-
-    if from_lower == to_lower {
-        result.push_str("## Result: ✅ No-op (already in role)\n\n");
-        return result;
+    #[test]
+    fn transition_admin_client_is_local_only() {
+        let p = plan_transition(Preset::Admin, Preset::Client);
+        assert_eq!(p.kind, TransitionKind::LocalOnly);
     }
 
-    let platform_blocks: &[(&str, &[&str])] = &[
-        ("windows", &["exit", "blind_exit", "relay", "anchor"]),
-        ("macos", &["blind_exit"]),
-        ("ios", &["relay", "anchor", "exit", "blind_exit", "admin"]),
-        (
-            "android",
-            &["relay", "anchor", "exit", "blind_exit", "admin"],
-        ),
-    ];
+    #[test]
+    fn transition_client_exit_is_signed_with_exit_cap() {
+        let p = plan_transition(Preset::Client, Preset::Exit);
+        assert_eq!(p.kind, TransitionKind::SignedMembership);
+        assert!(p.adds.contains(&"serves_exit"));
+    }
 
-    for (bp, br) in platform_blocks {
-        if platform == *bp && br.contains(&to_lower.as_str()) {
-            result.push_str("## Result: 🚫 Platform-Blocked\n\n");
-            result.push_str(&format!("Role `{to}` is not supported on `{platform}`.\n"));
-            result.push_str("The wizard greys out this role. `rustynet role set` returns `platform-blocked` error.\n");
-            return result;
+    #[test]
+    fn transition_from_blind_exit_blocked() {
+        let p = plan_transition(Preset::BlindExit, Preset::Client);
+        assert_eq!(p.kind, TransitionKind::Blocked);
+    }
+
+    #[test]
+    fn transition_to_blind_exit_irreversible() {
+        let p = plan_transition(Preset::Client, Preset::BlindExit);
+        assert_eq!(p.kind, TransitionKind::Irreversible);
+    }
+
+    #[test]
+    fn transition_relay_to_client_undeploys_relay() {
+        let p = plan_transition(Preset::Relay, Preset::Client);
+        assert!(p.relay_undeploy);
+        assert!(!p.relay_deploy);
+    }
+
+    #[test]
+    fn transition_client_to_anchor_deploys_relay() {
+        let p = plan_transition(Preset::Client, Preset::Anchor);
+        assert!(p.relay_deploy);
+        assert_eq!(p.kind, TransitionKind::SignedMembership);
+    }
+
+    #[test]
+    fn platform_gate_matches_code() {
+        // Windows blind_exit is a blocked host.
+        assert!(matches!(
+            role_support(Preset::BlindExit, "windows"),
+            Support::Blocked(_)
+        ));
+        // macOS blind_exit + exit are supported.
+        assert!(matches!(
+            role_support(Preset::BlindExit, "macos"),
+            Support::Supported
+        ));
+        assert!(matches!(
+            role_support(Preset::Exit, "macos"),
+            Support::Supported
+        ));
+        // Windows exit is fail-closed (NOT blocked) — the key bug we fixed.
+        assert!(matches!(
+            role_support(Preset::Exit, "windows"),
+            Support::FailClosed(_)
+        ));
+        // Anchor/relay fail-closed off Linux.
+        assert!(matches!(
+            role_support(Preset::Anchor, "windows"),
+            Support::FailClosed(_)
+        ));
+        assert!(matches!(
+            role_support(Preset::Relay, "macos"),
+            Support::FailClosed(_)
+        ));
+        // Linux supports everything.
+        assert!(matches!(
+            role_support(Preset::Anchor, "linux"),
+            Support::Supported
+        ));
+    }
+
+    #[test]
+    fn role_transition_and_platform_support_agree() {
+        // The two tools must never contradict: a role blocked for transition
+        // must show blocked in the matrix, and vice-versa.
+        for role in [
+            Preset::Exit,
+            Preset::BlindExit,
+            Preset::Relay,
+            Preset::Anchor,
+        ] {
+            for platform in ["linux", "macos", "windows", "ios", "android"] {
+                let transition =
+                    describe_role_transition("client", role.as_str(), platform).unwrap_or_default();
+                let blocked_in_transition = transition.contains("Platform-Blocked");
+                let blocked_in_matrix = matches!(role_support(role, platform), Support::Blocked(_));
+                assert_eq!(
+                    blocked_in_transition,
+                    blocked_in_matrix,
+                    "disagreement for {} on {platform}",
+                    role.as_str()
+                );
+            }
         }
     }
 
-    if from_lower == "blind_exit" {
-        result.push_str("## Result: 🚫 Irreversible\n\n");
-        result.push_str(
-            "BlindExit is immutable. Requires factory-reset: wipe identity → re-enroll.\n",
-        );
-        return result;
+    #[test]
+    fn which_crate_resolves_domain_crate() {
+        let out = which_crate("crates/rustynet-policy/src/eval.rs");
+        assert!(out.contains("rustynet-policy"));
+        assert!(out.contains("domain"));
+        assert!(out.contains("MUST NOT import backend"));
     }
 
-    if to_lower == "blind_exit" {
-        result.push_str("## Result: ⚠️ One-way (irreversible entry)\n\n");
-        result.push_str("Entering BlindExit is permanent. Requires typed confirmation + --confirm-irreversible flag.\n\n");
+    #[test]
+    fn which_crate_handles_non_crate_path() {
+        let out = which_crate("documents/Requirements.md");
+        assert!(out.contains("Documentation"));
     }
 
-    let is_priv = |r: &str| matches!(r, "exit" | "relay" | "anchor" | "blind_exit");
-    let adds = is_priv(&to_lower) && !is_priv(&from_lower);
-    let removes = !is_priv(&to_lower) && is_priv(&from_lower);
+    #[test]
+    fn parse_findings_expands_range_and_counts() {
+        let doc = "\
+## 18. Master finding-status tracker
 
-    result.push_str("## Result: ✅ Allowed (requires owner signature)\n\n");
-    result.push_str("Capability changes require an owner-signed membership bundle.\n\n");
+| ID | Sev | Domain | Status | Ref |
+|---|---|---|---|---|
+| RN-01 | High | Untrusted input | **Fixed** | RL-1 |
+| RN-02 | High | Dataplane | Open | §11 |
+| RN-21 | Low | Crypto | **Accepted** (fail-closed) | RL note |
+| RN-34–38 | Info | various | Open | — |
 
-    if to_lower == "relay" || adds && to_lower.contains("relay") {
-        result.push_str("### Relay deploy:\n- Deploy rustynet-relay service BEFORE emitting signed bundle\n- Failure to deploy MUST abort transition\n\n");
+## 19. Next
+";
+        let f = parse_findings_table(doc);
+        // 3 explicit + 5 expanded = 8
+        assert_eq!(f.len(), 8);
+        assert!(f.iter().any(|x| x.id == "RN-34" && x.severity == "Info"));
+        assert!(f.iter().any(|x| x.id == "RN-38"));
+        let fixed = f.iter().filter(|x| x.status == "Fixed").count();
+        assert_eq!(fixed, 1);
+        let accepted = f.iter().filter(|x| x.status == "Accepted").count();
+        assert_eq!(accepted, 1);
     }
-    if removes && from_lower.contains("relay") {
-        result.push_str("### Relay undeploy:\n- Stop+remove rustynet-relay BEFORE revocation bundle\n- Failure to undeploy MUST keep previous state\n\n");
+
+    #[test]
+    fn severity_filter_normalizes_med() {
+        assert!(severity_matches("Med", "medium"));
+        assert!(severity_matches("Medium", "Med"));
+        assert!(!severity_matches("Low", "High"));
     }
-    if to_lower == "exit" || to_lower.contains("exit") {
-        result.push_str("### Exit setup:\n- Deploy forwarding+NAT before capability advertisement\n- On revocation: tear down NAT BEFORE removing capability\n- NAT residue after revocation = release-blocking defect\n\n");
-    }
-    if to_lower == "anchor" || to_lower.contains("anchor") {
-        result.push_str("### Anchor setup:\n- Deploy enrollment endpoint (loopback bind by default)\n- Store HMAC secret in OS-secure custody\n- Token-gated bundle-pull + enrollment share single-use ledger\n- Port-mapping: lex-min node_id gets router lease\n\n");
-    }
-    result.push_str("### Audit: every transition emits append-only log entry (timestamp, from, to, side-effects, outcome, operator).\n");
-    result
 }
-
-// ── Platform support data ───────────────────────────────────────────
-
-struct PlatformSupportEntry {
-    feature: &'static str,
-    platform: &'static str,
-    status: &'static str,
-    note: &'static str,
-}
-
-static PLATFORM_SUPPORT: &[PlatformSupportEntry] = &[
-    PlatformSupportEntry {
-        feature: "client role",
-        platform: "linux",
-        status: "supported",
-        note: "Full mesh client with WireGuard kernel backend",
-    },
-    PlatformSupportEntry {
-        feature: "exit role",
-        platform: "linux",
-        status: "supported",
-        note: "Full exit node with NAT/forwarding",
-    },
-    PlatformSupportEntry {
-        feature: "relay role",
-        platform: "linux",
-        status: "supported",
-        note: "Production relay binary, frame forwarding",
-    },
-    PlatformSupportEntry {
-        feature: "anchor role",
-        platform: "linux",
-        status: "supported",
-        note: "Bundle-pull, enrollment endpoint, port mapping authority",
-    },
-    PlatformSupportEntry {
-        feature: "blind_exit role",
-        platform: "linux",
-        status: "supported",
-        note: "Immutable blind exit with factory-reset requirement",
-    },
-    PlatformSupportEntry {
-        feature: "killswitch",
-        platform: "linux",
-        status: "supported",
-        note: "nftables pre-start and post-start",
-    },
-    PlatformSupportEntry {
-        feature: "wireguard kernel",
-        platform: "linux",
-        status: "supported",
-        note: "in-kernel wireguard.ko",
-    },
-    PlatformSupportEntry {
-        feature: "uPnP/NAT-PMP/PCP",
-        platform: "linux",
-        status: "supported",
-        note: "Gateway detection via /proc/net/route",
-    },
-    PlatformSupportEntry {
-        feature: "IPv6 dataplane",
-        platform: "linux",
-        status: "supported",
-        note: "Dual-stack with v6 candidate gathering",
-    },
-    PlatformSupportEntry {
-        feature: "client role",
-        platform: "macos",
-        status: "supported",
-        note: "Userspace WireGuard (boringtun)",
-    },
-    PlatformSupportEntry {
-        feature: "exit role",
-        platform: "macos",
-        status: "fail-closed",
-        note: "Implemented, gated behind live evidence (W5.4)",
-    },
-    PlatformSupportEntry {
-        feature: "relay role",
-        platform: "macos",
-        status: "planned",
-        note: "On roadmap, not yet implemented",
-    },
-    PlatformSupportEntry {
-        feature: "anchor role",
-        platform: "macos",
-        status: "planned",
-        note: "On roadmap, not yet implemented",
-    },
-    PlatformSupportEntry {
-        feature: "blind_exit role",
-        platform: "macos",
-        status: "blocked",
-        note: "Platform limitation",
-    },
-    PlatformSupportEntry {
-        feature: "killswitch",
-        platform: "macos",
-        status: "fail-closed",
-        note: "pf anchor available but pre-killswitch not mandatory",
-    },
-    PlatformSupportEntry {
-        feature: "client role",
-        platform: "windows",
-        status: "supported",
-        note: "WireGuard-NT, WFP killswitch, single-node smoke validated",
-    },
-    PlatformSupportEntry {
-        feature: "exit role",
-        platform: "windows",
-        status: "fail-closed",
-        note: "Implemented, gated behind WinNAT/HNS live evidence",
-    },
-    PlatformSupportEntry {
-        feature: "relay role",
-        platform: "windows",
-        status: "planned",
-        note: "D8 omitted (relay = Linux home server)",
-    },
-    PlatformSupportEntry {
-        feature: "anchor role",
-        platform: "windows",
-        status: "planned",
-        note: "On roadmap",
-    },
-    PlatformSupportEntry {
-        feature: "blind_exit role",
-        platform: "windows",
-        status: "blocked",
-        note: "Platform limitation",
-    },
-    PlatformSupportEntry {
-        feature: "killswitch",
-        platform: "windows",
-        status: "partial",
-        note: "netsh-based, IPv4 LAN egress allow-all (RN-06); WFP migration planned (E2)",
-    },
-    PlatformSupportEntry {
-        feature: "wireguard-nt",
-        platform: "windows",
-        status: "supported",
-        note: "WireGuard-NT kernel driver",
-    },
-    PlatformSupportEntry {
-        feature: "DPAPI secrets",
-        platform: "windows",
-        status: "supported",
-        note: "DPAPI-protected blobs under ProgramData\\RustyNet\\secrets",
-    },
-    PlatformSupportEntry {
-        feature: "client role",
-        platform: "ios",
-        status: "planned",
-        note: "Consumption-only; no hosting",
-    },
-    PlatformSupportEntry {
-        feature: "client role",
-        platform: "android",
-        status: "planned",
-        note: "Consumption-only; no hosting",
-    },
-    PlatformSupportEntry {
-        feature: "all other roles",
-        platform: "ios",
-        status: "blocked",
-        note: "Mobile is client-only by design",
-    },
-    PlatformSupportEntry {
-        feature: "all other roles",
-        platform: "android",
-        status: "blocked",
-        note: "Mobile is client-only by design",
-    },
-];

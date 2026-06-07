@@ -1,30 +1,35 @@
 {
-  "description": "Rustynet MCP server manifest — three servers providing repo context, gate running, and lab state management for AI agents.",
+  "description": "Rustynet MCP server manifest — three stdio JSON-RPC servers providing repo context, gate running, and lab state management for AI agents.",
   "servers": [
     {
       "name": "rustynet-mcp-repo-context",
-      "description": "Structured access to the Rustynet documentation graph, requirements, security controls, architecture constraints, and codebase structure. 13 tools.",
+      "description": "Structured access to the Rustynet documentation graph, requirements, security controls/findings, architecture constraints, role transitions, platform support, and crate structure. 16 tools + MCP resources (docs) + prompts.",
       "tools": [
         "get_read_order",
         "get_active_ledger",
         "get_requirements",
         "get_security_controls",
-        "get_security_findings",
         "get_architecture_constraints",
         "get_definition_of_done",
-        "get_role_transition",
-        "get_platform_support",
+        "get_gate_definitions",
         "find_in_docs",
+        "list_documents",
         "get_document",
         "get_crate_structure",
-        "get_orchestrator_stages"
+        "which_crate",
+        "get_orchestrator_stages",
+        "get_security_findings",
+        "get_role_transition",
+        "get_platform_support"
       ],
-      "requires_working_dir": true,
-      "working_dir": "<rustynet_repo_root>"
+      "resources": "Curated documentation index exposed as rustynet-doc:// resources (resources/list + resources/read).",
+      "prompts": ["scoped-task", "role-transition-plan"],
+      "requires_working_dir": false,
+      "working_dir": "<baked at build time via build.rs; CWD-independent>"
     },
     {
       "name": "rustynet-mcp-gate-runner",
-      "description": "Runs Rustynet quality gates on demand — cargo fmt, check, clippy, test, audit, deny, and phase-specific CI scripts. 9 tools.",
+      "description": "Runs Rustynet quality gates on demand — cargo fmt, check, clippy, test, build, audit, deny, and phase-specific CI scripts. Every command runs under a kill-on-timeout watchdog. 9 tools.",
       "tools": [
         "run_gates",
         "run_check",
@@ -36,33 +41,40 @@
         "list_gate_scripts",
         "run_gate_script"
       ],
-      "requires_working_dir": true,
-      "working_dir": "<rustynet_repo_root>"
+      "requires_working_dir": false,
+      "working_dir": "<baked at build time via build.rs; CWD-independent>"
     },
     {
       "name": "rustynet-mcp-lab-state",
-      "description": "Queries and manages the UTM VM lab — discovery, restart, recovery, repo sync, bootstrap, diagnostics, and run matrix evidence. 11 tools.",
+      "description": "Queries and manages the UTM VM lab — discovery, inventory update, restart, recovery, repo sync, bootstrap, diagnostics, live-lab setup/run/orchestrate/diagnose, and run-matrix evidence. Every command runs under a kill-on-timeout watchdog. 16 tools.",
       "tools": [
         "get_lab_status",
         "get_lab_status_json",
         "get_inventory",
         "validate_inventory",
+        "update_inventory",
         "restart_vm",
         "recover_stuck_vms",
         "ensure_lab_ready",
         "sync_repo_to_vm",
         "bootstrap_vm",
         "get_vm_diagnostics",
+        "setup_live_lab",
+        "run_live_lab",
+        "orchestrate_live_lab",
+        "diagnose_live_lab_failure",
         "get_run_matrix"
       ],
-      "requires_working_dir": true,
-      "working_dir": "<rustynet_repo_root>"
+      "requires_working_dir": false,
+      "working_dir": "<baked at build time via build.rs; CWD-independent>"
     }
   ],
+  "notes": "The repo root is baked into each binary at compile time (build.rs), so the servers resolve documents/ and crates/ regardless of the client's working directory. Override with the RUSTYNET_REPO_ROOT env var if needed.",
   "platform_configs": {
     "zed": {
       "config_path": ".zed/settings.json",
-      "config_key": "context_servers"
+      "config_key": "context_servers",
+      "form": "{ \"command\": \"<abs path>\", \"args\": [], \"env\": {} }"
     },
     "claude_desktop_macos": {
       "config_path": "~/Library/Application Support/Claude/claude_desktop_config.json",
