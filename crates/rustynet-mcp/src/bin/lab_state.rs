@@ -30,6 +30,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_INVENTORY: &str = "documents/operations/active/vm_lab_inventory.json";
 /// Where job records + logs live (repo-relative; under gitignored state/).
 const JOBS_SUBDIR: &str = "state/mcp-jobs";
+/// Durable append-only loop journal (repo-relative; under gitignored state/).
+/// Survives MCP-server reloads and the agent's context compaction over a long run.
+const LOOP_JOURNAL: &str = "state/mcp-loop-journal.jsonl";
 /// Timeout for discovery/inventory ops. Generous because the FIRST lab call on a
 /// cold checkout must also build rustynet-cli (the largest crate), which can take
 /// several minutes; warm calls return in seconds. The kill-on-timeout watchdog
@@ -1025,6 +1028,479 @@ impl LabStateServer {
         }
         tool_success(&out)
     }
+
+    /// Resolve a report dir from a specific (dir_key | job_key) arg pair, so a
+    /// single call can take two runs (diff_runs).
+    fn resolve_report_dir_keyed(
+        &self,
+        args: Option<&Value>,
+        dir_key: &str,
+        job_key: &str,
+    ) -> Result<PathBuf, String> {
+        if let Some(dir) = arg_str(args, dir_key) {
+            return Ok(self.abs_path(dir));
+        }
+        if let Some(job_id) = arg_str(args, job_key) {
+            let rec = self
+                .read_job_record(job_id)
+                .ok_or_else(|| format!("Unknown job_id: {job_id}"))?;
+            let dir = rec
+                .get("report_dir")
+                .and_then(|v| v.as_str())
+                .ok_or("job record missing report_dir")?;
+            return Ok(self.abs_path(dir));
+        }
+        Err(format!("Provide {dir_key} or {job_key}"))
+    }
+
+    /// Compare two runs' stage outcomes (which stages flipped pass↔fail).
+    fn diff_runs(&self, args: Option<&Value>) -> ToolCallResult {
+        let old = match self.resolve_report_dir_keyed(args, "old_report_dir", "old_job_id") {
+            Ok(d) => d,
+            Err(e) => return tool_error(&format!("old run: {e}")),
+        };
+        let new = match self.resolve_report_dir_keyed(args, "new_report_dir", "new_job_id") {
+            Ok(d) => d,
+            Err(e) => return tool_error(&format!("new run: {e}")),
+        };
+        let old_s = old.to_string_lossy().to_string();
+        let new_s = new.to_string_lossy().to_string();
+        // No --inventory: this op reads only the two report dirs' stages.tsv.
+        self.run_cli(
+            &[
+                "ops",
+                "vm-lab-diff-live-lab-runs",
+                "--old-report-dir",
+                &old_s,
+                "--new-report-dir",
+                &new_s,
+            ],
+            "Run diff (old → new)",
+            DISCOVERY_TIMEOUT_SECS,
+        )
+    }
+
+    /// Parse `utmctl list` once → utm_name → power status. Mirrors the parse in
+    /// utm_power_status but returns the whole fleet in one call.
+    fn utm_status_map(&self) -> BTreeMap<String, String> {
+        let mut m = BTreeMap::new();
+        if let Ok(o) = run_with_timeout(
+            &utmctl_path(),
+            &["list"],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(30),
+        ) && o.success
+        {
+            for line in o.stdout.lines() {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with("UUID") {
+                    continue;
+                }
+                if let Some(status) = t.split_whitespace().nth(1)
+                    && let Some(idx) = t.find(status)
+                {
+                    let name = t[idx + status.len()..].trim().to_string();
+                    if !name.is_empty() {
+                        m.insert(name, status.to_string());
+                    }
+                }
+            }
+        }
+        m
+    }
+
+    /// Consolidated loop-start readiness: one go/no-go over host tools, ssh
+    /// material, the inventory, disk, the working-tree deploy set, and every
+    /// node's power+TCP. Replaces ~6 separate calls at the top of the loop.
+    fn preflight_check(&self) -> ToolCallResult {
+        let mut out = String::from("# Lab preflight (go/no-go)\n\n## Host prerequisites\n");
+        let mut hard_fail = false;
+        let mut warn = false;
+        let which = |bin: &str| {
+            run_with_timeout(
+                "which",
+                &[bin],
+                &self.repo_root,
+                &[],
+                Duration::from_secs(5),
+            )
+            .map(|o| o.success)
+            .unwrap_or(false)
+        };
+
+        if which("cargo") {
+            out.push_str("- ✅ cargo present\n");
+        } else {
+            out.push_str("- ❌ cargo NOT found (gates + CLI cannot run)\n");
+            hard_fail = true;
+        }
+        let utmctl = utmctl_path();
+        if Path::new(&utmctl).exists() || which("utmctl") {
+            out.push_str(&format!("- ✅ utmctl present ({utmctl})\n"));
+        } else {
+            out.push_str(&format!(
+                "- ❌ utmctl NOT found at {utmctl} (set RUSTYNET_UTMCTL_PATH)\n"
+            ));
+            hard_fail = true;
+        }
+        for (bin, why) in [("ssh", "node access"), ("git", "source deploy")] {
+            if which(bin) {
+                out.push_str(&format!("- ✅ {bin} present\n"));
+            } else {
+                out.push_str(&format!("- ❌ {bin} NOT found ({why})\n"));
+                hard_fail = true;
+            }
+        }
+        let id = default_ssh_identity();
+        if Path::new(&id).exists() {
+            out.push_str(&format!("- ✅ ssh identity {id}\n"));
+        } else {
+            out.push_str(&format!("- ⚠️ ssh identity missing: {id}\n"));
+            warn = true;
+        }
+        let kh = default_known_hosts();
+        if Path::new(&kh).exists() {
+            out.push_str(&format!("- ✅ known_hosts {kh}\n"));
+        } else {
+            out.push_str(&format!("- ⚠️ known_hosts missing: {kh}\n"));
+            warn = true;
+        }
+
+        out.push_str("\n## Inventory\n");
+        let inv_entries = match std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)) {
+            Ok(s) => match serde_json::from_str::<Value>(&s) {
+                Ok(v) => {
+                    let entries = v
+                        .get("entries")
+                        .and_then(|e| e.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "- ✅ inventory parseable ({} entries)\n",
+                        entries.len()
+                    ));
+                    entries
+                }
+                Err(e) => {
+                    out.push_str(&format!("- ❌ inventory invalid JSON: {e}\n"));
+                    hard_fail = true;
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                out.push_str(&format!("- ❌ inventory unreadable: {e}\n"));
+                hard_fail = true;
+                Vec::new()
+            }
+        };
+
+        out.push_str("\n## Disk\n");
+        match run_with_timeout(
+            "df",
+            &["-h", "."],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(10),
+        ) {
+            Ok(o) if o.success => {
+                let last = o.stdout.lines().last().unwrap_or("").trim();
+                if let Some(pct) = last
+                    .split_whitespace()
+                    .find(|t| t.ends_with('%'))
+                    .and_then(|t| t.trim_end_matches('%').parse::<u32>().ok())
+                {
+                    if pct >= 90 {
+                        out.push_str(&format!(
+                            "- ⚠️ disk {pct}% full — prune_jobs / host_disk_status\n"
+                        ));
+                        warn = true;
+                    } else {
+                        out.push_str(&format!("- ✅ disk {pct}% used\n"));
+                    }
+                } else {
+                    out.push_str(&format!("- {last}\n"));
+                }
+            }
+            _ => {
+                out.push_str("- ⚠️ could not read df\n");
+                warn = true;
+            }
+        }
+
+        out.push_str("\n## Source (working-tree deploy)\n");
+        let untracked = self.untracked_crate_files();
+        if untracked.is_empty() {
+            out.push_str("- ✅ no untracked crates/ files (working-tree deploy is complete)\n");
+        } else {
+            out.push_str(&format!(
+                "- ⚠️ {} untracked crates/ file(s) will NOT deploy — `git add` them:\n",
+                untracked.len()
+            ));
+            for p in &untracked {
+                out.push_str(&format!("  - `{p}`\n"));
+            }
+            warn = true;
+        }
+
+        out.push_str("\n## Nodes (power + TCP)\n");
+        let status_map = self.utm_status_map();
+        let (mut nodes_ok, mut nodes_total) = (0u32, 0u32);
+        for e in &inv_entries {
+            let alias = e.get("alias").and_then(|v| v.as_str()).unwrap_or("");
+            if alias.is_empty() {
+                continue;
+            }
+            nodes_total += 1;
+            let utm_name = e
+                .get("controller")
+                .and_then(|c| c.get("utm_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let platform = e
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .unwrap_or("linux");
+            let ip = e
+                .get("last_known_ip")
+                .and_then(|v| v.as_str())
+                .or_else(|| e.get("ssh_target").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let port = e.get("ssh_port").and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+            let power = status_map
+                .get(utm_name)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            let reachable = tcp_reachable(ip, port, Duration::from_secs(2));
+            let mark = if reachable {
+                nodes_ok += 1;
+                "✅"
+            } else if power == "started" {
+                "⚠️"
+            } else {
+                "❌"
+            };
+            out.push_str(&format!(
+                "- {mark} {alias} ({platform}): power={power}, TCP/{port}@{}={reachable}\n",
+                if ip.is_empty() { "?" } else { ip }
+            ));
+        }
+        if nodes_ok < nodes_total {
+            // Some nodes unreachable: runnable on the reachable subset, but flag
+            // it so a full-topology run isn't started blind. Recoverable, not a
+            // hard NO-GO.
+            warn = true;
+        }
+
+        let verdict = if hard_fail {
+            "🛑 NO-GO — fix the ❌ host/inventory prerequisites before running."
+        } else if warn {
+            "⚠️ GO WITH CAUTION — runnable, but address the ⚠️ items (recover unreachable nodes via check_vm_reachable / reset_vm_network / power_on_vm; `git add` untracked code; free disk)."
+        } else {
+            "✅ GO — all prerequisites met."
+        };
+        out.push_str(&format!(
+            "\n## Verdict\n{verdict}\n- nodes reachable: {nodes_ok}/{nodes_total}\n"
+        ));
+        tool_success(&out)
+    }
+
+    /// Append one structured note to the durable loop journal.
+    fn write_loop_note(&self, args: Option<&Value>) -> ToolCallResult {
+        let note = arg_str(args, "note").unwrap_or("").trim();
+        if note.is_empty() {
+            return tool_error("Missing required parameter: note");
+        }
+        let iteration = args
+            .and_then(|a| a.get("iteration"))
+            .and_then(|v| v.as_u64());
+        let status = arg_str(args, "status");
+        let rec = json!({
+            "ts_unix": now_unix(),
+            "iteration": iteration,
+            "status": status,
+            "note": note,
+        });
+        let path = self.abs_path(LOOP_JOURNAL);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let line = format!("{}\n", serde_json::to_string(&rec).unwrap_or_default());
+        use std::io::Write;
+        let res = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+        match res {
+            Ok(_) => {
+                let count = std::fs::read_to_string(&path)
+                    .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+                    .unwrap_or(0);
+                tool_success(&format!(
+                    "# Loop note recorded (#{count}{})\n\n{}\n\nRead the history with get_loop_journal.\n",
+                    iteration
+                        .map(|i| format!(", iteration {i}"))
+                        .unwrap_or_default(),
+                    truncate_output(note, 5, 500)
+                ))
+            }
+            Err(e) => tool_error(&format!("Cannot write loop journal: {e}")),
+        }
+    }
+
+    /// Read back the loop journal (last N notes) — the agent's memory across
+    /// context compaction over a long run.
+    fn get_loop_journal(&self, args: Option<&Value>) -> ToolCallResult {
+        let limit = args
+            .and_then(|a| a.get("limit"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30)
+            .clamp(1, 500) as usize;
+        let path = self.abs_path(LOOP_JOURNAL);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => {
+                return tool_success(
+                    "# Loop journal\n\nEmpty — no notes yet. Use write_loop_note to record each iteration's hypothesis/patch/result; it survives context compaction over a long run.\n",
+                );
+            }
+        };
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        let total = lines.len();
+        let start = total.saturating_sub(limit);
+        let now = now_unix();
+        let mut out = format!(
+            "# Loop journal ({total} notes, showing last {})\n\n",
+            total - start
+        );
+        for (i, line) in lines[start..].iter().enumerate() {
+            let n = start + i + 1;
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                let ts = v.get("ts_unix").and_then(|x| x.as_u64()).unwrap_or(0);
+                let ago = now.saturating_sub(ts);
+                let ago_s = if ago < 90 {
+                    format!("{ago}s ago")
+                } else if ago < 5400 {
+                    format!("{}m ago", ago / 60)
+                } else {
+                    format!("{}h ago", ago / 3600)
+                };
+                let it = v
+                    .get("iteration")
+                    .and_then(|x| x.as_u64())
+                    .map(|i| format!("it{i} "))
+                    .unwrap_or_default();
+                let st = v
+                    .get("status")
+                    .and_then(|x| x.as_str())
+                    .map(|s| format!("[{s}] "))
+                    .unwrap_or_default();
+                let note = v.get("note").and_then(|x| x.as_str()).unwrap_or("");
+                out.push_str(&format!("{n}. ({ago_s}) {it}{st}{note}\n"));
+            } else {
+                out.push_str(&format!("{n}. {line}\n"));
+            }
+        }
+        tool_success(&out)
+    }
+
+    /// Run `git` in the repo and capture trimmed stdout on success.
+    fn git_capture(&self, args: &[&str]) -> Option<String> {
+        run_with_timeout("git", args, &self.repo_root, &[], Duration::from_secs(30))
+            .ok()
+            .filter(|o| o.success)
+            .map(|o| o.stdout.trim().to_string())
+    }
+
+    /// Preview exactly what the next run ships to the VMs for a given source mode
+    /// — so the agent never tests stale code (working-tree captures TRACKED
+    /// changes only; new files need `git add`).
+    fn what_will_deploy(&self, args: Option<&Value>) -> ToolCallResult {
+        let mode = arg_str(args, "source_mode").unwrap_or("working-tree");
+        let head = self
+            .git_capture(&["rev-parse", "--short", "HEAD"])
+            .unwrap_or_else(|| "?".into());
+        let subj = self
+            .git_capture(&["log", "-1", "--pretty=%s"])
+            .unwrap_or_default();
+        let mut out =
+            format!("# Deploy preview (source_mode={mode})\n\n- **HEAD:** {head} — {subj}\n");
+        match mode {
+            "working-tree" => {
+                let tracked = self
+                    .git_capture(&["diff", "--name-only", "HEAD"])
+                    .unwrap_or_default();
+                let tracked: Vec<&str> = tracked.lines().filter(|l| !l.trim().is_empty()).collect();
+                out.push_str(&format!(
+                    "\n## Will deploy — tracked changes vs HEAD ({})\n",
+                    tracked.len()
+                ));
+                for f in tracked.iter().take(60) {
+                    out.push_str(&format!("- {f}\n"));
+                }
+                if tracked.len() > 60 {
+                    out.push_str(&format!("- … {} more\n", tracked.len() - 60));
+                }
+                let status = self
+                    .git_capture(&["status", "--porcelain", "--untracked-files=all"])
+                    .unwrap_or_default();
+                let untracked: Vec<&str> = status
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("?? "))
+                    .collect();
+                out.push_str(&format!(
+                    "\n## Will NOT deploy — untracked (`git add` to include) ({})\n",
+                    untracked.len()
+                ));
+                for f in untracked.iter().take(60) {
+                    let crit = if f.starts_with("crates/") {
+                        " ⚠️ (code — tests would be STALE)"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!("- {f}{crit}\n"));
+                }
+                if untracked.len() > 60 {
+                    out.push_str(&format!("- … {} more\n", untracked.len() - 60));
+                }
+                let crit = untracked
+                    .iter()
+                    .filter(|f| f.starts_with("crates/"))
+                    .count();
+                let verdict = if crit > 0 {
+                    format!(
+                        "⚠️ {crit} untracked file(s) under crates/ will be MISSING from the deploy — `git add` them or the run builds stale code."
+                    )
+                } else if tracked.is_empty() && untracked.is_empty() {
+                    "✅ Clean tree — deploys exactly HEAD.".to_string()
+                } else {
+                    "✅ All code changes are tracked and will deploy.".to_string()
+                };
+                out.push_str(&format!("\n## Verdict\n{verdict}\n"));
+            }
+            "local-head" | "origin-main" => {
+                out.push_str(
+                    "\nDeploys the committed ref only; uncommitted edits (tracked or untracked) are NOT included — commit first.\n",
+                );
+                let dirty = self
+                    .git_capture(&["status", "--porcelain"])
+                    .unwrap_or_default();
+                let n = dirty.lines().filter(|l| !l.trim().is_empty()).count();
+                if n > 0 {
+                    out.push_str(&format!(
+                        "- ⚠️ {n} uncommitted change(s) will be ignored under {mode}.\n"
+                    ));
+                }
+            }
+            other => {
+                out.push_str(&format!(
+                    "\nsource_mode={other}: deploys per that mode's ref (commit-ref / repo-url); working-tree edits are not involved.\n"
+                ));
+            }
+        }
+        tool_success(&out)
+    }
 }
 
 fn now_unix() -> u64 {
@@ -1230,6 +1706,9 @@ wakeups between polls.
 
 LOOP:
 1. READY THE LAB (no human needed)
+   - preflight_check FIRST — one go/no-go over host tools, ssh material, inventory,
+     disk, the deploy set, and every node's power+TCP. 🛑 NO-GO → fix the ❌ host
+     items; ⚠️/✅ → proceed, recovering flagged nodes below.
    - check_vm_reachable(alias) per node. DOWN → power_on_vm. UP-but-UNREACHABLE →
      reset_vm_network (out-of-band via utmctl exec: flushes the killswitch +
      restarts networking, no SSH), then update_inventory (refresh live IPs — NEVER
@@ -1265,6 +1744,8 @@ LOOP:
    - gate-runner run_gates with changed_only=true (auto-scopes to the crates you
      touched) for a fast inner loop, then a full run_gates. Fix until green.
 7. RE-VERIFY ON THE LAB (don't waste hours)
+   - what_will_deploy FIRST — confirm your patch (incl. any NEW files) is in the
+     deploy set; untracked crates/ files won't ship until `git add`ed.
    - If the patch touched ONE node's code: start_live_lab_run mode=orchestrate with
      your full `nodes` topology + rebuild_nodes=[that node] + skip_soak — redeploys
      only that node (others keep their daemon/state), skips the slow soak. This is
@@ -1273,7 +1754,8 @@ LOOP:
      out the exact re-verify command.
    - If the patch is in shared code / affects all nodes: omit rebuild_nodes (all
      rebuild). Dirty tree is fine (working-tree deploys it; git add new files).
-   - Fresh report_dir each run. Back to step 3.
+   - Fresh report_dir each run. Back to step 3. When it ends, diff_runs(old=prev,
+     new=this) tells you whether the patch HELPED or REGRESSED (which stages flipped).
 8. TRACK
    - get_run_trend → one-line verdict across recent runs: STUCK at <stage> (keep
      patching that stage), MOVING (each fix advanced the run), or two greens =
@@ -1281,6 +1763,10 @@ LOOP:
 
 RULES
 - One root-cause fix per iteration; re-verify before moving on.
+- JOURNAL every iteration: write_loop_note (iteration #, hypothesis, patch, result)
+  as you go. Your context WILL compact over a long run — at the start of each
+  iteration (and right after any compaction) get_loop_journal to recover what you
+  already tried, so you don't repeat a dead end.
 - If a VM wedges repeatedly: recover_stuck_vms + update_inventory before retrying.
 - Never claim green without get_run_result overall_result=pass (or run_passed=true).
 - Commit/push ONLY if the user authorized it; otherwise leave patches in the tree
@@ -1467,6 +1953,11 @@ impl McpServer for LabStateServer {
                 input_schema: json_schema_object(json!({}), vec![]),
             },
             Tool {
+                name: "preflight_check".into(),
+                description: "Fast, read-only loop-start go/no-go in ONE call: host tools (cargo/utmctl/ssh/git), ssh identity + known_hosts, inventory parseability, disk headroom, the working-tree deploy set (untracked crates/ that won't ship), and every node's power+TCP. Returns a 🛑 NO-GO / ⚠️ CAUTION / ✅ GO verdict. Use it before start_live_lab_run instead of calling host_disk_status + get_lab_topology + check_vm_reachable separately. (Does not mutate or restart anything — for active recovery use ensure_lab_ready.)".into(),
+                input_schema: json_schema_object(json!({}), vec![]),
+            },
+            Tool {
                 name: "sync_repo_to_vm".into(),
                 description: "rsync the working tree to a VM. `ops vm-lab-sync-repo`.".into(),
                 input_schema: json_schema_object(
@@ -1532,6 +2023,14 @@ impl McpServer for LabStateServer {
                         "skip_soak": json_schema_boolean("Skip soak stages"),
                         "skip_cross_network": json_schema_boolean("Skip cross-network stages"),
                     }),
+                    vec![],
+                ),
+            },
+            Tool {
+                name: "what_will_deploy".into(),
+                description: "Preview exactly what the next run ships to the VMs for a source_mode (default working-tree): tracked changes vs HEAD that WILL deploy, and untracked files that will NOT (crates/ ones flagged as stale-code hazards). Run before start_live_lab_run so a patch that adds a new file isn't silently left behind. Read-only.".into(),
+                input_schema: json_schema_object(
+                    json!({"source_mode": json_schema_string("working-tree (default) | local-head | origin-main | commit-ref | repo-url")}),
                     vec![],
                 ),
             },
@@ -1662,6 +2161,19 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "diff_runs".into(),
+                description: "Diff two runs' per-stage outcomes — which stages flipped pass↔fail/rc and the first divergent stage — so you can tell whether a patch HELPED or REGRESSED. Pass old + new as report dirs or job_ids (old_report_dir|old_job_id, new_report_dir|new_job_id). Both runs need state/stages.tsv. The direct answer after a re-verify run.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "old_job_id": json_schema_string("Baseline run's job_id"),
+                        "old_report_dir": json_schema_string("Baseline run's report dir (alternative)"),
+                        "new_job_id": json_schema_string("New run's job_id"),
+                        "new_report_dir": json_schema_string("New run's report dir (alternative)"),
+                    }),
+                    vec![],
+                ),
+            },
+            Tool {
                 name: "host_disk_status".into(),
                 description: "Host disk free space + the lab's biggest consumers (state/, target-livelab/, target/). Check periodically over a long run — a full disk fails builds/runs. Reclaim with prune_jobs.".into(),
                 input_schema: json_schema_object(json!({}), vec![]),
@@ -1674,6 +2186,26 @@ impl McpServer for LabStateServer {
                         "keep": json!({"type": "integer", "description": "How many most-recent jobs to keep (default: 10)"}),
                         "delete_report_dirs": json_schema_boolean("Also delete each pruned job's report dir (default: false)"),
                     }),
+                    vec![],
+                ),
+            },
+            Tool {
+                name: "write_loop_note".into(),
+                description: "Append one note to the durable loop journal (state/mcp-loop-journal.jsonl) — the agent's own memory across context compaction over a 24h+ run. Record each iteration's hypothesis, the patch you made, and the result, so after a compaction you don't repeat a fix you already tried. Pair with get_loop_journal.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "note": json_schema_string("What you're recording (hypothesis / patch / result / blocker)"),
+                        "iteration": json!({"type": "integer", "description": "Loop iteration number (optional)"}),
+                        "status": json_schema_string("Optional tag, e.g. trying | failed | fixed | blocked | green"),
+                    }),
+                    vec!["note"],
+                ),
+            },
+            Tool {
+                name: "get_loop_journal".into(),
+                description: "Read back the loop journal (last N notes, default 30) — what past iterations tried and concluded. Call this after a context compaction, or at the start of an iteration, to recover continuity instead of repeating work.".into(),
+                input_schema: json_schema_object(
+                    json!({"limit": json!({"type": "integer", "description": "Most-recent notes to show (default 30, max 500)"})}),
                     vec![],
                 ),
             },
@@ -1971,6 +2503,11 @@ impl McpServer for LabStateServer {
             "grep_report" => self.grep_report(args),
             "get_stage_log" => self.get_stage_log(args),
             "get_run_trend" => self.get_run_trend(args),
+            "diff_runs" => self.diff_runs(args),
+            "what_will_deploy" => self.what_will_deploy(args),
+            "preflight_check" => self.preflight_check(),
+            "write_loop_note" => self.write_loop_note(args),
+            "get_loop_journal" => self.get_loop_journal(args),
             "prune_jobs" => self.prune_jobs(args),
 
             "get_run_matrix" => {
@@ -3273,6 +3810,41 @@ mod tests {
         assert!(
             !txt.contains("bootstrap stage"),
             "non-matching row excluded; got: {txt}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn loop_journal_appends_and_reads_back() {
+        let tmp = std::env::temp_dir().join(format!("mcp-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let srv = test_server(&tmp);
+        // empty first
+        assert!(srv.get_loop_journal(None).content[0].text.contains("Empty"));
+        // append two notes (one with iteration+status)
+        let r = srv.write_loop_note(Some(
+            &json!({"note":"relay bind failed; trying port fix","iteration":3,"status":"trying"}),
+        ));
+        assert!(
+            r.content[0].text.contains("#1"),
+            "got: {}",
+            r.content[0].text
+        );
+        srv.write_loop_note(Some(&json!({"note":"port fix worked","status":"fixed"})));
+        let j = srv.get_loop_journal(Some(&json!({"limit":10}))).content[0]
+            .text
+            .clone();
+        assert!(j.contains("2 notes"), "count; got: {j}");
+        assert!(j.contains("it3"), "iteration rendered; got: {j}");
+        assert!(
+            j.contains("[trying]") && j.contains("[fixed]"),
+            "status; got: {j}"
+        );
+        assert!(j.contains("port fix worked"), "note body; got: {j}");
+        // empty note rejected
+        assert_eq!(
+            srv.write_loop_note(Some(&json!({"note":"  "}))).is_error,
+            Some(true)
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
