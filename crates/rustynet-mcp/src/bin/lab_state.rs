@@ -834,9 +834,16 @@ LOOP:
 6. VERIFY THE PATCH (fast, before re-running the lab)
    - gate-runner run_gates with changed_only=true (auto-scopes to the crates you
      touched) for a fast inner loop, then a full run_gates. Fix until green.
-7. RE-VERIFY ON THE LAB
-   - start_live_lab_run again with a fresh report_dir (a dirty tree is fine; the run
-     records it and builds from the working tree). Back to step 3.
+7. RE-VERIFY ON THE LAB (don't waste hours)
+   - If the patch touched ONE node's code: start_live_lab_run mode=orchestrate with
+     your full `nodes` topology + rebuild_nodes=[that node] + skip_soak — redeploys
+     only that node (others keep their daemon/state), skips the slow soak. This is
+     the big time saver. There is NO mid-stage resume (redeploying a node resets its
+     state, so its setup stages must replay); explain_stage(first_failed_stage) spells
+     out the exact re-verify command.
+   - If the patch is in shared code / affects all nodes: omit rebuild_nodes (all
+     rebuild). Dirty tree is fine (working-tree deploys it; git add new files).
+   - Fresh report_dir each run. Back to step 3.
 8. TRACK
    - get_run_matrix to see the first_failed_stage trend across iterations.
 
@@ -1062,7 +1069,7 @@ impl McpServer for LabStateServer {
             // ── Async live-lab jobs ──
             Tool {
                 name: "start_live_lab_run".into(),
-                description: "Launch a live-lab run as a DETACHED background job and return immediately with a job_id (does NOT block). mode=orchestrate (one-shot discover→setup→run→diagnose, all 3 OS), run (against an existing profile), or setup. Poll with get_job_status; results via get_run_result. Survives an MCP-server reload. Use dry_run to validate quickly.".into(),
+                description: "Launch a live-lab run as a DETACHED background job and return immediately with a job_id (does NOT block). mode=orchestrate (one-shot discover→setup→run→diagnose, all 3 OS), run (against an existing profile), or setup. Poll with get_job_status; results via get_run_result. Survives an MCP-server reload. Use dry_run to validate quickly. FAST RE-VERIFY after a per-node code patch: pass nodes=[topology] + rebuild_nodes=[patched node] + skip_soak — redeploys only that node (others keep state) instead of a full multi-node rebuild. (No mid-stage resume; see explain_stage.)".into(),
                 input_schema: json_schema_object(
                     json!({
                         "mode": json_schema_string("orchestrate | run | setup (default: orchestrate)"),
@@ -1071,8 +1078,11 @@ impl McpServer for LabStateServer {
                         "windows_vm": json_schema_string("orchestrate: Windows VM alias (overrides auto_topology)"),
                         "macos_vm": json_schema_string("orchestrate: macOS VM alias (overrides auto_topology)"),
                         "nodes": json_schema_array_string("orchestrate: role assignments 'alias:role'"),
+                        "rebuild_nodes": json_schema_array_string("orchestrate: redeploy code to ONLY these node aliases (others keep their daemon+state); the fast re-verify after a per-node code patch. Requires nodes to be set. Pair with skip_soak."),
                         "profile": json_schema_string("run: profile env file (required for mode=run)"),
                         "profile_output": json_schema_string("setup: where to write the generated profile"),
+                        "resume_from": json_schema_string("setup: resume a FAILED setup from this setup-stage (preflight..validate_baseline_runtime) reusing the same report_dir. For a code patch use 'prepare_source_archive' (later = stale code)."),
+                        "rerun_stage": json_schema_string("setup: run exactly one setup stage (same names as resume_from)."),
                         "source_mode": json_schema_string("working-tree (default — deploys your uncommitted patch) | local-head | commit-ref | repo-url"),
                         "timeout_secs": json!({"type": "integer", "description": "Per-run hard cap in seconds (CLI default 86400 = 24h). Raise for a >24h soak."}),
                         "dry_run": json_schema_boolean("Plan only (default: false)"),
@@ -1608,6 +1618,16 @@ impl LabStateServer {
                 for n in string_array(args, "nodes") {
                     cli.extend(["--node".into(), n]);
                 }
+                // Fast re-verify of a code patch: redeploy ONLY the affected
+                // node(s); others keep their daemon + distributed state. The full
+                // stage sequence still replays (cheap SSH steps; pair with
+                // skip_soak) but the expensive multi-node rebuild is avoided.
+                // Requires the Rust-native path → `nodes` must also be set.
+                let rebuild = string_array(args, "rebuild_nodes");
+                if !rebuild.is_empty() {
+                    cli.push("--rebuild-nodes".into());
+                    cli.push(rebuild.join(","));
+                }
             }
             "run" => {
                 cli.push("vm-lab-run-live-lab".into());
@@ -1639,6 +1659,17 @@ impl LabStateServer {
                 cli.extend(["--report-dir".into(), report_dir.clone()]);
                 if let Some(po) = arg_str(args, "profile_output") {
                     cli.extend(["--profile-output".into(), po.into()]);
+                }
+                // Resume a FAILED SETUP (preflight..validate_baseline_runtime)
+                // against the SAME report_dir without redoing earlier setup
+                // stages. For a CODE patch, only resume from prepare_source_archive
+                // (or earlier) — resuming later reuses the prior build = STALE
+                // code. rerun_stage runs exactly one setup stage.
+                if let Some(rf) = arg_str(args, "resume_from") {
+                    cli.extend(["--resume-from".into(), rf.into()]);
+                }
+                if let Some(rs) = arg_str(args, "rerun_stage") {
+                    cli.extend(["--rerun-stage".into(), rs.into()]);
                 }
                 if arg_bool(args, "dry_run") {
                     cli.push("--dry-run".into());
@@ -2400,6 +2431,9 @@ fn explain_stage(stage: &str) -> ToolCallResult {
                 "\n## Next\nRead the failing node's log (read_report_artifact / tail_job_log), then `which_crate` on `{}` (repo-context) for the boundary rules before patching the root cause.\n",
                 s.owning
             ));
+            out.push_str(
+                "\n## Re-verify a code fix WITHOUT redoing the whole lab\nThere is no mid-stage resume. The efficient path: start_live_lab_run mode=orchestrate with your full `nodes` topology + `rebuild_nodes=[<the failing node>]` + `skip_soak=true` — redeploys ONLY the patched node (others keep their daemon/state), replays the stage sequence (cheap), skips the slow soak. (Redeploying a node resets its distributed state, so its setup stages must replay — that's why you can't skip them.) If this was a SETUP stage and no test stage ran yet, mode=setup `resume_from=prepare_source_archive` also redeploys + continues.\n",
+            );
             tool_success(&out)
         }
         None => {
