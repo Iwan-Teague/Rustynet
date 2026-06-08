@@ -46,7 +46,7 @@
     },
     {
       "name": "rustynet-mcp-lab-state",
-      "description": "Queries/manages the UTM VM lab AND drives the autonomous overnight live-lab loop (run → catch bugs → patch → re-verify) via async background jobs. Live-lab runs launch detached (start_live_lab_run returns a job_id instantly, survives an MCP-server reload); poll get_job_status (completion-record-first, pid-reuse-safe), read structured results with get_run_result, read logs with bounded tail_job_log / read_report_artifact, reclaim disk with prune_jobs. Runs default to source-mode working-tree (deploys uncommitted patches), auto-topology (fills Windows+macOS from the inventory for full 3-OS coverage), and accept a >24h timeout_secs. wait_for_job blocks until done (no busy-poll); explain_stage maps a failed stage to its owning file + common causes; get_lab_topology gives a secret-free node/role digest. Full VM power control (power_on_vm / power_off_vm[force] / get_vm_power_state) + host_disk_status let an agent recover the lab and manage disk over a long run with no human. Short ops run under a kill-on-timeout watchdog. 29 tools + an overnight-loop prompt.",
+      "description": "Queries/manages the UTM VM lab AND drives the autonomous overnight live-lab loop (run → catch bugs → patch → re-verify) via async background jobs. Live-lab runs launch detached (start_live_lab_run returns a job_id instantly, survives an MCP-server reload); poll get_job_status (completion-record-first, pid-reuse-safe), read structured results with get_run_result, read logs with bounded tail_job_log / read_report_artifact, reclaim disk with prune_jobs. Runs default to source-mode working-tree (deploys uncommitted patches), auto-topology (fills Windows+macOS from the inventory for full 3-OS coverage), and accept a >24h timeout_secs. wait_for_job blocks until done (no busy-poll); explain_stage maps a failed stage to its owning file + common causes; get_lab_topology gives a secret-free node/role digest. Full VM power control (power_on_vm / power_off_vm[force] / get_vm_power_state), reachability triage (check_vm_reachable = power-state + TCP probe), out-of-band network reset for unreachable Linux guests (reset_vm_network via utmctl exec, no SSH), and host_disk_status let an agent recover the lab and manage disk over a long run with no human. Short ops run under a kill-on-timeout watchdog. 31 tools + an overnight-loop prompt.",
       "tools": [
         "get_lab_status",
         "get_lab_status_json",
@@ -58,6 +58,8 @@
         "power_on_vm",
         "power_off_vm",
         "get_vm_power_state",
+        "check_vm_reachable",
+        "reset_vm_network",
         "recover_stuck_vms",
         "ensure_lab_ready",
         "sync_repo_to_vm",
