@@ -648,6 +648,383 @@ impl LabStateServer {
         }
         tool_success(&out)
     }
+
+    /// Out-of-band Linux guest network diagnostics via utmctl exec (no SSH).
+    /// The triage companion to reset_vm_network: shows why a guest is
+    /// unreachable (addresses, routes, the nft killswitch, daemon state) when
+    /// SSH is dead.
+    ///
+    /// One root shell writes every probe (with `@@`-markers) to a single temp
+    /// file; an unprivileged `cat` reads it back. Going through a complete file
+    /// is what makes this reliable: the QEMU guest agent's stdout capture races
+    /// on short, fast commands (a direct `systemctl is-active` is captured only
+    /// ~2/3 of the time), and `sudo <cmd>` under use_pty returns nothing at all,
+    /// so the privileged probes (nft/journalctl) would otherwise be blank.
+    fn get_vm_network_info(&self, alias: &str) -> ToolCallResult {
+        if alias.is_empty() {
+            return tool_error("Missing required parameter: alias");
+        }
+        let Some((utm_name, platform, ip, port)) = self.alias_to_utm(alias) else {
+            return tool_error(&format!("Unknown alias '{alias}' (not in inventory)"));
+        };
+        match platform.as_str() {
+            "macos" => {
+                return tool_error(
+                    "macOS UTM uses Apple Virtualization (no utmctl exec); gather network info over SSH via get_vm_diagnostics or the serial console.",
+                );
+            }
+            "windows" => {
+                return tool_error(
+                    "get_vm_network_info targets Linux guests (utmctl exec); for Windows use get_vm_diagnostics over SSH.",
+                );
+            }
+            _ => {}
+        }
+        // The guest agent (utmctl exec) only answers on a running VM.
+        match self.utm_power_status(&utm_name).as_deref() {
+            Some("started") => {}
+            Some(other) => {
+                return tool_error(&format!(
+                    "VM '{alias}' is '{other}', not started — power_on_vm first (utmctl exec needs a running guest)."
+                ));
+            }
+            None => {} // unknown — attempt anyway
+        }
+        let utmctl = utmctl_path();
+        let reachable = tcp_reachable(&ip, port, Duration::from_secs(3));
+        let mut out = format!(
+            "# Network info: {alias} (utm_name={utm_name})\n\nOut-of-band via utmctl exec (no SSH needed).\n\n- **address:** {}:{port}\n- **TCP/{port} reachable from host:** {reachable}\n",
+            if ip.is_empty() { "(no IP)" } else { &ip }
+        );
+        // Static, no untrusted interpolation — the alias only reaches utmctl as a
+        // separate argv element, never this in-guest script.
+        const PROBE_SCRIPT: &str = "{ \
+            echo '@@ip addr'; ip addr; \
+            echo '@@ip route'; ip route; \
+            echo '@@rustynetd active?'; systemctl is-active rustynetd; \
+            echo '@@nft ruleset (killswitch)'; nft list ruleset; \
+            echo '@@rustynetd recent log'; journalctl -u rustynetd --no-pager -n 30; \
+            } > /tmp/rn_netinfo 2>&1";
+        // Step 1: one root shell writes all probes to the temp file.
+        let _ = run_with_timeout(
+            &utmctl,
+            &[
+                "exec",
+                &utm_name,
+                "--cmd",
+                "/usr/bin/sudo",
+                "/bin/sh",
+                "-c",
+                PROBE_SCRIPT,
+            ],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(90),
+        );
+        // Step 2: unprivileged read of the complete file (one retry — a large
+        // file's cat is reliable, but guard the rare empty first read).
+        let mut raw = String::new();
+        for attempt in 0..2 {
+            match run_with_timeout(
+                &utmctl,
+                &["exec", &utm_name, "--cmd", "/bin/cat", "/tmp/rn_netinfo"],
+                &self.repo_root,
+                &[],
+                Duration::from_secs(60),
+            ) {
+                Ok(o) if !o.stdout.trim().is_empty() => {
+                    raw = o.stdout;
+                    break;
+                }
+                Ok(_) => {
+                    if attempt == 0 {
+                        std::thread::sleep(Duration::from_millis(400));
+                    }
+                }
+                Err(e) => return tool_error(&format!("guest read failed: {e}")),
+            }
+        }
+        if raw.trim().is_empty() {
+            out.push_str(
+                "\n_No probe output captured (guest agent may be slow). Retry, or use get_vm_diagnostics over SSH._\n",
+            );
+            return tool_success(&out);
+        }
+        // Split the combined output on the @@section markers.
+        let mut sections: Vec<(String, String)> = Vec::new();
+        let mut cur_label: Option<String> = None;
+        let mut cur_body = String::new();
+        for line in raw.lines() {
+            if let Some(label) = line.strip_prefix("@@") {
+                if let Some(prev) = cur_label.take() {
+                    sections.push((prev, std::mem::take(&mut cur_body)));
+                }
+                cur_label = Some(label.to_string());
+            } else if cur_label.is_some() {
+                cur_body.push_str(line);
+                cur_body.push('\n');
+            }
+        }
+        if let Some(prev) = cur_label.take() {
+            sections.push((prev, cur_body));
+        }
+        for (label, body) in &sections {
+            let trimmed = body.trim();
+            let shown = if trimmed.is_empty() {
+                "(no output)".to_string()
+            } else {
+                truncate_tail(trimmed, 60, 6_000)
+            };
+            out.push_str(&format!("\n## {label}\n```\n{shown}\n```\n"));
+        }
+        out.push_str(
+            "\nIf the nft ruleset is a stale killswitch blocking SSH → reset_vm_network. If addresses look wrong (NAT subnet) → the VM is on the wrong UTM network (host-side fix). If the daemon log shows repeated reconcile/fail-closed errors → that's your patch target.\n",
+        );
+        tool_success(&out)
+    }
+
+    /// Summarize the trend across the last N run-matrix rows (converging or stuck?).
+    fn get_run_trend(&self, args: Option<&Value>) -> ToolCallResult {
+        let limit = args
+            .and_then(|a| a.get("limit"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .clamp(1, 200) as usize;
+        let matrix_path = self
+            .repo_root
+            .join("documents/operations/live_lab_run_matrix.csv");
+        let content = match std::fs::read_to_string(&matrix_path) {
+            Ok(c) => c,
+            Err(e) => return tool_error(&format!("Cannot read run matrix: {e}")),
+        };
+        let mut lines = content.lines();
+        let Some(header_line) = lines.next() else {
+            return tool_success("# Run trend\n\nMatrix is empty.\n");
+        };
+        let header = split_csv_line(header_line);
+        let col = |name: &str| header.iter().position(|h| h == name);
+        let (Some(c_run), Some(c_commit), Some(c_result), Some(c_stage)) = (
+            col("run_id"),
+            col("git_commit"),
+            col("overall_result"),
+            col("first_failed_stage"),
+        ) else {
+            return tool_error(
+                "Run matrix missing expected columns (run_id/git_commit/overall_result/first_failed_stage)",
+            );
+        };
+        let all: Vec<Vec<String>> = lines
+            .filter(|l| !l.trim().is_empty())
+            .map(split_csv_line)
+            .collect();
+        if all.is_empty() {
+            return tool_success("# Run trend\n\nNo data rows in the matrix yet.\n");
+        }
+        let cell =
+            |row: &[String], i: usize| row.get(i).map(|s| s.trim().to_string()).unwrap_or_default();
+        // Newest-first tail of the matrix.
+        let recent: Vec<&Vec<String>> = all.iter().rev().take(limit).collect();
+        // Oldest-first (result, stage) pairs feed the verdict.
+        let verdict_rows: Vec<(String, String)> = recent
+            .iter()
+            .rev()
+            .map(|&r| (cell(r, c_result), cell(r, c_stage)))
+            .collect();
+        let verdict = trend_verdict(&verdict_rows);
+
+        let mut out = format!(
+            "# Run trend (last {} of {} runs)\n\n**Verdict:** {verdict}\n\n| run_id | commit | result | first_failed_stage |\n|---|---|---|---|\n",
+            recent.len(),
+            all.len()
+        );
+        for &r in &recent {
+            let commit = cell(r, c_commit);
+            let short = commit.get(..10).unwrap_or(commit.as_str()).to_string();
+            let result = cell(r, c_result);
+            let stage = cell(r, c_stage);
+            out.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                cell(r, c_run),
+                short,
+                if result.is_empty() {
+                    "-"
+                } else {
+                    result.as_str()
+                },
+                if stage.is_empty() {
+                    "-"
+                } else {
+                    stage.as_str()
+                },
+            ));
+        }
+        out.push_str(
+            "\nLegend: GREEN — stable (≥2 pass) · JUST GREEN (1 pass) · STUCK at X (≥2 fails, same stage → patch that stage) · MOVING (fails, but the stage is advancing).\n",
+        );
+        tool_success(&out)
+    }
+
+    /// Case-insensitive substring search across every file in a run's report dir.
+    fn grep_report(&self, args: Option<&Value>) -> ToolCallResult {
+        let report_dir = match self.resolve_report_dir(args) {
+            Ok(d) => d,
+            Err(e) => return tool_error(&e),
+        };
+        let pattern = arg_str(args, "pattern").unwrap_or("");
+        if pattern.is_empty() {
+            return tool_error("Missing required parameter: pattern");
+        }
+        let needle = pattern.to_lowercase();
+        let max_matches = args
+            .and_then(|a| a.get("max_matches"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(100)
+            .clamp(1, 1000) as usize;
+        let skip_ext = [
+            ".tar", ".gz", ".tgz", ".zip", ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".pcap", ".bin",
+        ];
+        let mut files: Vec<(String, u64)> = Vec::new();
+        collect_files(&report_dir, &report_dir, &mut files, 0);
+        files.sort();
+        let mut matches: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        let mut truncated = false;
+        'outer: for (rel, size) in &files {
+            let rel_l = rel.to_lowercase();
+            if *size > 8_000_000 || skip_ext.iter().any(|e| rel_l.ends_with(e)) {
+                continue;
+            }
+            let Ok(content) = read_file_capped(&report_dir.join(rel), 8_000_000) else {
+                continue;
+            };
+            scanned += 1;
+            for (lineno, line) in content.lines().enumerate() {
+                if line.to_lowercase().contains(&needle) {
+                    matches.push(format!(
+                        "`{rel}`:{} — {}",
+                        lineno + 1,
+                        truncate_output(line.trim(), 1, 400)
+                    ));
+                    if matches.len() >= max_matches {
+                        truncated = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let mut out = format!(
+            "# grep_report: \"{pattern}\"\n\n`{}`\n\n- files scanned: {scanned}\n- matches: {}{}\n\n",
+            report_dir.display(),
+            matches.len(),
+            if truncated {
+                format!(" (capped at {max_matches})")
+            } else {
+                String::new()
+            },
+        );
+        if matches.is_empty() {
+            out.push_str(
+                "No matches. Try list_report_artifacts to see the files, or a broader pattern.\n",
+            );
+        } else {
+            for m in &matches {
+                out.push_str(&format!("- {m}\n"));
+            }
+        }
+        tool_success(&out)
+    }
+
+    /// Pull one stage's row(s) from state/stages.tsv and the tail of its log.
+    fn get_stage_log(&self, args: Option<&Value>) -> ToolCallResult {
+        let report_dir = match self.resolve_report_dir(args) {
+            Ok(d) => d,
+            Err(e) => return tool_error(&e),
+        };
+        let stage = arg_str(args, "stage").unwrap_or("").trim().to_string();
+        if stage.is_empty() {
+            return tool_error("Missing required parameter: stage");
+        }
+        // Strip OS prefixes so 'linux_stage_anchor' matches an 'anchor' row.
+        let lower = stage.to_lowercase();
+        let norm = lower
+            .strip_prefix("linux_stage_")
+            .or_else(|| lower.strip_prefix("macos_stage_"))
+            .or_else(|| lower.strip_prefix("windows_stage_"))
+            .unwrap_or(lower.as_str());
+
+        let mut out = format!("# Stage log: '{stage}'\n\n`{}`\n\n", report_dir.display());
+        let mut matched_logs: Vec<PathBuf> = Vec::new();
+        match std::fs::read_to_string(report_dir.join("state/stages.tsv")) {
+            Ok(body) => {
+                let mut hits = 0;
+                out.push_str(
+                    "## Matching rows in state/stages.tsv\n\n| stage | status | rc | description |\n|---|---|---|---|\n",
+                );
+                for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                    let cols: Vec<&str> = line.split('\t').collect();
+                    if cols.len() < 6 {
+                        continue;
+                    }
+                    let name_l = cols[0].to_lowercase();
+                    if !name_l.contains(norm) && !norm.contains(name_l.as_str()) {
+                        continue;
+                    }
+                    hits += 1;
+                    out.push_str(&format!(
+                        "| {} | {} | {} | {} |\n",
+                        cols[0], cols[2], cols[3], cols[5]
+                    ));
+                    // Resolve the log path (col 4): absolute, report-relative, or ./-prefixed.
+                    let raw = cols[4];
+                    for cand in [
+                        PathBuf::from(raw),
+                        report_dir.join(raw),
+                        report_dir.join(raw.trim_start_matches("./")),
+                    ] {
+                        if cand.is_file() && !matched_logs.iter().any(|m| m == &cand) {
+                            matched_logs.push(cand);
+                            break;
+                        }
+                    }
+                }
+                if hits == 0 {
+                    out.push_str("| (none matched) | | | |\n");
+                }
+            }
+            Err(_) => out.push_str(
+                "_state/stages.tsv not found (run may predate it or not have completed)._\n",
+            ),
+        }
+        // If the TSV gave no log, fall back to filename matching.
+        if matched_logs.is_empty() {
+            let mut files: Vec<(String, u64)> = Vec::new();
+            collect_files(&report_dir, &report_dir, &mut files, 0);
+            for (rel, _) in &files {
+                let rel_l = rel.to_lowercase();
+                if rel_l.contains(norm) && (rel_l.ends_with(".log") || rel_l.ends_with(".txt")) {
+                    matched_logs.push(report_dir.join(rel));
+                }
+            }
+        }
+        if matched_logs.is_empty() {
+            out.push_str(
+                "\nNo stage log located. Use list_report_artifacts to browse, grep_report to search, or tail_job_log for the run's combined log.\n",
+            );
+            return tool_success(&out);
+        }
+        for log in matched_logs.iter().take(3) {
+            let rel = log.strip_prefix(&report_dir).unwrap_or(log);
+            out.push_str(&format!("\n## {} (tail)\n", rel.display()));
+            match read_file_capped(log, 1_000_000) {
+                Ok(content) => out.push_str(&format!(
+                    "```\n{}\n```\n",
+                    truncate_tail(content.trim(), 300, 60_000)
+                )),
+                Err(e) => out.push_str(&format!("_cannot read: {e}_\n")),
+            }
+        }
+        tool_success(&out)
+    }
 }
 
 fn now_unix() -> u64 {
@@ -705,6 +1082,55 @@ fn split_csv_line(line: &str) -> Vec<String> {
     }
     out.push(cur);
     out
+}
+
+/// Classify a run history (oldest-first `(overall_result, first_failed_stage)`
+/// pairs) into a one-line trend verdict. Pure so it's unit-testable without the
+/// matrix file. Used by get_run_trend.
+fn trend_verdict(rows: &[(String, String)]) -> String {
+    let is_pass = |r: &str| r.eq_ignore_ascii_case("pass") || r.eq_ignore_ascii_case("passed");
+    // Drop rows with no recorded result (in-flight / malformed).
+    let runs: Vec<(&str, &str)> = rows
+        .iter()
+        .filter(|(r, _)| !r.trim().is_empty())
+        .map(|(r, s)| (r.as_str(), s.as_str()))
+        .collect();
+    if runs.is_empty() {
+        return "NO DATA".to_string();
+    }
+    let (last_res, _) = runs[runs.len() - 1];
+    if is_pass(last_res) {
+        let prev_pass = runs.len() >= 2 && is_pass(runs[runs.len() - 2].0);
+        return if prev_pass {
+            "GREEN — stable (last 2+ runs pass)".to_string()
+        } else {
+            "JUST GREEN (latest run passed; confirm with one more run)".to_string()
+        };
+    }
+    // Latest run failed — measure the trailing run of consecutive failures.
+    let mut streak: Vec<&str> = Vec::new();
+    for pair in runs.iter().rev() {
+        if is_pass(pair.0) {
+            break;
+        }
+        streak.push(pair.1);
+    }
+    let latest_stage = streak.first().copied().unwrap_or("");
+    let stage_label = if latest_stage.is_empty() {
+        "(unknown stage)"
+    } else {
+        latest_stage
+    };
+    if streak.len() >= 2 && streak.iter().all(|s| *s == latest_stage) {
+        format!(
+            "STUCK at {stage_label} ({} consecutive fails at the same stage)",
+            streak.len()
+        )
+    } else if streak.len() >= 2 {
+        format!("MOVING (failing, but the stage is changing — latest: {stage_label})")
+    } else {
+        format!("FAILING at {stage_label} (only 1 run; need history to judge a trend)")
+    }
 }
 
 fn find_digest_recursive(dir: &Path, depth: usize) -> Option<Value> {
@@ -824,9 +1250,13 @@ LOOP:
      map, failure digest (stage / reason / message).
    - explain_stage(first_failed_stage) → what that stage checks, the owning
      file/crate, and common causes (turns the failure into a patch target).
-   - list_report_artifacts(job_id) then read_report_artifact for the failing stage's
-     log; get_vm_diagnostics(alias) on the failing node; diagnose_live_lab_failure
-     for deep triage.
+   - get_stage_log(job_id, stage=first_failed_stage) → that stage's row + the tail
+     of its log in one call (faster than browsing artifacts). grep_report(job_id,
+     pattern) to hunt a specific error string / panic / peer id across all logs.
+     list_report_artifacts + read_report_artifact for anything else;
+     get_vm_diagnostics(alias) on the failing node — or, if it's unreachable,
+     get_vm_network_info(alias) (out-of-band: ip/route/nft killswitch/daemon log,
+     no SSH); diagnose_live_lab_failure for deep triage.
 5. PATCH
    - repo-context which_crate (on explain_stage's owning file) + get_read_order to
      find the owning crate + rules; get_architecture_constraints (default-deny,
@@ -845,7 +1275,9 @@ LOOP:
      rebuild). Dirty tree is fine (working-tree deploys it; git add new files).
    - Fresh report_dir each run. Back to step 3.
 8. TRACK
-   - get_run_matrix to see the first_failed_stage trend across iterations.
+   - get_run_trend → one-line verdict across recent runs: STUCK at <stage> (keep
+     patching that stage), MOVING (each fix advanced the run), or two greens =
+     done. get_run_matrix for the full per-stage CSV when you need detail.
 
 RULES
 - One root-cause fix per iteration; re-verify before moving on.
@@ -1008,6 +1440,14 @@ impl McpServer for LabStateServer {
             Tool {
                 name: "reset_vm_network".into(),
                 description: "Reset a Linux VM's networking OUT-OF-BAND via utmctl exec (no SSH needed) when it's up but unreachable: flush the nft killswitch, stop rustynetd, restart systemd-networkd/networking, then re-probe TCP/22. Use when check_vm_reachable says UP-but-UNREACHABLE. (macOS Apple-Virt has no utmctl exec; Windows: use restart_vm.)".into(),
+                input_schema: json_schema_object(
+                    json!({"alias": json_schema_string("VM alias (Linux guest)")}),
+                    vec!["alias"],
+                ),
+            },
+            Tool {
+                name: "get_vm_network_info".into(),
+                description: "Out-of-band Linux guest network diagnostics via utmctl exec (no SSH): ip addr, ip route, the nft killswitch ruleset, rustynetd active-state, and the daemon's recent journal. The triage companion to reset_vm_network — run it when check_vm_reachable says UP-but-UNREACHABLE to see WHY (stale killswitch? wrong NAT subnet? daemon crashed?) before resetting. (macOS Apple-Virt / Windows: use get_vm_diagnostics over SSH.)".into(),
                 input_schema: json_schema_object(
                     json!({"alias": json_schema_string("VM alias (Linux guest)")}),
                     vec!["alias"],
@@ -1181,10 +1621,43 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "grep_report".into(),
+                description: "Case-insensitive substring search across every text file in a run's report directory → `path:line — matching text`. Fast way to find an error string, panic, peer id, or stage marker without reading whole logs. Pass a job_id OR a report_dir, plus a pattern. Binary/archive files are skipped; results capped (max_matches, default 100).".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "job_id": json_schema_string("Job id"),
+                        "report_dir": json_schema_string("Report dir (alternative to job_id)"),
+                        "pattern": json_schema_string("Substring to search for (case-insensitive)"),
+                        "max_matches": json!({"type": "integer", "description": "Cap on matches returned (default 100, max 1000)"}),
+                    }),
+                    vec!["pattern"],
+                ),
+            },
+            Tool {
+                name: "get_stage_log".into(),
+                description: "Jump straight to one stage's evidence: its row(s) in state/stages.tsv (status, rc, description) plus the tail of that stage's log file. The fast path after explain_stage(first_failed_stage) — go from a failed stage name to its actual log without browsing artifacts. Pass a job_id OR report_dir, plus the stage (linux_/macos_/windows_stage_ prefixes are stripped).".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "job_id": json_schema_string("Job id"),
+                        "report_dir": json_schema_string("Report dir (alternative to job_id)"),
+                        "stage": json_schema_string("Stage name, e.g. 'anchor', 'role_switch_matrix', 'validate_baseline_runtime'"),
+                    }),
+                    vec!["stage"],
+                ),
+            },
+            Tool {
                 name: "get_run_matrix".into(),
                 description: "Read the live-lab run matrix (CSV evidence ledger) — recent runs with OS/role/stage coverage and pass/fail.".into(),
                 input_schema: json_schema_object(
                     json!({"limit": json!({"type": "integer", "description": "Recent rows (default: 20)"})}),
+                    vec![],
+                ),
+            },
+            Tool {
+                name: "get_run_trend".into(),
+                description: "Trend across the last N matrix rows: a one-line verdict (GREEN — stable / JUST GREEN / STUCK at <stage> / MOVING) plus a compact run_id/commit/result/first_failed_stage table. Use it to decide whether the loop is converging — 'STUCK at X' means keep patching that stage; 'MOVING' means each fix advanced the run; two greens means done. Cheaper than get_run_matrix for loop control.".into(),
+                input_schema: json_schema_object(
+                    json!({"limit": json!({"type": "integer", "description": "Recent rows to analyze (default: 10, max 200)"})}),
                     vec![],
                 ),
             },
@@ -1355,6 +1828,7 @@ impl McpServer for LabStateServer {
             "get_vm_power_state" => self.get_vm_power_state(arg_str(args, "alias")),
             "check_vm_reachable" => self.check_vm_reachable(arg_str(args, "alias").unwrap_or("")),
             "reset_vm_network" => self.reset_vm_network(arg_str(args, "alias").unwrap_or("")),
+            "get_vm_network_info" => self.get_vm_network_info(arg_str(args, "alias").unwrap_or("")),
 
             "recover_stuck_vms" => {
                 let aliases = string_array(args, "aliases");
@@ -1494,6 +1968,9 @@ impl McpServer for LabStateServer {
             "get_run_result" => self.get_run_result(args),
             "list_report_artifacts" => self.list_report_artifacts(args),
             "read_report_artifact" => self.read_report_artifact(args),
+            "grep_report" => self.grep_report(args),
+            "get_stage_log" => self.get_stage_log(args),
+            "get_run_trend" => self.get_run_trend(args),
             "prune_jobs" => self.prune_jobs(args),
 
             "get_run_matrix" => {
@@ -2709,6 +3186,94 @@ mod tests {
         let res = srv.wait_for_job(Some(&json!({"job_id":"w1","timeout_secs":10})));
         assert!(res.content[0].text.contains("passed"));
         assert!(res.content[0].text.contains("finished"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn trend_verdict_classifies() {
+        let mk = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(r, s)| (r.to_string(), s.to_string()))
+                .collect()
+        };
+        // ≥2 trailing passes → stable green.
+        assert!(trend_verdict(&mk(&[("pass", ""), ("pass", "")])).starts_with("GREEN"));
+        // single latest pass after a fail → just green.
+        assert!(trend_verdict(&mk(&[("fail", "anchor"), ("pass", "")])).starts_with("JUST GREEN"));
+        // same failing stage repeatedly → stuck (names the stage).
+        let v = trend_verdict(&mk(&[
+            ("fail", "relay_service_lifecycle"),
+            ("fail", "relay_service_lifecycle"),
+            ("fail", "relay_service_lifecycle"),
+        ]));
+        assert!(
+            v.starts_with("STUCK at relay_service_lifecycle"),
+            "got: {v}"
+        );
+        // failing but the stage advances → moving.
+        let v = trend_verdict(&mk(&[("fail", "bootstrap"), ("fail", "anchor")]));
+        assert!(v.starts_with("MOVING"), "got: {v}");
+        // no usable rows.
+        assert_eq!(trend_verdict(&mk(&[("", "")])), "NO DATA");
+    }
+
+    #[test]
+    fn grep_report_finds_matches_case_insensitive() {
+        let tmp = std::env::temp_dir().join(format!("mcp-grep-{}", std::process::id()));
+        let rd = tmp.join("rep");
+        std::fs::create_dir_all(rd.join("logs")).unwrap();
+        std::fs::write(rd.join("logs/a.log"), "all good\nFATAL: boom\nmore\n").unwrap();
+        std::fs::write(rd.join("logs/b.log"), "nothing here\n").unwrap();
+        let srv = test_server(&tmp);
+        let res = srv.grep_report(Some(
+            &json!({"report_dir": rd.to_string_lossy(), "pattern": "fatal"}),
+        ));
+        let txt = res.content[0].text.clone();
+        assert!(txt.contains("logs/a.log"), "got: {txt}");
+        assert!(
+            txt.contains(":2"),
+            "should report the line number; got: {txt}"
+        );
+        assert!(
+            !txt.contains("b.log"),
+            "non-matching file excluded; got: {txt}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn get_stage_log_reads_matching_row_and_log() {
+        let tmp = std::env::temp_dir().join(format!("mcp-stagelog-{}", std::process::id()));
+        let rd = tmp.join("rep");
+        std::fs::create_dir_all(rd.join("state")).unwrap();
+        std::fs::create_dir_all(rd.join("logs")).unwrap();
+        let anchor_log = rd.join("logs/anchor.log");
+        std::fs::write(&anchor_log, "anchor stage output\nVALIDATION OK\n").unwrap();
+        let tsv = format!(
+            "bootstrap\thard\tpass\t0\t{}\tbootstrap stage\nanchor_validation\thard\tfail\t1\t{}\tanchor stage\n",
+            rd.join("logs/bootstrap.log").display(),
+            anchor_log.display(),
+        );
+        std::fs::write(rd.join("state/stages.tsv"), tsv).unwrap();
+        let srv = test_server(&tmp);
+        // 'linux_stage_anchor' must normalize and match the 'anchor_validation' row.
+        let res = srv.get_stage_log(Some(
+            &json!({"report_dir": rd.to_string_lossy(), "stage": "linux_stage_anchor"}),
+        ));
+        let txt = res.content[0].text.clone();
+        assert!(
+            txt.contains("anchor_validation"),
+            "row should match; got: {txt}"
+        );
+        assert!(
+            txt.contains("VALIDATION OK"),
+            "log body should be included; got: {txt}"
+        );
+        assert!(
+            !txt.contains("bootstrap stage"),
+            "non-matching row excluded; got: {txt}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
