@@ -103,15 +103,19 @@ cat <<EOF
                                 support, crate structure, doc search/list/read).
   rustynet-mcp-gate-runner   —  9 tools (fmt/check/clippy/test/build, security audit,
                                 CI gate scripts) — all kill-on-timeout.
-  rustynet-mcp-lab-state     — 35 tools + overnight-loop prompt. UTM discovery/
+  rustynet-mcp-lab-state     — 40 tools + overnight-loop prompt. UTM discovery/
                                 inventory/restart/recover, power on/off + state, host disk,
                                 out-of-band guest net diagnostics (get_vm_network_info),
-                                sync/bootstrap/diagnostics, AND the autonomous overnight
-                                loop: async background live-lab runs (start_live_lab_run
-                                with auto-topology → wait_for_job → get_run_result →
-                                explain_stage → get_stage_log / grep_report /
-                                read_report_artifact), get_run_trend, prune_jobs, run
-                                matrix. Built for unattended 24h+ loops.
+                                one-call readiness (preflight_check), deploy preview
+                                (what_will_deploy), sync/bootstrap/diagnostics, AND the
+                                autonomous overnight loop: async background live-lab runs
+                                (start_live_lab_run with auto-topology → wait_for_job →
+                                get_run_result → explain_stage → get_stage_log /
+                                grep_report / read_report_artifact), get_run_trend,
+                                diff_runs (helped vs regressed), a durable loop journal
+                                (write_loop_note / get_loop_journal) that survives context
+                                compaction, prune_jobs, run matrix. Built for unattended
+                                24h+ loops.
 
 The repo root is baked into each binary (build.rs); no working_directory needed.
 Override with RUSTYNET_REPO_ROOT if running a binary built from a different checkout.
