@@ -20,6 +20,7 @@ use rustynet_mcp::{
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -384,8 +385,7 @@ impl LabStateServer {
     }
 
     fn get_vm_power_state(&self, filter: Option<&str>) -> ToolCallResult {
-        let utmctl = std::env::var("RUSTYNET_UTMCTL_PATH")
-            .unwrap_or_else(|_| "/Applications/UTM.app/Contents/MacOS/utmctl".to_string());
+        let utmctl = utmctl_path();
         let outcome = match run_with_timeout(
             &utmctl,
             &["list"],
@@ -474,6 +474,180 @@ impl LabStateServer {
         );
         tool_success(&out)
     }
+
+    /// Resolve an inventory alias → (utm_name, platform, ip, ssh_port).
+    fn alias_to_utm(&self, alias: &str) -> Option<(String, String, String, u16)> {
+        let s = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)).ok()?;
+        let inv: Value = serde_json::from_str(&s).ok()?;
+        inv.get("entries")?.as_array()?.iter().find_map(|e| {
+            if e.get("alias").and_then(|v| v.as_str()) != Some(alias) {
+                return None;
+            }
+            let utm_name = e
+                .get("controller")
+                .and_then(|c| c.get("utm_name"))
+                .and_then(|v| v.as_str())?
+                .to_string();
+            let platform = e
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .unwrap_or("linux")
+                .to_string();
+            let ip = e
+                .get("last_known_ip")
+                .and_then(|v| v.as_str())
+                .or_else(|| e.get("ssh_target").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let port = e.get("ssh_port").and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+            Some((utm_name, platform, ip, port))
+        })
+    }
+
+    /// utmctl power status (started/stopped/...) for one utm_name.
+    fn utm_power_status(&self, utm_name: &str) -> Option<String> {
+        let o = run_with_timeout(
+            &utmctl_path(),
+            &["list"],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(30),
+        )
+        .ok()?;
+        if !o.success {
+            return None;
+        }
+        o.stdout.lines().find_map(|line| {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("UUID") {
+                return None;
+            }
+            let status = t.split_whitespace().nth(1)?;
+            let name = t.get(t.find(status)? + status.len()..)?.trim();
+            (name == utm_name).then(|| status.to_string())
+        })
+    }
+
+    fn check_vm_reachable(&self, alias: &str) -> ToolCallResult {
+        if alias.is_empty() {
+            return tool_error("Missing required parameter: alias");
+        }
+        let Some((utm_name, _platform, ip, port)) = self.alias_to_utm(alias) else {
+            return tool_error(&format!("Unknown alias '{alias}' (not in inventory)"));
+        };
+        let power = self
+            .utm_power_status(&utm_name)
+            .unwrap_or_else(|| "unknown".into());
+        let reachable = tcp_reachable(&ip, port, Duration::from_secs(3));
+        let (verdict, action) = match (power.as_str(), reachable) {
+            ("stopped", _) => ("DOWN — powered off", "power_on_vm"),
+            (_, true) => ("UP and reachable (TCP open)", "ready"),
+            ("started", false) => (
+                "UP but UNREACHABLE",
+                "reset_vm_network (clears killswitch + restarts networking) or recover_stuck_vms. If it stays unreachable, the VM is likely on the wrong UTM network (NAT vs bridged — host-side fix) or has a stale inventory IP → update_inventory.",
+            ),
+            (_, false) => (
+                "UNREACHABLE, power state unknown",
+                "get_vm_power_state; power_on_vm if stopped",
+            ),
+        };
+        tool_success(&format!(
+            "# Reachability: {alias}\n\n- **utm_name:** {utm_name}\n- **power:** {power}\n- **address:** {}:{port}\n- **TCP/{port} reachable:** {reachable}\n- **verdict:** {verdict}\n- **suggested:** {action}\n",
+            if ip.is_empty() {
+                "(no IP in inventory)"
+            } else {
+                &ip
+            }
+        ))
+    }
+
+    fn reset_vm_network(&self, alias: &str) -> ToolCallResult {
+        if alias.is_empty() {
+            return tool_error("Missing required parameter: alias");
+        }
+        let Some((utm_name, platform, ip, port)) = self.alias_to_utm(alias) else {
+            return tool_error(&format!("Unknown alias '{alias}' (not in inventory)"));
+        };
+        match platform.as_str() {
+            "macos" => {
+                return tool_error(
+                    "macOS UTM uses Apple Virtualization (no utmctl exec); reset its network via the serial console or manually.",
+                );
+            }
+            "windows" => {
+                return tool_error(
+                    "reset_vm_network targets Linux guests; for Windows use restart_vm (power cycle) or power_off_vm force=true + power_on_vm.",
+                );
+            }
+            _ => {}
+        }
+        // Must be running for the guest agent (utmctl exec) to work.
+        match self.utm_power_status(&utm_name).as_deref() {
+            Some("started") => {}
+            Some(other) => {
+                return tool_error(&format!(
+                    "VM '{alias}' is '{other}', not started — power_on_vm first (utmctl exec needs a running guest)."
+                ));
+            }
+            None => {} // unknown — attempt anyway
+        }
+        let utmctl = utmctl_path();
+        // Out-of-band network reset (no SSH) via the QEMU guest agent.
+        let steps: &[(&str, &[&str])] = &[
+            ("flush killswitch (nft)", &["nft", "flush", "ruleset"]),
+            ("stop rustynetd", &["systemctl", "stop", "rustynetd"]),
+            (
+                "stop privileged helper",
+                &["systemctl", "stop", "rustynetd-privileged-helper"],
+            ),
+            (
+                "restart systemd-networkd",
+                &["systemctl", "restart", "systemd-networkd"],
+            ),
+            (
+                "restart networking.service",
+                &["systemctl", "restart", "networking"],
+            ),
+        ];
+        let mut out = format!(
+            "# Network reset: {alias} (utm_name={utm_name})\n\nOut-of-band via utmctl exec (no SSH needed).\n\n"
+        );
+        for (label, cmd) in steps {
+            let mut argv: Vec<&str> = vec!["exec", &utm_name, "--cmd", "/usr/bin/sudo"];
+            argv.extend_from_slice(cmd);
+            match run_with_timeout(
+                &utmctl,
+                &argv,
+                &self.repo_root,
+                &[],
+                Duration::from_secs(60),
+            ) {
+                Ok(o) => {
+                    let tag = if o.success { "✅" } else { "⚠️" };
+                    let msg = o.stderr.trim();
+                    let suffix = if msg.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", truncate_output(msg, 3, 300))
+                    };
+                    out.push_str(&format!("- {tag} {label}{suffix}\n"));
+                }
+                Err(e) => out.push_str(&format!("- ❌ {label} — {e}\n")),
+            }
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        let reachable = tcp_reachable(&ip, port, Duration::from_secs(3));
+        out.push_str(&format!(
+            "\n## Re-probe\n- TCP/{port} @ {} reachable: **{reachable}**\n",
+            if ip.is_empty() { "(no IP)" } else { &ip }
+        ));
+        if !reachable {
+            out.push_str(
+                "\nStill unreachable from the host. Likely the VM is on the wrong UTM network (NAT vs bridged — fix the adapter in UTM, host-side), or its IP changed → run update_inventory then check_vm_reachable.\n",
+            );
+        }
+        tool_success(&out)
+    }
 }
 
 fn now_unix() -> u64 {
@@ -481,6 +655,26 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Path to the utmctl binary (env override, else the standard UTM.app location).
+fn utmctl_path() -> String {
+    std::env::var("RUSTYNET_UTMCTL_PATH")
+        .unwrap_or_else(|_| "/Applications/UTM.app/Contents/MacOS/utmctl".to_string())
+}
+
+/// True if a TCP connection to `ip:port` succeeds within `timeout`.
+fn tcp_reachable(ip: &str, port: u16, timeout: Duration) -> bool {
+    if ip.is_empty() {
+        return false;
+    }
+    match format!("{ip}:{port}").to_socket_addrs() {
+        Ok(mut addrs) => addrs
+            .next()
+            .map(|a| TcpStream::connect_timeout(&a, timeout).is_ok())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 /// RFC4180-aware single-line CSV split (handles quoted fields with commas).
@@ -610,12 +804,13 @@ wakeups between polls.
 
 LOOP:
 1. READY THE LAB (no human needed)
-   - get_vm_power_state: any VM 'stopped' → power_on_vm. get_lab_status for SSH
-     reachability. If a VM is 'started' but unreachable: recover_stuck_vms (Linux
-     QEMU killswitch lockouts) → update_inventory (refresh live IPs — NEVER
-     hand-edit). If a VM is wedged and recover_stuck_vms doesn't fix it:
-     power_off_vm force=true → power_on_vm (hard reset). ensure_lab_ready does
-     discover→restart→confirm in one call.
+   - check_vm_reachable(alias) per node. DOWN → power_on_vm. UP-but-UNREACHABLE →
+     reset_vm_network (out-of-band via utmctl exec: flushes the killswitch +
+     restarts networking, no SSH), then update_inventory (refresh live IPs — NEVER
+     hand-edit). Still unreachable after reset → the VM is on the wrong UTM network
+     (host-side fix) or try power_off_vm force=true → power_on_vm (hard reset).
+     ensure_lab_ready does discover→restart→confirm in one call; recover_stuck_vms
+     clears killswitch lockouts fleet-wide.
 2. START A RUN (non-blocking)
    - start_live_lab_run mode=orchestrate. Leave windows_vm/macos_vm unset —
      auto_topology (default on) fills them from the inventory for full 3-OS
@@ -793,6 +988,22 @@ impl McpServer for LabStateServer {
                 input_schema: json_schema_object(
                     json!({"alias": json_schema_string("Optional: only show this VM (alias or utm_name)")}),
                     vec![],
+                ),
+            },
+            Tool {
+                name: "check_vm_reachable".into(),
+                description: "Answer 'is this VM up but unreachable?' in one call: combines utmctl power state with a direct TCP/22 probe → DOWN (power off) / UP+reachable / UP-but-UNREACHABLE, plus the right next action (power_on_vm / reset_vm_network / update_inventory).".into(),
+                input_schema: json_schema_object(
+                    json!({"alias": json_schema_string("VM alias")}),
+                    vec!["alias"],
+                ),
+            },
+            Tool {
+                name: "reset_vm_network".into(),
+                description: "Reset a Linux VM's networking OUT-OF-BAND via utmctl exec (no SSH needed) when it's up but unreachable: flush the nft killswitch, stop rustynetd, restart systemd-networkd/networking, then re-probe TCP/22. Use when check_vm_reachable says UP-but-UNREACHABLE. (macOS Apple-Virt has no utmctl exec; Windows: use restart_vm.)".into(),
+                input_schema: json_schema_object(
+                    json!({"alias": json_schema_string("VM alias (Linux guest)")}),
+                    vec!["alias"],
                 ),
             },
             Tool {
@@ -1132,6 +1343,8 @@ impl McpServer for LabStateServer {
             }
 
             "get_vm_power_state" => self.get_vm_power_state(arg_str(args, "alias")),
+            "check_vm_reachable" => self.check_vm_reachable(arg_str(args, "alias").unwrap_or("")),
+            "reset_vm_network" => self.reset_vm_network(arg_str(args, "alias").unwrap_or("")),
 
             "recover_stuck_vms" => {
                 let aliases = string_array(args, "aliases");
@@ -2386,6 +2599,33 @@ mod tests {
             Some("deb-1")
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn alias_to_utm_resolves_fields() {
+        let tmp = std::env::temp_dir().join(format!("mcp-a2u-{}", std::process::id()));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1","last_known_ip":"192.168.0.200","controller":{"utm_name":"debian-headless-1"}}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let (utm, plat, ip, port) = srv.alias_to_utm("deb-1").unwrap();
+        assert_eq!(utm, "debian-headless-1");
+        assert_eq!(plat, "linux"); // no platform field → linux default
+        assert_eq!(ip, "192.168.0.200");
+        assert_eq!(port, 22);
+        assert!(srv.alias_to_utm("nope").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tcp_reachable_false_for_closed_and_empty() {
+        assert!(!tcp_reachable("", 22, Duration::from_millis(200)));
+        // 127.0.0.1:1 is reserved/closed → connection refused, fast.
+        assert!(!tcp_reachable("127.0.0.1", 1, Duration::from_millis(500)));
     }
 
     #[test]
