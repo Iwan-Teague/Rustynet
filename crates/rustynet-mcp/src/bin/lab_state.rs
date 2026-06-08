@@ -360,6 +360,120 @@ impl LabStateServer {
         );
         tool_success(&out)
     }
+
+    /// Map UTM `utm_name` → inventory `alias` (Windows/macOS utm_names differ
+    /// from their aliases, e.g. "Windows" vs "windows-utm-1").
+    fn utm_name_alias_map(&self) -> BTreeMap<String, String> {
+        let mut m = BTreeMap::new();
+        if let Ok(s) = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY))
+            && let Ok(inv) = serde_json::from_str::<Value>(&s)
+            && let Some(entries) = inv.get("entries").and_then(|v| v.as_array())
+        {
+            for e in entries {
+                if let (Some(name), Some(alias)) = (
+                    e.get("controller")
+                        .and_then(|c| c.get("utm_name"))
+                        .and_then(|v| v.as_str()),
+                    e.get("alias").and_then(|v| v.as_str()),
+                ) {
+                    m.insert(name.to_string(), alias.to_string());
+                }
+            }
+        }
+        m
+    }
+
+    fn get_vm_power_state(&self, filter: Option<&str>) -> ToolCallResult {
+        let utmctl = std::env::var("RUSTYNET_UTMCTL_PATH")
+            .unwrap_or_else(|_| "/Applications/UTM.app/Contents/MacOS/utmctl".to_string());
+        let outcome = match run_with_timeout(
+            &utmctl,
+            &["list"],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(30),
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                return tool_error(&format!(
+                    "Cannot run utmctl ({utmctl}): {e}. Set RUSTYNET_UTMCTL_PATH if UTM is elsewhere."
+                ));
+            }
+        };
+        if !outcome.success {
+            return tool_error(&format!("utmctl list failed: {}", outcome.stderr.trim()));
+        }
+        let map = self.utm_name_alias_map();
+        let mut out = String::from(
+            "# VM power state (utmctl list)\n\n| alias | utm_name | status |\n|---|---|---|\n",
+        );
+        let mut rows = 0;
+        for line in outcome.stdout.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("UUID") {
+                continue;
+            }
+            // Columns: UUID  Status  Name (mirror of the CLI's own parser).
+            let status = match t.split_whitespace().nth(1) {
+                Some(s) => s,
+                None => continue,
+            };
+            let name = match t.find(status) {
+                Some(i) => t[i + status.len()..].trim(),
+                None => continue,
+            };
+            let alias = map.get(name).cloned().unwrap_or_else(|| "-".into());
+            if let Some(f) = filter
+                && f != name
+                && f != alias
+            {
+                continue;
+            }
+            out.push_str(&format!("| {alias} | {name} | {status} |\n"));
+            rows += 1;
+        }
+        if rows == 0 {
+            out.push_str("| (none matched) | | |\n");
+        }
+        out.push_str(
+            "\n_started + SSH-reachable = ready. started + unreachable = network/killswitch (recover_stuck_vms / update_inventory), NOT a power issue. stopped = power_on_vm._\n",
+        );
+        tool_success(&out)
+    }
+
+    fn host_disk_status(&self) -> ToolCallResult {
+        let mut out = String::from("# Host disk status\n\n## Filesystem (repo volume)\n");
+        match run_with_timeout(
+            "df",
+            &["-h", &self.repo_root.to_string_lossy()],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(15),
+        ) {
+            Ok(o) if o.success => out.push_str(&format!("```\n{}\n```\n", o.stdout.trim())),
+            _ => out.push_str("(df unavailable)\n"),
+        }
+        out.push_str("\n## Lab disk consumers\n");
+        for dir in ["state", "target-livelab", "target"] {
+            let p = self.repo_root.join(dir);
+            if p.exists()
+                && let Ok(o) = run_with_timeout(
+                    "du",
+                    &["-sh", &p.to_string_lossy()],
+                    &self.repo_root,
+                    &[],
+                    Duration::from_secs(60),
+                )
+                && o.success
+            {
+                out.push_str(&format!("- {}\n", o.stdout.trim()));
+            }
+        }
+        out.push_str(
+            "\nReclaim with prune_jobs (old run dirs/logs). target-livelab is a warm build cache for lab jobs; target/ is the gate-runner build cache.\n",
+        );
+        tool_success(&out)
+    }
 }
 
 fn now_unix() -> u64 {
@@ -495,10 +609,13 @@ job_id instantly; poll get_job_status every ~5–10 min. Use your /loop or sched
 wakeups between polls.
 
 LOOP:
-1. READY THE LAB
-   - get_lab_status. If a VM is unready / SSH times out: recover_stuck_vms (Linux
-     QEMU killswitch lockouts) → restart_vm or ensure_lab_ready → update_inventory
-     (refresh live IPs — NEVER hand-edit the inventory).
+1. READY THE LAB (no human needed)
+   - get_vm_power_state: any VM 'stopped' → power_on_vm. get_lab_status for SSH
+     reachability. If a VM is 'started' but unreachable: recover_stuck_vms (Linux
+     QEMU killswitch lockouts) → update_inventory (refresh live IPs — NEVER
+     hand-edit). If a VM is wedged and recover_stuck_vms doesn't fix it:
+     power_off_vm force=true → power_on_vm (hard reset). ensure_lab_ready does
+     discover→restart→confirm in one call.
 2. START A RUN (non-blocking)
    - start_live_lab_run mode=orchestrate. Leave windows_vm/macos_vm unset —
      auto_topology (default on) fills them from the inventory for full 3-OS
@@ -542,8 +659,9 @@ LONG-RUN (24h+) NOTES
   reach the VMs.
 - A single run is capped at 24h (CLI default). For a longer soak, pass
   timeout_secs to start_live_lab_run.
-- Disk: each run writes a report dir + log. Every ~10 iterations call prune_jobs
-  (keeps the most recent; never touches a running job) to reclaim space.
+- Disk: each run writes a report dir + log. Check host_disk_status periodically;
+  every ~10 iterations call prune_jobs (keeps the most recent; never touches a
+  running job) to reclaim space.
 - Job status is read from the run's completion record first (pid-reuse-safe), so
   get_job_status stays correct across MCP-server reloads over many hours.
 "#;
@@ -641,13 +759,40 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "restart_vm".into(),
-                description: "Restart one or more VMs. ['--all'] for all; wait_ready waits for SSH. Minutes-scale (blocking).".into(),
+                description: "Restart one or more VMs (power cycle). ['--all'] for all; wait_ready waits for SSH. Minutes-scale (blocking).".into(),
                 input_schema: json_schema_object(
                     json!({
                         "aliases": json_schema_array_string("VM aliases, or ['--all']"),
                         "wait_ready": json_schema_boolean("Wait for SSH readiness (default: true)"),
                     }),
                     vec!["aliases"],
+                ),
+            },
+            Tool {
+                name: "power_on_vm".into(),
+                description: "Power ON one or more stopped VMs via utmctl (`ops vm-lab-start`). ['--all'] for all. Does NOT wait for SSH — follow with get_lab_status, or use restart_vm with wait_ready to start+wait. Use this to bring up a VM that get_vm_power_state shows as 'stopped'.".into(),
+                input_schema: json_schema_object(
+                    json!({"aliases": json_schema_array_string("VM aliases to power on, or ['--all']")}),
+                    vec!["aliases"],
+                ),
+            },
+            Tool {
+                name: "power_off_vm".into(),
+                description: "Power OFF one or more VMs via utmctl (`ops vm-lab-stop`). Graceful by default; force=true hard-stops a wedged VM. ['--all'] for all. Pair with power_on_vm for a hard reset when recover_stuck_vms isn't enough.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "aliases": json_schema_array_string("VM aliases to power off, or ['--all']"),
+                        "force": json_schema_boolean("Hard stop (utmctl --force) instead of graceful (default: false)"),
+                    }),
+                    vec!["aliases"],
+                ),
+            },
+            Tool {
+                name: "get_vm_power_state".into(),
+                description: "Raw VM power state from `utmctl list` (started/stopped/paused), annotated with inventory aliases — distinct from SSH reachability. 'started but unreachable' = network/killswitch issue (recover_stuck_vms/update_inventory); 'stopped' = power_on_vm. Pass alias to filter.".into(),
+                input_schema: json_schema_object(
+                    json!({"alias": json_schema_string("Optional: only show this VM (alias or utm_name)")}),
+                    vec![],
                 ),
             },
             Tool {
@@ -823,6 +968,11 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "host_disk_status".into(),
+                description: "Host disk free space + the lab's biggest consumers (state/, target-livelab/, target/). Check periodically over a long run — a full disk fails builds/runs. Reclaim with prune_jobs.".into(),
+                input_schema: json_schema_object(json!({}), vec![]),
+            },
+            Tool {
                 name: "prune_jobs".into(),
                 description: "Reclaim disk from old FINISHED jobs over a long loop: keep the most recent N job records+logs, delete the rest. Running jobs are never touched. Set delete_report_dirs to also remove their report directories (lab evidence) — off by default.".into(),
                 input_schema: json_schema_object(
@@ -928,7 +1078,7 @@ impl McpServer for LabStateServer {
                     extra.push("--all");
                 } else {
                     for alias in &aliases {
-                        extra.push("--alias");
+                        extra.push("--vm");
                         extra.push(alias.as_str());
                     }
                 }
@@ -943,6 +1093,45 @@ impl McpServer for LabStateServer {
                 }
                 self.run_ops("vm-lab-restart", &extra, 900)
             }
+
+            "power_on_vm" => {
+                let aliases = string_array(args, "aliases");
+                if aliases.is_empty() {
+                    return tool_error("At least one alias (or ['--all']) is required");
+                }
+                let mut extra: Vec<&str> = Vec::new();
+                if aliases.len() == 1 && aliases[0] == "--all" {
+                    extra.push("--all");
+                } else {
+                    for a in &aliases {
+                        extra.push("--vm");
+                        extra.push(a.as_str());
+                    }
+                }
+                self.run_ops("vm-lab-start", &extra, 300)
+            }
+
+            "power_off_vm" => {
+                let aliases = string_array(args, "aliases");
+                if aliases.is_empty() {
+                    return tool_error("At least one alias (or ['--all']) is required");
+                }
+                let mut extra: Vec<&str> = Vec::new();
+                if aliases.len() == 1 && aliases[0] == "--all" {
+                    extra.push("--all");
+                } else {
+                    for a in &aliases {
+                        extra.push("--vm");
+                        extra.push(a.as_str());
+                    }
+                }
+                if arg_bool(args, "force") {
+                    extra.push("--force");
+                }
+                self.run_ops("vm-lab-stop", &extra, 300)
+            }
+
+            "get_vm_power_state" => self.get_vm_power_state(arg_str(args, "alias")),
 
             "recover_stuck_vms" => {
                 let aliases = string_array(args, "aliases");
@@ -997,7 +1186,7 @@ impl McpServer for LabStateServer {
                 if alias.is_empty() {
                     return tool_error("Missing required parameter: alias");
                 }
-                self.run_ops("vm-lab-sync-repo", &["--alias", alias], 900)
+                self.run_ops("vm-lab-sync-repo", &["--vm", alias], 900)
             }
 
             "bootstrap_vm" => {
@@ -1008,7 +1197,7 @@ impl McpServer for LabStateServer {
                 }
                 self.run_ops(
                     "vm-lab-bootstrap-phase",
-                    &["--alias", alias, "--phase", phase],
+                    &["--vm", alias, "--phase", phase],
                     2400,
                 )
             }
@@ -1019,7 +1208,7 @@ impl McpServer for LabStateServer {
                     return tool_error("Missing required parameter: alias");
                 }
                 let mut result = format!("# VM Diagnostics: {alias}\n\n## Daemon Status\n\n");
-                let status = self.run_ops("vm-lab-status", &["--alias", alias], 300);
+                let status = self.run_ops("vm-lab-status", &["--vm", alias], 300);
                 if let Some(c) = status.content.first() {
                     result.push_str(&c.text);
                     result.push_str("\n\n");
@@ -1029,7 +1218,7 @@ impl McpServer for LabStateServer {
                     self.ensure_report_dir(&format!("state/live-lab-mcp/diag-{alias}"));
                 let artifacts = self.run_ops(
                     "vm-lab-collect-artifacts",
-                    &["--alias", alias, "--report-dir", &report_dir],
+                    &["--vm", alias, "--report-dir", &report_dir],
                     600,
                 );
                 if let Some(c) = artifacts.content.first() {
@@ -1118,6 +1307,8 @@ impl McpServer for LabStateServer {
                     Err(e) => tool_error(&format!("Cannot read run matrix: {e}")),
                 }
             }
+
+            "host_disk_status" => self.host_disk_status(),
 
             _ => tool_error(&format!("Unknown tool: {name}")),
         }
@@ -2172,6 +2363,27 @@ mod tests {
         assert!(
             !txt.contains("tempo"),
             "topology digest must not leak credentials"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn utm_name_alias_map_maps_controller_names() {
+        let tmp = std::env::temp_dir().join(format!("mcp-utmmap-{}", std::process::id()));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1","controller":{"utm_name":"debian-headless-1"}},{"alias":"win-1","platform":"windows","controller":{"utm_name":"Windows"}}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let m = srv.utm_name_alias_map();
+        // utm_name differs from alias for Windows — the annotation must bridge it.
+        assert_eq!(m.get("Windows").map(|s| s.as_str()), Some("win-1"));
+        assert_eq!(
+            m.get("debian-headless-1").map(|s| s.as_str()),
+            Some("deb-1")
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
