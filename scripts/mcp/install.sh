@@ -97,12 +97,15 @@ cat <<EOF
 ========================================
  Servers
 ========================================
-  rustynet-mcp-repo-context  — 16 tools + resources (docs) + prompts
+  rustynet-mcp-repo-context  — 17 tools + resources (docs) + prompts
                                (read-order, requirements, security controls/findings,
                                 architecture constraints, role transitions, platform
-                                support, crate structure, doc search/list/read).
-  rustynet-mcp-gate-runner   —  9 tools (fmt/check/clippy/test/build, security audit,
-                                CI gate scripts) — all kill-on-timeout.
+                                support, crate structure, which_crate boundary rules,
+                                get_crate_dependencies blast-radius, doc search/list/read).
+  rustynet-mcp-gate-runner   — 11 tools (fmt/check/clippy/test/build, security audit,
+                                run_security_gates bundled security suite, categorized
+                                CI gate scripts + run_gate_scripts batch) — all
+                                kill-on-timeout.
   rustynet-mcp-lab-state     — 41 tools + overnight-loop prompt. UTM discovery/
                                 inventory/restart/recover, power on/off + state, host disk,
                                 out-of-band guest net diagnostics (get_vm_network_info),

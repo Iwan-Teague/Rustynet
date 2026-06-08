@@ -3,7 +3,7 @@
   "servers": [
     {
       "name": "rustynet-mcp-repo-context",
-      "description": "Structured access to the Rustynet documentation graph, requirements, security controls/findings, architecture constraints, role transitions, platform support, and crate structure. 16 tools + MCP resources (docs) + prompts.",
+      "description": "Structured access to the Rustynet documentation graph, requirements, security controls/findings, architecture constraints, role transitions, platform support, and crate structure. which_crate gives a file's layer + boundary rule; get_crate_dependencies gives a crate's forward + reverse deps (blast radius before patching a shared crate). 17 tools + MCP resources (docs) + prompts.",
       "tools": [
         "get_read_order",
         "get_active_ledger",
@@ -17,6 +17,7 @@
         "get_document",
         "get_crate_structure",
         "which_crate",
+        "get_crate_dependencies",
         "get_orchestrator_stages",
         "get_security_findings",
         "get_role_transition",
@@ -29,7 +30,7 @@
     },
     {
       "name": "rustynet-mcp-gate-runner",
-      "description": "Runs Rustynet quality gates on demand — cargo fmt, check, clippy, test, build, audit, deny, and phase-specific CI scripts. Every command runs under a kill-on-timeout watchdog. 9 tools.",
+      "description": "Runs Rustynet quality gates on demand — cargo fmt, check, clippy, test, build, audit, deny, and CI gate scripts. run_security_gates bundles the local security-critical suite (secrets hygiene, backend-boundary leakage, dataplane-leak, security-regression, supply-chain, role-auth, secret-redaction, traversal-adversarial, active-network) + audit/deny into one pass/fail verdict — the 'did I break security?' check. list_gate_scripts is categorized (security / role / phase / release / lab); run_gate_scripts runs any chosen set. Every command runs under a kill-on-timeout watchdog. 11 tools.",
       "tools": [
         "run_gates",
         "run_check",
@@ -38,8 +39,10 @@
         "run_test",
         "run_build",
         "run_security_audit",
+        "run_security_gates",
         "list_gate_scripts",
-        "run_gate_script"
+        "run_gate_script",
+        "run_gate_scripts"
       ],
       "requires_working_dir": false,
       "working_dir": "<baked at build time via build.rs; CWD-independent>"
