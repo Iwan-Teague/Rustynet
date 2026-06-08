@@ -21,7 +21,7 @@ use rustynet_mcp::{
     prompt_text, read_file_capped, run_server, tool_error, tool_success, truncate_output,
 };
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -328,6 +328,120 @@ impl RepoContextServer {
         // blown up by a stray huge file committed under documents/.
         read_file_capped(&self.repo_root.join(relative_path), 8_000_000)
     }
+
+    /// Forward + reverse internal-crate dependencies for `crate_name`.
+    fn get_crate_dependencies(&self, crate_name: &str) -> ToolCallResult {
+        if crate_name.is_empty() {
+            return tool_error("Missing required parameter: crate");
+        }
+        let graph = crate_dep_graph(&self.repo_root.join("crates"));
+        if graph.is_empty() {
+            return tool_error("Could not read any crates/*/Cargo.toml");
+        }
+        let Some(deps) = graph.get(crate_name) else {
+            let known: Vec<&str> = graph.keys().map(|s| s.as_str()).collect();
+            return tool_error(&format!(
+                "Unknown crate '{crate_name}'. Known: {}",
+                known.join(", ")
+            ));
+        };
+        let dependents: Vec<&String> = graph
+            .iter()
+            .filter(|(_, d)| d.contains(crate_name))
+            .map(|(k, _)| k)
+            .collect();
+
+        let mut out = format!("# Dependencies: `{crate_name}`\n");
+        if let Some(c) = CRATES.iter().find(|c| c.name == crate_name) {
+            out.push_str(&format!(
+                "\n- **Layer:** {}\n- **Boundary:** {}\n",
+                c.layer,
+                layer_boundary(c.layer)
+            ));
+        }
+        out.push_str(&format!(
+            "\n## Depends on ({}) — internal crates it imports\n",
+            deps.len()
+        ));
+        if deps.is_empty() {
+            out.push_str("- (none — leaf crate)\n");
+        } else {
+            for d in deps {
+                out.push_str(&format!("- `{d}`\n"));
+            }
+        }
+        out.push_str(&format!(
+            "\n## Depended on by ({}) — blast radius if you change `{crate_name}`\n",
+            dependents.len()
+        ));
+        if dependents.is_empty() {
+            out.push_str("- (none — nothing else imports it)\n");
+        } else {
+            for d in &dependents {
+                out.push_str(&format!("- `{d}`\n"));
+            }
+        }
+        out.push_str(
+            "\nChanging this crate's public API can break the **depended-on-by** set — re-gate those after editing (gate-runner run_gates changed_only auto-scopes to them). For the boundary rule use which_crate.\n",
+        );
+        tool_success(&out)
+    }
+}
+
+/// Build the internal-crate dependency graph (forward edges) by parsing every
+/// `crates/*/Cargo.toml`. Keyed by package name; values are the `rustynet-*`
+/// crates it lists as dependencies (any dependency table). Line-based parse —
+/// the MCP crate intentionally has no `toml` dependency.
+fn crate_dep_graph(crates_dir: &Path) -> BTreeMap<String, BTreeSet<String>> {
+    let mut graph: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(crates_dir) else {
+        return graph;
+    };
+    for entry in entries.flatten() {
+        let cargo = entry.path().join("Cargo.toml");
+        let Ok(content) = std::fs::read_to_string(&cargo) else {
+            continue;
+        };
+        let mut pkg = entry.file_name().to_string_lossy().to_string();
+        let mut deps: BTreeSet<String> = BTreeSet::new();
+        let mut section = "";
+        for line in content.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            if t.starts_with('[') {
+                section = if t == "[package]" {
+                    "package"
+                } else if t.contains("dependencies") {
+                    "deps"
+                } else {
+                    "other"
+                };
+                continue;
+            }
+            match section {
+                "package" => {
+                    if let Some((k, v)) = t.split_once('=')
+                        && k.trim() == "name"
+                        && let Some(name) = v.split('"').nth(1)
+                    {
+                        pkg = name.to_string();
+                    }
+                }
+                "deps" => {
+                    let name = t.split([' ', '=', '.']).next().unwrap_or("");
+                    if name.starts_with("rustynet-") {
+                        deps.insert(name.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        deps.remove(&pkg); // no self-edges
+        graph.insert(pkg, deps);
+    }
+    graph
 }
 
 impl McpServer for RepoContextServer {
@@ -422,6 +536,14 @@ impl McpServer for RepoContextServer {
                 input_schema: json_schema_object(
                     json!({"path": json_schema_string("Repo-relative file path, e.g. 'crates/rustynet-policy/src/eval.rs'")}),
                     vec!["path"],
+                ),
+            },
+            Tool {
+                name: "get_crate_dependencies".into(),
+                description: "Given a workspace crate, return what it depends on (internal rustynet-* crates) AND what depends on it (reverse deps) — the blast radius before you patch a shared crate. Parsed live from crates/*/Cargo.toml. Pair with which_crate (layer + boundary): a change to a crate's public API can break its 'depended on by' set, so re-gate those (gate-runner changed_only picks them up).".into(),
+                input_schema: json_schema_object(
+                    json!({"crate": json_schema_string("Crate name, e.g. 'rustynet-backend-api'")}),
+                    vec!["crate"],
                 ),
             },
             Tool {
@@ -520,6 +642,9 @@ impl McpServer for RepoContextServer {
             "get_document" => self.get_document(arg_str(args, "path").unwrap_or_default()),
             "get_crate_structure" => tool_success(&render_crate_structure()),
             "which_crate" => tool_success(&which_crate(arg_str(args, "path").unwrap_or_default())),
+            "get_crate_dependencies" => {
+                self.get_crate_dependencies(arg_str(args, "crate").unwrap_or_default())
+            }
             "get_orchestrator_stages" => tool_success(ORCHESTRATOR_STAGES),
             "get_security_findings" => self.get_security_findings(
                 arg_str(args, "status").unwrap_or("all"),
@@ -2012,5 +2137,48 @@ mod tests {
         assert!(severity_matches("Med", "medium"));
         assert!(severity_matches("Medium", "Med"));
         assert!(!severity_matches("Low", "High"));
+    }
+
+    #[test]
+    fn crate_dep_graph_parses_forward_and_reverse() {
+        let tmp = std::env::temp_dir().join(format!("rc-deps-{}", std::process::id()));
+        let mk = |name: &str, toml: &str| {
+            let d = tmp.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("Cargo.toml"), toml).unwrap();
+        };
+        mk(
+            "rustynet-b",
+            "[package]\nname = \"rustynet-b\"\n[dependencies]\nserde = \"1\"\n",
+        );
+        mk(
+            "rustynet-a",
+            "[package]\nname = \"rustynet-a\"\n[dependencies]\nrustynet-b = { path = \"../rustynet-b\" }\nserde.workspace = true\n",
+        );
+        mk(
+            "rustynet-c",
+            "[package]\nname = \"rustynet-c\"\n[dev-dependencies]\nrustynet-a.workspace = true\n",
+        );
+        let g = crate_dep_graph(&tmp);
+        // forward: a → b (serde excluded, non-internal)
+        assert_eq!(
+            g.get("rustynet-a")
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["rustynet-b".to_string()]
+        );
+        assert!(g.get("rustynet-b").unwrap().is_empty());
+        // dev-dependencies count too: c → a
+        assert!(g.get("rustynet-c").unwrap().contains("rustynet-a"));
+        // reverse: who depends on rustynet-a → rustynet-c
+        let dependents: Vec<&String> = g
+            .iter()
+            .filter(|(_, d)| d.contains("rustynet-a"))
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(dependents, vec![&"rustynet-c".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
