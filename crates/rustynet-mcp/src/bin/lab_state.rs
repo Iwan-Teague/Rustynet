@@ -1501,6 +1501,121 @@ impl LabStateServer {
         }
         tool_success(&out)
     }
+
+    /// Live mid-run progress for a running job: elapsed, last-activity age (hang
+    /// detection), the latest log lines, and artifacts produced so far. Fills the
+    /// gap between start_live_lab_run and the end — stages.tsv isn't written until
+    /// finalize, so this reads the streaming combined log + report-dir mtimes.
+    fn get_run_progress(&self, args: Option<&Value>) -> ToolCallResult {
+        let job_id = arg_str(args, "job_id");
+        let rec = job_id.and_then(|j| self.read_job_record(j));
+        let report_dir = self.resolve_report_dir(args).ok();
+        if rec.is_none() && report_dir.is_none() {
+            return tool_error("Provide job_id or report_dir");
+        }
+        let mut out = String::from("# Run progress\n\n");
+
+        if let (Some(rec), Some(jid)) = (&rec, job_id) {
+            let pid = rec.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let created = rec
+                .get("created_unix")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let rd = report_dir.clone().unwrap_or_else(|| {
+                self.abs_path(rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or(""))
+            });
+            let state = self.job_state(jid, pid, &rd);
+            let elapsed = now_unix().saturating_sub(created);
+            out.push_str(&format!(
+                "- **job:** `{jid}`\n- **state:** {state}\n- **elapsed:** {}\n",
+                fmt_dur(elapsed)
+            ));
+
+            if let Some(log) = rec.get("log_path").and_then(|v| v.as_str()) {
+                let lp = Path::new(log);
+                if let Ok(meta) = std::fs::metadata(lp) {
+                    let age = mtime_age_secs(lp).unwrap_or(0);
+                    out.push_str(&format!(
+                        "- **log size:** {} bytes\n- **last activity:** {} ago\n",
+                        meta.len(),
+                        fmt_dur(age)
+                    ));
+                    if state == "running" && age > 600 {
+                        out.push_str(&format!(
+                            "- ⚠️ **possible hang:** no log output for {} (>10m). Inspect the tail below; if truly stuck, cancel_job then recover.\n",
+                            fmt_dur(age)
+                        ));
+                    }
+                }
+                if let Ok(body) = tail_file(lp, 200) {
+                    // Best-effort current stage: the last known stage token seen
+                    // in the tail (the verbatim lines below are authoritative).
+                    let mut current: Option<&str> = None;
+                    for line in body.lines() {
+                        let toks: Vec<String> = line
+                            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                            .map(|t| t.to_ascii_lowercase())
+                            .collect();
+                        for s in STAGE_INFO {
+                            // Match the stage name + only SPECIFIC aliases (>=8
+                            // chars). Short generic aliases like "ssh"/"install"/
+                            // "enforce" match unrelated log noise (e.g. "SSH allow
+                            // CIDRs") and would mislabel the stage.
+                            let hit = toks.iter().any(|t| t == s.name)
+                                || s.aliases
+                                    .iter()
+                                    .filter(|a| a.len() >= 8)
+                                    .any(|a| toks.iter().any(|t| t == a));
+                            if hit {
+                                current = Some(s.name);
+                            }
+                        }
+                    }
+                    if let Some(cs) = current {
+                        out.push_str(&format!("- **latest stage seen (heuristic):** {cs}\n"));
+                    }
+                    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+                    let start = lines.len().saturating_sub(12);
+                    out.push_str("\n## Latest log lines\n```\n");
+                    for l in &lines[start..] {
+                        out.push_str(l);
+                        out.push('\n');
+                    }
+                    out.push_str("```\n");
+                } else {
+                    out.push_str("\n_Log not readable yet (run may be starting up)._\n");
+                }
+            }
+        }
+
+        if let Some(rd) = &report_dir {
+            let mut files: Vec<(String, u64)> = Vec::new();
+            collect_files(rd, rd, &mut files, 0);
+            out.push_str(&format!(
+                "\n## Report dir\n- artifacts so far: {}\n",
+                files.len()
+            ));
+            let mut newest: Option<(String, u64)> = None;
+            for (rel, _) in &files {
+                if let Some(age) = mtime_age_secs(&rd.join(rel))
+                    && newest.as_ref().is_none_or(|(_, a)| age < *a)
+                {
+                    newest = Some((rel.clone(), age));
+                }
+            }
+            if let Some((rel, age)) = newest {
+                out.push_str(&format!(
+                    "- newest artifact: `{rel}` ({} ago)\n",
+                    fmt_dur(age)
+                ));
+            }
+        }
+
+        out.push_str(
+            "\nFull log: tail_job_log. Finished run: get_run_result. Stuck (no activity): cancel_job → recover.\n",
+        );
+        tool_success(&out)
+    }
 }
 
 fn now_unix() -> u64 {
@@ -1514,6 +1629,28 @@ fn now_unix() -> u64 {
 fn utmctl_path() -> String {
     std::env::var("RUSTYNET_UTMCTL_PATH")
         .unwrap_or_else(|_| "/Applications/UTM.app/Contents/MacOS/utmctl".to_string())
+}
+
+/// Human-friendly duration: `45s`, `12m3s`, `4h7m`.
+fn fmt_dur(secs: u64) -> String {
+    if secs < 90 {
+        format!("{secs}s")
+    } else if secs < 5400 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Seconds since a file was last modified (None if unreadable / clock skew).
+fn mtime_age_secs(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// True if a TCP connection to `ip:port` succeeds within `timeout`.
@@ -1722,8 +1859,11 @@ LOOP:
      coverage. Note the returned job_id + report_dir.
 3. WAIT until done (don't busy-poll)
    - wait_for_job(job_id) — blocks up to ~4 min and returns the instant the job
-     ends; call it in a loop. tail_job_log(job_id) any time for progress.
-     State resolves to passed / failed / ended.
+     ends; call it in a loop. State resolves to passed / failed / ended.
+   - get_run_progress(job_id) between waits for live mid-run visibility: elapsed,
+     last-activity age (flags a possible hang if no log output >10m), latest log
+     lines, artifacts so far. Use it to tell 'progressing' from 'stuck' over a
+     multi-hour run; tail_job_log(job_id) for the full log.
 4. CATCH BUGS (on failure)
    - get_run_result(job_id) → overall_result, first_failed_stage, per-OS/per-stage
      map, failure digest (stage / reason / message).
@@ -2040,6 +2180,17 @@ impl McpServer for LabStateServer {
                 input_schema: json_schema_object(
                     json!({"job_id": json_schema_string("Job id from start_live_lab_run")}),
                     vec!["job_id"],
+                ),
+            },
+            Tool {
+                name: "get_run_progress".into(),
+                description: "Live mid-run progress for a RUNNING job (the gap between start and finish): elapsed, last-activity age with a possible-hang flag (no log output >10m), best-effort current stage, the latest log lines, and how many report artifacts exist so far. Use it between wait_for_job calls to tell 'progressing' from 'hung' without scrolling the whole log. (stages.tsv isn't written until the run ends, so this reads the streaming log + report-dir mtimes.) Pass a job_id (or report_dir for artifacts only).".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "job_id": json_schema_string("Job id from start_live_lab_run"),
+                        "report_dir": json_schema_string("Report dir (alternative; artifacts only, no log/elapsed)"),
+                    }),
+                    vec![],
                 ),
             },
             Tool {
@@ -2492,6 +2643,7 @@ impl McpServer for LabStateServer {
 
             "start_live_lab_run" => self.start_live_lab_run(args),
             "get_job_status" => self.get_job_status(args),
+            "get_run_progress" => self.get_run_progress(args),
             "wait_for_job" => self.wait_for_job(args),
             "explain_stage" => explain_stage(arg_str(args, "stage").unwrap_or("")),
             "list_jobs" => self.list_jobs(),
@@ -3846,6 +3998,49 @@ mod tests {
             srv.write_loop_note(Some(&json!({"note":"  "}))).is_error,
             Some(true)
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fmt_dur_formats() {
+        assert_eq!(fmt_dur(45), "45s");
+        assert_eq!(fmt_dur(125), "2m5s");
+        assert_eq!(fmt_dur(7380), "2h3m");
+    }
+
+    #[test]
+    fn get_run_progress_reports_tail_and_artifacts() {
+        let tmp = std::env::temp_dir().join(format!("mcp-prog-{}", std::process::id()));
+        let report = tmp.join("rep");
+        std::fs::create_dir_all(report.join("logs")).unwrap();
+        std::fs::write(report.join("logs/x.log"), "stage out\n").unwrap();
+        let srv = test_server(&tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        let log = tmp.join("p1.log");
+        std::fs::write(&log, "bootstrap ok\n=== anchor ===\nssh peer ping\n").unwrap();
+        let rec = json!({
+            "job_id":"p1","report_dir":report.to_string_lossy(),
+            "pid":999_999_999u64,"log_path":log.to_string_lossy(),
+            "created_unix": now_unix().saturating_sub(7)
+        });
+        std::fs::write(
+            srv.job_record_path("p1"),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+        let t = srv.get_run_progress(Some(&json!({"job_id":"p1"}))).content[0]
+            .text
+            .clone();
+        assert!(t.contains("elapsed"), "got: {t}");
+        assert!(t.contains("Latest log lines"), "got: {t}");
+        assert!(t.contains("ssh peer ping"), "verbatim tail; got: {t}");
+        assert!(t.contains("anchor"), "heuristic stage token; got: {t}");
+        assert!(
+            t.contains("artifacts so far: 1"),
+            "report artifacts; got: {t}"
+        );
+        // neither job_id nor report_dir → error
+        assert_eq!(srv.get_run_progress(None).is_error, Some(true));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
