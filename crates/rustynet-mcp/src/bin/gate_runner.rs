@@ -25,6 +25,18 @@ fn main() {
     run_server(server);
 }
 
+/// Reject cargo flags in a `scope` that could turn a gate into arbitrary code
+/// execution (`--config` can set a custom runner) or redirect the build.
+/// Defense-in-depth: scope is a trusted-agent input, but the project forbids
+/// such surfaces on principle. Returns the first offending token, if any.
+fn unsafe_scope_token(scope: &str) -> Option<&str> {
+    scope.split_whitespace().find(|t| {
+        t.starts_with("--config")
+            || t.starts_with("--target-dir")
+            || t.starts_with("--manifest-path")
+    })
+}
+
 struct GateRunnerServer {
     repo_root: PathBuf,
 }
@@ -211,6 +223,11 @@ impl McpServer for GateRunnerServer {
                 } else {
                     String::new()
                 };
+                if let Some(bad) = unsafe_scope_token(&scope) {
+                    return tool_error(&format!(
+                        "Refusing scope token '{bad}': --config/--target-dir/--manifest-path are not allowed."
+                    ));
+                }
 
                 if changed_only && explicit_scope.is_empty() && scope.is_empty() {
                     return tool_success(
@@ -235,6 +252,11 @@ impl McpServer for GateRunnerServer {
                     .and_then(|a| a.get("scope"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("--workspace");
+                if let Some(bad) = unsafe_scope_token(scope) {
+                    return tool_error(&format!(
+                        "Refusing scope token '{bad}': --config/--target-dir/--manifest-path are not allowed."
+                    ));
+                }
 
                 let mut args = vec!["check"];
                 if scope == "--workspace" || scope.is_empty() {
@@ -255,6 +277,11 @@ impl McpServer for GateRunnerServer {
                     .and_then(|a| a.get("scope"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("--workspace");
+                if let Some(bad) = unsafe_scope_token(scope) {
+                    return tool_error(&format!(
+                        "Refusing scope token '{bad}': --config/--target-dir/--manifest-path are not allowed."
+                    ));
+                }
 
                 let mut args = vec!["clippy"];
                 if scope == "--workspace" || scope.is_empty() {
@@ -284,6 +311,11 @@ impl McpServer for GateRunnerServer {
                     .and_then(|a| a.get("nocapture"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                if let Some(bad) = unsafe_scope_token(scope) {
+                    return tool_error(&format!(
+                        "Refusing scope token '{bad}': --config/--target-dir/--manifest-path are not allowed."
+                    ));
+                }
 
                 let mut args = vec!["test"];
                 if scope == "--workspace" || scope.is_empty() {
@@ -445,6 +477,11 @@ impl McpServer for GateRunnerServer {
                     .and_then(|a| a.get("scope"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if let Some(bad) = unsafe_scope_token(scope) {
+                    return tool_error(&format!(
+                        "Refusing scope token '{bad}': --config/--target-dir/--manifest-path are not allowed."
+                    ));
+                }
 
                 let mut args = vec!["build"];
                 if release {
@@ -463,6 +500,25 @@ impl McpServer for GateRunnerServer {
     }
 }
 
-// ── Appended: run_build tool ─────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-// The tool definition is inserted into the tools() Vec. The handler is in call_tool.
+    #[test]
+    fn unsafe_scope_token_blocks_cargo_injection() {
+        assert!(unsafe_scope_token("-p rustynet-cli").is_none());
+        assert!(unsafe_scope_token("--workspace --all-features").is_none());
+        assert_eq!(
+            unsafe_scope_token("--config target.x.runner='sh -c id'"),
+            Some("--config")
+        );
+        assert_eq!(
+            unsafe_scope_token("-p a --target-dir /tmp/x"),
+            Some("--target-dir")
+        );
+        assert_eq!(
+            unsafe_scope_token("--manifest-path /evil/Cargo.toml"),
+            Some("--manifest-path")
+        );
+    }
+}

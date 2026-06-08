@@ -46,8 +46,9 @@ pub fn repo_root() -> PathBuf {
 
 pub const JSONRPC_VERSION: &str = "2.0";
 
-/// The MCP protocol version this server prefers to speak.
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// The MCP protocol version this server prefers to speak (newest we support;
+/// used as the fallback when a client requests an unknown version).
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// MCP protocol revisions this server is compatible with. During `initialize`
 /// the server echoes the client's requested version if it is in this set;
@@ -361,6 +362,33 @@ pub fn truncate_output(text: &str, max_lines: usize, max_bytes: usize) -> String
     out
 }
 
+/// Like [`truncate_output`] but keeps the END of the text. This is the right
+/// choice for cargo/test output: the verdict an agent needs (`error[...]`,
+/// `test result: FAILED`, panics, `failures:`) lands at the TAIL, while the head
+/// is just "Compiling ..." preamble. Head-truncating those would hide the bug.
+pub fn truncate_tail(text: &str, max_lines: usize, max_bytes: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let mut out = if total > max_lines {
+        let tail = lines[total - max_lines..].join("\n");
+        format!("... (truncated: showing last {max_lines} of {total} lines)\n{tail}")
+    } else {
+        text.to_string()
+    };
+    if out.len() > max_bytes {
+        // Keep the tail: drop from the front, on a UTF-8 char boundary.
+        let mut start = out.len() - max_bytes;
+        while start < out.len() && !out.is_char_boundary(start) {
+            start += 1;
+        }
+        out = format!(
+            "... (truncated: output exceeded byte limit)\n{}",
+            &out[start..]
+        );
+    }
+    out
+}
+
 // ── Bounded external command execution ───────────────────────────────
 
 /// Outcome of running an external command with a timeout watchdog.
@@ -473,18 +501,19 @@ pub fn outcome_to_result(title: &str, outcome: &CommandOutcome) -> ToolCallResul
             .unwrap_or_else(|| "killed".into())
     ));
 
+    // Tail-bias: cargo/test put the verdict + errors at the END.
     let stdout = outcome.stdout.trim();
     if !stdout.is_empty() {
         result.push_str(&format!(
             "### stdout\n```\n{}\n```\n\n",
-            truncate_output(stdout, 200, 60_000)
+            truncate_tail(stdout, 200, 60_000)
         ));
     }
     let stderr = outcome.stderr.trim();
     if !stderr.is_empty() {
         result.push_str(&format!(
             "### stderr\n```\n{}\n```\n\n",
-            truncate_output(stderr, 100, 40_000)
+            truncate_tail(stderr, 120, 40_000)
         ));
     }
 
@@ -684,10 +713,11 @@ fn negotiate_protocol_version(requested: Option<&str>) -> String {
 fn handle_request(server: &impl McpServer, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
     eprintln!("[rustynet-mcp] <- {} id={:?}", req.method, req.id);
 
-    // JSON-RPC notifications (no `id`) must never receive a response.
-    if req.id.is_none() && req.method != "initialize" {
-        return None;
-    }
+    // JSON-RPC notifications (no `id`) must never receive a response. A real
+    // client always sends `initialize` with an id; a no-id initialize is
+    // malformed and is correctly ignored here (avoids emitting an id-less
+    // response, which would itself violate JSON-RPC).
+    req.id.as_ref()?;
 
     match req.method.as_str() {
         "initialize" => {
@@ -1095,6 +1125,24 @@ mod tests {
         assert!(!tail.contains("line0\n"), "must not load the whole file");
         assert!(tail.len() < 5_000, "tail output must be small");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn truncate_tail_keeps_the_end() {
+        // The verdict an agent needs is at the END (cargo error / test result).
+        let mut s = String::new();
+        for i in 0..500 {
+            s.push_str(&format!("Compiling crate-{i}\n"));
+        }
+        s.push_str("error[E0599]: no method `foo`\ntest result: FAILED");
+        let capped = truncate_tail(&s, 5, 1_000_000);
+        assert!(capped.contains("test result: FAILED"), "must keep the tail");
+        assert!(capped.contains("error[E0599]"));
+        assert!(
+            !capped.contains("Compiling crate-0\n"),
+            "must drop the head"
+        );
+        assert!(capped.contains("truncated"));
     }
 
     #[test]

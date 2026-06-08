@@ -103,7 +103,7 @@ cat <<EOF
                                 support, crate structure, doc search/list/read).
   rustynet-mcp-gate-runner   —  9 tools (fmt/check/clippy/test/build, security audit,
                                 CI gate scripts) — all kill-on-timeout.
-  rustynet-mcp-lab-state     — 24 tools + overnight-loop prompt. UTM discovery/
+  rustynet-mcp-lab-state     — 25 tools + overnight-loop prompt. UTM discovery/
                                 inventory/restart/recover, sync/bootstrap/diagnostics,
                                 AND the autonomous overnight loop: async background
                                 live-lab runs (start_live_lab_run with auto-topology →

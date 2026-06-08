@@ -18,7 +18,7 @@
 use rustynet_mcp::{
     GetPromptResult, McpServer, Prompt, PromptArgument, ReadResourceResult, Resource,
     ResourceContent, ServerInfo, Tool, ToolCallResult, json_schema_object, json_schema_string,
-    prompt_text, run_server, tool_error, tool_success, truncate_output,
+    prompt_text, read_file_capped, run_server, tool_error, tool_success, truncate_output,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -324,9 +324,9 @@ impl RepoContextServer {
     }
 
     fn read_file(&self, relative_path: &str) -> Result<String, String> {
-        let full_path = self.repo_root.join(relative_path);
-        fs::read_to_string(&full_path)
-            .map_err(|e| format!("Cannot read '{}': {e}", full_path.display()))
+        // Cap reads so the full-tree search (find_in_docs/list_documents) can't be
+        // blown up by a stray huge file committed under documents/.
+        read_file_capped(&self.repo_root.join(relative_path), 8_000_000)
     }
 }
 

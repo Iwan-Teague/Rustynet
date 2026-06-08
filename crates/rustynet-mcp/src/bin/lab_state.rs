@@ -16,7 +16,7 @@ use rustynet_mcp::{
     CommandOutcome, GetPromptResult, McpServer, Prompt, PromptArgument, ServerInfo, Tool,
     ToolCallResult, json_schema_array_string, json_schema_boolean, json_schema_object,
     json_schema_string, prompt_text, read_file_capped, run_server, run_with_timeout, spawn_logged,
-    tail_file, text_content, tool_error, tool_success, truncate_output,
+    tail_file, text_content, tool_error, tool_success, truncate_output, truncate_tail,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -123,7 +123,10 @@ impl LabStateServer {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let seq = self.job_seq.fetch_add(1, Ordering::Relaxed);
-        format!("ll-{millis}-{seq}")
+        // Include the pid: each piped client request is a fresh server process
+        // whose job_seq restarts at 0, so without the pid two same-millisecond
+        // starts would collide and silently overwrite each other's record.
+        format!("ll-{millis}-{}-{seq}", std::process::id())
     }
 
     fn job_record_path(&self, job_id: &str) -> PathBuf {
@@ -184,16 +187,30 @@ impl LabStateServer {
                 "failed".into()
             };
         }
-        let running = match self.jobs.lock() {
-            Ok(mut jobs) => match jobs.get_mut(job_id) {
+        // Decide liveness WITHOUT holding the jobs lock across the (blocking)
+        // pid probe — otherwise list_jobs/prune_jobs would serialize every job op
+        // behind a `kill` subprocess. Recover a poisoned lock (into_inner) so a
+        // panic elsewhere can't permanently degrade job tracking.
+        enum Live {
+            Done,
+            Alive,
+            Unknown,
+        }
+        let live = {
+            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            match jobs.get_mut(job_id) {
                 Some(child) => match child.try_wait() {
-                    Ok(Some(_)) => false,
-                    Ok(None) => true,
-                    Err(_) => self.pid_alive(pid),
+                    Ok(Some(_)) => Live::Done,
+                    Ok(None) => Live::Alive,
+                    Err(_) => Live::Unknown,
                 },
-                None => self.pid_alive(pid),
-            },
-            Err(_) => self.pid_alive(pid),
+                None => Live::Unknown,
+            }
+        };
+        let running = match live {
+            Live::Alive => true,
+            Live::Done => false,
+            Live::Unknown => self.pid_alive(pid),
         };
         if running {
             "running".into()
@@ -247,6 +264,101 @@ impl LabStateServer {
                 .then(|| e.get("alias").and_then(|v| v.as_str()).map(String::from))
                 .flatten()
         })
+    }
+
+    /// Untracked files under `crates/` — these are NOT captured by working-tree
+    /// source deploy (`git stash create` only stashes tracked changes), so a
+    /// patch that adds a new file won't reach the VMs until it's `git add`ed.
+    fn untracked_crate_files(&self) -> Vec<String> {
+        match run_with_timeout(
+            "git",
+            &["status", "--porcelain", "--untracked-files=all"],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(30),
+        ) {
+            Ok(o) if o.success => o
+                .stdout
+                .lines()
+                .filter_map(|l| l.strip_prefix("?? "))
+                .filter(|p| p.starts_with("crates/"))
+                .take(20)
+                .map(String::from)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Secret-free topology digest + resolved auto-topology preview.
+    fn get_lab_topology(&self) -> ToolCallResult {
+        let s = match std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)) {
+            Ok(s) => s,
+            Err(e) => return tool_error(&format!("Cannot read inventory: {e}")),
+        };
+        let inv: Value = match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(e) => return tool_error(&format!("Invalid inventory JSON: {e}")),
+        };
+        let entries = inv
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut out = String::from(
+            "# Lab Topology\n\n| alias | platform | lab_role | exit | relay | in_all | mesh_ip |\n|---|---|---|---|---|---|---|\n",
+        );
+        let mut linux_roles: Vec<String> = Vec::new();
+        for e in &entries {
+            let g = |k: &str| e.get(k).and_then(|v| v.as_str()).unwrap_or("");
+            let b = |k: &str| match e.get(k).and_then(|v| v.as_bool()) {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "-",
+            };
+            let platform = if g("platform").is_empty() {
+                "linux"
+            } else {
+                g("platform")
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                g("alias"),
+                platform,
+                g("lab_role"),
+                b("exit_capable"),
+                b("relay_capable"),
+                b("include_in_all"),
+                g("mesh_ip"),
+            ));
+            if platform == "linux" && !g("alias").is_empty() && !g("lab_role").is_empty() {
+                linux_roles.push(format!("{}={}", g("alias"), g("lab_role")));
+            }
+        }
+
+        out.push_str("\n## Auto-topology (what start_live_lab_run uses with no VM flags)\n");
+        out.push_str(&format!(
+            "- windows_vm → {}\n",
+            self.inventory_alias_for_platform("windows")
+                .unwrap_or_else(|| "(none in inventory)".into())
+        ));
+        out.push_str(&format!(
+            "- macos_vm → {}\n",
+            self.inventory_alias_for_platform("macos")
+                .unwrap_or_else(|| "(none in inventory)".into())
+        ));
+        out.push_str(&format!(
+            "- linux nodes (by lab_role) → {}\n",
+            if linux_roles.is_empty() {
+                "(none tagged)".into()
+            } else {
+                linux_roles.join(", ")
+            }
+        ));
+        out.push_str(
+            "\nOverride any with start_live_lab_run's `nodes` ('alias:role') / windows_vm / macos_vm. Credentials are intentionally omitted here — use get_inventory for the raw record.\n",
+        );
+        tool_success(&out)
     }
 }
 
@@ -325,18 +437,19 @@ fn format_lab_outcome(title: &str, o: &CommandOutcome) -> ToolCallResult {
             .map(|c| c.to_string())
             .unwrap_or_else(|| "killed".into())
     ));
+    // Tail-bias: when a lab op's output overflows, the error/verdict is at the end.
     let stdout = o.stdout.trim();
     if !stdout.is_empty() {
         result.push_str(&format!(
             "```\n{}\n```\n",
-            truncate_output(stdout, 400, 100_000)
+            truncate_tail(stdout, 400, 100_000)
         ));
     }
     let stderr = o.stderr.trim();
     if !stderr.is_empty() {
         result.push_str(&format!(
             "### stderr\n```\n{}\n```\n",
-            truncate_output(stderr, 80, 40_000)
+            truncate_tail(stderr, 80, 40_000)
         ));
     }
     ToolCallResult {
@@ -508,7 +621,12 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "get_inventory".into(),
-                description: "Return the machine-readable VM inventory (aliases, IPs, roles, OS, capabilities).".into(),
+                description: "Return the raw machine-readable VM inventory JSON (aliases, IPs, roles, OS, capabilities — includes credentials). For a clean, secret-free topology digest prefer get_lab_topology.".into(),
+                input_schema: json_schema_object(json!({}), vec![]),
+            },
+            Tool {
+                name: "get_lab_topology".into(),
+                description: "Compact, secret-free per-node digest (alias, platform, lab_role, exit/relay-capable, include_in_all, mesh_ip) PLUS the resolved auto-topology — what start_live_lab_run will actually use for Windows/macOS/Linux if you pass no VM flags. Use this to plan a run.".into(),
                 input_schema: json_schema_object(json!({}), vec![]),
             },
             Tool {
@@ -574,15 +692,15 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "diagnose_live_lab_failure".into(),
-                description: "Deep triage of a failed run. `ops vm-lab-diagnose-live-lab-failure` (needs profile + report_dir from the failed run).".into(),
+                description: "Deep triage of a failed run. `ops vm-lab-diagnose-live-lab-failure`. Only report_dir is required — profile is auto-resolved from the run's matrix row (orchestrate runs generate it internally); pass profile only to override.".into(),
                 input_schema: json_schema_object(
                     json!({
-                        "profile": json_schema_string("Profile env file used by the failed run"),
-                        "report_dir": json_schema_string("Report directory of the failed run"),
+                        "report_dir": json_schema_string("Report directory of the failed run (from start_live_lab_run / get_job_status)"),
+                        "profile": json_schema_string("Optional: profile env file; auto-resolved from the report dir if omitted"),
                         "stage": json_schema_string("Optional stage to focus on"),
                         "collect_artifacts": json_schema_boolean("Collect per-VM artifacts (default: false)"),
                     }),
-                    vec!["profile", "report_dir"],
+                    vec!["report_dir"],
                 ),
             },
             // ── Async live-lab jobs ──
@@ -735,6 +853,8 @@ impl McpServer for LabStateServer {
                 }
                 self.run_ops("vm-lab-discover-local-utm", &extra, DISCOVERY_TIMEOUT_SECS)
             }
+
+            "get_lab_topology" => self.get_lab_topology(),
 
             "get_inventory" => {
                 let inv_path = self.repo_root.join(DEFAULT_INVENTORY);
@@ -919,13 +1039,29 @@ impl McpServer for LabStateServer {
             }
 
             "diagnose_live_lab_failure" => {
-                let profile = arg_str(args, "profile").unwrap_or("");
                 let report_dir_arg = arg_str(args, "report_dir").unwrap_or("");
-                if profile.is_empty() || report_dir_arg.is_empty() {
-                    return tool_error("Missing required parameters: profile and report_dir");
+                if report_dir_arg.is_empty() {
+                    return tool_error("Missing required parameter: report_dir");
+                }
+                // `profile` is optional: orchestrate runs generate it internally.
+                // Resolve it from the run's matrix row (profile_path) when omitted,
+                // so the result→deep-triage handoff isn't broken for orchestrate.
+                let profile_owned: String = match arg_str(args, "profile") {
+                    Some(p) if !p.is_empty() => p.to_string(),
+                    _ => self
+                        .read_matrix_row(&self.abs_path(report_dir_arg))
+                        .and_then(|row| row.get("profile_path").cloned())
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or_default(),
+                };
+                if profile_owned.is_empty() {
+                    return tool_error(
+                        "No 'profile' given and none recorded in the report dir's matrix row (profile_path); pass profile explicitly.",
+                    );
                 }
                 let report_dir = self.ensure_report_dir(report_dir_arg);
-                let mut extra: Vec<&str> = vec!["--profile", profile, "--report-dir", &report_dir];
+                let mut extra: Vec<&str> =
+                    vec!["--profile", &profile_owned, "--report-dir", &report_dir];
                 if let Some(stage) = arg_str(args, "stage") {
                     extra.push("--stage");
                     extra.push(stage);
@@ -1141,9 +1277,10 @@ impl LabStateServer {
         ) {
             Ok(child) => {
                 let pid = child.id();
-                if let Ok(mut jobs) = self.jobs.lock() {
-                    jobs.insert(job_id.clone(), child);
-                }
+                self.jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(job_id.clone(), child);
                 let rec = json!({
                     "job_id": job_id,
                     "mode": mode,
@@ -1154,8 +1291,26 @@ impl LabStateServer {
                     "created_unix": now_unix(),
                 });
                 let _ = self.write_job_record(&job_id, &rec);
+                // Warn if untracked crates/ files won't deploy (working-tree
+                // source captures TRACKED changes only) — else the run tests
+                // stale code and the agent gets a misleading "still failing".
+                let mut warn = String::new();
+                if source_mode == "working-tree" {
+                    let untracked = self.untracked_crate_files();
+                    if !untracked.is_empty() {
+                        warn = format!(
+                            "\n\n⚠️ **{} untracked file(s) under crates/ will NOT be deployed** (working-tree captures tracked changes only). `git add` them or this run builds stale code:\n{}",
+                            untracked.len(),
+                            untracked
+                                .iter()
+                                .map(|p| format!("- `{p}`"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        );
+                    }
+                }
                 tool_success(&format!(
-                    "# Started live-lab job\n\n- **job_id:** `{job_id}`\n- **mode:** {mode}\n- **report_dir:** `{report_dir}`\n- **pid:** {pid}\n- **log:** `{}`\n\nThis is async — poll `get_job_status(job_id=\"{job_id}\")` every ~5–10 min, `tail_job_log` for progress, `get_run_result` when done.",
+                    "# Started live-lab job\n\n- **job_id:** `{job_id}`\n- **mode:** {mode}\n- **report_dir:** `{report_dir}`\n- **pid:** {pid}\n- **log:** `{}`{warn}\n\nThis is async — poll `get_job_status(job_id=\"{job_id}\")` or `wait_for_job`, `tail_job_log` for progress, `get_run_result` when done.",
                     log_path.display()
                 ))
             }
@@ -1310,15 +1465,33 @@ impl LabStateServer {
             return tool_error(&format!("Unknown job_id: {job_id}"));
         };
         let pid = rec.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
-        let mut killed_handle = false;
-        if let Ok(mut jobs) = self.jobs.lock()
-            && let Some(mut child) = jobs.remove(job_id)
+        let report_dir =
+            self.abs_path(rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or(""));
+
+        // If we still hold the child handle, kill via it (no pid race at all).
+        if let Some(mut child) = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(job_id)
         {
             let _ = child.kill();
             let _ = child.wait();
-            killed_handle = true;
+            return tool_success(&format!(
+                "# Cancelled job {job_id}\n\nKilled via the live child handle (pid {pid}).\n"
+            ));
         }
-        if !killed_handle && pid != 0 {
+
+        // No handle (e.g. after a server reload). Only kill-by-pid if the job is
+        // STILL running — a finished job's pid may have been recycled by the OS,
+        // and signalling it would hit an unrelated process.
+        let state = self.job_state(job_id, pid, &report_dir);
+        if state != "running" {
+            return tool_success(&format!(
+                "# Job {job_id} not cancelled\n\nIt is already **{state}** — refusing to kill pid {pid} (it may have been recycled to another process).\n"
+            ));
+        }
+        if pid != 0 {
             let pid_s = pid.to_string();
             let _ = run_with_timeout(
                 "kill",
@@ -1336,7 +1509,7 @@ impl LabStateServer {
             );
         }
         tool_success(&format!(
-            "# Cancelled job {job_id}\n\nSent kill to pid {pid}.\n"
+            "# Cancelled job {job_id}\n\nSent kill to running pid {pid}.\n"
         ))
     }
 
@@ -1546,9 +1719,10 @@ impl LabStateServer {
                 skipped_running += 1;
                 continue;
             }
-            if let Ok(mut m) = self.jobs.lock() {
-                m.remove(&job_id);
-            }
+            self.jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&job_id);
             let _ = std::fs::remove_file(self.job_record_path(&job_id));
             if let Some(log) = rec.get("log_path").and_then(|v| v.as_str()) {
                 let _ = std::fs::remove_file(log);
@@ -1725,6 +1899,70 @@ static STAGE_INFO: &[StageInfo] = &[
             "bundle issuance failure",
         ],
     },
+    // ── Early stages (common first failure points) ──
+    StageInfo {
+        name: "preflight",
+        aliases: &[],
+        checks: "Local prerequisites on the host: cargo, ssh, git, utmctl present and the inventory readable.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/preflight.rs",
+        causes: &[
+            "a required local tool is missing (cargo/ssh/git/utmctl)",
+            "inventory file missing or unparseable",
+        ],
+    },
+    StageInfo {
+        name: "source_archive",
+        aliases: &[],
+        checks: "Tars the working tree (or HEAD, per source-mode) into the state archive that gets scp'd to each node.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/source_archive.rs",
+        causes: &[
+            "`git stash create` / `git archive` failed (not a git repo, or a huge untracked tree)",
+            "NOTE: source-mode=working-tree captures only TRACKED changes — `git add` new files or they won't deploy",
+        ],
+    },
+    StageInfo {
+        name: "verify_ssh",
+        aliases: &["ssh"],
+        checks: "Confirms SSH reachability to each selected node before doing any work.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/verify_ssh.rs",
+        causes: &[
+            "a VM is powered off or on the wrong (non-bridged) network → unreachable",
+            "VM alive but SSH closed behind a stale nft killswitch → run recover_stuck_vms",
+            "stale inventory IP → run update_inventory; then ensure_lab_ready",
+        ],
+    },
+    StageInfo {
+        name: "collect_pubkeys",
+        aliases: &[],
+        checks: "SSHes each peer and reads its WireGuard public key (needed before membership_init).",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/collect_pubkeys.rs",
+        causes: &[
+            "WireGuard not installed / interface not up on a node",
+            "the daemon hasn't generated a key yet (bootstrap incomplete)",
+            "SSH dropped mid-run (see verify_ssh causes)",
+        ],
+    },
+    StageInfo {
+        name: "enforce_runtime",
+        aliases: &["enforce"],
+        checks: "Starts the daemon on each peer so it ingests the distributed signed state.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/enforce_runtime.rs",
+        causes: &[
+            "daemon fails to start / crashes on boot (check the node's daemon log)",
+            "service unit not installed (bootstrap/install didn't complete)",
+            "fail-closed: missing/invalid signed state so the daemon refuses to serve",
+        ],
+    },
+    StageInfo {
+        name: "active_exit",
+        aliases: &["exit_route_advertise"],
+        checks: "Windows active-exit promotion: advertises the default route and verifies egress through the exit.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/active_exit.rs",
+        causes: &[
+            "Windows exit is fail-closed pending WinNAT/HNS live evidence (expected until promoted)",
+            "route advertisement / NAT setup failed on the exit",
+        ],
+    },
 ];
 
 // `aliases` are &'static str but `norm` is borrowed from a local, so
@@ -1888,6 +2126,54 @@ mod tests {
                 .text
                 .contains("Unknown stage")
         );
+    }
+
+    #[test]
+    fn explain_stage_covers_early_failure_stages() {
+        for s in [
+            "verify_ssh",
+            "preflight",
+            "source_archive",
+            "collect_pubkeys",
+            "enforce_runtime",
+            "active_exit",
+        ] {
+            let txt = explain_stage(s).content[0].text.clone();
+            assert!(
+                txt.starts_with("# Stage:"),
+                "{s} should resolve, got: {txt}"
+            );
+        }
+        // verify_ssh must point the agent at recovery.
+        assert!(
+            explain_stage("verify_ssh").content[0]
+                .text
+                .contains("recover_stuck_vms")
+        );
+    }
+
+    #[test]
+    fn get_lab_topology_digest_and_resolution() {
+        let tmp = std::env::temp_dir().join(format!("mcp-topo-{}", std::process::id()));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1","lab_role":"exit","exit_capable":true,"ssh_password":"tempo"},{"alias":"win-1","platform":"windows"},{"alias":"mac-1","platform":"macos"}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let txt = srv.get_lab_topology().content[0].text.clone();
+        assert!(txt.contains("deb-1") && txt.contains("win-1") && txt.contains("mac-1"));
+        assert!(txt.contains("windows_vm → win-1"));
+        assert!(txt.contains("macos_vm → mac-1"));
+        assert!(txt.contains("deb-1=exit"));
+        // secret-free: the raw ssh_password must NOT appear.
+        assert!(
+            !txt.contains("tempo"),
+            "topology digest must not leak credentials"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
