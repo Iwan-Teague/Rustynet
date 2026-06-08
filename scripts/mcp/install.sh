@@ -103,7 +103,7 @@ cat <<EOF
                                 support, crate structure, doc search/list/read).
   rustynet-mcp-gate-runner   —  9 tools (fmt/check/clippy/test/build, security audit,
                                 CI gate scripts) — all kill-on-timeout.
-  rustynet-mcp-lab-state     — 40 tools + overnight-loop prompt. UTM discovery/
+  rustynet-mcp-lab-state     — 41 tools + overnight-loop prompt. UTM discovery/
                                 inventory/restart/recover, power on/off + state, host disk,
                                 out-of-band guest net diagnostics (get_vm_network_info),
                                 one-call readiness (preflight_check), deploy preview
