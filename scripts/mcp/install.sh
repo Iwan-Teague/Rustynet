@@ -106,7 +106,7 @@ cat <<EOF
                                 run_security_gates bundled security suite, categorized
                                 CI gate scripts + run_gate_scripts batch) — all
                                 kill-on-timeout.
-  rustynet-mcp-lab-state     — 41 tools + overnight-loop prompt. UTM discovery/
+  rustynet-mcp-lab-state     — 42 tools + overnight-loop prompt. UTM discovery/
                                 inventory/restart/recover, power on/off + state, host disk,
                                 out-of-band guest net diagnostics (get_vm_network_info),
                                 one-call readiness (preflight_check), deploy preview
