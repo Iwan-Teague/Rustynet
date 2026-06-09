@@ -867,6 +867,167 @@ impl LabStateServer {
         tool_success(&out)
     }
 
+    /// Coverage-driven work finder: aggregate every per-OS-stage and cross-OS
+    /// cell DOWN the whole run-matrix history and surface what still needs to be
+    /// proven green — regressed, never-passed, never-run, stale-green — so an
+    /// agent can be handed a target instead of hunting for work.
+    fn find_untested_work(&self, args: Option<&Value>) -> ToolCallResult {
+        let os_filter = arg_str(args, "os").map(|s| s.to_ascii_lowercase());
+        let include_green = arg_bool(args, "include_green");
+        let path = self
+            .repo_root
+            .join("documents/operations/live_lab_run_matrix.csv");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => return tool_error(&format!("Cannot read run matrix: {e}")),
+        };
+        let mut lines = content.lines();
+        let Some(header_line) = lines.next() else {
+            return tool_success("# Untested work\n\nMatrix is empty.\n");
+        };
+        let header = split_csv_line(header_line);
+        let run_idx = header.iter().position(|h| h == "run_id");
+        // Coverage cells = per-OS stage columns + cross-OS scenario columns.
+        let cols: Vec<(usize, String)> = header
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.contains("_stage_") || h.starts_with("cross_os_"))
+            .map(|(i, h)| (i, h.clone()))
+            .collect();
+        let rows: Vec<Vec<String>> = lines
+            .filter(|l| !l.trim().is_empty())
+            .map(split_csv_line)
+            .collect();
+        if rows.is_empty() {
+            return tool_success("# Untested work\n\nNo data rows in the matrix yet.\n");
+        }
+        let total = rows.len();
+        let stale_window = 15usize;
+
+        let (mut regressed, mut never_passed, mut never_run, mut stale_green) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut green = 0u32;
+
+        for (idx, name) in &cols {
+            if let Some(f) = &os_filter {
+                let belongs = if f == "cross" {
+                    name.starts_with("cross_os_")
+                } else {
+                    name.starts_with(&format!("{f}_"))
+                };
+                if !belongs {
+                    continue;
+                }
+            }
+            let (mut passes, mut fails) = (0u32, 0u32);
+            let mut last_status: Option<&str> = None;
+            let mut last_run = String::new();
+            let mut last_idx = 0usize;
+            for (ri, row) in rows.iter().enumerate() {
+                let v = row.get(*idx).map(|s| s.trim()).unwrap_or("");
+                if v == "pass" || v == "fail" {
+                    if v == "pass" {
+                        passes += 1;
+                    } else {
+                        fails += 1;
+                    }
+                    last_status = Some(if v == "pass" { "pass" } else { "fail" });
+                    last_run = run_idx
+                        .and_then(|j| row.get(j))
+                        .cloned()
+                        .unwrap_or_default();
+                    last_idx = ri;
+                }
+            }
+            let entry = format!(
+                "`{name}` — {passes} pass / {fails} fail{}",
+                if last_run.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (last: {last_run})")
+                }
+            );
+            match last_status {
+                None => never_run.push(format!("`{name}`")),
+                Some("fail") => {
+                    if passes > 0 {
+                        regressed.push(entry);
+                    } else {
+                        never_passed.push(entry);
+                    }
+                }
+                Some(_) => {
+                    if last_idx + stale_window < total {
+                        stale_green.push(entry);
+                    } else {
+                        green += 1;
+                    }
+                }
+            }
+        }
+
+        let mut out = format!(
+            "# Untested / failing work ({total} runs analyzed{})\n\n",
+            os_filter
+                .as_ref()
+                .map(|f| format!(", os={f}"))
+                .unwrap_or_default()
+        );
+        let mut section = |title: &str, items: &[String], hint: &str| {
+            out.push_str(&format!("## {title} ({}){hint}\n", items.len()));
+            if items.is_empty() {
+                out.push_str("- (none)\n");
+            }
+            for it in items {
+                out.push_str(&format!("- {it}\n"));
+            }
+            out.push('\n');
+        };
+        section(
+            "🔴 REGRESSED — passed before, latest run FAILED",
+            &regressed,
+            " — fix these first",
+        );
+        section(
+            "🟠 NEVER PASSED — only ever failed",
+            &never_passed,
+            " — unproven, needs a working impl",
+        );
+        section(
+            "⚪ NEVER RUN — no pass/fail on record",
+            &never_run,
+            " — untested; some are unsupported-by-design (check get_platform_support before targeting)",
+        );
+        section(
+            "🟡 STALE GREEN — passed only in older runs",
+            &stale_green,
+            " — re-verify they still hold",
+        );
+        if include_green {
+            out.push_str(&format!("## 🟢 GREEN (current): {green}\n\n"));
+        } else {
+            out.push_str(&format!(
+                "_{green} cell(s) currently green — pass include_green=true to list them._\n\n"
+            ));
+        }
+        let next = regressed
+            .first()
+            .or(never_passed.first())
+            .or(stale_green.first());
+        if let Some(n) = next {
+            out.push_str(&format!(
+                "**Suggested next target:** {n}\nStrip the `<os>_stage_` / `cross_os_` prefix → explain_stage on that stage for the owning file + causes, then drive a focused run (start_live_lab_run with the relevant role topology). Record the attempt with write_loop_note.\n"
+            ));
+        } else if !never_run.is_empty() {
+            out.push_str(
+                "**Suggested next target:** pick a NEVER-RUN cell that IS supported on its platform (get_platform_support) and prove it green.\n",
+            );
+        } else {
+            out.push_str("**Everything covered is green.** Consider a fresh full-matrix run to catch regressions.\n");
+        }
+        tool_success(&out)
+    }
+
     /// Case-insensitive substring search across every file in a run's report dir.
     fn grep_report(&self, args: Option<&Value>) -> ToolCallResult {
         let report_dir = match self.resolve_report_dir(args) {
@@ -1901,6 +2062,13 @@ LOOP:
      patching that stage), MOVING (each fix advanced the run), or two greens =
      done. get_run_matrix for the full per-stage CSV when you need detail.
 
+PICKING WORK (when there's no active failure to chase)
+   - find_untested_work → a prioritized queue from the whole matrix history:
+     REGRESSED (passed before, now failing) → NEVER-PASSED → STALE-GREEN →
+     NEVER-RUN (check get_platform_support — some are unsupported-by-design).
+     Take the suggested target, explain_stage it, drive a focused run. This is
+     how you make forward progress without a human handing you a task.
+
 RULES
 - One root-cause fix per iteration; re-verify before moving on.
 - JOURNAL every iteration: write_loop_note (iteration #, hypothesis, patch, result)
@@ -2312,6 +2480,17 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "find_untested_work".into(),
+                description: "Coverage-driven WORK FINDER: aggregates every per-OS-stage and cross-OS cell DOWN the whole run-matrix history → a prioritized queue of what still needs proving green: 🔴 REGRESSED (passed before, latest fail), 🟠 NEVER-PASSED (only ever failed), ⚪ NEVER-RUN (untested; some unsupported-by-design), 🟡 STALE-GREEN (passed only in old runs). Hands the agent a target instead of making it hunt. Filter by os (linux|macos|windows|cross); include_green lists currently-green cells. Pair with explain_stage + get_platform_support.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "os": json_schema_string("Filter to one OS: linux | macos | windows | cross (cross-OS scenarios)"),
+                        "include_green": json_schema_boolean("Also list currently-green cells (default: false)"),
+                    }),
+                    vec![],
+                ),
+            },
+            Tool {
                 name: "diff_runs".into(),
                 description: "Diff two runs' per-stage outcomes — which stages flipped pass↔fail/rc and the first divergent stage — so you can tell whether a patch HELPED or REGRESSED. Pass old + new as report dirs or job_ids (old_report_dir|old_job_id, new_report_dir|new_job_id). Both runs need state/stages.tsv. The direct answer after a re-verify run.".into(),
                 input_schema: json_schema_object(
@@ -2655,6 +2834,7 @@ impl McpServer for LabStateServer {
             "grep_report" => self.grep_report(args),
             "get_stage_log" => self.get_stage_log(args),
             "get_run_trend" => self.get_run_trend(args),
+            "find_untested_work" => self.find_untested_work(args),
             "diff_runs" => self.diff_runs(args),
             "what_will_deploy" => self.what_will_deploy(args),
             "preflight_check" => self.preflight_check(),
@@ -4041,6 +4221,56 @@ mod tests {
         );
         // neither job_id nor report_dir → error
         assert_eq!(srv.get_run_progress(None).is_error, Some(true));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn find_untested_work_classifies_coverage() {
+        let tmp = std::env::temp_dir().join(format!("mcp-untested-{}", std::process::id()));
+        let dir = tmp.join("documents/operations");
+        std::fs::create_dir_all(&dir).unwrap();
+        // a=pass→fail (regressed), b=fail,fail (never passed), c=not_run (never run),
+        // cross_os_x=pass,pass (green).
+        let csv = "run_id,linux_stage_a,linux_stage_b,linux_stage_c,cross_os_x\n\
+                   r1,pass,fail,not_run,pass\n\
+                   r2,fail,fail,not_run,pass\n";
+        std::fs::write(dir.join("live_lab_run_matrix.csv"), csv).unwrap();
+        let srv = test_server(&tmp);
+        let t = srv.find_untested_work(None).content[0].text.clone();
+        // regressed section names a; never-passed names b; never-run names c.
+        let regressed = t.split("NEVER PASSED").next().unwrap_or("");
+        assert!(
+            regressed.contains("linux_stage_a"),
+            "a should be REGRESSED; got: {t}"
+        );
+        assert!(
+            t.contains("linux_stage_b"),
+            "b should appear (never passed); got: {t}"
+        );
+        let after_never_passed = t.split("NEVER PASSED").nth(1).unwrap_or("");
+        assert!(
+            after_never_passed.contains("linux_stage_b"),
+            "b under NEVER PASSED; got: {t}"
+        );
+        assert!(
+            t.contains("linux_stage_c"),
+            "c should appear (never run); got: {t}"
+        );
+        // cross_os_x is green → not listed unless include_green.
+        assert!(
+            !t.contains("cross_os_x"),
+            "green cell hidden by default; got: {t}"
+        );
+        // os filter
+        let macos = srv
+            .find_untested_work(Some(&json!({"os": "macos"})))
+            .content[0]
+            .text
+            .clone();
+        assert!(
+            !macos.contains("linux_stage_a"),
+            "os=macos excludes linux cells; got: {macos}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
