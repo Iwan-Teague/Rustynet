@@ -26,6 +26,70 @@ use live_lab_support::{
 
 const ROLE_SWITCH_ROUTE_CONVERGENCE_TIMEOUT_SECS: u64 = 20;
 
+/// Extract the value of a `KEY="value"` line from a refresh/issuance env body.
+fn env_file_value(content: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=\"");
+    content.lines().find_map(|line| {
+        line.strip_prefix(prefix.as_str())
+            .and_then(|rest| rest.strip_suffix('"'))
+            .map(ToString::to_string)
+    })
+}
+
+/// Build the blind_exit variant of a Linux node's assignment-refresh env:
+/// swap in the serving-blind_exit NODES/ALLOW specs and drop the
+/// exit-consumer line (a blind_exit node must not consume an exit), while
+/// preserving every node-specific line (signing-secret paths, TTLs)
+/// verbatim. `install-systemd enforce` re-mints the assignment from this env
+/// — not from the installed bundle — so the env itself must carry the
+/// blind_exit intent for the enforce to survive the daemon's role/intent
+/// alignment gate.
+fn build_blind_exit_refresh_env(original: &str, nodes_spec: &str, allow_spec: &str) -> String {
+    let mut out = String::new();
+    for line in original.lines() {
+        if line.starts_with("RUSTYNET_ASSIGNMENT_NODES=") {
+            out.push_str(&format!("RUSTYNET_ASSIGNMENT_NODES=\"{nodes_spec}\"\n"));
+        } else if line.starts_with("RUSTYNET_ASSIGNMENT_ALLOW=") {
+            out.push_str(&format!("RUSTYNET_ASSIGNMENT_ALLOW=\"{allow_spec}\"\n"));
+        } else if line.starts_with("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=") {
+            // dropped: blind_exit cannot consume a selected exit node
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Install an assignment-refresh env body onto a Linux node, mirroring
+/// live_lab_install_assignment_refresh_env's ownership and modes.
+fn install_linux_refresh_env(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    workspace_dir: &Path,
+    body: &str,
+    label: &str,
+) -> Result<(), String> {
+    let local = workspace_dir.join(format!("refresh-env-{label}-{}.env", unix_now()));
+    write_file(local.as_path(), body)?;
+    scp_to(
+        identity,
+        known_hosts,
+        local.as_path(),
+        host,
+        "/tmp/rn-roleswitch-refresh.env",
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        host,
+        "install -d -m 0750 -o root -g rustynetd /etc/rustynet \
+         && install -m 0600 -o root -g root /tmp/rn-roleswitch-refresh.env /etc/rustynet/assignment-refresh.env \
+         && rm -f /tmp/rn-roleswitch-refresh.env",
+    )
+}
+
 fn daemon_socket_for_platform(platform: &str) -> &'static str {
     daemon_socket_path_for_platform(platform)
 }
@@ -109,6 +173,14 @@ struct ClientRoleContext<'a> {
     ssh_allow_cidrs: &'a str,
     workspace_dir: &'a Path,
     signed_state_refresh: Option<&'a SignedStateRefreshContext>,
+    /// Reinstall the freshly minted baseline assignment bundle onto the host
+    /// during the restore-to-client refresh. Only the blind_exit leg sets
+    /// this: its serving-blind_exit bundle carries no exit-consumer
+    /// assignment, so without the baseline reinstall the post-restore
+    /// exit-route convergence wait can never succeed. Other legs must NOT
+    /// reinstall — their hosts may hold richer bundles (e.g. the
+    /// upgrade-admin anchor bundle) that the baseline intent would clobber.
+    reinstall_assignment_on_restore: bool,
 }
 
 fn main() {
@@ -562,12 +634,84 @@ fn process_host(
             ssh_allow_cidrs: context.ssh_allow_cidrs,
             workspace_dir: context.workspace_dir,
             signed_state_refresh: context.signed_state_refresh,
+            reinstall_assignment_on_restore: false,
         };
         let baseline = ensure_client_role(&mut client_role)?;
         let baseline_exit = field_value(&baseline, "exit_node");
         (baseline, baseline_exit)
     };
 
+    // A blind_exit enforce re-mints the assignment from the node-local
+    // refresh env (NOT from the installed bundle — proven live: a
+    // pre-installed serving-blind_exit bundle was still denied), so the env
+    // itself must carry the blind_exit intent before switch_role runs. Swap
+    // the Linux node's refresh env for a blind_exit variant (backed up and
+    // restored after the leg) and pre-install the matching bundle, which is
+    // also valid under the still-client role (capability superset, no exit
+    // consumer).
+    let mut refresh_env_backup: Option<String> = None;
+    if spec.temp_role == "blind_exit"
+        && let Some(refresh) = context.signed_state_refresh
+    {
+        if spec.platform != "macos" {
+            let special_env_path = refresh
+                .aux_blind_exit_assignment_env_file
+                .as_ref()
+                .ok_or_else(|| {
+                    "role-switch: blind_exit leg requires the aux blind-exit assignment env"
+                        .to_owned()
+                })?;
+            let special = fs::read_to_string(special_env_path).map_err(|err| {
+                format!(
+                    "read aux blind-exit assignment env failed ({}): {err}",
+                    special_env_path.display()
+                )
+            })?;
+            let nodes_spec = env_file_value(&special, "NODES_SPEC")
+                .ok_or_else(|| "aux blind-exit assignment env is missing NODES_SPEC".to_owned())?;
+            let allow_spec = env_file_value(&special, "ALLOW_SPEC")
+                .ok_or_else(|| "aux blind-exit assignment env is missing ALLOW_SPEC".to_owned())?;
+            let env_path = assignment_refresh_env_path_for_platform(spec.platform);
+            let original = capture_root(
+                context.identity,
+                context.known_hosts,
+                spec.host,
+                format!("cat {env_path}").as_str(),
+            )?;
+            let blind_exit_env = build_blind_exit_refresh_env(&original, &nodes_spec, &allow_spec);
+            context.logger.line(
+                format!(
+                    "[role-switch] swap assignment-refresh env to blind_exit intent on {} ({})",
+                    spec.node_id, spec.host
+                )
+                .as_str(),
+            )?;
+            install_linux_refresh_env(
+                context.identity,
+                context.known_hosts,
+                spec.host,
+                context.workspace_dir,
+                blind_exit_env.as_str(),
+                "blind-exit",
+            )?;
+            refresh_env_backup = Some(original);
+        }
+        refresh_signed_state_for_transition(
+            context.logger,
+            context.identity,
+            context.known_hosts,
+            context.workspace_dir,
+            refresh,
+            spec.host,
+            spec.temp_role,
+            true,
+            format!(
+                "before enforcing blind_exit on {} ({})",
+                spec.node_id, spec.host
+            )
+            .as_str(),
+        )?;
+    }
     switch_role(
         context.identity,
         context.known_hosts,
@@ -586,6 +730,7 @@ fn process_host(
             refresh,
             spec.host,
             spec.temp_role,
+            spec.temp_role == "blind_exit",
             format!(
                 "before waiting for {} to settle as {}",
                 spec.node_id, spec.temp_role
@@ -639,6 +784,27 @@ fn process_host(
         least_privilege_preserved = "pass";
     }
 
+    // Put the baseline refresh env back BEFORE the restore-to-client enforce
+    // so it re-mints the baseline (exit-consuming) intent. The blind_exit
+    // bundle still installed at this moment is also valid under client role,
+    // so the ordering has no denied window.
+    if let Some(original) = refresh_env_backup.as_deref() {
+        context.logger.line(
+            format!(
+                "[role-switch] restore baseline assignment-refresh env on {} ({})",
+                spec.node_id, spec.host
+            )
+            .as_str(),
+        )?;
+        install_linux_refresh_env(
+            context.identity,
+            context.known_hosts,
+            spec.host,
+            context.workspace_dir,
+            original,
+            "baseline-restore",
+        )?;
+    }
     let mut restore_context = ClientRoleContext {
         logger: &mut *context.logger,
         identity: context.identity,
@@ -649,6 +815,7 @@ fn process_host(
         ssh_allow_cidrs: context.ssh_allow_cidrs,
         workspace_dir: context.workspace_dir,
         signed_state_refresh: context.signed_state_refresh,
+        reinstall_assignment_on_restore: spec.temp_role == "blind_exit",
     };
     let after_restore =
         ensure_client_role_with_expected_exit(&mut restore_context, Some(&baseline_exit))?;
@@ -829,6 +996,7 @@ fn ensure_client_role_with_expected_exit(
             refresh,
             context.host,
             "client",
+            context.reinstall_assignment_on_restore,
             format!("before restoring {} to client", context.node_id).as_str(),
         )?;
     }
@@ -867,6 +1035,7 @@ fn refresh_signed_state_for_transition(
     refresh: &SignedStateRefreshContext,
     target_host: &str,
     target_role: &str,
+    reinstall_switch_target_assignment: bool,
     reason: &str,
 ) -> Result<(), String> {
     refresh_traversal_bundles_for_transition(
@@ -878,7 +1047,7 @@ fn refresh_signed_state_for_transition(
         reason,
     )?;
     refresh_dns_zone_bundles_for_transition(identity, known_hosts, workspace_dir, refresh)?;
-    refresh_assignment_bundles_for_macos_targets(
+    refresh_assignment_bundles_for_transition(
         logger,
         identity,
         known_hosts,
@@ -886,6 +1055,7 @@ fn refresh_signed_state_for_transition(
         refresh,
         target_host,
         target_role,
+        reinstall_switch_target_assignment,
         reason,
     )?;
     for target in &refresh.targets {
@@ -1029,20 +1199,27 @@ fn refresh_traversal_bundles_for_transition(
     Ok(())
 }
 
-/// Re-mint and reinstall the auto-tunnel assignment bundle for every
-/// macOS target from the exit node (the sole authoritative assignment
-/// signer) so the bundle's `generated_at` stays inside the daemon's
-/// auto-tunnel max-age window before the per-target `state refresh`.
+/// Re-mint and reinstall the auto-tunnel assignment bundle from the exit
+/// node (the sole authoritative assignment signer) for every macOS target
+/// and for the transition's own switch target.
 ///
-/// Linux targets self-refresh via the `rustynetd-assignment-refresh`
-/// systemd timer, so their bundles never age out mid-transition. macOS
-/// has no such service and never holds the assignment signing secret,
-/// so without this external re-issue the macOS bundle ages past the
-/// freshness bound and `state refresh` fails closed with "auto-tunnel
-/// bundle is stale". Keeping the signer on the exit preserves
-/// least-privilege: the macOS blind_exit node gains no signing power.
+/// macOS targets need this on every transition: they have no local
+/// assignment-refresh service and never hold the signing secret, so without
+/// the external re-issue the bundle ages past the freshness bound and
+/// `state refresh` fails closed with "auto-tunnel bundle is stale".
+///
+/// The switch target needs it (on any platform) because the BASELINE
+/// assignment intent cannot express every role: a `blind_exit` transition
+/// requires a bundle that grants blind_exit in its intent and carries no
+/// exit-consumer assignment, which only the serving-blind_exit issuance env
+/// provides — the node's installed bundle and (on Linux) its self-refresh
+/// env both carry the baseline client intent, so enforcing blind_exit
+/// against them is denied by the daemon's role/intent alignment gate.
+/// Restoring to client afterwards re-issues the baseline intent the same
+/// way. Keeping the signer on the exit preserves least-privilege: the
+/// switch target gains no signing power.
 #[allow(clippy::too_many_arguments)]
-fn refresh_assignment_bundles_for_macos_targets(
+fn refresh_assignment_bundles_for_transition(
     logger: &mut Logger,
     identity: &Path,
     known_hosts: &Path,
@@ -1050,31 +1227,38 @@ fn refresh_assignment_bundles_for_macos_targets(
     refresh: &SignedStateRefreshContext,
     target_host: &str,
     target_role: &str,
+    reinstall_switch_target_assignment: bool,
     reason: &str,
 ) -> Result<(), String> {
-    if !refresh
+    // A blind_exit transition must use the serving-blind_exit env regardless
+    // of the target platform; everything else re-issues the baseline intent.
+    let switching_to_blind_exit = target_role == "blind_exit";
+    // Install onto the (Linux) switch target ONLY for the blind_exit leg and
+    // its restore: other legs' hosts may hold richer bundles (e.g. the
+    // upgrade-admin anchor bundle) that the baseline intent would clobber —
+    // observed as "intent lacks required local capability anchor" when the
+    // admin leg's bundle was overwritten.
+    let install_on_switch_target = switching_to_blind_exit || reinstall_switch_target_assignment;
+    let switch_target = refresh
         .targets
         .iter()
-        .any(|target| target.platform == "macos")
-    {
+        .find(|target| target.host == target_host);
+    let has_macos_target = refresh
+        .targets
+        .iter()
+        .any(|target| target.platform == "macos");
+    let linux_switch_target = switch_target
+        .filter(|target| target.platform == "linux" || target.platform.is_empty())
+        .filter(|_| install_on_switch_target);
+    if !has_macos_target && linux_switch_target.is_none() {
         return Ok(());
     }
-    // When the transition enforces blind_exit on the macOS target itself, the
-    // bundle must grant blind_exit in its intent and must NOT assign it an exit
-    // to consume (a blind_exit node cannot consume exit traffic). Use the
-    // serving-blind_exit env in that case; otherwise re-issue the baseline
-    // (client) assignment to keep the mac fresh.
-    let macos_switching_to_blind_exit = target_role == "blind_exit"
-        && refresh
-            .targets
-            .iter()
-            .any(|target| target.platform == "macos" && target.host == target_host);
-    let assignment_env_file = if macos_switching_to_blind_exit {
+    let assignment_env_file = if switching_to_blind_exit {
         match refresh.aux_blind_exit_assignment_env_file.as_ref() {
             Some(path) => path,
             None => {
                 return Err(
-                    "role-switch: macOS target is switching to blind_exit but no aux blind-exit assignment env was provided"
+                    "role-switch: target is switching to blind_exit but no aux blind-exit assignment env was provided"
                         .to_owned(),
                 );
             }
@@ -1139,11 +1323,10 @@ fn refresh_assignment_bundles_for_macos_targets(
         verifier_key.as_path(),
     )?;
 
-    for target in refresh
-        .targets
-        .iter()
-        .filter(|target| target.platform == "macos")
-    {
+    for target in refresh.targets.iter().filter(|target| {
+        target.platform == "macos"
+            || linux_switch_target.is_some_and(|switch| switch.host == target.host)
+    }) {
         let bundle = issue_dir.join(format!("rn-assignment-{}.assignment", target.node_id));
         capture_root_file_to_path(
             identity,
@@ -1169,15 +1352,32 @@ fn refresh_assignment_bundles_for_macos_targets(
             target.host.as_str(),
             "/tmp/rn-assignment.bundle",
         )?;
-        run_root(
-            identity,
-            known_hosts,
-            target.host.as_str(),
-            "mkdir -p /usr/local/var/rustynet/trust \
-             && install -m 0644 /tmp/rn-assignment.pub /usr/local/var/rustynet/trust/assignment.pub \
-             && install -m 0640 /tmp/rn-assignment.bundle /usr/local/var/rustynet/trust/rustynetd.assignment \
-             && rm -f /usr/local/var/rustynet/trust/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle",
-        )?;
+        if target.platform == "macos" {
+            run_root(
+                identity,
+                known_hosts,
+                target.host.as_str(),
+                "mkdir -p /usr/local/var/rustynet/trust \
+                 && install -m 0644 /tmp/rn-assignment.pub /usr/local/var/rustynet/trust/assignment.pub \
+                 && install -m 0640 /tmp/rn-assignment.bundle /usr/local/var/rustynet/trust/rustynetd.assignment \
+                 && rm -f /usr/local/var/rustynet/trust/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle",
+            )?;
+        } else {
+            // Linux paths mirror live_lab_install_assignment_bundle: verifier
+            // under /etc/rustynet, bundle under /var/lib/rustynet with the
+            // rustynetd group, and the replay watermark cleared so the fresh
+            // bundle's nonce is accepted.
+            run_root(
+                identity,
+                known_hosts,
+                target.host.as_str(),
+                "install -d -m 0750 -o root -g rustynetd /etc/rustynet \
+                 && install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet \
+                 && install -m 0644 -o root -g root /tmp/rn-assignment.pub /etc/rustynet/assignment.pub \
+                 && install -m 0640 -o root -g rustynetd /tmp/rn-assignment.bundle /var/lib/rustynet/rustynetd.assignment \
+                 && rm -f /var/lib/rustynet/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle",
+            )?;
+        }
     }
 
     Ok(())
@@ -1661,11 +1861,51 @@ fn utc_now_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, build_signed_state_refresh_context, client_exit_route_converged,
-        role_runtime_ready, route_uses_tunnel,
+        Config, build_blind_exit_refresh_env, build_signed_state_refresh_context,
+        client_exit_route_converged, env_file_value, role_runtime_ready, route_uses_tunnel,
     };
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn env_file_value_extracts_quoted_values() {
+        let body = "NODES_SPEC=\"a|1;b|2\"\nALLOW_SPEC=\"a|b\"\nBUNDLE_TTL_SECS=\"3600\"\n";
+        assert_eq!(
+            env_file_value(body, "NODES_SPEC").as_deref(),
+            Some("a|1;b|2")
+        );
+        assert_eq!(env_file_value(body, "ALLOW_SPEC").as_deref(), Some("a|b"));
+        assert!(env_file_value(body, "MISSING").is_none());
+    }
+
+    #[test]
+    fn blind_exit_refresh_env_swaps_specs_and_drops_exit_consumer() {
+        let original = "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=\"client-3\"\n\
+                        RUSTYNET_ASSIGNMENT_NODES=\"client-3|x|y|client,relay_host\"\n\
+                        RUSTYNET_ASSIGNMENT_ALLOW=\"client-3|exit-1\"\n\
+                        RUSTYNET_ASSIGNMENT_SIGNING_SECRET=\"/etc/rustynet/assignment.signing.secret\"\n\
+                        RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\"exit-1\"\n";
+        let out = build_blind_exit_refresh_env(
+            original,
+            "client-3|x|y|client,relay_host,exit_server,blind_exit",
+            "client-3|exit-1;exit-1|client-3",
+        );
+        assert!(out.contains(
+            "RUSTYNET_ASSIGNMENT_NODES=\"client-3|x|y|client,relay_host,exit_server,blind_exit\""
+        ));
+        assert!(out.contains("RUSTYNET_ASSIGNMENT_ALLOW=\"client-3|exit-1;exit-1|client-3\""));
+        assert!(
+            !out.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID"),
+            "blind_exit env must not retain an exit consumer: {out}"
+        );
+        assert!(
+            out.contains(
+                "RUSTYNET_ASSIGNMENT_SIGNING_SECRET=\"/etc/rustynet/assignment.signing.secret\""
+            ),
+            "node-specific lines must be preserved verbatim"
+        );
+        assert!(out.contains("RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=\"client-3\""));
+    }
 
     #[test]
     fn role_runtime_ready_requires_converged_runtime_state() {
