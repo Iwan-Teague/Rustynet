@@ -264,7 +264,7 @@ impl McpServer for GateRunnerServer {
     fn server_info(&self) -> ServerInfo {
         ServerInfo {
             name: "rustynet-gate-runner".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: rustynet_mcp::server_version(),
         }
     }
 

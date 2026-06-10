@@ -448,7 +448,7 @@ impl McpServer for RepoContextServer {
     fn server_info(&self) -> ServerInfo {
         ServerInfo {
             name: "rustynet-repo-context".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: rustynet_mcp::server_version(),
         }
     }
 

@@ -152,27 +152,61 @@ impl LabStateServer {
         serde_json::from_str(&s).ok()
     }
 
-    /// `kill -0 <pid>` exits 0 iff the (same-user) process is alive.
-    fn pid_alive(&self, pid: u64) -> bool {
-        matches!(
-            run_with_timeout(
-                "kill",
-                &["-0", &pid.to_string()],
-                &self.repo_root,
-                &[],
-                Duration::from_secs(5),
-            ),
-            Ok(o) if o.success
+    /// Process start-time string (`ps -o lstart=`), used as a PID-identity token
+    /// to detect PID reuse. Rendered in UTC so the string is stable across a
+    /// local DST transition over a long run. `None` if the pid is not alive.
+    /// Works on macOS and Linux. Captured at spawn and re-checked on every
+    /// liveness probe; a non-empty result also proves the pid is currently live.
+    fn pid_start_time(&self, pid: u64) -> Option<String> {
+        if pid == 0 {
+            return None;
+        }
+        let out = run_with_timeout(
+            "ps",
+            &["-o", "lstart=", "-p", &pid.to_string()],
+            &self.repo_root,
+            &[("TZ", "UTC")],
+            Duration::from_secs(5),
         )
+        .ok()?;
+        if !out.success {
+            return None;
+        }
+        let s = out.stdout.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+
+    /// Liveness WITH PID-reuse protection. The pid must be alive AND its process
+    /// start-time must match the token recorded at spawn. Over a 24h+ run the OS
+    /// recycles pids; a bare `kill -0` would then report a crashed job's recycled
+    /// pid as "running" forever (and cancel_job would signal an unrelated
+    /// process). On a start-time mismatch we fail closed to "not this job".
+    /// Records written before this field existed (no `pid_start`) fall back to
+    /// bare liveness — no regression for in-flight legacy jobs.
+    fn pid_alive_verified(&self, job_id: &str, pid: u64) -> bool {
+        let Some(current_start) = self.pid_start_time(pid) else {
+            return false; // pid not alive
+        };
+        match self.read_job_record(job_id).and_then(|r| {
+            r.get("pid_start")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        }) {
+            // Identity recorded → must match exactly, else the pid was recycled.
+            Some(expected) if !expected.is_empty() => expected == current_start,
+            // Legacy record without identity → alive pid is the best we have.
+            _ => true,
+        }
     }
 
     /// running / passed / failed / ended for a job.
     ///
     /// The completion record (report_state.json) is checked FIRST and is
     /// authoritative — this is immune to PID reuse, which is a real hazard over
-    /// 24h+ runs where a finished job's pid could be recycled by the OS and a
-    /// naive `kill -0` would falsely report "running" forever. Liveness is only
-    /// consulted when there is no completion record yet.
+    /// 24h+ runs where a finished job's pid could be recycled by the OS. Liveness
+    /// is only consulted when there is no completion record yet (e.g. a job that
+    /// crashed before writing one), and even then it is PID-identity-checked
+    /// (`pid_alive_verified`) so a recycled pid can't peg the job "running".
     fn job_state(&self, job_id: &str, pid: u64, report_dir: &Path) -> String {
         let report_state = self.read_report_state(report_dir);
         if let Some(rs) = &report_state
@@ -214,7 +248,7 @@ impl LabStateServer {
         let running = match live {
             Live::Alive => true,
             Live::Done => false,
-            Live::Unknown => self.pid_alive(pid),
+            Live::Unknown => self.pid_alive_verified(job_id, pid),
         };
         if running {
             "running".into()
@@ -1692,6 +1726,18 @@ impl LabStateServer {
                 fmt_dur(elapsed)
             ));
 
+            // The combined log goes silent for long stretches during healthy
+            // stages (utmctl source pushes, on-node builds write nothing), so
+            // log mtime alone false-positives. Report-dir artifact mtimes are
+            // the second liveness signal: only flag a hang when BOTH are stale.
+            let newest_artifact_age = {
+                let mut files: Vec<(String, u64)> = Vec::new();
+                collect_files(&rd, &rd, &mut files, 0);
+                files
+                    .iter()
+                    .filter_map(|(rel, _)| mtime_age_secs(&rd.join(rel)))
+                    .min()
+            };
             if let Some(log) = rec.get("log_path").and_then(|v| v.as_str()) {
                 let lp = Path::new(log);
                 if let Ok(meta) = std::fs::metadata(lp) {
@@ -1702,10 +1748,20 @@ impl LabStateServer {
                         fmt_dur(age)
                     ));
                     if state == "running" && age > 600 {
-                        out.push_str(&format!(
-                            "- ⚠️ **possible hang:** no log output for {} (>10m). Inspect the tail below; if truly stuck, cancel_job then recover.\n",
-                            fmt_dur(age)
-                        ));
+                        let artifacts_stale = newest_artifact_age.is_none_or(|a| a > 600);
+                        if artifacts_stale {
+                            out.push_str(&format!(
+                                "- ⚠️ **possible hang:** no log output for {} and no report artifact written for {} (both >10m). Inspect the tail below; if truly stuck, cancel_job then recover.\n",
+                                fmt_dur(age),
+                                newest_artifact_age.map_or_else(|| "ever".to_owned(), fmt_dur)
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "- **log silent {} but artifacts still flowing** (newest {} ago) — a long quiet stage (source push / on-node build), not a hang.\n",
+                                fmt_dur(age),
+                                newest_artifact_age.map_or_else(String::new, fmt_dur)
+                            ));
+                        }
                     }
                 }
                 if let Ok(body) = tail_file(lp, 200) {
@@ -2098,7 +2154,7 @@ impl McpServer for LabStateServer {
     fn server_info(&self) -> ServerInfo {
         ServerInfo {
             name: "rustynet-lab-state".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: rustynet_mcp::server_version(),
         }
     }
 
@@ -3058,6 +3114,11 @@ impl LabStateServer {
         ) {
             Ok(child) => {
                 let pid = child.id();
+                // Capture the pid's start-time NOW (while we hold the live child,
+                // so the pid is unambiguously this process) as a reuse-detection
+                // token. job_state/cancel_job compare against it after a server
+                // reload to avoid acting on a recycled pid.
+                let pid_start = self.pid_start_time(pid as u64);
                 self.jobs
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -3068,6 +3129,7 @@ impl LabStateServer {
                     "report_dir": report_dir,
                     "log_path": log_path.to_string_lossy(),
                     "pid": pid,
+                    "pid_start": pid_start,
                     "command": format!("cargo {}", cli.join(" ")),
                     "created_unix": now_unix(),
                 });
@@ -3250,16 +3312,23 @@ impl LabStateServer {
             self.abs_path(rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or(""));
 
         // If we still hold the child handle, kill via it (no pid race at all).
+        // The job was spawned as a process-group leader, so signal the whole
+        // group FIRST (orchestrator → bash workers → utmctl pushes), then reap
+        // the leader through the handle. Killing only the leader leaves
+        // workers orphaned, still pushing archives and retrying bootstraps.
         if let Some(mut child) = self
             .jobs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(job_id)
         {
+            if pid != 0 {
+                self.kill_process_group(pid);
+            }
             let _ = child.kill();
             let _ = child.wait();
             return tool_success(&format!(
-                "# Cancelled job {job_id}\n\nKilled via the live child handle (pid {pid}).\n"
+                "# Cancelled job {job_id}\n\nKilled the job's process group and reaped the leader (pid {pid}).\n"
             ));
         }
 
@@ -3273,25 +3342,41 @@ impl LabStateServer {
             ));
         }
         if pid != 0 {
-            let pid_s = pid.to_string();
-            let _ = run_with_timeout(
-                "kill",
-                &[&pid_s],
-                &self.repo_root,
-                &[],
-                Duration::from_secs(5),
-            );
-            let _ = run_with_timeout(
-                "kill",
-                &["-9", &pid_s],
-                &self.repo_root,
-                &[],
-                Duration::from_secs(5),
-            );
+            self.kill_process_group(pid);
         }
         tool_success(&format!(
-            "# Cancelled job {job_id}\n\nSent kill to running pid {pid}.\n"
+            "# Cancelled job {job_id}\n\nSent kill to running pid {pid} and its process group.\n"
         ))
+    }
+
+    /// Signal a job's whole process group (TERM, then KILL): `kill -- -<pid>`
+    /// targets the group of which the job is the leader (set at spawn via
+    /// `process_group(0)`). Falls back to the bare pid for any straggler that
+    /// detached into its own group.
+    fn kill_process_group(&self, pid: u64) {
+        let group = format!("-{pid}");
+        let pid_s = pid.to_string();
+        let _ = run_with_timeout(
+            "kill",
+            &["--", &group],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(5),
+        );
+        let _ = run_with_timeout(
+            "kill",
+            &["-9", "--", &group],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(5),
+        );
+        let _ = run_with_timeout(
+            "kill",
+            &["-9", &pid_s],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(5),
+        );
     }
 
     /// Resolve report dir from an explicit report_dir arg or a job_id's record.
@@ -3857,6 +3942,57 @@ mod tests {
             srv.job_state("j", 999_999_999, &report)
                 .starts_with("ended")
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn job_state_pid_identity_detects_reuse() {
+        // No completion record + a LIVE pid: the verdict must hinge on the
+        // recorded pid_start token. Matching identity → running; a mismatch (the
+        // recycled-pid case) → ended, NOT a false "running" forever.
+        let tmp = std::env::temp_dir().join(format!("mcp-pididentity-{}", std::process::id()));
+        let srv = test_server(&tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        let report = tmp.join("rep");
+        // Deliberately NO state/report_state.json → forces the liveness path.
+        std::fs::create_dir_all(report.join("state")).unwrap();
+
+        // This test process's own pid is guaranteed alive — use it as the
+        // stand-in for a job's pid, and its real start-time as the token.
+        let mypid = std::process::id() as u64;
+        let real_start = srv
+            .pid_start_time(mypid)
+            .expect("our own pid must report a start time");
+
+        // (a) matching identity → running
+        let rec_ok = json!({
+            "job_id": "live", "report_dir": report.to_string_lossy(),
+            "pid": mypid, "pid_start": real_start,
+            "log_path": tmp.join("live.log").to_string_lossy(), "created_unix": 1,
+        });
+        std::fs::write(
+            srv.job_record_path("live"),
+            serde_json::to_string(&rec_ok).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(srv.job_state("live", mypid, &report), "running");
+
+        // (b) same live pid, MISMATCHED recorded start → recycled → ended
+        let rec_recycled = json!({
+            "job_id": "recycled", "report_dir": report.to_string_lossy(),
+            "pid": mypid, "pid_start": "Thu Jan  1 00:00:00 1970",
+            "log_path": tmp.join("recycled.log").to_string_lossy(), "created_unix": 1,
+        });
+        std::fs::write(
+            srv.job_record_path("recycled"),
+            serde_json::to_string(&rec_recycled).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            srv.job_state("recycled", mypid, &report)
+                .starts_with("ended")
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

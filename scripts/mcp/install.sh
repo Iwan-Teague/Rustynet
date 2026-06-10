@@ -122,4 +122,18 @@ cat <<EOF
 
 The repo root is baked into each binary (build.rs); no working_directory needed.
 Override with RUSTYNET_REPO_ROOT if running a binary built from a different checkout.
+
+========================================
+ IMPORTANT: reconnect after reinstalling
+========================================
+MCP clients spawn the server ONCE and keep that process for the session, so a
+freshly installed ./bin is NOT picked up until you reconnect — restart the
+editor / "Reconnect MCP server", or in Claude Code reconnect the server. A
+session left running on the old binary keeps the old tool set.
+
+Each server now reports its build provenance as serverInfo.version, e.g.
+  "0.1.0 (git 1c9f306abcde-dirty, built 2026-06-09T14:03:11Z)"
+If that git SHA lags \`git rev-parse --short=12 HEAD\`, the running process is
+stale — reinstall and reconnect. A \`-dirty\` suffix means it was built from a
+modified working tree.
 EOF
