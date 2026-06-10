@@ -3,7 +3,10 @@
 mod bootstrap;
 pub mod capability;
 pub mod orchestrator;
+pub mod overnight;
 pub mod topology;
+
+pub use overnight::{VmLabOvernightConfig, execute_ops_vm_lab_overnight};
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -223,6 +226,7 @@ pub struct VmLabRunLiveLabConfig {
     pub skip_gates: bool,
     pub skip_soak: bool,
     pub skip_cross_network: bool,
+    pub enable_chaos_suite: bool,
     pub source_mode: Option<String>,
     pub repo_ref: Option<String>,
     pub report_dir: Option<PathBuf>,
@@ -908,6 +912,7 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// orchestrator can stamp `ANCHOR_VM` / `ANCHOR_PLATFORM` in the
     /// profile env without a follow-up flag-plumbing churn.
     pub anchor_platform: Option<String>,
+    pub enable_chaos_suite: bool,
 }
 
 /// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.
@@ -2129,11 +2134,16 @@ fn default_utm_documents_root() -> Result<PathBuf, String> {
 }
 
 fn setup_stage_names() -> &'static [&'static str] {
+    // Must stay in sync with the bash orchestrator's setup-stage
+    // classification (scripts/e2e/live_linux_lab_orchestrator.sh) — a name
+    // missing here makes the run-freshness guard reject the orchestrate
+    // flow's own setup evidence.
     &[
         "preflight",
         "prepare_source_archive",
         "verify_ssh_reachability",
         "prime_remote_access",
+        "macos_preflight_check",
         "cleanup_hosts",
         "bootstrap_hosts",
         "collect_pubkeys",
@@ -3010,20 +3020,6 @@ pub fn execute_ops_vm_lab_discover_local_utm(
         Some(path) => resolve_path(path)?,
         None => default_utm_documents_root()?,
     };
-    if !documents_root.is_dir() {
-        return Err(format!(
-            "UTM documents root must be an existing directory: {}",
-            documents_root.display()
-        ));
-    }
-
-    let discovered_bundle_paths = discover_local_utm_bundle_paths(documents_root.as_path())?;
-    if discovered_bundle_paths.is_empty() {
-        return Err(format!(
-            "no UTM bundle directories found under {}",
-            documents_root.display()
-        ));
-    }
 
     let utmctl_path = config
         .utmctl_path
@@ -3049,6 +3045,49 @@ pub fn execute_ops_vm_lab_discover_local_utm(
         ),
         None => (Vec::new(), None),
     };
+
+    // The container scan (and even the root existence stat) is subject to
+    // macOS TCC mediation, which can park filesystem syscalls indefinitely
+    // when this process context lacks consent for the UTM container. Bound it
+    // and degrade to inventory-recorded bundle paths — the scan only exists to
+    // find bundles the inventory does not know about yet.
+    let mut bundle_scan_error = None::<String>;
+    let discovered_bundle_paths = match discover_local_utm_bundle_paths_bounded(
+        documents_root.clone(),
+        Duration::from_secs(UTM_BUNDLE_SCAN_TIMEOUT_SECS),
+    ) {
+        Ok(paths) => paths,
+        Err(scan_err) => {
+            let mut fallback: Vec<PathBuf> = inventory
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .controller
+                        .as_ref()
+                        .map(|VmController::LocalUtm { bundle_path, .. }| bundle_path.clone())
+                })
+                .collect();
+            if fallback.is_empty() {
+                return Err(format!(
+                    "UTM bundle scan failed ({scan_err}) and the inventory provides no \
+                     local UTM bundle paths to fall back to"
+                ));
+            }
+            fallback.sort();
+            fallback.dedup();
+            bundle_scan_error = Some(format!(
+                "{scan_err}; degraded to {} inventory-recorded bundle path(s)",
+                fallback.len()
+            ));
+            fallback
+        }
+    };
+    if discovered_bundle_paths.is_empty() {
+        return Err(format!(
+            "no UTM bundle directories found under {}",
+            documents_root.display()
+        ));
+    }
 
     let mut entries = Vec::new();
     let mut matched_inventory_count = 0usize;
@@ -3437,6 +3476,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             "ready_count": ready_count,
         },
         "inventory_error": inventory_error,
+        "bundle_scan_error": bundle_scan_error,
         "inventory_update": inventory_update,
         "entries": entries,
     });
@@ -5211,6 +5251,7 @@ pub struct LiveLabRunInputs {
     pub skip_gates: bool,
     pub skip_soak: bool,
     pub skip_cross_network: bool,
+    pub enable_chaos_suite: bool,
 }
 
 /// Outcome of one live-lab run, surfaced uniformly across orchestrator
@@ -5277,6 +5318,9 @@ impl LinuxBashOrchestrator {
         }
         if inputs.skip_cross_network {
             command.arg("--skip-cross-network");
+        }
+        if inputs.enable_chaos_suite {
+            command.arg("--enable-chaos-suite");
         }
         command.arg("--source-mode").arg(&inputs.source_mode);
         if let Some(value) = inputs.repo_ref.as_deref() {
@@ -6416,6 +6460,7 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
         skip_gates: config.skip_gates,
         skip_soak: config.skip_soak,
         skip_cross_network: config.skip_cross_network,
+        enable_chaos_suite: config.enable_chaos_suite,
     };
     let orchestrator = LinuxBashOrchestrator::new(config.script_path.clone());
     let run_report = orchestrator.execute_live_lab(&inputs)?;
@@ -7380,6 +7425,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         skip_gates: config.skip_gates,
         skip_soak: config.skip_soak,
         skip_cross_network: config.skip_cross_network,
+        enable_chaos_suite: config.enable_chaos_suite,
         source_mode: config.source_mode.clone(),
         repo_ref: config.repo_ref.clone(),
         report_dir: Some(report_dir.clone()),
@@ -10382,11 +10428,11 @@ fn run_windows_orchestration_stages_with_options(
             known_hosts_path,
         );
         match result {
-            Ok((summary, raw_report)) => {
+            Ok((status, summary, raw_report)) => {
                 let _ = std::fs::write(&dns_failclosed_log_path, raw_report.as_str());
                 stage_outcome(
                     "validate_windows_dns_failclosed",
-                    VmLabStageStatus::Pass,
+                    status,
                     summary,
                     vec![dns_failclosed_log_path.clone()],
                 )
@@ -10410,7 +10456,9 @@ fn run_windows_orchestration_stages_with_options(
         }
     };
 
-    let dns_failclosed_passed = dns_failclosed_outcome.status == VmLabStageStatus::Pass;
+    // Downstream stages must proceed when the posture is verified OR simply
+    // not engaged yet (Skipped); only detected drift (Fail) blocks them.
+    let dns_failclosed_passed = dns_failclosed_outcome.status != VmLabStageStatus::Fail;
 
     // ── Track B Step 4 (W1): promote Windows to active mesh exit ─────────
     //
@@ -12218,6 +12266,26 @@ fn evaluate_windows_runtime_acls_report(
     ))
 }
 
+/// Build the guest-side named-pipe ACL check. The daemon's pipes correctly
+/// grant the service's own NT SERVICE virtual account (the service runs with
+/// SID_TYPE_UNRESTRICTED), and the checker treats any principal it was not
+/// told about as drift — so the script first resolves the service SID via the
+/// OS's authoritative account translator and passes it as the reviewed
+/// principal.
+fn build_windows_named_pipe_acls_check_script() -> Result<String, String> {
+    let check = build_windows_security_check_invocation("windows-named-pipe-acls-check", &[])?;
+    let service_account = format!(
+        r"NT SERVICE\{}",
+        orchestrator::adapter::windows_install::WINDOWS_SERVICE_NAME
+    );
+    Ok(format!(
+        "$svcSid = (New-Object System.Security.Principal.NTAccount({account}))\
+.Translate([System.Security.Principal.SecurityIdentifier]).Value; \
+{check} --service-sid $svcSid",
+        account = powershell_quote(service_account.as_str())?,
+    ))
+}
+
 fn run_validate_windows_named_pipe_acls_stage(
     windows_alias: &str,
     inventory_path: &Path,
@@ -12242,8 +12310,8 @@ fn run_validate_windows_named_pipe_acls_stage(
         ));
     }
     let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
-    let script = build_windows_security_check_invocation("windows-named-pipe-acls-check", &[])
-        .map_err(|err| (err, String::new()))?;
+    let script =
+        build_windows_named_pipe_acls_check_script().map_err(|err| (err, String::new()))?;
     let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
         .map_err(|err| (err, String::new()))?;
     let raw_output = capture_remote_shell_command_for_target(
@@ -12626,7 +12694,7 @@ fn run_validate_windows_dns_failclosed_stage(
     inventory_path: &Path,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
-) -> Result<(String, String), (String, String)> {
+) -> Result<(VmLabStageStatus, String, String), (String, String)> {
     let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])
         .map_err(|err| (err, String::new()))?;
     let target = targets.into_iter().next().ok_or_else(|| {
@@ -12664,18 +12732,43 @@ fn run_validate_windows_dns_failclosed_stage(
         )
     })?;
     let raw_trimmed = raw_output.trim().to_owned();
-    evaluate_windows_dns_failclosed_report(windows_alias, raw_trimmed.as_str())
-        .map(|summary| (summary, raw_trimmed.clone()))
-        .map_err(|reason| (reason, raw_trimmed))
+    match evaluate_windows_dns_failclosed_report(windows_alias, raw_trimmed.as_str()) {
+        Ok(WindowsDnsFailclosedVerdict::Verified(summary)) => {
+            Ok((VmLabStageStatus::Pass, summary, raw_trimmed))
+        }
+        Ok(WindowsDnsFailclosedVerdict::NotEngaged(summary)) => {
+            Ok((VmLabStageStatus::Skipped, summary, raw_trimmed))
+        }
+        Err(reason) => Err((reason, raw_trimmed)),
+    }
+}
+
+/// Verdict of the Windows DNS fail-closed posture check at this point in the
+/// orchestration sequence.
+#[derive(Debug)]
+enum WindowsDnsFailclosedVerdict {
+    /// Protected-mode posture is engaged (NRPT root rule present) and fully
+    /// verified against the reviewed contract.
+    Verified(String),
+    /// The daemon has not engaged DNS protection (no NRPT rule) but the
+    /// install-time half of the posture holds: every non-loopback interface
+    /// is pinned to the loopback resolver (Install-RustyNetWindowsService
+    /// sets this; the daemon resolver serves :53). The NRPT root rule is
+    /// added by `apply_dns_protection` when the daemon enters protected
+    /// mode, which the standard post-bootstrap sequence has not reached —
+    /// demanding it here would assert protected-mode state that cannot exist.
+    NotEngaged(String),
 }
 
 /// Pure evaluator for the JSON output of `rustynetd windows-dns-failclosed-check`.
-/// Returns a one-line success summary or a precise drift reason. Callable in
-/// tests without SSH/IO.
+/// Classifies the snapshot (engaged / not-engaged / drift) — strict validation
+/// applies whenever the NRPT root rule is present, and HALF-APPLIED residue
+/// (adapter DNS at loopback with no NRPT rule) is drift, not a skip. Callable
+/// in tests without SSH/IO.
 fn evaluate_windows_dns_failclosed_report(
     windows_alias: &str,
     raw_json: &str,
-) -> Result<String, String> {
+) -> Result<WindowsDnsFailclosedVerdict, String> {
     let report: rustynetd::windows_dns_failclosed::WindowsDnsFailclosedReport =
         serde_json::from_str(raw_json).map_err(|err| {
             format!("parse windows-dns-failclosed-check JSON output failed: {err}")
@@ -12685,6 +12778,50 @@ fn evaluate_windows_dns_failclosed_report(
             "windows-dns-failclosed-check returned unsupported schema_version={}",
             report.schema_version
         ));
+    }
+    if report.snapshot.nrpt_rules.is_empty() {
+        // Protection not engaged. The daemon-side evaluator asserts the full
+        // protected-mode contract unconditionally, so overall_ok=false with a
+        // missing-NRPT drift reason is the expected shape here. What must
+        // still hold is the install-time half of the posture: the installer
+        // pins every interface's DNS to the loopback resolver, so any
+        // non-loopback server on a real interface is a fail-closed bypass
+        // route regardless of protection state. Unparseable addresses count
+        // as rogue — they are not provably loopback.
+        let rogue: Vec<String> = report
+            .snapshot
+            .interfaces
+            .iter()
+            .filter(|interface| {
+                !interface.interface_alias.starts_with("Loopback")
+                    && interface.server_addresses.iter().any(|addr| {
+                        !addr
+                            .parse::<IpAddr>()
+                            .map(|ip| ip.is_loopback())
+                            .unwrap_or(false)
+                    })
+            })
+            .map(|interface| {
+                format!(
+                    "{} ({:?})",
+                    interface.interface_alias, interface.address_family
+                )
+            })
+            .collect();
+        if !rogue.is_empty() {
+            return Err(format!(
+                "Windows DNS ownership drift on {windows_alias}: the installer pins every \
+                 interface to the loopback resolver, but interface(s) [{}] point at a \
+                 non-loopback DNS server — a fail-closed bypass route is present",
+                rogue.join(", ")
+            ));
+        }
+        return Ok(WindowsDnsFailclosedVerdict::NotEngaged(format!(
+            "Windows DNS interface ownership verified on {windows_alias} (loopback-only \
+             resolvers); NRPT root rule engages when the daemon enters protected mode \
+             ({} interfaces)",
+            report.snapshot.interfaces.len()
+        )));
     }
     if !report.overall_ok {
         let reasons = if report.drift_reasons.is_empty() {
@@ -12701,11 +12838,11 @@ fn evaluate_windows_dns_failclosed_report(
             report.drift_reasons.join("; ")
         ));
     }
-    Ok(format!(
+    Ok(WindowsDnsFailclosedVerdict::Verified(format!(
         "Windows DNS fail-closed verified on {windows_alias} ({} interfaces, {} NRPT rules)",
         report.snapshot.interfaces.len(),
         report.snapshot.nrpt_rules.len()
-    ))
+    )))
 }
 
 fn evaluate_windows_exit_nat_lifecycle_artifact(
@@ -15606,6 +15743,7 @@ pub fn execute_ops_vm_lab_iterate_live_lab(
         skip_gates: config.skip_gates,
         skip_soak: config.skip_soak,
         skip_cross_network: config.skip_cross_network,
+        enable_chaos_suite: false,
         source_mode: Some(resolved_source_mode),
         repo_ref: resolved_repo_ref,
         report_dir: Some(report_dir.clone()),
@@ -16755,6 +16893,33 @@ fn collected_at_utc_now() -> String {
         .unwrap_or_else(|| format!("unix:{}", unix_now()))
 }
 
+/// Overlay the run-level verdict from `state/report_state.json` (when
+/// present) onto the stage-derived overall status. stages.tsv alone can read
+/// all-pass while the run failed in a wrapper stage recorded only at the run
+/// level — a diff that then reports "pass → pass, no change" between two
+/// failed runs is actively misleading. The overlay only ever tightens toward
+/// "fail"; it never upgrades a stage-derived failure.
+fn live_lab_overall_status_with_report_state(report_dir: &Path, stage_derived: &str) -> String {
+    let path = report_dir.join("state/report_state.json");
+    let Ok(body) = fs::read_to_string(&path) else {
+        return stage_derived.to_owned();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&body) else {
+        return stage_derived.to_owned();
+    };
+    match (
+        value.get("run_complete").and_then(Value::as_bool),
+        value.get("run_passed").and_then(Value::as_bool),
+    ) {
+        (Some(true), Some(false)) => "fail".to_owned(),
+        // The run never completed (e.g. it died in a wrapper/validator stage
+        // after setup): calling the dir "pass" off setup-only stage records
+        // is the misleading verdict this overlay exists to prevent.
+        (Some(false), _) if stage_derived == "pass" => "incomplete".to_owned(),
+        _ => stage_derived.to_owned(),
+    }
+}
+
 pub fn execute_ops_vm_lab_diff_live_lab_runs(
     config: VmLabDiffLiveLabRunsConfig,
 ) -> Result<String, String> {
@@ -16806,8 +16971,20 @@ pub fn execute_ops_vm_lab_diff_live_lab_runs(
     let mut lines = vec![
         format!("old_report_dir={}", config.old_report_dir.display()),
         format!("new_report_dir={}", config.new_report_dir.display()),
-        format!("old_overall_status={}", old_summary.overall_status),
-        format!("new_overall_status={}", new_summary.overall_status),
+        format!(
+            "old_overall_status={}",
+            live_lab_overall_status_with_report_state(
+                config.old_report_dir.as_path(),
+                old_summary.overall_status.as_str()
+            )
+        ),
+        format!(
+            "new_overall_status={}",
+            live_lab_overall_status_with_report_state(
+                config.new_report_dir.as_path(),
+                new_summary.overall_status.as_str()
+            )
+        ),
         format!(
             "old_first_failed_stage={}",
             old_summary.first_failed_stage.as_deref().unwrap_or("none")
@@ -20875,6 +21052,53 @@ fn probe_tcp_port_status(
     }
 }
 
+/// Hard deadline for the recursive UTM-bundle scan. The scan normally
+/// completes in milliseconds; macOS TCC consent mediation can park `open()`
+/// on another app's container indefinitely when the process context lacks
+/// approval (observed under unattended agent runs), so the scan must never
+/// be allowed to block a run forever.
+const UTM_BUNDLE_SCAN_TIMEOUT_SECS: u64 = 20;
+
+/// Run the UTM bundle scan — including the root existence check, which is
+/// also subject to TCC mediation — on a worker thread with a hard deadline.
+///
+/// On deadline the worker is abandoned (it holds no locks or shared state and
+/// parks harmlessly in the kernel) and an error is returned so the caller can
+/// degrade to inventory-recorded bundle paths instead of hanging.
+fn discover_local_utm_bundle_paths_bounded(
+    root: PathBuf,
+    timeout: Duration,
+) -> Result<Vec<PathBuf>, String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("utm-bundle-scan".to_owned())
+        .spawn(move || {
+            let result = if root.is_dir() {
+                discover_local_utm_bundle_paths(root.as_path())
+            } else {
+                Err(format!(
+                    "UTM documents root must be an existing directory: {}",
+                    root.display()
+                ))
+            };
+            // A send error only means the receiver gave up at the deadline.
+            let _ = sender.send(result);
+        })
+        .map_err(|err| format!("spawn UTM bundle scan thread failed: {err}"))?;
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "UTM bundle scan did not finish within {}s — on macOS this usually means \
+             privacy (TCC) consent for the UTM container is missing for this process \
+             context, which parks filesystem access indefinitely",
+            timeout.as_secs()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("UTM bundle scan thread exited without producing a result".to_owned())
+        }
+    }
+}
+
 fn discover_local_utm_bundle_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut bundles = Vec::new();
     discover_local_utm_bundle_paths_recursive(root, &mut bundles)?;
@@ -21561,6 +21785,9 @@ fn build_windows_local_source_extract_script(
            Expand-Archive -LiteralPath $archive -DestinationPath $staging -Force; \
            $stagedEntries = @(Get-ChildItem -LiteralPath $staging -Force -ErrorAction SilentlyContinue); \
            if ($stagedEntries.Count -eq 0) {{ throw ('Windows local source archive extracted no files: {{0}}' -f $archive) }}; \
+           foreach ($junk in @(Get-ChildItem -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -like '._*' -or $_.Name -eq '.DS_Store' }})) {{ \
+             try {{ [System.IO.File]::Delete('\\\\?\\' + $junk.FullName) }} catch {{ }} \
+           }}; \
            foreach ($existing in @(Get-ChildItem -LiteralPath $dest -Force -ErrorAction SilentlyContinue)) {{ \
              $existingPath = $existing.FullName; \
              if ($currentScriptPath -and $existingPath.Equals($currentScriptPath, [System.StringComparison]::OrdinalIgnoreCase)) {{ continue }}; \
@@ -21617,6 +21844,9 @@ fn build_windows_local_source_extract_result_script(
            Expand-Archive -LiteralPath $archive -DestinationPath $staging -Force; \
            $stagedEntries = @(Get-ChildItem -LiteralPath $staging -Force -ErrorAction SilentlyContinue); \
            if ($stagedEntries.Count -eq 0) {{ throw ('Windows local source archive extracted no files: {{0}}' -f $archive) }}; \
+           foreach ($junk in @(Get-ChildItem -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -like '._*' -or $_.Name -eq '.DS_Store' }})) {{ \
+             try {{ [System.IO.File]::Delete('\\\\?\\' + $junk.FullName) }} catch {{ }} \
+           }}; \
            foreach ($existing in @(Get-ChildItem -LiteralPath $dest -Force -ErrorAction SilentlyContinue)) {{ \
              $existingPath = $existing.FullName; \
              if ($currentScriptPath -and $existingPath.Equals($currentScriptPath, [System.StringComparison]::OrdinalIgnoreCase)) {{ continue }}; \
@@ -21662,6 +21892,24 @@ fn prepare_local_source_archive(
         ));
     }
     Ok(LocalSourceArchive { path: archive_path })
+}
+
+/// macOS metadata sidecars (AppleDouble `._*`, Finder `.DS_Store`) must never
+/// ship in source archives. AppleDouble names include POSIX-only forms such as
+/// `._.` (trailing dot) that Win32 path normalization cannot address once they
+/// land on NTFS, permanently bricking extraction cleanup on Windows guests.
+fn is_macos_metadata_artifact_name(name: &str) -> bool {
+    name == ".DS_Store" || name.starts_with("._")
+}
+
+fn path_contains_macos_metadata_artifact(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name)
+                if name.to_str().is_some_and(is_macos_metadata_artifact_name)
+        )
+    })
 }
 
 fn prepare_local_source_zip_archive(
@@ -21862,6 +22110,9 @@ fn write_git_worktree_zip_archive(
             continue;
         }
         let relative_path = Path::new(relative);
+        if path_contains_macos_metadata_artifact(relative_path) {
+            continue;
+        }
         let absolute_path = source_dir.join(relative_path);
         if !absolute_path.is_file() {
             continue;
@@ -22048,6 +22299,9 @@ fn append_raw_local_source_tree(
             )
         })?;
         let path = entry.path();
+        if is_macos_metadata_artifact_name(entry.file_name().to_string_lossy().as_ref()) {
+            continue;
+        }
         let relative = path.strip_prefix(source_root).map_err(|err| {
             format!(
                 "strip local source prefix failed ({}): {err}",
@@ -22101,6 +22355,9 @@ fn append_raw_local_source_tree_to_zip(
             )
         })?;
         let path = entry.path();
+        if is_macos_metadata_artifact_name(entry.file_name().to_string_lossy().as_ref()) {
+            continue;
+        }
         let relative = path.strip_prefix(source_root).map_err(|err| {
             format!(
                 "strip local ZIP source prefix failed ({}): {err}",
@@ -22151,6 +22408,9 @@ fn append_directory_tree_to_archive(
             )
         })?;
         let path = entry.path();
+        if is_macos_metadata_artifact_name(entry.file_name().to_string_lossy().as_ref()) {
+            continue;
+        }
         let archive_path = archive_root.join(entry.file_name());
         let file_type = entry.file_type().map_err(|err| {
             format!(
@@ -22201,6 +22461,9 @@ fn append_directory_tree_to_zip(
             )
         })?;
         let path = entry.path();
+        if is_macos_metadata_artifact_name(entry.file_name().to_string_lossy().as_ref()) {
+            continue;
+        }
         let archive_path = archive_root.join(entry.file_name());
         let file_type = entry.file_type().map_err(|err| {
             format!(
@@ -23152,7 +23415,12 @@ fn capture_remote_shell_command_for_target_with_phase(
                     }
                 };
                 if rc != 0 {
-                    return Err(format!("remote command exited with status {rc}"));
+                    let trimmed = output.trim();
+                    return if trimmed.is_empty() {
+                        Err(format!("remote command exited with status {rc}"))
+                    } else {
+                        Err(format!("remote command exited with status {rc}: {trimmed}"))
+                    };
                 }
                 Ok(output)
             }
@@ -23470,9 +23738,20 @@ fn capture_remote_shell_command(
     command.arg("--").arg(target).arg(remote_script);
     let output = run_output_with_timeout(&mut command, timeout)?;
     if !output.status.success() {
+        let stderr_snippet = String::from_utf8_lossy(&output.stderr);
+        let stdout_snippet = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{}{}", stdout_snippet.trim(), stderr_snippet.trim());
+        let trimmed = combined.trim();
+        if trimmed.is_empty() {
+            return Err(format!(
+                "remote command exited with status {}",
+                status_code(output.status)
+            ));
+        }
         return Err(format!(
-            "remote command exited with status {}",
-            status_code(output.status)
+            "remote command exited with status {}: {}",
+            status_code(output.status),
+            trimmed
         ));
     }
     String::from_utf8(output.stdout)
@@ -26495,20 +26774,22 @@ mod tests {
         build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
-        build_vm_lab_topology, build_windows_local_source_extract_script,
-        collect_live_lab_stage_local_bundle, create_orchestration_staging_dir,
-        default_inventory_path, default_live_lab_iteration_profile_path,
-        default_live_lab_iteration_report_dir, default_live_lab_orchestrator_path,
-        default_platform_profile, default_utmctl_path, discover_local_utm_bundle_paths,
+        build_vm_lab_topology, build_windows_local_source_extract_result_script,
+        build_windows_local_source_extract_script, collect_live_lab_stage_local_bundle,
+        create_orchestration_staging_dir, default_inventory_path,
+        default_live_lab_iteration_profile_path, default_live_lab_iteration_report_dir,
+        default_live_lab_orchestrator_path, default_platform_profile, default_utmctl_path,
+        discover_local_utm_bundle_paths, discover_local_utm_bundle_paths_bounded,
         encode_powershell_command, ensure_inventory_entries_share_network,
         execute_ops_vm_lab_diff_live_lab_runs, execute_ops_vm_lab_discover_local_utm,
         execute_ops_vm_lab_discover_local_utm_summary,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
-        live_lab_stage_forensics_notes, load_inventory, load_live_lab_profile,
-        local_utm_process_present_in_ps_output, local_utm_process_present_with_ps,
-        materialize_orchestration_staging_dir, parse_live_lab_stage_records,
-        parse_local_utm_list_started_status, parse_vm_lab_iteration_validation_step_spec,
-        parse_vm_lab_topology, persist_local_utm_ready_states_to_inventory,
+        is_macos_metadata_artifact_name, live_lab_stage_forensics_notes, load_inventory,
+        load_live_lab_profile, local_utm_process_present_in_ps_output,
+        local_utm_process_present_with_ps, materialize_orchestration_staging_dir,
+        parse_live_lab_stage_records, parse_local_utm_list_started_status,
+        parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
+        path_contains_macos_metadata_artifact, persist_local_utm_ready_states_to_inventory,
         privileged_rustynet_cli_script, remote_copy_destination_for_target,
         remote_script_for_ssh_transport, render_live_lab_iteration_summary,
         render_live_lab_stage_forensics_review, render_local_utm_discovery_summary,
@@ -26527,6 +26808,7 @@ mod tests {
         windows_service_install_helper_script_local_path,
         windows_service_uninstall_helper_script_local_path,
         windows_verify_helper_script_local_path, workspace_root_path,
+        write_raw_directory_zip_archive,
     };
     use serde_json::json;
     use std::fs;
@@ -27120,6 +27402,44 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discover_local_utm_bundle_paths_bounded_finds_bundles_within_deadline() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-bounded-{unique}.dir"));
+        fs::create_dir_all(root.join("gamma.utm")).expect("bundle should exist");
+
+        let bundles =
+            discover_local_utm_bundle_paths_bounded(root.clone(), Duration::from_secs(10))
+                .expect("bounded discovery should succeed");
+        assert_eq!(bundles.len(), 1);
+        assert!(
+            bundles
+                .iter()
+                .any(|path| path.ends_with(Path::new("gamma.utm")))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discover_local_utm_bundle_paths_bounded_rejects_missing_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-missing-{unique}.dir"));
+
+        let err = discover_local_utm_bundle_paths_bounded(root, Duration::from_secs(10))
+            .expect_err("missing root must fail");
+        assert!(
+            err.contains("existing directory"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -28857,6 +29177,95 @@ mod tests {
     }
 
     #[test]
+    fn windows_local_source_extract_scripts_purge_apple_double_residue() {
+        // AppleDouble names like `._.` (trailing dot) can only be deleted via
+        // \\?\ extended-length paths; the cleanup loop bricks without this
+        // purge once a guest is contaminated.
+        let script = build_windows_local_source_extract_script(
+            r"C:\Rustynet",
+            r"C:\ProgramData\Rustynet\vm-lab\rn-vm-lab-source-123.zip",
+        )
+        .expect("Windows extract script should build");
+        let result_script = build_windows_local_source_extract_result_script(
+            r"C:\Rustynet",
+            r"C:\ProgramData\Rustynet\vm-lab\rn-vm-lab-source-123.zip",
+            r"C:\ProgramData\Rustynet\vm-lab\extract-result.json",
+        )
+        .expect("Windows extract result script should build");
+        for s in [script.as_str(), result_script.as_str()] {
+            assert!(
+                s.contains(r"[System.IO.File]::Delete('\\?\' + $junk.FullName)"),
+                "purge must delete via extended-length paths"
+            );
+            assert!(
+                s.contains("$_.Name -like '._*' -or $_.Name -eq '.DS_Store'"),
+                "purge must target AppleDouble and Finder sidecars"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_metadata_artifact_names_are_recognized() {
+        assert!(is_macos_metadata_artifact_name("._."));
+        assert!(is_macos_metadata_artifact_name("._adler2"));
+        assert!(is_macos_metadata_artifact_name(".DS_Store"));
+        assert!(!is_macos_metadata_artifact_name(".gitignore"));
+        assert!(!is_macos_metadata_artifact_name("normal.rs"));
+        assert!(!is_macos_metadata_artifact_name("_.x"));
+        assert!(path_contains_macos_metadata_artifact(Path::new(
+            "vendor/._adler2"
+        )));
+        assert!(path_contains_macos_metadata_artifact(Path::new("._.")));
+        assert!(!path_contains_macos_metadata_artifact(Path::new(
+            "crates/rustynet-cli/src/main.rs"
+        )));
+    }
+
+    #[test]
+    fn raw_zip_archive_excludes_macos_metadata_artifacts() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-zip-junk-{unique}.dir"));
+        let sub = root.join("sub");
+        fs::create_dir_all(sub.as_path()).expect("source tree should exist");
+        fs::write(root.join("real.rs"), b"fn main() {}").expect("write real file");
+        fs::write(root.join("._real.rs"), b"junk").expect("write sidecar");
+        fs::write(root.join(".DS_Store"), b"junk").expect("write ds_store");
+        fs::write(sub.join("ok.txt"), b"ok").expect("write nested file");
+        fs::write(sub.join("._ok.txt"), b"junk").expect("write nested sidecar");
+
+        let archive_path =
+            std::env::temp_dir().join(format!("rustynet-vm-lab-zip-junk-{unique}.zip"));
+        write_raw_directory_zip_archive(root.as_path(), archive_path.as_path(), None)
+            .expect("raw zip archive should build");
+
+        let file = fs::File::open(archive_path.as_path()).expect("open zip");
+        let mut archive = zip::ZipArchive::new(file).expect("read zip");
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| {
+                archive
+                    .by_index(i)
+                    .expect("zip entry should read")
+                    .name()
+                    .to_owned()
+            })
+            .collect();
+        assert!(names.iter().any(|n| n.ends_with("real.rs")));
+        assert!(names.iter().any(|n| n.ends_with("ok.txt")));
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("._") || n.contains(".DS_Store")),
+            "sidecars leaked into ZIP: {names:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&archive_path);
+    }
+
+    #[test]
     fn resolve_repo_sync_source_rejects_ambiguous_inputs() {
         let err = resolve_repo_sync_source(
             Some("https://example.invalid/repo.git"),
@@ -30494,6 +30903,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             skip_gates: false,
             skip_soak: false,
             skip_cross_network: false,
+            enable_chaos_suite: false,
             source_mode: None,
             repo_ref: None,
             report_dir: Some(report_dir.clone()),
@@ -31919,16 +32329,69 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
 
     #[test]
     fn evaluate_windows_dns_failclosed_report_accepts_reviewed_payload() {
-        let summary = super::evaluate_windows_dns_failclosed_report(
+        let verdict = super::evaluate_windows_dns_failclosed_report(
             "windows-utm-1",
             reviewed_dns_failclosed_payload().to_string().as_str(),
         )
         .expect("reviewed payload must validate");
+        let super::WindowsDnsFailclosedVerdict::Verified(summary) = verdict else {
+            panic!("engaged posture must be Verified, got {verdict:?}");
+        };
         assert!(
             summary.contains("windows-utm-1")
                 && summary.contains("2 interfaces")
                 && summary.contains("1 NRPT rules"),
             "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_dns_failclosed_report_not_engaged_with_loopback_ownership() {
+        // Post-install posture before protected mode: every interface pinned
+        // to the loopback resolver, no NRPT rule yet. The daemon-side checker
+        // reports drift for the missing NRPT rule; the stage must classify
+        // this as not-engaged rather than failing a state that cannot exist.
+        let mut payload = reviewed_dns_failclosed_payload();
+        payload["snapshot"]["nrpt_rules"] = serde_json::json!([]);
+        payload["overall_ok"] = serde_json::Value::Bool(false);
+        payload["drift_reasons"] = serde_json::json!([
+            "no NRPT rule covers the . root namespace with loopback name servers"
+        ]);
+        let verdict = super::evaluate_windows_dns_failclosed_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect("loopback-owned unprotected posture must classify");
+        assert!(
+            matches!(
+                verdict,
+                super::WindowsDnsFailclosedVerdict::NotEngaged(ref msg)
+                    if msg.contains("ownership verified")
+            ),
+            "expected NotEngaged, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_dns_failclosed_report_flags_ownership_drift_when_unprotected() {
+        // The installer pins interface DNS to loopback; an upstream server on
+        // a real interface is a bypass route even before protection engages.
+        let mut payload = reviewed_dns_failclosed_payload();
+        payload["snapshot"]["nrpt_rules"] = serde_json::json!([]);
+        payload["snapshot"]["interfaces"][0]["server_addresses"] =
+            serde_json::json!(["192.168.0.1"]);
+        payload["overall_ok"] = serde_json::Value::Bool(false);
+        payload["drift_reasons"] = serde_json::json!([
+            "no NRPT rule covers the . root namespace with loopback name servers"
+        ]);
+        let err = super::evaluate_windows_dns_failclosed_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("non-loopback interface DNS must be ownership drift");
+        assert!(
+            err.contains("ownership drift") && err.contains("non-loopback DNS server"),
+            "unexpected error: {err}"
         );
     }
 
@@ -33152,6 +33615,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             skip_gates: false,
             skip_soak: false,
             skip_cross_network: false,
+            enable_chaos_suite: false,
         }
     }
 
@@ -34211,6 +34675,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             skip_gates: false,
             skip_soak: false,
             skip_cross_network: false,
+            enable_chaos_suite: false,
         }
     }
 
@@ -35470,6 +35935,120 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     }
 
     #[test]
+    fn windows_named_pipe_acls_check_script_passes_resolved_service_sid() {
+        let script = super::build_windows_named_pipe_acls_check_script()
+            .expect("named-pipe ACL check script must build");
+        assert!(
+            script.contains(r"System.Security.Principal.NTAccount('NT SERVICE\RustyNet')"),
+            "script must resolve the service's NT SERVICE account: {script:?}"
+        );
+        assert!(
+            script.contains("Translate([System.Security.Principal.SecurityIdentifier])"),
+            "script must translate the account to a SID: {script:?}"
+        );
+        assert!(
+            script
+                .contains("windows-named-pipe-acls-check --no-fail-on-drift --service-sid $svcSid"),
+            "check must receive the resolved SID as the reviewed principal: {script:?}"
+        );
+    }
+
+    #[test]
+    fn diff_overall_status_tightens_to_fail_from_report_state() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-diffstate-{unique}.dir"));
+        fs::create_dir_all(root.join("state")).expect("state dir");
+
+        // No report_state.json → passthrough.
+        assert_eq!(
+            super::live_lab_overall_status_with_report_state(root.as_path(), "pass"),
+            "pass"
+        );
+
+        // Completed-but-failed run overrides a stage-derived pass.
+        fs::write(
+            root.join("state/report_state.json"),
+            r#"{"run_complete": true, "run_passed": false}"#,
+        )
+        .expect("write report state");
+        assert_eq!(
+            super::live_lab_overall_status_with_report_state(root.as_path(), "pass"),
+            "fail"
+        );
+
+        // A passing run never upgrades a stage-derived failure.
+        fs::write(
+            root.join("state/report_state.json"),
+            r#"{"run_complete": true, "run_passed": true}"#,
+        )
+        .expect("rewrite report state");
+        assert_eq!(
+            super::live_lab_overall_status_with_report_state(root.as_path(), "fail"),
+            "fail"
+        );
+
+        // An incomplete run must not read as a pass off setup-only records.
+        fs::write(
+            root.join("state/report_state.json"),
+            r#"{"run_complete": false, "run_passed": false}"#,
+        )
+        .expect("rewrite report state");
+        assert_eq!(
+            super::live_lab_overall_status_with_report_state(root.as_path(), "pass"),
+            "incomplete"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_freshness_guard_accepts_every_bash_setup_stage_record() {
+        // The bash orchestrator's setup classification and setup_stage_names()
+        // must stay in sync: a setup stage missing from the Rust list (e.g.
+        // macos_preflight_check) makes the freshness guard reject the
+        // orchestrate flow's own setup evidence and brick vm_lab_run_live_lab.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-guard-{unique}.dir"));
+        fs::create_dir_all(root.join("state")).expect("report state dir");
+        let row = |name: &str| {
+            format!(
+                "{name}\thard\tpass\t0\t/tmp/{name}.log\tdesc\t2026-01-01T00:00:00Z\t2026-01-01T00:00:01Z\n"
+            )
+        };
+        let mut body = String::new();
+        for name in super::setup_stage_names() {
+            body.push_str(row(name).as_str());
+        }
+        fs::write(root.join("state/stages.tsv"), body.as_str()).expect("write stages.tsv");
+        assert!(
+            !super::live_lab_report_has_non_setup_stage_records(root.as_path())
+                .expect("guard must evaluate"),
+            "setup-only records must not trip the freshness guard"
+        );
+        assert!(
+            super::setup_stage_names().contains(&"macos_preflight_check"),
+            "macos_preflight_check is a bash-orchestrator setup stage"
+        );
+
+        // A run-stage record must still trip it.
+        body.push_str(row("live_anchor").as_str());
+        fs::write(root.join("state/stages.tsv"), body.as_str()).expect("rewrite stages.tsv");
+        assert!(
+            super::live_lab_report_has_non_setup_stage_records(root.as_path())
+                .expect("guard must evaluate"),
+            "run-stage records must trip the freshness guard"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn windows_exit_evidence_artifact_specs_are_exact_allowlist() {
         let specs = super::windows_exit_evidence_artifact_specs();
         let labels: Vec<&str> = specs.iter().map(|spec| spec.label).collect();
@@ -35627,6 +36206,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             exit_platform: None,
             relay_platform: None,
             anchor_platform: None,
+            enable_chaos_suite: false,
         }
     }
 

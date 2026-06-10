@@ -857,6 +857,9 @@ enum OpsCommand {
     VmLabOrchestrateLiveLab {
         config: vm_lab::VmLabOrchestrateLiveLabConfig,
     },
+    VmLabOvernight {
+        config: vm_lab::VmLabOvernightConfig,
+    },
     VmLabValidateWindowsSecurity {
         config: vm_lab::VmLabValidateWindowsSecurityConfig,
     },
@@ -3315,6 +3318,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 dry_run: parser.has_flag("--dry-run"),
                 windows_only: parser.has_flag("--windows-only"),
                 validate_linux_daemon_state: parser.has_flag("--validate-linux-daemon-state"),
+                enable_chaos_suite: parser.has_flag("--enable-chaos-suite"),
                 node_assignments: {
                     let raw = collect_repeated_option_values(&args[1..], "--node");
                     let mut out = Vec::with_capacity(raw.len());
@@ -3333,6 +3337,38 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 exit_platform: parser.value("--exit-platform"),
                 relay_platform: parser.value("--relay-platform"),
                 anchor_platform: parser.value("--anchor-platform"),
+            },
+        }),
+        "vm-lab-overnight" => Ok(OpsCommand::VmLabOvernight {
+            config: vm_lab::VmLabOvernightConfig {
+                inventory_path: parser
+                    .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                ssh_identity_file: parser.required_path("--ssh-identity-file")?,
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                branch_prefix: parser
+                    .value("--branch-prefix")
+                    .unwrap_or_else(|| "overnight".to_owned()),
+                backlog_path: parser.optional_path("--backlog"),
+                max_duration_secs: parser.parse_u64_or_default(
+                    "--max-duration-secs",
+                    vm_lab::overnight::DEFAULT_MAX_DURATION_SECS,
+                )?,
+                max_attempts_per_cell: u32::try_from(parser.parse_u64_or_default(
+                    "--max-attempts-per-cell",
+                    vm_lab::overnight::DEFAULT_MAX_ATTEMPTS_PER_CELL as u64,
+                )?)
+                .map_err(|_| "invalid value for --max-attempts-per-cell".to_owned())?,
+                rotation_raw: parser.value("--rotation"),
+                auto_merge_safe_cells: parser.has_flag("--auto-merge-safe-cells"),
+                agent_cmd: parser
+                    .value("--agent-cmd")
+                    .unwrap_or_else(|| "claude".to_owned()),
+                agent_timeout_secs: parser.parse_u64_or_default(
+                    "--agent-timeout-secs",
+                    vm_lab::overnight::DEFAULT_AGENT_TIMEOUT_SECS,
+                )?,
+                seed_status: parser.value("--seed-status"),
+                dry_run: parser.has_flag("--dry-run"),
             },
         }),
         "vm-lab-validate-windows-security" => Ok(OpsCommand::VmLabValidateWindowsSecurity {
@@ -3523,6 +3559,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 skip_gates: parser.has_flag("--skip-gates"),
                 skip_soak: parser.has_flag("--skip-soak"),
                 skip_cross_network: parser.has_flag("--skip-cross-network"),
+                enable_chaos_suite: parser.has_flag("--enable-chaos-suite"),
                 source_mode: parser.value("--source-mode"),
                 repo_ref: parser.value("--repo-ref"),
                 report_dir: parser.optional_path("--report-dir"),
@@ -7040,6 +7077,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::VmLabOrchestrateLiveLab { config } => {
             vm_lab::execute_ops_vm_lab_orchestrate_live_lab(config)
         }
+        OpsCommand::VmLabOvernight { config } => vm_lab::execute_ops_vm_lab_overnight(config),
         OpsCommand::VmLabValidateWindowsSecurity { config } => {
             vm_lab::run_validate_windows_security(&config)
         }
@@ -17834,6 +17872,7 @@ fn help_text() -> String {
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
         "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--dry-run]",
         "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--legacy-bash-orchestrator] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--script <path>] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>]",
+        "  ops vm-lab-overnight --ssh-identity-file <path> [--inventory <path>] [--known-hosts-file <path>] [--branch-prefix <name>] [--backlog <path>] [--max-duration-secs <secs>] [--max-attempts-per-cell <n>] [--rotation <breadth-first|deep-first>] [--auto-merge-safe-cells] [--agent-cmd <path>] [--agent-timeout-secs <secs>] [--seed-status <os:role=status,...>] [--dry-run]",
         "  ops vm-lab-validate-windows-security --inventory <path> --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] [--ssh-port <port>] [--utm-documents-root <path>] [--utmctl-path <path>] --report-dir <path> [--dry-run] [--skip-access-bootstrap] [--skip-install] [--no-fail-on-authenticode] [--distribute-windows-membership-bundle <path>] [--distribute-windows-assignment-bundle <path>] [--distribute-windows-traversal-bundle <path>] [--distribute-windows-dns-zone-bundle <path>]",
         "  ops vm-lab-validate-linux-security [--inventory <path>] --linux-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--mesh-status-state-path <path>] [--mesh-status-expected-peer-ids <id[,id...]>] [--mesh-status-max-age-seconds <secs>]",
         "  ops vm-lab-distribute-windows-state [--inventory <path>] --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--membership-bundle <path>] [--assignment-bundle <path>] [--traversal-bundle <path>] [--dns-zone-bundle <path>]",

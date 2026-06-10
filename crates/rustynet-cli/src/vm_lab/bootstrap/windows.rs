@@ -2270,7 +2270,14 @@ impl WindowsBootstrapProvider {
                 )
             }
             BootstrapPhase::VerifyRuntime => {
-                let invocation = build_windows_verify_invocation(context, true);
+                // Bootstrap completes before any peer or tunnel exists, so the
+                // in-sequence verify asserts service posture only. Live-path
+                // proof (`-RequireLivePath`) is owned by the tunnel-smoke
+                // flows, which bring up a real tunnel before demanding it —
+                // requiring it here is unsatisfiable by construction (no
+                // tunnel yet, and the Windows trust CLI cannot run the
+                // status/netcheck probes) and bricked Windows bootstrap.
+                let invocation = build_windows_verify_invocation(context, false);
                 if local_utm_result_file_supported_for_phase(BootstrapPhase::VerifyRuntime, target)
                 {
                     self.run_helper_via_local_utm_result_file(
@@ -2821,7 +2828,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_verify_invocation_requires_live_path_only_for_final_verify() {
+    fn windows_verify_invocation_emits_require_live_path_flag_only_when_requested() {
         let context = sample_context(None);
         let layout_only = build_windows_verify_invocation(&context, false);
         assert_eq!(layout_only.helper_file_name, WINDOWS_VERIFY_HELPER_FILE);

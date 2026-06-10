@@ -898,6 +898,7 @@ mod tests {
             exit_platform: None,
             relay_platform: None,
             anchor_platform: None,
+            enable_chaos_suite: false,
         }
     }
 
