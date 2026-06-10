@@ -101,8 +101,8 @@ fn run() -> Result<(), String> {
     let mut ctx = LiveLabContext::new("rustynet-key-custody", ssh_id.as_path())?;
     ctx.push_sudo_password(&target_host)?;
 
-    const KEY_FILE: &str = "/etc/rustynet/device.key";
-    const KEY_DIR: &str = "/etc/rustynet";
+    const KEY_FILE: &str = "/var/lib/rustynet/keys/wireguard.key.enc";
+    const KEY_DIR: &str = "/var/lib/rustynet/keys";
 
     // ── Stage 1: initial permission check ────────────────────────────────────
     logger.line("[key-custody] checking initial key file permissions")?;
@@ -160,6 +160,10 @@ fn run() -> Result<(), String> {
     // ── Stage 4: restore permissions ─────────────────────────────────────────
     logger.line("[key-custody] restoring key file permissions to 0600")?;
     let _ = ctx.run_root_allow_failure(&target_host, &["chmod", "0600", KEY_FILE]);
+    // Clear systemd's failed-start counter before restarting: a single
+    // rejected start (bad perms) increments the burst counter and the unit
+    // stays in "failed" state, blocking the next `systemctl start`.
+    let _ = ctx.run_root_allow_failure(&target_host, &["systemctl", "reset-failed", "rustynetd"]);
     let _ = ctx.run_root_allow_failure(&target_host, &["systemctl", "start", "rustynetd"]);
     std::thread::sleep(std::time::Duration::from_secs(8));
 

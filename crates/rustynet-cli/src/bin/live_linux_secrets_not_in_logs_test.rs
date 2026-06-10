@@ -228,6 +228,11 @@ fn run() -> Result<(), String> {
 fn scan_hex_pattern(text: &str, char_len: usize) -> Vec<String> {
     let mut hits = Vec::new();
     for line in text.lines() {
+        // journalctl inserts "-- Boot <boot-id> --" separator lines between boots;
+        // the boot-id is not a secret — skip these metadata lines.
+        if line.starts_with("-- Boot ") || line.starts_with("-- Reboot ") {
+            continue;
+        }
         let bytes = line.as_bytes();
         let mut i = 0usize;
         while i + char_len <= bytes.len() {
