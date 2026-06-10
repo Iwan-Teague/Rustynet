@@ -1967,7 +1967,7 @@ pub fn execute_ops_write_live_linux_reboot_recovery_report(
     if status != CHECK_PASS {
         return Err("live_linux_reboot_recovery report status is fail".to_owned());
     }
-    Ok(report_path.display().to_string())
+    Ok(CHECK_PASS.to_owned())
 }
 
 pub fn execute_ops_write_live_linux_lab_run_summary(
