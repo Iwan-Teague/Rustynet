@@ -25,9 +25,11 @@ pub fn repo_root() -> PathBuf {
             return p;
         }
     }
-    // Use compile-time baked path (set via build.rs or default)
-    if let Ok(dir) = std::env::var("RUSTYNET_REPO_BAKED") {
-        let p = PathBuf::from(&dir);
+    // Use the compile-time baked path (set via build.rs). This must be
+    // option_env! — a runtime env::var never sees cargo:rustc-env values, which
+    // left servers rooted at the client's CWD when launched outside the repo.
+    if let Some(dir) = option_env!("RUSTYNET_REPO_BAKED") {
+        let p = PathBuf::from(dir);
         if p.is_dir() {
             return p;
         }
@@ -40,6 +42,18 @@ pub fn repo_root() -> PathBuf {
         }
     }
     PathBuf::from(".")
+}
+
+/// Full version string with build provenance (git short SHA + a `-dirty` flag +
+/// build time), baked by `build.rs`. Each server reports this as
+/// `serverInfo.version` during `initialize`, so stale-binary drift — a client
+/// launched an old `./bin` while the tree moved on — is detectable by comparing
+/// it against the working tree's `git rev-parse HEAD`.
+pub fn server_version() -> String {
+    let pkg = env!("CARGO_PKG_VERSION");
+    let sha = option_env!("RUSTYNET_GIT_SHA").unwrap_or("unknown");
+    let built = option_env!("RUSTYNET_BUILD_TIME").unwrap_or("unknown");
+    format!("{pkg} (git {sha}, built {built})")
 }
 
 // ── JSON-RPC 2.0 types ────────────────────────────────────────────────
@@ -549,6 +563,14 @@ pub fn spawn_logged(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
+    // Make the job its own process-group leader so cancellation can signal the
+    // WHOLE tree (orchestrator → bash workers → utmctl pushes). Killing only
+    // the leader leaves workers orphaned and still mutating the lab.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -710,6 +732,18 @@ fn negotiate_protocol_version(requested: Option<&str>) -> String {
     }
 }
 
+/// Extract a human-readable message from a caught panic payload (the `Box<dyn
+/// Any>` returned by `catch_unwind`). Panics carry either a `&str` or a `String`.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 fn handle_request(server: &impl McpServer, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
     eprintln!("[rustynet-mcp] <- {} id={:?}", req.method, req.id);
 
@@ -777,7 +811,23 @@ fn handle_request(server: &impl McpServer, req: &JsonRpcRequest) -> Option<JsonR
                 }
             };
 
-            let result = server.call_tool(&params.name, params.arguments);
+            // Isolate tool panics. This loop is single-threaded with no outer
+            // guard, so without catch_unwind a panic in ANY tool (CLAUDE.md
+            // §10.2 — a panic is a DoS) would unwind and kill the whole server,
+            // dropping every in-flight background-job handle. Catch it and
+            // surface it as a tool error so one bad call can't take the server
+            // down. The default panic hook still logs the backtrace to stderr.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                server.call_tool(&params.name, params.arguments)
+            }))
+            .unwrap_or_else(|panic| {
+                let msg = panic_message(panic.as_ref());
+                eprintln!("[rustynet-mcp] tool '{}' panicked: {msg}", params.name);
+                tool_error(&format!(
+                    "Internal error: tool '{}' panicked: {msg}",
+                    params.name
+                ))
+            });
             let value = serde_json::to_value(&result).unwrap_or(Value::Null);
             Some(make_response(req.id.clone(), value))
         }
@@ -890,10 +940,10 @@ mod tests {
             }]
         }
         fn call_tool(&self, name: &str, _arguments: Option<Value>) -> ToolCallResult {
-            if name == "echo" {
-                tool_success("ok")
-            } else {
-                tool_error("unknown")
+            match name {
+                "echo" => tool_success("ok"),
+                "boom" => panic!("kaboom"),
+                _ => tool_error("unknown"),
             }
         }
         fn resources(&self) -> Vec<Resource> {
@@ -1045,6 +1095,31 @@ mod tests {
         let resp = handle_request(&TestServer, &req("ping", Some(Value::from(7)), None)).unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn tool_panic_is_caught_not_fatal() {
+        // A panicking tool must NOT unwind out of handle_request (that would
+        // kill the single-threaded server). It must come back as a tool error
+        // carrying the panic message. (This intentionally logs a panic line to
+        // stderr via the default hook — that is the caught panic, not a failure.)
+        let resp = handle_request(
+            &TestServer,
+            &req(
+                "tools/call",
+                Some(Value::from(1)),
+                Some(serde_json::json!({"name": "boom"})),
+            ),
+        )
+        .unwrap();
+        let v = resp.result.unwrap();
+        assert_eq!(v["isError"], true);
+        let text = v["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("panicked"), "got: {text}");
+        assert!(
+            text.contains("kaboom"),
+            "should include the panic message: {text}"
+        );
     }
 
     #[test]
