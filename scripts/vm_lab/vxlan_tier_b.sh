@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # vxlan_tier_b.sh - D5.1 Tier B VXLAN-overlay cross-NAT lab driver.
 #
-# Builds isolated VXLAN "home LANs" over the flat UTM bridge. The script only
-# kills simulator processes it started and recorded by PID. It never pkill's
-# rustynetd; daemon setup is delegated to the existing rustynet bootstrap verb.
+# Builds isolated VXLAN "home LANs" over the flat UTM bridge, then runs a full
+# two-node rustynetd E2E test through the NAT boundary. The script only kills
+# simulator processes it started and recorded by PID. It never pkill's
+# rustynetd broadly.
 set -euo pipefail
 
 SSH_BIN="${SSH_BIN:-ssh}"
@@ -11,6 +12,8 @@ SSH_USER="${SSH_USER:-debian}"
 SSH_IDENTITY="${SSH_IDENTITY:-${HOME}/.ssh/rustynet_lab_ed25519}"
 SSH_KNOWN_HOSTS="${SSH_KNOWN_HOSTS:-${HOME}/.ssh/known_hosts}"
 REMOTE_REPO="${REMOTE_REPO:-/home/debian/Rustynet}"
+CARGO="${CARGO:-cargo}"
+RUSTYNET_CLI="${RUSTYNET_CLI:-${CARGO} run -p rustynet-cli --}"
 STATE_ROOT="${STATE_ROOT:-/tmp/rustynet-tier-b}"
 NETWORK_ID="${NETWORK_ID:-tier-b-vxlan}"
 PROFILE_A="${PROFILE_A:-port_restricted_cone}"
@@ -34,6 +37,7 @@ ROUTER_WAN_VX="10.200.0.11/24"
 SVC_VX="10.200.0.254/24"
 VXLAN_PORT="${VXLAN_PORT:-4789}"
 STUN_PORT="${STUN_PORT:-3478}"
+SKIP_APT="${SKIP_APT:-true}"
 
 ssh_opts() {
   printf '%s\n' \
@@ -175,7 +179,24 @@ done
 EOF
 }
 
+# ---------------------------------------------------------------------------
+# setup [--profile-a PROFILE] [--profile-b PROFILE]
+# ---------------------------------------------------------------------------
 setup() {
+  local parsed_a parsed_b
+  parsed_a=""; parsed_b=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile-a) parsed_a="${2:?--profile-a needs a value}"; shift 2 ;;
+      --profile-b) parsed_b="${2:?--profile-b needs a value}"; shift 2 ;;
+      --profile)   parsed_a="${2:?--profile needs a value}"; parsed_b="$parsed_a"; shift 2 ;;
+      -h|--help)   usage; exit 0 ;;
+      *) echo "unknown setup arg: $1" >&2; usage; exit 2 ;;
+    esac
+  done
+  [ -n "$parsed_a" ] && PROFILE_A="$parsed_a"
+  [ -n "$parsed_b" ] && PROFILE_B="$parsed_b"
+
   remote "$NODE_A_HOST" "$(vxlan_leaf_cmd 100 "$NODE_A_HOST" "$ROUTER_HOST" "$NODE_A_VX" "$NODE_A_GW" vxlan100)"
   remote "$NODE_B_HOST" "$(vxlan_leaf_cmd 200 "$NODE_B_HOST" "$ROUTER_HOST" "$NODE_B_VX" "$NODE_B_GW" vxlan200)"
   remote "$SVC_HOST" "$(vxlan_svc_cmd)"
@@ -187,51 +208,101 @@ setup() {
   remote "$ROUTER_HOST" "bash '$REMOTE_REPO/scripts/vm_lab/apply_nat_profile.sh' --profile '$PROFILE_B' --wan-if vxlan1 --lan-if vxlan200 --lan-host 172.16.20.2 --wan-udp-ports '$UDP_PORTS_B'"
   remote "$ROUTER_HOST" "$(install_combined_nat_cmd)"
   remote "$SVC_HOST" "$(start_stun_cmd)"
+
+  echo "tier-b: setup complete profile_a=${PROFILE_A} profile_b=${PROFILE_B}"
   status
 }
 
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
 status() {
-  echo "== node A =="
+  echo "== node A ($NODE_A_HOST) =="
   remote "$NODE_A_HOST" "ip -br addr show vxlan100 2>/dev/null || true; ip route show default"
-  echo "== node B =="
+  echo "== node B ($NODE_B_HOST) =="
   remote "$NODE_B_HOST" "ip -br addr show vxlan200 2>/dev/null || true; ip route show default"
-  echo "== router =="
+  echo "== router ($ROUTER_HOST) =="
   remote "$ROUTER_HOST" "for link in vxlan100 vxlan200 vxlan1; do ip -br addr show \"\$link\" 2>/dev/null || true; done; cat /run/rustynet_tier_b_nat_profile 2>/dev/null || true"
-  echo "== svc =="
+  echo "== svc ($SVC_HOST) =="
   remote "$SVC_HOST" "ip -br addr show vxlan1 2>/dev/null || true; cat '$STATE_ROOT/stun.pid' 2>/dev/null || true"
 }
 
+# ---------------------------------------------------------------------------
+# teardown
+# ---------------------------------------------------------------------------
 teardown() {
   remote "$NODE_A_HOST" "$(teardown_cmd)" || true
   remote "$NODE_B_HOST" "$(teardown_cmd)" || true
   remote "$SVC_HOST" "$(teardown_cmd)" || true
   remote "$ROUTER_HOST" "$(teardown_cmd)" || true
+  echo "tier-b: teardown complete"
 }
 
+# ---------------------------------------------------------------------------
+# run-daemon-test
+#
+# Runs the full two-node E2E flow through the NAT boundary using the existing
+# `ops run-debian-two-node-e2e` orchestrator, which handles bootstrap, membership
+# setup, assignment issuance, WG handshake verification, and tunnel ping.
+# ---------------------------------------------------------------------------
 run_daemon_test() {
-  setup
-  remote "$NODE_A_HOST" "mkdir -p '$STATE_ROOT/node-a'"
-  remote "$NODE_B_HOST" "mkdir -p '$STATE_ROOT/node-b'"
-  remote "$NODE_A_HOST" "cd '$REMOTE_REPO' && RUSTYNET_INSTALL_SOURCE_ROOT='$REMOTE_REPO' /usr/local/bin/rustynet ops e2e-bootstrap-host --role client --node-id tier-b-a --network-id '$NETWORK_ID' --src-dir '$REMOTE_REPO' --ssh-allow-cidrs 172.16.0.0/12,10.200.0.0/24 --skip-apt"
-  remote "$NODE_B_HOST" "cd '$REMOTE_REPO' && RUSTYNET_INSTALL_SOURCE_ROOT='$REMOTE_REPO' /usr/local/bin/rustynet ops e2e-bootstrap-host --role client --node-id tier-b-b --network-id '$NETWORK_ID' --src-dir '$REMOTE_REPO' --ssh-allow-cidrs 172.16.0.0/12,10.200.0.0/24 --skip-apt"
+  setup "$@"
+
+  echo "== Tier B daemon test: two-node E2E over VXLAN NAT boundary =="
+  echo "   node A (exit):  ${SSH_USER}@${NODE_A_HOST}  overlay=${NODE_A_VX}"
+  echo "   node B (client): ${SSH_USER}@${NODE_B_HOST}  overlay=${NODE_B_VX}"
+  echo "   router:         ${ROUTER_HOST}  profiles=${PROFILE_A}/${PROFILE_B}"
+  echo "   svc (STUN):     ${SVC_HOST}  ${SVC_VX}:${STUN_PORT}"
+  echo ""
+
+  local report="${STATE_ROOT}/report.json"
+
+  ${RUSTYNET_CLI} ops run-debian-two-node-e2e \
+    --exit-host "${SSH_USER}@${NODE_A_HOST}" \
+    --client-host "${SSH_USER}@${NODE_B_HOST}" \
+    --ssh-allow-cidrs "172.16.0.0/12,10.200.0.0/24" \
+    --network-id "$NETWORK_ID" \
+    --exit-node-id tier-b-a \
+    --client-node-id tier-b-b \
+    --ssh-identity "${SSH_IDENTITY}" \
+    --ssh-known-hosts-file "${SSH_KNOWN_HOSTS}" \
+    $( [ "$SKIP_APT" = "true" ] && echo "--skip-apt" ) \
+    --report-path "$report"
+
+  echo ""
+  echo "== Tier B daemon test: PASS =="
+  echo "   report: $report"
 }
 
+# ---------------------------------------------------------------------------
+# usage
+# ---------------------------------------------------------------------------
 usage() {
   cat <<EOF
-usage: $0 setup|status|teardown|run-daemon-test
+usage: $0 setup [--profile-a PROFILE] [--profile-b PROFILE] [--profile PROFILE]
+       $0 status
+       $0 teardown
+       $0 run-daemon-test [--profile-a PROFILE] [--profile-b PROFILE]
 
 Env overrides:
-  NODE_A_HOST=$NODE_A_HOST NODE_B_HOST=$NODE_B_HOST SVC_HOST=$SVC_HOST ROUTER_HOST=$ROUTER_HOST WORK_HOST=$WORK_HOST
-  PROFILE_A=$PROFILE_A PROFILE_B=$PROFILE_B REMOTE_REPO=$REMOTE_REPO
+  PROFILE_A=$PROFILE_A  PROFILE_B=$PROFILE_B  NETWORK_ID=$NETWORK_ID
+  NODE_A_HOST=$NODE_A_HOST  NODE_B_HOST=$NODE_B_HOST
+  SVC_HOST=$SVC_HOST  ROUTER_HOST=$ROUTER_HOST
+  REMOTE_REPO=$REMOTE_REPO  SSH_USER=$SSH_USER
+  SKIP_APT=$SKIP_APT
+  RUSTYNET_CLI=$RUSTYNET_CLI
 EOF
 }
 
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 cmd="${1:-}"
 case "$cmd" in
-  setup) setup ;;
-  status) status ;;
-  teardown) teardown ;;
-  run-daemon-test) run_daemon_test ;;
-  -h|--help|"") usage ;;
+  setup)           shift; setup "$@" ;;
+  status)          status ;;
+  teardown)        teardown ;;
+  run-daemon-test) shift; run_daemon_test "$@" ;;
+  -h|--help|"")    usage ;;
   *) echo "unknown command: $cmd" >&2; usage; exit 2 ;;
 esac
