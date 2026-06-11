@@ -21027,23 +21027,85 @@ fn probe_tcp_port_status(
     match TcpStream::connect_timeout(&socket_addr, timeout) {
         Ok(_) => Ok(("open".to_owned(), None)),
         Err(primary_err) => {
-            // On macOS, the 192.168.64.0/24 UTM shared-network route is SCOPED to bridge100
-            // and absent from the global routing table. TcpStream::connect_timeout uses the
-            // global table → routes via en0 → fails. Retry by binding to 192.168.64.1 so the
-            // OS selects the bridge100-scoped route instead.
-            if let IpAddr::V4(v4) = parsed_ip {
+            // On macOS some process contexts (e.g. sandboxed app descendants) cannot reach
+            // bridged-network VMs with an unbound socket because the route lookup returns
+            // EHOSTUNREACH before the ARP-cloned host route is consulted.  Retrying with
+            // the socket explicitly bound to the source IP that the kernel would select for
+            // this destination (discovered via a zero-cost UDP connect that sends no bytes)
+            // forces the correct interface-scoped path.
+            //
+            // Also handles 192.168.64.0/24 (UTM shared-network bridge100) where the same
+            // scoping issue was first observed.
+            use socket2::{Domain, SockAddr, Socket, Type};
+            let source_ip_for_bind: Option<IpAddr> = if let IpAddr::V4(v4) = parsed_ip {
                 let octets = v4.octets();
                 if octets[0] == 192 && octets[1] == 168 && octets[2] == 64 {
-                    use socket2::{Domain, SockAddr, Socket, Type};
-                    if let Ok(sock) = Socket::new(Domain::IPV4, Type::STREAM, None) {
-                        let bind: SocketAddr = "192.168.64.1:0".parse().unwrap();
-                        if sock.bind(&SockAddr::from(bind)).is_ok()
-                            && sock
-                                .connect_timeout(&SockAddr::from(socket_addr), timeout)
-                                .is_ok()
-                        {
-                            return Ok(("open".to_owned(), None));
-                        }
+                    // Legacy: UTM shared network — bind to the bridge100 gateway.
+                    "192.168.64.1".parse().ok()
+                } else {
+                    // General case: probe the source IP the kernel would select for
+                    // this destination via a UDP connect (no packets sent).
+                    std::net::UdpSocket::bind("0.0.0.0:0")
+                        .and_then(|u| {
+                            u.connect(SocketAddr::new(IpAddr::V4(v4), port))?;
+                            u.local_addr()
+                        })
+                        .ok()
+                        .map(|a| a.ip())
+                        .filter(|src| *src != IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+                }
+            } else {
+                None
+            };
+            if let (Some(src), Ok(sock)) = (
+                source_ip_for_bind,
+                Socket::new(Domain::IPV4, Type::STREAM, None),
+            ) {
+                let bind: SocketAddr = SocketAddr::new(src, 0);
+                if sock.bind(&SockAddr::from(bind)).is_ok()
+                    && sock
+                        .connect_timeout(&SockAddr::from(socket_addr), timeout)
+                        .is_ok()
+                {
+                    return Ok(("open".to_owned(), None));
+                }
+            }
+            // Third fallback: on macOS the UDP connect trick can also fail (EHOSTUNREACH) when
+            // running as a subprocess of a sandboxed app whose network extension intercepts
+            // outgoing UDP.  Enumerate local interface addresses directly via getifaddrs and
+            // pick the first IPv4 address on the same /24 as the target — this is the address
+            // that *would* be selected for the destination if routing were not blocked — then
+            // bind the TCP socket explicitly before connecting.
+            if let IpAddr::V4(v4_target) = parsed_ip {
+                let target_prefix = {
+                    let o = v4_target.octets();
+                    [o[0], o[1], o[2]]
+                };
+                let ifaddr_src: Option<IpAddr> =
+                    nix::ifaddrs::getifaddrs().ok().and_then(|addrs| {
+                        addrs
+                            .filter_map(|ia| ia.address)
+                            .filter_map(|sa| {
+                                let v4 = sa.as_sockaddr_in()?.ip();
+                                let o = v4.octets();
+                                if [o[0], o[1], o[2]] == target_prefix && v4 != v4_target {
+                                    Some(IpAddr::V4(v4))
+                                } else {
+                                    None
+                                }
+                            })
+                            .next()
+                    });
+                if let (Some(src), Ok(sock)) =
+                    (ifaddr_src, Socket::new(Domain::IPV4, Type::STREAM, None))
+                {
+                    let bind: SocketAddr = SocketAddr::new(src, 0);
+                    if sock.bind(&SockAddr::from(bind)).is_ok()
+                        && sock
+                            .connect_timeout(&SockAddr::from(socket_addr), timeout)
+                            .is_ok()
+                    {
+                        return Ok(("open".to_owned(), None));
                     }
                 }
             }
@@ -24171,7 +24233,10 @@ fn parse_local_utm_list_started_status(list_output: &str, utm_name: &str) -> Opt
             return None;
         }
 
-        Some(status == "started")
+        // "stopping" means a graceful-shutdown was requested but the QEMU process is still
+        // alive and the guest is still reachable. Treat it as present so a VM undergoing a
+        // clean shutdown is not incorrectly flagged as powered-off and needlessly restarted.
+        Some(status == "started" || status == "stopping")
     })
 }
 
@@ -30470,6 +30535,7 @@ live_lan_toggle\thard\tfail\t1\t{}/logs/live_lan_toggle.log\trun LAN access togg
 UUID                                 Status   Name
 21589998-AC14-41A8-A146-006AC70501D3 stopped  debian-headless-1
 FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
+EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
 ";
 
         assert_eq!(
@@ -30478,6 +30544,13 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         );
         assert_eq!(
             parse_local_utm_list_started_status(list_output, "debian-headless-2"),
+            Some(true)
+        );
+        // "stopping" returns Some(true) — the QEMU process is still alive during a graceful
+        // shutdown window and the VM is still SSH-accessible; treat it as present so the
+        // orchestrator does not needlessly power-cycle an SSH-accessible VM.
+        assert_eq!(
+            parse_local_utm_list_started_status(list_output, "debian-headless-3"),
             Some(true)
         );
         assert_eq!(
@@ -36238,6 +36311,21 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         cfg.node_assignments =
             vec![super::orchestrator::role_assignment::parse_node_role_arg("a:exit").unwrap()];
         super::validate_orchestrate_live_lab_config(&cfg).expect("must accept --node alone");
+    }
+
+    #[test]
+    fn execute_orchestrate_with_node_uses_rust_native_known_hosts_gate() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.node_assignments =
+            vec![super::orchestrator::role_assignment::parse_node_role_arg("a:exit").unwrap()];
+
+        let err = super::execute_ops_vm_lab_orchestrate_live_lab(cfg)
+            .expect_err("--node path must fail before legacy bash dispatch");
+
+        assert!(
+            err.contains("--known-hosts-file is required when --node flags are present"),
+            "rust-native dispatch must enforce pinned SSH trust before inventory or bash: {err}"
+        );
     }
 
     #[test]

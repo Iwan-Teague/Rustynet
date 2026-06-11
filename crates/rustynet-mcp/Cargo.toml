@@ -20,6 +20,8 @@ path = "src/bin/lab_state.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+nix = { version = "0.29", default-features = false, features = ["net"] }
+socket2 = "0.6"
 
 [lints]
 workspace = true

@@ -19,8 +19,9 @@ use rustynet_mcp::{
     tail_file, text_content, tool_error, tool_success, truncate_output, truncate_tail,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
-use std::net::{TcpStream, ToSocketAddrs};
+use socket2::{Domain, SockAddr, Socket, Type};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +39,83 @@ const LOOP_JOURNAL: &str = "state/mcp-loop-journal.jsonl";
 /// several minutes; warm calls return in seconds. The kill-on-timeout watchdog
 /// still bounds a genuinely hung probe.
 const DISCOVERY_TIMEOUT_SECS: u64 = 600;
+
+const CANONICAL_COVERAGE_COLUMNS: &[&str] = &[
+    "linux_stage_bootstrap",
+    "linux_stage_membership",
+    "linux_stage_assignments",
+    "linux_stage_baseline_runtime",
+    "linux_stage_anchor",
+    "linux_stage_relay_service_lifecycle",
+    "linux_stage_exit_handoff",
+    "linux_stage_lan_toggle",
+    "linux_stage_two_hop",
+    "linux_stage_role_switch_matrix",
+    "linux_stage_managed_dns",
+    "linux_stage_traversal",
+    "linux_stage_mixed_topology",
+    "linux_stage_reboot_recovery",
+    "linux_stage_extended_soak",
+    "linux_stage_chaos",
+    "linux_stage_cleanup",
+    "linux_stage_secrets_not_in_logs",
+    "linux_stage_key_custody",
+    "linux_stage_enrollment_restart",
+    "linux_stage_network_flap",
+    "macos_stage_bootstrap",
+    "macos_stage_membership",
+    "macos_stage_assignments",
+    "macos_stage_baseline_runtime",
+    "macos_stage_anchor",
+    "macos_stage_relay_service_lifecycle",
+    "macos_stage_exit_handoff",
+    "macos_stage_lan_toggle",
+    "macos_stage_two_hop",
+    "macos_stage_role_switch_matrix",
+    "macos_stage_managed_dns",
+    "macos_stage_traversal",
+    "macos_stage_mixed_topology",
+    "macos_stage_reboot_recovery",
+    "macos_stage_extended_soak",
+    "macos_stage_chaos",
+    "macos_stage_cleanup",
+    "macos_stage_secrets_not_in_logs",
+    "macos_stage_key_custody",
+    "macos_stage_enrollment_restart",
+    "macos_stage_network_flap",
+    "windows_stage_bootstrap",
+    "windows_stage_membership",
+    "windows_stage_assignments",
+    "windows_stage_baseline_runtime",
+    "windows_stage_anchor",
+    "windows_stage_relay_service_lifecycle",
+    "windows_stage_exit_handoff",
+    "windows_stage_lan_toggle",
+    "windows_stage_two_hop",
+    "windows_stage_role_switch_matrix",
+    "windows_stage_managed_dns",
+    "windows_stage_traversal",
+    "windows_stage_mixed_topology",
+    "windows_stage_reboot_recovery",
+    "windows_stage_extended_soak",
+    "windows_stage_chaos",
+    "windows_stage_cleanup",
+    "windows_stage_secrets_not_in_logs",
+    "windows_stage_key_custody",
+    "windows_stage_enrollment_restart",
+    "windows_stage_network_flap",
+    "cross_os_bootstrap",
+    "cross_os_membership_convergence",
+    "cross_os_peer_visibility",
+    "cross_os_direct_path",
+    "cross_os_relay_path",
+    "cross_os_exit_path",
+    "cross_os_dns",
+    "cross_os_lan_toggle",
+    "cross_os_role_switch",
+    "cross_os_anchor_bundle_pull",
+    "cross_os_anchor_enrollment",
+];
 
 fn main() {
     let server = LabStateServer::new();
@@ -922,12 +1000,9 @@ impl LabStateServer {
         let header = split_csv_line(header_line);
         let run_idx = header.iter().position(|h| h == "run_id");
         // Coverage cells = per-OS stage columns + cross-OS scenario columns.
-        let cols: Vec<(usize, String)> = header
-            .iter()
-            .enumerate()
-            .filter(|(_, h)| h.contains("_stage_") || h.starts_with("cross_os_"))
-            .map(|(i, h)| (i, h.clone()))
-            .collect();
+        // Include canonical columns even when an older matrix header has not
+        // been schema-upgraded yet; those cells classify as NEVER-RUN.
+        let cols = coverage_columns_from_header(&header);
         let rows: Vec<Vec<String>> = lines
             .filter(|l| !l.trim().is_empty())
             .map(split_csv_line)
@@ -958,7 +1033,7 @@ impl LabStateServer {
             let mut last_run = String::new();
             let mut last_idx = 0usize;
             for (ri, row) in rows.iter().enumerate() {
-                let v = row.get(*idx).map(|s| s.trim()).unwrap_or("");
+                let v = idx.and_then(|i| row.get(i)).map(|s| s.trim()).unwrap_or("");
                 if v == "pass" || v == "fail" {
                     if v == "pass" {
                         passes += 1;
@@ -1875,13 +1950,74 @@ fn tcp_reachable(ip: &str, port: u16, timeout: Duration) -> bool {
     if ip.is_empty() {
         return false;
     }
-    match format!("{ip}:{port}").to_socket_addrs() {
-        Ok(mut addrs) => addrs
-            .next()
-            .map(|a| TcpStream::connect_timeout(&a, timeout).is_ok())
-            .unwrap_or(false),
-        Err(_) => false,
+    let parsed_ip: IpAddr = match ip.trim().parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let socket_addr = SocketAddr::new(parsed_ip, port);
+    if TcpStream::connect_timeout(&socket_addr, timeout).is_ok() {
+        return true;
     }
+    // On macOS some process contexts (e.g. MCP server spawned under Claude.app) cannot
+    // reach bridged-network VMs with an unbound socket. Retry bound to the source IP the
+    // kernel would select (discovered via zero-cost UDP connect — sends no bytes).
+    let IpAddr::V4(v4) = parsed_ip else {
+        return false;
+    };
+    let octets = v4.octets();
+    let source_ip: Option<IpAddr> = if octets[0] == 192 && octets[1] == 168 && octets[2] == 64 {
+        "192.168.64.1".parse().ok()
+    } else {
+        std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|u| {
+                u.connect(SocketAddr::new(IpAddr::V4(v4), port))?;
+                u.local_addr()
+            })
+            .ok()
+            .map(|a| a.ip())
+            .filter(|src| *src != IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    };
+    if let (Some(src), Ok(sock)) = (source_ip, Socket::new(Domain::IPV4, Type::STREAM, None)) {
+        let bind: SocketAddr = SocketAddr::new(src, 0);
+        if sock.bind(&SockAddr::from(bind)).is_ok()
+            && sock
+                .connect_timeout(&SockAddr::from(socket_addr), timeout)
+                .is_ok()
+        {
+            return true;
+        }
+    }
+    // Third fallback: UDP connect also fails from sandboxed process contexts on macOS.
+    // Enumerate local interface addresses and find one in the same /24 as the target.
+    let target_prefix = {
+        let o = v4.octets();
+        [o[0], o[1], o[2]]
+    };
+    let ifaddr_src: Option<IpAddr> = nix::ifaddrs::getifaddrs().ok().and_then(|addrs| {
+        addrs
+            .filter_map(|ia| ia.address)
+            .filter_map(|sa| {
+                let v4_local = sa.as_sockaddr_in()?.ip();
+                let o = v4_local.octets();
+                if [o[0], o[1], o[2]] == target_prefix && v4_local != v4 {
+                    Some(IpAddr::V4(v4_local))
+                } else {
+                    None
+                }
+            })
+            .next()
+    });
+    if let (Some(src), Ok(sock)) = (ifaddr_src, Socket::new(Domain::IPV4, Type::STREAM, None)) {
+        let bind: SocketAddr = SocketAddr::new(src, 0);
+        if sock.bind(&SockAddr::from(bind)).is_ok()
+            && sock
+                .connect_timeout(&SockAddr::from(socket_addr), timeout)
+                .is_ok()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// RFC4180-aware single-line CSV split (handles quoted fields with commas).
@@ -1912,6 +2048,23 @@ fn split_csv_line(line: &str) -> Vec<String> {
     }
     out.push(cur);
     out
+}
+
+fn coverage_columns_from_header(header: &[String]) -> Vec<(Option<usize>, String)> {
+    let mut seen = BTreeSet::new();
+    let mut cols = Vec::new();
+    for (index, name) in header.iter().enumerate() {
+        if name.contains("_stage_") || name.starts_with("cross_os_") {
+            seen.insert(name.clone());
+            cols.push((Some(index), name.clone()));
+        }
+    }
+    for name in CANONICAL_COVERAGE_COLUMNS {
+        if seen.insert((*name).to_owned()) {
+            cols.push((None, (*name).to_owned()));
+        }
+    }
+    cols
 }
 
 /// Classify a run history (oldest-first `(overall_result, first_failed_stage)`
@@ -3648,7 +3801,7 @@ struct StageInfo {
 static STAGE_INFO: &[StageInfo] = &[
     StageInfo {
         name: "bootstrap",
-        aliases: &["bootstrap_hosts", "install"],
+        aliases: &["cleanup_hosts", "bootstrap_hosts", "install"],
         checks: "Builds rustynetd on each node from the source archive, installs the service, starts the daemon, and waits for the control socket.",
         owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/install.rs",
         causes: &[
@@ -3765,6 +3918,17 @@ static STAGE_INFO: &[StageInfo] = &[
             "bundle issuance failure",
         ],
     },
+    StageInfo {
+        name: "traversal",
+        aliases: &["distribute_traversal"],
+        checks: "Signs and distributes traversal hints before runtime enforcement so peers can prefer direct paths and fail closed on stale/invalid traversal state.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/distribute_traversal.rs",
+        causes: &[
+            "Exit node not found in assignments",
+            "no node_id for a node",
+            "traversal bundle issuance or distribution failure",
+        ],
+    },
     // ── Early stages (common first failure points) ──
     StageInfo {
         name: "preflight",
@@ -3778,7 +3942,7 @@ static STAGE_INFO: &[StageInfo] = &[
     },
     StageInfo {
         name: "source_archive",
-        aliases: &[],
+        aliases: &["prepare_source_archive"],
         checks: "Tars the working tree (or HEAD, per source-mode) into the state archive that gets scp'd to each node.",
         owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/source_archive.rs",
         causes: &[
@@ -3788,7 +3952,7 @@ static STAGE_INFO: &[StageInfo] = &[
     },
     StageInfo {
         name: "verify_ssh",
-        aliases: &["ssh"],
+        aliases: &["verify_ssh_reachability", "ssh"],
         checks: "Confirms SSH reachability to each selected node before doing any work.",
         owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/verify_ssh.rs",
         causes: &[
@@ -3827,6 +3991,16 @@ static STAGE_INFO: &[StageInfo] = &[
         causes: &[
             "Windows exit is fail-closed pending WinNAT/HNS live evidence (expected until promoted)",
             "route advertisement / NAT setup failed on the exit",
+        ],
+    },
+    StageInfo {
+        name: "cleanup",
+        aliases: &["final_cleanup"],
+        checks: "Final teardown and artifact collection after exit/role validation has completed.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/final_cleanup.rs",
+        causes: &[
+            "cleanup command failed on a node",
+            "artifact collection failed or report directory is not writable",
         ],
     },
 ];
@@ -4052,11 +4226,15 @@ mod tests {
     fn explain_stage_covers_early_failure_stages() {
         for s in [
             "verify_ssh",
+            "verify_ssh_reachability",
             "preflight",
             "source_archive",
+            "prepare_source_archive",
             "collect_pubkeys",
+            "distribute_traversal",
             "enforce_runtime",
             "active_exit",
+            "cleanup",
         ] {
             let txt = explain_stage(s).content[0].text.clone();
             assert!(
@@ -4391,6 +4569,10 @@ mod tests {
         assert!(
             t.contains("linux_stage_c"),
             "c should appear (never run); got: {t}"
+        );
+        assert!(
+            t.contains("linux_stage_traversal") && t.contains("linux_stage_cleanup"),
+            "canonical new rust-native cells must be visible even before schema upgrade; got: {t}"
         );
         // cross_os_x is green → not listed unless include_green.
         assert!(

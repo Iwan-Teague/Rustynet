@@ -66,10 +66,12 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_stage_two_hop",
     "linux_stage_role_switch_matrix",
     "linux_stage_managed_dns",
+    "linux_stage_traversal",
     "linux_stage_mixed_topology",
     "linux_stage_reboot_recovery",
     "linux_stage_extended_soak",
     "linux_stage_chaos",
+    "linux_stage_cleanup",
     "macos_stage_bootstrap",
     "macos_stage_membership",
     "macos_stage_assignments",
@@ -81,10 +83,12 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "macos_stage_two_hop",
     "macos_stage_role_switch_matrix",
     "macos_stage_managed_dns",
+    "macos_stage_traversal",
     "macos_stage_mixed_topology",
     "macos_stage_reboot_recovery",
     "macos_stage_extended_soak",
     "macos_stage_chaos",
+    "macos_stage_cleanup",
     "windows_stage_bootstrap",
     "windows_stage_membership",
     "windows_stage_assignments",
@@ -96,10 +100,12 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "windows_stage_two_hop",
     "windows_stage_role_switch_matrix",
     "windows_stage_managed_dns",
+    "windows_stage_traversal",
     "windows_stage_mixed_topology",
     "windows_stage_reboot_recovery",
     "windows_stage_extended_soak",
     "windows_stage_chaos",
+    "windows_stage_cleanup",
     "linux_stage_secrets_not_in_logs",
     "macos_stage_secrets_not_in_logs",
     "windows_stage_secrets_not_in_logs",
@@ -438,7 +444,11 @@ fn build_live_lab_run_matrix_values(
         .transpose()?
         .unwrap_or_default();
     let node_rows = read_node_rows(config.report_dir.join(NODES_RELATIVE_PATH).as_path())?;
-    let target_evidence = target_evidence_from_profile(&profile_values, &node_rows);
+    let mut target_evidence = target_evidence_from_profile(&profile_values, &node_rows);
+    if target_evidence.is_empty() {
+        target_evidence =
+            target_evidence_from_parity(config.report_dir.join("parity_input.json").as_path())?;
+    }
     let mut stage_evidence =
         read_stage_evidence(config.report_dir.join(STAGES_RELATIVE_PATH).as_path())?;
     stage_evidence.extend(
@@ -813,6 +823,53 @@ fn target_evidence_from_profile(
     targets
 }
 
+fn target_evidence_from_parity(path: &Path) -> Result<Vec<TargetEvidence>, String> {
+    let Some(report) = read_json_optional(path)? else {
+        return Ok(Vec::new());
+    };
+    let Some(nodes) = report
+        .get("node_statuses")
+        .and_then(|value| value.as_object())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut targets = nodes
+        .iter()
+        .map(|(alias, node)| {
+            let alias_value = node
+                .get("alias")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(alias.as_str())
+                .to_owned();
+            TargetEvidence {
+                label: alias_value.clone(),
+                target: String::new(),
+                alias: alias_value.clone(),
+                platform: node
+                    .get("platform")
+                    .and_then(|value| value.as_str())
+                    .map(normalize_platform)
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                node_id: node
+                    .get("node_id")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(alias_value.as_str())
+                    .to_owned(),
+                bootstrap_role: node
+                    .get("role")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("client")
+                    .to_owned(),
+            }
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|a, b| a.alias.cmp(&b.alias));
+    Ok(targets)
+}
+
 fn normalize_platform(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "mac" | "macos" | "mac_os" | "osx" | "darwin" => "macos".to_owned(),
@@ -830,7 +887,7 @@ fn default_bootstrap_role(label: &str) -> &'static str {
 
 fn role_slots_for_target(target: &TargetEvidence, relay_label: Option<&str>) -> Vec<&'static str> {
     let mut roles = Vec::new();
-    match target.label.as_str() {
+    match target.bootstrap_role.as_str() {
         "exit" => {
             if target.platform == "macos" {
                 roles.push("blind_exit");
@@ -841,6 +898,20 @@ fn role_slots_for_target(target: &TargetEvidence, relay_label: Option<&str>) -> 
                 roles.push("exit");
                 roles.push("anchor");
             }
+        }
+        "anchor" => {
+            roles.push("admin");
+            roles.push("anchor");
+        }
+        "relay" => {
+            roles.push("client");
+            roles.push("relay");
+        }
+        "client" | "entry" | "aux" | "extra" => roles.push("client"),
+        _ if target.label == "exit" => {
+            roles.push("admin");
+            roles.push("exit");
+            roles.push("anchor");
         }
         _ => roles.push("client"),
     }
@@ -970,6 +1041,18 @@ fn populate_role_result_values(
             );
         }
         match stage.stage.as_str() {
+            "bootstrap_hosts" | "validate_baseline_runtime" => {
+                set_target_role_statuses(values, schema, targets, status, |_| true);
+            }
+            "anchor_validation" => {
+                set_target_role_statuses(values, schema, targets, status, |role| role == "anchor");
+            }
+            "deploy_relay_service" | "relay_validation" => {
+                set_target_role_statuses(values, schema, targets, status, |role| role == "relay");
+            }
+            "exit_handoff" | "active_exit" => {
+                set_target_role_statuses(values, schema, targets, status, |role| role == "exit");
+            }
             "live_anchor" => {
                 if let Some(exit) = targets.iter().find(|target| target.label == "exit") {
                     set_status(
@@ -1033,6 +1116,28 @@ fn populate_role_result_values(
                     ),
                     _ => {}
                 }
+            }
+        }
+    }
+}
+
+fn set_target_role_statuses(
+    values: &mut BTreeMap<String, String>,
+    schema: &BTreeSet<String>,
+    targets: &[TargetEvidence],
+    status: &str,
+    include_role: impl Fn(&str) -> bool,
+) {
+    let relay_label = relay_label(targets);
+    for target in targets {
+        for role in role_slots_for_target(target, relay_label) {
+            if include_role(role) {
+                set_status(
+                    values,
+                    schema,
+                    format!("{}_{}", target.platform, role).as_str(),
+                    status,
+                );
             }
         }
     }
@@ -1105,17 +1210,27 @@ fn direct_platform_role(stage: &str) -> Option<(&'static str, &'static str)> {
 fn logical_stage_name(stage: &str) -> Option<&'static str> {
     match stage {
         "preflight"
+        | "prepare_source_archive"
         | "verify_ssh_reachability"
         | "prime_remote_access"
         | "cleanup_hosts"
         | "bootstrap_hosts"
         | "collect_pubkeys" => Some("bootstrap"),
-        "membership_setup" | "distribute_membership_state" => Some("membership"),
-        "issue_and_distribute_assignments" => Some("assignments"),
+        "membership_init"
+        | "distribute_membership"
+        | "membership_setup"
+        | "distribute_membership_state" => Some("membership"),
+        "distribute_assignments" | "issue_and_distribute_assignments" => Some("assignments"),
+        "distribute_traversal" => Some("traversal"),
+        "distribute_dns_zone" => Some("managed_dns"),
         "enforce_baseline_runtime" | "validate_baseline_runtime" => Some("baseline_runtime"),
-        "live_anchor" => Some("anchor"),
-        "live_relay" => Some("relay_service_lifecycle"),
-        "live_exit_handoff" => Some("exit_handoff"),
+        "anchor_validation" | "live_anchor" => Some("anchor"),
+        "deploy_relay_service" | "relay_validation" | "live_relay" => {
+            Some("relay_service_lifecycle")
+        }
+        "exit_handoff" | "active_exit" | "live_exit_handoff" => Some("exit_handoff"),
+        "traffic_test_matrix" => Some("two_hop"),
+        "role_switch_matrix" => Some("role_switch_matrix"),
         "live_lan_toggle" => Some("lan_toggle"),
         "live_two_hop" => Some("two_hop"),
         "live_role_switch_matrix" => Some("role_switch_matrix"),
@@ -1127,6 +1242,7 @@ fn logical_stage_name(stage: &str) -> Option<&'static str> {
         "live_enrollment_restart" => Some("enrollment_restart"),
         "live_network_flap" => Some("network_flap"),
         "extended_soak" => Some("extended_soak"),
+        "cleanup" => Some("cleanup"),
         stage if stage.starts_with("chaos_") => Some("chaos"),
         stage if stage.contains("reboot") => Some("reboot_recovery"),
         _ => None,
@@ -1135,6 +1251,7 @@ fn logical_stage_name(stage: &str) -> Option<&'static str> {
 
 fn platforms_for_stage(stage: &str, targets: &[TargetEvidence]) -> Vec<String> {
     match stage {
+        stage if is_rust_native_stage_name(stage) => unique_platforms(targets),
         "live_anchor" | "live_exit_handoff" => targets
             .iter()
             .find(|target| target.label == "exit")
@@ -1151,6 +1268,33 @@ fn platforms_for_stage(stage: &str, targets: &[TargetEvidence]) -> Vec<String> {
             .filter(|platform| platform == "linux")
             .collect(),
     }
+}
+
+fn is_rust_native_stage_name(stage: &str) -> bool {
+    matches!(
+        stage,
+        "preflight"
+            | "prepare_source_archive"
+            | "verify_ssh_reachability"
+            | "cleanup_hosts"
+            | "bootstrap_hosts"
+            | "collect_pubkeys"
+            | "membership_init"
+            | "distribute_membership"
+            | "anchor_validation"
+            | "distribute_assignments"
+            | "distribute_traversal"
+            | "distribute_dns_zone"
+            | "enforce_baseline_runtime"
+            | "validate_baseline_runtime"
+            | "deploy_relay_service"
+            | "relay_validation"
+            | "traffic_test_matrix"
+            | "role_switch_matrix"
+            | "exit_handoff"
+            | "active_exit"
+            | "cleanup"
+    )
 }
 
 fn unique_platforms(targets: &[TargetEvidence]) -> Vec<String> {
@@ -1175,24 +1319,41 @@ fn populate_cross_os_values(
         return;
     }
     match stage {
+        "preflight"
+        | "prepare_source_archive"
+        | "verify_ssh_reachability"
+        | "cleanup_hosts"
+        | "bootstrap_hosts"
+        | "collect_pubkeys" => set_status(values, schema, "cross_os_bootstrap", status),
+        "membership_init" | "distribute_membership" => {
+            set_status(values, schema, "cross_os_membership_convergence", status)
+        }
+        "distribute_traversal" => set_status(values, schema, "cross_os_direct_path", status),
         "live_mixed_topology" | "validate_windows_mesh_join" | "validate_macos_mesh_join" => {
             set_status(values, schema, "cross_os_peer_visibility", status);
         }
-        "live_exit_handoff" | "promote_windows_exit_active" => {
+        "live_exit_handoff" | "exit_handoff" | "active_exit" | "promote_windows_exit_active" => {
             set_status(values, schema, "cross_os_exit_path", status);
         }
         "live_relay"
+        | "deploy_relay_service"
+        | "relay_validation"
         | "validate_windows_relay_service_lifecycle"
         | "validate_macos_relay_service_lifecycle" => {
             set_status(values, schema, "cross_os_relay_path", status);
         }
         "live_lan_toggle" => set_status(values, schema, "cross_os_lan_toggle", status),
-        "live_role_switch_matrix" => set_status(values, schema, "cross_os_role_switch", status),
+        "live_role_switch_matrix" | "role_switch_matrix" => {
+            set_status(values, schema, "cross_os_role_switch", status)
+        }
         "live_managed_dns"
+        | "distribute_dns_zone"
         | "validate_windows_dns_failclosed"
         | "validate_macos_exit_dns_failclosed" => {
             set_status(values, schema, "cross_os_dns", status)
         }
+        "traffic_test_matrix" => set_status(values, schema, "cross_os_peer_visibility", status),
+        "anchor_validation" => set_status(values, schema, "cross_os_anchor_bundle_pull", status),
         "validate_windows_anchor_bundle_pull"
         | "validate_macos_anchor_bundle_pull"
         | "validate_linux_anchor_bundle_pull" => {
@@ -1506,7 +1667,7 @@ fn parse_csv_record(line: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome,
+        DEFAULT_MATRIX_COLUMNS, LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome,
         build_live_lab_run_matrix_values, parse_csv_record, render_csv_row,
     };
     use std::collections::BTreeMap;
@@ -1631,6 +1792,130 @@ mod tests {
         assert_eq!(values["linux_admin_alias"], "debian-exit");
         assert_eq!(values["windows_client_alias"], "windows-client");
         assert!(!values.contains_key("future_added_column"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rust_native_stage_outcomes_populate_matrix_coverage_cells() {
+        let root = temp_dir("rust-native");
+        let state = root.join("state");
+        fs::create_dir_all(&state).expect("state dir");
+        fs::write(
+            state.join("report_state.json"),
+            r#"{"run_complete": true, "run_passed": true}"#,
+        )
+        .expect("state");
+        fs::write(
+            root.join("parity_input.json"),
+            r#"{
+  "node_statuses": {
+    "linux-exit": {"alias": "linux-exit", "platform": "linux", "role": "exit", "validator_results": []},
+    "windows-client": {"alias": "windows-client", "platform": "windows", "role": "client", "validator_results": []}
+  }
+}"#,
+        )
+        .expect("parity");
+        let stages = [
+            "preflight",
+            "prepare_source_archive",
+            "verify_ssh_reachability",
+            "cleanup_hosts",
+            "bootstrap_hosts",
+            "collect_pubkeys",
+            "membership_init",
+            "distribute_membership",
+            "anchor_validation",
+            "distribute_assignments",
+            "distribute_traversal",
+            "distribute_dns_zone",
+            "enforce_baseline_runtime",
+            "validate_baseline_runtime",
+            "deploy_relay_service",
+            "relay_validation",
+            "traffic_test_matrix",
+            "role_switch_matrix",
+            "exit_handoff",
+            "active_exit",
+            "cleanup",
+        ]
+        .into_iter()
+        .map(|stage| LiveLabRunMatrixStageOutcome {
+            stage: stage.to_owned(),
+            status: "pass".to_owned(),
+            artifacts: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+        let schema = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|column| (*column).to_owned())
+            .collect::<Vec<_>>();
+
+        let values = build_live_lab_run_matrix_values(
+            &schema,
+            &LiveLabRunMatrixAppendConfig {
+                command_name: "vm-lab-orchestrate-live-lab",
+                report_dir: &root,
+                profile_path: None,
+                inventory_path: None,
+                extra_stage_outcomes: stages.as_slice(),
+                notes: None,
+            },
+        )
+        .expect("values");
+
+        assert_eq!(
+            values.get("linux_present").map(String::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            values.get("windows_present").map(String::as_str),
+            Some("pass")
+        );
+        assert_eq!(values.get("linux_exit").map(String::as_str), Some("pass"));
+        assert_eq!(
+            values.get("windows_client").map(String::as_str),
+            Some("pass")
+        );
+        for platform in ["linux", "windows"] {
+            for stage in [
+                "bootstrap",
+                "membership",
+                "assignments",
+                "baseline_runtime",
+                "anchor",
+                "relay_service_lifecycle",
+                "exit_handoff",
+                "two_hop",
+                "role_switch_matrix",
+                "managed_dns",
+                "traversal",
+                "cleanup",
+            ] {
+                let column = format!("{platform}_stage_{stage}");
+                assert_eq!(
+                    values.get(column.as_str()).map(String::as_str),
+                    Some("pass"),
+                    "{column} must be populated from rust-native StageId evidence"
+                );
+            }
+        }
+        for column in [
+            "cross_os_bootstrap",
+            "cross_os_membership_convergence",
+            "cross_os_peer_visibility",
+            "cross_os_direct_path",
+            "cross_os_relay_path",
+            "cross_os_exit_path",
+            "cross_os_dns",
+            "cross_os_role_switch",
+            "cross_os_anchor_bundle_pull",
+        ] {
+            assert_eq!(
+                values.get(column).map(String::as_str),
+                Some("pass"),
+                "{column} must be populated from rust-native StageId evidence"
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 }
