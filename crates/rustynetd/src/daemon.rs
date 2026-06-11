@@ -56,6 +56,11 @@ use crate::relay_client::{
 use crate::resilience::{
     ResilienceError, SessionStateSnapshot, load_session_snapshot, persist_session_snapshot,
 };
+use crate::service_access_state::{
+    derive_service_access_snapshot, force_deny_all, remove_access_state, service_access_dir,
+    write_access_state_atomic, write_grants_and_scopes_atomic,
+};
+use crate::service_exposure::{ExposedService, service_hosting_view_from_membership};
 use crate::stun_client::{StunClient, StunResult, StunTransportRoundTrip};
 use crate::traversal::{
     CandidateSource as ProbeCandidateSource, CoordinationReplayWindow, CoordinationSchedule,
@@ -4098,6 +4103,109 @@ impl DaemonRuntime {
         }
     }
 
+    /// D13 daemon runtime integration: materialise the per-service
+    /// access state (`grants.v1`/`peers.v1`/`scopes.v1`) the sibling
+    /// service binaries consume, derived ONLY from the signed state
+    /// this runtime just verified and committed.
+    ///
+    /// Insertion seam: this is called from the same four places that
+    /// refresh `self.membership_state` + `self.membership_directory`
+    /// after a successful signed-state apply — `bootstrap`,
+    /// `refresh_signed_state_with_reason`, `reconcile`, and
+    /// `handle_membership_apply` — i.e. exactly alongside the
+    /// existing `refresh_dns_zone_state` post-apply hook. There is no
+    /// single shared post-apply function in this runtime (each path
+    /// owns its own fail-closed error handling), so the narrowest
+    /// correct seam is this one method invoked at each commit point.
+    ///
+    /// Behaviour per service (nas, llm):
+    /// - signed membership says this node serves it ⇒ derive the
+    ///   default-deny snapshot from `self.policy` + membership and
+    ///   write it atomically (empty grants = deny-all, written
+    ///   explicitly).
+    /// - it does not serve it but an access dir exists ⇒ remove the
+    ///   state, `grants.v1` first (deny before identity removal) —
+    ///   teardown-before-revoke at the materialisation layer.
+    /// - a failed write degrades to deny-all (`grants.v1` deleted),
+    ///   never to a stale grant list.
+    ///
+    /// The overlay identity map (`peers.v1`) comes from the verified
+    /// assignment bundle's peer `allowed_ips` host CIDRs. At the one
+    /// seam without a bundle in scope (`handle_membership_apply`),
+    /// grants/scopes are rewritten immediately (revocation must not
+    /// wait) and the existing `peers.v1` is left as the last
+    /// verified map — never faked (delta plan D13.b status note).
+    ///
+    /// Logs carry counts only — never node ids, addresses, tokens,
+    /// or file contents.
+    fn materialize_service_access_state(&self, auto_tunnel: Option<&AutoTunnelBundleEnvelope>) {
+        let Some(membership_state) = self.membership_state.as_ref() else {
+            // No verified membership committed yet: nothing to derive,
+            // and the binaries' missing-file default is already deny-all.
+            return;
+        };
+        let view = service_hosting_view_from_membership(membership_state, &self.local_node_id);
+        let overlay_addr_of =
+            auto_tunnel.map(|envelope| overlay_addresses_from_bundle_peers(&envelope.bundle));
+        let empty_overlay = BTreeMap::new();
+
+        for service in [ExposedService::Nas, ExposedService::Llm] {
+            let dir = service_access_dir(service);
+            if view.serves(service) {
+                let snapshot = derive_service_access_snapshot(
+                    &self.policy,
+                    &self.membership_directory,
+                    membership_state,
+                    &self.local_node_id,
+                    service,
+                    overlay_addr_of.as_ref().unwrap_or(&empty_overlay),
+                );
+                let write_result = match overlay_addr_of.as_ref() {
+                    Some(_) => write_access_state_atomic(&dir, &snapshot),
+                    // No verified per-node address source at this seam:
+                    // refresh authorisation now, keep the last verified
+                    // identity map (see doc comment above).
+                    None => write_grants_and_scopes_atomic(&dir, &snapshot),
+                };
+                match write_result {
+                    Ok(()) => eprintln!(
+                        "rustynetd: service access state materialised: service={} grants={} peers={}",
+                        service.as_str(),
+                        snapshot.grants.len(),
+                        snapshot.peers.len(),
+                    ),
+                    Err(err) => {
+                        // Fail closed: a half-written refresh must not
+                        // leave a stale grant list from an earlier epoch.
+                        log::warn!(
+                            "service access state write failed for service={}; forcing deny-all: {err}",
+                            service.as_str()
+                        );
+                        if let Err(deny_err) = force_deny_all(&dir) {
+                            log::warn!(
+                                "service access deny-all fallback failed for service={}: {deny_err}",
+                                service.as_str()
+                            );
+                        }
+                    }
+                }
+            } else if dir.exists() {
+                // Signed state no longer advertises this service for us:
+                // tear the materialised access state down (grants first).
+                match remove_access_state(&dir) {
+                    Ok(()) => eprintln!(
+                        "rustynetd: service access state removed: service={}",
+                        service.as_str()
+                    ),
+                    Err(err) => log::warn!(
+                        "service access state removal failed for service={}: {err}",
+                        service.as_str()
+                    ),
+                }
+            }
+        }
+    }
+
     fn record_dns_zone_bootstrap_error(&mut self, err: &DnsZoneBootstrapError) {
         match err {
             DnsZoneBootstrapError::Stale => {
@@ -4449,6 +4557,7 @@ impl DaemonRuntime {
         self.membership_state = Some(membership_state);
         self.membership_directory = membership_directory;
         self.refresh_dns_zone_state(auto_bundle.as_ref());
+        self.materialize_service_access_state(auto_bundle.as_ref());
         self.refresh_traversal_hint_state(force_reprobe);
 
         if self.traversal_authority_mode().is_enforced()
@@ -6712,6 +6821,7 @@ impl DaemonRuntime {
         self.membership_state = Some(membership_state);
         self.membership_directory = membership_directory;
         self.refresh_dns_zone_state(auto_bundle.as_ref());
+        self.materialize_service_access_state(auto_bundle.as_ref());
 
         if self.auto_tunnel_enforce {
             if self.node_role.is_blind_exit() {
@@ -7593,6 +7703,12 @@ impl DaemonRuntime {
         );
         self.membership_directory = membership_directory_from_state(&next);
         self.membership_state = Some(next);
+        // D13: a membership apply is the revocation path — refresh the
+        // materialised service grants immediately. No verified
+        // assignment bundle is in scope here, so the identity map
+        // (`peers.v1`) keeps the last verified contents (see
+        // `materialize_service_access_state`).
+        self.materialize_service_access_state(None);
         Ok(summary)
     }
 
@@ -8169,6 +8285,7 @@ impl DaemonRuntime {
                     self.membership_state = Some(membership_state);
                     self.membership_directory = membership_directory;
                     self.refresh_dns_zone_state(auto_bundle.as_ref());
+                    self.materialize_service_access_state(auto_bundle.as_ref());
                     if self.auto_tunnel_enforce {
                         if self.node_role.is_blind_exit() {
                             self.selected_exit_node = None;
@@ -14629,6 +14746,44 @@ fn membership_directory_from_state(state: &MembershipState) -> MembershipDirecto
         directory.set_node_status(node.node_id.clone(), status);
     }
     directory
+}
+
+/// D13: per-node overlay addresses from the verified assignment
+/// bundle, for the `peers.v1` identity map the service binaries
+/// resolve tunnel source addresses against. The bundle's peer
+/// `allowed_ips` host CIDRs (`/32` / `/128`) are the daemon's only
+/// signed per-node overlay-address source on the apply paths; the
+/// first host entry per node wins (the assignment generator emits
+/// exactly one). Non-host CIDRs (advertised routes) are skipped —
+/// a route is not an identity.
+fn overlay_addresses_from_bundle_peers(bundle: &AutoTunnelBundle) -> BTreeMap<String, IpAddr> {
+    let mut map = BTreeMap::new();
+    for peer in &bundle.peers {
+        let Some(addr) = peer
+            .allowed_ips
+            .iter()
+            .find_map(|cidr| parse_host_cidr_addr(cidr))
+        else {
+            continue;
+        };
+        map.entry(peer.node_id.as_str().to_owned()).or_insert(addr);
+    }
+    map
+}
+
+/// Parse a host CIDR (`a.b.c.d/32` or `x::y/128`) to its address.
+/// Anything else — broader prefixes, malformed input — returns
+/// `None` (fail-closed: better to omit an identity entry than to
+/// invent one).
+fn parse_host_cidr_addr(cidr: &str) -> Option<IpAddr> {
+    let (addr_raw, prefix_raw) = cidr.trim().split_once('/')?;
+    let addr: IpAddr = addr_raw.trim().parse().ok()?;
+    let prefix: u8 = prefix_raw.trim().parse().ok()?;
+    let host_prefix = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    (prefix == host_prefix).then_some(addr)
 }
 
 #[cfg(all(test, not(windows)))]
