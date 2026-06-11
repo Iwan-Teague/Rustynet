@@ -125,7 +125,10 @@ On `debian-headless-1`, 2026-06-11:
   mapped WireGuard/relay port, while port-restricted cone and symmetric block). The wrapper rebuilds a clean
   topology per profile/scenario so conntrack state cannot hide the cold-inbound result. It adds
   `100.64.0.253/24` to `rnsim-svc-w` for the secondary svc sender and uses only UDP probe packets; no
-  Rustynet daemon is started or stopped.
+  Rustynet daemon is started or stopped. **VALIDATED on debian-headless-5 2026-06-11**: all 9 cells
+  (3 profiles × 3 scenarios) produce the expected matrix — `full_cone` receives in all three scenarios;
+  `port_restricted_cone` and `symmetric` receive only `RETURN_EXACT` and block `UNSOLICITED_DIFF_PORT`
+  and `COLD_INBOUND`.
 
 Run the filtering verifier on the Debian sim guest:
 
@@ -166,11 +169,16 @@ scripts/vm_lab/vxlan_tier_b.sh teardown
 The driver invokes `apply_nat_profile.sh` for both router LANs (`vxlan100/vxlan1` and
 `vxlan200/vxlan1`) and then installs a combined two-LAN nftables table because the helper is currently a
 single-LAN/table-reset tool. The active defaults are `PROFILE_A=port_restricted_cone` and
-`PROFILE_B=port_restricted_cone`; set `PROFILE_A`, `PROFILE_B`, `UDP_PORTS_A`, and `UDP_PORTS_B` to vary
-the NAT matrix. `run-daemon-test` uses the existing `rustynet ops e2e-bootstrap-host` path on the client
-VMs and stages Tier B state under `/tmp/rustynet-tier-b/node-a` and `/tmp/rustynet-tier-b/node-b`; it does
-not mint signed state by hand. Simulator processes are stopped only by recorded PID files, and the script
-does not `pkill -f rustynetd`.
+`PROFILE_B=port_restricted_cone`; override via `--profile-a`/`--profile-b` flags or
+`PROFILE_A`/`PROFILE_B` env vars. `UDP_PORTS_A` and `UDP_PORTS_B` control the DNAT port ranges for
+`full_cone` profiles.
+
+`run-daemon-test` delegates the full two-node lifecycle to `rustynet ops run-debian-two-node-e2e`,
+which handles source archive, bootstrap, membership init and add, assignment issuance, WG handshake
+verification, and tunnel ping — exactly the same path the live-lab orchestrator uses. It does not
+hand-mint bundles. The script runs from the Mac host; the Rust CLI drives both VMs over SSH.
+Simulator processes (STUN responder on the svc node) are stopped only by recorded PID files, and
+the script does not `pkill -f rustynetd`.
 
 ## Tier A pending work
 
