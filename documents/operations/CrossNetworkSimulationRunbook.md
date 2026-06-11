@@ -30,8 +30,8 @@ The substrate is therefore four tiers (see plan §D5.1 for the authoritative des
 
 | Tier | Substrate | What it tests | Status |
 |---|---|---|---|
-| A | netns "internet simulator" in one Debian guest | Deterministic §4.1 NAT-profile matrix; CI gate | **Topology validated** (2026-06-11); lifecycle integration in progress |
-| B | VXLAN overlay across Debian VMs (over the flat bridge) | Separate-kernel / separate-WireGuard fidelity with controllable NAT | Designed; not built |
+| A | netns "internet simulator" in one Debian guest | Deterministic §4.1 NAT-profile matrix; CI gate | **Topology + mapping classifier built** (2026-06-11); filtering verifier added; lifecycle integration in progress |
+| B | VXLAN overlay across Debian VMs (over the flat bridge) | Separate-kernel / separate-WireGuard fidelity with controllable NAT | Setup driver added; live run pending |
 | C | slirp `Shared` mode for Windows/macOS guests | Coarse cross-OS traversal + relay fallback (NAT type not selectable) | Designed; not built |
 | D | chaos / soak / adversarial on A + B | Churn, rebinding, renumber, replay/forged-bundle/downgrade | Designed; not built |
 
@@ -117,8 +117,62 @@ On `debian-headless-1`, 2026-06-11:
   `symmetric` is endpoint-DEPENDENT (relay-forced) — all as intended. This is the foundation the §4.1 matrix
   rests on: if a "cone" profile had behaved symmetrically, the traversal tests would be exercising the wrong
   NAT semantics. Pure netns + UDP, no rustynetd, so it runs safely alongside a VM's live mesh daemon.
+- **NAT filtering-behaviour verification** (`netns_nat_filter.sh` + `nat_filter_probe.py`): each profile is
+  checked against the three §4.1.1 cold-contact cases the mapping classifier cannot prove by itself:
+  `RETURN_EXACT` (the exact STUN responder return path reaches every profile),
+  `UNSOLICITED_DIFF_PORT` (full cone admits packets from a different svc IP:port, while
+  port-restricted cone and symmetric block), and `COLD_INBOUND` (full cone admits a cold packet to the
+  mapped WireGuard/relay port, while port-restricted cone and symmetric block). The wrapper rebuilds a clean
+  topology per profile/scenario so conntrack state cannot hide the cold-inbound result. It adds
+  `100.64.0.253/24` to `rnsim-svc-w` for the secondary svc sender and uses only UDP probe packets; no
+  Rustynet daemon is started or stopped.
 
-### What is still pending (Tier A)
+Run the filtering verifier on the Debian sim guest:
+
+```
+sudo bash netns_nat_filter.sh
+```
+
+Expected matrix:
+
+| Profile | RETURN_EXACT | UNSOLICITED_DIFF_PORT | COLD_INBOUND |
+|---|---:|---:|---:|
+| `full_cone` | receive | receive | receive |
+| `port_restricted_cone` | receive | block | block |
+| `symmetric` | receive | block | block |
+
+## Tier B — VXLAN-overlay multi-VM cross-NAT
+
+`scripts/vm_lab/vxlan_tier_b.sh` builds the separate-kernel Tier B topology without UTM network
+reconfiguration. It uses unicast VXLAN links over the existing `192.168.0.0/24` bridge:
+
+| VM | Role | Underlay | Overlay |
+|---|---|---:|---:|
+| `debian-headless-1` | client A | `192.168.0.200` | `vxlan100` `172.16.10.2/24`, gateway `172.16.10.1` |
+| `debian-headless-2` | client B | `192.168.0.201` | `vxlan200` `172.16.20.2/24`, gateway `172.16.20.1` |
+| `debian-headless-3` | svc / STUN / relay | `192.168.0.202` | `vxlan1` `10.200.0.254/24` |
+| `debian-headless-4` | router | `192.168.0.203` | `vxlan100` `172.16.10.1/24`, `vxlan200` `172.16.20.1/24`, `vxlan1` `10.200.0.11/24` |
+| `debian-headless-5` | sim work host | `192.168.0.204` | reserved for driving/capturing sim work |
+
+Commands from the Mac host:
+
+```
+scripts/vm_lab/vxlan_tier_b.sh setup
+scripts/vm_lab/vxlan_tier_b.sh status
+scripts/vm_lab/vxlan_tier_b.sh run-daemon-test
+scripts/vm_lab/vxlan_tier_b.sh teardown
+```
+
+The driver invokes `apply_nat_profile.sh` for both router LANs (`vxlan100/vxlan1` and
+`vxlan200/vxlan1`) and then installs a combined two-LAN nftables table because the helper is currently a
+single-LAN/table-reset tool. The active defaults are `PROFILE_A=port_restricted_cone` and
+`PROFILE_B=port_restricted_cone`; set `PROFILE_A`, `PROFILE_B`, `UDP_PORTS_A`, and `UDP_PORTS_B` to vary
+the NAT matrix. `run-daemon-test` uses the existing `rustynet ops e2e-bootstrap-host` path on the client
+VMs and stages Tier B state under `/tmp/rustynet-tier-b/node-a` and `/tmp/rustynet-tier-b/node-b`; it does
+not mint signed state by hand. Simulator processes are stopped only by recorded PID files, and the script
+does not `pkill -f rustynetd`.
+
+## Tier A pending work
 
 Layering the rest of the real lifecycle into the topology: `rustynetd` (kernel WireGuard) in each endpoint
 namespace pointed at the in-sim STUN responder via the legitimate `--traversal-stun-servers` flag, then the
@@ -165,4 +219,6 @@ drive Tier A directly with the commands above and capture artifacts manually und
   — orchestrator and evidence ledger.
 - `scripts/vm_lab/netns_internet_sim.sh`, `scripts/vm_lab/apply_nat_profile.sh`,
   `scripts/vm_lab/stun_responder.py`, `scripts/vm_lab/nat_probe.py`,
-  `scripts/vm_lab/netns_nat_classify.sh` — the substrate + NAT-behaviour tooling.
+  `scripts/vm_lab/netns_nat_classify.sh`, `scripts/vm_lab/nat_filter_probe.py`,
+  `scripts/vm_lab/netns_nat_filter.sh`, `scripts/vm_lab/vxlan_tier_b.sh` — the substrate +
+  NAT-behaviour tooling and Tier B driver.
