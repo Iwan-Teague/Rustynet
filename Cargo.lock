@@ -1032,6 +1032,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustynet-llm-gateway"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "rustynet-policy",
+ "sha2",
+]
+
+[[package]]
 name = "rustynet-local-security"
 version = "0.1.0"
 
@@ -1039,8 +1048,21 @@ version = "0.1.0"
 name = "rustynet-mcp"
 version = "0.1.0"
 dependencies = [
+ "nix 0.29.0",
  "serde",
  "serde_json",
+ "socket2",
+]
+
+[[package]]
+name = "rustynet-nas"
+version = "0.1.0"
+dependencies = [
+ "rustynet-crypto",
+ "serde",
+ "serde_json",
+ "sha2",
+ "zeroize",
 ]
 
 [[package]]

@@ -1350,6 +1350,65 @@ pub fn decrypt_private_key_envelope(
     Ok(plaintext)
 }
 
+/// Raw-key XChaCha20-Poly1305 sealed blob for at-rest service data
+/// (D13 NAS backup objects, snapshot manifests, quota records).
+/// Same reviewed primitive as the key envelopes — no new crypto.
+/// The 32-byte key comes from OS-secure custody (keychain / DPAPI /
+/// `LoadCredentialEncrypted`), NOT from a passphrase KDF, and the
+/// associated data binds the blob to its logical location (peer
+/// namespace + content address) so a ciphertext cannot be replayed
+/// into another peer's namespace or under another name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AeadSealedBlob {
+    pub nonce: [u8; 24],
+    pub ciphertext: Vec<u8>,
+}
+
+/// Seal `plaintext` under `key` with `aad` as associated data.
+/// Nonce is drawn from the OS CSPRNG; fails closed when the CSPRNG
+/// is unavailable (nonce reuse under one key breaks the AEAD).
+pub fn aead_seal(
+    key: &[u8; 32],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<AeadSealedBlob, CryptoError> {
+    use rand::TryRngCore;
+    let mut nonce = [0u8; 24];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| CryptoError::RandomnessUnavailable)?;
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            chacha20poly1305::aead::Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| CryptoError::EncryptionFailed)?;
+    Ok(AeadSealedBlob { nonce, ciphertext })
+}
+
+/// Open a sealed blob. Any tamper of nonce, ciphertext, or location
+/// binding (`aad`) fails the tag check and is rejected.
+pub fn aead_open(
+    key: &[u8; 32],
+    aad: &[u8],
+    blob: &AeadSealedBlob,
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = XChaCha20Poly1305::new(key.into());
+    cipher
+        .decrypt(
+            XNonce::from_slice(&blob.nonce),
+            chacha20poly1305::aead::Payload {
+                msg: blob.ciphertext.as_ref(),
+                aad,
+            },
+        )
+        .map_err(|_| CryptoError::DecryptionFailed)
+}
+
 pub fn write_encrypted_key_file(
     directory: &Path,
     file: &Path,

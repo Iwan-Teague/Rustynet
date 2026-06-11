@@ -6,6 +6,8 @@ members = [
   "crates/rustynetd",
   "crates/rustynet-cli",
   "crates/rustynet-relay",
+  "crates/rustynet-nas",
+  "crates/rustynet-llm-gateway",
   "crates/rustynet-policy",
   "crates/rustynet-crypto",
   "crates/rustynet-windows-native",

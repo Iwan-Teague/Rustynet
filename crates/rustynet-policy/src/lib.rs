@@ -15,6 +15,27 @@ pub enum TrafficContext {
     Mesh,
     SharedSubnetRouter,
     SharedExit,
+    /// Session access to a `serves_nas` host's tunnel-bound storage
+    /// API (D13). Service contexts are never matched by rules with
+    /// an empty `contexts` list — access requires a rule that names
+    /// the context explicitly.
+    NasService,
+    /// Session access to a `serves_llm` host's tunnel-bound
+    /// inference API (D13). Same explicit-naming requirement as
+    /// [`TrafficContext::NasService`].
+    LlmService,
+}
+
+impl TrafficContext {
+    /// Whether this is a service-hosting access context
+    /// (application-layer session to a nas/llm host) as opposed to
+    /// a dataplane traffic context.
+    pub fn is_service_context(self) -> bool {
+        matches!(
+            self,
+            TrafficContext::NasService | TrafficContext::LlmService
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +241,67 @@ impl ContextualPolicySet {
     }
 }
 
+/// Per-peer (or per-group) restriction attached to an existing
+/// `LlmService` allow decision. Scopes only ever *narrow* what an
+/// authorised peer may do — they are never an authorisation source:
+/// the gateway must first obtain `Decision::Allow` from
+/// [`ContextualPolicySet::evaluate_with_membership`] for
+/// `TrafficContext::LlmService`, then apply the scope. A peer with
+/// no scope entry keeps the full grant (the grant itself is the
+/// authorisation; scoping is an optional admin restriction).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LlmAccessScope {
+    /// Models the peer may invoke. `None` = the grant is
+    /// unrestricted (any model the node offers). `Some(list)` =
+    /// only the named models; an empty list denies every model.
+    pub allowed_models: Option<Vec<String>>,
+    /// Token budget per accounting window. `None` = no token quota.
+    pub max_tokens_per_window: Option<u64>,
+    /// Request-rate ceiling per minute. `None` = no rate ceiling.
+    pub max_requests_per_minute: Option<u32>,
+}
+
+impl LlmAccessScope {
+    /// Whether this scope permits invoking `model`. Purely a
+    /// restriction check — callers must already hold an Allow
+    /// decision for the peer.
+    pub fn permits_model(&self, model: &str) -> bool {
+        match &self.allowed_models {
+            None => true,
+            Some(models) => models.iter().any(|m| m == model),
+        }
+    }
+}
+
+/// Selector → [`LlmAccessScope`] table distributed alongside the
+/// signed service-access policy. Lookup prefers the most specific
+/// selector: an exact peer selector (e.g. `node:laptop-1`) wins over
+/// a group selector (e.g. `group:family`); first match wins within
+/// each specificity tier (mirrors rule ordering elsewhere).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LlmScopePolicy {
+    pub entries: Vec<(String, LlmAccessScope)>,
+}
+
+impl LlmScopePolicy {
+    /// Resolve the effective scope for a peer. `peer_selectors` is
+    /// the peer's identity selectors in decreasing specificity
+    /// (typically `["node:<id>", "group:<g1>", …]`). Returns `None`
+    /// when no entry applies — the grant stays unrestricted.
+    pub fn scope_for<'a>(&'a self, peer_selectors: &[String]) -> Option<&'a LlmAccessScope> {
+        for selector in peer_selectors {
+            if let Some((_, scope)) = self
+                .entries
+                .iter()
+                .find(|(entry_selector, _)| entry_selector == selector)
+            {
+                return Some(scope);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RolloutError {
     UnsafeAllowAll,
@@ -286,7 +368,16 @@ fn selector_matches(rule_value: &str, candidate: &str) -> bool {
 }
 
 fn context_matches(allowed_contexts: &[TrafficContext], candidate: TrafficContext) -> bool {
-    allowed_contexts.is_empty() || allowed_contexts.contains(&candidate)
+    if allowed_contexts.is_empty() {
+        // An empty contexts list is the legacy "applies to all
+        // dataplane contexts" form. It deliberately does NOT match
+        // service-hosting contexts: a pre-D13 rule must never start
+        // granting application-layer NAS/LLM access just because the
+        // context taxonomy grew. Service access requires a rule that
+        // names the service context explicitly (default-deny).
+        return !candidate.is_service_context();
+    }
+    allowed_contexts.contains(&candidate)
 }
 
 fn membership_rule_allowed(
