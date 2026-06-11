@@ -1,7 +1,10 @@
-//! D12.b — CLI orchestrator for the six user-selectable node roles.
+//! D12.b — CLI orchestrator for the eight user-selectable node roles.
 //!
 //! Canonical taxonomy:
-//! `documents/operations/active/NodeRoleTaxonomy_2026-05-21.md`.
+//! `documents/operations/active/NodeRoleTaxonomy_2026-05-21.md`,
+//! extended by
+//! `documents/operations/active/NodeRoleTaxonomyExtension_2026-06-11.md`
+//! (service-hosting presets `nas` and `llm`).
 //!
 //! This module owns:
 //!
@@ -26,7 +29,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use rustynet_control::role_presets::{
-    Capability, PrimaryRole, RolePreset, TransitionKind, composition_for, transition_plan,
+    Capability, PrimaryRole, RolePreset, ServiceKind, TransitionKind, composition_for,
+    transition_plan,
 };
 
 /// Stable error-category tag for a [`RoleCliError`]. Used by the
@@ -121,6 +125,41 @@ pub enum ConcreteAction {
     /// exit preflight via the platform-specific installer when
     /// leaving an exit-bearing preset.
     UndeployExitService,
+    /// Install, enable, and start the sibling `rustynet-nas`
+    /// service (tunnel-only storage endpoint). Deploy precedes the
+    /// signed `serves_nas` advertisement (deploy-before-advertise).
+    DeployNasService,
+    /// Stop, disable, and remove the sibling `rustynet-nas`
+    /// service. Undeploy (after session severance) precedes the
+    /// signed `serves_nas` revocation (undeploy-before-revoke).
+    UndeployNasService,
+    /// Install, enable, and start the sibling
+    /// `rustynet-llm-gateway` service (tunnel-only inference
+    /// endpoint). Deploy precedes the signed `serves_llm`
+    /// advertisement.
+    DeployLlmService,
+    /// Stop, disable, and remove the sibling
+    /// `rustynet-llm-gateway` service. Undeploy (after stream
+    /// severance) precedes the signed `serves_llm` revocation.
+    UndeployLlmService,
+}
+
+/// Map a sibling-service kind to its deploy action.
+fn deploy_action_for(kind: ServiceKind) -> ConcreteAction {
+    match kind {
+        ServiceKind::Relay => ConcreteAction::DeployRelayService,
+        ServiceKind::Nas => ConcreteAction::DeployNasService,
+        ServiceKind::Llm => ConcreteAction::DeployLlmService,
+    }
+}
+
+/// Map a sibling-service kind to its undeploy action.
+fn undeploy_action_for(kind: ServiceKind) -> ConcreteAction {
+    match kind {
+        ServiceKind::Relay => ConcreteAction::UndeployRelayService,
+        ServiceKind::Nas => ConcreteAction::UndeployNasService,
+        ServiceKind::Llm => ConcreteAction::UndeployLlmService,
+    }
 }
 
 /// Outcome of [`plan_concrete_actions`].
@@ -197,10 +236,10 @@ impl RoleCliError {
                 format!("could not resolve current role from daemon status: {reason}")
             }
             RoleCliError::UnknownPreset { raw } => format!(
-                "unknown role preset {raw:?}. Expected one of: anchor, admin, exit, relay, client, blind_exit"
+                "unknown role preset {raw:?}. Expected one of: anchor, admin, exit, relay, nas, llm, client, blind_exit"
             ),
             RoleCliError::UnknownCapability { raw } => format!(
-                "unknown capability flag {raw:?}. Expected one of: serves_exit, serves_relay, anchor.gossip_seed, anchor.bundle_pull, anchor.enrollment_endpoint, anchor.relay_colocation, anchor.port_mapping_authoritative"
+                "unknown capability flag {raw:?}. Expected one of: serves_exit, serves_relay, serves_nas, serves_llm, anchor.gossip_seed, anchor.bundle_pull, anchor.enrollment_endpoint, anchor.relay_colocation, anchor.port_mapping_authoritative"
             ),
         }
     }
@@ -430,11 +469,37 @@ pub fn plan_concrete_actions(
                             restart_required: true,
                         });
                     }
-                    if validator.requires_relay_deploy {
-                        actions.push(ConcreteAction::DeployRelayService);
+                    // Exit-capability side-effects mirror the
+                    // explicit admin ↔ exit cells: gaining
+                    // serves_exit advertises 0.0.0.0/0 then runs the
+                    // platform preflight; losing it must tear the
+                    // preflight down and retract the route — leaving
+                    // exit NAT/forwarding active after the
+                    // capability is revoked is a release-blocking
+                    // defect (SecurityMinimumBar §6.D control 7).
+                    if validator
+                        .adds_capabilities
+                        .contains(&Capability::ServesExit)
+                    {
+                        actions.push(ConcreteAction::AdvertiseDefaultRoute);
+                        actions.push(ConcreteAction::DeployExitService);
                     }
-                    if validator.requires_relay_undeploy {
-                        actions.push(ConcreteAction::UndeployRelayService);
+                    // Deploy new sibling services before undeploying
+                    // the old ones; both precede the operator's
+                    // signed membership update (deploy-before-
+                    // advertise / undeploy-before-revoke).
+                    for &kind in validator.service_deploys.iter() {
+                        actions.push(deploy_action_for(kind));
+                    }
+                    for &kind in validator.service_undeploys.iter() {
+                        actions.push(undeploy_action_for(kind));
+                    }
+                    if validator
+                        .removes_capabilities
+                        .contains(&Capability::ServesExit)
+                    {
+                        actions.push(ConcreteAction::UndeployExitService);
+                        actions.push(ConcreteAction::RetractDefaultRoute);
                     }
                     if actions.is_empty() {
                         actions.push(ConcreteAction::NoOp);
@@ -559,6 +624,14 @@ fn render_action(action: &ConcreteAction) -> String {
         }
         ConcreteAction::UndeployExitService => {
             "disable+remove rustynet-exit preflight (platform-specific)".to_owned()
+        }
+        ConcreteAction::DeployNasService => "install+enable rustynet-nas.service".to_owned(),
+        ConcreteAction::UndeployNasService => "disable+remove rustynet-nas.service".to_owned(),
+        ConcreteAction::DeployLlmService => {
+            "install+enable rustynet-llm-gateway.service".to_owned()
+        }
+        ConcreteAction::UndeployLlmService => {
+            "disable+remove rustynet-llm-gateway.service".to_owned()
         }
     }
 }
@@ -909,6 +982,190 @@ mod tests {
                 assert!(actions.contains(&ConcreteAction::UndeployRelayService));
             }
             other => panic!("expected relay departure allowed, got {other:?}"),
+        }
+    }
+
+    // ----- Planner: service-hosting presets (D13.a) -----
+
+    #[test]
+    fn target_nas_deploys_nas_service() {
+        for &from in &[RolePreset::Client, RolePreset::Admin, RolePreset::Exit] {
+            let plan = plan_concrete_actions(from, RolePreset::Nas, false, env_path());
+            match plan {
+                RoleSetPlan::Allowed { actions, .. } => {
+                    assert!(
+                        actions.contains(&ConcreteAction::DeployNasService),
+                        "({from:?} → nas) missing DeployNasService: {actions:?}"
+                    );
+                    assert!(!actions.contains(&ConcreteAction::DeployRelayService));
+                }
+                other => panic!("expected nas transition allowed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn current_nas_to_admin_undeploys_nas_service() {
+        let plan = plan_concrete_actions(RolePreset::Nas, RolePreset::Admin, false, env_path());
+        match plan {
+            RoleSetPlan::Allowed { actions, .. } => {
+                assert!(actions.contains(&ConcreteAction::UndeployNasService));
+                assert!(!actions.contains(&ConcreteAction::UndeployRelayService));
+            }
+            other => panic!("expected nas departure allowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_llm_deploys_llm_service() {
+        for &from in &[RolePreset::Client, RolePreset::Admin, RolePreset::Exit] {
+            let plan = plan_concrete_actions(from, RolePreset::Llm, false, env_path());
+            match plan {
+                RoleSetPlan::Allowed { actions, .. } => {
+                    assert!(
+                        actions.contains(&ConcreteAction::DeployLlmService),
+                        "({from:?} → llm) missing DeployLlmService: {actions:?}"
+                    );
+                }
+                other => panic!("expected llm transition allowed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn current_llm_to_admin_undeploys_llm_service() {
+        let plan = plan_concrete_actions(RolePreset::Llm, RolePreset::Admin, false, env_path());
+        match plan {
+            RoleSetPlan::Allowed { actions, .. } => {
+                assert!(actions.contains(&ConcreteAction::UndeployLlmService));
+            }
+            other => panic!("expected llm departure allowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_to_nas_deploys_nas_and_undeploys_relay_in_order() {
+        // Cross-service transition: the deploy of the new sibling
+        // precedes the undeploy of the old one, and both precede the
+        // operator's signed membership update.
+        let plan = plan_concrete_actions(RolePreset::Relay, RolePreset::Nas, false, env_path());
+        match plan {
+            RoleSetPlan::Allowed { actions, .. } => {
+                assert_eq!(
+                    actions,
+                    vec![
+                        ConcreteAction::DeployNasService,
+                        ConcreteAction::UndeployRelayService,
+                    ]
+                );
+            }
+            other => panic!("expected relay → nas allowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nas_to_llm_deploys_llm_and_undeploys_nas() {
+        let plan = plan_concrete_actions(RolePreset::Nas, RolePreset::Llm, false, env_path());
+        match plan {
+            RoleSetPlan::Allowed { actions, .. } => {
+                assert_eq!(
+                    actions,
+                    vec![
+                        ConcreteAction::DeployLlmService,
+                        ConcreteAction::UndeployNasService,
+                    ]
+                );
+            }
+            other => panic!("expected nas → llm allowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exit_to_nas_tears_down_exit_serving_in_order() {
+        // Leaving an exit-bearing preset through the generic arm
+        // must tear down the exit preflight and retract 0.0.0.0/0 —
+        // exit NAT residue after revocation is release-blocking
+        // (SecurityMinimumBar §6.D control 7).
+        let plan = plan_concrete_actions(RolePreset::Exit, RolePreset::Nas, false, env_path());
+        match plan {
+            RoleSetPlan::Allowed { actions, .. } => {
+                assert_eq!(
+                    actions,
+                    vec![
+                        ConcreteAction::DeployNasService,
+                        ConcreteAction::UndeployExitService,
+                        ConcreteAction::RetractDefaultRoute,
+                    ]
+                );
+            }
+            other => panic!("expected exit → nas allowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exit_to_relay_tears_down_exit_serving() {
+        let plan = plan_concrete_actions(RolePreset::Exit, RolePreset::Relay, false, env_path());
+        match plan {
+            RoleSetPlan::Allowed { actions, .. } => {
+                assert_eq!(
+                    actions,
+                    vec![
+                        ConcreteAction::DeployRelayService,
+                        ConcreteAction::UndeployExitService,
+                        ConcreteAction::RetractDefaultRoute,
+                    ]
+                );
+            }
+            other => panic!("expected exit → relay allowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_to_exit_activates_exit_serving_and_undeploys_relay() {
+        let plan = plan_concrete_actions(RolePreset::Relay, RolePreset::Exit, false, env_path());
+        match plan {
+            RoleSetPlan::Allowed { actions, .. } => {
+                assert_eq!(
+                    actions,
+                    vec![
+                        ConcreteAction::AdvertiseDefaultRoute,
+                        ConcreteAction::DeployExitService,
+                        ConcreteAction::UndeployRelayService,
+                    ]
+                );
+            }
+            other => panic!("expected relay → exit allowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nas_and_llm_to_blind_exit_require_acknowledgement() {
+        for &from in &[RolePreset::Nas, RolePreset::Llm] {
+            let plan = plan_concrete_actions(from, RolePreset::BlindExit, false, env_path());
+            match plan {
+                RoleSetPlan::Blocked { error, .. } => {
+                    assert!(matches!(
+                        error,
+                        RoleCliError::BlindExitRequiresExplicitAcknowledgement { .. }
+                    ));
+                }
+                other => {
+                    panic!("expected ack-gated block for {from:?} → blind_exit, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blind_exit_to_nas_and_llm_is_locked() {
+        for &to in &[RolePreset::Nas, RolePreset::Llm] {
+            let plan = plan_concrete_actions(RolePreset::BlindExit, to, false, env_path());
+            match plan {
+                RoleSetPlan::Blocked { error, .. } => {
+                    assert!(matches!(error, RoleCliError::BlindExitImmutable { .. }));
+                }
+                other => panic!("expected blind_exit lock for → {to:?}, got {other:?}"),
+            }
         }
     }
 

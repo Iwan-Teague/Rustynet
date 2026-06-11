@@ -33,6 +33,8 @@ pub enum RolePreset {
     Admin,
     Exit,
     Relay,
+    Nas,
+    Llm,
     Client,
     BlindExit,
 }
@@ -44,6 +46,8 @@ impl RolePreset {
             Self::Admin => "admin",
             Self::Exit => "exit",
             Self::Relay => "relay",
+            Self::Nas => "nas",
+            Self::Llm => "llm",
             Self::Client => "client",
             Self::BlindExit => "blind_exit",
         }
@@ -55,6 +59,8 @@ impl RolePreset {
             "admin" => Some(Self::Admin),
             "exit" => Some(Self::Exit),
             "relay" => Some(Self::Relay),
+            "nas" => Some(Self::Nas),
+            "llm" => Some(Self::Llm),
             "client" => Some(Self::Client),
             "blind_exit" => Some(Self::BlindExit),
             _ => None,
@@ -65,7 +71,9 @@ impl RolePreset {
         match self {
             Self::Client => NodeRole::Client,
             Self::BlindExit => NodeRole::BlindExit,
-            Self::Admin | Self::Exit | Self::Relay | Self::Anchor => NodeRole::Admin,
+            Self::Admin | Self::Exit | Self::Relay | Self::Anchor | Self::Nas | Self::Llm => {
+                NodeRole::Admin
+            }
         }
     }
 }
@@ -266,6 +274,26 @@ mod tests {
         assert_eq!(role, NodeRole::Admin);
         assert_eq!(preset, Some(RolePreset::Exit));
         assert!(warnings.iter().any(|msg| msg.contains("coercing")));
+    }
+
+    #[test]
+    fn service_hosting_presets_parse_and_map_to_admin_primary() {
+        for (raw, expected) in [("nas", RolePreset::Nas), ("llm", RolePreset::Llm)] {
+            let preset = RolePreset::parse(raw).expect("preset should parse");
+            assert_eq!(preset, expected);
+            assert_eq!(preset.as_str(), raw);
+            assert_eq!(preset.primary_role(), NodeRole::Admin);
+        }
+    }
+
+    #[test]
+    fn service_hosting_preset_coerces_node_role_to_admin() {
+        for raw in ["nas", "llm"] {
+            let (role, preset, _) =
+                normalize_role(Some("client"), Some(raw), true, HostProfile::Linux);
+            assert_eq!(role, NodeRole::Admin);
+            assert_eq!(preset, RolePreset::parse(raw));
+        }
     }
 
     #[test]

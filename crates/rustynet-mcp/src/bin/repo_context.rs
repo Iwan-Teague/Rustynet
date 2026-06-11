@@ -96,15 +96,15 @@ impl RepoContextServer {
             },
             DocEntry {
                 path: "documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md",
-                title: "Dataplane Execution Plan (D2-D12)",
-                description: "Source of truth for cross-network dataplane: gossip, relay, uPnP, IPv6, ICE, enrollment, anchor role, 6-role taxonomy.",
+                title: "Dataplane Execution Plan (D2-D13)",
+                description: "Source of truth for cross-network dataplane: gossip, relay, uPnP, IPv6, ICE, enrollment, anchor role, 8-role taxonomy, service-hosting roles.",
                 priority: 6,
                 category: "ledger",
             },
             DocEntry {
                 path: "documents/operations/active/NodeRoleTaxonomy_2026-05-21.md",
                 title: "Node Role Taxonomy (D12)",
-                description: "Canonical taxonomy for 6 user-selectable roles: relay, anchor, exit, blind_exit, client, admin. Presets, transition matrix, platform eligibility.",
+                description: "Canonical taxonomy for the base 6 user-selectable roles: relay, anchor, exit, blind_exit, client, admin. Extended to 8 by NodeRoleTaxonomyExtension_2026-06-11.md (nas, llm). Presets, transition matrix, platform eligibility.",
                 priority: 6,
                 category: "ledger",
             },
@@ -112,6 +112,41 @@ impl RepoContextServer {
                 path: "documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md",
                 title: "Anchor Node Role Design (D11)",
                 description: "Canonical design for anchor role: definition, per-platform host capability, refactor inventory, security controls.",
+                priority: 6,
+                category: "ledger",
+            },
+            DocEntry {
+                path: "documents/operations/active/NodeRoleTaxonomyExtension_2026-06-11.md",
+                title: "Node Role Taxonomy Extension (D13)",
+                description: "Service-hosting role category (nas, llm): eight-role matrix, secure-exposure model, §6.E security controls, transition rules. Parent of the NAS and LLM role designs.",
+                priority: 6,
+                category: "ledger",
+            },
+            DocEntry {
+                path: "documents/operations/active/NasNodeRoleDesign_2026-06-11.md",
+                title: "NAS Node Role Design (D13.c)",
+                description: "nas role deep dive: rustynet-nas sibling service, tunnel-only storage exposure, per-peer namespace, at-rest AEAD, RustyBackup node-side contract.",
+                priority: 6,
+                category: "ledger",
+            },
+            DocEntry {
+                path: "documents/operations/active/LlmNodeRoleDesign_2026-06-11.md",
+                title: "LLM Node Role Design (D13.d)",
+                description: "llm role deep dive: rustynet-llm-gateway, identity-from-tunnel (no API key), in-tunnel streaming, exit-node coexistence, admin access governance, RustyAI node-side contract.",
+                priority: 6,
+                category: "ledger",
+            },
+            DocEntry {
+                path: "documents/operations/active/ServiceHostingRolesDeltaPlan_2026-06-11.md",
+                title: "Service-Hosting Roles Delta Plan (D13)",
+                description: "Gap-driven execution ledger for nas/llm: ordered slices D13.a-e, defect carry-overs, gate plan, live-lab readiness.",
+                priority: 6,
+                category: "ledger",
+            },
+            DocEntry {
+                path: "documents/operations/active/ServiceHostingRolesRoadmap_2026-06-11.md",
+                title: "Service-Hosting Roles Roadmap (D13)",
+                description: "Program roadmap for nas/llm roles: milestones M0-M6, dependency graph, status tracker, RustyBackup/RustyAI app sequencing.",
                 priority: 6,
                 category: "ledger",
             },
@@ -568,8 +603,8 @@ impl McpServer for RepoContextServer {
                 description: "Validate whether a node role transition is allowed. Mirrors the canonical Rust validator (rustynet-control role_presets::transition_plan) and the platform gate. Returns kind (identity/local-only/signed/blocked/irreversible), capability deltas, service deploy/undeploy side-effects, and platform eligibility.".into(),
                 input_schema: json_schema_object(
                     json!({
-                        "from": json_schema_string("Current role: client, admin, exit, blind_exit, relay, anchor"),
-                        "to": json_schema_string("Target role: client, admin, exit, blind_exit, relay, anchor"),
+                        "from": json_schema_string("Current role: client, admin, exit, blind_exit, relay, anchor, nas, llm"),
+                        "to": json_schema_string("Target role: client, admin, exit, blind_exit, relay, anchor, nas, llm"),
                         "platform": json_schema_string("Target platform: linux, macos, windows, ios, android"),
                     }),
                     vec!["from", "to"],
@@ -1326,6 +1361,8 @@ enum Preset {
     BlindExit,
     Relay,
     Anchor,
+    Nas,
+    Llm,
 }
 
 impl Preset {
@@ -1337,6 +1374,8 @@ impl Preset {
             "blind_exit" | "blindexit" => Some(Preset::BlindExit),
             "relay" => Some(Preset::Relay),
             "anchor" => Some(Preset::Anchor),
+            "nas" => Some(Preset::Nas),
+            "llm" => Some(Preset::Llm),
             _ => None,
         }
     }
@@ -1348,6 +1387,8 @@ impl Preset {
             Preset::BlindExit => "blind_exit",
             Preset::Relay => "relay",
             Preset::Anchor => "anchor",
+            Preset::Nas => "nas",
+            Preset::Llm => "llm",
         }
     }
     /// Axis-1 primary role (Client | Admin | BlindExit).
@@ -1371,6 +1412,8 @@ impl Preset {
                 "anchor.relay_colocation",
                 "anchor.port_mapping_authoritative",
             ],
+            Preset::Nas => &["serves_nas"],
+            Preset::Llm => &["serves_llm"],
         }
     }
 }
@@ -1378,6 +1421,23 @@ impl Preset {
 fn needs_relay_binary(caps: &[&str]) -> bool {
     caps.iter()
         .any(|c| *c == "serves_relay" || *c == "anchor.relay_colocation")
+}
+
+/// Mirror of `role_presets::ServiceKind` + `required_service_binaries`:
+/// (wire name, binary name, required-by predicate), canonical order.
+const SERVICE_KINDS: [(&str, &str); 3] = [
+    ("relay", "rustynet-relay"),
+    ("nas", "rustynet-nas"),
+    ("llm", "rustynet-llm-gateway"),
+];
+
+fn needs_service_binary(kind: &str, caps: &[&str]) -> bool {
+    match kind {
+        "relay" => needs_relay_binary(caps),
+        "nas" => caps.contains(&"serves_nas"),
+        "llm" => caps.contains(&"serves_llm"),
+        _ => false,
+    }
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -1394,8 +1454,12 @@ struct TransitionPlan {
     reason: &'static str,
     adds: Vec<&'static str>,
     removes: Vec<&'static str>,
-    relay_deploy: bool,
-    relay_undeploy: bool,
+    /// Sibling-service wire names ("relay"/"nas"/"llm") this
+    /// transition deploys / undeploys. Mirror of the generalised
+    /// `service_deploys` / `service_undeploys` on the canonical
+    /// `role_presets::TransitionPlan`.
+    service_deploys: Vec<&'static str>,
+    service_undeploys: Vec<&'static str>,
     primary_change: Option<(&'static str, &'static str)>,
 }
 
@@ -1407,8 +1471,8 @@ fn plan_transition(from: Preset, to: Preset) -> TransitionPlan {
             reason: "from == to; no-op",
             adds: vec![],
             removes: vec![],
-            relay_deploy: false,
-            relay_undeploy: false,
+            service_deploys: vec![],
+            service_undeploys: vec![],
             primary_change: None,
         };
     }
@@ -1418,8 +1482,8 @@ fn plan_transition(from: Preset, to: Preset) -> TransitionPlan {
             reason: "blind_exit is immutable; factory reset + fresh key provisioning required to change role",
             adds: vec![],
             removes: vec![],
-            relay_deploy: false,
-            relay_undeploy: false,
+            service_deploys: vec![],
+            service_undeploys: vec![],
             primary_change: None,
         };
     }
@@ -1436,8 +1500,18 @@ fn plan_transition(from: Preset, to: Preset) -> TransitionPlan {
         .filter(|c| !to_caps.contains(c))
         .copied()
         .collect();
-    let relay_deploy = !needs_relay_binary(from_caps) && needs_relay_binary(to_caps);
-    let relay_undeploy = needs_relay_binary(from_caps) && !needs_relay_binary(to_caps);
+    let mut service_deploys = Vec::new();
+    let mut service_undeploys = Vec::new();
+    for (kind, _binary) in SERVICE_KINDS {
+        let from_needs = needs_service_binary(kind, from_caps);
+        let to_needs = needs_service_binary(kind, to_caps);
+        if !from_needs && to_needs {
+            service_deploys.push(kind);
+        }
+        if from_needs && !to_needs {
+            service_undeploys.push(kind);
+        }
+    }
     let primary_change = if from.primary() != to.primary() {
         Some((from.primary(), to.primary()))
     } else {
@@ -1468,18 +1542,20 @@ fn plan_transition(from: Preset, to: Preset) -> TransitionPlan {
         reason,
         adds,
         removes,
-        relay_deploy,
-        relay_undeploy,
+        service_deploys,
+        service_undeploys,
         primary_change,
     }
 }
 
 fn describe_role_transition(from: &str, to: &str, platform: &str) -> Result<String, String> {
     let from_p = Preset::parse(from).ok_or_else(|| {
-        format!("Unknown 'from' role: {from} (use client/admin/exit/blind_exit/relay/anchor)")
+        format!(
+            "Unknown 'from' role: {from} (use client/admin/exit/blind_exit/relay/anchor/nas/llm)"
+        )
     })?;
     let to_p = Preset::parse(to).ok_or_else(|| {
-        format!("Unknown 'to' role: {to} (use client/admin/exit/blind_exit/relay/anchor)")
+        format!("Unknown 'to' role: {to} (use client/admin/exit/blind_exit/relay/anchor/nas/llm)")
     })?;
 
     let mut out = format!("# Role Transition: {from} → {to} on {platform}\n\n");
@@ -1550,8 +1626,15 @@ fn describe_role_transition(from: &str, to: &str, platform: &str) -> Result<Stri
         out.push_str("- Wipes node identity and re-enrolls fresh.\n");
     }
     // Service deploy/undeploy, in the safe order.
-    if plan.relay_deploy {
-        out.push_str("- **Deploy** the `rustynet-relay` sibling service and verify it is Running BEFORE advertising the capability in the signed bundle (deploy-then-advertise).\n");
+    for kind in &plan.service_deploys {
+        let binary = SERVICE_KINDS
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, b)| *b)
+            .unwrap_or(kind);
+        out.push_str(&format!(
+            "- **Deploy** the `{binary}` sibling service and verify it is Running BEFORE advertising the capability in the signed bundle (deploy-then-advertise).\n"
+        ));
     }
     if plan.adds.contains(&"serves_exit") {
         out.push_str(
@@ -1561,11 +1644,24 @@ fn describe_role_transition(from: &str, to: &str, platform: &str) -> Result<Stri
     if plan.removes.contains(&"serves_exit") {
         out.push_str("- **Tear down** exit NAT/forwarding BEFORE revoking the capability (NAT residue after revocation is a release-blocking defect).\n");
     }
-    if plan.relay_undeploy {
-        out.push_str("- **Undeploy** the `rustynet-relay` service BEFORE the revocation bundle (fail-closed: keep previous state on undeploy failure).\n");
+    if plan.removes.contains(&"serves_nas") || plan.removes.contains(&"serves_llm") {
+        out.push_str("- **Tear down** the tunnel-bound service listener and sever all in-flight authorised sessions BEFORE the capability leaves local state (a revoked service host must not keep serving an already-connected peer; SecurityMinimumBar §6.E control E3).\n");
+    }
+    for kind in &plan.service_undeploys {
+        let binary = SERVICE_KINDS
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, b)| *b)
+            .unwrap_or(kind);
+        out.push_str(&format!(
+            "- **Undeploy** the `{binary}` service BEFORE the revocation bundle (fail-closed: keep previous state on undeploy failure).\n"
+        ));
     }
     if to_p == Preset::Anchor {
         out.push_str("- Anchor brings up: bundle-pull listener, enrollment endpoint (loopback by default), gossip seed, and port-mapping authority (lex-min lease).\n");
+    }
+    if to_p == Preset::Nas || to_p == Preset::Llm {
+        out.push_str("- Service-hosting role: the endpoint binds to the mesh tunnel address ONLY (no LAN/public bind; non-tunnel bind is a fail-closed startup error) and is default-deny — no peer can reach it until the owner signs a service-access policy.\n");
     }
     out.push_str("- Emit an append-only audit log entry (timestamp, from, to, side-effects, outcome, operator).\n");
 
@@ -1589,13 +1685,29 @@ enum Support {
 fn role_support(role: Preset, platform: &str) -> Support {
     let p = platform.to_lowercase();
     match (role, p.as_str()) {
-        // Mobile is consume-only by OS constraint.
+        // Mobile is consume-only by OS constraint. For nas/llm the
+        // mobile story is the RustyBackup/RustyAI client apps —
+        // hosting is never available.
         (Preset::Client, "ios" | "android") => {
             Support::Planned("mobile is client-only; adapter not yet shipped")
         }
         (_, "ios" | "android") => Support::Blocked("mobile is client-only by design"),
 
-        // Linux: everything is live-evidenced.
+        // Service-hosting roles (D13): fail-closed on every host
+        // until their live-lab evidence rows are green — Linux is
+        // the designated primary host, macOS secondary, Windows
+        // gated on D7/D9 dataplane parity.
+        (Preset::Nas | Preset::Llm, "linux") => {
+            Support::FailClosed("D13.c/D13.d in progress; pending Linux live-lab evidence row")
+        }
+        (Preset::Nas | Preset::Llm, "macos") => {
+            Support::FailClosed("secondary host; pending cross-OS green run")
+        }
+        (Preset::Nas | Preset::Llm, "windows") => {
+            Support::FailClosed("gated on D7/D9 Windows dataplane parity")
+        }
+
+        // Linux: everything else is live-evidenced.
         (_, "linux") => Support::Supported,
 
         // blind_exit host gate.
@@ -1633,6 +1745,8 @@ fn render_platform_support(feature: Option<&str>, platform: Option<&str>) -> Str
         Preset::BlindExit,
         Preset::Relay,
         Preset::Anchor,
+        Preset::Nas,
+        Preset::Llm,
     ];
     let feat = feature.map(|f| f.to_lowercase());
     let plat = platform.map(|p| p.to_lowercase());
@@ -2011,15 +2125,73 @@ mod tests {
     #[test]
     fn transition_relay_to_client_undeploys_relay() {
         let p = plan_transition(Preset::Relay, Preset::Client);
-        assert!(p.relay_undeploy);
-        assert!(!p.relay_deploy);
+        assert_eq!(p.service_undeploys, vec!["relay"]);
+        assert!(p.service_deploys.is_empty());
     }
 
     #[test]
     fn transition_client_to_anchor_deploys_relay() {
         let p = plan_transition(Preset::Client, Preset::Anchor);
-        assert!(p.relay_deploy);
+        assert_eq!(p.service_deploys, vec!["relay"]);
         assert_eq!(p.kind, TransitionKind::SignedMembership);
+    }
+
+    #[test]
+    fn transition_admin_to_nas_deploys_nas() {
+        let p = plan_transition(Preset::Admin, Preset::Nas);
+        assert_eq!(p.kind, TransitionKind::SignedMembership);
+        assert!(p.adds.contains(&"serves_nas"));
+        assert_eq!(p.service_deploys, vec!["nas"]);
+        assert!(p.service_undeploys.is_empty());
+    }
+
+    #[test]
+    fn transition_llm_to_admin_undeploys_llm() {
+        let p = plan_transition(Preset::Llm, Preset::Admin);
+        assert!(p.removes.contains(&"serves_llm"));
+        assert_eq!(p.service_undeploys, vec!["llm"]);
+        assert!(p.service_deploys.is_empty());
+    }
+
+    #[test]
+    fn transition_relay_to_nas_fires_both_lifecycles() {
+        // nas and relay share nothing: one transition undeploys
+        // rustynet-relay and deploys rustynet-nas.
+        let p = plan_transition(Preset::Relay, Preset::Nas);
+        assert_eq!(p.service_deploys, vec!["nas"]);
+        assert_eq!(p.service_undeploys, vec!["relay"]);
+    }
+
+    #[test]
+    fn transition_from_blind_exit_to_nas_blocked_and_to_blind_exit_irreversible() {
+        assert_eq!(
+            plan_transition(Preset::BlindExit, Preset::Nas).kind,
+            TransitionKind::Blocked
+        );
+        assert_eq!(
+            plan_transition(Preset::Llm, Preset::BlindExit).kind,
+            TransitionKind::Irreversible
+        );
+    }
+
+    #[test]
+    fn service_hosting_roles_fail_closed_on_every_host_platform() {
+        for role in [Preset::Nas, Preset::Llm] {
+            for platform in ["linux", "macos", "windows"] {
+                assert!(
+                    matches!(role_support(role, platform), Support::FailClosed(_)),
+                    "{} on {platform} must be fail-closed until live evidence",
+                    role.as_str()
+                );
+            }
+            for platform in ["ios", "android"] {
+                assert!(
+                    matches!(role_support(role, platform), Support::Blocked(_)),
+                    "{} on {platform} must be blocked (consume-only mobile)",
+                    role.as_str()
+                );
+            }
+        }
     }
 
     #[test]

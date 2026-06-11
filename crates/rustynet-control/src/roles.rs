@@ -15,6 +15,12 @@ pub enum RoleCapability {
     AnchorEnrollmentEndpoint,
     AnchorRelayColocation,
     AnchorPortMappingAuthoritative,
+    // New variants append at the end only: the derived ordering
+    // feeds `canonicalize_role_capabilities` and therefore the
+    // canonical signed pre-image. Reordering existing variants
+    // would silently change signed payloads.
+    ServesNas,
+    ServesLlm,
 }
 
 impl RoleCapability {
@@ -31,6 +37,8 @@ impl RoleCapability {
             RoleCapability::AnchorEnrollmentEndpoint => "anchor.enrollment_endpoint",
             RoleCapability::AnchorRelayColocation => "anchor.relay_colocation",
             RoleCapability::AnchorPortMappingAuthoritative => "anchor.port_mapping_authoritative",
+            RoleCapability::ServesNas => "serves_nas",
+            RoleCapability::ServesLlm => "serves_llm",
         }
     }
 
@@ -57,6 +65,8 @@ impl RoleCapability {
             "anchor.port_mapping_authoritative"
             | "port_mapping_authoritative"
             | "port-mapping-authoritative" => Ok(RoleCapability::AnchorPortMappingAuthoritative),
+            "serves_nas" | "serves-nas" => Ok(RoleCapability::ServesNas),
+            "serves_llm" | "serves-llm" => Ok(RoleCapability::ServesLlm),
             "" => Err(RoleCapabilityParseError::Empty),
             other => Err(RoleCapabilityParseError::Unknown(other.to_owned())),
         }
@@ -71,6 +81,14 @@ impl RoleCapability {
                 | RoleCapability::AnchorRelayColocation
                 | RoleCapability::AnchorPortMappingAuthoritative
         )
+    }
+
+    /// Whether this is a service-hosting capability (the node
+    /// co-runs an application-layer sibling service exposed
+    /// tunnel-only under default-deny signed policy). See
+    /// `NodeRoleTaxonomyExtension_2026-06-11.md`.
+    pub fn is_service_hosting_capability(self) -> bool {
+        matches!(self, RoleCapability::ServesNas | RoleCapability::ServesLlm)
     }
 }
 
@@ -150,7 +168,7 @@ pub fn role_capability_csv(capabilities: &[RoleCapability]) -> String {
 mod tests {
     use super::*;
 
-    const ALL_CAPABILITIES: [RoleCapability; 11] = [
+    const ALL_CAPABILITIES: [RoleCapability; 13] = [
         RoleCapability::Anchor,
         RoleCapability::Client,
         RoleCapability::ExitServer,
@@ -162,6 +180,8 @@ mod tests {
         RoleCapability::AnchorEnrollmentEndpoint,
         RoleCapability::AnchorRelayColocation,
         RoleCapability::AnchorPortMappingAuthoritative,
+        RoleCapability::ServesNas,
+        RoleCapability::ServesLlm,
     ];
 
     #[test]
@@ -200,11 +220,50 @@ mod tests {
                 "port-mapping-authoritative",
                 RoleCapability::AnchorPortMappingAuthoritative,
             ),
+            ("serves-nas", RoleCapability::ServesNas),
+            ("serves-llm", RoleCapability::ServesLlm),
         ];
 
         for (input, expected) in cases {
             assert_eq!(RoleCapability::parse(input), Ok(expected));
         }
+    }
+
+    #[test]
+    fn service_hosting_capability_predicate() {
+        assert!(RoleCapability::ServesNas.is_service_hosting_capability());
+        assert!(RoleCapability::ServesLlm.is_service_hosting_capability());
+        for capability in ALL_CAPABILITIES {
+            if capability != RoleCapability::ServesNas && capability != RoleCapability::ServesLlm {
+                assert!(
+                    !capability.is_service_hosting_capability(),
+                    "{capability} must not be service-hosting"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn service_hosting_capabilities_sort_after_existing_variants() {
+        // Canonical signed pre-images sort capabilities by the
+        // derived ordering; the new variants must append after every
+        // pre-existing one so historical canonical payloads are
+        // unchanged.
+        for capability in ALL_CAPABILITIES {
+            if capability == RoleCapability::ServesNas || capability == RoleCapability::ServesLlm {
+                continue;
+            }
+            assert!(capability < RoleCapability::ServesNas);
+        }
+        assert!(RoleCapability::ServesNas < RoleCapability::ServesLlm);
+        assert_eq!(
+            role_capability_csv(&[
+                RoleCapability::ServesLlm,
+                RoleCapability::Anchor,
+                RoleCapability::ServesNas,
+            ]),
+            "anchor,serves_nas,serves_llm"
+        );
     }
 
     #[test]
