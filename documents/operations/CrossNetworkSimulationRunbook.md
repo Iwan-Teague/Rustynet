@@ -110,6 +110,13 @@ On `debian-headless-1`, 2026-06-11:
   `100.64.0.12:<mapped>`). The responder speaks the exact wire format `crates/rustynetd/src/stun_client.rs`
   parses (RFC 5389 binding request/response, XOR-MAPPED-ADDRESS), so the real client consumes it unchanged.
   It is lab tooling standing in for the public STUN servers — not a Rustynet component.
+- **NAT mapping-behaviour classification** (`netns_nat_classify.sh` + `nat_probe.py`): each
+  `apply_nat_profile` profile produces its intended NAT type, verified by probing a single socket against two
+  distinct STUN server addresses and comparing the reflexive ports (RFC 5780-style). Result on
+  debian-headless-5: `port_restricted_cone` and `full_cone` are endpoint-INDEPENDENT (hole-punchable),
+  `symmetric` is endpoint-DEPENDENT (relay-forced) — all as intended. This is the foundation the §4.1 matrix
+  rests on: if a "cone" profile had behaved symmetrically, the traversal tests would be exercising the wrong
+  NAT semantics. Pure netns + UDP, no rustynetd, so it runs safely alongside a VM's live mesh daemon.
 
 ### What is still pending (Tier A)
 
@@ -157,4 +164,5 @@ drive Tier A directly with the commands above and capture artifacts manually und
 - [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md), [LiveLabRunMatrix.md](./LiveLabRunMatrix.md)
   — orchestrator and evidence ledger.
 - `scripts/vm_lab/netns_internet_sim.sh`, `scripts/vm_lab/apply_nat_profile.sh`,
-  `scripts/vm_lab/stun_responder.py` — the substrate tooling.
+  `scripts/vm_lab/stun_responder.py`, `scripts/vm_lab/nat_probe.py`,
+  `scripts/vm_lab/netns_nat_classify.sh` — the substrate + NAT-behaviour tooling.
