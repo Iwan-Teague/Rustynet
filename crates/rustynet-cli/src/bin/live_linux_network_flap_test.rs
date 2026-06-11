@@ -148,8 +148,7 @@ fn run() -> Result<(), String> {
     logger.line("[network-flap] waiting for baseline WG handshake (up to 300s)")?;
     let mut baseline_age_s = u64::MAX;
     for attempt in 0..60u32 {
-        let nc_result =
-            ctx.capture_root_allow_failure(&client_host, &["rustynet", "netcheck"]);
+        let nc_result = ctx.capture_root_allow_failure(&client_host, &["rustynet", "netcheck"]);
         let client_err = nc_result
             .as_ref()
             .err()
@@ -167,7 +166,11 @@ fn run() -> Result<(), String> {
                 .as_ref()
                 .err()
                 .map(|e| e.chars().take(120).collect::<String>());
-            let exit_nc: String = exit_nc_result.unwrap_or_default().chars().take(300).collect();
+            let exit_nc: String = exit_nc_result
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect();
             logger.line(format!(
                 "[network-flap] nc-diag attempt={attempt} \
                  client={client_nc:?} client-err={client_err:?} \
@@ -297,9 +300,7 @@ fn run() -> Result<(), String> {
     let tunnel_active = status_out.contains("ExitActive")
         || status_out.contains("active")
         || status_out.contains("Connected");
-    logger.line(format!(
-        "[network-flap] tunnel_active={tunnel_active}"
-    ))?;
+    logger.line(format!("[network-flap] tunnel_active={tunnel_active}"))?;
 
     // ── Stage 8: membership integrity ────────────────────────────────────────
     let integrity_out = ctx
