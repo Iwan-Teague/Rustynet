@@ -377,6 +377,86 @@ fn parse_table_header(trimmed_line: &str) -> Option<ParsedTableHeader> {
     })
 }
 
+// ── D13.b — service-port tunnel scoping (nas / llm) ───────────────────
+
+/// Reviewed table-name prefix for service-hosting port scoping
+/// (`inet rustynet_svc_nas`, `inet rustynet_svc_llm`).
+pub const REVIEWED_SERVICE_TABLE_PREFIX: &str = "rustynet_svc_";
+
+/// Fail-closed input validation error for the service-scope
+/// renderer. The renderer feeds `nft -f` via the privileged helper,
+/// so every field is strictly validated — no untrusted value reaches
+/// rule text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceScopeRenderError {
+    pub reason: String,
+}
+
+impl std::fmt::Display for ServiceScopeRenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "service scope render refused: {}", self.reason)
+    }
+}
+
+impl std::error::Error for ServiceScopeRenderError {}
+
+fn validate_service_label(service: &str) -> Result<(), ServiceScopeRenderError> {
+    if service.is_empty() || service.len() > 16 || !service.bytes().all(|b| b.is_ascii_lowercase())
+    {
+        return Err(ServiceScopeRenderError {
+            reason: format!("service label {service:?} must be 1-16 ascii lowercase letters"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_interface_name(iface: &str) -> Result<(), ServiceScopeRenderError> {
+    if iface.is_empty()
+        || iface.len() > 15
+        || !iface
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return Err(ServiceScopeRenderError {
+            reason: format!("interface name {iface:?} must be 1-15 chars of [A-Za-z0-9._-]"),
+        });
+    }
+    Ok(())
+}
+
+/// Render the belt-and-braces nftables table that scopes a
+/// service-hosting port to the tunnel interface: any packet to the
+/// service port that did not arrive on the tunnel interface is
+/// dropped, regardless of the listener's bind address. This sits on
+/// top of (never instead of) the tunnel-only bind validation in
+/// `crate::service_exposure::validate_tunnel_only_bind` —
+/// SecurityMinimumBar §6.E control E1's second layer.
+///
+/// All inputs are strictly validated; the output is deterministic
+/// canonical text suitable for `nft -f` and for snapshot comparison.
+pub fn render_service_port_tunnel_scope_table(
+    service: &str,
+    port: u16,
+    tunnel_iface: &str,
+) -> Result<String, ServiceScopeRenderError> {
+    validate_service_label(service)?;
+    validate_interface_name(tunnel_iface)?;
+    if port == 0 {
+        return Err(ServiceScopeRenderError {
+            reason: "service port must be non-zero".to_owned(),
+        });
+    }
+    Ok(format!(
+        "table inet {prefix}{service} {{\n\
+         \tchain input {{\n\
+         \t\ttype filter hook input priority -10; policy accept;\n\
+         \t\ttcp dport {port} iifname != \"{tunnel_iface}\" drop\n\
+         \t}}\n\
+         }}\n",
+        prefix = REVIEWED_SERVICE_TABLE_PREFIX,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

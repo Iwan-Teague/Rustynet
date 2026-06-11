@@ -51,6 +51,7 @@ pub mod privileged_helper;
 pub mod relay_client;
 pub mod resilience;
 pub mod secret_log_audit;
+pub mod service_exposure;
 pub mod stun_client;
 pub mod traversal;
 #[cfg(unix)]

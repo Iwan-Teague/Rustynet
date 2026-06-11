@@ -1278,6 +1278,38 @@ fn sanitize_dataplane_routes_for_node_role(node_role: NodeRole, routes: Vec<Rout
         .collect()
 }
 
+/// D13.d — exit-node coexistence guard
+/// (`LlmNodeRoleDesign_2026-06-11.md` §6). When the route set
+/// carries an `ExitNodeDefault` route (0.0.0.0/0 via the selected
+/// exit), it MUST also retain mesh overlay routes: WireGuard's
+/// longest-prefix cryptokey routing keeps intra-mesh service
+/// traffic (the nas/llm tunnel endpoints) peer-to-peer only while
+/// the more-specific mesh routes coexist with the exit default. A
+/// route set whose mesh routes were dropped would silently hairpin
+/// overlay traffic — including inference streams — through the exit
+/// operator. Refuse the apply instead (fail closed); internet
+/// egress without mesh reachability is never a valid mesh state.
+fn enforce_overlay_exception_for_exit_routes(routes: &[Route]) -> Result<(), String> {
+    let has_exit_default = routes
+        .iter()
+        .any(|route| matches!(route.kind, RouteKind::ExitNodeDefault));
+    if !has_exit_default {
+        return Ok(());
+    }
+    let has_mesh_route = routes
+        .iter()
+        .any(|route| matches!(route.kind, RouteKind::Mesh));
+    if has_mesh_route {
+        Ok(())
+    } else {
+        Err(
+            "route set carries an exit default route but no mesh overlay routes; \
+             overlay (service) traffic would hairpin through the exit — refusing apply"
+                .to_owned(),
+        )
+    }
+}
+
 fn validate_node_role_membership_alignment(
     membership_state: &MembershipState,
     local_node_id: &str,
@@ -6616,6 +6648,15 @@ impl DaemonRuntime {
         };
 
         let routes = sanitize_dataplane_routes_for_node_role(self.node_role, routes);
+        if let Err(err) = enforce_overlay_exception_for_exit_routes(&routes) {
+            self.restrict_recoverable(format!(
+                "exit coexistence guard rejected bootstrap apply: {err}"
+            ));
+            let _ = self
+                .controller
+                .force_fail_closed("bootstrap_exit_overlay_exception_violated");
+            return;
+        }
         let apply_result = self.controller.apply_dataplane_generation(
             trust,
             RuntimeContext {
@@ -8068,6 +8109,17 @@ impl DaemonRuntime {
             };
 
             let routes = sanitize_dataplane_routes_for_node_role(self.node_role, routes);
+            if let Err(err) = enforce_overlay_exception_for_exit_routes(&routes) {
+                self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                let message = format!("exit coexistence guard rejected reconcile apply: {err}");
+                self.last_reconcile_error = Some(message.clone());
+                self.restrict_recoverable(message);
+                let _ = self
+                    .controller
+                    .force_fail_closed("reconcile_exit_overlay_exception_violated");
+                self.promote_to_permanent_if_over_limit();
+                return;
+            }
             let previously_managed_peer_ids = self
                 .controller
                 .managed_peer_ids()
