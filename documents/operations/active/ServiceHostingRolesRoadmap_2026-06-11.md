@@ -127,11 +127,11 @@ Fast local iteration: `cargo run -p rustynet-xtask -- gates` (fmt → check → 
 | D13 added to dataplane execution plan | ✅ 2026-06-11 | `RustynetDataplaneExecutionPlan_2026-05-18.md` §5.1 + per-phase D13 section |
 | SecurityMinimumBar §6.E | ✅ 2026-06-11 | `../../SecurityMinimumBar.md` §6.E (E1–E4 + enforcement-point map) |
 | M0 D12 prerequisite | ✅ verified in-tree 2026-06-11 | six-role `ROLE_PRESET_TABLE`, `transition_plan`, CLI verbs, wizard present; named role gate scripts were missing — see delta plan D13.a resolution 1 |
-| M1 D13.a/b | ✅ D13.a landed 2026-06-11 · ✅ D13.b code+tests landed (daemon reconcile-loop wiring open — see delta plan D13.b status) | delta plan §3 + `scripts/ci/role_taxonomy_gates.sh` |
-| M2 D13.c (nas) | ✅ crate+bin+installer+tests landed 2026-06-11 (daemon runtime integration + live evidence open) | delta plan D13.c status + `scripts/ci/nas_default_deny_gates.sh` |
-| M3 D13.d (llm) | ✅ crate+bin+verbs+coexistence guard+tests landed 2026-06-11 (daemon runtime integration + live evidence open) | delta plan D13.d status + `scripts/ci/llm_default_deny_gates.sh` + `llm_exit_coexistence_gates.sh` |
+| M1 D13.a/b | ✅ complete 2026-06-11 (D13.a + D13.b incl. daemon access-state materialisation `de02cc2`) | delta plan §3 + `scripts/ci/role_taxonomy_gates.sh` |
+| M2 D13.c (nas) | ✅ crate+bin+installer+tests landed 2026-06-11 (daemon access-state materialisation ✅ `de02cc2`; live evidence open) | delta plan D13.c status + `scripts/ci/nas_default_deny_gates.sh` |
+| M3 D13.d (llm) | ✅ crate+bin+verbs+coexistence guard+tests landed 2026-06-11 (daemon access-state materialisation ✅ `de02cc2`; live evidence open) | delta plan D13.d status + `scripts/ci/llm_default_deny_gates.sh` + `llm_exit_coexistence_gates.sh` |
 | M4 D13.e surface | ✅ docs+gates landed 2026-06-11 (SecurityMinimumBar §6.E, Requirements §6.1, platform matrix ⛔ rows, hardening + redaction sections, `service_hosting_role_gates.sh`, `role_transition_audit_gates.sh`); wizard already lists eight presets via `RolePreset::all()` | this commit |
-| M5 live-lab rows | ☐ not started | `../live_lab_run_matrix.csv` |
+| M5 live-lab rows | ☐ open — next step; blocked 2026-06-11 on the in-flight vm-lab simulator stream | `../live_lab_run_matrix.csv` |
 | M6 RustyBackup / RustyAI | ☐ future | separate program |
 
 Legend: ✅ done · ☐ open · ⛔ blocked.
