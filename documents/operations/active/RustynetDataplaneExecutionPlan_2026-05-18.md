@@ -139,6 +139,90 @@ The architecture intentionally trades cellular-pair-success for "zero external i
 
 Anything outside this list is a bug, not an accepted trade-off.
 
+### 4.1 Residual traversal gaps (identified 2026-06-11)
+
+A 2026-06-11 review of decisions 2.1–2.6 against the implemented code found three failure modes that the
+tables above either understate or do not cover. None of them invalidates the architecture; all three have
+mitigations that stay inside the "zero external infrastructure, no manual router config" constraints.
+They are recorded here so they are tested deliberately (D5 evidence cycle) rather than discovered in the field.
+
+#### 4.1.1 Cold-contact paradox: anchor NAT *filtering* behaviour gates cross-network enrollment
+
+§2.3's outbound-keepalive technique holds the anchor's NAT **mapping** open, but on the most common
+consumer NAT types (address- and port-restricted cone), the **filtering** rule only admits inbound
+packets from endpoints the anchor has already sent to. A brand-new enrollee is, by definition, an
+endpoint the anchor has never sent to — and the anchor cannot initiate the hole-punch because it does
+not know the enrollee's reflexive endpoint (the enrollment token is minted before that endpoint exists).
+§2.5's "reachable from any network that has cone-type NAT" implicitly requires the **anchor side** to be
+full-cone (endpoint-independent filtering, ~30–40% of consumer routers) or to hold a real uPnP/NAT-PMP/PCP
+mapping. §4's "new device cannot bootstrap" row attributes this to "symmetric-NAT-on-both-sides," which
+is too narrow: a port-restricted cone on the anchor side alone is sufficient to block cold contact.
+
+Mitigations (in priority order):
+1. **Anchor role defaults port mapping to `auto`, not `keepalive`.** A real router mapping makes
+   filtering behaviour irrelevant. The security cost is acceptable: the mapped port lands on the relay /
+   WireGuard listener, both of which drop unauthenticated traffic (signed relay session tokens; WG
+   handshake). The conservative `keepalive` default remains correct for non-anchor roles.
+2. **NAT behaviour discovery (RFC 5780-style STUN probing) on anchor startup.** Classify the anchor's NAT
+   as EIF (full-cone) vs address/port-restricted, surface the result in `rustynet status` and the anchor
+   wizard, and emit an explicit warning when the anchor is not cold-reachable: "cross-network enrollment
+   will fail from foreign networks; bootstrap new devices on the home LAN, or enable uPnP on the router."
+   A handful of extra STUN queries; not a "loud" technique under §3.
+3. **IPv6 enrollment listener.** Global IPv6 has no NAT filtering problem; when the anchor has a global
+   v6 address, cold contact works regardless of the IPv4 NAT type. Requires the enrollee's network to be
+   v6-capable, which cellular networks usually are.
+4. **Documented fallback:** LAN-first bootstrap remains the always-works path and stays the documented
+   default recommendation.
+
+#### 4.1.2 Gossip-needs-connectivity circularity on anchor renumber (roaming-only mesh)
+
+§4 already records the "anchor endpoint changes while the mesh is fully offline" trade-off and its
+operational mitigations (DHCP-reserve, second anchor). The sharper version: the in-band recovery story
+("gossip handles this automatically," §2.3) only works for peers that still hold *some* live path. A
+mesh whose remote peers are all roaming (no second anchor, no peer on the anchor's LAN) loses every path
+simultaneously on anchor renumber, and the new endpoint cannot be gossiped over tunnels that no longer
+exist. Anchor-initiated re-punch does not help: the roaming peers' NATs filter inbound from the anchor's
+*new* address as an unknown source.
+
+Mitigations:
+1. **Second anchor at a different site** (already documented) — remains the primary answer.
+2. **Opt-in out-of-band endpoint record (proposed, requires user sign-off — reopens §3 partially).**
+   The anchor publishes a small, Ed25519-signed, mesh-key-encrypted endpoint record to a free
+   write-once channel the peers can poll when all paths are dead: a free dynamic-DNS TXT record
+   (DuckDNS et al.) or a BitTorrent Mainline DHT entry under a blinded key derived from the mesh secret.
+   This is a *mailbox*, not a coordination server: it carries one encrypted record, learns nothing about
+   the mesh, and the dataplane never touches it. It is free and requires no user infrastructure, but it
+   is a third-party dependency for the disaster-recovery path only, so it must be explicitly opted into.
+3. **Stale-endpoint retry ladder:** peers cache the last N anchor endpoints and on total loss retry all
+   of them plus the anchor's LAN-host candidate (covers the returning-to-home-LAN case automatically).
+
+#### 4.1.3 CGNAT on the anchor's home ISP
+
+§4's cellular rows cover carrier-grade NAT on *roaming* endpoints, but not the case where the anchor's
+own residential ISP uses CGNAT (increasingly common; the anchor's "public" IPv4 is then 100.64.0.0/10-side
+and shared). Consequences: uPnP/NAT-PMP on the home router maps to a WAN address that is not actually
+public; the keepalive trick depends on the *carrier's* NAT behaviour, not the home router's; and two
+layers of NAT must both cooperate.
+
+Mitigations:
+1. **Detect and surface.** Compare the router's WAN address (uPnP `GetExternalIPAddress`) against the
+   STUN-observed public address; a mismatch, or a WAN address in 100.64.0.0/10, means CGNAT. The anchor
+   wizard should state it plainly and list the realistic options (IPv6, ISP public-IP request, second
+   anchor at a non-CGNAT site).
+2. **IPv6-first.** CGNAT ISPs are usually DS-Lite or 464XLAT deployments with native IPv6; the relay and
+   enrollment listeners must be dual-stack and *prefer* v6 so the IPv4 CGNAT path is bypassed entirely.
+   This is the single highest-value mitigation and is already architecturally allowed (§2.6).
+3. **PCP toward the CGN (RFC 6887).** PCP was designed for carrier NATs and some deploy it; the existing
+   PCP client should attempt the carrier hop when CGNAT is detected. Cheap to try, fails cleanly.
+
+These three gaps share one test-plan consequence: **D5's evidence matrix must include NAT *filtering*
+profiles (full-cone vs port-restricted vs symmetric), not just "two different networks."** The lab's
+cross-network prerequisites checklist (`documents/operations/CrossNetworkLiveLabPrerequisitesChecklist.md`)
+already anticipates NAT profile labels (`--cross-network-nat-profiles`); the profiles must cover at
+minimum: restricted-cone anchor + cold enrollee (expects documented failure or uPnP rescue), anchor
+renumber under roaming-only peers (expects documented failure or out-of-band rescue), and double-NAT
+anchor (expects v6 bypass or documented failure).
+
 ---
 
 ## 5) Phase queue
@@ -154,11 +238,13 @@ The plan executes in four tracks. Alpha is sequential and is the critical path. 
 5. **D2.5** — Peer-distributed signed-bundle gossip
 6. **D4** — Production relay binary
 7. **D2.7** — Enrollment-token mint/verify/consume
-8. **D5** — Linux ↔ Linux cross-LAN baseline evidence
-9. **D5.5** — ICE-style candidate prioritisation
-10. **D11** — Anchor node role formalisation (canonical design: [`AnchorNodeRoleDesign_2026-05-21.md`](./AnchorNodeRoleDesign_2026-05-21.md))
-11. **D12** — Node role taxonomy + 6-role user-selectable surface (canonical design: [`NodeRoleTaxonomy_2026-05-21.md`](./NodeRoleTaxonomy_2026-05-21.md))
-12. **D13** — Service-hosting role category (`nas`, `llm`) (canonical design: [`NodeRoleTaxonomyExtension_2026-06-11.md`](./NodeRoleTaxonomyExtension_2026-06-11.md); delta ledger: [`ServiceHostingRolesDeltaPlan_2026-06-11.md`](./ServiceHostingRolesDeltaPlan_2026-06-11.md); roadmap: [`ServiceHostingRolesRoadmap_2026-06-11.md`](./ServiceHostingRolesRoadmap_2026-06-11.md))
+8. **D5.1** — NAT-profile lab enablement (added 2026-06-11; prerequisite for D5 evidence — see §4.1 test-plan consequence)
+9. **D5** — Linux ↔ Linux cross-LAN baseline evidence
+10. **D5.5** — ICE-style candidate prioritisation
+11. **D11** — Anchor node role formalisation (canonical design: [`AnchorNodeRoleDesign_2026-05-21.md`](./AnchorNodeRoleDesign_2026-05-21.md))
+12. **D12** — Node role taxonomy + 6-role user-selectable surface (canonical design: [`NodeRoleTaxonomy_2026-05-21.md`](./NodeRoleTaxonomy_2026-05-21.md))
+13. **D13** — Service-hosting role category (`nas`, `llm`) (canonical design: [`NodeRoleTaxonomyExtension_2026-06-11.md`](./NodeRoleTaxonomyExtension_2026-06-11.md); delta ledger: [`ServiceHostingRolesDeltaPlan_2026-06-11.md`](./ServiceHostingRolesDeltaPlan_2026-06-11.md); roadmap: [`ServiceHostingRolesRoadmap_2026-06-11.md`](./ServiceHostingRolesRoadmap_2026-06-11.md))
+14. **D14** — Traversal coverage & relay reachability (added 2026-06-11; addresses §4.1 gaps — relay-reachability slices first, direct-path NAT-combo slices after, per user direction 2026-06-11)
 
 (The non-monotonic numbering — D2.3, D2.4, D2.5, D2.7 sitting between D2 and D5 — preserves cross-references to earlier brainstorm conversations. The numbers are labels, not sort keys; execute in the order above.)
 
@@ -268,6 +354,68 @@ Operators running these live-evidence cycles should use
 `scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh` as the
 starting script, and archive the resulting artifacts under
 `artifacts/cross_network/<commit>/` per the existing pattern.
+
+### D5.1 — NAT-profile lab enablement (added 2026-06-11)
+
+- **Why.** All live-lab evidence to date is same-LAN (every guest on 192.168.0.0/24). The orchestrator
+  already carries the cross-network surface — `--cross-network-nat-profiles`,
+  `--cross-network-required-nat-profiles`, impairment profiles, per-role underlay IPs, and four defined
+  stages (`cross_network_direct_remote_exit`, `cross_network_relay_remote_exit`,
+  `cross_network_failback_roaming`, `cross_network_traversal_adversarial`) — but the only profile that has
+  ever run is `baseline_lan`, and the phase10 cross-network reports under `artifacts/phase10/` are all
+  `fail` at runtime init. §4.1 additionally requires NAT *filtering* behaviour to be part of the matrix.
+  This phase makes the lab physically able to execute all of it.
+- **Topology.** Repurpose `debian-headless-4` (aux) and `debian-headless-5` (extra) as **router VMs**
+  rather than adding new guests. Each router VM gets two NICs: WAN on the existing shared bridge
+  (192.168.0.0/24, standing in for "the internet") and LAN on a new isolated UTM bridge
+  (`10.77.1.0/24` behind router-1, `10.77.2.0/24` behind router-2). The client guest moves behind
+  router-1; for anchor-side NAT scenarios the anchor guest moves behind router-2. Inventory updates go
+  through `--update-inventory-live-ips` only (never hand-edit `vm_lab_inventory.json`).
+- **NAT profiles** (nftables on the router VMs; one profile label = one deterministic ruleset, applied by
+  a new `scripts/vm_lab/apply_nat_profile.sh <profile>` invoked by the orchestrator over SSH):
+  - `port_restricted_cone` — plain `masquerade` (netfilter's default conntrack behaviour:
+    endpoint-independent mapping, endpoint-dependent filtering). This is the **default cross-network
+    profile** because it is the common consumer-router behaviour and the one that exposes the §4.1.1
+    cold-contact gap.
+  - `full_cone` — static SNAT plus a matching DNAT rule for the mapped port (endpoint-independent
+    mapping *and* filtering).
+  - `symmetric` — `masquerade random` (per-flow randomised source ports).
+  - `double_nat_cgnat` — two NAT hops inside router-2 via a nested network namespace, outer hop
+    numbered from 100.64.0.0/10 with **no** uPnP at the outer layer. Emulates a CGNAT ISP (§4.1.3).
+  - `upnp_available` — modifier flag, not a standalone profile: run `miniupnpd` on the router VM so the
+    guest's existing uPnP IGD client (D2.3) can obtain a real mapping. This is how D14.a's anchor
+    `auto` mode is proven live rather than against mocks.
+  - `v6_native` — modifier flag: router advertises a ULA/GUA-style IPv6 prefix via `radvd` and routes v6
+    natively (no NAT66), so the v6-bypass claims (§4.1.3, D14.b) are testable alongside any v4 profile.
+- **New stages** (one per §4.1 gap, added to the orchestrator alongside the four existing cross-network
+  stages; all four existing stages additionally run once per requested NAT profile):
+  - `cross_network_cold_enroll` — anchor behind `port_restricted_cone`, factory-fresh enrollee behind the
+    other router. With `--port-mapping-mode=keepalive`: stage passes only if the failure is *diagnosed
+    correctly* (explicit cold-contact warning, no hang, no silent retry loop). With `upnp_available` +
+    `auto`: enrollment must succeed end-to-end. Pins §4.1.1 and is the acceptance test for D14.a/D14.c.
+  - `cross_network_anchor_renumber` — establish the mesh with roaming-only remote peers, then flip the
+    anchor-side router's WAN address mid-session. Expected today: documented lockout with correct peer-side
+    diagnostics and automatic recovery via the stale-endpoint ladder when the peer returns to the anchor
+    LAN. Becomes a recovery-success test if/when D14.f (mailbox) is signed off. Pins §4.1.2.
+  - `cross_network_double_nat_anchor` — anchor behind `double_nat_cgnat`. Stage passes when the daemon
+    *detects* the CGNAT condition (uPnP WAN address vs STUN mismatch, or 100.64.0.0/10 WAN) and surfaces
+    it, and — with `v6_native` — when traffic bypasses the v4 path entirely. Pins §4.1.3 and accepts
+    D14.b/D14.c.
+- **Validators.** tcpdump on the router VM WAN interface is the path oracle (direct vs relay vs none);
+  zero tunnel-CIDR leaks on every underlay; every run appends its row to
+  `documents/operations/live_lab_run_matrix.csv` via the standard wrappers (new stage columns included),
+  and the row is verified after the run per the operating contract.
+- **Pass criterion.** One orchestrator invocation with
+  `--cross-network-nat-profiles port_restricted_cone,full_cone,symmetric,double_nat_cgnat` completes with
+  every stage either green or in a *documented-expected-failure* state matching §4/§4.1, artifacts under
+  `artifacts/cross_network/<commit>/<profile>/`, and a run-matrix row present. The phase10 init failure is
+  root-caused and fixed as part of bring-up.
+- **Files.** `scripts/vm_lab/apply_nat_profile.sh` (new), `scripts/e2e/live_linux_lab_orchestrator.sh`
+  (three new stages + per-profile loop), `documents/operations/CrossNetworkLiveLabPrerequisitesChecklist.md`
+  (profile definitions), `documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md` +
+  `vm_lab_inventory.json` (router-VM roles, via the supported update path).
+- **Estimated cost.** 2–3 cycles (router-VM provisioning dominates).
+- **Depends on.** D2 through D2.7 (all complete). Blocks D5.
 
 ### D5 — Linux ↔ Linux cross-LAN baseline evidence
 
@@ -443,6 +591,63 @@ starting script, and archive the resulting artifacts under
 - **Pass criteria.** `role set nas` / `role set llm` end-to-end on clean Linux, default-deny until owner-signed authorisation, green live-lab evidence rows (deploy → advertise → authorise → use → revoke-severance → undeploy); LLM streams with no API key while exit-node coexistence keeps inference intra-mesh; eight-role matrix drift tests green; standard + new gates green (`role_taxonomy_gates.sh`, `service_hosting_role_gates.sh`, `nas_default_deny_gates.sh`, `llm_default_deny_gates.sh`, `llm_exit_coexistence_gates.sh`).
 - **Status (2026-06-11).** **D13.a complete.** Eight-preset table (`RolePreset::Nas`/`Llm`, `Capability::ServesNas`/`ServesLlm` appended append-only), `RoleCapability::ServesNas`/`ServesLlm` wire vocabulary, membership pre-image round-trip + tamper tests, blind_exit × service-hosting invariant, generalised `ServiceKind` lifecycle (`service_deploys`/`service_undeploys` replacing the relay-only booleans, per the taxonomy extension §3.4 preferred form), CLI planner nas/llm actions (executor fails closed pending D13.c/d installers), operator wizard vocabulary, MCP repo-context mirror, new `scripts/ci/role_taxonomy_gates.sh`. D13.b–e queued.
 
+### D14 — Traversal coverage & relay reachability (Track Alpha, added 2026-06-11)
+
+- **What.** The §4.1 mitigations plus the coverage levers reviewed with the user on 2026-06-11, as
+  scheduled work. Direction set by the user that day: **relay reachability first** (it converts every
+  reachable-relay pair into a working pair, so it dominates connectivity), **direct-path NAT-combo work
+  after** (it improves latency/throughput UX for common NAT combinations, not reachability). Security
+  posture explicitly unchanged: every slice below keeps WireGuard as the only authentication boundary,
+  adds no plaintext exposure, and respects default-deny.
+- **Sub-slices, in execution order:**
+  - **D14.a — Anchor port-mapping default flips to `auto`.** For the anchor role only,
+    `--port-mapping-mode` defaults to `auto` (uPnP/NAT-PMP/PCP probe) instead of `keepalive`. A real
+    router mapping makes the anchor cold-reachable regardless of NAT filtering type (§4.1.1). Security
+    note recorded here so the default change is auditable: the mapped port terminates at the relay /
+    WireGuard listeners, both of which drop unauthenticated traffic (signed relay session tokens; WG
+    handshake); no new plaintext surface. Non-anchor roles keep `keepalive`.
+    *Acceptance:* `cross_network_cold_enroll` green under `upnp_available`; unit pin that the default is
+    role-conditional. Cost: 1 cycle. Depends on: D11 (role surface), D5.1 (live proof).
+  - **D14.b — IPv6-first listeners + PCP-toward-CGN.** Relay and enrollment/bundle-pull listeners become
+    dual-stack and *prefer* v6; candidate pair-selection already prefers v6 (D5.5). When CGNAT is
+    detected (D14.c), attempt PCP against the carrier hop (RFC 6887 was designed for CGNs; cheap, fails
+    cleanly). *Acceptance:* `cross_network_double_nat_anchor` + `v6_native` shows traffic bypassing the
+    v4 CGNAT path. Cost: 1–2 cycles. Depends on: D2.3/D2.4 (complete), D5.1.
+  - **D14.c — NAT behaviour discovery + honest surfacing.** RFC 5780-style STUN probing classifies the
+    local NAT (EIF/full-cone vs address/port-restricted vs symmetric); uPnP `GetExternalIPAddress` vs
+    STUN comparison (plus 100.64.0.0/10 WAN check) detects CGNAT. Result lands in `rustynet status`, the
+    anchor wizard, and the gossip bundle's local metadata, with the §4.1.1 cold-contact warning emitted
+    when the anchor is not cold-reachable. A few extra STUN queries — not a "loud" technique under §3.
+    *Acceptance:* classification correct against every D5.1 profile; warning text pinned by test.
+    Cost: 1–2 cycles. Depends on: D5.1.
+  - **D14.d — Gossip-coordinated punch timing.** A signed "punch-now" control message over the existing
+    gossip channel lets two already-meshed peers schedule simultaneous-open rounds at the same instant
+    (the technique Tailscale's DISCO uses). Rescues port-restricted ↔ port-restricted pairs — the most
+    common consumer NAT combination — that timing-blind simultaneous-open misses, improving direct-path
+    rate (latency/throughput UX) without touching reachability. Rides the existing Ed25519-signed,
+    replay-protected gossip transport; no new trust surface.
+    *Acceptance:* `cross_network_traversal_adversarial` with `port_restricted_cone` on both routers
+    achieves Direct (not relay) path; tcpdump oracle confirms. Cost: 2 cycles. Depends on: D5.5
+    (complete), D5.1, D5.
+  - **D14.e — Quiet sequential port-delta prediction (GATED).** For symmetric NATs with linear port
+    allocation, predict the next mapping from 2–3 observed deltas — a handful of extra probes, distinct
+    from the banned birthday-paradox spraying (which stays banned: loud, ISP-rate-limit risk). Gated on
+    formally reopening the §3 port-prediction non-goal: the user signalled interest on 2026-06-11; final
+    sign-off happens when D14.c field data shows how much symmetric-NAT pair volume it would recover.
+    Cost: 1–2 cycles. Depends on: D14.c evidence + user sign-off.
+  - **D14.f — Opt-in out-of-band endpoint mailbox (GATED).** Per §4.1.2: anchor publishes an
+    Ed25519-signed, mesh-key-encrypted endpoint record to a free channel (dynDNS TXT or BitTorrent
+    Mainline DHT under a blinded key) that peers poll **only** when every path is dead. Mailbox, not
+    coordinator: one encrypted record, no mesh metadata legible to the third party, dataplane never
+    touches it, off by default. Gated on explicit user sign-off because it partially reopens §3's
+    third-party exclusion. *Acceptance if approved:* `cross_network_anchor_renumber` converts from
+    documented-lockout to automatic-recovery. Cost: 2 cycles. Depends on: user sign-off.
+- **Pass criteria (phase).** D14.a–d landed with their per-slice acceptance stages green in the D5.1
+  matrix; D14.e/f either landed (post-sign-off) with the same standard or still gated with the §8 rows
+  updated to reflect the latest decision state. All standard gates green throughout.
+- **Depends on.** D5.1 (lab can verify the claims), D5 (baseline evidence exists so deltas are
+  attributable), D11 (anchor role surface).
+
 ### D6 — Windows readiness + node-id fix (Track Beta)
 
 - **Scope.** Per `WindowsExitAndRelayDeltaPlan_2026-05-10.md` §3.3. Replace the broken `rustynet.exe status` call in the orchestrator's Windows readiness path with a real readiness check (SCM `Running` state + parse of `RUSTYNETD_DAEMON_ARGS_JSON` for `--node-id` from `C:\ProgramData\RustyNet\config\rustynetd.env`).
@@ -514,6 +719,10 @@ These are the points where the user has explicitly chosen a path but where the c
 | Should bundle gossip have a heartbeat / liveness signal beyond bundle version? | Bundle version + epoch only (D2.5). | If split-brain scenarios occur after partition healing, add an explicit gossip-anti-entropy round. |
 | Should enrollment tokens be redeemable from anywhere or only via the existing-peer's gossiped endpoint? | Via the existing peer's gossiped endpoint. | If enrollment commonly fails because the existing peer's endpoint is stale, add a "fallback contact via any peer that knows the bundle" path. |
 | Should we support an exit-node feature (all internet traffic through one peer)? | No — out of base-plan scope. | The Windows-as-exit track (`WindowsExitAndRelayDeltaPlan_2026-05-10.md`) covers this separately. Don't fold it in here. |
+| Should the anchor role default `--port-mapping-mode` to `auto` instead of `keepalive`? (§4.1.1) | `keepalive` everywhere today. | D5 NAT-profile evidence showing cold-contact enrollment failure on a restricted-cone anchor; flipping the default for the anchor role only is the prepared fix. |
+| Should we add an opt-in out-of-band encrypted endpoint record (dynDNS TXT / DHT mailbox) for anchor-renumber disaster recovery? (§4.1.2) | No — §3 currently excludes any third-party rendezvous. | User accepts the mailbox-not-coordinator distinction, or a real roaming-only lockout occurs. Requires explicit user sign-off because it touches §3. |
+| Should we allow *quiet* sequential port-delta prediction for linear-allocation symmetric NATs (2–3 extra probes, not birthday spraying)? | No — §3 bans port-prediction wholesale. | User asks to push direct-pair success on cellular above the v6/uPnP ceiling. Distinguish it from the banned "loud" birthday-paradox technique before reopening. |
+| Should we add WireGuard-over-TCP/443 fallback for UDP-blocked networks? | No — §3 marks it out of current scope. | User reports recurring hotel/corporate UDP-blocked networks. Closes the last connectivity gap; costs throughput and adds a code path, security model unchanged (WG inside). |
 
 ---
 
