@@ -1,0 +1,67 @@
+[Unit]
+# D13.d — Rustynet LLM gateway sibling service.
+#
+# Hosts the rustynet-llm-gateway inference endpoint for the `llm`
+# service-hosting preset (LlmNodeRoleDesign_2026-06-11.md). The
+# gateway binds the mesh tunnel address ONLY (fail-closed startup
+# check); the inference engine it proxies to is loopback-only and
+# never reachable from tunnel or LAN. Identity comes from the
+# authenticated tunnel (no API key); peer access is default-deny
+# under owner-signed policy; revocation severs in-flight streams.
+#
+# Installed alongside rustynetd.service when the operator runs
+# `rustynet role set llm`; disabled + removed (after stream
+# severance) when leaving the preset, BEFORE the signed revocation
+# drops `serves_llm`.
+Description=Rustynet LLM Gateway (tunnel-only inference endpoint, default-deny, no API key)
+Documentation=https://github.com/Iwan-Teague/Rustynet
+After=network-online.target rustynetd.service
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/rustynet-llm-gateway
+# RUSTYNET_LLM_BIND must be the node's tunnel address; the binary
+# refuses wildcard/loopback/non-tunnel binds at startup. The engine
+# endpoint must be loopback (refused otherwise). The orchestrator
+# writes /etc/default/rustynet-llm-gateway before enabling.
+Environment=RUSTYNET_LLM_BIND=
+Environment=RUSTYNET_LLM_ENGINE_ENDPOINT=127.0.0.1:11434
+Environment=RUSTYNET_LLM_ACCESS_DIR=/var/lib/rustynet-llm/access
+Environment=RUSTYNET_LLM_SIGNING_KEY=/etc/rustynet/llm-session-signing.key
+ExecStart=/usr/local/bin/rustynet-llm-gateway \
+    --bind ${RUSTYNET_LLM_BIND} \
+    --engine-endpoint ${RUSTYNET_LLM_ENGINE_ENDPOINT} \
+    --access-dir ${RUSTYNET_LLM_ACCESS_DIR} \
+    --session-signing-key ${RUSTYNET_LLM_SIGNING_KEY}
+# Fail-closed pre-start: session-token signing key must exist with
+# strict permissions (the binary re-verifies mode bits).
+ExecStartPre=/usr/bin/test -f ${RUSTYNET_LLM_SIGNING_KEY}
+TimeoutStopSec=10s
+Restart=on-failure
+RestartSec=2s
+StateDirectory=rustynet-llm
+StateDirectoryMode=0700
+# Hardening — same baseline as the relay/NAS siblings. Prompts and
+# completions transit this process: smallest privilege surface, no
+# home access, loopback+tunnel sockets only.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/rustynet-llm
+
+[Install]
+WantedBy=multi-user.target

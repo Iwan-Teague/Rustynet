@@ -4,6 +4,7 @@ mod anchor_init;
 mod env_file;
 mod live_lab_results;
 mod live_lab_run_matrix;
+mod llm_cli;
 mod ops_cross_network_preflight;
 mod ops_cross_network_reports;
 mod ops_e2e;
@@ -13,6 +14,7 @@ mod ops_install_macos_relay;
 mod ops_install_systemd;
 mod ops_install_systemd_exit;
 mod ops_install_systemd_relay;
+mod ops_install_systemd_service;
 mod ops_live_lab_failure_digest;
 mod ops_live_lab_orchestrator;
 mod ops_network_discovery;
@@ -181,6 +183,7 @@ enum CliCommand {
     ExitNodeList,
     Role(RoleCommand),
     Capability(CapabilityCommand),
+    Llm(llm_cli::LlmCommand),
     ConnectivityTest,
     PeerStats,
     Bandwidth,
@@ -1548,6 +1551,27 @@ fn parse_command(args: &[String]) -> CliCommand {
                 Ok(cap) => CliCommand::Capability(CapabilityCommand::Remove(cap)),
                 Err(_) => CliCommand::Help,
             }
+        }
+        [cmd, subcmd, peer, rest @ ..] if cmd == "llm" && subcmd == "allow" => {
+            match llm_cli::parse_allow_flags(peer, rest) {
+                Ok(command) => CliCommand::Llm(command),
+                Err(err) => {
+                    eprintln!("{err}");
+                    CliCommand::Help
+                }
+            }
+        }
+        [cmd, subcmd, peer] if cmd == "llm" && subcmd == "deny" => {
+            match llm_cli::validate_peer_selector(peer) {
+                Ok(peer) => CliCommand::Llm(llm_cli::LlmCommand::Deny { peer }),
+                Err(err) => {
+                    eprintln!("{err}");
+                    CliCommand::Help
+                }
+            }
+        }
+        [cmd, subcmd, verb] if cmd == "llm" && subcmd == "access" && verb == "list" => {
+            CliCommand::Llm(llm_cli::LlmCommand::AccessList)
         }
         [cmd] if cmd == "connectivity-test" || cmd == "test" => CliCommand::ConnectivityTest,
         [cmd] if cmd == "peer-stats" || cmd == "peer-health" => CliCommand::PeerStats,
@@ -5305,6 +5329,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::ExitNodeList => execute_exit_node_list(),
         CliCommand::Role(cmd) => execute_role(cmd),
         CliCommand::Capability(cmd) => execute_capability(cmd),
+        CliCommand::Llm(cmd) => llm_cli::execute_llm(&cmd, None),
         CliCommand::ConnectivityTest => execute_connectivity_test(),
         CliCommand::PeerStats => execute_peer_stats(),
         CliCommand::Bandwidth => execute_bandwidth(),
@@ -14929,6 +14954,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::ExitNodeList
         | CliCommand::Role(_)
         | CliCommand::Capability(_)
+        | CliCommand::Llm(_)
         | CliCommand::Anchor(_)
         | CliCommand::ConnectivityTest
         | CliCommand::PeerStats
@@ -17433,29 +17459,49 @@ fn execute_platform_exit_service_action(install: bool) -> Result<String, String>
     ))
 }
 
-/// `rustynet-nas` sibling-service lifecycle dispatch. The hardened
-/// per-OS installer lands with the D13.c slice
-/// (`ServiceHostingRolesDeltaPlan_2026-06-11.md`); until it does,
-/// every platform fails closed here — the role transition stops
-/// before any signed `serves_nas` advertisement can be emitted
-/// (deploy-before-advertise is preserved by failing the deploy).
+/// `rustynet-nas` sibling-service lifecycle dispatch. Linux drives
+/// the hardened systemd installer; macOS/Windows fail closed until
+/// their scaffolds land with live evidence (platform matrix keeps
+/// them ⛔) — the role transition stops before any signed
+/// `serves_nas` advertisement can be emitted (deploy-before-
+/// advertise is preserved by failing the deploy).
 fn execute_platform_nas_service_action(install: bool) -> Result<String, String> {
+    if cfg!(target_os = "linux") {
+        let config = if install {
+            ops_install_systemd_service::InstallServiceConfig::nas_install()
+        } else {
+            ops_install_systemd_service::InstallServiceConfig::nas_uninstall()
+        };
+        return ops_install_systemd_service::execute_install_service(config)
+            .map(|report| report.summary());
+    }
     let verb = if install { "deploy" } else { "undeploy" };
     Err(format!(
-        "rustynet-nas service {verb} is blocked_by_service_install_path on {}: this build has no nas service installer, failing closed",
+        "rustynet-nas service {verb} is not supported on {} yet (fail-closed; Linux is the \
+         primary nas host, macOS/Windows pending their platform-matrix promotion)",
         std::env::consts::OS
     ))
 }
 
-/// `rustynet-llm-gateway` sibling-service lifecycle dispatch. The
-/// hardened per-OS installer lands with the D13.d slice; until it
-/// does, every platform fails closed here — the role transition
-/// stops before any signed `serves_llm` advertisement can be
-/// emitted.
+/// `rustynet-llm-gateway` sibling-service lifecycle dispatch. Linux
+/// drives the hardened systemd installer; macOS/Windows fail closed
+/// until their scaffolds land with live evidence — the role
+/// transition stops before any signed `serves_llm` advertisement
+/// can be emitted.
 fn execute_platform_llm_service_action(install: bool) -> Result<String, String> {
+    if cfg!(target_os = "linux") {
+        let config = if install {
+            ops_install_systemd_service::InstallServiceConfig::llm_install()
+        } else {
+            ops_install_systemd_service::InstallServiceConfig::llm_uninstall()
+        };
+        return ops_install_systemd_service::execute_install_service(config)
+            .map(|report| report.summary());
+    }
     let verb = if install { "deploy" } else { "undeploy" };
     Err(format!(
-        "rustynet-llm-gateway service {verb} is blocked_by_service_install_path on {}: this build has no llm service installer, failing closed",
+        "rustynet-llm-gateway service {verb} is not supported on {} yet (fail-closed; Linux is \
+         the primary llm host, macOS/Windows pending their platform-matrix promotion)",
         std::env::consts::OS
     ))
 }
@@ -17780,6 +17826,9 @@ fn help_text() -> String {
         "  tunnel-info",
         "  exit-node-list",
         "  role [show|set <admin|client|blind_exit>]",
+        "  llm allow <node:id|group:name> [--models a,b] [--quota <tokens>] [--rate <req/min>]",
+        "  llm deny <node:id|group:name>",
+        "  llm access list",
         "  connectivity-test",
         "  peer-stats",
         "  bandwidth",
