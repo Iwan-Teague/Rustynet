@@ -105,13 +105,20 @@ On `debian-headless-1`, 2026-06-11:
   router wan IP).
 - Endpoint isolation holds (an endpoint cannot reach another site's private address).
 - Concurrent multi-site reachability to the shared `svc` node from distinct translated wan IPs.
+- **NAT-reflexive (srflx) discovery** end-to-end: with `scripts/vm_lab/stun_responder.py` running in `svc`,
+  an endpoint behind its NAT learns its translated public mapping (ep-A → `100.64.0.11:<mapped>`, ep-B →
+  `100.64.0.12:<mapped>`). The responder speaks the exact wire format `crates/rustynetd/src/stun_client.rs`
+  parses (RFC 5389 binding request/response, XOR-MAPPED-ADDRESS), so the real client consumes it unchanged.
+  It is lab tooling standing in for the public STUN servers — not a Rustynet component.
 
 ### What is still pending (Tier A)
 
-Layering the real lifecycle into the topology: a STUN responder + `rustynet-relay` in `svc`, `rustynetd`
-(kernel WireGuard) in each endpoint namespace, then the full enrollment cold-contact → gossip → STUN →
-ICE pair race → direct-punch flow with forced relay fallback, `tcpdump` on the wan as the direct-vs-relay
-path oracle, and the expanded `full_cone` / `symmetric` / double-NAT / impairment matrix. Tracked in plan
+Layering the rest of the real lifecycle into the topology: `rustynet-relay` in `svc`, `rustynetd`
+(kernel WireGuard) in each endpoint namespace pointed at the in-sim STUN responder via the legitimate
+`traversal_stun_servers` config, then the full enrollment cold-contact → gossip → ICE pair race →
+direct-punch flow with forced relay fallback, `tcpdump` on the wan as the direct-vs-relay path oracle, and
+the expanded `full_cone` / `symmetric` / double-NAT / impairment matrix. (STUN reflexive discovery — the
+prerequisite — is done; see above.) Tracked in plan
 §D5.1 and the §4.1 gap stages (`cross_network_cold_enroll`, `cross_network_anchor_renumber`,
 `cross_network_double_nat_anchor`).
 
@@ -140,4 +147,5 @@ drive Tier A directly with the commands above and capture artifacts manually und
   profile vocabulary, go/no-go checklist.
 - [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md), [LiveLabRunMatrix.md](./LiveLabRunMatrix.md)
   — orchestrator and evidence ledger.
-- `scripts/vm_lab/netns_internet_sim.sh`, `scripts/vm_lab/apply_nat_profile.sh` — the substrate tooling.
+- `scripts/vm_lab/netns_internet_sim.sh`, `scripts/vm_lab/apply_nat_profile.sh`,
+  `scripts/vm_lab/stun_responder.py` — the substrate tooling.
