@@ -417,6 +417,45 @@ starting script, and archive the resulting artifacts under
 - **Estimated cost.** 2–3 cycles (router-VM provisioning dominates).
 - **Depends on.** D2 through D2.7 (all complete). Blocks D5.
 
+#### D5.1 substrate architecture (revised 2026-06-11 — single-host, fixed 7-VM lab)
+
+A feasibility pass on 2026-06-11 established two hard UTM constraints that reshape how the lab gets a NAT
+boundary: (1) editing a VM's `config.plist` while UTM is running is silently clobbered from UTM's
+in-memory model, so any VM network reconfig requires stop → quit UTM → rewrite → relaunch → start (a
+full-lab restart per switch); and (2) UTM cannot place two VMs alone on a shared isolated L2 segment, so a
+"client alone behind its own router VM" topology is not directly buildable. The user's directive: extract
+maximum battle-testing on the single host, keeping the existing 7 VMs (no new VMs), before any move to
+real hardware. The substrate is therefore four tiers, each catching a class of defect the others cannot:
+
+- **Tier A — netns "internet simulator" (one Debian guest). Primary / CI gate.**
+  `scripts/vm_lab/netns_internet_sim.sh` builds a full cross-NAT internet from network namespaces inside a
+  single guest: a `wan` bridge ("the internet"), a `svc` node (STUN responder + `rustynet-relay`), and N
+  edge sites each = `{router ns running a chosen NAT profile} + {endpoint ns running rustynetd over kernel
+  WireGuard}`. Validated 2026-06-11 on debian-headless-1 (kernel WG, nft 1.1.3, veth/vxlan/dummy/sch_netem
+  all present): topology build/teardown, real SNAT translation (conntrack-confirmed), endpoint isolation,
+  and concurrent multi-site reachability all pass. This tier drives the deterministic §4.1 matrix (every
+  NAT filtering type, multi-hop CGNAT, anchor renumber, netem impairment) and is the reproducible
+  regression gate. Reuses the `apply_nat_profile.sh` profile vocabulary.
+- **Tier B — VXLAN-overlay multi-VM cross-NAT (Debian guests). Separate-kernel fidelity.**
+  VXLAN VNIs built *over* the existing flat 192.168.0.0/24 bridge give each leaf VM an isolated "home LAN"
+  terminating on a router VM, which NATs (controllable profile via `apply_nat_profile.sh`) between that VNI
+  and a shared "wan" VNI hosting svc. Defeats UTM constraint (2) in software — no UTM reconfig, no new VMs
+  — while exercising genuinely separate kernels / WireGuard instances / conntrack tables. Catches
+  race/timing/independent-state defects Tier A's single kernel hides.
+- **Tier C — cross-OS cross-NAT (Windows + macOS guests). Coarse but real.**
+  Win/mac cannot be netns'd; put each behind a NAT via slirp `Shared` mode (reversible via the
+  quit/relaunch switch from constraint (1)) and validate cross-OS traversal + relay fallback. NAT type is
+  not selectable here — this is the cross-OS smoke layer, not the filtering matrix.
+- **Tier D — chaos / soak / adversarial.** Layered on A and B: netem flaps, conntrack-flush rebinding,
+  anchor renumber, relay kill/restart, partition-heal, plus adversarial replay/forged-bundle/downgrade.
+
+Orchestrator integration: a `--cross-network-substrate={netns,vxlan,slirp}` selector chooses the tier; the
+three new stages (`cross_network_cold_enroll`, `cross_network_anchor_renumber`,
+`cross_network_double_nat_anchor`) and the existing four cross-network stages run on whichever substrate is
+selected, against the requested NAT-profile matrix. The router-VM topology in the original D5.1 text is
+superseded by Tier B (overlay) for controllable multi-VM NAT; real separate-network hardware remains the
+post-lab fidelity ceiling (DoD §10).
+
 ### D5 — Linux ↔ Linux cross-LAN baseline evidence
 
 - **Scope.** Two Linux devices on different LANs (or one on a LAN and one on a tethered cellular network) prove the dataplane works end-to-end. Capture artifacts pinned to the commit SHA. Validate the relay-fallback path by forcing direct-connect to fail.
