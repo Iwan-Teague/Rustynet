@@ -516,6 +516,26 @@ pub fn plan_concrete_actions(
                                 .to_owned(),
                         );
                     }
+                    if target == RolePreset::Nas {
+                        followup_instructions.push(
+                            "Your NAS will be up but DEFAULT-DENY: no device can reach it until the membership owner signs a service-access policy. Authorise devices from your admin box."
+                                .to_owned(),
+                        );
+                        followup_instructions.push(
+                            "Resource note: point RUSTYNET_NAS_DATA_ROOT (/etc/default/rustynet-nas) at the dedicated data disk before relying on the role."
+                                .to_owned(),
+                        );
+                    }
+                    if target == RolePreset::Llm {
+                        followup_instructions.push(
+                            "Your LLM node will be up but DEFAULT-DENY: no device can use it until you authorise one — run `rustynet llm allow node:<id>` on your admin box and sign the record."
+                                .to_owned(),
+                        );
+                        followup_instructions.push(
+                            "Resource note: the inference engine needs a GPU/accelerator (or a tiny CPU model for testing); it must listen on loopback only."
+                                .to_owned(),
+                        );
+                    }
                     if validator.primary_change.is_some() {
                         followup_instructions.push(
                             "Restart the daemon so the new primary role takes effect: `systemctl restart rustynetd.service`."

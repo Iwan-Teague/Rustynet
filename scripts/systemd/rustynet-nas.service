@@ -1,0 +1,68 @@
+[Unit]
+# D13.c — Rustynet NAS sibling service.
+#
+# Hosts the rustynet-nas storage/backup endpoint for the `nas`
+# service-hosting preset (NasNodeRoleDesign_2026-06-11.md). The
+# listener binds the mesh tunnel address ONLY — never 0.0.0.0,
+# loopback, LAN, or public (fail-closed startup check). Peer access
+# is default-deny under owner-signed service-access policy enforced
+# through the daemon's exposure gate; a fresh NAS authorises nobody.
+#
+# Installed alongside rustynetd.service when the operator runs
+# `rustynet role set nas`; disabled + removed (after session
+# severance) when leaving the preset, BEFORE the signed
+# revocation drops `serves_nas`.
+Description=Rustynet NAS (tunnel-only encrypted backup endpoint, default-deny)
+Documentation=https://github.com/Iwan-Teague/Rustynet
+After=network-online.target rustynetd.service
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/rustynet-nas
+# RUSTYNET_NAS_BIND must be the node's tunnel address; the binary
+# refuses wildcard/loopback/non-tunnel binds at startup. The
+# role-transition orchestrator writes /etc/default/rustynet-nas
+# with the real overlay address before enabling this unit.
+Environment=RUSTYNET_NAS_BIND=
+Environment=RUSTYNET_NAS_DATA_ROOT=/var/lib/rustynet-nas/data
+Environment=RUSTYNET_NAS_ACCESS_DIR=/var/lib/rustynet-nas/access
+# At-rest key delivered via systemd credentials (encrypted at rest
+# with the host credential key; never world-readable, never in env).
+LoadCredentialEncrypted=nas_at_rest_key:/etc/rustynet/nas_at_rest_key.cred
+ExecStart=/usr/local/bin/rustynet-nas \
+    --bind ${RUSTYNET_NAS_BIND} \
+    --data-root ${RUSTYNET_NAS_DATA_ROOT} \
+    --access-dir ${RUSTYNET_NAS_ACCESS_DIR} \
+    --at-rest-key-credential nas_at_rest_key
+# Fail-closed pre-start: data root must exist (operator-provided
+# data disk); the binary additionally refuses world-accessible
+# permissions and an unopenable keycheck sentinel.
+ExecStartPre=/usr/bin/test -d ${RUSTYNET_NAS_DATA_ROOT}
+TimeoutStopSec=10s
+Restart=on-failure
+RestartSec=2s
+StateDirectory=rustynet-nas
+StateDirectoryMode=0700
+# Hardening — same baseline as the relay sibling. The NAS holds
+# user backup data: smallest practical privilege surface.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/rustynet-nas
+
+[Install]
+WantedBy=multi-user.target

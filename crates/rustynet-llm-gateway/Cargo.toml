@@ -10,5 +10,13 @@ ed25519-dalek = "2"
 rustynet-policy = { path = "../rustynet-policy" }
 sha2 = "0.10"
 
+[features]
+default = []
+daemon = []
+
+[[bin]]
+name = "rustynet-llm-gateway"
+required-features = ["daemon"]
+
 [lints]
 workspace = true
