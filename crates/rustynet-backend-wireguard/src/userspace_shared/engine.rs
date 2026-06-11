@@ -63,6 +63,17 @@ pub(crate) struct UserspaceEngine {
     peer_states: BTreeMap<NodeId, PeerEngineState>,
     recorded_peer_ciphertext_ingress: Vec<RecordedPeerCiphertextIngress>,
     recorded_tunnel_plaintext_packets: Vec<RecordedTunnelPlaintextPacket>,
+    // Long-lived per-engine scratch buffers reused across every packet instead
+    // of allocating+zeroing a fresh 64 KiB Vec per frame. boringtun's
+    // `encapsulate`/`decapsulate` write out-of-place into these and the engine
+    // copies the (small) result out before the next packet reuses the buffer,
+    // so reuse is sound. `decrypt_scratch` holds the initial inbound result
+    // while `decrypt_follow_up_scratch` services the mandatory drain loop — two
+    // distinct buffers so the in-flight `TunnResult` borrow never aliases the
+    // drain buffer. Owned by the single worker thread; never shared.
+    decrypt_scratch: Vec<u8>,
+    decrypt_follow_up_scratch: Vec<u8>,
+    encrypt_scratch: Vec<u8>,
 }
 
 struct PeerEngineState {
@@ -124,6 +135,9 @@ impl UserspaceEngine {
             peer_states: BTreeMap::new(),
             recorded_peer_ciphertext_ingress: Vec::new(),
             recorded_tunnel_plaintext_packets: Vec::new(),
+            decrypt_scratch: vec![0u8; MAX_DECRYPTED_PACKET_BYTES],
+            decrypt_follow_up_scratch: vec![0u8; MAX_DECRYPTED_PACKET_BYTES],
+            encrypt_scratch: vec![0u8; MAX_ENCRYPTED_PACKET_BYTES],
         })
     }
 
@@ -258,16 +272,17 @@ impl UserspaceEngine {
         let Self {
             peer_states,
             recorded_tunnel_plaintext_packets,
+            decrypt_scratch,
+            decrypt_follow_up_scratch,
             ..
         } = self;
         let peer_state = peer_states
             .get_mut(&node_id)
             .expect("matched peer state should exist");
-        let mut decrypt_buf = vec![0u8; MAX_DECRYPTED_PACKET_BYTES];
         let initial_result =
             peer_state
                 .tunnel
-                .decapsulate(Some(remote_addr.ip()), &payload, &mut decrypt_buf);
+                .decapsulate(Some(remote_addr.ip()), &payload, decrypt_scratch);
         Ok(drive_inbound_result(
             &node_id,
             peer_state,
@@ -275,6 +290,7 @@ impl UserspaceEngine {
             transport_generation,
             initial_result,
             recorded_tunnel_plaintext_packets,
+            decrypt_follow_up_scratch,
         ))
     }
 
@@ -298,13 +314,21 @@ impl UserspaceEngine {
         let Self {
             peer_states,
             recorded_tunnel_plaintext_packets,
+            encrypt_scratch,
             ..
         } = self;
         let peer_state = peer_states
             .get_mut(&node_id)
             .expect("selected peer state should exist");
-        let mut encrypt_buf = vec![0u8; MAX_ENCRYPTED_PACKET_BYTES.max(packet.len() + 32)];
-        let initial_result = peer_state.tunnel.encapsulate(packet, &mut encrypt_buf);
+        // Reuse the long-lived scratch buffer; grow only if a packet ever needs
+        // more than the standard ceiling (it cannot on this path — the TUN/UDP
+        // read buffers cap at 65 535 — but the resize preserves byte-identical
+        // behavior with the previous `.max(packet.len() + 32)` sizing).
+        let needed = MAX_ENCRYPTED_PACKET_BYTES.max(packet.len() + 32);
+        if encrypt_scratch.len() < needed {
+            encrypt_scratch.resize(needed, 0);
+        }
+        let initial_result = peer_state.tunnel.encapsulate(packet, encrypt_scratch);
         Ok(drive_outbound_result(
             &node_id,
             peer_state,
@@ -373,11 +397,11 @@ fn drive_inbound_result(
     transport_generation: u64,
     initial_result: TunnResult<'_>,
     recorded_tunnel_plaintext_packets: &mut Vec<RecordedTunnelPlaintextPacket>,
+    follow_up_scratch: &mut [u8],
 ) -> EngineProcessingOutcome {
     let should_drain_follow_ups = !matches!(initial_result, TunnResult::Err(_));
     let mut outcome = handle_single_tunn_result(
         node_id,
-        peer_state,
         remote_addr,
         transport_generation,
         initial_result,
@@ -386,14 +410,14 @@ fn drive_inbound_result(
 
     if should_drain_follow_ups {
         loop {
-            let mut follow_up_buf = vec![0u8; MAX_DECRYPTED_PACKET_BYTES];
-            let follow_up = peer_state.tunnel.decapsulate(None, &[], &mut follow_up_buf);
+            // Reuse the long-lived drain buffer; each iteration's result is
+            // copied out by `handle_single_tunn_result` before the next reuse.
+            let follow_up = peer_state.tunnel.decapsulate(None, &[], follow_up_scratch);
             if matches!(follow_up, TunnResult::Done) {
                 break;
             }
             let next = handle_single_tunn_result(
                 node_id,
-                peer_state,
                 remote_addr,
                 transport_generation,
                 follow_up,
@@ -420,7 +444,6 @@ fn drive_outbound_result(
 ) -> EngineProcessingOutcome {
     let mut outcome = handle_single_tunn_result(
         node_id,
-        peer_state,
         peer_state.endpoint,
         transport_generation,
         initial_result,
@@ -435,12 +458,16 @@ fn drive_outbound_result(
 
 fn handle_single_tunn_result(
     node_id: &NodeId,
-    peer_state: &mut PeerEngineState,
     remote_addr: SocketAddr,
     transport_generation: u64,
     result: TunnResult<'_>,
     recorded_tunnel_plaintext_packets: &mut Vec<RecordedTunnelPlaintextPacket>,
 ) -> EngineProcessingOutcome {
+    // `node_id` is consumed only by the `cfg(test)` plaintext-recording fixtures
+    // below; in production builds it is otherwise unused now that the redundant
+    // per-result handshake observation has moved to the drive functions.
+    #[cfg(not(test))]
+    let _ = node_id;
     let mut outcome = EngineProcessingOutcome::default();
     match result {
         TunnResult::Done | TunnResult::Err(_) => {}
@@ -490,10 +517,13 @@ fn handle_single_tunn_result(
         }
     }
 
-    let observed_handshake = authenticated_handshake_unix(&peer_state.tunnel);
-    if let Some(observed_handshake) = observed_handshake {
-        outcome.authenticated_handshake = Some((node_id.clone(), observed_handshake));
-    }
+    // The observed-handshake timestamp is computed once per drive (at the end
+    // of `drive_inbound_result` / `drive_outbound_result`), which always
+    // overwrites this outcome's value. Computing it per result here is pure
+    // redundancy (an extra `Tunn::stats()` + clock read per Tunn result), so it
+    // is intentionally omitted — `authenticated_handshake` stays `None` here and
+    // is filled in by the drive function. Handshake time is monotonic, so the
+    // end-of-drive value is always >= any per-result observation.
     outcome
 }
 

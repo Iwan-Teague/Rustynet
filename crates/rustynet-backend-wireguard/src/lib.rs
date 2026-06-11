@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(any(test, feature = "test-harness"))]
+pub mod bench_support;
 mod in_memory;
 mod linux_command;
 mod macos_command;
