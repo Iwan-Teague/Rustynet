@@ -110,6 +110,41 @@ mod tests {
     }
 
     #[test]
+    fn build_returns_canonical_security_stage_order() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new().build();
+        let ids: Vec<_> = stages.iter().map(|stage| stage.id()).collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                StageId::Preflight,
+                StageId::PrepareSourceArchive,
+                StageId::VerifySshReachability,
+                StageId::CleanupHosts,
+                StageId::BootstrapHosts,
+                StageId::CollectPubkeys,
+                StageId::MembershipInit,
+                StageId::DistributeMembership,
+                StageId::AnchorValidation,
+                StageId::DistributeAssignments,
+                StageId::DistributeTraversal,
+                StageId::DistributeDnsZone,
+                StageId::EnforceBaselineRuntime,
+                StageId::ValidateBaselineRuntime,
+                StageId::DeployRelayService,
+                StageId::RelayValidation,
+                StageId::TrafficTestMatrix,
+                StageId::RoleSwitchMatrix,
+                StageId::ExitHandoff,
+                StageId::ActiveExit,
+                StageId::Cleanup,
+            ],
+            "orchestrator stage order is security-sensitive"
+        );
+    }
+
+    #[test]
     fn active_exit_runs_after_exit_handoff_and_before_cleanup() {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().build();

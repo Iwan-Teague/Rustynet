@@ -2101,6 +2101,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_topology_mixed_desktop_is_supported_for_live_lab_wrapper_scopes() {
+        let platforms = vec![
+            VmLabPlatform::Linux,
+            VmLabPlatform::MacOS,
+            VmLabPlatform::Windows,
+        ];
+        for scope in [
+            VmLabCapabilityScope::SetupLiveLab,
+            VmLabCapabilityScope::RunLiveLab,
+            VmLabCapabilityScope::OrchestrateLiveLab,
+            VmLabCapabilityScope::RepoSync,
+            VmLabCapabilityScope::Suite,
+        ] {
+            assert_eq!(
+                validate_vm_lab_target_topology(scope, &platforms),
+                VmLabTopologyValidation::Ok,
+                "mixed desktop topology must be accepted for {scope:?}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_topology_pure_windows_is_rejected_with_linux_shell_orchestrator_only() {
         let platforms = vec![VmLabPlatform::Windows; 3];
         let rec = assert_rejected(

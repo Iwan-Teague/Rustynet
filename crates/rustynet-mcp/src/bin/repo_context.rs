@@ -2065,26 +2065,26 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | # | Stage | What it does | File |
 |---|-------|-------------|------|
 | 1 | `preflight` | Local prerequisites (cargo, ssh, git) | `stage/preflight.rs` |
-| 2 | `source_archive` | Tar the working tree → state archive | `stage/source_archive.rs` |
-| 3 | `verify_ssh` | Confirm SSH reachability to each node | `stage/verify_ssh.rs` |
-| 4 | `install` | scp source → cargo build → install daemon + service | `stage/install.rs` |
-| 5 | `cleanup` | Wipe prior daemon state on each node | `stage/cleanup.rs` |
+| 2 | `prepare_source_archive` | Tar the working tree → state archive | `stage/source_archive.rs` |
+| 3 | `verify_ssh_reachability` | Confirm SSH reachability to each node | `stage/verify_ssh.rs` |
+| 4 | `cleanup_hosts` | Wipe prior daemon state before rebuild | `stage/cleanup.rs` |
+| 5 | `bootstrap_hosts` | scp source → cargo build → install daemon + service | `stage/install.rs` |
 | 6 | `collect_pubkeys` | SSH each peer + read WireGuard public key | `stage/collect_pubkeys.rs` |
 | 7 | `membership_init` | Exit node signs initial membership snapshot | `stage/membership_init.rs` |
 | 8 | `distribute_membership` | scp membership snapshot to non-exit peers | `stage/distribute_membership.rs` |
-| 9 | `distribute_assignments` | Exit signs + distributes assignments | `stage/distribute_assignments.rs` |
-| 10 | `distribute_traversal` | Exit signs + distributes traversal hints | `stage/distribute_traversal.rs` |
-| 11 | `distribute_dns_zone` | Exit signs + distributes DNS zone | `stage/distribute_dns_zone.rs` |
-| 12 | `enforce_runtime` | Start daemon on each peer | `stage/enforce_runtime.rs` |
-| 13 | `validate_runtime` | Each peer's daemon ingests state + validates | `stage/validate_runtime.rs` |
-| 14 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
-| 15 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
-| 16 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
-| 17 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
-| 18 | `anchor_validation` | Anchor role validation (bundle-pull, gossip, enrollment) | `stage/anchor_validation.rs` |
-| 19 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
-| 20 | `deploy_relay` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
-| 21 | `final_cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 9 | `anchor_validation` | Anchor role validation (bundle-pull, gossip, enrollment) | `stage/anchor_validation.rs` |
+| 10 | `distribute_assignments` | Exit signs + distributes assignments | `stage/distribute_assignments.rs` |
+| 11 | `distribute_traversal` | Exit signs + distributes traversal hints | `stage/distribute_traversal.rs` |
+| 12 | `distribute_dns_zone` | Exit signs + distributes DNS zone | `stage/distribute_dns_zone.rs` |
+| 13 | `enforce_baseline_runtime` | Start daemon on each peer | `stage/enforce_runtime.rs` |
+| 14 | `validate_baseline_runtime` | Each peer's daemon ingests state + validates | `stage/validate_runtime.rs` |
+| 15 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
+| 16 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
+| 17 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
+| 18 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
+| 19 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
+| 20 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
+| 21 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## VM Lab Entry Points (CLI / lab-state MCP)
 - `ops vm-lab-discover-local-utm-summary` — discover VMs, quick summary

@@ -25,7 +25,7 @@ rustynet-operator = { path = "../rustynet-operator" }
 rustynet-policy = { path = "../rustynet-policy" }
 rustynetd = { path = "../rustynetd" }
 ed25519-dalek = "2"
-nix = { version = "0.29", default-features = false, features = ["user"] }
+nix = { version = "0.29", default-features = false, features = ["user", "net"] }
 rand.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
