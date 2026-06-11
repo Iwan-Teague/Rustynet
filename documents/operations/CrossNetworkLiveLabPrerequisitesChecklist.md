@@ -83,6 +83,23 @@ Scope: direct remote exit, relay remote exit, failback/roaming, traversal advers
 
 ## 8) Reproducibility Controls
 - Use explicit NAT profile labels (`--cross-network-nat-profiles`).
+- Defined NAT profile labels (dataplane plan D5.1; applied on a lab router VM by
+  `scripts/vm_lab/apply_nat_profile.sh`, which records the active profile in
+  `/run/rustynet_nat_profile` for pre-run verification):
+  - `baseline_lan` — plain routing, no NAT (legacy same-subnet baseline; cross-network
+    suites must NOT claim cross-network results under this label).
+  - `port_restricted_cone` — plain conntrack masquerade: endpoint-independent mapping,
+    endpoint-dependent filtering. Default cross-network profile; exposes the
+    cold-contact gap (plan §4.1.1).
+  - `full_cone` — masquerade plus DMZ-style DNAT of the WireGuard/relay UDP port range
+    to the LAN host: endpoint-independent mapping and filtering.
+  - `symmetric` — masquerade with randomised source ports per flow (endpoint-dependent
+    mapping).
+  - `double_nat_cgnat` — nested-namespace double NAT with an RFC 6598 (100.64.0.0/10)
+    inner segment and a randomised outer hop; no uPnP at the outer hop (plan §4.1.3).
+  - Modifier `upnp_available` — miniupnpd answering on the router's LAN side (inner hop
+    only under `double_nat_cgnat`).
+  - Modifier `v6_native` — radvd-advertised IPv6 prefix routed natively (no NAT66).
 - Use explicit impairment profile labels for each run.
 - Stamp reports with commit-bound evidence (`git_commit`).
 - Store outputs in canonical artifact directory (`artifacts/phase10`).
