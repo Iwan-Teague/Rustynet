@@ -17358,6 +17358,10 @@ fn execute_role_action(action: &role_cli::ConcreteAction) -> Result<String, Stri
         role_cli::ConcreteAction::UndeployExitService => {
             execute_platform_exit_service_action(false)
         }
+        role_cli::ConcreteAction::DeployNasService => execute_platform_nas_service_action(true),
+        role_cli::ConcreteAction::UndeployNasService => execute_platform_nas_service_action(false),
+        role_cli::ConcreteAction::DeployLlmService => execute_platform_llm_service_action(true),
+        role_cli::ConcreteAction::UndeployLlmService => execute_platform_llm_service_action(false),
     }
 }
 
@@ -17425,6 +17429,33 @@ fn execute_platform_exit_service_action(install: bool) -> Result<String, String>
     }
     Err(format!(
         "exit service role transition is not supported on {}",
+        std::env::consts::OS
+    ))
+}
+
+/// `rustynet-nas` sibling-service lifecycle dispatch. The hardened
+/// per-OS installer lands with the D13.c slice
+/// (`ServiceHostingRolesDeltaPlan_2026-06-11.md`); until it does,
+/// every platform fails closed here — the role transition stops
+/// before any signed `serves_nas` advertisement can be emitted
+/// (deploy-before-advertise is preserved by failing the deploy).
+fn execute_platform_nas_service_action(install: bool) -> Result<String, String> {
+    let verb = if install { "deploy" } else { "undeploy" };
+    Err(format!(
+        "rustynet-nas service {verb} is blocked_by_service_install_path on {}: this build has no nas service installer, failing closed",
+        std::env::consts::OS
+    ))
+}
+
+/// `rustynet-llm-gateway` sibling-service lifecycle dispatch. The
+/// hardened per-OS installer lands with the D13.d slice; until it
+/// does, every platform fails closed here — the role transition
+/// stops before any signed `serves_llm` advertisement can be
+/// emitted.
+fn execute_platform_llm_service_action(install: bool) -> Result<String, String> {
+    let verb = if install { "deploy" } else { "undeploy" };
+    Err(format!(
+        "rustynet-llm-gateway service {verb} is blocked_by_service_install_path on {}: this build has no llm service installer, failing closed",
         std::env::consts::OS
     ))
 }

@@ -1711,6 +1711,20 @@ fn validate_membership_node_capabilities(node: &MembershipNode) -> Result<(), Me
             node.node_id
         )));
     }
+    if capabilities.contains(&RoleCapability::BlindExit)
+        && capabilities
+            .iter()
+            .any(|capability| capability.is_service_hosting_capability())
+    {
+        // blind_exit is the hardened minimal-surface final-hop exit;
+        // co-hosting an application-layer service contradicts that
+        // posture. The preset table never produces this combination
+        // — reject it in signed state as well (strictest default).
+        return Err(MembershipError::InvalidFormat(format!(
+            "node {} cannot combine service-hosting (serves_nas/serves_llm) and blind_exit capabilities",
+            node.node_id
+        )));
+    }
     Ok(())
 }
 
@@ -1995,6 +2009,155 @@ mod tests {
         ];
         let err = state.validate().expect_err("state should be rejected");
         assert!(format!("{err}").contains("cannot combine anchor and blind_exit"));
+    }
+
+    #[test]
+    fn blind_exit_rejects_service_hosting_capability_mix() {
+        for service_capability in [RoleCapability::ServesNas, RoleCapability::ServesLlm] {
+            let mut state = base_state();
+            state.nodes[0].capabilities = vec![
+                RoleCapability::BlindExit,
+                RoleCapability::ExitServer,
+                service_capability,
+            ];
+            let err = state.validate().expect_err("state should be rejected");
+            assert!(
+                format!("{err}").contains("cannot combine service-hosting"),
+                "expected service-hosting rejection for {service_capability}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_membership_payload_carries_service_hosting_capabilities() {
+        let mut state = base_state();
+        state.nodes[0].capabilities = vec![
+            RoleCapability::ServesLlm,
+            RoleCapability::Anchor,
+            RoleCapability::ServesNas,
+        ];
+        let payload = state.canonical_payload().expect("payload should build");
+        // Canonical order is append-only: serves_nas / serves_llm
+        // sort after every pre-existing capability.
+        assert!(payload.contains("node.0.capabilities=anchor,serves_nas,serves_llm\n"));
+    }
+
+    #[test]
+    fn set_node_capabilities_update_round_trips_service_hosting_flags() {
+        let state = base_state();
+        for (capabilities, expected_line) in [
+            (
+                vec![RoleCapability::Anchor, RoleCapability::ServesNas],
+                "op.capabilities=anchor,serves_nas\n",
+            ),
+            (
+                vec![RoleCapability::Anchor, RoleCapability::ServesLlm],
+                "op.capabilities=anchor,serves_llm\n",
+            ),
+        ] {
+            let operation = MembershipOperation::SetNodeCapabilities {
+                node_id: "node-a".to_owned(),
+                capabilities: capabilities.clone(),
+            };
+            let next = preview_next_state(&state, &operation).expect("preview should pass");
+            for capability in &capabilities {
+                assert!(next.nodes[0].capabilities.contains(capability));
+            }
+
+            let record = MembershipUpdateRecord {
+                network_id: state.network_id.clone(),
+                update_id: "update-node-caps-service".to_owned(),
+                operation,
+                target: "node-a".to_owned(),
+                prev_state_root: state.state_root_hex().expect("root"),
+                new_state_root: next.state_root_hex().expect("root"),
+                epoch_prev: state.epoch,
+                epoch_new: state.epoch + 1,
+                created_at_unix: 101,
+                expires_at_unix: 400,
+                reason_code: "service_hosting_advertise".to_owned(),
+                policy_context: None,
+            };
+            let payload = record.canonical_payload().expect("payload should build");
+            assert!(
+                payload.contains(expected_line),
+                "payload missing {expected_line:?}:\n{payload}"
+            );
+            let decoded = decode_update_record(&payload).expect("decode update");
+            assert_eq!(decoded, record);
+        }
+    }
+
+    #[test]
+    fn tampered_service_hosting_capability_invalidates_signature() {
+        // E-series control: serves_nas / serves_llm are signed
+        // metadata. Flipping the flag after signing must fail closed
+        // at signature verification, before any state mutation.
+        let state = base_state();
+        let mut node = active_node("node-b", 12);
+        node.capabilities = vec![RoleCapability::Anchor, RoleCapability::ServesNas];
+
+        let mut candidate = state.clone();
+        candidate.nodes.push(node.clone());
+        candidate.epoch += 1;
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-add-nas-node".to_owned(),
+            operation: MembershipOperation::AddNode(node),
+            target: "node-b".to_owned(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: candidate.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 120,
+            expires_at_unix: 600,
+            reason_code: "join".to_owned(),
+            policy_context: None,
+        };
+
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let guardian_key = SigningKey::from_bytes(&[2; 32]);
+        let signatures = vec![
+            sign_update_record(&record, "owner-1", &owner_key).expect("sign"),
+            sign_update_record(&record, "guardian-1", &guardian_key).expect("sign"),
+        ];
+
+        // Tamper: swap the signed serves_nas flag for serves_llm
+        // (and separately drop it) after signing.
+        for tampered_capabilities in [
+            vec![RoleCapability::Anchor, RoleCapability::ServesLlm],
+            vec![RoleCapability::Anchor],
+        ] {
+            let mut tampered_record = record.clone();
+            if let MembershipOperation::AddNode(ref mut tampered_node) = tampered_record.operation {
+                tampered_node.capabilities = tampered_capabilities;
+            } else {
+                unreachable!("record is an AddNode operation");
+            }
+            let signed = SignedMembershipUpdate {
+                record: tampered_record,
+                approver_signatures: signatures.clone(),
+            };
+            let err =
+                apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+                    .expect_err("tampered capability must fail closed");
+            assert!(
+                matches!(err, MembershipError::SignatureInvalid),
+                "expected SignatureInvalid, got {err:?}"
+            );
+        }
+
+        // Untampered control: the same signatures apply cleanly.
+        let signed = SignedMembershipUpdate {
+            record,
+            approver_signatures: signatures,
+        };
+        let applied =
+            apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+                .expect("untampered update should apply");
+        assert!(applied.nodes.iter().any(|node| {
+            node.node_id == "node-b" && node.capabilities.contains(&RoleCapability::ServesNas)
+        }));
     }
 
     #[test]
