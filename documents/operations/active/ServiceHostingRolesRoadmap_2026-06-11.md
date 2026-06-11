@@ -125,12 +125,12 @@ Fast local iteration: `cargo run -p rustynet-xtask -- gates` (fmt → check → 
 | Delta plan (D13) | ✅ written 2026-06-11 | [`ServiceHostingRolesDeltaPlan_2026-06-11.md`](./ServiceHostingRolesDeltaPlan_2026-06-11.md) |
 | Roadmap | ✅ this doc | — |
 | D13 added to dataplane execution plan | ✅ 2026-06-11 | `RustynetDataplaneExecutionPlan_2026-05-18.md` §5.1 + per-phase D13 section |
-| SecurityMinimumBar §6.E | ☐ pending (D13.e) | `../../SecurityMinimumBar.md` |
+| SecurityMinimumBar §6.E | ✅ 2026-06-11 | `../../SecurityMinimumBar.md` §6.E (E1–E4 + enforcement-point map) |
 | M0 D12 prerequisite | ✅ verified in-tree 2026-06-11 | six-role `ROLE_PRESET_TABLE`, `transition_plan`, CLI verbs, wizard present; named role gate scripts were missing — see delta plan D13.a resolution 1 |
-| M1 D13.a/b | ✅ D13.a landed 2026-06-11 · ☐ D13.b | delta plan §3 D13.a status + `scripts/ci/role_taxonomy_gates.sh` |
-| M2 D13.c (nas) | ☐ not started | — |
-| M3 D13.d (llm) | ☐ not started | — |
-| M4 D13.e surface | ☐ not started | — |
+| M1 D13.a/b | ✅ D13.a landed 2026-06-11 · ✅ D13.b code+tests landed (daemon reconcile-loop wiring open — see delta plan D13.b status) | delta plan §3 + `scripts/ci/role_taxonomy_gates.sh` |
+| M2 D13.c (nas) | ✅ crate+bin+installer+tests landed 2026-06-11 (daemon runtime integration + live evidence open) | delta plan D13.c status + `scripts/ci/nas_default_deny_gates.sh` |
+| M3 D13.d (llm) | ✅ crate+bin+verbs+coexistence guard+tests landed 2026-06-11 (daemon runtime integration + live evidence open) | delta plan D13.d status + `scripts/ci/llm_default_deny_gates.sh` + `llm_exit_coexistence_gates.sh` |
+| M4 D13.e surface | ✅ docs+gates landed 2026-06-11 (SecurityMinimumBar §6.E, Requirements §6.1, platform matrix ⛔ rows, hardening + redaction sections, `service_hosting_role_gates.sh`, `role_transition_audit_gates.sh`); wizard already lists eight presets via `RolePreset::all()` | this commit |
 | M5 live-lab rows | ☐ not started | `../live_lab_run_matrix.csv` |
 | M6 RustyBackup / RustyAI | ☐ future | separate program |
 

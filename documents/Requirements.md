@@ -208,6 +208,12 @@ Primary goal:
 - Provides a stable bootstrap target for new devices, a LAN-loopback bundle-pull endpoint, and a deterministic relay co-deployment surface. No central trust authority — every peer still verifies signatures independently.
 - Multiple anchors are supported; anchors are not a single point of failure.
 - Canonical design: [`operations/active/AnchorNodeRoleDesign_2026-05-21.md`](./operations/active/AnchorNodeRoleDesign_2026-05-21.md).
+- `rustynet-nas`:
+- Sibling service for the `nas` service-hosting role: tunnel-only, default-deny content-addressed backup/restore endpoint with AEAD-encrypted-at-rest per-peer namespaces and quotas. Reachable only by signed-authorised mesh peers; no LAN/public listener exists. Node-side contract for the future RustyBackup client.
+- Canonical design: [`operations/active/NasNodeRoleDesign_2026-06-11.md`](./operations/active/NasNodeRoleDesign_2026-06-11.md).
+- `rustynet-llm-gateway`:
+- Sibling service for the `llm` service-hosting role: tunnel-only, default-deny inference gateway in front of a loopback-only swappable inference engine. Identity derives from the authenticated tunnel (no API key); admin-signed policy scopes models/quotas/rates; revocation severs in-flight streams. Node-side contract for the future RustyAI client.
+- Canonical design: [`operations/active/LlmNodeRoleDesign_2026-06-11.md`](./operations/active/LlmNodeRoleDesign_2026-06-11.md).
 
 ### 6.2 Data Plane
 - WireGuard-compatible transport behavior.

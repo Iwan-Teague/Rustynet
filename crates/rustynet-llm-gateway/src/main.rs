@@ -227,10 +227,10 @@ fn load_access_state(
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if let Some((ip_raw, node_id)) = line.split_once(' ') {
-                if let Ok(ip) = ip_raw.parse::<IpAddr>() {
-                    peers.insert(ip, node_id.trim().to_owned());
-                }
+            if let Some((ip_raw, node_id)) = line.split_once(' ')
+                && let Ok(ip) = ip_raw.parse::<IpAddr>()
+            {
+                peers.insert(ip, node_id.trim().to_owned());
             }
         }
     }

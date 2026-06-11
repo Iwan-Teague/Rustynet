@@ -408,8 +408,9 @@ fn selector_node_id(selector: &str) -> Option<&str> {
 mod tests {
     use super::{
         AccessRequest, ContextualAccessRequest, ContextualPolicyRule, ContextualPolicySet,
-        Decision, MembershipDirectory, MembershipStatus, PolicyRolloutController, PolicyRule,
-        PolicySet, Protocol, RolloutError, RuleAction, TrafficContext,
+        Decision, LlmAccessScope, LlmScopePolicy, MembershipDirectory, MembershipStatus,
+        PolicyRolloutController, PolicyRule, PolicySet, Protocol, RolloutError, RuleAction,
+        TrafficContext,
     };
 
     #[test]
@@ -746,6 +747,239 @@ mod tests {
             set.evaluate_with_membership(&request, &membership),
             Decision::Deny,
             "revoked node must be denied even with a permissive allow rule"
+        );
+    }
+
+    /// D13.b E2: an empty policy set denies service-context access
+    /// (the engine's `Decision::Deny` default covers the service
+    /// contexts exactly like the dataplane contexts).
+    #[test]
+    fn service_contexts_default_to_deny_on_empty_policy() {
+        let set = ContextualPolicySet::default();
+        for context in [TrafficContext::NasService, TrafficContext::LlmService] {
+            let request = ContextualAccessRequest {
+                src: "node:laptop-1".to_owned(),
+                dst: "node:service-host".to_owned(),
+                protocol: Protocol::Tcp,
+                context,
+            };
+            assert_eq!(
+                set.evaluate(&request),
+                Decision::Deny,
+                "empty policy must deny {context:?}"
+            );
+        }
+    }
+
+    /// D13.b E2: an explicit (peer → NasService) allow grants exactly
+    /// that peer and exactly that service — a different peer stays
+    /// denied, and the same peer stays denied for `LlmService`
+    /// (no cross-service widening).
+    #[test]
+    fn service_allow_is_scoped_to_peer_and_service() {
+        let set = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "node:laptop-1".to_owned(),
+                dst: "node:nas-host".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::NasService],
+            }],
+        };
+
+        let allowed_peer = ContextualAccessRequest {
+            src: "node:laptop-1".to_owned(),
+            dst: "node:nas-host".to_owned(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::NasService,
+        };
+        let other_peer = ContextualAccessRequest {
+            src: "node:laptop-2".to_owned(),
+            ..allowed_peer.clone()
+        };
+        let other_service = ContextualAccessRequest {
+            context: TrafficContext::LlmService,
+            ..allowed_peer.clone()
+        };
+
+        assert_eq!(set.evaluate(&allowed_peer), Decision::Allow);
+        assert_eq!(
+            set.evaluate(&other_peer),
+            Decision::Deny,
+            "allow for laptop-1 must not leak to laptop-2"
+        );
+        assert_eq!(
+            set.evaluate(&other_service),
+            Decision::Deny,
+            "NasService allow must not widen to LlmService"
+        );
+    }
+
+    /// D13.b hazard pin: a rule with an EMPTY `contexts` list is the
+    /// legacy "all dataplane contexts" form. It matches
+    /// Mesh/SharedSubnetRouter/SharedExit but deliberately does NOT
+    /// match the service contexts — a pre-D13 wildcard-context rule
+    /// must never silently start granting NAS/LLM application access
+    /// (see `context_matches`).
+    #[test]
+    fn empty_contexts_rule_matches_dataplane_but_never_service_contexts() {
+        let set = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "group:family".to_owned(),
+                dst: "tag:servers".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+                contexts: vec![],
+            }],
+        };
+
+        let request_in = |context| ContextualAccessRequest {
+            src: "group:family".to_owned(),
+            dst: "tag:servers".to_owned(),
+            protocol: Protocol::Tcp,
+            context,
+        };
+
+        for dataplane_context in [
+            TrafficContext::Mesh,
+            TrafficContext::SharedSubnetRouter,
+            TrafficContext::SharedExit,
+        ] {
+            assert_eq!(
+                set.evaluate(&request_in(dataplane_context)),
+                Decision::Allow,
+                "legacy empty-contexts rule must keep matching {dataplane_context:?}"
+            );
+        }
+        for service_context in [TrafficContext::NasService, TrafficContext::LlmService] {
+            assert_eq!(
+                set.evaluate(&request_in(service_context)),
+                Decision::Deny,
+                "legacy empty-contexts rule must never match {service_context:?}"
+            );
+        }
+    }
+
+    /// D13.b E2: the membership gate runs for service contexts too —
+    /// a revoked or unknown `node:*` selector is denied even when a
+    /// permissive allow rule names the service context.
+    #[test]
+    fn service_context_membership_gate_denies_revoked_and_unknown_peers() {
+        let set = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "*".to_owned(),
+                dst: "node:nas-host".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::NasService],
+            }],
+        };
+        let request = ContextualAccessRequest {
+            src: "node:peer-1".to_owned(),
+            dst: "node:nas-host".to_owned(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::NasService,
+        };
+
+        let mut revoked_membership = MembershipDirectory::default();
+        revoked_membership.set_node_status("peer-1", MembershipStatus::Revoked);
+        revoked_membership.set_node_status("nas-host", MembershipStatus::Active);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &revoked_membership),
+            Decision::Deny,
+            "revoked peer must be denied service access despite the allow rule"
+        );
+
+        let mut unknown_membership = MembershipDirectory::default();
+        unknown_membership.set_node_status("nas-host", MembershipStatus::Active);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &unknown_membership),
+            Decision::Deny,
+            "unknown peer must be denied service access despite the allow rule"
+        );
+
+        let mut active_membership = MembershipDirectory::default();
+        active_membership.set_node_status("peer-1", MembershipStatus::Active);
+        active_membership.set_node_status("nas-host", MembershipStatus::Active);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &active_membership),
+            Decision::Allow,
+            "active peer proceeds to rule evaluation"
+        );
+    }
+
+    #[test]
+    fn is_service_context_truth_table() {
+        assert!(!TrafficContext::Mesh.is_service_context());
+        assert!(!TrafficContext::SharedSubnetRouter.is_service_context());
+        assert!(!TrafficContext::SharedExit.is_service_context());
+        assert!(TrafficContext::NasService.is_service_context());
+        assert!(TrafficContext::LlmService.is_service_context());
+    }
+
+    /// D13.b: scope model-restriction truth table — `None` permits
+    /// any model, `Some(list)` permits only the listed models, and
+    /// `Some(empty)` permits none.
+    #[test]
+    fn llm_access_scope_permits_model_truth_table() {
+        let unrestricted = LlmAccessScope::default();
+        assert!(unrestricted.allowed_models.is_none());
+        assert!(unrestricted.permits_model("any-model"));
+
+        let listed = LlmAccessScope {
+            allowed_models: Some(vec!["small-model".to_owned(), "code-model".to_owned()]),
+            ..LlmAccessScope::default()
+        };
+        assert!(listed.permits_model("small-model"));
+        assert!(listed.permits_model("code-model"));
+        assert!(!listed.permits_model("big-model"));
+
+        let none_allowed = LlmAccessScope {
+            allowed_models: Some(vec![]),
+            ..LlmAccessScope::default()
+        };
+        assert!(
+            !none_allowed.permits_model("small-model"),
+            "an explicit empty model list must deny every model"
+        );
+    }
+
+    /// D13.b: scope lookup follows the peer's selector specificity —
+    /// the FIRST selector in `peer_selectors` that has an entry wins
+    /// (node beats group because the caller lists node first), and a
+    /// peer with no entry keeps the unrestricted grant (`None`).
+    #[test]
+    fn llm_scope_policy_scope_for_prefers_most_specific_selector() {
+        let node_scope = LlmAccessScope {
+            allowed_models: Some(vec!["small-model".to_owned()]),
+            ..LlmAccessScope::default()
+        };
+        let group_scope = LlmAccessScope {
+            allowed_models: Some(vec!["small-model".to_owned(), "big-model".to_owned()]),
+            ..LlmAccessScope::default()
+        };
+        let policy = LlmScopePolicy {
+            entries: vec![
+                ("group:family".to_owned(), group_scope.clone()),
+                ("node:laptop-1".to_owned(), node_scope.clone()),
+            ],
+        };
+
+        let node_selectors = vec!["node:laptop-1".to_owned(), "group:family".to_owned()];
+        assert_eq!(
+            policy.scope_for(&node_selectors),
+            Some(&node_scope),
+            "node entry must win even though the group entry is listed first"
+        );
+
+        let group_only_selectors = vec!["node:laptop-2".to_owned(), "group:family".to_owned()];
+        assert_eq!(policy.scope_for(&group_only_selectors), Some(&group_scope));
+
+        let unmatched_selectors = vec!["node:laptop-3".to_owned(), "group:guests".to_owned()];
+        assert_eq!(
+            policy.scope_for(&unmatched_selectors),
+            None,
+            "no entry means the grant stays unrestricted"
         );
     }
 

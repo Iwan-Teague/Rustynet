@@ -308,6 +308,81 @@ Enforcement points map to verification tests in
 `scripts/ci/blind_exit_irreversibility_gates.sh` (new gates added
 in D12).
 
+## 6.E) Service-Hosting Role Controls (`nas`, `llm`)
+
+The two service-hosting presets (`nas`, `llm`; canonical design:
+[`operations/active/NodeRoleTaxonomyExtension_2026-06-11.md`](./operations/active/NodeRoleTaxonomyExtension_2026-06-11.md))
+inherit every §6.D control unchanged and add four category-specific
+controls. A service-hosting role changes what an **authorised** peer
+can reach, never who is trusted: `serves_nas`/`serves_llm` are signed
+metadata, and no verifier may consult them before validating
+signatures.
+
+1. **E1 — Service endpoint binds tunnel-only.** The service API
+   binds the node's mesh tunnel address only — never `0.0.0.0`,
+   loopback, LAN, or public. A non-tunnel bind configuration is a
+   fail-closed startup error; there is no LAN-bind escape hatch for
+   service-hosting roles. The LLM inference engine is the inverse:
+   loopback-only, never tunnel- or LAN-reachable.
+   Enforcement: `rustynetd::service_exposure::validate_tunnel_only_bind`
+   / `validate_loopback_only_bind`, the bin-side startup checks in
+   `rustynet-nas` / `rustynet-llm-gateway`, and the
+   `inet rustynet_svc_<service>` nftables scope table
+   (`linux_runtime_nftables::render_service_port_tunnel_scope_table`).
+
+2. **E2 — Default-deny per-peer service authorisation.** Being inside
+   the tunnel is necessary, not sufficient. Every new service session
+   is gated by `ContextualPolicySet::evaluate_with_membership` for
+   `TrafficContext::NasService` / `TrafficContext::LlmService`;
+   empty/missing/stale policy ⇒ `Decision::Deny`. Rules with an empty
+   `contexts` list MUST NOT match service contexts (a pre-D13
+   wildcard-context rule never silently grants application-layer
+   access). Identity comes from the authenticated tunnel source
+   resolved against signed state — never from a client-supplied
+   header or key; there is no API key.
+   Enforcement: `service_exposure::evaluate_service_access`,
+   `rustynet_policy::context_matches`, per-frame grant re-checks in
+   both service binaries (deny-all when no signed access state is
+   materialised).
+
+3. **E3 — Service teardown precedes capability revocation.** On
+   `serves_nas`/`serves_llm` removal the daemon closes the listener
+   and severs all in-flight sessions BEFORE the capability leaves
+   local state. A revoked service host keeping an already-connected
+   peer served is a release-blocking defect (the service-hosting
+   analogue of §6.D control 7).
+   Enforcement: `service_exposure::ServiceExposureController` —
+   `capability_release_ready()` is true only after `begin_revocation`
+   and the severance of every active session; the LLM gateway
+   additionally re-checks grants per token event so revocation cuts
+   in-flight generations mid-stream.
+
+4. **E4 — App-layer token cannot exceed signed policy.** Any
+   node-issued service session token is short-lived, single-audience,
+   node-signed (existing ed25519 primitives — no new crypto/PKI), and
+   re-checked against CURRENT signed policy on every use. A token
+   outliving its peer's authorisation MUST be rejected before TTL
+   expiry. Tokens are defence-in-depth only — never an identity
+   source, never a substitute for the tunnel.
+   Enforcement: `rustynet_llm_gateway::session::verify_session_token`
+   (signature → validity window → peer/audience binding → current
+   policy decision, in that order).
+
+Inherited essentials restated for the category: capability grant
+requires the owner signing key (no self-promotion); deploy-before-
+advertise and undeploy-before-revoke per §6.D; NAS data is
+AEAD-encrypted at rest with a key from OS-secure custody and
+location-binding associated data; attacker-influenced wire input
+(uploads, prompts) is length-bounded and deny-on-malformed; logs
+carry ids/thumbprints/counts only — never tokens, prompts,
+completions, or file contents.
+
+Enforcement points map to verification tests in
+`scripts/ci/service_hosting_role_gates.sh`,
+`scripts/ci/nas_default_deny_gates.sh`,
+`scripts/ci/llm_default_deny_gates.sh`, and
+`scripts/ci/llm_exit_coexistence_gates.sh` (D13).
+
 ## 7) Phase Mapping
 - Phase 1: baseline standards and threat model defined.
 - Phase 2: auth/enrollment abuse controls + key custody baseline + atomic one-time key handling.

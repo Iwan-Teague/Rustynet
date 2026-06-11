@@ -44,3 +44,57 @@ pub fn evaluate_health(store: &NasStore) -> NasHealth {
         },
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::store::NasStore;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    const KEY: [u8; 32] = [0x42; 32];
+
+    /// Unique private temp root per test (no external tempdir dep;
+    /// same pattern as the `ops_install_systemd_relay` tests).
+    fn test_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-nas-health-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn healthy_store_reports_healthy() {
+        let root = test_root("healthy");
+        let store = NasStore::open(&root, KEY).unwrap();
+        let health = evaluate_health(&store);
+        assert!(health.healthy());
+        assert!(health.storage_writable);
+        assert!(health.key_check_ok);
+        assert!(health.failure_reason.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removed_data_root_reports_unhealthy_with_reason() {
+        let root = test_root("root-removed");
+        let store = NasStore::open(&root, KEY).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let health = evaluate_health(&store);
+        assert!(!health.healthy());
+        assert!(!health.storage_writable);
+        let reason = health
+            .failure_reason
+            .expect("unhealthy report must carry a refusal reason");
+        assert!(
+            reason.contains("storage io failure"),
+            "reason must name the storage failure, got: {reason}"
+        );
+    }
+}

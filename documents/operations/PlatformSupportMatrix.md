@@ -113,6 +113,8 @@ work are listed honestly here even when wizard UX shows them as
 | `blind_exit` | yes | yes (PF-backed hard-lock; live evidence pending) | no (not in current dataplane plan) | no | no |
 | `relay` | yes | yes (`rustynet-relay` builds on macOS) | yes (gated on D7/D9; `rustynet-relay` already builds with SCM feature) | no | no |
 | `anchor` | yes | yes | yes (gated on D7/D9) | no (consume-only) | no (consume-only) |
+| `nas` | ⛔ fail-closed (primary host; D13.c code landed, pending Linux live-lab evidence row) | ⛔ fail-closed (secondary host; pending cross-OS green run) | ⛔ fail-closed (gated on D7/D9 dataplane parity) | no (consume-only — RustyBackup client) | no (consume-only — RustyBackup client) |
+| `llm` | ⛔ fail-closed (primary host; D13.d code landed, pending Linux live-lab evidence row) | ⛔ fail-closed (Apple-silicon inference candidate; pending green run) | ⛔ fail-closed (gated on D7/D9 dataplane parity) | no (consume-only — RustyAI client) | no (consume-only — RustyAI client) |
 
 Notes:
 

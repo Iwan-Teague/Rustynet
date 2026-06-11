@@ -356,3 +356,219 @@ pub fn decode_event(body: &[u8]) -> Result<Event, ProtocolError> {
     reader.finish()?;
     Ok(event)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_round_trip(request: Request) {
+        let encoded = encode_request(&request);
+        let decoded = decode_request(&encoded).expect("encoded request must decode");
+        assert_eq!(decoded, request);
+    }
+
+    fn event_round_trip(event: Event) {
+        let encoded = encode_event(&event);
+        let decoded = decode_event(&encoded).expect("encoded event must decode");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn every_request_variant_round_trips() {
+        request_round_trip(Request::Hello {
+            version: PROTOCOL_VERSION,
+        });
+        request_round_trip(Request::ListModels);
+        request_round_trip(Request::Complete {
+            model: "tiny".to_owned(),
+            prompt: "explain rust lifetimes".to_owned(),
+        });
+        request_round_trip(Request::UploadContext {
+            data: vec![0u8, 1, 2, 0xff, 0xfe],
+        });
+        request_round_trip(Request::Usage);
+    }
+
+    #[test]
+    fn every_event_variant_round_trips() {
+        event_round_trip(Event::HelloOk {
+            version: PROTOCOL_VERSION,
+            models: vec!["a".to_owned(), "b".to_owned()],
+            tokens_used_in_window: 42,
+        });
+        event_round_trip(Event::Models {
+            models: vec!["tiny".to_owned()],
+        });
+        event_round_trip(Event::Token {
+            text: "fragment ".to_owned(),
+        });
+        event_round_trip(Event::Done);
+        event_round_trip(Event::ContextAccepted);
+        event_round_trip(Event::Usage {
+            tokens_used_in_window: 7,
+        });
+        event_round_trip(Event::Error {
+            message: "quota exhausted".to_owned(),
+        });
+    }
+
+    #[test]
+    fn unknown_opcodes_refused() {
+        assert_eq!(
+            decode_request(&[0x7f]),
+            Err(ProtocolError::UnknownOpcode(0x7f))
+        );
+        assert_eq!(
+            decode_event(&[0x10]),
+            Err(ProtocolError::UnknownOpcode(0x10))
+        );
+    }
+
+    #[test]
+    fn truncated_frames_refused() {
+        let encoded = encode_request(&Request::Complete {
+            model: "tiny".to_owned(),
+            prompt: "hello world".to_owned(),
+        });
+        for cut in 1..encoded.len() {
+            let decoded = decode_request(&encoded[..cut]);
+            assert!(
+                decoded.is_err(),
+                "truncation at {cut} must not decode: {decoded:?}"
+            );
+        }
+        // Empty frame is truncated too.
+        assert_eq!(decode_request(&[]), Err(ProtocolError::Truncated));
+        assert_eq!(decode_event(&[]), Err(ProtocolError::Truncated));
+    }
+
+    #[test]
+    fn trailing_bytes_refused() {
+        let mut encoded = encode_request(&Request::ListModels);
+        encoded.push(0x00);
+        assert_eq!(
+            decode_request(&encoded),
+            Err(ProtocolError::TrailingBytes { count: 1 })
+        );
+        let mut encoded_event = encode_event(&Event::Done);
+        encoded_event.extend_from_slice(&[0xaa, 0xbb]);
+        assert_eq!(
+            decode_event(&encoded_event),
+            Err(ProtocolError::TrailingBytes { count: 2 })
+        );
+    }
+
+    /// Oversize prompt: the declared length exceeds `MAX_PROMPT_LEN`
+    /// and the frame carries no body bytes — the decoder must refuse
+    /// on the declared length BEFORE attempting any allocation, so
+    /// the error is `FieldTooLarge`, not `Truncated`.
+    #[test]
+    fn oversize_prompt_refused_before_allocation() {
+        let mut frame = vec![0x03]; // COMPLETE opcode
+        frame.extend_from_slice(&4u32.to_be_bytes());
+        frame.extend_from_slice(b"tiny");
+        frame.extend_from_slice(&((MAX_PROMPT_LEN as u32) + 1).to_be_bytes());
+        // No prompt bytes follow on purpose.
+        assert_eq!(
+            decode_request(&frame),
+            Err(ProtocolError::FieldTooLarge {
+                field: "prompt",
+                len: MAX_PROMPT_LEN + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn oversize_frame_refused() {
+        let body = vec![0u8; MAX_FRAME_LEN + 1];
+        assert_eq!(
+            decode_request(&body),
+            Err(ProtocolError::FrameTooLarge {
+                len: MAX_FRAME_LEN + 1
+            })
+        );
+        assert_eq!(
+            decode_event(&body),
+            Err(ProtocolError::FrameTooLarge {
+                len: MAX_FRAME_LEN + 1
+            })
+        );
+    }
+
+    #[test]
+    fn wrong_hello_version_refused() {
+        let encoded = encode_request(&Request::Hello {
+            version: PROTOCOL_VERSION + 1,
+        });
+        assert_eq!(
+            decode_request(&encoded),
+            Err(ProtocolError::UnsupportedVersion {
+                peer_version: PROTOCOL_VERSION + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn non_utf8_string_refused() {
+        let mut frame = vec![0x03]; // COMPLETE opcode
+        frame.extend_from_slice(&2u32.to_be_bytes());
+        frame.extend_from_slice(&[0xff, 0xfe]); // invalid UTF-8 model
+        frame.extend_from_slice(&0u32.to_be_bytes()); // empty prompt
+        assert_eq!(
+            decode_request(&frame),
+            Err(ProtocolError::MalformedField { field: "model" })
+        );
+    }
+
+    #[test]
+    fn model_list_count_over_cap_refused() {
+        let mut frame = vec![0x82]; // E_MODELS opcode
+        frame.extend_from_slice(&((MAX_MODEL_LIST as u32) + 1).to_be_bytes());
+        assert_eq!(
+            decode_event(&frame),
+            Err(ProtocolError::FieldTooLarge {
+                field: "model_list",
+                len: MAX_MODEL_LIST + 1,
+            })
+        );
+    }
+
+    /// Deterministic no-panic fuzz over pseudo-random buffers. A
+    /// simple LCG (no new dependencies) drives lengths and bytes;
+    /// the decoders must reject or accept but never panic and never
+    /// allocate unboundedly.
+    #[test]
+    fn decoders_never_panic_on_random_input() {
+        let mut state: u64 = 0x5eed_cafe_f00d_1234;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 512) as usize;
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                buf.push(next() as u8);
+            }
+            let _ = decode_request(&buf);
+            let _ = decode_event(&buf);
+        }
+        // Bias the corpus toward valid opcodes so deeper field
+        // parsing is exercised, not just the opcode switch.
+        let opcodes = [
+            0x01u8, 0x02, 0x03, 0x04, 0x05, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xff,
+        ];
+        for _ in 0..20_000 {
+            let len = (next() % 256) as usize;
+            let mut buf = Vec::with_capacity(len + 1);
+            buf.push(opcodes[(next() as usize) % opcodes.len()]);
+            for _ in 0..len {
+                buf.push(next() as u8);
+            }
+            let _ = decode_request(&buf);
+            let _ = decode_event(&buf);
+        }
+    }
+}

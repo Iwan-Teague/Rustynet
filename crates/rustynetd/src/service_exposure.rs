@@ -592,3 +592,418 @@ impl fmt::Display for ServiceAccessEvent {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use rustynet_control::membership::{
+        MEMBERSHIP_SCHEMA_VERSION, MembershipNode, MembershipNodeStatus, MembershipState,
+    };
+    use rustynet_control::roles::RoleCapability;
+    use rustynet_policy::{Decision, MembershipDirectory, MembershipStatus};
+
+    use super::{
+        ExposedService, ServiceExposureController, ServiceExposureError, VerifiedPeerIdentity,
+        evaluate_service_access, resolve_peer_identity, service_hosting_view_from_membership,
+        validate_loopback_only_bind, validate_tunnel_only_bind,
+    };
+
+    fn tunnel_addrs() -> Vec<IpAddr> {
+        vec![
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 7)),
+            IpAddr::V6(Ipv6Addr::new(0xfd7a, 0x115c, 0, 0, 0, 0, 0, 0x7)),
+        ]
+    }
+
+    fn membership_node(
+        node_id: &str,
+        status: MembershipNodeStatus,
+        capabilities: Vec<RoleCapability>,
+    ) -> MembershipNode {
+        MembershipNode {
+            node_id: node_id.to_owned(),
+            node_pubkey_hex: "0a".repeat(32),
+            owner: "owner@example.local".to_owned(),
+            status,
+            roles: vec!["tag:servers".to_owned()],
+            capabilities,
+            joined_at_unix: 100,
+            updated_at_unix: 100,
+        }
+    }
+
+    fn membership_state(nodes: Vec<MembershipNode>) -> MembershipState {
+        MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-1".to_owned(),
+            epoch: 1,
+            nodes,
+            approver_set: vec![],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        }
+    }
+
+    fn peer(node_id: &str, last_octet: u8) -> VerifiedPeerIdentity {
+        VerifiedPeerIdentity {
+            node_id: node_id.to_owned(),
+            overlay_addr: IpAddr::V4(Ipv4Addr::new(100, 64, 0, last_octet)),
+        }
+    }
+
+    #[test]
+    fn tunnel_only_bind_rejects_unspecified_addresses() {
+        for requested in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ] {
+            let err = validate_tunnel_only_bind(requested, &tunnel_addrs())
+                .expect_err("wildcard bind must be refused");
+            assert!(matches!(
+                err,
+                ServiceExposureError::NonTunnelBind { requested: addr, .. } if addr == requested
+            ));
+        }
+    }
+
+    #[test]
+    fn tunnel_only_bind_rejects_loopback_and_multicast() {
+        let loopback_err =
+            validate_tunnel_only_bind(IpAddr::V4(Ipv4Addr::LOCALHOST), &tunnel_addrs())
+                .expect_err("loopback bind must be refused for the mesh-facing listener");
+        assert!(matches!(
+            loopback_err,
+            ServiceExposureError::NonTunnelBind { .. }
+        ));
+
+        let multicast_err =
+            validate_tunnel_only_bind(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)), &tunnel_addrs())
+                .expect_err("multicast bind must be refused");
+        assert!(matches!(
+            multicast_err,
+            ServiceExposureError::NonTunnelBind { .. }
+        ));
+    }
+
+    #[test]
+    fn tunnel_only_bind_rejects_non_tunnel_lan_address() {
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let err = validate_tunnel_only_bind(lan, &tunnel_addrs())
+            .expect_err("LAN bind must be refused (E1)");
+        assert!(matches!(
+            err,
+            ServiceExposureError::NonTunnelBind { requested, .. } if requested == lan
+        ));
+    }
+
+    #[test]
+    fn tunnel_only_bind_accepts_tunnel_address() {
+        let tunnel = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 7));
+        let accepted = validate_tunnel_only_bind(tunnel, &tunnel_addrs())
+            .expect("tunnel address must be accepted");
+        assert_eq!(accepted, tunnel);
+    }
+
+    #[test]
+    fn loopback_only_bind_accepts_loopback_and_rejects_others() {
+        for loopback in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            assert_eq!(
+                validate_loopback_only_bind(loopback).expect("loopback must be accepted"),
+                loopback
+            );
+        }
+
+        for non_loopback in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 7)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+        ] {
+            let err = validate_loopback_only_bind(non_loopback)
+                .expect_err("non-loopback engine bind must be refused");
+            assert!(matches!(
+                err,
+                ServiceExposureError::NonLoopbackEngineBind { requested } if requested == non_loopback
+            ));
+        }
+    }
+
+    #[test]
+    fn resolve_peer_identity_fails_closed_on_unknown_source() {
+        let mut overlay_addr_to_node = BTreeMap::new();
+        let known = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 11));
+        overlay_addr_to_node.insert(known, "laptop-1".to_owned());
+
+        let resolved =
+            resolve_peer_identity(known, &overlay_addr_to_node).expect("known source must resolve");
+        assert_eq!(resolved.node_id, "laptop-1");
+        assert_eq!(resolved.overlay_addr, known);
+
+        let unknown = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 99));
+        let err = resolve_peer_identity(unknown, &overlay_addr_to_node)
+            .expect_err("unknown source must fail closed");
+        assert!(matches!(
+            err,
+            ServiceExposureError::UnknownPeerAddress { source } if source == unknown
+        ));
+    }
+
+    #[test]
+    fn service_hosting_view_serves_nothing_for_absent_or_inactive_node() {
+        let state = membership_state(vec![
+            membership_node(
+                "nas-host",
+                MembershipNodeStatus::Revoked,
+                vec![RoleCapability::ServesNas],
+            ),
+            membership_node(
+                "llm-host",
+                MembershipNodeStatus::Quarantined,
+                vec![RoleCapability::ServesLlm],
+            ),
+        ]);
+
+        let absent = service_hosting_view_from_membership(&state, "missing-node");
+        assert!(!absent.serves_nas);
+        assert!(!absent.serves_llm);
+
+        let revoked = service_hosting_view_from_membership(&state, "nas-host");
+        assert!(
+            !revoked.serves_nas,
+            "a revoked node must serve nothing even with the capability listed"
+        );
+        let quarantined = service_hosting_view_from_membership(&state, "llm-host");
+        assert!(
+            !quarantined.serves_llm,
+            "a quarantined node must serve nothing even with the capability listed"
+        );
+    }
+
+    #[test]
+    fn service_hosting_view_reflects_active_node_capabilities() {
+        let state = membership_state(vec![membership_node(
+            "nas-host",
+            MembershipNodeStatus::Active,
+            vec![RoleCapability::ServesNas],
+        )]);
+
+        let view = service_hosting_view_from_membership(&state, "nas-host");
+        assert!(view.serves_nas);
+        assert!(!view.serves_llm, "ServesNas must not imply ServesLlm");
+        assert!(view.serves(ExposedService::Nas));
+        assert!(!view.serves(ExposedService::Llm));
+    }
+
+    #[test]
+    fn exposure_controller_enforces_full_lifecycle_fail_closed() {
+        let mut controller = ServiceExposureController::new(ExposedService::Nas);
+        assert_eq!(controller.phase_name(), "not_deployed");
+
+        // NotDeployed admits nobody.
+        let refused = controller
+            .admit_session(peer("laptop-1", 11), Decision::Allow)
+            .expect_err("NotDeployed must admit nobody");
+        assert!(matches!(refused, ServiceExposureError::NotServing { .. }));
+
+        // Deployed but health unverified: still admits nobody, and the
+        // capability must not be advertised (deploy-before-advertise).
+        controller.mark_deployed().expect("deploy from NotDeployed");
+        assert_eq!(controller.phase_name(), "awaiting_health");
+        assert!(!controller.advertisement_permitted());
+        let refused = controller
+            .admit_session(peer("laptop-1", 11), Decision::Allow)
+            .expect_err("AwaitingHealth must admit nobody");
+        assert!(matches!(refused, ServiceExposureError::NotServing { .. }));
+
+        // Health verified: Serving admits Allow, refuses Deny (E2).
+        controller
+            .report_health_ok(1_000)
+            .expect("health ok from AwaitingHealth");
+        assert_eq!(controller.phase_name(), "serving");
+        assert!(controller.advertisement_permitted());
+        let allowed_session = controller
+            .admit_session(peer("laptop-1", 11), Decision::Allow)
+            .expect("Serving must admit an allowed peer");
+        let denied = controller
+            .admit_session(peer("laptop-2", 12), Decision::Deny)
+            .expect_err("a Deny decision must refuse the session");
+        assert!(matches!(
+            denied,
+            ServiceExposureError::PolicyDenied { ref peer_node_id, service }
+                if peer_node_id == "laptop-2" && service == ExposedService::Nas
+        ));
+        assert_eq!(controller.active_session_count(), 1);
+
+        // Health failure: Degraded refuses new sessions.
+        controller.report_health_failure("storage unmounted");
+        assert_eq!(controller.phase_name(), "degraded");
+        assert!(!controller.advertisement_permitted());
+        let refused = controller
+            .admit_session(peer("laptop-3", 13), Decision::Allow)
+            .expect_err("Degraded must refuse new sessions");
+        assert!(matches!(refused, ServiceExposureError::NotServing { .. }));
+
+        // Revocation: admission closes, in-flight sessions are returned
+        // for severance, and the capability may not be released while
+        // any session remains (E3).
+        let to_sever = controller.begin_revocation();
+        assert_eq!(to_sever, vec![allowed_session]);
+        assert_eq!(controller.phase_name(), "revoking");
+        let refused = controller
+            .admit_session(peer("laptop-1", 11), Decision::Allow)
+            .expect_err("Revoking must admit nobody");
+        assert!(matches!(refused, ServiceExposureError::NotServing { .. }));
+
+        let blocked = controller
+            .confirm_torn_down()
+            .expect_err("teardown must fail closed while sessions are active (E3)");
+        assert!(matches!(
+            blocked,
+            ServiceExposureError::SessionsStillActive { count: 1 }
+        ));
+        assert!(!controller.capability_release_ready());
+
+        for session_id in to_sever {
+            assert!(controller.close_session(session_id));
+        }
+        controller
+            .confirm_torn_down()
+            .expect("teardown completes once every session is closed");
+        assert_eq!(controller.phase_name(), "torn_down");
+        assert!(controller.capability_release_ready());
+
+        // Undeploy only from TornDown.
+        controller
+            .mark_undeployed()
+            .expect("undeploy from TornDown");
+        assert_eq!(controller.phase_name(), "not_deployed");
+        assert!(!controller.capability_release_ready());
+    }
+
+    #[test]
+    fn capability_release_ready_only_in_torn_down() {
+        let mut controller = ServiceExposureController::new(ExposedService::Llm);
+        assert!(!controller.capability_release_ready());
+        controller.mark_deployed().expect("deploy");
+        assert!(!controller.capability_release_ready());
+        controller.report_health_ok(1_000).expect("health ok");
+        assert!(!controller.capability_release_ready());
+        controller.report_health_failure("engine gone");
+        assert!(!controller.capability_release_ready());
+        let severed = controller.begin_revocation();
+        assert!(severed.is_empty());
+        assert!(!controller.capability_release_ready());
+        controller.confirm_torn_down().expect("no active sessions");
+        assert!(controller.capability_release_ready());
+    }
+
+    #[test]
+    fn mark_undeployed_fails_outside_torn_down() {
+        let mut controller = ServiceExposureController::new(ExposedService::Nas);
+        let err = controller
+            .mark_undeployed()
+            .expect_err("undeploy from NotDeployed must be refused");
+        assert!(matches!(
+            err,
+            ServiceExposureError::InvalidTransition {
+                from: "not_deployed",
+                attempted: "mark_undeployed"
+            }
+        ));
+
+        controller.mark_deployed().expect("deploy");
+        controller.report_health_ok(1_000).expect("health ok");
+        let err = controller
+            .mark_undeployed()
+            .expect_err("undeploy from Serving must be refused");
+        assert!(matches!(
+            err,
+            ServiceExposureError::InvalidTransition {
+                from: "serving",
+                attempted: "mark_undeployed"
+            }
+        ));
+    }
+
+    #[test]
+    fn sessions_to_sever_after_policy_change_returns_exactly_now_denied_sessions() {
+        let mut controller = ServiceExposureController::new(ExposedService::Llm);
+        controller.mark_deployed().expect("deploy");
+        controller.report_health_ok(1_000).expect("health ok");
+
+        let kept_session = controller
+            .admit_session(peer("laptop-1", 11), Decision::Allow)
+            .expect("admit laptop-1");
+        let revoked_session = controller
+            .admit_session(peer("laptop-2", 12), Decision::Allow)
+            .expect("admit laptop-2");
+
+        let to_sever = controller.sessions_to_sever_after_policy_change(|identity| {
+            if identity.node_id == "laptop-1" {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            }
+        });
+        assert_eq!(to_sever, vec![revoked_session]);
+        assert!(!to_sever.contains(&kept_session));
+    }
+
+    #[test]
+    fn evaluate_service_access_default_denies_and_honours_explicit_allow() {
+        use rustynet_policy::{
+            ContextualPolicyRule, ContextualPolicySet, Protocol, RuleAction, TrafficContext,
+        };
+
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("laptop-1", MembershipStatus::Active);
+        membership.set_node_status("nas-host", MembershipStatus::Active);
+
+        // Empty policy ⇒ deny (E2 default).
+        assert_eq!(
+            evaluate_service_access(
+                &ContextualPolicySet::default(),
+                &membership,
+                "laptop-1",
+                "nas-host",
+                ExposedService::Nas,
+            ),
+            Decision::Deny
+        );
+
+        let policy = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "node:laptop-1".to_owned(),
+                dst: "node:nas-host".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::NasService],
+            }],
+        };
+        assert_eq!(
+            evaluate_service_access(
+                &policy,
+                &membership,
+                "laptop-1",
+                "nas-host",
+                ExposedService::Nas
+            ),
+            Decision::Allow
+        );
+        // The NasService allow must not widen to the LLM service.
+        assert_eq!(
+            evaluate_service_access(
+                &policy,
+                &membership,
+                "laptop-1",
+                "nas-host",
+                ExposedService::Llm
+            ),
+            Decision::Deny
+        );
+    }
+}

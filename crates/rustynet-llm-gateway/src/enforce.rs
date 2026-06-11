@@ -94,13 +94,13 @@ impl EnforcementState {
             counters.minute_start_unix = now_unix;
             counters.requests_in_minute = 0;
         }
-        if let Some(limit) = scope.max_requests_per_minute {
-            if counters.requests_in_minute >= limit {
-                return Err(EnforceError::RateLimited {
-                    requests_in_minute: counters.requests_in_minute,
-                    limit,
-                });
-            }
+        if let Some(limit) = scope.max_requests_per_minute
+            && counters.requests_in_minute >= limit
+        {
+            return Err(EnforceError::RateLimited {
+                requests_in_minute: counters.requests_in_minute,
+                limit,
+            });
         }
         counters.requests_in_minute = counters.requests_in_minute.saturating_add(1);
 
@@ -108,13 +108,13 @@ impl EnforcementState {
             counters.window_start_unix = now_unix;
             counters.tokens_in_window = 0;
         }
-        if let Some(limit) = scope.max_tokens_per_window {
-            if counters.tokens_in_window >= limit {
-                return Err(EnforceError::TokenQuotaExhausted {
-                    used: counters.tokens_in_window,
-                    limit,
-                });
-            }
+        if let Some(limit) = scope.max_tokens_per_window
+            && counters.tokens_in_window >= limit
+        {
+            return Err(EnforceError::TokenQuotaExhausted {
+                used: counters.tokens_in_window,
+                limit,
+            });
         }
         Ok(())
     }
@@ -135,15 +135,14 @@ impl EnforcementState {
             counters.tokens_in_window = 0;
         }
         counters.tokens_in_window = counters.tokens_in_window.saturating_add(token_count);
-        if let Some(scope) = scope {
-            if let Some(limit) = scope.max_tokens_per_window {
-                if counters.tokens_in_window > limit {
-                    return Err(EnforceError::TokenQuotaExhausted {
-                        used: counters.tokens_in_window,
-                        limit,
-                    });
-                }
-            }
+        if let Some(scope) = scope
+            && let Some(limit) = scope.max_tokens_per_window
+            && counters.tokens_in_window > limit
+        {
+            return Err(EnforceError::TokenQuotaExhausted {
+                used: counters.tokens_in_window,
+                limit,
+            });
         }
         Ok(())
     }
@@ -172,5 +171,166 @@ impl EnforcementState {
             .iter()
             .filter(|model| scope.map(|s| s.permits_model(model)).unwrap_or(true))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PEER: &str = "node:laptop-1";
+    const NOW: u64 = 1_750_000_000;
+
+    fn scope(
+        allowed_models: Option<Vec<&str>>,
+        max_tokens_per_window: Option<u64>,
+        max_requests_per_minute: Option<u32>,
+    ) -> LlmAccessScope {
+        LlmAccessScope {
+            allowed_models: allowed_models
+                .map(|models| models.into_iter().map(str::to_owned).collect()),
+            max_tokens_per_window,
+            max_requests_per_minute,
+        }
+    }
+
+    #[test]
+    fn no_scope_admits_any_model_without_quota_or_rate() {
+        let mut state = EnforcementState::new();
+        // Far more requests than any plausible rate limit, any model.
+        for i in 0..1000 {
+            state
+                .admit_request(PEER, None, &format!("model-{i}"), NOW)
+                .expect("no scope ⇒ unrestricted grant");
+        }
+        // Token recording never severs without a scope either.
+        state
+            .record_tokens(PEER, None, u32::MAX as u64, NOW)
+            .expect("no scope ⇒ no token quota");
+    }
+
+    #[test]
+    fn model_outside_allow_list_refused() {
+        let mut state = EnforcementState::new();
+        let scope = scope(Some(vec!["a"]), None, None);
+        state
+            .admit_request(PEER, Some(&scope), "a", NOW)
+            .expect("allowed model admits");
+        let err = state
+            .admit_request(PEER, Some(&scope), "b", NOW)
+            .expect_err("model outside allow-list must be refused");
+        assert_eq!(
+            err,
+            EnforceError::ModelNotAllowed {
+                model: "b".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn rate_limit_trips_on_third_request_and_resets_after_minute() {
+        let mut state = EnforcementState::new();
+        let scope = scope(None, None, Some(2));
+        state
+            .admit_request(PEER, Some(&scope), "a", NOW)
+            .expect("first request admits");
+        state
+            .admit_request(PEER, Some(&scope), "a", NOW)
+            .expect("second request admits");
+        let err = state
+            .admit_request(PEER, Some(&scope), "a", NOW)
+            .expect_err("third request in the same minute must be rate-limited");
+        assert_eq!(
+            err,
+            EnforceError::RateLimited {
+                requests_in_minute: 2,
+                limit: 2
+            }
+        );
+        // Advancing the clock by a full minute resets the window.
+        state
+            .admit_request(PEER, Some(&scope), "a", NOW + 60)
+            .expect("rate window resets after 60s");
+    }
+
+    #[test]
+    fn token_quota_severs_stream_and_window_resets() {
+        let mut state = EnforcementState::new();
+        let scope = scope(None, Some(10), None);
+        state
+            .record_tokens(PEER, Some(&scope), 6, NOW)
+            .expect("under quota");
+        let err = state
+            .record_tokens(PEER, Some(&scope), 6, NOW)
+            .expect_err("crossing the quota must sever the stream");
+        assert_eq!(
+            err,
+            EnforceError::TokenQuotaExhausted {
+                used: 12,
+                limit: 10
+            }
+        );
+        // A new request while exhausted is refused at admission too.
+        let admit_err = state
+            .admit_request(PEER, Some(&scope), "a", NOW)
+            .expect_err("exhausted quota refuses new requests");
+        assert!(matches!(
+            admit_err,
+            EnforceError::TokenQuotaExhausted { .. }
+        ));
+        // After the accounting window passes, the quota resets.
+        state
+            .record_tokens(PEER, Some(&scope), 6, NOW + QUOTA_WINDOW_SECONDS)
+            .expect("quota window resets after QUOTA_WINDOW_SECONDS");
+        assert_eq!(state.tokens_used_in_window(PEER), 6);
+    }
+
+    #[test]
+    fn visible_models_filters_by_scope() {
+        let node_models = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let scope = scope(Some(vec!["a", "c"]), None, None);
+        let visible = EnforcementState::visible_models(Some(&scope), &node_models);
+        assert_eq!(visible, vec![&"a".to_owned(), &"c".to_owned()]);
+        // No scope ⇒ everything visible.
+        let all = EnforcementState::visible_models(None, &node_models);
+        assert_eq!(all.len(), 3);
+        // Empty allow-list ⇒ nothing visible (deny posture).
+        let empty = scope_empty();
+        assert!(EnforcementState::visible_models(Some(&empty), &node_models).is_empty());
+    }
+
+    fn scope_empty() -> LlmAccessScope {
+        LlmAccessScope {
+            allowed_models: Some(Vec::new()),
+            max_tokens_per_window: None,
+            max_requests_per_minute: None,
+        }
+    }
+
+    #[test]
+    fn forget_peer_clears_counters() {
+        let mut state = EnforcementState::new();
+        let scope = scope(None, Some(100), None);
+        state
+            .record_tokens(PEER, Some(&scope), 42, NOW)
+            .expect("under quota");
+        assert_eq!(state.tokens_used_in_window(PEER), 42);
+        state.forget_peer(PEER);
+        assert_eq!(state.tokens_used_in_window(PEER), 0);
+    }
+
+    #[test]
+    fn tokens_used_in_window_accounting() {
+        let mut state = EnforcementState::new();
+        assert_eq!(state.tokens_used_in_window(PEER), 0);
+        state
+            .record_tokens(PEER, None, 3, NOW)
+            .expect("no quota without scope");
+        state
+            .record_tokens(PEER, None, 4, NOW + 1)
+            .expect("no quota without scope");
+        assert_eq!(state.tokens_used_in_window(PEER), 7);
+        // Accounting is per-peer.
+        assert_eq!(state.tokens_used_in_window("node:laptop-2"), 0);
     }
 }

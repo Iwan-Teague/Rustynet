@@ -630,3 +630,362 @@ impl NasStore {
             .map_err(|err| NasStoreError::Io(format!("{}: {err}", probe.display())))
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const KEY_A: [u8; 32] = [0xa1; 32];
+    const KEY_B: [u8; 32] = [0xb2; 32];
+    const PEER_A: &str = "peer-a";
+    const PEER_B: &str = "peer-b";
+
+    /// Unique private temp root per test (no external tempdir dep;
+    /// same pattern as the `ops_install_systemd_relay` tests).
+    fn test_root(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-nas-store-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    fn open_store(root: &Path) -> NasStore {
+        NasStore::open(root, KEY_A).unwrap()
+    }
+
+    #[test]
+    fn open_refuses_missing_data_root() {
+        let root = test_root("missing-root");
+        let missing = root.join("does-not-exist");
+        // `.err()` instead of `unwrap_err()`: NasStore deliberately
+        // does not implement Debug (it holds the at-rest key).
+        let err = NasStore::open(&missing, KEY_A)
+            .err()
+            .expect("missing data root must refuse");
+        assert!(matches!(err, NasStoreError::DataRootMissing(_)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_refuses_symlinked_data_root() {
+        let root = test_root("symlink-root");
+        let real = root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = NasStore::open(&link, KEY_A)
+            .err()
+            .expect("symlinked data root must refuse");
+        assert!(matches!(err, NasStoreError::DataRootInsecure(_)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_refuses_group_world_accessible_data_root() {
+        let root = test_root("loose-mode-root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let err = NasStore::open(&root, KEY_A)
+            .err()
+            .expect("group/world-accessible data root must refuse");
+        assert!(matches!(err, NasStoreError::DataRootInsecure(_)));
+
+        // Tightening to owner-only makes the same root acceptable.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        NasStore::open(&root, KEY_A).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reopen_with_wrong_key_fails_keycheck() {
+        let root = test_root("keycheck");
+        {
+            // First open initialises the `.keycheck` sentinel under
+            // key A.
+            let _store = open_store(&root);
+        }
+        let err = NasStore::open(&root, KEY_B)
+            .err()
+            .expect("wrong at-rest key must refuse the store");
+        assert!(matches!(err, NasStoreError::KeyCheckFailed(_)));
+        // The right key still opens the store.
+        NasStore::open(&root, KEY_A).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_get_round_trip_with_at_rest_ciphertext() {
+        let root = test_root("roundtrip");
+        let store = open_store(&root);
+        let plaintext =
+            b"rustynet-nas at-rest-encryption evidence payload 0123456789 abcdefghij".to_vec();
+        let hash = content_hash_hex(&plaintext);
+
+        // A claimed hash that does not match the payload refuses
+        // before anything is stored.
+        let wrong_hash = content_hash_hex(b"some other payload");
+        let err = store
+            .put_chunk(PEER_A, &wrong_hash, &plaintext)
+            .unwrap_err();
+        assert!(matches!(err, NasStoreError::HashMismatch { .. }));
+        assert!(!root.join("objects").join(PEER_A).join(&wrong_hash).exists());
+
+        store.put_chunk(PEER_A, &hash, &plaintext).unwrap();
+        assert_eq!(store.get_chunk(PEER_A, &hash).unwrap(), plaintext);
+
+        // At-rest encryption evidence (§7: "at-rest blobs are
+        // ciphertext"): the on-disk file must not contain the
+        // plaintext bytes anywhere.
+        let raw = fs::read(root.join("objects").join(PEER_A).join(&hash)).unwrap();
+        assert!(
+            !raw.windows(plaintext.len())
+                .any(|window| window == plaintext.as_slice()),
+            "on-disk blob contains plaintext bytes; at-rest encryption broken"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn namespace_isolation_and_cross_namespace_replay_refused() {
+        let root = test_root("namespace");
+        let store = open_store(&root);
+        let plaintext = b"peer-a private chunk content".to_vec();
+        let hash = content_hash_hex(&plaintext);
+        store.put_chunk(PEER_A, &hash, &plaintext).unwrap();
+
+        // Peer B does not see peer A's object at all.
+        let err = store.get_chunk(PEER_B, &hash).unwrap_err();
+        assert!(matches!(err, NasStoreError::UnknownObject { .. }));
+
+        // Replaying A's raw blob file into B's namespace must still
+        // refuse: the AAD binds the blob to
+        // `nas:object:peer-a:<hash>`, so the tag check fails under
+        // B's location.
+        let b_dir = root.join("objects").join(PEER_B);
+        fs::create_dir_all(&b_dir).unwrap();
+        fs::set_permissions(&b_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::copy(
+            root.join("objects").join(PEER_A).join(&hash),
+            b_dir.join(&hash),
+        )
+        .unwrap();
+        let err = store.get_chunk(PEER_B, &hash).unwrap_err();
+        assert!(matches!(err, NasStoreError::OpenFailed(_)));
+
+        // Peer A still reads its own copy fine.
+        assert_eq!(store.get_chunk(PEER_A, &hash).unwrap(), plaintext);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quota_enforced_and_idempotent_reput_not_double_counted() {
+        let root = test_root("quota");
+        let store = open_store(&root);
+        let chunk = vec![0x5a; 32];
+        let hash = content_hash_hex(&chunk);
+
+        store.set_quota_limit(PEER_A, 16).unwrap();
+        let err = store.put_chunk(PEER_A, &hash, &chunk).unwrap_err();
+        assert!(matches!(
+            err,
+            NasStoreError::QuotaExceeded {
+                used: 0,
+                limit: 16,
+                requested: 32,
+            }
+        ));
+
+        store.set_quota_limit(PEER_A, 100).unwrap();
+        store.put_chunk(PEER_A, &hash, &chunk).unwrap();
+        assert_eq!(store.usage(PEER_A).unwrap().used_bytes, 32);
+
+        // Idempotent re-put of the same hash: no rewrite, no quota
+        // double-count.
+        store.put_chunk(PEER_A, &hash, &chunk).unwrap();
+        assert_eq!(store.usage(PEER_A).unwrap().used_bytes, 32);
+
+        // A distinct chunk that would breach the limit refuses.
+        let big = vec![0x6b; 80];
+        let big_hash = content_hash_hex(&big);
+        let err = store.put_chunk(PEER_A, &big_hash, &big).unwrap_err();
+        assert!(matches!(
+            err,
+            NasStoreError::QuotaExceeded {
+                used: 32,
+                limit: 100,
+                requested: 80,
+            }
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn oversize_chunk_refused() {
+        let root = test_root("oversize-chunk");
+        let store = open_store(&root);
+        let chunk = vec![0u8; MAX_CHUNK_LEN + 1];
+        let hash = "0".repeat(64);
+        let err = store.put_chunk(PEER_A, &hash, &chunk).unwrap_err();
+        assert!(matches!(err, NasStoreError::ChunkTooLarge { len } if len == MAX_CHUNK_LEN + 1));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invalid_peer_ids_rejected() {
+        let root = test_root("bad-peer-ids");
+        let store = open_store(&root);
+        let hash = content_hash_hex(b"x");
+        let overlong = "a".repeat(65);
+        for bad in [
+            "",
+            "../x",
+            "PEER",
+            ".hidden",
+            "a/b",
+            "peer a",
+            overlong.as_str(),
+        ] {
+            assert!(
+                matches!(validate_peer_id(bad), Err(NasStoreError::InvalidPeerId(_))),
+                "peer id {bad:?} must be refused"
+            );
+            assert!(
+                matches!(
+                    store.get_chunk(bad, &hash),
+                    Err(NasStoreError::InvalidPeerId(_))
+                ),
+                "get_chunk with peer id {bad:?} must be refused"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invalid_content_hashes_rejected() {
+        let root = test_root("bad-hashes");
+        let store = open_store(&root);
+        let upper = "A".repeat(64);
+        let nonhex = "g".repeat(64);
+        let short = "abc123";
+        let overlong = "a".repeat(65);
+        for bad in [
+            "",
+            short,
+            upper.as_str(),
+            nonhex.as_str(),
+            overlong.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    validate_content_hash(bad),
+                    Err(NasStoreError::InvalidContentHash(_))
+                ),
+                "hash {bad:?} must be refused"
+            );
+            assert!(
+                matches!(
+                    store.get_chunk(PEER_A, bad),
+                    Err(NasStoreError::InvalidContentHash(_))
+                ),
+                "get_chunk with hash {bad:?} must be refused"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_commit_get_list_round_trip_and_soft_delete() {
+        let root = test_root("snapshots");
+        let store = open_store(&root);
+        let manifest_one = b"manifest one".to_vec();
+        let manifest_two = b"manifest two".to_vec();
+
+        store
+            .commit_snapshot(PEER_A, "snap-001", &manifest_one)
+            .unwrap();
+        store
+            .commit_snapshot(PEER_A, "snap-002", &manifest_two)
+            .unwrap();
+        assert_eq!(
+            store.get_snapshot(PEER_A, "snap-001").unwrap(),
+            manifest_one
+        );
+        assert_eq!(
+            store.get_snapshot(PEER_A, "snap-002").unwrap(),
+            manifest_two
+        );
+        assert_eq!(
+            store.list_snapshots(PEER_A).unwrap(),
+            vec![
+                SnapshotEntry {
+                    snapshot_id: "snap-001".to_owned(),
+                    soft_deleted: false,
+                },
+                SnapshotEntry {
+                    snapshot_id: "snap-002".to_owned(),
+                    soft_deleted: false,
+                },
+            ]
+        );
+
+        // Soft delete: listing flags it, reads refuse, data file is
+        // retained under the `.deleted` marker name.
+        store.delete_snapshot(PEER_A, "snap-001").unwrap();
+        assert_eq!(
+            store.list_snapshots(PEER_A).unwrap(),
+            vec![
+                SnapshotEntry {
+                    snapshot_id: "snap-001".to_owned(),
+                    soft_deleted: true,
+                },
+                SnapshotEntry {
+                    snapshot_id: "snap-002".to_owned(),
+                    soft_deleted: false,
+                },
+            ]
+        );
+        let err = store.get_snapshot(PEER_A, "snap-001").unwrap_err();
+        assert!(matches!(err, NasStoreError::UnknownSnapshot { .. }));
+        let err = store.delete_snapshot(PEER_A, "snap-001").unwrap_err();
+        assert!(matches!(err, NasStoreError::UnknownSnapshot { .. }));
+        assert!(
+            root.join("snapshots")
+                .join(PEER_A)
+                .join("snap-001.deleted")
+                .exists()
+        );
+
+        // Other peers' snapshot listings stay empty (namespace
+        // isolation on the snapshot surface too).
+        assert!(store.list_snapshots(PEER_B).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_id_validation_rejects_traversal_ids() {
+        let root = test_root("bad-snapshot-ids");
+        let store = open_store(&root);
+        let overlong = "a".repeat(81);
+        for bad in [
+            "",
+            "../etc",
+            ".hidden",
+            "snap.deleted",
+            "SNAP",
+            "a/b",
+            overlong.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    store.commit_snapshot(PEER_A, bad, b"m"),
+                    Err(NasStoreError::InvalidSnapshotId(_))
+                ),
+                "snapshot id {bad:?} must be refused"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+}
