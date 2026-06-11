@@ -14685,8 +14685,9 @@ mod tests {
         TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS, TraversalCandidate, TraversalCandidateType,
         TrustEvidenceRecord, TrustPolicy, TrustWatermark, anchor_bundle_pull_token_thumbprint,
         build_dns_response, collect_traversal_host_candidate_snapshot_with_retry,
-        is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
-        load_dns_zone_bundle, load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
+        enforce_overlay_exception_for_exit_routes, is_root_managed_shared_runtime_parent,
+        load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_dns_zone_bundle,
+        load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
         load_traversal_bundle_set, load_traversal_watermark, load_trust_evidence,
         load_trust_watermark, membership_watermark_is_replay, parse_route_interface_token,
         parse_windows_default_egress_interface_output, passphrase_disallowed_mode_mask,
@@ -26590,6 +26591,59 @@ mod tests {
         assert_eq!(client_routes[0].kind, RouteKind::ExitNodeDefault);
         assert_eq!(admin_routes.len(), 1);
         assert_eq!(admin_routes[0].kind, RouteKind::ExitNodeDefault);
+    }
+
+    #[test]
+    fn enforce_overlay_exception_accepts_exit_default_with_mesh_route() {
+        let routes = vec![
+            Route {
+                destination_cidr: "100.64.0.0/10".to_owned(),
+                via_node: NodeId::new("mesh-peer".to_owned()).expect("mesh peer node id"),
+                kind: RouteKind::Mesh,
+            },
+            Route {
+                destination_cidr: "0.0.0.0/0".to_owned(),
+                via_node: NodeId::new("exit-peer".to_owned()).expect("exit peer node id"),
+                kind: RouteKind::ExitNodeDefault,
+            },
+        ];
+
+        enforce_overlay_exception_for_exit_routes(&routes)
+            .expect("exit default coexisting with mesh routes must be accepted");
+    }
+
+    #[test]
+    fn enforce_overlay_exception_refuses_exit_default_without_mesh_route() {
+        let routes = vec![
+            Route {
+                destination_cidr: "0.0.0.0/0".to_owned(),
+                via_node: NodeId::new("exit-peer".to_owned()).expect("exit peer node id"),
+                kind: RouteKind::ExitNodeDefault,
+            },
+            Route {
+                destination_cidr: "192.168.1.0/24".to_owned(),
+                via_node: NodeId::new("exit-peer".to_owned()).expect("exit peer node id"),
+                kind: RouteKind::ExitNodeLan,
+            },
+        ];
+
+        let err = enforce_overlay_exception_for_exit_routes(&routes)
+            .expect_err("exit default without mesh routes must be refused (fail closed)");
+        assert!(err.contains("no mesh overlay routes"));
+    }
+
+    #[test]
+    fn enforce_overlay_exception_accepts_route_sets_without_exit_default() {
+        let mesh_only = vec![Route {
+            destination_cidr: "100.64.0.0/10".to_owned(),
+            via_node: NodeId::new("mesh-peer".to_owned()).expect("mesh peer node id"),
+            kind: RouteKind::Mesh,
+        }];
+        enforce_overlay_exception_for_exit_routes(&mesh_only)
+            .expect("mesh-only route set must be accepted");
+
+        enforce_overlay_exception_for_exit_routes(&[])
+            .expect("empty route set carries no exit default and must be accepted");
     }
 
     #[test]

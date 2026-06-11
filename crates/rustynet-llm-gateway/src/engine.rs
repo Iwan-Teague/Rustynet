@@ -155,3 +155,104 @@ impl InferenceEngine for MockEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("test address parses")
+    }
+
+    #[test]
+    fn loopback_endpoints_accepted() {
+        assert_eq!(
+            validate_engine_endpoint(addr("127.0.0.1:11434")),
+            Ok(addr("127.0.0.1:11434"))
+        );
+        assert_eq!(
+            validate_engine_endpoint(addr("[::1]:11434")),
+            Ok(addr("[::1]:11434"))
+        );
+    }
+
+    #[test]
+    fn non_loopback_endpoints_refused_fail_closed() {
+        for endpoint in [
+            "10.0.0.1:11434",
+            "0.0.0.0:11434",
+            "192.168.1.5:8080",
+            "[::]:11434",
+        ] {
+            let err = validate_engine_endpoint(addr(endpoint))
+                .expect_err("non-loopback engine endpoint must be refused");
+            assert_eq!(
+                err,
+                EngineError::NonLoopbackEndpoint {
+                    requested: addr(endpoint)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_model_refused() {
+        let engine = MockEngine::serving(vec!["tiny".to_owned()]);
+        let err = engine
+            .stream_completion("missing", "hello")
+            .err()
+            .expect("unknown model must be refused");
+        assert_eq!(
+            err,
+            EngineError::UnknownModel {
+                model: "missing".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn unhealthy_engine_unavailable_everywhere() {
+        let engine = MockEngine {
+            models: vec!["tiny".to_owned()],
+            healthy: false,
+        };
+        assert!(matches!(
+            engine.list_models(),
+            Err(EngineError::Unavailable(_))
+        ));
+        assert!(matches!(
+            engine.stream_completion("tiny", "hello").err(),
+            Some(EngineError::Unavailable(_))
+        ));
+        assert!(matches!(
+            engine.probe_health(),
+            Err(EngineError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn stream_ends_with_done_and_token_counts_match_prompt_words() {
+        let engine = MockEngine::serving(vec!["tiny".to_owned()]);
+        let prompt = "the quick brown fox jumps";
+        let events: Vec<CompletionEvent> = engine
+            .stream_completion("tiny", prompt)
+            .expect("healthy engine streams")
+            .map(|event| event.expect("mock stream never errors"))
+            .collect();
+        assert_eq!(events.last(), Some(&CompletionEvent::Done));
+        let token_total: u64 = events
+            .iter()
+            .map(|event| match event {
+                CompletionEvent::Fragment { token_count, .. } => *token_count,
+                CompletionEvent::Done => 0,
+            })
+            .sum();
+        assert_eq!(token_total, prompt.split_whitespace().count() as u64);
+        // Exactly one terminal Done.
+        let done_count = events
+            .iter()
+            .filter(|e| matches!(e, CompletionEvent::Done))
+            .count();
+        assert_eq!(done_count, 1);
+    }
+}

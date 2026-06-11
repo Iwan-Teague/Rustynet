@@ -389,3 +389,292 @@ pub fn decode_response(body: &[u8]) -> Result<Response, ProtocolError> {
     reader.finish()?;
     Ok(response)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_hash() -> String {
+        "0123456789abcdef".repeat(4)
+    }
+
+    #[test]
+    fn request_round_trips_every_variant() {
+        let requests = vec![
+            Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+            Request::PutChunk {
+                content_hash: sample_hash(),
+                data: vec![1, 2, 3, 4, 5],
+            },
+            Request::GetChunk {
+                content_hash: sample_hash(),
+            },
+            Request::CommitSnapshot {
+                snapshot_id: "snap-001".to_owned(),
+                manifest: vec![9; 128],
+            },
+            Request::ListSnapshots,
+            Request::GetSnapshot {
+                snapshot_id: "snap-001".to_owned(),
+            },
+            Request::DeleteSnapshot {
+                snapshot_id: "snap-001".to_owned(),
+            },
+            Request::Usage,
+        ];
+        for request in requests {
+            let body = encode_request(&request);
+            assert_eq!(
+                decode_request(&body).unwrap(),
+                request,
+                "round-trip failed for {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_round_trips_every_variant() {
+        let responses = vec![
+            Response::HelloOk {
+                version: PROTOCOL_VERSION,
+                quota_limit_bytes: 64 * 1024 * 1024 * 1024,
+                quota_used_bytes: 17,
+            },
+            Response::Ok,
+            Response::Chunk {
+                data: vec![0xab; 64],
+            },
+            Response::Snapshots {
+                snapshot_ids: Vec::new(),
+            },
+            Response::Snapshots {
+                snapshot_ids: vec!["snap-001".to_owned(), "snap-002".to_owned()],
+            },
+            Response::Snapshot {
+                manifest: vec![7; 32],
+            },
+            Response::Usage {
+                quota_limit_bytes: 1024,
+                quota_used_bytes: 1023,
+            },
+            Response::Error {
+                message: "quota exceeded: used 32 + requested 80 > limit 100".to_owned(),
+            },
+        ];
+        for response in responses {
+            let body = encode_response(&response);
+            assert_eq!(
+                decode_response(&body).unwrap(),
+                response,
+                "round-trip failed for {response:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_opcodes_refused() {
+        assert_eq!(
+            decode_request(&[0x7f]).unwrap_err(),
+            ProtocolError::UnknownOpcode(0x7f)
+        );
+        // A response opcode arriving as a request (and vice versa) is
+        // unknown on that side.
+        assert_eq!(
+            decode_request(&[opcode::R_OK]).unwrap_err(),
+            ProtocolError::UnknownOpcode(opcode::R_OK)
+        );
+        assert_eq!(
+            decode_response(&[0x00]).unwrap_err(),
+            ProtocolError::UnknownOpcode(0x00)
+        );
+        assert_eq!(
+            decode_response(&[opcode::HELLO]).unwrap_err(),
+            ProtocolError::UnknownOpcode(opcode::HELLO)
+        );
+    }
+
+    #[test]
+    fn truncated_frames_refused() {
+        assert_eq!(decode_request(&[]).unwrap_err(), ProtocolError::Truncated);
+        assert_eq!(decode_response(&[]).unwrap_err(), ProtocolError::Truncated);
+
+        // Every strict prefix of a valid multi-field frame refuses
+        // as truncated.
+        let full = encode_request(&Request::PutChunk {
+            content_hash: sample_hash(),
+            data: vec![1, 2, 3],
+        });
+        for cut in 1..full.len() {
+            assert_eq!(
+                decode_request(&full[..cut]).unwrap_err(),
+                ProtocolError::Truncated,
+                "prefix of {cut} bytes must refuse as truncated"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_refused() {
+        let mut body = encode_request(&Request::Usage);
+        body.push(0x00);
+        assert_eq!(
+            decode_request(&body).unwrap_err(),
+            ProtocolError::TrailingBytes { count: 1 }
+        );
+
+        let mut body = encode_response(&Response::Ok);
+        body.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(
+            decode_response(&body).unwrap_err(),
+            ProtocolError::TrailingBytes { count: 3 }
+        );
+    }
+
+    #[test]
+    fn oversize_length_prefix_refused_before_allocation() {
+        // A PutChunk frame claiming a chunk larger than
+        // MAX_CHUNK_LEN, with no body bytes behind the claim: the
+        // per-field cap must refuse before any allocation happens.
+        let mut body = vec![opcode::PUT_CHUNK];
+        let hash = sample_hash();
+        body.extend_from_slice(&(hash.len() as u32).to_be_bytes());
+        body.extend_from_slice(hash.as_bytes());
+        body.extend_from_slice(&((MAX_CHUNK_LEN as u32) + 1).to_be_bytes());
+        assert_eq!(
+            decode_request(&body).unwrap_err(),
+            ProtocolError::FieldTooLarge {
+                field: "chunk",
+                len: MAX_CHUNK_LEN + 1,
+            }
+        );
+
+        // String-field cap on the request side.
+        let mut body = vec![opcode::GET_CHUNK];
+        body.extend_from_slice(&65u32.to_be_bytes());
+        assert_eq!(
+            decode_request(&body).unwrap_err(),
+            ProtocolError::FieldTooLarge {
+                field: "content_hash",
+                len: 65,
+            }
+        );
+
+        // Snapshot-list count cap on the response side.
+        let mut body = vec![opcode::R_SNAPSHOTS];
+        body.extend_from_slice(&((MAX_SNAPSHOT_LIST as u32) + 1).to_be_bytes());
+        assert_eq!(
+            decode_response(&body).unwrap_err(),
+            ProtocolError::FieldTooLarge {
+                field: "snapshot_list",
+                len: MAX_SNAPSHOT_LIST + 1,
+            }
+        );
+
+        // Whole-frame cap on both sides.
+        let oversized = vec![0u8; MAX_FRAME_LEN + 1];
+        assert_eq!(
+            decode_request(&oversized).unwrap_err(),
+            ProtocolError::FrameTooLarge {
+                len: MAX_FRAME_LEN + 1,
+            }
+        );
+        assert_eq!(
+            decode_response(&oversized).unwrap_err(),
+            ProtocolError::FrameTooLarge {
+                len: MAX_FRAME_LEN + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn hello_with_wrong_version_refused() {
+        for wrong in [0u16, 2, u16::MAX] {
+            let body = encode_request(&Request::Hello { version: wrong });
+            assert_eq!(
+                decode_request(&body).unwrap_err(),
+                ProtocolError::UnsupportedVersion {
+                    peer_version: wrong,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn non_utf8_string_field_refused() {
+        let mut body = vec![opcode::GET_SNAPSHOT];
+        body.extend_from_slice(&4u32.to_be_bytes());
+        body.extend_from_slice(&[0xff, 0xfe, 0x80, 0x00]);
+        assert_eq!(
+            decode_request(&body).unwrap_err(),
+            ProtocolError::MalformedField {
+                field: "snapshot_id",
+            }
+        );
+
+        let mut body = vec![opcode::R_ERROR];
+        body.extend_from_slice(&2u32.to_be_bytes());
+        // 0xc3 0x28 is an invalid UTF-8 continuation sequence.
+        body.extend_from_slice(&[0xc3, 0x28]);
+        assert_eq!(
+            decode_response(&body).unwrap_err(),
+            ProtocolError::MalformedField {
+                field: "error_message",
+            }
+        );
+    }
+
+    /// Deterministic LCG (Knuth MMIX constants) — no external deps.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+    }
+
+    #[test]
+    fn decode_never_panics_on_arbitrary_bytes() {
+        // Every single-byte body (covers all opcodes, known and
+        // unknown).
+        for byte in 0u8..=255 {
+            let _ = decode_request(&[byte]);
+            let _ = decode_response(&[byte]);
+        }
+
+        // A few hundred pseudo-random buffers from a fixed seed;
+        // decode must return Ok or Err — never panic, never
+        // over-allocate.
+        let mut lcg = Lcg(0x5eed_2026_0611_0001);
+        for _ in 0..400 {
+            let len = (lcg.next_u64() % 1024) as usize;
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                buf.push((lcg.next_u64() >> 56) as u8);
+            }
+            let _ = decode_request(&buf);
+            let _ = decode_response(&buf);
+
+            // Opcode-prefixed bodies so the deeper field parsers run
+            // against the random tail too.
+            for op in [
+                opcode::HELLO,
+                opcode::PUT_CHUNK,
+                opcode::COMMIT_SNAPSHOT,
+                opcode::R_SNAPSHOTS,
+                opcode::R_ERROR,
+            ] {
+                let mut prefixed = Vec::with_capacity(buf.len() + 1);
+                prefixed.push(op);
+                prefixed.extend_from_slice(&buf);
+                let _ = decode_request(&prefixed);
+                let _ = decode_response(&prefixed);
+            }
+        }
+    }
+}

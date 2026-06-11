@@ -123,3 +123,40 @@ Implementation note (runtime shell removal):
 7. If `RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true`: `sudo systemctl --no-pager --full status rustynetd-assignment-refresh.timer`
 8. Trigger one assignment refresh cycle: `sudo systemctl start rustynetd-assignment-refresh.service`
 9. `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- status`
+
+## Service-Hosting Sibling Units (D13: `nas`, `llm`)
+
+- NAS unit: `scripts/systemd/rustynet-nas.service`
+- LLM gateway unit: `scripts/systemd/rustynet-llm-gateway.service`
+- Installer: `crates/rustynet-cli/src/ops_install_systemd_service.rs`
+  (generalised hardened installer driven by the role-transition
+  executor; relay keeps its own reviewed installer)
+
+Both units carry the relay sibling's hardening baseline
+(`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
+`PrivateTmp`, `PrivateDevices`, kernel-protections,
+`RestrictAddressFamilies`, `MemoryDenyWriteExecute`,
+`SystemCallArchitectures=native`, private `StateDirectory`) plus
+service-hosting specifics:
+
+- Tunnel-only listener: the binary refuses wildcard/loopback/
+  multicast binds at startup (fail-closed); the daemon-side
+  validator (`rustynetd::service_exposure::validate_tunnel_only_bind`)
+  and the `inet rustynet_svc_<service>` nftables table are the
+  authoritative layers (SecurityMinimumBar §6.E E1).
+- NAS at-rest key via systemd `LoadCredentialEncrypted`
+  (`nas_at_rest_key`); never in environment, never world-readable.
+  The store refuses group/world-accessible data roots and an
+  unopenable keycheck sentinel.
+- LLM session-token signing key: regular owner-only 32-byte file,
+  permission-checked fail-closed at startup; the inference engine
+  endpoint is validated loopback-only.
+- Default-deny access state: both binaries consume the
+  daemon-materialised `grants.v1` / `peers.v1` (LLM also
+  `scopes.v1`) files; missing state means deny-all, and grants are
+  re-checked per frame (LLM additionally per token event, so
+  revocation severs in-flight streams).
+- Lifecycle ordering: install/enable/start runs BEFORE the signed
+  capability advertisement; stop/disable/remove runs after session
+  severance and BEFORE the signed revocation (§6.D controls 4-5,
+  §6.E control E3).
