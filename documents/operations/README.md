@@ -84,6 +84,7 @@ Cross-platform code-quality ledger:
 - [CrossNetworkLiveLabPrerequisitesChecklist.md](./CrossNetworkLiveLabPrerequisitesChecklist.md)
 - [CrossNetworkRemoteExitArtifactSchema_2026-03-16.md](./CrossNetworkRemoteExitArtifactSchema_2026-03-16.md)
 - [CrossNetworkRemoteExitIncidentPlaybook.md](./CrossNetworkRemoteExitIncidentPlaybook.md)
+- [CrossNetworkSimulationRunbook.md](./CrossNetworkSimulationRunbook.md) — how to simulate cross-network (NAT traversal/relay/gossip) on the single-host VM lab without real separate networks; the four-tier substrate (netns internet-simulator / VXLAN-overlay multi-VM / slirp cross-OS / chaos), the validated `netns_internet_sim.sh` + `apply_nat_profile.sh` tooling, and the UTM constraints that drive the design
 - [CryptoDeprecationSchedule.md](./CryptoDeprecationSchedule.md) — algorithm deprecation/removal calendar and reviewed exception rules
 - [DependencyExceptionPolicy.md](./DependencyExceptionPolicy.md) — controlled-exception workflow for the dependency policy gate
 - [DisasterRecoveryValidation.md](./DisasterRecoveryValidation.md)
