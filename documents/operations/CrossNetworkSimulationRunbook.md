@@ -113,12 +113,21 @@ On `debian-headless-1`, 2026-06-11:
 
 ### What is still pending (Tier A)
 
-Layering the rest of the real lifecycle into the topology: `rustynet-relay` in `svc`, `rustynetd`
-(kernel WireGuard) in each endpoint namespace pointed at the in-sim STUN responder via the legitimate
-`traversal_stun_servers` config, then the full enrollment cold-contact → gossip → ICE pair race →
-direct-punch flow with forced relay fallback, `tcpdump` on the wan as the direct-vs-relay path oracle, and
-the expanded `full_cone` / `symmetric` / double-NAT / impairment matrix. (STUN reflexive discovery — the
-prerequisite — is done; see above.) Tracked in plan
+Layering the rest of the real lifecycle into the topology: `rustynetd` (kernel WireGuard) in each endpoint
+namespace pointed at the in-sim STUN responder via the legitimate `--traversal-stun-servers` flag, then the
+full enrollment cold-contact → gossip → ICE pair race → direct-punch flow with forced relay fallback
+(`rustynet-relay` in `svc`), `tcpdump` on the wan as the direct-vs-relay path oracle, and the expanded
+`full_cone` / `symmetric` / double-NAT / impairment matrix. (STUN reflexive discovery — the prerequisite —
+is done; see above.)
+
+Validated frontier (2026-06-11): a real `rustynetd` started in an endpoint namespace passes config
+validation, runtime-ACL checks, key-material preparation and the hardened passphrase-credential check
+(`RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH`), then correctly fail-closes at the signed-trust-evidence
+gate — the security bar enforcing itself inside the simulator. Bringing a node fully up therefore reuses
+the operator provisioning path the live-lab orchestrator already uses
+(`rustynet ops e2e-bootstrap-host` → `e2e-membership-add` → `refresh-signed-trust`) rather than
+hand-minting bundles; that node-bringup helper is the next build step. The simulator drives the daemon
+exactly as a human/operator would — no test-only daemon flags. Tracked in plan
 §D5.1 and the §4.1 gap stages (`cross_network_cold_enroll`, `cross_network_anchor_renumber`,
 `cross_network_double_nat_anchor`).
 
