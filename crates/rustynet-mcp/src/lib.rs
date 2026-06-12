@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 // ── Repo root resolution ─────────────────────────────────────────────
@@ -435,6 +435,11 @@ pub fn run_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -472,7 +477,7 @@ pub fn run_with_timeout(
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
+                    kill_child_tree(&mut child);
                     timed_out = true;
                     // Reap the killed child (releases the cargo build lock).
                     break child.wait().ok();
@@ -493,6 +498,30 @@ pub fn run_with_timeout(
         timed_out,
         success: !timed_out && status.map(|s| s.success()).unwrap_or(false),
     })
+}
+
+#[cfg(unix)]
+fn kill_child_tree(child: &mut Child) {
+    let group = format!("-{}", child.id());
+    let _ = Command::new("kill")
+        .args(["-TERM", "--", &group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    std::thread::sleep(Duration::from_millis(50));
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_child_tree(child: &mut Child) {
+    let _ = child.kill();
 }
 
 /// Format a [`CommandOutcome`] into a Markdown report (header, exit code,
@@ -1165,6 +1194,25 @@ mod tests {
         .unwrap();
         assert!(outcome.timed_out, "slow command must be killed");
         assert!(!outcome.success);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_kills_child_process_group() {
+        let started = Instant::now();
+        let outcome = run_with_timeout(
+            "sh",
+            &["-c", "sleep 30 & wait"],
+            Path::new("."),
+            &[],
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(outcome.timed_out, "shell wrapper must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "orphaned grandchild kept stdout/stderr pipes open"
+        );
     }
 
     #[test]

@@ -1494,8 +1494,9 @@ fn atomic_write(path: &Path, body: &[u8], _mode: u32) -> Result<(), MembershipEr
     // file.  root can always chown, so an error here is unexpected and we
     // surface it rather than silently leaving a root-owned snapshot.
     #[cfg(unix)]
-    if matches!(prev_owner, Some((uid, _)) if uid != 0) && Uid::effective().is_root() {
-        let (uid, gid) = prev_owner.unwrap();
+    if let Some((uid, gid)) = prev_owner.filter(|(uid, _)| *uid != 0)
+        && Uid::effective().is_root()
+    {
         std::os::unix::fs::chown(path, Some(uid), Some(gid))
             .map_err(|err| MembershipError::Io(format!("chown {}: {err}", path.display())))?;
     }

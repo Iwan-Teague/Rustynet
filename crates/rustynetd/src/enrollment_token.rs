@@ -338,13 +338,12 @@ pub fn decode_token(encoded: &str) -> Result<EnrollmentToken, EnrollmentTokenErr
     }
     let mut token_id = [0u8; TOKEN_ID_LEN];
     token_id.copy_from_slice(&bytes[..TOKEN_ID_LEN]);
-    let issued_at_unix =
-        u64::from_be_bytes(bytes[TOKEN_ID_LEN..TOKEN_ID_LEN + 8].try_into().unwrap());
-    let expires_at_unix = u64::from_be_bytes(
-        bytes[TOKEN_ID_LEN + 8..TOKEN_ID_LEN + 16]
-            .try_into()
-            .unwrap(),
-    );
+    let mut issued_at_bytes = [0u8; 8];
+    issued_at_bytes.copy_from_slice(&bytes[TOKEN_ID_LEN..TOKEN_ID_LEN + 8]);
+    let issued_at_unix = u64::from_be_bytes(issued_at_bytes);
+    let mut expires_at_bytes = [0u8; 8];
+    expires_at_bytes.copy_from_slice(&bytes[TOKEN_ID_LEN + 8..TOKEN_ID_LEN + 16]);
+    let expires_at_unix = u64::from_be_bytes(expires_at_bytes);
     let mut tag = [0u8; TOKEN_TAG_LEN];
     tag.copy_from_slice(&bytes[TOKEN_ID_LEN + 16..]);
     Ok(EnrollmentToken {
