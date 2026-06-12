@@ -4742,7 +4742,10 @@ current_local_source_tree_is_dirty() {
     . \
     ':(exclude)artifacts' \
     ':(exclude).cargo-audit-db' \
-    ':(exclude)profiles/live_lab' | grep -q .
+    ':(exclude)profiles/live_lab' \
+    ':(exclude)documents/operations/live_lab_run_matrix.csv' \
+    ':(exclude)documents/operations/gate_timings.csv' \
+    ':(exclude)state/' | grep -q .
 }
 
 assert_local_gate_suite_provenance() {

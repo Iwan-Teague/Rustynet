@@ -743,7 +743,7 @@ impl RuntimeState {
             let outcome = self.engine.process_inbound_ciphertext(
                 datagram.remote_addr,
                 local_addr,
-                datagram.payload,
+                &datagram.payload,
                 self.authoritative_socket.transport_generation(),
             )?;
             self.apply_engine_processing_outcome(outcome)?;

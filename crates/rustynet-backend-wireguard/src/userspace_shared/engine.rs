@@ -239,7 +239,7 @@ impl UserspaceEngine {
         &mut self,
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
-        payload: Vec<u8>,
+        payload: &[u8],
         transport_generation: u64,
     ) -> Result<EngineProcessingOutcome, BackendError> {
         let matched_node_id = self.find_node_id_by_endpoint(remote_addr);
@@ -255,7 +255,7 @@ impl UserspaceEngine {
                     node_id: matched_node_id.clone(),
                     local_addr,
                     remote_addr,
-                    payload: payload.clone(),
+                    payload: payload.to_vec(),
                     transport_generation,
                 });
         }
@@ -282,7 +282,7 @@ impl UserspaceEngine {
         let initial_result =
             peer_state
                 .tunnel
-                .decapsulate(Some(remote_addr.ip()), &payload, decrypt_scratch);
+                .decapsulate(Some(remote_addr.ip()), payload, decrypt_scratch);
         Ok(drive_inbound_result(
             &node_id,
             peer_state,
