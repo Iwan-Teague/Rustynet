@@ -215,7 +215,39 @@ These network-facing parsers process untrusted input but lack `cargo-fuzz` targe
 
 ---
 
-## 7. Cross-Reference
+## 7. Additional Findings from Deep Scan (2026-06-12)
+
+### RN-N7 — CIDR validation is character-set-only, not structural
+**Location:** `ipc.rs:272-282` — `validate_cidr` checks only hex-digit/dot/colon/slash characters and length (3-43). It does not parse the CIDR to verify it represents a valid network prefix (e.g. `999.999.999.999/33` passes).
+**Severity:** Low — the OS networking stack rejects structurally invalid CIDRs downstream. The pre-filter reduces garbage input but is not a security gate.
+**Suggested approach:** Parse with `IpNet` or `ipnet` crate to validate structure at input boundary. Reject before any privileged operation uses the value.
+
+### RN-N8 — `SeenSequenceState` (gossip replay ledger) grows unbounded per source
+**Location:** `peer_gossip.rs:213` — `HashMap<[u8; 32], u64>` with no eviction. Each new peer adds a permanent entry.
+**Severity:** Low — the map is bounded by the number of peers in the mesh (typically <100). An attacker who can inject arbitrary source IDs into the gossip path could grow the map, but the source must pass Ed25519 signature verification under a known verifying key first, which gates this to authenticated peers only.
+**Suggested approach:** Add an LRU eviction policy or a maximum entry count. Document the operational bound.
+
+### Positive Controls Verified This Pass
+
+These were checked during the deep scan and confirmed as correctly implemented:
+
+| Area | Control | Status |
+|---|---|---|
+| Env-var binary paths | All `RUSTYNET_*_BINARY_PATH` overrides go through `validate_binary_path` (absolute, canonicalize, regular-file, executable, non-group-writable, root-owned) | ✅ |
+| Relay hello handler | 12-step ordered security check (rate-limit → signature → TTL → freshness → replay → ct_eq bindings → scope → capacity) | ✅ |
+| Key material | `symlink_metadata()` BEFORE every I/O op; `create_new(true)` for atomic writes; `fs::rename()` for commit; symlink rejection on all paths | ✅ |
+| Service exposure | Tunnel-only bind enforced; default-deny via `evaluate_with_membership`; session severance on policy change; audit events with thumbprints only | ✅ |
+| Gossip deserialization | `checked_add`/`checked_mul` on all offsets; `MAX_CANDIDATES_PER_BUNDLE=32`; `WireTruncated`/`WireMalformed` errors; version gate | ✅ |
+| Windows named pipes | `PIPE_REJECT_REMOTE_CLIENTS` at kernel level; SDDL ACL with forbidden principals list; 16KB message cap | ✅ |
+| macOS utun helper | Unsafe isolated in one file; bounded buffers; MSG_CTRUNC detection; truncated cmsg test coverage | ✅ |
+| DNS zone parser | 256KB bundle cap; 16K line cap; 4KB line cap; 128B key cap; 1.5KB value cap; 1024 record cap; 8 alias cap | ✅ |
+| UPnP HTTP client | 256KB body cap with +1 byte overflow detection; control-char sanitization on gateway-supplied strings; 4-device SSDP cap | ✅ |
+| STUN parser | 1024B buffer; attribute boundary check; 4-byte alignment; transaction ID match | ✅ |
+| Unsafe code | Zero `unsafe` in `rustynetd/src/` outside `macos_utun_helper_unsafe.rs`; `#![forbid(unsafe_code)]` on all other files | ✅ |
+
+---
+
+## 8. Cross-Reference
 
 - `documents/operations/active/SecurityReview_2026-05-24.md` — 38 findings, 8 fixed
 - `documents/operations/active/SecurityHardeningAudit_2026-04-28.md` — Phase A+B
