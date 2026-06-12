@@ -1,6 +1,6 @@
 # Rustynet Security Analysis — Verified & Patched
 
-**Date:** 2026-06-12 · **Commit:** `4fbd5f1` · **Status:** Every claim verified against live code at `file:line`
+**Date:** 2026-06-12 · **Commit:** `4fbd5f1` originally, reconciled against current `129cf4d69fb2` + working-tree fixes · **Status:** Current findings below were re-checked against live code; stale/false items were removed or narrowed.
 
 ---
 
@@ -19,22 +19,11 @@ Each finding below was verified by reading the actual source code at the cited l
 
 ## 1. P0 — Fix Immediately (fail-open / leak / DoS)
 
-### 1.1 RN-03 — 10 sites discard `force_fail_closed` Result
+### 1.1 RN-03 — `force_fail_closed` Results are discarded across daemon paths
 
-**Verified:** `grep 'let _ =.*force_fail_closed' crates/rustynetd/src/daemon.rs` → 10 hits.
-```
-daemon.rs:6651   let _ = self.controller.force_fail_closed("trust_bootstrap_failed");
-daemon.rs:6725   let _ = self.controller.force_fail_closed("invalid_local_node_id");
-daemon.rs:6801   let _ = self.controller.force_fail_closed("bootstrap_apply_failed");
-daemon.rs:6808   let _ = self.controller.force_fail_closed("bootstrap_apply_failed");
-daemon.rs:7878   let _ = self.controller.force_fail_closed("local_key_revoked");
-daemon.rs:7955   let _ = self.controller.force_fail_closed("state_persist_failure");
-daemon.rs:8069   let _ = self.controller.force_fail_closed("trust_reconcile_failed");
-daemon.rs:8186   let _ = self.controller.force_fail_closed("invalid_local_node_id");
-daemon.rs:8320   let _ = self.controller.force_fail_closed("reconcile_apply_failed");
-daemon.rs:8330   let _ = self.controller.force_fail_closed("reconcile_apply_failed");
-```
-`force_fail_closed` → `block_all_egress()` → programs `policy drop` killswitch. If this fails (nft unavailable, helper down, transaction race), the error is swallowed. Worst case: first bootstrap, no prior killswitch table exists → daemon proceeds as if protected → host egresses cleartext.
+**Verified:** `rg 'force_fail_closed\(' crates/rustynetd/src/daemon.rs` shows 40 daemon call sites. The previous "10 sites" count only matched single-line `let _ = ...force_fail_closed(...)` forms and missed multiline discarded Results.
+
+`force_fail_closed` → `block_all_egress()` → programs `policy drop` killswitch. If this fails (nft unavailable, helper down, transaction race), many daemon paths do not propagate the error. Worst case: first bootstrap, no prior killswitch table exists → daemon proceeds as if protected → host egresses cleartext.
 
 **Suggested approach** (the implementer should research the best solution):
 - At minimum, never discard the Result without error-level logging
@@ -139,8 +128,8 @@ If this path executes twice (concurrent traversal probe + relay health check), t
 **Location:** `key_material.rs:674` — wider permission mask on `/run/credentials/` prefix.
 **Suggested approach:** Require stricter parent-directory ownership and group checks before honoring the wider mask. Verify the filesystem is actually a systemd-managed tmpfs mount.
 
-### 2.4 RN-10 — Corrupt rotation ledger silently resets to genesis
-**Location:** `daemon.rs:8082` — `load_rotation_ledger` returns `genesis()` on any error.
+### 2.4 RN-10 — Corrupt rotation ledger returns `genesis()` after logging
+**Location:** `daemon.rs:8601` — `load_rotation_ledger` logs on load error but still returns `genesis()`, so callers cannot distinguish "ledger absent on first run" from "ledger corrupt/unparseable."
 **Suggested approach:** Distinguish absent (genesis is correct) from corrupt/unparseable (refuse to proceed). The implementer should also add a clear operator runbook entry for recovery from a genuinely corrupt ledger.
 
 ### 2.5 RN-16 — GitHub Actions pinned to mutable tags
@@ -151,17 +140,13 @@ If this path executes twice (concurrent traversal probe + relay health check), t
 
 ## 3. P2 — Defense-in-Depth (new findings)
 
-### 3.1 RN-N4 — Gossip has no per-peer rate limiting
-**Location:** `gossip_runtime.rs` — `drain_gossip_inbound` processes every bundle in a tight loop. A rogue peer flooding forged bundles can consume CPU with Ed25519 verification.
+### 3.1 RN-N4 — Gossip has no per-peer inbound rate limiting
+**Location:** `gossip_runtime.rs` / `peer_gossip.rs` — inbound gossip has freshness, known-peer, signature, and monotonic-sequence checks, but no token-bucket or budget per authenticated source. A rogue authenticated peer flooding forged/stale bundles can consume CPU with repeated Ed25519 verification.
 **Suggested approach:** Token-bucket per source node (e.g. 10 bundles/sec). Drop above-limit bundles before signature verification. The implementer should tune the rate based on expected cluster size and gossip propagation latency requirements.
 
-### 3.2 RN-N5 — Enrollment TTL checked before constant-time HMAC
-**Location:** `enrollment_token.rs` — verify path checks expiry before HMAC compare. Different response timing for "expired" vs "wrong secret." The 256-bit HMAC makes brute-force impractical regardless; this is defense-in-depth.
-**Suggested approach:** Reorder checks so the constant-time HMAC comparison runs before any time-based rejection. The implementer should verify that this reorder doesn't introduce other observable timing differences.
-
-### 3.3 RN-N6 — No fuzz targets for relay hello parser
-**Location:** `crates/rustynet-relay/src/transport.rs`, `session.rs`. Relay processes untrusted UDP from any source.
-**Suggested approach:** Add `cargo-fuzz` targets for `parse_relay_hello`, `verify_session_token`, and the rate-limiter state machine. The implementer should also consider adding fuzz targets for the other parsers listed in §6.
+### 3.2 RN-N6 — No fuzz targets for relay hello parser
+**Location:** `crates/rustynet-relay/src/main.rs:669` (`parse_relay_hello` / `parse_relay_token`) and `crates/rustynet-relay/src/transport.rs` (hello validation state machine). Relay hello handling has strong unit tests and pre-signature rate limiting, but no `cargo-fuzz` target for hostile wire bytes.
+**Suggested approach:** Add `cargo-fuzz` targets for `parse_relay_hello`, `parse_relay_token`, and the `RelayTransport` hello validation state machine. The implementer should also consider adding fuzz targets for the other parsers listed in §6.
 
 ---
 
@@ -171,7 +156,7 @@ If this path executes twice (concurrent traversal probe + relay health check), t
 |---|---|---|---|
 | RN-01 | Fixed (RL-1) | Fixed | — |
 | RN-02 | Open | **Still open** | Dead code still present |
-| RN-03 | Open (10 sites) | **Confirmed 10 sites** | No change |
+| RN-03 | Open | **Confirmed broader than prior single-line count** | Current daemon has 40 `force_fail_closed()` call sites; many discarded |
 | RN-04 | Open | **Confirmed** | Killswitch after backend.start() |
 | RN-05 | Open | **Confirmed** | Non-node selectors bypass revocation |
 | RN-06 | Open | **FIXED** | Scoped egress allows replace unscoped LAN allow (phase10.rs:3096-3142) |
@@ -187,7 +172,7 @@ If this path executes twice (concurrent traversal probe + relay health check), t
 | ID | Severity | Location | Direction to investigate |
 |---|---|---|---|
 | HB-1 | Low | `windows_tunnel_smoke.rs` | Use secure scrub (`remove_file_if_present`) instead of plain `remove_file` for ephemeral key cleanup |
-| HB-2 | Low | `key_material.rs:739` | On Windows, set explicit owner-only ACL or write to validated hardened dir (the `cfg(unix)` mode set is a no-op on Windows) |
+| HB-2 | Low | `rustynet-crypto/src/lib.rs:1573` | Narrowed: daemon DPAPI passphrase paths now validate Windows ACLs, but the generic encrypted-file fallback permission check still no-ops on non-Unix |
 | HB-3 | Low | `windows_killswitch_smoke.rs` | Use absolute `%SystemRoot%\System32\netsh.exe` instead of PATH-resolved `netsh` |
 | HB-4 | Low | `windows_killswitch_smoke.rs` Drop guard | Add IPv6 block rule cleanup in the Drop guard for panic safety |
 | HB-5 | Info | `windows_killswitch_smoke.rs` | Document the hardcoded Cloudflare IPv6 dependency; prefer a lab-local target when available |
@@ -211,7 +196,7 @@ These network-facing parsers process untrusted input but lack `cargo-fuzz` targe
 | UPnP device desc | `rustynetd` | ❌ |
 | DNS zone | `rustynet-dns-zone` | ❌ |
 
-**Recommendation:** Add `cargo-fuzz` targets for all 6 missing parsers. Run 1hr/commit in CI.
+**Recommendation:** Add `cargo-fuzz` targets for the missing hostile-input parsers. Run 1hr/commit in CI.
 
 ---
 
@@ -235,6 +220,7 @@ These were checked during the deep scan and confirmed as correctly implemented:
 |---|---|---|
 | Env-var binary paths | All `RUSTYNET_*_BINARY_PATH` overrides go through `validate_binary_path` (absolute, canonicalize, regular-file, executable, non-group-writable, root-owned) | ✅ |
 | Relay hello handler | 12-step ordered security check (rate-limit → signature → TTL → freshness → replay → ct_eq bindings → scope → capacity) | ✅ |
+| Enrollment tokens | HMAC is recomputed and compared with `ct_eq` before expiry, future-issued, or replay checks in both consume and inspect paths | ✅ |
 | Key material | `symlink_metadata()` BEFORE every I/O op; `create_new(true)` for atomic writes; `fs::rename()` for commit; symlink rejection on all paths | ✅ |
 | Service exposure | Tunnel-only bind enforced; default-deny via `evaluate_with_membership`; session severance on policy change; audit events with thumbprints only | ✅ |
 | Gossip deserialization | `checked_add`/`checked_mul` on all offsets; `MAX_CANDIDATES_PER_BUNDLE=32`; `WireTruncated`/`WireMalformed` errors; version gate | ✅ |
