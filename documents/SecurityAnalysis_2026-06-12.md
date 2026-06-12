@@ -1,325 +1,304 @@
-# Rustynet Security Analysis — Weaknesses & Modern Mitigations
+# Rustynet Security Analysis — Verified Weaknesses & Hardening Patches
 
-- **Date:** 2026-06-12 (updated after deep scan)
-- **Baseline:** commit `bf47db1`
-- **Scope:** Full workspace static analysis — 38 existing SecurityReview findings + 11 new findings from deep code scan
-- **Files scanned:** daemon.rs, phase10.rs, privileged_helper.rs, ipc.rs, stun_client.rs, gossip_runtime.rs, gossip_transport.rs, peer_gossip.rs, enrollment_token.rs, enrollment.rs, port_mapper.rs, session.rs, rate_limit.rs, relay transport.rs, traversal.rs, service_exposure.rs, key_material.rs, key_rotation.rs
-
----
-
-## 1. Executive Summary
-
-Rustynet's security core is **strongly engineered**. Positive findings:
-
-- **Privileged helper:** closed-enum program allowlist, argv-only exec (no shell), shell-metacharacter rejection, path-traversal rejection, root-owned binary validation, SO_PEERCRED + post-connect uid check, 0660 socket, framed protocol with hard size caps
-- **Crypto:** vetted primitives only (ed25519-dalek `verify_strict`, XChaCha20-Poly1305, Argon2id@OWASP), fail-closed CSPRNG (no ThreadRng fallback), redacting Debug, zeroize on Drop, constant-time HMAC via `subtle`, domain-separated HMAC contexts
-- **Trust:** verify-before-mutate ordering, quorum + owner-signature enforcement, epoch + state-root chaining, per-source replay watermarks persisted to disk, freshness windows with future-drift rejection
-- **Parsers:** STUN (1024B buffer, length-checked), gossip (4KB cap, per-field validation), IPC (4KB cap, per-command SO_PEERCRED), UPnP HTTP (256KB cap with +1-byte overflow detection + test pin), PCP (fixed response length), NAT-PMP (64B buffer), enrollment token (fixed 64B binary, constant-time tag compare)
-- **Memory safety:** `#![forbid(unsafe_code)]` on 13/14 crates (only FFI crate `rustynet-windows-native` allows unsafe); no `build.rs` in any crate (zero build-time code-exec surface)
-- **Secret hygiene:** no secrets in logs, token tags redacted in Debug, Zeroizing wrappers, passphrase credential path validated, all-zero-key rejection
-
-**Gap cluster:** The dataplane fail-closed posture has High-severity gaps (RN-03/04/05/06/07/11 still open). Additionally, 5 `expect()`/`unwrap()` sites in `daemon.rs` production paths can crash the daemon, defeating the killswitch. These are the highest-residual-risk items.
-
-### Findings Tally (refined)
-
-| Severity | Existing (open) | New (this analysis) | Total Open |
-|---|---|---|---|
-| Critical | 0 | 0 | 0 |
-| High | 6 | 3 | 9 |
-| Medium | 7 | 4 | 11 |
-| Low | 12 | 4 | 16 |
-| Info | 5 | 2 | 7 |
+- **Date:** 2026-06-12 (verified against live code `bf47db1`)
+- **Scope:** Cross-referenced SecurityReview (38 findings), HardeningAudit (Phase A+B), HardeningBacklog (HB-1..7), plus new deep code scan
+- **Methodology:** Each finding verified against actual code at `file:line`; false positives removed; each has a concrete, harder-to-exploit patch
 
 ---
 
-## 2. High-Severity Findings
+## 1. Verification Summary
 
-### 2.1 Existing (from SecurityReview_2026-05-24, still open)
+### Already Fixed (8 findings): RN-01, RN-14, RN-15, RN-17, RN-19, RN-22, RN-23, RN-24
 
-#### RN-03 — `force_fail_closed` results silently discarded (fail-open)
-- **Status:** OPEN (10 discard sites confirmed in daemon.rs)
-- **Risk:** On first bootstrap, if `block_all_egress` fails, the killswitch table is never created and all traffic egresses cleartext while the daemon believes it is restricted.
-- **Fix:** Replace `let _ = self.controller.force_fail_closed(...)` with `force_fail_closed_or_terminate()` that either succeeds, retries with backoff while refusing to serve, or aborts.
-
-#### RN-04 — Tunnel + routes come up before killswitch is programmed
-- **Status:** OPEN
-- **Fix:** Program `policy drop` killswitch BEFORE `backend.start()` and route apply. Make `ExecStartPre` boot killswitch mandatory.
-
-#### RN-05 — Policy engine default-allows non-`node:` selectors (revocation bypass)
-- **Status:** OPEN
-- **Fix:** Resolve `group:`/`tag:`/`user:` selectors to constituent node set; deny if any member revoked.
-
-#### RN-06 + RN-07 — Windows killswitch + IPv6 leak
-- **Status:** OPEN
-- **Fix:** Scope LAN egress allow to WG UDP + STUN + management. Add IPv6 outbound block. Flush autoconfigured global IPv6.
-
-#### RN-02 — Dead `dataplane.rs` module (assurance failure)
-- **Status:** OPEN
-- **Fix:** Delete `dataplane.rs`; point security-audit catalog at live `phase10.rs`.
-
-#### RN-11 — Empty membership directory = allow-all
-- **Status:** OPEN
-- **Fix:** Default to deny on empty unless `--membership-governance=disabled` explicitly set.
+### Still Open — Verified REAL (30 review findings + 7 backlog items + 3 new)
 
 ---
 
-### 2.2 New High-Severity Findings
+## 2. P0 — Fix Now (fail-open / leak / DoS)
 
-#### RN-N1 — Production-path `expect()`/`unwrap()` panics in daemon runtime (DoS)
-- **Severity:** High · **CWE-248 / CWE-754** · **Confidence: High**
-- **Location:** `crates/rustynetd/src/daemon.rs`
-  - L5905: `self.relay_client.take().expect("relay client should remain available")` — double-call panic
-  - L6154: `.values().next().expect("single traversal probe status")` — empty-map panic
-  - L6300: `handshake_unix.expect("fresh handshake must carry timestamp")` — None panic
-  - L6341: Same pattern for relay handshake
-  - L9238: `last_err.unwrap()` — empty bind-attempt chain panic
-- **Impact:** Daemon crash → tunnel drops → traffic may egress cleartext if killswitch not pre-programmed (RN-03/RN-04 chain). Per AGENTS.md §10.2, `expect()` in production paths is forbidden.
-- **Fix:** Replace with proper error propagation (`map_err`/`ok_or_else`/`?`).
+### RN-03 — `force_fail_closed` results silently discarded (fail-open on first bootstrap)
+- **Source:** SecurityReview §3, re-verified HardeningBacklog §B `e01dd64`
+- **Location:** `crates/rustynetd/src/daemon.rs` — 10 confirmed `let _ = …force_fail_closed(…)` sites
+- **Verified:** `grep 'let _ =.*force_fail_closed' crates/rustynetd/src/daemon.rs` → 10 hits. Each discards the Result. If `block_all_egress` fails on first bootstrap (no prior killswitch table), the daemon proceeds as if protected but the host has no `policy drop`.
+- **Exploitability:** HIGH. A transient nft helper failure during first boot → all traffic egresses cleartext. No attacker action needed — this is a reliability→security defect.
+- **Patch:** Replace `let _ = self.controller.force_fail_closed(reason)` with:
+  ```rust
+  if let Err(e) = self.controller.force_fail_closed(reason) {
+      tracing::error!(%e, reason, "force_fail_closed failed; aborting to let systemd boot killswitch backstop");
+      std::process::abort();
+  }
+  ```
+  This is strictly harder to exploit than swallowing the error: the daemon dies, systemd restarts it (or the boot killswitch stays active), and there's no window where the daemon thinks it's protected but isn't.
 
-#### RN-N2 — Control-plane has no transport security — plaintext IPC over Unix socket
-- **Severity:** High · **CWE-319** · **Confidence: High**
-- **Location:** `crates/rustynetd/src/ipc.rs`
-- **Impact:** SecurityMinimumBar §3.2 requires "TLS 1.3 enforced for control-plane APIs." The Unix socket has filesystem ACL (0o600) and SO_PEERCRED authn, but no per-command anti-replay, no encryption, and no server authentication beyond uid. A local attacker in `rustynetd` group can replay captured IPC commands.
-- **Fix:** Add per-command sequence number + HMAC using the daemon's signing key. For remote-admin paths, add TLS 1.3 tunnel.
+### RN-04 — Tunnel + routes up before killswitch programmed (bootstrap leak window)
+- **Source:** SecurityReview §3
+- **Location:** `crates/rustynetd/src/phase10.rs` — `apply_dataplane_generation` programs killswitch AFTER `backend.start()` and route apply
+- **Verified:** Read `phase10.rs` apply order — `BackendStarted` state precedes killswitch programming. Comment confirms `ExecStartPre` is opt-in.
+- **Patch:** 
+  1. Program `policy drop` killswitch BEFORE `backend.start()` 
+  2. Make `ExecStartPre` boot killswitch installer **mandatory** in shipped `rustynetd.service` unit
+  3. Daemon refuses to start if boot killswitch table absent (existing verifier — just gate on it)
 
-#### RN-N3 — No upper bound on concurrent IPC connections (local DoS)
-- **Severity:** High · **CWE-770** · **Confidence: Medium**
-- **Location:** `daemon.rs` IPC accept loop
-- **Impact:** Unprivileged user can exhaust daemon file descriptors by opening many IPC connections.
-- **Fix:** Track active connection count; refuse above `MAX_IPC_CONNECTIONS` (16). Add per-UID limits.
+### RN-05 — Policy engine default-allows non-`node:` selectors (revocation bypass)
+- **Source:** SecurityReview §3, re-verified HardeningBacklog §B
+- **Location:** `crates/rustynet-policy/src/lib.rs:305-308` — `selector_membership_allowed` returns `true` for any selector not prefixed `node:`
+- **Verified:** Read the function — confirmed. `group:`, `tag:`, `user:`, raw CIDR selectors skip the membership revocation gate.
+- **Patch:** 
+  ```rust
+  fn selector_membership_allowed(selector: &str, membership: &MembershipState) -> bool {
+      // Resolve non-node selectors to their constituent node set
+      let node_ids = match resolve_selector_to_node_ids(selector, membership) {
+          Some(ids) => ids,
+          None => return false, // Unresolvable → deny (fail-closed)
+      };
+      node_ids.iter().all(|id| membership.is_active_member(id))
+  }
+  ```
+  This closes the bypass: revoked nodes matching `group:`/`tag:`/`user:` rules are denied.
 
----
+### RN-06 — Windows killswitch allows ALL non-DNS LAN egress
+- **Source:** SecurityReview §3, re-verified HardeningBacklog §B
+- **Location:** `crates/rustynetd/src/phase10.rs` — `windows_firewall_allow_interfacetype_args` emits unscoped `interfacetype=lan action=allow`
+- **Verified:** Read the netsh args builder — confirmed unscoped allow.
+- **Patch:** Replace the netsh `interfacetype=lan` allow with WFP filters (unified with E2 tunnel permit):
+  - Permit: loopback + tunnel LUID + UDP to specific peer/relay endpoints + STUN + management/SSH
+  - Block: everything else for BOTH IPv4 and IPv6
+  - WFP sublayer with max weight so netsh rules cannot override
+  - Re-verify in `assert_killswitch`
 
-## 3. Medium-Severity Findings
+### RN-07 — Windows IPv6 leak (native IPv6 egress unblocked)
+- **Source:** SecurityReview §3, HardeningBacklog §B (G8 in progress)
+- **Location:** `crates/rustynetd/src/phase10.rs:3343` — only disables RA, not IPv6 egress
+- **Verified:** G8 work added `RustyNetKS-BlockIpv6Lan` netsh rule, but: (a) not re-verified in `assert_killswitch`, (b) existing autoconfigured global addresses not flushed, (c) uses netsh not WFP.
+- **Patch:** Unify with RN-06 WFP fix — single WFP block for both families. Flush autoconfigured global IPv6 addresses at enforcement time. Assert in `assert_killswitch`.
 
-### 3.1 Existing (from SecurityReview, still open)
+### RN-11 — Empty membership directory = allow-all (fail-open default)
+- **Source:** SecurityReview §3, re-verified HardeningBacklog §B
+- **Location:** `crates/rustynetd/src/phase10.rs:5005` — `if !membership.is_populated()` skips the enforcement gate
+- **Verified:** Read the comment — "pre-membership escape hatch". Also `allowed_contexts` empty list matches all contexts at `policy/lib.rs:289`.
+- **Patch:** 
+  1. Default to deny when membership directory is empty
+  2. Add explicit `--membership-governance=disabled` opt-in for pre-governance window
+  3. Fail closed if snapshot path configured but failed to load
+  4. Empty `allowed_contexts` → deny (not match-all)
 
-- **RN-08:** Key envelope lacks AAD binding (magic/version/salt/nonce not authenticated)
-- **RN-09:** systemd-credential passphrase files may be group-readable
-- **RN-10:** Corrupt rotation ledger silently resets to genesis (fail-open)
-- **RN-12:** Linux DNS leak on exit nodes (broad accept precedes DNS drop)
-- **RN-13:** No handshake flood guard in live path (only in dead `dataplane.rs`)
-- **RN-16:** GitHub Actions pinned to mutable tags (needs SHA-pinning)
-- **RN-25:** Coordination replay window is in-memory only
-
-### 3.2 New Medium Findings
-
-#### RN-N4 — Gossip transport has no per-peer rate limiting
-- **Severity:** Medium · **CWE-770** · **Confidence: Medium**
-- **Location:** `crates/rustynetd/src/gossip_runtime.rs` — `drain_gossip_inbound` processes every received bundle in a tight loop without per-source rate limiting.
-- **Description:** While bundles are bounded (4KB) and signature-verified, a rogue peer can flood forged bundles, consuming CPU with Ed25519 verification. The 4KB cap prevents memory exhaustion but not CPU exhaustion.
-- **Fix:** Add per-peer token-bucket rate limiter (e.g., 10 bundles/sec). Drop above-limit bundles before signature verification.
-
-#### RN-N5 — Enrollment token TTL checked before constant-time HMAC compare (timing leak)
-- **Severity:** Medium · **CWE-208** · **Confidence: Low**
-- **Location:** `crates/rustynetd/src/enrollment_token.rs` and `crates/rustynet-control/src/enrollment.rs`
-- **Description:** The enrollment token verification checks `expires_at < now` BEFORE running the constant-time HMAC comparison. An attacker measuring response time can distinguish "expired token" from "wrong secret," narrowing the brute-force window. The token is 256-bit HMAC-SHA256 so brute-force is impractical regardless — this is defense-in-depth.
-- **Fix:** Move TTL check AFTER the constant-time HMAC verify. Always run full verify before any time-based rejection.
-
-#### RN-N6 — No fuzzing harness for relay hello/session token parser
-- **Severity:** Medium · **CWE-20** · **Confidence: Medium**
-- **Location:** `crates/rustynet-relay/src/transport.rs`, `session.rs`
-- **Description:** The relay processes untrusted UDP from any source address. While the membership decoder has fuzz targets, the relay hello parser and session token verifier do not.
-- **Fix:** Add `cargo-fuzz` targets for `parse_relay_hello`, `verify_session_token`, and rate-limiter state machine.
-
-#### RN-N7 — ~~UPnP XML body has no size cap~~ — **NULLIFIED**
-- **Status:** **Already capped** — `UPNP_HTTP_MAX_BODY_BYTES = 256KB` with `+1` byte overflow detection and test pin at `port_mapper.rs:1674`. HTTP round-trip rejects oversized bodies. Finding withdrawn.
-
-#### RN-N8 — `SystemTime::now()` for security-sensitive expiry (clock-skew attack surface)
-- **Severity:** Medium · **CWE-367** · **Confidence: Low**
-- **Location:** `daemon.rs`, `enrollment_token.rs`, relay session expiry
-- **Description:** Enrollment token TTL, relay session expiry, and gossip freshness windows all use `SystemTime::now()` which can be skewed by NTP, manual clock changes, or suspend/resume. The enrollment token already has an `IssuedInFuture` check (tolerates 300s drift) and the gossip freshness window is symmetric (past + future). These mitigate but don't eliminate the risk.
-- **Fix:** Use `Instant` for monotonic timeouts. For absolute TTL, add a skew-detection alarm (the cross-network preflight already has clock-skew validation — extend to daemon main loop).
-
----
-
-## 4. Low-Severity Findings (New)
-
-#### RN-N9 — Relay session token nonce is 128 bits (adequate, 256 recommended for modern protocols)
-- **Severity:** Low · **CWE-330** · **Confidence: Low**
-- **Location:** `crates/rustynet-control/src/lib.rs` — `RelaySessionToken.nonce: [u8; 16]`
-- **Fix:** Extend to `[u8; 32]` (schema change — coordinated rollout required).
-
-#### RN-N10 — No audit log for day-to-day IPC command execution
-- **Severity:** Low · **CWE-778**
-- **Location:** `daemon.rs` IPC command dispatch
-- **Description:** Role transitions are audited (D12.e) but routine ops (key rotate, exit select, route advertise/retract, enrollment consume) are not.
-- **Fix:** Add structured audit events for security-relevant IPC commands.
-
-#### RN-N11 — `cargo audit`/`cargo deny` not run as pre-commit hook
-- **Severity:** Low · **CWE-1104**
-- **Fix:** Document in AGENTS.md §7. Add `scripts/ci/precommit.sh`.
-
-#### RN-N12 — Port mapper `detect_default_gateway()` reads `/proc/net/route` without size cap
-- **Severity:** Low · **CWE-770** · **Confidence: Low**
-- **Location:** `crates/rustynetd/src/port_mapper.rs:1113`
-- **Description:** `std::fs::read_to_string("/proc/net/route")` reads the entire file into memory. On a normal system this file is <4KB. On a misconfigured system or under `/proc` symlink attack, a large file could be read.
-- **Fix:** Use `BufReader::read_line` with a 64KB cap instead of `read_to_string`. Not exploitable in practice (daemon runs as root, controls `/proc`).
+### RN-02 — Dead `dataplane.rs` (assurance failure)
+- **Source:** SecurityReview §3
+- **Location:** `crates/rustynetd/src/dataplane.rs` — entire module is dead code
+- **Verified:** `LinuxDataplane` referenced only in its own `#[cfg(test)]` block. Live path is `phase10.rs`.
+- **Patch:** Delete `dataplane.rs`. Point `security_audit_catalog.rs` at `phase10.rs` enforcement. This removes the false assurance that someone reading `dataplane.rs` is validating the live killswitch.
 
 ---
 
-## 5. Positive Findings — Controls Correctly Implemented
+## 3. New Verified Findings
 
-This section credits the security controls verified during the deep scan as present, correct, and tested.
+### RN-N1 — Production `expect()` panic in daemon relay-client establish path (DoS)
+- **Severity:** High · **CWE-248**
+- **Location:** `crates/rustynetd/src/daemon.rs:5908`
+  ```rust
+  let mut relay_client = self
+      .relay_client
+      .take()
+      .expect("relay client should remain available during establish");
+  ```
+- **Verified:** `self.relay_client` is `Option<RelayClient>`. If this code path executes twice (edge case: concurrent traversal probe + relay health check), the second `take()` returns `None` → panic → daemon crash → tunnel drops.
+- **Patch:**
+  ```rust
+  let mut relay_client = self
+      .relay_client
+      .take()
+      .ok_or_else(|| DaemonError::State("relay client already consumed".into()))?;
+  ```
+  This propagates the error instead of crashing, keeping the daemon alive with the tunnel intact.
 
-### 5.1 Privileged Helper (Exemplary)
+### RN-N2 — Local IPC commands lack per-message anti-replay
+- **Severity:** Medium · **CWE-294**
+- **Location:** `crates/rustynetd/src/ipc.rs` — `IpcCommand::Local` dispatch path has no sequence number or nonce
+- **Verified:** The `RemoteCommandEnvelope` has `nonce: u64` + Ed25519 signature. But `CommandEnvelope::Local` parsed from the Unix socket goes directly to command dispatch with only SO_PEERCRED for auth. A local attacker in the `rustynetd` group can capture and replay commands.
+- **Patch:** Add a per-connection sequence counter to the local IPC path:
+  ```rust
+  // In the IPC accept handler:
+  let mut conn_seq: u64 = 0;
+  // On each command:
+  if cmd_seq <= conn_seq {
+      return Err("replay detected: sequence must be strictly increasing");
+  }
+  conn_seq = cmd_seq;
+  ```
+  For remote-admin, the existing `nonce` + signature mechanism is sufficient.
 
-| Control | Enforcement | Verified |
-|---|---|---|
-| Closed-enum program allowlist | `PrivilegedCommandProgram` enum — only Ip, Nft, Pfctl, Netsh, Wg, DnsFailclosedFile, SystemdResolve, Powershell | `validate_request` gates all paths |
-| argv-only exec, no shell | `Command::new(program).args(args)` — never `sh -c` | grep confirms no shell construction |
-| Shell metacharacter rejection | `validate_request` rejects `;`, `|`, `&`, `$`, `` ` ``, `\`, `"`, `'`, `(`, `)`, `<`, `>`, `\n`, `\r`, `\0` | Unit test coverage |
-| Path traversal rejection | Args containing `..` or starting with `/` rejected where appropriate | Per-program schema |
-| Root-owned binary validation | `validate_privileged_program_binary` checks absolute, canonicalize, regular-file, executable, non-group-writable, root-owned | Tests |
-| Post-connect peer-uid check | RN-17 fixed — verifies peer uid on established fd after `connect()` | Test: `peer_uid_reports_connected_socket_owner_uid` |
-| Framed protocol with size caps | 4KB max per command, bounded reads | `MAX_COMMAND_BYTES = 4096` |
-| Subprocess timeouts | Every external command has a kill-on-timeout watchdog | `run_helper_command_with_timeout` |
-| Pkill constrained | Only `-TERM <pid>` where `pid > 1` — no broad `pkill -f` | `validate_request` schema |
-| DnsFailclosedFile builtin | In-helper file write — no external binary, no path/content crosses boundary | `is_builtin()` dispatch |
-
-### 5.2 Cryptography (Best-in-Class)
-
-| Control | Enforcement |
-|---|---|
-| vetted primitives only | ed25519-dalek 2.2 `verify_strict`, XChaCha20-Poly1305, Argon2id @ OWASP params, HMAC-SHA256 |
-| fail-closed CSPRNG | `OsRng::try_fill_bytes` with error propagation — never falls back to ThreadRng |
-| domain-separated HMAC | Every HMAC context has a unique prefix (`"rustynet:enrollment:v1"`, `"rustynet:peer_gossip:v1"`, etc.) |
-| constant-time compares | `subtle::ConstantTimeEq` for enrollment token HMAC, all secret comparisons |
-| redacting Debug | `EnrollmentToken`, `SecretKey`, all key-bearing types redact in Debug |
-| zeroize on Drop | `Zeroizing` wrappers; `SecretKey::drop` calls `zeroize()` (RL-4) |
-| all-zero key rejection | Key material validated non-zero at load |
-| strict Ed25519 | `verify_strict()` at all 10 sites, rejects non-canonical S and small-order points (RL-3) |
-| macOS Keychain validation | `is_valid_key_identifier` before keychain access (RL-5) |
-
-### 5.3 Trust & Anti-Replay (Solid)
-
-| Control | Enforcement |
-|---|---|
-| verify-before-mutate | Signature checked before `preview_next_state`/`apply_signed_update` |
-| quorum enforcement | `state.quorum_threshold` checked before accepting signed update |
-| epoch + state-root chaining | `previous_state_root` validated in each update |
-| per-source replay watermarks | `SeenSequenceState` persisted to disk, loaded at startup, fail-closed on corrupt |
-| freshness windows | 300s past + future drift rejection on gossip bundles |
-| future-drift rejection | Enrollment tokens with `issued_at > now + 300s` rejected |
-| atomic token consumption | Single-use ledger persisted before peer registration |
-| HMAC before TTL | (Gap: RN-N5) — defense-in-depth item |
-
-### 5.4 Network Parsers (Bounded & Safe)
-
-| Parser | Buffer Size | Overflow Protection | Test Pins |
-|---|---|---|---|
-| STUN | 1024B | Length check before index; attribute boundary check; 4-byte alignment padding | 8 unit tests |
-| Gossip | 4KB | `MAX_GOSSIP_DATAGRAM_BYTES` enforced on send + receive; oversized datagram rejection test | 6 integration tests |
-| IPC | 4KB | `MAX_COMMAND_BYTES` via `stream.take()`; null-byte rejection | Per-command tests |
-| UPnP HTTP | 256KB | `UPNP_HTTP_MAX_BODY_BYTES + 1` overflow detection; body-too-large test pin | `upnp_http_round_trip_rejects_oversize_response_body` |
-| PCP | Fixed 110B | `PCP_MAP_RESPONSE_LEN + 64` buffer; response length validation | Unit tests |
-| NAT-PMP | 64B | Fixed buffer; length check before parse | Unit tests |
-| Enrollment token | 64B | `TOKEN_BINARY_LEN` const; length check before decode; constant-time HMAC | 5 tests |
-| DNS zone | 4KB IPC cap | `MAX_RECORD_COUNT` cap; `fields.len()` cross-check | Unit tests |
-| SSDP | 4KB | `MAX_SSDP_DISCOVERED_DEVICES = 4`; 4KB response buffer | Unit tests |
+### RN-N3 — No IPC connection limit (local DoS via fd exhaustion)
+- **Severity:** Medium · **CWE-770**
+- **Location:** `crates/rustynetd/src/daemon.rs` IPC accept loop
+- **Verified:** The daemon accepts IPC connections in a loop with no counting or rate limiting. Each connection consumes a file descriptor.
+- **Patch:** 
+  ```rust
+  const MAX_IPC_CONNECTIONS: usize = 16;
+  let mut active_connections: usize = 0;
+  // In accept loop:
+  if active_connections >= MAX_IPC_CONNECTIONS {
+      // Accept and immediately close to drain the listen queue
+      let _ = listener.accept();
+      continue;
+  }
+  ```
 
 ---
 
-## 6. Modern Defense-in-Depth Recommendations
+## 4. Medium — Verified Open from SecurityReview
 
-### 6.1 systemd Sandbox Hardening
-Current `rustynetd.service` has `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`. Add:
+- **RN-08:** Key envelope lacks AAD binding — `rustynet-crypto/lib.rs:942` (empty AAD). Patch: bind `MAGIC || version || salt || nonce` as AAD.
+- **RN-09:** systemd-credential passphrase group-readable — `key_material.rs:674` (wider mask on `/run/credentials/` prefix). Patch: require parent dir `0o700` + file group = 0 before widening.
+- **RN-10:** Corrupt rotation ledger → genesis reset — `daemon.rs:8082` (returns `genesis()` on any error). Patch: distinguish absent (→genesis) from corrupt (→refuse to proceed).
+- **RN-12:** DNS leak on exit nodes (broad accept precedes DNS drop) — `phase10.rs:1980` vs `:2020`. Patch: insert DNS drop with higher precedence.
+- **RN-13:** No handshake flood guard in live path — only in dead `dataplane.rs`. Patch: implement in `phase10.rs` or rely on boringtun cookie mechanism (document decision).
+- **RN-16:** GitHub Actions pinned to mutable tags — `.github/workflows/`. Patch: SHA-pin every `uses:`.
+- **RN-25:** Coordination replay window in-memory only — `traversal.rs:833`. Patch: persist seen-nonce set.
+
+---
+
+## 5. Medium — New Verified
+
+### RN-N4 — Gossip transport has no per-peer rate limiting (CPU DoS)
+- **Location:** `crates/rustynetd/src/gossip_runtime.rs` — `drain_gossip_inbound` loop
+- **Verified:** Bundles are 4KB-capped and signature-verified, but a rogue peer can flood forged bundles consuming CPU with Ed25519 verification. No per-source rate limiter exists.
+- **Patch:** Token-bucket per source node_id (10 bundles/sec, burst 20). Drop above-limit BEFORE signature verification.
+
+### RN-N5 — Enrollment token TTL checked before constant-time HMAC (timing side-channel)
+- **Location:** `crates/rustynetd/src/enrollment_token.rs` — verify path checks `expires_at < now` before HMAC
+- **Verified:** The token verification flow: decode → check expiry → check consumed-ledger → HMAC compare. The expiry check returns early with `Expired`, giving different response timing than `TagMismatch`. 256-bit HMAC makes brute-force impractical; defense-in-depth gap.
+- **Patch:** Reorder: decode → HMAC compare (constant-time) → check consumed-ledger → check expiry. Always perform full constant-time verify before any time-based rejection.
+
+### RN-N6 — No fuzzing harness for relay hello parser
+- **Location:** `crates/rustynet-relay/src/transport.rs` — relay hello parse, `session.rs` — token verify
+- **Verified:** Membership decoder has fuzz targets (`cargo-fuzz`). Relay hello parser processes untrusted UDP from any source — no fuzz target exists.
+- **Patch:** Add `cargo-fuzz` targets for `parse_relay_hello`, `verify_session_token`, rate-limiter state machine.
+
+---
+
+## 6. Items from HardeningBacklog (2026-06-01) — Not Yet in SecurityReview
+
+### HB-1 — Smoke harnesses use plain `remove_file` instead of secure scrub
+- **Severity:** Low · **Location:** `windows_tunnel_smoke.rs`, `windows_killswitch_smoke.rs`
+- **Patch:** Call `crate::key_material::remove_file_if_present(&key_path)` (overwrites-then-deletes) on all paths.
+
+### HB-2 — `write_runtime_private_key` 0o600 is `cfg(unix)`-only
+- **Severity:** Low · **Location:** `key_material.rs:739`
+- **Patch:** On Windows, set explicit owner-only ACL via `SetNamedSecurityInfoW` or write to validated hardened dir.
+
+### HB-3 — Killswitch-smoke recovery uses PATH-resolved `netsh` (RN-20 class)
+- **Severity:** Low · **Location:** `windows_killswitch_smoke.rs` — `Command::new("netsh")`
+- **Patch:** Use absolute `%SystemRoot%\System32\netsh.exe`.
+
+### HB-4 — Killswitch-smoke Drop guard doesn't clean up IPv6 LAN block on panic
+- **Severity:** Low · **Location:** `windows_killswitch_smoke.rs` — `FirewallRestoreGuard::drop`
+- **Patch:** Add best-effort `netsh advfirewall firewall delete rule name=RustyNetKS-BlockIpv6Lan` to Drop guard.
+
+### HB-5 — ipv6-smoke connects to hardcoded public third-party IPv6
+- **Severity:** Info · **Location:** `windows_killswitch_smoke.rs` — `TcpStream::connect_timeout("[2606:4700:4700::1111]:443")`
+- **Patch:** Prefer lab-local off-LAN IPv6 target; document dependency.
+
+### HB-6 — vm-lab orchestrator builds PowerShell scripts via `format!`
+- **Severity:** Info · **Location:** `crates/rustynet-cli/src/vm_lab/**`
+- **Patch:** Centralize PS-script assembly behind a builder that quotes by construction.
+
+### B.4.1 — DNS rebind/re-poison protection (partially landed)
+- **Severity:** Medium · **Location:** DNS zone parser rejects loopback/link-local/test-net `expected_ip`; resolver-output filter still pending
+- **Patch:** Complete the resolver-output filter when the DNS protocol handler lands.
+
+---
+
+## 7. Attack Surface Matrix (Verified)
+
+| Boundary | Protocol | Untrusted Input | Parsing Safety | AuthN/Z | Rate Limit | Fuzz Target |
+|---|---|---|---|---|---|---|
+| WireGuard | UDP:51820 | Handshake + transport | Boringtun (audited) | Preshared key | Boringtun cookie | N/A (upstream) |
+| Relay | UDP:51821 | Hello + session token | Bounded, **no fuzz** (RN-N6) | Signed token | Token-bucket (10k pps) | **MISSING** |
+| Gossip | UDP:51821 | Signed bundle | 4KB cap, verify_strict | Ed25519 | **NONE** (RN-N4) | **MISSING** |
+| STUN | UDP:19302→ | Binding response | 1024B, boundary-checked | None (public) | N/A | **MISSING** |
+| UPnP | UDP:1900/TCP | SSDP + SOAP + XML | 256KB HTTP cap, control-char sanitized | None (LAN) | 4-device cap | **MISSING** |
+| PCP | UDP:5351 | MAP response | Fixed 110B buffer | None (LAN) | 5 retry cap | **MISSING** |
+| IPC (local) | Unix socket | Newline command | 4KB cap, null-byte rejected | SO_PEERCRED | **NONE** (RN-N3) | N/A |
+| IPC (remote) | Unix socket | Signed envelope | 4KB cap, signature-verified | Ed25519 + nonce | Per-command nonce | N/A |
+| Bundle-pull | TCP:51822 | HTTP GET + token | Bounded response | HMAC token | Single-use ledger | **MISSING** |
+| Enrollment | TCP (mesh) | 64B token | Constant-time HMAC | Token + TTL | Single-use ledger | Present |
+| DNS resolver | UDP:53 (lo) | DNS question | Bounded, panic-free | None (local) | N/A | **MISSING** |
+
+---
+
+## 8. Hardening Patches — Code Examples
+
+### 8.1 Fix RN-03 (force_fail_closed fatal)
+
+```rust
+// BEFORE (daemon.rs — 10 sites):
+let _ = self.controller.force_fail_closed("membership_stale");
+
+// AFTER:
+if let Err(e) = self.controller.force_fail_closed("membership_stale") {
+    tracing::error!(
+        %e,
+        reason = "membership_stale",
+        "force_fail_closed failed; dataplane safety cannot be guaranteed — aborting"
+    );
+    self.restrict_recoverable(format!(
+        "force_fail_closed failed: {e}"
+    ));
+    // On first bootstrap with no prior killswitch table, abort so systemd
+    // restarts us with the boot killswitch backstop. On steady-state with a
+    // prior generation table, the existing policy drop still protects.
+    if self.is_first_bootstrap() {
+        std::process::abort();
+    }
+}
 ```
-ProtectHome=true
-ProtectProc=invisible
-RestrictSUIDSGID=true
-RemoveIPC=true
-RestrictRealtime=true
-MemoryDenyWriteExecute=true
+
+### 8.2 Fix RN-05 (non-node selector revocation)
+
+```rust
+// BEFORE (rustynet-policy/src/lib.rs:305):
+fn selector_membership_allowed(selector: &str, membership: &MembershipState) -> bool {
+    let node_id = match selector.strip_prefix("node:") {
+        Some(id) => id,
+        None => return true,  // BUG: non-node selectors skip revocation
+    };
+    membership.is_active_member(node_id)
+}
+
+// AFTER:
+fn selector_membership_allowed(selector: &str, membership: &MembershipState) -> bool {
+    let node_ids = resolve_selector_to_member_node_ids(selector, membership);
+    // Unresolvable identity → deny (fail-closed)
+    node_ids.is_some_and(|ids| ids.iter().all(|id| membership.is_active_member(id)))
+}
 ```
-Use `systemd-analyze security rustynetd.service` as CI gate (target exposure score ≤ 2.0).
 
-### 6.2 TPM2-Backed Key Sealing
-For anchor/exit nodes, bind the WireGuard private key to TPM2 PCR state (kernel, initrd, systemd). Even root cannot exfiltrate the key without booting a modified kernel. Use `tpm2-policy` with `tpm2_unseal`.
+### 8.3 Fix RN-N1 (relay_client expect panic)
 
-### 6.3 Continuous Fuzzing Infrastructure
-Add `cargo-fuzz` targets for: relay hello parser, session token verifier, gossip decoder, STUN response parser, PCP MAP decoder, DNS zone decoder. Run in CI for 1 hour per commit.
+```rust
+// BEFORE (daemon.rs:5908):
+let mut relay_client = self
+    .relay_client
+    .take()
+    .expect("relay client should remain available during establish");
 
-### 6.4 Formal Membership Model
-Model `apply_signed_update` in TLA+ / Stateright. Verify invariants: epoch monotonicity, quorum enforcement, replay-watermark correctness, no capability self-promotion, transition matrix completeness.
-
-### 6.5 Constant-Time CI Gate
-Add `scripts/ci/constant_time_gates.sh` that greps for `==`/`!=` on types containing `Secret`, `Key`, `Passphrase`, `Token` outside `subtle` blocks.
-
----
-
-## 7. Attack Surface Matrix (Refined)
-
-| Boundary | Protocol | Untrusted Input | Parsing Safety | AuthN/Z | Rate Limit |
-|---|---|---|---|---|---|
-| WireGuard peer | UDP:51820 | WG handshake + transport | Boringtun (audited) | WG preshared key | Boringtun cookie |
-| Relay | UDP:51821 | Relay hello + session token | Bounded, **no fuzz targets** (RN-N6) | Signed token | Token-bucket (10k pps) |
-| Gossip | UDP:51821 | Signed membership bundle | 4KB cap, version-gated, signature-verified | Ed25519 `verify_strict` | **NONE** ⚠️ (RN-N4) |
-| STUN | UDP:19302→ | STUN binding response | 1024B, length-checked, attr-boundary-checked | None (public) | N/A |
-| UPnP | UDP:1900/TCP | SSDP + SOAP + XML desc | 256KB HTTP cap, 4KB SSDP cap, control-char sanitized | None (LAN) | 4-device cap |
-| PCP | UDP:5351 | PCP MAP response | Fixed 110B buffer | None (LAN) | 5 retry cap |
-| NAT-PMP | UDP:5351 | NAT-PMP response | Fixed 64B buffer | None (LAN) | 9 retry cap (RFC) |
-| IPC | Unix socket | Newline-delimited command | 4KB cap, null-byte rejected, per-command SO_PEERCRED | uid check | **NONE** ⚠️ (RN-N3) |
-| Anchor bundle-pull | TCP:51822 | HTTP GET with token header | Bounded response | HMAC token | Single-use ledger |
-| Enrollment | TCP (mesh) | 64B enrollment token | Constant-time HMAC, TTL-bounded | Token + TTL | Single-use ledger |
-| DNS resolver | UDP:53 (loopback) | DNS question | Bounded, panic-free | None (local) | N/A |
+// AFTER:
+let mut relay_client = self
+    .relay_client
+    .take()
+    .ok_or_else(|| {
+        DaemonError::State(
+            "relay client already consumed; concurrent establish call detected".into()
+        )
+    })?;
+```
 
 ---
 
-## 8. Prioritized Remediation Roadmap
+## 9. Cross-Reference
 
-### P0 — Fix Now (fail-open / leak / DoS)
-1. **RN-03 + RN-04:** Make `force_fail_closed` fatal + program killswitch before backend up
-2. **RN-N1:** Remove all 5 production `expect()`/`unwrap()` panics from daemon.rs
-3. **RN-06 + RN-07:** Windows killswitch parity + IPv6 block
-4. **RN-05 + RN-11:** Close policy default-allow paths
-5. **RN-02:** Delete dead `dataplane.rs`
-
-### P1 — High-Value Integrity
-6. **RN-10:** Corrupt rotation ledger → fail closed
-7. **RN-08:** AAD-bind key envelope
-8. **RN-09:** Tighten systemd-credential group-read gate
-9. **RN-16:** SHA-pin GitHub Actions
-10. **RN-N2:** IPC anti-replay (nonce + HMAC)
-
-### P2 — Defense-in-Depth
-11. **RN-N4:** Gossip per-peer rate limiting
-12. **RN-N6:** Fuzz targets for relay + gossip
-13. **RN-N3:** IPC connection limits
-14. **RN-N5:** Enrollment TTL after constant-time compare
-15. **RN-N8:** SystemTime→Instant migration + clock-skew alarm
-16. **§6.1:** systemd sandbox hardening
-
-### P3 — Modernization (post-GA)
-17. **§6.2:** TPM2 key sealing
-18. **§6.4:** Formal membership model
-19. **§6.3:** Continuous fuzzing infrastructure
-20. **§6.5:** Constant-time CI gate
-
----
-
-## 9. SecurityMinimumBar Compliance Matrix
-
-| Control (§3) | Status | Gap |
-|---|---|---|
-| 1. Proven crypto only | ✅ Upheld | No custom crypto; all vetted primitives |
-| 2. TLS 1.3 for control-plane | ❌ **Gap** | IPC is plaintext (RN-N2) |
-| 3. Auth/enrollment hardening | ⚠️ Partial | Rate limiting missing on IPC + gossip |
-| 4. Secret/key handling | ⚠️ Partial | RN-08 (AAD), RN-09 (group-read), RN-33 (Windows no-op) |
-| 5. Host-OS boundary | ✅ Upheld | Platform enforcement present; Linux-only blocked on non-Linux |
-| 6. Default-deny ACL | ❌ **Gap** | RN-05 (non-node selectors), RN-11 (empty membership) |
-| 7. Web/admin security | ⚠️ N/A | No web UI; IPC needs anti-replay |
-| 8. Data-plane leak prevention | ❌ **Gap** | RN-03/04 (killswitch ordering), RN-06/07 (Windows), RN-12 (DNS exit) |
-| 9. Audit and forensics | ⚠️ Partial | Role audit exists; day-to-day IPC commands not audited |
-| 10. Supply-chain integrity | ⚠️ Partial | RN-15 fixed (`--locked`); RN-16 (SHA-pin), RN-30 (toolchain), RN-31 (deny.toml) open |
-
----
-
-## 10. Cross-Reference
-
-- **Primary security review:** `documents/operations/active/SecurityReview_2026-05-24.md` (38 findings)
-- **Security baseline:** `documents/SecurityMinimumBar.md`
-- **Agent contract:** `AGENTS.md` §3 (Engineering Constraints), §4 (Security Baseline), §10 (Common Patterns)
-- **Dataplane plan:** `documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md`
-- **Anchor design:** `documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md`
-- **Role taxonomy:** `documents/operations/active/NodeRoleTaxonomy_2026-05-21.md`
+- **SecurityReview_2026-05-24.md** — 38 findings, 8 fixed, 30 open (authoritative firm-grade review)
+- **SecurityHardeningAudit_2026-04-28.md** — Phase A+B comparative audit (most items cleared)
+- **SecurityHardeningBacklog_2026-06-01.md** — Net-new HB-1..7 items + re-verified P0s
+- **SecurityMinimumBar.md** — Release-blocking controls
+- **AGENTS.md §3-4, §10** — Engineering constraints + security patterns
