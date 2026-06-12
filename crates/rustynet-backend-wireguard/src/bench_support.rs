@@ -138,7 +138,7 @@ impl DataplaneEnginePair {
         // Receiver consumes init, emits response.
         let response = self
             .receiver
-            .process_inbound_ciphertext(self.sender_addr, self.receiver_addr, init_ct, 1)
+            .process_inbound_ciphertext(self.sender_addr, self.receiver_addr, &init_ct, 1)
             .expect("receiver processes handshake init");
         if let Some(resp_ct) = response.outbound_ciphertext_packets.first() {
             // Sender consumes the response → handshake complete.
@@ -147,7 +147,7 @@ impl DataplaneEnginePair {
                 .process_inbound_ciphertext(
                     self.receiver_addr,
                     self.sender_addr,
-                    resp_ct.payload.clone(),
+                    &resp_ct.payload,
                     1,
                 )
                 .expect("sender processes handshake response");
@@ -177,7 +177,7 @@ impl DataplaneEnginePair {
     pub fn decrypt(&mut self, ciphertext: Vec<u8>) -> usize {
         let outcome = self
             .receiver
-            .process_inbound_ciphertext(self.sender_addr, self.receiver_addr, ciphertext, 1)
+            .process_inbound_ciphertext(self.sender_addr, self.receiver_addr, &ciphertext, 1)
             .expect("process inbound ciphertext");
         outcome.tunnel_plaintext_packets.len()
     }

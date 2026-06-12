@@ -10,6 +10,7 @@ pub(crate) const AUTHORITATIVE_TRANSPORT_LABEL: &str =
 /// A received datagram with sender address and payload.
 /// Mirrors the same-named type in `userspace_shared_macos::socket`
 /// so the shared runtime can use it across both backends.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReceivedDatagram {
     pub(crate) remote_addr: SocketAddr,
@@ -113,6 +114,7 @@ impl AuthoritativeSocket {
     /// Prefer `try_recv_into` with a reused scratch buffer for hot-path use;
     /// this method exists for compatibility with the shared runtime's
     /// `ReceivedDatagram`-based interface.
+    #[allow(dead_code)]
     pub(crate) fn try_recv(&self) -> Result<Option<ReceivedDatagram>, BackendError> {
         let mut scratch = vec![0u8; 65536];
         match self.try_recv_into(&mut scratch) {

@@ -24,6 +24,9 @@ use crate::userspace_shared::handshake::HandshakeTelemetry;
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK: usize = 64;
 const MAX_TUN_PACKETS_PER_TICK: usize = 64;
+/// Size of the long-lived UDP/TUN receive scratch buffers (max
+/// datagram / max IP packet).
+const RECV_SCRATCH_BYTES: usize = 65_535;
 
 type ReplySender<T> = SyncSender<Result<T, BackendError>>;
 
@@ -451,6 +454,20 @@ struct RuntimeState {
     recorded_authoritative_operations: Vec<RecordedAuthoritativeTransportOperation>,
     recorded_peer_ciphertext_egress: Vec<RecordedPeerCiphertextEgress>,
     handshake_telemetry: HandshakeTelemetry,
+    // Long-lived receive scratch buffers (UDP and TUN) reused across every
+    // poll pass instead of allocating+zeroing a fresh 64 KiB Vec per packet.
+    // Owned by the single worker thread; taken out (mem::take) for the
+    // duration of a poll pass so engine calls can borrow `self` mutably.
+    udp_recv_scratch: Vec<u8>,
+    tun_recv_scratch: Vec<u8>,
+    // True when the most recent poll pass consumed its full per-tick budget,
+    // i.e. more data is likely still pending. The worker then waits with a
+    // zero timeout instead of the 10ms idle interval, removing the
+    // ~6.4k pps/direction throughput ceiling while keeping the per-pass
+    // budgets (DoS fairness between packet work and control commands) and
+    // the commands-first loop structure exactly as before.
+    udp_budget_exhausted: bool,
+    tun_budget_exhausted: bool,
 }
 
 impl RuntimeState {
@@ -716,6 +733,13 @@ impl RuntimeState {
     }
 
     fn next_wait_timeout(&self) -> Duration {
+        // Data backlog: the last poll pass consumed its full budget, so more
+        // packets are likely already queued — re-poll immediately. Commands
+        // are still drained first in the worker loop, so the per-pass budgets
+        // keep their DoS-fairness role; only the idle sleep is skipped.
+        if self.udp_budget_exhausted || self.tun_budget_exhausted {
+            return Duration::ZERO;
+        }
         let Some(outstanding) = self.outstanding_round_trip.as_ref() else {
             return WORKER_POLL_INTERVAL;
         };
@@ -731,34 +755,57 @@ impl RuntimeState {
     }
 
     fn poll_authoritative_socket(&mut self) -> Result<(), BackendError> {
+        // Take the scratch out of `self` for the pass so the engine call can
+        // borrow `self` mutably while the payload slice stays alive.
+        let mut scratch = std::mem::take(&mut self.udp_recv_scratch);
+        let result = self.poll_authoritative_socket_with(&mut scratch);
+        self.udp_recv_scratch = scratch;
+        result
+    }
+
+    fn poll_authoritative_socket_with(&mut self, scratch: &mut [u8]) -> Result<(), BackendError> {
+        let mut drained = 0usize;
         for _ in 0..MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK {
-            let Some(datagram) = self.authoritative_socket.try_recv()? else {
+            let Some((len, remote_addr)) = self.authoritative_socket.try_recv_into(scratch)? else {
                 break;
             };
-            if self.try_deliver_round_trip_response(&datagram)? {
+            drained += 1;
+            let payload = &scratch[..len];
+            if self.try_deliver_round_trip_response(remote_addr, payload)? {
                 continue;
             }
 
             let local_addr = self.authoritative_socket.local_addr()?;
             let outcome = self.engine.process_inbound_ciphertext(
-                datagram.remote_addr,
+                remote_addr,
                 local_addr,
-                &datagram.payload,
+                payload,
                 self.authoritative_socket.transport_generation(),
             )?;
             self.apply_engine_processing_outcome(outcome)?;
         }
+        self.udp_budget_exhausted = drained == MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK;
         Ok(())
     }
 
     fn poll_tun_device(&mut self) -> Result<(), BackendError> {
+        let mut scratch = std::mem::take(&mut self.tun_recv_scratch);
+        let result = self.poll_tun_device_with(&mut scratch);
+        self.tun_recv_scratch = scratch;
+        result
+    }
+
+    fn poll_tun_device_with(&mut self, scratch: &mut [u8]) -> Result<(), BackendError> {
+        let mut drained = 0usize;
         for _ in 0..MAX_TUN_PACKETS_PER_TICK {
-            let Some(packet) = self.tun_device.recv_packet()? else {
+            let Some(len) = self.tun_device.recv_packet_into(scratch)? else {
                 break;
             };
+            drained += 1;
+            let packet = &scratch[..len];
             let outcome = match self
                 .engine
-                .inject_plaintext_packet(&packet, self.authoritative_socket.transport_generation())
+                .inject_plaintext_packet(packet, self.authoritative_socket.transport_generation())
             {
                 Ok(outcome) => outcome,
                 Err(err) if should_drop_tun_plaintext_packet_error(&err) => continue,
@@ -766,6 +813,7 @@ impl RuntimeState {
             };
             self.apply_engine_processing_outcome(outcome)?;
         }
+        self.tun_budget_exhausted = drained == MAX_TUN_PACKETS_PER_TICK;
         Ok(())
     }
 
@@ -800,12 +848,13 @@ impl RuntimeState {
 
     fn try_deliver_round_trip_response(
         &mut self,
-        datagram: &super::socket::ReceivedDatagram,
+        remote_addr: SocketAddr,
+        payload: &[u8],
     ) -> Result<bool, BackendError> {
         let Some(outstanding) = self.outstanding_round_trip.as_ref() else {
             return Ok(false);
         };
-        if datagram.remote_addr != outstanding.remote_addr {
+        if remote_addr != outstanding.remote_addr {
             return Ok(false);
         }
         if self.authoritative_socket.transport_generation() != outstanding.transport_generation {
@@ -815,8 +864,10 @@ impl RuntimeState {
         let local_addr = self.authoritative_socket.local_addr()?;
         let response = AuthoritativeTransportResponse {
             local_addr,
-            remote_addr: datagram.remote_addr,
-            payload: datagram.payload.clone(),
+            remote_addr,
+            // Owned copy only on the (rare) round-trip match path; data
+            // frames stay borrowed from the receive scratch.
+            payload: payload.to_vec(),
         };
         let Some(outstanding) = self.outstanding_round_trip.take() else {
             return Ok(false);
@@ -1007,6 +1058,10 @@ fn run_worker(parts: WorkerRuntimeParts) {
         recorded_authoritative_operations: Vec::new(),
         recorded_peer_ciphertext_egress: Vec::new(),
         handshake_telemetry: HandshakeTelemetry::default(),
+        udp_recv_scratch: vec![0u8; RECV_SCRATCH_BYTES],
+        tun_recv_scratch: vec![0u8; RECV_SCRATCH_BYTES],
+        udp_budget_exhausted: false,
+        tun_budget_exhausted: false,
     };
 
     match state.authoritative_identity() {
@@ -1642,6 +1697,10 @@ mod tests {
                 recorded_authoritative_operations: Vec::new(),
                 recorded_peer_ciphertext_egress: Vec::new(),
                 handshake_telemetry: HandshakeTelemetry::default(),
+                udp_recv_scratch: vec![0u8; RECV_SCRATCH_BYTES],
+                tun_recv_scratch: vec![0u8; RECV_SCRATCH_BYTES],
+                udp_budget_exhausted: false,
+                tun_budget_exhausted: false,
             },
             tun_state,
             private_key,
