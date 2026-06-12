@@ -6,7 +6,9 @@
 
 ## 0. Methodology
 
-Each finding below was verified by reading the actual source code at the cited location. Findings that could not be confirmed were removed. Severity reflects both exploitability and blast radius. Every finding includes a concrete fix direction.
+Each finding below was verified by reading the actual source code at the cited location. Findings that could not be confirmed were removed. Severity reflects both exploitability and blast radius.
+
+**Important:** Fix directions in this document are suggestions — sketches of one possible approach, not prescriptive mandates. The implementer should research the best solution for each finding using their knowledge of the codebase, the project's architecture, and the relevant RFCs. Do not blindly copy the suggested code.
 
 **Sources cross-referenced:**
 - `SecurityReview_2026-05-24.md` — 38 findings (8 fixed, 30 open)
@@ -34,16 +36,11 @@ daemon.rs:8330   let _ = self.controller.force_fail_closed("reconcile_apply_fail
 ```
 `force_fail_closed` → `block_all_egress()` → programs `policy drop` killswitch. If this fails (nft unavailable, helper down, transaction race), the error is swallowed. Worst case: first bootstrap, no prior killswitch table exists → daemon proceeds as if protected → host egresses cleartext.
 
-**Fix direction:**
-```rust
-// Replace each `let _ =` with:
-if let Err(e) = self.controller.force_fail_closed(reason) {
-    tracing::error!(%e, reason, "force_fail_closed failed; cannot guarantee dataplane safety");
-    self.restrict_recoverable(format!("force_fail_closed failed: {e}"));
-    return; // or abort on first-bootstrap path
-}
-```
-At minimum, never discard the Result without logging at error level. On the bootstrap path (no prior generation table), abort to let systemd's mandatory boot killswitch backstop.
+**Suggested approach** (the implementer should research the best solution):
+- At minimum, never discard the Result without error-level logging
+- On the bootstrap path (no prior generation table), aborting lets systemd's mandatory boot killswitch backstop
+- On the steady-state path (prior generation table exists), the existing policy drop still protects, so a retry-with-backoff may be appropriate
+- The implementer should evaluate whether `abort()`, retry, or a different escalation fits the project's fail-closed contract
 
 ---
 
@@ -62,10 +59,10 @@ Order in `apply_generation_stages`:
 
 There is a window between steps 1 and 6 where the tunnel interface exists with routes but no `policy drop`. If the daemon crashes or is killed during this window, the host has routes with no killswitch. The `ExecStartPre` boot killswitch (`linux_killswitch_boot.rs`) is **opt-in** (`--install-boot-killswitch`).
 
-**Fix direction:**
-1. Move `apply_firewall_killswitch()` to BEFORE `backend.start()`
-2. Make `ExecStartPre` boot killswitch **mandatory** in the shipped `rustynetd.service` unit
-3. Gate `backend.start()` on boot killswitch table presence (verifier already exists)
+**Suggested approach** (the implementer should research the best solution):
+- Reorder so the killswitch is programmed before the interface comes up (may need carve-outs for bootstrap traffic like STUN and control-plane fetch)
+- Consider making the boot killswitch mandatory in the shipped unit, not opt-in
+- The existing verifier that checks for boot killswitch table presence could gate `backend.start()`
 
 ---
 
@@ -86,18 +83,10 @@ fn selector_node_id(selector: &str) -> Option<&str> {
 ```
 A revoked node matching a `group:family` or `user:admin` rule is permitted. Revocation is silently ineffective across the entire non-`node:` rule surface.
 
-**Fix direction:**
-```rust
-fn selector_membership_allowed(selector: &str, membership: &MembershipDirectory) -> bool {
-    // Resolve group/tag/user selectors to their member node set
-    let node_ids = resolve_selector_to_node_ids(selector, membership);
-    match node_ids {
-        Some(ids) => ids.iter().all(|id| membership.node_status(id) == MembershipStatus::Active),
-        None => false, // Unresolvable → deny (fail-closed)
-    }
-}
-```
-If group resolution is not yet implemented, the immediate mitigation is to return `false` for unresolvable non-`node:` selectors, breaking rules that use group selectors but closing the revocation bypass immediately.
+**Suggested approach** (the implementer should research the best solution):
+- The core issue: non-`node:` selectors skip the membership revocation check. The fix needs to map group/tag/user selectors to their member node set, then check each member's status
+- If group resolution data isn't available yet, the fail-closed default is to deny unresolvable selectors. This breaks rules using group selectors but closes the revocation bypass immediately
+- The implementer should decide whether to build the resolution layer first or take the simpler deny-by-default path as an interim step
 
 ---
 
@@ -115,10 +104,10 @@ fn check_peer_membership_active(node_id: &NodeId, membership: &MembershipDirecto
 ```
 When the membership directory is empty (unpopulated), every peer is allowed. This is indistinguishable from "membership state failed to load / was wiped."
 
-**Fix direction:**
-1. Distinguish "explicit opt-out" (`--membership-governance=disabled`) from "unpopulated/unloadable"
-2. Default to **deny** when membership is empty
-3. Fail closed if snapshot path was configured but failed to load
+**Suggested approach** (the implementer should research the best solution):
+- Distinguish an explicit operator opt-out (`--membership-governance=disabled`) from genuinely unpopulated or unloadable state
+- Default to denying when membership is empty
+- Fail closed if a snapshot path was configured but failed to load
 
 ---
 
@@ -126,7 +115,7 @@ When the membership directory is empty (unpopulated), every peer is allowed. Thi
 
 **Verified:** `LinuxDataplane` in `crates/rustynetd/src/dataplane.rs` is referenced only in its own `#[cfg(test)]` block and one string in `security_audit_catalog.rs`. No production code constructs it. The live dataplane is `phase10.rs`.
 
-**Fix:** Delete `dataplane.rs`. Point `security_audit_catalog.rs` at `phase10.rs`.
+**Suggested approach:** Either delete `dataplane.rs` and point the security-audit catalog at `phase10.rs`, or wire the daemon through `dataplane.rs`. The implementer should evaluate which path keeps the project's security guarantees intact with the least risk of introducing divergence.
 
 ---
 
@@ -140,23 +129,23 @@ let mut relay_client = self.relay_client.take()
 ```
 If this path executes twice (concurrent traversal probe + relay health check), the second `take()` returns `None` → panic → daemon crash → tunnel drops.
 
-**Fix:** `.ok_or_else(|| DaemonError::State("relay client already consumed".into()))?`
+**Suggested approach:** Replace with proper error propagation (`.ok_or_else(|| ...)?`). The implementer should verify that the error type and handling path are appropriate for this call site.
 
 ### 2.2 RN-08 — Key envelope lacks AAD binding
 **Location:** `rustynet-crypto/src/lib.rs:942` — empty AAD in XChaCha20-Poly1305.
-**Fix:** Bind `MAGIC || version || salt || nonce` as AAD.
+**Suggested approach:** Bind `MAGIC || version || salt || nonce` as AAD. The implementer should choose the exact framing format and add a version byte for future algorithm agility.
 
 ### 2.3 RN-09 — systemd-credential passphrase group-readable
 **Location:** `key_material.rs:674` — wider permission mask on `/run/credentials/` prefix.
-**Fix:** Require parent dir `0o700` + file group = 0 before honoring wider mask.
+**Suggested approach:** Require stricter parent-directory ownership and group checks before honoring the wider mask. Verify the filesystem is actually a systemd-managed tmpfs mount.
 
 ### 2.4 RN-10 — Corrupt rotation ledger silently resets to genesis
 **Location:** `daemon.rs:8082` — `load_rotation_ledger` returns `genesis()` on any error.
-**Fix:** Distinguish absent (→genesis) from corrupt (→refuse to proceed).
+**Suggested approach:** Distinguish absent (genesis is correct) from corrupt/unparseable (refuse to proceed). The implementer should also add a clear operator runbook entry for recovery from a genuinely corrupt ledger.
 
 ### 2.5 RN-16 — GitHub Actions pinned to mutable tags
 **Location:** `.github/workflows/cross-platform-ci.yml`, `release-windows.yml`.
-**Fix:** Pin every `uses:` to full 40-char commit SHA.
+**Suggested approach:** Pin every `uses:` to a full 40-char commit SHA. The implementer should verify each SHA against the upstream repository and add a CI check that prevents unpinned actions from being merged.
 
 ---
 
@@ -164,15 +153,15 @@ If this path executes twice (concurrent traversal probe + relay health check), t
 
 ### 3.1 RN-N4 — Gossip has no per-peer rate limiting
 **Location:** `gossip_runtime.rs` — `drain_gossip_inbound` processes every bundle in a tight loop. A rogue peer flooding forged bundles can consume CPU with Ed25519 verification.
-**Fix:** Token-bucket per source (10 bundles/sec, burst 20). Drop above limit before signature verification.
+**Suggested approach:** Token-bucket per source node (e.g. 10 bundles/sec). Drop above-limit bundles before signature verification. The implementer should tune the rate based on expected cluster size and gossip propagation latency requirements.
 
 ### 3.2 RN-N5 — Enrollment TTL checked before constant-time HMAC
-**Location:** `enrollment_token.rs` — verify path checks expiry before HMAC compare. Different response timing for "expired" vs "wrong secret."
-**Fix:** Reorder: decode → HMAC compare (constant-time) → check consumed-ledger → check expiry.
+**Location:** `enrollment_token.rs` — verify path checks expiry before HMAC compare. Different response timing for "expired" vs "wrong secret." The 256-bit HMAC makes brute-force impractical regardless; this is defense-in-depth.
+**Suggested approach:** Reorder checks so the constant-time HMAC comparison runs before any time-based rejection. The implementer should verify that this reorder doesn't introduce other observable timing differences.
 
 ### 3.3 RN-N6 — No fuzz targets for relay hello parser
 **Location:** `crates/rustynet-relay/src/transport.rs`, `session.rs`. Relay processes untrusted UDP from any source.
-**Fix:** Add `cargo-fuzz` targets for `parse_relay_hello`, `verify_session_token`, rate-limiter.
+**Suggested approach:** Add `cargo-fuzz` targets for `parse_relay_hello`, `verify_session_token`, and the rate-limiter state machine. The implementer should also consider adding fuzz targets for the other parsers listed in §6.
 
 ---
 
@@ -195,15 +184,15 @@ If this path executes twice (concurrent traversal probe + relay health check), t
 
 ## 5. Items from HardeningBacklog (not in SecurityReview)
 
-| ID | Severity | Location | Fix |
+| ID | Severity | Location | Direction to investigate |
 |---|---|---|---|
-| HB-1 | Low | `windows_tunnel_smoke.rs` | Use `remove_file_if_present` (secure scrub) |
-| HB-2 | Low | `key_material.rs:739` | Windows: set explicit owner-only ACL |
-| HB-3 | Low | `windows_killswitch_smoke.rs` | Use absolute `%SystemRoot%\System32\netsh.exe` |
-| HB-4 | Low | `windows_killswitch_smoke.rs` Drop guard | Add IPv6 block cleanup on panic |
-| HB-5 | Info | `windows_killswitch_smoke.rs` | Document hardcoded Cloudflare IPv6 dependency |
-| HB-6 | Info | `crates/rustynet-cli/src/vm_lab/**` | Centralize PS-script assembly behind builder |
-| B.4.1 | Medium | DNS zone parser | Complete resolver-output filter when DNS handler lands |
+| HB-1 | Low | `windows_tunnel_smoke.rs` | Use secure scrub (`remove_file_if_present`) instead of plain `remove_file` for ephemeral key cleanup |
+| HB-2 | Low | `key_material.rs:739` | On Windows, set explicit owner-only ACL or write to validated hardened dir (the `cfg(unix)` mode set is a no-op on Windows) |
+| HB-3 | Low | `windows_killswitch_smoke.rs` | Use absolute `%SystemRoot%\System32\netsh.exe` instead of PATH-resolved `netsh` |
+| HB-4 | Low | `windows_killswitch_smoke.rs` Drop guard | Add IPv6 block rule cleanup in the Drop guard for panic safety |
+| HB-5 | Info | `windows_killswitch_smoke.rs` | Document the hardcoded Cloudflare IPv6 dependency; prefer a lab-local target when available |
+| HB-6 | Info | `crates/rustynet-cli/src/vm_lab/**` | Centralize PowerShell script assembly behind a builder with quote-by-construction to reduce `format!` surface |
+| B.4.1 | Medium | DNS zone parser | Complete the resolver-output filter when the DNS protocol handler lands (reject RFC1918 answers for tailnet-internal names) |
 
 ---
 
