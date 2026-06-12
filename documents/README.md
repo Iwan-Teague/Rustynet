@@ -91,7 +91,11 @@ Entry point:
 
 Cross-platform improvement and security ledgers (most recently updated):
 - [PlatformImprovementBacklog_2026-05-14.md](./operations/active/PlatformImprovementBacklog_2026-05-14.md)
+- [DataplanePerfBacklog_2026-06-12.md](./operations/active/DataplanePerfBacklog_2026-06-12.md) —
+  active hot-path performance backlog for the WireGuard userspace-shared engine, relay forwarding,
+  utun I/O, and endpoint indexing; records measured baselines and bench commands
 - [SecurityReview_2026-05-24.md](./operations/active/SecurityReview_2026-05-24.md) — firm-grade security review (RN-01..RN-38, P0/P1/P2 remediation roadmap; load-bearing findings verified first-hand)
+- [SecurityAnalysis_2026-06-12.md](./SecurityAnalysis_2026-06-12.md) — comprehensive security analysis combining existing findings with new static analysis; modern defense-in-depth recommendations (TPM2, fuzzing, sandboxing, formal verification)
 - [SecurityHardeningBacklog_2026-06-01.md](./operations/active/SecurityHardeningBacklog_2026-06-01.md) — actionable hardening TODO tracker (net-new smoke/harness items + the highest-priority open review P0s re-verified on `main`)
 - [SecurityHardeningAudit_2026-04-28.md](./operations/active/SecurityHardeningAudit_2026-04-28.md)
 - [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./operations/active/RustynetComparativeVpnExploitCoverage_2026-03-14.md)
