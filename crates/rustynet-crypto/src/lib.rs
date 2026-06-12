@@ -271,6 +271,7 @@ pub fn unix_now() -> Result<u64, CryptoError> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedKeyBlob {
+    pub version: u8,
     pub salt: [u8; 16],
     pub nonce: [u8; 24],
     pub ciphertext: Vec<u8>,
@@ -1297,19 +1298,41 @@ pub fn try_generate_key_custody_material() -> Result<([u8; 16], [u8; 24]), Crypt
     Ok((salt, nonce))
 }
 
+/// Encrypt `plaintext` under `passphrase` with Argon2id + XChaCha20-Poly1305.
+///
+/// Generates a v1 envelope with AAD binding: the AAD is the constant
+/// magic `b"RNET"` plus the version byte. This binds the ciphertext to
+/// the Rustynet key-envelope format so a blob cannot be replayed into a
+/// different context (different project, different key-envelope version,
+/// raw AEAD unwrap without the envelope framing).
 pub fn encrypt_private_key_envelope(
     plaintext: &[u8],
     passphrase: &str,
     salt: [u8; 16],
     nonce: [u8; 24],
 ) -> Result<EncryptedKeyBlob, CryptoError> {
+    const KEY_ENVELOPE_AAD_MAGIC: &[u8; 4] = b"RNET";
+    const KEY_ENVELOPE_VERSION: u8 = 1;
+    let aad = [
+        KEY_ENVELOPE_AAD_MAGIC[0],
+        KEY_ENVELOPE_AAD_MAGIC[1],
+        KEY_ENVELOPE_AAD_MAGIC[2],
+        KEY_ENVELOPE_AAD_MAGIC[3],
+        KEY_ENVELOPE_VERSION,
+    ];
     let mut key = [0u8; 32];
     Argon2::default()
         .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
         .map_err(|_| CryptoError::KdfFailed)?;
 
     let cipher = XChaCha20Poly1305::new((&key).into());
-    let ciphertext = match cipher.encrypt(XNonce::from_slice(&nonce), plaintext) {
+    let ciphertext = match cipher.encrypt(
+        XNonce::from_slice(&nonce),
+        chacha20poly1305::aead::Payload {
+            msg: plaintext,
+            aad: &aad,
+        },
+    ) {
         Ok(value) => value,
         Err(_) => {
             key.zeroize();
@@ -1320,12 +1343,17 @@ pub fn encrypt_private_key_envelope(
     key.zeroize();
 
     Ok(EncryptedKeyBlob {
+        version: KEY_ENVELOPE_VERSION,
         salt,
         nonce,
         ciphertext,
     })
 }
 
+/// Decrypt a key envelope, supporting both v0 (legacy, no AAD) and
+/// v1 (AAD-bound) blobs. v0 decryption uses empty AAD; v1 uses the
+/// constant magic `b"RNET"` + version byte. A v0 blob re-encrypted
+/// becomes a v1 blob on the next write cycle.
 pub fn decrypt_private_key_envelope(
     blob: &EncryptedKeyBlob,
     passphrase: &str,
@@ -1336,8 +1364,37 @@ pub fn decrypt_private_key_envelope(
         .map_err(|_| CryptoError::KdfFailed)?;
 
     let cipher = XChaCha20Poly1305::new((&key).into());
-    let plaintext = match cipher.decrypt(XNonce::from_slice(&blob.nonce), blob.ciphertext.as_ref())
-    {
+    let decrypt_result = match blob.version {
+        0 => cipher.decrypt(
+            XNonce::from_slice(&blob.nonce),
+            chacha20poly1305::aead::Payload {
+                msg: blob.ciphertext.as_ref(),
+                aad: b"",
+            },
+        ),
+        1 => {
+            const KEY_ENVELOPE_AAD_MAGIC: &[u8; 4] = b"RNET";
+            let aad = [
+                KEY_ENVELOPE_AAD_MAGIC[0],
+                KEY_ENVELOPE_AAD_MAGIC[1],
+                KEY_ENVELOPE_AAD_MAGIC[2],
+                KEY_ENVELOPE_AAD_MAGIC[3],
+                blob.version,
+            ];
+            cipher.decrypt(
+                XNonce::from_slice(&blob.nonce),
+                chacha20poly1305::aead::Payload {
+                    msg: blob.ciphertext.as_ref(),
+                    aad: &aad,
+                },
+            )
+        }
+        _ => {
+            key.zeroize();
+            return Err(CryptoError::DeniedAlgorithm);
+        }
+    };
+    let plaintext = match decrypt_result {
         Ok(value) => value,
         Err(_) => {
             key.zeroize();
@@ -1523,19 +1580,37 @@ pub fn read_encrypted_key_file(
 }
 
 fn encode_encrypted_blob(blob: &EncryptedKeyBlob) -> Vec<u8> {
-    let mut out = Vec::with_capacity(16 + 24 + 4 + blob.ciphertext.len());
-    out.extend_from_slice(&blob.salt);
-    out.extend_from_slice(&blob.nonce);
-    out.extend_from_slice(&(blob.ciphertext.len() as u32).to_be_bytes());
-    out.extend_from_slice(&blob.ciphertext);
-    out
+    if blob.version == 0 {
+        let mut out = Vec::with_capacity(16 + 24 + 4 + blob.ciphertext.len());
+        out.extend_from_slice(&blob.salt);
+        out.extend_from_slice(&blob.nonce);
+        out.extend_from_slice(&(blob.ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&blob.ciphertext);
+        out
+    } else {
+        let mut out = Vec::with_capacity(1 + 16 + 24 + 4 + blob.ciphertext.len());
+        out.push(blob.version);
+        out.extend_from_slice(&blob.salt);
+        out.extend_from_slice(&blob.nonce);
+        out.extend_from_slice(&(blob.ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&blob.ciphertext);
+        out
+    }
 }
 
 fn decode_encrypted_blob(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoError> {
+    // v1: [version:1][salt:16][nonce:24][len:4][ct] — min 45 bytes, version != 0
+    // v0: [salt:16][nonce:24][len:4][ct] — min 44 bytes, version implicitly 0
+    if bytes.len() >= 45 && bytes[0] != 0 {
+        return decode_encrypted_blob_v1(bytes);
+    }
+    decode_encrypted_blob_v0(bytes)
+}
+
+fn decode_encrypted_blob_v0(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoError> {
     if bytes.len() < 44 {
         return Err(CryptoError::InvalidLength);
     }
-
     let mut salt = [0u8; 16];
     salt.copy_from_slice(&bytes[0..16]);
     let mut nonce = [0u8; 24];
@@ -1549,9 +1624,38 @@ fn decode_encrypted_blob(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoError> 
     }
 
     Ok(EncryptedKeyBlob {
+        version: 0,
         salt,
         nonce,
         ciphertext: bytes[44..].to_vec(),
+    })
+}
+
+fn decode_encrypted_blob_v1(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoError> {
+    if bytes.len() < 45 {
+        return Err(CryptoError::InvalidLength);
+    }
+    let version = bytes[0];
+    if version == 0 {
+        return Err(CryptoError::InvalidLength);
+    }
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&bytes[1..17]);
+    let mut nonce = [0u8; 24];
+    nonce.copy_from_slice(&bytes[17..41]);
+
+    let mut length_bytes = [0u8; 4];
+    length_bytes.copy_from_slice(&bytes[41..45]);
+    let ciphertext_len = u32::from_be_bytes(length_bytes) as usize;
+    if bytes.len() != 45 + ciphertext_len {
+        return Err(CryptoError::InvalidLength);
+    }
+
+    Ok(EncryptedKeyBlob {
+        version,
+        salt,
+        nonce,
+        ciphertext: bytes[45..].to_vec(),
     })
 }
 

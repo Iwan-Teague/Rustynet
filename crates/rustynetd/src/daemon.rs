@@ -3848,7 +3848,8 @@ impl DaemonRuntime {
             gossip_transport: None,
             enrollment_secret_path: config.enrollment_secret_path.clone(),
             enrollment_ledger_path: config.enrollment_ledger_path.clone(),
-            rotation_ledger: load_rotation_ledger(config.wg_private_key_path.as_deref()),
+            rotation_ledger: load_rotation_ledger(config.wg_private_key_path.as_deref())
+                .map_err(|err| DaemonError::InvalidConfig(format!("rotation ledger: {err}")))?,
             rotation_handshake_tracker: InFlightHandshakeTracker::new(),
             rotation_drain_timeout: Duration::from_secs(DEFAULT_ROTATION_DRAIN_TIMEOUT_SECS),
             port_mapping_mode: config.port_mapping_mode,
@@ -5902,10 +5903,9 @@ impl DaemonRuntime {
         if !needs_refresh {
             return Ok(relay_client.relay_endpoint_for_peer(remote_node_id));
         }
-        let mut relay_client = self
-            .relay_client
-            .take()
-            .expect("relay client should remain available during establish");
+        let mut relay_client = self.relay_client.take().ok_or_else(|| {
+            "relay client unavailable during establish (concurrent probe or state reset)".to_owned()
+        })?;
         let endpoint = relay_client.establish_session_with_round_trip(
             remote_node_id,
             relay_candidate.endpoint,
@@ -8594,32 +8594,28 @@ impl DaemonRuntime {
 ///   (in-memory backend / test profile), or
 /// * no on-disk ledger has been written yet (first ever rotation).
 ///
-/// Treats any load failure as fatal-for-config: corrupt ledger state
-/// must not be silently reset. The caller (daemon bootstrap) surfaces
-/// the error so the operator can investigate before the daemon
-/// proceeds with key-bearing operations.
-fn load_rotation_ledger(wg_private_key_path: Option<&Path>) -> LocalKeyRotationLedger {
+/// On load failure (corrupt ledger, I/O error) returns an Err so the
+/// caller can fail-closed. A corrupt ledger is a security condition —
+/// it could mask a stolen-key replay or a rotation-state rollback.
+/// The operator must investigate and either restore a known-good
+/// ledger backup or remove the corrupt file to reset the rotation
+/// epoch (see the key-rotation recovery runbook).
+fn load_rotation_ledger(
+    wg_private_key_path: Option<&Path>,
+) -> Result<LocalKeyRotationLedger, String> {
     let Some(path) = wg_private_key_path else {
-        return LocalKeyRotationLedger::genesis();
+        return Ok(LocalKeyRotationLedger::genesis());
     };
     let ledger_path = ledger_path_for(path);
     if !ledger_path.exists() {
-        return LocalKeyRotationLedger::genesis();
+        return Ok(LocalKeyRotationLedger::genesis());
     }
     match LocalKeyRotationLedger::load(&ledger_path) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            // Fail-closed: a corrupt rotation ledger is a security
-            // condition (could mask a stolen-key replay). Emit a
-            // structured log and keep the in-memory ledger at
-            // genesis; subsequent rotation attempts will refuse
-            // until the operator resets the ledger.
-            log::error!(
-                "rotation_ledger_load_failed path={} reason={err}",
-                ledger_path.display()
-            );
-            LocalKeyRotationLedger::genesis()
-        }
+        Ok(ledger) => Ok(ledger),
+        Err(err) => Err(format!(
+            "rotation ledger corrupt or unreadable at {}: {err}",
+            ledger_path.display()
+        )),
     }
 }
 

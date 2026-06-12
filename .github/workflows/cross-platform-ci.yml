@@ -13,7 +13,7 @@ jobs:
     name: macOS build+security
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Bootstrap CI tools
         run: |
           RUSTYNET_CI_BOOTSTRAP_SYSTEM=0 ./scripts/ci/bootstrap_ci_tools.sh
@@ -34,7 +34,7 @@ jobs:
     container:
       image: debian:trixie
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Bootstrap CI tools
         run: |
           ./scripts/ci/bootstrap_ci_tools.sh
@@ -53,7 +53,7 @@ jobs:
     name: Linux real WireGuard E2E
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Bootstrap CI tools
         run: |
           ./scripts/ci/bootstrap_ci_tools.sh
@@ -80,7 +80,7 @@ jobs:
         # the cargo invocations match the macOS / Debian jobs above.
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Pin toolchain + install cargo-audit / cargo-deny
         run: |
           # The bash bootstrap wrapper invokes `cargo run -p

@@ -24,19 +24,19 @@ name: Windows Release Signing
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - "v*.*.*"
   # Allow manual dispatch with no signing — used for dry-run testing
   # of the build path on PRs / branches without a tagged release.
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Build only — skip signing + artifact upload'
+        description: "Build only — skip signing + artifact upload"
         type: boolean
         required: false
         default: true
 
 permissions:
-  contents: write  # release upload
+  contents: write # release upload
 
 jobs:
   windows-release:
@@ -46,7 +46,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Pin toolchain
         run: |
@@ -155,7 +155,7 @@ jobs:
 
       - name: Upload to release
         if: steps.signing-decision.outputs.should_sign == 'true' && github.event_name == 'push'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             target/release/rustynetd.exe
@@ -182,7 +182,7 @@ jobs:
     # upload it anywhere.
     needs: []
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Pin toolchain
         run: |
           rustup toolchain install 1.85.0 --profile minimal
@@ -202,7 +202,7 @@ jobs:
           ls -la artifacts/release/sbom.cargo-metadata.json artifacts/release/sbom.sha256
       - name: Upload SBOM to release
         if: github.event_name == 'push'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             artifacts/release/sbom.cargo-metadata.json
