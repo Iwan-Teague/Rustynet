@@ -71,6 +71,16 @@ pub struct RelaySession {
     pub expires_at_unix: u64,
     pub established_at: Instant,
     pub last_packet_at: Instant,
+    /// Cached id of the paired (reverse-direction) session, filled on
+    /// first successful pair resolution so the per-frame forward path
+    /// avoids rebuilding the owned `(String, String)` pair-index key.
+    /// Purely a cache: it is re-validated against the live session map
+    /// on every use (a session and its pair-index entry are always
+    /// removed together, so a stale entry can only point at a removed
+    /// session, never at the wrong live one) and the forward path
+    /// falls back to the authoritative `node_pair_index` lookup on a
+    /// miss.
+    pub paired_session_id: Option<SessionId>,
 }
 
 impl RelaySession {
