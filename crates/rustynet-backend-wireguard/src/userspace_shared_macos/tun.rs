@@ -38,34 +38,61 @@ impl MacosTunDevice {
         }
     }
 
-    pub(crate) fn recv_packet(&self) -> Result<Option<Vec<u8>>, BackendError> {
+    /// Receive one TUN packet into the caller's long-lived scratch
+    /// buffer (no per-packet allocation). Returns the filled length;
+    /// `None` when nothing is pending.
+    pub(crate) fn recv_packet_into(
+        &self,
+        scratch: &mut [u8],
+    ) -> Result<Option<usize>, BackendError> {
         match &self.inner {
-            MacosTunDeviceInner::Real(device) => {
-                let mut buffer = vec![0u8; 65_535];
-                match device.recv(&mut buffer) {
-                    Ok(len) => {
-                        if len == 0 {
-                            return Ok(None);
-                        }
-                        buffer.truncate(len);
-                        Ok(Some(buffer))
+            MacosTunDeviceInner::Real(device) => match device.recv(scratch) {
+                Ok(len) => {
+                    if len == 0 {
+                        return Ok(None);
                     }
-                    Err(err)
-                        if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                    {
-                        Ok(None)
-                    }
-                    Err(err) => Err(BackendError::internal(format!(
-                        "macos userspace-shared TUN receive failed: {err}"
-                    ))),
+                    Ok(Some(len))
                 }
-            }
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    Ok(None)
+                }
+                Err(err) => Err(BackendError::internal(format!(
+                    "macos userspace-shared TUN receive failed: {err}"
+                ))),
+            },
             MacosTunDeviceInner::Test(handle) => {
                 if let Some(message) = handle.state.take_next_recv_error() {
                     return Err(BackendError::internal(message));
                 }
-                Ok(handle.dequeue_nonempty_inbound_packet())
+                let Some(packet) = handle.dequeue_nonempty_inbound_packet() else {
+                    return Ok(None);
+                };
+                if packet.len() > scratch.len() {
+                    return Err(BackendError::internal(format!(
+                        "macos userspace-shared TUN test packet of {} bytes exceeds the {} byte receive scratch",
+                        packet.len(),
+                        scratch.len()
+                    )));
+                }
+                scratch[..packet.len()].copy_from_slice(&packet);
+                Ok(Some(packet.len()))
             }
+        }
+    }
+
+    /// Receive one TUN packet (allocating convenience wrapper).
+    /// Prefer `recv_packet_into` with a reused scratch buffer for
+    /// hot-path use; this method exists for compatibility with callers
+    /// that expect a `Vec<u8>` return.
+    pub(crate) fn recv_packet(&self) -> Result<Option<Vec<u8>>, BackendError> {
+        let mut scratch = vec![0u8; 65536];
+        match self.recv_packet_into(&mut scratch) {
+            Ok(Some(len)) => {
+                scratch.truncate(len);
+                Ok(Some(scratch))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 

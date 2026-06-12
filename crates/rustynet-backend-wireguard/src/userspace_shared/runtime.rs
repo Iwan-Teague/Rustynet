@@ -699,8 +699,7 @@ impl RuntimeState {
     fn poll_authoritative_socket_with(&mut self, scratch: &mut [u8]) -> Result<(), BackendError> {
         let mut drained = 0usize;
         for _ in 0..MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK {
-            let Some((len, remote_addr)) = self.authoritative_socket.try_recv_into(scratch)?
-            else {
+            let Some((len, remote_addr)) = self.authoritative_socket.try_recv_into(scratch)? else {
                 break;
             };
             drained += 1;
@@ -1218,6 +1217,10 @@ mod tests {
                 recorded_authoritative_operations: Vec::new(),
                 recorded_peer_ciphertext_egress: Vec::new(),
                 handshake_telemetry: HandshakeTelemetry::default(),
+                udp_recv_scratch: vec![0u8; RECV_SCRATCH_BYTES],
+                tun_recv_scratch: vec![0u8; RECV_SCRATCH_BYTES],
+                udp_budget_exhausted: false,
+                tun_budget_exhausted: false,
             },
             tun_state,
             private_key,

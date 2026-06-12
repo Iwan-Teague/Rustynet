@@ -78,6 +78,7 @@ impl TunDevice {
     /// Prefer `recv_packet_into` with a reused scratch buffer for
     /// hot-path use; this method exists for compatibility with callers
     /// that expect a `Vec<u8>` return.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recv_packet(&self) -> Result<Option<Vec<u8>>, BackendError> {
         let mut scratch = vec![0u8; 65536];
         match self.recv_packet_into(&mut scratch) {
