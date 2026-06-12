@@ -1278,6 +1278,7 @@ version = "0.1.0"
 name = "rustynet-relay"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "ed25519-dalek",
  "rand",
  "rustynet-control",

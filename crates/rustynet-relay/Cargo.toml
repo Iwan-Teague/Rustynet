@@ -26,6 +26,11 @@ rustynet-windows-native = { path = "../rustynet-windows-native" }
 # Linux, breaking offline guest bootstraps where it was never cached.)
 windows-service = "0.8"
 
+[dev-dependencies]
+# Same flagged dev-only criterion as rustynet-backend-wireguard
+# (default-features off: no plotters/rayon/html tree).
+criterion = { version = "0.5", default-features = false }
+
 [features]
 default = []
 daemon = ["tokio", "tracing", "serde", "serde_json"]
@@ -33,6 +38,10 @@ daemon = ["tokio", "tracing", "serde", "serde_json"]
 [[bin]]
 name = "rustynet-relay"
 required-features = ["daemon"]
+
+[[bench]]
+name = "relay_forward"
+harness = false
 
 [lints]
 workspace = true

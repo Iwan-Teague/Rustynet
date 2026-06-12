@@ -537,18 +537,10 @@ mod daemon {
                 let mut buf = [0u8; 65536];
 
                 loop {
-                    // Get socket reference
-                    let socket_result = {
-                        let sockets = allocated_sockets.read().await;
-                        sockets.get(&port).map(|(s, _)| s.local_addr())
-                    };
-
-                    let Some(Some(_)) = socket_result.map(std::result::Result::ok) else {
-                        // Socket no longer exists
-                        break;
-                    };
-
-                    // We need to recv on the socket
+                    // Recv on the socket. Socket existence is checked here
+                    // (the map lookup) — the previous separate existence
+                    // probe added a redundant RwLock read + getsockname
+                    // syscall per 100µs tick and is intentionally gone.
                     let recv_result = {
                         let sockets = allocated_sockets.read().await;
                         if let Some((socket, alloc)) = sockets.get(&port) {
@@ -559,6 +551,7 @@ mod daemon {
                                 Err(_) => None,
                             }
                         } else {
+                            // Socket no longer exists
                             break;
                         }
                     };
@@ -584,9 +577,11 @@ mod daemon {
                                 if let Some((peer_socket, _)) =
                                     sockets.get(&target.peer_allocated_port)
                                 {
-                                    let _ = peer_socket
-                                        .send_to(&target.payload, target.peer_addr)
-                                        .await;
+                                    // Zero-copy forward: send the exact
+                                    // received bytes (the transport never
+                                    // copies or inspects the payload).
+                                    let _ =
+                                        peer_socket.send_to(&buf[..len], target.peer_addr).await;
                                 }
                             }
                             Ok(None) => {}

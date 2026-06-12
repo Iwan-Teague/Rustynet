@@ -123,12 +123,15 @@ pub enum RelayForwardError {
     UnauthorizedSourceTuple,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where to forward a received frame. Deliberately carries NO payload:
+/// the relay never copies or inspects frame contents — the caller sends
+/// the exact received bytes (`&buf[..len]`) to `peer_addr` via the
+/// socket bound to `peer_allocated_port` (zero-copy forward path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayForwardTarget {
     pub peer_session_id: SessionId,
     pub peer_allocated_port: u16,
     pub peer_addr: SocketAddr,
-    pub payload: Vec<u8>,
 }
 
 pub struct RelayTransport {
@@ -221,6 +224,23 @@ impl RelayTransport {
         Ok(())
     }
 
+    /// Operator tuning for the per-node forward rate limits. Zero is
+    /// refused fail-closed (a zero budget would silently blackhole every
+    /// frame; an operator wanting to stop forwarding should drain
+    /// sessions instead). Defaults stay `RateLimiter::default()`
+    /// (10k pps / 100 Mbps per node).
+    pub fn set_rate_limits(&mut self, max_pps: u64, max_bps: u64) -> Result<(), String> {
+        if max_pps == 0 || max_bps == 0 {
+            return Err(
+                "relay rate limits must be greater than 0 (drain sessions to stop forwarding)"
+                    .to_owned(),
+            );
+        }
+        self.rate_limiter.max_pps = max_pps;
+        self.rate_limiter.max_bps = max_bps;
+        Ok(())
+    }
+
     /// Validate a session establishment request without allocating relay state.
     ///
     /// This is used by the relay daemon to reject forged/stale/flooded hellos
@@ -292,6 +312,7 @@ impl RelayTransport {
             expires_at_unix: hello.session_token.expires_at_unix,
             established_at: Instant::now(),
             last_packet_at: Instant::now(),
+            paired_session_id: None,
         };
 
         self.sessions.insert(session_id, session);
@@ -531,28 +552,58 @@ impl RelayTransport {
             session.last_packet_at = Instant::now();
         }
 
-        let (peer_session_id, current_node_id, current_peer_node_id) = {
+        // Resolve the paired session id. Fast path: the cached id on the
+        // session, re-validated against the live session map with plain
+        // &str comparisons (no allocation). Fallback (first packet after
+        // pairing, or after the partner was replaced/evicted): the
+        // authoritative owned-key pair-index lookup, exactly as before.
+        let cached_peer_sid = {
             let session = self
                 .sessions
                 .get(&session_id)
                 .expect("session should remain available while forwarding");
-            (
-                self.node_pair_index
-                    .get(&(session.peer_node_id.clone(), session.node_id.clone()))
-                    .copied(),
-                session.node_id.clone(),
-                session.peer_node_id.clone(),
-            )
+            session.paired_session_id.filter(|sid| {
+                self.sessions
+                    .get(sid)
+                    .is_some_and(|candidate| session.is_paired_with(candidate))
+            })
         };
-
-        let Some(peer_sid) = peer_session_id else {
-            // Half-open: no paired session yet; silently drop
-            return Ok(None);
+        let peer_sid = match cached_peer_sid {
+            Some(sid) => sid,
+            None => {
+                let (looked_up, current_node_id, current_peer_node_id) = {
+                    let session = self
+                        .sessions
+                        .get(&session_id)
+                        .expect("session should remain available while forwarding");
+                    (
+                        self.node_pair_index
+                            .get(&(session.peer_node_id.clone(), session.node_id.clone()))
+                            .copied(),
+                        session.node_id.clone(),
+                        session.peer_node_id.clone(),
+                    )
+                };
+                let Some(sid) = looked_up else {
+                    // Half-open: no paired session yet; silently drop
+                    return Ok(None);
+                };
+                if !self.sessions.contains_key(&sid) {
+                    self.node_pair_index
+                        .remove(&(current_peer_node_id, current_node_id));
+                    return Ok(None);
+                }
+                // Cache for subsequent frames on this session.
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    session.paired_session_id = Some(sid);
+                }
+                sid
+            }
         };
 
         let Some(peer_session) = self.sessions.get_mut(&peer_sid) else {
-            self.node_pair_index
-                .remove(&(current_peer_node_id, current_node_id));
+            // Unreachable in practice (existence was just validated on
+            // both paths), kept as a silent drop for defence in depth.
             return Ok(None);
         };
         if peer_session.expires_at_unix <= now_unix {
@@ -563,12 +614,12 @@ impl RelayTransport {
             return Ok(None);
         };
         peer_session.last_packet_at = Instant::now();
-        // Forward payload as-is — never inspect content
+        // Forward payload as-is — never inspected, never copied: the caller
+        // sends the same received bytes to the returned target.
         Ok(Some(RelayForwardTarget {
             peer_session_id: peer_sid,
             peer_allocated_port: peer_session.allocated_port,
             peer_addr,
-            payload: payload.to_vec(),
         }))
     }
 
@@ -1612,7 +1663,6 @@ mod tests {
         assert_eq!(forward_b.peer_session_id, sid_a);
         assert_eq!(forward_b.peer_allocated_port, 50_000);
         assert_eq!(forward_b.peer_addr, data_a);
-        assert_eq!(forward_b.payload, payload_b);
 
         let forward_a = transport
             .forward_packet(sid_a, payload_a, data_a)
@@ -1621,7 +1671,6 @@ mod tests {
         assert_eq!(forward_a.peer_session_id, sid_b);
         assert_eq!(forward_a.peer_allocated_port, 50_001);
         assert_eq!(forward_a.peer_addr, data_b);
-        assert_eq!(forward_a.payload, payload_a);
     }
 
     #[test]
@@ -1668,6 +1717,11 @@ mod tests {
 
     #[test]
     fn test_payload_forwarded_byte_for_byte_without_inspection() {
+        // The transport never touches payload bytes at all: the target it
+        // returns carries no payload (the caller forwards the exact
+        // received buffer — structurally byte-for-byte). This test pins
+        // that parser-hostile byte patterns still resolve a forward target
+        // rather than being inspected/rejected.
         let (sk, _) = make_test_keypair();
         let mut transport = make_transport(&sk);
 
@@ -1681,20 +1735,18 @@ mod tests {
         let _ = transport.forward_packet(sid_a, b"bind-a", data_a);
         let _ = transport.forward_packet(sid_b, b"bind-b", data_b);
 
-        // Test with byte patterns that could confuse parsers
+        // Byte patterns that could confuse parsers must still forward.
         for payload in [
             vec![0u8; 100],
             vec![0xFFu8; 100],
             (0u8..100).collect::<Vec<_>>(),
         ] {
-            let result = transport.forward_packet(sid_a, &payload, data_a).unwrap();
-            if let Some(forwarded) = result {
-                assert_eq!(
-                    forwarded.payload, payload,
-                    "payload must be forwarded verbatim"
-                );
-                assert_eq!(forwarded.peer_session_id, sid_b);
-            }
+            let forwarded = transport
+                .forward_packet(sid_a, &payload, data_a)
+                .unwrap()
+                .expect("parser-hostile payloads must still resolve a forward target");
+            assert_eq!(forwarded.peer_session_id, sid_b);
+            assert_eq!(forwarded.peer_addr, data_b);
         }
     }
 
