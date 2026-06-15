@@ -33,3 +33,39 @@ rand = "0.9.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# ── Release/bench performance profile ────────────────────────────────────────
+# Runtime-perf tuning for shipped binaries. Trades build time (release builds
+# only — dev/test/incremental are untouched) for faster generated code on the
+# hot crypto + dataplane paths. No semantic change; keep only while the
+# perfprobe/criterion numbers justify the build-time cost.
+#
+# - thin LTO lets the dataplane engine inline across the crate boundary into
+#   boringtun (the per-packet crypto), which a default build cannot do.
+# - codegen-units = 1 is scoped to the hot crypto/dataplane crates only (full
+#   intra-crate optimization) to avoid serialising codegen for the whole
+#   workspace.
+# `[profile.bench]` mirrors release so `cargo bench` measures shipped code.
+[profile.release]
+lto = "thin"
+
+[profile.release.package.boringtun]
+codegen-units = 1
+
+[profile.release.package.rustynet-backend-wireguard]
+codegen-units = 1
+
+[profile.release.package.rustynet-relay]
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+
+[profile.bench.package.boringtun]
+codegen-units = 1
+
+[profile.bench.package.rustynet-backend-wireguard]
+codegen-units = 1
+
+[profile.bench.package.rustynet-relay]
+codegen-units = 1
