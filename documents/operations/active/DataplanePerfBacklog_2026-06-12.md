@@ -70,6 +70,34 @@ stream is mid-edit on. Land them once `daemon.rs` settles (both small:
 #9 trivial `is_some()` guard; #7 ~0.05% CPU + a generation counter threaded
 through traversal-hint mutation sites).
 
+## 1.7) Build-profile tuning (landed 2026-06-12)
+
+Approved dimension trade (runtime gain for release build-time cost; dev/test/
+incremental builds untouched). `[profile.release]` + `[profile.bench]` in the
+root Cargo.toml: `lto = "thin"` (lets the dataplane engine inline across the
+crate boundary into boringtun's per-packet crypto) + `codegen-units = 1`
+scoped to the hot crates (`boringtun`, `rustynet-backend-wireguard`,
+`rustynet-relay`).
+
+Measured (perfprobe examples, `--release`): engine forward **4991 → 4713
+ns/op (−5.6%)**, reproducible; relay forward flat (~150 ns/op — already
+minimal, no cross-crate hot inlining). Allocations unchanged. Cost: hot-crate
+release rebuild ~3× slower (thin-LTO link + cgu=1); standard ~+15–30% on a
+full release build. Keep only while the runtime numbers justify the build cost.
+
+## 1.8) Rejected: D (shrink relay per-port recv buffer)
+
+Not pursued. Today the relay recv buffer is `[0u8; 65536]` and the forward
+cap `MAX_PACKET_SIZE_BYTES = 65_536`; max UDP datagram is 65_507, so
+truncation is currently impossible. The ~250 MiB saving (relay VPS, 4096
+sessions) requires shrinking the buffer far below 64 KiB, which makes
+`recv_from` truncate any larger frame and then forward it corrupted (silent,
+data-dependent on tunnel MTU). The only safe form is a deliberate protocol
+decision — lower `MAX_PACKET_SIZE_BYTES` to a real cap (MTU + WG overhead)
+and size the buffer to cap+1 so oversized frames are cleanly dropped, not
+truncated. Revisit only if RAM-bound on a large relay; treat as a frame-size
+protocol change, not a perf knob.
+
 ## 2) Remaining items (ordered)
 
 ### P1 — Engine outcome sink (remove the last per-frame copy in each direction)
