@@ -625,20 +625,18 @@ fn validate_secret_file_security(
         // systemd mounts /run/credentials/ as a tmpfs; if the directory
         // is group- or world-accessible, any local process can read the
         // credential file regardless of its own permissions.
-        if allow_root_owner {
-            if let Some(parent) = path.parent() {
-                let parent_meta = fs::symlink_metadata(parent)
-                    .map_err(|err| format!("inspect {label} parent directory failed: {err}"))?;
-                if parent_meta.file_type().is_symlink() {
-                    return Err(format!("{label} parent directory must not be a symlink"));
-                }
-                let parent_mode = parent_meta.mode() & 0o777;
-                if parent_mode & 0o077 != 0 {
-                    return Err(format!(
-                        "{label} parent directory permissions are too broad: \
-                         must be owner-only (0o700), found {parent_mode:03o}",
-                    ));
-                }
+        if allow_root_owner && let Some(parent) = path.parent() {
+            let parent_meta = fs::symlink_metadata(parent)
+                .map_err(|err| format!("inspect {label} parent directory failed: {err}"))?;
+            if parent_meta.file_type().is_symlink() {
+                return Err(format!("{label} parent directory must not be a symlink"));
+            }
+            let parent_mode = parent_meta.mode() & 0o777;
+            if parent_mode & 0o077 != 0 {
+                return Err(format!(
+                    "{label} parent directory permissions are too broad: \
+                     must be owner-only (0o700), found {parent_mode:03o}",
+                ));
             }
         }
         let owner_uid = metadata.uid();

@@ -8,6 +8,10 @@ Read-only audit: no code, config, inventory, or VM/network state was modified. O
 
 Relationship to prior reviews: `SecurityReview_2026-05-24.md` (RN-01..RN-38) is the prior authoritative assessment; `SecurityHardeningBacklog_2026-06-01.md` (HB-1..HB-7) tracks post-review items. This audit is a fresh full-repo pass: it re-verifies the status of prior findings (§8), does not re-narrate still-open RN-xx except where status changed, and numbers net-new findings AUDIT-001+.
 
+2026-06-12 working-tree update: RN-03/RN-04/RN-05/RN-11 have code fixes and focused tests. `force_fail_closed` Results are no longer discarded in the daemon; Phase10 applies the killswitch before backend start and fail-closes on pre-start failure; non-node policy selectors require explicit active membership resolution; empty membership denies peer provisioning. RN-02 remains open. Older "still open" text below is the original audit snapshot unless specifically superseded by this update or `documents/SecurityAnalysis_2026-06-12.md`.
+
+2026-06-12 P1 review update: RN-08 is only partially fixed. The AAD-bound v1 envelope was added, but the v0/v1 decoder currently treats any blob with `len >= 45 && first_byte != 0` as v1. Legacy v0 blobs start with random salt, so most existing v0 encrypted keys will be misclassified as v1 and fail to decrypt after upgrade. Do not mark RN-08 closed until legacy v0 decode compatibility is fixed and covered by an explicit old-format regression test.
+
 ---
 
 ## 1. Executive summary
@@ -18,14 +22,14 @@ Relationship to prior reviews: `SecurityReview_2026-05-24.md` (RN-01..RN-38) is 
 
 **Top risks (the 11 Highs cluster in five places):**
 1. **The fail-closed killswitch can fail open (RN-03/RN-04/RN-10).** All ~39 `force_fail_closed` sites in the daemon discard the Result, the tunnel/routes come up before the killswitch, and a corrupt rotation ledger silently resets to genesis. On a transient nft/helper fault during first bootstrap a node can egress cleartext while reporting "restricted." This is the project's central guarantee and the highest residual risk.
-2. **New agent/automation tooling outruns its safety envelope.** The uncommitted overnight driver (AUDIT-017/018/019) never checks out its isolation branch (commits land on `main`) and runs `git reset --hard && git clean -fd` in the operator's real tree (destroys all uncommitted work) — **do not run its live path**. The `lab_state` MCP server (AUDIT-006) has an unconfined `report_dir` giving any driven agent arbitrary host-file read (SSH keys) and recursive delete.
+2. **New agent/automation tooling outruns its safety envelope.** The uncommitted overnight driver (AUDIT-017/018/019) never checks out its isolation branch (commits land on `main`) and runs `git reset --hard && git clean -fd` in the operator's real tree (destroys all uncommitted work) — **do not run its live path**. The `lab_state` MCP `report_dir` escape (AUDIT-006) is fixed in uncommitted 2026-06-12 work; the overnight driver remains unsafe.
 3. **A trust-core correctness bug disables revocation (AUDIT-040):** the membership reducer stamps wall-clock time into the hashed state, so `RevokeNode`/`RotateNodeKey`/`SetNodeCapabilities`/`RestoreNode` updates fail the state-root check and cannot be applied — and replay of any logged such op breaks daemon bootstrap. Fail-closed in direction, but a compromised node cannot be revoked via the signed path.
 4. **Windows key custody fails open (AUDIT-027/RN-33):** the encrypted-at-rest fallback's permission/ACL check is a no-op `Ok(())` on Windows (the real SDDL validator exists in-tree, just unwired).
 5. **Remote relay DoS (AUDIT-031)** and a **macOS bootstrap privilege-escalation residue (AUDIT-045/RN-32):** an unbounded pre-auth map keyed by attacker `node_id` can OOM the relay; the macOS bootstrap leaves a `NOPASSWD: ALL` sudoers file on disk if the Homebrew install fails.
 
 **Good news / improvement since the last review:** the headline open High from the 2026-06-01 backlog — **RN-06, the Windows killswitch allowing all non-DNS LAN egress — is now fixed** (rescoped to WFP egress allow-lists), and RN-07 (IPv6) is largely fixed. RN-01/17/19/22(in-scope)/23/24 fixes all hold.
 
-**Ship / no-ship recommendation: NO-SHIP until the P0 set (§9) is closed.** Concretely, before release: fix the killswitch fail-open cluster (RN-03/RN-04) and the revocation bug (AUDIT-040); wire/fail-close the Windows key-custody ACL (AUDIT-027); cap the relay pre-auth map (AUDIT-031); trap-clean the macOS sudoers file (AUDIT-045). **Independently of release: do not invoke `ops vm-lab-overnight` without `--dry-run`** — its live path is destructive today (AUDIT-017/018/019) — and confine the `lab_state` MCP `report_dir` (AUDIT-006). None of these is a remote-compromise Critical, but several defeat controls the product markets as guarantees (fail-closed leak prevention, revocation, unattended-autonomy safety), which is a release blocker for a security-first VPN. The Medium/Low set is dominated by Windows-side hardening gaps, false-assurance diagnostics/gates, and supply-chain pinning — all individually small fixes.
+**Ship / no-ship recommendation: NO-SHIP until the P0 set (§9) is closed.** Concretely, before release: fix the killswitch fail-open cluster (RN-03/RN-04) and the revocation bug (AUDIT-040); wire/fail-close the Windows key-custody ACL (AUDIT-027); cap the relay pre-auth map (AUDIT-031); trap-clean the macOS sudoers file (AUDIT-045). **Independently of release: do not invoke `ops vm-lab-overnight` without `--dry-run`** — its live path is destructive today (AUDIT-017/018/019). MCP `lab_state` `report_dir` confinement (AUDIT-006) is fixed in uncommitted 2026-06-12 work. None of these is a remote-compromise Critical, but several defeat controls the product markets as guarantees (fail-closed leak prevention, revocation, unattended-autonomy safety), which is a release blocker for a security-first VPN. The Medium/Low set is dominated by Windows-side hardening gaps, false-assurance diagnostics/gates, and supply-chain pinning — all individually small fixes.
 
 **Verification honesty:** this is a static review. Windows/macOS firewall + key-custody behavior was read but not validated on a live host; the relay/overnight Highs were confirmed by code path (the overnight ones first-hand) but not by live PoC. See §11.
 
@@ -54,7 +58,7 @@ Net-new findings (AUDIT-NNN) plus the load-bearing prior findings re-verified th
 | RN-03 | `force_fail_closed` Result swallowed at all ~39 sites (fail-open killswitch) | High | rustynetd | daemon.rs (39 sites) | confirmed | Open |
 | RN-04 | Tunnel/routes up before killswitch; boot killswitch opt-in/Linux-only | High | rustynetd | phase10.rs:4386/4541 | confirmed | Open |
 | RN-10 | Corrupt rotation ledger silently resets to genesis (anti-rollback loss) | High (was Med) | rustynetd | daemon.rs:8432 | confirmed | Open |
-| AUDIT-006 | MCP `lab_state` unconfined `report_dir` → arbitrary host read + recursive delete | High | rustynet-mcp | lab_state.rs:109 | confirmed | Open |
+| AUDIT-006 | MCP `lab_state` unconfined `report_dir` → arbitrary host read + recursive delete | High | rustynet-mcp | lab_state.rs:109 | confirmed | Fixed (2026-06-12, uncommitted) |
 | AUDIT-017 | Overnight: isolation branch never checked out → commits land on `main` | High | rustynet-cli/overnight | mod.rs:200-232 | confirmed | Open (uncommitted) |
 | AUDIT-018 | Overnight: `git reset --hard`+`clean -fd` in operator tree destroys uncommitted work | High | rustynet-cli/overnight | executor.rs:401 | confirmed | Open (uncommitted) |
 | AUDIT-019 | Overnight: security-diff "revert" resets to the offending commit (no-op) | High | rustynet-cli/overnight | executor.rs:401 | confirmed | Open (uncommitted) |
@@ -86,10 +90,10 @@ Net-new findings (AUDIT-NNN) plus the load-bearing prior findings re-verified th
 | AUDIT-002 | Prior "unsafe only in windows-native/vendored" claim stale (rustynetd FFI) | Info | docs/rustynetd | macos_utun_helper_unsafe.rs | confirmed | Open |
 | AUDIT-003 | SCM_RIGHTS receiver doesn't bound/close surplus fds (DiD) | Info | rustynetd | macos_utun_helper_unsafe.rs:197 | confirmed | Open |
 | AUDIT-004 | rustynetd uses `deny` not `forbid` unsafe (overridable; documented) | Info | rustynetd | Cargo.toml:47 | confirmed | Open |
-| AUDIT-007 | MCP `get_inventory` emits VM `ssh_password` | Low | rustynet-mcp | lab_state.rs:2621 | confirmed | Open |
+| AUDIT-007 | MCP `get_inventory` emits VM `ssh_password` | Low | rustynet-mcp | lab_state.rs:2621 | confirmed | Fixed (2026-06-12, uncommitted) |
 | AUDIT-008 | New `build.rs` build-time exec + non-reproducible; "no build.rs" claim stale | Low | rustynet-mcp | build.rs:31 | confirmed | Open |
-| AUDIT-009 | MCP `run_with_timeout` orphans grandchildren on timeout | Low | rustynet-mcp | lib.rs:475 | confirmed | Open |
-| AUDIT-010 | MCP: no concurrency cap on background live-lab jobs | Low | rustynet-mcp | lab_state.rs:2946 | confirmed | Open |
+| AUDIT-009 | MCP `run_with_timeout` orphans grandchildren on timeout | Low | rustynet-mcp | lib.rs:475 | confirmed | Fixed (2026-06-12, uncommitted) |
+| AUDIT-010 | MCP: no concurrency cap on background live-lab jobs | Low | rustynet-mcp | lab_state.rs:2946 | confirmed | Fixed (2026-06-12, uncommitted) |
 | AUDIT-011 | `enrollment mint --output` writes bearer token without 0600 | Low | rustynet-cli | main.rs:6526/14083 | confirmed | Open |
 | AUDIT-012 | `secrets_hygiene_gates` content-scan narrowly scoped (false assurance) | Low | rustynet-cli | ops_phase1.rs:2006 | confirmed | Open |
 | AUDIT-013 | `check_backend_boundary_leakage` omits dns-zone + weak pattern | Low | rustynet-cli | check_backend_boundary_leakage.rs:9 | confirmed | Open |
@@ -161,12 +165,14 @@ Tally (net-new + re-rated): **High 11, Medium 19, Low 16, Info 7.** No Critical.
 - **Impact / exploit scenario:** a prompt-injected or merely confused agent exfiltrates `~/.ssh/rustynet_lab_ed25519` (and any other host secret) into its context, or destroys arbitrary host directories. The overnight autonomous driver (AUDIT-001) makes this reachable unattended.
 - **Confidence:** confirmed (read `abs_path` first-hand; delete path is two-step but fully reachable).
 - **Recommendation:** confine `abs_path`/`resolve_report_dir` to `repo_root` (ideally `repo_root/state`): reject absolute paths and any `..`, canonicalize the *result*, require `starts_with(repo_root)` — apply at resolution so read/create/delete sinks all inherit it. Reuse the `repo_context.rs:1067` pattern.
+- **2026-06-12 fix evidence:** `lab_state` now resolves report paths through a repo-confined canonical-prefix resolver before read/create/delete sinks, rejects absolute or relative escapes, refuses invalid stored job `report_dir`s, and covers the boundary with `report_dir_inputs_are_confined_to_repo`.
 
 #### AUDIT-007 — `get_inventory` MCP tool emits VM `ssh_password` into the response
 - **Severity:** Low — throwaway committed lab creds; key-auth is used everywhere, so the agent never needs the password.
 - **CWE:** CWE-312 (cleartext exposure).
 - **Location:** `crates/rustynet-mcp/src/bin/lab_state.rs:2621-2636` (`get_inventory` returns inventory JSON verbatim); secret at `documents/operations/active/vm_lab_inventory.json` (`"ssh_password":"tempo"` ×8). `get_lab_topology` (:397) deliberately omits creds, so the exposure is inconsistent.
 - **Recommendation:** redact `ssh_password` (and any future secret field) in `get_inventory`; longer-term move the password out of the committed inventory. Also reachable via AUDIT-006's arbitrary read.
+- **2026-06-12 fix evidence:** `get_inventory` now redacts credential-like fields recursively and refuses to echo malformed inventory JSON; `get_lab_topology_digest_and_resolution` asserts the `tempo` password is absent and `<redacted>` appears.
 
 #### AUDIT-008 — `build.rs` build-time exec + non-reproducible output; prior review's "no build.rs anywhere" claim is now false (doc drift)
 - **Severity:** Low (assurance/doc-drift + reproducibility).
@@ -179,12 +185,14 @@ Tally (net-new + re-rated): **High 11, Medium 19, Low 16, Info 7.** No Critical.
 - **CWE:** CWE-404.
 - **Location:** `crates/rustynet-mcp/src/lib.rs:475-478` (`child.kill()` only; not a process-group leader, unlike the background-job path which correctly uses `process_group(0)` at lib.rs:569).
 - **Description:** synchronous ops (cargo check/test, gate scripts) leave `rustc`/script grandchildren on timeout, holding `target/` locks and CPU. Recommendation: spawn as group leader and TERM/KILL the group, mirroring the background-job path.
+- **2026-06-12 fix evidence:** `run_with_timeout` now starts Unix children as process-group leaders and kills the group on timeout; `run_with_timeout_kills_child_process_group` proves a shell-spawned grandchild cannot hold MCP pipes open.
 
 #### AUDIT-010 — No concurrency cap on background live-lab jobs
 - **Severity:** Low (host resource exhaustion, dev host).
 - **CWE:** CWE-770.
 - **Location:** `crates/rustynet-mcp/src/bin/lab_state.rs:2946` `start_live_lab_run`.
 - **Description:** each call spawns a heavy detached `cargo orchestrate-live-lab` tree; nothing limits in-flight count. A looping agent can exhaust the host. Recommendation: cap concurrent non-finished jobs and surface the count.
+- **2026-06-12 fix evidence:** `start_live_lab_run` now rejects a second running job (`MAX_CONCURRENT_LIVE_LAB_JOBS=1`) using durable job records plus PID identity checks; `start_live_lab_run_rejects_second_running_job` covers the guard.
 
 ### Area: rustynet-cli (operator CLI + gate bins)
 
@@ -531,7 +539,7 @@ Per the §12.2 boundaries in the prior review, re-evaluated against current code
 - **TB4 on-disk artifacts → daemon:** signed snapshots/ledgers are signature+watermark+digest gated with bounded reads and atomic writes (verified). Residual: corrupt rotation ledger resets to genesis instead of failing closed (RN-10, High); Windows encrypted-key custody ACL unchecked (AUDIT-027, High).
 - **TB5 process memory ↔ at-rest key storage:** strong on Unix (zeroize on Drop + derived keys, strict perms, atomic+fsync writes). Residual: DPAPI plaintext not zeroized before LocalFree (AUDIT-029); Windows config render leaves plaintext key in a non-zeroized String (AUDIT-024); DPAPI no secondary entropy (AUDIT-028); envelope AAD/version binding absent (RN-08).
 - **TB6 build/CI → released artifact:** CI uses `--locked` + fails loud on missing signing secrets + Authenticode self-verify. Residual: mutable action tags (RN-16/AUDIT-046), toolchain drift (RN-30/AUDIT-047), bootstrap omits `--locked` (AUDIT-048), unsigned SBOM, macOS bootstrap sudoers (AUDIT-045, High).
-- **TB7 (new) agent/automation → host & repo (MCP servers, overnight driver):** the audit's net-new boundary. The MCP `lab_state` server has an arbitrary host-file read/delete primitive (AUDIT-006, High); the overnight driver can destroy the operator tree and commit to main unattended (AUDIT-017/018/019, High) and grants the spawned agent ambient authority (AUDIT-020). This boundary is the least mature and gates "can this tooling run unattended" = currently no.
+- **TB7 (new) agent/automation → host & repo (MCP servers, overnight driver):** the audit's net-new boundary. The MCP `lab_state` arbitrary host-file read/delete primitive (AUDIT-006, High) is fixed in uncommitted 2026-06-12 work; the overnight driver can still destroy the operator tree and commit to main unattended (AUDIT-017/018/019, High) and grants the spawned agent ambient authority (AUDIT-020). This boundary is the least mature and gates "can this tooling run unattended" = currently no.
 - **Killswitch / dataplane leak prevention (AS4):** the central guarantee. RN-03 (swallowed fail-closed) + RN-04 (interface-before-killswitch) remain the highest-residual-risk pair: on a transient nft/helper fault during first bootstrap a node can egress cleartext while reporting "restricted." Windows killswitch RN-06 (IPv4 LAN leak) is now **fixed** (scoped WFP egress allows) and RN-07 (IPv6) is largely fixed (block rule added; assert-drift + address-flush gaps remain). Linux exit-serving DNS ordering (RN-12) still leaks for explicit-resolver apps on exit nodes only.
 
 ## 7. Verified-solid controls + refuted hypotheses (coverage evidence)
@@ -582,10 +590,9 @@ Re-verified status of every prior finding (sampled "fixed" ones re-checked first
 **P0 — fix before any release / before running the overnight driver:**
 1. Overnight driver (AUDIT-017/018/019): do not run the live path; before it ships, add worktree isolation + branch checkout + correct revert base + a confirmation gate. *Effort: M.* (Today: only `--dry-run` is safe.)
 2. RN-03 + RN-04: stop swallowing `force_fail_closed`; program a mandatory cross-platform killswitch before backend start. *Effort: M (behavioral, regression-risk — confirm direction).*
-3. AUDIT-006: confine the MCP `lab_state` `report_dir` to repo_root. *Effort: S (reuse repo_context resolver).*
-4. AUDIT-031: cap + evict the relay HelloLimiter map; rate-limit before signature; cap node_id length. *Effort: S.*
-5. AUDIT-040: make the membership reducer deterministic so revocation/key-rotation can actually be applied. *Effort: S-M + round-trip tests.*
-6. AUDIT-045 (RN-32): trap-cleanup the macOS bootstrap sudoers file. *Effort: S.*
+3. AUDIT-031: cap + evict the relay HelloLimiter map; rate-limit before signature; cap node_id length. *Effort: S.*
+4. AUDIT-040: make the membership reducer deterministic so revocation/key-rotation can actually be applied. *Effort: S-M + round-trip tests.*
+5. AUDIT-045 (RN-32): trap-cleanup the macOS bootstrap sudoers file. *Effort: S.*
 
 **P1 — high-value integrity/assurance:**
 7. AUDIT-027 (RN-33): wire the Windows key-custody ACL validator or fail closed. *Effort: S (validator exists).*
