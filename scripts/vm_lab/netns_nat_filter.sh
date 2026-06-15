@@ -18,7 +18,7 @@ STUN_PORT=3478
 EP_WG_PORT=51820
 DIFF_PORT=49378
 COLD_PORT=49379
-TMP_DIR="/tmp/rustynet-nat-filter.$$"
+TMP_DIR=""
 declare -a PIDS=()
 
 cleanup() {
@@ -28,7 +28,9 @@ cleanup() {
     wait "$pid" 2>/dev/null || true
   done
   bash "$SIM" teardown >/dev/null 2>&1 || true
-  rm -rf "$TMP_DIR"
+  if [ -n "$TMP_DIR" ]; then
+    rm -rf "$TMP_DIR"
+  fi
 }
 trap cleanup EXIT
 
@@ -153,7 +155,7 @@ run_scenario() {
 }
 
 require_root
-mkdir -p "$TMP_DIR"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rustynet-nat-filter.XXXXXX")" || exit 1
 rc=0
 echo "== NAT filtering-behaviour verification =="
 for profile in full_cone port_restricted_cone symmetric; do

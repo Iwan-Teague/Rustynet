@@ -73,6 +73,7 @@ finished Phase 1/2/3/5 checklists are archived in
 
 Cross-platform code-quality ledger:
 - [active/PlatformImprovementBacklog_2026-05-14.md](./active/PlatformImprovementBacklog_2026-05-14.md) — most recently updated cross-platform improvement backlog (X1-X7 numbered tracks are the cleanest current path for code-only quality work)
+- [active/DataplanePerfBacklog_2026-06-12.md](./active/DataplanePerfBacklog_2026-06-12.md) — active hot-path performance backlog with measured baselines and bench commands for the userspace-shared engine, relay forward path, utun I/O, and endpoint indexing
 - [active/SecurityHardeningAudit_2026-04-28.md](./active/SecurityHardeningAudit_2026-04-28.md) — current cross-platform security-hardening audit set
 
 ## High-Value Evergreen References
@@ -84,7 +85,7 @@ Cross-platform code-quality ledger:
 - [CrossNetworkLiveLabPrerequisitesChecklist.md](./CrossNetworkLiveLabPrerequisitesChecklist.md)
 - [CrossNetworkRemoteExitArtifactSchema_2026-03-16.md](./CrossNetworkRemoteExitArtifactSchema_2026-03-16.md)
 - [CrossNetworkRemoteExitIncidentPlaybook.md](./CrossNetworkRemoteExitIncidentPlaybook.md)
-- [CrossNetworkSimulationRunbook.md](./CrossNetworkSimulationRunbook.md) — how to simulate cross-network (NAT traversal/relay/gossip) on the single-host VM lab without real separate networks; the four-tier substrate (netns internet-simulator / VXLAN-overlay multi-VM / slirp cross-OS / chaos), the validated `netns_internet_sim.sh` + `apply_nat_profile.sh` tooling, and the UTM constraints that drive the design
+- [CrossNetworkSimulationRunbook.md](./CrossNetworkSimulationRunbook.md) — how to simulate cross-network (NAT traversal/relay/gossip) on the single-host VM lab without real separate networks; the four-tier substrate (netns internet-simulator / VXLAN-overlay multi-VM / slirp cross-OS / chaos), the validated netns NAT mapping/filtering tools, the Tier B VXLAN driver, and the UTM constraints that drive the design
 - [CryptoDeprecationSchedule.md](./CryptoDeprecationSchedule.md) — algorithm deprecation/removal calendar and reviewed exception rules
 - [DependencyExceptionPolicy.md](./DependencyExceptionPolicy.md) — controlled-exception workflow for the dependency policy gate
 - [DisasterRecoveryValidation.md](./DisasterRecoveryValidation.md)

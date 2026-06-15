@@ -1203,6 +1203,7 @@ dependencies = [
  "nix 0.29.0",
  "rand",
  "rusqlite",
+ "rustynet-alloc-meter",
  "rustynet-crypto",
  "rustynet-dns-zone",
  "rustynet-policy",
