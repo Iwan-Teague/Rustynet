@@ -550,11 +550,20 @@ fn transport_error_kind(err: &TransportError) -> &'static str {
 /// 8-byte hex prefix of a node id, suitable for shared logs. Same
 /// shape as the existing log markers in `daemon.rs` for trust /
 /// traversal / membership events.
+/// Lowercase hex alphabet for the nibble-lookup encoders.
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    // Append lowercase hex without a per-byte `format!` allocation.
+    for &byte in bytes {
+        out.push(HEX_LOWER[(byte >> 4) as usize] as char);
+        out.push(HEX_LOWER[(byte & 0x0f) as usize] as char);
+    }
+}
+
 fn short_id(id: &[u8; 32]) -> String {
     let mut out = String::with_capacity(16);
-    for byte in &id[..8] {
-        out.push_str(&format!("{byte:02x}"));
-    }
+    push_hex(&mut out, &id[..8]);
     out
 }
 
@@ -715,9 +724,7 @@ pub fn write_gossip_watermark(
             payload.push(',');
         }
         first = false;
-        for byte in id {
-            payload.push_str(&format!("{byte:02x}"));
-        }
+        push_hex(&mut payload, &id);
         payload.push(':');
         payload.push_str(&seq.to_string());
     }

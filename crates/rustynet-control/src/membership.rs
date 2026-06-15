@@ -183,14 +183,16 @@ impl MembershipState {
             ));
         }
 
-        let mut node_ids = HashSet::new();
+        // Borrow node/approver ids for the duplicate check instead of
+        // cloning each into the set (same membership, same error strings).
+        let mut node_ids: HashSet<&str> = HashSet::new();
         for node in &self.nodes {
             if node.node_id.trim().is_empty() {
                 return Err(MembershipError::InvalidFormat(
                     "node id must not be empty".to_owned(),
                 ));
             }
-            if !node_ids.insert(node.node_id.clone()) {
+            if !node_ids.insert(node.node_id.as_str()) {
                 return Err(MembershipError::InvalidFormat(format!(
                     "duplicate node id {}",
                     node.node_id
@@ -206,7 +208,7 @@ impl MembershipState {
             validate_membership_node_capabilities(node)?;
         }
 
-        let mut approver_ids = HashSet::new();
+        let mut approver_ids: HashSet<&str> = HashSet::new();
         let active_approvers = self
             .approver_set
             .iter()
@@ -218,7 +220,7 @@ impl MembershipState {
                     "approver id must not be empty".to_owned(),
                 ));
             }
-            if !approver_ids.insert(approver.approver_id.clone()) {
+            if !approver_ids.insert(approver.approver_id.as_str()) {
                 return Err(MembershipError::InvalidFormat(format!(
                     "duplicate approver id {}",
                     approver.approver_id
@@ -242,69 +244,61 @@ impl MembershipState {
     }
 
     pub fn canonical_payload(&self) -> Result<String, MembershipError> {
+        // Write directly into one buffer (no per-line `format!` temporary) and
+        // sort *references* to the rosters rather than cloning every node /
+        // approver String. Output is byte-identical — signatures and state
+        // roots depend on it; the canonical/round-trip determinism tests pin
+        // it.
+        use std::fmt::Write as _;
         self.validate()?;
-        let mut nodes = self.nodes.clone();
+        let mut nodes: Vec<&MembershipNode> = self.nodes.iter().collect();
         nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-        let mut approvers = self.approver_set.clone();
+        let mut approvers: Vec<&MembershipApprover> = self.approver_set.iter().collect();
         approvers.sort_by(|left, right| left.approver_id.cmp(&right.approver_id));
 
-        let mut out = String::new();
-        out.push_str(&format!("version={}\n", self.schema_version));
-        out.push_str(&format!("network_id={}\n", self.network_id));
-        out.push_str(&format!("epoch={}\n", self.epoch));
-        out.push_str(&format!("quorum_threshold={}\n", self.quorum_threshold));
-        out.push_str(&format!(
-            "metadata_hash={}\n",
+        let mut out = String::with_capacity(256 + nodes.len() * 256 + approvers.len() * 192);
+        let _ = writeln!(out, "version={}", self.schema_version);
+        let _ = writeln!(out, "network_id={}", self.network_id);
+        let _ = writeln!(out, "epoch={}", self.epoch);
+        let _ = writeln!(out, "quorum_threshold={}", self.quorum_threshold);
+        let _ = writeln!(
+            out,
+            "metadata_hash={}",
             self.metadata_hash.as_deref().unwrap_or("")
-        ));
-        out.push_str(&format!("node_count={}\n", nodes.len()));
+        );
+        let _ = writeln!(out, "node_count={}", nodes.len());
         for (index, node) in nodes.iter().enumerate() {
-            out.push_str(&format!("node.{index}.node_id={}\n", node.node_id));
-            out.push_str(&format!(
-                "node.{index}.node_pubkey_hex={}\n",
-                node.node_pubkey_hex
-            ));
-            out.push_str(&format!("node.{index}.owner={}\n", node.owner));
-            out.push_str(&format!("node.{index}.status={}\n", node.status.as_str()));
-            let mut roles = node.roles.clone();
-            roles.sort();
+            let _ = writeln!(out, "node.{index}.node_id={}", node.node_id);
+            let _ = writeln!(out, "node.{index}.node_pubkey_hex={}", node.node_pubkey_hex);
+            let _ = writeln!(out, "node.{index}.owner={}", node.owner);
+            let _ = writeln!(out, "node.{index}.status={}", node.status.as_str());
+            let mut roles: Vec<&str> = node.roles.iter().map(String::as_str).collect();
+            roles.sort_unstable();
             roles.dedup();
-            out.push_str(&format!("node.{index}.roles={}\n", roles.join(",")));
-            out.push_str(&format!(
-                "node.{index}.capabilities={}\n",
+            let _ = writeln!(out, "node.{index}.roles={}", roles.join(","));
+            let _ = writeln!(
+                out,
+                "node.{index}.capabilities={}",
                 role_capability_csv(&node.capabilities)
-            ));
-            out.push_str(&format!(
-                "node.{index}.joined_at_unix={}\n",
-                node.joined_at_unix
-            ));
-            out.push_str(&format!(
-                "node.{index}.updated_at_unix={}\n",
-                node.updated_at_unix
-            ));
+            );
+            let _ = writeln!(out, "node.{index}.joined_at_unix={}", node.joined_at_unix);
+            let _ = writeln!(out, "node.{index}.updated_at_unix={}", node.updated_at_unix);
         }
-        out.push_str(&format!("approver_count={}\n", approvers.len()));
+        let _ = writeln!(out, "approver_count={}", approvers.len());
         for (index, approver) in approvers.iter().enumerate() {
-            out.push_str(&format!(
-                "approver.{index}.approver_id={}\n",
-                approver.approver_id
-            ));
-            out.push_str(&format!(
-                "approver.{index}.approver_pubkey_hex={}\n",
+            let _ = writeln!(out, "approver.{index}.approver_id={}", approver.approver_id);
+            let _ = writeln!(
+                out,
+                "approver.{index}.approver_pubkey_hex={}",
                 approver.approver_pubkey_hex
-            ));
-            out.push_str(&format!(
-                "approver.{index}.role={}\n",
-                approver.role.as_str()
-            ));
-            out.push_str(&format!(
-                "approver.{index}.status={}\n",
-                approver.status.as_str()
-            ));
-            out.push_str(&format!(
-                "approver.{index}.created_at_unix={}\n",
+            );
+            let _ = writeln!(out, "approver.{index}.role={}", approver.role.as_str());
+            let _ = writeln!(out, "approver.{index}.status={}", approver.status.as_str());
+            let _ = writeln!(
+                out,
+                "approver.{index}.created_at_unix={}",
                 approver.created_at_unix
-            ));
+            );
         }
 
         Ok(out)
@@ -1258,11 +1252,11 @@ fn parse_membership_state_payload(payload: &str) -> Result<MembershipState, Memb
             roles: split_csv(required_field(&fields, &format!("node.{index}.roles"))?),
             capabilities: parse_node_capabilities(
                 fields
-                    .get(&format!("node.{index}.capabilities"))
-                    .map(String::as_str),
+                    .get(format!("node.{index}.capabilities").as_str())
+                    .copied(),
                 fields
-                    .get(&format!("node.{index}.roles"))
-                    .map(String::as_str)
+                    .get(format!("node.{index}.roles").as_str())
+                    .copied()
                     .unwrap_or(""),
             )?,
             joined_at_unix: parse_u64_field(&fields, &format!("node.{index}.joined_at_unix"))?,
@@ -1358,18 +1352,15 @@ fn parse_membership_update_payload(
             status: MembershipNodeStatus::parse(required_field(&fields, "op.status")?)?,
             roles: split_csv(required_field(&fields, "op.roles")?),
             capabilities: parse_node_capabilities(
-                fields.get("op.capabilities").map(String::as_str),
-                fields.get("op.roles").map(String::as_str).unwrap_or(""),
+                fields.get("op.capabilities").copied(),
+                fields.get("op.roles").copied().unwrap_or(""),
             )?,
             joined_at_unix: parse_u64_field(&fields, "op.joined_at_unix")?,
             updated_at_unix: parse_u64_field(&fields, "op.updated_at_unix")?,
         }),
         "set_node_capabilities" => MembershipOperation::SetNodeCapabilities {
             node_id: required_field(&fields, "op.node_id")?.to_owned(),
-            capabilities: parse_node_capabilities(
-                fields.get("op.capabilities").map(String::as_str),
-                "",
-            )?,
+            capabilities: parse_node_capabilities(fields.get("op.capabilities").copied(), "")?,
         },
         "remove_node" => MembershipOperation::RemoveNode {
             node_id: required_field(&fields, "op.node_id")?.to_owned(),
@@ -1589,16 +1580,21 @@ fn validate_membership_file_security(path: &Path, label: &str) -> Result<(), Mem
 }
 
 fn required_field<'a>(
-    fields: &'a HashMap<String, String>,
+    fields: &HashMap<&'a str, &'a str>,
     key: &str,
 ) -> Result<&'a str, MembershipError> {
     fields
         .get(key)
-        .map(String::as_str)
+        .copied()
         .ok_or_else(|| MembershipError::InvalidFormat(format!("missing field {key}")))
 }
 
-fn parse_key_values(value: &str) -> Result<HashMap<String, String>, MembershipError> {
+/// Parse the line-oriented `key=value` body into a map that BORROWS keys and
+/// values from `value` — no per-field `String` allocation. The returned map
+/// is valid only while `value` lives (every caller holds the source string
+/// for the duration). Same accepted/rejected inputs and error strings as
+/// before; fail-closed callers match on those strings, so they are verbatim.
+fn parse_key_values(value: &str) -> Result<HashMap<&str, &str>, MembershipError> {
     let mut fields = HashMap::new();
     for line in value.lines() {
         if line.trim().is_empty() {
@@ -1609,10 +1605,7 @@ fn parse_key_values(value: &str) -> Result<HashMap<String, String>, MembershipEr
                 "line missing key/value separator".to_owned(),
             ));
         };
-        if fields
-            .insert(key.to_owned(), field_value.to_owned())
-            .is_some()
-        {
+        if fields.insert(key, field_value).is_some() {
             return Err(MembershipError::InvalidFormat(format!(
                 "duplicate field {key}"
             )));
@@ -1621,22 +1614,19 @@ fn parse_key_values(value: &str) -> Result<HashMap<String, String>, MembershipEr
     Ok(fields)
 }
 
-fn parse_u8_field(fields: &HashMap<String, String>, key: &str) -> Result<u8, MembershipError> {
+fn parse_u8_field(fields: &HashMap<&str, &str>, key: &str) -> Result<u8, MembershipError> {
     required_field(fields, key)?
         .parse::<u8>()
         .map_err(|_| MembershipError::InvalidFormat(format!("invalid u8 field {key}")))
 }
 
-fn parse_u64_field(fields: &HashMap<String, String>, key: &str) -> Result<u64, MembershipError> {
+fn parse_u64_field(fields: &HashMap<&str, &str>, key: &str) -> Result<u64, MembershipError> {
     required_field(fields, key)?
         .parse::<u64>()
         .map_err(|_| MembershipError::InvalidFormat(format!("invalid u64 field {key}")))
 }
 
-fn parse_usize_field(
-    fields: &HashMap<String, String>,
-    key: &str,
-) -> Result<usize, MembershipError> {
+fn parse_usize_field(fields: &HashMap<&str, &str>, key: &str) -> Result<usize, MembershipError> {
     required_field(fields, key)?
         .parse::<usize>()
         .map_err(|_| MembershipError::InvalidFormat(format!("invalid usize field {key}")))
@@ -1791,12 +1781,21 @@ fn split_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Lowercase hex alphabet for the nibble-lookup encoder.
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
 fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
+    // Two-char-per-byte lookup instead of a `format!("{:02x}")` call (which
+    // allocates a throwaway `String`) per byte. Byte-identical output — this
+    // feeds canonical signed payloads and state-root hashes, so determinism
+    // is pinned by the existing canonical/round-trip tests.
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX_LOWER[(byte >> 4) as usize]);
+        out.push(HEX_LOWER[(byte & 0x0f) as usize]);
     }
-    out
+    // Safe: every pushed byte is an ASCII hex digit.
+    String::from_utf8(out).expect("hex alphabet is valid ASCII")
 }
 
 fn hex_decode(encoded: &str) -> Result<Vec<u8>, MembershipError> {

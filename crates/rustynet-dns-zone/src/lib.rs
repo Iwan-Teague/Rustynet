@@ -808,11 +808,15 @@ fn sha256_digest(payload: &[u8]) -> [u8; 32] {
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push_str(&format!("{byte:02x}"));
+    // Nibble lookup instead of a per-byte `format!` allocation;
+    // byte-identical output (feeds the signed zone canonical payload).
+    const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = Vec::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(HEX_LOWER[(byte >> 4) as usize]);
+        encoded.push(HEX_LOWER[(byte & 0x0f) as usize]);
     }
-    encoded
+    String::from_utf8(encoded).expect("hex alphabet is valid ASCII")
 }
 
 fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], DnsZoneError> {

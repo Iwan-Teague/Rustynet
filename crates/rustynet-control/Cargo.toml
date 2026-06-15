@@ -23,6 +23,8 @@ nix = { version = "0.29", default-features = false, features = ["user"] }
 rustynet-windows-native = { path = "../rustynet-windows-native" }
 
 [dev-dependencies]
+# Dev-only counting allocator for the perfprobe example (flagged; third_party internal).
+rustynet-alloc-meter = { path = "../../third_party/rustynet-alloc-meter" }
 tempfile = "3"
 
 [lints]

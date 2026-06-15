@@ -183,23 +183,25 @@ pub struct RoleAuditEntry {
 /// first entry. The membership log uses the same convention.
 pub const GENESIS_PREVIOUS_HASH: &str = "genesis";
 
+/// Lowercase hex alphabet for the nibble-lookup encoder.
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    hex_encode(hasher.finalize().as_slice())
 }
 
+/// Encode bytes as lowercase hex via a nibble lookup (no per-byte
+/// `format!` allocation). Byte-identical to the previous formatter;
+/// the hash-chain determinism tests pin it.
 fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX_LOWER[(byte >> 4) as usize]);
+        out.push(HEX_LOWER[(byte & 0x0f) as usize]);
     }
-    out
+    String::from_utf8(out).expect("hex alphabet is valid ASCII")
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, RoleAuditError> {
