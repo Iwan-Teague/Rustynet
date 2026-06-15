@@ -1128,6 +1128,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustynet-alloc-meter"
+version = "0.1.0"
+
+[[package]]
 name = "rustynet-backend-api"
 version = "0.1.0"
 
@@ -1155,6 +1159,7 @@ dependencies = [
  "base64 0.22.1",
  "boringtun",
  "criterion",
+ "rustynet-alloc-meter",
  "rustynet-backend-api",
  "rustynet-tun",
  "rustynet-windows-native",
@@ -1281,6 +1286,7 @@ dependencies = [
  "criterion",
  "ed25519-dalek",
  "rand",
+ "rustynet-alloc-meter",
  "rustynet-control",
  "rustynet-windows-native",
  "serde",

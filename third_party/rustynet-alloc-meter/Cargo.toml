@@ -1,0 +1,9 @@
+[package]
+name = "rustynet-alloc-meter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Rustynet Team"]
+description = "Dev-only counting global allocator for perf baselines. Internal, no external code; lives in third_party because installing a GlobalAlloc requires `unsafe`, which workspace crates forbid."
+
+[dependencies]

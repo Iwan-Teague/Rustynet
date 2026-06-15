@@ -23,10 +23,17 @@ tempfile = "3"
 # tree to keep the supply-chain surface minimal — the bench reports
 # plain-text estimates. Dev-only; never in the shipped dependency graph.
 criterion = { version = "0.5", default-features = false }
+# Dev-only counting allocator for the perfprobe examples (internal
+# crate in third_party, no external code; flagged in the perf docs).
+rustynet-alloc-meter = { path = "../../third_party/rustynet-alloc-meter" }
 
 [[bench]]
 name = "dataplane_engine"
 harness = false
+required-features = ["test-harness"]
+
+[[example]]
+name = "perfprobe_engine"
 required-features = ["test-harness"]
 
 [lints]

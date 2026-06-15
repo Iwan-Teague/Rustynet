@@ -15,6 +15,37 @@
 
 Benches: `cargo bench -p rustynet-backend-wireguard --features test-harness` (engine encrypt + forward round-trip) and `cargo bench -p rustynet-relay` (relay forward). criterion is a flagged dev-only dependency (`default-features = false`). Capture before/after for every backlog item below.
 
+## 1.5) Three-dimension baseline (2026-06-12, Apple Silicon dev host)
+
+Measured with the `perfprobe_*` fixed-work example binaries (release build)
+under `/usr/bin/time -l`; allocations counted by the dev-only
+`third_party/rustynet-alloc-meter` counting global allocator (internal crate,
+no external code — flagged; needed because `GlobalAlloc` requires `unsafe`,
+which first-party crates forbid). Reproduce with:
+
+```sh
+cargo build --release -p rustynet-backend-wireguard --features test-harness --example perfprobe_engine
+cargo build --release -p rustynet-relay --example perfprobe_relay
+/usr/bin/time -l target/release/examples/perfprobe_engine
+/usr/bin/time -l target/release/examples/perfprobe_relay
+```
+
+| Probe | SPEED (wall/op) | MEMORY (allocs/op · bytes/op · peak RSS) | HARDWARE (instr/op · cycles/op · user CPU/op · sys) |
+|---|---|---|---|
+| engine forward (encrypt+decrypt, 1400B, 200k ops) | 4,890 ns | 8.00 · 3,204 B · 2.0 MB | ≈76,200 · ≈21,000 · ≈4.7 µs · 0.01 s total |
+| relay forward (1400B, 2M ops) | 156 ns | 1.00 · ≈1 B · 1.8 MB | ≈2,886 · ≈661 · ≈157 ns · 0.00 s total |
+
+Syscalls: zero on both probed paths by construction (pure in-memory seams);
+the per-frame syscall counts for the full loops are code-verified in the
+hot-path map (Linux verification path: `strace -c` around the live-lab run).
+Criterion SPEED cross-check: `engine_forward_one_1400b` 4.43 µs,
+`engine_encrypt_outbound_1400b` 2.22 µs, `relay_forward_packet_1400b` 187 ns.
+
+Baseline observations feeding §2: the engine's 8 allocs/op are the P1
+outcome-sink copies (now quantified); the relay's single remaining alloc/op
+is the rate limiter's `node_id.to_owned()` `entry()` key — see the
+opportunity list.
+
 ## 2) Remaining items (ordered)
 
 ### P1 — Engine outcome sink (remove the last per-frame copy in each direction)
