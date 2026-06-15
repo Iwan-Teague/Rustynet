@@ -429,78 +429,79 @@ impl MembershipUpdateRecord {
             ));
         }
 
-        let mut out = String::new();
-        out.push_str(&format!("version={MEMBERSHIP_SCHEMA_VERSION}\n"));
-        out.push_str(&format!("network_id={}\n", self.network_id));
-        out.push_str(&format!("update_id={}\n", self.update_id));
-        out.push_str(&format!("operation={}\n", self.operation.operation_name()));
-        out.push_str(&format!("target={}\n", self.target));
-        out.push_str(&format!("prev_state_root={}\n", self.prev_state_root));
-        out.push_str(&format!("new_state_root={}\n", self.new_state_root));
-        out.push_str(&format!("epoch_prev={}\n", self.epoch_prev));
-        out.push_str(&format!("epoch_new={}\n", self.epoch_new));
-        out.push_str(&format!("created_at_unix={}\n", self.created_at_unix));
-        out.push_str(&format!("expires_at_unix={}\n", self.expires_at_unix));
-        out.push_str(&format!("reason_code={}\n", self.reason_code));
-        out.push_str(&format!(
-            "policy_context={}\n",
+        // Build the canonical signed payload by writing into one buffer (no
+        // per-line `format!` temporary). Byte-identical output — the update
+        // signature is computed over this; round-trip/determinism tests pin it.
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(384);
+        let _ = writeln!(out, "version={MEMBERSHIP_SCHEMA_VERSION}");
+        let _ = writeln!(out, "network_id={}", self.network_id);
+        let _ = writeln!(out, "update_id={}", self.update_id);
+        let _ = writeln!(out, "operation={}", self.operation.operation_name());
+        let _ = writeln!(out, "target={}", self.target);
+        let _ = writeln!(out, "prev_state_root={}", self.prev_state_root);
+        let _ = writeln!(out, "new_state_root={}", self.new_state_root);
+        let _ = writeln!(out, "epoch_prev={}", self.epoch_prev);
+        let _ = writeln!(out, "epoch_new={}", self.epoch_new);
+        let _ = writeln!(out, "created_at_unix={}", self.created_at_unix);
+        let _ = writeln!(out, "expires_at_unix={}", self.expires_at_unix);
+        let _ = writeln!(out, "reason_code={}", self.reason_code);
+        let _ = writeln!(
+            out,
+            "policy_context={}",
             self.policy_context.as_deref().unwrap_or("")
-        ));
+        );
 
         match &self.operation {
             MembershipOperation::AddNode(node) => {
-                out.push_str(&format!("op.node_id={}\n", node.node_id));
-                out.push_str(&format!("op.node_pubkey_hex={}\n", node.node_pubkey_hex));
-                out.push_str(&format!("op.owner={}\n", node.owner));
-                out.push_str(&format!("op.status={}\n", node.status.as_str()));
-                let mut roles = node.roles.clone();
-                roles.sort();
+                let _ = writeln!(out, "op.node_id={}", node.node_id);
+                let _ = writeln!(out, "op.node_pubkey_hex={}", node.node_pubkey_hex);
+                let _ = writeln!(out, "op.owner={}", node.owner);
+                let _ = writeln!(out, "op.status={}", node.status.as_str());
+                let mut roles: Vec<&str> = node.roles.iter().map(String::as_str).collect();
+                roles.sort_unstable();
                 roles.dedup();
-                out.push_str(&format!("op.roles={}\n", roles.join(",")));
-                out.push_str(&format!(
-                    "op.capabilities={}\n",
+                let _ = writeln!(out, "op.roles={}", roles.join(","));
+                let _ = writeln!(
+                    out,
+                    "op.capabilities={}",
                     role_capability_csv(&node.capabilities)
-                ));
-                out.push_str(&format!("op.joined_at_unix={}\n", node.joined_at_unix));
-                out.push_str(&format!("op.updated_at_unix={}\n", node.updated_at_unix));
+                );
+                let _ = writeln!(out, "op.joined_at_unix={}", node.joined_at_unix);
+                let _ = writeln!(out, "op.updated_at_unix={}", node.updated_at_unix);
             }
             MembershipOperation::SetNodeCapabilities {
                 node_id,
                 capabilities,
             } => {
-                out.push_str(&format!("op.node_id={node_id}\n"));
-                out.push_str(&format!(
-                    "op.capabilities={}\n",
-                    role_capability_csv(capabilities)
-                ));
+                let _ = writeln!(out, "op.node_id={node_id}");
+                let _ = writeln!(out, "op.capabilities={}", role_capability_csv(capabilities));
             }
             MembershipOperation::RemoveNode { node_id }
             | MembershipOperation::RevokeNode { node_id }
             | MembershipOperation::RestoreNode { node_id } => {
-                out.push_str(&format!("op.node_id={node_id}\n"));
+                let _ = writeln!(out, "op.node_id={node_id}");
             }
             MembershipOperation::RotateNodeKey {
                 node_id,
                 new_pubkey_hex,
             } => {
-                out.push_str(&format!("op.node_id={node_id}\n"));
-                out.push_str(&format!("op.new_pubkey_hex={new_pubkey_hex}\n"));
+                let _ = writeln!(out, "op.node_id={node_id}");
+                let _ = writeln!(out, "op.new_pubkey_hex={new_pubkey_hex}");
             }
             MembershipOperation::RotateApprover(approver) => {
-                out.push_str(&format!("op.approver_id={}\n", approver.approver_id));
-                out.push_str(&format!(
-                    "op.approver_pubkey_hex={}\n",
+                let _ = writeln!(out, "op.approver_id={}", approver.approver_id);
+                let _ = writeln!(
+                    out,
+                    "op.approver_pubkey_hex={}",
                     approver.approver_pubkey_hex
-                ));
-                out.push_str(&format!("op.role={}\n", approver.role.as_str()));
-                out.push_str(&format!("op.status={}\n", approver.status.as_str()));
-                out.push_str(&format!(
-                    "op.created_at_unix={}\n",
-                    approver.created_at_unix
-                ));
+                );
+                let _ = writeln!(out, "op.role={}", approver.role.as_str());
+                let _ = writeln!(out, "op.status={}", approver.status.as_str());
+                let _ = writeln!(out, "op.created_at_unix={}", approver.created_at_unix);
             }
             MembershipOperation::SetQuorum { threshold } => {
-                out.push_str(&format!("op.threshold={threshold}\n"));
+                let _ = writeln!(out, "op.threshold={threshold}");
             }
         }
 
@@ -522,22 +523,20 @@ pub struct SignedMembershipUpdate {
 
 impl SignedMembershipUpdate {
     pub fn canonical_envelope(&self) -> Result<String, MembershipError> {
+        // Hot on the reconcile path: chain verification builds this for every
+        // log entry each tick. Write into one buffer and sort signature
+        // references instead of cloning the signature roster. Byte-identical.
+        use std::fmt::Write as _;
         let payload = self.record.canonical_payload()?;
-        let mut signatures = self.approver_signatures.clone();
+        let mut signatures: Vec<&MembershipSignature> = self.approver_signatures.iter().collect();
         signatures.sort_by(|left, right| left.approver_id.cmp(&right.approver_id));
 
-        let mut out = String::new();
-        out.push_str(&format!("payload_hex={}\n", hex_encode(payload.as_bytes())));
-        out.push_str(&format!("sig_count={}\n", signatures.len()));
+        let mut out = String::with_capacity(payload.len() * 2 + 64 + signatures.len() * 160);
+        let _ = writeln!(out, "payload_hex={}", hex_encode(payload.as_bytes()));
+        let _ = writeln!(out, "sig_count={}", signatures.len());
         for (index, signature) in signatures.iter().enumerate() {
-            out.push_str(&format!(
-                "sig.{index}.approver_id={}\n",
-                signature.approver_id
-            ));
-            out.push_str(&format!(
-                "sig.{index}.signature_hex={}\n",
-                signature.signature_hex
-            ));
+            let _ = writeln!(out, "sig.{index}.approver_id={}", signature.approver_id);
+            let _ = writeln!(out, "sig.{index}.signature_hex={}", signature.signature_hex);
         }
         Ok(out)
     }
