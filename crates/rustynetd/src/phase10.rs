@@ -4280,6 +4280,16 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         policy: ContextualPolicySet,
         trust_policy: TrustPolicy,
     ) -> Self {
+        // `mut` is only exercised by the cfg(test) seeding below; non-test
+        // builds construct the default and never mutate it.
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut membership = MembershipDirectory::default();
+        #[cfg(test)]
+        {
+            membership.set_node_status("node-b", MembershipStatus::Active);
+            membership.set_node_status("node-c", MembershipStatus::Active);
+        }
+
         Self {
             backend,
             system,
@@ -4300,7 +4310,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             current_serve_exit_node: false,
             direct_stability_window_ms: 3_000,
             relay_stability_window_ms: 5_000,
-            membership: MembershipDirectory::default(),
+            membership,
         }
     }
 
@@ -4383,6 +4393,17 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         }
 
         let mut applied_stages = Vec::new();
+        let relay_with_upstream =
+            options.exit_mode == ExitMode::FullTunnel && options.serve_exit_node;
+        self.system.set_relay_forwarding(relay_with_upstream);
+        if let Err(err) = self.system.apply_firewall_killswitch() {
+            // Pre-start killswitch application failed: fail closed FIRST (and
+            // propagate if even that fails), then surface the original error.
+            self.force_fail_closed("killswitch_pre_start_failed")?;
+            return Err(err.into());
+        }
+        applied_stages.push(StageMarker::FirewallApplied);
+
         match self.backend.start(context) {
             Ok(()) => applied_stages.push(StageMarker::BackendStarted),
             Err(err) if err.kind == BackendErrorKind::AlreadyRunning => {}
@@ -4535,12 +4556,6 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.system.apply_routes(&routes)?;
         applied_stages.push(StageMarker::SystemRoutesApplied);
 
-        let relay_with_upstream =
-            options.exit_mode == ExitMode::FullTunnel && options.serve_exit_node;
-        self.system.set_relay_forwarding(relay_with_upstream);
-        self.system.apply_firewall_killswitch()?;
-        applied_stages.push(StageMarker::FirewallApplied);
-
         if options.exit_mode == ExitMode::FullTunnel || options.serve_exit_node {
             self.system.apply_nat_forwarding(
                 options.serve_exit_node,
@@ -4642,11 +4657,14 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                         rollback_errors.push(format!("rollback nat forwarding: {err}"));
                     }
                 }
-                StageMarker::FirewallApplied => {
-                    if let Err(err) = self.system.rollback_firewall() {
-                        rollback_errors.push(format!("rollback firewall: {err}"));
+                StageMarker::FirewallApplied => match intent {
+                    RollbackIntent::CleanShutdown => {
+                        if let Err(err) = self.system.rollback_firewall() {
+                            rollback_errors.push(format!("rollback firewall: {err}"));
+                        }
                     }
-                }
+                    RollbackIntent::FailClosed => {}
+                },
                 StageMarker::EndpointBypassApplied => {
                     if let Err(err) = self.system.rollback_routes() {
                         rollback_errors.push(format!("rollback endpoint bypass routes: {err}"));
@@ -5356,17 +5374,10 @@ fn handshake_is_fresh(value: Option<u64>, now_unix: u64, freshness_secs: u64) ->
 /// A node that is not positively confirmed `Active` in the membership
 /// directory is denied provisioning (default-deny).
 ///
-/// When the directory is unpopulated (no entries have been registered) the
-/// check is skipped so that deployments that have not yet adopted quorum
-/// membership governance are not broken.
 fn check_peer_membership_active(
     node_id: &NodeId,
     membership: &MembershipDirectory,
 ) -> Result<(), Phase10Error> {
-    if !membership.is_populated() {
-        // Membership governance not yet active — skip the gate.
-        return Ok(());
-    }
     match membership.node_status(node_id.as_str()) {
         MembershipStatus::Active => Ok(()),
         MembershipStatus::Revoked => {
@@ -7719,10 +7730,10 @@ mod tests {
             .expect("protected full-tunnel apply should succeed");
 
         let expected_order = [
+            "apply_firewall_killswitch",
             "rollback_routes",
             "apply_peer_endpoint_bypass_routes",
             "apply_routes",
-            "apply_firewall_killswitch",
             "apply_nat_forwarding",
             "apply_dns_protection",
             "assert_dns_protection",
@@ -9313,30 +9324,28 @@ mod tests {
                 },
             )
             .expect_err("failed plain reapply should fail closed");
-        assert!(matches!(
-            err,
-            Phase10Error::System(SystemError::RollbackFailed(_))
-        ));
+        assert!(matches!(err, Phase10Error::System(_)));
         assert_eq!(controller.state(), DataplaneState::FailClosed);
         let second_apply_ops = &controller.system.operations[second_apply_start..];
         assert!(
-            second_apply_ops.contains(&"rollback_nat_forwarding".to_owned())
-                && second_apply_ops.contains(&"rollback_dns_protection".to_owned())
-                && second_apply_ops.contains(&"rollback_ipv6_egress".to_owned()),
-            "failed role change must still retire obsolete exit controls before fail-close; ops={second_apply_ops:?}"
+            second_apply_ops.contains(&"block_all_egress".to_owned())
+                && !second_apply_ops.contains(&"rollback_nat_forwarding".to_owned())
+                && !second_apply_ops.contains(&"rollback_dns_protection".to_owned())
+                && !second_apply_ops.contains(&"rollback_ipv6_egress".to_owned()),
+            "killswitch failure must fail closed before mutating live exit controls; ops={second_apply_ops:?}"
         );
 
         controller.system.fail_operation = None;
         let shutdown_start = controller.system.operations.len();
         controller
             .shutdown()
-            .expect("shutdown after failed reapply should not replay stale exit rollback markers");
+            .expect("shutdown after failed reapply should cleanup still-live exit controls");
         let shutdown_ops = &controller.system.operations[shutdown_start..];
         assert!(
-            !shutdown_ops.contains(&"rollback_nat_forwarding".to_owned())
-                && !shutdown_ops.contains(&"rollback_dns_protection".to_owned())
-                && !shutdown_ops.contains(&"rollback_ipv6_egress".to_owned()),
-            "shutdown must not replay stale exit-control rollback after failed reapply; ops={shutdown_ops:?}"
+            shutdown_ops.contains(&"rollback_nat_forwarding".to_owned())
+                && shutdown_ops.contains(&"rollback_dns_protection".to_owned())
+                && shutdown_ops.contains(&"rollback_ipv6_egress".to_owned()),
+            "shutdown must cleanup previous live exit controls after pre-mutation fail-close; ops={shutdown_ops:?}"
         );
         assert_eq!(controller.state(), DataplaneState::Init);
     }
@@ -11736,6 +11745,37 @@ mod tests {
         assert!(
             controller.backend.peers.contains_key(&peer_id),
             "backend must have the provisioned peer"
+        );
+    }
+
+    #[test]
+    fn test_empty_membership_directory_denies_peer_provisioning() {
+        use rustynet_policy::MembershipDirectory;
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        controller.set_membership(MembershipDirectory::default());
+
+        let result = controller.apply_dataplane_generation(
+            trust_ok(),
+            test_runtime_context(),
+            vec![sample_peer("node-b")],
+            vec![],
+            ApplyOptions::default(),
+        );
+
+        assert!(
+            matches!(result, Err(Phase10Error::MembershipNotFound(_))),
+            "empty membership directory must fail closed: {result:?}"
+        );
+        let peer_id = NodeId::new("node-b").expect("node id");
+        assert!(
+            !controller.backend.peers.contains_key(&peer_id),
+            "empty membership must not configure the peer"
         );
     }
 

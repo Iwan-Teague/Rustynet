@@ -83,11 +83,23 @@ pub enum MembershipStatus {
 #[derive(Debug, Clone, Default)]
 pub struct MembershipDirectory {
     nodes: HashMap<String, MembershipStatus>,
+    selector_members: HashMap<String, Vec<String>>,
 }
 
 impl MembershipDirectory {
     pub fn set_node_status(&mut self, node_id: impl Into<String>, status: MembershipStatus) {
         self.nodes.insert(node_id.into(), status);
+    }
+
+    pub fn set_selector_members<I, S>(&mut self, selector: impl Into<String>, node_ids: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.selector_members.insert(
+            selector.into(),
+            node_ids.into_iter().map(Into::into).collect(),
+        );
     }
 
     pub fn node_status(&self, node_id: &str) -> MembershipStatus {
@@ -103,6 +115,10 @@ impl MembershipDirectory {
     /// that deployments that have not yet adopted governance are not broken.
     pub fn is_populated(&self) -> bool {
         !self.nodes.is_empty()
+    }
+
+    fn selector_members(&self, selector: &str) -> Option<&[String]> {
+        self.selector_members.get(selector).map(Vec::as_slice)
     }
 }
 
@@ -394,14 +410,33 @@ fn membership_request_allowed(src: &str, dst: &str, membership: &MembershipDirec
 }
 
 fn selector_membership_allowed(selector: &str, membership: &MembershipDirectory) -> bool {
-    let Some(node_id) = selector_node_id(selector) else {
+    if selector == "*" {
         return true;
+    }
+    if !selector_requires_membership(selector) {
+        return true;
+    }
+    let Some(node_id) = selector_node_id(selector) else {
+        let Some(members) = membership.selector_members(selector) else {
+            return false;
+        };
+        return !members.is_empty()
+            && members
+                .iter()
+                .all(|node_id| membership.node_status(node_id) == MembershipStatus::Active);
     };
     membership.node_status(node_id) == MembershipStatus::Active
 }
 
 fn selector_node_id(selector: &str) -> Option<&str> {
     selector.strip_prefix("node:")
+}
+
+fn selector_requires_membership(selector: &str) -> bool {
+    selector.starts_with("node:")
+        || selector.starts_with("user:")
+        || selector.starts_with("group:")
+        || selector.starts_with("tag:")
 }
 
 #[cfg(test)]
@@ -618,14 +653,18 @@ mod tests {
         );
 
         let mut revoked_membership = MembershipDirectory::default();
+        revoked_membership.set_node_status("local-operator", MembershipStatus::Active);
         revoked_membership.set_node_status("node-exit", MembershipStatus::Revoked);
+        revoked_membership.set_selector_members("user:local", ["local-operator"]);
         assert_eq!(
             set.evaluate_with_membership(&request, &revoked_membership),
             Decision::Deny
         );
 
         let mut active_membership = MembershipDirectory::default();
+        active_membership.set_node_status("local-operator", MembershipStatus::Active);
         active_membership.set_node_status("node-exit", MembershipStatus::Active);
+        active_membership.set_selector_members("user:local", ["local-operator"]);
         assert_eq!(
             set.evaluate_with_membership(&request, &active_membership),
             Decision::Allow
@@ -644,7 +683,9 @@ mod tests {
             }],
         };
         let mut membership = MembershipDirectory::default();
+        membership.set_node_status("local-operator", MembershipStatus::Active);
         membership.set_node_status("node-a", MembershipStatus::Active);
+        membership.set_selector_members("user:local", ["local-operator"]);
 
         let tcp = ContextualAccessRequest {
             src: "user:local".to_owned(),
@@ -715,6 +756,80 @@ mod tests {
         assert_eq!(
             set.evaluate_with_membership(&request, &membership),
             Decision::Deny
+        );
+    }
+
+    #[test]
+    fn non_node_selectors_require_membership_resolution() {
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "group:family".to_owned(),
+                dst: "tag:servers".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let request = AccessRequest {
+            src: "group:family".to_owned(),
+            dst: "tag:servers".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+
+        let mut unresolved = MembershipDirectory::default();
+        unresolved.set_node_status("node-a", MembershipStatus::Active);
+        unresolved.set_node_status("node-server", MembershipStatus::Active);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &unresolved),
+            Decision::Deny,
+            "unmapped non-node selectors must fail closed"
+        );
+
+        let mut with_revoked_member = MembershipDirectory::default();
+        with_revoked_member.set_node_status("node-a", MembershipStatus::Revoked);
+        with_revoked_member.set_node_status("node-server", MembershipStatus::Active);
+        with_revoked_member.set_selector_members("group:family", ["node-a"]);
+        with_revoked_member.set_selector_members("tag:servers", ["node-server"]);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &with_revoked_member),
+            Decision::Deny,
+            "revoked selector member must deny the grouped allow rule"
+        );
+
+        let mut active = MembershipDirectory::default();
+        active.set_node_status("node-a", MembershipStatus::Active);
+        active.set_node_status("node-server", MembershipStatus::Active);
+        active.set_selector_members("group:family", ["node-a"]);
+        active.set_selector_members("tag:servers", ["node-server"]);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &active),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn literal_route_destinations_do_not_require_membership_resolution() {
+        let set = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "user:local".to_owned(),
+                dst: "*".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::Mesh],
+            }],
+        };
+        let request = ContextualAccessRequest {
+            src: "user:local".to_owned(),
+            dst: "100.64.0.2/32".to_owned(),
+            protocol: Protocol::Any,
+            context: TrafficContext::Mesh,
+        };
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("local-operator", MembershipStatus::Active);
+        membership.set_selector_members("user:local", ["local-operator"]);
+
+        assert_eq!(
+            set.evaluate_with_membership(&request, &membership),
+            Decision::Allow
         );
     }
 
@@ -1003,7 +1118,9 @@ mod tests {
         };
 
         let mut membership = MembershipDirectory::default();
+        membership.set_node_status("alice-node", MembershipStatus::Active);
         membership.set_node_status("active-node", MembershipStatus::Active);
+        membership.set_selector_members("user:alice", ["alice-node"]);
 
         // Active node — rule evaluation runs and the allow rule fires
         assert_eq!(

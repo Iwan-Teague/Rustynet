@@ -21,8 +21,9 @@ use rustynet_mcp::{
 use serde_json::{Value, json};
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,6 +40,10 @@ const LOOP_JOURNAL: &str = "state/mcp-loop-journal.jsonl";
 /// several minutes; warm calls return in seconds. The kill-on-timeout watchdog
 /// still bounds a genuinely hung probe.
 const DISCOVERY_TIMEOUT_SECS: u64 = 600;
+/// A live-lab job mutates shared VMs, shared SSH identity/known-hosts state, and
+/// the shared warm Cargo target. More than one concurrent run produces false
+/// failures and can fight over node services, so fail closed.
+const MAX_CONCURRENT_LIVE_LAB_JOBS: usize = 1;
 
 const CANONICAL_COVERAGE_COLUMNS: &[&str] = &[
     "linux_stage_bootstrap",
@@ -178,19 +183,81 @@ impl LabStateServer {
         }
     }
 
-    fn ensure_report_dir(&self, dir: &str) -> String {
-        let path = self.abs_path(dir);
-        let _ = std::fs::create_dir_all(&path);
-        dir.to_string()
+    fn ensure_report_dir(&self, dir: &str) -> Result<String, String> {
+        let path = self.confined_repo_path(dir, "report_dir")?;
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("cannot create report_dir {}: {e}", path.display()))?;
+        Ok(path.to_string_lossy().to_string())
     }
 
     fn abs_path(&self, dir: &str) -> PathBuf {
-        let p = Path::new(dir);
-        if p.is_absolute() {
+        self.confined_repo_path(dir, "path")
+            .unwrap_or_else(|_| self.repo_root.join("__invalid_out_of_repo_path__"))
+    }
+
+    fn confined_repo_path(&self, raw: &str, label: &str) -> Result<PathBuf, String> {
+        if raw.trim().is_empty() {
+            return Err(format!("{label} cannot be empty"));
+        }
+        let repo = self
+            .repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.repo_root.clone());
+        let p = Path::new(raw);
+        let candidate = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            self.repo_root.join(dir)
+            repo.join(p)
+        };
+        let normalized = canonicalize_existing_prefix(&candidate);
+        if !normalized.starts_with(&repo) {
+            return Err(format!(
+                "{label} must stay under repo root {}",
+                repo.display()
+            ));
         }
+        if let Some(existing) = deepest_existing_ancestor(&normalized)
+            && let Ok(real) = existing.canonicalize()
+            && !real.starts_with(&repo)
+        {
+            return Err(format!(
+                "{label} ancestor escapes repo root via symlink: {}",
+                existing.display()
+            ));
+        }
+        Ok(normalized)
+    }
+
+    fn report_dir_from_record(&self, dir: &str) -> Option<PathBuf> {
+        self.confined_repo_path(dir, "job report_dir").ok()
+    }
+
+    fn active_live_job_count(&self) -> usize {
+        let Ok(entries) = std::fs::read_dir(self.jobs_dir()) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let p = entry.path();
+                (p.extension().map(|e| e == "json").unwrap_or(false))
+                    .then(|| std::fs::read_to_string(p).ok())
+                    .flatten()
+            })
+            .filter_map(|s| serde_json::from_str::<Value>(&s).ok())
+            .filter(|rec| {
+                let job_id = rec.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+                let pid = rec.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                let Some(report_dir) = rec
+                    .get("report_dir")
+                    .and_then(|v| v.as_str())
+                    .and_then(|dir| self.report_dir_from_record(dir))
+                else {
+                    return pid != 0 && self.pid_alive_verified(job_id, pid);
+                };
+                self.job_state(job_id, pid, &report_dir) == "running"
+            })
+            .count()
     }
 
     // ── Background-job machinery ──────────────────────────────────────
@@ -472,7 +539,7 @@ impl LabStateServer {
             }
         ));
         out.push_str(
-            "\nOverride any with start_live_lab_run's `nodes` ('alias:role') / windows_vm / macos_vm. Credentials are intentionally omitted here — use get_inventory for the raw record.\n",
+            "\nOverride any with start_live_lab_run's `nodes` ('alias:role') / windows_vm / macos_vm. Credentials are intentionally omitted from MCP output.\n",
         );
         tool_success(&out)
     }
@@ -1308,7 +1375,7 @@ impl LabStateServer {
         job_key: &str,
     ) -> Result<PathBuf, String> {
         if let Some(dir) = arg_str(args, dir_key) {
-            return Ok(self.abs_path(dir));
+            return self.confined_repo_path(dir, dir_key);
         }
         if let Some(job_id) = arg_str(args, job_key) {
             let rec = self
@@ -1318,7 +1385,7 @@ impl LabStateServer {
                 .get("report_dir")
                 .and_then(|v| v.as_str())
                 .ok_or("job record missing report_dir")?;
-            return Ok(self.abs_path(dir));
+            return self.confined_repo_path(dir, "job report_dir");
         }
         Err(format!("Provide {dir_key} or {job_key}"))
     }
@@ -1791,9 +1858,14 @@ impl LabStateServer {
                 .get("created_unix")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let rd = report_dir.clone().unwrap_or_else(|| {
-                self.abs_path(rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or(""))
-            });
+            let rd = match report_dir.clone().or_else(|| {
+                rec.get("report_dir")
+                    .and_then(|v| v.as_str())
+                    .and_then(|dir| self.report_dir_from_record(dir))
+            }) {
+                Some(rd) => rd,
+                None => return tool_error("job record has invalid report_dir"),
+            };
             let state = self.job_state(jid, pid, &rd);
             let elapsed = now_unix().saturating_sub(created);
             out.push_str(&format!(
@@ -2376,7 +2448,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "get_inventory".into(),
-                description: "Return the raw machine-readable VM inventory JSON (aliases, IPs, roles, OS, capabilities — includes credentials). For a clean, secret-free topology digest prefer get_lab_topology.".into(),
+                description: "Return the machine-readable VM inventory JSON with credential-like fields redacted. For a compact topology digest prefer get_lab_topology.".into(),
                 input_schema: json_schema_object(json!({}), vec![]),
             },
             Tool {
@@ -2637,7 +2709,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "read_report_artifact".into(),
-                description: "Read one file from a run's report directory (path-confined to that directory; report dirs can live outside the repo). Pass a job_id OR report_dir, plus the relative path.".into(),
+                description: "Read one file from a run's report directory (path-confined to a repo-local report dir). Pass a job_id OR report_dir, plus the relative path.".into(),
                 input_schema: json_schema_object(
                     json!({
                         "job_id": json_schema_string("Job id"),
@@ -2762,9 +2834,14 @@ impl McpServer for LabStateServer {
 
             "get_lab_status_json" => {
                 let mut extra: Vec<&str> = vec!["--json"];
+                let report_dir_owned;
                 if let Some(dir) = arg_str(args, "report_dir") {
+                    report_dir_owned = match self.ensure_report_dir(dir) {
+                        Ok(dir) => dir,
+                        Err(e) => return tool_error(&e),
+                    };
                     extra.push("--report-dir");
-                    extra.push(dir);
+                    extra.push(&report_dir_owned);
                 }
                 self.run_ops("vm-lab-discover-local-utm", &extra, DISCOVERY_TIMEOUT_SECS)
             }
@@ -2775,13 +2852,14 @@ impl McpServer for LabStateServer {
                 let inv_path = self.repo_root.join(DEFAULT_INVENTORY);
                 match std::fs::read_to_string(&inv_path) {
                     Ok(content) => {
-                        if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+                        if let Ok(mut parsed) = serde_json::from_str::<Value>(&content) {
+                            redact_secret_fields(&mut parsed);
                             let pretty = serde_json::to_string_pretty(&parsed).unwrap_or(content);
                             tool_success(&format!("# VM Lab Inventory\n\n```json\n{pretty}\n```\n"))
                         } else {
-                            tool_success(&format!(
-                                "# VM Lab Inventory\n\n```json\n{content}\n```\n"
-                            ))
+                            tool_error(
+                                "Invalid inventory JSON; refusing to echo unredacted content",
+                            )
                         }
                     }
                     Err(e) => tool_error(&format!("Cannot read inventory: {e}")),
@@ -2983,7 +3061,10 @@ impl McpServer for LabStateServer {
                 }
                 result.push_str("## Diagnostic Artifacts\n\n");
                 let report_dir =
-                    self.ensure_report_dir(&format!("state/live-lab-mcp/diag-{alias}"));
+                    match self.ensure_report_dir(&format!("state/live-lab-mcp/diag-{alias}")) {
+                        Ok(dir) => dir,
+                        Err(e) => return tool_error(&e),
+                    };
                 let artifacts = self.run_ops(
                     "vm-lab-collect-artifacts",
                     &["--vm", alias, "--report-dir", &report_dir],
@@ -3005,18 +3086,27 @@ impl McpServer for LabStateServer {
                 // so the result→deep-triage handoff isn't broken for orchestrate.
                 let profile_owned: String = match arg_str(args, "profile") {
                     Some(p) if !p.is_empty() => p.to_string(),
-                    _ => self
-                        .read_matrix_row(&self.abs_path(report_dir_arg))
-                        .and_then(|row| row.get("profile_path").cloned())
-                        .filter(|p| !p.is_empty())
-                        .unwrap_or_default(),
+                    _ => {
+                        let report_path =
+                            match self.confined_repo_path(report_dir_arg, "report_dir") {
+                                Ok(path) => path,
+                                Err(e) => return tool_error(&e),
+                            };
+                        self.read_matrix_row(&report_path)
+                            .and_then(|row| row.get("profile_path").cloned())
+                            .filter(|p| !p.is_empty())
+                            .unwrap_or_default()
+                    }
                 };
                 if profile_owned.is_empty() {
                     return tool_error(
                         "No 'profile' given and none recorded in the report dir's matrix row (profile_path); pass profile explicitly.",
                     );
                 }
-                let report_dir = self.ensure_report_dir(report_dir_arg);
+                let report_dir = match self.ensure_report_dir(report_dir_arg) {
+                    Ok(dir) => dir,
+                    Err(e) => return tool_error(&e),
+                };
                 let mut extra: Vec<&str> =
                     vec!["--profile", &profile_owned, "--report-dir", &report_dir];
                 if let Some(stage) = arg_str(args, "stage") {
@@ -3110,7 +3200,16 @@ impl LabStateServer {
         let report_dir = arg_str(args, "report_dir")
             .map(String::from)
             .unwrap_or_else(|| format!("state/live-lab-{job_id}"));
-        self.ensure_report_dir(&report_dir);
+        let report_dir = match self.ensure_report_dir(&report_dir) {
+            Ok(dir) => dir,
+            Err(e) => return tool_error(&e),
+        };
+        let active_jobs = self.active_live_job_count();
+        if active_jobs >= MAX_CONCURRENT_LIVE_LAB_JOBS {
+            return tool_error(&format!(
+                "live-lab job already running ({active_jobs}/{MAX_CONCURRENT_LIVE_LAB_JOBS}); cancel or wait before starting another"
+            ));
+        }
         if let Err(e) = std::fs::create_dir_all(self.jobs_dir()) {
             return tool_error(&format!("cannot create jobs dir: {e}"));
         }
@@ -3318,7 +3417,9 @@ impl LabStateServer {
     /// wait_for_job so they never drift.
     fn render_job_status(&self, job_id: &str, rec: &Value) -> (String, String) {
         let report_dir_rel = rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or("");
-        let report_dir = self.abs_path(report_dir_rel);
+        let report_dir = self
+            .report_dir_from_record(report_dir_rel)
+            .unwrap_or_else(|| self.repo_root.join("__invalid_out_of_repo_path__"));
         let pid = rec.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
         let created = rec
             .get("created_unix")
@@ -3370,7 +3471,10 @@ impl LabStateServer {
             .unwrap_or(240)
             .clamp(10, 270);
         let report_dir_rel = rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or("");
-        let report_dir = self.abs_path(report_dir_rel);
+        let report_dir = match self.report_dir_from_record(report_dir_rel) {
+            Some(dir) => dir,
+            None => return tool_error("job record has invalid report_dir"),
+        };
         let pid = rec.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
         let start = Instant::now();
         loop {
@@ -3414,7 +3518,10 @@ impl LabStateServer {
                     .get("created_unix")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                let state = self.job_state(job_id, pid, &self.abs_path(report_dir_rel));
+                let state = self
+                    .report_dir_from_record(report_dir_rel)
+                    .map(|dir| self.job_state(job_id, pid, &dir))
+                    .unwrap_or_else(|| "invalid report_dir".into());
                 rows.push((
                     created,
                     format!(
@@ -3461,8 +3568,11 @@ impl LabStateServer {
             return tool_error(&format!("Unknown job_id: {job_id}"));
         };
         let pid = rec.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
-        let report_dir =
-            self.abs_path(rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or(""));
+        let report_dir_rel = rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or("");
+        let report_dir = match self.report_dir_from_record(report_dir_rel) {
+            Some(dir) => dir,
+            None => return tool_error("job record has invalid report_dir"),
+        };
 
         // If we still hold the child handle, kill via it (no pid race at all).
         // The job was spawned as a process-group leader, so signal the whole
@@ -3535,7 +3645,7 @@ impl LabStateServer {
     /// Resolve report dir from an explicit report_dir arg or a job_id's record.
     fn resolve_report_dir(&self, args: Option<&Value>) -> Result<PathBuf, String> {
         if let Some(dir) = arg_str(args, "report_dir") {
-            return Ok(self.abs_path(dir));
+            return self.confined_repo_path(dir, "report_dir");
         }
         if let Some(job_id) = arg_str(args, "job_id") {
             let rec = self
@@ -3545,7 +3655,7 @@ impl LabStateServer {
                 .get("report_dir")
                 .and_then(|v| v.as_str())
                 .ok_or("job record missing report_dir")?;
-            return Ok(self.abs_path(dir));
+            return self.confined_repo_path(dir, "job report_dir");
         }
         Err("Provide either job_id or report_dir".into())
     }
@@ -3734,7 +3844,11 @@ impl LabStateServer {
         for (_, job_id, rec) in jobs.into_iter().skip(keep) {
             let report_dir_rel = rec.get("report_dir").and_then(|v| v.as_str()).unwrap_or("");
             let pid = rec.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
-            if self.job_state(&job_id, pid, &self.abs_path(report_dir_rel)) == "running" {
+            if self
+                .report_dir_from_record(report_dir_rel)
+                .map(|dir| self.job_state(&job_id, pid, &dir) == "running")
+                .unwrap_or_else(|| pid != 0 && self.pid_alive_verified(&job_id, pid))
+            {
                 skipped_running += 1;
                 continue;
             }
@@ -3746,8 +3860,11 @@ impl LabStateServer {
             if let Some(log) = rec.get("log_path").and_then(|v| v.as_str()) {
                 let _ = std::fs::remove_file(log);
             }
-            if delete_reports && !report_dir_rel.is_empty() {
-                let _ = std::fs::remove_dir_all(self.abs_path(report_dir_rel));
+            if delete_reports
+                && !report_dir_rel.is_empty()
+                && let Some(report_dir) = self.report_dir_from_record(report_dir_rel)
+            {
+                let _ = std::fs::remove_dir_all(report_dir);
             }
             pruned += 1;
         }
@@ -3767,6 +3884,77 @@ fn string_array(args: Option<&Value>, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let normalized = lexical_normalize(path);
+    let mut current = normalized.clone();
+    let mut suffix: Vec<OsString> = Vec::new();
+    while !current.exists() {
+        if let Some(name) = current.file_name() {
+            suffix.push(name.to_os_string());
+        }
+        if !current.pop() {
+            return normalized;
+        }
+    }
+    let mut out = current.canonicalize().unwrap_or(current);
+    for name in suffix.into_iter().rev() {
+        out.push(name);
+    }
+    lexical_normalize(&out)
+}
+
+fn deepest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        if current.exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn redact_secret_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                let lower = key.to_ascii_lowercase();
+                if lower.contains("password")
+                    || lower.contains("private_key")
+                    || lower.contains("secret")
+                    || lower.ends_with("token")
+                    || lower == "token"
+                {
+                    *child = Value::String("<redacted>".into());
+                } else {
+                    redact_secret_fields(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                redact_secret_fields(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_files(dir: &Path, base: &Path, out: &mut Vec<(String, u64)>, depth: usize) {
@@ -4270,6 +4458,73 @@ mod tests {
         assert!(
             !txt.contains("tempo"),
             "topology digest must not leak credentials"
+        );
+        let inv = srv.call_tool("get_inventory", None).content[0].text.clone();
+        assert!(
+            !inv.contains("tempo"),
+            "inventory MCP output must redact credentials"
+        );
+        assert!(
+            inv.contains("<redacted>"),
+            "redacted inventory should mark secret fields"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn report_dir_inputs_are_confined_to_repo() {
+        let tmp = std::env::temp_dir().join(format!("mcp-confine-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("mcp-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let srv = test_server(&tmp);
+
+        let abs =
+            srv.list_report_artifacts(Some(&json!({"report_dir": outside.to_string_lossy()})));
+        assert_eq!(abs.is_error, Some(true));
+        assert!(abs.content[0].text.contains("repo root"));
+
+        let rel = srv.list_report_artifacts(Some(&json!({"report_dir": "../outside"})));
+        assert_eq!(rel.is_error, Some(true));
+        assert!(rel.content[0].text.contains("repo root"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn start_live_lab_run_rejects_second_running_job() {
+        let tmp = std::env::temp_dir().join(format!("mcp-jobcap-{}", std::process::id()));
+        let srv = test_server(&tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        let report = tmp.join("rep");
+        std::fs::create_dir_all(report.join("state")).unwrap();
+        let pid = std::process::id() as u64;
+        let pid_start = srv
+            .pid_start_time(pid)
+            .expect("test process must have a start token");
+        let rec = json!({
+            "job_id":"active",
+            "report_dir": report.to_string_lossy(),
+            "pid": pid,
+            "pid_start": pid_start,
+            "log_path": tmp.join("active.log").to_string_lossy(),
+            "created_unix": now_unix()
+        });
+        std::fs::write(
+            srv.job_record_path("active"),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+
+        let res = srv.start_live_lab_run(Some(
+            &json!({"mode":"run","profile":"dummy","report_dir":"state/next"}),
+        ));
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            res.content[0].text.contains("already running"),
+            "got: {}",
+            res.content[0].text
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -4479,9 +4479,7 @@ impl DaemonRuntime {
             self.traversal_hint_error = Some(err.clone());
             if self.traversal_authority_mode().is_enforced() {
                 self.restrict_recoverable(format!("traversal runtime sync failed: {err}"));
-                let _ = self
-                    .controller
-                    .force_fail_closed("traversal_runtime_sync_failed");
+                self.force_fail_closed_or_restrict("traversal_runtime_sync_failed");
             }
         }
     }
@@ -4545,7 +4543,8 @@ impl DaemonRuntime {
             }
             Err(err) => return Err(format!("signed membership refresh failed: {err}")),
         };
-        let membership_directory = membership_directory_from_state(&membership_state);
+        let membership_directory =
+            membership_directory_from_state(&membership_state, &self.local_node_id);
         let auto_bundle = if self.auto_tunnel_enforce {
             Some(
                 self.load_verified_auto_tunnel(&membership_state, &membership_directory)
@@ -4556,6 +4555,7 @@ impl DaemonRuntime {
         };
 
         self.membership_state = Some(membership_state);
+        self.controller.set_membership(membership_directory.clone());
         self.membership_directory = membership_directory;
         self.refresh_dns_zone_state(auto_bundle.as_ref());
         self.materialize_service_access_state(auto_bundle.as_ref());
@@ -4656,9 +4656,7 @@ impl DaemonRuntime {
             self.refresh_signed_state_with_reason(true, SignedStateRefreshReason::PreExpiry)
         {
             self.restrict_recoverable(err);
-            let _ = self
-                .controller
-                .force_fail_closed("preexpiry_signed_state_refresh_failed");
+            self.force_fail_closed_or_restrict("preexpiry_signed_state_refresh_failed");
         }
     }
 
@@ -4747,9 +4745,9 @@ impl DaemonRuntime {
                     SignedStateRefreshReason::EndpointChange,
                 ) {
                     self.restrict_recoverable(err);
-                    let _ = self
-                        .controller
-                        .force_fail_closed("endpoint_change_signed_state_refresh_failed");
+                    self.force_fail_closed_or_restrict(
+                        "endpoint_change_signed_state_refresh_failed",
+                    );
                 }
             }
             None => {
@@ -5690,9 +5688,9 @@ impl DaemonRuntime {
                         Ok(endpoint) => endpoint,
                         Err(err) => {
                             if relay_keepalive_recovery_due {
-                                let _ = self
-                                    .controller
-                                    .force_fail_closed("relay_keepalive_recovery_failed");
+                                self.force_fail_closed_or_restrict(
+                                    "relay_keepalive_recovery_failed",
+                                );
                             }
                             return Err(err);
                         }
@@ -6494,9 +6492,7 @@ impl DaemonRuntime {
             Ok(FetchDecision::Skipped) => {}
             Err(e) => {
                 self.restrict_permanent(format!("remote trust fetch verification failed: {e}"));
-                let _ = self
-                    .controller
-                    .force_fail_closed("remote_trust_fetch_verification_failed");
+                self.force_fail_closed_or_restrict("remote_trust_fetch_verification_failed");
                 return;
             }
         }
@@ -6507,9 +6503,7 @@ impl DaemonRuntime {
             Ok(FetchDecision::Skipped) => {}
             Err(e) => {
                 self.restrict_permanent(format!("remote traversal fetch verification failed: {e}"));
-                let _ = self
-                    .controller
-                    .force_fail_closed("remote_traversal_fetch_verification_failed");
+                self.force_fail_closed_or_restrict("remote_traversal_fetch_verification_failed");
                 return;
             }
         }
@@ -6523,9 +6517,9 @@ impl DaemonRuntime {
                     self.restrict_permanent(format!(
                         "remote assignment fetch verification failed: {e}"
                     ));
-                    let _ = self
-                        .controller
-                        .force_fail_closed("remote_assignment_fetch_verification_failed");
+                    self.force_fail_closed_or_restrict(
+                        "remote_assignment_fetch_verification_failed",
+                    );
                     return;
                 }
             }
@@ -6538,9 +6532,7 @@ impl DaemonRuntime {
             Ok(FetchDecision::Skipped) => {}
             Err(e) => {
                 self.restrict_permanent(format!("remote dns zone fetch verification failed: {e}"));
-                let _ = self
-                    .controller
-                    .force_fail_closed("remote_dns_zone_fetch_verification_failed");
+                self.force_fail_closed_or_restrict("remote_dns_zone_fetch_verification_failed");
                 return;
             }
         }
@@ -6549,9 +6541,7 @@ impl DaemonRuntime {
             Ok(()) => {}
             Err(_err) => {
                 self.restrict_permanent("state restore failed integrity checks".to_owned());
-                let _ = self
-                    .controller
-                    .force_fail_closed("state_restore_integrity_failed");
+                self.force_fail_closed_or_restrict("state_restore_integrity_failed");
                 return;
             }
         }
@@ -6559,9 +6549,7 @@ impl DaemonRuntime {
             self.restrict_permanent(format!(
                 "blind-exit role invariants failed during bootstrap: {err}"
             ));
-            let _ = self
-                .controller
-                .force_fail_closed("blind_exit_invariants_failed");
+            self.force_fail_closed_or_restrict("blind_exit_invariants_failed");
             return;
         }
 
@@ -6570,9 +6558,7 @@ impl DaemonRuntime {
             Ok(FetchDecision::Skipped) => {}
             Err(e) => {
                 self.restrict_permanent(format!("remote trust fetch failed: {e}"));
-                let _ = self
-                    .controller
-                    .force_fail_closed("remote_trust_fetch_failed");
+                self.force_fail_closed_or_restrict("remote_trust_fetch_failed");
                 return;
             }
         }
@@ -6583,9 +6569,7 @@ impl DaemonRuntime {
             Ok(FetchDecision::Skipped) => {}
             Err(e) => {
                 self.restrict_permanent(format!("remote traversal fetch failed: {e}"));
-                let _ = self
-                    .controller
-                    .force_fail_closed("remote_traversal_fetch_failed");
+                self.force_fail_closed_or_restrict("remote_traversal_fetch_failed");
                 return;
             }
         }
@@ -6597,9 +6581,7 @@ impl DaemonRuntime {
                 Ok(FetchDecision::Skipped) => {}
                 Err(e) => {
                     self.restrict_permanent(format!("remote assignment fetch failed: {e}"));
-                    let _ = self
-                        .controller
-                        .force_fail_closed("remote_assignment_fetch_failed");
+                    self.force_fail_closed_or_restrict("remote_assignment_fetch_failed");
                     return;
                 }
             }
@@ -6637,9 +6619,7 @@ impl DaemonRuntime {
             Ok(FetchDecision::Skipped) => {}
             Err(e) => {
                 self.restrict_permanent(format!("remote dns zone fetch failed: {e}"));
-                let _ = self
-                    .controller
-                    .force_fail_closed("remote_dns_zone_fetch_failed");
+                self.force_fail_closed_or_restrict("remote_dns_zone_fetch_failed");
                 return;
             }
         }
@@ -6648,7 +6628,7 @@ impl DaemonRuntime {
             Ok(evidence) => evidence,
             Err(err) => {
                 self.restrict_recoverable(err.to_string());
-                let _ = self.controller.force_fail_closed("trust_bootstrap_failed");
+                self.force_fail_closed_or_restrict("trust_bootstrap_failed");
                 return;
             }
         };
@@ -6657,22 +6637,20 @@ impl DaemonRuntime {
             Ok(state) => state,
             Err(err) => {
                 self.restrict_recoverable(err.to_string());
-                let _ = self
-                    .controller
-                    .force_fail_closed("membership_bootstrap_failed");
+                self.force_fail_closed_or_restrict("membership_bootstrap_failed");
                 return;
             }
         };
-        let membership_directory = membership_directory_from_state(&membership_state);
+        let membership_directory =
+            membership_directory_from_state(&membership_state, &self.local_node_id);
+        self.controller.set_membership(membership_directory.clone());
 
         let auto_bundle = if self.auto_tunnel_enforce {
             match self.load_verified_auto_tunnel(&membership_state, &membership_directory) {
                 Ok(bundle) => Some(bundle),
                 Err(err) => {
                     self.restrict_recoverable(err.to_string());
-                    let _ = self
-                        .controller
-                        .force_fail_closed("auto_tunnel_bootstrap_failed");
+                    self.force_fail_closed_or_restrict("auto_tunnel_bootstrap_failed");
                     return;
                 }
             }
@@ -6710,9 +6688,7 @@ impl DaemonRuntime {
         if let Err(err) = self.validate_blind_exit_assignment(auto_exit.as_deref(), auto_lan_access)
         {
             self.restrict_recoverable(err);
-            let _ = self
-                .controller
-                .force_fail_closed("blind_exit_assignment_rejected");
+            self.force_fail_closed_or_restrict("blind_exit_assignment_rejected");
             return;
         }
 
@@ -6722,16 +6698,14 @@ impl DaemonRuntime {
             Ok(node_id) => node_id,
             Err(err) => {
                 self.restrict_permanent(format!("invalid local node id in runtime: {err}"));
-                let _ = self.controller.force_fail_closed("invalid_local_node_id");
+                self.force_fail_closed_or_restrict("invalid_local_node_id");
                 return;
             }
         };
 
         if let Err(err) = self.ensure_runtime_private_key_material() {
             self.restrict_recoverable(format!("runtime key preparation failed: {err}"));
-            let _ = self
-                .controller
-                .force_fail_closed("runtime_key_prepare_failed");
+            self.force_fail_closed_or_restrict("runtime_key_prepare_failed");
             return;
         }
 
@@ -6749,9 +6723,7 @@ impl DaemonRuntime {
                 self.restrict_recoverable(format!(
                     "traversal authority rejected bootstrap apply: {err}"
                 ));
-                let _ = self
-                    .controller
-                    .force_fail_closed("bootstrap_traversal_authority_rejected");
+                self.force_fail_closed_or_restrict("bootstrap_traversal_authority_rejected");
                 return;
             }
         };
@@ -6761,9 +6733,7 @@ impl DaemonRuntime {
             self.restrict_recoverable(format!(
                 "exit coexistence guard rejected bootstrap apply: {err}"
             ));
-            let _ = self
-                .controller
-                .force_fail_closed("bootstrap_exit_overlay_exception_violated");
+            self.force_fail_closed_or_restrict("bootstrap_exit_overlay_exception_violated");
             return;
         }
         let apply_result = self.controller.apply_dataplane_generation(
@@ -6798,23 +6768,21 @@ impl DaemonRuntime {
             (Ok(()), Ok(())) => {}
             (Err(err), Ok(())) => {
                 self.restrict_recoverable(format!("dataplane bootstrap apply failed: {err}"));
-                let _ = self.controller.force_fail_closed("bootstrap_apply_failed");
+                self.force_fail_closed_or_restrict("bootstrap_apply_failed");
                 return;
             }
             (Err(err), Err(cleanup_err)) => {
                 self.restrict_recoverable(format!(
                     "dataplane bootstrap apply failed: {err}; runtime key cleanup failed: {cleanup_err}"
                 ));
-                let _ = self.controller.force_fail_closed("bootstrap_apply_failed");
+                self.force_fail_closed_or_restrict("bootstrap_apply_failed");
                 return;
             }
             (Ok(()), Err(cleanup_err)) => {
                 self.restrict_recoverable(format!(
                     "runtime key cleanup failed after bootstrap apply: {cleanup_err}"
                 ));
-                let _ = self
-                    .controller
-                    .force_fail_closed("runtime_key_cleanup_failed");
+                self.force_fail_closed_or_restrict("runtime_key_cleanup_failed");
                 return;
             }
         }
@@ -7192,9 +7160,7 @@ impl DaemonRuntime {
                     Ok(()) => IpcResponse::ok("signed state refresh completed"),
                     Err(err) => {
                         self.restrict_recoverable(err.clone());
-                        let _ = self
-                            .controller
-                            .force_fail_closed("command_signed_state_refresh_failed");
+                        self.force_fail_closed_or_restrict("command_signed_state_refresh_failed");
                         IpcResponse::err(format!("signed state refresh failed: {err}"))
                     }
                 }
@@ -7701,7 +7667,9 @@ impl DaemonRuntime {
             "membership update applied: epoch_prev={} epoch_new={} state_root={}",
             state.epoch, next.epoch, new_state_root
         );
-        self.membership_directory = membership_directory_from_state(&next);
+        self.membership_directory = membership_directory_from_state(&next, &self.local_node_id);
+        self.controller
+            .set_membership(self.membership_directory.clone());
         self.membership_state = Some(next);
         // D13: a membership apply is the revocation path — refresh the
         // materialised service grants immediately. No verified
@@ -7875,7 +7843,7 @@ impl DaemonRuntime {
             );
         }
         self.restrict_permanent("local key revoked".to_owned());
-        let _ = self.controller.force_fail_closed("local_key_revoked");
+        self.force_fail_closed_or_restrict("local_key_revoked");
 
         let mut failures = Vec::new();
         if let Err(err) = self.set_interface_down_runtime() {
@@ -7952,7 +7920,7 @@ impl DaemonRuntime {
         };
         persist_session_snapshot(&snapshot, &self.state_path).map_err(|err| {
             self.restrict_permanent("state persist failure".to_owned());
-            let _ = self.controller.force_fail_closed("state_persist_failure");
+            self.force_fail_closed_or_restrict("state_persist_failure");
             err.to_string()
         })
     }
@@ -8050,9 +8018,7 @@ impl DaemonRuntime {
             }
             self.last_reconcile_error = Some(message.clone());
             self.restrict_permanent(message);
-            let _ = self
-                .controller
-                .force_fail_closed("blind_exit_invariants_failed");
+            self.force_fail_closed_or_restrict("blind_exit_invariants_failed");
             return;
         }
 
@@ -8066,7 +8032,7 @@ impl DaemonRuntime {
                 }
                 self.last_reconcile_error = Some(message.clone());
                 self.restrict_recoverable(message);
-                let _ = self.controller.force_fail_closed("trust_reconcile_failed");
+                self.force_fail_closed_or_restrict("trust_reconcile_failed");
                 self.promote_to_permanent_if_over_limit();
                 return;
             }
@@ -8082,14 +8048,14 @@ impl DaemonRuntime {
                 }
                 self.last_reconcile_error = Some(message.clone());
                 self.restrict_recoverable(message);
-                let _ = self
-                    .controller
-                    .force_fail_closed("membership_reconcile_failed");
+                self.force_fail_closed_or_restrict("membership_reconcile_failed");
                 self.promote_to_permanent_if_over_limit();
                 return;
             }
         };
-        let membership_directory = membership_directory_from_state(&membership_state);
+        let membership_directory =
+            membership_directory_from_state(&membership_state, &self.local_node_id);
+        self.controller.set_membership(membership_directory.clone());
 
         let auto_bundle = if self.auto_tunnel_enforce {
             match self.load_verified_auto_tunnel(&membership_state, &membership_directory) {
@@ -8102,9 +8068,7 @@ impl DaemonRuntime {
                     }
                     self.last_reconcile_error = Some(message.clone());
                     self.restrict_recoverable(message);
-                    let _ = self
-                        .controller
-                        .force_fail_closed("auto_tunnel_reconcile_failed");
+                    self.force_fail_closed_or_restrict("auto_tunnel_reconcile_failed");
                     self.promote_to_permanent_if_over_limit();
                     return;
                 }
@@ -8170,9 +8134,7 @@ impl DaemonRuntime {
                 self.reconcile_failures = self.reconcile_failures.saturating_add(1);
                 self.last_reconcile_error = Some(err.clone());
                 self.restrict_recoverable(err);
-                let _ = self
-                    .controller
-                    .force_fail_closed("blind_exit_assignment_rejected");
+                self.force_fail_closed_or_restrict("blind_exit_assignment_rejected");
                 self.promote_to_permanent_if_over_limit();
                 return;
             }
@@ -8183,7 +8145,7 @@ impl DaemonRuntime {
                     let message = format!("invalid local node id in runtime: {err}");
                     self.last_reconcile_error = Some(message.clone());
                     self.restrict_permanent(message);
-                    let _ = self.controller.force_fail_closed("invalid_local_node_id");
+                    self.force_fail_closed_or_restrict("invalid_local_node_id");
                     return;
                 }
             };
@@ -8193,9 +8155,7 @@ impl DaemonRuntime {
                 let message = format!("runtime key preparation failed: {err}");
                 self.last_reconcile_error = Some(message.clone());
                 self.restrict_recoverable(message);
-                let _ = self
-                    .controller
-                    .force_fail_closed("runtime_key_prepare_failed");
+                self.force_fail_closed_or_restrict("runtime_key_prepare_failed");
                 self.promote_to_permanent_if_over_limit();
                 return;
             }
@@ -8216,9 +8176,7 @@ impl DaemonRuntime {
                     let message = format!("traversal authority rejected reconcile apply: {err}");
                     self.last_reconcile_error = Some(message.clone());
                     self.restrict_recoverable(message);
-                    let _ = self
-                        .controller
-                        .force_fail_closed("reconcile_traversal_authority_rejected");
+                    self.force_fail_closed_or_restrict("reconcile_traversal_authority_rejected");
                     self.promote_to_permanent_if_over_limit();
                     return;
                 }
@@ -8230,9 +8188,7 @@ impl DaemonRuntime {
                 let message = format!("exit coexistence guard rejected reconcile apply: {err}");
                 self.last_reconcile_error = Some(message.clone());
                 self.restrict_recoverable(message);
-                let _ = self
-                    .controller
-                    .force_fail_closed("reconcile_exit_overlay_exception_violated");
+                self.force_fail_closed_or_restrict("reconcile_exit_overlay_exception_violated");
                 self.promote_to_permanent_if_over_limit();
                 return;
             }
@@ -8283,6 +8239,7 @@ impl DaemonRuntime {
                         self.close_relay_session(removed_peer);
                     }
                     self.membership_state = Some(membership_state);
+                    self.controller.set_membership(membership_directory.clone());
                     self.membership_directory = membership_directory;
                     self.refresh_dns_zone_state(auto_bundle.as_ref());
                     self.materialize_service_access_state(auto_bundle.as_ref());
@@ -8317,7 +8274,7 @@ impl DaemonRuntime {
                     let message = format!("reconcile dataplane apply failed: {err}");
                     self.last_reconcile_error = Some(message.clone());
                     self.restrict_recoverable(message);
-                    let _ = self.controller.force_fail_closed("reconcile_apply_failed");
+                    self.force_fail_closed_or_restrict("reconcile_apply_failed");
                     self.promote_to_permanent_if_over_limit();
                 }
                 (Err(err), Err(cleanup_err)) => {
@@ -8327,7 +8284,7 @@ impl DaemonRuntime {
                     );
                     self.last_reconcile_error = Some(message.clone());
                     self.restrict_recoverable(message);
-                    let _ = self.controller.force_fail_closed("reconcile_apply_failed");
+                    self.force_fail_closed_or_restrict("reconcile_apply_failed");
                     self.promote_to_permanent_if_over_limit();
                 }
                 (Ok(()), Err(cleanup_err)) => {
@@ -8336,9 +8293,7 @@ impl DaemonRuntime {
                         format!("runtime key cleanup failed after reconcile apply: {cleanup_err}");
                     self.last_reconcile_error = Some(message.clone());
                     self.restrict_recoverable(message);
-                    let _ = self
-                        .controller
-                        .force_fail_closed("runtime_key_cleanup_failed");
+                    self.force_fail_closed_or_restrict("runtime_key_cleanup_failed");
                     self.promote_to_permanent_if_over_limit();
                 }
             }
@@ -8464,6 +8419,23 @@ impl DaemonRuntime {
         eprintln!("rustynetd: restrict_permanent: {message}");
         self.restriction_mode = RestrictionMode::Permanent;
         self.bootstrap_error = Some(message);
+    }
+
+    fn force_fail_closed_or_restrict(&mut self, reason: &'static str) {
+        if let Err(err) = self.controller.force_fail_closed(reason) {
+            // RN-03: surface the enforcement failure instead of discarding it —
+            // record a PERMANENT restriction so the node never silently treats a
+            // failed fail-close as success. Deliberately do NOT call
+            // `controller.shutdown()` here: shutdown rolls the firewall back
+            // (deletes the nft killswitch table / flushes the pf anchor), which
+            // would remove the existing drop baseline and let traffic fall back
+            // to the open physical NIC — a fail-OPEN. Leaving the prior
+            // generation's killswitch in place keeps egress blocked (fail
+            // CLOSED) while the permanent restriction is reported.
+            let message = format!("force_fail_closed failed for {reason}: {err}");
+            eprintln!("rustynetd: {message}");
+            self.restrict_permanent(message);
+        }
     }
 
     fn promote_to_permanent_if_over_limit(&mut self) {
@@ -14730,7 +14702,10 @@ fn sanitize_netcheck_value(value: &str) -> String {
         .collect()
 }
 
-fn membership_directory_from_state(state: &MembershipState) -> MembershipDirectory {
+fn membership_directory_from_state(
+    state: &MembershipState,
+    local_node_id: &str,
+) -> MembershipDirectory {
     let mut directory = MembershipDirectory::default();
     for node in &state.nodes {
         let status = match node.status {
@@ -14741,6 +14716,7 @@ fn membership_directory_from_state(state: &MembershipState) -> MembershipDirecto
         };
         directory.set_node_status(node.node_id.clone(), status);
     }
+    directory.set_selector_members(DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, [local_node_id]);
     directory
 }
 
@@ -14856,6 +14832,21 @@ mod tests {
         DataplaneState, PathMode, RuntimeSystem, TraversalProbeDecision, TraversalProbeReason,
     };
     use crate::stun_client::StunResult;
+
+    #[test]
+    fn daemon_does_not_discard_force_fail_closed_results() {
+        let source = include_str!("daemon.rs");
+        let single_line_discard = concat!("let _ = self.controller.", "force_fail_closed");
+        let multiline_discard = concat!(".controller\n                    .", "force_fail_closed(");
+        assert!(
+            !source.contains(single_line_discard),
+            "daemon must route fail-close attempts through force_fail_closed_or_restrict"
+        );
+        assert!(
+            !source.contains(multiline_discard),
+            "daemon must not discard multiline force_fail_closed results"
+        );
+    }
 
     fn hex_encode(bytes: &[u8]) -> String {
         let mut out = String::with_capacity(bytes.len() * 2);

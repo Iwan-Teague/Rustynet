@@ -1,6 +1,6 @@
 # Rustynet Security Analysis — Verified & Patched
 
-**Date:** 2026-06-12 · **Commit:** `4fbd5f1` originally, reconciled against current `129cf4d69fb2` + working-tree fixes · **Status:** Current findings below were re-checked against live code; stale/false items were removed or narrowed.
+**Date:** 2026-06-12 · **Commit:** `4fbd5f1` originally, reconciled against current `129cf4d69fb2` + working-tree fixes · **Status:** Current findings below were re-checked against live code; stale/false items were removed or narrowed. Working-tree P0 fixes now close RN-03, RN-04, RN-05, and RN-11; RN-02 remains open as cleanup/dead-code risk.
 
 ---
 
@@ -21,82 +21,41 @@ Each finding below was verified by reading the actual source code at the cited l
 
 ### 1.1 RN-03 — `force_fail_closed` Results are discarded across daemon paths
 
-**Verified:** `rg 'force_fail_closed\(' crates/rustynetd/src/daemon.rs` shows 40 daemon call sites. The previous "10 sites" count only matched single-line `let _ = ...force_fail_closed(...)` forms and missed multiline discarded Results.
+**Status:** Fixed in working tree.
 
-`force_fail_closed` → `block_all_egress()` → programs `policy drop` killswitch. If this fails (nft unavailable, helper down, transaction race), many daemon paths do not propagate the error. Worst case: first bootstrap, no prior killswitch table exists → daemon proceeds as if protected → host egresses cleartext.
+**Fix:** daemon call sites now route through `DaemonRuntime::force_fail_closed_or_restrict`. If `force_fail_closed` fails, the daemon records a **permanent restriction** (the enforcement error is surfaced, never discarded) and **leaves the existing killswitch drop baseline in place** so egress stays blocked (fail CLOSED). It deliberately does NOT call `controller.shutdown()` on this path: shutdown rolls the firewall back (deletes the nft killswitch table / flushes the pf anchor), which would let traffic fall back to the open physical NIC — a fail-OPEN. (A shutdown "backstop" was present in an earlier draft of this fix and removed after review confirmed it re-introduced the very leak RN-03 closes.)
 
-**Suggested approach** (the implementer should research the best solution):
-- At minimum, never discard the Result without error-level logging
-- On the bootstrap path (no prior generation table), aborting lets systemd's mandatory boot killswitch backstop
-- On the steady-state path (prior generation table exists), the existing policy drop still protects, so a retry-with-backoff may be appropriate
-- The implementer should evaluate whether `abort()`, retry, or a different escalation fits the project's fail-closed contract
+**Verification:** `daemon::tests::daemon_does_not_discard_force_fail_closed_results`; `cargo test -p rustynetd daemon --lib`.
 
 ---
 
 ### 1.2 RN-04 — Killswitch programmed AFTER tunnel interface comes up
 
-**Verified:** `phase10.rs:4386` — `self.backend.start(context)` creates the tunnel interface.
-`phase10.rs:4541` — `self.system.apply_firewall_killswitch()` programs the killswitch **8 operations later**.
+**Status:** Fixed in working tree.
 
-Order in `apply_generation_stages`:
-1. `backend.start()` — **tunnel interface UP** (line 4386)
-2. `rollback_routes()` (line 4527)
-3. `apply_peer_endpoint_bypass_routes()` (line 4528)
-4. `backend.apply_routes()` (line 4531)
-5. `system.apply_routes()` (line 4535)
-6. `system.apply_firewall_killswitch()` — **killswitch FINALLY active** (line 4541)
+**Fix:** `Phase10Controller::apply_dataplane_generation` applies the firewall killswitch before `backend.start()` and before route mutation. If pre-start killswitch application fails, the controller calls `force_fail_closed("killswitch_pre_start_failed")` and returns the original system error only after fail-closed enforcement succeeds.
 
-There is a window between steps 1 and 6 where the tunnel interface exists with routes but no `policy drop`. If the daemon crashes or is killed during this window, the host has routes with no killswitch. The `ExecStartPre` boot killswitch (`linux_killswitch_boot.rs`) is **opt-in** (`--install-boot-killswitch`).
-
-**Suggested approach** (the implementer should research the best solution):
-- Reorder so the killswitch is programmed before the interface comes up (may need carve-outs for bootstrap traffic like STUN and control-plane fetch)
-- Consider making the boot killswitch mandatory in the shipped unit, not opt-in
-- The existing verifier that checks for boot killswitch table presence could gate `backend.start()`
+**Verification:** `phase10::tests::full_tunnel_route_dns_apply_order_keeps_exit_commit_last`, `phase10::tests::killswitch_apply_failure_fails_closed_before_exit_mode`; `cargo test -p rustynetd phase10::tests --lib`.
 
 ---
 
 ### 1.3 RN-05 — Policy revocation bypass for non-`node:` selectors
 
-**Verified:** `rustynet-policy/src/lib.rs:396-405`
-```rust
-fn selector_membership_allowed(selector: &str, membership: &MembershipDirectory) -> bool {
-    let Some(node_id) = selector_node_id(selector) else {
-        return true;  // ← Any selector without "node:" prefix SKIPS the membership gate
-    };
-    membership.node_status(node_id) == MembershipStatus::Active
-}
+**Status:** Fixed in working tree.
 
-fn selector_node_id(selector: &str) -> Option<&str> {
-    selector.strip_prefix("node:")
-}
-```
-A revoked node matching a `group:family` or `user:admin` rule is permitted. Revocation is silently ineffective across the entire non-`node:` rule surface.
+**Fix:** `MembershipDirectory` now carries explicit selector-member mappings for `user:`, `group:`, and `tag:` selectors. Unresolved membership selectors fail closed; mapped selectors require every mapped node to be active. Literal route destinations such as CIDRs are not treated as membership selectors. Daemon membership conversion maps `user:local` to the signed local node only.
 
-**Suggested approach** (the implementer should research the best solution):
-- The core issue: non-`node:` selectors skip the membership revocation check. The fix needs to map group/tag/user selectors to their member node set, then check each member's status
-- If group resolution data isn't available yet, the fail-closed default is to deny unresolvable selectors. This breaks rules using group selectors but closes the revocation bypass immediately
-- The implementer should decide whether to build the resolution layer first or take the simpler deny-by-default path as an interim step
+**Verification:** `rustynet-policy` tests `non_node_selectors_require_membership_resolution` and `literal_route_destinations_do_not_require_membership_resolution`; daemon auto-tunnel tests pass after wiring signed membership into the controller.
 
 ---
 
 ### 1.4 RN-11 — Empty membership directory = allow-all
 
-**Verified:** `phase10.rs:5362-5369`
-```rust
-fn check_peer_membership_active(node_id: &NodeId, membership: &MembershipDirectory) -> Result<(), Phase10Error> {
-    if !membership.is_populated() {
-        // Membership governance not yet active — skip the gate.
-        return Ok(());
-    }
-    match membership.node_status(node_id.as_str()) { ... }
-}
-```
-When the membership directory is empty (unpopulated), every peer is allowed. This is indistinguishable from "membership state failed to load / was wiped."
+**Status:** Fixed in working tree.
 
-**Suggested approach** (the implementer should research the best solution):
-- Distinguish an explicit operator opt-out (`--membership-governance=disabled`) from genuinely unpopulated or unloadable state
-- Default to denying when membership is empty
-- Fail closed if a snapshot path was configured but failed to load
+**Fix:** `check_peer_membership_active` no longer treats an empty membership directory as governance-disabled. A peer must be positively present and `Active`. Daemon now pushes the signed membership directory into `Phase10Controller` before bootstrap and reconcile applies.
+
+**Verification:** `phase10::tests::test_empty_membership_directory_denies_peer_provisioning`; `cargo test -p rustynetd phase10::tests --lib`.
 
 ---
 
@@ -121,8 +80,13 @@ If this path executes twice (concurrent traversal probe + relay health check), t
 **Suggested approach:** Replace with proper error propagation (`.ok_or_else(|| ...)?`). The implementer should verify that the error type and handling path are appropriate for this call site.
 
 ### 2.2 RN-08 — Key envelope lacks AAD binding
-**Location:** `rustynet-crypto/src/lib.rs:942` — empty AAD in XChaCha20-Poly1305.
-**Suggested approach:** Bind `MAGIC || version || salt || nonce` as AAD. The implementer should choose the exact framing format and add a version byte for future algorithm agility.
+**Status:** Partially fixed in `cc5ca96`; do not close yet.
+
+**Current issue to fix:** `rustynet-crypto/src/lib.rs:1601` auto-detects v1 blobs with `bytes.len() >= 45 && bytes[0] != 0`. Legacy v0 blobs start with the random salt, so about 255/256 existing v0 key files will have a nonzero first byte and will be misclassified as v1. That makes most legacy encrypted keys fail to decrypt after upgrade.
+
+**Required follow-up:** Change the envelope framing/detection so v0 legacy blobs always decode correctly and v1 blobs remain AAD-bound. Add a regression test that manually builds an old v0 `[salt][nonce][len][ciphertext]` blob and proves `read_encrypted_key_file`/`decrypt_private_key_envelope` can still decrypt it. Also add negative tests that v1 rejects tampered version/AAD framing.
+
+**Original issue:** `rustynet-crypto/src/lib.rs` used empty AAD in XChaCha20-Poly1305. The fix direction remains binding the envelope to a versioned Rustynet framing, but backward-compatible decoding must be correct.
 
 ### 2.3 RN-09 — systemd-credential passphrase group-readable
 **Location:** `key_material.rs:674` — wider permission mask on `/run/credentials/` prefix.
@@ -156,12 +120,12 @@ If this path executes twice (concurrent traversal probe + relay health check), t
 |---|---|---|---|
 | RN-01 | Fixed (RL-1) | Fixed | — |
 | RN-02 | Open | **Still open** | Dead code still present |
-| RN-03 | Open | **Confirmed broader than prior single-line count** | Current daemon has 40 `force_fail_closed()` call sites; many discarded |
-| RN-04 | Open | **Confirmed** | Killswitch after backend.start() |
-| RN-05 | Open | **Confirmed** | Non-node selectors bypass revocation |
+| RN-03 | Open | **Fixed in working tree** | Daemon no longer discards fail-close Results; regression test added |
+| RN-04 | Open | **Fixed in working tree** | Killswitch now applies before backend start and fail-closes on pre-start failure |
+| RN-05 | Open | **Fixed in working tree** | Non-node membership selectors require explicit active member resolution |
 | RN-06 | Open | **FIXED** | Scoped egress allows replace unscoped LAN allow (phase10.rs:3096-3142) |
 | RN-07 | Open (G8 in progress) | **Partially fixed** | IPv6 block rule exists; still uses netsh not WFP |
-| RN-11 | Open | **Confirmed** | Empty membership = skip gate (phase10.rs:5366) |
+| RN-11 | Open | **Fixed in working tree** | Empty membership now denies peer provisioning |
 | RN-14 | Fixed (RL-2) | Fixed | — |
 | RN-15 | Fixed (RL-8) | Fixed | — |
 
