@@ -46,6 +46,30 @@ outcome-sink copies (now quantified); the relay's single remaining alloc/op
 is the rate limiter's `node_id.to_owned()` `entry()` key — see the
 opportunity list.
 
+## 1.6) Control-plane Tier-1 (landed 2026-06-12, commit `9719922`)
+
+Structured perf pass beyond the dataplane found Pareto wins on the daemon's
+1 Hz reconcile + membership-apply path. All byte-identical (canonical signed
+output unchanged; determinism + round-trip tests pin it):
+
+- **#1 hex via nibble LUT** (was `format!("{:02x}")`/byte) — membership,
+  role_audit, dns-zone, gossip_runtime.
+- **#2 zero-clone canonical builders** — `write!` into one buffer, sort
+  references not cloned rosters, `HashSet<&str>` in `validate()`.
+- **#4 borrowed-`&str` key=value parser** — no per-field `String` clone.
+
+Measured with the new `perfprobe_membership` example (50 nodes, dev-only
+counting allocator; `cargo build --release -p rustynet-control --example
+perfprobe_membership` then `/usr/bin/time -l`): wall/op **−34%** (177→117 µs),
+allocs/op **−63%** (4358→1598), bytes/op **−41%**. All three dimensions
+improve, none regress.
+
+**Deferred (still open):** #7 runtime-fingerprint memoize and #9 gossip
+candidate-build gate — both live in `daemon.rs`, which a concurrent change
+stream is mid-edit on. Land them once `daemon.rs` settles (both small:
+#9 trivial `is_some()` guard; #7 ~0.05% CPU + a generation counter threaded
+through traversal-hint mutation sites).
+
 ## 2) Remaining items (ordered)
 
 ### P1 — Engine outcome sink (remove the last per-frame copy in each direction)
