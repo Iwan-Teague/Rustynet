@@ -386,6 +386,72 @@ project mandate: an enforcement point in code plus a verification test.
   re-resolution can no longer slip in unreviewed. `cargo fmt`/`audit`/`deny`
   are left unchanged (they do not take `--locked`).
 
+### RL-9 — RN-03 / RN-04 killswitch fail-closed (no discarded result; pre-start ordering) **(landed)**
+- **Commit:** `8cca145`. **Files:** `crates/rustynetd/src/daemon.rs`, `crates/rustynetd/src/phase10.rs`.
+- **Change (RN-03):** every `let _ = …force_fail_closed(…)` discard is gone; all
+  ~40 sites route through `force_fail_closed_or_restrict` (daemon.rs), which on
+  enforcement failure does **not** swallow the error — it logs and calls
+  `restrict_permanent` (restricted-safe mode that blocks mutating IPC) rather
+  than `controller.shutdown()` (shutdown would tear down the nft/pf table and
+  fall open). `force_fail_closed` itself runs `block_all_egress()?`.
+- **Change (RN-04):** the killswitch (`apply_firewall_killswitch`) now runs
+  **before** `backend.start()` and route mutation; a pre-start failure escalates
+  via `force_fail_closed("killswitch_pre_start_failed")?`. Rollback distinguishes
+  `RollbackIntent::FailClosed` (leaves the killswitch in place) from
+  `CleanShutdown`.
+- **Tests:** `daemon_does_not_discard_force_fail_closed_results` (source-grep
+  guard forbidding both discard forms) and
+  `killswitch_apply_failure_fails_closed_before_exit_mode` (apply-order + state
+  assertions).
+
+### RL-10 — RN-05 / RN-11 policy default-deny (non-`node:` selectors + empty membership) **(landed)**
+- **Commit:** `8cca145`. **Files:** `crates/rustynet-policy/src/lib.rs`, `crates/rustynetd/src/phase10.rs`, `crates/rustynetd/src/daemon.rs`.
+- **Change (RN-05):** `selector_membership_allowed` resolves `node:`/`user:`/
+  `group:`/`tag:` selectors against membership; an unmapped non-node selector,
+  empty members, or any non-`Active` member → **deny**. `*` is the only
+  unconditional allow; literal route destinations are exempted explicitly.
+- **Change (RN-11):** the `is_populated()` "governance disabled → skip gate"
+  bypass is removed from `check_peer_membership_active`; empty/missing membership
+  falls through to non-Active → deny.
+- **Tests:** `non_node_selectors_require_membership_resolution`,
+  `literal_route_destinations_do_not_require_membership_resolution`,
+  `test_empty_membership_directory_denies_peer_provisioning`.
+
+### RL-11 — RN-09 / RN-10 / RN-16 (credential parent-dir, ledger fail-closed, CI SHA pins) **(landed)**
+- **Commit:** `cc5ca96`. **Files:** `crates/rustynetd/src/daemon.rs`, `crates/rustynet-crypto/src/lib.rs`, `.github/workflows/*`.
+- **Change (RN-09):** when a systemd-credential path allows a root-owned file,
+  the parent directory is validated — symlink parent rejected, mode with
+  `& 0o077 != 0` rejected (owner-only `0o700`); fail-closed (`return Err`).
+- **Change (RN-10):** `load_rotation_ledger` returns `Result`; a corrupt/
+  unreadable ledger → `Err` → `DaemonError::InvalidConfig` at construction
+  (`?`), replacing the prior fail-open `genesis()` reset of anti-rollback state.
+  Absent ledger still yields genesis.
+- **Change (RN-16):** `actions/checkout` and `softprops/action-gh-release`
+  pinned to commit SHAs in both workflows.
+- **Tests:** `validate_file_security_rejects_group_writable_parent_directory`,
+  `validate_file_security_rejects_symlink_parent_directory`,
+  `passphrase_permission_mask_accepts_systemd_runtime_credential_mode` (RN-09);
+  `load_rotation_ledger_refuses_corrupt_ledger_and_fails_closed` (RN-10, added
+  2026-06-16).
+
+### RL-12 — RN-08 key-envelope AAD binding **(partial — landed; legacy v0 decode open)**
+- **Commit:** `cc5ca96`. **Files:** `crates/rustynet-crypto/src/lib.rs`.
+- **Change:** `encrypt_private_key_envelope` always emits a **v1** envelope whose
+  XChaCha20-Poly1305 AAD binds magic `b"RNET"` + version byte; decrypt supports
+  v0 (empty AAD) + v1, unknown version → `DeniedAlgorithm`. This binds the
+  ciphertext to the envelope context so a blob cannot be replayed into a raw
+  AEAD unwrap or a different envelope version.
+- **Test:** `encrypted_envelope_is_v1_aad_bound_and_fails_closed_on_version_tamper`
+  (added 2026-06-16) — asserts v1 emission, encode/decode round-trip,
+  version-tamper → denied, and v1-ciphertext-under-v0-AAD → `DecryptionFailed`.
+- **Open follow-up (why Partial):** the on-disk `decode_encrypted_blob` router
+  discriminates v0/v1 on `bytes[0] != 0`, which collides with a v0 blob's random
+  `salt[0]`, so ~255/256 legacy v0 blobs misdecode to `InvalidLength`. This is
+  **fail-closed** (an error, never a bypass), and nothing writes v0 anymore, but
+  in-place upgrades of hosts holding a v0 blob need a robust try-v1-then-v0
+  decode before RN-08 can be marked **Fixed**. Tracked in
+  `SecurityAndQualityAudit_2026-06-10.md`.
+
 ### RL note — RN-21 deliberately left as-is
 `AlgorithmPolicy::with_exceptions` currently rejects *all* non-empty exception
 lists (the dead-guard). That over-rejection is **fail-closed** and is the more
@@ -403,6 +469,11 @@ These P0s are **behavioral/semantic** changes that carry real regression risk
 decision. They are scoped here so the implementer (and owner) can choose the
 exact behavior before code lands — recommended to confirm direction first
 rather than unilaterally change fail-closed/leak semantics.
+
+> **Status update (post-implementation):** RN-03, RN-04, RN-05, RN-10 and RN-11
+> have since **landed** — see the §18 master tracker and Remediation log RL-9,
+> RL-10, RL-11. The design notes below are retained as the pre-implementation
+> rationale the shipped fixes followed; they are no longer open work.
 
 ### RN-03 / RN-04 — fail-open on `force_fail_closed` + pre-killswitch bootstrap window
 - **Design choice to confirm:** on `force_fail_closed` error, **terminate** the
@@ -591,43 +662,44 @@ Individual findings understate risk where they combine:
 
 | Mandate (CLAUDE.md §3/§4) | Findings against it | Status |
 |---|---|---|
-| Fail closed when trust/security state missing/invalid/stale | RN-03, RN-04, RN-10, RN-11 | **Open** |
-| Default-deny across ACL/routes | RN-05, RN-11 | **Open** |
-| Anti-replay / rollback protection | RN-10, RN-13, RN-25, RN-26 | **Open** |
+| Fail closed when trust/security state missing/invalid/stale | RN-03, RN-04, RN-10, RN-11 | **Fixed** |
+| Default-deny across ACL/routes | RN-05, RN-11 | **Fixed** |
+| Anti-replay / rollback protection | RN-10, RN-13, RN-25, RN-26 | **Partial** (RN-10 fixed; RN-13/25/26 open) |
 | Signed control/trust-state validation before mutation | RN-22 | **Fixed** |
 | No custom cryptography in production paths | — | **Upheld** |
-| Strict key custody (OS store / encrypted-at-rest + startup perm checks) | RN-08, RN-09, RN-33 | **Open** (RN-23/24 fixed) |
+| Strict key custody (OS store / encrypted-at-rest + startup perm checks) | RN-08, RN-09, RN-33 | **Partial** (RN-09/23/24 fixed; RN-08 AAD-bound, v0 decode open; RN-33 open) |
 | Never log secrets / private key material | RN-38 (coverage) | **Upheld** |
 | Preserve tunnel + DNS fail-closed in protected modes | RN-06, RN-07, RN-12, RN-29 | **Open** |
 | Argv-only exec for privileged helpers; strict input validation | RN-19, RN-20, RN-34/35/36 | **Upheld** (DiD gaps open) |
-| One hardened execution path; no fallback/downgrade/legacy branch | RN-02, RN-03 (direct vs helper), RN-19 | **Open** |
+| One hardened execution path; no fallback/downgrade/legacy branch | RN-02, RN-03 (direct vs helper), RN-19 | **Partial** (RN-03/RN-19 fixed; RN-02 open) |
 | No TODO/FIXME/placeholders in completed deliverables | RN-13, RN-26 | **Open** |
 | `forbid(unsafe_code)` enforced | RN-14 | **Fixed** |
 | Each security control has enforcement + verification test | cross-ref TestCoverageImprovementPlan | **Partial** |
 
 ## 18. Master finding-status tracker
 
-Status: **Fixed** (landed + tested), **Open** (not started), **Accepted**
+Status: **Fixed** (landed + tested), **Partial** (control landed + tested, with a
+scoped follow-up still open), **Open** (not started), **Accepted**
 (won't-fix, with rationale).
 
 | ID | Sev | Domain | Status | Ref |
 |---|---|---|---|---|
 | RN-01 | High | Untrusted input | **Fixed** | RL-1 |
 | RN-02 | High | Dataplane | Open | §11 |
-| RN-03 | High | Dataplane | Open | §11 |
-| RN-04 | High | Dataplane | Open | §11 |
-| RN-05 | High | Policy | Open | §11 |
+| RN-03 | High | Dataplane | **Fixed** | RL-9 |
+| RN-04 | High | Dataplane | **Fixed** | RL-9 |
+| RN-05 | High | Policy | **Fixed** | RL-10 |
 | RN-06 | High | Dataplane (Win) | Open | §11 |
 | RN-07 | High | Dataplane (Win) | Open | §11 |
-| RN-08 | Med | Crypto | Open | — |
-| RN-09 | Med | Key custody | Open | — |
-| RN-10 | Med | Trust | Open | §11 |
-| RN-11 | Med | Policy | Open | §11 |
+| RN-08 | Med | Crypto | **Partial** | RL-12 |
+| RN-09 | Med | Key custody | **Fixed** | RL-11 |
+| RN-10 | Med | Trust | **Fixed** | RL-11 |
+| RN-11 | Med | Policy | **Fixed** | RL-10 |
 | RN-12 | Med | Dataplane | Open | — |
 | RN-13 | Med | Dataplane | Open | — |
 | RN-14 | Med | Supply chain | **Fixed** | RL-2 |
 | RN-15 | Med | Supply chain | **Fixed** | RL-8 |
-| RN-16 | Med | Supply chain | Open | — |
+| RN-16 | Med | Supply chain | **Fixed** | RL-11 |
 | RN-17 | Low | Priv | **Fixed** | RL-7 |
 | RN-18 | Low | Priv | Open | — |
 | RN-19 | Low | Priv | **Fixed** | RL-6 |
@@ -647,9 +719,12 @@ Status: **Fixed** (landed + tested), **Open** (not started), **Accepted**
 | RN-33 | Low | Key custody | Open | — |
 | RN-34–38 | Info | various | Open | — |
 
-Progress: **8 Fixed**, **1 Accepted**, **29 Open** (7 High / 7 Med / 9 Low /
-5 Info remaining open). All High remaining are the behavioral dataplane/policy
-items deferred for owner direction (§11).
+Progress: **15 Fixed**, **1 Partial**, **1 Accepted**, **21 Open** (3 High /
+2 Med / 11 Low / 5 Info remaining open). The remaining open High items are the
+behavioral Windows/dataplane leak findings RN-02/06/07 (§11). RN-03/04/05/09/10/11
+and the RN-16 SHA pins landed in commits 8cca145 + cc5ca96 (see RL-9..RL-11);
+RN-08's AAD binding landed (RL-12) with the legacy v0-blob decode compatibility
+left as a tracked, fail-closed follow-up.
 
 ## 19. Reproduction notes (top findings)
 
@@ -715,6 +790,14 @@ change; the rows below add the finding-specific acceptance bar.
 | RN-22 | A non-canonical (mauled) ed25519 signature is rejected; all legitimate signatures still verify | crypto `verify_attestation_rejects_non_canonical_malleable_signature` + control 237-test suite green |
 | RN-24 | Derived key material + `SecretKey` cleared via `zeroize()` (no `fill(0)` on secret buffers) | `grep -n 'fill(0)' crates/rustynet-crypto/src/lib.rs` returns none on key buffers; envelope round-trip tests pass |
 | RN-23 | Malformed macOS keychain `key_id` rejected before keychain call | unit test asserting `is_valid_key_identifier` gate on store/load (add when next on macOS) |
+| RN-03 | A failed `force_fail_closed` is never swallowed: on error the daemon enters restricted-safe mode (no IPC mutation) rather than tearing down the killswitch | `daemon_does_not_discard_force_fail_closed_results` (source guard) |
+| RN-04 | Killswitch `policy drop` precedes `backend.start()`; pre-start failure fails closed | `killswitch_apply_failure_fails_closed_before_exit_mode` |
+| RN-05 | Revocation applies to non-`node:` selectors; unresolvable trust selectors denied | `non_node_selectors_require_membership_resolution` |
+| RN-09 | Root-owned credential file accepted only under a uid-0 `0o700` non-symlink parent | `validate_file_security_rejects_group_writable_parent_directory`, `..._rejects_symlink_parent_directory` |
+| RN-10 | Corrupt rotation ledger → boot refusal (not genesis reset); absent ledger → genesis | `load_rotation_ledger_refuses_corrupt_ledger_and_fails_closed` |
+| RN-11 | Empty/missing membership denies peer provisioning (no governance-disabled bypass) | `test_empty_membership_directory_denies_peer_provisioning` |
+| RN-16 | CI actions pinned to commit SHAs | both workflows pin `actions/checkout` + `action-gh-release` to `@<sha>` |
+| RN-08 (partial) | Envelope binds magic+version as AEAD AAD; v1 emitted; tamper/cross-AAD fails closed. **Open:** robust legacy v0 decode | `encrypted_envelope_is_v1_aad_bound_and_fails_closed_on_version_tamper` |
 
 ### Accepted (won't-fix) — criterion to re-open
 | ID | Re-open if | 
@@ -722,6 +805,12 @@ change; the rows below add the finding-specific acceptance bar.
 | RN-21 | The denylisted-algorithm compatibility-exception mechanism becomes a wanted feature; then it lands with its own review and the mis-pinned test is corrected to assert acceptance of a valid denylisted exception. |
 
 ### Open — acceptance criteria for the fix
+
+> RN-03/04/05/09/10/11 and RN-16 have since landed and moved to the Fixed table
+> above (RL-9..RL-11); RN-08 is now **Partial** (AAD bound; legacy v0 decode
+> open, RL-12). The rows for those IDs below are retained only as the historical
+> acceptance bar they were closed against.
+
 | ID | Acceptance criterion | Verify |
 |---|---|---|
 | RN-02 | No dead enforcement module masquerades as the killswitch authority: `dataplane.rs` is either deleted or wired into the live path; the security-audit catalog + tests reference the executing path (`phase10.rs`) | `grep -rn LinuxDataplane crates` shows production construction or the module is gone; catalog points at live tests |
