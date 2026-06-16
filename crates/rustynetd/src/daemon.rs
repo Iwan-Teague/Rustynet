@@ -25706,10 +25706,15 @@ mod tests {
         .expect("signed assignment should load");
 
         let policy = TrustPolicy::default();
-        // generated_at_unix one second beyond the configured skew window.
+        // generated_at_unix well beyond the configured skew window. The margin
+        // must exceed any wall-clock that can elapse between this `unix_now()`
+        // and the loader's own `unix_now()` (file write + ed25519 signing). A
+        // +1s margin races the 1-second clock granularity and intermittently
+        // makes the bundle appear in-skew; +20s matches the convention used by
+        // the daemon-runtime future-dated tests.
         let future_at = unix_now()
             .saturating_add(policy.max_clock_skew_secs)
-            .saturating_add(1);
+            .saturating_add(20);
         write_dns_zone_file_with_timing(
             &dns_zone_path,
             &dns_zone_verifier_path,
@@ -26010,6 +26015,43 @@ mod tests {
         let _ = std::fs::remove_file(dns_zone_path);
         let _ = std::fs::remove_file(dns_zone_verifier_path);
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_rotation_ledger_refuses_corrupt_ledger_and_fails_closed() {
+        // RN-10: a corrupt/unreadable rotation ledger must fail closed (refuse
+        // daemon construction) rather than silently resetting the anti-rollback
+        // epoch to genesis. Absent ledger and the None path still yield genesis
+        // so a first boot is not blocked, but a tampered ledger is rejected.
+        let test_dir = secure_test_dir("rustynetd-rotation-ledger-corrupt");
+        let key_path = test_dir.join("wireguard.key");
+        std::fs::write(&key_path, b"key-material").expect("key file should be written");
+
+        assert!(
+            super::load_rotation_ledger(None).is_ok(),
+            "None key path must yield genesis"
+        );
+        assert!(
+            super::load_rotation_ledger(Some(key_path.as_path())).is_ok(),
+            "absent ledger must yield genesis, not an error"
+        );
+
+        let ledger_path = super::ledger_path_for(&key_path);
+        std::fs::write(&ledger_path, b"not-a-valid-ledger\n=\n\0garbage")
+            .expect("corrupt ledger should be written");
+        let result = super::load_rotation_ledger(Some(key_path.as_path()));
+        assert!(
+            result.is_err(),
+            "corrupt rotation ledger must fail closed, got {result:?}"
+        );
+        assert!(
+            result
+                .expect_err("corrupt ledger must error")
+                .contains("corrupt or unreadable"),
+            "error must identify the corrupt ledger"
+        );
+
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 
     #[test]
