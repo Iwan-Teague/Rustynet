@@ -1874,6 +1874,59 @@ mod tests {
         assert_eq!(result.err(), Some(CryptoError::DecryptionFailed));
     }
 
+    #[test]
+    fn encrypted_envelope_is_v1_aad_bound_and_fails_closed_on_version_tamper() {
+        // RN-08 (AAD binding): `encrypt_private_key_envelope` always emits a v1
+        // envelope whose AEAD AAD binds magic b"RNET" + the version byte. This
+        // verification confirms the control end-to-end: (1) v1 is emitted, (2) it
+        // round-trips through the on-disk encode/decode router, (3) tampering the
+        // version byte fails closed (denied, never decrypted), and (4) the v1
+        // ciphertext does not decrypt under the legacy v0 empty-AAD path — i.e.
+        // the AAD genuinely binds the envelope context rather than being inert.
+        let (salt, nonce) = generate_key_custody_material();
+        let blob = encrypt_private_key_envelope(b"private-material", "pw", salt, nonce)
+            .expect("encryption should succeed");
+        assert_eq!(blob.version, 1, "encrypt must emit a v1 AAD-bound envelope");
+
+        // (2) Round-trip through the real on-disk encoding + decode router.
+        let encoded = super::encode_encrypted_blob(&blob);
+        assert_eq!(
+            encoded[0], 1,
+            "v1 encoding carries an explicit version byte"
+        );
+        let decoded = super::decode_encrypted_blob(&encoded).expect("v1 blob should decode");
+        assert_eq!(
+            decrypt_private_key_envelope(&decoded, "pw").expect("v1 round-trip should decrypt"),
+            b"private-material"
+        );
+
+        // (3) Tamper the version byte to an unknown version: the blob still
+        // parses structurally, but decrypt must deny it, never return plaintext.
+        let mut tampered = encoded.clone();
+        tampered[0] = 2;
+        let tampered_blob =
+            super::decode_encrypted_blob(&tampered).expect("tampered blob parses structurally");
+        assert_eq!(
+            decrypt_private_key_envelope(&tampered_blob, "pw").err(),
+            Some(CryptoError::DeniedAlgorithm),
+            "unknown envelope version must be denied, not decrypted"
+        );
+
+        // (4) Re-label the v1 ciphertext as v0 (empty AAD). The tag was computed
+        // over the v1 AAD, so the empty-AAD path must fail the tag check.
+        let as_v0 = super::EncryptedKeyBlob {
+            version: 0,
+            salt: blob.salt,
+            nonce: blob.nonce,
+            ciphertext: blob.ciphertext.clone(),
+        };
+        assert_eq!(
+            decrypt_private_key_envelope(&as_v0, "pw").err(),
+            Some(CryptoError::DecryptionFailed),
+            "v1 ciphertext must not decrypt under the v0 empty-AAD path"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn validates_strict_key_custody_permissions() {
