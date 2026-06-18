@@ -632,10 +632,27 @@ fn validate_secret_file_security(
                 return Err(format!("{label} parent directory must not be a symlink"));
             }
             let parent_mode = parent_meta.mode() & 0o777;
-            if parent_mode & 0o077 != 0 {
+            let parent_uid = parent_meta.uid();
+            // systemd materializes credential directories (/run/credentials/<unit>)
+            // as a root-owned, world-inaccessible tmpfs: observed mode 0o550
+            // (dr-xr-x---) on systemd >= 257, with a POSIX ACL granting the
+            // (non-root) service user access. The group r-x bits belong to gid 0
+            // (root), which can already read any file, so they are not an exposure;
+            // world (other) has no access. Demanding strict 0o700 here wrongly
+            // rejected systemd's standard layout and stopped the daemon from
+            // starting under a least-privilege `User=` (regression introduced with
+            // the encrypted-credential hardening). The invariants that actually
+            // matter for a root-owned credential directory are: owned by root (or
+            // by us), no world access, and not group-writable.
+            let parent_owner_ok = parent_uid == 0 || parent_uid == Uid::effective().as_raw();
+            // 0o027 = group-write (0o020) | any world access (0o007). Group
+            // read/execute — needed to traverse a root:root 0o550 directory — is
+            // permitted; world access and group-write are rejected.
+            if !parent_owner_ok || parent_mode & 0o027 != 0 {
                 return Err(format!(
-                    "{label} parent directory permissions are too broad: \
-                     must be owner-only (0o700), found {parent_mode:03o}",
+                    "{label} parent directory permissions are too broad: must be \
+                     root- or owner-owned with no world access and no group-write, \
+                     found uid={parent_uid} mode={parent_mode:03o}",
                 ));
             }
         }
@@ -1387,6 +1404,67 @@ mod tests {
 
         let _ = remove_file_if_present(&pub_path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression guard for the systemd-credential parent-directory check.
+    ///
+    /// systemd materializes `/run/credentials/<unit>` as a root-owned tmpfs with
+    /// mode `0o550` (`dr-xr-x---`) plus a POSIX ACL granting the non-root service
+    /// user; world has no access. The earlier check demanded strict `0o700` and
+    /// therefore rejected this standard layout, crashing the daemon at startup
+    /// under a least-privilege `User=`. This pins that a world-inaccessible,
+    /// non-group-writable credential directory is accepted while world-readable
+    /// and group-writable directories are still rejected (the real exposures).
+    #[test]
+    #[cfg(unix)]
+    fn passphrase_parent_dir_allows_systemd_layout_rejects_world_or_group_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = unique_test_dir("rn-cred-parent");
+        let secret = parent.join("wg_key_passphrase");
+        // systemd credential files are group-readable (root:root 0o440); the file
+        // check tolerates that for a root-owned credential. In-test the file is
+        // owned by the effective uid, so 0o440 likewise passes the file check and
+        // lets the parent-directory branch run.
+        std::fs::write(&secret, b"passphrase-bytes").expect("write secret");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o440))
+            .expect("set secret 0o440");
+
+        let set_parent = |mode: u32| {
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode))
+                .expect("set parent mode");
+        };
+
+        // systemd's standard 0o550 credential directory must be accepted.
+        set_parent(0o550);
+        assert!(
+            super::validate_secret_file_security(&secret, "passphrase file", true).is_ok(),
+            "root-style 0o550 credential dir (world-inaccessible) must be accepted"
+        );
+
+        // A strict owner-only 0o700 directory remains valid (backward compatible).
+        set_parent(0o700);
+        assert!(
+            super::validate_secret_file_security(&secret, "passphrase file", true).is_ok(),
+            "owner-only 0o700 parent dir must remain valid"
+        );
+
+        // World read/execute on the parent is a real exposure and must be rejected.
+        set_parent(0o555);
+        assert!(
+            super::validate_secret_file_security(&secret, "passphrase file", true).is_err(),
+            "world-accessible parent dir must be rejected"
+        );
+
+        // Group-write on the parent allows tampering and must be rejected.
+        set_parent(0o570);
+        assert!(
+            super::validate_secret_file_security(&secret, "passphrase file", true).is_err(),
+            "group-writable parent dir must be rejected"
+        );
+
+        set_parent(0o700);
+        let _ = remove_file_if_present(&secret);
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     /// Pin the macOS passphrase custody routing: the cross-binary case
