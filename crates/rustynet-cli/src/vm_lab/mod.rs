@@ -17054,7 +17054,22 @@ fn resolve_iteration_source_selection(
 fn git_worktree_is_dirty() -> Result<bool, String> {
     let mut command = Command::new("git");
     command.current_dir(workspace_root_path());
-    command.args(["status", "--short"]);
+    // The live-lab evidence ledgers are appended to BY THIS ORCHESTRATOR during a
+    // run (the run-matrix row and gate-timing telemetry are written by design — see
+    // append_live_lab_run_matrix_row). They are documentation/telemetry, not deployed
+    // code, so their churn must not count as a dirty worktree for the setup->run git
+    // provenance check; otherwise a clean-tree run flips clean->dirty mid-run on the
+    // orchestrator's own evidence write and the provenance comparison fails closed on
+    // a non-code change. Any real code (or other tracked-file) change still surfaces
+    // here and still fails the provenance check.
+    command.args([
+        "status",
+        "--short",
+        "--",
+        ".",
+        ":(exclude)documents/operations/live_lab_run_matrix.csv",
+        ":(exclude)documents/operations/gate_timings.csv",
+    ]);
     let output = run_output_with_timeout(
         &mut command,
         timeout_or_default(30, DEFAULT_RUN_TIMEOUT_SECS),
