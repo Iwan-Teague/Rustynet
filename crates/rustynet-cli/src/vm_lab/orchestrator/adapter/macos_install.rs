@@ -1339,6 +1339,32 @@ mod tests {
         );
     }
 
+    /// Regression guard: the WireGuard decrypt config (keychain env +
+    /// `--wg-encrypted-private-key`) must be gated on the encrypted key in
+    /// `keys/` and reference the passphrase at its real location in
+    /// `bootstrap/`. A prior version gated on `keys/wireguard.passphrase` —
+    /// which never exists, because the passphrase deliberately lives in
+    /// BOOTSTRAP_DIR (+ System.keychain) so the key-custody check does not flag
+    /// it — so the plist silently dropped the decrypt config and the macOS
+    /// daemon crash-looped at startup ("wireguard private key metadata read
+    /// failed", exit 65).
+    #[test]
+    fn install_service_script_gates_wg_decrypt_on_encrypted_key_and_bootstrap_passphrase() {
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("keys/wireguard.key.enc"),
+            "decrypt config must be gated on the encrypted key in keys/"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("bootstrap/wireguard.passphrase"),
+            "passphrase file reference must point at BOOTSTRAP_DIR, not keys/"
+        );
+        assert!(
+            !INSTALL_SERVICE_SCRIPT.contains("keys/wireguard.passphrase"),
+            "must not reference keys/wireguard.passphrase — it never exists by \
+             design and gating on it drops the decrypt config (daemon exit 65)"
+        );
+    }
+
     #[test]
     fn utun_index_is_in_valid_range_for_lab_node_ids() {
         let long_id = "x".repeat(64);
