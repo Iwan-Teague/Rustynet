@@ -209,23 +209,37 @@ if [[ "${FAIL_CLOSED_SSH_ALLOW}" == "true" && -n "${FAIL_CLOSED_SSH_ALLOW_CIDRS}
 fi
 
 # Build the optional encrypted-key plist fragment.
-# Only included when wireguard.passphrase exists (produced by `rustynetd key init`).
-# When absent the daemon uses the plaintext --wg-private-key path directly;
-# this is expected on nodes bootstrapped without full key-custody setup (e.g.
-# the manual-install lab path in MacosInstallRunbook.md).
+# Gated on the encrypted key (wireguard.key.enc, produced by `rustynetd key
+# init`) — the reliable signal for encrypted key custody. The decrypt passphrase
+# is read from the System.keychain (primary; see the keychain env below) with the
+# bootstrap-dir passphrase file as fallback. The passphrase deliberately lives in
+# BOOTSTRAP_DIR (../bootstrap/), NOT keys/, so the macos-key-custody-check — which
+# only scans keys/ — does not flag it as plaintext key material at rest (see
+# Bootstrap-RustyNetMacos.sh). The previous gate checked a passphrase file under
+# keys/, which never exists by design, so the decrypt config was silently dropped
+# and the daemon failed at startup ("wireguard private key metadata read failed").
+# When the encrypted key is absent the daemon uses the plaintext --wg-private-key
+# path directly (the manual-install lab path in MacosInstallRunbook.md).
 WG_ENCRYPTED_KEY_PLIST_FRAGMENT=""
 WG_KEYCHAIN_ENV_FRAGMENT=""
-if [[ -f "${STATE_ROOT}/keys/wireguard.passphrase" ]]; then
+if [[ -f "${STATE_ROOT}/keys/wireguard.key.enc" ]]; then
   WG_ENCRYPTED_KEY_PLIST_FRAGMENT="        <string>--wg-encrypted-private-key</string>
-        <string>${STATE_ROOT}/keys/wireguard.key.enc</string>
-        <string>--wg-key-passphrase</string>
-        <string>${STATE_ROOT}/keys/wireguard.passphrase</string>"
+        <string>${STATE_ROOT}/keys/wireguard.key.enc</string>"
   WG_KEYCHAIN_ENV_FRAGMENT="        <key>RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT</key>
         <string>wg-passphrase-${NODE_ID}</string>
         <key>RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE</key>
-        <string>net.rustynet.wg-key-passphrase</string>
+        <string>net.rustynet.wg-key-passphrase</string>"
+  # File fallback (used when the keychain item is unavailable), pointed at the
+  # passphrase's actual location in BOOTSTRAP_DIR. Only wired up when present so
+  # the daemon never gets a path to a non-existent file.
+  if [[ -f "${STATE_ROOT}/bootstrap/wireguard.passphrase" ]]; then
+    WG_ENCRYPTED_KEY_PLIST_FRAGMENT="${WG_ENCRYPTED_KEY_PLIST_FRAGMENT}
+        <string>--wg-key-passphrase</string>
+        <string>${STATE_ROOT}/bootstrap/wireguard.passphrase</string>"
+    WG_KEYCHAIN_ENV_FRAGMENT="${WG_KEYCHAIN_ENV_FRAGMENT}
         <key>RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH</key>
-        <string>${STATE_ROOT}/keys/wireguard.passphrase</string>"
+        <string>${STATE_ROOT}/bootstrap/wireguard.passphrase</string>"
+  fi
 fi
 
 # ── Audited Linux→macOS plist flag parity (HIGH 4 reviewer fold-in) ──────────
