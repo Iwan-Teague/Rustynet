@@ -308,7 +308,7 @@ impl LabStateServer {
         }
         let out = run_with_timeout(
             "ps",
-            &["-o", "lstart=", "-p", &pid.to_string()],
+            &["-o", "state=,lstart=", "-p", &pid.to_string()],
             &self.repo_root,
             &[("TZ", "UTC")],
             Duration::from_secs(5),
@@ -317,8 +317,7 @@ impl LabStateServer {
         if !out.success {
             return None;
         }
-        let s = out.stdout.trim().to_string();
-        (!s.is_empty()).then_some(s)
+        parse_ps_state_lstart(&out.stdout)
     }
 
     /// Liveness WITH PID-reuse protection. The pid must be alive AND its process
@@ -2015,6 +2014,33 @@ fn mtime_age_secs(path: &Path) -> Option<u64> {
         .elapsed()
         .ok()
         .map(|d| d.as_secs())
+}
+
+/// Parse `ps -o state=,lstart=` output into the process start-time token, or
+/// `None` when the process is a zombie/defunct (state begins with `Z`) or the
+/// output is empty.
+///
+/// A defunct process still has a `ps` entry and an `lstart`, but it is NOT
+/// running — its parent has exited or not yet reaped it. Treating it as alive
+/// pegged a crashed live-lab job "running" forever (and `cancel_job`'s SIGKILL
+/// is a no-op on an already-dead pid), which wedged the single job slot until a
+/// human cleared the record by hand. Failing closed to "not alive" for zombies
+/// lets the job-state machinery report the crashed job as ended and frees the
+/// slot automatically. The returned token is the `lstart` string only, so it
+/// stays byte-compatible with records written before this change (which stored
+/// the bare `lstart`).
+fn parse_ps_state_lstart(output: &str) -> Option<String> {
+    let s = output.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut parts = s.splitn(2, char::is_whitespace);
+    let state = parts.next().unwrap_or("");
+    if state.starts_with('Z') {
+        return None;
+    }
+    let lstart = parts.next().map(str::trim).unwrap_or("");
+    (!lstart.is_empty()).then(|| lstart.to_string())
 }
 
 /// True if a TCP connection to `ip:port` succeeds within `timeout`.
@@ -4266,6 +4292,28 @@ mod tests {
         let v = json!({"aliases": ["a", "b"]});
         assert_eq!(string_array(Some(&v), "aliases"), vec!["a", "b"]);
         assert!(string_array(Some(&v), "missing").is_empty());
+    }
+
+    #[test]
+    fn parse_ps_state_lstart_treats_zombie_as_not_alive() {
+        // Running/sleeping process: return the lstart token (state stripped),
+        // byte-compatible with the legacy bare-lstart record.
+        assert_eq!(
+            parse_ps_state_lstart("S Thu Jun 12 07:03:26 2026"),
+            Some("Thu Jun 12 07:03:26 2026".to_string())
+        );
+        assert_eq!(
+            parse_ps_state_lstart("  R+   Fri Jan  3 11:22:33 2025  "),
+            Some("Fri Jan  3 11:22:33 2025".to_string())
+        );
+        // Zombie/defunct (a crashed job's unreaped leader): NOT alive, so the
+        // job-state machinery reports the job ended instead of pegging the slot.
+        assert_eq!(parse_ps_state_lstart("Z Thu Jun 12 07:03:26 2026"), None);
+        assert_eq!(parse_ps_state_lstart("Z+ Thu Jun 12 07:03:26 2026"), None);
+        // Empty (no such pid) and state-only (no lstart) → not alive.
+        assert_eq!(parse_ps_state_lstart(""), None);
+        assert_eq!(parse_ps_state_lstart("   "), None);
+        assert_eq!(parse_ps_state_lstart("S"), None);
     }
 
     fn test_server(root: &Path) -> LabStateServer {
