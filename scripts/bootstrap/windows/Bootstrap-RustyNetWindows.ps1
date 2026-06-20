@@ -1569,16 +1569,29 @@ function Build-RustyNet {
     # exposes only `rustynet trust keygen/export-verifier-key/issue`.
     $daemonBuildArgs = @('build', '--locked', '--release', '-p', 'rustynetd')
     $trustCliBuildArgs = @('build', '--locked', '--release', '-p', 'rustynet-cli', '--bin', 'rustynet-windows-trust-cli')
+    # Offline fallback: live-lab guests have no internet egress, so the online
+    # build can't reach the registry (it fails trying to fetch e.g. criterion,
+    # a bench-only dep that --offline + the scoped -p build never pulls). Retry
+    # from the seeded cargo cache with --offline, mirroring the Linux
+    # (rn_bootstrap.sh) and macOS bootstrap --offline fallback.
+    $daemonBuildArgsOffline = $daemonBuildArgs + '--offline'
+    $trustCliBuildArgsOffline = $trustCliBuildArgs + '--offline'
     Push-Location $RustyNetRoot
     try {
         if ($null -eq $buildReportLayout) {
             & $cargoCommand $daemonBuildArgs
             if ($LASTEXITCODE -ne 0) {
-                throw 'cargo build failed for Windows daemon build-release'
+                & $cargoCommand $daemonBuildArgsOffline
+                if ($LASTEXITCODE -ne 0) {
+                    throw 'cargo build failed for Windows daemon build-release'
+                }
             }
             & $cargoCommand $trustCliBuildArgs
             if ($LASTEXITCODE -ne 0) {
-                throw 'cargo build failed for Windows trust CLI build-release'
+                & $cargoCommand $trustCliBuildArgsOffline
+                if ($LASTEXITCODE -ne 0) {
+                    throw 'cargo build failed for Windows trust CLI build-release'
+                }
             }
             return
         }
@@ -1587,12 +1600,26 @@ function Build-RustyNet {
             -CargoCommand $cargoCommand `
             -CargoArgs $daemonBuildArgs `
             -Layout $buildReportLayout
+        if ($exitCode -ne 0) {
+            $exitCode = Invoke-CargoBuildForReport `
+                -CargoCommand $cargoCommand `
+                -CargoArgs $daemonBuildArgsOffline `
+                -Layout $buildReportLayout `
+                -Append
+        }
         if ($exitCode -eq 0) {
             $exitCode = Invoke-CargoBuildForReport `
                 -CargoCommand $cargoCommand `
                 -CargoArgs $trustCliBuildArgs `
                 -Layout $buildReportLayout `
                 -Append
+            if ($exitCode -ne 0) {
+                $exitCode = Invoke-CargoBuildForReport `
+                    -CargoCommand $cargoCommand `
+                    -CargoArgs $trustCliBuildArgsOffline `
+                    -Layout $buildReportLayout `
+                    -Append
+            }
         }
         $stderrTail = Get-FileTailOrEmpty -Path $buildReportLayout.stderr_path
         if ($exitCode -eq 0) {

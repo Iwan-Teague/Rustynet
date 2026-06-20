@@ -1008,6 +1008,30 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_script_has_offline_build_fallback() {
+        // Live-lab guests have no internet egress, so the Windows build must fall
+        // back to --offline from the seeded cargo cache when the registry is
+        // unreachable, mirroring the Linux/macOS bootstrap. Without it the build
+        // dies trying to fetch a bench-only dep (criterion) with
+        // "Could not resolve host: index.crates.io".
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("$daemonBuildArgsOffline = $daemonBuildArgs + '--offline'"),
+            "Windows daemon build must define an --offline fallback variant"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("$trustCliBuildArgsOffline = $trustCliBuildArgs + '--offline'"),
+            "Windows trust-CLI build must define an --offline fallback variant"
+        );
+        // The fallback must be invoked, not merely defined (both build paths).
+        assert!(
+            BOOTSTRAP_SCRIPT.matches("$daemonBuildArgsOffline").count() >= 2,
+            "the daemon --offline fallback must be invoked, not just defined"
+        );
+    }
+
+    #[test]
     fn encode_ps_command_is_utf16le_base64() {
         let script = "Write-Host Hello";
         let encoded = encode_ps_command(script).unwrap();
