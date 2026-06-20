@@ -857,6 +857,38 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_script_clears_stale_signed_state_on_fresh_enroll() {
+        // A fresh (re)enrollment must wipe the prior membership/trust signed-state
+        // + anti-replay watermarks, or the daemon rejects the fresh genesis bundle
+        // as a replay/rollback ("membership replay/rollback detected by watermark")
+        // and fail-closes (observed live: macOS stuck state=FailClosed,
+        // membership_active_nodes=none). macOS analogue of the Linux cleanup's
+        // `rm -rf /var/lib/rustynet`; key custody must be preserved.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("for _residual_dir in membership trust"),
+            "clear_residual_state must wipe the membership/ and trust/ signed-state"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("rm -f \"${STATE_ROOT}/rustynetd.state\""),
+            "clear_residual_state must remove the stale top-level session state"
+        );
+        // The reset must NOT touch key-custody material.
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("for _residual_dir in membership trust keys")
+                && !BOOTSTRAP_SCRIPT.contains("rm -rf \"${KEYS_DIR}\""),
+            "key custody (keys/) must be preserved by the fresh-enroll reset"
+        );
+        // The reset must run in BOTH the full-install and SKIP_BUILD paths (a
+        // SKIP_BUILD redeploy onto a prior enrollment is the exact case that
+        // stranded the epoch-16 watermark live).
+        assert_eq!(
+            BOOTSTRAP_SCRIPT.matches("  clear_residual_state\n").count(),
+            2,
+            "clear_residual_state must be invoked in both the full and SKIP_BUILD paths"
+        );
+    }
+
+    #[test]
     fn bootstrap_script_refuses_root_homebrew_fallback() {
         assert!(
             BOOTSTRAP_SCRIPT.contains("resolve_non_root_bootstrap_user"),
