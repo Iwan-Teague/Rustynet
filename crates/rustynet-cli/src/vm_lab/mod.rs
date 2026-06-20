@@ -231,6 +231,10 @@ pub struct VmLabRunLiveLabConfig {
     pub repo_ref: Option<String>,
     pub report_dir: Option<PathBuf>,
     pub timeout_secs: u64,
+    /// Per-stage watchdog timeout in seconds, forwarded to the bash
+    /// orchestrator as `--stage-timeout-secs <N>` when greater than zero.
+    /// `0` disables the watchdog (historical behaviour).
+    pub stage_timeout_secs: u64,
     pub orchestrated: bool,
 }
 
@@ -256,6 +260,10 @@ pub struct VmLabSetupLiveLabConfig {
     pub rerun_stage: Option<String>,
     pub max_parallel_node_workers: Option<usize>,
     pub timeout_secs: u64,
+    /// Per-stage watchdog timeout in seconds, forwarded to the bash
+    /// orchestrator as `--stage-timeout-secs <N>` when greater than zero.
+    /// `0` disables the watchdog (historical behaviour).
+    pub stage_timeout_secs: u64,
     pub dry_run: bool,
     /// Set to `true` when called from `vm-lab-orchestrate-live-lab`. Signals that the
     /// orchestrator has already claimed the report dir and written pre-setup discovery
@@ -913,6 +921,14 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// profile env without a follow-up flag-plumbing churn.
     pub anchor_platform: Option<String>,
     pub enable_chaos_suite: bool,
+    /// Per-stage watchdog timeout in seconds, forwarded to the bash
+    /// orchestrator as `--stage-timeout-secs <N>` when greater than zero.
+    /// `0` (the default) disables the watchdog and preserves the historical
+    /// "run until the outer `--timeout-secs` fires" behaviour. A non-zero
+    /// value caps any single stage so a hung node-setup step (e.g. an ssh
+    /// probe wedged against a Windows guest) fails the stage instead of
+    /// stalling the whole run for hours.
+    pub stage_timeout_secs: u64,
 }
 
 /// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.
@@ -5153,6 +5169,11 @@ pub fn execute_ops_vm_lab_setup_live_lab(
             .arg("--max-parallel-node-workers")
             .arg(max_parallel_node_workers.to_string());
     }
+    if config.stage_timeout_secs > 0 {
+        command
+            .arg("--stage-timeout-secs")
+            .arg(config.stage_timeout_secs.to_string());
+    }
 
     let status = run_status_with_timeout_passthrough(&mut command, timeout)
         .map_err(|err| format!("live-lab setup failed: {err}"))?;
@@ -5252,6 +5273,10 @@ pub struct LiveLabRunInputs {
     pub skip_soak: bool,
     pub skip_cross_network: bool,
     pub enable_chaos_suite: bool,
+    /// Per-stage watchdog timeout in seconds. Forwarded to the bash
+    /// orchestrator as `--stage-timeout-secs <N>` when greater than zero;
+    /// `0` omits the flag (bash default of 0 = watchdog disabled).
+    pub stage_timeout_secs: u64,
 }
 
 /// Outcome of one live-lab run, surfaced uniformly across orchestrator
@@ -5325,6 +5350,11 @@ impl LinuxBashOrchestrator {
         command.arg("--source-mode").arg(&inputs.source_mode);
         if let Some(value) = inputs.repo_ref.as_deref() {
             command.arg("--repo-ref").arg(value);
+        }
+        if inputs.stage_timeout_secs > 0 {
+            command
+                .arg("--stage-timeout-secs")
+                .arg(inputs.stage_timeout_secs.to_string());
         }
         command
     }
@@ -6461,6 +6491,7 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
         skip_soak: config.skip_soak,
         skip_cross_network: config.skip_cross_network,
         enable_chaos_suite: config.enable_chaos_suite,
+        stage_timeout_secs: config.stage_timeout_secs,
     };
     let orchestrator = LinuxBashOrchestrator::new(config.script_path.clone());
     let run_report = orchestrator.execute_live_lab(&inputs)?;
@@ -7268,6 +7299,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         rerun_stage: None,
         max_parallel_node_workers: config.max_parallel_node_workers,
         timeout_secs: config.timeout_secs,
+        stage_timeout_secs: config.stage_timeout_secs,
         dry_run: config.dry_run,
         // This call comes from the orchestrator, which has already written pre-setup
         // discovery metadata into report_dir/orchestration/. Tell setup to exempt that
@@ -7430,6 +7462,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         repo_ref: config.repo_ref.clone(),
         report_dir: Some(report_dir.clone()),
         timeout_secs: config.timeout_secs,
+        stage_timeout_secs: config.stage_timeout_secs,
         orchestrated: true,
     };
     let run_result_path = orchestration_dir.join("run_result.json");
@@ -15827,6 +15860,10 @@ pub fn execute_ops_vm_lab_iterate_live_lab(
         repo_ref: resolved_repo_ref,
         report_dir: Some(report_dir.clone()),
         timeout_secs,
+        // vm-lab-iterate-live-lab does not expose a per-stage watchdog flag;
+        // keep the historical behaviour (0 = watchdog disabled, outer
+        // --timeout-secs still bounds the whole run).
+        stage_timeout_secs: 0,
         orchestrated: false,
     });
 
@@ -31157,6 +31194,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             repo_ref: None,
             report_dir: Some(report_dir.clone()),
             timeout_secs: 30,
+            stage_timeout_secs: 0,
             orchestrated: false,
         });
 
@@ -31237,6 +31275,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             rerun_stage: None,
             max_parallel_node_workers: None,
             timeout_secs: 30,
+            stage_timeout_secs: 0,
             dry_run: false,
             orchestrated: false,
         });
@@ -33865,6 +33904,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             skip_soak: false,
             skip_cross_network: false,
             enable_chaos_suite: false,
+            stage_timeout_secs: 0,
         }
     }
 
@@ -34161,6 +34201,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "--skip-soak",
             "--skip-cross-network",
             "--repo-ref",
+            "--stage-timeout-secs",
         ] {
             assert!(
                 !args.contains(&forbidden.to_owned()),
@@ -34223,6 +34264,37 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             .position(|a| a == "--repo-ref")
             .expect("--repo-ref must be emitted");
         assert_eq!(args.get(repo_index + 1).map(String::as_str), Some("v1.2.3"));
+    }
+
+    #[test]
+    fn linux_bash_orchestrator_emits_stage_timeout_secs_when_positive() {
+        // The per-stage watchdog flag must reach the bash orchestrator as the
+        // pair "--stage-timeout-secs" "<N>" so a hung node-setup stage is
+        // capped instead of stalling the run for hours. This is the forwarding
+        // path that was previously missing end-to-end.
+        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
+        let mut inputs = baseline_live_lab_run_inputs();
+        inputs.stage_timeout_secs = 900;
+        let args = collect_command_args(&orchestrator.build_command(&inputs));
+        let idx = args
+            .iter()
+            .position(|a| a == "--stage-timeout-secs")
+            .expect("--stage-timeout-secs must be emitted when > 0");
+        assert_eq!(args.get(idx + 1).map(String::as_str), Some("900"));
+    }
+
+    #[test]
+    fn linux_bash_orchestrator_omits_stage_timeout_secs_when_zero() {
+        // 0 is the "watchdog disabled" sentinel and must not emit the flag,
+        // preserving the historical outer-timeout-only behaviour.
+        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
+        let mut inputs = baseline_live_lab_run_inputs();
+        inputs.stage_timeout_secs = 0;
+        let args = collect_command_args(&orchestrator.build_command(&inputs));
+        assert!(
+            !args.contains(&"--stage-timeout-secs".to_owned()),
+            "stage_timeout_secs=0 must omit the flag: {args:?}"
+        );
     }
 
     #[test]
@@ -34925,6 +34997,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             skip_soak: false,
             skip_cross_network: false,
             enable_chaos_suite: false,
+            stage_timeout_secs: 0,
         }
     }
 
@@ -36456,6 +36529,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             relay_platform: None,
             anchor_platform: None,
             enable_chaos_suite: false,
+            stage_timeout_secs: 0,
         }
     }
 

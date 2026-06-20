@@ -1121,6 +1121,110 @@ mod tests {
     }
 
     #[test]
+    fn live_lab_cleanup_host_worker_reachability_probe_is_platform_aware() {
+        // cleanup_host_worker runs an SSH reachability gate before dispatching
+        // per-platform cleanup. A Windows role node must NOT be probed with the
+        // bare `true`-over-default-shell `ssh_wait_for_host`, which wedges a
+        // memory-pressured Windows guest (the cleanup_hosts hang we are fixing).
+        // The gate must route through ssh_wait_for_host_for_platform, which
+        // sends Windows through the cmd.exe-wrapped probe.
+        let cleanup_fn = LIVE_LINUX_LAB_ORCHESTRATOR
+            .split("cleanup_host_worker() {")
+            .nth(1)
+            .and_then(|rest| rest.split("\ncleanup_host_worker_macos() {").next())
+            .expect("cleanup_host_worker body must be present");
+        assert!(
+            cleanup_fn.contains("ssh_wait_for_host_for_platform \"$target\" \"$platform\" 120 5"),
+            "cleanup_host_worker must gate reachability via the platform-aware probe"
+        );
+        assert!(
+            !cleanup_fn.contains("ssh_wait_for_host \"$target\" 120 5"),
+            "cleanup_host_worker must not call the POSIX-only ssh_wait_for_host directly"
+        );
+    }
+
+    #[test]
+    fn live_lab_windows_reachability_probe_uses_cmd_exe_wrapper() {
+        // The Windows-safe reachability helper must route through
+        // live_lab_ssh_windows (cmd.exe /c powershell.exe -EncodedCommand),
+        // never the POSIX live_lab_ssh_via_ssh default-shell path that hangs.
+        let probe_fn = LIVE_LINUX_LAB_ORCHESTRATOR
+            .split("ssh_wait_for_host_windows() {")
+            .nth(1)
+            .and_then(|rest| rest.split("\nssh_wait_for_host_for_platform() {").next())
+            .expect("ssh_wait_for_host_windows body must be present");
+        assert!(
+            probe_fn.contains("live_lab_ssh_windows \"$target\" 'exit 0'"),
+            "windows reachability probe must use the cmd.exe-wrapped live_lab_ssh_windows"
+        );
+        assert!(
+            !probe_fn.contains("live_lab_ssh_via_ssh"),
+            "windows reachability probe must not use the POSIX default-shell ssh path"
+        );
+        // The dispatcher must send windows to the windows probe and POSIX
+        // platforms to the POSIX probe, and fail closed on an unknown platform.
+        let dispatch_fn = LIVE_LINUX_LAB_ORCHESTRATOR
+            .split("ssh_wait_for_host_for_platform() {")
+            .nth(1)
+            .and_then(|rest| rest.split("\ncapture_boot_id() {").next())
+            .expect("ssh_wait_for_host_for_platform body must be present");
+        assert!(
+            dispatch_fn.contains("windows)")
+                && dispatch_fn.contains(
+                    "ssh_wait_for_host_windows \"$target\" \"$attempts\" \"$sleep_secs\""
+                ),
+            "dispatcher must route windows to the windows-safe probe"
+        );
+        assert!(
+            dispatch_fn.contains("linux|macos)"),
+            "dispatcher must keep the POSIX probe for linux/macos"
+        );
+        assert!(
+            dispatch_fn.contains("unsupported platform"),
+            "dispatcher must fail closed on an unknown platform"
+        );
+    }
+
+    #[test]
+    fn live_lab_windows_bootstrap_worker_reachability_probe_is_windows_safe() {
+        // bootstrap_host_worker_windows used the POSIX ssh_wait_for_host before
+        // its per-step live_lab_ssh_windows calls — the same default-shell hang
+        // class. It must use the Windows-safe probe so the bootstrap_hosts stage
+        // cannot wedge on a Windows guest.
+        let win_bootstrap = LIVE_LINUX_LAB_ORCHESTRATOR
+            .split("bootstrap_host_worker_windows() {")
+            .nth(1)
+            .and_then(|rest| rest.split("\nstage_collect_pubkeys() {").next())
+            .expect("bootstrap_host_worker_windows body must be present");
+        assert!(
+            win_bootstrap.contains("ssh_wait_for_host_windows \"$target\""),
+            "windows bootstrap worker must use the windows-safe reachability probe"
+        );
+        assert!(
+            !win_bootstrap.contains("ssh_wait_for_host \"$target\" ||"),
+            "windows bootstrap worker must not call the POSIX-only ssh_wait_for_host"
+        );
+    }
+
+    #[test]
+    fn live_lab_stage_watchdog_kills_process_tree() {
+        // The per-stage watchdog must terminate the whole descendant tree, not
+        // just the subshell pid: a stuck remote ssh/scp child would otherwise
+        // survive and keep the run wedged past --stage-timeout-secs. This is the
+        // companion to the CLI wiring that forwards the flag.
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains("kill_stage_process_tree() {"),
+            "orchestrator must define a descendant-tree kill helper for the watchdog"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains("kill_stage_process_tree TERM \"$_bg_pid\"")
+                && LIVE_LINUX_LAB_ORCHESTRATOR
+                    .contains("kill_stage_process_tree KILL \"$_bg_pid\""),
+            "stage watchdog must escalate TERM then KILL across the stage process tree"
+        );
+    }
+
+    #[test]
     fn live_lab_refresh_runtime_state_dispatches_per_platform() {
         assert!(
             LIVE_LINUX_LAB_ORCHESTRATOR.contains(
