@@ -1053,6 +1053,14 @@ if (-not (Test-Path -LiteralPath $cliPath)) {
 }
 $trustPlaintext = -join ((1..48 | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) }))
 [System.IO.File]::WriteAllText($trustPassphrasePath, $trustPlaintext)
+# Lock the passphrase temp file to SYSTEM + Administrators before the native
+# keygen reads it. WriteAllText creates the file under C:\ProgramData, whose
+# inheritable Builtin Users (BU) read ACE makes `rustynet trust keygen` reject
+# the passphrase source fail-closed: [policy_reject (78)] "trust signing key
+# passphrase source invalid ... passphrase file ACL grants a broader-than-
+# reviewed Windows principal (BU)". Strip inherited ACEs and grant only the
+# reviewed principals (mirrors the $preServiceDirectory hardening above).
+Repair-RustyNetPreServiceAcl -Path $trustPassphrasePath -AdministratorsName $preServiceAdministratorsName -LocalSystemName $preServiceLocalSystemName
 try {
     $keygen = Invoke-RustyNetNativeCommand -Path $cliPath -Arguments @(
         'trust', 'keygen',
