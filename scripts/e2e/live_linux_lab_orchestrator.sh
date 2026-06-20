@@ -3720,6 +3720,17 @@ enforce_runtime_worker() {
       live_lab_enforce_host "$target" "$role" "$node_id" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$target")"
       ;;
     macos)
+      # Re-mint + re-distribute fresh signed bundles on the exit BEFORE the
+      # macOS service re-install restarts the daemon. The macOS enforce path
+      # (Install-RustyNetMacosService.sh re-install) is slow enough that the
+      # assignment bundle issued back in stage_issue_and_distribute_assignments
+      # is older than DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS (300s) by the time the
+      # restarted daemon reconciles it on startup. The daemon's first
+      # auto-tunnel reconcile then fails closed as "stale" and wedges, so the
+      # downstream refresh_runtime/refresh_signed_state re-mints (which also call
+      # macos_admin_repush) can no longer reach it via `state refresh`. Re-mint
+      # here so the startup reconcile sees a bundle inside the freshness window.
+      macos_admin_repush_signed_bundles "$label" "$target" "$node_id" || return 1
       enforce_runtime_worker_macos "$target" "$role" "$node_id"
       ;;
     windows)
