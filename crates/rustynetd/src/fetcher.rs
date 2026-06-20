@@ -11,7 +11,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 
 /// Hard cap on the HTTP response body the fetcher will consume.
 ///
@@ -224,7 +224,7 @@ impl StateFetcher {
     fn verify_signature(&self, bundle: &SignedBundle) -> Result<(), String> {
         let signature = Signature::from_bytes(&bundle.signature);
         self.verifying_key
-            .verify(bundle.payload.as_bytes(), &signature)
+            .verify_strict(bundle.payload.as_bytes(), &signature)
             .map_err(|e| format!("signature verification failed: {e}"))
     }
 

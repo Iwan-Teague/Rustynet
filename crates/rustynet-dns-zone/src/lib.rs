@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
@@ -282,7 +282,7 @@ pub fn verify_signed_dns_zone_bundle(
     let signature_bytes = decode_hex_to_fixed::<64>(&bundle.signature_hex)?;
     let signature = Signature::from_bytes(&signature_bytes);
     verifying_key
-        .verify(bundle.payload.as_bytes(), &signature)
+        .verify_strict(bundle.payload.as_bytes(), &signature)
         .map_err(|_| DnsZoneError::SignatureInvalid)?;
     Ok(())
 }

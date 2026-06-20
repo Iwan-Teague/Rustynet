@@ -5,7 +5,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use rand::TryRngCore;
 use rustynet_backend_api::{NodeId, SocketEndpoint};
 use rustynet_control::SignedTraversalCoordinationRecord;
@@ -603,7 +603,7 @@ fn verify_coordination_record_signature(
     let verifying_key = VerifyingKey::from_bytes(endpoint_hint_verifier_key)
         .map_err(|_| TraversalError::CoordinationSignatureInvalid)?;
     verifying_key
-        .verify(record.payload.as_bytes(), &signature)
+        .verify_strict(record.payload.as_bytes(), &signature)
         .map_err(|_| TraversalError::CoordinationSignatureInvalid)
 }
 

@@ -99,7 +99,7 @@ use crate::windows_paths::{
     validate_windows_local_secret_acl, validate_windows_runtime_acl,
     validate_windows_runtime_file_path,
 };
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::ifaddrs;
 #[cfg(not(windows))]
@@ -6854,7 +6854,6 @@ impl DaemonRuntime {
                 envelope.nonce,
                 &envelope.command,
             );
-            use ed25519_dalek::Verifier;
             let signature = ed25519_dalek::Signature::from_bytes(
                 &envelope
                     .signature
@@ -6863,7 +6862,7 @@ impl DaemonRuntime {
                     .map_err(|_| "invalid signature length".to_owned())?,
             );
             verifier
-                .verify(&payload, &signature)
+                .verify_strict(&payload, &signature)
                 .map_err(|e| format!("signature verification failed: {e}"))?;
 
             let active_window_floor = now_unix.saturating_sub(60);
@@ -7925,6 +7924,13 @@ impl DaemonRuntime {
         })
     }
 
+    /// Performs a full verified load (signature + freshness + replay-watermark check)
+    /// of the on-disk auto-tunnel assignment bundle, solely to obtain assignment-bundle
+    /// context for DNS-zone verification. It deliberately does NOT persist a new replay
+    /// watermark — the canonical `load_verified_auto_tunnel` advances the watermark in
+    /// the same refresh — and its result is never fed to the dataplane peer-apply path.
+    /// On any verification failure it returns `Err` and the caller proceeds with no
+    /// context (`None`).
     fn try_load_auto_tunnel_bundle_for_dns_context(&self) -> Result<AutoTunnelBundle, String> {
         let bundle_path = self
             .auto_tunnel_bundle_path
@@ -7934,23 +7940,6 @@ impl DaemonRuntime {
             return Err("assignment bundle not found".to_owned());
         }
         let _content = std::fs::read_to_string(bundle_path).map_err(|e| e.to_string())?;
-
-        // Use the existing private parser logic. Since load_auto_tunnel_bundle is what parses it,
-        // and it returns AutoTunnelEnvelope, we can reuse it if we can construct the arguments.
-        // But load_auto_tunnel_bundle requires verification. We just want to parse it for context.
-        // However, we can use load_auto_tunnel_bundle with a relaxed policy OR just trust the file on disk
-        // since we are about to re-verify everything in fetch_dns_zone anyway?
-        // Actually, the prompt says: "Use a local load, not the full load_verified_auto_tunnel ... we just need the bundle content".
-        // It implies we should duplicate the parsing logic or reuse a parser.
-        // Since AutoTunnelBundle is likely a struct with a parse method (or internal parsing logic), let's check.
-        // I don't see a public parse method for AutoTunnelBundle exposed.
-        // However, I can call load_auto_tunnel_bundle and just ignore the policy error?
-        // No, that enforces signatures.
-        // Let's assume for now we call load_auto_tunnel_bundle with current watermark.
-
-        // Wait, I should check if there is a 'parse_auto_tunnel_bundle_content' or similar.
-        // If not, I'll have to rely on `load_auto_tunnel_bundle` being available.
-        // I see `load_auto_tunnel_bundle` call in `fetch_assignment`.
 
         let verifier_path = self
             .auto_tunnel_verifier_key_path
@@ -7964,8 +7953,6 @@ impl DaemonRuntime {
         let previous_watermark =
             load_auto_tunnel_watermark(watermark_path).map_err(|e| e.to_string())?;
 
-        // We use the real load function. This is safe (it verifies signature again).
-        // If it fails, we return Err, and caller passes None.
         let envelope = load_auto_tunnel_bundle(
             bundle_path,
             verifier_path,
@@ -11262,7 +11249,7 @@ fn load_trust_evidence(
     let signature = Signature::from_bytes(&signature_bytes);
     let payload = trust_evidence_payload(&record);
     verifying_key
-        .verify(payload.as_bytes(), &signature)
+        .verify_strict(payload.as_bytes(), &signature)
         .map_err(|_| TrustBootstrapError::SignatureInvalid)?;
 
     let now = unix_now();
@@ -12154,7 +12141,7 @@ fn load_auto_tunnel_bundle(
     let signature_bytes = decode_auto_tunnel_hex_to_fixed::<64>(&signature_hex)?;
     let signature = Signature::from_bytes(&signature_bytes);
     verifying_key
-        .verify(payload.as_bytes(), &signature)
+        .verify_strict(payload.as_bytes(), &signature)
         .map_err(|_| AutoTunnelBootstrapError::SignatureInvalid)?;
 
     let now = unix_now();
@@ -13179,7 +13166,7 @@ fn parse_traversal_bundle_section(
     let signature_bytes = decode_traversal_hex_to_fixed::<64>(&signature_hex)?;
     let signature = Signature::from_bytes(&signature_bytes);
     verifying_key
-        .verify(payload.as_bytes(), &signature)
+        .verify_strict(payload.as_bytes(), &signature)
         .map_err(|_| TraversalBootstrapError::SignatureInvalid)?;
 
     let now = unix_now();
@@ -13446,7 +13433,7 @@ fn parse_traversal_coordination_section(
     let signature_bytes = decode_traversal_hex_to_fixed::<64>(&signature_hex)?;
     let signature = Signature::from_bytes(&signature_bytes);
     verifying_key
-        .verify(payload.as_bytes(), &signature)
+        .verify_strict(payload.as_bytes(), &signature)
         .map_err(|_| TraversalBootstrapError::SignatureInvalid)?;
 
     Ok(TraversalSectionEnvelope::Coordination(

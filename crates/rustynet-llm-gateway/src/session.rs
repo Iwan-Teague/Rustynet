@@ -15,7 +15,7 @@
 
 use std::fmt;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rustynet_policy::Decision;
 use sha2::{Digest, Sha256};
 
@@ -164,7 +164,7 @@ pub fn verify_session_token(
         token.expires_at_unix,
     );
     node_verifying_key
-        .verify(payload.as_bytes(), &token.signature)
+        .verify_strict(payload.as_bytes(), &token.signature)
         .map_err(|_| SessionTokenError::SignatureInvalid)?;
     if now_unix < token.issued_at_unix || now_unix >= token.expires_at_unix {
         return Err(SessionTokenError::OutsideValidity { now_unix });

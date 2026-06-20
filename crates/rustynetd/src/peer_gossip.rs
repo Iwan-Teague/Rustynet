@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 use crate::dataplane_candidates::CandidateSet;
 
@@ -398,7 +398,7 @@ pub fn verify_signature(
         &bundle.candidates,
     );
     verifying_key
-        .verify(&preimage, &bundle.signature)
+        .verify_strict(&preimage, &bundle.signature)
         .map_err(|_| GossipError::SignatureInvalid)
 }
 

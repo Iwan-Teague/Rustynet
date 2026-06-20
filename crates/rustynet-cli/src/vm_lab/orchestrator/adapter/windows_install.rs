@@ -1015,8 +1015,7 @@ mod tests {
         // dies trying to fetch a bench-only dep (criterion) with
         // "Could not resolve host: index.crates.io".
         assert!(
-            BOOTSTRAP_SCRIPT
-                .contains("$daemonBuildArgsOffline = $daemonBuildArgs + '--offline'"),
+            BOOTSTRAP_SCRIPT.contains("$daemonBuildArgsOffline = $daemonBuildArgs + '--offline'"),
             "Windows daemon build must define an --offline fallback variant"
         );
         assert!(

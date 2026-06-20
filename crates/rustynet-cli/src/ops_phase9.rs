@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use nix::unistd::Uid;
 use rand::TryRngCore;
 use rand::rngs::OsRng;
@@ -2810,7 +2810,7 @@ fn verify_phase10_provenance_document(
         });
         let signature = Signature::from_bytes(&signature_bytes);
         verifier_key
-            .verify(payload.as_bytes(), &signature)
+            .verify_strict(payload.as_bytes(), &signature)
             .map_err(|_| format!("phase10 provenance signature verification failed for {label}"))?;
     }
 
@@ -2997,7 +2997,7 @@ fn verify_release_provenance_document(
     let signature = Signature::from_bytes(&signature_bytes);
     inputs
         .verifier_key
-        .verify(payload.as_bytes(), &signature)
+        .verify_strict(payload.as_bytes(), &signature)
         .map_err(|_| "release provenance signature verification failed".to_owned())?;
     Ok(())
 }
@@ -3386,7 +3386,7 @@ fn verify_phase6_parity_attestation_document(
     let signature = Signature::from_bytes(&signature_bytes);
     inputs
         .verifier_key
-        .verify(payload.as_bytes(), &signature)
+        .verify_strict(payload.as_bytes(), &signature)
         .map_err(|_| "phase6 parity signature verification failed".to_owned())?;
     Ok(())
 }
@@ -3684,7 +3684,7 @@ fn verify_phase9_evidence_attestation_document(
     let signature = Signature::from_bytes(&signature_bytes);
     inputs
         .verifier_key
-        .verify(payload.as_bytes(), &signature)
+        .verify_strict(payload.as_bytes(), &signature)
         .map_err(|_| "phase9 evidence signature verification failed".to_owned())?;
     Ok(())
 }
