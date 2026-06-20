@@ -2698,10 +2698,22 @@ ssh_reachability_worker() {
 prime_remote_access_worker() {
   local label="$1"
   local target="$2"
-  printf '[prime-remote] %s %s\n' "$label" "$target"
+  local platform
+  platform="$(node_platform_for_label "$label")" || return 1
+  printf '[prime-remote] %s %s platform=%s\n' "$label" "$target" "$platform"
   # Keep this stage safe if it is invoked directly, even though the composed
   # setup wrapper now performs an explicit SSH reachability gate first.
   ssh_reachability_worker "$label" "$target" || return 1
+  # A Windows role node has no sudo: live_lab_push_sudo_password runs a POSIX
+  # `sudo -n` probe over plain ssh (not the cmd.exe/EncodedCommand wrapper a
+  # Windows guest needs), so the probe never completes and blocks for the full
+  # live_lab_ssh timeout (3h). Windows privilege is handled by the Windows
+  # orchestration path (rn_bootstrap_windows.ps1 / live_lab_ssh_windows); skip
+  # the sudo-prime here. macOS/Linux are POSIX and keep priming normally.
+  if [[ "$platform" == "windows" ]]; then
+    printf '[prime-remote] %s skipping sudo-prime (windows/non-posix role node)\n' "$label"
+    return 0
+  fi
   live_lab_push_sudo_password "$target"
 }
 
