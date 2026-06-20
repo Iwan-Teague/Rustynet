@@ -1681,6 +1681,24 @@ live_lab_collect_route_matrix_snapshot() {
   }
 }
 
+# Recursively signal a process and all of its descendants, leaves first.
+# The stage watchdog needs this because the per-stage work runs in a bash
+# subshell that forks child `ssh`/`scp` processes; signalling only the
+# subshell pid leaves those children alive (a hung remote ssh keeps the
+# whole run wedged even after the watchdog "kills" the stage). `setsid` is
+# not available on the macOS orchestrator host, so a portable pgrep-based
+# descendant walk is used instead of process-group signalling. Best-effort
+# throughout: a child that already exited is not an error.
+kill_stage_process_tree() {
+  local sig="$1"
+  local root_pid="$2"
+  local child
+  for child in $(pgrep -P "$root_pid" 2>/dev/null); do
+    kill_stage_process_tree "$sig" "$child"
+  done
+  kill "-${sig}" "$root_pid" 2>/dev/null || true
+}
+
 run_stage() {
   local severity="$1"
   local stage_name="$2"
@@ -1736,11 +1754,13 @@ run_stage() {
     (
       sleep "${STAGE_TIMEOUT_SECS}"
       if kill -0 "$_bg_pid" 2>/dev/null; then
-        printf '\n[stage:%s] TIMEOUT: exceeded %ss — sending SIGTERM\n' \
+        printf '\n[stage:%s] TIMEOUT: exceeded %ss — sending SIGTERM to stage process tree\n' \
           "$stage_name" "${STAGE_TIMEOUT_SECS}" >> "$_tmp_log"
-        kill -TERM "$_bg_pid" 2>/dev/null || true
+        # Signal the whole descendant tree, not just the subshell: a stuck
+        # remote ssh/scp child would otherwise survive and keep the run wedged.
+        kill_stage_process_tree TERM "$_bg_pid"
         sleep 5
-        kill -KILL "$_bg_pid" 2>/dev/null || true
+        kill_stage_process_tree KILL "$_bg_pid"
       fi
     ) &
     local _watchdog_pid=$!
@@ -2691,8 +2711,12 @@ stage_verify_ssh_reachability() {
 ssh_reachability_worker() {
   local label="$1"
   local target="$2"
-  printf '[ssh-reachable] %s %s\n' "$label" "$target"
-  ssh_wait_for_host "$target" 120 5 || return 1
+  local platform
+  platform="$(node_platform_for_label "$label")" || return 1
+  printf '[ssh-reachable] %s %s platform=%s\n' "$label" "$target" "$platform"
+  # Windows role nodes must not be probed with the POSIX `true`-over-ssh path
+  # (default-shell PowerShell launch can hang the stage); route per platform.
+  ssh_wait_for_host_for_platform "$target" "$platform" 120 5 || return 1
 }
 
 prime_remote_access_worker() {
@@ -2880,7 +2904,10 @@ cleanup_host_worker() {
   local platform
   platform="$(node_platform_for_label "${label}")" || return 1
   printf '[cleanup] %s %s platform=%s\n' "$label" "$target" "$platform"
-  ssh_wait_for_host "$target" 120 5 || return 1
+  # Platform-aware reachability gate: a Windows role node would otherwise wedge
+  # here on the POSIX `true`-over-default-shell probe (the same class fixed in
+  # prime_remote_access_worker). Route Windows to the cmd.exe-wrapped probe.
+  ssh_wait_for_host_for_platform "$target" "$platform" 120 5 || return 1
   case "${platform}" in
     linux)
       live_lab_scp_to "$STATE_DIR/rn_cleanup.sh" "$target" "/tmp/rn_cleanup.sh"
@@ -3180,7 +3207,12 @@ bootstrap_host_worker_windows() {
     printf 'bootstrap_host_worker_windows: wrapper missing at %s\n' "$wrapper_local" >&2
     return 1
   fi
-  ssh_wait_for_host "$target" || return 1
+  # Windows-safe reachability probe: the bare `true`-over-default-shell probe in
+  # the POSIX ssh_wait_for_host can wedge a memory-pressured Windows guest (the
+  # same HRESULT 0x800705AF launch failure this worker avoids elsewhere by using
+  # live_lab_ssh_windows). Use the cmd.exe-wrapped probe so a dead guest fails
+  # closed quickly instead of hanging the bootstrap_hosts stage.
+  ssh_wait_for_host_windows "$target" || return 1
   printf '[bootstrap] %s %s (%s %s) platform=windows\n' "$label" "$target" "$node_id" "$role"
   # argv-only PowerShell invocation. Each orchestrator-controlled value
   # rides in via a named parameter (-NodeId, -NetworkId, ...); the
@@ -7283,6 +7315,65 @@ ssh_wait_for_host() {
   fi
   rm -f "$error_log"
   return 1
+}
+
+# Windows-safe SSH reachability probe. The POSIX `ssh_wait_for_host` runs a
+# bare `true` remote command, which OpenSSH on Windows executes through the
+# default shell (PowerShell). On a memory-pressured Windows guest that launch
+# path can wedge (HRESULT 0x800705AF / thread-create failure), and because
+# `live_lab_ssh_via_ssh` only bounds the TCP connect (ConnectTimeout) — not the
+# post-auth remote command — the session blocks for the full ServerAlive budget
+# per attempt and the stage appears to hang for hours. Route Windows probes
+# through `live_lab_ssh_windows`, which wraps the payload in
+# `cmd.exe /c "powershell.exe -EncodedCommand ..."` exactly like the rest of the
+# Windows orchestration path, so launch is reliable and a dead guest fails
+# closed quickly rather than hanging. The payload is a constant `exit 0`.
+ssh_wait_for_host_windows() {
+  local target="$1"
+  local attempts="${2:-240}"
+  local sleep_secs="${3:-5}"
+  local attempt rc
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if live_lab_ssh_windows "$target" 'exit 0' 60 >/dev/null 2>&1; then
+      return 0
+    fi
+    rc=$?
+    # A non-255 rc means the SSH transport reached the host and the remote
+    # command ran (and failed) — surface that immediately instead of retrying
+    # the full attempt budget, mirroring ssh_wait_for_host's fail-fast.
+    if [[ "$rc" -ne 255 ]]; then
+      return "$rc"
+    fi
+    if [[ "$attempt" -lt "$attempts" ]]; then
+      sleep "$sleep_secs"
+    fi
+  done
+  return 1
+}
+
+# Platform-aware SSH reachability gate. Linux/macOS are POSIX and keep the
+# `true`-over-ssh probe; Windows routes to the cmd.exe-wrapped probe so a
+# non-POSIX role node cannot wedge the stage on the default-shell launch path.
+# Fails closed (returns non-zero) on an unknown platform rather than running a
+# probe that could hang.
+ssh_wait_for_host_for_platform() {
+  local target="$1"
+  local platform="$2"
+  local attempts="${3:-240}"
+  local sleep_secs="${4:-5}"
+  case "$platform" in
+    windows)
+      ssh_wait_for_host_windows "$target" "$attempts" "$sleep_secs"
+      ;;
+    linux|macos)
+      ssh_wait_for_host "$target" "$attempts" "$sleep_secs"
+      ;;
+    *)
+      printf 'ssh_wait_for_host_for_platform: unsupported platform %q for target %q\n' \
+        "$platform" "$target" >&2
+      return 1
+      ;;
+  esac
 }
 
 capture_boot_id() {
