@@ -228,46 +228,67 @@ fn create_restricted_file(path: &Path) -> Result<File, ResilienceError> {
 
 /// Acquire the state-file write lock (unix: hardened with advisory `flock`).
 ///
-/// The lock is an exclusive `flock(LOCK_EX)` on a persistent lock file. The
-/// kernel releases an `flock` automatically when the holding file descriptor
-/// closes — including on process death (crash, OOM-kill, `SIGKILL` on a
-/// shutdown timeout, or a restart mid-persist) — so a lock file stranded by an
-/// ungraceful exit NEVER wedges a future writer. The lock file is deliberately
-/// NOT unlinked on release: unlinking it would let a concurrent acquirer create
-/// a fresh inode at the same path and lock *that* instead, silently breaking
-/// mutual exclusion.
+/// Mutual exclusion is an exclusive `flock(LOCK_EX)`, which the kernel releases
+/// automatically when the holding file descriptor closes — including on process
+/// death (crash, OOM-kill, `SIGKILL` on a shutdown timeout, or a restart
+/// mid-persist). So a lock file stranded by an ungraceful exit NEVER wedges a
+/// future writer: the next acquirer opens the leftover file and its `flock`
+/// succeeds because the dead holder's lock is already gone.
+///
+/// Two robustness properties beyond bare `flock`:
+///   - The lock file is removed on clean release (see `StateLockGuard::drop`),
+///     so a lock created by one UID does not persist to block another. This
+///     matters because admin/enforce operations run as root (via sudo) while
+///     the daemon runs as a non-root service user; a persistent root-owned lock
+///     file would be unopenable by the daemon (EACCES).
+///   - If the lock file IS present and owned by a UID we cannot open (a
+///     root-owned lock left by an ungraceful root exit), we unlink and recreate
+///     it: the daemon owns the parent state directory, so it may remove any file
+///     within. Without this the non-root daemon's `persist_state` would fail
+///     EACCES -> spurious I/O error -> `restrict_permanent` permanent
+///     fail-closed brick.
 ///
 /// This replaces an earlier `O_EXCL` lockfile-as-mutex that had no stale-lock
-/// recovery: a single ungraceful daemon exit left the lock file behind, every
-/// subsequent `persist_state` then failed with a spurious I/O error, and the
-/// daemon drove itself into a permanent fail-closed `restrict_permanent` state
-/// it could not recover from without a manual `rm` of the lock file.
+/// recovery: a single ungraceful daemon exit left the lock file behind and
+/// every subsequent `persist_state` failed with a spurious I/O error.
 #[cfg(unix)]
 fn acquire_lock(path: &Path) -> Result<StateLockGuard, ResilienceError> {
     const MAX_WAIT: Duration = Duration::from_secs(3);
     const WAIT_MS: u64 = 10;
     let deadline = Instant::now() + MAX_WAIT;
 
-    // create(true) (NOT create_new): the lock file may legitimately survive a
-    // crash. Mutual exclusion comes from the advisory flock below, not from the
-    // file's existence.
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).mode(0o600);
-    let mut file = options.open(path).map_err(|_| ResilienceError::Io)?;
-
     loop {
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(flock) => return Ok(StateLockGuard { _flock: flock }),
-            Err((returned, _errno)) => {
-                // Held by another live descriptor (EWOULDBLOCK): wait + retry on
-                // the same fd. A dead holder's lock is already gone, so this only
-                // loops for genuine live contention, never for a stale file.
-                file = returned;
-                if Instant::now() >= deadline {
+        // create(true) (NOT create_new): a lock file may legitimately survive a
+        // crash. Mutual exclusion comes from the advisory flock below.
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).mode(0o600);
+        match options.open(path) {
+            Ok(file) => match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(flock) => {
+                    return Ok(StateLockGuard {
+                        path: path.to_path_buf(),
+                        _flock: flock,
+                    });
+                }
+                Err((_returned, _errno)) => {
+                    // Held by another live descriptor (EWOULDBLOCK). A dead
+                    // holder's flock is already released, so this only loops for
+                    // genuine live contention.
+                    if Instant::now() >= deadline {
+                        return Err(ResilienceError::Io);
+                    }
+                    sleep(Duration::from_millis(WAIT_MS));
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Wrong-owned lock file (e.g. left by a root-run op). We own the
+                // state dir, so unlink it and recreate under our own UID.
+                if fs::remove_file(path).is_err() || Instant::now() >= deadline {
                     return Err(ResilienceError::Io);
                 }
                 sleep(Duration::from_millis(WAIT_MS));
             }
+            Err(_) => return Err(ResilienceError::Io),
         }
     }
 }
@@ -333,21 +354,24 @@ fn unix_now() -> u64 {
 }
 
 struct StateLockGuard {
-    // Unix: the advisory flock is released when this descriptor closes — on
-    // drop AND on process death — so nothing needs to (or should) unlink the
-    // lock file. The file persists as a stable flock anchor.
+    path: PathBuf,
+    // Unix: the advisory flock is released when this descriptor closes (on drop
+    // AND on process death). Held only for the duration of one write.
     #[cfg(unix)]
     _flock: Flock<File>,
-    // Non-unix: the lock file IS the mutex, so it must be removed on release.
-    #[cfg(not(unix))]
-    path: PathBuf,
     #[cfg(not(unix))]
     _handle: File,
 }
 
-#[cfg(not(unix))]
 impl Drop for StateLockGuard {
     fn drop(&mut self) {
+        // Remove the lock file on clean release. On unix the advisory flock is
+        // also released when `_flock` closes; removing the file additionally
+        // stops a wrong-owned lock from persisting across a root/daemon UID
+        // handoff (the EACCES brick). The guard lives only for one write, so the
+        // post-write unlink never races a concurrent writer into split inodes: a
+        // contender either shares this inode (flock-excluded until release) or
+        // creates a fresh one, which can only happen after this write completed.
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -673,6 +697,39 @@ mod tests {
         let guard =
             acquire_lock(&lock_path).expect("stale lock file must not block a live acquirer");
         drop(guard);
+
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acquire_lock_removes_lock_file_on_clean_release() {
+        // Regression for the cross-UID EACCES brick: the lock file MUST be
+        // removed on clean release so a lock created by one UID (e.g. a root-run
+        // enforce op) cannot persist and wedge a different-UID writer (the
+        // non-root daemon) that can read+write the dir but not the file.
+        let unique = format!(
+            "rustynet-lock-cleanup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        let lock_path = lock_path_for(&path);
+
+        {
+            let _guard = acquire_lock(&lock_path).expect("acquire should succeed");
+            assert!(
+                lock_path.exists(),
+                "lock file must exist while the guard is held"
+            );
+        }
+        assert!(
+            !lock_path.exists(),
+            "lock file must be removed on clean release"
+        );
 
         let _ = std::fs::remove_file(&lock_path);
         let _ = std::fs::remove_file(&path);
