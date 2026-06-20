@@ -10,6 +10,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+#[cfg(unix)]
+use nix::fcntl::{Flock, FlockArg};
+
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +226,56 @@ fn create_restricted_file(path: &Path) -> Result<File, ResilienceError> {
     options.open(path).map_err(|_| ResilienceError::Io)
 }
 
+/// Acquire the state-file write lock (unix: hardened with advisory `flock`).
+///
+/// The lock is an exclusive `flock(LOCK_EX)` on a persistent lock file. The
+/// kernel releases an `flock` automatically when the holding file descriptor
+/// closes — including on process death (crash, OOM-kill, `SIGKILL` on a
+/// shutdown timeout, or a restart mid-persist) — so a lock file stranded by an
+/// ungraceful exit NEVER wedges a future writer. The lock file is deliberately
+/// NOT unlinked on release: unlinking it would let a concurrent acquirer create
+/// a fresh inode at the same path and lock *that* instead, silently breaking
+/// mutual exclusion.
+///
+/// This replaces an earlier `O_EXCL` lockfile-as-mutex that had no stale-lock
+/// recovery: a single ungraceful daemon exit left the lock file behind, every
+/// subsequent `persist_state` then failed with a spurious I/O error, and the
+/// daemon drove itself into a permanent fail-closed `restrict_permanent` state
+/// it could not recover from without a manual `rm` of the lock file.
+#[cfg(unix)]
+fn acquire_lock(path: &Path) -> Result<StateLockGuard, ResilienceError> {
+    const MAX_WAIT: Duration = Duration::from_secs(3);
+    const WAIT_MS: u64 = 10;
+    let deadline = Instant::now() + MAX_WAIT;
+
+    // create(true) (NOT create_new): the lock file may legitimately survive a
+    // crash. Mutual exclusion comes from the advisory flock below, not from the
+    // file's existence.
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).mode(0o600);
+    let mut file = options.open(path).map_err(|_| ResilienceError::Io)?;
+
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(flock) => return Ok(StateLockGuard { _flock: flock }),
+            Err((returned, _errno)) => {
+                // Held by another live descriptor (EWOULDBLOCK): wait + retry on
+                // the same fd. A dead holder's lock is already gone, so this only
+                // loops for genuine live contention, never for a stale file.
+                file = returned;
+                if Instant::now() >= deadline {
+                    return Err(ResilienceError::Io);
+                }
+                sleep(Duration::from_millis(WAIT_MS));
+            }
+        }
+    }
+}
+
+/// Non-unix fallback: `O_EXCL` lock file as a mutex (legacy behavior). Windows
+/// advisory-lock hardening (auto-release on process death) is tracked
+/// separately; this path retains the prior semantics unchanged.
+#[cfg(not(unix))]
 fn acquire_lock(path: &Path) -> Result<StateLockGuard, ResilienceError> {
     const MAX_WAIT: Duration = Duration::from_secs(3);
     const WAIT_MS: u64 = 10;
@@ -231,8 +284,6 @@ fn acquire_lock(path: &Path) -> Result<StateLockGuard, ResilienceError> {
     loop {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
         match options.open(path) {
             Ok(mut handle) => {
                 let stamp = format!("pid={} ts={}\n", std::process::id(), unix_now());
@@ -273,6 +324,7 @@ fn temp_path_for(path: &Path) -> PathBuf {
     PathBuf::from(out)
 }
 
+#[cfg(not(unix))]
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -281,10 +333,19 @@ fn unix_now() -> u64 {
 }
 
 struct StateLockGuard {
+    // Unix: the advisory flock is released when this descriptor closes — on
+    // drop AND on process death — so nothing needs to (or should) unlink the
+    // lock file. The file persists as a stable flock anchor.
+    #[cfg(unix)]
+    _flock: Flock<File>,
+    // Non-unix: the lock file IS the mutex, so it must be removed on release.
+    #[cfg(not(unix))]
     path: PathBuf,
+    #[cfg(not(unix))]
     _handle: File,
 }
 
+#[cfg(not(unix))]
 impl Drop for StateLockGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
@@ -586,5 +647,34 @@ mod tests {
 
         let _ = std::fs::remove_file(&*path);
         let _ = std::fs::remove_file(lock_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acquire_lock_succeeds_over_stale_lock_file_without_live_holder() {
+        // Regression for the state-persist brick: a daemon that died holding the
+        // lock leaves the lock FILE on disk. With advisory (flock) locking the
+        // kernel has already released the lock, so a fresh acquisition must
+        // succeed immediately and never wedge persistence. Pre-fix, the O_EXCL
+        // lockfile-as-mutex saw the leftover file as AlreadyExists, returned Io
+        // forever, and drove the daemon into a permanent fail-closed state.
+        let unique = format!(
+            "rustynet-stale-state-lock-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        let lock_path = lock_path_for(&path);
+        // Simulate the lock file stranded by a crashed/killed holder.
+        std::fs::write(&lock_path, "pid=999999 ts=1\n").expect("seed stale lock file");
+
+        let guard =
+            acquire_lock(&lock_path).expect("stale lock file must not block a live acquirer");
+        drop(guard);
+
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
     }
 }
