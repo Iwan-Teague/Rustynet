@@ -29,6 +29,7 @@ Read in this order before touching code:
 8. Relevant runbooks under `documents/operations/`
 
 Current primary execution ledgers:
+- `documents/operations/active/CrossPlatformRoleParityPlan_2026-06-21.md` — **RELEASE-BLOCKING COMPLETENESS MANDATE.** Rustynet cannot be called complete until **every node role + capability (client, admin, anchor, exit, blind_exit, relay, +nas/llm) works and is LIVE-LAB-PROVEN on macOS AND Windows, not just Linux.** Linux is the done reference; macOS/Windows must reach full per-role parity, each role proven live in the lab. This doc is the single source of truth for that gap (live-proven status matrix per role × OS, the per-role × per-OS live-lab acceptance matrix, known blockers, and the parity Definition of Done). No OS may be a capability limiter.
 - `documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md` for the cross-network dataplane track (D2-D13): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding, service-hosting roles (nas, llm). Source of truth for "what are we building and why" when working on traversal, relay, gossip, enrollment, or cellular reliability.
 - `documents/operations/active/MasterWorkPlan_2026-03-22.md` for repo-wide remaining work
 - `documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md` for traversal, relay, and live-lab readiness (the defects it documents drive D2/D3/D4 in the dataplane execution plan)
