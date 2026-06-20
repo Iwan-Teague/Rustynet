@@ -7797,6 +7797,63 @@ const MACOS_INSTALL_SERVICE_SCRIPT_REMOTE: &str = "/tmp/Install-RustyNetMacosSer
 /// Remote path of the macOS env file (uploaded by stage 1).
 const MACOS_ENV_FILE_REMOTE: &str = "/tmp/rustynet-macos-bootstrap.env";
 
+/// Decide whether `rustynet peer-list` output proves the macOS daemon actually
+/// joined the mesh.
+///
+/// Fail-closed contract: returns `true` ONLY when the daemon is live AND
+/// reports at least one active peer. Every "looks like output but isn't a real
+/// peer list" shape must be rejected, because `validate_macos_mesh_join`
+/// previously soft-passed against a *down* daemon: `peer-list` prints a
+/// non-empty `daemon unreachable: inspect daemon socket failed …` diagnostic on
+/// a crash-looping daemon, so the old bare `is_empty()` check let it pass. A
+/// live-but-unmeshed daemon prints `peers:\n  (no peers)`, which must also fail.
+/// Mirrors the Linux managed-DNS `dns_inspect_readback_ready` sentinel guard.
+fn macos_peer_list_indicates_mesh_join(output: &str) -> bool {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    // Daemon-down / IPC-failure sentinels: socket absent or control request
+    // errored. Treat as not-joined (fail closed).
+    const DAEMON_DOWN_SENTINELS: &[&str] = &[
+        "daemon unreachable",
+        "inspect daemon socket failed",
+        "daemon error",
+        "no such file or directory",
+        "connection refused",
+        "permission denied",
+    ];
+    if DAEMON_DOWN_SENTINELS
+        .iter()
+        .any(|sentinel| normalized.contains(sentinel))
+    {
+        return false;
+    }
+    // Must be the real peer-list reflection, not a bare error line.
+    if !normalized.contains("peers:") {
+        return false;
+    }
+    // Positive mesh evidence. `rustynet peer-list` reflects the local node's
+    // status line (one line terminating in `membership_active_nodes=N`), so the
+    // honest mesh-join signal is an active-membership view that includes at
+    // least one peer beyond this node. A down daemon emits no such field; an
+    // un-joined / still-bootstrapping daemon reports 0 (or 1 = only itself).
+    // Require >= 2 so the stage proves the node sees the mesh, not just that the
+    // daemon process answered.
+    matches!(parse_membership_active_nodes(trimmed), Some(n) if n >= 2)
+}
+
+/// Extract the `membership_active_nodes=N` count from a `rustynet peer-list` /
+/// `rustynet status` line. Returns `None` when the field is absent (e.g. a
+/// daemon-down diagnostic) — callers must treat that as not-joined.
+fn parse_membership_active_nodes(output: &str) -> Option<u64> {
+    output
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("membership_active_nodes="))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 /// Run all macOS orchestration stages for the alias given by `--macos-vm`.
 ///
 /// `linux_outcomes` is the current accumulated outcome list — the membership
@@ -8401,6 +8458,11 @@ fn run_macos_orchestration_stages(
             vec![],
         )
     } else {
+        // Poll for mesh convergence: peers populate after the first gossip
+        // round, so a single shot right after distribute can race. Fail closed
+        // if the daemon never reports a real peer within the window.
+        const MESH_JOIN_ATTEMPTS: usize = 6;
+        const MESH_JOIN_SLEEP: Duration = Duration::from_secs(8);
         let result = (|| -> Result<String, String> {
             let inventory = load_inventory(inventory_path)?;
             let macos_entry = inventory
@@ -8409,25 +8471,42 @@ fn run_macos_orchestration_stages(
                 .ok_or_else(|| format!("macOS alias {macos_alias:?} not found in inventory"))?
                 .clone();
             let target = remote_target_from_inventory_entry(&macos_entry, None);
-            let check_script = "sudo /usr/local/bin/rustynet peer-list 2>/dev/null || true";
-            let output = capture_remote_shell_command_for_target(
-                &target,
-                None,
-                Some(ssh_identity_file),
-                known_hosts_path,
-                check_script,
-                Duration::from_secs(30),
-            )
-            .map_err(|e| format!("rustynet peer-list on {macos_alias} failed: {e}"))?;
-            let trimmed = output.trim().to_owned();
-            if trimmed.is_empty() {
-                Err(format!(
-                    "rustynet peer-list returned no output on {macos_alias}; \
-                     daemon may not have joined mesh yet"
-                ))
-            } else {
-                Ok(format!("macOS node {macos_alias} peer-list: {trimmed}"))
+            // Merge stderr (`2>&1`) so a daemon-down diagnostic is captured and
+            // detected, not silently dropped; `|| true` keeps a non-zero
+            // peer-list exit from being treated as an SSH transport failure.
+            let check_script = "sudo /usr/local/bin/rustynet peer-list 2>&1 || true";
+            let mut last_output = String::new();
+            for attempt in 1..=MESH_JOIN_ATTEMPTS {
+                let output = capture_remote_shell_command_for_target(
+                    &target,
+                    None,
+                    Some(ssh_identity_file),
+                    known_hosts_path,
+                    check_script,
+                    Duration::from_secs(30),
+                )
+                .map_err(|e| format!("rustynet peer-list on {macos_alias} failed: {e}"))?;
+                if macos_peer_list_indicates_mesh_join(&output) {
+                    return Ok(format!(
+                        "macOS node {macos_alias} joined mesh (attempt {attempt}/{MESH_JOIN_ATTEMPTS}); peer-list:\n{}",
+                        output.trim()
+                    ));
+                }
+                last_output = output.trim().to_owned();
+                if attempt < MESH_JOIN_ATTEMPTS {
+                    std::thread::sleep(MESH_JOIN_SLEEP);
+                }
             }
+            Err(format!(
+                "macOS node {macos_alias} did not report a live mesh peer after \
+                 {MESH_JOIN_ATTEMPTS} attempts; daemon is down or unmeshed. \
+                 Last peer-list output:\n{}",
+                if last_output.is_empty() {
+                    "(empty)".to_owned()
+                } else {
+                    last_output
+                }
+            ))
         })();
         match result {
             Ok(summary) => {
@@ -26866,8 +26945,9 @@ mod tests {
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
         is_macos_metadata_artifact_name, live_lab_stage_forensics_notes, load_inventory,
         load_live_lab_profile, local_utm_process_present_in_ps_output,
-        local_utm_process_present_with_ps, materialize_orchestration_staging_dir,
-        parse_live_lab_stage_records, parse_local_utm_list_started_status,
+        local_utm_process_present_with_ps, macos_peer_list_indicates_mesh_join,
+        materialize_orchestration_staging_dir, parse_live_lab_stage_records,
+        parse_local_utm_list_started_status, parse_membership_active_nodes,
         parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
         path_contains_macos_metadata_artifact, persist_local_utm_ready_states_to_inventory,
         privileged_rustynet_cli_script, remote_copy_destination_for_target,
@@ -26895,6 +26975,87 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn macos_peer_list_mesh_join_rejects_empty_output() {
+        // No output at all: daemon may have exited before printing — fail closed.
+        assert!(!macos_peer_list_indicates_mesh_join(""));
+        assert!(!macos_peer_list_indicates_mesh_join("   \n  \n"));
+    }
+
+    #[test]
+    fn macos_peer_list_mesh_join_rejects_daemon_socket_failure() {
+        // The exact soft-pass that slipped through before: a down daemon prints
+        // a non-empty unreachable diagnostic. This MUST NOT be treated as joined.
+        assert!(!macos_peer_list_indicates_mesh_join(
+            "daemon unreachable: inspect daemon socket failed \
+             (/private/var/run/rustynet/rustynetd.sock): No such file or directory"
+        ));
+    }
+
+    #[test]
+    fn macos_peer_list_mesh_join_rejects_daemon_error_response() {
+        // IPC reached the daemon but it answered not-ok.
+        assert!(!macos_peer_list_indicates_mesh_join(
+            "daemon error: trust state unavailable"
+        ));
+    }
+
+    #[test]
+    fn macos_peer_list_mesh_join_rejects_live_but_unmeshed_daemon() {
+        // Daemon answered but printed no status line / no membership — not joined.
+        assert!(!macos_peer_list_indicates_mesh_join("peers:\n  (no peers)"));
+    }
+
+    #[test]
+    fn macos_peer_list_mesh_join_rejects_zero_membership() {
+        // Daemon up (status line present) but has loaded no active membership.
+        assert!(!macos_peer_list_indicates_mesh_join(
+            "peers:\n  node_id=macos-client-1 node_role=client state=Bootstrapping \
+             encrypted_key_store=true membership_epoch=0 membership_active_nodes=0"
+        ));
+    }
+
+    #[test]
+    fn macos_peer_list_mesh_join_rejects_membership_of_only_self() {
+        // Sees only itself (1) — has not joined a mesh with any peer.
+        assert!(!macos_peer_list_indicates_mesh_join(
+            "peers:\n  node_id=macos-client-1 node_role=client state=DataplaneApplied \
+             encrypted_key_store=true membership_epoch=3 membership_active_nodes=1"
+        ));
+    }
+
+    #[test]
+    fn macos_peer_list_mesh_join_accepts_joined_node_status_line() {
+        // The real shape: peer-list reflects the local node status line with an
+        // active membership view of the full mesh. This is the only PASS shape.
+        assert!(macos_peer_list_indicates_mesh_join(
+            "peers:\n  node_id=macos-client-1 node_role=client state=DataplaneApplied \
+             generation=1 encrypted_key_store=true membership_epoch=16 \
+             membership_active_nodes=7"
+        ));
+    }
+
+    #[test]
+    fn parse_membership_active_nodes_reads_count_and_handles_absence() {
+        assert_eq!(
+            parse_membership_active_nodes(
+                "node_id=macos-client-1 state=DataplaneApplied membership_active_nodes=7"
+            ),
+            Some(7)
+        );
+        assert_eq!(
+            parse_membership_active_nodes("membership_active_nodes=0"),
+            Some(0)
+        );
+        // Absent field (daemon-down diagnostic) -> None, treated as not-joined.
+        assert_eq!(
+            parse_membership_active_nodes(
+                "daemon unreachable: inspect daemon socket failed: No such file or directory"
+            ),
+            None
+        );
+    }
 
     fn write_temp_inventory(body: &str) -> PathBuf {
         let unique = super::unique_suffix();
