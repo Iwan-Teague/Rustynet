@@ -136,6 +136,8 @@ Primary goal:
 - A future non-WireGuard backend must be swappable with minimal changes outside backend adapter crates.
 - Cross-platform clients:
 - Linux (priority), macOS, Windows.
+- Cross-platform role parity (completeness mandate, release-blocking):
+- Every node role and capability (client, admin, anchor, exit, blind_exit, relay, and the service-hosting nas/llm roles) must be operable AND live-lab-proven on Linux, macOS, AND Windows. Linux is the reference and is complete; macOS and Windows must graduate from compatibility-mode client to full per-role support — each role and its platform-native dataplane (kill-switch, NAT/egress, DNS fail-closed, route advertise, signed-state verify, anti-replay) proven live in the UTM lab. No OS may limit which role a node can take. Rustynet is not cross-platform complete until this holds for every role on macOS and Windows. Single source of truth + status matrix + acceptance criteria: `operations/active/CrossPlatformRoleParityPlan_2026-06-21.md`.
 - Setup/runtime host profiling:
 - The startup wizard and runtime bootstrap must detect host OS at launch and enforce a host profile (`linux`, `macos`, or unsupported).
 - Linux profile may provision dataplane/runtime artifacts and privileged integration.

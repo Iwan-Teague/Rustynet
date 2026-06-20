@@ -76,6 +76,7 @@ This block is the quick source of truth for what remains in this document.
 If historical notes later in the file conflict with this block, the execution scope above, or current code reality, update the stale section instead of following the stale note.
 
 `Open scope`
+- **RELEASE-BLOCKING COMPLETENESS MANDATE — cross-platform role parity:** every node role + capability (client, admin, anchor, exit, blind_exit, relay, +nas/llm) must be operable AND live-lab-proven on macOS AND Windows, not just Linux. Linux has full parity; macOS and Windows do not. This is a top-level completeness gap — Rustynet cannot be called complete until every role × {macOS, Windows} cell is green in the lab. Single source of truth + live-proven status matrix + per-role × per-OS acceptance criteria + known blockers: [CrossPlatformRoleParityPlan_2026-06-21.md](./CrossPlatformRoleParityPlan_2026-06-21.md).
 - This file is the top-level remaining-work map for the repo, but some lower session logs are historical and may describe old blockers.
 - Core Track A/Track B controller hardening and Track G controls are implemented in code; remaining high-value work is now primarily live cross-network evidence collection and validation refresh (Track E and Track B WS-4 measured runs), plus any backend-agility expansion beyond current conformance proof (Track F).
 
