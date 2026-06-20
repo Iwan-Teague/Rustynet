@@ -1196,12 +1196,14 @@ live_lab_ssh_windows() {
   # /c command line. The base64 token is alphanumeric + `+/=` only,
   # so it cannot break out of the quoted region.
   remote_command="cmd.exe /c \"powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${b64}\""
-  if live_lab_target_uses_utm_transport "$target"; then
-    if live_lab_utm_exec "$target" "$ps_command" "$timeout"; then
-      return 0
-    fi
-    printf 'UTM exec failed for %s; falling back to SSH (windows)\n' "$target" >&2
-  fi
+  # Windows must NOT use the UTM guest-agent exec transport. live_lab_utm_exec
+  # deploys a POSIX wrapper script to /var/tmp/rn-utm-exec.*.sh and runs it via
+  # `utmctl exec`; a Windows guest cannot execute that (no /var/tmp, not a shell
+  # script -> "system cannot find the path specified"), and utmctl then blocks
+  # for its full timeout before failing over, hanging the stage for hours
+  # (observed: cleanup_hosts stalled on a Windows role node until the watchdog
+  # killed it). SSH (cmd.exe/EncodedCommand) is the proven Windows transport and
+  # is gated by verify_ssh_reachability, so route straight to it.
   live_lab_ssh_via_ssh "$target" "$remote_command" "$timeout"
 }
 
