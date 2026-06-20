@@ -688,6 +688,28 @@ clear_residual_state() {
     launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
     sleep 1
   fi
+
+  # Clear residual distributed signed-state + anti-replay watermarks from any
+  # prior enrollment. This is the macOS analogue of the Linux cleanup's
+  # `rm -rf /var/lib/rustynet`: a fresh (re)enrollment must not inherit a stale
+  # membership/trust epoch watermark, or the daemon rejects the fresh genesis
+  # bundle as a replay/rollback ("membership replay/rollback detected by
+  # watermark") and fail-closes (observed live: macOS stuck state=FailClosed,
+  # reconcile_failures, membership_active_nodes=none). Key custody (keys/,
+  # bootstrap/, secrets/) is deliberately preserved — only the membership/ and
+  # trust/ signed-state plus the top-level session state are removed, and only
+  # here on an operator-driven fresh bootstrap (the running daemon's
+  # anti-rollback protection between enrollments is unchanged). `seed_trust_evidence`
+  # re-seeds trust/, the orchestrator re-distributes the signed bundles, and the
+  # daemon rebuilds its watermarks from the fresh genesis.
+  local _residual_dir
+  for _residual_dir in membership trust; do
+    if [[ -d "${STATE_ROOT}/${_residual_dir}" ]]; then
+      find "${STATE_ROOT}/${_residual_dir}" -mindepth 1 -maxdepth 1 \
+        -exec rm -rf {} + 2>/dev/null || true
+    fi
+  done
+  rm -f "${STATE_ROOT}/rustynetd.state" "${STATE_ROOT}/rustynetd.state.lock" 2>/dev/null || true
 }
 
 # ── Build from source ─────────────────────────────────────────────────────────
@@ -1201,6 +1223,7 @@ if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
   fi
   ensure_rustynetd_user
   setup_directories
+  clear_residual_state
   ensure_system_keychain_unlocked
   generate_wireguard_keys
   provision_enrollment_secret
