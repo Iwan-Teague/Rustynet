@@ -1081,6 +1081,46 @@ mod tests {
     }
 
     #[test]
+    fn live_lab_prime_remote_access_skips_sudo_for_windows_role_node() {
+        // A Windows role node has no sudo. live_lab_push_sudo_password runs a
+        // POSIX `sudo -n` probe over plain ssh (not the cmd.exe/EncodedCommand
+        // wrapper a Windows guest needs), so against a Windows node it blocks
+        // for the full live_lab_ssh timeout (3h) instead of completing. The
+        // prime worker must resolve the node platform and skip the sudo-prime
+        // for windows, returning success without ever invoking the probe.
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR
+                .contains("[prime-remote] %s skipping sudo-prime (windows/non-posix role node)"),
+            "prime_remote_access_worker must skip (not hang on) the sudo-prime for a windows role node"
+        );
+        // The skip must be platform-gated: the worker resolves the node's
+        // platform and the windows branch must precede the sudo push so the
+        // POSIX probe is never reached for a Windows node.
+        let prime_fn = LIVE_LINUX_LAB_ORCHESTRATOR
+            .split("prime_remote_access_worker() {")
+            .nth(1)
+            .and_then(|rest| rest.split("\nstage_preflight() {").next())
+            .expect("prime_remote_access_worker body must be present");
+        let skip_idx = prime_fn
+            .find("skipping sudo-prime (windows/non-posix role node)")
+            .expect("prime worker must log the windows skip");
+        // Match the actual call form (`live_lab_push_sudo_password "$target"`),
+        // not the bare symbol — the guard comment above also names the helper,
+        // and matching the symbol alone would find the comment, not the call.
+        let push_idx = prime_fn
+            .find("live_lab_push_sudo_password \"$target\"")
+            .expect("prime worker must still push sudo for posix nodes");
+        assert!(
+            skip_idx < push_idx,
+            "windows skip must be evaluated before the POSIX sudo-prime so a windows node never reaches it"
+        );
+        assert!(
+            prime_fn.contains("if [[ \"$platform\" == \"windows\" ]]; then"),
+            "prime worker windows guard must branch on the resolved node platform"
+        );
+    }
+
+    #[test]
     fn live_lab_refresh_runtime_state_dispatches_per_platform() {
         assert!(
             LIVE_LINUX_LAB_ORCHESTRATOR.contains(
