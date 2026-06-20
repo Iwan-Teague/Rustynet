@@ -47,5 +47,24 @@ echo "PASS: cargo deny bans check passed"
 # truth — it lived here from before the X3 migration landed and the
 # Rust scanner duplicates its coverage with stronger guarantees.
 
+# G3 (RN-22 / RSA-0077): all ed25519 signature verification must use the strict
+# verifier. `VerifyingKey::verify_strict` (RFC 8032 strict / ZIP-215) rejects
+# non-canonical S and small-order/torsion components — eliminating ed25519
+# signature malleability — whereas the non-strict `Verifier::verify` accepts
+# them. The migration covers control/crypto and (RSA-0077) the daemon / dns-zone
+# / llm-gateway / cli trust-signature surface. This gate fails closed if a plain
+# `.verify(` reappears, so the standard cannot silently regress to half-applied.
+# (If a legitimate NON-ed25519 `.verify(` is ever introduced, prefer a typed
+# wrapper; otherwise add a narrowly-scoped allowlist to the second grep.)
+echo "Checking all ed25519 signature verification uses verify_strict (RN-22)..."
+if grep -rn '\.verify(' crates --include='*.rs' \
+    | grep -v 'verify_strict' \
+    | grep -vE ':[0-9]+:[[:space:]]*(//|///|\*)'; then
+  echo "FAIL: non-strict ed25519 .verify() found above — RN-22 mandates VerifyingKey::verify_strict" >&2
+  echo "FAIL: verify_strict rejects malleable/non-canonical signatures; replace .verify( with .verify_strict(" >&2
+  exit 1
+fi
+echo "PASS: all ed25519 signature verification uses verify_strict (RN-22 / RSA-0077)"
+
 echo "All security regression gates passed."
 exit 0
