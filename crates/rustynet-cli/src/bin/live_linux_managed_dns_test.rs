@@ -133,8 +133,22 @@ fn run() -> Result<(), String> {
     let mut host_by_node = HashMap::new();
     host_by_node.insert(config.signer_node_id.clone(), config.signer_host.clone());
     host_by_node.insert(config.client_node_id.clone(), config.client_host.clone());
+    // The signer and client are always Linux in this validator; each managed
+    // peer carries its own platform parsed from --managed-peer. The platform
+    // map locates per-OS state (assignment bundle) and decides which peers can
+    // accept the Linux-only bundle re-push.
+    let mut platform_by_node: HashMap<String, live_lab_support::LiveLabPlatform> = HashMap::new();
+    platform_by_node.insert(
+        config.signer_node_id.clone(),
+        live_lab_support::LiveLabPlatform::Linux,
+    );
+    platform_by_node.insert(
+        config.client_node_id.clone(),
+        live_lab_support::LiveLabPlatform::Linux,
+    );
     for peer in &config.managed_peers {
         host_by_node.insert(peer.node_id.clone(), peer.host.clone());
+        platform_by_node.insert(peer.node_id.clone(), peer.platform);
     }
 
     if current_exit_node != "none"
@@ -146,7 +160,8 @@ fn run() -> Result<(), String> {
             "client exit_node {current_exit_node} is not mapped to a host; provide --managed-peer {current_exit_node}|<user@host>"
         ));
     }
-    let assignment_scopes = capture_assignment_authority_scopes(&ctx, &host_by_node)?;
+    let assignment_scopes =
+        capture_assignment_authority_scopes(&ctx, &host_by_node, &platform_by_node)?;
 
     let mut mesh_peers = Vec::new();
     for (node_id, host) in sorted_node_host_pairs(&host_by_node) {
@@ -451,8 +466,10 @@ fn run() -> Result<(), String> {
     refresh_traversal_bundles(
         &ctx,
         &config,
+        &logger,
         &workspace,
         &host_by_node,
+        &platform_by_node,
         &nodes_spec,
         &allow_spec,
     )?;
@@ -507,6 +524,7 @@ fn run() -> Result<(), String> {
         config: &config,
         workspace: &workspace,
         host_by_node: &host_by_node,
+        platform_by_node: &platform_by_node,
         verifier_local: &verifier_local,
         dns_issue,
     };
@@ -602,6 +620,23 @@ fn run() -> Result<(), String> {
         wait_for_dns_inspect_state(&ctx, &config.client_host, Some("valid"), 20, 2)?;
 
     for (node_id, host) in managed_dns_distribution_targets(&host_by_node, &config.client_host) {
+        let node_platform = platform_by_node
+            .get(&node_id)
+            .copied()
+            .ok_or_else(|| format!("missing platform mapping for managed DNS node {node_id}"))?;
+        // The Linux re-issue+re-push below uses Linux paths and `-o root -g
+        // rustynetd` ownership, which do not exist on macOS/Windows. Those
+        // peers already received correct, signed bundles during the setup
+        // distribution stages, and the lab daemon max-age is 86400s, so the
+        // bundles stay valid for the whole run. Only the client's resolution is
+        // asserted, and the client + signer are Linux. Skip non-Linux peers.
+        if node_platform != live_lab_support::LiveLabPlatform::Linux {
+            logger.line(format!(
+                "[managed-dns] skip bundle re-push for non-linux peer {node_id} ({platform}); setup-distributed bundles stay fresh under the 86400s lab window",
+                platform = node_platform.as_str()
+            ))?;
+            continue;
+        }
         logger.line(
             format!(
                 "[managed-dns] issuing valid managed DNS bundle for {node_id} on {}",
@@ -1008,6 +1043,7 @@ struct ManagedDnsValidationContext<'a> {
     config: &'a Config,
     workspace: &'a Path,
     host_by_node: &'a HashMap<String, String>,
+    platform_by_node: &'a HashMap<String, live_lab_support::LiveLabPlatform>,
     verifier_local: &'a Path,
     dns_issue: DnsIssueContext<'a>,
 }
@@ -1176,11 +1212,14 @@ fn install_dns_bundle_with_options(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_traversal_bundles(
     ctx: &LiveLabContext,
     config: &Config,
+    logger: &Logger,
     workspace: &Path,
     host_by_node: &HashMap<String, String>,
+    platform_by_node: &HashMap<String, live_lab_support::LiveLabPlatform>,
     nodes_spec: &str,
     allow_spec: &str,
 ) -> Result<(), String> {
@@ -1216,6 +1255,22 @@ fn refresh_traversal_bundles(
                 &traversal_pub_local,
             )?;
             for (node_id, host) in sorted_node_host_pairs(host_by_node) {
+                let node_platform = platform_by_node.get(&node_id).copied().ok_or_else(|| {
+                    format!("missing platform mapping for traversal node {node_id}")
+                })?;
+                // install_traversal_bundle uses Linux paths and `-o root -g
+                // rustynetd` ownership absent on macOS/Windows. Those peers got
+                // valid signed traversal bundles during setup distribution and
+                // the 86400s lab max-age keeps them fresh for the whole run.
+                // Only the Linux client's resolution is asserted, so skip the
+                // re-push to non-Linux peers.
+                if node_platform != live_lab_support::LiveLabPlatform::Linux {
+                    logger.line(format!(
+                        "[managed-dns] skip bundle re-push for non-linux peer {node_id} ({platform}); setup-distributed bundles stay fresh under the 86400s lab window",
+                        platform = node_platform.as_str()
+                    ))?;
+                    continue;
+                }
                 let traversal_remote = traversal_bundle_remote_path(node_id.as_str());
                 let traversal_local = workspace.join(format!("traversal-{node_id}.bundle"));
                 capture_remote_text(
@@ -1433,11 +1488,17 @@ fn build_authorized_allow_spec(
 fn capture_assignment_authority_scopes(
     ctx: &LiveLabContext,
     host_by_node: &HashMap<String, String>,
+    platform_by_node: &HashMap<String, live_lab_support::LiveLabPlatform>,
 ) -> Result<HashMap<String, AssignmentAuthorityScope>, String> {
     let mut scopes = HashMap::new();
     for (node_id, host) in sorted_node_host_pairs(host_by_node) {
+        let platform = platform_by_node
+            .get(&node_id)
+            .copied()
+            .ok_or_else(|| format!("missing platform mapping for node {node_id}"))?;
+        // Locate the assignment bundle per-OS; the cat stays argv-only.
         let assignment_bundle =
-            ctx.capture_root(&host, &["cat", "/var/lib/rustynet/rustynetd.assignment"])?;
+            ctx.capture_root(&host, &["cat", assignment_bundle_path(platform)])?;
         let scope = parse_assignment_authority_scope(&assignment_bundle)?;
         if scope.node_id != node_id {
             return Err(format!(
@@ -1661,8 +1722,10 @@ fn exercise_invalid_bundle_case(
     refresh_traversal_bundles(
         validation.dns_issue.ctx,
         validation.config,
+        validation.logger,
         validation.workspace,
         validation.host_by_node,
+        validation.platform_by_node,
         validation.dns_issue.nodes_spec,
         validation.dns_issue.allow_spec,
     )?;
@@ -1843,8 +1906,10 @@ fn restore_valid_bundle_after_invalid_case(
             refresh_traversal_bundles(
                 validation.dns_issue.ctx,
                 validation.config,
+                validation.logger,
                 validation.workspace,
                 validation.host_by_node,
+                validation.platform_by_node,
                 validation.dns_issue.nodes_spec,
                 validation.dns_issue.allow_spec,
             )?;
@@ -2189,6 +2254,7 @@ fn ensure_safe_spec(label: &str, value: &str) -> Result<(), String> {
 struct ManagedPeerSpec {
     node_id: String,
     host: String,
+    platform: live_lab_support::LiveLabPlatform,
 }
 
 #[derive(Debug, Clone)]
@@ -2200,9 +2266,21 @@ struct ManagedPeerRuntime {
 
 fn parse_managed_peer_spec(value: &str) -> Result<ManagedPeerSpec, String> {
     let trimmed = value.trim();
-    let (node_id_raw, host_raw) = trimmed.split_once('|').ok_or_else(|| {
-        format!("invalid --managed-peer value (expected <node-id>|<user@host>): {value}")
+    let (node_id_raw, rest) = trimmed.split_once('|').ok_or_else(|| {
+        format!(
+            "invalid --managed-peer value (expected <node-id>|<user@host>[|<platform>]): {value}"
+        )
     })?;
+    // The host field may itself carry a trailing `|<platform>`. Split off at
+    // most one more `|` so the platform field is optional: a 2-field legacy
+    // value (`<node-id>|<host>`) defaults to Linux for backward compatibility.
+    let (host_raw, platform) = match rest.split_once('|') {
+        Some((host_raw, platform_raw)) => {
+            let platform = live_lab_support::LiveLabPlatform::parse(platform_raw.trim())?;
+            (host_raw, platform)
+        }
+        None => (rest, live_lab_support::LiveLabPlatform::Linux),
+    };
     let node_id = node_id_raw.trim();
     let host = host_raw.trim();
     if node_id.is_empty() || host.is_empty() {
@@ -2213,7 +2291,25 @@ fn parse_managed_peer_spec(value: &str) -> Result<ManagedPeerSpec, String> {
     Ok(ManagedPeerSpec {
         node_id: node_id.to_owned(),
         host: host.to_owned(),
+        platform,
     })
+}
+
+/// Per-OS on-disk location of the signed assignment bundle. Mirrors the
+/// per-platform paths encoded by `rustynet_assignment_bundle_path` in
+/// `scripts/e2e/live_lab_common.sh`. Used to READ (cat) the bundle from a
+/// managed peer for authority-scope parsing; the content is still parsed and
+/// verified identically regardless of OS.
+fn assignment_bundle_path(platform: live_lab_support::LiveLabPlatform) -> &'static str {
+    match platform {
+        live_lab_support::LiveLabPlatform::Linux => "/var/lib/rustynet/rustynetd.assignment",
+        live_lab_support::LiveLabPlatform::MacOs => {
+            "/usr/local/var/rustynet/trust/rustynetd.assignment"
+        }
+        live_lab_support::LiveLabPlatform::Windows => {
+            r"C:\ProgramData\RustyNet\trust\rustynetd.assignment"
+        }
+    }
 }
 
 fn next_value(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String, String> {
@@ -2292,13 +2388,14 @@ fn print_usage() {
 
 #[cfg(test)]
 mod tests {
+    use super::live_lab_support::LiveLabPlatform;
     use super::{
-        Config, ManagedDnsRecordTemplate, ManagedPeerSpec, dns_inspect_matches_expected_state,
-        dns_inspect_readback_ready, dns_query_failed_closed, managed_dns_distribution_targets,
-        managed_dns_invalid_state_observed, managed_dns_replay_records,
-        parse_assignment_authority_scope, parse_managed_peer_spec, parse_status_field,
-        rewrite_bundle_line_value, rewrite_bundle_signature, sorted_node_host_pairs,
-        validate_targets,
+        Config, ManagedDnsRecordTemplate, ManagedPeerSpec, assignment_bundle_path,
+        dns_inspect_matches_expected_state, dns_inspect_readback_ready, dns_query_failed_closed,
+        managed_dns_distribution_targets, managed_dns_invalid_state_observed,
+        managed_dns_replay_records, parse_assignment_authority_scope, parse_managed_peer_spec,
+        parse_status_field, rewrite_bundle_line_value, rewrite_bundle_signature,
+        sorted_node_host_pairs, validate_targets,
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -2327,6 +2424,32 @@ mod tests {
             .expect("managed peer should parse");
         assert_eq!(parsed.node_id, "client-2");
         assert_eq!(parsed.host, "debian@192.168.64.26");
+        // A 2-field legacy value defaults to Linux for backward compatibility.
+        assert_eq!(parsed.platform, LiveLabPlatform::Linux);
+    }
+
+    #[test]
+    fn parse_managed_peer_spec_parses_platform_field_and_maps_macos_bundle_path() {
+        let macos = parse_managed_peer_spec("aux-1|macuser@192.168.64.30|macos")
+            .expect("3-field managed peer should parse");
+        assert_eq!(macos.node_id, "aux-1");
+        assert_eq!(macos.host, "macuser@192.168.64.30");
+        assert_eq!(macos.platform, LiveLabPlatform::MacOs);
+
+        // A 2-field legacy value defaults to Linux.
+        let legacy = parse_managed_peer_spec("client-9|debian@192.168.64.40")
+            .expect("legacy 2-field managed peer should parse");
+        assert_eq!(legacy.platform, LiveLabPlatform::Linux);
+
+        // The macOS assignment bundle lives under the per-OS trust state root.
+        assert_eq!(
+            assignment_bundle_path(LiveLabPlatform::MacOs),
+            "/usr/local/var/rustynet/trust/rustynetd.assignment"
+        );
+        assert_eq!(
+            assignment_bundle_path(LiveLabPlatform::Linux),
+            "/var/lib/rustynet/rustynetd.assignment"
+        );
     }
 
     #[test]
@@ -2344,6 +2467,7 @@ mod tests {
         config.managed_peers.push(ManagedPeerSpec {
             node_id: "client-1".to_owned(),
             host: "debian@192.168.64.26".to_owned(),
+            platform: LiveLabPlatform::Linux,
         });
         let err = validate_targets(&config).expect_err("duplicate node id must fail");
         assert!(
@@ -2358,6 +2482,7 @@ mod tests {
         config.managed_peers.push(ManagedPeerSpec {
             node_id: "client-2".to_owned(),
             host: "debian@192.168.64.22".to_owned(),
+            platform: LiveLabPlatform::Linux,
         });
         let err = validate_targets(&config).expect_err("duplicate host must fail");
         assert!(

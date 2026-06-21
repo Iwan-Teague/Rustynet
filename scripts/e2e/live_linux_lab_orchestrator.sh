@@ -6509,7 +6509,7 @@ stage_run_live_managed_dns() {
   while IFS= read -r label; do
     [[ -n "$label" ]] || continue
     cmd+=(
-      --managed-peer "$(node_id_for_label "$label")|$(node_target_for_label "$label")"
+      --managed-peer "$(node_id_for_label "$label")|$(node_target_for_label "$label")|$(node_platform_for_label "$label")"
     )
   done < <(managed_peer_labels)
   cmd+=(
@@ -6543,7 +6543,7 @@ run_periodic_managed_dns_refresh() {
   while IFS= read -r label; do
     [[ -n "$label" ]] || continue
     cmd+=(
-      --managed-peer "$(node_id_for_label "$label")|$(node_target_for_label "$label")"
+      --managed-peer "$(node_id_for_label "$label")|$(node_target_for_label "$label")|$(node_platform_for_label "$label")"
     )
   done < <(managed_peer_labels)
   cmd+=(
