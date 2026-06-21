@@ -683,9 +683,10 @@ fn galaxy_rot(gid: u64) -> f32 {
     (h % 100_000) as f32 / 100_000.0 * std::f32::consts::TAU
 }
 
-/// Deterministic per-tile (x, z) world nudge used to scatter the layout off its
-/// rigid grid. Bounded to a fraction of the inter-layer / inter-tile gaps so
-/// galaxies never merge; the caller still verifies it adds no crossings.
+/// Deterministic per-tile random direction in [-1, 1]^2 used to scatter the
+/// layout off its rigid grid. Magnitude is applied by the caller (and clamped by
+/// gutter + crossing checks), so the same direction serves galaxies and the
+/// backbone with different budgets.
 fn tile_jitter(t: usize) -> (f32, f32) {
     let mut h = (t as u64)
         .wrapping_add(1)
@@ -695,7 +696,7 @@ fn tile_jitter(t: usize) -> (f32, f32) {
     h = h.wrapping_mul(0x2545_F491_4F6C_DD1D);
     h ^= h >> 29;
     let uz = (h % 1000) as f32 / 1000.0 * 2.0 - 1.0;
-    (ux * LAYER_GAP * 0.28, uz * CLUSTER_GAP * 0.35)
+    (ux, uz)
 }
 
 #[derive(Default)]
@@ -1407,26 +1408,36 @@ impl Graph {
             }
         }
 
-        // Organic scatter: nudge each tile off the rigid grid (deterministically,
-        // by id) so the map reads like a scattered universe rather than aligned
-        // columns — but only keep the largest nudge scale that adds NO straight-
-        // line crossing, so the proven minimum is preserved. Bounds are small
-        // enough that galaxies never merge.
+        // Organic "gutter": after the non-overlapping spacing computed above,
+        // give every tile its OWN deterministic nudge so the backbone
+        // (anchor/relay/exit/admin) and galaxies don't sit on a rigid grid. Each
+        // tile is moved greedily by the largest fraction of its budget that (a)
+        // adds no rendered crossing and (b) keeps at least GUTTER of clear space
+        // to every other tile — so spacing holds and the proven minimum is kept.
+        // Backbone singletons get a bigger budget since they have more room.
         {
-            let clean = centers.clone();
-            let mut scale_used = 0.0f32;
-            for &scale in &[1.0f32, 0.7, 0.45, 0.25] {
-                for t in 0..m {
-                    let (jx, jz) = tile_jitter(t);
-                    centers[t] = V3::new(clean[t].x + jx * scale, 0.0, clean[t].z + jz * scale);
+            const GUTTER: f32 = 12.0;
+            let clear = |cs: &[V3], t: usize| -> bool {
+                (0..m)
+                    .filter(|&s| s != t)
+                    .all(|s| cs[t].sub(cs[s]).len() >= unit_radius[t] + unit_radius[s] + GUTTER)
+            };
+            for t in 0..m {
+                let (ux, uz) = tile_jitter(t);
+                let singleton = tiles[t].info.is_none();
+                let (mx, mz) = if singleton {
+                    (LAYER_GAP * 0.42, CLUSTER_GAP * 0.85)
+                } else {
+                    (LAYER_GAP * 0.26, CLUSTER_GAP * 0.45)
+                };
+                let saved = centers[t];
+                for &s in &[1.0f32, 0.7, 0.45, 0.25] {
+                    centers[t] = V3::new(saved.x + ux * mx * s, 0.0, saved.z + uz * mz * s);
+                    if node_xings(&centers) == base_node && clear(&centers, t) {
+                        break;
+                    }
+                    centers[t] = saved; // revert; try a smaller step
                 }
-                if node_xings(&centers) == base_node {
-                    scale_used = scale;
-                    break;
-                }
-            }
-            if scale_used == 0.0 {
-                centers = clean; // no safe nudge; keep the clean layout
             }
         }
 
