@@ -558,6 +558,42 @@ pub struct LiveLabContext {
     verified_hosts: HashSet<String>,
 }
 
+/// Bounded transient-retry budget for the local-scp push path in
+/// [`LiveLabContext::scp_to`]. Mirrors the bash orchestrator's
+/// `live_lab_scp_to_via_ssh` (scripts/e2e/live_lab_common.sh), which retries
+/// the scp three times on ssh connection-level (exit 255) failures before
+/// giving up. A single dropped "scp: Connection closed" must not fail an
+/// entire 45-minute live-lab stage.
+const SCP_RETRY_ATTEMPTS: u32 = 3;
+/// Seconds to sleep between transient scp retry attempts. Matches the bash
+/// orchestrator's `sleep 2` between connection-level retries.
+const SCP_RETRY_SLEEP_SECS: u64 = 2;
+
+/// Classify an scp failure as transient (worth retrying) vs. likely-permanent
+/// (fail fast). Retry when the ssh layer reported a connection-level error
+/// (exit code 255) or the captured stderr names a recoverable network fault.
+/// Permanent failures (permission denied, no such file, etc.) are NOT retried
+/// so we don't burn the retry budget on errors that will never succeed.
+/// Mirrors how `live_linux_lan_toggle_test` classifies transient ssh/scp
+/// failures. `stderr_lower` must already be lowercased by the caller.
+fn scp_failure_is_transient(exit_code: Option<i32>, stderr_lower: &str) -> bool {
+    if exit_code == Some(255) {
+        return true;
+    }
+    const TRANSIENT_MARKERS: [&str; 7] = [
+        "connection closed",
+        "connection reset",
+        "connection timed out",
+        "timed out",
+        "broken pipe",
+        "lost connection",
+        "connection refused",
+    ];
+    TRANSIENT_MARKERS
+        .iter()
+        .any(|marker| stderr_lower.contains(marker))
+}
+
 impl LiveLabContext {
     pub fn new(prefix: &str, ssh_identity_file: &Path) -> Result<Self, String> {
         require_local_file_mode(ssh_identity_file, "owner-only", "ssh identity file")?;
@@ -783,43 +819,64 @@ impl LiveLabContext {
             return utm_file_push(&transport, src, dst);
         }
         self.require_pinned_host_entry(target)?;
-        let status = Command::new("scp")
-            .arg("-q")
-            .args([
-                "-o",
-                "LogLevel=ERROR",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=yes",
-            ])
-            .arg("-o")
-            .arg(format!(
-                "UserKnownHostsFile={}",
-                self.known_hosts_file.display()
-            ))
-            .args([
-                "-o",
-                "ConnectTimeout=15",
-                "-o",
-                "ServerAliveInterval=60",
-                "-o",
-                "ServerAliveCountMax=10",
-                "-o",
-                "IdentitiesOnly=yes",
-                "-i",
-            ])
-            .arg(&self.ssh_identity_file)
-            .arg("--")
-            .arg(src)
-            .arg(format!("{target}:{dst}"))
-            .status()
-            .map_err(|err| format!("failed to run scp to {target}: {err}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("scp to {target} failed"))
+        // Bounded transient-retry for the local-scp push, matching the bash
+        // orchestrator's `live_lab_scp_to_via_ssh`: a single dropped
+        // "scp: Connection closed" must not fail a 45-minute stage. Re-copying
+        // on retry is safe because scp overwrites the destination atomically
+        // and every caller pushes a fixed local file to a fixed remote path,
+        // so the operation is idempotent.
+        let mut last_stderr = String::new();
+        for attempt in 1..=SCP_RETRY_ATTEMPTS {
+            let output = Command::new("scp")
+                .arg("-q")
+                .args([
+                    "-o",
+                    "LogLevel=ERROR",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                ])
+                .arg("-o")
+                .arg(format!(
+                    "UserKnownHostsFile={}",
+                    self.known_hosts_file.display()
+                ))
+                .args([
+                    "-o",
+                    "ConnectTimeout=15",
+                    "-o",
+                    "ServerAliveInterval=60",
+                    "-o",
+                    "ServerAliveCountMax=10",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-i",
+                ])
+                .arg(&self.ssh_identity_file)
+                .arg("--")
+                .arg(src)
+                .arg(format!("{target}:{dst}"))
+                .output()
+                .map_err(|err| format!("failed to run scp to {target}: {err}"))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            // Fail fast on likely-permanent errors (permission denied, no such
+            // file, ...) so we don't waste the retry budget. Only ssh
+            // connection-level (exit 255) or recognized network faults retry.
+            if !scp_failure_is_transient(output.status.code(), &stderr.to_lowercase()) {
+                return Err(format!("scp to {target} failed: {stderr}"));
+            }
+            last_stderr = stderr;
+            if attempt < SCP_RETRY_ATTEMPTS {
+                sleep(Duration::from_secs(SCP_RETRY_SLEEP_SECS));
+            }
         }
+        Err(format!(
+            "scp to {target} failed after {SCP_RETRY_ATTEMPTS} attempts: {last_stderr}"
+        ))
     }
 
     pub fn run_root(&self, target: &str, args: &[&str]) -> Result<(), String> {
@@ -1285,8 +1342,34 @@ mod tests {
     use super::{
         LiveLabPlatform, enforce_linux_only_until_validator_lands, env_flag_truthy,
         known_hosts_lookup_host, resolved_known_hosts_candidates,
-        resolved_target_address_from_ssh_g,
+        resolved_target_address_from_ssh_g, scp_failure_is_transient,
     };
+
+    #[test]
+    fn scp_failure_is_transient_retries_connection_level_and_network_faults() {
+        // ssh connection-level error (exit 255) is always transient.
+        assert!(scp_failure_is_transient(Some(255), ""));
+        // The dropped-connection signature that motivated bash-parity retry.
+        assert!(scp_failure_is_transient(Some(1), "scp: connection closed"));
+        // Other recognized recoverable network faults.
+        assert!(scp_failure_is_transient(
+            Some(1),
+            "ssh: connect to host: connection reset by peer"
+        ));
+        assert!(scp_failure_is_transient(
+            Some(1),
+            "client_loop: send disconnect: broken pipe"
+        ));
+        // Likely-permanent failures must fail fast, never retry.
+        assert!(!scp_failure_is_transient(
+            Some(1),
+            "scp: /etc/rustynet/bundle: permission denied"
+        ));
+        assert!(!scp_failure_is_transient(
+            Some(1),
+            "scp: open local \"/missing\": no such file or directory"
+        ));
+    }
 
     #[test]
     fn live_lab_platform_parser_accepts_canonical_strings() {
