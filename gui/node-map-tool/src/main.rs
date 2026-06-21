@@ -302,6 +302,162 @@ fn segments_cross(p1: V3, p2: V3, p3: V3, p4: V3) -> bool {
         && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
 }
 
+// --------------------- LAYERED CROSSING MINIMISATION -------------------
+// Helpers for the exact (provably minimum) Sugiyama crossing minimisation used
+// by Graph::layout_galaxies. With dummy units on long edges, every edge spans
+// one layer, so the crossing number is the sum over adjacent layers of the
+// inversions between them; the minimum is found by branch-and-bound seeded with
+// a strong heuristic incumbent.
+
+/// Lexicographic next permutation in place; false once `a` is the last
+/// (descending) permutation. Used to enumerate a layer's orderings in B&B.
+fn next_perm(a: &mut [usize]) -> bool {
+    if a.len() < 2 {
+        return false;
+    }
+    let mut i = a.len() - 1;
+    while i > 0 && a[i - 1] >= a[i] {
+        i -= 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    let mut j = a.len() - 1;
+    while a[j] <= a[i - 1] {
+        j -= 1;
+    }
+    a.swap(i - 1, j);
+    a[i..].reverse();
+    true
+}
+
+/// Crossings between two adjacent layer orderings: the number of inverted pairs
+/// among the edges running between them (`below[u]` lists u's lower-layer
+/// neighbours). Edges sharing an endpoint never count.
+fn bilayer_x(upper: &[usize], lower: &[usize], below: &[Vec<usize>]) -> usize {
+    let mut es: Vec<(usize, usize)> = Vec::new();
+    for (ru, &u) in upper.iter().enumerate() {
+        for &w in &below[u] {
+            if let Some(rw) = lower.iter().position(|&x| x == w) {
+                es.push((ru, rw));
+            }
+        }
+    }
+    let mut c = 0;
+    for i in 0..es.len() {
+        for j in (i + 1)..es.len() {
+            let (a, b) = (es[i], es[j]);
+            if a.0 != b.0 && a.1 != b.1 && (a.0 < b.0) != (a.1 < b.1) {
+                c += 1;
+            }
+        }
+    }
+    c
+}
+
+/// Branch-and-bound recursion: assign an ordering to each layer in turn, adding
+/// the crossings of each freshly-completed adjacent layer pair, pruning any
+/// branch that already reaches the incumbent. Returns false if the node budget
+/// is exhausted (search incomplete → result not certified).
+#[allow(clippy::too_many_arguments)]
+fn bnb_rec(
+    l: usize,
+    chosen: &mut Vec<Vec<usize>>,
+    partial: usize,
+    layer_sets: &[Vec<usize>],
+    below: &[Vec<usize>],
+    n_layers: usize,
+    incumbent: &mut usize,
+    best: &mut Vec<Vec<usize>>,
+    budget: &mut u64,
+) -> bool {
+    if l == n_layers {
+        if partial < *incumbent {
+            *incumbent = partial;
+            best.clone_from(chosen);
+        }
+        return true;
+    }
+    let mut perm = layer_sets[l].clone();
+    perm.sort_unstable();
+    loop {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let added = if l > 0 {
+            bilayer_x(&chosen[l - 1], &perm, below)
+        } else {
+            0
+        };
+        let np = partial + added;
+        if np < *incumbent {
+            chosen[l].clone_from(&perm);
+            if !bnb_rec(
+                l + 1,
+                chosen,
+                np,
+                layer_sets,
+                below,
+                n_layers,
+                incumbent,
+                best,
+                budget,
+            ) {
+                return false;
+            }
+        }
+        if !next_perm(&mut perm) {
+            break;
+        }
+    }
+    true
+}
+
+/// Exact, provably-minimum layered crossing number via branch-and-bound, seeded
+/// with a heuristic incumbent. Returns `Some((min, order))` once the search
+/// completes within budget (the minimum is then *certified*), or `None` if the
+/// instance is too large to prove optimality (caller keeps the heuristic result).
+fn bnb_min(
+    incumbent_order: &[Vec<usize>],
+    below: &[Vec<usize>],
+    n_layers: usize,
+    incumbent_val: usize,
+) -> Option<(usize, Vec<Vec<usize>>)> {
+    // Skip instances whose permutation space is hopeless even with pruning.
+    let mut est: u128 = 1;
+    for s in incumbent_order {
+        let mut f: u128 = 1;
+        for k in 1..=s.len() as u128 {
+            f = f.saturating_mul(k);
+        }
+        est = est.saturating_mul(f);
+        if est > 5_000_000_000 {
+            return None;
+        }
+    }
+    let mut budget: u64 = 8_000_000;
+    let mut incumbent = incumbent_val;
+    let mut best = incumbent_order.to_vec();
+    let mut chosen = vec![Vec::new(); n_layers];
+    let completed = bnb_rec(
+        0,
+        &mut chosen,
+        0,
+        incumbent_order,
+        below,
+        n_layers,
+        &mut incumbent,
+        &mut best,
+        &mut budget,
+    );
+    if completed {
+        Some((incumbent, best))
+    } else {
+        None
+    }
+}
+
 /// Normalised perspective scale (~0.3 far .. 3.2 near) from camera-space depth.
 fn pscale_of(depth: f32) -> f32 {
     (REF_DISTANCE / depth).clamp(0.3, 3.2)
@@ -763,7 +919,6 @@ impl Graph {
         for (u, &l) in unit_layer.iter().enumerate() {
             layer_tiles[l].push(u);
         }
-        let mut pos: Vec<f32> = vec![0.0; n_units];
 
         // Layer x-offsets depend only on each layer's widest unit, not on the
         // within-layer order, so compute them once.
@@ -824,124 +979,166 @@ impl Graph {
             x
         };
 
-        // Crossing minimisation = iterated barycenter + transpose (the Graphviz
-        // `dot` strategy), wrapped in deterministic multi-start to escape local
-        // minima. Per refine pass, each round does: (1) barycenter — reorder
-        // every layer by the mean position of its neighbours, the classic global
-        // heuristic; then (2) transpose — greedily swap adjacent tiles whenever
-        // it strictly lowers the *actual* geometric crossing count, to a fixed
-        // point. Re-seeding barycenter from the transposed order propagates an
-        // ordering win across layers. Some optima need a *coordinated* reorder
-        // of two coupled layers at once (e.g. an admin control-star plus a
-        // many-to-one relay fan-in), which single adjacent swaps can't reach in
-        // one basin — so when a pass doesn't hit zero we restart from the best
-        // order with each layer shuffled (a fixed-seed xorshift, hence fully
-        // repeatable) and refine again, keeping the global best. Crossing
-        // minimisation is NP-hard, so this targets the minimum rather than
-        // proving it; in practice it reaches 0 for the network shapes Rustynet
-        // produces (forest-like data paths + a control plane).
-        let mut seed: u64 = (m as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ (tedges.len() as u64).wrapping_add(0xD1B5_4A32_D192_ED03);
-        let mut next_rand = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        // One barycenter pass (up-sweep then down-sweep), the classic global
-        // crossing-reduction heuristic: order each layer by the mean position of
-        // its neighbours. Seeded from the current order; mutates layer_tiles+pos.
-        let barycenter = |layer_tiles: &mut [Vec<usize>], pos: &mut [f32]| {
-            for lt in layer_tiles.iter() {
-                for (i, &t) in lt.iter().enumerate() {
-                    pos[t] = i as f32;
+        // ---- Exact layered crossing minimisation ----
+        // With dummies inserted, every connection spans exactly one layer, so
+        // the only crossings are *inversions between adjacent layers*: edges
+        // (u->a) and (v->b) cross iff u,v and a,b are oppositely ordered. The sum
+        // over adjacent layers is the well-studied layered (Sugiyama) crossing
+        // number. Minimising it is NP-hard (Garey & Johnson; Eades & Wormald for
+        // the two-layer case), so there is no polynomial closed-form "formula" —
+        // but the established method (ILP / branch-and-bound, cf. Jünger & Mutzel
+        // and the OGDF library) computes the exact minimum, and for the small
+        // per-layer tile counts Rustynet produces we both reach it and *certify*
+        // it. Pipeline: (1) a strong heuristic incumbent — optimal per-layer
+        // reordering (the Linear Ordering Problem, solved exactly by Held-Karp
+        // subset DP) iterated in up/down sweeps with deterministic multi-start;
+        // then (2) branch-and-bound over layer permutations which, when it
+        // finishes within budget, proves the global minimum.
+
+        // above[u]/below[u] = connected units one layer up / down.
+        let mut above: Vec<Vec<usize>> = vec![Vec::new(); n_units];
+        let mut below: Vec<Vec<usize>> = vec![Vec::new(); n_units];
+        for u in 0..n_units {
+            for &w in &adj[u] {
+                if unit_layer[w] == unit_layer[u] + 1 {
+                    below[u].push(w);
+                } else if unit_layer[w] + 1 == unit_layer[u] {
+                    above[u].push(w);
                 }
             }
-            for &dir_down in &[true, false] {
-                let seq: Vec<usize> = if dir_down {
-                    (0..n_layers).collect()
-                } else {
-                    (0..n_layers).rev().collect()
-                };
-                for li in seq {
-                    let mut order: Vec<(f32, usize)> = layer_tiles[li]
-                        .iter()
-                        .map(|&t| {
-                            let (mut s, mut c) = (0.0, 0.0);
-                            for &nb in &adj[t] {
-                                s += pos[nb];
-                                c += 1.0;
-                            }
-                            (if c > 0.0 { s / c } else { pos[t] }, t)
-                        })
-                        .collect();
-                    order
-                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                    layer_tiles[li] = order.iter().map(|(_, t)| *t).collect();
-                    for (i, &t) in layer_tiles[li].iter().enumerate() {
-                        pos[t] = i as f32;
-                    }
-                }
-            }
+        }
+        let total_cross = |order: &[Vec<usize>]| -> usize {
+            (0..n_layers.saturating_sub(1))
+                .map(|l| bilayer_x(&order[l], &order[l + 1], &below))
+                .sum()
         };
 
-        // Greedy local search to a fixed point on the *true* crossing count:
-        // accept any within-layer pair swap (not just adjacent — the full
-        // neighbourhood) that strictly lowers crossings. Returns the count.
-        let local_min = |layer_tiles: &mut [Vec<usize>]| -> usize {
-            let mut best = count(&assign(layer_tiles));
-            let mut improved = true;
-            let mut guard = 0;
-            while improved && guard < 64 {
-                improved = false;
-                guard += 1;
-                for l in 0..n_layers {
-                    let len = layer_tiles[l].len();
-                    for i in 0..len {
-                        for j in (i + 1)..len {
-                            layer_tiles[l].swap(i, j);
-                            let c = count(&assign(layer_tiles));
-                            if c < best {
-                                best = c;
-                                improved = true;
-                            } else {
-                                layer_tiles[l].swap(i, j); // revert
+        // Exact optimal ordering of one layer with both neighbours fixed: the
+        // Linear Ordering Problem on the pairwise crossing matrix, solved by
+        // Held-Karp subset DP (O(2^k * k^2)). Layers wider than DP_MAX are left
+        // as-is (the sweeps and B&B still drive the global result down).
+        const DP_MAX: usize = 12;
+        let optimal_layer = |order: &mut Vec<Vec<usize>>, l: usize| {
+            let units = order[l].clone();
+            let n = units.len();
+            if !(2..=DP_MAX).contains(&n) {
+                return;
+            }
+            let mut rank = vec![usize::MAX; n_units];
+            if l > 0 {
+                for (i, &u) in order[l - 1].iter().enumerate() {
+                    rank[u] = i;
+                }
+            }
+            if l + 1 < n_layers {
+                for (i, &u) in order[l + 1].iter().enumerate() {
+                    rank[u] = i;
+                }
+            }
+            // cost when x is placed left of y: crossings between their edges to
+            // the (fixed) neighbour layers.
+            let cost_dir = |x: usize, y: usize| -> usize {
+                let mut c = 0;
+                for nbr in [&below, &above] {
+                    for &a in &nbr[x] {
+                        let ra = rank[a];
+                        if ra == usize::MAX {
+                            continue;
+                        }
+                        for &b in &nbr[y] {
+                            let rb = rank[b];
+                            if rb != usize::MAX && rb < ra {
+                                c += 1;
                             }
                         }
                     }
                 }
+                c
+            };
+            let mut kk = vec![vec![0usize; n]; n];
+            for i in 0..n {
+                for j in 0..n {
+                    if i != j {
+                        kk[i][j] = cost_dir(units[i], units[j]);
+                    }
+                }
             }
-            best
+            let size = 1usize << n;
+            let mut dp = vec![usize::MAX; size];
+            let mut choice = vec![usize::MAX; size];
+            dp[0] = 0;
+            for mask in 0..size {
+                if dp[mask] == usize::MAX {
+                    continue;
+                }
+                for j in 0..n {
+                    if mask & (1 << j) != 0 {
+                        continue;
+                    }
+                    let mut add = 0;
+                    let mut mm = mask;
+                    while mm != 0 {
+                        let i = mm.trailing_zeros() as usize;
+                        add += kk[i][j];
+                        mm &= mm - 1;
+                    }
+                    let nm = mask | (1 << j);
+                    let cand = dp[mask] + add;
+                    if cand < dp[nm] {
+                        dp[nm] = cand;
+                        choice[nm] = j;
+                    }
+                }
+            }
+            let mut seq = Vec::with_capacity(n);
+            let mut mask = size - 1;
+            while mask != 0 {
+                let j = choice[mask];
+                seq.push(units[j]);
+                mask &= !(1 << j);
+            }
+            seq.reverse();
+            order[l] = seq;
         };
 
-        // Primary: a deterministic forest ordering. With dummies inserted every
-        // edge spans exactly one layer, so the data path is (near-)tree-shaped;
-        // rooting at the top layer and laying each subtree out contiguously via
-        // DFS is the textbook crossing-free tree drawing. This nails the coupled
-        // optima that local moves can't build up (multi-parent fan-ins, a long
-        // edge routed past a hub), leaving only genuine non-tree edges (e.g. an
-        // admin control star) for the search below to repair. Deterministic, so
-        // repeatable for any topology/size.
-        {
+        // Iterated optimal sweeps to a fixed point.
+        let sweep_optimize = |order: &mut Vec<Vec<usize>>| -> usize {
+            let mut prev = total_cross(order);
+            for _ in 0..8 {
+                for l in 0..n_layers {
+                    optimal_layer(order, l);
+                }
+                for l in (0..n_layers).rev() {
+                    optimal_layer(order, l);
+                }
+                let c = total_cross(order);
+                if c >= prev {
+                    break;
+                }
+                prev = c;
+            }
+            total_cross(order)
+        };
+
+        // Incumbent: seed from the deterministic forest (DFS) ordering — with
+        // dummies the data path is (near-)tree-shaped, and contiguous-subtree
+        // placement is the textbook crossing-free tree drawing — then optimal-
+        // sweep it, then diversify with a fixed-seed multi-start.
+        let mut best_order = {
             let mut children: Vec<Vec<usize>> = vec![Vec::new(); n_units];
             let mut has_parent = vec![false; n_units];
             for u in 0..n_units {
-                for &v in &adj[u] {
-                    // Parent = neighbour one layer up (toward the exits/roots).
-                    if unit_layer[u] + 1 == unit_layer[v] {
-                        // v is a parent of u; record u as v's child once.
-                        if !children[v].contains(&u) {
-                            children[v].push(u);
-                        }
-                        has_parent[u] = true;
+                for &v in &above[u] {
+                    if !children[v].contains(&u) {
+                        children[v].push(u);
                     }
+                    has_parent[u] = true;
                 }
             }
             for ch in children.iter_mut() {
-                ch.sort_unstable(); // stable, repeatable child order
+                ch.sort_unstable();
             }
             let mut roots: Vec<usize> = (0..n_units).filter(|&u| !has_parent[u]).collect();
-            // Highest layers first so each root's subtree is laid out as a block.
             roots.sort_by_key(|&u| (std::cmp::Reverse(unit_layer[u]), u));
             let mut order_layers: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
             let mut visited = vec![false; n_units];
@@ -969,54 +1166,56 @@ impl Graph {
                     order_layers[unit_layer[u]].push(u);
                 }
             }
-            layer_tiles = order_layers;
-        }
+            order_layers
+        };
+        let mut best_cross = sweep_optimize(&mut best_order);
 
-        // Refine the forest ordering with local search (repairs non-tree edges),
-        // then keep the best ordering seen across everything below.
-        let mut best_order = layer_tiles.clone();
-        let mut best_cross = local_min(&mut layer_tiles);
-        if best_cross < count(&assign(&best_order)) {
-            best_order = layer_tiles.clone();
-        }
-        for _ in 0..12 {
+        let mut seed: u64 = (m as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (tedges.len() as u64).wrapping_add(0xD1B5_4A32_D192_ED03);
+        let mut next_rand = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut trial = best_order.clone();
+        for _ in 0..40 {
             if best_cross == 0 {
                 break;
             }
-            barycenter(&mut layer_tiles, &mut pos);
-            let c = local_min(&mut layer_tiles);
-            if c < best_cross {
-                best_cross = c;
-                best_order = layer_tiles.clone();
-            }
-        }
-        // Multi-start: shuffle every layer (fixed-seed xorshift => repeatable)
-        // and run local search ONLY. Skipping barycenter here is deliberate —
-        // it would collapse the shuffle straight back into the same basin,
-        // whereas the shuffle's joint, all-layers-at-once exploration is exactly
-        // what reaches the coupled optima that single-layer moves can't build up
-        // (e.g. a many-to-one relay fan-in, or a long edge routed past a hub).
-        for _ in 0..200 {
-            if best_cross == 0 {
-                break;
-            }
-            layer_tiles = best_order.clone();
-            for lt in layer_tiles.iter_mut() {
+            trial.clone_from(&best_order);
+            for lt in trial.iter_mut() {
                 for i in (1..lt.len()).rev() {
                     let j = (next_rand() % (i as u64 + 1)) as usize;
                     lt.swap(i, j);
                 }
             }
-            let c = local_min(&mut layer_tiles);
+            let c = sweep_optimize(&mut trial);
             if c < best_cross {
                 best_cross = c;
-                best_order = layer_tiles.clone();
+                best_order.clone_from(&trial);
             }
         }
+
+        // Certify (or improve) with branch-and-bound. If it completes within
+        // budget, the result is the proven global minimum for this layering.
+        let certified = match bnb_min(&best_order, &below, n_layers, best_cross) {
+            Some((minv, order)) => {
+                best_cross = minv;
+                best_order = order;
+                true
+            }
+            None => false,
+        };
         layer_tiles = best_order;
 
         let centers = assign(&layer_tiles);
-        let crossings = count(&centers);
+        let crossings = best_cross;
+        debug_assert_eq!(
+            crossings,
+            count(&centers),
+            "combinatorial and geometric crossing counts must agree"
+        );
         // Centre on the real tiles only (dummy units are routing artefacts).
         let mut mid = V3::default();
         for c in &centers[..m] {
@@ -1024,8 +1223,13 @@ impl Graph {
         }
         mid = mid.scale(1.0 / m.max(1) as f32);
         eprintln!(
-            "[layout] tile connections = {}, crossings = {crossings}",
-            tedges.len()
+            "[layout] tile connections = {}, crossings = {crossings} ({})",
+            tedges.len(),
+            if certified {
+                "proven minimum"
+            } else {
+                "best found (instance too large to certify)"
+            }
         );
         if std::env::var("RUSTYNET_DEBUG_XINGS").is_ok() {
             let desc = |u: usize| -> String {
