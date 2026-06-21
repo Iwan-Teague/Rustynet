@@ -44,30 +44,46 @@ Nodes are grouped into **galaxies** — one per `(hub, role)`, e.g. the clients 
 Within a galaxy, members are spread evenly with Vogel's Fibonacci-sunflower disc
 model, leaving a clear margin to the polygon border.
 
-Galaxies and backbone nodes are then placed by a **layered (Sugiyama) layout**
-that explicitly minimises connection-line crossings — the layout the user keeps
-asking about ("no needless overlaps"). The pipeline, in order:
+Connections are always drawn as **straight lines**. Galaxies and backbone nodes
+are placed by a **layered (Sugiyama) layout** that computes the **provable
+minimum** number of straight-line crossings — not merely "a low number".
+
+Crossing minimisation is **NP-hard** (Garey & Johnson; Eades & Wormald proved
+even the two-layer case is hard), so there is no polynomial closed-form formula.
+The established route to the exact optimum is ILP / branch-and-bound (cf. Jünger
+& Mutzel; the OGDF library). For the small *per-layer tile counts* Rustynet
+produces, we compute that exact optimum and **certify** it. Pipeline:
 
 1. **Layering by flow rank** — sources (clients/nas/llm/admin) → anchor → relay →
-   exit become left-to-right columns, matching the real data path.
-2. **Dummy nodes on skip-layer edges** — an edge that jumps layers (e.g. an
-   anchor egressing straight to an exit, or an admin control link to a relay)
-   gets virtual waypoints in the intermediate layers, so it can be routed
-   *between* other nodes instead of slicing across them.
-3. **Deterministic forest ordering (primary)** — with dummies in place the data
-   path is (near-)tree-shaped, so each subtree is laid out contiguously via a
-   rooted DFS. This is the textbook crossing-free tree drawing and resolves the
-   coupled cases (multi-parent relay fan-ins, long edges past a hub) that local
-   moves alone can't.
-4. **Barycenter + pairwise local search + multi-start (repair)** — cleans up any
-   genuinely non-tree edges (e.g. an admin control star). Crossing minimisation
-   is NP-hard, so this targets the minimum rather than proving it; for the
-   network shapes Rustynet produces it reaches **zero**.
+   exit become left-to-right bands, matching the real data path.
+2. **Dummy nodes on skip-layer edges** make every edge span one layer, turning
+   the problem into the classic layered crossing number (a sum of adjacent-layer
+   inversions).
+3. **Strong heuristic incumbent** — optimal per-layer reordering (the Linear
+   Ordering Problem, solved exactly by Held-Karp subset DP) iterated in up/down
+   sweeps, seeded from a deterministic forest (DFS) ordering, with fixed-seed
+   multi-start.
+4. **Branch-and-bound** over layer permutations with incumbent pruning and a
+   budget gate. When it completes it **proves** the global minimum; the layout
+   prints `crossings = N (proven minimum)`. (Huge instances that blow the budget
+   keep the heuristic result, printed as `best found`.)
 
-Everything is deterministic (fixed-seed), so the same topology always lays out
-the same way, at any size. The overview distance auto-fits the world bounds.
-Regression tests in `src/main.rs` assert zero edge crossings on the demo plus
-stress topologies (`cargo test`). Run the binary with `RUSTYNET_DEBUG_XINGS=1`
+Because a polyline (via dummies) can only avoid crossings a straight line would
+have, when the straight-line count equals the certified layered minimum the
+straight drawing is itself provably minimal — which holds for the shapes
+Rustynet produces. A K₃,₃ block, for example, certifies its true minimum of 9.
+
+To stay "like a universe" rather than a grid, each galaxy gets its own rotation
+and a polygon whose vertex count grows with its node count (a pentagon for the
+smallest), and every tile is nudged off the grid by a deterministic amount —
+kept only at the largest scale that adds **zero** crossings, so the proven
+minimum is never sacrificed. Within a galaxy, nodes fill the disc via Vogel's
+sunflower with predetermined, evenly-spaced node↔node and node↔border gaps.
+
+Everything is deterministic (fixed-seed) and repeatable at any size; the overview
+camera auto-fits the world bounds. Regression tests in `src/main.rs` assert zero
+edge crossings on the demo plus stress topologies, the polygon-growth rule, and
+the data-flow schedule (`cargo test`). Run the binary with `RUSTYNET_DEBUG_XINGS=1`
 to print any residual crossing pairs to stderr.
 
 ## Isolation / why it's a separate crate
