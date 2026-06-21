@@ -187,10 +187,63 @@ fn edge_has_flow(kind: &str) -> bool {
 }
 
 /// Layout tunables.
-const LINK_DISTANCE: f32 = 14.0;
-const CHARGE: f32 = -260.0; // node repulsion
-const GRAVITY: f32 = 0.015; // pull toward centre
+const CHARGE: f32 = -180.0; // base node repulsion (scaled per-role below)
+const GRAVITY: f32 = 0.011; // pull toward centre
 const DAMPING: f32 = 0.86;
+const MAX_SPEED: f32 = 5.0; // per-step velocity clamp (stops blow-ups)
+
+// Spring rest lengths: leaves hug their hub (tight orbit), backbone spreads out.
+const LEAF_LINK: f32 = 10.0;
+const BACKBONE_LINK: f32 = 26.0;
+// Collision/separation: nodes never overlap. World radius = size_mult * this,
+// and every pair is kept at least (r_a + r_b + NODE_MARGIN) apart.
+const NODE_WORLD_R: f32 = 2.6;
+const NODE_MARGIN: f32 = 7.5;
+const COLLISION_K: f32 = 0.5;
+
+/// Leaf roles orbit the node their path follows; backbone roles form the skeleton.
+fn is_leaf_role(role: &str) -> bool {
+    matches!(role, "client" | "nas" | "llm")
+}
+
+/// Per-role repulsion weight: backbone pushes harder so each hub's cluster ends
+/// up in a distinct location; leaves push gently so they stay near their hub.
+fn role_repulsion(role: &str) -> f32 {
+    if is_leaf_role(role) {
+        0.6
+    } else {
+        1.7
+    }
+}
+
+/// World-space collision radius for a role.
+fn role_world_radius(role: &str) -> f32 {
+    role_style(role).size_mult * NODE_WORLD_R
+}
+
+/// Spring rest length for an edge (short when a leaf is involved).
+fn edge_rest_length(kind: &str, leaf_either: bool) -> f32 {
+    let base = if leaf_either {
+        LEAF_LINK
+    } else {
+        BACKBONE_LINK
+    };
+    match kind {
+        "control" => base * 1.1,
+        "potential" => base * 1.35,
+        _ => base,
+    }
+}
+
+/// Spring strength per edge kind: the actual data path binds tightest.
+fn edge_spring_k(kind: &str) -> f32 {
+    match kind {
+        "data_path" => 0.07,
+        "control" => 0.04,
+        "potential" => 0.015,
+        _ => 0.035,
+    }
+}
 
 // ----------------------- THEME / GLOBAL CONSTANTS ----------------------
 const BG: Color32 = Color32::from_rgb(64, 69, 80); // window background (grey)
@@ -439,10 +492,24 @@ impl Graph {
         Graph { nodes, edges }
     }
 
-    /// One step of a light spring-electrical force-directed layout in 3D.
+    /// One step of a spring-electrical force-directed layout in 3D, with role-
+    /// weighted repulsion (distinct hub clusters), short leaf links (satellites
+    /// orbit their hub) and a hard separation force (guaranteed spacing).
     fn step_layout(&mut self) {
         let n = self.nodes.len();
-        // Repulsion (O(n^2) — fine at prototype scale).
+        // Precompute per-node repulsion weight + collision radius once.
+        let w: Vec<f32> = self
+            .nodes
+            .iter()
+            .map(|nd| role_repulsion(&nd.role))
+            .collect();
+        let r: Vec<f32> = self
+            .nodes
+            .iter()
+            .map(|nd| role_world_radius(&nd.role))
+            .collect();
+
+        // Repulsion + hard separation (O(n^2) — fine at prototype scale).
         for i in 0..n {
             for j in (i + 1)..n {
                 let d = self.nodes[i].pos.sub(self.nodes[j].pos);
@@ -451,23 +518,38 @@ impl Graph {
                     d2 = 0.01;
                 }
                 let dist = d2.sqrt();
-                let f = CHARGE / d2;
                 let dir = d.scale(1.0 / dist);
+
+                // Inverse-square repulsion, scaled by both roles' weight.
+                let f = CHARGE * w[i] * w[j] / d2;
                 let push = dir.scale(f);
                 self.nodes[i].vel = self.nodes[i].vel.sub(push);
                 self.nodes[j].vel = self.nodes[j].vel.add(push);
+
+                // Hard separation: never let two nodes' glows overlap.
+                let min_sep = r[i] + r[j] + NODE_MARGIN;
+                if dist < min_sep {
+                    let sep = dir.scale((min_sep - dist) * COLLISION_K);
+                    self.nodes[i].vel = self.nodes[i].vel.add(sep);
+                    self.nodes[j].vel = self.nodes[j].vel.sub(sep);
+                }
             }
         }
-        // Spring attraction along edges.
+
+        // Spring attraction along edges (variable rest length + per-kind strength).
         for e in &self.edges {
+            let leaf = is_leaf_role(&self.nodes[e.a].role) || is_leaf_role(&self.nodes[e.b].role);
+            let rest = edge_rest_length(&e.kind, leaf);
+            let k = edge_spring_k(&e.kind);
             let d = self.nodes[e.b].pos.sub(self.nodes[e.a].pos);
             let dist = d.len().max(0.01);
-            let f = (dist - LINK_DISTANCE) * 0.05;
+            let f = (dist - rest) * k;
             let pull = d.scale(1.0 / dist).scale(f);
             self.nodes[e.a].vel = self.nodes[e.a].vel.add(pull);
             self.nodes[e.b].vel = self.nodes[e.b].vel.sub(pull);
         }
-        // Gravity toward centre + integrate.
+
+        // Gravity toward centre + integrate (with a velocity clamp).
         for node in &mut self.nodes {
             if node.pinned {
                 node.vel = V3::default();
@@ -475,6 +557,10 @@ impl Graph {
             }
             node.vel = node.vel.sub(node.pos.scale(GRAVITY));
             node.vel = node.vel.scale(DAMPING);
+            let speed = node.vel.len();
+            if speed > MAX_SPEED {
+                node.vel = node.vel.scale(MAX_SPEED / speed);
+            }
             node.pos = node.pos.add(node.vel);
         }
     }
@@ -565,7 +651,7 @@ impl App {
         Self {
             graph,
             cam: Camera::default(),
-            settle: 260,
+            settle: 520,
             show_labels: true,
             animate_flow: true,
             auto_rotate: false,
@@ -1291,6 +1377,14 @@ fn demo_graph() -> GraphDto {
                 "100.64.0.54",
                 "linux",
             ),
+            // Extra endpoints so the local grouping (satellites orbiting their
+            // hub) is visible: several clients on each anchor.
+            node("eu-phone", "client", "online", "100.64.0.60", "android"),
+            node("eu-tablet", "client", "online", "100.64.0.61", "ios"),
+            node("eu-desktop", "client", "online", "100.64.0.62", "linux"),
+            node("us-laptop", "client", "online", "100.64.0.63", "macos"),
+            node("us-phone", "client", "connecting", "100.64.0.64", "android"),
+            node("us-tablet", "client", "online", "100.64.0.65", "ios"),
         ],
         edges: vec![
             // Example data path: client -> anchor -> relay -> exit.
@@ -1302,6 +1396,13 @@ fn demo_graph() -> GraphDto {
             edge("phone", "anchor-eu", "data_path"),
             edge("laptop-mac", "nas-vault", "data_path"),
             edge("pc-win", "llm-box", "data_path"),
+            // Extra client groups orbiting their anchor.
+            edge("eu-phone", "anchor-eu", "data_path"),
+            edge("eu-tablet", "anchor-eu", "data_path"),
+            edge("eu-desktop", "anchor-eu", "data_path"),
+            edge("us-laptop", "anchor-us", "data_path"),
+            edge("us-phone", "anchor-us", "data_path"),
+            edge("us-tablet", "anchor-us", "data_path"),
             // Control-plane links.
             edge("admin-01", "anchor-eu", "control"),
             edge("admin-01", "anchor-us", "control"),
