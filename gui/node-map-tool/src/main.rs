@@ -200,9 +200,9 @@ const BACKBONE_LINK: f32 = 26.0;
 const NODE_WORLD_R: f32 = 2.6;
 const NODE_MARGIN: f32 = 7.5;
 const COLLISION_K: f32 = 0.5;
-// Cohesion: leaves sharing a hub are pulled toward their group's centre so they
-// clump into one local group (instead of spreading into a ring around the hub).
-const COHESION_K: f32 = 0.06;
+// Cohesion: leaves of the same role sharing a hub are pulled toward their
+// sub-group's centre so they clump tightly (instead of spreading into a ring).
+const COHESION_K: f32 = 0.09;
 
 /// Leaf roles orbit the node their path follows; backbone roles form the skeleton.
 fn is_leaf_role(role: &str) -> bool {
@@ -296,6 +296,22 @@ fn role_flow_rank(role: &str) -> i32 {
         "relay" => 2,
         "exit" | "blind_exit" => 3,
         _ => 1, // admin/unknown (control edges don't pulse anyway)
+    }
+}
+
+/// Small stable ordinal per role, used to build a (hub, role) grouping key so
+/// each role forms its own sub-cluster around a shared hub.
+fn role_ord(role: &str) -> u64 {
+    match role {
+        "client" => 1,
+        "nas" => 2,
+        "llm" => 3,
+        "admin" => 4,
+        "anchor" => 5,
+        "relay" => 6,
+        "exit" => 7,
+        "blind_exit" => 8,
+        _ => 0,
     }
 }
 
@@ -557,6 +573,14 @@ impl Graph {
             .iter()
             .map(|nd| role_world_radius(&nd.role))
             .collect();
+        // Grouping key = (hub, role): leaves of the same role sharing a hub form
+        // one sub-cluster (they cohere, don't repel); other roles on the same
+        // hub are separate groups and still repel.
+        let group: Vec<Option<u64>> = self
+            .nodes
+            .iter()
+            .map(|nd| nd.hub.map(|h| (h as u64) * 16 + role_ord(&nd.role)))
+            .collect();
 
         // Repulsion + hard separation (O(n^2) — fine at prototype scale).
         for i in 0..n {
@@ -569,10 +593,9 @@ impl Graph {
                 let dist = d2.sqrt();
                 let dir = d.scale(1.0 / dist);
 
-                // Same-group leaves don't repel (so they clump); everyone else
-                // gets inverse-square repulsion, scaled by both roles' weight.
-                let same_group =
-                    self.nodes[i].hub.is_some() && self.nodes[i].hub == self.nodes[j].hub;
+                // Same (hub, role) leaves don't repel (so they clump); everyone
+                // else gets inverse-square repulsion, scaled by both roles' weight.
+                let same_group = group[i].is_some() && group[i] == group[j];
                 if !same_group {
                     let f = CHARGE * w[i] * w[j] / d2;
                     let push = dir.scale(f);
@@ -603,20 +626,20 @@ impl Graph {
             self.nodes[e.b].vel = self.nodes[e.b].vel.sub(pull);
         }
 
-        // Group cohesion: pull each leaf toward the centre of its hub-group so
-        // the satellites of a hub clump together (one tight group) instead of
-        // spreading evenly around it.
-        let mut group_sum: HashMap<usize, (V3, u32)> = HashMap::new();
-        for node in &self.nodes {
-            if let Some(h) = node.hub {
-                let entry = group_sum.entry(h).or_insert((V3::default(), 0));
+        // Group cohesion: pull each leaf toward the centre of its (hub, role)
+        // sub-group so same-role satellites of a hub clump into one tight group,
+        // kept separate from the hub's other role groups.
+        let mut group_sum: HashMap<u64, (V3, u32)> = HashMap::new();
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if let Some(g) = group[idx] {
+                let entry = group_sum.entry(g).or_insert((V3::default(), 0));
                 entry.0 = entry.0.add(node.pos);
                 entry.1 += 1;
             }
         }
-        for node in &mut self.nodes {
-            if let Some(h) = node.hub {
-                if let Some(&(sum, count)) = group_sum.get(&h) {
+        for (idx, node) in self.nodes.iter_mut().enumerate() {
+            if let Some(g) = group[idx] {
+                if let Some(&(sum, count)) = group_sum.get(&g) {
                     if count > 1 {
                         let centroid = sum.scale(1.0 / count as f32);
                         node.vel = node.vel.add(centroid.sub(node.pos).scale(COHESION_K));
@@ -783,9 +806,13 @@ impl eframe::App for App {
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
         let time = ctx.input(|i| i.time) as f32;
 
-        // Layout settling + auto-rotate + live demo.
+        // Layout settling + auto-rotate + live demo. Run several substeps per
+        // frame so the force layout fully converges (and doesn't freeze mid-
+        // migration) within a few seconds.
         if self.settle > 0 {
-            self.graph.step_layout();
+            for _ in 0..4 {
+                self.graph.step_layout();
+            }
             self.settle -= 1;
         }
         if self.auto_rotate {
@@ -1445,7 +1472,9 @@ fn demo_graph() -> GraphDto {
             node("exit-nl", "exit", "online", "100.64.0.30", "linux"),
             node("exit-blind", "blind_exit", "online", "100.64.0.31", "linux"),
             node("nas-vault", "nas", "online", "100.64.0.40", "linux"),
+            node("nas-cache", "nas", "online", "100.64.0.42", "linux"),
             node("llm-box", "llm", "connecting", "100.64.0.41", "linux"),
+            node("llm-edge", "llm", "online", "100.64.0.43", "linux"),
             node("laptop-mac", "client", "online", "100.64.0.50", "macos"),
             node("pc-win", "client", "online", "100.64.0.51", "windows"),
             node("phone", "client", "connecting", "100.64.0.52", "ios"),
@@ -1477,7 +1506,9 @@ fn demo_graph() -> GraphDto {
             // Service nodes (nas/llm) hang off anchors; clients reach them via
             // the anchor rather than connecting to them directly.
             edge("nas-vault", "anchor-eu", "data_path"),
+            edge("nas-cache", "anchor-eu", "data_path"),
             edge("llm-box", "anchor-us", "data_path"),
+            edge("llm-edge", "anchor-us", "data_path"),
             // Extra client groups orbiting their anchor.
             edge("eu-phone", "anchor-eu", "data_path"),
             edge("eu-tablet", "anchor-eu", "data_path"),
