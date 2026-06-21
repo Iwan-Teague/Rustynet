@@ -17185,6 +17185,7 @@ fn git_worktree_is_dirty() -> Result<bool, String> {
         ".",
         ":(exclude)documents/operations/live_lab_run_matrix.csv",
         ":(exclude)documents/operations/gate_timings.csv",
+        ":(exclude)documents/operations/live_lab_stage_timings.csv",
     ]);
     let output = run_output_with_timeout(
         &mut command,

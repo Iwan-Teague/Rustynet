@@ -1787,7 +1787,8 @@ run_stage() {
   fi
 
   finished_at="$(date -u +%FT%TZ)"
-  local _stage_elapsed; _stage_elapsed="$(format_elapsed_duration "$(( $(date +%s) - _stage_started_unix ))")"
+  local _stage_elapsed_secs=$(( $(date +%s) - _stage_started_unix ))
+  local _stage_elapsed; _stage_elapsed="$(format_elapsed_duration "$_stage_elapsed_secs")"
   if [[ "$rc" -ne 0 ]]; then
     status="fail"
     printf '[stage:%s] FAIL rc=%s (%s)\n' "$stage_name" "$rc" "$_stage_elapsed" | tee -a "$log_path"
@@ -1803,6 +1804,7 @@ run_stage() {
     printf '[stage:%s] PASS (%s)\n' "$stage_name" "$_stage_elapsed" | tee -a "$log_path"
   fi
   record_stage "$stage_name" "$severity" "$status" "$rc" "$log_path" "$description" "$started_at" "$finished_at"
+  record_stage_timing "$stage_name" "$_stage_elapsed_secs" "$status" "$started_at"
   update_overall_status "$severity" "$status"
   refresh_failure_digest
   if [[ "$status" == "fail" && "$severity" == "hard" ]]; then
@@ -4807,6 +4809,29 @@ current_run_git_status_is_dirty() {
   [[ -s "$STATE_DIR/git_status.txt" ]]
 }
 
+# Append one row per stage to documents/operations/live_lab_stage_timings.csv,
+# mirroring the cargo gate timings in documents/operations/gate_timings.csv
+# (identical schema). Best-effort: a logging failure must NEVER affect the
+# stage result, so everything here is guarded and the function always returns 0.
+record_stage_timing() {
+  local stage_name="$1" duration_secs="$2" outcome="$3" timestamp="${4:-}"
+  local csv="${ROOT_DIR}/documents/operations/live_lab_stage_timings.csv"
+  local header="timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome"
+  local commit dirty scope ts
+  ts="${timestamp:-$(date -u +%FT%TZ 2>/dev/null)}"
+  commit="$(current_run_git_commit_short 2>/dev/null || printf 'unknown')"
+  if current_run_git_status_is_dirty 2>/dev/null; then dirty="dirty"; else dirty="clean"; fi
+  scope="$(basename "${REPORT_DIR:-live-lab}" 2>/dev/null || printf 'live-lab')"
+  # Create the file with a header on first write.
+  if [[ ! -f "$csv" ]]; then
+    printf '%s\n' "$header" >> "$csv" 2>/dev/null || return 0
+  fi
+  printf '%s,%s,%s,%s,%s,%s,%s\n' \
+    "$ts" "$commit" "$dirty" "$stage_name" "$scope" "${duration_secs:-0}" "$outcome" \
+    >> "$csv" 2>/dev/null || true
+  return 0
+}
+
 current_local_source_tree_is_dirty() {
   git -C "$ROOT_DIR" status --short --untracked-files=all -- \
     . \
@@ -4815,6 +4840,7 @@ current_local_source_tree_is_dirty() {
     ':(exclude)profiles/live_lab' \
     ':(exclude)documents/operations/live_lab_run_matrix.csv' \
     ':(exclude)documents/operations/gate_timings.csv' \
+    ':(exclude)documents/operations/live_lab_stage_timings.csv' \
     ':(exclude)state/' | grep -q .
 }
 

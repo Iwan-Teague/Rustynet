@@ -1080,6 +1080,29 @@ mod tests {
         );
     }
 
+    /// Every live-lab stage must automatically append a duration row to
+    /// documents/operations/live_lab_stage_timings.csv, mirroring how cargo
+    /// gate timings land in documents/operations/gate_timings.csv (identical
+    /// schema). run_stage is the single choke point (run_setup_stage delegates
+    /// to it), so the timing helper must be defined and invoked there, and it
+    /// must target the dedicated sibling CSV — not the gate-timings file.
+    #[test]
+    fn live_lab_run_stage_logs_per_stage_timing_to_csv() {
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains("record_stage_timing() {"),
+            "orchestrator must define the record_stage_timing helper"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR
+                .contains("record_stage_timing \"$stage_name\" \"$_stage_elapsed_secs\" \"$status\" \"$started_at\""),
+            "run_stage must invoke record_stage_timing with the raw elapsed seconds and finalized status"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains("documents/operations/live_lab_stage_timings.csv"),
+            "stage timings must be appended to the dedicated live_lab_stage_timings.csv sibling file"
+        );
+    }
+
     /// Regression guard for the macOS stale-bundle enforce wedge. The legacy
     /// bash enforce path (`enforce_runtime_worker_macos`) and the bootstrap
     /// install invocation must forward the same relaxed lab freshness window
