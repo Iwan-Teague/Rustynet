@@ -100,6 +100,11 @@ CROSS_NETWORK_CLIENT_UNDERLAY_IP="${RUSTYNET_CROSS_NETWORK_CLIENT_UNDERLAY_IP:-}
 CROSS_NETWORK_EXIT_UNDERLAY_IP="${RUSTYNET_CROSS_NETWORK_EXIT_UNDERLAY_IP:-}"
 CROSS_NETWORK_RELAY_UNDERLAY_IP="${RUSTYNET_CROSS_NETWORK_RELAY_UNDERLAY_IP:-}"
 CROSS_NETWORK_PROBE_UNDERLAY_IP="${RUSTYNET_CROSS_NETWORK_PROBE_UNDERLAY_IP:-}"
+# D5.1 substrate selector (CrossNetworkSubstrateIntegrationSpec_2026-06-21):
+#   netns  — Tier A "internet in a box" on one guest (deterministic NAT-matrix gate)
+#   vxlan  — Tier B VXLAN overlay; the existing SSH remote-exit validators run here
+#   slirp  — Tier C cross-OS smoke (not wired yet)
+CROSS_NETWORK_SUBSTRATE="${RUSTYNET_CROSS_NETWORK_SUBSTRATE:-netns}"
 CROSS_NETWORK_NAT_PROFILE_LIST=()
 CROSS_NETWORK_REQUIRED_NAT_PROFILE_LIST=()
 
@@ -1036,6 +1041,17 @@ cross_network_stages_applicable() {
   if [[ "$CROSS_NETWORK_MODE" == "skip" ]]; then
     CROSS_NETWORK_SKIP_REASON="skipped by --skip-cross-network"
     return 1
+  fi
+  # Tier A netns builds its own NAT'd networks inside ONE guest's namespaces, so
+  # it does NOT require distinct client/exit VM underlay prefixes (the same-LAN
+  # UTM topology is fine). Applicable whenever cross-network is not skipped and an
+  # exit guest exists.
+  if [[ "$CROSS_NETWORK_SUBSTRATE" == "netns" ]]; then
+    if [[ -z "$(node_target_for_label exit)" ]]; then
+      CROSS_NETWORK_SKIP_REASON="netns substrate requires an exit guest"
+      return 1
+    fi
+    return 0
   fi
   if [[ "$CROSS_NETWORK_MODE" == "force" ]]; then
     return 0
@@ -7288,6 +7304,39 @@ stage_run_cross_network_preflight() {
     --signed-artifact-max-age-secs "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" >/dev/null
 }
 
+# Tier A (dataplane plan D5.1 / CrossNetworkSubstrateIntegrationSpec_2026-06-21):
+# the deterministic NAT mapping/filtering classification gate. Both
+# netns_nat_classify.sh and netns_nat_filter.sh build and tear down their own
+# rnsim-* network-namespace topology on the guest (no host networking, no
+# rustynetd) and assert each NAT profile's mapping (endpoint-independent cone vs
+# endpoint-dependent symmetric) and filtering behaviour matches the §4.1 matrix
+# the traversal design relies on. Run as root on the exit guest.
+stage_run_cross_network_nat_classification() {
+  local guest tool local_path
+  guest="$(node_target_for_label exit)" || return 1
+  # The netns scripts need python3 (STUN responder + NAT probes), nft, and
+  # iproute2 netns. Lab guests have no internet egress, so a missing tool cannot
+  # be installed mid-run; fail fast with an actionable message rather than a
+  # cryptic mid-script "command not found".
+  if ! live_lab_run_root "$guest" "root python3 --version >/dev/null 2>&1 && root nft --version >/dev/null 2>&1 && root ip -V >/dev/null 2>&1"; then
+    printf 'cross_network_nat_classification: %s is missing python3/nft/iproute2 required by the netns substrate (no egress to install — bake into the guest image)\n' "$guest" >&2
+    return 1
+  fi
+  for tool in netns_internet_sim.sh netns_nat_classify.sh netns_nat_filter.sh \
+              stun_responder.py nat_probe.py nat_filter_probe.py; do
+    local_path="$ROOT_DIR/scripts/vm_lab/$tool"
+    if [[ ! -f "$local_path" ]]; then
+      printf 'cross_network_nat_classification: missing tool %s\n' "$local_path" >&2
+      return 1
+    fi
+    live_lab_scp_to "$local_path" "$guest" "/tmp/$tool" || return 1
+  done
+  printf '[cross-network] netns NAT mapping classification (netns_nat_classify.sh) on %s\n' "$guest"
+  live_lab_run_root "$guest" "root bash /tmp/netns_nat_classify.sh" || return 1
+  printf '[cross-network] netns NAT filtering classification (netns_nat_filter.sh) on %s\n' "$guest"
+  live_lab_run_root "$guest" "root bash /tmp/netns_nat_filter.sh" || return 1
+}
+
 stage_run_cross_network_nat_matrix() {
   local output_path="$REPORT_DIR/cross_network_remote_exit_nat_matrix_validation.md"
   cargo run --quiet -p rustynet-cli -- ops validate-cross-network-nat-matrix \
@@ -7946,6 +7995,12 @@ parse_args() {
       --skip-cross-network) CROSS_NETWORK_MODE="skip"; shift ;;
       --force-cross-network) CROSS_NETWORK_MODE="force"; shift ;;
       --cross-network-nat-profiles) CROSS_NETWORK_NAT_PROFILES="$2"; shift 2 ;;
+      --cross-network-substrate)
+        case "$2" in
+          netns|vxlan|slirp) CROSS_NETWORK_SUBSTRATE="$2" ;;
+          *) printf 'invalid --cross-network-substrate %q (expected netns|vxlan|slirp)\n' "$2" >&2; return 1 ;;
+        esac
+        shift 2 ;;
       --cross-network-required-nat-profiles) CROSS_NETWORK_REQUIRED_NAT_PROFILES="$2"; shift 2 ;;
       --cross-network-impairment-profile) CROSS_NETWORK_IMPAIRMENT_PROFILE="$2"; shift 2 ;;
       --cross-network-max-time-skew-secs) CROSS_NETWORK_MAX_TIME_SKEW_SECS="$2"; shift 2 ;;
@@ -8497,7 +8552,38 @@ main() {
   fi
 
   local cross_network_stage_rc=0 stage_rc=0
-  if cross_network_stages_applicable; then
+  if cross_network_stages_applicable && [[ "$CROSS_NETWORK_SUBSTRATE" == "netns" ]]; then
+    # Tier A (dataplane plan D5.1 / CrossNetworkSubstrateIntegrationSpec_2026-06-21):
+    # a self-contained netns "internet in a box" NAT-classification gate runs
+    # entirely on one Debian guest (no separate cross-network VMs). It proves each
+    # NAT profile produces its intended mapping/filtering behaviour — the §4.1
+    # oracle. The SSH-based remote-exit stages assume separate-VM hosts on distinct
+    # subnets and run on substrate=vxlan instead; record them skipped here so the
+    # stage matrix stays honest.
+    local nat_profile nat_idx stage_suffix
+    set +e
+    run_stage hard cross_network_nat_classification 'verify NAT mapping/filtering behaviour for each profile via the netns internet simulator (Tier A)' stage_run_cross_network_nat_classification
+    stage_rc=$?
+    if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+      cross_network_stage_rc="$stage_rc"
+    fi
+    local xn_netns_skip='substrate=netns: Tier A NAT-classification gate covers this; SSH remote-exit stages run on substrate=vxlan'
+    record_stage_skip cross_network_preflight hard "$xn_netns_skip"
+    for nat_idx in "${!CROSS_NETWORK_NAT_PROFILE_LIST[@]}"; do
+      nat_profile="${CROSS_NETWORK_NAT_PROFILE_LIST[$nat_idx]}"
+      stage_suffix="$(cross_network_stage_suffix_for_profile_index "$nat_idx" "$nat_profile")"
+      record_stage_skip "cross_network_direct_remote_exit${stage_suffix}" hard "$xn_netns_skip"
+      record_stage_skip "cross_network_relay_remote_exit${stage_suffix}" hard "$xn_netns_skip"
+      record_stage_skip "cross_network_failback_roaming${stage_suffix}" hard "$xn_netns_skip"
+      record_stage_skip "cross_network_controller_switch${stage_suffix}" hard "$xn_netns_skip"
+      record_stage_skip "cross_network_node_network_switch${stage_suffix}" hard "$xn_netns_skip"
+      record_stage_skip "cross_network_traversal_adversarial${stage_suffix}" hard "$xn_netns_skip"
+      record_stage_skip "cross_network_remote_exit_dns${stage_suffix}" hard "$xn_netns_skip"
+      record_stage_skip "cross_network_remote_exit_soak${stage_suffix}" hard "$xn_netns_skip"
+    done
+    record_stage_skip cross_network_nat_matrix hard "$xn_netns_skip"
+    set -e
+  elif cross_network_stages_applicable; then
     local nat_profile nat_idx stage_suffix profile_report profile_log
     set +e
     run_stage hard cross_network_preflight 'verify cross-network validator prerequisites (time skew, DNS health, cryptographic signed-state verification, daemon health, discovery bundle validation, required binaries/services)' stage_run_cross_network_preflight
