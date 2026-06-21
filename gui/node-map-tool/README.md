@@ -45,7 +45,7 @@ own (`cargo build`, `cargo clippy --all-targets`, `cargo fmt -- --check`).
 
 ## Data contract & wiring to the real daemon
 
-Input JSON matches `../node-map-prototype/data-contract.md`:
+Input JSON matches [`DATA_CONTRACT.md`](DATA_CONTRACT.md):
 
 ```jsonc
 {
@@ -59,14 +59,17 @@ Input JSON matches `../node-map-prototype/data-contract.md`:
 - **Statuses**: `online`, `connecting`, `offline`, `powered_off`.
 - **Edge kinds**: `data_path` (animated flow), `control`, `potential`.
 
+See [`DATA_CONTRACT.md`](DATA_CONTRACT.md) for the full shape + suggested wiring.
+
 To make it live later, have `rustynetd` emit this JSON (a file, a local socket,
 or a command) and replace `load_graph()` / the `simulate()` demo loop with a
 real feed. All role/status/edge/colour/layout styling is isolated in the CONFIG
 section at the top of `src/main.rs` for easy retheming.
 
-## Relationship to the browser prototype
+## Visual design (Claude handoff)
 
-`../node-map-prototype/` is the original zero-build HTML/Three.js reference
-(GPU bloom in a browser). **This** crate is the native Rust implementation of
-the same idea and the same data contract. Use the browser one for quick visual
-experiments; use this one as the basis for the shipped GUI.
+The visual language is being refined with Claude. [`CLAUDE_DESIGN_BRIEF.md`](CLAUDE_DESIGN_BRIEF.md)
+is a self-contained, copy-paste brief: paste the whole file into Claude and it
+returns (a) an HTML mockup to eyeball and (b) paste-ready Rust that drops over
+the CONFIG section here. The brief encodes the egui painter constraints so the
+design stays 1:1 portable to this app.
