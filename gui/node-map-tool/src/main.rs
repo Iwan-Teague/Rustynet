@@ -255,10 +255,15 @@ const TEXT_HI: Color32 = Color32::from_rgb(232, 238, 248);
 const TEXT_DIM: Color32 = Color32::from_rgb(186, 194, 210);
 
 // ------------------------------ GLOW -----------------------------------
-// 3 tight halo layers (outer -> inner) plus one coloured core dot.
-const GLOW_RADIUS_MULT: [f32; 3] = [1.9, 1.45, 1.12]; // x core_r
-const GLOW_ALPHA: [f32; 3] = [0.12, 0.22, 0.36];
-const GLOW_COLOR_MIX: [f32; 3] = [0.00, 0.07, 0.15]; // lerp(role->WARM_WHITE)
+// A smooth, faint glow built from many thin layers whose radius shrinks AND
+// whose alpha fades from the core outward, so they blend into a soft aura
+// rather than reading as discrete rings.
+const GLOW_LAYERS: usize = 14;
+const GLOW_OUTER: f32 = 1.8; // outermost halo radius (x core_r)
+const GLOW_INNER: f32 = 1.0; // innermost halo radius (meets the core)
+const GLOW_PEAK: f32 = 0.085; // strongest per-layer alpha (nearest the core)
+const GLOW_FALLOFF: f32 = 2.6; // higher = faster fade outward (fainter halo)
+const GLOW_WARM: f32 = 0.15; // how much the inner glow warms toward WARM_WHITE
 const CORE_R_MULT: f32 = 0.72;
 const CORE_ALPHA: f32 = 0.95;
 
@@ -1061,14 +1066,14 @@ impl App {
 
                     let core_r = core_r_of(rs.size_mult, d.p.depth);
 
-                    // 3 tight halo layers (outer -> inner): only the outer 2 obey status.glow.
-                    for i in 0..3 {
-                        let r = core_r * GLOW_RADIUS_MULT[i];
-                        let col = lerp_color(color, WARM_WHITE, GLOW_COLOR_MIX[i]);
-                        let mut a = GLOW_ALPHA[i] * bri;
-                        if i < 2 {
-                            a *= glow_op;
-                        }
+                    // Smooth faint glow: many thin layers, radius + alpha both
+                    // falling off from the core outward (blends, no rings).
+                    for i in 0..GLOW_LAYERS {
+                        // t: 0 at the outermost layer -> 1 at the innermost.
+                        let t = i as f32 / (GLOW_LAYERS - 1) as f32;
+                        let r = core_r * (GLOW_INNER + (GLOW_OUTER - GLOW_INNER) * (1.0 - t));
+                        let a = GLOW_PEAK * t.powf(GLOW_FALLOFF) * bri * glow_op;
+                        let col = lerp_color(color, WARM_WHITE, t * GLOW_WARM);
                         painter.circle_filled(d.p.screen, r, with_alpha(col, a));
                     }
                     // Coloured core dot (role colour, lifted just slightly).
@@ -1080,7 +1085,7 @@ impl App {
                     );
 
                     // Selection / hover ring.
-                    let ring_r = core_r * GLOW_RADIUS_MULT[0] + 4.0;
+                    let ring_r = core_r * GLOW_OUTER + 4.0;
                     if self.selected == Some(d.idx) {
                         painter.circle_stroke(
                             d.p.screen,
