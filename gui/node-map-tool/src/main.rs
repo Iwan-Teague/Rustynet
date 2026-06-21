@@ -11,7 +11,7 @@
 //! Usage:
 //!   rustynet-node-map [topology.json]
 //! With no argument it shows built-in demo data + simulated live updates.
-//! The JSON shape matches ../node-map-prototype/data-contract.md.
+//! The JSON shape matches DATA_CONTRACT.md.
 //!
 //! Everything Rustynet-domain-specific (roles, statuses, edge kinds, colours,
 //! layout tunables) lives in the CONFIG section so it is easy to retheme and to
@@ -417,7 +417,7 @@ impl Graph {
 }
 
 // ===========================================================================
-// DATA CONTRACT (input DTOs) — matches data-contract.md
+// DATA CONTRACT (input DTOs) — matches DATA_CONTRACT.md
 // ===========================================================================
 
 #[derive(Deserialize, Default)]

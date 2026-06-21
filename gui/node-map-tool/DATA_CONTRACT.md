@@ -85,31 +85,29 @@ Defined in `EDGE_KINDS`:
 Flow particles only travel when both endpoints are `online` and the edge is
 `active`, so the animation always reflects real reachability.
 
-## Runtime API
+## How the native tool consumes this
 
-```js
-// Replace the whole graph (initial load or full refresh):
-window.RustynetNodeMap.setGraph({ nodes, edges });
+The native app (`src/main.rs`) reads this JSON either from a file argument
+(`cargo run -- topology.json`) or falls back to built-in demo data:
 
-// Patch a single node in place (status/role/meta change):
-window.RustynetNodeMap.updateNode("phone", { status: "online" });
-window.RustynetNodeMap.updateNode("box-7", { role: "relay" }); // recolours live
-
-// Inspect current state:
-window.RustynetNodeMap.getNodes();
+```rust
+// load_graph() reads the JSON into the input DTOs (GraphDto/NodeDto/EdgeDto),
+// then Graph::from_dto(..) builds the live model.
+let graph = load_graph();
 ```
 
 ### Suggested wiring (later)
 
-```js
-const ws = new WebSocket("ws://127.0.0.1:PORT/topology");
-ws.onmessage = (ev) => {
-  const msg = JSON.parse(ev.data);
-  if (msg.type === "snapshot") RustynetNodeMap.setGraph(msg.graph);
-  if (msg.type === "node_update") RustynetNodeMap.updateNode(msg.id, msg.patch);
-};
-```
+To make it live, have `rustynetd` emit this JSON and feed it in continuously.
+Two simple options:
 
-The daemon side should emit a `snapshot` on connect, then incremental
-`node_update` deltas. Keep the JSON contract above stable so the view and the
-backend can evolve independently.
+- **Poll a file / endpoint:** re-read the JSON on an interval and call
+  `Graph::from_dto(..)` to rebuild, or diff against the current model.
+- **Stream deltas over a local socket:** the daemon emits a full `snapshot`
+  on connect, then incremental `node_update` messages; apply each patch to the
+  matching `Node` in place (status/role changes are cheap; a role change just
+  re-reads `role_style`).
+
+Replace `load_graph()` / the `simulate()` demo loop in `src/main.rs` with the
+real feed. Keep the JSON contract above stable so the view and the backend can
+evolve independently.
