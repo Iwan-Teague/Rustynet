@@ -182,65 +182,24 @@ fn edge_has_flow(kind: &str) -> bool {
     kind == "data_path"
 }
 
-/// Layout tunables.
-const CHARGE: f32 = -180.0; // base node repulsion (scaled per-role below)
-const GRAVITY: f32 = 0.011; // pull toward centre
-const DAMPING: f32 = 0.86;
-const MAX_SPEED: f32 = 5.0; // per-step velocity clamp (stops blow-ups)
+/// Galaxy layout tunables. Placement is deterministic (no force sim): each role
+/// gets its own "galaxy" — a packed disc of its nodes — laid out left-to-right
+/// along the data-flow path.
+const GALAXY_COL_SPACING: f32 = 80.0; // world gap between role columns (flow axis)
+const GALAXY_ROW_SPACING: f32 = 66.0; // world gap between stacked roles in a column
+const NODE_GAP: f32 = 7.0; // packing spacing of nodes within a galaxy
+const GALAXY_PAD: f32 = 16.0; // screen px padding of a galaxy border past its nodes
 
-// Spring rest lengths: leaves hug their hub (tight orbit), backbone spreads out.
-const LEAF_LINK: f32 = 10.0;
-const BACKBONE_LINK: f32 = 26.0;
-// Collision/separation: nodes never overlap. World radius = size_mult * this,
-// and every pair is kept at least (r_a + r_b + NODE_MARGIN) apart.
-const NODE_WORLD_R: f32 = 2.6;
-const NODE_MARGIN: f32 = 7.5;
-const COLLISION_K: f32 = 0.5;
-// Cohesion: leaves of the same role sharing a hub are pulled toward their
-// sub-group's centre so they clump tightly (instead of spreading into a ring).
-const COHESION_K: f32 = 0.09;
-
-/// Leaf roles orbit the node their path follows; backbone roles form the skeleton.
-fn is_leaf_role(role: &str) -> bool {
-    matches!(role, "client" | "nas" | "llm")
-}
-
-/// Per-role repulsion weight: backbone pushes harder so each hub's cluster ends
-/// up in a distinct location; leaves push gently so they stay near their hub.
-fn role_repulsion(role: &str) -> f32 {
-    if is_leaf_role(role) {
-        0.6
-    } else {
-        1.7
-    }
-}
-
-/// World-space collision radius for a role.
-fn role_world_radius(role: &str) -> f32 {
-    role_style(role).size_mult * NODE_WORLD_R
-}
-
-/// Spring rest length for an edge (short when a leaf is involved).
-fn edge_rest_length(kind: &str, leaf_either: bool) -> f32 {
-    let base = if leaf_either {
-        LEAF_LINK
-    } else {
-        BACKBONE_LINK
-    };
-    match kind {
-        "control" => base * 1.1,
-        "potential" => base * 1.35,
-        _ => base,
-    }
-}
-
-/// Spring strength per edge kind: the actual data path binds tightest.
-fn edge_spring_k(kind: &str) -> f32 {
-    match kind {
-        "data_path" => 0.07,
-        "control" => 0.04,
-        "potential" => 0.015,
-        _ => 0.035,
+/// Column for a role along the data-flow axis: operator | sources | anchor |
+/// relay | exit. Determines left-to-right galaxy placement.
+fn galaxy_col(role: &str) -> i32 {
+    match role {
+        "admin" => 0,
+        "client" | "nas" | "llm" => 1,
+        "anchor" => 2,
+        "relay" => 3,
+        "exit" | "blind_exit" => 4,
+        _ => 1,
     }
 }
 
@@ -271,7 +230,7 @@ const CORE_R_MULT: f32 = 0.9; // node ball radius (x core_r)
 // (Node bodies are NOT depth-tinted, so same-role nodes keep a consistent shade;
 // depth is conveyed by size.)
 const DEPTH_FOG_MAX: f32 = 0.45;
-const REF_DISTANCE: f32 = 135.0;
+const REF_DISTANCE: f32 = 410.0;
 
 // ------------------------------ PULSE ----------------------------------
 // Pulses propagate as a synchronized wave toward the exit: a node emits its
@@ -292,22 +251,6 @@ fn role_flow_rank(role: &str) -> i32 {
         "relay" => 2,
         "exit" | "blind_exit" => 3,
         _ => 1, // admin/unknown (control edges don't pulse anyway)
-    }
-}
-
-/// Small stable ordinal per role, used to build a (hub, role) grouping key so
-/// each role forms its own sub-cluster around a shared hub.
-fn role_ord(role: &str) -> u64 {
-    match role {
-        "client" => 1,
-        "nas" => 2,
-        "llm" => 3,
-        "admin" => 4,
-        "anchor" => 5,
-        "relay" => 6,
-        "exit" => 7,
-        "blind_exit" => 8,
-        _ => 0,
     }
 }
 
@@ -373,7 +316,8 @@ impl V3 {
     }
 }
 
-/// Orbit camera around a target point.
+/// Fixed angled top-down camera. Rotation is disabled (the view stays a
+/// controlled isometric-style map); only pan + zoom are allowed.
 struct Camera {
     target: V3,
     yaw: f32,
@@ -386,10 +330,10 @@ impl Default for Camera {
     fn default() -> Self {
         Self {
             target: V3::default(),
-            yaw: 0.6,
-            pitch: 0.35,
-            distance: 95.0,
-            fov: 55_f32.to_radians(),
+            yaw: 0.0,
+            pitch: 0.95, // look down at an angle (not straight down)
+            distance: 460.0,
+            fov: 50_f32.to_radians(),
         }
     }
 }
@@ -447,14 +391,11 @@ struct Node {
     status: String,
     meta: BTreeMap<String, String>,
     pos: V3,
-    vel: V3,
+    /// True when the position came from the data feed (don't auto-place it).
     pinned: bool,
     /// Smoothly-ramped "lit" factor (0..1) that eases toward the status target
     /// so a node fading up on connect/online doesn't pop.
     lit: f32,
-    /// For leaf nodes: the index of the upstream hub (anchor) they attach to.
-    /// Leaves sharing a hub form one local group (they cohere, don't repel).
-    hub: Option<usize>,
 }
 
 /// Steady-state lit target per status (drives the smooth ramp).
@@ -503,17 +444,11 @@ impl Graph {
     fn from_dto(dto: GraphDto) -> Self {
         let mut nodes = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
-        let n_total = dto.nodes.len().max(1);
-        for (i, nd) in dto.nodes.into_iter().enumerate() {
+        for nd in dto.nodes.into_iter() {
             let pinned = nd.position.is_some();
             let pos = match &nd.position {
                 Some(p) => V3::new(p.x, p.y, p.z),
-                None => {
-                    // Scatter on a ring so the force layout has somewhere to start.
-                    let t = (i as f32 / n_total as f32) * std::f32::consts::TAU;
-                    let r = 18.0 + (i as f32 * 2.3).sin().abs() * 14.0;
-                    V3::new(t.cos() * r, ((i as f32) * 1.7).sin() * 10.0, t.sin() * r)
-                }
+                None => V3::default(), // placed by layout_galaxies()
             };
             index.insert(nd.id.clone(), nodes.len());
             let status = nd.status.unwrap_or_else(|| "offline".into());
@@ -525,10 +460,8 @@ impl Graph {
                 status,
                 meta: nd.meta,
                 pos,
-                vel: V3::default(),
                 pinned,
                 lit,
-                hub: None,
             });
         }
         let mut edges = Vec::new();
@@ -543,40 +476,55 @@ impl Graph {
             }
         }
 
-        // Assign each leaf node its hub: the connected node nearest the exit
-        // (highest flow rank). Leaves sharing a hub form one local group.
-        for i in 0..nodes.len() {
-            if !is_leaf_role(&nodes[i].role) {
-                continue;
-            }
-            let my_rank = role_flow_rank(&nodes[i].role);
-            let mut best: Option<(i32, usize)> = None;
-            for e in &edges {
-                let other = if e.a == i {
-                    Some(e.b)
-                } else if e.b == i {
-                    Some(e.a)
-                } else {
-                    None
-                };
-                if let Some(o) = other {
-                    let r = role_flow_rank(&nodes[o].role);
-                    if r > my_rank && best.is_none_or(|(br, _)| r > br) {
-                        best = Some((r, o));
-                    }
-                }
-            }
-            nodes[i].hub = best.map(|(_, o)| o);
-        }
-
         let mut graph = Graph {
             nodes,
             edges,
             fire_at: Vec::new(),
             cycle_len: 0.0,
         };
+        graph.layout_galaxies();
         graph.compute_pulse_schedule();
         graph
+    }
+
+    /// Deterministic galaxy layout: group nodes by role, give each role its own
+    /// "galaxy" laid out left-to-right by data-flow column (operator | sources |
+    /// anchor | relay | exit) and stacked within a column, then pack each role's
+    /// nodes into a disc (phyllotaxis) on the y=0 plane. Pinned nodes keep their
+    /// supplied position.
+    fn layout_galaxies(&mut self) {
+        use std::collections::BTreeMap as Map;
+        // Bucket node indices by role (BTreeMap keeps a stable role order).
+        let mut by_role: Map<String, Vec<usize>> = Map::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.pinned {
+                continue;
+            }
+            by_role.entry(n.role.clone()).or_default().push(i);
+        }
+        // Group roles into columns; within a column, stack roles in rows.
+        let mut cols: Map<i32, Vec<String>> = Map::new();
+        for role in by_role.keys() {
+            cols.entry(galaxy_col(role)).or_default().push(role.clone());
+        }
+        let col_keys: Vec<i32> = cols.keys().copied().collect();
+        let col_center = (col_keys.len() as f32 - 1.0) * 0.5;
+        for (ci, col) in col_keys.iter().enumerate() {
+            let roles = &cols[col];
+            let row_center = (roles.len() as f32 - 1.0) * 0.5;
+            let x = (ci as f32 - col_center) * GALAXY_COL_SPACING;
+            for (ri, role) in roles.iter().enumerate() {
+                let z = (ri as f32 - row_center) * GALAXY_ROW_SPACING;
+                let center = V3::new(x, 0.0, z);
+                // Pack this role's nodes around the galaxy centre (sunflower).
+                let members = &by_role[role];
+                for (k, &idx) in members.iter().enumerate() {
+                    let ang = k as f32 * 2.399_963_2; // golden angle
+                    let rr = NODE_GAP * (k as f32).sqrt();
+                    self.nodes[idx].pos = center.add(V3::new(rr * ang.cos(), 0.0, rr * ang.sin()));
+                }
+            }
+        }
     }
 
     /// Orient a data-path edge upstream -> downstream (lower flow rank -> higher,
@@ -622,113 +570,6 @@ impl Graph {
         }
         self.fire_at = fire_at;
         self.cycle_len = cycle;
-    }
-
-    /// One step of a spring-electrical force-directed layout in 3D, with role-
-    /// weighted repulsion (distinct hub clusters), short leaf links (satellites
-    /// orbit their hub) and a hard separation force (guaranteed spacing).
-    fn step_layout(&mut self) {
-        let n = self.nodes.len();
-        // Precompute per-node repulsion weight + collision radius once.
-        let w: Vec<f32> = self
-            .nodes
-            .iter()
-            .map(|nd| role_repulsion(&nd.role))
-            .collect();
-        let r: Vec<f32> = self
-            .nodes
-            .iter()
-            .map(|nd| role_world_radius(&nd.role))
-            .collect();
-        // Grouping key = (hub, role): leaves of the same role sharing a hub form
-        // one sub-cluster (they cohere, don't repel); other roles on the same
-        // hub are separate groups and still repel.
-        let group: Vec<Option<u64>> = self
-            .nodes
-            .iter()
-            .map(|nd| nd.hub.map(|h| (h as u64) * 16 + role_ord(&nd.role)))
-            .collect();
-
-        // Repulsion + hard separation (O(n^2) — fine at prototype scale).
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let d = self.nodes[i].pos.sub(self.nodes[j].pos);
-                let mut d2 = d.dot(d);
-                if d2 < 0.01 {
-                    d2 = 0.01;
-                }
-                let dist = d2.sqrt();
-                let dir = d.scale(1.0 / dist);
-
-                // Same (hub, role) leaves don't repel (so they clump); everyone
-                // else gets inverse-square repulsion, scaled by both roles' weight.
-                let same_group = group[i].is_some() && group[i] == group[j];
-                if !same_group {
-                    let f = CHARGE * w[i] * w[j] / d2;
-                    let push = dir.scale(f);
-                    self.nodes[i].vel = self.nodes[i].vel.sub(push);
-                    self.nodes[j].vel = self.nodes[j].vel.add(push);
-                }
-
-                // Hard separation: never let two nodes' glows overlap.
-                let min_sep = r[i] + r[j] + NODE_MARGIN;
-                if dist < min_sep {
-                    let sep = dir.scale((min_sep - dist) * COLLISION_K);
-                    self.nodes[i].vel = self.nodes[i].vel.add(sep);
-                    self.nodes[j].vel = self.nodes[j].vel.sub(sep);
-                }
-            }
-        }
-
-        // Spring attraction along edges (variable rest length + per-kind strength).
-        for e in &self.edges {
-            let leaf = is_leaf_role(&self.nodes[e.a].role) || is_leaf_role(&self.nodes[e.b].role);
-            let rest = edge_rest_length(&e.kind, leaf);
-            let k = edge_spring_k(&e.kind);
-            let d = self.nodes[e.b].pos.sub(self.nodes[e.a].pos);
-            let dist = d.len().max(0.01);
-            let f = (dist - rest) * k;
-            let pull = d.scale(1.0 / dist).scale(f);
-            self.nodes[e.a].vel = self.nodes[e.a].vel.add(pull);
-            self.nodes[e.b].vel = self.nodes[e.b].vel.sub(pull);
-        }
-
-        // Group cohesion: pull each leaf toward the centre of its (hub, role)
-        // sub-group so same-role satellites of a hub clump into one tight group,
-        // kept separate from the hub's other role groups.
-        let mut group_sum: HashMap<u64, (V3, u32)> = HashMap::new();
-        for (idx, node) in self.nodes.iter().enumerate() {
-            if let Some(g) = group[idx] {
-                let entry = group_sum.entry(g).or_insert((V3::default(), 0));
-                entry.0 = entry.0.add(node.pos);
-                entry.1 += 1;
-            }
-        }
-        for (idx, node) in self.nodes.iter_mut().enumerate() {
-            if let Some(g) = group[idx] {
-                if let Some(&(sum, count)) = group_sum.get(&g) {
-                    if count > 1 {
-                        let centroid = sum.scale(1.0 / count as f32);
-                        node.vel = node.vel.add(centroid.sub(node.pos).scale(COHESION_K));
-                    }
-                }
-            }
-        }
-
-        // Gravity toward centre + integrate (with a velocity clamp).
-        for node in &mut self.nodes {
-            if node.pinned {
-                node.vel = V3::default();
-                continue;
-            }
-            node.vel = node.vel.sub(node.pos.scale(GRAVITY));
-            node.vel = node.vel.scale(DAMPING);
-            let speed = node.vel.len();
-            if speed > MAX_SPEED {
-                node.vel = node.vel.scale(MAX_SPEED / speed);
-            }
-            node.pos = node.pos.add(node.vel);
-        }
     }
 }
 
@@ -807,10 +648,9 @@ fn with_alpha(c: Color32, a: f32) -> Color32 {
 struct App {
     graph: Graph,
     cam: Camera,
-    settle: i32,
     show_labels: bool,
     animate_flow: bool,
-    auto_rotate: bool,
+    show_galaxies: bool,
     live_sim: bool,
     hidden_roles: HashSet<String>,
     selected: Option<usize>,
@@ -823,10 +663,9 @@ impl App {
         Self {
             graph,
             cam: Camera::default(),
-            settle: 520,
             show_labels: true,
             animate_flow: true,
-            auto_rotate: false,
+            show_galaxies: true,
             live_sim: true,
             hidden_roles: HashSet::new(),
             selected: None,
@@ -873,18 +712,7 @@ impl eframe::App for App {
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
         let time = ctx.input(|i| i.time) as f32;
 
-        // Layout settling + auto-rotate + live demo. Run several substeps per
-        // frame so the force layout fully converges (and doesn't freeze mid-
-        // migration) within a few seconds.
-        if self.settle > 0 {
-            for _ in 0..4 {
-                self.graph.step_layout();
-            }
-            self.settle -= 1;
-        }
-        if self.auto_rotate {
-            self.cam.yaw += dt * 0.25;
-        }
+        // Live demo status churn (layout is now static/deterministic).
         if self.live_sim {
             self.sim_accum += dt;
             if self.sim_accum >= 1.8 {
@@ -967,19 +795,17 @@ impl App {
                 ui.label(egui::RichText::new("VIEW").weak().small());
                 ui.checkbox(&mut self.show_labels, "Labels");
                 ui.checkbox(&mut self.animate_flow, "Animate data paths");
-                ui.checkbox(&mut self.auto_rotate, "Auto-rotate");
+                ui.checkbox(&mut self.show_galaxies, "Galaxy borders");
                 ui.checkbox(&mut self.live_sim, "Live demo updates");
                 ui.add_space(6.0);
-                if ui.button("Reset camera").clicked() {
+                if ui.button("Reset view").clicked() {
                     self.cam = Camera::default();
                 }
                 ui.add_space(10.0);
                 ui.label(
-                    egui::RichText::new(
-                        "Drag: orbit · scroll: zoom · right-drag: pan · click a node to inspect.",
-                    )
-                    .weak()
-                    .small(),
+                    egui::RichText::new("Drag: pan · scroll: zoom · click a node to inspect.")
+                        .weak()
+                        .small(),
                 );
             });
 
@@ -1044,35 +870,27 @@ impl App {
                     ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
                 let rect = response.rect;
 
-                // ----- camera interaction -----
+                // ----- camera interaction (pan + zoom only; no rotation) -----
                 if response.dragged() {
                     let d = response.drag_delta();
-                    if response.dragged_by(egui::PointerButton::Secondary)
-                        || response.dragged_by(egui::PointerButton::Middle)
-                    {
-                        // Pan: move the target in the camera plane.
-                        let cam = self.cam.position();
-                        let forward = self.cam.target.sub(cam).norm();
-                        let right = forward.cross(V3::new(0.0, 1.0, 0.0)).norm();
-                        let up = right.cross(forward);
-                        let k = self.cam.distance * 0.0015;
-                        self.cam.target = self
-                            .cam
-                            .target
-                            .add(right.scale(-d.x * k))
-                            .add(up.scale(d.y * k));
-                    } else {
-                        // Orbit.
-                        self.cam.yaw += d.x * 0.01;
-                        self.cam.pitch = (self.cam.pitch + d.y * 0.01).clamp(-1.5, 1.5);
-                    }
+                    // Pan: slide the target in the camera's screen plane.
+                    let cam = self.cam.position();
+                    let forward = self.cam.target.sub(cam).norm();
+                    let right = forward.cross(V3::new(0.0, 1.0, 0.0)).norm();
+                    let up = right.cross(forward);
+                    let k = self.cam.distance * 0.0016;
+                    self.cam.target = self
+                        .cam
+                        .target
+                        .add(right.scale(-d.x * k))
+                        .add(up.scale(d.y * k));
                 }
                 if response.hovered() {
                     let scroll =
                         ctx.input(|i| i.smooth_scroll_delta.y + (i.zoom_delta() - 1.0) * 200.0);
                     if scroll != 0.0 {
                         self.cam.distance =
-                            (self.cam.distance * (1.0 - scroll * 0.0015)).clamp(12.0, 600.0);
+                            (self.cam.distance * (1.0 - scroll * 0.0015)).clamp(60.0, 1400.0);
                     }
                 }
 
@@ -1091,6 +909,38 @@ impl App {
                     }
                     if let Some(p) = self.cam.project(node.pos, rect) {
                         drawn.push(Drawn { idx, p });
+                    }
+                }
+
+                // ----- galaxy borders: one bordered region per role -----
+                if self.show_galaxies {
+                    let mut groups: std::collections::BTreeMap<&str, Vec<Pos2>> =
+                        std::collections::BTreeMap::new();
+                    for d in &drawn {
+                        groups
+                            .entry(self.graph.nodes[d.idx].role.as_str())
+                            .or_default()
+                            .push(d.p.screen);
+                    }
+                    for (role, pts) in &groups {
+                        let n = pts.len() as f32;
+                        let c = Pos2::new(
+                            pts.iter().map(|p| p.x).sum::<f32>() / n,
+                            pts.iter().map(|p| p.y).sum::<f32>() / n,
+                        );
+                        let rad = pts.iter().fold(0.0_f32, |m, p| m.max(c.distance(*p)))
+                            + GALAXY_PAD
+                            + 8.0;
+                        let col = role_style(role).color;
+                        painter.circle_filled(c, rad, with_alpha(col, 0.05));
+                        painter.circle_stroke(c, rad, Stroke::new(1.4, with_alpha(col, 0.45)));
+                        painter.text(
+                            Pos2::new(c.x, c.y - rad - 3.0),
+                            Align2::CENTER_BOTTOM,
+                            role_style(role).label,
+                            FontId::monospace(12.0),
+                            with_alpha(col, 0.9),
+                        );
                     }
                 }
 
