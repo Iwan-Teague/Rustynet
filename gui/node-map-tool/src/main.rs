@@ -182,16 +182,22 @@ fn edge_has_flow(kind: &str) -> bool {
     kind == "data_path"
 }
 
-/// Galaxy layout tunables. Placement is deterministic (no force sim): each role
-/// gets its own "galaxy" — a packed disc of its nodes — laid out left-to-right
-/// along the data-flow path.
-const GALAXY_COL_SPACING: f32 = 80.0; // world gap between role columns (flow axis)
-const GALAXY_ROW_SPACING: f32 = 66.0; // world gap between stacked roles in a column
+/// Galaxy layout tunables. Placement is deterministic (no force sim). Backbone
+/// nodes (anchor/relay/exit/admin) sit in fixed data-flow columns; leaf nodes
+/// (client/nas/llm) form per-(hub, role) "galaxies" that orbit their hub.
+const GALAXY_COL_SPACING: f32 = 82.0; // world gap between backbone columns (flow axis)
+const GALAXY_ROW_SPACING: f32 = 195.0; // world gap between stacked backbone nodes (room for orbits)
+const ORBIT_RADIUS: f32 = 30.0; // base distance of a leaf galaxy from its hub
 const NODE_GAP: f32 = 7.0; // packing spacing of nodes within a galaxy
-const GALAXY_PAD: f32 = 16.0; // screen px padding of a galaxy border past its nodes
+const GALAXY_PAD: f32 = 14.0; // screen px padding of a galaxy border past its nodes
 
-/// Column for a role along the data-flow axis: operator | sources | anchor |
-/// relay | exit. Determines left-to-right galaxy placement.
+/// Leaf roles orbit the node their data travels to; backbone roles are the skeleton.
+fn is_leaf_role(role: &str) -> bool {
+    matches!(role, "client" | "nas" | "llm")
+}
+
+/// Backbone column along the data-flow axis: operator | (sources) | anchor |
+/// relay | exit. Only backbone + unattached nodes use this for placement.
 fn galaxy_col(role: &str) -> i32 {
     match role {
         "admin" => 0,
@@ -200,6 +206,16 @@ fn galaxy_col(role: &str) -> i32 {
         "relay" => 3,
         "exit" | "blind_exit" => 4,
         _ => 1,
+    }
+}
+
+/// Small stable ordinal per role, used to build a (hub, role) galaxy key.
+fn role_ord(role: &str) -> u64 {
+    match role {
+        "client" => 1,
+        "nas" => 2,
+        "llm" => 3,
+        _ => 4,
     }
 }
 
@@ -331,7 +347,7 @@ impl Default for Camera {
         Self {
             target: V3::default(),
             yaw: 0.0,
-            pitch: 0.95, // look down at an angle (not straight down)
+            pitch: 0.62, // oblique top-down angle (clearly tilted, not straight down)
             distance: 460.0,
             fov: 50_f32.to_radians(),
         }
@@ -396,6 +412,9 @@ struct Node {
     /// Smoothly-ramped "lit" factor (0..1) that eases toward the status target
     /// so a node fading up on connect/online doesn't pop.
     lit: f32,
+    /// Galaxy id (hub, role) for leaf nodes that orbit a hub; None for backbone
+    /// / unattached nodes (no border drawn).
+    galaxy: Option<u64>,
 }
 
 /// Steady-state lit target per status (drives the smooth ramp).
@@ -462,6 +481,7 @@ impl Graph {
                 pos,
                 pinned,
                 lit,
+                galaxy: None,
             });
         }
         let mut edges = Vec::new();
@@ -487,41 +507,98 @@ impl Graph {
         graph
     }
 
-    /// Deterministic galaxy layout: group nodes by role, give each role its own
-    /// "galaxy" laid out left-to-right by data-flow column (operator | sources |
-    /// anchor | relay | exit) and stacked within a column, then pack each role's
-    /// nodes into a disc (phyllotaxis) on the y=0 plane. Pinned nodes keep their
-    /// supplied position.
+    /// Each leaf node's hub = the connected node nearest the exit (its next hop).
+    fn leaf_hub(&self, i: usize) -> Option<usize> {
+        if !is_leaf_role(&self.nodes[i].role) {
+            return None;
+        }
+        let my = role_flow_rank(&self.nodes[i].role);
+        let mut best: Option<(i32, usize)> = None;
+        for e in &self.edges {
+            let other = if e.a == i {
+                Some(e.b)
+            } else if e.b == i {
+                Some(e.a)
+            } else {
+                None
+            };
+            if let Some(o) = other {
+                let r = role_flow_rank(&self.nodes[o].role);
+                if r > my && best.is_none_or(|(br, _)| r > br) {
+                    best = Some((r, o));
+                }
+            }
+        }
+        best.map(|(_, o)| o)
+    }
+
+    /// Deterministic layout. Backbone (and unattached) nodes go into fixed
+    /// data-flow columns. Each leaf node joins a per-(hub, role) galaxy that
+    /// orbits its hub, so e.g. anchor-eu's clients are a distinct galaxy from
+    /// anchor-us's clients. Pinned nodes keep their supplied position.
     fn layout_galaxies(&mut self) {
         use std::collections::BTreeMap as Map;
-        // Bucket node indices by role (BTreeMap keeps a stable role order).
-        let mut by_role: Map<String, Vec<usize>> = Map::new();
-        for (i, n) in self.nodes.iter().enumerate() {
-            if n.pinned {
+        let n = self.nodes.len();
+        let hub: Vec<Option<usize>> = (0..n).map(|i| self.leaf_hub(i)).collect();
+
+        // 1) Standalone nodes: backbone + any leaf without a hub. Place them in
+        //    flow columns, stacked within a column.
+        let mut cols: Map<i32, Vec<usize>> = Map::new();
+        for (i, h) in hub.iter().enumerate() {
+            if self.nodes[i].pinned {
                 continue;
             }
-            by_role.entry(n.role.clone()).or_default().push(i);
-        }
-        // Group roles into columns; within a column, stack roles in rows.
-        let mut cols: Map<i32, Vec<String>> = Map::new();
-        for role in by_role.keys() {
-            cols.entry(galaxy_col(role)).or_default().push(role.clone());
+            if is_leaf_role(&self.nodes[i].role) && h.is_some() {
+                continue; // placed as an orbiting galaxy below
+            }
+            cols.entry(galaxy_col(&self.nodes[i].role))
+                .or_default()
+                .push(i);
         }
         let col_keys: Vec<i32> = cols.keys().copied().collect();
         let col_center = (col_keys.len() as f32 - 1.0) * 0.5;
         for (ci, col) in col_keys.iter().enumerate() {
-            let roles = &cols[col];
-            let row_center = (roles.len() as f32 - 1.0) * 0.5;
+            let members = &cols[col];
             let x = (ci as f32 - col_center) * GALAXY_COL_SPACING;
-            for (ri, role) in roles.iter().enumerate() {
+            let row_center = (members.len() as f32 - 1.0) * 0.5;
+            for (ri, &i) in members.iter().enumerate() {
                 let z = (ri as f32 - row_center) * GALAXY_ROW_SPACING;
-                let center = V3::new(x, 0.0, z);
-                // Pack this role's nodes around the galaxy centre (sunflower).
-                let members = &by_role[role];
+                self.nodes[i].pos = V3::new(x, 0.0, z);
+            }
+        }
+
+        // 2) Leaf galaxies: group leaves by (hub, role), then orbit each group
+        //    around its hub at a distinct angle and pack it into a disc.
+        let mut by_hub: Map<usize, Map<String, Vec<usize>>> = Map::new();
+        for (i, h) in hub.iter().enumerate() {
+            if self.nodes[i].pinned {
+                continue;
+            }
+            if let Some(h) = *h {
+                by_hub
+                    .entry(h)
+                    .or_default()
+                    .entry(self.nodes[i].role.clone())
+                    .or_default()
+                    .push(i);
+            }
+        }
+        for (h, role_groups) in by_hub {
+            let hub_pos = self.nodes[h].pos;
+            let g = role_groups.len().max(1);
+            for (gi, (role, members)) in role_groups.iter().enumerate() {
+                // Spread the hub's role-groups around it (start pointing "up").
+                let ang =
+                    std::f32::consts::TAU * (gi as f32) / g as f32 - std::f32::consts::FRAC_PI_2;
+                let grp_r = NODE_GAP * (members.len() as f32).sqrt();
+                let orbit = ORBIT_RADIUS + grp_r;
+                let gc = hub_pos.add(V3::new(orbit * ang.cos(), 0.0, orbit * ang.sin()));
+                let gid = (h as u64) * 16 + role_ord(role);
                 for (k, &idx) in members.iter().enumerate() {
-                    let ang = k as f32 * 2.399_963_2; // golden angle
+                    let a = k as f32 * 2.399_963_2; // golden angle
                     let rr = NODE_GAP * (k as f32).sqrt();
-                    self.nodes[idx].pos = center.add(V3::new(rr * ang.cos(), 0.0, rr * ang.sin()));
+                    self.nodes[idx].pos = gc.add(V3::new(rr * a.cos(), 0.0, rr * a.sin()));
+                    self.nodes[idx].galaxy = Some(gid);
                 }
             }
         }
@@ -912,17 +989,23 @@ impl App {
                     }
                 }
 
-                // ----- galaxy borders: one bordered region per role -----
+                // ----- galaxy borders: one bordered region per (hub, role) leaf
+                // group, so each hub's clients/nas/llm orbit it as its own galaxy -----
                 if self.show_galaxies {
-                    let mut groups: std::collections::BTreeMap<&str, Vec<Pos2>> =
+                    let mut groups: std::collections::BTreeMap<u64, (Vec<Pos2>, &str)> =
                         std::collections::BTreeMap::new();
                     for d in &drawn {
-                        groups
-                            .entry(self.graph.nodes[d.idx].role.as_str())
-                            .or_default()
-                            .push(d.p.screen);
+                        if let Some(g) = self.graph.nodes[d.idx].galaxy {
+                            groups
+                                .entry(g)
+                                .or_insert_with(|| {
+                                    (Vec::new(), self.graph.nodes[d.idx].role.as_str())
+                                })
+                                .0
+                                .push(d.p.screen);
+                        }
                     }
-                    for (role, pts) in &groups {
+                    for (pts, role) in groups.values() {
                         let n = pts.len() as f32;
                         let c = Pos2::new(
                             pts.iter().map(|p| p.x).sum::<f32>() / n,
@@ -932,14 +1015,14 @@ impl App {
                             + GALAXY_PAD
                             + 8.0;
                         let col = role_style(role).color;
-                        painter.circle_filled(c, rad, with_alpha(col, 0.05));
-                        painter.circle_stroke(c, rad, Stroke::new(1.4, with_alpha(col, 0.45)));
+                        painter.circle_filled(c, rad, with_alpha(col, 0.06));
+                        painter.circle_stroke(c, rad, Stroke::new(1.4, with_alpha(col, 0.5)));
                         painter.text(
                             Pos2::new(c.x, c.y - rad - 3.0),
                             Align2::CENTER_BOTTOM,
                             role_style(role).label,
-                            FontId::monospace(12.0),
-                            with_alpha(col, 0.9),
+                            FontId::monospace(11.0),
+                            with_alpha(col, 0.85),
                         );
                     }
                 }
