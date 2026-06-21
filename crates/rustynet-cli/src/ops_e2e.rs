@@ -226,6 +226,24 @@ pub fn execute_ops_e2e_bootstrap_host(
     }
     let backend_mode = e2e_backend_mode_from_env()?;
 
+    // Forward lab-pipeline freshness-window overrides if set in the process
+    // environment, mirroring e2e_enforce_host. The lab bootstrap passes
+    // RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS / RUSTYNET_TRAVERSAL_MAX_AGE_SECS /
+    // RUSTYNET_DNS_ZONE_MAX_AGE_SECS = 86400 via sudo so install-systemd bakes
+    // the relaxed age into the unit file at *bootstrap* time (parity with the
+    // macOS Bootstrap-RustyNetMacos.sh and Windows installer paths). Without
+    // this, a freshly bootstrapped Linux node runs the strict 300s/120s window
+    // and can be stranded fail-closed if the later enforce pass is interrupted.
+    // Production deployments leave these unset → install-systemd falls back to
+    // its built-in 300s/120s defaults, so the production unit default is
+    // unchanged; this only relaxes the LAB window.
+    //
+    // Declared here, above install_env, so the borrowed `as_str()` slices
+    // outlive the run_status("ops install-systemd") call below.
+    let auto_tunnel_max_age_secs = std::env::var("RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS").ok();
+    let traversal_max_age_secs = std::env::var("RUSTYNET_TRAVERSAL_MAX_AGE_SECS").ok();
+    let dns_zone_max_age_secs = std::env::var("RUSTYNET_DNS_ZONE_MAX_AGE_SECS").ok();
+
     let daemon_binary = format!("{}/target/release/rustynetd", src_dir.display());
     run_status(
         "install",
@@ -634,6 +652,18 @@ pub fn execute_ops_e2e_bootstrap_host(
         ];
         if let Some(value) = backend_mode.as_deref() {
             install_env.push(("RUSTYNET_BACKEND", value));
+        }
+        // Lab freshness-window passthrough (see the declarations above). Only
+        // forwarded when present; install-systemd consumes all three and falls
+        // back to its built-in 300s/120s defaults otherwise.
+        if let Some(ref value) = auto_tunnel_max_age_secs {
+            install_env.push(("RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS", value.as_str()));
+        }
+        if let Some(ref value) = traversal_max_age_secs {
+            install_env.push(("RUSTYNET_TRAVERSAL_MAX_AGE_SECS", value.as_str()));
+        }
+        if let Some(ref value) = dns_zone_max_age_secs {
+            install_env.push(("RUSTYNET_DNS_ZONE_MAX_AGE_SECS", value.as_str()));
         }
         run_status(
             "rustynet",

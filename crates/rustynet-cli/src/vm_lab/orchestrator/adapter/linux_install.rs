@@ -471,6 +471,41 @@ mod tests {
         );
     }
 
+    /// Regression: the Linux lab bootstrap must relax the freshness window
+    /// (86400 s) for the auto-tunnel, traversal and DNS-zone bundles at
+    /// bootstrap time, the same way the macOS Bootstrap-RustyNetMacos.sh and
+    /// the Windows installer already do. The bootstrap installs the daemon via
+    /// `rustynet ops e2e-bootstrap-host`, which forwards these env vars into
+    /// `ops install-systemd`; without them a freshly bootstrapped Linux node
+    /// runs the strict 300 s/120 s production window and can be stranded
+    /// fail-closed if the later `e2e-enforce-host` pass is interrupted (the
+    /// daemon ages a bundle past 300 s, wedges in restrict_permanent, and the
+    /// enforce restart cannot cleanly cycle the socket). The systemd unit's
+    /// 300 s/120 s production default is unchanged; this only sets the LAB
+    /// window via the bootstrap env passthrough.
+    #[test]
+    fn bootstrap_script_relaxes_lab_freshness_window_for_all_bundles() {
+        for env_assignment in [
+            "RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400",
+            "RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400",
+            "RUSTYNET_DNS_ZONE_MAX_AGE_SECS=86400",
+        ] {
+            assert!(
+                BOOTSTRAP_SCRIPT.contains(env_assignment),
+                "linux bootstrap must forward {env_assignment} on the e2e-bootstrap-host \
+                 invocation so the bootstrap-time daemon uses the relaxed lab freshness \
+                 window instead of the strict 300 s/120 s production default"
+            );
+        }
+        // The relaxed env must be on the e2e-bootstrap-host invocation itself
+        // (not some unrelated command), so e2e-bootstrap-host forwards it into
+        // install-systemd.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("rustynet ops e2e-bootstrap-host"),
+            "bootstrap must install the daemon via e2e-bootstrap-host"
+        );
+    }
+
     #[test]
     fn bootstrap_script_builds_and_installs_the_relay_binary() {
         // The relay runtime deploy stage assumes the bootstrap built + installed
