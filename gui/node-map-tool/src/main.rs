@@ -192,6 +192,8 @@ fn edge_has_flow(kind: &str) -> bool {
 const NODE_GAP: f32 = 34.0; // spacing of nodes within a galaxy + interior padding
 const SINGLETON_RADIUS: f32 = 46.0; // tile radius for a lone backbone node
 const CLUSTER_GAP: f32 = 40.0; // gap between packed tiles
+const EDGE_CLEAR: f32 = 16.0; // world clearance kept between a routed edge and an obstacle
+const NODE_OBSTACLE_R: f32 = 28.0; // obstacle radius for a lone backbone node when routing
 
 // Camera zoom levels: overview vs drilled-into-a-galaxy.
 const OVERVIEW_DISTANCE: f32 = 820.0;
@@ -636,32 +638,70 @@ impl Graph {
             });
         }
 
-        // Shelf-pack tiles into a roughly-square area with small gaps.
-        let total_w: f32 = tiles.iter().map(|t| 2.0 * t.radius + CLUSTER_GAP).sum();
-        let rows = ((tiles.len() as f32).sqrt()).round().max(1.0);
-        let target_w = (total_w / rows).max(1.0);
-        let mut cx = 0.0;
-        let mut cy = 0.0;
-        let mut row_h = 0.0;
-        let mut centers: Vec<V3> = Vec::with_capacity(tiles.len());
-        let (mut min_x, mut max_x, mut min_z, mut max_z) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
-        for t in &tiles {
-            let w = 2.0 * t.radius + CLUSTER_GAP;
-            if cx > 0.0 && cx + w > target_w {
-                cx = 0.0;
-                cy += row_h;
-                row_h = 0.0;
+        // ----- Organic packing (force-directed: link + collide + centre) -----
+        // This is the standard way (cf. d3-force forceLink/forceCollide/forceCenter)
+        // to get evenly-spaced, non-overlapping, non-grid placement ("blue-noise"
+        // feel): springs pull each galaxy toward its hub tile, a collision force
+        // keeps tiles apart (radius + gap), and gravity keeps the whole map compact.
+        let m = tiles.len();
+        // node -> tile index, so a galaxy can be sprung to its hub's tile.
+        let mut node_tile = vec![0usize; n];
+        for (ti, t) in tiles.iter().enumerate() {
+            for &(idx, _) in &t.members {
+                node_tile[idx] = ti;
             }
-            let center = V3::new(cx + t.radius, 0.0, cy + t.radius);
-            centers.push(center);
-            min_x = min_x.min(center.x - t.radius);
-            max_x = max_x.max(center.x + t.radius);
-            min_z = min_z.min(center.z - t.radius);
-            max_z = max_z.max(center.z + t.radius);
-            cx += w;
-            row_h = row_h.max(2.0 * t.radius + CLUSTER_GAP);
         }
-        let mid = V3::new((min_x + max_x) * 0.5, 0.0, (min_z + max_z) * 0.5);
+        let mut springs: Vec<(usize, usize, f32)> = Vec::new();
+        for (ti, t) in tiles.iter().enumerate() {
+            if let Some((gid, _)) = &t.info {
+                let hub = (*gid / 16) as usize;
+                let ht = node_tile[hub];
+                if ht != ti {
+                    springs.push((ti, ht, t.radius + tiles[ht].radius + CLUSTER_GAP));
+                }
+            }
+        }
+        // Deterministic spiral seed so the layout is stable run-to-run.
+        let mut centers: Vec<V3> = (0..m)
+            .map(|i| {
+                let a = i as f32 * 2.399_963_2;
+                let r = 26.0 * (i as f32).sqrt();
+                V3::new(r * a.cos(), 0.0, r * a.sin())
+            })
+            .collect();
+        for _ in 0..420 {
+            // Springs: keep each galaxy near its hub.
+            for &(a, b, rest) in &springs {
+                let d = centers[b].sub(centers[a]);
+                let dist = d.len().max(0.001);
+                let pull = d.scale(1.0 / dist).scale((dist - rest) * 0.06);
+                centers[a] = centers[a].add(pull);
+                centers[b] = centers[b].sub(pull);
+            }
+            // Gravity: gentle pull toward the origin for compactness.
+            for c in &mut centers {
+                *c = c.sub(c.scale(0.02));
+            }
+            // Collision: never let two tiles' footprints (+gap) overlap.
+            for i in 0..m {
+                for j in (i + 1)..m {
+                    let d = centers[i].sub(centers[j]);
+                    let dist = d.len().max(0.001);
+                    let min = tiles[i].radius + tiles[j].radius + CLUSTER_GAP;
+                    if dist < min {
+                        let push = d.scale(1.0 / dist).scale((min - dist) * 0.5);
+                        centers[i] = centers[i].add(push);
+                        centers[j] = centers[j].sub(push);
+                    }
+                }
+            }
+        }
+        // Centre the whole map on the origin.
+        let mut mid = V3::default();
+        for c in &centers {
+            mid = mid.add(*c);
+        }
+        mid = mid.scale(1.0 / m.max(1) as f32);
 
         // Apply, centring the whole map at the origin; record galaxy world boxes.
         self.galaxies.clear();
@@ -742,6 +782,60 @@ impl Graph {
             V3::default()
         }
     }
+
+    /// World-space path for an edge that detours around the most-blocking
+    /// galaxy/backbone obstacle it would otherwise cross (single waypoint).
+    /// Endpoints' own galaxies/nodes are never treated as obstacles.
+    fn route_path(&self, a: usize, b: usize) -> Vec<V3> {
+        let pa = self.nodes[a].pos;
+        let pb = self.nodes[b].pos;
+        let ga = self.nodes[a].galaxy;
+        let gb = self.nodes[b].galaxy;
+        let mut best: Option<(f32, V3)> = None;
+        let mut keep = |hit: Option<(f32, V3)>| {
+            if let Some((pen, wp)) = hit {
+                if best.is_none_or(|(bp, _)| pen > bp) {
+                    best = Some((pen, wp));
+                }
+            }
+        };
+        for gx in &self.galaxies {
+            if Some(gx.gid) == ga || Some(gx.gid) == gb {
+                continue;
+            }
+            keep(segment_detour(pa, pb, gx.center, gx.radius + EDGE_CLEAR));
+        }
+        for (i, nd) in self.nodes.iter().enumerate() {
+            if i == a || i == b || nd.galaxy.is_some() {
+                continue;
+            }
+            keep(segment_detour(pa, pb, nd.pos, NODE_OBSTACLE_R));
+        }
+        match best {
+            Some((_, wp)) => vec![pa, wp, pb],
+            None => vec![pa, pb],
+        }
+    }
+}
+
+/// If segment pa->pb passes within `r` of obstacle centre `o`, return the
+/// penetration depth and a waypoint just outside the obstacle to route around it.
+fn segment_detour(pa: V3, pb: V3, o: V3, r: f32) -> Option<(f32, V3)> {
+    let ab = pb.sub(pa);
+    let denom = ab.dot(ab).max(1e-4);
+    let t = (o.sub(pa).dot(ab) / denom).clamp(0.0, 1.0);
+    let closest = pa.add(ab.scale(t));
+    let to = closest.sub(o);
+    let dist = to.len();
+    if dist >= r {
+        return None;
+    }
+    let dir = if dist > 1e-3 {
+        to.scale(1.0 / dist)
+    } else {
+        V3::new(-ab.z, 0.0, ab.x).norm()
+    };
+    Some((r - dist, o.add(dir.scale(r + 6.0))))
 }
 
 // ===========================================================================
@@ -806,6 +900,27 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 /// Interpolate between two screen points.
 fn lerp_pos(a: Pos2, b: Pos2, t: f32) -> Pos2 {
     Pos2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+}
+
+/// Sample a screen-space polyline at parameter t in [0,1] by arc length.
+fn poly_sample(path: &[Pos2], t: f32) -> Pos2 {
+    if path.len() < 2 {
+        return path.first().copied().unwrap_or(Pos2::ZERO);
+    }
+    let total: f32 = path.windows(2).map(|w| w[0].distance(w[1])).sum();
+    if total <= 1e-4 {
+        return path[0];
+    }
+    let mut target = t.clamp(0.0, 1.0) * total;
+    for w in path.windows(2) {
+        let seg = w[0].distance(w[1]);
+        if target <= seg {
+            let f = if seg > 1e-4 { target / seg } else { 0.0 };
+            return lerp_pos(w[0], w[1], f);
+        }
+        target -= seg;
+    }
+    *path.last().unwrap()
 }
 
 fn with_alpha(c: Color32, a: f32) -> Color32 {
@@ -1135,11 +1250,13 @@ impl App {
                     }
                 }
 
-                // ----- galaxy boxes: project each galaxy's WORLD footprint (a
-                // padded disc) to a screen rect, so node<->border and
-                // border<->border spacing is guaranteed by the world packing. -----
+                // ----- galaxy polygons: project each galaxy's WORLD footprint to
+                // an N-gon (straight edges, vertices marked with white dots). The
+                // world packing guarantees node<->border and border<->border gaps. -----
+                const GAL_SIDES: usize = 9;
                 struct GalScreen {
                     gid: u64,
+                    poly: Vec<Pos2>,
                     bounds: Rect,
                     color: Color32,
                     label: &'static str,
@@ -1149,10 +1266,13 @@ impl App {
                     if !self.visible(&gb.role) {
                         continue;
                     }
-                    let mut bb: Option<Rect> = None;
+                    let mut poly: Vec<Pos2> = Vec::with_capacity(GAL_SIDES);
+                    let mut bounds: Option<Rect> = None;
                     let mut ok = true;
-                    for s in 0..12 {
-                        let ang = std::f32::consts::TAU * s as f32 / 12.0;
+                    for s in 0..GAL_SIDES {
+                        // start at top (-PI/2) for a flat-ish top edge.
+                        let ang = std::f32::consts::TAU * s as f32 / GAL_SIDES as f32
+                            - std::f32::consts::FRAC_PI_2;
                         let wp = gb.center.add(V3::new(
                             gb.radius * ang.cos(),
                             0.0,
@@ -1160,7 +1280,8 @@ impl App {
                         ));
                         match self.cam.project(wp, rect) {
                             Some(p) => {
-                                bb = Some(match bb {
+                                poly.push(p.screen);
+                                bounds = Some(match bounds {
                                     Some(mut r) => {
                                         r.extend_with(p.screen);
                                         r
@@ -1174,10 +1295,11 @@ impl App {
                             }
                         }
                     }
-                    if let (true, Some(bounds)) = (ok, bb) {
+                    if let (true, Some(bounds)) = (ok, bounds) {
                         let rs = role_style(&gb.role);
                         galaxies.push(GalScreen {
                             gid: gb.gid,
+                            poly,
                             bounds,
                             color: rs.color,
                             label: rs.label,
@@ -1243,26 +1365,32 @@ impl App {
                     }
                 }
 
-                // ----- galaxy borders: square-ish (rounded-rect) regions -----
+                // ----- galaxy borders: polygons with white vertex dots -----
                 if self.show_galaxies {
                     for g in &galaxies {
                         let hl = hovered_gal == Some(g.gid) || self.focused_galaxy == Some(g.gid);
-                        let rounding = 12.0;
-                        painter.rect_filled(
-                            g.bounds,
-                            rounding,
+                        // Faint fill.
+                        painter.add(egui::Shape::convex_polygon(
+                            g.poly.clone(),
                             with_alpha(g.color, if hl { 0.12 } else { 0.06 }),
+                            Stroke::NONE,
+                        ));
+                        // Straight polygon edges.
+                        let stroke = Stroke::new(
+                            if hl { 2.4 } else { 1.4 },
+                            with_alpha(g.color, if hl { 0.95 } else { 0.55 }),
                         );
-                        painter.rect_stroke(
-                            g.bounds,
-                            rounding,
-                            Stroke::new(
-                                if hl { 2.6 } else { 1.4 },
-                                with_alpha(g.color, if hl { 0.95 } else { 0.5 }),
-                            ),
-                        );
+                        for k in 0..g.poly.len() {
+                            painter
+                                .line_segment([g.poly[k], g.poly[(k + 1) % g.poly.len()]], stroke);
+                        }
+                        // White dots at each polygon vertex.
+                        let dot = with_alpha(Color32::WHITE, if hl { 1.0 } else { 0.85 });
+                        for &v in &g.poly {
+                            painter.circle_filled(v, if hl { 3.0 } else { 2.4 }, dot);
+                        }
                         painter.text(
-                            Pos2::new(g.bounds.center().x, g.bounds.top() - 4.0),
+                            Pos2::new(g.bounds.center().x, g.bounds.top() - 5.0),
                             Align2::CENTER_BOTTOM,
                             g.label,
                             FontId::monospace(if hl { 13.0 } else { 11.0 }),
@@ -1282,7 +1410,7 @@ impl App {
                 };
                 let focused = focus.is_some();
 
-                // ----- edges (behind nodes) -----
+                // ----- edges (behind nodes), routed around obstacles -----
                 for e in &self.graph.edges {
                     if !self.visible(&self.graph.nodes[e.a].role)
                         || !self.visible(&self.graph.nodes[e.b].role)
@@ -1295,6 +1423,23 @@ impl App {
                             (Some(pa), Some(pb)) => (pa, pb),
                             _ => continue,
                         };
+                    // Routed world path (detours around blocking galaxies/nodes),
+                    // projected to screen.
+                    let world_path = self.graph.route_path(e.a, e.b);
+                    let mut spath: Vec<Pos2> = Vec::with_capacity(world_path.len());
+                    let mut ok = true;
+                    for wp in &world_path {
+                        match self.cam.project(*wp, rect) {
+                            Some(p) => spath.push(p.screen),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok || spath.len() < 2 {
+                        continue;
+                    }
                     let kind = edge_kind_style(&e.kind);
                     let live = a.status == "online" && b.status == "online" && e.active;
                     let ca = role_style(&a.role).color;
@@ -1313,27 +1458,27 @@ impl App {
                             alpha *= 0.28;
                         }
                     }
-                    painter.line_segment(
-                        [pa.screen, pb.screen],
-                        Stroke::new(width, with_alpha(col, alpha)),
-                    );
+                    let stroke = Stroke::new(width, with_alpha(col, alpha));
+                    for w in spath.windows(2) {
+                        painter.line_segment([w[0], w[1]], stroke);
+                    }
 
-                    // ----- pulse: wave blob for this hop. It only travels while
-                    // the upstream node is "firing" (fire_at..+TRAVEL), so a node
-                    // emits downstream only after all its upstream blobs melted in
-                    // (+ a PULSE_PAUSE), giving a staged flow toward the exit. -----
+                    // ----- pulse: wave blob for this hop, following the routed path.
+                    // It only travels while the upstream node is "firing"
+                    // (fire_at..+TRAVEL), so a node emits downstream only after all
+                    // its upstream blobs melted in (+ a PULSE_PAUSE). -----
                     if edge_has_flow(&e.kind)
                         && live
                         && self.animate_flow
                         && self.graph.cycle_len > 0.0
                     {
-                        // Upstream endpoint (nearer the source) + its emit time.
                         let up_is_a = role_flow_rank(&a.role) <= role_flow_rank(&b.role);
-                        let (src, dst, up_idx) = if up_is_a {
-                            (pa.screen, pb.screen, e.a)
-                        } else {
-                            (pb.screen, pa.screen, e.b)
-                        };
+                        let up_idx = if up_is_a { e.a } else { e.b };
+                        // Path oriented upstream -> downstream.
+                        let mut flow = spath.clone();
+                        if !up_is_a {
+                            flow.reverse();
+                        }
                         let emit = self.graph.fire_at[up_idx];
                         let ct = time % self.graph.cycle_len;
                         if ct >= emit && ct <= emit + PULSE_TRAVEL {
@@ -1344,7 +1489,7 @@ impl App {
                             // Envelope: emerge from the source, melt into the receiver.
                             let env = smoothstep(0.0, 0.12, t) * (1.0 - smoothstep(0.6, 1.0, t));
                             if env > 0.01 {
-                                let p = lerp_pos(src, dst, t);
+                                let p = poly_sample(&flow, t);
                                 let rr = pr * (0.45 + 0.55 * env);
                                 painter.circle_filled(
                                     p,
