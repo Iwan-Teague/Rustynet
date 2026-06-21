@@ -200,6 +200,9 @@ const BACKBONE_LINK: f32 = 26.0;
 const NODE_WORLD_R: f32 = 2.6;
 const NODE_MARGIN: f32 = 7.5;
 const COLLISION_K: f32 = 0.5;
+// Cohesion: leaves sharing a hub are pulled toward their group's centre so they
+// clump into one local group (instead of spreading into a ring around the hub).
+const COHESION_K: f32 = 0.06;
 
 /// Leaf roles orbit the node their path follows; backbone roles form the skeleton.
 fn is_leaf_role(role: &str) -> bool {
@@ -437,6 +440,9 @@ struct Node {
     /// Smoothly-ramped "lit" factor (0..1) that eases toward the status target
     /// so a node fading up on connect/online doesn't pop.
     lit: f32,
+    /// For leaf nodes: the index of the upstream hub (anchor) they attach to.
+    /// Leaves sharing a hub form one local group (they cohere, don't repel).
+    hub: Option<usize>,
 }
 
 /// Steady-state lit target per status (drives the smooth ramp).
@@ -491,6 +497,7 @@ impl Graph {
                 vel: V3::default(),
                 pinned,
                 lit,
+                hub: None,
             });
         }
         let mut edges = Vec::new();
@@ -504,6 +511,33 @@ impl Graph {
                 });
             }
         }
+
+        // Assign each leaf node its hub: the connected node nearest the exit
+        // (highest flow rank). Leaves sharing a hub form one local group.
+        for i in 0..nodes.len() {
+            if !is_leaf_role(&nodes[i].role) {
+                continue;
+            }
+            let my_rank = role_flow_rank(&nodes[i].role);
+            let mut best: Option<(i32, usize)> = None;
+            for e in &edges {
+                let other = if e.a == i {
+                    Some(e.b)
+                } else if e.b == i {
+                    Some(e.a)
+                } else {
+                    None
+                };
+                if let Some(o) = other {
+                    let r = role_flow_rank(&nodes[o].role);
+                    if r > my_rank && best.is_none_or(|(br, _)| r > br) {
+                        best = Some((r, o));
+                    }
+                }
+            }
+            nodes[i].hub = best.map(|(_, o)| o);
+        }
+
         Graph { nodes, edges }
     }
 
@@ -535,11 +569,16 @@ impl Graph {
                 let dist = d2.sqrt();
                 let dir = d.scale(1.0 / dist);
 
-                // Inverse-square repulsion, scaled by both roles' weight.
-                let f = CHARGE * w[i] * w[j] / d2;
-                let push = dir.scale(f);
-                self.nodes[i].vel = self.nodes[i].vel.sub(push);
-                self.nodes[j].vel = self.nodes[j].vel.add(push);
+                // Same-group leaves don't repel (so they clump); everyone else
+                // gets inverse-square repulsion, scaled by both roles' weight.
+                let same_group =
+                    self.nodes[i].hub.is_some() && self.nodes[i].hub == self.nodes[j].hub;
+                if !same_group {
+                    let f = CHARGE * w[i] * w[j] / d2;
+                    let push = dir.scale(f);
+                    self.nodes[i].vel = self.nodes[i].vel.sub(push);
+                    self.nodes[j].vel = self.nodes[j].vel.add(push);
+                }
 
                 // Hard separation: never let two nodes' glows overlap.
                 let min_sep = r[i] + r[j] + NODE_MARGIN;
@@ -562,6 +601,28 @@ impl Graph {
             let pull = d.scale(1.0 / dist).scale(f);
             self.nodes[e.a].vel = self.nodes[e.a].vel.add(pull);
             self.nodes[e.b].vel = self.nodes[e.b].vel.sub(pull);
+        }
+
+        // Group cohesion: pull each leaf toward the centre of its hub-group so
+        // the satellites of a hub clump together (one tight group) instead of
+        // spreading evenly around it.
+        let mut group_sum: HashMap<usize, (V3, u32)> = HashMap::new();
+        for node in &self.nodes {
+            if let Some(h) = node.hub {
+                let entry = group_sum.entry(h).or_insert((V3::default(), 0));
+                entry.0 = entry.0.add(node.pos);
+                entry.1 += 1;
+            }
+        }
+        for node in &mut self.nodes {
+            if let Some(h) = node.hub {
+                if let Some(&(sum, count)) = group_sum.get(&h) {
+                    if count > 1 {
+                        let centroid = sum.scale(1.0 / count as f32);
+                        node.vel = node.vel.add(centroid.sub(node.pos).scale(COHESION_K));
+                    }
+                }
+            }
         }
 
         // Gravity toward centre + integrate (with a velocity clamp).
