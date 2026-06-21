@@ -55,7 +55,38 @@ will port cleanly. When you design the glow, the depth fade, the background,
 etc., describe them as **"draw N shapes with these radii and these alpha
 values."** Give me the **exact numbers**.
 
-### So that I can SEE your design before I port it
+### 2.1 The exact painter API (so your numbers map 1:1)
+
+These are the only drawing calls I have. Design against them directly:
+
+```rust
+// colour: alpha is STRAIGHT (not premultiplied) via from_rgba_unmultiplied.
+let c = Color32::from_rgb(r, g, b);                 // opaque
+let c = Color32::from_rgba_unmultiplied(r, g, b, a); // a = 0..=255 alpha
+
+painter.circle_filled(center: Pos2, radius: f32, fill: Color32);
+painter.circle_stroke(center: Pos2, radius: f32, Stroke::new(width: f32, color: Color32));
+painter.line_segment([p1: Pos2, p2: Pos2], Stroke::new(width: f32, color: Color32));
+painter.rect_filled(rect: Rect, rounding: f32, fill: Color32);
+painter.rect_stroke(rect: Rect, rounding: f32, Stroke::new(width, color));
+painter.text(pos: Pos2, anchor: Align2, text, FontId::proportional(sz) | FontId::monospace(sz), color);
+```
+
+egui facts that affect your design:
+- **Draw order = call order.** Whatever is painted later sits on top. So
+  background → edges → glow halos → node cores → labels → HUD.
+- **Anti-aliasing is on**, so thin lines and small circles look smooth.
+- **Coordinates are pixels, y-down**, origin top-left.
+- **Blending is normal alpha over** (NOT additive). So a glow built from
+  stacked low-alpha circles *lightens* toward the centre on a dark background,
+  which is exactly the effect we want — design for normal alpha.
+- **Fonts:** default proportional + monospace only (no custom font files).
+  Sizes are in points (~px). Labels are currently `FontId::monospace(11.0)`.
+- **`perspective_scale`** (used to size nodes) ranges roughly **0.3 (far) →
+  3.0 (near)** in normal use; node core radius is then clamped to 2–26 px. Keep
+  your radius formulas sane across that range.
+
+### 2.2 So that I can SEE your design before I port it
 Build me a **single self-contained `index.html`** mockup that renders your design
 on an HTML `<canvas>` — but **only using the canvas equivalents of the painter
 primitives above**: `arc()`+`fill()` (circles), `fillRect`/`roundRect`,
@@ -65,10 +96,11 @@ primitives above**: `arc()`+`fill()` (circles), `fillRect`/`roundRect`,
 `createLinearGradient`, `filter`, or `globalCompositeOperation` for the node
 glow — because none of those exist in egui. Fake the glow by drawing **several
 concentric `arc()` fills with decreasing alpha**, exactly as my app does. If the
-mockup looks good under that restriction, it will look identical in my app. (You
-*may* set `ctx.globalCompositeOperation = 'lighter'` ONLY if you also give me the
-non-additive layered-alpha fallback values, since egui blends normally — but
-prefer plain layered alpha so it's 1:1.)
+mockup looks good under that restriction, it will look identical in my app.
+
+> Do **not** use `globalCompositeOperation = 'lighter'` (additive). egui blends
+> with normal alpha, so additive in the mockup would lie to me. Plain layered
+> alpha on the dark background is the honest, 1:1 preview.
 
 ---
 
@@ -92,11 +124,13 @@ There are two "families": **infrastructure** (always-on, fewer, important) and
 
 Requirements for the palette:
 - All role colours must be **clearly distinguishable** from each other on a
-  near-black background, including for common colour-blindness.
+  near-black background, including for common colour-blindness (see §10).
 - `exit` vs `blind_exit` should feel related (both egress) but distinct (blind =
   more "sealed/secure"). Today they're orange vs red.
 - Infra roles can feel cooler/more authoritative; clients warmer/lighter; this
   is a suggestion, not a rule — surprise me if you have something better.
+- Each role also has a relative **`size`** multiplier (infra bigger than
+  clients). Keep that hierarchy; tune the numbers if it helps.
 
 ### Statuses — brightness/animation encodes the status
 | status        | meaning                          | current feel              |
@@ -107,7 +141,10 @@ Requirements for the palette:
 | `powered_off` | known but powered down           | very faint                |
 
 A node never disappears when it goes down — it stays on the map, dimmed. Status
-must be **legible at a glance** without reading the label.
+must be **legible at a glance** without reading the label. The status knobs I
+have are: `brightness` (core/overall), `glow` (halo opacity), `pulse` (sine
+amplitude on brightness), `desat` (lerp toward grey), `flicker` (random
+brightness jitter, used for `connecting`).
 
 ### Edge kinds — lines encode the connection type
 | kind        | meaning                       | current feel                       |
@@ -116,7 +153,8 @@ must be **legible at a glance** without reading the label.
 | `control`   | signalling / control link     | thin steady line                   |
 | `potential` | known but idle link           | very faint line                    |
 
-Flow particles only travel when **both endpoints are `online`**.
+Flow particles only travel when **both endpoints are `online`** (and the edge is
+active). A down edge is dimmed to 25% opacity.
 
 ### Data contract (the JSON the app consumes; don't change it)
 ```jsonc
@@ -130,20 +168,25 @@ Flow particles only travel when **both endpoints are `online`**.
 
 ## 4. Where this lives on screen (layout to design)
 
-A single window, dark background:
+A single **1200×800** window, dark background:
 - **Centre:** the 3D node scene (the main event).
-- **Left panel (egui side panel):** title "Rustynet", live stats (Nodes /
-  Online / Offline / Data paths), and view toggles (labels, animate paths,
-  auto-rotate). Style this panel too.
-- **Right panel:** a **legend** (role colour swatches + names, click to
-  show/hide) and a **status key**.
+- **Left panel (egui side panel, ~210 px):** title "Rustynet", a subtitle,
+  live stats (Nodes / Online / Offline / Data paths), and view toggles
+  (labels, animate paths, auto-rotate, live demo) + a "Reset camera" button.
+  Style this panel too.
+- **Right panel (~200 px):** a **legend** (role colour swatches + name + short
+  description, click to show/hide a role) and a **status key**.
 - **Bottom-right floating window:** an **inspector** shown when a node is
   clicked (id, status, role, address, OS, last seen, connection count).
-- **On hover:** a small tooltip near the cursor (name · role · status).
+- **On hover:** a small tooltip near the cursor (a role dot + "name · role ·
+  status").
 
-You can restyle these panels (colours, spacing, the swatch shapes, the stat
-rows). They're drawn with egui widgets + painter, so the same primitive rules
-apply.
+You can restyle these panels (background fill, border, spacing, the swatch
+shapes, the stat-row layout, fonts). They're drawn with egui widgets + painter,
+so the same primitive rules apply. egui exposes a `Visuals` theme — if you want
+panel/border/selection colours changed, give them to me as a short list (e.g.
+`window_fill`, `panel_fill`, `extreme_bg_color`, `widgets stroke`), and I'll set
+them in `Visuals`.
 
 ---
 
@@ -210,39 +253,52 @@ GREY = rgb(90,96,114)  BG = rgb(5,7,13)
 ## 6. What I want you to improve
 
 Aim for **"premium network ops console / fiber-optic constellation in deep
-space."** Sleek, dark, calm, legible, a little bit alive. Specifically:
+space."** Sleek, dark, calm, legible, a little bit alive. Reference vibe:
+Tailscale's admin map, a clean SRE/NOC dashboard, sci-fi starmaps — but
+restrained, not a gamer-RGB explosion. Specifically:
 
 1. **A better role palette** — more harmonious and more distinguishable on
    near-black, with the infra/endpoint/service hierarchy readable. Give hex/RGB.
 2. **A more convincing "ball of light"** using only layered alpha circles —
    tune the layer count, radius multipliers, and alpha falloff so the glow has a
-   soft, luminous core-to-halo gradient. Consider a subtle 2-tone (warm core →
-   role-coloured halo).
+   soft, luminous core-to-halo gradient. Consider a subtle 2-tone (warm/white
+   core → role-coloured halo). Make the falloff smooth, not banded.
 3. **Clearer status encoding** — make online/connecting/offline/powered_off
-   instantly distinct (brightness, halo size, pulse speed/curve, desaturation).
+   instantly distinct (brightness, halo size, pulse speed/curve, desaturation,
+   flicker). Consider a slow "breathing" pulse for online vs a faster nervous
+   one for connecting.
 4. **Nicer data paths** — line styling, the colour blend, and especially the
-   **flow particle** look (size, count, spacing, trailing fade if you can fake a
-   trail with a few stamped circles).
+   **flow particle** look (size, count, spacing, and a faked trailing fade — a
+   few stamped circles of decreasing alpha behind each particle).
 5. **Depth cues** without GPU — fade/shrink/desaturate distant nodes, maybe a
    faint depth "fog" faked by tinting toward the background colour by distance.
 6. **Background** — keep it dark; improve the starfield and/or add a very subtle
-   faked radial vignette or grid (layered shapes only).
+   faked radial vignette or grid (layered shapes only). Maybe 2–3 star
+   brightness tiers for parallax feel.
 7. **HUD styling** — panel fill/border colours, stat-row layout, the legend
    swatch shape, the status-key, the inspector, the hover tooltip, and label
-   typography (size, colour, when to show).
-8. **Selection & hover affordances** — how a selected/hovered node reads.
+   typography (size, colour, when to show / fade distant labels).
+8. **Selection & hover affordances** — how a selected/hovered node reads (ring,
+   brighter halo, dim-the-rest, highlight its edges, etc.).
 
 **Avoid:** neon overload, looking like a toy, low-contrast text, anything that
 relies on blur/bloom/gradients/shadows that I can't reproduce.
+
+**Performance note:** glow is `layers × nodes` circle draws every frame, plus
+`particles × edges`. Keep glow layers ≲ 8 and particle trail stamps ≲ 5 so a
+100-node graph stays smooth. If you want a richer halo, prefer slightly larger
+radii over many more layers.
 
 ---
 
 ## 7. Deliverables (return ALL of these)
 
 **(A) An interactive `index.html` canvas mockup** — single self-contained file,
-no libraries, obeying the canvas restrictions in §2. It should render ~12 demo
-nodes across all roles and statuses with a few data paths, with the flow
-particles animating, so I can see the design in motion. (Camera controls
+no libraries, obeying the canvas restrictions in §2. Render the **demo dataset
+in §9** (covers every role + every status + all three edge kinds, including the
+`client → anchor → relay → exit` path) with the flow particles animating, so I
+can see the design in motion. Include the left/right HUD panels and a sample
+inspector + tooltip so I can see the whole composition. (Camera controls
 optional — a slow auto-rotate or a static 3/4 view is fine.)
 
 **(B) A paste-ready Rust block** that fills in the exact functions/structs below
@@ -280,22 +336,77 @@ DEPTH_FADE_START = ...     // tint toward BG beyond this depth
 **(D) A short rationale** (a few sentences): the palette logic and the key
 visual moves, so I understand what to tweak later.
 
+**(E) Optional but welcome:** a compact **design-tokens table** (every colour as
+hex + RGB, plus the glow/edge/status numbers) so I have a single reference.
+
 ---
 
 ## 8. What you get back / how I port it (for me, not Claude)
 
 1. Open Claude's `index.html` to eyeball the look; iterate with Claude until I
-   like it ("make exit more amber", "calmer pulse", etc.).
+   like it ("make exit more amber", "calmer pulse", "tighter glow", etc.).
 2. Paste deliverable **(B)** over the matching functions/constants in
    `src/main.rs` (the CONFIG section at the top).
 3. If there's a **(C)**, update the render loop's glow/edge/particle/background
    code with the new constants + formulas (search `core_r`, `glow_a`,
-   `for layer in 0..6`, flow particle block, `draw_starfield`).
+   `for layer in 0..6`, the flow-particle block, `draw_starfield`).
 4. `cargo run` and compare against the mockup. Tweak numbers to taste.
 
 ---
 
-## 9. Acceptance criteria
+## 9. Demo dataset (use this in the mockup so it matches my app)
+
+13 nodes covering every role and status, with all three edge kinds and the
+`client → anchor → relay → exit` example path:
+
+```jsonc
+nodes:
+  admin-01    role=admin       status=online      os=linux
+  anchor-eu   role=anchor      status=online      os=linux
+  anchor-us   role=anchor      status=online      os=linux
+  relay-home  role=relay       status=online      os=linux
+  exit-nl     role=exit        status=online      os=linux
+  exit-blind  role=blind_exit  status=online      os=linux
+  nas-vault   role=nas         status=online      os=linux
+  llm-box     role=llm         status=connecting  os=linux
+  laptop-mac  role=client      status=online      os=macos
+  pc-win      role=client      status=online      os=windows
+  phone       role=client      status=connecting  os=ios
+  pi-sensor   role=client      status=offline     os=linux
+  old-server  role=client      status=powered_off os=linux
+
+edges (kind):
+  laptop-mac → anchor-eu   data_path     # the example path, part 1
+  anchor-eu  → relay-home  data_path     # part 2
+  relay-home → exit-nl     data_path     # part 3
+  pc-win     → anchor-us   data_path
+  anchor-us  → exit-blind  data_path
+  phone      → anchor-eu   data_path
+  laptop-mac → nas-vault   data_path
+  pc-win     → llm-box     data_path
+  admin-01   → anchor-eu   control
+  admin-01   → anchor-us   control
+  admin-01   → relay-home  control
+  anchor-eu  → anchor-us   control
+  pi-sensor  → anchor-eu   potential
+```
+
+---
+
+## 10. Accessibility & legibility
+
+- Target **colour-blind distinguishability**: don't rely on red-vs-green alone
+  to separate two important roles. `client` (currently green) and `exit`
+  (orange/red) are the riskiest pair — make them differ in brightness/shape-of-
+  glow too, not just hue.
+- Body/label text should stay **WCAG-ish readable** on the dark background
+  (light grey ~`rgb(215,224,240)` works today).
+- Don't encode meaning in motion alone — a paused frame should still read.
+- Keep `powered_off` faint but **not invisible** (it must still be findable).
+
+---
+
+## 11. Acceptance criteria
 
 - Looks premium and intentional on a near-black background.
 - Every role is distinguishable; every status is legible at a glance.
