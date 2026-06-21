@@ -276,15 +276,25 @@ const DEPTH_FADE_MIN: f32 = 0.5;
 const DEPTH_FOG_MAX: f32 = 0.45;
 const REF_DISTANCE: f32 = 135.0;
 
-// ---------------------------- PARTICLES --------------------------------
-const PARTICLES_PER_EDGE: usize = 3;
-const PARTICLE_SPEED: f32 = 0.16; // cycles/sec along the segment
-const TRAIL_STAMPS: usize = 4; // index 0 = bright head, 1..3 = fading tail
-const TRAIL_SPACING: f32 = 0.035; // t-gap between stamps
-const TRAIL_RADIUS_MULT: [f32; 4] = [1.0, 0.82, 0.62, 0.44]; // x pr (head->tail)
-const TRAIL_ALPHA: [f32; 4] = [0.92, 0.30, 0.22, 0.14];
-const PARTICLE_HALO_MULT: f32 = 2.0;
-const PARTICLE_HALO_A: f32 = 0.12;
+// ------------------------------ PULSE ----------------------------------
+// One slow pulse per active data path, travelling downstream (toward the exit)
+// and melting into the receiving node as it arrives.
+const PULSE_SPEED: f32 = 0.14; // cycles/sec along the segment (low = slow)
+const PULSE_HALO_MULT: f32 = 2.2;
+const PULSE_HALO_A: f32 = 0.12;
+const PULSE_CORE_A: f32 = 0.95;
+
+/// Position along the path to the exit: leaves (0) -> anchor (1) -> relay (2)
+/// -> exit (3). Pulses flow from low rank to high rank (toward the exit).
+fn role_flow_rank(role: &str) -> i32 {
+    match role {
+        "client" | "nas" | "llm" => 0,
+        "anchor" => 1,
+        "relay" => 2,
+        "exit" | "blind_exit" => 3,
+        _ => 1, // admin/unknown (control edges don't pulse anyway)
+    }
+}
 
 /// Normalised perspective scale (~0.3 far .. 3.2 near) from camera-space depth.
 fn pscale_of(depth: f32) -> f32 {
@@ -622,6 +632,12 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 /// Scalar linear interpolation.
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+/// Smooth Hermite step between two edges (0 below e0, 1 above e1).
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Interpolate between two screen points.
@@ -980,38 +996,36 @@ impl App {
                         Stroke::new(width, with_alpha(col, alpha)),
                     );
 
-                    // ----- flow particles: data_path + live only; head + trailing fade -----
+                    // ----- pulse: one slow blip per active data path, flowing
+                    // downstream (toward the exit) and melting into the receiver -----
                     if edge_has_flow(&e.kind) && live && self.animate_flow {
+                        // Orient from the upstream endpoint toward the one nearer
+                        // the exit (higher flow rank).
+                        let (src, dst) = if role_flow_rank(&a.role) <= role_flow_rank(&b.role) {
+                            (pa.screen, pb.screen)
+                        } else {
+                            (pb.screen, pa.screen)
+                        };
                         let cra = core_r_of(role_style(&a.role).size_mult, pa.depth);
                         let crb = core_r_of(role_style(&b.role).size_mult, pb.depth);
-                        let pr = ((cra + crb) * 0.5 * 0.34).clamp(1.4, 4.2);
-                        for k in 0..PARTICLES_PER_EDGE {
-                            let base = (time * PARTICLE_SPEED
-                                + k as f32 / PARTICLES_PER_EDGE as f32)
-                                .fract();
-                            // tail first (under head)
-                            for s in (1..TRAIL_STAMPS).rev() {
-                                let t = base - s as f32 * TRAIL_SPACING;
-                                if (0.0..=1.0).contains(&t) {
-                                    let p = lerp_pos(pa.screen, pb.screen, t);
-                                    painter.circle_filled(
-                                        p,
-                                        pr * TRAIL_RADIUS_MULT[s],
-                                        with_alpha(FIBER, TRAIL_ALPHA[s]),
-                                    );
-                                }
-                            }
-                            // head: soft halo + bright core
-                            let p = lerp_pos(pa.screen, pb.screen, base);
+                        let pr = ((cra + crb) * 0.5 * 0.40).clamp(1.6, 4.6);
+                        // Per-edge phase so pulses don't all march in lock-step.
+                        let phase = ((e.a * 13 + e.b * 7) % 97) as f32 / 97.0;
+                        let t = (time * PULSE_SPEED + phase).fract();
+                        // Envelope: emerge from the source, melt into the receiver.
+                        let env = smoothstep(0.0, 0.12, t) * (1.0 - smoothstep(0.6, 1.0, t));
+                        if env > 0.01 {
+                            let p = lerp_pos(src, dst, t);
+                            let rr = pr * (0.45 + 0.55 * env);
                             painter.circle_filled(
                                 p,
-                                pr * PARTICLE_HALO_MULT,
-                                with_alpha(FIBER, PARTICLE_HALO_A),
+                                rr * PULSE_HALO_MULT,
+                                with_alpha(FIBER, PULSE_HALO_A * env),
                             );
                             painter.circle_filled(
                                 p,
-                                pr * TRAIL_RADIUS_MULT[0],
-                                with_alpha(Color32::from_rgb(248, 252, 255), 0.92),
+                                rr,
+                                with_alpha(Color32::from_rgb(248, 252, 255), PULSE_CORE_A * env),
                             );
                         }
                     }
@@ -1399,8 +1413,10 @@ fn demo_graph() -> GraphDto {
             edge("pc-win", "anchor-us", "data_path"),
             edge("anchor-us", "exit-blind", "data_path"),
             edge("phone", "anchor-eu", "data_path"),
-            edge("laptop-mac", "nas-vault", "data_path"),
-            edge("pc-win", "llm-box", "data_path"),
+            // Service nodes (nas/llm) hang off anchors; clients reach them via
+            // the anchor rather than connecting to them directly.
+            edge("nas-vault", "anchor-eu", "data_path"),
+            edge("llm-box", "anchor-us", "data_path"),
             // Extra client groups orbiting their anchor.
             edge("eu-phone", "anchor-eu", "data_path"),
             edge("eu-tablet", "anchor-eu", "data_path"),

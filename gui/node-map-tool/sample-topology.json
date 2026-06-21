@@ -13,7 +13,7 @@
     { "from": "laptop-mac", "to": "anchor-eu",  "kind": "data_path" },
     { "from": "anchor-eu",  "to": "relay-home", "kind": "data_path" },
     { "from": "relay-home", "to": "exit-nl",    "kind": "data_path" },
-    { "from": "laptop-mac", "to": "nas-vault",  "kind": "data_path" },
+    { "from": "nas-vault",  "to": "anchor-eu",  "kind": "data_path" },
     { "from": "pc-win",     "to": "anchor-eu",  "kind": "data_path" },
     { "from": "admin-01",   "to": "anchor-eu",  "kind": "control" },
     { "from": "admin-01",   "to": "relay-home", "kind": "control" },
