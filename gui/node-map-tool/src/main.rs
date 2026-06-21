@@ -186,10 +186,12 @@ fn edge_has_flow(kind: &str) -> bool {
 /// nodes (anchor/relay/exit/admin) are spread across a roomy 2D grid; leaf nodes
 /// (client/nas/llm) form per-(hub, role) "galaxies" that orbit their hub. The
 /// map is intentionally larger than the viewport so it can be panned around.
-const NODE_GAP: f32 = 26.0; // packing spacing of nodes within a galaxy (roomy)
-const SINGLETON_RADIUS: f32 = 44.0; // tile radius for a lone backbone node
-const CLUSTER_GAP: f32 = 30.0; // gap between packed tiles (keep them close)
-const GALAXY_PAD: f32 = 30.0; // screen px padding between nodes and the galaxy border
+// All spacing is world-space so node<->node, node<->border and border<->border
+// gaps hold at any zoom. NODE_GAP doubles as the node spacing AND the interior
+// pad (nodes to border); CLUSTER_GAP is the gap between galaxy/backbone tiles.
+const NODE_GAP: f32 = 34.0; // spacing of nodes within a galaxy + interior padding
+const SINGLETON_RADIUS: f32 = 46.0; // tile radius for a lone backbone node
+const CLUSTER_GAP: f32 = 40.0; // gap between packed tiles
 
 // Camera zoom levels: overview vs drilled-into-a-galaxy.
 const OVERVIEW_DISTANCE: f32 = 820.0;
@@ -451,10 +453,22 @@ struct Edge {
     active: bool,
 }
 
+/// A galaxy's world-space footprint (a disc on the y=0 plane). The border is
+/// drawn by projecting this, and the layout packs these with a world gap, so
+/// node↔border and border↔border spacing is guaranteed regardless of zoom.
+struct GalaxyBox {
+    gid: u64,
+    center: V3,
+    radius: f32,
+    role: String,
+}
+
 #[derive(Default)]
 struct Graph {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+    /// World-space footprint of each galaxy (for borders + hit-testing).
+    galaxies: Vec<GalaxyBox>,
     /// Per-node emit time within a pulse cycle (seconds). A node fires its
     /// downstream blobs at this offset; computed as a longest-path over the
     /// flow DAG so a node only emits after all upstream blobs have melted in.
@@ -503,6 +517,7 @@ impl Graph {
         let mut graph = Graph {
             nodes,
             edges,
+            galaxies: Vec::new(),
             fire_at: Vec::new(),
             cycle_len: 0.0,
         };
@@ -548,8 +563,9 @@ impl Graph {
         // A tile is one packed unit: either a galaxy (a disc of same-role leaves)
         // or a single backbone/unattached node. Tiles are shelf-packed.
         struct Tile {
-            members: Vec<(usize, V3)>, // (node idx, offset from tile centre)
-            radius: f32,
+            members: Vec<(usize, V3)>,   // (node idx, offset from tile centre)
+            radius: f32,                 // world footprint radius (incl. padding)
+            info: Option<(u64, String)>, // Some((gid, role)) for galaxy tiles
         }
 
         // Group leaves by (hub, role).
@@ -569,7 +585,7 @@ impl Graph {
         }
 
         // Build a galaxy tile: pack same-role leaves into a disc (phyllotaxis).
-        let galaxy_tile = |nodes: &mut [Node], mem: &[usize], gid: u64| -> Tile {
+        let galaxy_tile = |nodes: &mut [Node], mem: &[usize], gid: u64, role: &str| -> Tile {
             let mut members = Vec::with_capacity(mem.len());
             let mut maxr = 0.0_f32;
             for (k, &idx) in mem.iter().enumerate() {
@@ -582,7 +598,8 @@ impl Graph {
             }
             Tile {
                 members,
-                radius: maxr + NODE_GAP, // interior breathing room
+                radius: maxr + NODE_GAP, // interior breathing room (node <-> border)
+                info: Some((gid, role.to_string())),
             }
         };
 
@@ -594,10 +611,11 @@ impl Graph {
             tiles.push(Tile {
                 members: vec![(*h, V3::default())],
                 radius: SINGLETON_RADIUS,
+                info: None,
             });
             for (role, mem) in &by_hub[h] {
                 let gid = (*h as u64) * 16 + role_ord(role);
-                let t = galaxy_tile(&mut self.nodes, mem, gid);
+                let t = galaxy_tile(&mut self.nodes, mem, gid, role);
                 tiles.push(t);
             }
         }
@@ -614,6 +632,7 @@ impl Graph {
             tiles.push(Tile {
                 members: vec![(i, V3::default())],
                 radius: SINGLETON_RADIUS,
+                info: None,
             });
         }
 
@@ -644,11 +663,20 @@ impl Graph {
         }
         let mid = V3::new((min_x + max_x) * 0.5, 0.0, (min_z + max_z) * 0.5);
 
-        // Apply, centring the whole map at the origin.
+        // Apply, centring the whole map at the origin; record galaxy world boxes.
+        self.galaxies.clear();
         for (t, center) in tiles.iter().zip(centers) {
             let base = center.sub(mid);
             for &(idx, off) in &t.members {
                 self.nodes[idx].pos = base.add(off);
+            }
+            if let Some((gid, role)) = &t.info {
+                self.galaxies.push(GalaxyBox {
+                    gid: *gid,
+                    center: base,
+                    radius: t.radius,
+                    role: role.clone(),
+                });
             }
         }
     }
@@ -1107,39 +1135,49 @@ impl App {
                     }
                 }
 
-                // ----- galaxy boxes (one square-ish region per (hub, role) group) -----
+                // ----- galaxy boxes: project each galaxy's WORLD footprint (a
+                // padded disc) to a screen rect, so node<->border and
+                // border<->border spacing is guaranteed by the world packing. -----
                 struct GalScreen {
                     gid: u64,
-                    bounds: Rect, // node bounding box + interior padding
+                    bounds: Rect,
                     color: Color32,
                     label: &'static str,
                 }
                 let mut galaxies: Vec<GalScreen> = Vec::new();
-                {
-                    let mut groups: std::collections::BTreeMap<u64, (Vec<Pos2>, &str)> =
-                        std::collections::BTreeMap::new();
-                    for d in &drawn {
-                        if let Some(g) = self.graph.nodes[d.idx].galaxy {
-                            groups
-                                .entry(g)
-                                .or_insert_with(|| {
-                                    (Vec::new(), self.graph.nodes[d.idx].role.as_str())
-                                })
-                                .0
-                                .push(d.p.screen);
+                for gb in &self.graph.galaxies {
+                    if !self.visible(&gb.role) {
+                        continue;
+                    }
+                    let mut bb: Option<Rect> = None;
+                    let mut ok = true;
+                    for s in 0..12 {
+                        let ang = std::f32::consts::TAU * s as f32 / 12.0;
+                        let wp = gb.center.add(V3::new(
+                            gb.radius * ang.cos(),
+                            0.0,
+                            gb.radius * ang.sin(),
+                        ));
+                        match self.cam.project(wp, rect) {
+                            Some(p) => {
+                                bb = Some(match bb {
+                                    Some(mut r) => {
+                                        r.extend_with(p.screen);
+                                        r
+                                    }
+                                    None => Rect::from_min_max(p.screen, p.screen),
+                                });
+                            }
+                            None => {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
-                    for (gid, (pts, role)) in groups {
-                        // Bounding box of the group's nodes, padded on all sides so
-                        // nodes never touch the border.
-                        let mut bb = Rect::from_min_max(pts[0], pts[0]);
-                        for p in &pts {
-                            bb.extend_with(*p);
-                        }
-                        let bounds = bb.expand(GALAXY_PAD);
-                        let rs = role_style(role);
+                    if let (true, Some(bounds)) = (ok, bb) {
+                        let rs = role_style(&gb.role);
                         galaxies.push(GalScreen {
-                            gid,
+                            gid: gb.gid,
                             bounds,
                             color: rs.color,
                             label: rs.label,
