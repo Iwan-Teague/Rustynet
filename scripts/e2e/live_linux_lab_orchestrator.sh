@@ -3790,6 +3790,21 @@ enforce_runtime_worker_macos() {
   cmd+=" --network-id '${NETWORK_ID}'"
   cmd+=" --auto-tunnel-enforce true"
   cmd+=" --trust-max-age-secs 86400"
+  # Plumb the same relaxed lab freshness window the Linux systemd unit
+  # (scripts/systemd/rustynetd.service) and the Windows installer
+  # (Install-RustyNetWindowsService.ps1) already pass for the auto-tunnel,
+  # traversal and DNS-zone bundles. Without these the macOS daemon falls
+  # back to the strict 300 s production default for those three bundles
+  # (only --trust-max-age-secs was being forwarded), so on a slower
+  # multi-node run a bundle issued earlier in the pipeline ages past 300 s
+  # before the next re-mint reaches the daemon, the auto-tunnel reconcile
+  # fail-closes as "stale", the daemon wedges in restricted-safe mode, and
+  # the subsequent `rustynet state refresh` hangs until the stage watchdog
+  # fires. The 300 s production default is unchanged; this only matches
+  # macOS to the existing Linux/Windows lab window.
+  cmd+=" --auto-tunnel-max-age-secs 86400"
+  cmd+=" --traversal-max-age-secs 86400"
+  cmd+=" --dns-zone-max-age-secs 86400"
   cmd+=" --wg-interface '${wg_interface}'"
   if [[ -n "${SSH_ALLOW_CIDRS:-}" ]]; then
     cmd+=" --fail-closed-ssh-allow true"

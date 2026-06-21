@@ -1080,6 +1080,39 @@ mod tests {
         );
     }
 
+    /// Regression guard for the macOS stale-bundle enforce wedge. The legacy
+    /// bash enforce path (`enforce_runtime_worker_macos`) and the bootstrap
+    /// install invocation must forward the same relaxed lab freshness window
+    /// (86400 s) for the auto-tunnel, traversal and DNS-zone bundles that the
+    /// Linux systemd unit, the Windows installer and the Rust `enforce_daemon`
+    /// path already use. When only `--trust-max-age-secs` was forwarded the
+    /// macOS daemon fell back to the strict 300 s production default for those
+    /// three bundles; on a slower multi-node run a bundle aged past 300 s
+    /// before the next re-mint reached the daemon, the auto-tunnel reconcile
+    /// fail-closed as "stale", the daemon wedged in restricted-safe mode, and
+    /// the subsequent `rustynet state refresh` hung until the stage watchdog
+    /// fired. The 300 s production default is unchanged; this only keeps macOS
+    /// at parity with the existing Linux/Windows lab window.
+    #[test]
+    fn macos_daemon_launch_relaxes_lab_freshness_window_for_all_bundles() {
+        for flag in [
+            "--auto-tunnel-max-age-secs 86400",
+            "--traversal-max-age-secs 86400",
+            "--dns-zone-max-age-secs 86400",
+        ] {
+            assert!(
+                LIVE_LINUX_LAB_ORCHESTRATOR.contains(flag),
+                "macOS enforce path (enforce_runtime_worker_macos) must forward {flag} so the \
+                 enforced daemon does not fall back to the strict 300 s production default"
+            );
+            assert!(
+                BOOTSTRAP_SCRIPT.contains(flag),
+                "macOS bootstrap install invocation must forward {flag} so the bootstrap-time \
+                 daemon uses the same lab freshness window"
+            );
+        }
+    }
+
     #[test]
     fn live_lab_prime_remote_access_skips_sudo_for_windows_role_node() {
         // A Windows role node has no sudo. live_lab_push_sudo_password runs a

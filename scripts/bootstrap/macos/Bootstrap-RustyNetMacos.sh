@@ -1190,6 +1190,9 @@ install_launchd_service() {
     --brew-prefix "${BREW_PREFIX:-/opt/homebrew}" \
     --auto-tunnel-enforce "false" \
     --trust-max-age-secs 86400 \
+    --auto-tunnel-max-age-secs 86400 \
+    --traversal-max-age-secs 86400 \
+    --dns-zone-max-age-secs 86400 \
     --wg-interface "${wg_interface}" \
     --fail-closed-ssh-allow "${ssh_allow_flag}" \
     --fail-closed-ssh-allow-cidrs "${SSH_ALLOW_CIDRS:-}"
