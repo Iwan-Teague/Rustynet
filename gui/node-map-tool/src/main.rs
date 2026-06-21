@@ -245,13 +245,12 @@ fn edge_spring_k(kind: &str) -> f32 {
 }
 
 // ----------------------- THEME / GLOBAL CONSTANTS ----------------------
-const BG: Color32 = Color32::from_rgb(64, 69, 80); // window background (grey)
-const NEBULA: Color32 = Color32::from_rgb(86, 92, 108); // faked center-lift tint
+const BG: Color32 = Color32::from_rgb(82, 87, 97); // window background (grey)
+const NEBULA: Color32 = Color32::from_rgb(104, 110, 124); // faked center-lift tint
 const WARM_WHITE: Color32 = Color32::from_rgb(255, 248, 236); // glow highlight
 const FIBER: Color32 = Color32::from_rgb(176, 206, 236); // edge/particle tint
 const GREY_DOWN: Color32 = Color32::from_rgb(120, 126, 142); // desaturation target
 const TEXT_HI: Color32 = Color32::from_rgb(232, 238, 248);
-const TEXT_DIM: Color32 = Color32::from_rgb(186, 194, 210);
 
 // ------------------------------ GLOW -----------------------------------
 // A light, smooth glow built from many thin layers whose radius shrinks AND
@@ -1291,24 +1290,13 @@ impl App {
                         let core_r = core_r_of(role_style(&node.role).size_mult, d.p.depth);
                         let font =
                             FontId::monospace((10.5 * (0.8 + depth_t * 0.5)).clamp(9.0, 14.0));
-                        let pos = d.p.screen + Vec2::new(0.0, -core_r - 6.0);
-                        // Legibility plate behind the text.
-                        let galley =
-                            painter.layout_no_wrap(node.label.clone(), font.clone(), TEXT_DIM);
-                        let sz = galley.size();
-                        let plate = Rect::from_center_size(
-                            pos - Vec2::new(0.0, sz.y * 0.5),
-                            sz + Vec2::new(8.0, 4.0),
-                        );
-                        painter.rect_filled(
-                            plate,
-                            3.0,
-                            with_alpha(Color32::from_rgb(4, 6, 12), 0.45 * label_alpha),
-                        );
-                        let color = if is_focus { TEXT_HI } else { TEXT_DIM };
+                        // Translucent white name floating just below the node,
+                        // with no background plate.
+                        let pos = d.p.screen + Vec2::new(0.0, core_r + 6.0);
+                        let color = if is_focus { Color32::WHITE } else { TEXT_HI };
                         painter.text(
                             pos,
-                            Align2::CENTER_BOTTOM,
+                            Align2::CENTER_TOP,
                             &node.label,
                             font,
                             with_alpha(color, label_alpha),
