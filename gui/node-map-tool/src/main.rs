@@ -110,41 +110,37 @@ const ROLE_ORDER: &[&str] = &[
     "llm",
 ];
 
-/// How a status makes the "ball of light" behave.
+/// How a status makes the node glow behave. (Body colour comes from
+/// `status_body_color`; the smooth lit ramp comes from `lit_target`.)
 struct StatusStyle {
-    brightness: f32,
-    glow: f32,
-    pulse: f32,
-    desat: f32,
-    flicker: f32,
+    glow: f32,    // halo opacity
+    pulse: f32,   // gentle glow breathing amplitude
+    desat: f32,   // legend status-key swatch only
+    flicker: f32, // nervous glow jitter (connecting)
 }
 
 fn status_style(status: &str) -> StatusStyle {
     match status {
         "online" => StatusStyle {
-            brightness: 1.00,
             glow: 1.00,
             pulse: 0.10,
             desat: 0.00,
             flicker: 0.00,
         },
         "connecting" => StatusStyle {
-            brightness: 0.72,
             glow: 0.62,
             pulse: 0.05,
             desat: 0.30,
             flicker: 0.14,
         },
         "powered_off" => StatusStyle {
-            brightness: 0.24,
             glow: 0.15,
             pulse: 0.00,
             desat: 0.90,
             flicker: 0.00,
         },
-        // "offline" and anything unknown -> dim, mostly grey (fail-visible).
+        // "offline" and anything unknown -> dim, grey (fail-visible).
         _ => StatusStyle {
-            brightness: 0.42,
             glow: 0.30,
             pulse: 0.00,
             desat: 0.78,
@@ -258,24 +254,23 @@ const TEXT_HI: Color32 = Color32::from_rgb(232, 238, 248);
 const TEXT_DIM: Color32 = Color32::from_rgb(186, 194, 210);
 
 // ------------------------------ GLOW -----------------------------------
-// A smooth, faint glow built from many thin layers whose radius shrinks AND
+// A light, smooth glow built from many thin layers whose radius shrinks AND
 // whose alpha fades from the core outward, so they blend into a soft aura
 // rather than reading as discrete rings.
 const GLOW_LAYERS: usize = 14;
-const GLOW_OUTER: f32 = 1.8; // outermost halo radius (x core_r)
+const GLOW_OUTER: f32 = 1.9; // outermost halo radius (x core_r)
 const GLOW_INNER: f32 = 1.0; // innermost halo radius (meets the core)
-const GLOW_PEAK: f32 = 0.085; // strongest per-layer alpha (nearest the core)
+const GLOW_PEAK: f32 = 0.06; // strongest per-layer alpha (light glow)
 const GLOW_FALLOFF: f32 = 2.6; // higher = faster fade outward (fainter halo)
-const GLOW_WARM: f32 = 0.15; // how much the inner glow warms toward WARM_WHITE
-const CORE_R_MULT: f32 = 0.72;
-const CORE_ALPHA: f32 = 0.95;
+const GLOW_WARM: f32 = 0.12; // how much the inner glow warms toward WARM_WHITE
+const CORE_R_MULT: f32 = 0.9; // node ball radius (x core_r)
 
 // ------------------------------ DEPTH ----------------------------------
-// DEPTH_FADE_MIN = far-node opacity floor; DEPTH_FOG_MAX = far-node tint toward
-// BG. REF_DISTANCE maps camera-space depth onto the design's perspective_scale
-// band (~0.5 far .. 2.6 near), tuned so the default camera view produces
-// pleasing node sizes and a usable depth gradient.
-const DEPTH_FADE_MIN: f32 = 0.5;
+// DEPTH_FOG_MAX = how far edges fade toward BG with distance. REF_DISTANCE maps
+// camera-space depth onto the design's perspective_scale band (~0.5 far .. 2.6
+// near), tuned so the default view produces pleasing node sizes and depth.
+// (Node bodies are NOT depth-tinted, so same-role nodes keep a consistent shade;
+// depth is conveyed by size.)
 const DEPTH_FOG_MAX: f32 = 0.45;
 const REF_DISTANCE: f32 = 135.0;
 
@@ -468,6 +463,19 @@ fn lit_target(status: &str) -> f32 {
         "connecting" => 0.55,
         "powered_off" => 0.10,
         _ => 0.18, // offline + unknown
+    }
+}
+
+/// Bold, consistent node body colour by status: full role colour when online,
+/// grey when offline/unknown, partly desaturated while connecting, dark grey
+/// when powered off. Deliberately independent of depth so same-role online
+/// nodes always read as the same shade.
+fn status_body_color(role_col: Color32, status: &str) -> Color32 {
+    match status {
+        "online" => role_col,
+        "connecting" => lerp_color(role_col, GREY_DOWN, 0.30),
+        "powered_off" => lerp_color(GREY_DOWN, BG, 0.45),
+        _ => GREY_DOWN, // offline + unknown -> grey
     }
 }
 
@@ -1130,61 +1138,51 @@ impl App {
                     let rs = role_style(&node.role);
                     let st = status_style(&node.status);
 
-                    // Brightness: online breathes slow, connecting is nervous + flickers.
+                    // Bold, consistent body colour by status (online = full role
+                    // colour, offline = grey). NOT tinted by depth, so all
+                    // same-role online nodes read as the same shade.
+                    let body = status_body_color(rs.color, &node.status);
+
+                    // Glow opacity only: a light breathing glow (online slow,
+                    // connecting nervous + flicker). The core stays steady.
                     let pulse_speed = if node.status == "connecting" {
                         5.5
                     } else {
                         1.6
                     };
                     let seed = d.idx as f32 * 12.9898;
-                    let mut brightness =
-                        st.brightness + (time * pulse_speed + seed).sin() * st.pulse;
+                    let mut glow_op = (st.glow + (time * pulse_speed + seed).sin() * st.pulse)
+                        .max(0.0)
+                        * lerp(0.4, 1.0, node.lit);
                     if st.flicker > 0.0 {
-                        brightness += (self_rand_static(time, d.idx) - 0.5) * st.flicker;
+                        glow_op *= 0.7 + self_rand_static(time, d.idx) * st.flicker;
                     }
-                    brightness = brightness.clamp(0.05, 1.25);
+                    // Core opacity eases in with the status ramp (no pop on change).
+                    let mut ball_a = 0.55 + 0.45 * node.lit;
 
-                    // Depth fog/fade.
-                    let depth_t = depth_t_of(d.p.depth);
-                    let depth_fade = lerp(DEPTH_FADE_MIN, 1.0, depth_t);
-                    let mut color = lerp_color(rs.color, GREY_DOWN, st.desat);
-                    color = lerp_color(BG, color, lerp(1.0 - DEPTH_FOG_MAX, 1.0, depth_t));
-                    let mut glow_op = st.glow * depth_fade;
-                    let mut bri = brightness * depth_fade;
-
-                    // Smooth status-change ramp.
-                    glow_op *= lerp(0.35, 1.0, node.lit);
-                    bri *= lerp(0.5, 1.0, node.lit);
-
-                    // Focus mode: dim everything except the focused node.
+                    // Focus mode: emphasise the focused node, dim the rest.
                     if focused {
                         if focus == Some(d.idx) {
-                            glow_op *= 1.25;
+                            glow_op *= 1.3;
                         } else {
-                            glow_op *= 0.42;
-                            bri *= 0.6;
+                            glow_op *= 0.4;
+                            ball_a *= 0.55;
                         }
                     }
 
                     let core_r = core_r_of(rs.size_mult, d.p.depth);
 
-                    // Smooth faint glow: many thin layers, radius + alpha both
-                    // falling off from the core outward (blends, no rings).
+                    // Light glow: many thin layers, radius + alpha falling off
+                    // from the core outward (soft aura, no rings).
                     for i in 0..GLOW_LAYERS {
-                        // t: 0 at the outermost layer -> 1 at the innermost.
                         let t = i as f32 / (GLOW_LAYERS - 1) as f32;
                         let r = core_r * (GLOW_INNER + (GLOW_OUTER - GLOW_INNER) * (1.0 - t));
-                        let a = GLOW_PEAK * t.powf(GLOW_FALLOFF) * bri * glow_op;
-                        let col = lerp_color(color, WARM_WHITE, t * GLOW_WARM);
+                        let a = GLOW_PEAK * t.powf(GLOW_FALLOFF) * glow_op;
+                        let col = lerp_color(body, WARM_WHITE, t * GLOW_WARM);
                         painter.circle_filled(d.p.screen, r, with_alpha(col, a));
                     }
-                    // Coloured core dot (role colour, lifted just slightly).
-                    let core_col = lerp_color(color, WARM_WHITE, 0.12);
-                    painter.circle_filled(
-                        d.p.screen,
-                        core_r * CORE_R_MULT,
-                        with_alpha(core_col, CORE_ALPHA * bri),
-                    );
+                    // Bold core rendered as a simple 3D-looking sphere.
+                    draw_ball(&painter, d.p.screen, core_r * CORE_R_MULT, body, ball_a);
 
                     // Selection / hover ring.
                     let ring_r = core_r * GLOW_OUTER + 4.0;
@@ -1346,6 +1344,20 @@ fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
             ui.label(egui::RichText::new(v).monospace());
         });
     });
+}
+
+/// Draw a node core as a simple faked 3D sphere: a dark base rim, the bold body
+/// offset toward the light, then a highlight and a small specular (light from
+/// the upper-left). Four solid circles only — minimal, no gradients.
+fn draw_ball(painter: &egui::Painter, c: Pos2, r: f32, color: Color32, alpha: f32) {
+    let dir = Vec2::new(-0.40, -0.52); // light from upper-left (screen y is down)
+    let shadow = lerp_color(color, Color32::BLACK, 0.50);
+    let hi = lerp_color(color, Color32::WHITE, 0.38);
+    let spec = lerp_color(color, Color32::WHITE, 0.72);
+    painter.circle_filled(c, r, with_alpha(shadow, alpha));
+    painter.circle_filled(c + dir * (r * 0.14), r * 0.86, with_alpha(color, alpha));
+    painter.circle_filled(c + dir * (r * 0.34), r * 0.52, with_alpha(hi, alpha));
+    painter.circle_filled(c + dir * (r * 0.50), r * 0.22, with_alpha(spec, alpha));
 }
 
 fn draw_tooltip(painter: &egui::Painter, at: Pos2, node: &Node) {
