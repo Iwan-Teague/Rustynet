@@ -91,7 +91,7 @@ impl PrivilegedCommandProgram {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "ip" => Some(PrivilegedCommandProgram::Ip),
             "nft" => Some(PrivilegedCommandProgram::Nft),
@@ -1008,10 +1008,7 @@ fn truncate_lossy(bytes: &[u8], max_bytes: usize) -> String {
     out
 }
 
-pub(crate) fn validate_request(
-    program: PrivilegedCommandProgram,
-    args: &[&str],
-) -> Result<(), String> {
+pub fn validate_request(program: PrivilegedCommandProgram, args: &[&str]) -> Result<(), String> {
     if args.len() > MAX_ARGS {
         return Err(format!(
             "too many arguments for privileged command {program}",
