@@ -307,6 +307,18 @@ fn segments_cross(p1: V3, p2: V3, p3: V3, p4: V3) -> bool {
 // inversions between them; the minimum is found by branch-and-bound seeded with
 // a strong heuristic incumbent.
 
+/// Distance from point `p` to segment `a`-`b` in the xz plane.
+fn point_seg_dist(p: V3, a: V3, b: V3) -> f32 {
+    let ab = b.sub(a);
+    let d2 = ab.dot(ab);
+    let t = if d2 > 1e-6 {
+        (p.sub(a).dot(ab) / d2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    p.sub(a.add(ab.scale(t))).len()
+}
+
 /// Straight-line crossings between tile-to-tile connections, given tile centres.
 /// Connections sharing a tile never count.
 fn straight_crossings(tedges: &[(usize, usize)], centers: &[V3]) -> usize {
@@ -1289,11 +1301,11 @@ impl Graph {
         let crossings = straight_crossings(&tedges, &centers);
         let certified = certified && crossings == best_cross;
 
-        // Node-level (actually-rendered) straight crossings for a candidate set
-        // of tile centres: a galaxy's members fan out around its centre, so this
-        // is what the viewer truly sees. The organic transforms below must not
-        // increase it beyond the clean baseline — keeping the minimum the user
-        // cares about, not just the tile-level abstraction.
+        // Rendered-overlap penalty for a candidate set of tile centres: counts
+        // both connection-vs-connection crossings AND connections that pass over
+        // a non-endpoint node. The organic transforms below must never increase
+        // it beyond the clean baseline, so the randomness can never push a
+        // connection into an overlap it didn't already have.
         let mut node_off = vec![V3::default(); self.nodes.len()];
         let mut node_has_tile = vec![false; self.nodes.len()];
         for t in &tiles {
@@ -1302,7 +1314,7 @@ impl Graph {
                 node_has_tile[idx] = true;
             }
         }
-        let node_xings = |cs: &[V3]| -> usize {
+        let overlap_pen = |cs: &[V3]| -> usize {
             let np: Vec<V3> = (0..self.nodes.len())
                 .map(|i| {
                     if node_has_tile[i] {
@@ -1314,6 +1326,7 @@ impl Graph {
                 .collect();
             let e = &self.edges;
             let mut c = 0;
+            // (1) connection vs connection (proper crossings).
             for i in 0..e.len() {
                 for j in (i + 1)..e.len() {
                     let (a, b) = (e[i].a, e[i].b);
@@ -1335,9 +1348,25 @@ impl Graph {
                     }
                 }
             }
+            // (2) connection passing over a non-endpoint node.
+            const NODE_CLEAR: f32 = 14.0;
+            for ed in e {
+                let (a, b) = (ed.a, ed.b);
+                if !(node_has_tile[a] && node_has_tile[b]) {
+                    continue;
+                }
+                for v in 0..self.nodes.len() {
+                    if v == a || v == b || !node_has_tile[v] {
+                        continue;
+                    }
+                    if point_seg_dist(np[v], np[a], np[b]) < NODE_CLEAR {
+                        c += 1;
+                    }
+                }
+            }
             c
         };
-        let base_node = node_xings(&centers);
+        let base_pen = overlap_pen(&centers);
 
         // --- Curved "universe" placement (mathematical, size-independent) ---
         // Bend the rigid layered columns onto concentric arcs around a focus
@@ -1398,7 +1427,7 @@ impl Graph {
             let mut curved = false;
             for &s in &[1.0f32, 0.85, 0.7, 0.55, 0.4, 0.25] {
                 apply_curve(s, &mut centers);
-                if node_xings(&centers) == base_node {
+                if overlap_pen(&centers) <= base_pen {
                     curved = true;
                     break;
                 }
@@ -1433,7 +1462,7 @@ impl Graph {
                 let saved = centers[t];
                 for &s in &[1.0f32, 0.7, 0.45, 0.25] {
                     centers[t] = V3::new(saved.x + ux * mx * s, 0.0, saved.z + uz * mz * s);
-                    if node_xings(&centers) == base_node && clear(&centers, t) {
+                    if overlap_pen(&centers) <= base_pen && clear(&centers, t) {
                         break;
                     }
                     centers[t] = saved; // revert; try a smaller step
