@@ -187,11 +187,15 @@ fn edge_has_flow(kind: &str) -> bool {
 /// (client/nas/llm) form per-(hub, role) "galaxies" that orbit their hub. The
 /// map is intentionally larger than the viewport so it can be panned around.
 const GRID_COLS: usize = 3; // backbone cluster columns
-const GRID_CELL_X: f32 = 320.0; // world gap between cluster cells (horizontal)
-const GRID_CELL_Y: f32 = 320.0; // world gap between cluster cells (vertical)
-const ORBIT_RADIUS: f32 = 56.0; // base distance of a leaf galaxy from its hub
-const NODE_GAP: f32 = 8.0; // packing spacing of nodes within a galaxy
-const GALAXY_PAD: f32 = 16.0; // screen px padding of a galaxy border past its nodes
+const GRID_CELL_X: f32 = 300.0; // world gap between cluster cells (horizontal)
+const GRID_CELL_Y: f32 = 280.0; // world gap between cluster cells (vertical)
+const ORBIT_RADIUS: f32 = 80.0; // base distance of a leaf galaxy from its hub
+const NODE_GAP: f32 = 20.0; // packing spacing of nodes within a galaxy (roomy)
+const GALAXY_PAD: f32 = 18.0; // screen px padding of a galaxy border past its nodes
+
+// Camera zoom levels: overview vs drilled-into-a-galaxy.
+const OVERVIEW_DISTANCE: f32 = 820.0;
+const GALAXY_VIEW_DISTANCE: f32 = 200.0;
 
 /// Leaf roles orbit the node their data travels to; backbone roles are the skeleton.
 fn is_leaf_role(role: &str) -> bool {
@@ -350,7 +354,7 @@ impl Default for Camera {
             target: V3::default(),
             yaw: 0.0,
             pitch: 0.62, // oblique top-down angle (clearly tilted, not straight down)
-            distance: 820.0,
+            distance: OVERVIEW_DISTANCE,
             fov: 50_f32.to_radians(),
         }
     }
@@ -548,7 +552,7 @@ impl Graph {
         //    region. Each anchor cell hosts the leaf galaxies that orbit it.
         let mut standalone: Vec<usize> = (0..n)
             .filter(|&i| {
-                !self.nodes[i].pinned && !(is_leaf_role(&self.nodes[i].role) && hub[i].is_some())
+                !(self.nodes[i].pinned || is_leaf_role(&self.nodes[i].role) && hub[i].is_some())
             })
             .collect();
         standalone.sort_by(|&a, &b| {
@@ -647,6 +651,23 @@ impl Graph {
         self.fire_at = fire_at;
         self.cycle_len = cycle;
     }
+
+    /// World-space centroid of a galaxy's member nodes (for camera framing).
+    fn galaxy_centroid(&self, gid: u64) -> V3 {
+        let mut sum = V3::default();
+        let mut count = 0.0f32;
+        for nd in &self.nodes {
+            if nd.galaxy == Some(gid) {
+                sum = sum.add(nd.pos);
+                count += 1.0;
+            }
+        }
+        if count > 0.0 {
+            sum.scale(1.0 / count)
+        } else {
+            V3::default()
+        }
+    }
 }
 
 // ===========================================================================
@@ -730,6 +751,10 @@ struct App {
     live_sim: bool,
     hidden_roles: HashSet<String>,
     selected: Option<usize>,
+    /// When Some, we're drilled into a galaxy (zoomed-in view of one galaxy).
+    focused_galaxy: Option<u64>,
+    /// Smooth camera move goal (target, distance); cleared on manual pan/zoom.
+    view_anim: Option<(V3, f32)>,
     sim_accum: f32,
     rng: u64,
 }
@@ -745,9 +770,26 @@ impl App {
             live_sim: true,
             hidden_roles: HashSet::new(),
             selected: None,
+            focused_galaxy: None,
+            view_anim: None,
             sim_accum: 0.0,
             rng: 0x9e3779b97f4a7c15,
         }
+    }
+
+    /// Enter a galaxy: frame the camera on it at a fixed zoom.
+    fn enter_galaxy(&mut self, gid: u64) {
+        self.focused_galaxy = Some(gid);
+        self.selected = None;
+        let center = self.graph.galaxy_centroid(gid);
+        self.view_anim = Some((center, GALAXY_VIEW_DISTANCE));
+    }
+
+    /// Back to the spread-out overview.
+    fn exit_galaxy(&mut self) {
+        self.focused_galaxy = None;
+        self.selected = None;
+        self.view_anim = Some((V3::default(), OVERVIEW_DISTANCE));
     }
 
     /// Tiny xorshift RNG so we avoid an extra dependency.
@@ -804,6 +846,23 @@ impl eframe::App for App {
             node.lit += (target - node.lit) * k;
         }
 
+        // Smoothly fly the camera toward a view goal (enter/exit a galaxy).
+        if let Some((tgt, dist)) = self.view_anim {
+            let a = (dt * 6.0).min(1.0);
+            self.cam.target = self.cam.target.add(tgt.sub(self.cam.target).scale(a));
+            self.cam.distance += (dist - self.cam.distance) * a;
+            if tgt.sub(self.cam.target).len() < 0.5 && (dist - self.cam.distance).abs() < 0.5 {
+                self.cam.target = tgt;
+                self.cam.distance = dist;
+                self.view_anim = None;
+            }
+        }
+
+        // Escape leaves a galaxy view.
+        if self.focused_galaxy.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.exit_galaxy();
+        }
+
         self.side_panels(ctx);
         self.scene(ctx, time);
     }
@@ -826,6 +885,18 @@ impl App {
                         .small(),
                 );
                 ui.add_space(10.0);
+
+                if self.focused_galaxy.is_some() {
+                    if ui.button("← Back to overview").clicked() {
+                        self.exit_galaxy();
+                    }
+                    ui.label(
+                        egui::RichText::new("Esc or click outside to exit")
+                            .weak()
+                            .small(),
+                    );
+                    ui.add_space(10.0);
+                }
 
                 let vis: Vec<&Node> = self
                     .graph
@@ -948,6 +1019,7 @@ impl App {
 
                 // ----- camera interaction (pan + zoom only; no rotation) -----
                 if response.dragged() {
+                    self.view_anim = None; // manual control cancels any fly-to
                     let d = response.drag_delta();
                     // Pan: slide the target in the camera's screen plane.
                     let cam = self.cam.position();
@@ -965,8 +1037,9 @@ impl App {
                     let scroll =
                         ctx.input(|i| i.smooth_scroll_delta.y + (i.zoom_delta() - 1.0) * 200.0);
                     if scroll != 0.0 {
+                        self.view_anim = None; // manual zoom cancels any fly-to
                         self.cam.distance =
-                            (self.cam.distance * (1.0 - scroll * 0.0015)).clamp(60.0, 1400.0);
+                            (self.cam.distance * (1.0 - scroll * 0.0015)).clamp(60.0, 1600.0);
                     }
                 }
 
@@ -988,9 +1061,16 @@ impl App {
                     }
                 }
 
-                // ----- galaxy borders: one bordered region per (hub, role) leaf
-                // group, so each hub's clients/nas/llm orbit it as its own galaxy -----
-                if self.show_galaxies {
+                // ----- galaxy screen circles (one per (hub, role) leaf group) -----
+                struct GalScreen {
+                    gid: u64,
+                    center: Pos2,
+                    radius: f32,
+                    color: Color32,
+                    label: &'static str,
+                }
+                let mut galaxies: Vec<GalScreen> = Vec::new();
+                {
                     let mut groups: std::collections::BTreeMap<u64, (Vec<Pos2>, &str)> =
                         std::collections::BTreeMap::new();
                     for d in &drawn {
@@ -1004,31 +1084,30 @@ impl App {
                                 .push(d.p.screen);
                         }
                     }
-                    for (pts, role) in groups.values() {
+                    for (gid, (pts, role)) in groups {
                         let n = pts.len() as f32;
-                        let c = Pos2::new(
+                        let center = Pos2::new(
                             pts.iter().map(|p| p.x).sum::<f32>() / n,
                             pts.iter().map(|p| p.y).sum::<f32>() / n,
                         );
-                        let rad = pts.iter().fold(0.0_f32, |m, p| m.max(c.distance(*p)))
+                        let radius = pts.iter().fold(0.0_f32, |m, p| m.max(center.distance(*p)))
                             + GALAXY_PAD
                             + 8.0;
-                        let col = role_style(role).color;
-                        painter.circle_filled(c, rad, with_alpha(col, 0.06));
-                        painter.circle_stroke(c, rad, Stroke::new(1.4, with_alpha(col, 0.5)));
-                        painter.text(
-                            Pos2::new(c.x, c.y - rad - 3.0),
-                            Align2::CENTER_BOTTOM,
-                            role_style(role).label,
-                            FontId::monospace(11.0),
-                            with_alpha(col, 0.85),
-                        );
+                        let rs = role_style(role);
+                        galaxies.push(GalScreen {
+                            gid,
+                            center,
+                            radius,
+                            color: rs.color,
+                            label: rs.label,
+                        });
                     }
                 }
 
-                // ----- hover/click picking (before drawing, so focus can emphasise) -----
+                // ----- node hover pick -----
+                let mp = response.hover_pos();
                 let mut hover_idx: Option<usize> = None;
-                if let Some(mp) = response.hover_pos() {
+                if let Some(mp) = mp {
                     let mut best = f32::MAX;
                     for d in &drawn {
                         let rs = role_style(&self.graph.nodes[d.idx].role);
@@ -1040,11 +1119,87 @@ impl App {
                         }
                     }
                 }
-                if response.clicked() {
-                    self.selected = hover_idx;
+
+                // ----- galaxy hover (overview only) -----
+                let mut hovered_gal: Option<u64> = None;
+                if self.focused_galaxy.is_none() {
+                    if let Some(mp) = mp {
+                        let mut best = f32::MAX;
+                        for g in &galaxies {
+                            let dist = g.center.distance(mp);
+                            if dist <= g.radius && dist < best {
+                                best = dist;
+                                hovered_gal = Some(g.gid);
+                            }
+                        }
+                    }
                 }
-                // Focus = whatever is hovered, else the sticky selection.
-                let focus = hover_idx.or(self.selected);
+
+                // ----- click: drill in/out of a galaxy, or select a node -----
+                if response.clicked() {
+                    if self.focused_galaxy.is_some() {
+                        if hover_idx.is_some() {
+                            self.selected = hover_idx;
+                        } else {
+                            let inside = mp.is_some_and(|mp| {
+                                galaxies.iter().any(|g| {
+                                    Some(g.gid) == self.focused_galaxy
+                                        && g.center.distance(mp) <= g.radius
+                                })
+                            });
+                            if !inside {
+                                self.exit_galaxy();
+                            }
+                        }
+                    } else {
+                        // Overview: a backbone node selects; a galaxy drills in.
+                        let backbone = hover_idx.filter(|&i| self.graph.nodes[i].galaxy.is_none());
+                        if let Some(i) = backbone {
+                            self.selected = Some(i);
+                        } else if let Some(g) = hovered_gal {
+                            self.enter_galaxy(g);
+                        } else {
+                            self.selected = None;
+                        }
+                    }
+                }
+
+                // ----- galaxy borders (highlight hovered / focused) -----
+                if self.show_galaxies {
+                    for g in &galaxies {
+                        let hl = hovered_gal == Some(g.gid) || self.focused_galaxy == Some(g.gid);
+                        painter.circle_filled(
+                            g.center,
+                            g.radius,
+                            with_alpha(g.color, if hl { 0.12 } else { 0.06 }),
+                        );
+                        painter.circle_stroke(
+                            g.center,
+                            g.radius,
+                            Stroke::new(
+                                if hl { 2.6 } else { 1.4 },
+                                with_alpha(g.color, if hl { 0.95 } else { 0.5 }),
+                            ),
+                        );
+                        painter.text(
+                            Pos2::new(g.center.x, g.center.y - g.radius - 3.0),
+                            Align2::CENTER_BOTTOM,
+                            g.label,
+                            FontId::monospace(if hl { 13.0 } else { 11.0 }),
+                            with_alpha(g.color, if hl { 1.0 } else { 0.85 }),
+                        );
+                    }
+                }
+
+                // Per-node emphasis: galaxy view uses node hover/selection; the
+                // overview only emphasises standalone (non-galaxy) nodes.
+                let focus = if self.focused_galaxy.is_some() {
+                    hover_idx.or(self.selected)
+                } else {
+                    hover_idx
+                        .filter(|&i| self.graph.nodes[i].galaxy.is_none())
+                        .or(self.selected)
+                };
                 let focused = focus.is_some();
 
                 // ----- edges (behind nodes) -----
@@ -1203,11 +1358,20 @@ impl App {
                     }
                 }
 
-                // ----- labels (above nodes; near nodes drawn last = on top) -----
+                // ----- labels: in the overview only standalone nodes are named
+                // (galaxy contents are nameless until you drill in); inside a
+                // galaxy view, that galaxy's nodes (and the backbone) are named. -----
                 if self.show_labels {
                     for d in &drawn {
                         let node = &self.graph.nodes[d.idx];
                         if node.status == "powered_off" {
+                            continue;
+                        }
+                        let show_name = match self.focused_galaxy {
+                            Some(fg) => node.galaxy == Some(fg) || node.galaxy.is_none(),
+                            None => node.galaxy.is_none(),
+                        };
+                        if !show_name {
                             continue;
                         }
                         let is_focus = focus == Some(d.idx);
