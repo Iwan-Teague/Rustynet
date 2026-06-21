@@ -194,8 +194,6 @@ const SINGLETON_RADIUS: f32 = 46.0; // tile radius for a lone backbone node
 const CLUSTER_GAP: f32 = 40.0; // gap between packed tiles
 const LAYER_GAP: f32 = 96.0; // gap between flow layers (Sugiyama columns)
 const DUMMY_R: f32 = 12.0; // routing-lane radius for a virtual node on a skip-layer edge
-const EDGE_CLEAR: f32 = 16.0; // world clearance kept between a routed edge and an obstacle
-const NODE_OBSTACLE_R: f32 = 28.0; // obstacle radius for a lone backbone node when routing
 
 // Camera zoom levels: overview vs drilled-into-a-galaxy.
 const OVERVIEW_DISTANCE: f32 = 1040.0;
@@ -308,6 +306,25 @@ fn segments_cross(p1: V3, p2: V3, p3: V3, p4: V3) -> bool {
 // one layer, so the crossing number is the sum over adjacent layers of the
 // inversions between them; the minimum is found by branch-and-bound seeded with
 // a strong heuristic incumbent.
+
+/// Straight-line crossings between tile-to-tile connections, given tile centres.
+/// Connections sharing a tile never count.
+fn straight_crossings(tedges: &[(usize, usize)], centers: &[V3]) -> usize {
+    let mut c = 0;
+    for i in 0..tedges.len() {
+        for j in (i + 1)..tedges.len() {
+            let (a, b) = tedges[i];
+            let (p, q) = tedges[j];
+            if a == p || a == q || b == p || b == q {
+                continue;
+            }
+            if segments_cross(centers[a], centers[b], centers[p], centers[q]) {
+                c += 1;
+            }
+        }
+    }
+    c
+}
 
 /// Lexicographic next permutation in place; false once `a` is the last
 /// (descending) permutation. Used to enumerate a layer's orderings in B&B.
@@ -643,6 +660,42 @@ struct GalaxyBox {
     center: V3,
     radius: f32,
     role: String,
+    /// Number of polygon vertices for the border. Grows with the member count
+    /// (more nodes → rounder galaxy), starting at a pentagon for the smallest.
+    sides: usize,
+    /// Deterministic per-galaxy rotation (radians) so borders look varied, not
+    /// like a stamped grid.
+    rot: f32,
+}
+
+/// Polygon vertex count for a galaxy of `count` nodes: a pentagon for the
+/// smallest (≈2 nodes), growing one side per extra node up to a cap so larger
+/// galaxies read as rounder.
+fn galaxy_sides(count: usize) -> usize {
+    (count + 3).clamp(5, 16)
+}
+
+/// Deterministic per-galaxy rotation (radians) from its id, so galaxies look
+/// individually oriented rather than like stamped, aligned copies.
+fn galaxy_rot(gid: u64) -> f32 {
+    let mut h = gid.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 29;
+    (h % 100_000) as f32 / 100_000.0 * std::f32::consts::TAU
+}
+
+/// Deterministic per-tile (x, z) world nudge used to scatter the layout off its
+/// rigid grid. Bounded to a fraction of the inter-layer / inter-tile gaps so
+/// galaxies never merge; the caller still verifies it adds no crossings.
+fn tile_jitter(t: usize) -> (f32, f32) {
+    let mut h = (t as u64)
+        .wrapping_add(1)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 31;
+    let ux = (h % 1000) as f32 / 1000.0 * 2.0 - 1.0;
+    h = h.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    h ^= h >> 29;
+    let uz = (h % 1000) as f32 / 1000.0 * 2.0 - 1.0;
+    (ux * LAYER_GAP * 0.28, uz * CLUSTER_GAP * 0.35)
 }
 
 #[derive(Default)]
@@ -774,13 +827,21 @@ impl Graph {
         // Vogel's Fibonacci sunflower model (r = R*sqrt((k+0.5)/N), theta = k*137.5deg)
         // — the standard even/blue-noise disc fill — then leave a NODE_GAP margin
         // out to the border so nodes never crowd the edge.
+        // Predetermined galaxy dimensions (all derived from node count, so the
+        // result is deterministic): nodes fill a disc of radius `inner` via
+        // Vogel's sunflower (even neighbour spacing ≈ NODE_GAP), and the border
+        // sits a fixed margin beyond the outermost node — giving even node↔node
+        // AND node↔border spacing while using the galaxy's space.
+        const GAL_MARGIN: f32 = NODE_GAP * 0.62; // node ring → border gap
         let galaxy_tile = |nodes: &mut [Node], mem: &[usize], gid: u64, role: &str| -> Tile {
             let count = mem.len();
-            // Inner radius sized so neighbour spacing is ~NODE_GAP.
+            // Spread so the outermost node sits ~`inner` out and neighbour gaps
+            // stay ≈ NODE_GAP (the 0.72 factor fills the disc rather than
+            // clustering at the centre).
             let inner = if count <= 1 {
                 0.0
             } else {
-                NODE_GAP * (count as f32).sqrt() * 0.55
+                NODE_GAP * (count as f32).sqrt() * 0.72
             };
             let mut members = Vec::with_capacity(count);
             for (k, &idx) in mem.iter().enumerate() {
@@ -790,13 +851,14 @@ impl Graph {
                     (k as f32 + 0.5) / count as f32
                 };
                 let rr = inner * frac.sqrt();
-                let a = k as f32 * 2.399_963_2; // golden angle
+                // Golden-angle sunflower, rotated per-galaxy so discs look varied.
+                let a = k as f32 * 2.399_963_2 + galaxy_rot(gid);
                 members.push((idx, V3::new(rr * a.cos(), 0.0, rr * a.sin())));
                 nodes[idx].galaxy = Some(gid);
             }
             Tile {
                 members,
-                radius: inner + NODE_GAP, // clear margin between nodes and border
+                radius: (inner + GAL_MARGIN).max(NODE_GAP),
                 info: Some((gid, role.to_string())),
             }
         };
@@ -1209,13 +1271,46 @@ impl Graph {
         };
         layer_tiles = best_order;
 
-        let centers = assign(&layer_tiles);
-        let crossings = best_cross;
+        let mut centers = assign(&layer_tiles);
+        // The layered (polyline) crossing number the optimiser certified.
         debug_assert_eq!(
-            crossings,
+            best_cross,
             count(&centers),
             "combinatorial and geometric crossing counts must agree"
         );
+        // What a STRAIGHT-LINE render actually shows: crossings between the
+        // direct tile-to-tile segments. For a fixed ordering the polyline (via
+        // dummies) can only avoid crossings a straight line would have, so
+        // best_cross <= straight <= straight-optimum; hence when straight equals
+        // the certified best_cross, the straight drawing is itself provably
+        // minimal. (They coincide for the layouts Rustynet produces, because the
+        // optimiser places each dummy on its edge's straight path.)
+        let crossings = straight_crossings(&tedges, &centers);
+        let certified = certified && crossings == best_cross;
+
+        // Organic scatter: nudge each tile off the rigid grid (deterministically,
+        // by id) so the map reads like a scattered universe rather than aligned
+        // columns — but only keep the largest nudge scale that adds NO straight-
+        // line crossing, so the proven minimum is preserved. Bounds are small
+        // enough that galaxies never merge.
+        {
+            let clean = centers.clone();
+            let mut scale_used = 0.0f32;
+            for &scale in &[1.0f32, 0.7, 0.45, 0.25] {
+                for t in 0..m {
+                    let (jx, jz) = tile_jitter(t);
+                    centers[t] = V3::new(clean[t].x + jx * scale, 0.0, clean[t].z + jz * scale);
+                }
+                if straight_crossings(&tedges, &centers) == crossings {
+                    scale_used = scale;
+                    break;
+                }
+            }
+            if scale_used == 0.0 {
+                centers = clean; // no safe nudge; keep the clean layout
+            }
+        }
+
         // Centre on the real tiles only (dummy units are routing artefacts).
         let mut mid = V3::default();
         for c in &centers[..m] {
@@ -1277,6 +1372,8 @@ impl Graph {
                     center: base,
                     radius: t.radius,
                     role: role.clone(),
+                    sides: galaxy_sides(t.members.len()),
+                    rot: galaxy_rot(*gid),
                 });
             }
         }
@@ -1391,60 +1488,6 @@ impl Graph {
             V3::default()
         }
     }
-
-    /// World-space path for an edge that detours around the most-blocking
-    /// galaxy/backbone obstacle it would otherwise cross (single waypoint).
-    /// Endpoints' own galaxies/nodes are never treated as obstacles.
-    fn route_path(&self, a: usize, b: usize) -> Vec<V3> {
-        let pa = self.nodes[a].pos;
-        let pb = self.nodes[b].pos;
-        let ga = self.nodes[a].galaxy;
-        let gb = self.nodes[b].galaxy;
-        let mut best: Option<(f32, V3)> = None;
-        let mut keep = |hit: Option<(f32, V3)>| {
-            if let Some((pen, wp)) = hit {
-                if best.is_none_or(|(bp, _)| pen > bp) {
-                    best = Some((pen, wp));
-                }
-            }
-        };
-        for gx in &self.galaxies {
-            if Some(gx.gid) == ga || Some(gx.gid) == gb {
-                continue;
-            }
-            keep(segment_detour(pa, pb, gx.center, gx.radius + EDGE_CLEAR));
-        }
-        for (i, nd) in self.nodes.iter().enumerate() {
-            if i == a || i == b || nd.galaxy.is_some() {
-                continue;
-            }
-            keep(segment_detour(pa, pb, nd.pos, NODE_OBSTACLE_R));
-        }
-        match best {
-            Some((_, wp)) => vec![pa, wp, pb],
-            None => vec![pa, pb],
-        }
-    }
-}
-
-/// If segment pa->pb passes within `r` of obstacle centre `o`, return the
-/// penetration depth and a waypoint just outside the obstacle to route around it.
-fn segment_detour(pa: V3, pb: V3, o: V3, r: f32) -> Option<(f32, V3)> {
-    let ab = pb.sub(pa);
-    let denom = ab.dot(ab).max(1e-4);
-    let t = (o.sub(pa).dot(ab) / denom).clamp(0.0, 1.0);
-    let closest = pa.add(ab.scale(t));
-    let to = closest.sub(o);
-    let dist = to.len();
-    if dist >= r {
-        return None;
-    }
-    let dir = if dist > 1e-3 {
-        to.scale(1.0 / dist)
-    } else {
-        V3::new(-ab.z, 0.0, ab.x).norm()
-    };
-    Some((r - dist, o.add(dir.scale(r + 6.0))))
 }
 
 // ===========================================================================
@@ -1869,8 +1912,10 @@ impl App {
 
                 // ----- galaxy polygons: project each galaxy's WORLD footprint to
                 // an N-gon (straight edges, vertices marked with white dots). The
-                // world packing guarantees node<->border and border<->border gaps. -----
-                const GAL_SIDES: usize = 9;
+                // vertex count grows with the galaxy's node count and each galaxy
+                // has its own rotation, so borders look varied rather than like a
+                // grid of identical stamps. The world packing guarantees
+                // node<->border and border<->border gaps. -----
                 struct GalScreen {
                     gid: u64,
                     poly: Vec<Pos2>,
@@ -1883,13 +1928,14 @@ impl App {
                     if !self.visible(&gb.role) {
                         continue;
                     }
-                    let mut poly: Vec<Pos2> = Vec::with_capacity(GAL_SIDES);
+                    let sides = gb.sides;
+                    let mut poly: Vec<Pos2> = Vec::with_capacity(sides);
                     let mut bounds: Option<Rect> = None;
                     let mut ok = true;
-                    for s in 0..GAL_SIDES {
-                        // start at top (-PI/2) for a flat-ish top edge.
-                        let ang = std::f32::consts::TAU * s as f32 / GAL_SIDES as f32
-                            - std::f32::consts::FRAC_PI_2;
+                    for s in 0..sides {
+                        let ang = std::f32::consts::TAU * s as f32 / sides as f32
+                            - std::f32::consts::FRAC_PI_2
+                            + gb.rot;
                         let wp = gb.center.add(V3::new(
                             gb.radius * ang.cos(),
                             0.0,
@@ -2040,23 +2086,10 @@ impl App {
                             (Some(pa), Some(pb)) => (pa, pb),
                             _ => continue,
                         };
-                    // Routed world path (detours around blocking galaxies/nodes),
-                    // projected to screen.
-                    let world_path = self.graph.route_path(e.a, e.b);
-                    let mut spath: Vec<Pos2> = Vec::with_capacity(world_path.len());
-                    let mut ok = true;
-                    for wp in &world_path {
-                        match self.cam.project(*wp, rect) {
-                            Some(p) => spath.push(p.screen),
-                            None => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    if !ok || spath.len() < 2 {
-                        continue;
-                    }
+                    // Connections are always straight lines (node to node): the
+                    // layout already minimises straight-line crossings, so no
+                    // detour routing is needed or wanted.
+                    let spath: [Pos2; 2] = [pa.screen, pb.screen];
                     let kind = edge_kind_style(&e.kind);
                     let live = a.status == "online" && b.status == "online" && e.active;
                     let ca = role_style(&a.role).color;
@@ -2080,7 +2113,7 @@ impl App {
                         painter.line_segment([w[0], w[1]], stroke);
                     }
 
-                    // ----- pulse: wave blob for this hop, following the routed path.
+                    // ----- pulse: wave blob for this hop, along the straight line.
                     // It only travels while the upstream node is "firing"
                     // (fire_at..+TRAVEL), so a node emits downstream only after all
                     // its upstream blobs melted in (+ a PULSE_PAUSE). -----
@@ -2092,7 +2125,7 @@ impl App {
                         let up_is_a = role_flow_rank(&a.role) <= role_flow_rank(&b.role);
                         let up_idx = if up_is_a { e.a } else { e.b };
                         // Path oriented upstream -> downstream.
-                        let mut flow = spath.clone();
+                        let mut flow = spath;
                         if !up_is_a {
                             flow.reverse();
                         }
@@ -2688,5 +2721,34 @@ mod tests {
         let pa: Vec<(f32, f32)> = a.nodes.iter().map(|n| (n.pos.x, n.pos.z)).collect();
         let pb: Vec<(f32, f32)> = b.nodes.iter().map(|n| (n.pos.x, n.pos.z)).collect();
         assert_eq!(pa, pb, "layout must be repeatable run-to-run");
+    }
+
+    #[test]
+    fn galaxy_polygon_sides_grow_with_nodes() {
+        assert_eq!(galaxy_sides(2), 5, "smallest galaxy is a pentagon");
+        assert!(
+            galaxy_sides(5) > galaxy_sides(2),
+            "more nodes => more sides"
+        );
+        assert!(
+            galaxy_sides(50) <= 16,
+            "sides are capped so big galaxies stay round"
+        );
+        assert!(galaxy_sides(3) >= 5 && galaxy_sides(1) >= 5);
+    }
+
+    #[test]
+    fn data_flow_schedule_is_present() {
+        // The pulse wave (client -> ... -> exit) must still be scheduled.
+        let g = Graph::from_dto(demo_graph());
+        assert!(g.cycle_len > 0.0, "a pulse cycle must exist");
+        assert_eq!(g.fire_at.len(), g.nodes.len());
+        // A source (client) fires before a downstream exit.
+        let client = g.nodes.iter().position(|n| n.role == "client").unwrap();
+        let exit = g.nodes.iter().position(|n| n.role == "exit").unwrap();
+        assert!(
+            g.fire_at[client] <= g.fire_at[exit],
+            "data flows downstream, source emits no later than the exit"
+        );
     }
 }
