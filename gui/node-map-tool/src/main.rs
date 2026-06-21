@@ -186,16 +186,14 @@ fn edge_has_flow(kind: &str) -> bool {
 /// nodes (anchor/relay/exit/admin) are spread across a roomy 2D grid; leaf nodes
 /// (client/nas/llm) form per-(hub, role) "galaxies" that orbit their hub. The
 /// map is intentionally larger than the viewport so it can be panned around.
-const GRID_COLS: usize = 3; // backbone cluster columns
-const GRID_CELL_X: f32 = 300.0; // world gap between cluster cells (horizontal)
-const GRID_CELL_Y: f32 = 280.0; // world gap between cluster cells (vertical)
-const ORBIT_RADIUS: f32 = 80.0; // base distance of a leaf galaxy from its hub
-const NODE_GAP: f32 = 20.0; // packing spacing of nodes within a galaxy (roomy)
-const GALAXY_PAD: f32 = 18.0; // screen px padding of a galaxy border past its nodes
+const NODE_GAP: f32 = 26.0; // packing spacing of nodes within a galaxy (roomy)
+const SINGLETON_RADIUS: f32 = 44.0; // tile radius for a lone backbone node
+const CLUSTER_GAP: f32 = 30.0; // gap between packed tiles (keep them close)
+const GALAXY_PAD: f32 = 30.0; // screen px padding between nodes and the galaxy border
 
 // Camera zoom levels: overview vs drilled-into-a-galaxy.
 const OVERVIEW_DISTANCE: f32 = 820.0;
-const GALAXY_VIEW_DISTANCE: f32 = 200.0;
+const GALAXY_VIEW_DISTANCE: f32 = 230.0;
 
 /// Leaf roles orbit the node their data travels to; backbone roles are the skeleton.
 fn is_leaf_role(role: &str) -> bool {
@@ -252,7 +250,7 @@ const CORE_R_MULT: f32 = 0.9; // node ball radius (x core_r)
 // (Node bodies are NOT depth-tinted, so same-role nodes keep a consistent shade;
 // depth is conveyed by size.)
 const DEPTH_FOG_MAX: f32 = 0.45;
-const REF_DISTANCE: f32 = 730.0;
+const REF_DISTANCE: f32 = 760.0;
 
 // ------------------------------ PULSE ----------------------------------
 // Pulses propagate as a synchronized wave toward the exit: a node emits its
@@ -538,40 +536,23 @@ impl Graph {
         best.map(|(_, o)| o)
     }
 
-    /// Deterministic layout. Backbone (and unattached) nodes go into fixed
-    /// data-flow columns. Each leaf node joins a per-(hub, role) galaxy that
-    /// orbits its hub, so e.g. anchor-eu's clients are a distinct galaxy from
-    /// anchor-us's clients. Pinned nodes keep their supplied position.
+    /// Deterministic layout. Every galaxy (a same-role leaf group) and every
+    /// backbone node is a tile; tiles are shelf-packed tightly in flow order,
+    /// each anchor kept next to its galaxies. Compact, no overlap, and the
+    /// anchor stays a separate tile so galaxy borders never cover it.
     fn layout_galaxies(&mut self) {
         use std::collections::BTreeMap as Map;
         let n = self.nodes.len();
         let hub: Vec<Option<usize>> = (0..n).map(|i| self.leaf_hub(i)).collect();
 
-        // 1) Standalone nodes (backbone + any leaf without a hub) spread across a
-        //    roomy 2D grid; sorted by flow rank + role so each type keeps its own
-        //    region. Each anchor cell hosts the leaf galaxies that orbit it.
-        let mut standalone: Vec<usize> = (0..n)
-            .filter(|&i| {
-                !(self.nodes[i].pinned || is_leaf_role(&self.nodes[i].role) && hub[i].is_some())
-            })
-            .collect();
-        standalone.sort_by(|&a, &b| {
-            (galaxy_col(&self.nodes[a].role), self.nodes[a].role.as_str())
-                .cmp(&(galaxy_col(&self.nodes[b].role), self.nodes[b].role.as_str()))
-        });
-        let count = standalone.len().max(1);
-        let cols = GRID_COLS.min(count);
-        let rows = count.div_ceil(cols);
-        let cx_center = (cols as f32 - 1.0) * 0.5;
-        let cy_center = (rows as f32 - 1.0) * 0.5;
-        for (k, &i) in standalone.iter().enumerate() {
-            let cx = (k % cols) as f32 - cx_center;
-            let cy = (k / cols) as f32 - cy_center;
-            self.nodes[i].pos = V3::new(cx * GRID_CELL_X, 0.0, cy * GRID_CELL_Y);
+        // A tile is one packed unit: either a galaxy (a disc of same-role leaves)
+        // or a single backbone/unattached node. Tiles are shelf-packed.
+        struct Tile {
+            members: Vec<(usize, V3)>, // (node idx, offset from tile centre)
+            radius: f32,
         }
 
-        // 2) Leaf galaxies: group leaves by (hub, role), then orbit each group
-        //    around its hub at a distinct angle and pack it into a disc.
+        // Group leaves by (hub, role).
         let mut by_hub: Map<usize, Map<String, Vec<usize>>> = Map::new();
         for (i, h) in hub.iter().enumerate() {
             if self.nodes[i].pinned {
@@ -586,23 +567,88 @@ impl Graph {
                     .push(i);
             }
         }
-        for (h, role_groups) in by_hub {
-            let hub_pos = self.nodes[h].pos;
-            let g = role_groups.len().max(1);
-            for (gi, (role, members)) in role_groups.iter().enumerate() {
-                // Spread the hub's role-groups around it (start pointing "up").
-                let ang =
-                    std::f32::consts::TAU * (gi as f32) / g as f32 - std::f32::consts::FRAC_PI_2;
-                let grp_r = NODE_GAP * (members.len() as f32).sqrt();
-                let orbit = ORBIT_RADIUS + grp_r;
-                let gc = hub_pos.add(V3::new(orbit * ang.cos(), 0.0, orbit * ang.sin()));
-                let gid = (h as u64) * 16 + role_ord(role);
-                for (k, &idx) in members.iter().enumerate() {
-                    let a = k as f32 * 2.399_963_2; // golden angle
-                    let rr = NODE_GAP * (k as f32).sqrt();
-                    self.nodes[idx].pos = gc.add(V3::new(rr * a.cos(), 0.0, rr * a.sin()));
-                    self.nodes[idx].galaxy = Some(gid);
-                }
+
+        // Build a galaxy tile: pack same-role leaves into a disc (phyllotaxis).
+        let galaxy_tile = |nodes: &mut [Node], mem: &[usize], gid: u64| -> Tile {
+            let mut members = Vec::with_capacity(mem.len());
+            let mut maxr = 0.0_f32;
+            for (k, &idx) in mem.iter().enumerate() {
+                let a = k as f32 * 2.399_963_2; // golden angle
+                let rr = NODE_GAP * (k as f32).sqrt();
+                let off = V3::new(rr * a.cos(), 0.0, rr * a.sin());
+                members.push((idx, off));
+                maxr = maxr.max(rr);
+                nodes[idx].galaxy = Some(gid);
+            }
+            Tile {
+                members,
+                radius: maxr + NODE_GAP, // interior breathing room
+            }
+        };
+
+        // Emit tiles in flow order, keeping each anchor next to its galaxies.
+        let mut tiles: Vec<Tile> = Vec::new();
+        let mut hub_keys: Vec<usize> = by_hub.keys().copied().collect();
+        hub_keys.sort_by_key(|&h| (galaxy_col(&self.nodes[h].role), h));
+        for h in &hub_keys {
+            tiles.push(Tile {
+                members: vec![(*h, V3::default())],
+                radius: SINGLETON_RADIUS,
+            });
+            for (role, mem) in &by_hub[h] {
+                let gid = (*h as u64) * 16 + role_ord(role);
+                let t = galaxy_tile(&mut self.nodes, mem, gid);
+                tiles.push(t);
+            }
+        }
+        // Remaining backbone / unattached singletons, in flow order.
+        let mut singles: Vec<usize> = (0..n)
+            .filter(|&i| {
+                !(self.nodes[i].pinned
+                    || by_hub.contains_key(&i)
+                    || (is_leaf_role(&self.nodes[i].role) && hub[i].is_some()))
+            })
+            .collect();
+        singles.sort_by_key(|&i| (galaxy_col(&self.nodes[i].role), i));
+        for i in singles {
+            tiles.push(Tile {
+                members: vec![(i, V3::default())],
+                radius: SINGLETON_RADIUS,
+            });
+        }
+
+        // Shelf-pack tiles into a roughly-square area with small gaps.
+        let total_w: f32 = tiles.iter().map(|t| 2.0 * t.radius + CLUSTER_GAP).sum();
+        let rows = ((tiles.len() as f32).sqrt()).round().max(1.0);
+        let target_w = (total_w / rows).max(1.0);
+        let mut cx = 0.0;
+        let mut cy = 0.0;
+        let mut row_h = 0.0;
+        let mut centers: Vec<V3> = Vec::with_capacity(tiles.len());
+        let (mut min_x, mut max_x, mut min_z, mut max_z) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for t in &tiles {
+            let w = 2.0 * t.radius + CLUSTER_GAP;
+            if cx > 0.0 && cx + w > target_w {
+                cx = 0.0;
+                cy += row_h;
+                row_h = 0.0;
+            }
+            let center = V3::new(cx + t.radius, 0.0, cy + t.radius);
+            centers.push(center);
+            min_x = min_x.min(center.x - t.radius);
+            max_x = max_x.max(center.x + t.radius);
+            min_z = min_z.min(center.z - t.radius);
+            max_z = max_z.max(center.z + t.radius);
+            cx += w;
+            row_h = row_h.max(2.0 * t.radius + CLUSTER_GAP);
+        }
+        let mid = V3::new((min_x + max_x) * 0.5, 0.0, (min_z + max_z) * 0.5);
+
+        // Apply, centring the whole map at the origin.
+        for (t, center) in tiles.iter().zip(centers) {
+            let base = center.sub(mid);
+            for &(idx, off) in &t.members {
+                self.nodes[idx].pos = base.add(off);
             }
         }
     }
@@ -1061,11 +1107,10 @@ impl App {
                     }
                 }
 
-                // ----- galaxy screen circles (one per (hub, role) leaf group) -----
+                // ----- galaxy boxes (one square-ish region per (hub, role) group) -----
                 struct GalScreen {
                     gid: u64,
-                    center: Pos2,
-                    radius: f32,
+                    bounds: Rect, // node bounding box + interior padding
                     color: Color32,
                     label: &'static str,
                 }
@@ -1085,19 +1130,17 @@ impl App {
                         }
                     }
                     for (gid, (pts, role)) in groups {
-                        let n = pts.len() as f32;
-                        let center = Pos2::new(
-                            pts.iter().map(|p| p.x).sum::<f32>() / n,
-                            pts.iter().map(|p| p.y).sum::<f32>() / n,
-                        );
-                        let radius = pts.iter().fold(0.0_f32, |m, p| m.max(center.distance(*p)))
-                            + GALAXY_PAD
-                            + 8.0;
+                        // Bounding box of the group's nodes, padded on all sides so
+                        // nodes never touch the border.
+                        let mut bb = Rect::from_min_max(pts[0], pts[0]);
+                        for p in &pts {
+                            bb.extend_with(*p);
+                        }
+                        let bounds = bb.expand(GALAXY_PAD);
                         let rs = role_style(role);
                         galaxies.push(GalScreen {
                             gid,
-                            center,
-                            radius,
+                            bounds,
                             color: rs.color,
                             label: rs.label,
                         });
@@ -1120,15 +1163,14 @@ impl App {
                     }
                 }
 
-                // ----- galaxy hover (overview only) -----
+                // ----- galaxy hover (overview only): smallest box under cursor -----
                 let mut hovered_gal: Option<u64> = None;
                 if self.focused_galaxy.is_none() {
                     if let Some(mp) = mp {
                         let mut best = f32::MAX;
                         for g in &galaxies {
-                            let dist = g.center.distance(mp);
-                            if dist <= g.radius && dist < best {
-                                best = dist;
+                            if g.bounds.contains(mp) && g.bounds.area() < best {
+                                best = g.bounds.area();
                                 hovered_gal = Some(g.gid);
                             }
                         }
@@ -1143,8 +1185,7 @@ impl App {
                         } else {
                             let inside = mp.is_some_and(|mp| {
                                 galaxies.iter().any(|g| {
-                                    Some(g.gid) == self.focused_galaxy
-                                        && g.center.distance(mp) <= g.radius
+                                    Some(g.gid) == self.focused_galaxy && g.bounds.contains(mp)
                                 })
                             });
                             if !inside {
@@ -1164,25 +1205,26 @@ impl App {
                     }
                 }
 
-                // ----- galaxy borders (highlight hovered / focused) -----
+                // ----- galaxy borders: square-ish (rounded-rect) regions -----
                 if self.show_galaxies {
                     for g in &galaxies {
                         let hl = hovered_gal == Some(g.gid) || self.focused_galaxy == Some(g.gid);
-                        painter.circle_filled(
-                            g.center,
-                            g.radius,
+                        let rounding = 12.0;
+                        painter.rect_filled(
+                            g.bounds,
+                            rounding,
                             with_alpha(g.color, if hl { 0.12 } else { 0.06 }),
                         );
-                        painter.circle_stroke(
-                            g.center,
-                            g.radius,
+                        painter.rect_stroke(
+                            g.bounds,
+                            rounding,
                             Stroke::new(
                                 if hl { 2.6 } else { 1.4 },
                                 with_alpha(g.color, if hl { 0.95 } else { 0.5 }),
                             ),
                         );
                         painter.text(
-                            Pos2::new(g.center.x, g.center.y - g.radius - 3.0),
+                            Pos2::new(g.bounds.center().x, g.bounds.top() - 4.0),
                             Align2::CENTER_BOTTOM,
                             g.label,
                             FontId::monospace(if hl { 13.0 } else { 11.0 }),
