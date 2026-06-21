@@ -6837,6 +6837,22 @@ stage_run_chaos_daemon_fault() {
     --known-hosts-file "$SSH_KNOWN_HOSTS_FILE"
 }
 
+# Mirrors stage_run_chaos_daemon_fault but drives the SIGSTOP/SIGCONT freeze
+# fault via the same proven daemon-fault harness (--fault-mode sigstop-cont).
+stage_run_chaos_daemon_sigstop() {
+  local report_path="$REPORT_DIR/chaos_daemon_sigstop_sigcont_report.json"
+  local log_path="$REPORT_DIR/chaos_daemon_sigstop_sigcont.log"
+  bash "$ROOT_DIR/scripts/e2e/live_chaos_daemon_fault_test.sh" \
+    --fault-mode sigstop-cont \
+    --git-commit "$(current_run_git_commit)" \
+    --report-path "$report_path" \
+    --log-path "$log_path" \
+    --target-host "$(node_target_for_label exit)" \
+    --client-host "$(node_target_for_label client)" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --known-hosts-file "$SSH_KNOWN_HOSTS_FILE"
+}
+
 stage_run_chaos_clock_attack() {
   stage_run_chaos_category chaos_clock_attack live_chaos_clock_attack_test.sh
 }
@@ -6868,6 +6884,7 @@ stage_run_chaos_privileged_boundary() {
 run_or_skip_chaos_suite() {
   if [[ "$ENABLE_CHAOS_SUITE" -ne 1 ]]; then
     record_stage_skip chaos_daemon_fault hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
+    record_stage_skip chaos_daemon_sigstop_sigcont warn 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
     record_stage_skip chaos_clock_attack hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
     record_stage_skip chaos_signed_state_adversarial hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
     record_stage_skip chaos_crash_recovery hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
@@ -6881,6 +6898,7 @@ run_or_skip_chaos_suite() {
   # The remaining chaos categories are scaffolds (not yet implemented); they
   # emit warn-fail so the full functional suite still completes alongside them.
   run_stage hard chaos_daemon_fault 'run daemon KILL fault-injection proof' stage_run_chaos_daemon_fault
+  run_stage warn chaos_daemon_sigstop_sigcont 'run daemon SIGSTOP/SIGCONT fault proof' stage_run_chaos_daemon_sigstop
   run_stage warn chaos_clock_attack 'run clock attack scaffold' stage_run_chaos_clock_attack
   run_stage warn chaos_signed_state_adversarial 'run signed-state adversarial scaffold' stage_run_chaos_signed_state_adversarial
   run_stage warn chaos_crash_recovery 'run crash recovery scaffold' stage_run_chaos_crash_recovery
@@ -8256,6 +8274,7 @@ main() {
     record_stage_skip "live_managed_dns" "hard" "dry-run: not executed"
     if [[ "$ENABLE_CHAOS_SUITE" -eq 1 ]]; then
       record_stage_skip "chaos_daemon_fault" "hard" "dry-run: chaos scaffold not executed"
+      record_stage_skip "chaos_daemon_sigstop_sigcont" "warn" "dry-run: chaos scaffold not executed"
       record_stage_skip "chaos_clock_attack" "hard" "dry-run: chaos scaffold not executed"
       record_stage_skip "chaos_signed_state_adversarial" "hard" "dry-run: chaos scaffold not executed"
       record_stage_skip "chaos_crash_recovery" "hard" "dry-run: chaos scaffold not executed"
@@ -8265,6 +8284,7 @@ main() {
       record_stage_skip "chaos_privileged_boundary" "hard" "dry-run: chaos scaffold not executed"
     else
       record_stage_skip "chaos_daemon_fault" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"
+      record_stage_skip "chaos_daemon_sigstop_sigcont" "warn" "dry-run: skipped by default; pass --enable-chaos-suite"
       record_stage_skip "chaos_clock_attack" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"
       record_stage_skip "chaos_signed_state_adversarial" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"
       record_stage_skip "chaos_crash_recovery" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"

@@ -60,6 +60,18 @@ fn daemon_fault_stages() -> Vec<ChaosStage> {
     ]
 }
 
+/// Which live fault the harness injects. `Kill` is the original, proven
+/// `systemctl kill -s KILL` path (orchestrator stage `chaos_daemon_fault`);
+/// `StopCont` adds the SIGSTOP/SIGCONT freeze-then-resume sub-stage
+/// (`chaos_daemon_sigstop_sigcont`). Defaults to `Kill` so callers that do
+/// not pass `--fault-mode` keep byte-for-byte-identical kill behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FaultMode {
+    #[default]
+    Kill,
+    StopCont,
+}
+
 #[derive(Clone, Debug)]
 struct Config {
     report_path: PathBuf,
@@ -75,6 +87,7 @@ struct Config {
     capture_interface: String,
     mesh_cidr: String,
     recovery_deadline_secs: u64,
+    fault_mode: FaultMode,
 }
 
 impl Config {
@@ -97,6 +110,7 @@ impl Config {
             capture_interface: DEFAULT_CAPTURE_INTERFACE.to_owned(),
             mesh_cidr: DEFAULT_MESH_CIDR.to_owned(),
             recovery_deadline_secs: DEFAULT_RECOVERY_DEADLINE_SECS,
+            fault_mode: FaultMode::default(),
         };
 
         let args = args.into_iter().collect::<Vec<_>>();
@@ -163,6 +177,11 @@ impl Config {
                         required_value(&args, idx, "--recovery-deadline-secs")?
                             .parse::<u64>()
                             .map_err(|err| format!("invalid --recovery-deadline-secs: {err}"))?;
+                }
+                "--fault-mode" => {
+                    idx += 1;
+                    config.fault_mode =
+                        parse_fault_mode(&required_value(&args, idx, "--fault-mode")?)?;
                 }
                 "-h" | "--help" => {
                     print_usage();
@@ -282,12 +301,13 @@ fn run_live_daemon_kill(config: &Config, logger: &mut Logger) -> Result<Value, S
     let traffic_guard = ClientTrafficGuard::start(config, identity, known_hosts, client)?;
     logger.line("[chaos-daemon-fault] client exit-path traffic started")?;
 
-    let output = capture_root(
-        identity,
-        known_hosts,
-        target,
-        &render_remote_kill_script(config),
-    );
+    // ClientTrafficGuard is reused verbatim for both fault modes; only the
+    // remote fault script differs (kill vs SIGSTOP/SIGCONT).
+    let fault_script = match config.fault_mode {
+        FaultMode::Kill => render_remote_kill_script(config),
+        FaultMode::StopCont => render_remote_sigstop_script(config),
+    };
+    let output = capture_root(identity, known_hosts, target, &fault_script);
 
     let cleanup_result = traffic_guard.stop();
     let output = output?;
@@ -472,6 +492,111 @@ printf 'plaintext_leak_check=%s\n' "$plaintext_leak_check"
     )
 }
 
+/// SIGSTOP/SIGCONT variant of [`render_remote_kill_script`]. The prologue is
+/// IDENTICAL (mirrors render_remote_kill_script ~395-440): same mktemp, same
+/// `trap cleanup EXIT` registered BEFORE the fault, same
+/// teardown_registered_before_fault marker, same tcpdump/timeout/active/socket
+/// preflight, same default-route capture iface that REFUSES rustynet0, and the
+/// same `timeout $((deadline+15))` tcpdump with the same BPF mesh-egress
+/// filter. Divergences vs the kill path:
+///   * the cleanup trap issues `systemctl kill -s CONT` BEFORE `systemctl start`
+///     so the daemon is never left frozen on any abort path,
+///   * the fault block STOPs the daemon, proves the `T` (stopped) kernel state
+///     from `/proc/$pid/stat`, holds past the reconcile interval, then CONTs.
+///
+/// The bounded recovery poll and leak tally tail are identical to the kill path.
+fn render_remote_sigstop_script(config: &Config) -> String {
+    let service = shell_quote(&config.service_name);
+    let socket_path = shell_quote(&config.socket_path);
+    let capture_interface = shell_quote(&config.capture_interface);
+    let mesh_cidr = shell_quote(&config.mesh_cidr);
+    let deadline = config.recovery_deadline_secs;
+
+    format!(
+        r#"set -eu
+service={service}
+socket_path={socket_path}
+capture_interface={capture_interface}
+mesh_cidr={mesh_cidr}
+deadline={deadline}
+work_dir="$(mktemp -d /tmp/rustynet-chaos-daemon-sigstop.XXXXXX)"
+tcpdump_pid=""
+cleanup() {{
+  if [ -n "$tcpdump_pid" ]; then
+    kill "$tcpdump_pid" >/dev/null 2>&1 || true
+    wait "$tcpdump_pid" >/dev/null 2>&1 || true
+  fi
+  systemctl kill -s CONT "$service" >/dev/null 2>&1 || true
+  systemctl start "$service" >/dev/null 2>&1 || true
+  rm -rf "$work_dir"
+}}
+trap cleanup EXIT
+printf 'teardown_registered_before_fault=true\n'
+command -v tcpdump >/dev/null 2>&1 || {{ printf 'missing_tcpdump=true\n'; exit 1; }}
+command -v timeout >/dev/null 2>&1 || {{ printf 'missing_timeout=true\n'; exit 1; }}
+systemctl is-active --quiet "$service" || {{ printf 'baseline_service_active=false\n'; exit 1; }}
+test -S "$socket_path" || {{ printf 'baseline_socket_present=false\n'; exit 1; }}
+if [ "$capture_interface" = "default-route" ]; then
+  capture_interface="$(ip route show default 0.0.0.0/0 | awk 'NR==1 {{ for (i=1; i<=NF; i++) if ($i == "dev") {{ print $(i+1); exit }} }}')"
+fi
+case "$capture_interface" in
+  ""|*[!A-Za-z0-9_.:-]*) printf 'invalid_capture_interface=%s\n' "$capture_interface"; exit 1 ;;
+esac
+if [ "$capture_interface" = "rustynet0" ]; then
+  printf 'invalid_capture_interface=rustynet0\n'
+  exit 1
+fi
+printf 'capture_interface=%s\n' "$capture_interface"
+filter="ip and src net $mesh_cidr and not dst net $mesh_cidr"
+timeout "$((deadline + 15))" tcpdump -i "$capture_interface" -nn -l "$filter" > "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
+tcpdump_pid="$!"
+sleep 2
+start_unix="$(date +%s)"
+printf 'fault_signal=STOP\n'
+systemctl kill -s STOP "$service"
+main_pid="$(systemctl show -p MainPID --value "$service" 2>/dev/null || true)"
+case "$main_pid" in ""|*[!0-9]*|0) main_pid="" ;; esac
+observed_stopped_state=unknown
+if [ -n "$main_pid" ] && [ -r "/proc/$main_pid/stat" ]; then
+  observed_stopped_state="$(awk '{{ print $3 }}' "/proc/$main_pid/stat" 2>/dev/null || true)"
+  case "$observed_stopped_state" in ""|*[!A-Za-z]*) observed_stopped_state=unknown ;; esac
+fi
+printf 'observed_stopped_state=%s\n' "$observed_stopped_state"
+sleep 3
+printf 'fault_signal_resume=CONT\n'
+systemctl kill -s CONT "$service"
+recovered=false
+end_unix="$((start_unix + deadline))"
+while [ "$(date +%s)" -le "$end_unix" ]; do
+  if systemctl is-active --quiet "$service" && [ -S "$socket_path" ]; then
+    recovered=true
+    break
+  fi
+  sleep 1
+done
+measured_recovery_secs="$(( $(date +%s) - start_unix ))"
+kill "$tcpdump_pid" >/dev/null 2>&1 || true
+wait "$tcpdump_pid" >/dev/null 2>&1 || true
+tcpdump_pid=""
+if [ -f "$work_dir/tcpdump.txt" ]; then
+  tcpdump_lines="$(grep -Evc '^(tcpdump:|listening on|$)' "$work_dir/tcpdump.txt" 2>/dev/null || true)"
+else
+  tcpdump_lines=0
+fi
+case "$tcpdump_lines" in ""|*[!0-9]*) tcpdump_lines=0 ;; esac
+if [ "$tcpdump_lines" = "0" ]; then
+  plaintext_leak_check=pass
+else
+  plaintext_leak_check=fail
+fi
+printf 'recovered=%s\n' "$recovered"
+printf 'measured_recovery_secs=%s\n' "$measured_recovery_secs"
+printf 'tcpdump_lines=%s\n' "$tcpdump_lines"
+printf 'plaintext_leak_check=%s\n' "$plaintext_leak_check"
+"#
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct KillStageObservation {
     teardown_registered_before_fault: bool,
@@ -482,6 +607,11 @@ struct KillStageObservation {
     client_plaintext_lines: u64,
     client_plaintext_leak_check: String,
     capture_interface: Option<String>,
+    /// Field-3 (`state`) read from `/proc/<MainPID>/stat` while the daemon was
+    /// held under SIGSTOP. `Some("T")` proves the kernel parked the process in
+    /// the stopped state. `None` for kill-mode output (the key is never emitted
+    /// there), so it never affects the existing `.passed()` kill check.
+    observed_stopped_state: Option<String>,
 }
 
 impl KillStageObservation {
@@ -531,6 +661,7 @@ impl KillStageObservation {
                 .ok_or_else(|| "missing client_plaintext_leak_check in client output".to_owned())?
                 .to_owned(),
             capture_interface: exit_value("capture_interface").map(str::to_owned),
+            observed_stopped_state: exit_value("observed_stopped_state").map(str::to_owned),
         })
     }
 
@@ -543,20 +674,56 @@ impl KillStageObservation {
             && self.client_plaintext_lines == 0
             && self.client_plaintext_leak_check == "pass"
     }
+
+    /// Pass-check for the SIGSTOP/SIGCONT sub-stage. Mirrors `.passed()` but
+    /// additionally requires proof that the kernel actually parked the daemon in
+    /// the `T` (stopped) state during the freeze window. ANDs: teardown was
+    /// registered before the fault, the daemon was observed stopped (`T`), it
+    /// recovered within the deadline, and ALL FOUR zero-plaintext leak checks
+    /// (target tcpdump + client tcpdump) held during the fault window.
+    fn passed_stopcont(&self, deadline_secs: u64) -> bool {
+        self.teardown_registered_before_fault
+            && self.observed_stopped_state.as_deref() == Some("T")
+            && self.recovered
+            && self.measured_recovery_secs <= deadline_secs
+            && self.tcpdump_lines == 0
+            && self.plaintext_leak_check == "pass"
+            && self.client_plaintext_lines == 0
+            && self.client_plaintext_leak_check == "pass"
+    }
 }
 
 fn render_live_report(config: &Config, observation: &KillStageObservation) -> Value {
-    let implemented_status = if observation.passed(config.recovery_deadline_secs) {
-        "pass"
-    } else {
-        "fail"
+    // The implemented stage index depends on the fault mode: kill mode proves
+    // stages[0] (chaos_daemon_kill_during_reconcile), SIGSTOP/SIGCONT mode
+    // proves stages[2] (chaos_daemon_sigstop_sigcont). Every other stage stays
+    // "skipped" in both modes, so the implemented/remaining counts are constant.
+    let implemented_index = match config.fault_mode {
+        FaultMode::Kill => 0usize,
+        FaultMode::StopCont => 2usize,
+    };
+    let implemented_status = match config.fault_mode {
+        FaultMode::Kill => {
+            if observation.passed(config.recovery_deadline_secs) {
+                "pass"
+            } else {
+                "fail"
+            }
+        }
+        FaultMode::StopCont => {
+            if observation.passed_stopcont(config.recovery_deadline_secs) {
+                "pass"
+            } else {
+                "fail"
+            }
+        }
     };
     let stages = daemon_fault_stages()
         .into_iter()
         .enumerate()
         .map(|(idx, stage)| {
-            if idx == 0 {
-                json!({
+            if idx == implemented_index {
+                let mut implemented = json!({
                     "name": stage.name,
                     "status": implemented_status,
                     "fault": stage.fault,
@@ -570,7 +737,13 @@ fn render_live_report(config: &Config, observation: &KillStageObservation) -> Va
                     "capture_interface": observation.capture_interface,
                     "teardown_registered_before_fault": observation.teardown_registered_before_fault,
                     "recovered": observation.recovered,
-                })
+                });
+                if config.fault_mode == FaultMode::StopCont {
+                    // Surface the proof that the daemon was actually frozen.
+                    implemented["observed_stopped_state"] =
+                        json!(observation.observed_stopped_state);
+                }
+                implemented
             } else {
                 json!({
                     "name": stage.name,
@@ -585,12 +758,20 @@ fn render_live_report(config: &Config, observation: &KillStageObservation) -> Va
             }
         })
         .collect::<Vec<_>>();
+    let summary = match config.fault_mode {
+        FaultMode::Kill => {
+            "daemon KILL fault was injected under live client traffic with tcpdump plaintext-leak proof"
+        }
+        FaultMode::StopCont => {
+            "daemon SIGSTOP/SIGCONT fault was injected under live client traffic with tcpdump plaintext-leak proof"
+        }
+    };
     json!({
         "schema_version": 1,
         "suite": "rustynet-live-lab-chaos",
         "category": CATEGORY,
         "overall_status": implemented_status,
-        "summary": "daemon KILL fault was injected under live client traffic with tcpdump plaintext-leak proof",
+        "summary": summary,
         "dry_run": false,
         "generated_at_unix": unix_now(),
         "git_commit": config.git_commit,
@@ -626,9 +807,22 @@ fn required_path<'a>(value: Option<&'a Path>, flag: &str) -> Result<&'a Path, St
     value.ok_or_else(|| format!("{flag} is required"))
 }
 
+/// Map the `--fault-mode` argument onto [`FaultMode`], rejecting any unknown
+/// value so a typo can never silently fall back to the kill path. `kill` keeps
+/// the original behavior; `sigstop-cont` selects the freeze-then-resume fault.
+fn parse_fault_mode(value: &str) -> Result<FaultMode, String> {
+    match value {
+        "kill" => Ok(FaultMode::Kill),
+        "sigstop-cont" => Ok(FaultMode::StopCont),
+        other => Err(format!(
+            "invalid --fault-mode: {other} (expected one of: kill, sigstop-cont)"
+        )),
+    }
+}
+
 fn print_usage() {
     eprintln!(
-        "usage: {CATEGORY} [--dry-run] [--target-host <user@host>] [--client-host <user@host>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--socket-path <path>] [--service-name <name>] [--capture-interface <name|default-route>] [--mesh-cidr <cidr>] [--recovery-deadline-secs <secs>] [--report-path <path>] [--log-path <path>] [--git-commit <sha>]"
+        "usage: {CATEGORY} [--dry-run] [--target-host <user@host>] [--client-host <user@host>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--socket-path <path>] [--service-name <name>] [--capture-interface <name|default-route>] [--mesh-cidr <cidr>] [--recovery-deadline-secs <secs>] [--fault-mode <kill|sigstop-cont>] [--report-path <path>] [--log-path <path>] [--git-commit <sha>]"
     );
 }
 
@@ -730,6 +924,88 @@ mod tests {
         assert_eq!(stages[0]["status"], "pass");
         assert_eq!(stages[1]["status"], "skipped");
         assert_eq!(stages[2]["status"], "skipped");
+        assert_eq!(stages[3]["status"], "skipped");
+    }
+
+    #[test]
+    fn parse_accepts_fault_mode_sigstop() {
+        let config = parse(&["--dry-run", "--fault-mode", "sigstop-cont"])
+            .expect("sigstop-cont fault mode should parse");
+        assert_eq!(config.fault_mode, FaultMode::StopCont);
+        let default_config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        assert_eq!(default_config.fault_mode, FaultMode::Kill);
+        let kill_config =
+            parse(&["--dry-run", "--fault-mode", "kill"]).expect("kill fault mode should parse");
+        assert_eq!(kill_config.fault_mode, FaultMode::Kill);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_fault_mode() {
+        let err = parse(&["--dry-run", "--fault-mode", "sigsegv"])
+            .expect_err("unknown fault mode must reject");
+        assert!(err.contains("invalid --fault-mode"));
+    }
+
+    #[test]
+    fn sigstop_observation_parses_passing_output() {
+        let observation = KillStageObservation::parse(
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
+        )
+        .expect("observation should parse");
+        assert_eq!(observation.observed_stopped_state.as_deref(), Some("T"));
+        assert!(observation.passed_stopcont(90));
+    }
+
+    #[test]
+    fn sigstop_observation_fails_when_not_stopped() {
+        let observation = KillStageObservation::parse(
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=R\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
+        )
+        .expect("observation should parse");
+        assert!(!observation.passed_stopcont(90));
+    }
+
+    #[test]
+    fn sigstop_observation_fails_on_plaintext_lines() {
+        let observation = KillStageObservation::parse(
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=1\nplaintext_leak_check=fail\n",
+            "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
+        )
+        .expect("observation should parse");
+        assert!(!observation.passed_stopcont(90));
+    }
+
+    #[test]
+    fn sigstop_observation_fails_on_client_plaintext_lines() {
+        let observation = KillStageObservation::parse(
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "client_plaintext_lines=1\nclient_plaintext_leak_check=fail\n",
+        )
+        .expect("observation should parse");
+        assert!(!observation.passed_stopcont(90));
+    }
+
+    #[test]
+    fn live_report_marks_sigstop_stage_pass_and_others_skipped() {
+        let config = parse(&["--dry-run", "--fault-mode", "sigstop-cont"])
+            .expect("sigstop dry-run config should parse");
+        let observation = KillStageObservation::parse(
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
+        )
+        .expect("observation should parse");
+        let report = render_live_report(&config, &observation);
+        assert_eq!(report["overall_status"], "pass");
+        assert_eq!(report["implemented_stage_count"], 1);
+        assert_eq!(report["remaining_stage_count"], 3);
+        let stages = report["stages"].as_array().expect("stages array");
+        assert_eq!(stages[2]["name"], "chaos_daemon_sigstop_sigcont");
+        assert_eq!(stages[2]["status"], "pass");
+        assert_eq!(stages[2]["observed_stopped_state"], "T");
+        assert_eq!(stages[0]["status"], "skipped");
+        assert_eq!(stages[1]["status"], "skipped");
         assert_eq!(stages[3]["status"], "skipped");
     }
 }
