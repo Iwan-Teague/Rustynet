@@ -163,19 +163,19 @@ struct EdgeKindStyle {
 fn edge_kind_style(kind: &str) -> EdgeKindStyle {
     match kind {
         "data_path" => EdgeKindStyle {
-            width: 1.6,
+            width: 2.6,
             base_opacity: 0.55,
         },
         "control" => EdgeKindStyle {
-            width: 0.9,
+            width: 1.6,
             base_opacity: 0.30,
         },
         "potential" => EdgeKindStyle {
-            width: 0.6,
+            width: 1.1,
             base_opacity: 0.12,
         },
         _ => EdgeKindStyle {
-            width: 0.8,
+            width: 1.4,
             base_opacity: 0.20,
         },
     }
@@ -193,20 +193,20 @@ const GRAVITY: f32 = 0.015; // pull toward centre
 const DAMPING: f32 = 0.86;
 
 // ----------------------- THEME / GLOBAL CONSTANTS ----------------------
-const BG: Color32 = Color32::from_rgb(6, 8, 15); // window background
-const NEBULA: Color32 = Color32::from_rgb(26, 38, 66); // faked center-lift tint
-const WARM_WHITE: Color32 = Color32::from_rgb(255, 248, 236); // glow core
+const BG: Color32 = Color32::from_rgb(64, 69, 80); // window background (grey)
+const NEBULA: Color32 = Color32::from_rgb(86, 92, 108); // faked center-lift tint
+const WARM_WHITE: Color32 = Color32::from_rgb(255, 248, 236); // glow highlight
 const FIBER: Color32 = Color32::from_rgb(176, 206, 236); // edge/particle tint
-const GREY_DOWN: Color32 = Color32::from_rgb(94, 100, 118); // desaturation target
-const TEXT_HI: Color32 = Color32::from_rgb(216, 225, 240);
-const TEXT_DIM: Color32 = Color32::from_rgb(130, 144, 170);
+const GREY_DOWN: Color32 = Color32::from_rgb(120, 126, 142); // desaturation target
+const TEXT_HI: Color32 = Color32::from_rgb(232, 238, 248);
+const TEXT_DIM: Color32 = Color32::from_rgb(186, 194, 210);
 
 // ------------------------------ GLOW -----------------------------------
-// 6 halo layers (outer -> inner) plus one core dot.
-const GLOW_RADIUS_MULT: [f32; 6] = [4.2, 3.1, 2.3, 1.7, 1.25, 0.95]; // x core_r
-const GLOW_ALPHA: [f32; 6] = [0.06, 0.10, 0.16, 0.26, 0.42, 0.64];
-const GLOW_COLOR_MIX: [f32; 6] = [0.00, 0.12, 0.28, 0.48, 0.72, 0.92]; // lerp(role->WARM_WHITE)
-const CORE_R_MULT: f32 = 0.62;
+// 3 tight halo layers (outer -> inner) plus one coloured core dot.
+const GLOW_RADIUS_MULT: [f32; 3] = [1.9, 1.45, 1.12]; // x core_r
+const GLOW_ALPHA: [f32; 3] = [0.12, 0.22, 0.36];
+const GLOW_COLOR_MIX: [f32; 3] = [0.00, 0.07, 0.15]; // lerp(role->WARM_WHITE)
+const CORE_R_MULT: f32 = 0.72;
 const CORE_ALPHA: f32 = 0.95;
 
 // ------------------------------ DEPTH ----------------------------------
@@ -975,25 +975,26 @@ impl App {
 
                     let core_r = core_r_of(rs.size_mult, d.p.depth);
 
-                    // 6 halo layers (outer -> inner): only the outer 4 obey status.glow.
-                    for i in 0..6 {
+                    // 3 tight halo layers (outer -> inner): only the outer 2 obey status.glow.
+                    for i in 0..3 {
                         let r = core_r * GLOW_RADIUS_MULT[i];
                         let col = lerp_color(color, WARM_WHITE, GLOW_COLOR_MIX[i]);
                         let mut a = GLOW_ALPHA[i] * bri;
-                        if i < 4 {
+                        if i < 2 {
                             a *= glow_op;
                         }
                         painter.circle_filled(d.p.screen, r, with_alpha(col, a));
                     }
-                    // Hot core dot.
+                    // Coloured core dot (role colour, lifted just slightly).
+                    let core_col = lerp_color(color, WARM_WHITE, 0.12);
                     painter.circle_filled(
                         d.p.screen,
                         core_r * CORE_R_MULT,
-                        with_alpha(WARM_WHITE, CORE_ALPHA * bri),
+                        with_alpha(core_col, CORE_ALPHA * bri),
                     );
 
                     // Selection / hover ring.
-                    let ring_r = core_r * GLOW_RADIUS_MULT[0] * 0.62;
+                    let ring_r = core_r * GLOW_RADIUS_MULT[0] + 4.0;
                     if self.selected == Some(d.idx) {
                         painter.circle_stroke(
                             d.p.screen,
@@ -1183,10 +1184,11 @@ fn draw_background(painter: &egui::Painter, rect: Rect, time: f32) {
     // 1) base fill.
     painter.rect_filled(rect, 0.0, BG);
 
-    // 2) nebula centre-lift: a few big, very faint circles.
+    // 2) nebula centre-lift: a few big, very faint circles (kept barely-there so
+    //    it reads as a smooth lift, not concentric bands, on the grey backdrop).
     let base = rect.height().min(rect.width()) * 0.18;
     let nebula_r = [3.4, 2.4, 1.5, 0.8];
-    let nebula_a = [0.020, 0.026, 0.030, 0.034];
+    let nebula_a = [0.008, 0.010, 0.012, 0.014];
     for i in 0..4 {
         painter.circle_filled(
             rect.center(),
@@ -1222,7 +1224,8 @@ fn draw_background(painter: &egui::Painter, rect: Rect, time: f32) {
     tier(0x9e37_79b9, 70, 0.26, 0.46, 0.7, 1.2, 0.0); // mid
     tier(0xa5a5_f00d, 26, 0.50, 0.80, 1.1, 1.8, 0.25); // near
 
-    // 4) corner vignette: stack faint dark circles centred on each corner.
+    // 4) corner vignette: faint dark circles centred on each corner. Pushed
+    //    large so only the gentle interior darkening shows (no hard arc band).
     let vmax = rect.width().max(rect.height());
     let corners = [
         rect.left_top(),
@@ -1231,8 +1234,12 @@ fn draw_background(painter: &egui::Painter, rect: Rect, time: f32) {
         rect.right_bottom(),
     ];
     for c in corners {
-        for _ in 0..3 {
-            painter.circle_filled(c, vmax * 0.55, with_alpha(Color32::from_rgb(2, 3, 8), 0.05));
+        for _ in 0..2 {
+            painter.circle_filled(
+                c,
+                vmax * 0.85,
+                with_alpha(Color32::from_rgb(2, 3, 8), 0.035),
+            );
         }
     }
 }
