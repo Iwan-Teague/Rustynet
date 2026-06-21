@@ -32,67 +32,67 @@ struct RoleStyle {
     color: Color32,
     label: &'static str,
     desc: &'static str,
-    size: f32,
+    size_mult: f32,
 }
 
 /// Role registry. Keys must match the `role` field in the data feed. Mirrors the
 /// Rustynet role + capability set (client, admin, anchor, exit, blind_exit,
-/// relay, + service roles nas/llm). Colours are placeholders.
+/// relay, + service roles nas/llm). Colours/sizes from the visual design pass.
 fn role_style(role: &str) -> RoleStyle {
     match role {
         "client" => RoleStyle {
-            color: Color32::from_rgb(61, 220, 132),
+            color: Color32::from_rgb(120, 224, 168), // mint
             label: "Client",
             desc: "Endpoint device",
-            size: 1.0,
+            size_mult: 0.85,
         },
         "admin" => RoleStyle {
-            color: Color32::from_rgb(95, 208, 255),
+            color: Color32::from_rgb(149, 134, 244), // violet
             label: "Admin",
             desc: "Control / operator",
-            size: 1.15,
+            size_mult: 1.25,
         },
         "anchor" => RoleStyle {
-            color: Color32::from_rgb(255, 210, 63),
+            color: Color32::from_rgb(82, 150, 240), // azure
             label: "Anchor",
             desc: "Coordination anchor",
-            size: 1.2,
+            size_mult: 1.40,
         },
         "relay" => RoleStyle {
-            color: Color32::from_rgb(180, 107, 255),
+            color: Color32::from_rgb(64, 198, 210), // cyan
             label: "Relay",
             desc: "Zero-ingress relay",
-            size: 1.2,
+            size_mult: 1.20,
         },
         "exit" => RoleStyle {
-            color: Color32::from_rgb(255, 140, 59),
+            color: Color32::from_rgb(242, 162, 74), // amber
             label: "Exit",
             desc: "Internet egress",
-            size: 1.25,
+            size_mult: 1.30,
         },
         "blind_exit" => RoleStyle {
-            color: Color32::from_rgb(255, 77, 77),
+            color: Color32::from_rgb(226, 92, 104), // crimson
             label: "Blind exit",
             desc: "Egress, no plaintext",
-            size: 1.25,
+            size_mult: 1.30,
         },
         "nas" => RoleStyle {
-            color: Color32::from_rgb(77, 184, 255),
+            color: Color32::from_rgb(198, 182, 132), // sand
             label: "NAS",
             desc: "Storage service",
-            size: 1.1,
+            size_mult: 1.05,
         },
         "llm" => RoleStyle {
-            color: Color32::from_rgb(157, 123, 255),
+            color: Color32::from_rgb(222, 116, 198), // magenta
             label: "LLM",
             desc: "Inference service",
-            size: 1.1,
+            size_mult: 1.10,
         },
         _ => RoleStyle {
-            color: Color32::from_rgb(138, 151, 173),
+            color: Color32::from_rgb(150, 162, 184), // slate
             label: "Unknown",
             desc: "Unrecognised role",
-            size: 1.0,
+            size_mult: 0.90,
         },
     }
 }
@@ -122,73 +122,126 @@ struct StatusStyle {
 fn status_style(status: &str) -> StatusStyle {
     match status {
         "online" => StatusStyle {
-            brightness: 1.0,
-            glow: 1.0,
-            pulse: 0.18,
-            desat: 0.0,
-            flicker: 0.0,
+            brightness: 1.00,
+            glow: 1.00,
+            pulse: 0.10,
+            desat: 0.00,
+            flicker: 0.00,
         },
         "connecting" => StatusStyle {
-            brightness: 0.75,
-            glow: 0.7,
-            pulse: 0.0,
-            desat: 0.3,
-            flicker: 0.6,
+            brightness: 0.72,
+            glow: 0.62,
+            pulse: 0.05,
+            desat: 0.30,
+            flicker: 0.14,
         },
         "powered_off" => StatusStyle {
-            brightness: 0.12,
-            glow: 0.06,
-            pulse: 0.0,
-            desat: 1.0,
-            flicker: 0.0,
+            brightness: 0.24,
+            glow: 0.15,
+            pulse: 0.00,
+            desat: 0.90,
+            flicker: 0.00,
         },
         // "offline" and anything unknown -> dim, mostly grey (fail-visible).
         _ => StatusStyle {
-            brightness: 0.28,
-            glow: 0.22,
-            pulse: 0.0,
-            desat: 0.85,
-            flicker: 0.0,
+            brightness: 0.42,
+            glow: 0.30,
+            pulse: 0.00,
+            desat: 0.78,
+            flicker: 0.00,
         },
     }
 }
 
-/// How a connection line is drawn.
+/// How a connection line is drawn. Flow particles are drawn for `data_path`
+/// edges only (see `edge_has_flow`).
 struct EdgeKindStyle {
     width: f32,
-    flow: bool,
     base_opacity: f32,
 }
 
 fn edge_kind_style(kind: &str) -> EdgeKindStyle {
     match kind {
+        "data_path" => EdgeKindStyle {
+            width: 1.6,
+            base_opacity: 0.55,
+        },
         "control" => EdgeKindStyle {
-            width: 1.0,
-            flow: false,
-            base_opacity: 0.28,
+            width: 0.9,
+            base_opacity: 0.30,
         },
         "potential" => EdgeKindStyle {
-            width: 0.8,
-            flow: false,
-            base_opacity: 0.14,
+            width: 0.6,
+            base_opacity: 0.12,
         },
-        // "data_path" and anything unknown -> active traffic path.
         _ => EdgeKindStyle {
-            width: 1.6,
-            flow: true,
-            base_opacity: 0.55,
+            width: 0.8,
+            base_opacity: 0.20,
         },
     }
 }
 
-/// Layout + look tunables.
+/// Only active traffic paths carry travelling flow particles.
+fn edge_has_flow(kind: &str) -> bool {
+    kind == "data_path"
+}
+
+/// Layout tunables.
 const LINK_DISTANCE: f32 = 14.0;
 const CHARGE: f32 = -260.0; // node repulsion
 const GRAVITY: f32 = 0.015; // pull toward centre
 const DAMPING: f32 = 0.86;
 
-const GREY: Color32 = Color32::from_rgb(90, 96, 114);
-const BG: Color32 = Color32::from_rgb(5, 7, 13);
+// ----------------------- THEME / GLOBAL CONSTANTS ----------------------
+const BG: Color32 = Color32::from_rgb(6, 8, 15); // window background
+const NEBULA: Color32 = Color32::from_rgb(26, 38, 66); // faked center-lift tint
+const WARM_WHITE: Color32 = Color32::from_rgb(255, 248, 236); // glow core
+const FIBER: Color32 = Color32::from_rgb(176, 206, 236); // edge/particle tint
+const GREY_DOWN: Color32 = Color32::from_rgb(94, 100, 118); // desaturation target
+const TEXT_HI: Color32 = Color32::from_rgb(216, 225, 240);
+const TEXT_DIM: Color32 = Color32::from_rgb(130, 144, 170);
+
+// ------------------------------ GLOW -----------------------------------
+// 6 halo layers (outer -> inner) plus one core dot.
+const GLOW_RADIUS_MULT: [f32; 6] = [4.2, 3.1, 2.3, 1.7, 1.25, 0.95]; // x core_r
+const GLOW_ALPHA: [f32; 6] = [0.06, 0.10, 0.16, 0.26, 0.42, 0.64];
+const GLOW_COLOR_MIX: [f32; 6] = [0.00, 0.12, 0.28, 0.48, 0.72, 0.92]; // lerp(role->WARM_WHITE)
+const CORE_R_MULT: f32 = 0.62;
+const CORE_ALPHA: f32 = 0.95;
+
+// ------------------------------ DEPTH ----------------------------------
+// DEPTH_FADE_MIN = far-node opacity floor; DEPTH_FOG_MAX = far-node tint toward
+// BG. REF_DISTANCE maps camera-space depth onto the design's perspective_scale
+// band (~0.5 far .. 2.6 near), tuned so the default camera view produces
+// pleasing node sizes and a usable depth gradient.
+const DEPTH_FADE_MIN: f32 = 0.5;
+const DEPTH_FOG_MAX: f32 = 0.45;
+const REF_DISTANCE: f32 = 135.0;
+
+// ---------------------------- PARTICLES --------------------------------
+const PARTICLES_PER_EDGE: usize = 3;
+const PARTICLE_SPEED: f32 = 0.16; // cycles/sec along the segment
+const TRAIL_STAMPS: usize = 4; // index 0 = bright head, 1..3 = fading tail
+const TRAIL_SPACING: f32 = 0.035; // t-gap between stamps
+const TRAIL_RADIUS_MULT: [f32; 4] = [1.0, 0.82, 0.62, 0.44]; // x pr (head->tail)
+const TRAIL_ALPHA: [f32; 4] = [0.92, 0.30, 0.22, 0.14];
+const PARTICLE_HALO_MULT: f32 = 2.0;
+const PARTICLE_HALO_A: f32 = 0.12;
+
+/// Normalised perspective scale (~0.3 far .. 3.2 near) from camera-space depth.
+fn pscale_of(depth: f32) -> f32 {
+    (REF_DISTANCE / depth).clamp(0.3, 3.2)
+}
+
+/// Node core radius in pixels for a given role size + camera-space depth.
+fn core_r_of(size_mult: f32, depth: f32) -> f32 {
+    (7.0 * size_mult * pscale_of(depth)).clamp(2.0, 26.0)
+}
+
+/// Depth blend factor 0 (far) .. 1 (near), used for fog/fade/label sizing.
+fn depth_t_of(depth: f32) -> f32 {
+    ((pscale_of(depth) - 0.5) / (2.6 - 0.5)).clamp(0.0, 1.0)
+}
 
 // ===========================================================================
 // 3D MATH
@@ -235,9 +288,6 @@ impl V3 {
             V3::new(0.0, 0.0, 1.0)
         }
     }
-    fn lerp(self, o: V3, t: f32) -> V3 {
-        self.add(o.sub(self).scale(t))
-    }
 }
 
 /// Orbit camera around a target point.
@@ -264,9 +314,8 @@ impl Default for Camera {
 /// A point successfully projected to the screen.
 struct Projected {
     screen: Pos2,
-    /// World->screen size multiplier (perspective).
-    scale: f32,
-    /// Depth in front of the camera (smaller = nearer).
+    /// Depth in front of the camera (smaller = nearer). Drives perspective
+    /// sizing + depth fog via `pscale_of` / `core_r_of` / `depth_t_of`.
     depth: f32,
 }
 
@@ -299,7 +348,6 @@ impl Camera {
         let sy = rect.center().y - focal * y / z;
         Some(Projected {
             screen: Pos2::new(sx, sy),
-            scale: focal / z,
             depth: z,
         })
     }
@@ -318,6 +366,19 @@ struct Node {
     pos: V3,
     vel: V3,
     pinned: bool,
+    /// Smoothly-ramped "lit" factor (0..1) that eases toward the status target
+    /// so a node fading up on connect/online doesn't pop.
+    lit: f32,
+}
+
+/// Steady-state lit target per status (drives the smooth ramp).
+fn lit_target(status: &str) -> f32 {
+    match status {
+        "online" => 1.0,
+        "connecting" => 0.55,
+        "powered_off" => 0.10,
+        _ => 0.18, // offline + unknown
+    }
 }
 
 struct Edge {
@@ -350,15 +411,18 @@ impl Graph {
                 }
             };
             index.insert(nd.id.clone(), nodes.len());
+            let status = nd.status.unwrap_or_else(|| "offline".into());
+            let lit = lit_target(&status); // start settled, no first-frame fade-in
             nodes.push(Node {
                 label: nd.label.unwrap_or_else(|| nd.id.clone()),
                 id: nd.id,
                 role: nd.role.unwrap_or_else(|| "client".into()),
-                status: nd.status.unwrap_or_else(|| "offline".into()),
+                status,
                 meta: nd.meta,
                 pos,
                 vel: V3::default(),
                 pinned,
+                lit,
             });
         }
         let mut edges = Vec::new();
@@ -464,6 +528,16 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
+/// Scalar linear interpolation.
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Interpolate between two screen points.
+fn lerp_pos(a: Pos2, b: Pos2, t: f32) -> Pos2 {
+    Pos2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+}
+
 fn with_alpha(c: Color32, a: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (a.clamp(0.0, 1.0) * 255.0) as u8)
 }
@@ -555,6 +629,13 @@ impl eframe::App for App {
                 self.sim_accum = 0.0;
                 self.simulate();
             }
+        }
+
+        // Smoothly ramp each node's "lit" toward its status target.
+        let k = (dt * 2.2).min(1.0);
+        for node in &mut self.graph.nodes {
+            let target = lit_target(&node.status);
+            node.lit += (target - node.lit) * k;
         }
 
         self.side_panels(ctx);
@@ -733,10 +814,10 @@ impl App {
                     }
                 }
 
-                // ----- starfield -----
-                draw_starfield(&painter, rect);
+                // ----- background -----
+                draw_background(&painter, rect, time);
 
-                // ----- project nodes -----
+                // ----- project visible nodes -----
                 struct Drawn {
                     idx: usize,
                     p: Projected,
@@ -750,6 +831,27 @@ impl App {
                         drawn.push(Drawn { idx, p });
                     }
                 }
+
+                // ----- hover/click picking (before drawing, so focus can emphasise) -----
+                let mut hover_idx: Option<usize> = None;
+                if let Some(mp) = response.hover_pos() {
+                    let mut best = f32::MAX;
+                    for d in &drawn {
+                        let rs = role_style(&self.graph.nodes[d.idx].role);
+                        let core_r = core_r_of(rs.size_mult, d.p.depth);
+                        let dist = d.p.screen.distance(mp);
+                        if dist <= core_r + 4.0 && dist < best {
+                            best = dist;
+                            hover_idx = Some(d.idx);
+                        }
+                    }
+                }
+                if response.clicked() {
+                    self.selected = hover_idx;
+                }
+                // Focus = whatever is hovered, else the sticky selection.
+                let focus = hover_idx.or(self.selected);
+                let focused = focus.is_some();
 
                 // ----- edges (behind nodes) -----
                 for e in &self.graph.edges {
@@ -768,31 +870,58 @@ impl App {
                     let live = a.status == "online" && b.status == "online" && e.active;
                     let ca = role_style(&a.role).color;
                     let cb = role_style(&b.role).color;
-                    let col = lerp_color(ca, cb, 0.5);
-                    let op = kind.base_opacity * if live { 1.0 } else { 0.25 };
+                    // Blend the two endpoint colours, then tint toward FIBER and fog by depth.
+                    let mut col = lerp_color(lerp_color(ca, cb, 0.5), FIBER, 0.30);
+                    let fog_t = (depth_t_of(pa.depth) + depth_t_of(pb.depth)) * 0.5;
+                    col = lerp_color(BG, col, lerp(1.0 - DEPTH_FOG_MAX, 1.0, fog_t));
+                    let mut alpha = kind.base_opacity * if live { 1.0 } else { 0.25 };
+                    let mut width = kind.width;
+                    if focused {
+                        if focus == Some(e.a) || focus == Some(e.b) {
+                            alpha *= 1.6;
+                            width *= 1.4;
+                        } else {
+                            alpha *= 0.28;
+                        }
+                    }
                     painter.line_segment(
                         [pa.screen, pb.screen],
-                        Stroke::new(kind.width, with_alpha(col, op)),
+                        Stroke::new(width, with_alpha(col, alpha)),
                     );
 
-                    // Travelling flow particles in 3D (perspective-correct).
-                    if kind.flow && live && self.animate_flow {
-                        let count = 3;
-                        for k in 0..count {
-                            let mut t = (time * 0.18 + k as f32 / count as f32) % 1.0;
-                            if t < 0.0 {
-                                t += 1.0;
+                    // ----- flow particles: data_path + live only; head + trailing fade -----
+                    if edge_has_flow(&e.kind) && live && self.animate_flow {
+                        let cra = core_r_of(role_style(&a.role).size_mult, pa.depth);
+                        let crb = core_r_of(role_style(&b.role).size_mult, pb.depth);
+                        let pr = ((cra + crb) * 0.5 * 0.34).clamp(1.4, 4.2);
+                        for k in 0..PARTICLES_PER_EDGE {
+                            let base = (time * PARTICLE_SPEED
+                                + k as f32 / PARTICLES_PER_EDGE as f32)
+                                .fract();
+                            // tail first (under head)
+                            for s in (1..TRAIL_STAMPS).rev() {
+                                let t = base - s as f32 * TRAIL_SPACING;
+                                if (0.0..=1.0).contains(&t) {
+                                    let p = lerp_pos(pa.screen, pb.screen, t);
+                                    painter.circle_filled(
+                                        p,
+                                        pr * TRAIL_RADIUS_MULT[s],
+                                        with_alpha(FIBER, TRAIL_ALPHA[s]),
+                                    );
+                                }
                             }
-                            let wp = a.pos.lerp(b.pos, t);
-                            if let Some(pp) = self.cam.project(wp, rect) {
-                                let r = (2.4 * pp.scale * 0.1).clamp(1.2, 4.0);
-                                painter.circle_filled(pp.screen, r * 1.8, with_alpha(col, 0.12));
-                                painter.circle_filled(
-                                    pp.screen,
-                                    r,
-                                    with_alpha(lerp_color(col, Color32::WHITE, 0.5), 0.95),
-                                );
-                            }
+                            // head: soft halo + bright core
+                            let p = lerp_pos(pa.screen, pb.screen, base);
+                            painter.circle_filled(
+                                p,
+                                pr * PARTICLE_HALO_MULT,
+                                with_alpha(FIBER, PARTICLE_HALO_A),
+                            );
+                            painter.circle_filled(
+                                p,
+                                pr * TRAIL_RADIUS_MULT[0],
+                                with_alpha(Color32::from_rgb(248, 252, 255), 0.92),
+                            );
                         }
                     }
                 }
@@ -808,71 +937,123 @@ impl App {
                     let rs = role_style(&node.role);
                     let st = status_style(&node.status);
 
-                    let mut bright = st.brightness;
-                    if st.pulse > 0.0 {
-                        bright += (time * 2.5 + node.pos.x).sin() * st.pulse;
-                    }
+                    // Brightness: online breathes slow, connecting is nervous + flickers.
+                    let pulse_speed = if node.status == "connecting" {
+                        5.5
+                    } else {
+                        1.6
+                    };
+                    let seed = d.idx as f32 * 12.9898;
+                    let mut brightness =
+                        st.brightness + (time * pulse_speed + seed).sin() * st.pulse;
                     if st.flicker > 0.0 {
-                        bright *= 0.6 + self_rand_static(time, d.idx) * st.flicker;
+                        brightness += (self_rand_static(time, d.idx) - 0.5) * st.flicker;
                     }
-                    let col = lerp_color(rs.color, GREY, st.desat);
+                    brightness = brightness.clamp(0.05, 1.25);
 
-                    // Core radius in pixels (perspective-scaled).
-                    let core_r = (rs.size * 1.7 * d.p.scale * 0.1).clamp(2.0, 26.0);
+                    // Depth fog/fade.
+                    let depth_t = depth_t_of(d.p.depth);
+                    let depth_fade = lerp(DEPTH_FADE_MIN, 1.0, depth_t);
+                    let mut color = lerp_color(rs.color, GREY_DOWN, st.desat);
+                    color = lerp_color(BG, color, lerp(1.0 - DEPTH_FOG_MAX, 1.0, depth_t));
+                    let mut glow_op = st.glow * depth_fade;
+                    let mut bri = brightness * depth_fade;
 
-                    // Glow halo: stacked translucent circles read as a ball of light.
-                    let glow_a = st.glow * bright.max(0.08);
-                    for layer in 0..6 {
-                        let rr = core_r * (1.4 + layer as f32 * 0.95);
-                        let aa = glow_a * (0.16 / (layer as f32 * 0.5 + 1.0));
-                        painter.circle_filled(d.p.screen, rr, with_alpha(col, aa));
+                    // Smooth status-change ramp.
+                    glow_op *= lerp(0.35, 1.0, node.lit);
+                    bri *= lerp(0.5, 1.0, node.lit);
+
+                    // Focus mode: dim everything except the focused node.
+                    if focused {
+                        if focus == Some(d.idx) {
+                            glow_op *= 1.25;
+                        } else {
+                            glow_op *= 0.42;
+                            bri *= 0.6;
+                        }
                     }
-                    // Hot core.
-                    let hot = lerp_color(col, Color32::WHITE, 0.55 * bright.clamp(0.0, 1.0));
+
+                    let core_r = core_r_of(rs.size_mult, d.p.depth);
+
+                    // 6 halo layers (outer -> inner): only the outer 4 obey status.glow.
+                    for i in 0..6 {
+                        let r = core_r * GLOW_RADIUS_MULT[i];
+                        let col = lerp_color(color, WARM_WHITE, GLOW_COLOR_MIX[i]);
+                        let mut a = GLOW_ALPHA[i] * bri;
+                        if i < 4 {
+                            a *= glow_op;
+                        }
+                        painter.circle_filled(d.p.screen, r, with_alpha(col, a));
+                    }
+                    // Hot core dot.
                     painter.circle_filled(
                         d.p.screen,
-                        core_r,
-                        with_alpha(hot, (0.65 + 0.35 * bright).clamp(0.2, 1.0)),
+                        core_r * CORE_R_MULT,
+                        with_alpha(WARM_WHITE, CORE_ALPHA * bri),
                     );
 
-                    // Selection ring.
+                    // Selection / hover ring.
+                    let ring_r = core_r * GLOW_RADIUS_MULT[0] * 0.62;
                     if self.selected == Some(d.idx) {
                         painter.circle_stroke(
                             d.p.screen,
-                            core_r + 5.0,
-                            Stroke::new(1.5, Color32::from_rgb(95, 208, 255)),
+                            ring_r,
+                            Stroke::new(1.6, with_alpha(Color32::from_rgb(235, 242, 255), 0.85)),
+                        );
+                    } else if hover_idx == Some(d.idx) {
+                        painter.circle_stroke(
+                            d.p.screen,
+                            ring_r,
+                            Stroke::new(1.1, with_alpha(FIBER, 0.5)),
                         );
                     }
+                }
 
-                    // Label.
-                    if self.show_labels && node.status != "powered_off" {
+                // ----- labels (above nodes; near nodes drawn last = on top) -----
+                if self.show_labels {
+                    for d in &drawn {
+                        let node = &self.graph.nodes[d.idx];
+                        if node.status == "powered_off" {
+                            continue;
+                        }
+                        let is_focus = focus == Some(d.idx);
+                        let depth_t = depth_t_of(d.p.depth);
+                        let mut label_alpha = ((depth_t - 0.15) / 0.5).clamp(0.0, 1.0);
+                        if is_focus {
+                            label_alpha = 1.0;
+                        }
+                        if label_alpha < 0.06 {
+                            continue;
+                        }
+                        let core_r = core_r_of(role_style(&node.role).size_mult, d.p.depth);
+                        let font =
+                            FontId::monospace((10.5 * (0.8 + depth_t * 0.5)).clamp(9.0, 14.0));
+                        let pos = d.p.screen + Vec2::new(0.0, -core_r - 6.0);
+                        // Legibility plate behind the text.
+                        let galley =
+                            painter.layout_no_wrap(node.label.clone(), font.clone(), TEXT_DIM);
+                        let sz = galley.size();
+                        let plate = Rect::from_center_size(
+                            pos - Vec2::new(0.0, sz.y * 0.5),
+                            sz + Vec2::new(8.0, 4.0),
+                        );
+                        painter.rect_filled(
+                            plate,
+                            3.0,
+                            with_alpha(Color32::from_rgb(4, 6, 12), 0.45 * label_alpha),
+                        );
+                        let color = if is_focus { TEXT_HI } else { TEXT_DIM };
                         painter.text(
-                            d.p.screen + Vec2::new(0.0, -core_r - 6.0),
+                            pos,
                             Align2::CENTER_BOTTOM,
                             &node.label,
-                            FontId::monospace(11.0),
-                            with_alpha(Color32::from_rgb(215, 224, 240), 0.92),
+                            font,
+                            with_alpha(color, label_alpha),
                         );
                     }
                 }
 
-                // ----- hover + click picking -----
-                let mut hover_idx: Option<usize> = None;
-                if let Some(mp) = response.hover_pos() {
-                    let mut best = f32::MAX;
-                    for d in &drawn {
-                        let rs = role_style(&self.graph.nodes[d.idx].role);
-                        let core_r = (rs.size * 1.7 * d.p.scale * 0.1).clamp(2.0, 26.0);
-                        let dist = d.p.screen.distance(mp);
-                        if dist <= core_r + 4.0 && dist < best {
-                            best = dist;
-                            hover_idx = Some(d.idx);
-                        }
-                    }
-                }
-                if response.clicked() {
-                    self.selected = hover_idx;
-                }
+                // ----- tooltip -----
                 if let Some(i) = hover_idx {
                     draw_tooltip(
                         &painter,
@@ -953,7 +1134,7 @@ fn status_key(ui: &mut egui::Ui, status: &str, desc: &str) {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(22.0, 8.0), Sense::hover());
         let st = status_style(status);
-        let c = lerp_color(Color32::WHITE, GREY, st.desat);
+        let c = lerp_color(Color32::WHITE, GREY_DOWN, st.desat);
         ui.painter()
             .rect_filled(rect, 3.0, with_alpha(c, st.glow.max(0.25)));
         ui.label(
@@ -995,24 +1176,64 @@ fn draw_tooltip(painter: &egui::Painter, at: Pos2, node: &Node) {
     painter.galley(pos + pad + Vec2::new(10.0, 0.0), galley, Color32::WHITE);
 }
 
-fn draw_starfield(painter: &egui::Painter, rect: Rect) {
-    // Cheap deterministic starfield seeded by position.
-    let mut seed: u64 = 0x1234_5678;
-    let mut next = || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        (seed >> 11) as f32 / (1u64 << 53) as f32
-    };
-    for _ in 0..220 {
-        let x = rect.left() + next() * rect.width();
-        let y = rect.top() + next() * rect.height();
-        let a = 0.15 + next() * 0.35;
+/// Deep-space backdrop: BG fill + a faked nebula centre-lift + a 3-tier
+/// (parallax) starfield + corner vignette. All deterministic so stars don't
+/// jitter frame-to-frame (positions are reproduced from a fixed seed).
+fn draw_background(painter: &egui::Painter, rect: Rect, time: f32) {
+    // 1) base fill.
+    painter.rect_filled(rect, 0.0, BG);
+
+    // 2) nebula centre-lift: a few big, very faint circles.
+    let base = rect.height().min(rect.width()) * 0.18;
+    let nebula_r = [3.4, 2.4, 1.5, 0.8];
+    let nebula_a = [0.020, 0.026, 0.030, 0.034];
+    for i in 0..4 {
         painter.circle_filled(
-            Pos2::new(x, y),
-            next() * 1.1 + 0.3,
-            with_alpha(Color32::from_rgb(159, 179, 217), a),
+            rect.center(),
+            base * nebula_r[i],
+            with_alpha(NEBULA, nebula_a[i]),
         );
+    }
+
+    // 3) starfield, 3 tiers (far/mid/near) for a sense of parallax.
+    let star = Color32::from_rgb(150, 170, 210);
+    let warm = Color32::from_rgb(222, 214, 196);
+    let tier =
+        |seed0: u64, count: usize, a_lo: f32, a_hi: f32, r_lo: f32, r_hi: f32, warm_frac: f32| {
+            let mut seed = seed0;
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 11) as f32 / (1u64 << 53) as f32
+            };
+            for _ in 0..count {
+                let x = rect.left() + next() * rect.width();
+                let y = rect.top() + next() * rect.height();
+                let twinkle_seed = next() * std::f32::consts::TAU;
+                let mut a = a_lo + next() * (a_hi - a_lo);
+                a *= 1.0 + (time * 1.3 + twinkle_seed).sin() * 0.1; // gentle twinkle
+                let r = r_lo + next() * (r_hi - r_lo);
+                let col = if next() < warm_frac { warm } else { star };
+                painter.circle_filled(Pos2::new(x, y), r, with_alpha(col, a));
+            }
+        };
+    tier(0x1234_5678, 150, 0.10, 0.22, 0.3, 0.8, 0.0); // far
+    tier(0x9e37_79b9, 70, 0.26, 0.46, 0.7, 1.2, 0.0); // mid
+    tier(0xa5a5_f00d, 26, 0.50, 0.80, 1.1, 1.8, 0.25); // near
+
+    // 4) corner vignette: stack faint dark circles centred on each corner.
+    let vmax = rect.width().max(rect.height());
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.left_bottom(),
+        rect.right_bottom(),
+    ];
+    for c in corners {
+        for _ in 0..3 {
+            painter.circle_filled(c, vmax * 0.55, with_alpha(Color32::from_rgb(2, 3, 8), 0.05));
+        }
     }
 }
 
@@ -1114,7 +1335,13 @@ fn main() -> eframe::Result<()> {
         "Rustynet Node Map",
         options,
         Box::new(|cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            let mut v = egui::Visuals::dark();
+            v.window_fill = Color32::from_rgb(10, 13, 22);
+            v.panel_fill = Color32::from_rgb(10, 13, 22);
+            v.extreme_bg_color = Color32::from_rgb(6, 8, 15);
+            v.window_stroke = Stroke::new(1.0, Color32::from_rgb(40, 50, 72));
+            v.selection.bg_fill = Color32::from_rgb(82, 150, 240);
+            cc.egui_ctx.set_visuals(v);
             Ok(Box::new(App::new(graph)))
         }),
     )
