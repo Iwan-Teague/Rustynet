@@ -463,7 +463,16 @@ backend_env=()
 if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
   backend_env+=(RUSTYNET_BACKEND="${RUSTYNET_BACKEND}")
 fi
-run_root env RUSTYNET_INSTALL_SOURCE_ROOT="${HOME}/Rustynet" "${backend_env[@]}" \
+# Lab bootstrap uses the relaxed 86400s freshness window (parity with macOS
+# Bootstrap-RustyNetMacos.sh and the Windows installer) so a Linux node is not
+# left enforcing the strict 300s/120s window if the later enforce pass is
+# interrupted. e2e-bootstrap-host forwards these into `ops install-systemd`,
+# which bakes them into the unit file. Production deployments leave these unset.
+run_root env RUSTYNET_INSTALL_SOURCE_ROOT="${HOME}/Rustynet" \
+  RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400 \
+  RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400 \
+  RUSTYNET_DNS_ZONE_MAX_AGE_SECS=86400 \
+  "${backend_env[@]}" \
   rustynet ops e2e-bootstrap-host \
   --role "${ROLE}" \
   --node-id "${NODE_ID}" \
