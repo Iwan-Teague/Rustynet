@@ -1288,6 +1288,125 @@ impl Graph {
         let crossings = straight_crossings(&tedges, &centers);
         let certified = certified && crossings == best_cross;
 
+        // Node-level (actually-rendered) straight crossings for a candidate set
+        // of tile centres: a galaxy's members fan out around its centre, so this
+        // is what the viewer truly sees. The organic transforms below must not
+        // increase it beyond the clean baseline — keeping the minimum the user
+        // cares about, not just the tile-level abstraction.
+        let mut node_off = vec![V3::default(); self.nodes.len()];
+        let mut node_has_tile = vec![false; self.nodes.len()];
+        for t in &tiles {
+            for &(idx, off) in &t.members {
+                node_off[idx] = off;
+                node_has_tile[idx] = true;
+            }
+        }
+        let node_xings = |cs: &[V3]| -> usize {
+            let np: Vec<V3> = (0..self.nodes.len())
+                .map(|i| {
+                    if node_has_tile[i] {
+                        cs[node_tile[i]].add(node_off[i])
+                    } else {
+                        self.nodes[i].pos
+                    }
+                })
+                .collect();
+            let e = &self.edges;
+            let mut c = 0;
+            for i in 0..e.len() {
+                for j in (i + 1)..e.len() {
+                    let (a, b) = (e[i].a, e[i].b);
+                    let (p, q) = (e[j].a, e[j].b);
+                    if a == p || a == q || b == p || b == q {
+                        continue;
+                    }
+                    // Only judge edges whose endpoints are laid out by the tiles
+                    // (skip pinned nodes, which live in a different frame).
+                    if !(node_has_tile[a]
+                        && node_has_tile[b]
+                        && node_has_tile[p]
+                        && node_has_tile[q])
+                    {
+                        continue;
+                    }
+                    if segments_cross(np[a], np[b], np[p], np[q]) {
+                        c += 1;
+                    }
+                }
+            }
+            c
+        };
+        let base_node = node_xings(&centers);
+
+        // --- Curved "universe" placement (mathematical, size-independent) ---
+        // Bend the rigid layered columns onto concentric arcs around a focus
+        // placed downstream of the exits: a unit's flow layer becomes its RADIUS
+        // and its within-layer order becomes an ANGLE over a limited fan (never a
+        // full circle). The outermost ring is the leaf galaxies, so they wrap
+        // around their anchors in a rounded arc. Because adjacent-layer edges
+        // stay near-radial the crossing structure is unchanged — and we still
+        // keep only the largest curvature that adds NO straight-line crossing, so
+        // the proven minimum is never sacrificed. Works for any node/edge count.
+        {
+            let clean = centers.clone();
+            let x_max = (0..m).map(|t| clean[t].x).fold(f32::NEG_INFINITY, f32::max);
+            let cx = x_max + 0.30 * (x_max).max(1.0); // focus downstream of the exits
+            let phi = 1.05_f32; // full-curvature half-fan (~60°), < a half-turn
+                                // Rank of each unit within its layer + layer sizes: the angle is the
+                                // normalised rank, so the k-th unit of EVERY layer lands on the same
+                                // ray. Because the optimiser aligned each leaf with its anchor by
+                                // rank, the leaf->anchor edges become near-radial spokes, which is
+                                // why curving preserves the minimum.
+            let mut rank = vec![0usize; n_units];
+            let mut lsize = vec![1usize; n_layers];
+            for (l, lt) in layer_tiles.iter().enumerate() {
+                lsize[l] = lt.len();
+                for (i, &u) in lt.iter().enumerate() {
+                    rank[u] = i;
+                }
+            }
+            // Curvature strength falls off toward the backbone: the leaf layer
+            // (layer 0 — client/nas/llm) curves fully (its edges are tree edges,
+            // so arcing leaves around their anchors never adds a crossing), while
+            // inner layers (anchor/relay/exit, which carry the sensitive non-tree
+            // control/skip edges) curve only gently. This gives the rounded
+            // "leaves wrapping their anchors" shape without disturbing the
+            // crossing-critical backbone.
+            let apply_curve = |scale: f32, out: &mut [V3]| {
+                for t in 0..m {
+                    let l = unit_layer[t];
+                    let frac = if lsize[l] > 1 {
+                        rank[t] as f32 / (lsize[l] - 1) as f32 - 0.5
+                    } else {
+                        0.0
+                    };
+                    let theta = frac * 2.0 * phi; // fan over [-phi, +phi]
+                    let r = cx - clean[t].x; // leaves (small x) -> large radius
+                    let tx = cx - r * theta.cos();
+                    let tz = r * theta.sin();
+                    // Full curve on the leaves, tapering for inner layers.
+                    let layer_w = if l == 0 { 1.0 } else { 0.0 };
+                    let s = scale * layer_w;
+                    out[t] = V3::new(
+                        clean[t].x + (tx - clean[t].x) * s,
+                        0.0,
+                        clean[t].z + (tz - clean[t].z) * s,
+                    );
+                }
+            };
+            let mut curved = false;
+            for &s in &[1.0f32, 0.85, 0.7, 0.55, 0.4, 0.25] {
+                apply_curve(s, &mut centers);
+                if node_xings(&centers) == base_node {
+                    curved = true;
+                    break;
+                }
+            }
+            if !curved {
+                centers.copy_from_slice(&clean);
+            }
+        }
+
         // Organic scatter: nudge each tile off the rigid grid (deterministically,
         // by id) so the map reads like a scattered universe rather than aligned
         // columns — but only keep the largest nudge scale that adds NO straight-
@@ -1301,7 +1420,7 @@ impl Graph {
                     let (jx, jz) = tile_jitter(t);
                     centers[t] = V3::new(clean[t].x + jx * scale, 0.0, clean[t].z + jz * scale);
                 }
-                if straight_crossings(&tedges, &centers) == crossings {
+                if node_xings(&centers) == base_node {
                     scale_used = scale;
                     break;
                 }

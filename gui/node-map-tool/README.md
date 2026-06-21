@@ -73,11 +73,19 @@ have, when the straight-line count equals the certified layered minimum the
 straight drawing is itself provably minimal — which holds for the shapes
 Rustynet produces. A K₃,₃ block, for example, certifies its true minimum of 9.
 
-To stay "like a universe" rather than a grid, each galaxy gets its own rotation
-and a polygon whose vertex count grows with its node count (a pentagon for the
-smallest), and every tile is nudged off the grid by a deterministic amount —
-kept only at the largest scale that adds **zero** crossings, so the proven
-minimum is never sacrificed. Within a galaxy, nodes fill the disc via Vogel's
+To stay "like a universe" rather than a grid, the layout is curved: each leaf
+galaxy (client/nas/llm) is swung onto a **radial arc around its anchor** — flow
+layer → radius, within-layer order → angle over a limited fan (never a full
+circle) — so the leaves wrap their anchors in a rounded spread. Because the
+optimiser aligned each leaf with its anchor by rank, those spokes stay
+near-radial, so curving the leaves adds no crossings; the crossing-critical
+backbone (anchor/relay/exit + the control plane) keeps its spine. Each galaxy
+also gets its own rotation and a polygon whose vertex count grows with its node
+count (a pentagon for the smallest, capped so big galaxies stay round), and every
+tile is nudged off the grid by a deterministic jitter. **Both the curve and the
+jitter are kept only at the largest strength that adds zero *rendered* (node-to-
+node) crossings**, so the proven minimum is never sacrificed and the strength
+adapts to each network. Within a galaxy, nodes fill the disc via Vogel's
 sunflower with predetermined, evenly-spaced node↔node and node↔border gaps.
 
 Everything is deterministic (fixed-seed) and repeatable at any size; the overview
