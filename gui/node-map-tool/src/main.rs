@@ -586,21 +586,33 @@ impl Graph {
             }
         }
 
-        // Build a galaxy tile: pack same-role leaves into a disc (phyllotaxis).
+        // Build a galaxy tile: distribute same-role leaves evenly in a disc using
+        // Vogel's Fibonacci sunflower model (r = R*sqrt((k+0.5)/N), theta = k*137.5deg)
+        // — the standard even/blue-noise disc fill — then leave a NODE_GAP margin
+        // out to the border so nodes never crowd the edge.
         let galaxy_tile = |nodes: &mut [Node], mem: &[usize], gid: u64, role: &str| -> Tile {
-            let mut members = Vec::with_capacity(mem.len());
-            let mut maxr = 0.0_f32;
+            let count = mem.len();
+            // Inner radius sized so neighbour spacing is ~NODE_GAP.
+            let inner = if count <= 1 {
+                0.0
+            } else {
+                NODE_GAP * (count as f32).sqrt() * 0.55
+            };
+            let mut members = Vec::with_capacity(count);
             for (k, &idx) in mem.iter().enumerate() {
+                let frac = if count <= 1 {
+                    0.0
+                } else {
+                    (k as f32 + 0.5) / count as f32
+                };
+                let rr = inner * frac.sqrt();
                 let a = k as f32 * 2.399_963_2; // golden angle
-                let rr = NODE_GAP * (k as f32).sqrt();
-                let off = V3::new(rr * a.cos(), 0.0, rr * a.sin());
-                members.push((idx, off));
-                maxr = maxr.max(rr);
+                members.push((idx, V3::new(rr * a.cos(), 0.0, rr * a.sin())));
                 nodes[idx].galaxy = Some(gid);
             }
             Tile {
                 members,
-                radius: maxr + NODE_GAP, // interior breathing room (node <-> border)
+                radius: inner + NODE_GAP, // clear margin between nodes and border
                 info: Some((gid, role.to_string())),
             }
         };
@@ -651,14 +663,14 @@ impl Graph {
                 node_tile[idx] = ti;
             }
         }
+        // A spring for EVERY edge, between the tiles of its endpoints. Pulling all
+        // connected tiles together minimises total edge length, which is the
+        // standard force-directed way to reduce edge crossings.
         let mut springs: Vec<(usize, usize, f32)> = Vec::new();
-        for (ti, t) in tiles.iter().enumerate() {
-            if let Some((gid, _)) = &t.info {
-                let hub = (*gid / 16) as usize;
-                let ht = node_tile[hub];
-                if ht != ti {
-                    springs.push((ti, ht, t.radius + tiles[ht].radius + CLUSTER_GAP));
-                }
+        for e in &self.edges {
+            let (ta, tb) = (node_tile[e.a], node_tile[e.b]);
+            if ta != tb {
+                springs.push((ta, tb, tiles[ta].radius + tiles[tb].radius + CLUSTER_GAP));
             }
         }
         // Deterministic spiral seed so the layout is stable run-to-run.
