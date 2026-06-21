@@ -81,12 +81,15 @@ optimiser aligned each leaf with its anchor by rank, those spokes stay
 near-radial, so curving the leaves adds no crossings; the crossing-critical
 backbone (anchor/relay/exit + the control plane) keeps its spine. Each galaxy
 also gets its own rotation and a polygon whose vertex count grows with its node
-count (a pentagon for the smallest, capped so big galaxies stay round), and every
-tile is nudged off the grid by a deterministic jitter. **Both the curve and the
-jitter are kept only at the largest strength that adds zero *rendered* (node-to-
-node) crossings**, so the proven minimum is never sacrificed and the strength
-adapts to each network. Within a galaxy, nodes fill the disc via Vogel's
-sunflower with predetermined, evenly-spaced node↔node and node↔border gaps.
+count (a pentagon for the smallest, capped so big galaxies stay round). Finally,
+once the non-overlapping spacing is fixed, **every tile gets its own
+deterministic "gutter" nudge** (the backbone singletons — anchor/relay/exit —
+get a larger budget so they don't sit in a rigid line), applied greedily and
+kept only as far as it adds **zero rendered (node-to-node) crossings** and keeps
+clear space to every other tile. So the proven minimum and the spacing both hold,
+and the amount of scatter adapts to each network. Within a galaxy, nodes fill the
+disc via Vogel's sunflower with predetermined, evenly-spaced node↔node and
+node↔border gaps.
 
 Everything is deterministic (fixed-seed) and repeatable at any size; the overview
 camera auto-fits the world bounds. Regression tests in `src/main.rs` assert zero
