@@ -183,21 +183,23 @@ fn edge_has_flow(kind: &str) -> bool {
 }
 
 /// Galaxy layout tunables. Placement is deterministic (no force sim). Backbone
-/// nodes (anchor/relay/exit/admin) sit in fixed data-flow columns; leaf nodes
-/// (client/nas/llm) form per-(hub, role) "galaxies" that orbit their hub.
-const GALAXY_COL_SPACING: f32 = 82.0; // world gap between backbone columns (flow axis)
-const GALAXY_ROW_SPACING: f32 = 195.0; // world gap between stacked backbone nodes (room for orbits)
-const ORBIT_RADIUS: f32 = 30.0; // base distance of a leaf galaxy from its hub
-const NODE_GAP: f32 = 7.0; // packing spacing of nodes within a galaxy
-const GALAXY_PAD: f32 = 14.0; // screen px padding of a galaxy border past its nodes
+/// nodes (anchor/relay/exit/admin) are spread across a roomy 2D grid; leaf nodes
+/// (client/nas/llm) form per-(hub, role) "galaxies" that orbit their hub. The
+/// map is intentionally larger than the viewport so it can be panned around.
+const GRID_COLS: usize = 3; // backbone cluster columns
+const GRID_CELL_X: f32 = 320.0; // world gap between cluster cells (horizontal)
+const GRID_CELL_Y: f32 = 320.0; // world gap between cluster cells (vertical)
+const ORBIT_RADIUS: f32 = 56.0; // base distance of a leaf galaxy from its hub
+const NODE_GAP: f32 = 8.0; // packing spacing of nodes within a galaxy
+const GALAXY_PAD: f32 = 16.0; // screen px padding of a galaxy border past its nodes
 
 /// Leaf roles orbit the node their data travels to; backbone roles are the skeleton.
 fn is_leaf_role(role: &str) -> bool {
     matches!(role, "client" | "nas" | "llm")
 }
 
-/// Backbone column along the data-flow axis: operator | (sources) | anchor |
-/// relay | exit. Only backbone + unattached nodes use this for placement.
+/// Ordering rank so similar roles cluster together on the grid (operator →
+/// sources → anchor → relay → exit), giving each type its own screen region.
 fn galaxy_col(role: &str) -> i32 {
     match role {
         "admin" => 0,
@@ -246,7 +248,7 @@ const CORE_R_MULT: f32 = 0.9; // node ball radius (x core_r)
 // (Node bodies are NOT depth-tinted, so same-role nodes keep a consistent shade;
 // depth is conveyed by size.)
 const DEPTH_FOG_MAX: f32 = 0.45;
-const REF_DISTANCE: f32 = 410.0;
+const REF_DISTANCE: f32 = 730.0;
 
 // ------------------------------ PULSE ----------------------------------
 // Pulses propagate as a synchronized wave toward the exit: a node emits its
@@ -348,7 +350,7 @@ impl Default for Camera {
             target: V3::default(),
             yaw: 0.0,
             pitch: 0.62, // oblique top-down angle (clearly tilted, not straight down)
-            distance: 460.0,
+            distance: 820.0,
             fov: 50_f32.to_radians(),
         }
     }
@@ -541,30 +543,27 @@ impl Graph {
         let n = self.nodes.len();
         let hub: Vec<Option<usize>> = (0..n).map(|i| self.leaf_hub(i)).collect();
 
-        // 1) Standalone nodes: backbone + any leaf without a hub. Place them in
-        //    flow columns, stacked within a column.
-        let mut cols: Map<i32, Vec<usize>> = Map::new();
-        for (i, h) in hub.iter().enumerate() {
-            if self.nodes[i].pinned {
-                continue;
-            }
-            if is_leaf_role(&self.nodes[i].role) && h.is_some() {
-                continue; // placed as an orbiting galaxy below
-            }
-            cols.entry(galaxy_col(&self.nodes[i].role))
-                .or_default()
-                .push(i);
-        }
-        let col_keys: Vec<i32> = cols.keys().copied().collect();
-        let col_center = (col_keys.len() as f32 - 1.0) * 0.5;
-        for (ci, col) in col_keys.iter().enumerate() {
-            let members = &cols[col];
-            let x = (ci as f32 - col_center) * GALAXY_COL_SPACING;
-            let row_center = (members.len() as f32 - 1.0) * 0.5;
-            for (ri, &i) in members.iter().enumerate() {
-                let z = (ri as f32 - row_center) * GALAXY_ROW_SPACING;
-                self.nodes[i].pos = V3::new(x, 0.0, z);
-            }
+        // 1) Standalone nodes (backbone + any leaf without a hub) spread across a
+        //    roomy 2D grid; sorted by flow rank + role so each type keeps its own
+        //    region. Each anchor cell hosts the leaf galaxies that orbit it.
+        let mut standalone: Vec<usize> = (0..n)
+            .filter(|&i| {
+                !self.nodes[i].pinned && !(is_leaf_role(&self.nodes[i].role) && hub[i].is_some())
+            })
+            .collect();
+        standalone.sort_by(|&a, &b| {
+            (galaxy_col(&self.nodes[a].role), self.nodes[a].role.as_str())
+                .cmp(&(galaxy_col(&self.nodes[b].role), self.nodes[b].role.as_str()))
+        });
+        let count = standalone.len().max(1);
+        let cols = GRID_COLS.min(count);
+        let rows = count.div_ceil(cols);
+        let cx_center = (cols as f32 - 1.0) * 0.5;
+        let cy_center = (rows as f32 - 1.0) * 0.5;
+        for (k, &i) in standalone.iter().enumerate() {
+            let cx = (k % cols) as f32 - cx_center;
+            let cy = (k / cols) as f32 - cy_center;
+            self.nodes[i].pos = V3::new(cx * GRID_CELL_X, 0.0, cy * GRID_CELL_Y);
         }
 
         // 2) Leaf galaxies: group leaves by (hub, role), then orbit each group
