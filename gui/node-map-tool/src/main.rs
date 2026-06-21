@@ -192,11 +192,13 @@ fn edge_has_flow(kind: &str) -> bool {
 const NODE_GAP: f32 = 34.0; // spacing of nodes within a galaxy + interior padding
 const SINGLETON_RADIUS: f32 = 46.0; // tile radius for a lone backbone node
 const CLUSTER_GAP: f32 = 40.0; // gap between packed tiles
+const LAYER_GAP: f32 = 96.0; // gap between flow layers (Sugiyama columns)
+const DUMMY_R: f32 = 12.0; // routing-lane radius for a virtual node on a skip-layer edge
 const EDGE_CLEAR: f32 = 16.0; // world clearance kept between a routed edge and an obstacle
 const NODE_OBSTACLE_R: f32 = 28.0; // obstacle radius for a lone backbone node when routing
 
 // Camera zoom levels: overview vs drilled-into-a-galaxy.
-const OVERVIEW_DISTANCE: f32 = 820.0;
+const OVERVIEW_DISTANCE: f32 = 1040.0;
 const GALAXY_VIEW_DISTANCE: f32 = 230.0;
 
 /// Leaf roles orbit the node their data travels to; backbone roles are the skeleton.
@@ -276,6 +278,28 @@ fn role_flow_rank(role: &str) -> i32 {
         "exit" | "blind_exit" => 3,
         _ => 1, // admin/unknown (control edges don't pulse anyway)
     }
+}
+
+/// Flow layer for the layered (Sugiyama) layout: leaves/admin sources feed the
+/// backbone columns toward the exit. Mirrors role_flow_rank so the layout's
+/// columns match the conceptual data path (sources -> anchor -> relay -> exit).
+fn flow_layer(role: &str) -> usize {
+    role_flow_rank(role).max(0) as usize
+}
+
+/// True iff the open segments p1p2 and p3p4 properly intersect in the xz plane.
+/// Shared endpoints and collinear touching deliberately do NOT count, so this
+/// reports only genuine line-over-line crossings.
+fn segments_cross(p1: V3, p2: V3, p3: V3, p4: V3) -> bool {
+    fn orient(a: V3, b: V3, c: V3) -> f32 {
+        (b.x - a.x) * (c.z - a.z) - (b.z - a.z) * (c.x - a.x)
+    }
+    let d1 = orient(p3, p4, p1);
+    let d2 = orient(p3, p4, p2);
+    let d3 = orient(p1, p2, p3);
+    let d4 = orient(p1, p2, p4);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
 }
 
 /// Normalised perspective scale (~0.3 far .. 3.2 near) from camera-space depth.
@@ -477,6 +501,9 @@ struct Graph {
     fire_at: Vec<f32>,
     /// Total length of one pulse cycle (seconds).
     cycle_len: f32,
+    /// Camera distance that frames the whole layout in the overview, derived
+    /// from the world-space bounds so the default view fits any network size.
+    overview_distance: f32,
 }
 
 impl Graph {
@@ -522,6 +549,7 @@ impl Graph {
             galaxies: Vec::new(),
             fire_at: Vec::new(),
             cycle_len: 0.0,
+            overview_distance: OVERVIEW_DISTANCE,
         };
         graph.layout_galaxies();
         graph.compute_pulse_schedule();
@@ -650,70 +678,387 @@ impl Graph {
             });
         }
 
-        // ----- Organic packing (force-directed: link + collide + centre) -----
-        // This is the standard way (cf. d3-force forceLink/forceCollide/forceCenter)
-        // to get evenly-spaced, non-overlapping, non-grid placement ("blue-noise"
-        // feel): springs pull each galaxy toward its hub tile, a collision force
-        // keeps tiles apart (radius + gap), and gravity keeps the whole map compact.
+        // ----- Layered (Sugiyama) layout with barycenter crossing reduction -----
+        // The standard, general way to minimise edge crossings on a flow graph:
+        // put each tile in a layer by flow rank, then repeatedly reorder each
+        // layer by the average position of its neighbours (the barycenter
+        // heuristic, as used by Graphviz `dot`). Works for any topology/size.
         let m = tiles.len();
-        // node -> tile index, so a galaxy can be sprung to its hub's tile.
         let mut node_tile = vec![0usize; n];
         for (ti, t) in tiles.iter().enumerate() {
             for &(idx, _) in &t.members {
                 node_tile[idx] = ti;
             }
         }
-        // A spring for EVERY edge, between the tiles of its endpoints. Pulling all
-        // connected tiles together minimises total edge length, which is the
-        // standard force-directed way to reduce edge crossings.
-        let mut springs: Vec<(usize, usize, f32)> = Vec::new();
-        for e in &self.edges {
-            let (ta, tb) = (node_tile[e.a], node_tile[e.b]);
-            if ta != tb {
-                springs.push((ta, tb, tiles[ta].radius + tiles[tb].radius + CLUSTER_GAP));
-            }
-        }
-        // Deterministic spiral seed so the layout is stable run-to-run.
-        let mut centers: Vec<V3> = (0..m)
-            .map(|i| {
-                let a = i as f32 * 2.399_963_2;
-                let r = 26.0 * (i as f32).sqrt();
-                V3::new(r * a.cos(), 0.0, r * a.sin())
+        let layer_of: Vec<usize> = tiles
+            .iter()
+            .map(|t| {
+                let role = match &t.info {
+                    Some((_, r)) => r.as_str(),
+                    None => self.nodes[t.members[0].0].role.as_str(),
+                };
+                flow_layer(role)
             })
             .collect();
-        for _ in 0..420 {
-            // Springs: keep each galaxy near its hub.
-            for &(a, b, rest) in &springs {
-                let d = centers[b].sub(centers[a]);
-                let dist = d.len().max(0.001);
-                let pull = d.scale(1.0 / dist).scale((dist - rest) * 0.06);
-                centers[a] = centers[a].add(pull);
-                centers[b] = centers[b].sub(pull);
-            }
-            // Gravity: gentle pull toward the origin for compactness.
-            for c in &mut centers {
-                *c = c.sub(c.scale(0.02));
-            }
-            // Collision: never let two tiles' footprints (+gap) overlap.
-            for i in 0..m {
-                for j in (i + 1)..m {
-                    let d = centers[i].sub(centers[j]);
-                    let dist = d.len().max(0.001);
-                    let min = tiles[i].radius + tiles[j].radius + CLUSTER_GAP;
-                    if dist < min {
-                        let push = d.scale(1.0 / dist).scale((min - dist) * 0.5);
-                        centers[i] = centers[i].add(push);
-                        centers[j] = centers[j].sub(push);
+        let n_layers = layer_of.iter().copied().max().unwrap_or(0) + 1;
+
+        // The unique tile-to-tile connection list (deduped).
+        let mut tedges: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut seen: HashSet<(usize, usize)> = HashSet::new();
+            for e in &self.edges {
+                let (ta, tb) = (node_tile[e.a], node_tile[e.b]);
+                if ta != tb {
+                    let key = if ta < tb { (ta, tb) } else { (tb, ta) };
+                    if seen.insert(key) {
+                        tedges.push(key);
                     }
                 }
             }
         }
-        // Centre the whole map on the origin.
+
+        // Proper Sugiyama requires every edge to span a single layer, so an edge
+        // that skips layers gets *dummy* units inserted in the intermediate
+        // layers and becomes a chain through them. Ordering the dummies
+        // alongside the real tiles lets the optimiser route a long edge between
+        // others without crossing — the standard fix for skip-layer edges (e.g.
+        // an anchor egressing straight to an exit, or an admin control link to a
+        // relay). Real tiles are units 0..m; dummies are appended after.
+        let mut unit_layer: Vec<usize> = layer_of.clone();
+        let mut unit_radius: Vec<f32> = tiles.iter().map(|t| t.radius).collect();
+        let mut chains: Vec<Vec<usize>> = Vec::with_capacity(tedges.len());
+        for &(a, b) in &tedges {
+            let (la, lb) = (layer_of[a], layer_of[b]);
+            let (lo_u, hi_u, lo, hi) = if la <= lb {
+                (a, b, la, lb)
+            } else {
+                (b, a, lb, la)
+            };
+            if hi - lo <= 1 {
+                chains.push(vec![lo_u, hi_u]);
+            } else {
+                let mut chain = vec![lo_u];
+                for l in (lo + 1)..hi {
+                    let d = unit_layer.len();
+                    unit_layer.push(l);
+                    unit_radius.push(DUMMY_R);
+                    chain.push(d);
+                }
+                chain.push(hi_u);
+                chains.push(chain);
+            }
+        }
+        let n_units = unit_layer.len();
+
+        // Adjacency over the layered graph (real + dummy), one entry per chain
+        // segment — what the barycenter heuristic operates on.
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n_units];
+        for chain in &chains {
+            for w in chain.windows(2) {
+                adj[w[0]].push(w[1]);
+                adj[w[1]].push(w[0]);
+            }
+        }
+        let mut layer_tiles: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
+        for (u, &l) in unit_layer.iter().enumerate() {
+            layer_tiles[l].push(u);
+        }
+        let mut pos: Vec<f32> = vec![0.0; n_units];
+
+        // Layer x-offsets depend only on each layer's widest unit, not on the
+        // within-layer order, so compute them once.
+        let mut layer_x = vec![0.0f32; n_layers];
+        {
+            let mut x = 0.0;
+            let mut prev_maxr = 0.0;
+            for l in 0..n_layers {
+                let maxr = layer_tiles[l]
+                    .iter()
+                    .map(|&u| unit_radius[u])
+                    .fold(0.0, f32::max);
+                if l > 0 {
+                    x += prev_maxr + maxr + LAYER_GAP;
+                }
+                layer_x[l] = x;
+                prev_maxr = maxr;
+            }
+        }
+
+        // Lay units out along z by their current per-layer order (sized so
+        // nothing overlaps), returning every unit's centre.
+        let assign = |layer_tiles: &[Vec<usize>]| -> Vec<V3> {
+            let mut centers = vec![V3::default(); n_units];
+            for (l, lt) in layer_tiles.iter().enumerate() {
+                let total_h: f32 = lt.iter().map(|&u| 2.0 * unit_radius[u] + CLUSTER_GAP).sum();
+                let mut z = -total_h * 0.5;
+                for &u in lt {
+                    z += unit_radius[u];
+                    centers[u] = V3::new(layer_x[l], 0.0, z);
+                    z += unit_radius[u] + CLUSTER_GAP;
+                }
+            }
+            centers
+        };
+        // Count genuine line-over-line crossings between chain segments. Two
+        // segments that share a unit (e.g. edges from one anchor) never count;
+        // segments in disjoint layer gaps cannot meet, so only same-gap
+        // crossings are found.
+        let segs: Vec<(usize, usize)> = chains
+            .iter()
+            .flat_map(|c| c.windows(2).map(|w| (w[0], w[1])))
+            .collect();
+        let count = |centers: &[V3]| -> usize {
+            let mut x = 0;
+            for i in 0..segs.len() {
+                for j in (i + 1)..segs.len() {
+                    let (a, b) = segs[i];
+                    let (c, d) = segs[j];
+                    if a == c || a == d || b == c || b == d {
+                        continue;
+                    }
+                    if segments_cross(centers[a], centers[b], centers[c], centers[d]) {
+                        x += 1;
+                    }
+                }
+            }
+            x
+        };
+
+        // Crossing minimisation = iterated barycenter + transpose (the Graphviz
+        // `dot` strategy), wrapped in deterministic multi-start to escape local
+        // minima. Per refine pass, each round does: (1) barycenter — reorder
+        // every layer by the mean position of its neighbours, the classic global
+        // heuristic; then (2) transpose — greedily swap adjacent tiles whenever
+        // it strictly lowers the *actual* geometric crossing count, to a fixed
+        // point. Re-seeding barycenter from the transposed order propagates an
+        // ordering win across layers. Some optima need a *coordinated* reorder
+        // of two coupled layers at once (e.g. an admin control-star plus a
+        // many-to-one relay fan-in), which single adjacent swaps can't reach in
+        // one basin — so when a pass doesn't hit zero we restart from the best
+        // order with each layer shuffled (a fixed-seed xorshift, hence fully
+        // repeatable) and refine again, keeping the global best. Crossing
+        // minimisation is NP-hard, so this targets the minimum rather than
+        // proving it; in practice it reaches 0 for the network shapes Rustynet
+        // produces (forest-like data paths + a control plane).
+        let mut seed: u64 = (m as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (tedges.len() as u64).wrapping_add(0xD1B5_4A32_D192_ED03);
+        let mut next_rand = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // One barycenter pass (up-sweep then down-sweep), the classic global
+        // crossing-reduction heuristic: order each layer by the mean position of
+        // its neighbours. Seeded from the current order; mutates layer_tiles+pos.
+        let barycenter = |layer_tiles: &mut [Vec<usize>], pos: &mut [f32]| {
+            for lt in layer_tiles.iter() {
+                for (i, &t) in lt.iter().enumerate() {
+                    pos[t] = i as f32;
+                }
+            }
+            for &dir_down in &[true, false] {
+                let seq: Vec<usize> = if dir_down {
+                    (0..n_layers).collect()
+                } else {
+                    (0..n_layers).rev().collect()
+                };
+                for li in seq {
+                    let mut order: Vec<(f32, usize)> = layer_tiles[li]
+                        .iter()
+                        .map(|&t| {
+                            let (mut s, mut c) = (0.0, 0.0);
+                            for &nb in &adj[t] {
+                                s += pos[nb];
+                                c += 1.0;
+                            }
+                            (if c > 0.0 { s / c } else { pos[t] }, t)
+                        })
+                        .collect();
+                    order
+                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    layer_tiles[li] = order.iter().map(|(_, t)| *t).collect();
+                    for (i, &t) in layer_tiles[li].iter().enumerate() {
+                        pos[t] = i as f32;
+                    }
+                }
+            }
+        };
+
+        // Greedy local search to a fixed point on the *true* crossing count:
+        // accept any within-layer pair swap (not just adjacent — the full
+        // neighbourhood) that strictly lowers crossings. Returns the count.
+        let local_min = |layer_tiles: &mut [Vec<usize>]| -> usize {
+            let mut best = count(&assign(layer_tiles));
+            let mut improved = true;
+            let mut guard = 0;
+            while improved && guard < 64 {
+                improved = false;
+                guard += 1;
+                for l in 0..n_layers {
+                    let len = layer_tiles[l].len();
+                    for i in 0..len {
+                        for j in (i + 1)..len {
+                            layer_tiles[l].swap(i, j);
+                            let c = count(&assign(layer_tiles));
+                            if c < best {
+                                best = c;
+                                improved = true;
+                            } else {
+                                layer_tiles[l].swap(i, j); // revert
+                            }
+                        }
+                    }
+                }
+            }
+            best
+        };
+
+        // Primary: a deterministic forest ordering. With dummies inserted every
+        // edge spans exactly one layer, so the data path is (near-)tree-shaped;
+        // rooting at the top layer and laying each subtree out contiguously via
+        // DFS is the textbook crossing-free tree drawing. This nails the coupled
+        // optima that local moves can't build up (multi-parent fan-ins, a long
+        // edge routed past a hub), leaving only genuine non-tree edges (e.g. an
+        // admin control star) for the search below to repair. Deterministic, so
+        // repeatable for any topology/size.
+        {
+            let mut children: Vec<Vec<usize>> = vec![Vec::new(); n_units];
+            let mut has_parent = vec![false; n_units];
+            for u in 0..n_units {
+                for &v in &adj[u] {
+                    // Parent = neighbour one layer up (toward the exits/roots).
+                    if unit_layer[u] + 1 == unit_layer[v] {
+                        // v is a parent of u; record u as v's child once.
+                        if !children[v].contains(&u) {
+                            children[v].push(u);
+                        }
+                        has_parent[u] = true;
+                    }
+                }
+            }
+            for ch in children.iter_mut() {
+                ch.sort_unstable(); // stable, repeatable child order
+            }
+            let mut roots: Vec<usize> = (0..n_units).filter(|&u| !has_parent[u]).collect();
+            // Highest layers first so each root's subtree is laid out as a block.
+            roots.sort_by_key(|&u| (std::cmp::Reverse(unit_layer[u]), u));
+            let mut order_layers: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
+            let mut visited = vec![false; n_units];
+            let mut stack: Vec<usize> = Vec::new();
+            for r in roots {
+                if visited[r] {
+                    continue;
+                }
+                stack.push(r);
+                while let Some(u) = stack.pop() {
+                    if visited[u] {
+                        continue;
+                    }
+                    visited[u] = true;
+                    order_layers[unit_layer[u]].push(u);
+                    for &c in children[u].iter().rev() {
+                        if !visited[c] {
+                            stack.push(c);
+                        }
+                    }
+                }
+            }
+            for u in 0..n_units {
+                if !visited[u] {
+                    order_layers[unit_layer[u]].push(u);
+                }
+            }
+            layer_tiles = order_layers;
+        }
+
+        // Refine the forest ordering with local search (repairs non-tree edges),
+        // then keep the best ordering seen across everything below.
+        let mut best_order = layer_tiles.clone();
+        let mut best_cross = local_min(&mut layer_tiles);
+        if best_cross < count(&assign(&best_order)) {
+            best_order = layer_tiles.clone();
+        }
+        for _ in 0..12 {
+            if best_cross == 0 {
+                break;
+            }
+            barycenter(&mut layer_tiles, &mut pos);
+            let c = local_min(&mut layer_tiles);
+            if c < best_cross {
+                best_cross = c;
+                best_order = layer_tiles.clone();
+            }
+        }
+        // Multi-start: shuffle every layer (fixed-seed xorshift => repeatable)
+        // and run local search ONLY. Skipping barycenter here is deliberate —
+        // it would collapse the shuffle straight back into the same basin,
+        // whereas the shuffle's joint, all-layers-at-once exploration is exactly
+        // what reaches the coupled optima that single-layer moves can't build up
+        // (e.g. a many-to-one relay fan-in, or a long edge routed past a hub).
+        for _ in 0..200 {
+            if best_cross == 0 {
+                break;
+            }
+            layer_tiles = best_order.clone();
+            for lt in layer_tiles.iter_mut() {
+                for i in (1..lt.len()).rev() {
+                    let j = (next_rand() % (i as u64 + 1)) as usize;
+                    lt.swap(i, j);
+                }
+            }
+            let c = local_min(&mut layer_tiles);
+            if c < best_cross {
+                best_cross = c;
+                best_order = layer_tiles.clone();
+            }
+        }
+        layer_tiles = best_order;
+
+        let centers = assign(&layer_tiles);
+        let crossings = count(&centers);
+        // Centre on the real tiles only (dummy units are routing artefacts).
         let mut mid = V3::default();
-        for c in &centers {
+        for c in &centers[..m] {
             mid = mid.add(*c);
         }
         mid = mid.scale(1.0 / m.max(1) as f32);
+        eprintln!(
+            "[layout] tile connections = {}, crossings = {crossings}",
+            tedges.len()
+        );
+        if std::env::var("RUSTYNET_DEBUG_XINGS").is_ok() {
+            let desc = |u: usize| -> String {
+                if u < m {
+                    match &tiles[u].info {
+                        Some((_, r)) => format!("G[{}]L{}", r, unit_layer[u]),
+                        None => {
+                            format!("{}L{}", self.nodes[tiles[u].members[0].0].id, unit_layer[u])
+                        }
+                    }
+                } else {
+                    format!("dummy#{u}L{}", unit_layer[u])
+                }
+            };
+            for i in 0..segs.len() {
+                for j in (i + 1)..segs.len() {
+                    let (a, b) = segs[i];
+                    let (c, d) = segs[j];
+                    if a == c || a == d || b == c || b == d {
+                        continue;
+                    }
+                    if segments_cross(centers[a], centers[b], centers[c], centers[d]) {
+                        eprintln!(
+                            "[xing] {}--{}  X  {}--{}",
+                            desc(a),
+                            desc(b),
+                            desc(c),
+                            desc(d)
+                        );
+                    }
+                }
+            }
+        }
 
         // Apply, centring the whole map at the origin; record galaxy world boxes.
         self.galaxies.clear();
@@ -731,6 +1076,54 @@ impl Graph {
                 });
             }
         }
+
+        // Frame the whole layout: take the world-space half-extents (nodes plus
+        // galaxy footprints) and pick a camera distance that fits them. The view
+        // is an oblique top-down, so the x span maps to screen width and the z
+        // span (foreshortened) to height; scale by whichever is binding so the
+        // default overview fits networks of any size. Calibrated against the
+        // demo so small graphs keep comfortable margins.
+        let mut hx = 1.0f32;
+        let mut hz = 1.0f32;
+        for nd in &self.nodes {
+            hx = hx.max(nd.pos.x.abs());
+            hz = hz.max(nd.pos.z.abs());
+        }
+        for g in &self.galaxies {
+            hx = hx.max(g.center.x.abs() + g.radius);
+            hz = hz.max(g.center.z.abs() + g.radius);
+        }
+        // x dominates width directly; z is foreshortened by the oblique angle.
+        let extent = (hx).max(hz * 1.6);
+        self.overview_distance = (extent * 1.25 + 220.0).clamp(540.0, 6000.0);
+    }
+
+    /// Count line-over-line crossings among the laid-out edges, using final node
+    /// positions in the xz plane. Edges that share an endpoint (e.g. a galaxy's
+    /// members all reaching one anchor) never count. This is the ground-truth
+    /// the layout minimises; exercised by the crossing-regression tests.
+    #[cfg(test)]
+    fn edge_crossings(&self) -> usize {
+        let segs: Vec<(usize, usize)> = self.edges.iter().map(|e| (e.a, e.b)).collect();
+        let mut c = 0;
+        for i in 0..segs.len() {
+            for j in (i + 1)..segs.len() {
+                let (a, b) = segs[i];
+                let (p, q) = segs[j];
+                if a == p || a == q || b == p || b == q {
+                    continue;
+                }
+                if segments_cross(
+                    self.nodes[a].pos,
+                    self.nodes[b].pos,
+                    self.nodes[p].pos,
+                    self.nodes[q].pos,
+                ) {
+                    c += 1;
+                }
+            }
+        }
+        c
     }
 
     /// Orient a data-path edge upstream -> downstream (lower flow rank -> higher,
@@ -962,9 +1355,13 @@ struct App {
 
 impl App {
     fn new(graph: Graph) -> Self {
+        let cam = Camera {
+            distance: graph.overview_distance,
+            ..Camera::default()
+        };
         Self {
             graph,
-            cam: Camera::default(),
+            cam,
             show_labels: true,
             animate_flow: true,
             show_galaxies: true,
@@ -990,7 +1387,7 @@ impl App {
     fn exit_galaxy(&mut self) {
         self.focused_galaxy = None;
         self.selected = None;
-        self.view_anim = Some((V3::default(), OVERVIEW_DISTANCE));
+        self.view_anim = Some((V3::default(), self.graph.overview_distance));
     }
 
     /// Tiny xorshift RNG so we avoid an extra dependency.
@@ -1147,7 +1544,11 @@ impl App {
                 ui.checkbox(&mut self.live_sim, "Live demo updates");
                 ui.add_space(6.0);
                 if ui.button("Reset view").clicked() {
-                    self.cam = Camera::default();
+                    self.cam = Camera {
+                        distance: self.graph.overview_distance,
+                        ..Camera::default()
+                    };
+                    self.focused_galaxy = None;
                 }
                 ui.add_space(10.0);
                 ui.label(
@@ -1970,4 +2371,118 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App::new(graph)))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dto(nodes: &[(&str, &str)], edges: &[(&str, &str, &str)]) -> GraphDto {
+        GraphDto {
+            nodes: nodes
+                .iter()
+                .map(|(id, role)| NodeDto {
+                    id: (*id).into(),
+                    label: None,
+                    role: Some((*role).into()),
+                    status: Some("online".into()),
+                    position: None,
+                    meta: BTreeMap::new(),
+                })
+                .collect(),
+            edges: edges
+                .iter()
+                .map(|(a, b, k)| EdgeDto {
+                    from: (*a).into(),
+                    to: (*b).into(),
+                    kind: Some((*k).into()),
+                    active: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn segments_cross_basic() {
+        let a = V3::new(0.0, 0.0, 0.0);
+        let b = V3::new(2.0, 0.0, 2.0);
+        let c = V3::new(0.0, 0.0, 2.0);
+        let d = V3::new(2.0, 0.0, 0.0);
+        assert!(segments_cross(a, b, c, d), "an X should cross");
+        // Parallel, shifted: must not cross.
+        let e = V3::new(0.0, 0.0, 5.0);
+        let f = V3::new(2.0, 0.0, 7.0);
+        assert!(!segments_cross(a, b, e, f));
+        // Sharing a touch point only at an endpoint is not a proper crossing.
+        assert!(!segments_cross(a, b, b, V3::new(4.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn demo_layout_has_no_edge_crossings() {
+        let g = Graph::from_dto(demo_graph());
+        assert_eq!(
+            g.edge_crossings(),
+            0,
+            "the demo layout must be drawn without edge crossings"
+        );
+    }
+
+    #[test]
+    fn linear_flow_has_no_crossings() {
+        // client galaxy -> anchor -> relay -> exit, many clients on one anchor.
+        let mut nodes = vec![("a1", "anchor"), ("r1", "relay"), ("e1", "exit")];
+        let mut edges = vec![("a1", "r1", "data_path"), ("r1", "e1", "data_path")];
+        let clients: Vec<String> = (0..8).map(|i| format!("c{i}")).collect();
+        for c in &clients {
+            nodes.push((c.as_str(), "client"));
+            edges.push((c.as_str(), "a1", "data_path"));
+        }
+        let g = Graph::from_dto(dto(&nodes, &edges));
+        assert_eq!(g.edge_crossings(), 0);
+    }
+
+    #[test]
+    fn multi_anchor_relay_fanin_has_no_crossings() {
+        // Two relays each serving two anchors (a many-to-one fan-in) plus a
+        // skip edge — the coupled case the tree ordering must resolve.
+        let g = Graph::from_dto(dto(
+            &[
+                ("a1", "anchor"),
+                ("a2", "anchor"),
+                ("a3", "anchor"),
+                ("a4", "anchor"),
+                ("r1", "relay"),
+                ("r2", "relay"),
+                ("e1", "exit"),
+                ("e2", "blind_exit"),
+                ("c1", "client"),
+                ("c2", "client"),
+                ("c3", "client"),
+                ("c4", "client"),
+            ],
+            &[
+                ("c1", "a1", "data_path"),
+                ("c2", "a2", "data_path"),
+                ("c3", "a3", "data_path"),
+                ("c4", "a4", "data_path"),
+                ("a1", "r1", "data_path"),
+                ("a2", "r1", "data_path"),
+                ("a3", "r2", "data_path"),
+                ("a4", "r2", "data_path"),
+                ("r1", "e1", "data_path"),
+                ("r2", "e2", "data_path"),
+                ("a1", "e1", "data_path"),
+            ],
+        ));
+        assert_eq!(g.edge_crossings(), 0);
+    }
+
+    #[test]
+    fn layout_is_deterministic() {
+        let a = Graph::from_dto(demo_graph());
+        let b = Graph::from_dto(demo_graph());
+        let pa: Vec<(f32, f32)> = a.nodes.iter().map(|n| (n.pos.x, n.pos.z)).collect();
+        let pb: Vec<(f32, f32)> = b.nodes.iter().map(|n| (n.pos.x, n.pos.z)).collect();
+        assert_eq!(pa, pb, "layout must be repeatable run-to-run");
+    }
 }

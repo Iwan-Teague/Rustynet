@@ -27,11 +27,48 @@ dependency tree; subsequent builds are a few seconds.
 > *run* it, but no extra system `-dev` packages are needed to *build* it.
 
 ## Controls
-- **Drag**: orbit · **scroll**: zoom · **right-drag**: pan
+The view is a fixed oblique top-down map (no free orbit): the camera angle stays
+constant and you pan + zoom around it.
+- **Drag**: pan · **scroll**: zoom
 - **Hover** a node for a tooltip; **click** it for an inspector panel
+- **Click a galaxy** to drill in (zoomed view of its nodes, with names); use
+  **← Back to overview** to return
 - **Legend** (right): click a role to show/hide it
-- **Controls** (left): toggle labels, data-path animation, auto-rotate, live
-  demo updates; reset camera
+- **Controls** (left): toggle labels, data-path animation, galaxy borders, live
+  demo updates; reset view (re-frames the whole network)
+
+## Layout & crossing minimisation
+
+Nodes are grouped into **galaxies** — one per `(hub, role)`, e.g. the clients on
+`anchor-eu` form their own galaxy, distinct from the clients on `anchor-us`.
+Within a galaxy, members are spread evenly with Vogel's Fibonacci-sunflower disc
+model, leaving a clear margin to the polygon border.
+
+Galaxies and backbone nodes are then placed by a **layered (Sugiyama) layout**
+that explicitly minimises connection-line crossings — the layout the user keeps
+asking about ("no needless overlaps"). The pipeline, in order:
+
+1. **Layering by flow rank** — sources (clients/nas/llm/admin) → anchor → relay →
+   exit become left-to-right columns, matching the real data path.
+2. **Dummy nodes on skip-layer edges** — an edge that jumps layers (e.g. an
+   anchor egressing straight to an exit, or an admin control link to a relay)
+   gets virtual waypoints in the intermediate layers, so it can be routed
+   *between* other nodes instead of slicing across them.
+3. **Deterministic forest ordering (primary)** — with dummies in place the data
+   path is (near-)tree-shaped, so each subtree is laid out contiguously via a
+   rooted DFS. This is the textbook crossing-free tree drawing and resolves the
+   coupled cases (multi-parent relay fan-ins, long edges past a hub) that local
+   moves alone can't.
+4. **Barycenter + pairwise local search + multi-start (repair)** — cleans up any
+   genuinely non-tree edges (e.g. an admin control star). Crossing minimisation
+   is NP-hard, so this targets the minimum rather than proving it; for the
+   network shapes Rustynet produces it reaches **zero**.
+
+Everything is deterministic (fixed-seed), so the same topology always lays out
+the same way, at any size. The overview distance auto-fits the world bounds.
+Regression tests in `src/main.rs` assert zero edge crossings on the demo plus
+stress topologies (`cargo test`). Run the binary with `RUSTYNET_DEBUG_XINGS=1`
+to print any residual crossing pairs to stderr.
 
 ## Isolation / why it's a separate crate
 
