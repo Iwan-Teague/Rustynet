@@ -275,9 +275,11 @@ const DEPTH_FOG_MAX: f32 = 0.45;
 const REF_DISTANCE: f32 = 135.0;
 
 // ------------------------------ PULSE ----------------------------------
-// One slow pulse per active data path, travelling downstream (toward the exit)
-// and melting into the receiving node as it arrives.
-const PULSE_SPEED: f32 = 0.14; // cycles/sec along the segment (low = slow)
+// Pulses propagate as a synchronized wave toward the exit: a node emits its
+// downstream blobs only after every upstream blob has melted in, then waits
+// PULSE_PAUSE before firing. One blob per edge per cycle.
+const PULSE_TRAVEL: f32 = 2.5; // seconds for a blob to cross one hop
+const PULSE_PAUSE: f32 = 5.0; // seconds a node waits after receiving all, before emitting
 const PULSE_HALO_MULT: f32 = 2.2;
 const PULSE_HALO_A: f32 = 0.12;
 const PULSE_CORE_A: f32 = 0.95;
@@ -490,6 +492,12 @@ struct Edge {
 struct Graph {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+    /// Per-node emit time within a pulse cycle (seconds). A node fires its
+    /// downstream blobs at this offset; computed as a longest-path over the
+    /// flow DAG so a node only emits after all upstream blobs have melted in.
+    fire_at: Vec<f32>,
+    /// Total length of one pulse cycle (seconds).
+    cycle_len: f32,
 }
 
 impl Graph {
@@ -562,7 +570,59 @@ impl Graph {
             nodes[i].hub = best.map(|(_, o)| o);
         }
 
-        Graph { nodes, edges }
+        let mut graph = Graph {
+            nodes,
+            edges,
+            fire_at: Vec::new(),
+            cycle_len: 0.0,
+        };
+        graph.compute_pulse_schedule();
+        graph
+    }
+
+    /// Orient a data-path edge upstream -> downstream (lower flow rank -> higher,
+    /// i.e. toward the exit). Returns (upstream_idx, downstream_idx).
+    fn oriented(&self, e: &Edge) -> (usize, usize) {
+        if role_flow_rank(&self.nodes[e.a].role) <= role_flow_rank(&self.nodes[e.b].role) {
+            (e.a, e.b)
+        } else {
+            (e.b, e.a)
+        }
+    }
+
+    /// Compute the wave schedule: each node's emit time within a cycle is the
+    /// latest upstream blob arrival (fire_at[u] + TRAVEL) plus PULSE_PAUSE, found
+    /// by longest-path relaxation over the flow DAG. Sources fire at t=0.
+    fn compute_pulse_schedule(&mut self) {
+        let n = self.nodes.len();
+        let mut fire_at = vec![0.0f32; n];
+        let oriented: Vec<(usize, usize)> = self
+            .edges
+            .iter()
+            .filter(|e| edge_has_flow(&e.kind))
+            .map(|e| self.oriented(e))
+            .collect();
+        // Relax up to n times (DAG by rank; the cap also guards against cycles).
+        let hop = PULSE_TRAVEL + PULSE_PAUSE;
+        for _ in 0..n.max(1) {
+            let mut changed = false;
+            for &(u, v) in &oriented {
+                if fire_at[u] + hop > fire_at[v] + 1e-3 {
+                    fire_at[v] = fire_at[u] + hop;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Cycle ends after the last blob has melted, plus a trailing pause.
+        let mut cycle = PULSE_TRAVEL + PULSE_PAUSE;
+        for &(u, _) in &oriented {
+            cycle = cycle.max(fire_at[u] + PULSE_TRAVEL + PULSE_PAUSE);
+        }
+        self.fire_at = fire_at;
+        self.cycle_len = cycle;
     }
 
     /// One step of a spring-electrical force-directed layout in 3D, with role-
@@ -1092,37 +1152,48 @@ impl App {
                         Stroke::new(width, with_alpha(col, alpha)),
                     );
 
-                    // ----- pulse: one slow blip per active data path, flowing
-                    // downstream (toward the exit) and melting into the receiver -----
-                    if edge_has_flow(&e.kind) && live && self.animate_flow {
-                        // Orient from the upstream endpoint toward the one nearer
-                        // the exit (higher flow rank).
-                        let (src, dst) = if role_flow_rank(&a.role) <= role_flow_rank(&b.role) {
-                            (pa.screen, pb.screen)
+                    // ----- pulse: wave blob for this hop. It only travels while
+                    // the upstream node is "firing" (fire_at..+TRAVEL), so a node
+                    // emits downstream only after all its upstream blobs melted in
+                    // (+ a PULSE_PAUSE), giving a staged flow toward the exit. -----
+                    if edge_has_flow(&e.kind)
+                        && live
+                        && self.animate_flow
+                        && self.graph.cycle_len > 0.0
+                    {
+                        // Upstream endpoint (nearer the source) + its emit time.
+                        let up_is_a = role_flow_rank(&a.role) <= role_flow_rank(&b.role);
+                        let (src, dst, up_idx) = if up_is_a {
+                            (pa.screen, pb.screen, e.a)
                         } else {
-                            (pb.screen, pa.screen)
+                            (pb.screen, pa.screen, e.b)
                         };
-                        let cra = core_r_of(role_style(&a.role).size_mult, pa.depth);
-                        let crb = core_r_of(role_style(&b.role).size_mult, pb.depth);
-                        let pr = ((cra + crb) * 0.5 * 0.40).clamp(1.6, 4.6);
-                        // Per-edge phase so pulses don't all march in lock-step.
-                        let phase = ((e.a * 13 + e.b * 7) % 97) as f32 / 97.0;
-                        let t = (time * PULSE_SPEED + phase).fract();
-                        // Envelope: emerge from the source, melt into the receiver.
-                        let env = smoothstep(0.0, 0.12, t) * (1.0 - smoothstep(0.6, 1.0, t));
-                        if env > 0.01 {
-                            let p = lerp_pos(src, dst, t);
-                            let rr = pr * (0.45 + 0.55 * env);
-                            painter.circle_filled(
-                                p,
-                                rr * PULSE_HALO_MULT,
-                                with_alpha(FIBER, PULSE_HALO_A * env),
-                            );
-                            painter.circle_filled(
-                                p,
-                                rr,
-                                with_alpha(Color32::from_rgb(248, 252, 255), PULSE_CORE_A * env),
-                            );
+                        let emit = self.graph.fire_at[up_idx];
+                        let ct = time % self.graph.cycle_len;
+                        if ct >= emit && ct <= emit + PULSE_TRAVEL {
+                            let t = (ct - emit) / PULSE_TRAVEL;
+                            let cra = core_r_of(role_style(&a.role).size_mult, pa.depth);
+                            let crb = core_r_of(role_style(&b.role).size_mult, pb.depth);
+                            let pr = ((cra + crb) * 0.5 * 0.40).clamp(1.6, 4.6);
+                            // Envelope: emerge from the source, melt into the receiver.
+                            let env = smoothstep(0.0, 0.12, t) * (1.0 - smoothstep(0.6, 1.0, t));
+                            if env > 0.01 {
+                                let p = lerp_pos(src, dst, t);
+                                let rr = pr * (0.45 + 0.55 * env);
+                                painter.circle_filled(
+                                    p,
+                                    rr * PULSE_HALO_MULT,
+                                    with_alpha(FIBER, PULSE_HALO_A * env),
+                                );
+                                painter.circle_filled(
+                                    p,
+                                    rr,
+                                    with_alpha(
+                                        Color32::from_rgb(248, 252, 255),
+                                        PULSE_CORE_A * env,
+                                    ),
+                                );
+                            }
                         }
                     }
                 }
