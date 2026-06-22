@@ -14470,6 +14470,60 @@ fn evaluate_linux_ipv6_leak_artifact(linux_alias: &str, raw_json: &str) -> Resul
     ))
 }
 
+/// Pure evaluator for the JSON output of
+/// `rustynetd privileged-helper-allowlist-audit`. The daemon-side audit runs
+/// an adversarial corpus through the REAL argv allowlist
+/// (`SecurityMinimumBar.md` §7) and reports any case whose outcome did not
+/// match expectation. Fail-closed: a non-empty `violations` list means the
+/// allowlist either ACCEPTED an adversarial request (privilege-escalation
+/// regression) or REJECTED a reviewed one (control-plane breakage).
+fn evaluate_privileged_helper_allowlist_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::privileged_helper_allowlist_audit::AllowlistAuditReport =
+        serde_json::from_str(raw_json).map_err(|err| {
+            format!("parse privileged-helper-allowlist-audit JSON output failed: {err}")
+        })?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "privileged-helper-allowlist-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases == 0 {
+        return Err(
+            "privileged-helper-allowlist-audit returned an empty corpus; the adversarial probe set is missing"
+                .to_owned(),
+        );
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| {
+                    format!(
+                        "{} ({}, expected {}, allowed={})",
+                        v.label, v.program, v.expectation, v.actual_allowed
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "privileged-helper argv allowlist drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Privileged-helper argv allowlist verified on {linux_alias}: {} adversarial requests denied, {} reviewed requests allowed",
+        report.malicious_denied, report.benign_allowed
+    ))
+}
+
 /// macOS DNS fail-closed artefact-directory validator. Parallel to the
 /// Windows variant. Required files in the artefact directory:
 ///
@@ -16124,6 +16178,26 @@ fn run_validate_linux_runtime_acls_stage(
         .map_err(|reason| (reason, raw))
 }
 
+fn run_validate_linux_privileged_helper_allowlist_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "privileged-helper-allowlist-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_privileged_helper_allowlist_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
 /// Build the `--state-path / --expected-peer-id / --max-age-seconds`
 /// extras for the mesh-status subcommand from a `MeshStatusOverrides`
 /// struct. Centralizes the override-to-argv mapping so callers don't
@@ -16299,6 +16373,8 @@ fn run_linux_orchestration_stages_with_options(
     let mesh_status_log_path = logs_dir.join("validate_linux_mesh_status.log");
     let key_custody_log_path = logs_dir.join("validate_linux_key_custody.log");
     let authenticode_log_path = logs_dir.join("validate_linux_authenticode.log");
+    let privileged_helper_allowlist_log_path =
+        logs_dir.join("validate_linux_privileged_helper_allowlist.log");
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
     let exit_nat_lifecycle_log_path = logs_dir.join("validate_linux_exit_nat_lifecycle.log");
@@ -16405,6 +16481,19 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_authenticode",
             authenticode_log_path.as_path(),
             run_validate_linux_authenticode_stage,
+        )
+    };
+
+    let privileged_helper_allowlist_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_privileged_helper_allowlist",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_privileged_helper_allowlist",
+            privileged_helper_allowlist_log_path.as_path(),
+            run_validate_linux_privileged_helper_allowlist_stage,
         )
     };
 
@@ -16848,6 +16937,7 @@ fn run_linux_orchestration_stages_with_options(
         key_custody_outcome,
         hardening_outcome,
         authenticode_outcome,
+        privileged_helper_allowlist_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
         exit_ipv6_leak_outcome,
@@ -34687,6 +34777,64 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn privileged_helper_allowlist_audit_producer_to_validator_round_trip_passes() {
+        // The shipped daemon audit (real argv allowlist + adversarial corpus)
+        // serialised into the orchestrator validator must verify clean.
+        let report =
+            rustynetd::privileged_helper_allowlist_audit::run_privileged_helper_allowlist_audit();
+        assert!(
+            report.overall_ok,
+            "reviewed allowlist must pass: {report:?}"
+        );
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary =
+            super::evaluate_privileged_helper_allowlist_report("debian-headless-1", raw.as_str())
+                .expect("clean allowlist audit must validate");
+        assert!(
+            summary.contains("debian-headless-1")
+                && summary.contains("adversarial requests denied"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_privileged_helper_allowlist_report_rejects_violation() {
+        // The bite: a report carrying a violation (an adversarial request the
+        // allowlist accepted) must Fail the stage.
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 24,
+            "malicious_denied": 14,
+            "benign_allowed": 9,
+            "violations": [
+                {"label": "nft_delete_arbitrary_table", "program": "nft", "expectation": "deny", "actual_allowed": true, "passed": false, "detail": "accepted"}
+            ]
+        }"#;
+        let err = super::evaluate_privileged_helper_allowlist_report("debian-headless-1", raw)
+            .expect_err("a violation must fail closed");
+        assert!(
+            err.contains("allowlist drift") && err.contains("nft_delete_arbitrary_table"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_privileged_helper_allowlist_report_rejects_empty_corpus() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 0,
+            "malicious_denied": 0,
+            "benign_allowed": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_privileged_helper_allowlist_report("debian-headless-1", raw)
+            .expect_err("an empty corpus must fail closed");
+        assert!(err.contains("empty corpus"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn linux_relay_lifecycle_output_validators_accept_reviewed_dry_run_text() {
         let install = "rustynet-relay systemd unit: install+enable (dry-run) at /etc/systemd/system/rustynet-relay.service\n  - would run: systemctl daemon-reload\n  - would run: systemctl enable rustynet-relay.service\n  - would run: systemctl start rustynet-relay.service\n";
         super::validate_linux_relay_install_output(install).expect("install output validates");
@@ -37430,6 +37578,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_key_custody",
             "validate_linux_service_hardening",
             "validate_linux_authenticode",
+            "validate_linux_privileged_helper_allowlist",
             "validate_linux_dns_failclosed",
             "validate_linux_exit_nat_lifecycle",
             "validate_linux_ipv6_leak",
@@ -37568,6 +37717,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_key_custody",
                 "validate_linux_service_hardening",
                 "validate_linux_authenticode",
+                "validate_linux_privileged_helper_allowlist",
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",
                 "validate_linux_ipv6_leak",
