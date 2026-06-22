@@ -933,6 +933,19 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// blind_exit live stage, which runs LAST because it wipes node identity.
     /// `Some("macos")` runs that stage; unset/other Skips it.
     pub blind_exit_platform: Option<String>,
+    /// Promote the macOS node to a SECONDARY regular (NATing) exit while a
+    /// Linux node remains the PRIMARY exit and the membership/assignment
+    /// authority. Unlike `--exit-platform macos` (which would make the macOS
+    /// node the primary exit = the authority, whose genesis/membership stages
+    /// are Linux-path-only and fail on macOS), this is a config-only election
+    /// NOT threaded into `topology::resolve_topology`: the Linux exit stays the
+    /// authority (membership_setup et al. run on it) and the macOS node joins
+    /// via `run_macos_orchestration_stages` and is transitioned
+    /// client->admin->exit by `activate_macos_exit_role`. This matches the
+    /// realistic deployment (an exit joins a mesh; it is not the authority) and
+    /// mirrors how the relay/anchor roles are elected by a flag rather than a
+    /// topology rewrite.
+    pub macos_promote_exit: bool,
     pub enable_chaos_suite: bool,
     /// Per-stage watchdog timeout in seconds, forwarded to the bash
     /// orchestrator as `--stage-timeout-secs <N>` when greater than zero.
@@ -7980,22 +7993,22 @@ fn run_macos_orchestration_stages(
         .as_deref()
         .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
 
-    // The macOS node is the elected regular (NATing) exit when the resolved
-    // topology has made it the exit VM (`--exit-platform macos` rewrites
-    // `config.exit_vm` to the macOS alias via
-    // `apply_topology_overrides_to_orchestrate_config`, so a macos-vs-exit
-    // alias match is the canonical signal — mirroring the Windows
-    // `promote_to_active_exit` gate). When elected, the membership grant adds
-    // the `exit_server` capability and the `activate_macos_exit_role` stage
-    // drives the staged client→admin→exit transition so the daemon enters the
-    // regular-exit role and brings up the `com.rustynet/nat` translation anchor
-    // + IPv4 forwarding; the exit-evidence capture stage then proves the live
-    // NAT lifecycle.
-    let is_macos_active_exit = config
-        .macos_vm
-        .as_deref()
-        .zip(config.exit_vm.as_deref())
-        .is_some_and(|(macos, exit)| macos == exit);
+    // The macOS node is promoted to a SECONDARY regular (NATing) exit when
+    // `--macos-promote-exit` is set, while a LINUX node stays the PRIMARY exit
+    // and the membership/assignment authority. This is a config-only election
+    // (NOT a topology rewrite) — mirroring how relay/anchor/admin/blind_exit
+    // are elected by a flag rather than by becoming the exit VM. The earlier
+    // `macos_vm == exit_vm` signal (via `--exit-platform macos`) made the macOS
+    // node the PRIMARY exit = the authority, whose genesis/membership stages are
+    // Linux-path-only (`/var/lib/rustynet/...` on `$exit_target`) and fail on a
+    // macOS exit (proven by a live run). When elected here, the Linux exit runs
+    // the authority stages, `amend_membership_for_macos` grants the macOS node
+    // `client,anchor,exit_server` ON THE LINUX AUTHORITY, and
+    // `activate_macos_exit_role` drives the staged client→admin→exit transition
+    // so the macOS daemon brings up the `com.rustynet/nat` anchor + IPv4
+    // forwarding; the exit-evidence capture stage then proves the live NAT
+    // lifecycle.
+    let is_macos_active_exit = config.macos_promote_exit;
 
     // ── Stage 1: bootstrap_macos_host ────────────────────────────────────
     let bootstrap_log_path = logs_dir.join("bootstrap_macos_host.log");
@@ -37774,6 +37787,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             anchor_platform: None,
             admin_platform: None,
             blind_exit_platform: None,
+            macos_promote_exit: false,
             enable_chaos_suite: false,
             stage_timeout_secs: 0,
         }
