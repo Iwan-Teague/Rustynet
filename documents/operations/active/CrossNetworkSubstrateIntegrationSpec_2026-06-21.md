@@ -145,6 +145,52 @@ required profiles have passing reports under `--artifact-dir`. It stays at the e
 5. **Acceptance:** `--cross-network-substrate netns --cross-network-nat-profiles port_restricted_cone,full_cone,symmetric`
    completes with every profile green-or-documented-expected-failure; matrix row present; timings logged.
 
+#### X1 status & decomposition (2026-06-22)
+- **X1 step 1-2 (substrate selector + classification gate): DONE + LIVE-VALIDATED** — commit
+  `ae5c7ce` (on `main`). Added the `--cross-network-substrate {netns,vxlan,slirp}` selector +
+  `RUSTYNET_CROSS_NETWORK_SUBSTRATE` env (default `netns`), the netns bypass in
+  `cross_network_stages_applicable` (applicable when an exit guest exists, no distinct-prefix
+  requirement), and `stage_run_cross_network_nat_classification` (HARD) which runs
+  `netns_nat_classify.sh` + `netns_nat_filter.sh` on the exit guest; the netns dispatch branch records
+  every SSH remote-exit stage as a documented skip ("run on substrate=vxlan"). Live run `crossnet1`
+  (report `state/live-lab-crossnet1`): `cross_network_nat_classification` PASS — mapping **3/3**
+  (cone→endpoint-independent, symmetric→endpoint-dependent) + filtering **9/9**. Trigger = standard
+  orchestrate **without `--skip-cross-network`** (auto mode + netns default → gate runs; no separate
+  VM prefixes needed). **NOTE:** the implementation landed as orchestrator-`.sh`-only (no `main.rs`
+  `--cross-network-substrate` CLI flag yet — the flag lives in the orchestrator `.sh` + the env var;
+  `rustynet-cli ops vm-lab-orchestrate-live-lab` has no `--cross-network-substrate` passthrough, so
+  select non-default substrates via the env var until X2 adds the CLI flag).
+- **X1 step 3 (daemon-path validator): DECOMPOSED into two increments** (the single-shot
+  Direct+Relay+multi-profile validator is too large/iteration-prone for one cycle). NEXT:
+  - **Increment 2 — netns single-pair Direct-path validator** (`port_restricted_cone`, 2 endpoints,
+    **NO relay**). Stand up `rustynetd` (kernel-WG, namespace-pure) in `rnsim-ep-A`/`rnsim-ep-B`
+    behind the cone NAT routers, STUN at `rnsim-svc` (`100.64.0.254:3478` via the existing
+    `stun_responder.py`), establish the A↔B mesh, and prove `path_mode=direct_active` +
+    `path_live_proven=true` with a fresh WG handshake; tcpdump on each router WAN veth shows WG UDP to
+    the peer's reflexive endpoint (no relay) and **zero tunnel-CIDR cleartext leaks**.
+    Feasibility unlocks: nftables is **netns-scoped** (the daemon's runtime nft + the host killswitch +
+    the router NAT never collide — launch namespace-pure, **no** host killswitch boot-check); the
+    daemon accepts a plaintext `--wg-private-key` (avoid the encrypted-key custody chain) and
+    `--traversal-stun-servers 100.64.0.254:3478`. Largest new work = minting a **minimal 2-node signed
+    state** (membership + A↔B assignments + traversal bundles) for the netns-local node identities via
+    the existing `rustynet-cli ops` issuance commands, written to per-ns state dirs (iteration-prone —
+    develop + validate `scripts/vm_lab/netns_daemon_path.sh` **standalone on a spare guest** with
+    `rustynetd` built on it before the full orchestrate). New stage
+    `stage_run_cross_network_daemon_path` mirrors the classification stage but runs at **`soft`/WARN
+    tier** (novel timing-sensitive in-guest daemon bring-up; promote to HARD once stable). Bulletproof
+    `trap cleanup EXIT` (kill rustynetd PIDs → `netns_internet_sim.sh teardown` → rm tmp state).
+  - **Increment 3 — Relay-fallback** (`symmetric` + `full_cone`): layer a `rustynet-relay` service in
+    `rnsim-svc` (argv-only, raw ed25519 verifier key, relay-fleet bundle) onto the proven
+    daemon-in-netns harness; force relay via `symmetric` (endpoint-dependent mapping → hole-punch
+    fails → fallback), assert `path_mode=relay_active` + `relay_session_state=live`, tcpdump shows
+    relay forwarding + **no** direct WG to the peer. (Relay = the hardest dependency; isolated here.)
+- Files for X1 step 3: NEW `scripts/vm_lab/netns_daemon_path.sh` (placed under `scripts/vm_lab/` like
+  the other netns tools, not the `scripts/e2e/...daemon_path_test.sh` named in §7 — self-contained
+  in-guest pattern); EDIT `scripts/e2e/live_linux_lab_orchestrator.sh` (new `soft` stage next to
+  `stage_run_cross_network_nat_classification`, wired into the netns dispatch branch). Assertion
+  targets = the daemon status line fields in `crates/rustynetd/src/daemon.rs` (`path_mode`,
+  `path_live_proven`, `traversal_probe_result`, `relay_session_state`, `stun_candidate_local_addrs`).
+
 ### Phase X2 — Tier B vxlan + existing e2e suite (~1–1.5 cycles)
 1. Harden `vxlan_tier_b.sh` for orchestrator use (robust remote teardown on failure; status check).
 2. Add the vxlan arm to setup/teardown + the per-profile dispatch; wire `CROSS_NETWORK_*_UNDERLAY_IP`.
