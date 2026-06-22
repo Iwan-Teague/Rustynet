@@ -191,6 +191,57 @@ required profiles have passing reports under `--artifact-dir`. It stays at the e
   targets = the daemon status line fields in `crates/rustynetd/src/daemon.rs` (`path_mode`,
   `path_live_proven`, `traversal_probe_result`, `relay_session_state`, `stun_candidate_local_addrs`).
 
+#### Increment 2 — minting recipe & implementation guide (researched 2026-06-22)
+- **Closest existing analog to copy:** `scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh:241-331`
+  — a real 2-node mesh that issues assignments + traversal, enforces, and asserts
+  `path_mode=direct_active && path_live_proven=true` (`:329`) **without STUN**. Increment 2 = this, but
+  with both identities as two daemons in two netns on ONE guest + a local membership mint.
+- **KEY SIMPLIFICATION — no STUN needed.** Two netns on one guest are directly reachable, so
+  **omit `--traversal-stun-servers`** (empty default at `daemon.rs:1595`; also disables the
+  transport-socket-identity blocker, `daemon.rs:3694`). The peer's host-candidate endpoint (from
+  `NODES_SPEC`) is reachable → WG handshake completes → `direct_active` (`daemon.rs:6369-6379`). This
+  removes the STUN responder + relay dependency entirely from Increment 2.
+- **Mesh IPs are NOT specified** — derived deterministically from `sha256(node_id)` inside
+  `signed_auto_tunnel_bundle` (`rustynet-control/src/lib.rs:3357-3369`); CIDR hard-coded `100.64.0.0/10`.
+  You only choose node ids, WG pubkeys, and the underlay endpoint `host:port`.
+- **Two authorities (both from one bootstrap):** membership owner key
+  (`/etc/rustynet/membership.owner.key`, self-verifying via genesis — no separate verifier distributed)
+  + the assignment/traversal signing secret (`/etc/rustynet/assignment.signing.secret`, emits
+  **distinct** `assignment.pub` and `traversal.pub` verifier keys per family) + trust evidence
+  (`rustynet trust keygen`/`issue`). One issuing namespace holds all three; it need not be one of the
+  two mesh daemons.
+- **Issuance command sequence** (all argv-driven, in `crates/rustynet-cli/src/ops_e2e.rs`):
+  membership = `rustynet membership propose-add → sign-update → apply-update` (the orchestrator's
+  `e2e-membership-add` hard-codes `/var/lib/rustynet/*` + `/etc/rustynet/membership.owner.key`
+  `:1729-1731`, so call the **raw 3 verbs** for custom state paths); assignments =
+  `rustynet ops e2e-issue-assignment-bundles-from-env --env-file <env>` (NODES_SPEC/ALLOW_SPEC/
+  ASSIGNMENTS_SPEC, `ops_e2e.rs:2576`) → `rn-assignment.pub` + `rn-assignment-<id>.assignment`;
+  traversal = `rustynet ops e2e-issue-traversal-bundles-from-env --env-file <env>` (`:2694`) →
+  `rn-traversal.pub` + `rn-traversal-<id>.traversal`. Spec formats:
+  `NODES_SPEC=id|host:port|pubkey_hex|caps`(`;`-joined), `ALLOW_SPEC=src|dst`(bidirectional = list both),
+  `ASSIGNMENTS_SPEC=target|exit_or_dash` (`-` = no exit = pure mesh direct path).
+- **Minimal daemon argv to reach `direct_active`** (per `daemon.rs:10170-10417` validate): REQUIRED =
+  `--node-id`/`--node-role`(admin serving, client consumer) + trust(`--trust-evidence`/`-verifier-key`/
+  `-watermark`) + membership(`--membership-snapshot`/`-log`/`-watermark`) + traversal(`--traversal-bundle`/
+  `-verifier-key`/`-watermark`) + `--wg-private-key` + `--privileged-helper-socket` + **`--auto-tunnel-enforce true`**
+  with `--auto-tunnel-bundle`/`-verifier-key`/`-watermark` (the assignment bundle; without enforce no peers
+  are programmed → never direct). OMIT: `--traversal-stun-servers`, all `--dns-zone-*`, `--relay-fleet-bundle`,
+  anchor/enrollment. Two daemons on one guest need distinct `--socket`/`--state`/`--privileged-helper-socket`/
+  bundle paths (same `--wg-interface` name is fine — distinct netns); CLI client picks socket via
+  `RUSTYNET_DAEMON_SOCKET`.
+- **TOP RISKS (iteration-prone — mitigate up front):** (1) `e2e-bootstrap-host` is DESTRUCTIVE
+  (`rm -rf /etc/rustynet /var/lib/rustynet /run/rustynet`, deletes `rustynet0`, clears nft —
+  `ops_e2e.rs:340-345`) → run it ONCE for keys, never for the 2nd node; (2) `--auto-tunnel-enforce true`
+  + all 3 auto-tunnel paths are MANDATORY for direct (bootstrap default is `false`); (3) `rm -f` all four
+  `*.watermark` per node before first start (stale watermark → replay floor rejects the bundle → peer
+  never programmed); (4) the privileged helper must run in the SAME netns as its daemon with CAP_NET_ADMIN
+  (WG iface creation, `linux_command.rs:138-167`) — most likely first failure; (5) hand-`cp`'d bundles must
+  match the loaders' owner/mode (`install -m0640 -o root -g rustynetd` semantics) or key-custody fails
+  closed; (6) the two netns endpoints must be mutually routable over a veth/bridge or you get
+  `direct_programmed` but never `direct_active`. Pass = `path_mode=direct_active && path_live_proven=true
+  && traversal_error=none`, no `*_alarm_state=critical`. Develop `netns_daemon_path.sh` and validate it
+  STANDALONE on a spare guest (needs `rustynetd` built on it) before wiring the soft orchestrator stage.
+
 ### Phase X2 — Tier B vxlan + existing e2e suite (~1–1.5 cycles)
 1. Harden `vxlan_tier_b.sh` for orchestrator use (robust remote teardown on failure; status check).
 2. Add the vxlan arm to setup/teardown + the per-profile dispatch; wire `CROSS_NETWORK_*_UNDERLAY_IP`.
