@@ -6869,8 +6869,24 @@ stage_run_chaos_resource_exhaustion() {
   stage_run_chaos_category chaos_resource_exhaustion live_chaos_resource_exhaustion_test.sh
 }
 
+# Mirrors stage_run_chaos_daemon_fault: drives a real LIVE rustynet0 netem
+# impairment (default --profile loss) and proves NO plaintext fallback while
+# the tunnel is impaired, then verifies bounded tunnel recovery after the
+# impairment is cleared. The netem qdisc is applied to the WireGuard tunnel
+# interface only (rustynet0, hard-coded in the bin); the SSH control path and
+# underlay egress NIC are never touched.
 stage_run_chaos_network_impairment() {
-  stage_run_chaos_category chaos_network_impairment live_chaos_network_impairment_test.sh
+  local report_path="$REPORT_DIR/chaos_network_impairment_report.json"
+  local log_path="$REPORT_DIR/chaos_network_impairment.log"
+  bash "$ROOT_DIR/scripts/e2e/live_chaos_network_impairment_test.sh" \
+    --git-commit "$(current_run_git_commit)" \
+    --report-path "$report_path" \
+    --log-path "$log_path" \
+    --target-host "$(node_target_for_label exit)" \
+    --client-host "$(node_target_for_label client)" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --known-hosts-file "$SSH_KNOWN_HOSTS_FILE" \
+    --profile loss
 }
 
 stage_run_chaos_membership_adversarial() {
@@ -6903,7 +6919,7 @@ run_or_skip_chaos_suite() {
   run_stage warn chaos_signed_state_adversarial 'run signed-state adversarial scaffold' stage_run_chaos_signed_state_adversarial
   run_stage warn chaos_crash_recovery 'run crash recovery scaffold' stage_run_chaos_crash_recovery
   run_stage warn chaos_resource_exhaustion 'run resource-exhaustion scaffold' stage_run_chaos_resource_exhaustion
-  run_stage warn chaos_network_impairment 'run network impairment scaffold' stage_run_chaos_network_impairment
+  run_stage warn chaos_network_impairment 'run rustynet0 netem impairment no-plaintext-fallback proof' stage_run_chaos_network_impairment
   run_stage warn chaos_membership_adversarial 'run membership adversarial scaffold' stage_run_chaos_membership_adversarial
   run_stage warn chaos_privileged_boundary 'run privileged-boundary scaffold' stage_run_chaos_privileged_boundary
 }
