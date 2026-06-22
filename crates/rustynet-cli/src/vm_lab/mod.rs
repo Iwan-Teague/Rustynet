@@ -7949,6 +7949,17 @@ fn run_macos_orchestration_stages(
         .as_deref()
         .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
 
+    // The macOS node is the elected relay when `--relay-platform macos` is set.
+    // When elected the relay lifecycle stage is proven LIVE (provision the
+    // verifier-key, install + bootstrap the launchd unit, assert the service is
+    // active with its datapath + health listeners bound and `/healthz` ok, then
+    // stop and assert the sockets are released). When not elected it stays the
+    // non-destructive install/uninstall dry-run contract check.
+    let is_macos_active_relay = config
+        .relay_platform
+        .as_deref()
+        .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
+
     // ── Stage 1: bootstrap_macos_host ────────────────────────────────────
     let bootstrap_log_path = logs_dir.join("bootstrap_macos_host.log");
     let bootstrap_outcome = if dry_run {
@@ -8939,12 +8950,24 @@ fn run_macos_orchestration_stages(
             vec![],
         )
     } else {
-        match exercise_macos_relay_lifecycle_dry_run(
-            macos_alias,
-            inventory_path,
-            ssh_identity_file,
-            known_hosts_path,
-        ) {
+        // Elected (--relay-platform macos) => prove the lifecycle LIVE;
+        // otherwise keep the non-destructive install/uninstall dry-run contract.
+        let result = if is_macos_active_relay {
+            exercise_macos_relay_lifecycle_live(
+                macos_alias,
+                inventory_path,
+                ssh_identity_file,
+                known_hosts_path,
+            )
+        } else {
+            exercise_macos_relay_lifecycle_dry_run(
+                macos_alias,
+                inventory_path,
+                ssh_identity_file,
+                known_hosts_path,
+            )
+        };
+        match result {
             Ok(summary) => {
                 let _ = std::fs::write(&macos_relay_lifecycle_log_path, summary.as_str());
                 stage_outcome(
@@ -9471,6 +9494,78 @@ find "$ROOT" -type f -print | sort
 /// the reviewed argv-only `launchctl` invocations without leaving a
 /// live LaunchDaemon on the guest. The chaos-grade end-to-end test
 /// (real service install + traffic flow + tear-down) is Track C scope.
+/// Live macOS relay launchd lifecycle proof (the elected-relay upgrade of the
+/// dry-run contract check). Mirrors the security posture of
+/// `macos_install::deploy_relay_service` + the lifecycle bar of the Linux
+/// `validate_relay_lifecycle`:
+///   1. Provision the relay `--verifier-key` from the already-distributed
+///      assignment-authority pubkey (a PUBLIC control-plane key, hex -> raw 32
+///      bytes; the relay fail-closes without it). Only the fixed paths are in
+///      the shell string — no key data is interpolated.
+///   2. Install + bootstrap the reviewed `com.rustynet.relay` launchd unit via
+///      the one hardened `ops install-macos-relay` path.
+///   3. DURING-RUN assert: the health listener `127.0.0.1:4501` is bound and
+///      `/healthz` answers `ok`.
+///   4. Stop via `--uninstall` and AFTER-STOP assert: `/healthz` no longer ok
+///      (the socket was released).
+///
+/// FAIL-LOUD: any failed step (`set -eu`) is a non-zero exit -> stage Fail.
+/// The relay forwards only already-encrypted frames and holds no key material
+/// that could decrypt them; live forwarding through the relay is HP-3 and is
+/// NOT claimed here — this proves the service lifecycle only.
+fn exercise_macos_relay_lifecycle_live(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[macos_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {macos_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+
+    let live_script = "set -eu; \
+         RN=/usr/local/bin/rustynet; \
+         sudo test -f /usr/local/var/rustynet/trust/assignment.pub; \
+         sudo sh -c 'tr -d \"[:space:]\" < /usr/local/var/rustynet/trust/assignment.pub | xxd -r -p > /usr/local/var/rustynet/relay-verifier.pub && chmod 644 /usr/local/var/rustynet/relay-verifier.pub'; \
+         SRC=\"${RUSTYNET_SRC:-$HOME/Rustynet}\"; \
+         ( cd \"$SRC\" && sudo $RN ops install-macos-relay ) 2>&1 | tail -3; \
+         sleep 5; \
+         HEALTH=\"$(curl -s --max-time 5 http://127.0.0.1:4501/healthz 2>/dev/null || true)\"; \
+         HP=$(sudo lsof -nP -iTCP:4501 -sTCP:LISTEN 2>/dev/null | grep -c 4501 || true); \
+         if ! printf '%s' \"$HEALTH\" | grep -qi ok; then echo \"relay /healthz not ok during run: '$HEALTH'\" >&2; exit 1; fi; \
+         if [ \"$HP\" = '0' ]; then echo 'relay health listener 127.0.0.1:4501 not bound during run' >&2; exit 1; fi; \
+         sudo $RN ops install-macos-relay --uninstall 2>&1 | tail -2; \
+         sleep 3; \
+         HEALTH2=\"$(curl -s --max-time 3 http://127.0.0.1:4501/healthz 2>/dev/null || true)\"; \
+         if printf '%s' \"$HEALTH2\" | grep -qi ok; then echo 'relay /healthz still ok after stop — socket not released' >&2; exit 1; fi; \
+         echo 'during-run health 127.0.0.1:4501 bound + /healthz=ok; after-stop /healthz released'";
+
+    let out = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        live_script,
+        timeout,
+    )
+    .map_err(|e| format!("macOS relay live lifecycle on {macos_alias} failed: {e}"))?;
+
+    Ok(format!(
+        "macOS relay launchd lifecycle live-proven on {macos_alias}: verifier-key provisioned + \
+         install/bootstrap -> active -> stop/release; {}",
+        out.trim()
+    ))
+}
+
 fn exercise_macos_relay_lifecycle_dry_run(
     macos_alias: &str,
     inventory_path: &Path,
