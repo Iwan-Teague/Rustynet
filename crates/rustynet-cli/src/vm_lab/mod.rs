@@ -9536,36 +9536,70 @@ fn exercise_macos_relay_lifecycle_live(
     }
     let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
 
-    let live_script = "set -eu; \
+    // The reviewed relay plist is static (no node-specific custody, unlike the
+    // anchor), but `install-macos-relay` reads it cwd-relative and the
+    // bootstrap build dir is ephemeral — so upload it and run the installer from
+    // a temp cwd. The relay `--verifier-key` is derived from the
+    // already-distributed trust verifier `trust-evidence.pub` (hex -> raw 32
+    // bytes, written root-owned via `tee`). For the lifecycle proof (no sessions;
+    // live forwarding is HP-3) any valid verifier-key suffices to start the
+    // service. Validated on the warm guest before wiring.
+    let host_plist = workspace_root_path().join("scripts/launchd/com.rustynet.relay.plist");
+    if !host_plist.is_file() {
+        return Err(format!(
+            "reviewed relay plist missing at {}",
+            host_plist.display()
+        ));
+    }
+    let remote_plist = format!("/tmp/com.rustynet.relay.plist.{}", unique_suffix());
+    ensure_success_status(
+        scp_to_remote_for_target(
+            &target,
+            None,
+            Some(ssh_identity_file),
+            known_hosts_path,
+            host_plist.as_path(),
+            remote_plist.as_str(),
+            Duration::from_secs(30),
+        )
+        .map_err(|e| format!("scp reviewed relay plist to {macos_alias} failed: {e}"))?,
+        "scp reviewed relay plist to macOS host",
+    )?;
+
+    let live_script = format!(
+        "set -eu; \
          RN=/usr/local/bin/rustynet; \
-         sudo test -f /usr/local/var/rustynet/trust/assignment.pub; \
-         sudo sh -c 'tr -d \"[:space:]\" < /usr/local/var/rustynet/trust/assignment.pub | xxd -r -p > /usr/local/var/rustynet/relay-verifier.pub && chmod 644 /usr/local/var/rustynet/relay-verifier.pub'; \
-         SRC=\"${RUSTYNET_SRC:-$HOME/Rustynet}\"; \
-         ( cd \"$SRC\" && sudo $RN ops install-macos-relay ) 2>&1 | tail -3; \
-         sleep 5; \
+         sudo test -f /usr/local/var/rustynet/trust/trust-evidence.pub; \
+         sudo sh -c 'tr -d \"[:space:]\" < /usr/local/var/rustynet/trust/trust-evidence.pub | xxd -r -p | tee /usr/local/var/rustynet/relay-verifier.pub >/dev/null && chmod 644 /usr/local/var/rustynet/relay-verifier.pub'; \
+         T=\"$(mktemp -d /tmp/rn-relay.XXXXXX)\"; mkdir -p \"$T/scripts/launchd\"; cp {plist} \"$T/scripts/launchd/com.rustynet.relay.plist\"; \
+         ( cd \"$T\" && sudo $RN ops install-macos-relay ) 2>&1 | tail -3; \
+         sleep 6; \
          HEALTH=\"$(curl -s --max-time 5 http://127.0.0.1:4501/healthz 2>/dev/null || true)\"; \
          HP=$(sudo lsof -nP -iTCP:4501 -sTCP:LISTEN 2>/dev/null | grep -c 4501 || true); \
-         if ! printf '%s' \"$HEALTH\" | grep -qi ok; then echo \"relay /healthz not ok during run: '$HEALTH'\" >&2; exit 1; fi; \
-         if [ \"$HP\" = '0' ]; then echo 'relay health listener 127.0.0.1:4501 not bound during run' >&2; exit 1; fi; \
+         if ! printf '%s' \"$HEALTH\" | grep -qi ok; then echo \"relay /healthz not ok during run: '$HEALTH'\" >&2; sudo rm -rf \"$T\"; exit 1; fi; \
+         if [ \"$HP\" = '0' ]; then echo 'relay health listener 127.0.0.1:4501 not bound during run' >&2; sudo rm -rf \"$T\"; exit 1; fi; \
          sudo $RN ops install-macos-relay --uninstall 2>&1 | tail -2; \
          sleep 3; \
          HEALTH2=\"$(curl -s --max-time 3 http://127.0.0.1:4501/healthz 2>/dev/null || true)\"; \
+         sudo rm -rf \"$T\"; \
          if printf '%s' \"$HEALTH2\" | grep -qi ok; then echo 'relay /healthz still ok after stop — socket not released' >&2; exit 1; fi; \
-         echo 'during-run health 127.0.0.1:4501 bound + /healthz=ok; after-stop /healthz released'";
+         echo \"during-run health 127.0.0.1:4501 bound + /healthz=ok; after-stop released\"",
+        plist = shell_quote(remote_plist.as_str()),
+    );
 
     let out = capture_remote_shell_command_for_target(
         &target,
         None,
         Some(ssh_identity_file),
         known_hosts_path,
-        live_script,
+        live_script.as_str(),
         timeout,
     )
     .map_err(|e| format!("macOS relay live lifecycle on {macos_alias} failed: {e}"))?;
 
     Ok(format!(
         "macOS relay launchd lifecycle live-proven on {macos_alias}: verifier-key provisioned + \
-         install/bootstrap -> active -> stop/release; {}",
+         install/bootstrap -> active (/healthz ok, :4501 bound) -> stop/release; {}",
         out.trim()
     ))
 }
