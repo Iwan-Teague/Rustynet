@@ -135,7 +135,8 @@ fail-closed, signed-state verify-before-apply, anti-replay, default-deny ACL/rou
 - `HomelabConnectivityParityDeltaPlan_2026-05-21.md` — macOS/Windows connectivity gap.
 - `NodeRoleTaxonomy_2026-05-21.md` / `NodeRoleTaxonomyExtension_2026-06-11.md` — role definitions + per-platform eligibility.
 - `LiveLabExecutionEfficiencyPlan_2026-06-20.md` — how to run the labs efficiently.
-- `state/cross_os_role_switch_plan.md` — live cross-OS role-transition design.
+- `CrossPlatformRoleParityRoadmap_2026-06-22.md` — **the execution roadmap for this mandate**: per-cell remaining work + effort, ordered program, file-by-file plans for the first cells, the FAIL-LOUD live-stage spec, the concurrent-Windows+macOS test pipeline, and the all-on-`main` workflow.
+- `state/cross_os_role_switch_plan.md` — live cross-OS role-transition design **(to author — currently missing; the role-transition cell depends on it; see Roadmap §4/§11.2)**.
 - Code anchors: `crates/rustynet-cli/src/vm_lab/mod.rs` (`is_macos_active_exit`, `promote_windows_exit_active`, `validate_windows_{exit_nat_lifecycle,relay_service_lifecycle_contract,anchor_bundle_pull_plan_contract}`, `--*-platform` selectors); `crates/rustynetd/src/macos_exit_killswitch_precedence.rs` (pf); `crates/rustynetd/src/phase10.rs` + `windows_service.rs` (netsh/WFP); `crates/rustynet-cli/src/role_cli.rs` (role presets + transitions).
 
 ## 8. Definition of Done (cross-platform role parity)
