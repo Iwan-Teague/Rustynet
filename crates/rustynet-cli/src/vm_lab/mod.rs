@@ -7964,6 +7964,23 @@ fn run_macos_orchestration_stages(
         .as_deref()
         .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
 
+    // The macOS node is the elected regular (NATing) exit when the resolved
+    // topology has made it the exit VM (`--exit-platform macos` rewrites
+    // `config.exit_vm` to the macOS alias via
+    // `apply_topology_overrides_to_orchestrate_config`, so a macos-vs-exit
+    // alias match is the canonical signal — mirroring the Windows
+    // `promote_to_active_exit` gate). When elected, the membership grant adds
+    // the `exit_server` capability and the `activate_macos_exit_role` stage
+    // drives the staged client→admin→exit transition so the daemon enters the
+    // regular-exit role and brings up the `com.rustynet/nat` translation anchor
+    // + IPv4 forwarding; the exit-evidence capture stage then proves the live
+    // NAT lifecycle.
+    let is_macos_active_exit = config
+        .macos_vm
+        .as_deref()
+        .zip(config.exit_vm.as_deref())
+        .is_some_and(|(macos, exit)| macos == exit);
+
     // ── Stage 1: bootstrap_macos_host ────────────────────────────────────
     let bootstrap_log_path = logs_dir.join("bootstrap_macos_host.log");
     let bootstrap_outcome = if dry_run {
@@ -8302,14 +8319,19 @@ fn run_macos_orchestration_stages(
 
             let pubkey_hex = macos_wg_pubkey_hex.as_deref().unwrap();
             let owner_approver_id = format!("{exit_node_id}-owner");
-            // When the macOS node is the elected anchor, grant it the
-            // `anchor.bundle_pull` capability in signed membership so its
-            // loopback bundle-pull listener actually serves: the daemon fails
-            // closed (`forbidden`) for a node lacking the capability even with a
-            // valid token. The CSV is a fixed, safe vocabulary string (Client +
-            // AnchorBundlePull canonicalised) — no untrusted input. Otherwise
-            // keep the default client-only capability.
-            let macos_capabilities = if is_macos_elected_anchor {
+            // Grant the capability the macOS node's elected role needs in
+            // signed membership; the daemon fails closed (`forbidden`) for a
+            // node lacking the capability even with a valid token. The CSV is a
+            // fixed, safe vocabulary string (canonical capability tokens) — no
+            // untrusted input.
+            // - elected exit: `exit_server` so the staged role transition can
+            //   advertise 0.0.0.0/0 and the daemon will serve as a regular exit.
+            // - elected anchor: `anchor.bundle_pull` so the loopback bundle-pull
+            //   listener actually serves.
+            // - otherwise: client-only.
+            let macos_capabilities = if is_macos_active_exit {
+                "client,exit_server"
+            } else if is_macos_elected_anchor {
                 "client,anchor.bundle_pull"
             } else {
                 "client"
@@ -8635,12 +8657,72 @@ fn run_macos_orchestration_stages(
     let mesh_join_passed = validate_outcome.status == VmLabStageStatus::Pass;
     outcomes.push(validate_outcome);
 
-    let is_macos_active_exit = config
-        .macos_vm
-        .as_deref()
-        .zip(config.exit_vm.as_deref())
-        .is_some_and(|(macos, exit)| macos == exit);
+    // `is_macos_active_exit` is computed once near the other role-election
+    // gates at the top of this function (it also drives the membership
+    // `exit_server` grant and the role-transition stage).
     let macos_exit_artifact_root = report_dir.join("macos_exit_evidence");
+
+    // ── Stage 5b: activate_macos_exit_role ───────────────────────────────
+    // Drive the staged client→admin→exit transition on the guest so the daemon
+    // enters the regular-exit role and brings up the `com.rustynet/nat`
+    // translation anchor + IPv4 forwarding. Gated on election; FAIL-LOUD (the
+    // live result IS the stage status — a dry-run is never a Pass). Runs before
+    // the evidence capture stage, which proves the live NAT lifecycle.
+    let activate_macos_exit_log_path = logs_dir.join("activate_macos_exit_role.log");
+    let activate_macos_exit_outcome = if dry_run {
+        stage_outcome(
+            "activate_macos_exit_role",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would drive the client→admin→exit role transition on {macos_alias} when elected exit"
+            ),
+            vec![],
+        )
+    } else if !is_macos_active_exit {
+        stage_outcome(
+            "activate_macos_exit_role",
+            VmLabStageStatus::Skipped,
+            format!(
+                "skipped: macOS host {macos_alias} is not the elected exit (exit_vm != macos_vm)"
+            ),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "activate_macos_exit_role",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        match activate_macos_exit_role(
+            macos_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = fs::write(&activate_macos_exit_log_path, summary.as_str());
+                stage_outcome(
+                    "activate_macos_exit_role",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![activate_macos_exit_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = fs::write(&activate_macos_exit_log_path, reason.as_str());
+                stage_outcome(
+                    "activate_macos_exit_role",
+                    VmLabStageStatus::Fail,
+                    format!("macOS exit role activation failed for {macos_alias}: {reason}"),
+                    vec![activate_macos_exit_log_path.clone()],
+                )
+            }
+        }
+    };
+    let macos_exit_role_active = activate_macos_exit_outcome.status == VmLabStageStatus::Pass;
+    outcomes.push(activate_macos_exit_outcome);
 
     // ── Stage 6: capture_macos_exit_evidence_artifacts ───────────────────
     let capture_macos_exit_log_path = logs_dir.join("capture_macos_exit_evidence_artifacts.log");
@@ -8668,6 +8750,15 @@ fn run_macos_orchestration_stages(
             "capture_macos_exit_evidence_artifacts",
             VmLabStageStatus::Skipped,
             format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else if !macos_exit_role_active {
+        stage_outcome(
+            "capture_macos_exit_evidence_artifacts",
+            VmLabStageStatus::Skipped,
+            format!(
+                "skipped: activate_macos_exit_role did not pass for {macos_alias} (the daemon is not serving as a regular exit; the failure is reported by that stage)"
+            ),
             vec![],
         )
     } else {
@@ -9316,6 +9407,73 @@ fn macos_exit_evidence_artifact_specs() -> &'static [MacosExitEvidenceArtifactSp
             local_relative_path: "macos_exit_killswitch_precedence.json",
         },
     ]
+}
+
+/// Drive the staged client→admin→exit role transition on the macOS guest so
+/// the daemon enters the regular (NATing) exit role, then assert the live
+/// dataplane came up. Returns a summary on success or the failure reason.
+///
+/// Sequence (the staged transition the role planner requires, confirmed on the
+/// lab guest via `role transition-check --to exit`): `role set admin` writes
+/// `NODE_ROLE=admin` (restart required) → restart the daemon so it re-reads the
+/// role → `role set exit` advertises `0.0.0.0/0`. The daemon only accepts that
+/// advertise if its regular-exit dataplane activates (the `com.rustynet/nat`
+/// translation anchor loads + IPv4 forwarding enables); otherwise it rolls the
+/// advertise back and the command fails — so a non-zero `role set exit` is a
+/// real activation failure. Finally assert the anchor carries a `nat` rule and
+/// `net.inet.ip.forwarding` reads `1`.
+fn activate_macos_exit_role(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[macos_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {macos_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+
+    let live_script = "set -eu; \
+         RN=/usr/local/bin/rustynet; \
+         sudo $RN role set admin; \
+         sudo launchctl kickstart -k system/com.rustynet.daemon; \
+         admin_ok=0; \
+         for _i in $(seq 1 30); do \
+           if sudo $RN role show 2>/dev/null | grep -qiE 'current role: admin|primary=admin|node_role=admin'; then admin_ok=1; break; fi; \
+           sleep 2; \
+         done; \
+         if [ \"$admin_ok\" != 1 ]; then echo 'daemon did not report admin role after restart' >&2; sudo $RN role show 2>&1 | head -3 >&2; exit 1; fi; \
+         sudo $RN role set exit; \
+         sleep 3; \
+         NAT=$(sudo pfctl -a com.rustynet/nat -s nat 2>/dev/null | grep -cE '^[[:space:]]*nat' || true); \
+         FWD=$(sysctl -n net.inet.ip.forwarding 2>/dev/null || echo 0); \
+         if [ \"$NAT\" = 0 ]; then echo 'exit NAT anchor com.rustynet/nat has no nat rule after role set exit' >&2; sudo pfctl -a com.rustynet/nat -s nat 2>&1 | head >&2; exit 1; fi; \
+         if [ \"$FWD\" != 1 ]; then echo \"net.inet.ip.forwarding=$FWD (expected 1) after role set exit\" >&2; exit 1; fi; \
+         echo \"role admin->exit advertised 0.0.0.0/0; com.rustynet/nat loaded ($NAT nat rule); net.inet.ip.forwarding=$FWD\"";
+
+    let out = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        live_script,
+        timeout,
+    )
+    .map_err(|e| format!("macOS exit role transition on {macos_alias} failed: {e}"))?;
+
+    Ok(format!(
+        "macOS regular-exit role activated on {macos_alias}: staged client→admin→exit \
+         transition + live NAT bring-up proven; {}",
+        out.trim()
+    ))
 }
 
 fn capture_macos_exit_evidence_artifacts(
