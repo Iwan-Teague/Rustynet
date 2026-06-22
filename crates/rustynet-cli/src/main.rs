@@ -3377,6 +3377,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 anchor_platform: parser.value("--anchor-platform"),
                 admin_platform: parser.value("--admin-platform"),
                 blind_exit_platform: parser.value("--blind-exit-platform"),
+                macos_promote_exit: parser.has_flag("--macos-promote-exit"),
                 stage_timeout_secs: parser.parse_u64_or_default("--stage-timeout-secs", 0)?,
             },
         }),
