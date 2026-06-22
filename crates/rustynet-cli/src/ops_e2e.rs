@@ -1393,6 +1393,38 @@ fn seed_macos_anchor_bundle_pull_token() -> Result<String, String> {
     Ok(token_path.display().to_string())
 }
 
+/// Standalone macOS anchor bundle-pull token seed, decoupled from genesis.
+///
+/// The full genesis verb (`ops e2e-bootstrap-macos`) cannot be reused to seed
+/// the token on a lab macOS *client*: it requires an owner signing key +
+/// passphrase that are never staged on a joined node, and it re-mints
+/// membership with `--force`, which would clobber the mesh-wide snapshot the
+/// node received when it joined. This verb seeds ONLY the bundle-pull token
+/// (>=32 printable-ASCII bytes, 0600, idempotent) under the 0700-fenced state
+/// root — no membership mutation, no keys — so the anchor profile's loopback
+/// bundle-pull listener can authenticate pulling peers. Fails closed: the token
+/// is the sole authority the listener checks (`daemon` rejects empty/short).
+#[cfg(not(target_os = "macos"))]
+pub fn execute_ops_seed_macos_anchor_token() -> Result<String, String> {
+    Err("ops seed-macos-anchor-token is only supported on macOS hosts".to_owned())
+}
+
+#[cfg(target_os = "macos")]
+pub fn execute_ops_seed_macos_anchor_token() -> Result<String, String> {
+    ensure_running_as_root()?;
+    // The token lives under the 0700-fenced macOS state root; ensure it exists
+    // with the mode the daemon's macos_runtime_acls verifier requires before
+    // the seed writes into it.
+    run_status(
+        "install",
+        &["-d", "-m", "0700", MACOS_STATE_ROOT],
+        &[],
+        "creating macOS state root failed",
+    )?;
+    let path = seed_macos_anchor_bundle_pull_token()?;
+    Ok(format!("macOS anchor bundle-pull token seeded at {path}"))
+}
+
 /// Phase 27 reviewer fold-in (MED 1) — provision the canonical
 /// macOS System.keychain item for the membership-owner signing-key
 /// passphrase.

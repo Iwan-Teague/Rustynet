@@ -1003,6 +1003,10 @@ enum OpsCommand {
         network_id: String,
         passphrase_file: PathBuf,
     },
+    /// Seed ONLY the macOS anchor bundle-pull token (decoupled from
+    /// genesis), so a joined macOS node elected as anchor can serve its
+    /// loopback bundle-pull listener without re-minting membership.
+    SeedMacosAnchorToken,
     /// Track B Step 7 (B1.2) — non-Linux genesis driver for Windows.
     /// Runs `rustynetd membership init` against the canonical
     /// `C:\ProgramData\RustyNet\membership\` paths. Operator runs
@@ -3371,6 +3375,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 exit_platform: parser.value("--exit-platform"),
                 relay_platform: parser.value("--relay-platform"),
                 anchor_platform: parser.value("--anchor-platform"),
+                admin_platform: parser.value("--admin-platform"),
                 stage_timeout_secs: parser.parse_u64_or_default("--stage-timeout-secs", 0)?,
             },
         }),
@@ -4236,6 +4241,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 passphrase_file,
             })
         }
+        "seed-macos-anchor-token" => Ok(OpsCommand::SeedMacosAnchorToken),
         "e2e-bootstrap-windows" => {
             // Track B Step 7 (B1.2) — non-Linux genesis driver on Windows.
             let node_id = parser
@@ -7266,6 +7272,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             network_id,
             passphrase_file,
         } => ops_e2e::execute_ops_e2e_bootstrap_macos(node_id, network_id, passphrase_file),
+        OpsCommand::SeedMacosAnchorToken => ops_e2e::execute_ops_seed_macos_anchor_token(),
         OpsCommand::E2eBootstrapWindows {
             node_id,
             network_id,
@@ -18064,6 +18071,7 @@ fn help_text() -> String {
         "  ops run-debian-two-node-e2e --exit-host <host|user@host> --client-host <host|user@host> --ssh-allow-cidrs <cidr[,cidr...]> [--ssh-user <user>] [--ssh-sudo <auto|always|never>] [--sudo-password-file <path>] [--ssh-port <port>] [--ssh-identity <path>] [--ssh-known-hosts-file <path>] [--exit-node-id <id>] [--client-node-id <id>] [--network-id <id>] [--remote-root <abs-path>] [--repo-ref <git-ref>] [--skip-apt] [--report-path <path>]",
         "  ops e2e-bootstrap-host --role <role> --node-id <id> --network-id <id> --src-dir <absolute-path> --ssh-allow-cidrs <cidr[,cidr...]> [--skip-apt]",
         "  ops e2e-bootstrap-macos --node-id <id> --network-id <id> --passphrase-file <absolute-path>",
+        "  ops seed-macos-anchor-token",
         "  ops e2e-bootstrap-windows --node-id <id> --network-id <id> --passphrase-file <absolute-path>",
         "  ops e2e-enforce-host --role <role> --node-id <id> --src-dir <absolute-path> --ssh-allow-cidrs <cidr[,cidr...]>",
         "  ops e2e-membership-add --client-node-id <id> --client-pubkey-hex <hex> --owner-approver-id <id> [--capabilities <csv>]",
