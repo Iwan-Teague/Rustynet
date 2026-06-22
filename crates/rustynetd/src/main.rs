@@ -155,6 +155,9 @@ fn run() -> Result<(), String> {
                 })
             }
             [cmd, rest @ ..] if cmd == "privileged-helper" => run_privileged_helper_command(rest),
+            [cmd, rest @ ..] if cmd == "privileged-helper-allowlist-audit" => {
+                run_privileged_helper_allowlist_audit_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "key" => run_key_command(rest),
             [cmd, rest @ ..] if cmd == "membership" => run_membership_command(rest),
             [cmd, rest @ ..] if cmd == "windows-runtime-boundary-check" => {
@@ -1579,6 +1582,29 @@ fn run_linux_ipv6_leak_capture_command(args: &[String]) -> Result<(), String> {
         serde_json::to_string_pretty(&snapshot)
             .map_err(|err| { format!("serialize linux-ipv6-leak snapshot failed: {err}") })?
     );
+    Ok(())
+}
+
+fn run_privileged_helper_allowlist_audit_command(args: &[String]) -> Result<(), String> {
+    if let Some(flag) = args.first() {
+        return Err(format!(
+            "unknown privileged-helper-allowlist-audit argument: {flag}"
+        ));
+    }
+    let report =
+        rustynetd::privileged_helper_allowlist_audit::run_privileged_helper_allowlist_audit();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|err| {
+            format!("serialize privileged-helper-allowlist-audit report failed: {err}")
+        })?
+    );
+    if !report.overall_ok {
+        return Err(format!(
+            "privileged-helper allowlist audit failed: {} violation(s) — the argv allowlist accepted an adversarial request or rejected a reviewed one",
+            report.violations.len()
+        ));
+    }
     Ok(())
 }
 
@@ -3571,6 +3597,7 @@ fn help_text() -> String {
         "  rustynetd linux-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>] [--killswitch-table <name>]",
         "  rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]",
         "  rustynetd linux-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--killswitch-table <name>]",
+        "  rustynetd privileged-helper-allowlist-audit",
         "  rustynetd macos-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>]",
         "  rustynetd macos-exit-killswitch-precedence-check --output <path> [--pf-anchor <name>]",
         "  rustynetd windows-service-hardening-check [--no-fail-on-drift]",
@@ -3663,7 +3690,8 @@ mod tests {
         classify_top_level_error, help_text, parse_daemon_config,
         run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
         run_macos_exit_dns_failclosed_capture_command,
-        run_macos_exit_killswitch_precedence_check_command, run_windows_authenticode_check_command,
+        run_macos_exit_killswitch_precedence_check_command,
+        run_privileged_helper_allowlist_audit_command, run_windows_authenticode_check_command,
         run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
         run_windows_exit_nat_lifecycle_snapshot_command, run_windows_key_custody_check_command,
         run_windows_killswitch_assert_command, run_windows_mesh_status_check_command,
@@ -4058,6 +4086,33 @@ mod tests {
             err.contains("--output is required"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn help_text_advertises_privileged_helper_allowlist_audit_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("privileged-helper-allowlist-audit"),
+            "help text must advertise privileged-helper-allowlist-audit subcommand"
+        );
+    }
+
+    #[test]
+    fn run_privileged_helper_allowlist_audit_command_rejects_unknown_flags() {
+        let err = run_privileged_helper_allowlist_audit_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown privileged-helper-allowlist-audit argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_privileged_helper_allowlist_audit_command_passes_on_reviewed_allowlist() {
+        // The shipped allowlist must satisfy the adversarial corpus, so the
+        // command exits Ok on a healthy binary.
+        run_privileged_helper_allowlist_audit_command(&[])
+            .expect("privileged-helper allowlist audit must pass on the reviewed allowlist");
     }
 
     #[test]

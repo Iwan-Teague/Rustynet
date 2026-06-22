@@ -50,6 +50,7 @@ pub mod phase10;
 pub mod platform;
 pub mod port_mapper;
 pub mod privileged_helper;
+pub mod privileged_helper_allowlist_audit;
 pub mod relay_client;
 pub mod resilience;
 pub mod secret_log_audit;
