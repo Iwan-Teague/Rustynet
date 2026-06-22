@@ -97,7 +97,8 @@ pub fn collect_macos_exit_nat_lifecycle_snapshot(
     let now_unix = current_unix_seconds();
     let (pf_anchor_present, internal_prefix) =
         capture_pf_anchor_state(options.pf_anchor.as_str()).unwrap_or((false, String::new()));
-    let forwarding_state = capture_sysctl_forwarding();
+    let forwarding_state =
+        capture_sysctl_forwarding(forwarding_sysctl_key_for_cidr(options.mesh_cidr.as_str()));
     MacosExitNatLifecycleSnapshot {
         schema_version: MACOS_EXIT_NAT_LIFECYCLE_SCHEMA_VERSION,
         captured_at_unix: now_unix,
@@ -206,9 +207,9 @@ fn capture_pf_anchor_state(_pf_anchor: &str) -> Result<(bool, String), ()> {
 }
 
 #[cfg(target_os = "macos")]
-fn capture_sysctl_forwarding() -> String {
+fn capture_sysctl_forwarding(forwarding_key: &str) -> String {
     let output = Command::new("/usr/sbin/sysctl")
-        .args(["-n", "net.inet.ip.forwarding"])
+        .args(["-n", forwarding_key])
         .output();
     match output {
         Ok(out) if out.status.success() => {
@@ -219,8 +220,19 @@ fn capture_sysctl_forwarding() -> String {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn capture_sysctl_forwarding() -> String {
+fn capture_sysctl_forwarding(_forwarding_key: &str) -> String {
     "Disabled".to_owned()
+}
+
+/// The macOS forwarding sysctl that governs the mesh prefix's address family:
+/// `net.inet6.ip6.forwarding` for an IPv6 CIDR, else `net.inet.ip.forwarding`.
+/// Matches the daemon's exit-NAT activation (which enables the same key).
+pub fn forwarding_sysctl_key_for_cidr(mesh_cidr: &str) -> &'static str {
+    if mesh_cidr.contains(':') {
+        "net.inet6.ip6.forwarding"
+    } else {
+        "net.inet.ip.forwarding"
+    }
 }
 
 fn pfctl_anchor_present(stdout: &str) -> bool {
@@ -316,6 +328,18 @@ mod tests {
         assert_eq!(parse_sysctl_forwarding("0\n"), "Disabled");
         assert_eq!(parse_sysctl_forwarding(""), "Disabled");
         assert_eq!(parse_sysctl_forwarding("garbage"), "Disabled");
+    }
+
+    #[test]
+    fn forwarding_sysctl_key_matches_mesh_family() {
+        assert_eq!(
+            forwarding_sysctl_key_for_cidr("100.64.0.0/10"),
+            "net.inet.ip.forwarding"
+        );
+        assert_eq!(
+            forwarding_sysctl_key_for_cidr("fd7a::/48"),
+            "net.inet6.ip6.forwarding"
+        );
     }
 
     #[test]
