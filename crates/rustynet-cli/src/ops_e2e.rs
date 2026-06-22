@@ -1155,6 +1155,17 @@ const MACOS_MEMBERSHIP_DIR: &str = "/usr/local/var/rustynet/membership";
 #[cfg(target_os = "macos")]
 const MACOS_OWNER_SIGNING_KEY_PATH: &str = "/usr/local/etc/rustynet/membership.owner.key";
 
+/// macOS anchor bundle-pull token path. The anchor profile's loopback
+/// bundle-pull listener authenticates pulling peers against this token
+/// (>=32 printable-ASCII bytes). Matches the
+/// `com.rustynet.anchor.plist` `RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH`
+/// and the live-test bin's macOS default. Seeded here at genesis so the
+/// anchor listener can fail closed (no token => no listener) until the
+/// token exists.
+#[cfg(target_os = "macos")]
+const MACOS_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str =
+    "/usr/local/var/rustynet/anchor-bundle-pull.token";
+
 /// Track B Step 7 (B1.2) — macOS genesis driver.
 ///
 /// Mirrors the Linux `e2e-bootstrap-host` membership-init step on
@@ -1287,9 +1298,99 @@ pub fn execute_ops_e2e_bootstrap_macos(
     // and is reachable by the launchd-managed daemon at startup.
     provision_macos_membership_signing_keychain_item(passphrase_file.as_path())?;
 
+    // Track B Cross-Platform Role Parity — seed the anchor bundle-pull
+    // token so the macOS anchor profile's loopback bundle-pull listener
+    // can serve the signed membership snapshot (the bundle is the same
+    // `membership.snapshot` just minted above). Mirrors the Linux
+    // systemd installer's admin-node token seeding
+    // (`ops_install_systemd.rs`): 32 bytes of OS randomness hex-encoded
+    // to a 64-char printable-ASCII token, written 0600 root-only, and
+    // preserved across re-runs so already-authorised peers stay valid.
+    // The daemon fails closed (no listener) when this token is absent or
+    // shorter than 32 printable-ASCII bytes — a security boundary, not
+    // an optimisation.
+    let anchor_token_path = seed_macos_anchor_bundle_pull_token()?;
+
     Ok(format!(
-        "macOS membership genesis initialized: node_id={node_id}, network_id={network_id}, snapshot={snapshot}"
+        "macOS membership genesis initialized: node_id={node_id}, network_id={network_id}, snapshot={snapshot}, anchor_bundle_pull_token={anchor_token_path}"
     ))
+}
+
+/// Seed (idempotently) the macOS anchor bundle-pull token at
+/// `MACOS_ANCHOR_BUNDLE_PULL_TOKEN_PATH`.
+///
+/// If the token already exists, leave its content untouched (so peers
+/// already holding the token stay authorised) and only re-assert the
+/// 0600 mode. Otherwise mint a fresh 32-byte hex token and write it
+/// atomically via a 0600 tempfile + rename in the same 0700-fenced
+/// state root, then return the path.
+#[cfg(target_os = "macos")]
+fn seed_macos_anchor_bundle_pull_token() -> Result<String, String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let token_path = std::path::Path::new(MACOS_ANCHOR_BUNDLE_PULL_TOKEN_PATH);
+    match fs::symlink_metadata(token_path) {
+        Ok(_) => {
+            // Token exists — re-assert 0600 and keep the content.
+            fs::set_permissions(token_path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |err| {
+                    format!(
+                        "set anchor bundle-pull token mode at {} failed: {err}",
+                        token_path.display()
+                    )
+                },
+            )?;
+            return Ok(token_path.display().to_string());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "inspect anchor bundle-pull token at {} failed: {err}",
+                token_path.display()
+            ));
+        }
+    }
+
+    let mut random_bytes = [0u8; 32];
+    fill_os_random_bytes(&mut random_bytes, "anchor bundle-pull token")?;
+    let mut token = String::with_capacity(random_bytes.len() * 2);
+    for byte in random_bytes {
+        use std::fmt::Write as _;
+        let _ = write!(token, "{byte:02x}");
+    }
+
+    let parent = token_path
+        .parent()
+        .ok_or_else(|| "anchor bundle-pull token path has no parent".to_owned())?;
+    let tmp = parent.join(".rustynetd.anchor-bundle-pull.token.tmp");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(tmp.as_path())
+            .map_err(|err| {
+                format!(
+                    "open anchor bundle-pull token tmp {} failed: {err}",
+                    tmp.display()
+                )
+            })?;
+        file.write_all(token.as_bytes())
+            .map_err(|err| format!("write anchor bundle-pull token content failed: {err}"))?;
+    }
+    // Defend against a pre-existing tmp with a looser mode.
+    fs::set_permissions(tmp.as_path(), std::fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("set anchor bundle-pull token tmp mode failed: {err}"))?;
+    fs::rename(tmp.as_path(), token_path).map_err(|err| {
+        format!(
+            "publish anchor bundle-pull token {} -> {} failed: {err}",
+            tmp.display(),
+            token_path.display()
+        )
+    })?;
+    Ok(token_path.display().to_string())
 }
 
 /// Phase 27 reviewer fold-in (MED 1) — provision the canonical

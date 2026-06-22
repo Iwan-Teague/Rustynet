@@ -9,6 +9,7 @@ mod ops_cross_network_preflight;
 mod ops_cross_network_reports;
 mod ops_e2e;
 mod ops_fresh_install_os_matrix;
+mod ops_install_macos_anchor;
 mod ops_install_macos_exit;
 mod ops_install_macos_relay;
 mod ops_install_systemd;
@@ -959,6 +960,14 @@ enum OpsCommand {
     },
     InstallMacosRelay {
         config: ops_install_macos_relay::InstallMacosRelayConfig,
+    },
+    /// macOS parity for the anchor profile. Installs / uninstalls the
+    /// `com.rustynet.anchor` launchd service (the always-on home-server
+    /// role that serves the loopback bundle-pull listener). Mirrors
+    /// `InstallMacosRelay`; the installer verifies the source plist's
+    /// reviewed hardened shape before deploying it (verify-before-serve).
+    InstallMacosAnchor {
+        config: ops_install_macos_anchor::InstallMacosAnchorConfig,
     },
     /// Track B Step 3 (B1.4) — install / uninstall the
     /// rustynet-exit.service sibling systemd unit. Used by the
@@ -4079,6 +4088,38 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             };
             Ok(OpsCommand::InstallMacosRelay { config })
         }
+        "install-macos-anchor" => {
+            let mut mode = ops_install_macos_anchor::LaunchdAnchorMode::InstallAndBootstrap;
+            let mut dry_run = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--uninstall" => {
+                        mode = ops_install_macos_anchor::LaunchdAnchorMode::DisableAndRemove;
+                    }
+                    "--dry-run" => dry_run = true,
+                    other => {
+                        return Err(format!(
+                            "ops install-macos-anchor: unknown flag {other:?} (expected --uninstall or --dry-run)"
+                        ));
+                    }
+                }
+            }
+            let config = match mode {
+                ops_install_macos_anchor::LaunchdAnchorMode::InstallAndBootstrap => {
+                    ops_install_macos_anchor::InstallMacosAnchorConfig {
+                        dry_run,
+                        ..ops_install_macos_anchor::InstallMacosAnchorConfig::default_install()
+                    }
+                }
+                ops_install_macos_anchor::LaunchdAnchorMode::DisableAndRemove => {
+                    ops_install_macos_anchor::InstallMacosAnchorConfig {
+                        dry_run,
+                        ..ops_install_macos_anchor::InstallMacosAnchorConfig::default_uninstall()
+                    }
+                }
+            };
+            Ok(OpsCommand::InstallMacosAnchor { config })
+        }
         "install-systemd-exit" => {
             // Track B Step 3 (B1.4) — install/uninstall the
             // rustynet-exit.service sibling unit on Linux. Default mode
@@ -7195,6 +7236,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::InstallMacosRelay { config } => {
             ops_install_macos_relay::execute_install_macos_relay(config)
+                .map(|report| report.summary())
+        }
+        OpsCommand::InstallMacosAnchor { config } => {
+            ops_install_macos_anchor::execute_install_macos_anchor(config)
                 .map(|report| report.summary())
         }
         OpsCommand::InstallSystemdExit { config } => {
@@ -21785,6 +21830,18 @@ mod tests {
         let macos_relay_installer =
             parse_command(&["ops".to_owned(), "install-macos-relay".to_owned()]);
         assert!(format!("{macos_relay_installer:?}").contains("InstallMacosRelay"));
+
+        let macos_anchor_installer =
+            parse_command(&["ops".to_owned(), "install-macos-anchor".to_owned()]);
+        assert!(format!("{macos_anchor_installer:?}").contains("InstallMacosAnchor"));
+
+        let macos_anchor_uninstaller = parse_command(&[
+            "ops".to_owned(),
+            "install-macos-anchor".to_owned(),
+            "--uninstall".to_owned(),
+            "--dry-run".to_owned(),
+        ]);
+        assert!(format!("{macos_anchor_uninstaller:?}").contains("DisableAndRemove"));
 
         let windows_installer =
             parse_command(&["ops".to_owned(), "install-windows-service".to_owned()]);

@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.rustynet.anchor.plist - reviewed launchd unit for the macOS
+  anchor profile (always-on home-server role).
+
+  macOS parity for scripts/systemd/rustynetd-anchor.service. The daemon
+  remains the authority for signed control state; this profile composes
+  the same daemon binary with the loopback bundle-pull listener enabled so
+  a peer can pull the signed membership snapshot byte-for-byte over
+  127.0.0.1:51822 after presenting the >=32 printable-ASCII authority
+  token. Anchor capability advertisement still flows through signed
+  membership updates (`rustynet anchor advertise`), exactly as on Linux.
+
+  Install to: /Library/LaunchDaemons/com.rustynet.anchor.plist
+  Owner/mode: root:wheel 0644
+  Load via:   launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.anchor.plist
+  Unload via: launchctl bootout system/com.rustynet.anchor
+
+  Reviewed hardening keys checked by macos_service_hardening.rs
+  (evaluate_macos_anchor_service_hardening / evaluate_macos_anchor_*):
+    UserName            = rustynetd
+    GroupName           = rustynetd
+    RunAtLoad           = true
+    KeepAlive           = true
+    ProcessType         = Background
+    AbandonProcessGroup = false
+
+  Reviewed bundle-pull security posture (ProgramArguments +
+  EnvironmentVariables, checked by evaluate_macos_anchor_program_arguments
+  / evaluate_macos_anchor_environment):
+    --anchor-bundle-pull-addr        = 127.0.0.1:51822  (loopback only)
+    --anchor-bundle-pull-token-path  = /usr/local/var/rustynet/anchor-bundle-pull.token
+    --anchor-bundle-pull-allow-lan   = false            (default-deny LAN)
+
+  The token path is sourced from RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH;
+  the daemon fails closed (no listener) when the token file is missing,
+  shorter than 32 printable-ASCII bytes, or unreadable. Operators must
+  flip RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN to true AND supply a
+  non-loopback addr to ever accept bundle-pull connections from LAN
+  peers; loopback-only is the reviewed default — a security boundary,
+  not an optimisation. Do not weaken without updating
+  macos_service_hardening.rs and the security minimum bar.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rustynet.anchor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/rustynetd</string>
+        <string>daemon</string>
+        <string>--state</string>
+        <string>/usr/local/var/rustynet/rustynetd.state</string>
+        <string>--wg-private-key</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.key</string>
+        <string>--wg-encrypted-private-key</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.key.enc</string>
+        <string>--wg-key-passphrase</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <string>--wg-public-key</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.pub</string>
+        <string>--backend</string>
+        <string>macos-wireguard-userspace-shared</string>
+        <string>--membership-snapshot</string>
+        <string>/usr/local/var/rustynet/membership/membership.snapshot</string>
+        <string>--membership-log</string>
+        <string>/usr/local/var/rustynet/membership/membership.log</string>
+        <string>--membership-watermark</string>
+        <string>/usr/local/var/rustynet/membership/membership.watermark</string>
+        <string>--anchor-bundle-pull-addr</string>
+        <string>127.0.0.1:51822</string>
+        <string>--anchor-bundle-pull-token-path</string>
+        <string>/usr/local/var/rustynet/anchor-bundle-pull.token</string>
+        <string>--anchor-bundle-pull-allow-lan</string>
+        <string>false</string>
+    </array>
+
+    <!-- Reviewed hardening directives - do not weaken without updating
+         macos_service_hardening.rs and the security minimum bar. -->
+    <key>UserName</key>
+    <string>rustynetd</string>
+
+    <key>GroupName</key>
+    <string>rustynetd</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>AbandonProcessGroup</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/rustynet/rustynetd-anchor.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/rustynet/rustynetd-anchor-error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT</key>
+        <string>wg-passphrase-daemon-local</string>
+        <key>RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE</key>
+        <string>net.rustynet.wg-key-passphrase</string>
+        <key>RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH</key>
+        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <key>RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR</key>
+        <string>127.0.0.1:51822</string>
+        <key>RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH</key>
+        <string>/usr/local/var/rustynet/anchor-bundle-pull.token</string>
+        <key>RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN</key>
+        <string>false</string>
+    </dict>
+</dict>
+</plist>

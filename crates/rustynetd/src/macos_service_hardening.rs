@@ -41,6 +41,37 @@ pub const REVIEWED_MACOS_RELAY_LAUNCHD_LABEL: &str = "com.rustynet.relay";
 pub const REVIEWED_MACOS_RELAY_LAUNCHD_PLIST_PATH: &str =
     "/Library/LaunchDaemons/com.rustynet.relay.plist";
 
+/// Reviewed launchd label for the macOS anchor profile (always-on
+/// home-server role that serves the loopback bundle-pull listener).
+/// Mirrors `scripts/launchd/com.rustynet.anchor.plist`. Kept next to
+/// the relay constants so the `ops install-macos-anchor` installer and
+/// the live-lab anchor validator share one source of truth — a future
+/// rename surfaces as a compile break in both call sites.
+pub const REVIEWED_MACOS_ANCHOR_LAUNCHD_LABEL: &str = "com.rustynet.anchor";
+
+/// Reviewed install path for the macOS anchor launchd plist. Same
+/// rationale as `REVIEWED_MACOS_ANCHOR_LAUNCHD_LABEL`.
+pub const REVIEWED_MACOS_ANCHOR_LAUNCHD_PLIST_PATH: &str =
+    "/Library/LaunchDaemons/com.rustynet.anchor.plist";
+
+/// Reviewed source plist (in the repo) for the macOS anchor profile.
+pub const REVIEWED_MACOS_ANCHOR_SOURCE_PLIST_PATH: &str =
+    "scripts/launchd/com.rustynet.anchor.plist";
+
+/// Reviewed loopback bundle-pull bind address for the macOS anchor
+/// profile. Mirrors the systemd `RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR`.
+pub const REVIEWED_MACOS_ANCHOR_BUNDLE_PULL_ADDR: &str = "127.0.0.1:51822";
+
+/// Reviewed anchor bundle-pull token path on macOS. The daemon fails
+/// closed (no listener) when the token file is missing / too short.
+pub const REVIEWED_MACOS_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str =
+    "/usr/local/var/rustynet/anchor-bundle-pull.token";
+
+/// Reviewed anchor bundle-pull membership snapshot path on macOS — the
+/// signed bundle that the listener serves byte-for-byte.
+pub const REVIEWED_MACOS_ANCHOR_MEMBERSHIP_SNAPSHOT_PATH: &str =
+    "/usr/local/var/rustynet/membership/membership.snapshot";
+
 /// Reviewed plist key=value pairs.
 const REVIEWED_PLIST_DIRECTIVES: &[(&str, &str)] = &[
     ("UserName", "rustynetd"),
@@ -402,6 +433,158 @@ fn reviewed_environment_fixture() -> BTreeMap<String, String> {
     .iter()
     .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
     .collect()
+}
+
+// ─── Anchor profile reviewed-shape validation ────────────────────────
+//
+// macOS parity for the systemd `rustynetd-anchor.service` reviewed
+// shape. The anchor profile shares the six hardening directives the
+// daemon profile uses (UserName / GroupName / RunAtLoad / KeepAlive /
+// ProcessType / AbandonProcessGroup) via `evaluate_macos_service_hardening`,
+// then layers the bundle-pull security posture: the loopback-only bind,
+// the token path, and the `allow-lan=false` default-deny gate. Each is a
+// fail-closed control whose enforcement point lives in `daemon.rs`
+// (`validate_anchor_bundle_pull_addr`, `load_anchor_bundle_pull_token`);
+// this verifier asserts the reviewed plist declares the hardened shape
+// so a drift surfaces before the daemon is ever started.
+
+/// Reviewed anchor `ProgramArguments` shape. Pins the exact bundle-pull
+/// flag/value pairs in addition to the shared daemon flags. Returns
+/// every drift reason in one pass (no short-circuit).
+pub fn evaluate_macos_anchor_program_arguments(program_arguments: &[String]) -> Vec<String> {
+    // Reuse the daemon ProgramArguments checks (daemon subcommand,
+    // userspace-shared backend, wg key custody flags) so the anchor
+    // profile cannot silently drop them.
+    let mut reasons = evaluate_macos_program_arguments(program_arguments);
+    if program_arguments.is_empty() {
+        // `evaluate_macos_program_arguments` already pushed the
+        // empty-array reason and bailed; do not double-report the
+        // bundle-pull flags against an empty array.
+        return reasons;
+    }
+    for (flag, expected) in [
+        (
+            "--anchor-bundle-pull-addr",
+            REVIEWED_MACOS_ANCHOR_BUNDLE_PULL_ADDR,
+        ),
+        (
+            "--anchor-bundle-pull-token-path",
+            REVIEWED_MACOS_ANCHOR_BUNDLE_PULL_TOKEN_PATH,
+        ),
+        ("--anchor-bundle-pull-allow-lan", "false"),
+    ] {
+        match program_arguments.iter().position(|arg| arg == flag) {
+            Some(index) => match program_arguments.get(index + 1) {
+                Some(value) if value == expected => {}
+                Some(value) => reasons.push(format!(
+                    "ProgramArguments {flag} drifted: expected {expected:?}, observed {value:?}"
+                )),
+                None => reasons.push(format!("ProgramArguments {flag} missing value")),
+            },
+            None => reasons.push(format!("ProgramArguments missing {flag}")),
+        }
+    }
+    reasons
+}
+
+/// Reviewed anchor `EnvironmentVariables` shape. Layers the bundle-pull
+/// env (`RUSTYNET_ANCHOR_BUNDLE_PULL_*`) on top of the daemon keychain
+/// custody env. The `allow-lan=false` env is the default-deny LAN gate;
+/// a drift to `true` here is a release-blocking weakening of the
+/// loopback-only boundary, so it is surfaced explicitly.
+pub fn evaluate_macos_anchor_launchd_environment(
+    environment: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut reasons = evaluate_macos_launchd_environment(environment);
+    if environment.is_empty() {
+        return reasons;
+    }
+    for (key, expected) in [
+        (
+            "RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR",
+            REVIEWED_MACOS_ANCHOR_BUNDLE_PULL_ADDR,
+        ),
+        (
+            "RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH",
+            REVIEWED_MACOS_ANCHOR_BUNDLE_PULL_TOKEN_PATH,
+        ),
+        ("RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN", "false"),
+    ] {
+        match environment.get(key) {
+            Some(value) if value == expected => {}
+            Some(value) => reasons.push(format!(
+                "EnvironmentVariables {key} drifted: expected {expected:?}, observed {value:?}"
+            )),
+            None => reasons.push(format!("EnvironmentVariables missing {key}")),
+        }
+    }
+    reasons
+}
+
+/// Build a `MacosServiceHardeningReport` for the anchor profile. Uses
+/// the shared hardening-key evaluator plus the anchor-specific
+/// ProgramArguments + EnvironmentVariables evaluators. The report's
+/// `service_label` / `plist_path` are the anchor constants so a consumer
+/// can tell daemon vs anchor reports apart.
+pub fn build_macos_anchor_service_hardening_report(
+    probed: bool,
+    probe_reason: Option<String>,
+    observed: BTreeMap<String, String>,
+    program_arguments: Vec<String>,
+    environment: BTreeMap<String, String>,
+) -> MacosServiceHardeningReport {
+    let drift_reasons = if probed {
+        let mut reasons = evaluate_macos_service_hardening(&observed);
+        reasons.extend(evaluate_macos_anchor_program_arguments(&program_arguments));
+        reasons.extend(evaluate_macos_anchor_launchd_environment(&environment));
+        reasons
+    } else {
+        vec![probe_reason.clone().unwrap_or_else(|| {
+            "anchor plist was not read; service hardening posture unknown".to_owned()
+        })]
+    };
+    let overall_ok = probed && drift_reasons.is_empty();
+    MacosServiceHardeningReport {
+        schema_version: 1,
+        service_label: REVIEWED_MACOS_ANCHOR_LAUNCHD_LABEL.to_owned(),
+        plist_path: REVIEWED_MACOS_ANCHOR_LAUNCHD_PLIST_PATH.to_owned(),
+        overall_ok,
+        probed,
+        probe_reason,
+        drift_reasons,
+        observed,
+        program_arguments,
+        environment,
+    }
+}
+
+/// Read the installed anchor plist and evaluate its reviewed shape.
+/// Fails closed (probed=false, overall_ok=false) when the plist cannot
+/// be read.
+pub fn collect_macos_anchor_service_hardening_report() -> MacosServiceHardeningReport {
+    match std::fs::read_to_string(REVIEWED_MACOS_ANCHOR_LAUNCHD_PLIST_PATH) {
+        Ok(xml) => {
+            let observed = parse_plist_scalars(&xml);
+            let program_arguments = parse_plist_string_array(&xml, "ProgramArguments");
+            let environment = parse_plist_string_dict(&xml, "EnvironmentVariables");
+            build_macos_anchor_service_hardening_report(
+                true,
+                None,
+                observed,
+                program_arguments,
+                environment,
+            )
+        }
+        Err(err) => build_macos_anchor_service_hardening_report(
+            false,
+            Some(format!(
+                "could not read {REVIEWED_MACOS_ANCHOR_LAUNCHD_PLIST_PATH}: {err}"
+            )),
+            BTreeMap::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -833,6 +1016,234 @@ mod tests {
                 .any(|r| r.contains("plist was not read")),
             "default fallback reason must surface: {:?}",
             report.drift_reasons
+        );
+    }
+
+    // ─── Anchor profile reviewed-shape coverage ───────────────────────
+
+    const ANCHOR_SAMPLE_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rustynet.anchor</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/rustynetd</string>
+        <string>daemon</string>
+        <string>--wg-private-key</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.key</string>
+        <string>--wg-encrypted-private-key</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.key.enc</string>
+        <string>--wg-key-passphrase</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <string>--wg-public-key</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.pub</string>
+        <string>--backend</string>
+        <string>macos-wireguard-userspace-shared</string>
+        <string>--anchor-bundle-pull-addr</string>
+        <string>127.0.0.1:51822</string>
+        <string>--anchor-bundle-pull-token-path</string>
+        <string>/usr/local/var/rustynet/anchor-bundle-pull.token</string>
+        <string>--anchor-bundle-pull-allow-lan</string>
+        <string>false</string>
+    </array>
+    <key>UserName</key>
+    <string>rustynetd</string>
+    <key>GroupName</key>
+    <string>rustynetd</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>AbandonProcessGroup</key>
+    <false/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT</key>
+        <string>wg-passphrase-daemon-local</string>
+        <key>RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE</key>
+        <string>net.rustynet.wg-key-passphrase</string>
+        <key>RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH</key>
+        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <key>RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR</key>
+        <string>127.0.0.1:51822</string>
+        <key>RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH</key>
+        <string>/usr/local/var/rustynet/anchor-bundle-pull.token</string>
+        <key>RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN</key>
+        <string>false</string>
+    </dict>
+</dict>
+</plist>"#;
+
+    fn anchor_program_arguments_fixture() -> Vec<String> {
+        parse_plist_string_array(ANCHOR_SAMPLE_PLIST, "ProgramArguments")
+    }
+
+    fn anchor_environment_fixture() -> BTreeMap<String, String> {
+        parse_plist_string_dict(ANCHOR_SAMPLE_PLIST, "EnvironmentVariables")
+    }
+
+    #[test]
+    fn anchor_program_arguments_accept_reviewed_bundle_pull_flags() {
+        let reasons = evaluate_macos_anchor_program_arguments(&anchor_program_arguments_fixture());
+        assert!(
+            reasons.is_empty(),
+            "reviewed anchor ProgramArguments must pass: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_program_arguments_reject_missing_token_path_flag() {
+        let args = anchor_program_arguments_fixture()
+            .into_iter()
+            .filter(|arg| arg != "--anchor-bundle-pull-token-path")
+            .collect::<Vec<_>>();
+        let reasons = evaluate_macos_anchor_program_arguments(&args);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("missing --anchor-bundle-pull-token-path")),
+            "missing token-path flag must drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_program_arguments_reject_allow_lan_true() {
+        // Default-deny LAN gate: a plist that flips allow-lan to true
+        // is a release-blocking weakening of the loopback-only boundary
+        // and must surface as drift.
+        let mut args = anchor_program_arguments_fixture();
+        let idx = args
+            .iter()
+            .position(|arg| arg == "--anchor-bundle-pull-allow-lan")
+            .expect("allow-lan flag present")
+            + 1;
+        args[idx] = "true".to_owned();
+        let reasons = evaluate_macos_anchor_program_arguments(&args);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("--anchor-bundle-pull-allow-lan drifted")),
+            "allow-lan=true must drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_environment_accepts_reviewed_bundle_pull_env() {
+        let reasons = evaluate_macos_anchor_launchd_environment(&anchor_environment_fixture());
+        assert!(
+            reasons.is_empty(),
+            "reviewed anchor environment must pass: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_environment_rejects_lan_bind_addr() {
+        // A non-loopback bind addr in the env is the other half of the
+        // loopback-only control; it must drift.
+        let mut env = anchor_environment_fixture();
+        env.insert(
+            "RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR".to_owned(),
+            "0.0.0.0:51822".to_owned(),
+        );
+        let reasons = evaluate_macos_anchor_launchd_environment(&env);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR drifted")),
+            "LAN bind addr env must drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_environment_rejects_allow_lan_true() {
+        let mut env = anchor_environment_fixture();
+        env.insert(
+            "RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN".to_owned(),
+            "true".to_owned(),
+        );
+        let reasons = evaluate_macos_anchor_launchd_environment(&env);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN drifted")),
+            "allow-lan=true env must drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_report_clean_plist_is_ok() {
+        let observed = parse_plist_scalars(ANCHOR_SAMPLE_PLIST);
+        let report = build_macos_anchor_service_hardening_report(
+            true,
+            None,
+            observed,
+            anchor_program_arguments_fixture(),
+            anchor_environment_fixture(),
+        );
+        assert!(report.overall_ok, "drift: {:?}", report.drift_reasons);
+        assert!(report.drift_reasons.is_empty());
+        assert_eq!(report.service_label, REVIEWED_MACOS_ANCHOR_LAUNCHD_LABEL);
+        assert_eq!(report.plist_path, REVIEWED_MACOS_ANCHOR_LAUNCHD_PLIST_PATH);
+    }
+
+    #[test]
+    fn anchor_report_surfaces_allow_lan_drift_in_program_arguments() {
+        let observed = parse_plist_scalars(ANCHOR_SAMPLE_PLIST);
+        let mut args = anchor_program_arguments_fixture();
+        let idx = args
+            .iter()
+            .position(|arg| arg == "--anchor-bundle-pull-allow-lan")
+            .expect("allow-lan flag present")
+            + 1;
+        args[idx] = "true".to_owned();
+        let report = build_macos_anchor_service_hardening_report(
+            true,
+            None,
+            observed,
+            args,
+            anchor_environment_fixture(),
+        );
+        assert!(!report.overall_ok);
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("--anchor-bundle-pull-allow-lan drifted")),
+            "allow-lan drift must be present: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn anchor_report_unprobed_marks_overall_fail() {
+        let report = build_macos_anchor_service_hardening_report(
+            false,
+            Some("anchor plist unreadable".to_owned()),
+            BTreeMap::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        );
+        assert!(!report.overall_ok);
+        assert!(!report.probed);
+    }
+
+    #[test]
+    fn anchor_constants_pin_loopback_and_token_path() {
+        // Pin the reviewed anchor security posture so a silent edit to
+        // the bind addr / token path / allow-lan default has to update
+        // this snapshot alongside the constant.
+        assert_eq!(REVIEWED_MACOS_ANCHOR_LAUNCHD_LABEL, "com.rustynet.anchor");
+        assert_eq!(
+            REVIEWED_MACOS_ANCHOR_LAUNCHD_PLIST_PATH,
+            "/Library/LaunchDaemons/com.rustynet.anchor.plist"
+        );
+        assert_eq!(REVIEWED_MACOS_ANCHOR_BUNDLE_PULL_ADDR, "127.0.0.1:51822");
+        assert_eq!(
+            REVIEWED_MACOS_ANCHOR_BUNDLE_PULL_TOKEN_PATH,
+            "/usr/local/var/rustynet/anchor-bundle-pull.token"
         );
     }
 }

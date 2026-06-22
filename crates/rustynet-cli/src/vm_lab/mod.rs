@@ -8930,11 +8930,20 @@ fn run_macos_orchestration_stages(
             vec![],
         )
     } else {
-        match exercise_macos_anchor_bundle_pull_plan_dry_run(
+        // Prefer the LIVE bundle-pull proof (sub-test A1.2 parity): a peer
+        // pulls the signed membership snapshot byte-for-byte over the
+        // loopback listener with the genesis-seeded token, and every
+        // fail-closed control is asserted live. The dry-run plan check
+        // (`anchor init --dry-run`) remains as a documented fallback so a
+        // transient live-environment failure (e.g. listener not yet up)
+        // still yields the contract-level evidence rather than a hard stop.
+        let live_report_dir = report_dir.join("macos_anchor_bundle_pull");
+        match exercise_macos_anchor_bundle_pull_live(
             macos_alias,
             inventory_path,
             ssh_identity_file,
             known_hosts_path,
+            &live_report_dir,
         ) {
             Ok(summary) => {
                 let _ = std::fs::write(&macos_anchor_bundle_pull_log_path, summary.as_str());
@@ -8945,17 +8954,37 @@ fn run_macos_orchestration_stages(
                     vec![macos_anchor_bundle_pull_log_path.clone()],
                 )
             }
-            Err(reason) => {
-                let _ = std::fs::write(&macos_anchor_bundle_pull_log_path, reason.as_str());
-                stage_outcome(
-                    "validate_macos_anchor_bundle_pull",
-                    VmLabStageStatus::Fail,
-                    format!(
-                        "macOS anchor bundle-pull plan validation failed for {macos_alias}: {reason}"
-                    ),
-                    vec![macos_anchor_bundle_pull_log_path.clone()],
-                )
-            }
+            Err(live_reason) => match exercise_macos_anchor_bundle_pull_plan_dry_run(
+                macos_alias,
+                inventory_path,
+                ssh_identity_file,
+                known_hosts_path,
+            ) {
+                Ok(plan_summary) => {
+                    let summary = format!(
+                        "macOS anchor bundle-pull live proof unavailable ({live_reason}); fell back to dry-run plan: {plan_summary}"
+                    );
+                    let _ = std::fs::write(&macos_anchor_bundle_pull_log_path, summary.as_str());
+                    stage_outcome(
+                        "validate_macos_anchor_bundle_pull",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![macos_anchor_bundle_pull_log_path.clone()],
+                    )
+                }
+                Err(plan_reason) => {
+                    let reason = format!(
+                        "macOS anchor bundle-pull live proof failed for {macos_alias}: {live_reason}; dry-run fallback also failed: {plan_reason}"
+                    );
+                    let _ = std::fs::write(&macos_anchor_bundle_pull_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_macos_anchor_bundle_pull",
+                        VmLabStageStatus::Fail,
+                        reason,
+                        vec![macos_anchor_bundle_pull_log_path.clone()],
+                    )
+                }
+            },
         }
     };
     outcomes.push(macos_anchor_bundle_pull_outcome);
@@ -9378,6 +9407,152 @@ fn exercise_macos_anchor_bundle_pull_plan_dry_run(
     Ok(format!(
         "macOS anchor bundle-pull dry-run plan verified on {macos_alias}: anchor capabilities + loopback listener plan present"
     ))
+}
+
+/// Live macOS anchor bundle-pull validator (sub-test A1.2 parity).
+///
+/// Drives the dedicated `live_macos_anchor_test` bin (via its bash
+/// wrapper) against the macOS anchor guest. The bin SSHes to the guest,
+/// presents the genesis-seeded authority token over the loopback
+/// bundle-pull listener, and asserts the served bytes match the signed
+/// membership snapshot byte-for-byte, plus every fail-closed control
+/// (wrong/short token rejected, LAN bind refused, no raw token in the
+/// served bytes). It writes a typed JSON report which this exerciser
+/// parses to surface a single-line summary and to confirm overall pass.
+fn exercise_macos_anchor_bundle_pull_live(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    report_dir: &Path,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[macos_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {macos_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let inventory = load_inventory(inventory_path)?;
+    let macos_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == macos_alias)
+        .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?;
+    let node_id = macos_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {macos_alias:?} has no node_id"))?
+        .to_owned();
+    // `resolve_remote_targets` yields a bare host for a live-discovered macOS
+    // guest (inventory `ssh_target` is the IP and `ssh_user` is a separate
+    // field). Compose user@host from the inventory ssh_user (e.g. `mac`) so the
+    // live test SSHes as the guest account, not the local operator (`whoami`).
+    let anchor_ssh_user = target.ssh_user.as_deref().or(macos_entry.ssh_user.as_deref());
+    let anchor_host = normalized_ssh_target(&target.ssh_target, anchor_ssh_user, macos_alias)?;
+
+    let wrapper = workspace_root_path().join("scripts/e2e/live_macos_anchor_bundle_pull_test.sh");
+    if !wrapper.is_file() {
+        return Err(format!(
+            "macOS anchor bundle-pull live wrapper missing at {}",
+            wrapper.display()
+        ));
+    }
+    std::fs::create_dir_all(report_dir)
+        .map_err(|err| format!("create report dir {} failed: {err}", report_dir.display()))?;
+    let report_path = report_dir.join("live_macos_anchor_bundle_pull_report.json");
+    let log_path = report_dir.join("live_macos_anchor_bundle_pull.log");
+
+    let mut command = Command::new("bash");
+    command.current_dir(workspace_root_path());
+    command.arg(&wrapper);
+    command.arg("--anchor-host").arg(&anchor_host);
+    command.arg("--anchor-node-id").arg(&node_id);
+    command.arg("--ssh-identity-file").arg(ssh_identity_file);
+    if let Some(known_hosts) = known_hosts_path {
+        command.arg("--known-hosts").arg(known_hosts);
+    }
+    command.arg("--report-path").arg(&report_path);
+    command.arg("--log-path").arg(&log_path);
+
+    let output = command
+        .output()
+        .map_err(|err| format!("spawn macOS anchor bundle-pull live wrapper failed: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "live_macos_anchor_test exited {} on {macos_alias}: {}{}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim(),
+            stdout.trim()
+        ));
+    }
+
+    let report_body = std::fs::read_to_string(&report_path).map_err(|err| {
+        format!(
+            "read macOS anchor bundle-pull report {} failed: {err}",
+            report_path.display()
+        )
+    })?;
+    validate_macos_anchor_bundle_pull_report(&report_body, macos_alias)?;
+    Ok(format!(
+        "macOS anchor bundle-pull live-proven on {macos_alias}: node_id={node_id} bind=127.0.0.1:51822 \
+         (loopback byte-for-byte + token gate + LAN refused + secrets hygiene); report={}",
+        report_path.display()
+    ))
+}
+
+/// Pure validator for the `live_macos_anchor_test` JSON report. Asserts
+/// the overall status is `pass` AND every one of the four bundle-pull
+/// controls (loopback byte-for-byte, token gate, LAN-bind refusal,
+/// secrets hygiene) reported `pass` (not `skipped`) — a skipped control
+/// would be a silent coverage gap. Extracted so a contract test can pin
+/// the consumption logic without an SSH round-trip.
+fn validate_macos_anchor_bundle_pull_report(
+    report_body: &str,
+    macos_alias: &str,
+) -> Result<(), String> {
+    let parsed: serde_json::Value = serde_json::from_str(report_body)
+        .map_err(|err| format!("parse macOS anchor bundle-pull report failed: {err}"))?;
+    if parsed.get("stage").and_then(|value| value.as_str()) != Some("live_macos_anchor_bundle_pull")
+    {
+        return Err("macOS anchor bundle-pull report has unexpected stage tag".to_owned());
+    }
+    if parsed.get("status").and_then(|value| value.as_str()) != Some("pass") {
+        return Err(format!(
+            "macOS anchor bundle-pull report status was not pass: {}",
+            parsed
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("<missing>")
+        ));
+    }
+    let required = [
+        "validate_macos_anchor_bundle_pull_loopback",
+        "validate_macos_anchor_bundle_pull_token_gate",
+        "validate_macos_anchor_bundle_pull_lan_refused",
+        "validate_macos_anchor_bundle_pull_secrets_hygiene",
+    ];
+    let subchecks = parsed
+        .get("subchecks")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "macOS anchor bundle-pull report missing subchecks array".to_owned())?;
+    for name in required {
+        let passed = subchecks.iter().any(|entry| {
+            entry.get("name").and_then(|value| value.as_str()) == Some(name)
+                && entry.get("status").and_then(|value| value.as_str()) == Some("pass")
+        });
+        if !passed {
+            return Err(format!(
+                "macOS anchor bundle-pull control {name} did not pass on {macos_alias}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn exercise_linux_anchor_bundle_pull_plan_dry_run(
@@ -33339,6 +33514,72 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             .expect_err("missing bundle-pull capability must fail closed");
         assert!(
             err.contains("anchor.bundle_pull"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── macOS anchor bundle-pull LIVE report consumption contract ───────
+
+    fn reviewed_macos_anchor_bundle_pull_report() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "stage": "live_macos_anchor_bundle_pull",
+            "status": "pass",
+            "platform": "macos",
+            "subchecks": [
+                { "name": "validate_macos_anchor_bundle_pull_loopback", "status": "pass" },
+                { "name": "validate_macos_anchor_bundle_pull_token_gate", "status": "pass" },
+                { "name": "validate_macos_anchor_bundle_pull_lan_refused", "status": "pass" },
+                { "name": "validate_macos_anchor_bundle_pull_secrets_hygiene", "status": "pass" }
+            ]
+        })
+    }
+
+    #[test]
+    fn validate_macos_anchor_bundle_pull_report_accepts_reviewed_pass() {
+        let body = reviewed_macos_anchor_bundle_pull_report().to_string();
+        super::validate_macos_anchor_bundle_pull_report(&body, "macos-utm-1")
+            .expect("reviewed macOS anchor bundle-pull report should validate");
+    }
+
+    #[test]
+    fn validate_macos_anchor_bundle_pull_report_rejects_overall_fail() {
+        let mut payload = reviewed_macos_anchor_bundle_pull_report();
+        payload["status"] = serde_json::Value::from("fail");
+        let err =
+            super::validate_macos_anchor_bundle_pull_report(&payload.to_string(), "macos-utm-1")
+                .expect_err("overall-fail report must be rejected");
+        assert!(
+            err.contains("status was not pass"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_macos_anchor_bundle_pull_report_rejects_skipped_lan_control() {
+        // A skipped LAN-bind-refusal control is a silent coverage gap and
+        // must fail the consumer — the loopback-only boundary has to be
+        // asserted live, not skipped.
+        let mut payload = reviewed_macos_anchor_bundle_pull_report();
+        payload["subchecks"][2]["status"] = serde_json::Value::from("skipped");
+        let err =
+            super::validate_macos_anchor_bundle_pull_report(&payload.to_string(), "macos-utm-1")
+                .expect_err("skipped LAN control must be rejected");
+        assert!(
+            err.contains("validate_macos_anchor_bundle_pull_lan_refused"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_macos_anchor_bundle_pull_report_rejects_wrong_stage_tag() {
+        let mut payload = reviewed_macos_anchor_bundle_pull_report();
+        payload["stage"] = serde_json::Value::from("live_anchor");
+        let err =
+            super::validate_macos_anchor_bundle_pull_report(&payload.to_string(), "macos-utm-1")
+                .expect_err("wrong stage tag must be rejected");
+        assert!(
+            err.contains("unexpected stage tag"),
             "unexpected error: {err}"
         );
     }
