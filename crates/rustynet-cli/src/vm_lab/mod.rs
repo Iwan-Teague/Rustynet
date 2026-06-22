@@ -8319,18 +8319,26 @@ fn run_macos_orchestration_stages(
 
             let pubkey_hex = macos_wg_pubkey_hex.as_deref().unwrap();
             let owner_approver_id = format!("{exit_node_id}-owner");
-            // Grant the capability the macOS node's elected role needs in
+            // Grant the capabilities the macOS node's elected role needs in
             // signed membership; the daemon fails closed (`forbidden`) for a
-            // node lacking the capability even with a valid token. The CSV is a
-            // fixed, safe vocabulary string (canonical capability tokens) — no
-            // untrusted input.
-            // - elected exit: `exit_server` so the staged role transition can
-            //   advertise 0.0.0.0/0 and the daemon will serve as a regular exit.
+            // node lacking a required capability even with a valid token. The
+            // CSV is a fixed, safe vocabulary string (canonical capability
+            // tokens) — no untrusted input.
+            // - elected exit: `anchor` + `exit_server`. A regular exit serves by
+            //   elevating its primary role to admin and advertising 0.0.0.0/0,
+            //   and the daemon's Admin role requires the `anchor` membership
+            //   capability (NodeRole::Admin => [RoleCapability::Anchor]) — so
+            //   without `anchor` the `role set admin` step fails closed. The
+            //   `exit_server` capability marks the node as a consumable exit
+            //   (peer-visibility, so assignment bundles can name it as an exit);
+            //   it does NOT gate the local serve path (that is admin role +
+            //   advertised 0.0.0.0/0), but it is the correct, complete grant for
+            //   a usable exit.
             // - elected anchor: `anchor.bundle_pull` so the loopback bundle-pull
             //   listener actually serves.
             // - otherwise: client-only.
             let macos_capabilities = if is_macos_active_exit {
-                "client,exit_server"
+                "client,anchor,exit_server"
             } else if is_macos_elected_anchor {
                 "client,anchor.bundle_pull"
             } else {
