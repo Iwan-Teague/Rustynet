@@ -6750,6 +6750,7 @@ impl DaemonRuntime {
                 protected_dns: true,
                 ipv6_parity_supported: false,
                 serve_exit_node,
+                blind_exit: self.node_role.is_blind_exit(),
                 exit_mode: if self.node_role.is_blind_exit() {
                     ExitMode::Off
                 } else if self.auto_tunnel_enforce {
@@ -8198,6 +8199,7 @@ impl DaemonRuntime {
                     protected_dns: true,
                     ipv6_parity_supported: false,
                     serve_exit_node,
+                    blind_exit: self.node_role.is_blind_exit(),
                     exit_mode: if self.node_role.is_blind_exit() {
                         ExitMode::Off
                     } else if self.auto_tunnel_enforce {
