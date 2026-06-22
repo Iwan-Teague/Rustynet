@@ -7729,6 +7729,10 @@ fn run_windows_orchestration_with_pulled_bundles(
     let mut options = WindowsOrchestrationOptions {
         no_fail_on_authenticode: config.no_fail_on_authenticode,
         promote_to_active_exit: promote_windows_to_active_exit,
+        validate_admin_issue: config
+            .admin_platform
+            .as_deref()
+            .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
         ..WindowsOrchestrationOptions::default()
     };
 
@@ -10620,6 +10624,13 @@ pub struct WindowsOrchestrationOptions {
     /// *capable* of exit-serving, but the active mesh exit stays on
     /// the Linux alias.
     pub promote_to_active_exit: bool,
+    /// Elect the Windows host as the admin role (`--admin-platform windows`).
+    /// When true the orchestrator runs `validate_windows_admin_issue`: the
+    /// Windows node mints its own assignment signing authority and issues a
+    /// cryptographically signed assignment bundle on the guest — the live proof
+    /// the mint/issue/sign path runs natively on Windows. Default (false) skips
+    /// it. Self-contained: needs no exit/peer.
+    pub validate_admin_issue: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12272,6 +12283,68 @@ fn run_windows_orchestration_stages_with_options(
         }
     };
 
+    // ── Stage: validate_windows_admin_issue ──────────────────────────────
+    //
+    // Prove the Windows node can act as ADMIN: mint its own assignment signing
+    // authority and issue a cryptographically signed assignment bundle on the
+    // guest (the Windows analogue of validate_macos_admin_issue). `assignment
+    // issue` signs internally and fails closed on a bad key, so a non-empty
+    // signed bundle + verifier key is the live proof. Runs only when elected
+    // (--admin-platform windows) and the node joined the mesh. FAIL-LOUD.
+    let windows_admin_issue_log_path = logs_dir.join("validate_windows_admin_issue.log");
+    let windows_admin_issue_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_admin_issue",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would mint signing authority + issue a signed assignment bundle on {windows_alias}"
+            ),
+            vec![],
+        )
+    } else if !options.validate_admin_issue {
+        stage_outcome(
+            "validate_windows_admin_issue",
+            VmLabStageStatus::Skipped,
+            format!(
+                "skipped: {windows_alias} is not the elected admin (admin_platform != windows)"
+            ),
+            vec![],
+        )
+    } else if mesh_join_outcome.status != VmLabStageStatus::Pass {
+        stage_outcome(
+            "validate_windows_admin_issue",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_mesh_join did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        match exercise_windows_admin_issue_live(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&windows_admin_issue_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_windows_admin_issue",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![windows_admin_issue_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&windows_admin_issue_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_windows_admin_issue",
+                    VmLabStageStatus::Fail,
+                    format!("Windows admin live issue failed for {windows_alias}: {reason}"),
+                    vec![windows_admin_issue_log_path.clone()],
+                )
+            }
+        }
+    };
+
     vec![
         bootstrap_outcome,
         validate_outcome,
@@ -12289,6 +12362,7 @@ fn run_windows_orchestration_stages_with_options(
         exit_killswitch_outcome,
         windows_relay_lifecycle_outcome,
         windows_anchor_bundle_pull_outcome,
+        windows_admin_issue_outcome,
         amend_membership_outcome,
         issue_windows_assignment_outcome,
         distribute_membership_outcome,
@@ -12300,6 +12374,86 @@ fn run_windows_orchestration_stages_with_options(
         distribute_dns_zone_outcome,
         mesh_join_outcome,
     ]
+}
+
+/// Prove the Windows node can act as ADMIN by minting its own assignment
+/// signing authority and issuing a cryptographically signed assignment bundle
+/// on the guest — the Windows analogue of `exercise_macos_admin_issue_live`,
+/// using the platform-neutral `assignment init-signing-secret` + `assignment
+/// issue` verbs via PowerShell. The passphrase is a 64-hex-char throwaway
+/// written to the per-invocation work dir; `assignment issue` signs internally
+/// and fails closed on a bad key, so a non-empty signed bundle + verifier key
+/// is the live proof the mint/issue/sign path runs natively on Windows.
+fn exercise_windows_admin_issue_live(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let windows_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == windows_alias)
+        .ok_or_else(|| format!("Windows alias {windows_alias:?} not found in inventory"))?
+        .clone();
+    if windows_entry.platform_profile().platform != VmGuestPlatform::Windows {
+        return Err(format!(
+            "alias {windows_alias} resolved to non-Windows platform: {}",
+            windows_entry.platform_profile().platform.as_str()
+        ));
+    }
+    let node_id = windows_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {windows_alias:?} has no node_id"))?
+        .to_owned();
+    validate_mesh_node_id(node_id.as_str())?;
+    let target = remote_target_from_inventory_entry(&windows_entry, None);
+
+    // node_id is a validated mesh id; the work dir/passphrase/secret live under
+    // the per-invocation TEMP dir and are removed after. The PS script
+    // fail-closes ($ErrorActionPreference=Stop + explicit $LASTEXITCODE checks).
+    let issue_script = format!(
+        "$ErrorActionPreference='Stop'; \
+         $rn='{cli}'; \
+         $work=Join-Path $env:TEMP ('rn-admin-'+[guid]::NewGuid().ToString('N')); \
+         New-Item -ItemType Directory -Force -Path $work | Out-Null; \
+         $pass=Join-Path $work 'pass'; \
+         [IO.File]::WriteAllText($pass,([guid]::NewGuid().ToString('N')+[guid]::NewGuid().ToString('N'))); \
+         $secret=Join-Path $work 'secret'; \
+         & $rn assignment init-signing-secret --output $secret --signing-secret-passphrase-file $pass --force; \
+         if($LASTEXITCODE -ne 0){{throw 'init-signing-secret failed'}}; \
+         $b=[Convert]::FromBase64String((Get-Content -LiteralPath 'C:\\ProgramData\\RustyNet\\keys\\wireguard.pub' -Raw).Trim()); \
+         $pubhex=-join($b|%{{$_.ToString('x2')}}); \
+         $nid='{node_id}'; \
+         $nodes=\"$nid|127.0.0.1:51820|$pubhex|$nid|$nid|windows||client\"; \
+         $allow=\"$nid|$nid\"; \
+         $bundle=Join-Path $work 'bundle'; $vpub=Join-Path $work 'vpub'; \
+         & $rn assignment issue --target-node-id $nid --nodes $nodes --allow $allow --signing-secret $secret --signing-secret-passphrase-file $pass --output $bundle --verifier-key-output $vpub --ttl-secs 300; \
+         if($LASTEXITCODE -ne 0){{throw 'assignment issue failed'}}; \
+         if(-not(Test-Path $bundle) -or (Get-Item $bundle).Length -eq 0){{throw 'issued bundle missing or empty'}}; \
+         if(-not(Test-Path $vpub) -or (Get-Item $vpub).Length -eq 0){{throw 'verifier key missing or empty'}}; \
+         $bytes=(Get-Item $bundle).Length; \
+         Remove-Item -Recurse -Force $work; \
+         Write-Output \"minted signing authority + issued a signed assignment bundle ($bytes bytes)\"",
+        cli = WINDOWS_RUSTYNETD_CLI_PATH,
+        node_id = node_id,
+    );
+
+    let out = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        issue_script.as_str(),
+        Duration::from_secs(120),
+    )
+    .map_err(|e| format!("Windows admin issue on {windows_alias} failed: {e}"))?;
+
+    Ok(format!(
+        "Windows admin live-proven on {windows_alias}: node_id={node_id} {}",
+        out.trim()
+    ))
 }
 
 /// Path of the installed `rustynetd.exe` on Windows guests, mirroring
