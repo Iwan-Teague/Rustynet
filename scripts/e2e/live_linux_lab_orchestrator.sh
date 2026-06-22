@@ -2964,7 +2964,15 @@ root chown root:wheel /private/tmp
 root chmod 1777 /private/tmp
 root launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
 root launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
+# The anchor + relay role profiles compose the same daemon/state; a prior run's
+# role deploy (deploy_macos_anchor_profile / install-macos-relay) leaves these
+# LaunchDaemons loaded. Without booting them out the next bootstrap's
+# com.rustynet.daemon cannot start (state/socket/port contention) and mesh-join
+# fails. Bootout both so cleanup fully resets the launchd surface.
+root launchctl bootout system/com.rustynet.anchor 2>/dev/null || true
+root launchctl bootout system/com.rustynet.relay 2>/dev/null || true
 root pkill -9 rustynetd 2>/dev/null || true
+root pkill -9 rustynet-relay 2>/dev/null || true
 sleep 1
 # Flush any pf rules the privileged-helper loaded. SIGKILL does not allow
 # the helper to run its cleanup path, so pf rules accumulate across retries
@@ -2972,7 +2980,9 @@ sleep 1
 # to restore plain connectivity; the bootstrap/daemon will re-enable it.
 root pfctl -F all -d 2>/dev/null || true
 root rm -f /Library/LaunchDaemons/com.rustynet.daemon.plist \
-      /Library/LaunchDaemons/com.rustynet.privileged-helper.plist
+      /Library/LaunchDaemons/com.rustynet.privileged-helper.plist \
+      /Library/LaunchDaemons/com.rustynet.anchor.plist \
+      /Library/LaunchDaemons/com.rustynet.relay.plist
 root rm -rf /usr/local/var/rustynet /usr/local/etc/rustynet \
        /usr/local/var/log/rustynet /private/var/run/rustynet
 # Best-effort interface cleanup — utun devices are torn down when the
