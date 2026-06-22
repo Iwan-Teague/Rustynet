@@ -66,6 +66,10 @@ use crate::macos_blind_exit::{
     build_macos_blind_exit_pf_rules, evaluate_macos_blind_exit_pf_rules,
     is_macos_blind_exit_anchor,
 };
+use crate::macos_exit_nat::{
+    DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR, MacosExitNatPfConfig, build_macos_exit_nat_pf_rules,
+    evaluate_macos_exit_nat_pf_rules,
+};
 use crate::privileged_helper::{
     PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram, validate_request,
 };
@@ -335,6 +339,14 @@ pub struct ApplyOptions {
     pub ipv6_parity_supported: bool,
     pub exit_mode: ExitMode,
     pub serve_exit_node: bool,
+    /// True only for the irreversible `blind_exit` role. Distinguishes a
+    /// blind exit (blocks internet egress, relays mesh only) from a regular
+    /// NATing exit — both have `serve_exit_node = true` and typically
+    /// `exit_mode = Off`, so the role cannot be inferred from those two
+    /// fields alone. macOS keys its blind-vs-regular exit dataplane on this
+    /// flag; Linux/Windows ignore it (their blind-exit posture is handled on
+    /// other paths).
+    pub blind_exit: bool,
 }
 
 impl Default for ApplyOptions {
@@ -344,6 +356,7 @@ impl Default for ApplyOptions {
             ipv6_parity_supported: false,
             exit_mode: ExitMode::Off,
             serve_exit_node: false,
+            blind_exit: false,
         }
     }
 }
@@ -490,6 +503,7 @@ pub trait DataplaneSystem {
         &mut self,
         serve_exit_node: bool,
         exit_mode: ExitMode,
+        blind_exit: bool,
         mesh_cidr: &str,
     ) -> Result<(), SystemError>;
     fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError>;
@@ -618,10 +632,11 @@ impl DataplaneSystem for DryRunSystem {
         &mut self,
         serve_exit_node: bool,
         exit_mode: ExitMode,
+        blind_exit: bool,
         mesh_cidr: &str,
     ) -> Result<(), SystemError> {
         self.operations.push(format!(
-            "apply_nat_forwarding:serve_exit_node={serve_exit_node}:exit_mode={}:mesh_cidr={mesh_cidr}",
+            "apply_nat_forwarding:serve_exit_node={serve_exit_node}:exit_mode={}:blind_exit={blind_exit}:mesh_cidr={mesh_cidr}",
             match exit_mode {
                 ExitMode::Off => "off",
                 ExitMode::FullTunnel => "full_tunnel",
@@ -1996,6 +2011,7 @@ impl DataplaneSystem for LinuxCommandSystem {
         &mut self,
         _serve_exit_node: bool,
         _exit_mode: ExitMode,
+        _blind_exit: bool,
         _mesh_cidr: &str,
     ) -> Result<(), SystemError> {
         self.prior_ipv4_forwarding = Some(Self::read_sysctl_bool(
@@ -2331,6 +2347,14 @@ pub struct MacosCommandSystem {
     traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
     managed_peer_egress_endpoints: Vec<SocketAddr>,
     blind_exit_pf_config: Option<MacosBlindExitPfConfig>,
+    /// The regular-exit NAT translation anchor (`com.rustynet/nat`) once
+    /// loaded, distinct from `anchor_name` (the killswitch filter anchor).
+    /// `Some` means the exit NAT is active and teardown must flush it.
+    exit_nat_anchor: Option<String>,
+    /// The `net.inet.ip.forwarding` value captured before the exit enabled
+    /// forwarding, so teardown can restore the exact prior state instead of
+    /// blindly forcing it off.
+    prior_ip_forwarding: Option<String>,
 }
 
 impl MacosCommandSystem {
@@ -2366,6 +2390,8 @@ impl MacosCommandSystem {
             traversal_bootstrap_allow_endpoints: Vec::new(),
             managed_peer_egress_endpoints: Vec::new(),
             blind_exit_pf_config: None,
+            exit_nat_anchor: None,
+            prior_ip_forwarding: None,
         })
     }
 
@@ -2697,6 +2723,136 @@ impl MacosCommandSystem {
             );
         }
     }
+
+    /// Enable IPv4 forwarding and load the regular-exit NAT translation anchor
+    /// (`com.rustynet/nat`). Caches the prior forwarding value for fail-closed
+    /// restore. Forwarding is enabled before the anchor loads (mirroring the
+    /// Linux ordering); on any failure the forwarding flip and a partial load
+    /// are rolled back, leaving the killswitch `block drop out quick all` in
+    /// force so egress stays blocked.
+    fn activate_exit_nat(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        let config =
+            MacosExitNatPfConfig::new(self.egress_interface.clone(), vec![mesh_cidr.to_owned()])
+                .map_err(SystemError::NatApplyFailed)?;
+        let rules = build_macos_exit_nat_pf_rules(&config).map_err(SystemError::NatApplyFailed)?;
+
+        // Cache the prior forwarding state, then enable forwarding FIRST.
+        let prior = self
+            .run_capture(
+                PrivilegedCommandProgram::Sysctl,
+                &["-n", "net.inet.ip.forwarding"],
+            )
+            .ok()
+            .filter(|out| out.success())
+            .map(|out| out.stdout.trim().to_owned())
+            .unwrap_or_else(|| "0".to_owned());
+        self.run(
+            PrivilegedCommandProgram::Sysctl,
+            &["-w", "net.inet.ip.forwarding=1"],
+        )
+        .map_err(|err| {
+            SystemError::NatApplyFailed(format!("enable macOS ip forwarding failed: {err}"))
+        })?;
+        self.prior_ip_forwarding = Some(prior);
+
+        let anchor = DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR;
+        let tmp_path = match write_pf_rules_temp_file_securely(&rules, self.generation) {
+            Ok(path) => path,
+            Err(err) => {
+                let _ = self.restore_ip_forwarding();
+                return Err(err);
+            }
+        };
+        let load_result = self.load_exit_nat_anchor(anchor, tmp_path.as_path());
+        let _ = fs::remove_file(&tmp_path);
+        if let Err(err) = load_result {
+            let _ = self.restore_ip_forwarding();
+            return Err(err);
+        }
+        self.exit_nat_anchor = Some(anchor.to_owned());
+
+        // Verify the loaded translation rules match the reviewed shape; on
+        // drift tear the NAT back down (anchor + forwarding) and fail closed.
+        if let Err(err) = self.verify_exit_nat_anchor(anchor, &config) {
+            let _ = self.teardown_exit_nat();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn load_exit_nat_anchor(&self, anchor: &str, tmp_path: &Path) -> Result<(), SystemError> {
+        let tmp = tmp_path
+            .to_str()
+            .ok_or_else(|| SystemError::NatApplyFailed("exit NAT pf temp path utf8".to_owned()))?;
+        // Parse-check before committing the load.
+        self.run(
+            PrivilegedCommandProgram::Pfctl,
+            &["-n", "-a", anchor, "-f", tmp],
+        )
+        .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
+        self.run(PrivilegedCommandProgram::Pfctl, &["-a", anchor, "-f", tmp])
+            .map_err(|err| SystemError::NatApplyFailed(err.to_string()))
+    }
+
+    fn verify_exit_nat_anchor(
+        &self,
+        anchor: &str,
+        config: &MacosExitNatPfConfig,
+    ) -> Result<(), SystemError> {
+        let output = self
+            .run_capture(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", anchor, "-s", "nat"],
+            )
+            .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
+        if !output.success() {
+            return Err(SystemError::NatApplyFailed(format!(
+                "exit NAT verification query failed: status={} stderr={}",
+                output.status, output.stderr
+            )));
+        }
+        let reasons = evaluate_macos_exit_nat_pf_rules(output.stdout.as_str(), config);
+        if !reasons.is_empty() {
+            return Err(SystemError::NatApplyFailed(format!(
+                "exit NAT verification failed: {}",
+                reasons.join("; ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Tear down the regular-exit NAT: flush the translation anchor FIRST, then
+    /// restore forwarding to its cached prior value. Order mirrors the Linux
+    /// rollback (delete NAT, then restore forwarding) and keeps the killswitch
+    /// block-all installed throughout, so egress stays fail-closed mid-teardown.
+    fn teardown_exit_nat(&mut self) -> Result<(), SystemError> {
+        if let Some(anchor) = self.exit_nat_anchor.take() {
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", anchor.as_str(), "-F", "all"],
+            );
+        }
+        self.restore_ip_forwarding()
+    }
+
+    /// Restore `net.inet.ip.forwarding` to the value cached before the exit
+    /// enabled it. No-op when nothing was cached.
+    fn restore_ip_forwarding(&mut self) -> Result<(), SystemError> {
+        if let Some(prior) = self.prior_ip_forwarding.take() {
+            let arg = if prior.trim() == "1" {
+                "net.inet.ip.forwarding=1"
+            } else {
+                "net.inet.ip.forwarding=0"
+            };
+            self.run(PrivilegedCommandProgram::Sysctl, &["-w", arg])
+                .map_err(|err| {
+                    SystemError::RollbackFailed(format!(
+                        "restore macOS ip forwarding failed: {err}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
 }
 
 impl DataplaneSystem for MacosCommandSystem {
@@ -2791,10 +2947,19 @@ impl DataplaneSystem for MacosCommandSystem {
     fn apply_nat_forwarding(
         &mut self,
         serve_exit_node: bool,
-        exit_mode: ExitMode,
+        _exit_mode: ExitMode,
+        blind_exit: bool,
         mesh_cidr: &str,
     ) -> Result<(), SystemError> {
-        if serve_exit_node && matches!(exit_mode, ExitMode::Off) {
+        // The blind-vs-regular exit decision is keyed on the explicit
+        // `blind_exit` flag, NOT on `exit_mode == Off`: a regular NATing exit
+        // is also `serve_exit_node = true` with `exit_mode = Off`, so the old
+        // proxy conflated the two and made a regular macOS exit impossible to
+        // express.
+        if serve_exit_node && blind_exit {
+            // Irreversible blind exit: blocks internet egress and relays mesh
+            // only. No NAT translation and no IP forwarding — the blind_exit
+            // filter anchor is the entire posture.
             let config = MacosBlindExitPfConfig::new(
                 self.interface_name.clone(),
                 self.egress_interface.clone(),
@@ -2803,12 +2968,30 @@ impl DataplaneSystem for MacosCommandSystem {
             .map_err(SystemError::NatApplyFailed)?;
             self.blind_exit_pf_config = Some(config);
             self.allow_egress_interface = false;
-        } else {
-            self.blind_exit_pf_config = None;
-            self.allow_egress_interface = true;
+            return self
+                .apply_pf_rules(false)
+                .map_err(|err| SystemError::NatApplyFailed(err.to_string()));
         }
+
+        self.blind_exit_pf_config = None;
+        self.allow_egress_interface = true;
+        // Load the killswitch filter anchor (egress pass + terminal
+        // `block drop out quick all`) BEFORE touching NAT so that if NAT
+        // activation fails, egress stays blocked (fail-closed).
         self.apply_pf_rules(false)
-            .map_err(|err| SystemError::NatApplyFailed(err.to_string()))
+            .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
+
+        if serve_exit_node {
+            // Regular NATing exit: enable IPv4 forwarding and load the
+            // com.rustynet/nat translation anchor.
+            self.activate_exit_nat(mesh_cidr)?;
+        } else {
+            // Full-tunnel client consuming a remote exit: no local NAT or
+            // forwarding. Tear down any exit NAT left from a prior generation
+            // so a former exit that became a client leaves no residue.
+            self.teardown_exit_nat()?;
+        }
+        Ok(())
     }
 
     fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError> {
@@ -2817,6 +3000,11 @@ impl DataplaneSystem for MacosCommandSystem {
                 .apply_pf_rules(false)
                 .map_err(|err| SystemError::RollbackFailed(err.to_string()));
         }
+        // Tear down the exit NAT (flush the translation anchor, then restore
+        // forwarding) BEFORE relaxing the filter, so NAT residue never
+        // outlives the exit capability (CLAUDE.md §10.7). The killswitch
+        // block-all stays installed throughout.
+        self.teardown_exit_nat()?;
         self.allow_egress_interface = false;
         self.apply_pf_rules(false)
             .map_err(|err| SystemError::RollbackFailed(err.to_string()))
@@ -3694,6 +3882,7 @@ impl DataplaneSystem for WindowsCommandSystem {
         &mut self,
         serve_exit_node: bool,
         _exit_mode: ExitMode,
+        _blind_exit: bool,
         mesh_cidr: &str,
     ) -> Result<(), SystemError> {
         if !serve_exit_node {
@@ -4113,20 +4302,21 @@ impl DataplaneSystem for RuntimeSystem {
         &mut self,
         serve_exit_node: bool,
         exit_mode: ExitMode,
+        blind_exit: bool,
         mesh_cidr: &str,
     ) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => {
-                system.apply_nat_forwarding(serve_exit_node, exit_mode, mesh_cidr)
+                system.apply_nat_forwarding(serve_exit_node, exit_mode, blind_exit, mesh_cidr)
             }
             RuntimeSystem::Linux(system) => {
-                system.apply_nat_forwarding(serve_exit_node, exit_mode, mesh_cidr)
+                system.apply_nat_forwarding(serve_exit_node, exit_mode, blind_exit, mesh_cidr)
             }
             RuntimeSystem::Macos(system) => {
-                system.apply_nat_forwarding(serve_exit_node, exit_mode, mesh_cidr)
+                system.apply_nat_forwarding(serve_exit_node, exit_mode, blind_exit, mesh_cidr)
             }
             RuntimeSystem::Windows(system) => {
-                system.apply_nat_forwarding(serve_exit_node, exit_mode, mesh_cidr)
+                system.apply_nat_forwarding(serve_exit_node, exit_mode, blind_exit, mesh_cidr)
             }
         }
     }
@@ -4560,6 +4750,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             self.system.apply_nat_forwarding(
                 options.serve_exit_node,
                 options.exit_mode,
+                options.blind_exit,
                 mesh_cidr,
             )?;
             applied_stages.push(StageMarker::NatApplied);
@@ -9112,6 +9303,7 @@ mod tests {
             &mut system,
             false,
             ExitMode::FullTunnel,
+            false,
             "100.64.0.0/10",
         )
         .expect("windows full-tunnel consumer should not require local NAT");
