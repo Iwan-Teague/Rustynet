@@ -7910,6 +7910,22 @@ fn parse_membership_active_nodes(output: &str) -> Option<u64> {
 /// amendment stage gates on whether the Linux distribute_* stages passed so
 /// that the macOS node is only added to a mesh that already has a complete
 /// signed bundle set.
+/// Select the signed-membership capability CSV granted to the macOS node based
+/// on its elected role. A regular exit assumes the Admin primary role, which
+/// the daemon requires the `anchor` capability for (`NodeRole::Admin =>
+/// [RoleCapability::Anchor]`), so the exit grant MUST include `anchor` or the
+/// `role set admin` step fails closed; `exit_server` marks it a consumable
+/// exit. Returns a fixed, reviewed vocabulary string (no untrusted input).
+fn macos_membership_capabilities(is_active_exit: bool, is_elected_anchor: bool) -> &'static str {
+    if is_active_exit {
+        "client,anchor,exit_server"
+    } else if is_elected_anchor {
+        "client,anchor.bundle_pull"
+    } else {
+        "client"
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_macos_orchestration_stages(
     config: &VmLabOrchestrateLiveLabConfig,
@@ -8337,13 +8353,8 @@ fn run_macos_orchestration_stages(
             // - elected anchor: `anchor.bundle_pull` so the loopback bundle-pull
             //   listener actually serves.
             // - otherwise: client-only.
-            let macos_capabilities = if is_macos_active_exit {
-                "client,anchor,exit_server"
-            } else if is_macos_elected_anchor {
-                "client,anchor.bundle_pull"
-            } else {
-                "client"
-            };
+            let macos_capabilities =
+                macos_membership_capabilities(is_macos_active_exit, is_macos_elected_anchor);
             let add_script = format!(
                 "set -eu; sudo -n rustynet ops e2e-membership-add \
                  --client-node-id {node_id} \
@@ -28151,6 +28162,34 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn macos_membership_capabilities_grants_anchor_for_exit() {
+        // Regression: a regular macOS exit assumes the Admin primary role, which
+        // the daemon requires the `anchor` capability for. The grant MUST include
+        // `anchor` (else `role set admin` fails closed) and `exit_server`.
+        let exit = super::macos_membership_capabilities(true, false);
+        assert!(
+            exit.split(',').any(|c| c == "anchor"),
+            "exit grant must include anchor (Admin role requirement): {exit}"
+        );
+        assert!(
+            exit.split(',').any(|c| c == "exit_server"),
+            "exit grant must include exit_server: {exit}"
+        );
+
+        // Anchor election and the client default are unchanged.
+        assert_eq!(
+            super::macos_membership_capabilities(false, true),
+            "client,anchor.bundle_pull"
+        );
+        assert_eq!(super::macos_membership_capabilities(false, false), "client");
+        // Exit election takes precedence over anchor election.
+        assert_eq!(
+            super::macos_membership_capabilities(true, true),
+            "client,anchor,exit_server"
+        );
+    }
 
     #[test]
     fn macos_peer_list_mesh_join_rejects_empty_output() {
