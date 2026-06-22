@@ -7337,6 +7337,39 @@ stage_run_cross_network_nat_classification() {
   live_lab_run_root "$guest" "root bash /tmp/netns_nat_filter.sh" || return 1
 }
 
+# Tier A netns daemon-path Direct validator (D5.1 X1 Increment 2). Stands up two
+# real rustynetd daemons in two network namespaces behind full_cone NATs on the
+# exit guest, mints a minimal isolated signed control state locally, and proves
+# the client reaches path_mode=direct_active && path_live_proven=true over a real
+# cross-NAT WireGuard handshake (signed-state healthy, traversal_error=none). The
+# script builds + tears down its own rnsim-* topology and isolated daemons (trap
+# cleanup EXIT); production rustynetd is untouched. full_cone is required because
+# Increment 2 omits STUN — a port-stable DNAT'd NAT lets the static endpoint hint
+# reach the peer (port_restricted_cone/symmetric need reflexive discovery = a
+# later increment). Run as root on the exit guest; WARN tier (novel live daemon
+# bring-up — a transient must not abort the run).
+stage_run_cross_network_daemon_path() {
+  local guest tool local_path
+  guest="$(node_target_for_label exit)" || return 1
+  # netns prereqs (python3/nft/iproute2) PLUS wireguard; the rustynetd/rustynet
+  # binaries are resolved (and fail-closed checked) inside the script. No egress
+  # to install a missing tool, so fail fast with an actionable message.
+  if ! live_lab_run_root "$guest" "root python3 --version >/dev/null 2>&1 && root nft --version >/dev/null 2>&1 && root ip -V >/dev/null 2>&1 && root wg --version >/dev/null 2>&1"; then
+    printf 'cross_network_daemon_path: %s is missing python3/nft/iproute2/wireguard required by the netns daemon-path validator (no egress to install — bake into the guest image)\n' "$guest" >&2
+    return 1
+  fi
+  for tool in netns_internet_sim.sh netns_daemon_path.sh; do
+    local_path="$ROOT_DIR/scripts/vm_lab/$tool"
+    if [[ ! -f "$local_path" ]]; then
+      printf 'cross_network_daemon_path: missing tool %s\n' "$local_path" >&2
+      return 1
+    fi
+    live_lab_scp_to "$local_path" "$guest" "/tmp/$tool" || return 1
+  done
+  printf '[cross-network] netns daemon-path Direct validator (netns_daemon_path.sh, full_cone) on %s\n' "$guest"
+  live_lab_run_root "$guest" "root bash /tmp/netns_daemon_path.sh --sim /tmp/netns_internet_sim.sh --nat-profile full_cone" || return 1
+}
+
 stage_run_cross_network_nat_matrix() {
   local output_path="$REPORT_DIR/cross_network_remote_exit_nat_matrix_validation.md"
   cargo run --quiet -p rustynet-cli -- ops validate-cross-network-nat-matrix \
@@ -8567,6 +8600,7 @@ main() {
     if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
       cross_network_stage_rc="$stage_rc"
     fi
+    run_stage warn cross_network_daemon_path 'establish two rustynetd daemons through netns NAT and prove the Direct path (path_mode=direct_active) on full_cone (Tier A, D5.1 X1 Increment 2)' stage_run_cross_network_daemon_path
     local xn_netns_skip='substrate=netns: Tier A NAT-classification gate covers this; SSH remote-exit stages run on substrate=vxlan'
     record_stage_skip cross_network_preflight hard "$xn_netns_skip"
     for nat_idx in "${!CROSS_NETWORK_NAT_PROFILE_LIST[@]}"; do
