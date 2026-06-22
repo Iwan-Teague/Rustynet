@@ -1141,7 +1141,10 @@ fn is_allowed_ips_token(value: &str) -> bool {
 }
 
 fn is_anchor_name_token(value: &str) -> bool {
-    if !(value.starts_with("com.apple/rustynet_g") || value == "com.rustynet/blind_exit") {
+    if !(value.starts_with("com.apple/rustynet_g")
+        || value == "com.rustynet/blind_exit"
+        || value == "com.rustynet/nat")
+    {
         return false;
     }
     if !value
@@ -1726,6 +1729,15 @@ fn validate_sysctl_args(args: &[&str]) -> Result<(), String> {
             "-w",
             "net.ipv6.conf.all.disable_ipv6=1" | "net.ipv6.conf.all.disable_ipv6=0",
         ] => Ok(()),
+        // macOS IPv4 forwarding toggle for the regular exit NAT dataplane. The
+        // read form (`-n net.inet.ip.forwarding`) is used to cache the prior
+        // value for fail-closed restore on teardown. Only the exact `=1`/`=0`
+        // writes are permitted — arbitrary values stay default-denied.
+        [
+            "-w",
+            "net.inet.ip.forwarding=1" | "net.inet.ip.forwarding=0",
+        ] => Ok(()),
+        ["-n", "net.inet.ip.forwarding"] => Ok(()),
         _ => Err("unsupported sysctl argument schema".to_owned()),
     }
 }
@@ -1824,6 +1836,9 @@ fn validate_pfctl_args(args: &[&str]) -> Result<(), String> {
             Ok(())
         }
         ["-a", anchor, "-s", "rules"] if is_anchor_name_token(anchor) => Ok(()),
+        // Read-only NAT-rule show, used to verify the exit NAT anchor after
+        // load (the filter `-s rules` show is empty for a translation anchor).
+        ["-a", anchor, "-s", "nat"] if is_anchor_name_token(anchor) => Ok(()),
         _ => Err("unsupported pfctl argument schema".to_owned()),
     }
 }
@@ -1888,8 +1903,9 @@ mod tests {
         MAX_MESSAGE_BYTES, MAX_PROGRAM_BYTES, PrivilegedCommandProgram, decode_helper_request,
         encode_helper_request, handle_request, is_anchor_name_token, is_nft_token, is_path_token,
         is_safe_token, peer_uid, read_request, read_response_frame, run_privileged_subprocess,
-        validate_privileged_helper_socket_security, validate_privileged_program_binary,
-        validate_request, write_request_frame, write_response,
+        validate_pfctl_args, validate_privileged_helper_socket_security,
+        validate_privileged_program_binary, validate_request, validate_sysctl_args,
+        write_request_frame, write_response,
     };
 
     #[test]
@@ -3187,6 +3203,11 @@ mod tests {
         assert!(!is_anchor_name_token("com.apple/rustynet_g1/.."));
         assert!(is_anchor_name_token("com.apple/rustynet_g1"));
         assert!(is_anchor_name_token("com.rustynet/blind_exit"));
+        // The regular exit NAT anchor is permitted, but nothing else under the
+        // com.rustynet/ namespace and no traversal off it.
+        assert!(is_anchor_name_token("com.rustynet/nat"));
+        assert!(!is_anchor_name_token("com.rustynet/nat/.."));
+        assert!(!is_anchor_name_token("com.rustynet/other"));
         let err = validate_request(
             PrivilegedCommandProgram::Pfctl,
             &[
@@ -3198,6 +3219,40 @@ mod tests {
         )
         .expect_err("pfctl anchor traversal must be rejected");
         assert!(err.contains("unsupported pfctl argument schema"));
+    }
+
+    #[test]
+    fn validate_sysctl_args_permits_only_exact_macos_forwarding_toggles() {
+        // The regular exit NAT needs to toggle + read the macOS IPv4
+        // forwarding sysctl; only the exact `=1`/`=0` writes and the `-n` read
+        // are permitted. Everything else stays default-denied.
+        assert!(validate_sysctl_args(&["-w", "net.inet.ip.forwarding=1"]).is_ok());
+        assert!(validate_sysctl_args(&["-w", "net.inet.ip.forwarding=0"]).is_ok());
+        assert!(validate_sysctl_args(&["-n", "net.inet.ip.forwarding"]).is_ok());
+        // Arbitrary values, the v6 forwarding key, and write-of-read-key must
+        // all be rejected — default-deny holds.
+        for bad in [
+            vec!["-w", "net.inet.ip.forwarding=2"],
+            vec!["-w", "net.inet.ip.forwarding=on"],
+            vec!["-w", "net.inet.ip.forwarding"],
+            vec!["-w", "net.inet.ip6.forwarding=1"],
+            vec!["-n", "net.inet.ip.forwarding=1"],
+        ] {
+            assert!(
+                validate_sysctl_args(&bad).is_err(),
+                "sysctl args must be rejected: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_pfctl_args_permits_nat_anchor_show_and_load() {
+        // The exit NAT activation loads + verifies the com.rustynet/nat anchor.
+        assert!(validate_pfctl_args(&["-a", "com.rustynet/nat", "-f", "/tmp/nat.pf"]).is_ok());
+        assert!(validate_pfctl_args(&["-a", "com.rustynet/nat", "-F", "all"]).is_ok());
+        assert!(validate_pfctl_args(&["-a", "com.rustynet/nat", "-s", "nat"]).is_ok());
+        // A non-allowlisted anchor stays denied even for the read-only show.
+        assert!(validate_pfctl_args(&["-a", "com.rustynet/other", "-s", "nat"]).is_err());
     }
 
     #[test]
