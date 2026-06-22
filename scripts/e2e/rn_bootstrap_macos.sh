@@ -47,7 +47,7 @@ usage() {
 usage: rn_bootstrap_macos.sh \
     --node-id <id> \
     --network-id <id> \
-    --node-role <client|exit|entry|aux|extra|fifth_client> \
+    --node-role <client|exit|entry|aux|extra|fifth_client|admin> \
     [--ssh-allow-cidrs <csv-cidrs>] \
     [--source-archive <path>] \
     [--build-dir <path>] \
@@ -101,8 +101,8 @@ validate_identifier() {
 validate_node_role() {
   local value="$1"
   case "$value" in
-    client|exit|entry|aux|extra|fifth_client) ;;
-    *) printf 'rn_bootstrap_macos.sh: --node-role must be one of client|exit|entry|aux|extra|fifth_client (received: %q)\n' \
+    client|exit|entry|aux|extra|fifth_client|admin) ;;
+    *) printf 'rn_bootstrap_macos.sh: --node-role must be one of client|exit|entry|aux|extra|fifth_client|admin (received: %q)\n' \
          "$value" >&2; exit 2 ;;
   esac
 }
@@ -245,11 +245,19 @@ fi
 # crates/rustynet-cli/src/vm_lab/orchestrator/role.rs. The bash side has
 # to stay in sync because Bootstrap-RustyNetMacos.sh refuses to start
 # the daemon without an explicit DAEMON_NODE_ROLE in {admin, client,
-# blind_exit}. macOS lab nodes always run as client (no relay/exit
-# parity yet); the exit role maps to blind_exit because the wizard
-# disallows full exit on macOS.
+# blind_exit}. The regular macOS exit now boots as the `client` daemon
+# role and is promoted client->admin->exit by the live-lab
+# `activate_macos_exit_role` stage AFTER its membership grants the
+# `anchor` capability the admin role requires (booting straight as admin
+# would fail-close reconcile with "admin requires anchor" before the
+# membership amendment lands). The orchestrator records the exit's
+# runtime daemon role as `admin`, so accept `admin` here and map it to
+# the `client` boot role. The `exit` lab token maps to `blind_exit` (the
+# IRREVERSIBLE macOS blind exit, driven by its own validate_macos_blind_exit
+# stage), which is a distinct posture.
 daemon_node_role_for_macos() {
   case "$1" in
+    admin) printf 'client' ;;
     exit) printf 'blind_exit' ;;
     client|entry|aux|extra|fifth_client) printf 'client' ;;
     *) printf 'rn_bootstrap_macos.sh: cannot map role %q to a macOS daemon role\n' \
