@@ -9695,53 +9695,61 @@ fn deploy_macos_anchor_profile(
     }
     let target = remote_target_from_inventory_entry(&macos_entry, None);
 
-    let host_plist = workspace_root_path().join("scripts/launchd/com.rustynet.anchor.plist");
-    if !host_plist.is_file() {
-        return Err(format!(
-            "reviewed anchor plist missing at {}",
-            host_plist.display()
-        ));
-    }
-    let remote_plist = format!("/tmp/com.rustynet.anchor.plist.{}", unique_suffix());
-    ensure_success_status(
-        scp_to_remote_for_target(
-            &target,
-            None,
-            Some(ssh_identity_file),
-            known_hosts_path,
-            host_plist.as_path(),
-            remote_plist.as_str(),
-            Duration::from_secs(30),
-        )
-        .map_err(|e| format!("scp reviewed anchor plist to {macos_alias} failed: {e}"))?,
-        "scp reviewed anchor plist to macOS host",
-    )?;
-
-    // The installer reads its source cwd-relative as
-    // scripts/launchd/com.rustynet.anchor.plist, so stage the uploaded plist
-    // under that layout in a temp dir and run the installer with that cwd.
-    // bootout the client daemon first: the anchor profile composes the SAME
-    // daemon binary + state + keys + membership with the bundle-pull listener,
-    // so running both labels would contend on one node's state.
+    // The anchor profile is the SAME daemon as the client (com.rustynet.daemon)
+    // plus the loopback bundle-pull listener (the plist comment says exactly
+    // this). A static reviewed plist cannot carry the node-specific custody the
+    // bootstrap actually provisions — the keychain account is per-node
+    // (wg-passphrase-<node_id>), the WG passphrase lives under /bootstrap/ not
+    // /keys/, and the daemon reads auto-tunnel metadata from the live state — so
+    // a static plist crash-loops (config_error 65). Instead DERIVE the anchor
+    // plist from the installed, proven client daemon plist (inheriting its exact
+    // state/keys/membership/passphrase custody) and add ONLY the bundle-pull
+    // arguments + environment. The bundle-pull values are set by THIS code
+    // (loopback addr + allow-lan=false) and asserted before load (verify-
+    // before-serve); the token is chowned to the daemon user by the seed verb.
+    // Canonical reviewed bundle-pull endpoint (mirrors the rustynetd
+    // macos_service_hardening REVIEWED_MACOS_ANCHOR_* constants and the seed
+    // verb's token path); loopback-only + LAN-deny is a security boundary.
+    let token = "/usr/local/var/rustynet/anchor-bundle-pull.token";
+    let addr = "127.0.0.1:51822";
     let deploy_script = format!(
         "set -eu; \
-         TMPD=\"$(mktemp -d /tmp/rn-anchor-deploy.XXXXXX)\"; \
-         mkdir -p \"$TMPD/scripts/launchd\"; \
-         cp {plist} \"$TMPD/scripts/launchd/com.rustynet.anchor.plist\"; \
+         PB=/usr/libexec/PlistBuddy; \
+         CLIENT=/Library/LaunchDaemons/com.rustynet.daemon.plist; \
+         ANCHOR=/Library/LaunchDaemons/com.rustynet.anchor.plist; \
+         test -f \"$CLIENT\"; \
          sudo /usr/local/bin/rustynet ops seed-macos-anchor-token; \
+         D=\"$(mktemp /tmp/rn-anchor.XXXXXX.plist)\"; \
+         sudo cp \"$CLIENT\" \"$D\"; \
+         sudo $PB -c 'Set :Label com.rustynet.anchor' \"$D\"; \
+         sudo $PB -c 'Set :StandardOutPath /usr/local/var/log/rustynet/rustynetd-anchor.log' \"$D\" 2>/dev/null || sudo $PB -c 'Add :StandardOutPath string /usr/local/var/log/rustynet/rustynetd-anchor.log' \"$D\"; \
+         sudo $PB -c 'Set :StandardErrorPath /usr/local/var/log/rustynet/rustynetd-anchor-error.log' \"$D\" 2>/dev/null || sudo $PB -c 'Add :StandardErrorPath string /usr/local/var/log/rustynet/rustynetd-anchor-error.log' \"$D\"; \
+         sudo $PB -c 'Add :ProgramArguments: string --anchor-bundle-pull-addr' \"$D\"; \
+         sudo $PB -c 'Add :ProgramArguments: string {addr}' \"$D\"; \
+         sudo $PB -c 'Add :ProgramArguments: string --anchor-bundle-pull-token-path' \"$D\"; \
+         sudo $PB -c 'Add :ProgramArguments: string {token}' \"$D\"; \
+         sudo $PB -c 'Add :ProgramArguments: string --anchor-bundle-pull-allow-lan' \"$D\"; \
+         sudo $PB -c 'Add :ProgramArguments: string false' \"$D\"; \
+         sudo $PB -c 'Add :EnvironmentVariables:RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR string {addr}' \"$D\"; \
+         sudo $PB -c 'Add :EnvironmentVariables:RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH string {token}' \"$D\"; \
+         sudo $PB -c 'Add :EnvironmentVariables:RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN string false' \"$D\"; \
+         GOT_ADDR=$(sudo $PB -c 'Print :EnvironmentVariables:RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR' \"$D\"); \
+         GOT_LAN=$(sudo $PB -c 'Print :EnvironmentVariables:RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN' \"$D\"); \
+         if [ \"$GOT_ADDR\" != \"{addr}\" ] || [ \"$GOT_LAN\" != \"false\" ]; then echo \"anchor verify-before-serve failed: addr=$GOT_ADDR allow_lan=$GOT_LAN (expected loopback + deny-LAN)\" >&2; exit 1; fi; \
          sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
-         ( cd \"$TMPD\" && sudo /usr/local/bin/rustynet ops install-macos-anchor ); \
+         sudo launchctl bootout system/com.rustynet.anchor 2>/dev/null || true; \
+         sudo cp \"$D\" \"$ANCHOR\"; sudo chown root:wheel \"$ANCHOR\"; sudo chmod 644 \"$ANCHOR\"; sudo rm -f \"$D\"; \
+         sudo launchctl bootstrap system \"$ANCHOR\"; \
+         sudo launchctl kickstart -k system/com.rustynet.anchor; \
          listener_up=0; \
          for _ in $(seq 1 20); do \
-           if nc -z 127.0.0.1 51822 2>/dev/null; then listener_up=1; break; fi; \
+           if sudo lsof -nP -iTCP:51822 -sTCP:LISTEN 2>/dev/null | grep -q 51822; then listener_up=1; break; fi; \
            sleep 2; \
          done; \
-         rm -rf \"$TMPD\"; \
-         if [ \"$listener_up\" != \"1\" ]; then \
-           echo 'anchor bundle-pull listener did not come up on 127.0.0.1:51822' >&2; exit 1; \
-         fi; \
-         echo 'anchor bundle-pull listener up on 127.0.0.1:51822'",
-        plist = shell_quote(remote_plist.as_str()),
+         if [ \"$listener_up\" != \"1\" ]; then echo 'anchor bundle-pull listener did not come up on {addr}' >&2; exit 1; fi; \
+         echo 'anchor bundle-pull listener up on {addr} (derived from client daemon profile)'",
+        addr = addr,
+        token = token,
     );
 
     let out = capture_remote_shell_command_for_target(
@@ -9755,8 +9763,9 @@ fn deploy_macos_anchor_profile(
     .map_err(|e| format!("macOS anchor deploy on {macos_alias} failed: {e}"))?;
 
     Ok(format!(
-        "macOS anchor profile deployed on {macos_alias}: token seeded (0600) + reviewed anchor \
-         profile installed (verify-before-serve) + loopback listener up on 127.0.0.1:51822; {}",
+        "macOS anchor profile deployed on {macos_alias}: derived from the proven client daemon \
+         profile + bundle-pull listener (loopback {addr}, allow-lan=false, verify-before-serve \
+         asserted), token chowned to the daemon user; {}",
         out.trim()
     ))
 }

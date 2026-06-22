@@ -1422,6 +1422,17 @@ pub fn execute_ops_seed_macos_anchor_token() -> Result<String, String> {
         "creating macOS state root failed",
     )?;
     let path = seed_macos_anchor_bundle_pull_token()?;
+    // The anchor daemon runs as the `rustynetd` service user and opens the
+    // token 0600 owner-only; the seed writes it root-owned, so chown it to the
+    // daemon user — the same custody the WG keys and membership snapshot the
+    // daemon already reads have. Without this the daemon fails closed with
+    // "anchor bundle-pull token open failed: Permission denied".
+    run_status(
+        "chown",
+        &["rustynetd:rustynetd", path.as_str()],
+        &[],
+        "chown anchor bundle-pull token to the daemon user failed",
+    )?;
     Ok(format!("macOS anchor bundle-pull token seeded at {path}"))
 }
 
