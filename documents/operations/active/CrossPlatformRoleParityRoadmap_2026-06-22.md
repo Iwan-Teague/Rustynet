@@ -34,10 +34,18 @@ program and to **concurrent Windows+macOS** runs.
   already-warm guest (seconds, no 9-min bootstrap), and **write the next cell's code
   on `main` while both run**. One ~20-line `flock` on the run-matrix CSV is the only
   thing standing between us and fully-safe concurrency.
-- **All on `main`:** the `orchestrate` command never re-validates HEAD mid-run, so
-  committing to `main` during a run is safe. Use `--source-mode working-tree` to test
-  uncommitted edits, commit after green. The node-map session lives on its own branch,
-  so `main` is free for parity work. No feature branches required.
+- **All on `main`:** two run kinds (§9). **Fast iteration** = `--skip-gates
+  --source-mode working-tree` — the provenance gate doesn't run, so you test uncommitted
+  edits and commit freely mid-run. **Authoritative evidence** = a clean, committed tree —
+  the bash gate-suite intentionally refuses dirty/HEAD-drifted attestation (this is what
+  aborted "chaos3"; it's a feature). The node-map session lives on its own branch, so
+  `main` is free. No feature branches required.
+- **Industry-grounded (Appendix A):** the cells inherit the proven patterns of the mature
+  mesh-VPNs — relay-never-sees-plaintext (DERP/Firezone/Nebula) with a negative live test,
+  exit/relay double-opt-in (Tailscale), single-use scoped enrollment tokens with
+  client-side keygen (innernet/NetBird), signer-stamped freshness + bounded rollback
+  window (ZeroTier), gossip revocation, and a WireGuard-adapter invariant contract. No
+  custom crypto.
 
 ---
 
@@ -382,34 +390,52 @@ done when a cell is ready to land.
 
 ## 9. All on `main` — the workflow
 
-The user constraint: **do all of this on `main`, not a feature branch.** This is safe and
-clean because:
+The user constraint: **do all of this on `main`, not a feature branch.** This works — but
+"can I commit during a run?" is **path- and stage-dependent**. There are **two** provenance
+mechanisms; know which is in your path:
 
-1. **`orchestrate` never re-validates HEAD mid-run.** The provenance check that emits
-   "setup manifest git provenance mismatch" (`validate_setup_manifest`,
-   `vm_lab/mod.rs:2584`) is called **only** from the `setup`/`run` split subcommands
-   (`:2784`, `:5107`) — **never** from `orchestrate`. So committing to `main` during an
-   `orchestrate` run cannot fail the run. **Rule: always use `orchestrate`; never the
-   `setup`→`run` split for parity work.**
-2. **`--source-mode working-tree` tests uncommitted edits.** It snapshots staged+unstaged
-   *tracked* changes via `git stash create` at stage 2 (`source_archive.rs:52-68`) and
-   ships that frozen tarball — so you edit role code on `main`, run the lab, validate
-   live, then **commit only after green**, keeping `main` always-green by construction.
-   (Untracked new files are *not* captured — `git add` them first, or they won't deploy;
-   `what_will_deploy` shows this.)
-3. **Commit freely mid-run.** Once stage 2 (`PrepareSourceArchive`) has run, the deployed
-   tarball is frozen; later commits on `main` are invisible to the running lab.
-4. **`main` is free.** The node-map session commits to
-   `claude/rustynet-node-map-visual-mmclho`, not `main`, so its work never moves `main`'s
-   HEAD. Parity dev and lab runs own `main`.
+1. **`validate_setup_manifest`** (`vm_lab/mod.rs:2584`) re-checks HEAD, but is called
+   **only** from the `setup`/`run` split subcommands (`:2784`, `:5107`) — **never** from
+   `orchestrate`. **Rule: always use `orchestrate`; never the `setup`→`run` split for
+   parity work.**
+2. **The bash orchestrator's `assert_local_gate_suite_provenance`**
+   (`scripts/e2e/live_linux_lab_orchestrator.sh:4863-4882`) is a **second, live** HEAD
+   re-read that runs **inside the local-full-gate-suite stage** (defined `:4941-4947`,
+   dispatched `:8569`). It **fails closed** if (a) live HEAD drifted from the deployed
+   commit, (b) `--source-mode working-tree` **and** the tree is dirty, or (c) the source
+   tree is dirty at all. **This is what aborted "chaos3"** when a concurrent session
+   committed to `main` mid-run. It is an **evidence-integrity control, not a bug** — the
+   authoritative gate suite refuses to attest a run whose source isn't clean and
+   commit-bound. **Do not weaken it.** It is **skipped under `--skip-gates`** (`:8025`,
+   `:8574`), and the rust-native `--node` path has no equivalent.
+
+**So the correct all-on-`main` loop has two run kinds:**
+
+- **Iteration run (fast, frequent):** `--skip-gates --source-mode working-tree`. The
+  provenance gate does **not** run, so you ship *uncommitted* tracked edits (`git stash
+  create` snapshot at stage 2, `source_archive.rs:52-68` — `git add` new files first;
+  untracked aren't captured), validate the cell's live stage, and **commit freely** —
+  mid-run commits cannot break these. This is the per-cell inner loop.
+- **Authoritative "section done" run (the matrix-row evidence):** a **clean, committed**
+  tree with `--source-mode local-head`. If you also drop `--skip-gates` to run the host
+  gate suite, the provenance gate **requires** that clean-committed tree — so **commit
+  first, run clean, do not commit during it.** That clean run is the authoritative parity
+  evidence (`LiveLabExecutionEfficiencyPlan` §3). Commit-bound evidence is a security
+  property, not an obstacle.
+
+**Why `main` is free:** the node-map session commits to
+`claude/rustynet-node-map-visual-mmclho`, not `main`, so its work never moves `main`'s
+HEAD. Parity dev and lab runs own `main`.
 
 **Concrete loop, all on `main`:**
 ```
 # (on main, in the lab-main worktree which tracks main)
 edit cell code → cargo fmt + clippy -p <crate> + touched-crate tests
-→ orchestrate ... --source-mode working-tree   # ships uncommitted edits, validates live
-→ green? git add -A && git commit (Iwan-Teague, NO Co-Authored-By trailer) && push origin HEAD:main
-→ next cell
+→ orchestrate ... --skip-gates --source-mode working-tree   # fast iteration; ships uncommitted edits; commit-freely-safe
+→ iterate until the cell's live stage is green
+→ git add -A && git commit (Iwan-Teague, NO Co-Authored-By trailer)
+→ orchestrate ... --source-mode local-head   # CLEAN authoritative run on the committed tree → matrix row
+→ green? push origin HEAD:main → next cell
 ```
 
 **Two practical notes:**
@@ -457,6 +483,12 @@ external blockers: Windows exit WinNAT, relay forwarding HP-3).
    (`install.rs:134-138`) — first-class validate-only ergonomics.
 5. *(Optional)* a second Debian exit-capable flag (via `--update-inventory-live-ips`) if
    the §8.3 first concurrent run shows the backbone requires it.
+6. **Security-hardening adopt-items (Appendix A.3)** — the per-cell CONFIRM items are folded
+   into each cell's spec; the genuine *new* additions (beyond current controls) are tracked
+   here so they aren't lost: gossip/rumor-mill revocation propagation (#11), overlapping-trust
+   window for owner-key rotation (#12), and distribution-layer default-deny / endpoint-info
+   withholding (#13). These are security roadmap items (not blockers for the first cells); land
+   them with the relay (HP-3) and revocation work they're closest to.
 
 ---
 
@@ -474,3 +506,142 @@ external blockers: Windows exit WinNAT, relay forwarding HP-3).
 - `documents/operations/live_lab_run_matrix.csv` — the evidence ledger; a row per run.
 - MCP `get_role_transition` / `get_platform_support` — canonical per-OS role support +
   transition side-effects.
+
+---
+
+## Appendix A — Industry-grounded security hardening (mature mesh-VPN patterns)
+
+The roadmap's cells must implement *industry-proven* logic, not novel invention — Rustynet
+is Rust-first with **no custom crypto / no custom VPN protocol** in production paths, so
+every control here is borrowed from a shipped project and cited. Verdicts: **CONFIRM** =
+Rustynet already does this and industry validates it (keep it, add the test if missing);
+**ADOPT** = a gap the mature projects say to close; **AVOID** = a risky divergence with a
+safer proven alternative.
+
+### A.1 Per-role / per-mechanism verdicts
+
+- **Admin (centralized signer).** CONFIRM owner-public-key-as-trust-anchor + admin mints
+  signed bundles (matches Tailscale's "coordination server is a drop box for public keys,
+  never private", ZeroTier controller-signs-all-credentials, Nebula offline CA). **ADOPT:**
+  (1) *signer-stamped freshness* — freshness/epoch is stamped by the signer, not the node's
+  wall clock (ZeroTier "controller-populated timestamps… without trusting the node's local
+  clock"), closing the clock-skew fail-open hole; (2) *mint-from-public-key-only* — admin
+  mints a membership record from a node's **public key alone**; the node private key never
+  transits (Nebula `nebula-cert sign -in-pub`; same invariant as client-side keygen below).
+- **Anchor (enrollment + gossip + bundle-pull).** CONFIRM strongly — anchor is operational
+  metadata, never a trust authority; anchor flags never consulted before signature verify;
+  bundle-pull defaults to loopback (default-deny bind); HMAC secret in OS-secure custody;
+  single-use enrollment-token ledger with fail-closed replay rejection. This *is* Nebula's
+  "lighthouse holds no keys, cannot decrypt, cannot forge" containment, codified. **ADOPT:**
+  (1) *control-plane-behind-the-tunnel* — bind steady-state bundle-pull to the mesh tunnel
+  address (innernet: "API only on the in-tunnel internal IP — to attack it you must already
+  be an enrolled peer"), reserving loopback+token for cold-start only; (2) *token carries
+  scope* — the enrollment token encodes the target role/CIDR/group so redemption lands the
+  node in the right default-deny scope (innernet CIDR / NetBird auto-group); (3) *revoke-
+  token ≠ deauthorize-node* — a separate membership revocation (epoch bump); make it a
+  negative test (Tailscale's explicit warning).
+- **Relay (HP-3, the next big implementable).** **ADOPT as hard requirements:** (1) the
+  load-bearing invariant **relay-never-sees-plaintext** + a **negative live test** that a
+  relay cannot produce plaintext from a captured forwarded frame (Tailscale DERP "blindly
+  forwards already-encrypted traffic", Firezone/NetBird TURN E2E-WireGuard, Nebula forwards
+  Noise); (2) **no relay chaining** (Nebula "you cannot relay to a relay"); (3) **inbound
+  rate-limit that closes — doesn't queue — and never throttles STUN/discovery** (DERP
+  `accept-connection-limit`/`burst`); (4) **start-relayed → discover-direct-in-parallel →
+  upgrade transparently** so sessions are usable instantly (Tailscale NAT-traversal); (5)
+  **relay client auth against signed membership** (DERP "verify client owns its claimed key
+  + is ACL-visible"; PSK only for relay↔relay mesh); (6) build as **sans-IO state machines**
+  (Firezone `snownet` = `str0m` ICE + `boringtun`) so anti-replay/fallback/upgrade get
+  deterministic time-travel tests with no sockets — directly serves CLAUDE §8 + the
+  one-enforcement-point-one-test rule. Note: `client → relay` is fail-closed on macOS/Windows
+  today, so test (1) is also the evidence gate that unblocks relay product-activation there.
+- **Exit.** CONFIRM — deploy-before-advertise + NAT-teardown-before-capability-removal is
+  Tailscale's exit-node **double opt-in** ("must opt in… Admin enables on the device AND in
+  the console") plus a teardown-ordering guarantee Tailscale doesn't even document. Optional
+  ADOPT: an autoApprovers-style **scoped** self-approval as explicit signed policy (never a
+  blanket bypass).
+- **blind_exit (irreversible).** CONFIRM — typed factory-reset ack + matrix-enforced
+  irreversibility goes *beyond* industry in a good direction (closest analog: Tailscale
+  tagged-identity replaces user identity). **ADOPT:** the fresh re-enrollment after wipe must
+  route through the **same single-use, client-side-keygen, scoped token path** — mint a brand
+  new device keypair locally, never reuse the old identity; negative test that the pre-reset
+  key is wiped and unrecoverable.
+- **Signed-bundle verify-before-apply.** CONFIRM exactly — signature → freshness/replay →
+  apply is the universal ordering (ZeroTier, Nebula handshake, even WireGuard checks replay
+  *after* AEAD auth). Only ADOPT: signer-stamped freshness (A.1 admin).
+- **Anti-replay / rollback.** CONFIRM epoch monotonicity + replay-watermark. **ADOPT** an
+  explicit **bounded-staleness rollback window** (ZeroTier COM moving-window: reject older
+  than `current_epoch` OR older than `now − max_staleness`, signer-stamped) for graceful
+  clock-skew while staying fail-closed; negative test: a re-served older-epoch bundle (incl.
+  an anchor-downgrade) is rejected.
+- **Key custody / rotation.** CONFIRM OS-secure custody (Keychain/DPAPI/encrypted-at-rest +
+  perm checks, never log key material). **ADOPT:** (1) *key separation by concern* — control-
+  identity key (stable) vs data-plane WireGuard key (rotatable/expirable) vs discovery key
+  (Tailscale machine/node/disco split limits blast radius); (2) *rotate-by-replacement* —
+  add-new-peer → propagate → drop-old-peer in the handshake idle gap, never in-place (WG has
+  no in-place renew by design); (3) *expiry fails closed → re-enroll*, with explicit audited
+  "disable expiry" only for unattended exit/anchor/relay/service nodes (Tailscale tagged-
+  default-disabled).
+- **Default-deny ACL.** CONFIRM structural default-deny (empty/missing/stale ⇒ Deny; rules
+  with empty `contexts` never match; identity from the authenticated tunnel source, never a
+  client header) — matches Tailscale's "only verb is accept", Nebula cert-bound groups,
+  WireGuard cryptokey-routing. **ADOPT** *distribution-layer enforcement* (innernet: the
+  membership snapshot served to a node contains only the peers/endpoints it may reach) — so
+  default-deny holds even if a host firewall is bypassed, and metadata leakage is bounded.
+- **Revocation (biggest gap).** **ADOPT:** (1) *gossip/rumor-mill revocation* over the anchor
+  gossip surface so a kicked node is excluded even when the admin can't reach every peer
+  (ZeroTier rumor-mill); (2) *overlapping-trust window* for owner-key rotation (Nebula
+  concatenated-CA: trust old+new during a migration window, verify-against-any, then drop
+  old) — no flag day; (3) codify token-revoke vs node-deauthorize (above).
+
+### A.2 Risky divergences — avoid these
+
+1. **Strict-monotonic epochs with no slack** → legitimate skew causes fail-closed lockouts,
+   or a clock-trusting node is tricked. **Safer:** ZeroTier signer-stamped bounded-staleness
+   window.
+2. **No gossip revocation** → a revoked node stays reachable across a partition. **Safer:**
+   rumor-mill propagation over the existing gossip surface.
+3. **Bundle-pull on loopback+LAN-flag rather than in-tunnel** → broadens attack surface to
+   the whole LAN. **Safer:** innernet in-tunnel API for steady-state.
+4. **Any custom crypto / PoW-style identity hardening** → ZeroTier's v1 "memory-hard" PoW was
+   shown *not* memory-hard and they migrated x25519→P-384. **Keep the no-custom-crypto rule;**
+   ed25519 signed bundles + WireGuard Noise_IK only; if anti-squatting is ever needed, use a
+   standard, versioned construction.
+5. **Reusable enrollment tokens without a usage cap** → a leaked token = unbounded
+   enrollment. **Safer:** single-use default; reusable only with usage-cap + expiry (NetBird).
+6. **WireGuard adapter widening `AllowedIPs` or mutating keys in place** → too-broad allowed-
+   IPs silently authorizes spoofed source IPs (breaks default-deny); in-place key mutation
+   breaks anti-replay/forward-secrecy. **Safer:** narrowest allowed-IPs policy permits; rotate
+   by full peer replacement; never disable the sliding window / mac2 cookie / handshake rate-
+   limit; optional PSK is an additive hedge, never sole auth.
+
+### A.3 Adopt-checklist (bake into the cells; ranked by where they land)
+
+| # | Pattern | Source | Rustynet hook / cell |
+|---|---|---|---|
+| 1 | **Relay-never-sees-plaintext invariant + negative live test** | DERP, Firezone, NetBird, Nebula | HP-3 relay; new live assert (also unblocks mac/win relay) |
+| 2 | No relay chaining | Nebula | HP-3 relay FSM |
+| 3 | Inbound rate-limit (close, don't queue); never throttle STUN | DERP `derper.go` | HP-3 relay listener |
+| 4 | Start-relayed → discover-direct-in-parallel → upgrade | Tailscale | HP-3 connectivity FSM |
+| 5 | sans-IO state machines (deterministic time-travel tests) | Firezone `snownet`/`str0m` | relay + role-transition + trust transitions |
+| 6 | Deploy-before-advertise / undeploy-before-revoke | Tailscale double opt-in | exit & relay cells (CONFIRM) |
+| 7 | Capability never self-granted; admin approval gate | Tailscale | role-transition cell (CONFIRM) |
+| 8 | Enrollment token: single-use default, client-side keygen, carries scope, bounded reuse+expiry | innernet, NetBird, Tailscale | anchor enrollment; extend token ledger with scope |
+| 9 | Revoke-token ≠ deauthorize-node (separate paths + test) | Tailscale | enrollment + revocation |
+| 10 | Signer-stamped freshness + bounded-staleness rollback window | ZeroTier COM moving-window | verify-before-apply + anti-replay |
+| 11 | Gossip/rumor-mill revocation propagation | ZeroTier | anchor gossip surface (NEW) |
+| 12 | Overlapping-trust window for owner-key rotation | Nebula multi-CA bundle | membership trust-root rotation (NEW) |
+| 13 | Default-deny enforced at distribution (withhold endpoint info unless authorized) | innernet | membership snapshot scoping (NEW) |
+| 14 | Key separation by concern; rotate-by-replacement; expiry fails closed → re-enroll | Tailscale + WireGuard | key custody/rotation; relevant to cross-OS transitions |
+| 15 | Adapter preserves WireGuard invariants (narrow allowed-IPs, no in-place key mutation, keep sliding-window/mac2/rate-limit, PSK additive only) | WireGuard | backend adapter contract |
+
+**Most relevant to the two next big implementables:** relay (HP-3) → items 1–5, with #1 the
+non-negotiable; cross-OS role transitions → items 6, 7, 14 (Rustynet already encodes the
+double-opt-in discipline; the gaps to add are key-expiry-fails-closed + re-enrollment, and
+routing blind_exit re-enrollment through the single-use token path).
+
+**Sources:** Tailscale (how-tailscale-works, how-nat-traversal-works, DERP `cmd/derper`,
+key-management, exit-nodes, auth-keys, policy-file syntax, tags); WireGuard (protocol,
+known-limitations, cryptokey-routing); Nebula (lighthouse/relay/firewall/CA-rotation docs);
+ZeroTier (controller + protocol docs, COM moving-window); innernet (`tonarino/innernet`,
+tonari blog); NetBird (how-it-works, setup-keys); Firezone (architecture, sans-IO blog,
+`snownet`). New `(NEW)` hooks (#11–#13) are genuine roadmap additions beyond current controls.
