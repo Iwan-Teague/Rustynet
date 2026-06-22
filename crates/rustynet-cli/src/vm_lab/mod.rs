@@ -926,6 +926,13 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// only elects the macOS admin live-issue stage. `Some("macos")`
     /// runs that stage; unset/other Skips it.
     pub admin_platform: Option<String>,
+    /// Counterpart of [`Self::exit_platform`] for the blind_exit role slot.
+    /// blind_exit is the irreversible exit variant (destructive `* ->
+    /// blind_exit`, factory-reset-only exit path). Like admin it is NOT
+    /// threaded into `topology::resolve_topology`; it only elects the macOS
+    /// blind_exit live stage, which runs LAST because it wipes node identity.
+    /// `Some("macos")` runs that stage; unset/other Skips it.
+    pub blind_exit_platform: Option<String>,
     pub enable_chaos_suite: bool,
     /// Per-stage watchdog timeout in seconds, forwarded to the bash
     /// orchestrator as `--stage-timeout-secs <N>` when greater than zero.
@@ -7932,6 +7939,16 @@ fn run_macos_orchestration_stages(
         .as_deref()
         .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
 
+    // The macOS node is the elected blind_exit when `--blind-exit-platform
+    // macos` is set. The blind_exit live stage drives the IRREVERSIBLE
+    // `* -> blind_exit` transition and asserts the `pf` blind_exit anchor +
+    // immutability gate. It runs ONLY when elected (it wipes node identity, so
+    // it must never fire on an unrelated macOS run) and LAST in the sequence.
+    let is_macos_active_blind_exit = config
+        .blind_exit_platform
+        .as_deref()
+        .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
+
     // ── Stage 1: bootstrap_macos_host ────────────────────────────────────
     let bootstrap_log_path = logs_dir.join("bootstrap_macos_host.log");
     let bootstrap_outcome = if dry_run {
@@ -9161,6 +9178,72 @@ fn run_macos_orchestration_stages(
     };
     outcomes.push(macos_admin_outcome);
 
+    // ── Stage: validate_macos_blind_exit (LAST — wipes node identity) ─────
+    //
+    // Prove the macOS node can become the IRREVERSIBLE blind_exit: drive the
+    // destructive `* -> blind_exit` transition on the guest, capture the live
+    // `pf` ruleset, and assert the blind_exit anchor's invariants (no
+    // route-to/reply-to/dup-to bypass, mesh-CIDR ingress allow, local-origin
+    // egress tunnel-only), then NEGATIVE-check that leaving blind_exit fails
+    // closed (BlindExitImmutable). Runs only when elected (--blind-exit-platform
+    // macos) and LAST because the transition factory-resets the node; the next
+    // run's bootstrap re-provisions a fresh identity, so the wipe is recoverable
+    // in-lab. FAIL-LOUD: the live result is the stage status.
+    let macos_blind_exit_log_path = logs_dir.join("validate_macos_blind_exit.log");
+    let macos_blind_exit_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_blind_exit",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would drive the irreversible blind_exit transition + assert the pf anchor on {macos_alias}"
+            ),
+            vec![],
+        )
+    } else if !is_macos_active_blind_exit {
+        stage_outcome(
+            "validate_macos_blind_exit",
+            VmLabStageStatus::Skipped,
+            format!(
+                "skipped: {macos_alias} is not the elected blind_exit (blind_exit_platform != macos)"
+            ),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "validate_macos_blind_exit",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        match exercise_macos_blind_exit_live(
+            macos_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&macos_blind_exit_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_macos_blind_exit",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![macos_blind_exit_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&macos_blind_exit_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_macos_blind_exit",
+                    VmLabStageStatus::Fail,
+                    format!("macOS blind_exit live transition failed for {macos_alias}: {reason}"),
+                    vec![macos_blind_exit_log_path.clone()],
+                )
+            }
+        }
+    };
+    outcomes.push(macos_blind_exit_outcome);
+
     outcomes
 }
 
@@ -9578,6 +9661,75 @@ fn exercise_macos_anchor_bundle_pull_plan_dry_run(
     validate_anchor_init_bundle_pull_plan(output.as_str())?;
     Ok(format!(
         "macOS anchor bundle-pull dry-run plan verified on {macos_alias}: anchor capabilities + loopback listener plan present"
+    ))
+}
+
+/// Prove the macOS node can become the IRREVERSIBLE blind_exit.
+///
+/// Drives the destructive `role set blind_exit --accept-irreversible`
+/// transition on the guest, then asserts the live `pf` blind_exit anchor
+/// invariants — the anchor `com.rustynet/blind_exit` is loaded and contains NO
+/// `route-to`/`reply-to`/`dup-to` bypass primitives (the hardened
+/// minimal-surface posture enforced by `macos_blind_exit::evaluate_*`) — and
+/// NEGATIVE-checks that leaving blind_exit is blocked (`role transition-check
+/// --to exit` reports the immutability gate). Destructive: the transition
+/// factory-resets the node, so this stage runs LAST and the next run's
+/// bootstrap re-provisions a fresh identity (recoverable in-lab). FAIL-LOUD:
+/// any non-zero step makes the stage Fail.
+fn exercise_macos_blind_exit_live(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let macos_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == macos_alias)
+        .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
+        .clone();
+    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            macos_entry.platform_profile().platform.as_str()
+        ));
+    }
+    let target = remote_target_from_inventory_entry(&macos_entry, None);
+
+    // Fixed, argv-only sequence (no untrusted interpolation): confirm the
+    // transition is reachable, apply it with the explicit irreversible
+    // acknowledgement, then assert the pf anchor posture + the immutability
+    // gate. `set -eu` makes any failed step a non-zero exit -> stage Fail.
+    let blind_exit_script = "set -eu; \
+         RN=/usr/local/bin/rustynet; \
+         sudo $RN role transition-check --to blind_exit >/dev/null 2>&1 || true; \
+         sudo $RN role set blind_exit --accept-irreversible 2>&1 | tail -4; \
+         sleep 5; \
+         RULES=\"$(sudo pfctl -a com.rustynet/blind_exit -sr 2>/dev/null || true)\"; \
+         if [ -z \"$(echo \"$RULES\" | tr -d '[:space:]')\" ]; then \
+           echo 'blind_exit pf anchor com.rustynet/blind_exit is empty (no rules loaded)' >&2; exit 1; fi; \
+         if echo \"$RULES\" | grep -qiE 'route-to|reply-to|dup-to'; then \
+           echo 'blind_exit pf rules contain a bypass primitive (route-to/reply-to/dup-to)' >&2; exit 1; fi; \
+         if sudo $RN role transition-check --to exit 2>&1 | grep -qiE 'immutable|factory.?reset|blocked'; then \
+           IMMUT=enforced; else \
+           echo 'leaving blind_exit was NOT blocked — immutability gate not enforced' >&2; exit 1; fi; \
+         RULECOUNT=$(echo \"$RULES\" | grep -cvE '^[[:space:]]*$'); \
+         echo \"blind_exit pf anchor loaded ($RULECOUNT rules, no route-to/reply-to/dup-to); immutability gate $IMMUT\"";
+
+    let out = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        blind_exit_script,
+        Duration::from_secs(120),
+    )
+    .map_err(|e| format!("macOS blind_exit transition on {macos_alias} failed: {e}"))?;
+
+    Ok(format!(
+        "macOS blind_exit live-proven on {macos_alias}: irreversible transition applied, pf anchor \
+         com.rustynet/blind_exit hardened (no route-to/reply-to/dup-to), immutability gate enforced; {}",
+        out.trim()
     ))
 }
 
@@ -37124,6 +37276,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             relay_platform: None,
             anchor_platform: None,
             admin_platform: None,
+            blind_exit_platform: None,
             enable_chaos_suite: false,
             stage_timeout_secs: 0,
         }
