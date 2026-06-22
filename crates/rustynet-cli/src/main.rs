@@ -3376,6 +3376,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 relay_platform: parser.value("--relay-platform"),
                 anchor_platform: parser.value("--anchor-platform"),
                 admin_platform: parser.value("--admin-platform"),
+                blind_exit_platform: parser.value("--blind-exit-platform"),
                 stage_timeout_secs: parser.parse_u64_or_default("--stage-timeout-secs", 0)?,
             },
         }),
