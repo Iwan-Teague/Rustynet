@@ -8930,13 +8930,14 @@ fn run_macos_orchestration_stages(
             vec![],
         )
     } else {
-        // Prefer the LIVE bundle-pull proof (sub-test A1.2 parity): a peer
-        // pulls the signed membership snapshot byte-for-byte over the
-        // loopback listener with the genesis-seeded token, and every
-        // fail-closed control is asserted live. The dry-run plan check
-        // (`anchor init --dry-run`) remains as a documented fallback so a
-        // transient live-environment failure (e.g. listener not yet up)
-        // still yields the contract-level evidence rather than a hard stop.
+        // FAIL-LOUD (CrossPlatformRoleParityRoadmap §7): the LIVE bundle-pull
+        // proof IS the stage status — a peer pulls the signed membership
+        // snapshot byte-for-byte over the loopback listener with the
+        // genesis-seeded token, and every fail-closed control is asserted live.
+        // The dry-run plan check (`anchor init --dry-run`) is captured only as
+        // an INFORMATIONAL note in the log; it must NEVER turn a live failure
+        // into a Pass. (A prior dry-run fallback masked a real defect — an
+        // empty bundle-pull token on the guest — as green.)
         let live_report_dir = report_dir.join("macos_anchor_bundle_pull");
         match exercise_macos_anchor_bundle_pull_live(
             macos_alias,
@@ -8954,37 +8955,31 @@ fn run_macos_orchestration_stages(
                     vec![macos_anchor_bundle_pull_log_path.clone()],
                 )
             }
-            Err(live_reason) => match exercise_macos_anchor_bundle_pull_plan_dry_run(
-                macos_alias,
-                inventory_path,
-                ssh_identity_file,
-                known_hosts_path,
-            ) {
-                Ok(plan_summary) => {
-                    let summary = format!(
-                        "macOS anchor bundle-pull live proof unavailable ({live_reason}); fell back to dry-run plan: {plan_summary}"
-                    );
-                    let _ = std::fs::write(&macos_anchor_bundle_pull_log_path, summary.as_str());
-                    stage_outcome(
-                        "validate_macos_anchor_bundle_pull",
-                        VmLabStageStatus::Pass,
-                        summary,
-                        vec![macos_anchor_bundle_pull_log_path.clone()],
-                    )
-                }
-                Err(plan_reason) => {
-                    let reason = format!(
-                        "macOS anchor bundle-pull live proof failed for {macos_alias}: {live_reason}; dry-run fallback also failed: {plan_reason}"
-                    );
-                    let _ = std::fs::write(&macos_anchor_bundle_pull_log_path, reason.as_str());
-                    stage_outcome(
-                        "validate_macos_anchor_bundle_pull",
-                        VmLabStageStatus::Fail,
-                        reason,
-                        vec![macos_anchor_bundle_pull_log_path.clone()],
-                    )
-                }
-            },
+            Err(live_reason) => {
+                // Live failure = stage Fail. Run the dry-run plan only to attach
+                // contract-level context to the log; it does not affect status.
+                let plan_note = match exercise_macos_anchor_bundle_pull_plan_dry_run(
+                    macos_alias,
+                    inventory_path,
+                    ssh_identity_file,
+                    known_hosts_path,
+                ) {
+                    Ok(plan_summary) => format!(
+                        "; informational dry-run plan (does not affect status): {plan_summary}"
+                    ),
+                    Err(plan_reason) => format!("; dry-run plan also failed: {plan_reason}"),
+                };
+                let reason = format!(
+                    "macOS anchor bundle-pull live proof FAILED for {macos_alias}: {live_reason}{plan_note}"
+                );
+                let _ = std::fs::write(&macos_anchor_bundle_pull_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_macos_anchor_bundle_pull",
+                    VmLabStageStatus::Fail,
+                    reason,
+                    vec![macos_anchor_bundle_pull_log_path.clone()],
+                )
+            }
         }
     };
     outcomes.push(macos_anchor_bundle_pull_outcome);
@@ -9451,7 +9446,10 @@ fn exercise_macos_anchor_bundle_pull_live(
     // guest (inventory `ssh_target` is the IP and `ssh_user` is a separate
     // field). Compose user@host from the inventory ssh_user (e.g. `mac`) so the
     // live test SSHes as the guest account, not the local operator (`whoami`).
-    let anchor_ssh_user = target.ssh_user.as_deref().or(macos_entry.ssh_user.as_deref());
+    let anchor_ssh_user = target
+        .ssh_user
+        .as_deref()
+        .or(macos_entry.ssh_user.as_deref());
     let anchor_host = normalized_ssh_target(&target.ssh_target, anchor_ssh_user, macos_alias)?;
 
     let wrapper = workspace_root_path().join("scripts/e2e/live_macos_anchor_bundle_pull_test.sh");
