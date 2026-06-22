@@ -920,6 +920,12 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// orchestrator can stamp `ANCHOR_VM` / `ANCHOR_PLATFORM` in the
     /// profile env without a follow-up flag-plumbing churn.
     pub anchor_platform: Option<String>,
+    /// Counterpart of [`Self::exit_platform`] for the admin role slot.
+    /// admin is a config-only role (it advertises no routes), so it is
+    /// deliberately NOT threaded into `topology::resolve_topology`; it
+    /// only elects the macOS admin live-issue stage. `Some("macos")`
+    /// runs that stage; unset/other Skips it.
+    pub admin_platform: Option<String>,
     pub enable_chaos_suite: bool,
     /// Per-stage watchdog timeout in seconds, forwarded to the bash
     /// orchestrator as `--stage-timeout-secs <N>` when greater than zero.
@@ -7907,6 +7913,25 @@ fn run_macos_orchestration_stages(
     let logs_dir = report_dir.join("logs");
     let _ = std::fs::create_dir_all(&logs_dir);
 
+    // The macOS node is the elected anchor when `--anchor-platform macos` is
+    // set. Anchor-specific work — granting the `anchor.bundle_pull` capability
+    // in the membership amendment, deploying the anchor launchd profile on the
+    // guest, and the live bundle-pull validation — runs ONLY when elected.
+    // When not elected those stages Skip (never a silent Pass, never a false
+    // Fail on an unrelated macOS run such as an exit-role run).
+    let is_macos_elected_anchor = config
+        .anchor_platform
+        .as_deref()
+        .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
+
+    // The macOS node is the elected admin when `--admin-platform macos` is set.
+    // The admin live-issue stage (mint signing authority + issue a signed
+    // assignment bundle on the guest) runs ONLY when elected; otherwise Skips.
+    let is_macos_active_admin = config
+        .admin_platform
+        .as_deref()
+        .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
+
     // ── Stage 1: bootstrap_macos_host ────────────────────────────────────
     let bootstrap_log_path = logs_dir.join("bootstrap_macos_host.log");
     let bootstrap_outcome = if dry_run {
@@ -8245,14 +8270,27 @@ fn run_macos_orchestration_stages(
 
             let pubkey_hex = macos_wg_pubkey_hex.as_deref().unwrap();
             let owner_approver_id = format!("{exit_node_id}-owner");
+            // When the macOS node is the elected anchor, grant it the
+            // `anchor.bundle_pull` capability in signed membership so its
+            // loopback bundle-pull listener actually serves: the daemon fails
+            // closed (`forbidden`) for a node lacking the capability even with a
+            // valid token. The CSV is a fixed, safe vocabulary string (Client +
+            // AnchorBundlePull canonicalised) — no untrusted input. Otherwise
+            // keep the default client-only capability.
+            let macos_capabilities = if is_macos_elected_anchor {
+                "client,anchor.bundle_pull"
+            } else {
+                "client"
+            };
             let add_script = format!(
                 "set -eu; sudo -n rustynet ops e2e-membership-add \
                  --client-node-id {node_id} \
                  --client-pubkey-hex {pubkey} \
-                 --capabilities client \
+                 --capabilities {capabilities} \
                  --owner-approver-id {approver}",
                 node_id = shell_quote(macos_node_id),
                 pubkey = shell_quote(pubkey_hex),
+                capabilities = macos_capabilities,
                 approver = shell_quote(owner_approver_id.as_str()),
             );
             let add_out = capture_remote_shell_command_for_target(
@@ -8912,6 +8950,69 @@ fn run_macos_orchestration_stages(
     };
     outcomes.push(macos_relay_lifecycle_outcome);
 
+    // ── Stage: deploy_macos_anchor_profile ───────────────────────────────
+    //
+    // Make the elected macOS anchor actually SERVE bundle-pull before the live
+    // validation runs: seed the loopback authority token (standalone seed, not
+    // genesis), replace the client daemon with the reviewed anchor launchd
+    // profile through the verify-before-serve installer, and wait for the
+    // loopback listener. Runs only when macOS is the elected anchor; otherwise
+    // it Skips — an unrelated macOS run (e.g. exit) must neither deploy nor
+    // fail this.
+    let deploy_macos_anchor_log_path = logs_dir.join("deploy_macos_anchor_profile.log");
+    let deploy_macos_anchor_outcome = if dry_run {
+        stage_outcome(
+            "deploy_macos_anchor_profile",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would seed the bundle-pull token + deploy the anchor profile on {macos_alias}"
+            ),
+            vec![],
+        )
+    } else if !is_macos_elected_anchor {
+        stage_outcome(
+            "deploy_macos_anchor_profile",
+            VmLabStageStatus::Skipped,
+            format!("skipped: {macos_alias} is not the elected anchor (anchor_platform != macos)"),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "deploy_macos_anchor_profile",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        match deploy_macos_anchor_profile(
+            macos_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&deploy_macos_anchor_log_path, summary.as_str());
+                stage_outcome(
+                    "deploy_macos_anchor_profile",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![deploy_macos_anchor_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&deploy_macos_anchor_log_path, reason.as_str());
+                stage_outcome(
+                    "deploy_macos_anchor_profile",
+                    VmLabStageStatus::Fail,
+                    format!("macOS anchor profile deploy failed for {macos_alias}: {reason}"),
+                    vec![deploy_macos_anchor_log_path.clone()],
+                )
+            }
+        }
+    };
+    let anchor_deploy_passed = deploy_macos_anchor_outcome.status == VmLabStageStatus::Pass;
+    outcomes.push(deploy_macos_anchor_outcome);
+
     let macos_anchor_bundle_pull_log_path = logs_dir.join("validate_macos_anchor_bundle_pull.log");
     let macos_anchor_bundle_pull_outcome = if dry_run {
         stage_outcome(
@@ -8922,11 +9023,25 @@ fn run_macos_orchestration_stages(
             ),
             vec![],
         )
+    } else if !is_macos_elected_anchor {
+        stage_outcome(
+            "validate_macos_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!("skipped: {macos_alias} is not the elected anchor (anchor_platform != macos)"),
+            vec![],
+        )
     } else if !mesh_join_passed {
         stage_outcome(
             "validate_macos_anchor_bundle_pull",
             VmLabStageStatus::Skipped,
             format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else if !anchor_deploy_passed {
+        stage_outcome(
+            "validate_macos_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!("skipped: deploy_macos_anchor_profile did not pass for {macos_alias}"),
             vec![],
         )
     } else {
@@ -8983,6 +9098,68 @@ fn run_macos_orchestration_stages(
         }
     };
     outcomes.push(macos_anchor_bundle_pull_outcome);
+
+    // ── Stage: validate_macos_admin_issue ────────────────────────────────
+    //
+    // Prove the macOS node can act as ADMIN: mint its own assignment signing
+    // authority on the guest and issue a cryptographically signed assignment
+    // bundle. `assignment issue` signs internally and fails closed on a bad
+    // key/passphrase, so a successful issue producing a non-empty signed bundle
+    // + verifier key IS the live proof the mint/issue/sign path runs natively on
+    // macOS. Runs only when elected (--admin-platform macos); else Skips.
+    // FAIL-LOUD: the live result is the stage status.
+    let macos_admin_log_path = logs_dir.join("validate_macos_admin_issue.log");
+    let macos_admin_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_admin_issue",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would mint signing authority + issue a signed assignment bundle on {macos_alias}"
+            ),
+            vec![],
+        )
+    } else if !is_macos_active_admin {
+        stage_outcome(
+            "validate_macos_admin_issue",
+            VmLabStageStatus::Skipped,
+            format!("skipped: {macos_alias} is not the elected admin (admin_platform != macos)"),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "validate_macos_admin_issue",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        match exercise_macos_admin_issue_live(
+            macos_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&macos_admin_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_macos_admin_issue",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![macos_admin_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&macos_admin_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_macos_admin_issue",
+                    VmLabStageStatus::Fail,
+                    format!("macOS admin live issue failed for {macos_alias}: {reason}"),
+                    vec![macos_admin_log_path.clone()],
+                )
+            }
+        }
+    };
+    outcomes.push(macos_admin_outcome);
 
     outcomes
 }
@@ -9406,6 +9583,184 @@ fn exercise_macos_anchor_bundle_pull_plan_dry_run(
 
 /// Live macOS anchor bundle-pull validator (sub-test A1.2 parity).
 ///
+/// Prove the macOS node can act as ADMIN by minting its own assignment signing
+/// authority and issuing a cryptographically signed assignment bundle on the
+/// guest. Mirrors the Linux issuing path (`assignment init-signing-secret` +
+/// `assignment issue`). The signing-secret passphrase is minted root-owned 0600
+/// (the daemon's custody check rejects broader/foreign-owned passphrase files —
+/// a security control asserted live here), and `assignment issue` fails closed
+/// on an invalid key, so a non-empty signed bundle + verifier key is the live
+/// proof the mint/issue/sign path runs natively on macOS. The whole sequence
+/// was validated on the warm guest before wiring.
+fn exercise_macos_admin_issue_live(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let macos_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == macos_alias)
+        .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
+        .clone();
+    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            macos_entry.platform_profile().platform.as_str()
+        ));
+    }
+    let node_id = macos_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {macos_alias:?} has no node_id"))?
+        .to_owned();
+    validate_mesh_node_id(node_id.as_str())?;
+    let target = remote_target_from_inventory_entry(&macos_entry, None);
+
+    // node_id is a validated mesh id; the work dir + passphrase + secret are all
+    // root-owned (sudo mktemp + sudo tee) so the daemon's passphrase custody
+    // check (owner-uid + 0600) passes. `set -eu` + the `test -s` asserts make a
+    // failed sign a non-zero exit -> stage Fail.
+    let issue_script = format!(
+        "set -eu; \
+         WORK=$(sudo mktemp -d /tmp/rn-macos-admin.XXXXXX); \
+         head -c 32 /dev/urandom | xxd -p -c 64 | sudo tee \"$WORK/pass\" >/dev/null; \
+         sudo chmod 600 \"$WORK/pass\"; \
+         sudo /usr/local/bin/rustynet assignment init-signing-secret --output \"$WORK/secret\" --signing-secret-passphrase-file \"$WORK/pass\" --force >/dev/null; \
+         PUBHEX=$(sudo cat /usr/local/var/rustynet/keys/wireguard.pub | base64 -d | xxd -p -c 64); \
+         NODES=\"{node_id}|127.0.0.1:51820|$PUBHEX|{node_id}|{node_id}|macos||client\"; \
+         ALLOW=\"{node_id}|{node_id}\"; \
+         sudo /usr/local/bin/rustynet assignment issue --target-node-id {node_id} --nodes \"$NODES\" --allow \"$ALLOW\" --signing-secret \"$WORK/secret\" --signing-secret-passphrase-file \"$WORK/pass\" --output \"$WORK/bundle\" --verifier-key-output \"$WORK/vpub\" --ttl-secs 300 >/dev/null; \
+         sudo test -s \"$WORK/bundle\"; \
+         sudo test -s \"$WORK/vpub\"; \
+         BYTES=$(sudo stat -f%z \"$WORK/bundle\" 2>/dev/null || echo unknown); \
+         sudo rm -rf \"$WORK\"; \
+         echo \"minted signing authority + issued a signed assignment bundle ($BYTES bytes)\"",
+        node_id = node_id,
+    );
+    let out = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        issue_script.as_str(),
+        Duration::from_secs(120),
+    )
+    .map_err(|e| format!("macOS admin issue on {macos_alias} failed: {e}"))?;
+    Ok(format!(
+        "macOS admin live-proven on {macos_alias}: node_id={node_id} {}",
+        out.trim()
+    ))
+}
+
+/// Deploy the reviewed macOS anchor launchd profile on the elected anchor
+/// guest so it SERVES bundle-pull before the live validation runs.
+///
+/// Three on-guest steps, each asserting a live security control:
+///   1. Seed the loopback authority token via the standalone
+///      `ops seed-macos-anchor-token` verb (0600 custody). Genesis is NOT
+///      reused: it needs an owner signing key that is never staged on a joined
+///      node and would re-mint membership with `--force`, clobbering the
+///      mesh-distributed snapshot the node received at join.
+///   2. Replace the client daemon with the anchor profile through the
+///      verify-before-serve installer (`ops install-macos-anchor`), which
+///      rejects any drift from the reviewed hardened shape (loopback addr,
+///      token-path present, allow-lan=false) before it writes
+///      `/Library/LaunchDaemons`. The reviewed plist is uploaded and the
+///      installer reads it cwd-relative.
+///   3. Wait for the loopback-only listener on `127.0.0.1:51822`.
+///
+/// The `anchor.bundle_pull` membership capability is granted earlier in
+/// `amend_membership_for_macos` (the daemon fails closed without it), so after
+/// this stage the live test's four controls (loopback byte-for-byte, token
+/// gate, LAN refused, secrets hygiene) can pass.
+fn deploy_macos_anchor_profile(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let macos_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == macos_alias)
+        .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
+        .clone();
+    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            macos_entry.platform_profile().platform.as_str()
+        ));
+    }
+    let target = remote_target_from_inventory_entry(&macos_entry, None);
+
+    let host_plist = workspace_root_path().join("scripts/launchd/com.rustynet.anchor.plist");
+    if !host_plist.is_file() {
+        return Err(format!(
+            "reviewed anchor plist missing at {}",
+            host_plist.display()
+        ));
+    }
+    let remote_plist = format!("/tmp/com.rustynet.anchor.plist.{}", unique_suffix());
+    ensure_success_status(
+        scp_to_remote_for_target(
+            &target,
+            None,
+            Some(ssh_identity_file),
+            known_hosts_path,
+            host_plist.as_path(),
+            remote_plist.as_str(),
+            Duration::from_secs(30),
+        )
+        .map_err(|e| format!("scp reviewed anchor plist to {macos_alias} failed: {e}"))?,
+        "scp reviewed anchor plist to macOS host",
+    )?;
+
+    // The installer reads its source cwd-relative as
+    // scripts/launchd/com.rustynet.anchor.plist, so stage the uploaded plist
+    // under that layout in a temp dir and run the installer with that cwd.
+    // bootout the client daemon first: the anchor profile composes the SAME
+    // daemon binary + state + keys + membership with the bundle-pull listener,
+    // so running both labels would contend on one node's state.
+    let deploy_script = format!(
+        "set -eu; \
+         TMPD=\"$(mktemp -d /tmp/rn-anchor-deploy.XXXXXX)\"; \
+         mkdir -p \"$TMPD/scripts/launchd\"; \
+         cp {plist} \"$TMPD/scripts/launchd/com.rustynet.anchor.plist\"; \
+         sudo /usr/local/bin/rustynet ops seed-macos-anchor-token; \
+         sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
+         ( cd \"$TMPD\" && sudo /usr/local/bin/rustynet ops install-macos-anchor ); \
+         listener_up=0; \
+         for _ in $(seq 1 20); do \
+           if nc -z 127.0.0.1 51822 2>/dev/null; then listener_up=1; break; fi; \
+           sleep 2; \
+         done; \
+         rm -rf \"$TMPD\"; \
+         if [ \"$listener_up\" != \"1\" ]; then \
+           echo 'anchor bundle-pull listener did not come up on 127.0.0.1:51822' >&2; exit 1; \
+         fi; \
+         echo 'anchor bundle-pull listener up on 127.0.0.1:51822'",
+        plist = shell_quote(remote_plist.as_str()),
+    );
+
+    let out = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        deploy_script.as_str(),
+        Duration::from_secs(180),
+    )
+    .map_err(|e| format!("macOS anchor deploy on {macos_alias} failed: {e}"))?;
+
+    Ok(format!(
+        "macOS anchor profile deployed on {macos_alias}: token seeded (0600) + reviewed anchor \
+         profile installed (verify-before-serve) + loopback listener up on 127.0.0.1:51822; {}",
+        out.trim()
+    ))
+}
+
 /// Drives the dedicated `live_macos_anchor_test` bin (via its bash
 /// wrapper) against the macOS anchor guest. The bin SSHes to the guest,
 /// presents the genesis-seeded authority token over the loopback
@@ -36768,6 +37123,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             exit_platform: None,
             relay_platform: None,
             anchor_platform: None,
+            admin_platform: None,
             enable_chaos_suite: false,
             stage_timeout_secs: 0,
         }
