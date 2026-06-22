@@ -1373,6 +1373,49 @@ fn install_traversal_bundle(
     Ok(())
 }
 
+/// Start `rustynetd.service` resiliently against the systemd start-limit.
+///
+/// The managed-DNS validator deliberately makes the client daemon reject
+/// adversarial bundles; a fatal traversal-preflight rejection makes the daemon
+/// exit non-zero, so the unit's own `Restart=on-failure` issues auto-restarts.
+/// Combined with the validator's explicit `systemctl start` calls these can
+/// exceed `StartLimitBurst` (5 in 60s) and latch the unit in `start-limit-hit`,
+/// after which every `systemctl start` returns non-zero and a plain retry loop
+/// can never recover. Clear the latch with `reset-failed` before EACH start
+/// attempt so a transient start-limit never aborts the stage.
+///
+/// This only hardens the harness's restart discipline: it does not modify the
+/// production unit, its StartLimit settings, or the daemon's correct
+/// fail-closed rejection of invalid bundles (which is exactly what this stage
+/// asserts).
+fn start_rustynetd_with_reset(
+    ctx: &LiveLabContext,
+    client_host: &str,
+    attempts: u32,
+    sleep_secs: u64,
+) -> Result<(), String> {
+    let mut last_err = None;
+    for attempt in 1..=attempts {
+        // Clear any start-limit latch accumulated by the unit's own
+        // Restart=on-failure before trying to start again.
+        let _ = ctx.run_root_allow_failure(
+            client_host,
+            &["systemctl", "reset-failed", "rustynetd.service"],
+        );
+        match ctx.run_root(client_host, &["systemctl", "start", "rustynetd.service"]) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < attempts {
+                    sleep(std::time::Duration::from_secs(sleep_secs));
+                }
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| "start rustynetd.service retry exhausted after reset-failed".to_owned()))
+}
+
 fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<(), String> {
     ctx.run_root_allow_failure(
         client_host,
@@ -1410,12 +1453,7 @@ fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<
         15,
         2,
     )?;
-    ctx.retry_root(
-        client_host,
-        &["systemctl", "start", "rustynetd.service"],
-        5,
-        2,
-    )?;
+    start_rustynetd_with_reset(ctx, client_host, 5, 2)?;
     ctx.wait_for_daemon_socket(client_host, "/run/rustynet/rustynetd.sock", 20, 2)?;
     ctx.retry_root(
         client_host,
