@@ -226,6 +226,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "linux-exit-nat-lifecycle-snapshot" => {
                 run_linux_exit_nat_lifecycle_snapshot_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "linux-ipv6-leak-capture" => {
+                run_linux_ipv6_leak_capture_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "macos-runtime-acls-check" => {
                 run_macos_runtime_acls_check_command(rest)
             }
@@ -1522,6 +1525,59 @@ fn run_linux_exit_nat_lifecycle_snapshot_command(args: &[String]) -> Result<(), 
         serde_json::to_string_pretty(&snapshot).map_err(|err| {
             format!("serialize linux-exit-nat-lifecycle snapshot failed: {err}")
         })?
+    );
+    Ok(())
+}
+
+fn run_linux_ipv6_leak_capture_command(args: &[String]) -> Result<(), String> {
+    let mut egress_iface: Option<String> = None;
+    let mut probe_target: Option<String> = None;
+    let mut killswitch_table: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--egress-iface") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-ipv6-leak-capture: --egress-iface requires a value".to_owned()
+                })?;
+                egress_iface = Some(value.clone());
+                index += 2;
+            }
+            Some("--probe-target") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-ipv6-leak-capture: --probe-target requires a value".to_owned()
+                })?;
+                probe_target = Some(value.clone());
+                index += 2;
+            }
+            Some("--killswitch-table") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-ipv6-leak-capture: --killswitch-table requires a value".to_owned()
+                })?;
+                killswitch_table = Some(value.clone());
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!("unknown linux-ipv6-leak-capture argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let egress_iface = egress_iface
+        .ok_or_else(|| "linux-ipv6-leak-capture: --egress-iface is required".to_owned())?;
+    let options = rustynetd::linux_ipv6_leak::LinuxIpv6LeakOptions {
+        egress_iface,
+        probe_target: probe_target
+            .unwrap_or_else(|| rustynetd::linux_ipv6_leak::DEFAULT_IPV6_PROBE_TARGET.to_owned()),
+        killswitch_table: killswitch_table.unwrap_or_else(|| {
+            rustynetd::linux_ipv6_leak::DEFAULT_LINUX_KILLSWITCH_TABLE.to_owned()
+        }),
+    };
+    let snapshot = rustynetd::linux_ipv6_leak::collect_linux_ipv6_leak_snapshot(&options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&snapshot)
+            .map_err(|err| { format!("serialize linux-ipv6-leak snapshot failed: {err}") })?
     );
     Ok(())
 }
@@ -3514,6 +3570,7 @@ fn help_text() -> String {
         "  rustynetd linux-dns-failclosed-check [--no-fail-on-drift]",
         "  rustynetd linux-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>] [--killswitch-table <name>]",
         "  rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]",
+        "  rustynetd linux-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--killswitch-table <name>]",
         "  rustynetd macos-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>]",
         "  rustynetd macos-exit-killswitch-precedence-check --output <path> [--pf-anchor <name>]",
         "  rustynetd windows-service-hardening-check [--no-fail-on-drift]",
@@ -3604,7 +3661,7 @@ fn help_text() -> String {
 mod tests {
     use super::{
         classify_top_level_error, help_text, parse_daemon_config,
-        run_linux_exit_dns_failclosed_capture_command,
+        run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
         run_macos_exit_dns_failclosed_capture_command,
         run_macos_exit_killswitch_precedence_check_command, run_windows_authenticode_check_command,
         run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
@@ -3999,6 +4056,42 @@ mod tests {
         .expect_err("missing output must reject");
         assert!(
             err.contains("--output is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_linux_ipv6_leak_capture_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("linux-ipv6-leak-capture"),
+            "help text must advertise linux-ipv6-leak-capture subcommand"
+        );
+        assert!(
+            help.contains("--egress-iface"),
+            "help text must advertise --egress-iface"
+        );
+    }
+
+    #[test]
+    fn run_linux_ipv6_leak_capture_command_rejects_unknown_flags() {
+        let err = run_linux_ipv6_leak_capture_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown linux-ipv6-leak-capture argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_linux_ipv6_leak_capture_command_requires_egress_iface() {
+        let err = run_linux_ipv6_leak_capture_command(&[
+            "--probe-target".to_owned(),
+            "2606:4700:4700::1111".to_owned(),
+        ])
+        .expect_err("missing egress iface must reject");
+        assert!(
+            err.contains("--egress-iface is required"),
             "unexpected error: {err}"
         );
     }

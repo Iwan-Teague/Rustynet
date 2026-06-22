@@ -14400,6 +14400,76 @@ fn evaluate_linux_exit_nat_lifecycle_artifact(
     ))
 }
 
+/// Linux IPv6 tunnel-leak artefact validator. Companion of the daemon-side
+/// `rustynetd linux-ipv6-leak-capture` producer
+/// (`crates/rustynetd/src/linux_ipv6_leak.rs`).
+///
+/// Adversarial intent: prove the protected-mode tunnel fail-closes for IPv6,
+/// not just IPv4 (`SecurityMinimumBar.md` §8 — tunnel fail-close behaviour in
+/// protected-routing modes). The "IPv6 leak" bug is an IPv4 killswitch that
+/// silently lets native IPv6 egress in the clear.
+///
+/// Fail-closed contract (the stage Fails if ANY holds):
+///   - `leaked_datagram_count > 0` — a global-scope IPv6 datagram was seen
+///     leaving on the egress interface (link-local + multicast are excluded
+///     by the capture filter, so any count is a real leak);
+///   - `probe_reached_target == true` — the outbound IPv6 probe reached its
+///     global target, i.e. traffic escaped the tunnel;
+///   - neither containment control is present (`ipv6_disabled == false` AND
+///     `killswitch_v6_drop_present == false`) — there is nothing fail-closing
+///     IPv6 at all.
+fn evaluate_linux_ipv6_leak_artifact(linux_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse linux IPv6 leak artifact failed: {err}"))?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "linux IPv6 leak artifact returned unsupported schema_version={}",
+                require_json_u64(&report, "schema_version").unwrap_or_default()
+            )
+        })?;
+    let egress_iface = require_json_str(&report, "egress_iface")?;
+    if egress_iface.trim().is_empty() {
+        return Err("linux IPv6 leak artifact has empty egress_iface".to_owned());
+    }
+    let probe_target = require_json_str(&report, "probe_target")?;
+    probe_target.parse::<std::net::Ipv6Addr>().map_err(|_| {
+        format!(
+            "linux IPv6 leak artifact probe_target {probe_target:?} is not a valid IPv6 address"
+        )
+    })?;
+
+    let leaked = require_json_u64(&report, "leaked_datagram_count")?;
+    if leaked > 0 {
+        return Err(format!(
+            "linux IPv6 leak artifact observed {leaked} cleartext IPv6 datagram(s) egressing on {egress_iface}: tunnel is NOT fail-closed for IPv6"
+        ));
+    }
+    if require_json_bool(&report, "probe_reached_target")? {
+        return Err(format!(
+            "linux IPv6 leak artifact reports the outbound IPv6 probe reached {probe_target}: IPv6 traffic escaped the protected path"
+        ));
+    }
+    let ipv6_disabled = require_json_bool(&report, "ipv6_disabled")?;
+    let killswitch_v6 = require_json_bool(&report, "killswitch_v6_drop_present")?;
+    if !ipv6_disabled && !killswitch_v6 {
+        return Err(
+            "linux IPv6 leak artifact found no IPv6 containment control (neither net.ipv6.conf.all.disable_ipv6 nor an inet/ip6 killswitch drop): IPv6 is not fail-closed"
+                .to_owned(),
+        );
+    }
+    let containment = if ipv6_disabled {
+        "ipv6-disabled"
+    } else {
+        "inet/ip6-killswitch-drop"
+    };
+    Ok(format!(
+        "Linux IPv6 leak proof verified on {linux_alias}: 0 leaked datagrams, probe blocked, containment={containment} (egress={egress_iface})"
+    ))
+}
+
 /// macOS DNS fail-closed artefact-directory validator. Parallel to the
 /// Windows variant. Required files in the artefact directory:
 ///
@@ -16232,6 +16302,7 @@ fn run_linux_orchestration_stages_with_options(
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
     let exit_nat_lifecycle_log_path = logs_dir.join("validate_linux_exit_nat_lifecycle.log");
+    let exit_ipv6_leak_log_path = logs_dir.join("validate_linux_ipv6_leak.log");
     let exit_dns_failclosed_log_path = logs_dir.join("validate_linux_exit_dns_failclosed.log");
     let relay_lifecycle_log_path = logs_dir.join("validate_linux_relay_service_lifecycle.log");
     let anchor_bundle_pull_log_path = logs_dir.join("validate_linux_anchor_bundle_pull.log");
@@ -16422,6 +16493,67 @@ fn run_linux_orchestration_stages_with_options(
                             "Linux Exit NAT lifecycle artifact validation failed for {linux_alias}: {reason}"
                         ),
                         vec![exit_nat_lifecycle_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+
+    let exit_ipv6_leak_outcome = if options.dry_run {
+        stage_outcome(
+            "validate_linux_ipv6_leak",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate Linux IPv6 leak artifact for {linux_alias}"),
+            vec![],
+        )
+    } else if !runtime_acls_passed {
+        make_skipped("validate_linux_ipv6_leak", "validate_linux_runtime_acls")
+    } else if !key_custody_passed {
+        make_skipped("validate_linux_ipv6_leak", "validate_linux_key_custody")
+    } else if !hardening_passed {
+        make_skipped(
+            "validate_linux_ipv6_leak",
+            "validate_linux_service_hardening",
+        )
+    } else {
+        let artifact_path = report_dir
+            .join("linux_exit_evidence")
+            .join("linux_ipv6_leak.json");
+        if !artifact_path.exists() {
+            stage_outcome(
+                "validate_linux_ipv6_leak",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: Linux IPv6 leak artifact not present at {}; Linux host is not proving IPv6 fail-closed posture",
+                    artifact_path.display()
+                ),
+                vec![],
+            )
+        } else {
+            match fs::read_to_string(&artifact_path)
+                .map_err(|err| format!("read {} failed: {err}", artifact_path.display()))
+                .and_then(|raw| {
+                    evaluate_linux_ipv6_leak_artifact(linux_alias, raw.as_str())
+                        .map(|summary| (summary, raw))
+                }) {
+                Ok((summary, raw)) => {
+                    let _ = fs::write(&exit_ipv6_leak_log_path, raw.as_str());
+                    stage_outcome(
+                        "validate_linux_ipv6_leak",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_ipv6_leak_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_ipv6_leak_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_linux_ipv6_leak",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "Linux IPv6 leak artifact validation failed for {linux_alias}: {reason}"
+                        ),
+                        vec![exit_ipv6_leak_log_path.clone()],
                     )
                 }
             }
@@ -16718,6 +16850,7 @@ fn run_linux_orchestration_stages_with_options(
         authenticode_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
+        exit_ipv6_leak_outcome,
         exit_dns_failclosed_outcome,
         relay_lifecycle_outcome,
         anchor_bundle_pull_outcome,
@@ -34403,6 +34536,156 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         );
     }
 
+    fn reviewed_linux_ipv6_leak_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "egress_iface": "enp0s1",
+            "probe_target": "2606:4700:4700::1111",
+            "killswitch_table": "rustynet_g1",
+            "ipv6_disabled": true,
+            "killswitch_v6_drop_present": false,
+            "leaked_datagram_count": 0,
+            "probe_reached_target": false
+        })
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_accepts_failclosed_posture() {
+        let summary = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            reviewed_linux_ipv6_leak_artifact().to_string().as_str(),
+        )
+        .expect("fail-closed IPv6 posture must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("containment=ipv6-disabled"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_accepts_killswitch_drop_containment() {
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["ipv6_disabled"] = serde_json::Value::Bool(false);
+        payload["killswitch_v6_drop_present"] = serde_json::Value::Bool(true);
+        let summary = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect("inet/ip6 killswitch drop is valid IPv6 containment");
+        assert!(
+            summary.contains("containment=inet/ip6-killswitch-drop"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_rejects_leaked_datagram() {
+        // The bite: a single leaked global-scope IPv6 datagram must Fail the
+        // stage even though containment claims to be present.
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["leaked_datagram_count"] = serde_json::Value::from(1);
+        let err = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a leaked IPv6 datagram must fail closed");
+        assert!(
+            err.contains("cleartext IPv6 datagram") && err.contains("NOT fail-closed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_rejects_probe_reaching_target() {
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["probe_reached_target"] = serde_json::Value::Bool(true);
+        let err = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a probe that reaches its global target must fail closed");
+        assert!(
+            err.contains("escaped the protected path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_rejects_no_containment_control() {
+        // No disable_ipv6 AND no killswitch drop => nothing fail-closes IPv6.
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["ipv6_disabled"] = serde_json::Value::Bool(false);
+        payload["killswitch_v6_drop_present"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("absence of any IPv6 containment control must fail closed");
+        assert!(
+            err.contains("no IPv6 containment control"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_rejects_bad_probe_target() {
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["probe_target"] = serde_json::Value::String("not-an-address".into());
+        let err = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a malformed probe_target must fail");
+        assert!(
+            err.contains("not a valid IPv6 address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn linux_ipv6_leak_producer_to_validator_round_trip_failclosed() {
+        // Producer builder (daemon crate) → orchestrator validator: a
+        // disabled-IPv6 host with an empty egress capture and a blocked probe
+        // is a clean fail-closed posture.
+        let snapshot = rustynetd::linux_ipv6_leak::build_linux_ipv6_leak_snapshot(
+            1,
+            "enp0s1",
+            "2606:4700:4700::1111",
+            "rustynet_g1",
+            "1\n",
+            "",
+            "reading from file /tmp/x.pcap\n0 packets captured\n",
+            false,
+        );
+        let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        let summary = super::evaluate_linux_ipv6_leak_artifact("debian-headless-1", raw.as_str())
+            .expect("producer-built fail-closed IPv6 artifact must validate");
+        assert!(
+            summary.contains("0 leaked datagrams"),
+            "unexpected: {summary}"
+        );
+    }
+
+    #[test]
+    fn linux_ipv6_leak_producer_to_validator_round_trip_detects_leak() {
+        // Producer builder on a leaking host (IPv6 enabled, IPv4-only
+        // killswitch, a captured datagram, probe reached) → validator Fail.
+        let snapshot = rustynetd::linux_ipv6_leak::build_linux_ipv6_leak_snapshot(
+            1,
+            "enp0s1",
+            "2606:4700:4700::1111",
+            "rustynet_g1",
+            "0\n",
+            "table ip rustynet_g1 {\n chain killswitch {\n  policy drop;\n  ip saddr 100.64.0.0/16 accept\n }\n}\n",
+            "12:00:00 IP6 2001:db8::1 > 2606:4700:4700::1111: ICMP6, echo request\n",
+            true,
+        );
+        let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        let err = super::evaluate_linux_ipv6_leak_artifact("debian-headless-1", raw.as_str())
+            .expect_err("a leaking host must fail closed");
+        assert!(err.contains("cleartext IPv6 datagram"), "unexpected: {err}");
+    }
+
     #[test]
     fn linux_relay_lifecycle_output_validators_accept_reviewed_dry_run_text() {
         let install = "rustynet-relay systemd unit: install+enable (dry-run) at /etc/systemd/system/rustynet-relay.service\n  - would run: systemctl daemon-reload\n  - would run: systemctl enable rustynet-relay.service\n  - would run: systemctl start rustynet-relay.service\n";
@@ -37149,6 +37432,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_authenticode",
             "validate_linux_dns_failclosed",
             "validate_linux_exit_nat_lifecycle",
+            "validate_linux_ipv6_leak",
             "validate_linux_exit_dns_failclosed",
             "validate_linux_relay_service_lifecycle",
             "validate_linux_anchor_bundle_pull",
@@ -37286,6 +37570,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_authenticode",
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",
+                "validate_linux_ipv6_leak",
                 "validate_linux_exit_dns_failclosed",
                 "validate_linux_relay_service_lifecycle",
                 "validate_linux_anchor_bundle_pull",
