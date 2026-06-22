@@ -2731,21 +2731,44 @@ impl MacosCommandSystem {
     /// are rolled back, leaving the killswitch `block drop out quick all` in
     /// force so egress stays blocked.
     fn activate_exit_nat(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        // IPv6 exit NAT requires enabling `net.inet6.ip6.forwarding`, which is
+        // not yet wired: the privileged helper permits only the v4 forwarding
+        // key and the live snapshot reads only v4. Fail closed on an IPv6 mesh
+        // rather than load a v6 NAT rule that silently cannot forward. (Dual
+        // stack is a tracked follow-up increment.)
+        if mesh_cidr.contains(':') {
+            return Err(SystemError::NatApplyFailed(format!(
+                "IPv6 exit NAT not yet supported (mesh_cidr={mesh_cidr}); IPv6 forwarding is unwired"
+            )));
+        }
+
         let config =
             MacosExitNatPfConfig::new(self.egress_interface.clone(), vec![mesh_cidr.to_owned()])
                 .map_err(SystemError::NatApplyFailed)?;
         let rules = build_macos_exit_nat_pf_rules(&config).map_err(SystemError::NatApplyFailed)?;
 
-        // Cache the prior forwarding state, then enable forwarding FIRST.
-        let prior = self
+        // Read the prior forwarding state FAIL-CLOSED — a read error or
+        // non-zero status aborts activation rather than guessing a value, so we
+        // never cache a wrong prior (e.g. defaulting to "0" when forwarding was
+        // already enabled would make teardown wrongly disable it).
+        let prior_out = self
             .run_capture(
                 PrivilegedCommandProgram::Sysctl,
                 &["-n", "net.inet.ip.forwarding"],
             )
-            .ok()
-            .filter(|out| out.success())
-            .map(|out| out.stdout.trim().to_owned())
-            .unwrap_or_else(|| "0".to_owned());
+            .map_err(|err| {
+                SystemError::NatApplyFailed(format!("read prior macOS ip forwarding failed: {err}"))
+            })?;
+        if !prior_out.success() {
+            return Err(SystemError::NatApplyFailed(format!(
+                "read prior macOS ip forwarding returned non-zero: status={} stderr={}",
+                prior_out.status, prior_out.stderr
+            )));
+        }
+        let prior = prior_out.stdout.trim().to_owned();
+
+        // Enable forwarding FIRST (mirrors the Linux ordering), then record the
+        // prior value so teardown can restore it.
         self.run(
             PrivilegedCommandProgram::Sysctl,
             &["-w", "net.inet.ip.forwarding=1"],
@@ -2766,6 +2789,13 @@ impl MacosCommandSystem {
         let load_result = self.load_exit_nat_anchor(anchor, tmp_path.as_path());
         let _ = fs::remove_file(&tmp_path);
         if let Err(err) = load_result {
+            // Flush any partial load and restore forwarding so no residue
+            // outlives the failed activation. The killswitch block-all stays
+            // in force throughout, so egress is blocked regardless.
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", anchor, "-F", "all"],
+            );
             let _ = self.restore_ip_forwarding();
             return Err(err);
         }
@@ -2826,31 +2856,38 @@ impl MacosCommandSystem {
     /// rollback (delete NAT, then restore forwarding) and keeps the killswitch
     /// block-all installed throughout, so egress stays fail-closed mid-teardown.
     fn teardown_exit_nat(&mut self) -> Result<(), SystemError> {
-        if let Some(anchor) = self.exit_nat_anchor.take() {
+        // Flush the anchor by reference (do NOT consume the field yet): if the
+        // forwarding restore below fails, exit_nat_anchor must stay `Some` so a
+        // retry re-flushes — otherwise teardown would silently leak the anchor.
+        if let Some(anchor) = self.exit_nat_anchor.as_ref() {
             self.run_allow_failure(
                 PrivilegedCommandProgram::Pfctl,
                 &["-a", anchor.as_str(), "-F", "all"],
             );
         }
-        self.restore_ip_forwarding()
+        // Restore forwarding; only after it succeeds do we clear the anchor —
+        // making teardown idempotent and retryable on partial failure.
+        self.restore_ip_forwarding()?;
+        self.exit_nat_anchor = None;
+        Ok(())
     }
 
     /// Restore `net.inet.ip.forwarding` to the value cached before the exit
-    /// enabled it. No-op when nothing was cached.
+    /// enabled it. No-op when nothing was cached. The cached value is cleared
+    /// ONLY after the sysctl write succeeds, so a failed restore leaves the
+    /// cache intact and a subsequent call retries it (fail-closed: forwarding
+    /// is never left enabled with the cache silently lost).
     fn restore_ip_forwarding(&mut self) -> Result<(), SystemError> {
-        if let Some(prior) = self.prior_ip_forwarding.take() {
-            let arg = if prior.trim() == "1" {
-                "net.inet.ip.forwarding=1"
-            } else {
-                "net.inet.ip.forwarding=0"
-            };
-            self.run(PrivilegedCommandProgram::Sysctl, &["-w", arg])
-                .map_err(|err| {
-                    SystemError::RollbackFailed(format!(
-                        "restore macOS ip forwarding failed: {err}"
-                    ))
-                })?;
-        }
+        let arg = match self.prior_ip_forwarding.as_deref() {
+            Some(prior) if prior.trim() == "1" => "net.inet.ip.forwarding=1",
+            Some(_) => "net.inet.ip.forwarding=0",
+            None => return Ok(()),
+        };
+        self.run(PrivilegedCommandProgram::Sysctl, &["-w", arg])
+            .map_err(|err| {
+                SystemError::RollbackFailed(format!("restore macOS ip forwarding failed: {err}"))
+            })?;
+        self.prior_ip_forwarding = None;
         Ok(())
     }
 }

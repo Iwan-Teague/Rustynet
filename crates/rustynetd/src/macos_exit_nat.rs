@@ -125,55 +125,55 @@ pub fn evaluate_macos_exit_nat_pf_rules(rules: &str, config: &MacosExitNatPfConf
         return reasons;
     }
 
-    let normalized: Vec<String> = rules
+    // The reviewed translation anchor must contain EXACTLY the set of NAT
+    // rules the builder emits for the configured mesh prefixes — one per
+    // prefix, each translating onto the egress interface. Computing the
+    // expected set and requiring every loaded line to be a member of it
+    // enforces, in one pass: the right rules are present; no rule translates
+    // onto an unreviewed interface (neither the `on <iface>` source scope nor
+    // the `-> (<iface>)` target may drift); and no non-NAT filter rule
+    // (`pass`/`block`/…) has been smuggled into the translation anchor.
+    let mut expected: Vec<String> = Vec::new();
+    for cidr in &config.mesh_cidrs {
+        match pf_family_for_cidr(cidr.as_str()) {
+            Ok(family) => expected.push(normalize_pf_nat_rule(&format!(
+                "nat on {} {} from {} to any -> ({})",
+                config.egress_interface, family, cidr, config.egress_interface
+            ))),
+            Err(err) => reasons.push(err),
+        }
+    }
+
+    let actual: Vec<String> = rules
         .lines()
         .map(normalize_pf_nat_rule)
         .filter(|line| !line.is_empty())
         .collect();
 
-    let nat_rules: Vec<&String> = normalized.iter().filter(|line| is_nat_rule(line)).collect();
-
-    if nat_rules.is_empty() {
+    if actual.is_empty() {
         reasons.push("exit NAT rules missing: anchor has no `nat ...` translation rule".to_owned());
     }
-
-    if contains_forbidden_route_primitive(&normalized) {
+    if contains_forbidden_route_primitive(&actual) {
         reasons.push(
             "exit NAT rules must not contain route-to/reply-to/dup-to bypass primitives".to_owned(),
         );
     }
 
-    // Every expected mesh prefix must have a NAT rule on the egress interface.
-    for cidr in &config.mesh_cidrs {
-        let family = match pf_family_for_cidr(cidr.as_str()) {
-            Ok(value) => value,
-            Err(err) => {
-                reasons.push(err);
-                continue;
-            }
-        };
-        let expected = normalize_pf_nat_rule(&format!(
-            "nat on {} {} from {} to any -> ({})",
-            config.egress_interface, family, cidr, config.egress_interface
-        ));
-        if !nat_rules.contains(&&expected) {
+    // Every expected translation must be present.
+    for rule in &expected {
+        if !actual.contains(rule) {
             reasons.push(format!(
-                "exit NAT rules missing translation for {cidr} on {}",
-                config.egress_interface
+                "exit NAT rules missing expected translation: {rule}"
             ));
         }
     }
-
-    // No NAT rule may translate onto an interface other than the reviewed
-    // egress interface — that would silently exfiltrate mesh traffic onto an
-    // unreviewed path.
-    let on_egress = format!("on {} ", config.egress_interface);
-    for line in &nat_rules {
-        if !line.contains(&on_egress) {
-            reasons.push(format!(
-                "exit NAT rules contain unreviewed translation not on {}: {line}",
-                config.egress_interface
-            ));
+    // Every loaded line must be one of the expected translations. This rejects
+    // an unreviewed NAT rule (drifted source/destination/interface or
+    // `-> (<iface>)` target) and any non-NAT filter rule injected into the
+    // anchor.
+    for line in &actual {
+        if !expected.contains(line) {
+            reasons.push(format!("exit NAT anchor contains unreviewed rule: {line}"));
         }
     }
 
@@ -266,10 +266,6 @@ fn normalize_pf_nat_rule(line: &str) -> String {
         .replace(" from any to any ", " to any ")
 }
 
-fn is_nat_rule(line: &str) -> bool {
-    line.starts_with("nat ") || line.contains(" nat ")
-}
-
 fn contains_forbidden_route_primitive(lines: &[String]) -> bool {
     lines.iter().any(|line| {
         line.contains(" route-to ") || line.contains(" reply-to ") || line.contains(" dup-to ")
@@ -338,10 +334,46 @@ mod tests {
         let cfg = config();
         let rules = "nat on en1 inet from 100.64.0.0/10 to any -> (en1)\n";
         let reasons = evaluate_macos_exit_nat_pf_rules(rules, &cfg);
+        // The whole rule is on the wrong interface: it is both an unreviewed
+        // rule and the expected en0 rule is missing.
+        assert!(reasons.iter().any(|r| r.contains("unreviewed rule")));
         assert!(
-            reasons.iter().any(|r| r.contains("unreviewed translation"))
-                || reasons.iter().any(|r| r.contains("missing translation"))
+            reasons
+                .iter()
+                .any(|r| r.contains("missing expected translation"))
         );
+    }
+
+    #[test]
+    fn evaluator_rejects_nat_to_unreviewed_target_interface() {
+        // Source/`on` interface is the reviewed egress, but the `-> (<iface>)`
+        // translation target is a different interface — must be rejected (the
+        // `on <iface>` token alone is not sufficient).
+        let cfg = config();
+        let rules = "nat on en0 inet from 100.64.0.0/10 to any -> (en1)\n";
+        let reasons = evaluate_macos_exit_nat_pf_rules(rules, &cfg);
+        assert!(reasons.iter().any(|r| r.contains("unreviewed rule")));
+    }
+
+    #[test]
+    fn evaluator_rejects_non_nat_filter_rule_in_anchor() {
+        // A filter rule smuggled into the translation anchor must be flagged —
+        // the NAT anchor owns only translation rules.
+        let cfg = config();
+        let mut rules = build_macos_exit_nat_pf_rules(&cfg).unwrap();
+        rules.push_str("pass out quick on en0 inet all keep state\n");
+        let reasons = evaluate_macos_exit_nat_pf_rules(&rules, &cfg);
+        assert!(reasons.iter().any(|r| r.contains("unreviewed rule")));
+    }
+
+    #[test]
+    fn evaluator_rejects_substring_interface_name_collision() {
+        // Regression for the substring check: config egress "en" must not be
+        // satisfied by a rule on "en0".
+        let cfg = MacosExitNatPfConfig::new("en", vec!["100.64.0.0/10".to_owned()]).unwrap();
+        let rules = "nat on en0 inet from 100.64.0.0/10 to any -> (en0)\n";
+        let reasons = evaluate_macos_exit_nat_pf_rules(rules, &cfg);
+        assert!(reasons.iter().any(|r| r.contains("unreviewed rule")));
     }
 
     #[test]
