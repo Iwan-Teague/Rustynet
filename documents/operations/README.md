@@ -78,6 +78,7 @@ Cross-platform code-quality ledger:
 
 ## High-Value Evergreen References
 
+- [Arm32BitEmbeddedSupportReference_2026-06-23.md](./Arm32BitEmbeddedSupportReference_2026-06-23.md) — developer reference for running Rustynet on 32-bit ARM Linux (armv7-unknown-linux-gnueabihf) embedded boards; covers compile concerns, toolchain setup, backend selection, systemd/nftables dependencies, memory budget, SD card wear, fd limits, and CI requirements for claiming support
 - [BackendAgilityValidation.md](./BackendAgilityValidation.md)
 - [CliExitCodeTaxonomy.md](./CliExitCodeTaxonomy.md) — shared CLI exit-code taxonomy (sysexits.h-aligned ExitCode enum) + operator decision rules; ADR-003 holds the design rationale
 - [CompatibilitySupportPolicy.md](./CompatibilitySupportPolicy.md)
