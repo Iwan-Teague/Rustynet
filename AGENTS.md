@@ -30,7 +30,11 @@ Read in this order before touching code:
 
 Current primary execution ledgers:
 - `documents/operations/active/CrossPlatformRoleParityPlan_2026-06-21.md` — **RELEASE-BLOCKING COMPLETENESS MANDATE.** Rustynet cannot be called complete until **every node role + capability (client, admin, anchor, exit, blind_exit, relay, +nas/llm) works and is LIVE-LAB-PROVEN on macOS AND Windows, not just Linux.** Linux is the done reference; macOS/Windows must reach full per-role parity, each role proven live in the lab. This doc is the single source of truth for that gap (live-proven status matrix per role × OS, the per-role × per-OS live-lab acceptance matrix, known blockers, and the parity Definition of Done). No OS may be a capability limiter.
+- `documents/operations/active/CrossPlatformRoleParityRoadmap_2026-06-22.md` — the execution roadmap that operationalizes the parity mandate: remaining work + effort per mac/win role cell, the ordered implementation program (admin → blind_exit → role-transitions → relay-lifecycle → anchor-live), file-by-file plans, the FAIL-LOUD live-stage spec (live result = stage status; no dry-run-as-pass), and the optimized concurrent Windows+macOS test pipeline + all-on-`main` workflow. Builds on the ParityPlan (status) + EfficiencyPlan (primitives).
+- `documents/operations/active/LiveLabExecutionEfficiencyPlan_2026-06-20.md` — the operating method for the same-LAN "drive defects to zero" live-lab loop: setup/run split, per-node `rebuild_nodes`, single-stage wrapper re-run, the mandatory periodic full-validation gate, and the never-idle parallel-work protocol. Follow this while iterating Linux→macOS→Windows→cross-OS.
 - `documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md` for the cross-network dataplane track (D2-D13): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding, service-hosting roles (nas, llm). Source of truth for "what are we building and why" when working on traversal, relay, gossip, enrollment, or cellular reliability.
+- `documents/operations/active/CrossNetworkSubstrateIntegrationSpec_2026-06-21.md` — focused integration spec to make the cross-network live-lab stages actually run (substrate↔validator mapping: netns NAT-matrix gate, vxlan SSH e2e, slirp cross-OS smoke; orchestrator wiring + phased plan X1–X4).
+- `documents/operations/active/ServiceHostingRolesRoadmap_2026-06-11.md` — top-level program roadmap for the `nas` + `llm` service-hosting roles (D13): document set, milestones M0–M6, dependency graph, gate checklist, and status tracker. Start here for the service-hosting-roles program.
 - `documents/operations/active/MasterWorkPlan_2026-03-22.md` for repo-wide remaining work
 - `documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md` for traversal, relay, and live-lab readiness (the defects it documents drive D2/D3/D4 in the dataplane execution plan)
 
@@ -262,3 +266,128 @@ Key rules:
 - Commit messages: imperative mood, what AND why
 - Never commit generated files, build artifacts, or secrets
 - Run at minimum: cargo fmt --all -- --check && cargo check -p <crate>
+
+## 11) Repository Map & Codebase Structure
+
+Rustynet is a Cargo workspace (`edition = "2024"`, `resolver = "2"`,
+`unsafe_code = "forbid"` workspace-wide). For a symbol-level reference (key
+types, traits, and the files they live in), read `documents/CODE_MAP.md` — it is
+the authoritative map and should be kept in sync when types move.
+
+### 11.1 Top-Level Layout
+- `crates/` — all workspace crates (see §11.2).
+- `third_party/` — vendored path deps: `boringtun` (userspace WireGuard),
+  `rustynet-tun` (TUN device), `rustynet-alloc-meter` (allocation accounting).
+  Treat as adapters behind the backend boundary; do not leak their types
+  upward (§8, §10.3).
+- `documents/` — source-of-truth docs. `Requirements.md` and
+  `SecurityMinimumBar.md` are top-precedence; `CODE_MAP.md` is the code map;
+  `operations/active/` holds the live execution ledgers (§2); `operations/done/`
+  and `archive/` hold history.
+- `scripts/` — operational + CI tooling, grouped by area: `ci/` (gate scripts),
+  `vm_lab/` (UTM lab helpers incl. `probe_and_recover_local_utm.sh`),
+  `bootstrap/`, `dev/`, `e2e/`, `fuzz/`, `launchd/`, `systemd/`, `windows/`,
+  `perf/`, `release/`, `operations/`, `mcp/`. Many `ci/*.sh` scripts are thin
+  wrappers over a Rust binary of the same name in `rustynet-cli/src/bin/` — the
+  Rust binary is the real implementation (§4 shell-to-Rust migration rule).
+- `fuzz/` — `cargo-fuzz` targets (`ipc_parse_command`, `membership_decode_state`,
+  `membership_decode_signed_update`). Its own `[workspace]`.
+- `mcp/` (`mcp.json`) and `tools/skills/` — MCP server config and the
+  `rustynet-security-auditor` skill (attack catalog, audit checklist, lab
+  playbooks) used for security review.
+- `profiles/live_lab/` — live-lab impairment/topology profiles.
+- `artifacts/` — generated evidence/SBOM/provenance outputs (do not hand-edit).
+- `start.sh` — interactive setup/menu wizard; `rust-toolchain.toml` pins the
+  toolchain; `deny.toml` configures `cargo deny`.
+
+### 11.2 Workspace Crates (layered per CODE_MAP.md)
+
+Domain layer (transport-agnostic — never import a backend or WireGuard type
+here, §8/§10.3):
+- `rustynet-control` — membership bundles, enrollment tokens, roles/capabilities,
+  role transitions, gossip, replay watermarks. The core trust-state crate.
+- `rustynet-policy` — ACL + policy evaluation (default-deny, §10.4).
+- `rustynet-dns-zone` — Magic DNS signed-zone schema.
+- `rustynet-crypto` — signing, key types, key custody primitives.
+- `rustynet-local-security` — local ACL verifiers / privileged-boundary checks.
+- `rustynet-sysinfo` — OS detection, interface enumeration.
+
+Daemon + services layer:
+- `rustynetd` — the node daemon: WireGuard management, dataplane engine, STUN,
+  gossip runtime/transport, ICE, enrollment, killswitch. Binary `rustynetd`.
+- `rustynet-relay` — frame forwarding for the zero-ingress relay role. Binary
+  `rustynet-relay`.
+- `rustynet-nas` — `nas` service-hosting role (tunnel-only storage). Binary
+  `rustynet-nas`.
+- `rustynet-llm-gateway` — `llm` service-hosting role (identity-from-tunnel
+  gateway in front of a loopback inference engine). Binary
+  `rustynet-llm-gateway`.
+
+Backend abstraction layer (the WireGuard adapter boundary, §3/§8):
+- `rustynet-backend-api` — the `Backend` trait and abstract types. No backend
+  internals.
+- `rustynet-backend-wireguard` — kernel WireGuard adapter (wraps `boringtun` /
+  `rustynet-tun`).
+- `rustynet-backend-userspace` — userspace (boringtun) backend.
+- `rustynet-backend-stub` — deterministic test stub backend.
+
+Platform + UX + tooling layer:
+- `rustynet-windows-native` — Windows-specific integration (WFP, DPAPI, named
+  pipes). The OS-boundary exception to Rust-first purity.
+- `rustynet-operator` — operator wizards / config (`rustynet operator menu`).
+- `rustynet-cli` — the main `rustynet` binary (`default-run = "rustynet-cli"`):
+  `ops`, `vm-lab`, live-lab orchestrator, role/anchor/llm subcommands. Its
+  `src/bin/` also holds the large family of `live_*`, `*_gates`, `phase*`, and
+  `check_*` evidence/gate binaries that the `scripts/ci/` wrappers dispatch to.
+- `rustynet-mcp` — MCP servers: `rustynet-mcp-repo-context`,
+  `rustynet-mcp-gate-runner`, `rustynet-mcp-lab-state`.
+- `rustynet-xtask` — the `xtask` dev runner (see §7 / §12).
+
+### 11.3 Release Profile Note
+`[profile.release]`/`[profile.bench]` enable thin LTO and pin
+`codegen-units = 1` for the hot crypto/dataplane crates (`boringtun`,
+`rustynet-backend-wireguard`, `rustynet-relay`). This is a perf tuning, not a
+semantic change — keep it only while the perfprobe/criterion numbers justify the
+build-time cost.
+
+## 12) Quick Command & Workflow Reference
+
+Authoritative gate definitions live in §7. This section is the fast-path map.
+
+### 12.1 Build & Iterate
+- Scoped check while editing: `cargo check -p <crate>` then
+  `cargo fmt --all -- --check`.
+- Fast-fail local gate run: `cargo run -p rustynet-xtask -- gates`
+  (fmt → check → clippy → test, stops at first failure, timeout watchdog). Add
+  `--skip-test` or a `-p <crate>` scope; override stage timeouts via
+  `XTASK_{FMT,CHECK,CLIPPY,TEST}_TIMEOUT` (seconds).
+- Full workspace test: `cargo test --workspace --all-targets --all-features`.
+
+### 12.2 Boundary & Security Gates (run for relevant scopes)
+- Backend leakage: `scripts/ci/check_backend_boundary_leakage.sh` (§10.3).
+- Secrets hygiene: `scripts/ci/secrets_hygiene_gates.sh` (§10.6).
+- Supply chain: `cargo audit --deny warnings` and
+  `cargo deny check bans licenses sources advisories`.
+- Phase/role/membership scopes have dedicated `scripts/ci/*_gates.sh` wrappers;
+  run the one matching your scope document.
+
+### 12.3 Live Lab
+- Inventory summary first: `rustynet ops vm-lab-discover-local-utm-summary
+  --inventory documents/operations/active/vm_lab_inventory.json`.
+- If a guest is stuck (SSH timeout but visible in `arp -a`):
+  `scripts/vm_lab/probe_and_recover_local_utm.sh` before retrying.
+- Never hand-edit `vm_lab_inventory.json` — refresh with
+  `--update-inventory-live-ips`.
+- After every evidence run, verify the appended row in
+  `documents/operations/live_lab_run_matrix.csv` (§2, §10.9).
+
+### 12.4 Operator UX
+- Interactive wizard: `./start.sh`.
+- Rust-native operator menu: `rustynet operator menu`.
+
+## 13) Keeping AGENTS.md / CLAUDE.md In Sync
+`AGENTS.md` and `CLAUDE.md` are intentionally byte-for-byte mirrored. Any edit to
+one MUST be applied identically to the other in the same change. When you add,
+move, or rename a crate, ledger, or top-level directory, update §2/§11/§12 here
+(and the mirror) plus `documents/CODE_MAP.md` so the structure map does not drift
+from the code.
