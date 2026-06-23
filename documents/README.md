@@ -163,6 +163,7 @@ These are the current runbooks, support matrices, gate references, and policies.
 
 - [operations/README.md](./operations/README.md)
 - [operations/Arm32BitEmbeddedSupportReference_2026-06-23.md](./operations/Arm32BitEmbeddedSupportReference_2026-06-23.md) — 32-bit ARM embedded developer reference (armv7 compile status, toolchain, backend selection, memory/fd/SD card pitfalls)
+- [operations/Arm32BitEmbeddedImplementationGuide_2026-06-23.md](./operations/Arm32BitEmbeddedImplementationGuide_2026-06-23.md) — implementation guide (Part 2): file-by-file code changes and operator tasks to close the §28 Known Open Items and reach supported status on armv7
 
 Start there when you need:
 - deployment or service guidance
