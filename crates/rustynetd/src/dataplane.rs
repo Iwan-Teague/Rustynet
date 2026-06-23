@@ -1126,4 +1126,105 @@ mod tests {
             .expect("clearing exit node should succeed");
         assert_eq!(dataplane.selected_exit_node(), None);
     }
+
+    // `ensure_lan_route_allowed` is a 4-factor default-deny gate: LAN access
+    // must be enabled, an exit must be selected, the CIDR must be advertised by
+    // *that* exit, and the (user, cidr) ACL entry must be present and true.
+    // Only the all-true row is an allow; every other row denies.
+    const LAN_USER: &str = "group:family";
+    const LAN_CIDR: &str = "192.168.1.0/24";
+
+    /// Build a dataplane whose four LAN-route factors are all satisfied, so
+    /// `ensure_lan_route_allowed(LAN_USER, LAN_CIDR)` returns `Ok`. Each test
+    /// then knocks out exactly one factor and asserts the deny.
+    fn lan_allow_engine() -> LinuxDataplane<WireguardBackend> {
+        let mut dataplane = LinuxDataplane::new(
+            WireguardBackend::default(),
+            NodeId::new("node-a").expect("local id should be valid"),
+            "100.64.0.0/10".to_owned(),
+            allow_all_policy(),
+        );
+        let exit = NodeId::new("node-exit").expect("exit id should be valid");
+        dataplane.set_lan_access(true);
+        dataplane.selected_exit_node = Some(exit.clone());
+        dataplane.advertise_lan_route(exit, LAN_CIDR);
+        dataplane.set_lan_route_permission(LAN_USER, LAN_CIDR, true);
+        dataplane
+    }
+
+    #[test]
+    fn lan_route_allowed_only_when_all_four_factors_hold() {
+        let dataplane = lan_allow_engine();
+        assert!(
+            dataplane
+                .ensure_lan_route_allowed(LAN_USER, LAN_CIDR)
+                .is_ok(),
+            "all four factors satisfied must allow"
+        );
+    }
+
+    #[test]
+    fn lan_route_denied_when_lan_access_disabled() {
+        let mut dataplane = lan_allow_engine();
+        dataplane.set_lan_access(false);
+        assert_eq!(
+            dataplane.ensure_lan_route_allowed(LAN_USER, LAN_CIDR),
+            Err(DataplaneError::LanAccessDenied)
+        );
+    }
+
+    #[test]
+    fn lan_route_denied_when_no_exit_selected() {
+        let mut dataplane = lan_allow_engine();
+        dataplane.selected_exit_node = None;
+        assert_eq!(
+            dataplane.ensure_lan_route_allowed(LAN_USER, LAN_CIDR),
+            Err(DataplaneError::LanAccessDenied)
+        );
+    }
+
+    #[test]
+    fn lan_route_denied_when_cidr_not_advertised() {
+        // The CIDR is advertised by the selected exit, but the request asks
+        // for a different, unadvertised CIDR.
+        let dataplane = lan_allow_engine();
+        assert_eq!(
+            dataplane.ensure_lan_route_allowed(LAN_USER, "10.0.0.0/24"),
+            Err(DataplaneError::LanAccessDenied)
+        );
+    }
+
+    #[test]
+    fn lan_route_denied_when_route_advertised_by_other_exit() {
+        // The CIDR is advertised, but by a node that is not the selected exit;
+        // advertisement must be attributed to the active exit specifically.
+        let mut dataplane = lan_allow_engine();
+        let other = NodeId::new("node-other").expect("other id should be valid");
+        dataplane.selected_exit_node = Some(other);
+        assert_eq!(
+            dataplane.ensure_lan_route_allowed(LAN_USER, LAN_CIDR),
+            Err(DataplaneError::LanAccessDenied)
+        );
+    }
+
+    #[test]
+    fn lan_route_denied_when_acl_denies_despite_advertised_route() {
+        let mut dataplane = lan_allow_engine();
+        dataplane.set_lan_route_permission(LAN_USER, LAN_CIDR, false);
+        assert_eq!(
+            dataplane.ensure_lan_route_allowed(LAN_USER, LAN_CIDR),
+            Err(DataplaneError::LanAccessDenied)
+        );
+    }
+
+    #[test]
+    fn lan_route_denied_when_acl_entry_absent() {
+        // Default-deny on a missing ACL entry: a user with no entry for the
+        // advertised CIDR is denied (unwrap_or(false), not a silent allow).
+        let dataplane = lan_allow_engine();
+        assert_eq!(
+            dataplane.ensure_lan_route_allowed("group:guest", LAN_CIDR),
+            Err(DataplaneError::LanAccessDenied)
+        );
+    }
 }
