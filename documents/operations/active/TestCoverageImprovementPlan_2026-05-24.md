@@ -92,12 +92,28 @@ passed 9/9 tests.
 
 #### P0.2 — `rustynet-control/src/membership.rs`: negative tests for signed-state validation
 Accept paths are covered; the security-relevant reject paths are not.
-- Invalid/tampered Ed25519 signature rejected (all-zero, bit-flipped, truncated) — `verify_membership_signatures()` (~L958).
-- `prev_state_root` and `new_state_root` tampering rejected — `apply_signed_update()` (~L701-718).
-- Clock-skew violation: `created_at_unix` beyond skew window rejected (~L698).
-- Expiration: `now > expires_at_unix` rejected (~L695) — explicit test.
-- Membership-log chain break (remove/reorder a middle entry) detected — `verify_membership_log_chain()` (~L933).
-- `validate()` rejects empty network_id, zero quorum, duplicate node_ids, quorum > active_approvers (~L158).
+
+Status 2026-06-23: landed the `apply_signed_update` reject matrix + `validate()`
+reject batch (9 new tests via a shared `signed_add_node_fixture` helper that
+asserts the untampered control still applies, so no negative test can pass for
+the wrong reason). Covered: expired record (`Expired`), future-dated /
+clock-skew with the skew-window boundary accepted (`FutureDated`),
+`prev_state_root` mismatch (`PrevStateRootMismatch`), network-id mismatch and
+apply-time epoch-chain break (`InvalidTransition`), raw signature-byte tampering
+— all-zero / single-bit-flip (`SignatureInvalid`) + truncated (fail-closed
+decode error), and `validate()` rejecting empty network_id / zero quorum /
+duplicate node_ids / quorum > active approvers. (`new_state_root` tampering was
+already pinned by `replay_cache_not_updated_on_failed_update` →
+`NewStateRootMismatch`; direct payload-capability tampering by
+`tampered_service_hosting_capability_invalidates_signature`.) Evidence:
+`cargo test -p rustynet-control --lib membership::tests` → 36/36; crate-wide
+`cargo test -p rustynet-control --all-targets --all-features` → 295/295; fmt +
+clippy `-D warnings` clean.
+
+Remaining follow-up:
+- Membership-log chain break (remove/reorder a middle entry) detected via
+  `verify_membership_log_chain()` — still to add (needs a persisted-log tamper
+  fixture through the public `load_membership_log` loader).
 
 #### P0.3 — `rustynet-crypto`: negative tests on verification + fail-closed CSPRNG
 Status 2026-05-27: added negative coverage for expired algorithm exceptions
