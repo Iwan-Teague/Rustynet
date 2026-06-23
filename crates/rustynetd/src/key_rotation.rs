@@ -1409,6 +1409,100 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    /// Persist a genesis ledger to a unique temp path and hand back the path
+    /// plus its on-disk text for the tamper tests below.
+    fn persisted_genesis_ledger(label: &str) -> (PathBuf, String) {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-rotation-tamper-{label}-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        LocalKeyRotationLedger::genesis()
+            .persist(&tmp)
+            .expect("persist genesis ledger");
+        let content = std::fs::read_to_string(&tmp).expect("read ledger");
+        (tmp, content)
+    }
+
+    #[test]
+    fn load_rejects_tampered_digest() {
+        // The trailing `digest=<hex>` binds the body; zeroing it must fail
+        // closed rather than load a ledger whose integrity is unverified.
+        let (tmp, content) = persisted_genesis_ledger("digest");
+        let marker = "\ndigest=";
+        let idx = content.find(marker).expect("digest line present");
+        let value_start = idx + marker.len();
+        let value_end = content[value_start..]
+            .find('\n')
+            .map(|n| value_start + n)
+            .unwrap_or(content.len());
+        let mut tampered = content.clone();
+        tampered.replace_range(value_start..value_end, &"0".repeat(value_end - value_start));
+        std::fs::write(&tmp, &tampered).expect("write tampered");
+
+        let err = LocalKeyRotationLedger::load(&tmp).expect_err("tampered digest must fail");
+        assert!(
+            matches!(err, RotationError::LedgerCorrupt(ref m) if m.contains("digest mismatch")),
+            "expected digest mismatch, got {err:?}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_rejects_tampered_body_field() {
+        // Mutating any signed body field (here `state`) must surface as a
+        // digest mismatch — the stored digest no longer matches the body.
+        let (tmp, content) = persisted_genesis_ledger("body");
+        assert!(content.contains("state=idle"), "genesis ledger is idle");
+        let tampered = content.replace("state=idle", "state=draining");
+        std::fs::write(&tmp, &tampered).expect("write tampered");
+
+        let err = LocalKeyRotationLedger::load(&tmp).expect_err("tampered body must fail");
+        assert!(
+            matches!(err, RotationError::LedgerCorrupt(ref m) if m.contains("digest mismatch")),
+            "expected digest mismatch, got {err:?}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_rejects_missing_digest_field() {
+        // Dropping the digest line entirely is a torn/short write; load must
+        // refuse it as a missing required field, never default it.
+        let (tmp, content) = persisted_genesis_ledger("nodigest");
+        let without_digest: String = content
+            .lines()
+            .filter(|line| !line.starts_with("digest="))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        std::fs::write(&tmp, &without_digest).expect("write");
+
+        let err = LocalKeyRotationLedger::load(&tmp).expect_err("missing digest must fail");
+        assert!(
+            matches!(err, RotationError::LedgerCorrupt(ref m) if m.contains("digest")),
+            "expected missing-digest rejection, got {err:?}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_rejects_truncated_ledger() {
+        // A file truncated to just the version line is missing every other
+        // required field; load fails closed instead of partially applying.
+        let (tmp, _content) = persisted_genesis_ledger("trunc");
+        std::fs::write(&tmp, format!("version={LEDGER_SCHEMA_VERSION}\n")).expect("write");
+
+        let err = LocalKeyRotationLedger::load(&tmp).expect_err("truncated ledger must fail");
+        assert!(
+            matches!(err, RotationError::LedgerCorrupt(_)),
+            "expected LedgerCorrupt, got {err:?}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
     #[test]
     fn mid_rotation_panic_leaves_one_epoch_on_disk() {
         let tmp = std::env::temp_dir().join(format!(
