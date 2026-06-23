@@ -1964,17 +1964,22 @@ fn wg_peers_internal() -> Vec<WireGuardPeer> {
 /// be exercised with golden fixtures. Lines with fewer than four whitespace
 /// fields, and the `interface:`/`public` header lines, are skipped; the name
 /// is `peer-` + the first ≤8 chars of field 0, with `allowed_ips` from field 2
-/// and `ip` from field 3. (Heuristic/positional — behavior preserved verbatim
-/// from the pre-split code, including the byte-prefix slice, which is safe on
-/// `wg`'s ASCII output.)
+/// and `ip` from field 3. (Heuristic/positional — behavior preserved from the
+/// pre-split code; the name prefix uses a char-boundary-safe truncation so an
+/// unexpected non-ASCII field 0 degrades gracefully instead of panicking.)
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_wg_show_peers(stdout: &str) -> Vec<WireGuardPeer> {
     let mut peers = Vec::new();
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 4 && parts[0] != "interface:" && parts[0] != "public" {
+            // `get(..8)` returns None if 8 is not a char boundary (non-ASCII);
+            // fall back to the whole field rather than panicking on a byte-slice
+            // at a mid-character index. Identical to `[..8]` for ASCII `wg`
+            // output where field 0 is a base64 key.
+            let name_prefix = parts[0].get(..8).unwrap_or(parts[0]);
             peers.push(WireGuardPeer {
-                name: format!("peer-{}", &parts[0][..8.min(parts[0].len())]),
+                name: format!("peer-{name_prefix}"),
                 ip: parts.get(3).unwrap_or(&"-").to_string(),
                 allowed_ips: parts.get(2).unwrap_or(&"-").to_string(),
                 last_handshake_ago: None,
@@ -7110,6 +7115,12 @@ short row here
         let peers = super::parse_wg_show_peers("ab x cd ef\n");
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].name, "peer-ab");
+        // Field 0 = "aaaaaa€" — the 3-byte '€' spans bytes 6..9, so byte index
+        // 8 is mid-character. The old `[..8]` byte slice panicked here; the
+        // char-boundary-safe truncation falls back to the whole field.
+        let peers = super::parse_wg_show_peers("aaaaaa\u{20ac} x cd ef\n");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "peer-aaaaaa\u{20ac}");
     }
 
     #[cfg(target_os = "linux")]
