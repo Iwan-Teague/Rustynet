@@ -1325,4 +1325,51 @@ mod tests {
             "expected WireMalformed, got {err:?}"
         );
     }
+
+    #[test]
+    fn deserialise_bundle_never_panics_on_truncations_and_arbitrary_bytes() {
+        // Parser-never-panics invariant (the property a fuzzer would assert):
+        // `deserialise_bundle` runs on untrusted UDP datagrams, so on any byte
+        // string — truncated mid-field, oversized, bit-flipped, or random — it
+        // must return Err, never panic (a panic here is a remote DoS). Any
+        // panic propagates and fails the test.
+        let signing_key = deterministic_signing_key(11);
+        let valid = serialise_bundle(
+            &mint_bundle_with_timestamp(&signing_key, 5, 1_700_000_000, sample_candidates())
+                .unwrap(),
+        );
+
+        // Every prefix of a valid wire — catches index/slice panics when a
+        // datagram is cut off inside a length or count field.
+        for len in 0..=valid.len() {
+            let _ = deserialise_bundle(&valid[..len]);
+        }
+
+        // Single-byte corruption at every offset of an otherwise-valid wire.
+        for i in 0..valid.len() {
+            let mut corrupted = valid.clone();
+            corrupted[i] ^= 0xFF;
+            let _ = deserialise_bundle(&corrupted);
+        }
+
+        // Pathological uniform fills across a range of lengths.
+        for len in [0usize, 1, 7, 64, 256, 4096, MAX_GOSSIP_DATAGRAM_BYTES + 1] {
+            let _ = deserialise_bundle(&vec![0u8; len]);
+            let _ = deserialise_bundle(&vec![0xFFu8; len]);
+        }
+
+        // Deterministic pseudo-random byte strings of every length 0..512
+        // (an LCG keeps the test reproducible without a rng dependency).
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for len in 0..512usize {
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                bytes.push((seed >> 33) as u8);
+            }
+            let _ = deserialise_bundle(&bytes);
+        }
+    }
 }

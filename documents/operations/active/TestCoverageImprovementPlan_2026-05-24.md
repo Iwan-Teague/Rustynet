@@ -389,6 +389,18 @@ compiles the large `rustynet-cli` bin/test family.)
 1. **Add `cargo llvm-cov` to CI**, capture a per-crate baseline, and ratchet (fail if coverage drops). Replaces brittle count-floors with real measurement and would auto-flag the next sysinfo.
 2. **Introduce `proptest`** for serde round-trips (generalizing the per-variant tests), wire-format decoders (never-panic + round-trip), and invariants (sequence monotonicity, canonicalize idempotence).
 3. **Expand fuzzing** to 4 new decoders: gossip bundle, coordination record, STUN response, DNS zone wire bundle.
+   - Status 2026-06-23: the **parser-never-panics invariant** (the core property a
+     fuzzer asserts) is now pinned for two untrusted decoders via deterministic
+     in-`cargo test` batteries — `deserialise_bundle` (gossip wire, rustynetd) and
+     `parse_signed_dns_zone_bundle_wire` (rustynet-dns-zone). Each feeds: every
+     truncation of a valid wire (catches mid-length/count-field slice panics),
+     single-byte corruption at every offset, pathological uniform fills, and
+     deterministic pseudo-random input; any panic fails the test. These run on
+     stable in CI now (no nightly), complementing — not replacing — true
+     `cargo-fuzz` targets. Adding the libfuzzer targets themselves +
+     registering them in `execute_ops_run_fuzz_smoke` remains (deferred: this
+     sandbox has no nightly/cargo-fuzz to verify the harnesses compile). Same
+     battery still wanted for the coordination-record and STUN-response decoders.
 4. **Bring untested crates under the gate**: add `rustynet-sysinfo`, the dataplane/gossip/traversal/key_rotation modules, and the control/policy/crypto/dns-zone crates to the floor set (interim) until llvm-cov ratcheting supersedes it.
 5. **Adopt a negative-test convention**: for every `accept_*` / `verify_*` / `validate_*`, require a paired `*_rejects_*` test — enforce via a lightweight source-scan gate (the `secret_log_audit` static-scanner pattern is a good template).
 
