@@ -92,6 +92,9 @@ If historical notes later in the file conflict with this block, the execution sc
 - Do not treat old session-log blockers as current truth without revalidation.
 - Do not mark tracks done based on document drift or unverified assumptions.
 
+`Post-parity backlog (not release-blocking)`
+- **32-bit ARM support (armv7-unknown-linux-gnueabihf):** finished-product requirement, not gating the current release. Primary use case is low-power relay/exit/blind_exit nodes (Raspberry Pi Zero 2 W class). Upstream boringtun supports this target; Rustynet's own code has compile blockers (`AtomicU64`, `u128`/`i128`). Full scope and known fix sites documented in `documents/operations/PlatformSupportMatrix.md` (ARM Architecture Support section) and `documents/Requirements.md` (ARM architecture support bullet). Do not pick this up until Linux/macOS/Windows role parity is complete.
+
 `Clarity note`
 - If this block and a lower historical note disagree, use this block plus the current code and update the stale note.
 
