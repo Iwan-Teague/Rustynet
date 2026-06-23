@@ -2500,8 +2500,20 @@ impl MacosCommandSystem {
                     "pass out quick on {} inet proto tcp to any port 53 keep state\n",
                     self.interface_name
                 ));
-                rules.push_str("block drop out quick inet proto udp to any port 53\n");
-                rules.push_str("block drop out quick inet proto tcp to any port 53\n");
+                // Label the LAN DNS-block rules so the macOS-exit DNS
+                // fail-closed evidence producer can find them by name in the
+                // anchor's `pfctl -s rules` dump (parse_pf_block_rule keys on
+                // these exact labels), matching the Linux nft path's
+                // `rustynet-dns-block-lan-*` naming. The terminal
+                // `block drop out quick all` killswitch rule stays UNLABELED.
+                rules.push_str(&format!(
+                    "block drop out quick inet proto udp to any port 53 label \"{}\"\n",
+                    crate::macos_exit_dns_failclosed::DNS_BLOCK_LAN_UDP_RULE
+                ));
+                rules.push_str(&format!(
+                    "block drop out quick inet proto tcp to any port 53 label \"{}\"\n",
+                    crate::macos_exit_dns_failclosed::DNS_BLOCK_LAN_TCP_RULE
+                ));
             }
             rules.push_str(&format!(
                 "pass out quick on {} inet all keep state\n",
@@ -11445,8 +11457,8 @@ mod tests {
              pass out quick on lo0 inet all keep state\n\
              pass out quick on utun9 inet proto udp to any port 53 keep state\n\
              pass out quick on utun9 inet proto tcp to any port 53 keep state\n\
-             block drop out quick inet proto udp to any port 53\n\
-             block drop out quick inet proto tcp to any port 53\n\
+             block drop out quick inet proto udp to any port 53 label \"rustynet-dns-block-lan-udp\"\n\
+             block drop out quick inet proto tcp to any port 53 label \"rustynet-dns-block-lan-tcp\"\n\
              pass out quick on utun9 inet all keep state\n\
              pass out quick on en0 inet all keep state\n\
              block drop out quick inet6 all\n\

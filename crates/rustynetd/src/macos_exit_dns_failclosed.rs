@@ -79,7 +79,13 @@ pub fn write_macos_exit_dns_failclosed_artifacts(
     output_dir: &Path,
     options: &MacosExitDnsFailclosedOptions,
 ) -> Result<(), String> {
-    validate_iface_name(options.lan_iface.as_str())?;
+    // Resolve the capture interface: when the caller passes `auto` (or an
+    // empty value) derive the live egress NIC from the routing table rather
+    // than trusting a hardcoded `en0`. A wrong/dead interface makes tcpdump
+    // observe nothing, turning the DNS-leak proof into a vacuous PASS — a
+    // false security guarantee. Deriving + failing loud when undetermined
+    // keeps the leak evidence honest.
+    let lan_iface = resolve_capture_lan_iface(options.lan_iface.as_str())?;
     validate_hostname(options.tunnel_dns_hostname.as_str())?;
     fs::create_dir_all(output_dir)
         .map_err(|err| format!("create {} failed: {err}", output_dir.display()))?;
@@ -100,7 +106,7 @@ pub fn write_macos_exit_dns_failclosed_artifacts(
     )?;
 
     let udp_pcap = capture_dns_pcap_text(
-        options.lan_iface.as_str(),
+        lan_iface.as_str(),
         "udp",
         Duration::from_secs(options.tcpdump_secs),
     )?;
@@ -108,7 +114,7 @@ pub fn write_macos_exit_dns_failclosed_artifacts(
         .map_err(|err| format!("write udp_block_pcap.txt failed: {err}"))?;
 
     let tcp_pcap = capture_dns_pcap_text(
-        options.lan_iface.as_str(),
+        lan_iface.as_str(),
         "tcp",
         Duration::from_secs(options.tcpdump_secs),
     )?;
@@ -207,6 +213,61 @@ fn write_json<T: Serialize>(path: &Path, value: &T, label: &str) -> Result<(), S
     fs::write(path, encoded).map_err(|err| format!("write {label} failed: {err}"))
 }
 
+/// Resolve the LAN egress interface to capture on. `auto` (or an empty
+/// value) triggers live derivation from the routing table; any other value
+/// is taken as an explicit interface name (still validated). Fails loud
+/// rather than silently falling back to a guessed default.
+fn resolve_capture_lan_iface(requested: &str) -> Result<String, String> {
+    let trimmed = requested.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        let derived = derive_macos_egress_interface()?;
+        validate_iface_name(derived.as_str())?;
+        return Ok(derived);
+    }
+    validate_iface_name(trimmed)?;
+    Ok(trimmed.to_owned())
+}
+
+/// Extract the `interface:` value from `route -n get <dst>` output. Pure so
+/// it is host-testable regardless of the build target.
+pub fn parse_macos_route_interface(route_output: &str) -> Option<String> {
+    route_output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("interface:").map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+#[cfg(target_os = "macos")]
+fn derive_macos_egress_interface() -> Result<String, String> {
+    let stdout = run_route(&["-n", "get", "default"])?;
+    parse_macos_route_interface(stdout.as_str()).ok_or_else(|| {
+        "could not derive default egress interface from `route -n get default`".to_owned()
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn derive_macos_egress_interface() -> Result<String, String> {
+    Err("egress interface auto-derivation is only supported on macOS".to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn run_route(args: &[&str]) -> Result<String, String> {
+    let output = Command::new("/sbin/route")
+        .args(args)
+        .output()
+        .map_err(|err| format!("route {} failed to start: {err}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "route {} failed: status={} stderr={}",
+            args.join(" "),
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn validate_iface_name(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 32
@@ -233,10 +294,40 @@ fn validate_hostname(value: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn capture_pf_rules_stdout() -> Result<String, String> {
+    use crate::macos_exit_killswitch_precedence::{
+        select_macos_rustynet_anchor, validate_pf_anchor_name,
+    };
+    // The macOS exit dataplane loads its filter rules — including the labeled
+    // LAN DNS-block rules `render_pf_rules` emits — into a generation-numbered
+    // anchor `com.apple/rustynet_g<N>`, NOT the main ruleset. A bare
+    // `pfctl -s rules` therefore never observes them. Enumerate the live
+    // anchors, select the highest-generation rustynet anchor, and dump ITS
+    // rules. Fail loud when no rustynet anchor is active: the producer must
+    // observe the real filter rules rather than silently reporting an empty
+    // ruleset that would mask an absent DNS block.
+    let anchors = run_pfctl(&["-s", "Anchors"])?;
+    let anchor = select_macos_rustynet_anchor(anchors.as_str()).ok_or_else(|| {
+        "no active com.apple/rustynet_g<N> pf anchor found; daemon killswitch path not active"
+            .to_owned()
+    })?;
+    validate_pf_anchor_name(anchor.as_str())?;
+    run_pfctl(&["-a", anchor.as_str(), "-s", "rules"])
+}
+
+#[cfg(target_os = "macos")]
+fn run_pfctl(args: &[&str]) -> Result<String, String> {
     let output = Command::new("/sbin/pfctl")
-        .args(["-s", "rules"])
+        .args(args)
         .output()
-        .map_err(|err| format!("pfctl -s rules failed to start: {err}"))?;
+        .map_err(|err| format!("pfctl {} failed to start: {err}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "pfctl {} failed: status={} stderr={}",
+            args.join(" "),
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -327,6 +418,44 @@ block drop out quick on en0 inet proto tcp from any to 192.168.1.0/24 port = dom
     }
 
     #[test]
+    fn pf_report_accepts_rendered_anchor_rule_shape() {
+        // Mirrors what `pfctl -a com.apple/rustynet_g<N> -s rules` emits for
+        // the rules render_pf_rules (phase10.rs) now produces: `block drop out
+        // quick inet proto udp/tcp to any port 53 label "rustynet-dns-block-
+        // lan-*"`, after pfctl normalization (`port 53` -> `port = 53`, an
+        // explicit `from any to any`). The labels are the canonical
+        // DNS_BLOCK_LAN_*_RULE constants shared with render_pf_rules.
+        let body = format!(
+            "block drop out quick inet proto udp from any to any port = 53 label \"{udp}\"\n\
+             block drop out quick inet proto tcp from any to any port = 53 label \"{tcp}\"\n\
+             block drop out quick all\n",
+            udp = DNS_BLOCK_LAN_UDP_RULE,
+            tcp = DNS_BLOCK_LAN_TCP_RULE,
+        );
+        let report = build_macos_pf_block_rules_report(body.as_str());
+        assert!(report.overall_ok, "labeled rendered rules must pass");
+        assert_eq!(report.rules.len(), 2);
+        assert!(report.rules.iter().all(|rule| rule.action == "block"));
+        assert!(report.rules.iter().all(|rule| rule.direction == "out"));
+    }
+
+    #[test]
+    fn pf_report_rejects_label_less_block_rules() {
+        // The pre-fix failure mode: the live rules (or a bare main-ruleset
+        // `pfctl -s rules` dump that never sees the anchor) carry NO label, so
+        // the producer cannot identify them and must fail closed. This is what
+        // made the live capture stage abort before the fix.
+        let body = "block drop out quick inet proto udp from any to any port = 53\n\
+             block drop out quick inet proto tcp from any to any port = 53\n\
+             block drop out quick all\n";
+        let report = build_macos_pf_block_rules_report(body);
+        assert!(
+            !report.overall_ok,
+            "label-less block rules must not satisfy the DNS-block contract"
+        );
+    }
+
+    #[test]
     fn tunnel_resolve_report_accepts_dscacheutil_answer() {
         let report = build_tunnel_path_resolves_report(
             "exit-1.rustynet",
@@ -342,6 +471,29 @@ block drop out quick on en0 inet proto tcp from any to 192.168.1.0/24 port = dom
         let report = build_tunnel_path_resolves_report("exit-1.rustynet", "");
         assert!(!report.overall_ok);
         assert!(!report.resolved);
+    }
+
+    #[test]
+    fn route_interface_parser_extracts_egress_nic() {
+        // Real `route -n get default` block shape on macOS 26.x.
+        let out = "   route to: default\ndestination: default\n       gateway: 192.168.0.1\n     interface: en0\n         flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n";
+        assert_eq!(parse_macos_route_interface(out).as_deref(), Some("en0"));
+    }
+
+    #[test]
+    fn route_interface_parser_handles_bridged_nic_and_missing() {
+        // A bridged/secondary NIC must be derived faithfully (not assumed en0).
+        let bridged = "       gateway: 10.0.0.1\n     interface: en1\n";
+        assert_eq!(parse_macos_route_interface(bridged).as_deref(), Some("en1"));
+        // No interface line -> None so the caller fails loud rather than guessing.
+        assert_eq!(parse_macos_route_interface("   route to: default\n"), None);
+        assert_eq!(parse_macos_route_interface("     interface:   \n"), None);
+    }
+
+    #[test]
+    fn resolve_capture_lan_iface_takes_explicit_value() {
+        assert_eq!(resolve_capture_lan_iface("en3").unwrap(), "en3");
+        assert!(resolve_capture_lan_iface("en0;rm").is_err());
     }
 
     #[test]
