@@ -399,8 +399,13 @@ compiles the large `rustynet-cli` bin/test family.)
      stable in CI now (no nightly), complementing — not replacing — true
      `cargo-fuzz` targets. Adding the libfuzzer targets themselves +
      registering them in `execute_ops_run_fuzz_smoke` remains (deferred: this
-     sandbox has no nightly/cargo-fuzz to verify the harnesses compile). Same
-     battery still wanted for the coordination-record and STUN-response decoders.
+     sandbox has no nightly/cargo-fuzz to verify the harnesses compile).
+   - Status 2026-06-23 (cont.): extended the battery to the remaining two
+     untrusted decoders the plan names — `parse_stun_xor_mapped_address`
+     (STUN binding response, untrusted network bytes) and
+     `parse_coordination_payload` (traversal coordination record, untrusted peer
+     payload), both in `rustynetd::traversal`. All four target decoders
+     (gossip, DNS-zone, STUN, coordination) now have a never-panic battery.
 4. **Bring untested crates under the gate**: add `rustynet-sysinfo`, the dataplane/gossip/traversal/key_rotation modules, and the control/policy/crypto/dns-zone crates to the floor set (interim) until llvm-cov ratcheting supersedes it.
 5. **Adopt a negative-test convention**: for every `accept_*` / `verify_*` / `validate_*`, require a paired `*_rejects_*` test — enforce via a lightweight source-scan gate (the `secret_log_audit` static-scanner pattern is a good template).
 
