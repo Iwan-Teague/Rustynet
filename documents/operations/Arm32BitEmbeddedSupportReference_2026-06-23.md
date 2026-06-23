@@ -581,14 +581,346 @@ mandate. Do not pick it up until that mandate is complete.
 
 ---
 
-## 20. Known Open Items (At Time of Writing)
+## 20. WireGuard Interface MTU Not Set Automatically
+
+**Rating: CONCERN**
+
+The daemon's `configure_interface()` at
+`crates/rustynet-backend-wireguard/src/linux_command.rs:138-193` runs four commands:
+`ip link add`, `wg set`, `ip address add`, `ip link set up`. There is no
+`ip link set mtu ... dev rustynet0` call anywhere in the backend.
+
+The kernel assigns a newly created WireGuard interface the default Ethernet MTU of
+**1500 bytes**. WireGuard encapsulation adds 60 bytes of overhead for IPv4 outer
+headers (20 IP + 8 UDP + 32 WireGuard header), leaving only 1440 bytes of inner
+payload per packet before the outer frame exceeds the physical MTU.
+
+On a Pi Zero 2 W with WiFi (physical MTU 1500), inner frames larger than 1440 bytes
+will be fragmented at the IP layer. The CYW43438 WiFi driver handles fragment
+reassembly poorly under load, causing **silent packet loss** on large-frame transfers
+rather than graceful retransmission. The standard WireGuard recommendation is to set
+the tunnel interface MTU to **1420** (leaving 80 bytes for the widest-case IPv6 outer
+encapsulation).
+
+**Operator workaround until the daemon sets MTU automatically:**
+
+```sh
+# Add to /etc/networkd-dispatcher/routable.d/50-rustynet-mtu
+# or to a post-up hook in the systemd unit ExecStartPost
+ip link set mtu 1420 dev rustynet0
+```
+
+Or add to `rustynetd.service`:
+```ini
+ExecStartPost=-/usr/sbin/ip link set mtu 1420 dev rustynet0
+```
+
+This is also required on any other 32-bit board. It is not Pi-specific — it is a
+general gap in the backend code that matters everywhere fragmentation is a concern.
+
+---
+
+## 21. WiFi Reconnection: Relay Socket Is Not Re-bound
+
+**Rating: CONCERN**
+
+`rustynet-relay` binds its control UDP socket and per-session UDP sockets at startup
+(`crates/rustynet-relay/src/transport.rs`). There is no re-bind or socket recreation
+logic when the source IP changes.
+
+When the Pi Zero 2 W's WiFi drops and reconnects with a new DHCP address:
+- Existing relay session sockets remain bound to the old source IP.
+- Outbound relay packets carry the old source address and will be dropped by the router.
+- New peers connecting to the new IP will be refused by stale sessions.
+- Dead sessions are cleaned up by `IDLE_SESSION_TIMEOUT_SECS=30`
+  (`transport.rs:46`), but the relay process itself does not restart automatically
+  after an IP change since it does not crash.
+
+The daemon (`rustynetd`) recovers correctly: `poll_endpoint_monitor_and_maybe_refresh()`
+at `daemon.rs:4759-4772` detects the new IP within one reconcile interval (1 s
+default) and updates gossip advertisements.
+
+**Mitigation until re-bind logic is added:**
+
+Use a dhcpcd exit-hook to restart the relay on interface changes:
+
+```sh
+# /etc/dhcpcd.exit-hook
+if [ "$reason" = "BOUND" ] || [ "$reason" = "RENEW" ] || [ "$reason" = "REBIND" ]; then
+    systemctl restart rustynet-relay.service 2>/dev/null || true
+fi
+```
+
+This is Pi OS specific (dhcpcd). On other distributions using NetworkManager, use
+a NetworkManager dispatcher script instead.
+
+---
+
+## 22. dhcpcd Overwrites DNS Configuration
+
+**Rating: CONCERN**
+
+Raspberry Pi OS Bookworm uses **dhcpcd** as its DHCP client, not NetworkManager.
+Rustynet's DNS fail-closed mode writes two files to protect DNS:
+
+1. `/etc/resolv.conf` — rewritten to point at `127.0.0.1` (the daemon's loopback
+   resolver, `crates/rustynetd/src/linux_dns_protect.rs:73`).
+2. `/etc/NetworkManager/conf.d/rustynet-dns-failclosed.conf` — written to prevent NM
+   from overwriting resolv.conf (`linux_dns_protect.rs:78`).
+
+On a Pi OS system with dhcpcd, file (2) is silently ignored — NetworkManager is not
+installed. File (1) will be **overwritten by dhcpcd** on every DHCP lease renewal or
+WiFi reconnect, reverting DNS to the DHCP-provided nameserver and silently breaking
+Rustynet DNS fail-closed protection.
+
+**Required operator steps on Raspberry Pi OS:**
+
+Add to `/etc/dhcpcd.conf` to prevent dhcpcd from managing resolv.conf:
+
+```
+nohook resolv.conf
+```
+
+Then manually set `/etc/resolv.conf` to `nameserver 127.0.0.1` and make it
+immutable during Rustynet operation:
+
+```sh
+chattr +i /etc/resolv.conf
+```
+
+Remove the immutable flag before stopping the daemon:
+```sh
+chattr -i /etc/resolv.conf
+```
+
+Alternatively, ship a `dhcpcd.exit-hook` that reinstates the Rustynet nameserver
+entry after each DHCP event. This is the most robust long-term solution and should
+be implemented as a Rustynet-installed hook script.
+
+This concern applies to **any embedded Linux distribution using dhcpcd** and is not
+Pi-specific.
+
+---
+
+## 23. NTP Step Corrections and Gossip Freshness Window
+
+**Rating: CONCERN**
+
+This extends the NTP dependency documented in §17. The concern there is whether
+the daemon starts before NTP syncs. This section addresses what happens when NTP
+performs a large step correction *while the daemon is running*.
+
+Gossip bundle freshness checks (`crates/rustynetd/src/peer_gossip.rs:258`) use
+`SystemTime::now()` (wall clock). If NTP steps the clock forward by more than
+the freshness window, all currently-held gossip bundles appear stale and are
+discarded, forcing a full gossip re-sync. If NTP steps the clock backward by the
+same amount, locally-generated bundles are rejected by peers as "from the future."
+
+The guard at `peer_gossip.rs:186` handles the extreme case of `SystemTime` being
+before the Unix epoch, but not moderate steps.
+
+On a Pi Zero 2 W with no RTC, NTP corrections after boot are typically large
+(minutes to hours) if the board has been offline. After a correction the daemon
+recovers within one gossip cycle, but during that window gossip-dependent features
+(peer bundle acceptance, membership updates) may behave incorrectly.
+
+**Mitigations:**
+
+- Configure `chrony` with `makestep 1.0 3` to allow up to 3 step corrections
+  at startup (fast convergence), then slew-only thereafter, minimising mid-session
+  step events.
+- Add `After=time-sync.target` to `rustynetd.service` (already noted in §17) to
+  guarantee the clock is correct before the daemon starts and reduces the need for
+  in-session corrections.
+- Token expiry (`crates/rustynetd/src/daemon.rs`) has a fail-closed guard on
+  backward clock (returns 0 on underflow) — this is safe, but it means all tokens
+  are considered expired until the clock is correct.
+
+---
+
+## 24. UDP Socket Buffer Sizes
+
+**Rating: CONCERN**
+
+Neither `rustynetd` nor `rustynet-relay` sets `SO_RCVBUF` or `SO_SNDBUF` on any
+UDP socket. The Linux default receive buffer is ~208 KB (`rmem_default`), governed
+by `/proc/sys/net/core/rmem_default`.
+
+On a Pi Zero 2 W relaying bursts of WireGuard UDP packets over WiFi, the receive
+ring can fill during burst arrivals, causing kernel-level packet drops before the
+userspace relay reads them. This is invisible to the application — no error is
+returned; packets are silently discarded.
+
+The systemd sandbox (`ProtectSystem=strict` in all service files) prevents the
+daemon from writing to `/proc/sys/net/core/rmem_max` at runtime. To allow larger
+buffers, the operator must raise the kernel limit before the daemon starts:
+
+```sh
+# /etc/sysctl.d/rustynet-net.conf
+net.core.rmem_max=4194304
+net.core.wmem_max=4194304
+net.core.rmem_default=1048576
+net.core.wmem_default=1048576
+```
+
+Apply with `sysctl -p /etc/sysctl.d/rustynet-net.conf`. On a 512 MB Pi, 4 MB
+receive buffer is reasonable; adjust down if memory is constrained.
+
+Once the kernel limit is raised, code can be added to call
+`setsockopt(SO_RCVBUF, 4194304)` on relay UDP sockets. Until then, the sysctl
+increase alone raises the default for all new sockets.
+
+---
+
+## 25. OOM Killer Protection
+
+**Rating: ADVISORY**
+
+None of the service files sets `OOMScoreAdjust`. The daemon, relay, and privileged
+helper all run at the kernel-default OOM score of 0, competing equally with all
+user-space processes for survival under memory pressure.
+
+On a 512 MB Pi, a temporary allocation spike (large membership replay at startup,
+gossip batch processing) can trigger OOM. The OOM killer may terminate `rustynetd`
+or `rustynet-relay` rather than a less-critical process.
+
+**Add to service files:**
+
+```ini
+# rustynetd.service and rustynet-relay.service
+OOMScoreAdjust=-500
+
+# rustynetd-privileged-helper.service (most critical — killing this breaks all
+# privileged operations including tunnel teardown)
+OOMScoreAdjust=-900
+```
+
+A score of -500 makes the process significantly less likely to be OOM-killed than
+default processes. -900 gives the privileged helper near-protected status without
+fully preventing OOM killing in extreme scenarios.
+
+---
+
+## 26. Watchdog and Unattended Supervision
+
+**Rating: ADVISORY**
+
+All three service files set `Restart=on-failure` with `RestartSec=2s` and
+`StartLimitBurst=5` / `StartLimitIntervalSec=60`. This means the daemon restarts
+on crash, but:
+
+1. **No watchdog is implemented.** There is no `WatchdogSec=` directive in any
+   service file and no `sd_notify("WATCHDOG=1")` call anywhere in the Rust codebase.
+   If the daemon enters a soft hang (reconcile loop blocked on a mutex, tokio runtime
+   stalled by a blocking SD card write), the process stays alive but non-functional
+   indefinitely — systemd sees a running PID and never fires `Restart=on-failure`.
+
+2. **StartLimitBurst caps auto-restarts.** Five rapid crashes in 60 seconds causes
+   systemd to give up and leave the daemon stopped. On an unattended Pi this is a
+   silent outage until someone runs `systemctl reset-failed rustynetd && systemctl
+   start rustynetd`.
+
+Both risks are elevated on a Pi Zero 2 W where SD card I/O latency under wear can
+cause unexpected blocking in paths that assume fast storage.
+
+**Minimum viable watchdog for unattended deployment:**
+
+Add to `rustynetd.service`:
+```ini
+WatchdogSec=30s
+NotifyAccess=main
+```
+
+And add a periodic `sd_notify(0, "WATCHDOG=1\n")` kick inside the daemon's
+reconcile loop tick (`daemon.rs` — the `loop {}` body). This is a one-line Rust
+change using the `sd-notify` crate (already common in Linux Rust daemons) or a
+direct `nix::sys::socket::send` to `NOTIFY_SOCKET`.
+
+For `StartLimitBurst`, consider increasing the window:
+```ini
+StartLimitBurst=10
+StartLimitIntervalSec=300
+```
+
+This allows 10 restarts over 5 minutes before giving up, which is more appropriate
+for a network daemon that may hit transient startup failures (NTP not ready,
+interface not yet up).
+
+---
+
+## 27. Binary Size Optimisation
+
+**Rating: ADVISORY**
+
+The root `Cargo.toml` `[profile.release]` section contains only `lto = "thin"`.
+Missing for embedded deployment:
+
+```toml
+[profile.release]
+lto = "thin"
+strip = true          # removes debug symbols; typically saves 25-40% binary size
+panic = "abort"       # removes unwinding tables; saves 5-15% on ARM
+```
+
+Without `strip = true`, the `rustynetd` release binary will likely exceed 15-20 MB
+on armv7. With stripping it should fall to 8-12 MB. Large binaries increase cold
+start time (SD card read) and initial RSS from text-segment page faults.
+
+`panic = "abort"` is safe for a daemon that should never panic in production (and
+should be caught by OOM/watchdog if it does). It has no correctness implications.
+
+`opt-level = "z"` (size-optimise) is **not recommended at the workspace level**
+because it degrades boringtun's crypto throughput. If size is critical, override
+per-crate:
+
+```toml
+# In Cargo.toml [profile.release] or a workspace override
+[profile.release.package.rustynetd]
+opt-level = "z"
+
+# Keep boringtun at speed-optimised level
+[profile.release.package.boringtun]
+opt-level = 3
+```
+
+These changes are also beneficial on all platforms, not just ARM. They should be
+made as a general improvement, not gated on ARM support.
+
+---
+
+## 28. Confirmed Safe on 32-bit ARM (Third Pass)
+
+The following areas were investigated and found to need no action:
+
+| Area | Finding |
+|---|---|
+| Startup ordering (network-online.target) | All three service files already declare correct ordering. `ExecStartPre` socket check provides additional guard. |
+| Power loss resilience | All state writes use atomic temp→fsync→rename pattern with parent dir fsync. Fail-closed on corrupt read. |
+| First-boot entropy | `OsRng` fails closed on unavailable randomness. Linux 5.6+ blocks `getrandom` until pool is seeded. Pi OS 6.6.x kernel satisfies this. Hardware RNG (bcm2835-rng) seeds the pool from WiFi interrupt jitter. |
+| Serialisation portability | All state formats are text or explicit big-endian binary. No `usize` serialised to disk. x86-generated state files are safe on ARM. |
+| Unix socket path length | Longest production path is 39 characters. Linux limit is 107. No risk. |
+| Stack guard pages | Rust default stack guard pages active. No recursive descent algorithms in hot paths. |
+| Default firewall on Pi OS | None present. WireGuard and relay ports open by default. No conflict. |
+| Privileged helper capabilities (systemd) | CAP_NET_ADMIN / CAP_NET_RAW / CAP_SYS_ADMIN granted via AmbientCapabilities in service file. Correct and complete. |
+
+---
+
+## 29. Known Open Items (At Time of Writing)
 
 | Item | Severity | Notes |
 |---|---|---|
 | `PlatformSupportMatrix.md` "compile blocker" language overstates severity | Documentation | Update after first successful cross-compile confirms no hard blockers |
 | No `.cargo/config.toml` in repo | Setup | Must be created before cross-compilation; do not commit host-specific paths |
-| `LimitNOFILE` missing from `rustynet-relay.service` | Operational | Add before any deployment; default 1024 is insufficient at >512 sessions |
-| `rustynetd.service` missing `After=time-sync.target` | Operational | Required on Pi Zero 2 W (no RTC); clock must be synced before daemon starts |
-| Log file has no rotation | Operational | Mitigate by redirecting to `/dev/null` or using journal-only on embedded |
+| `LimitNOFILE` missing from `rustynet-relay.service` | Operational | Required before any deployment; default 1024 insufficient at >512 sessions |
+| `rustynetd.service` missing `After=time-sync.target` | Operational | Required on Pi Zero 2 W (no RTC); prevents gossip failures on startup |
+| WireGuard interface MTU not set by daemon | Operational | Manually set to 1420 via `ExecStartPost` until code fix; causes fragmentation on WiFi |
+| Relay socket not re-bound on IP change | Operational | Relay requires restart after WiFi reconnect with new IP; use dhcpcd exit-hook |
+| dhcpcd overwrites resolv.conf in DNS protected mode | Operational | Add `nohook resolv.conf` to `/etc/dhcpcd.conf`; ship dhcpcd exit-hook with Rustynet |
+| No `OOMScoreAdjust` in service files | Operational | Add -500 to daemon/relay, -900 to privileged-helper |
+| No `sd_notify` watchdog in daemon | Operational | Soft hangs are invisible to systemd; add `WatchdogSec=30s` + watchdog kick in reconcile loop |
+| `StartLimitBurst=5` too low for unattended node | Operational | Increase to 10/300s to survive transient startup failures |
+| No `strip = true` / `panic = "abort"` in release profile | Build | Binary is unnecessarily large for embedded; safe to add on all platforms |
+| UDP socket buffers not set | Operational | Raise `net.core.rmem_max` via sysctl; code change to `setsockopt` deferred |
+| Log file has no rotation | Operational | Redirect to `/dev/null` or journal-only on embedded |
 | No CI gate for armv7 target | CI | Required before 32-bit ARM can be called supported |
 | No live-lab evidence row for ARM | Evidence | Required before 32-bit ARM can be called supported |
