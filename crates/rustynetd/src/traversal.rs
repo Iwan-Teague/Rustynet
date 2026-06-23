@@ -3092,4 +3092,100 @@ mod tests {
         index.prune_expired(200);
         assert_eq!(index.len(), 0);
     }
+
+    fn valid_stun_xor_mapped_message(transaction_id: [u8; 12]) -> Vec<u8> {
+        let mut message = Vec::new();
+        message.extend_from_slice(&0x0101u16.to_be_bytes());
+        message.extend_from_slice(&0u16.to_be_bytes());
+        message.extend_from_slice(&0x2112_A442u32.to_be_bytes());
+        message.extend_from_slice(&transaction_id);
+        message.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+        message.extend_from_slice(&8u16.to_be_bytes()); // attr len
+        message.push(0x00);
+        message.push(0x01); // IPv4 family
+        let cookie = 0x2112_A442u32.to_be_bytes();
+        let port_mask = u16::from_be_bytes([cookie[0], cookie[1]]);
+        message.extend_from_slice(&(51820u16 ^ port_mask).to_be_bytes());
+        for (i, octet) in Ipv4Addr::new(203, 0, 113, 5).octets().iter().enumerate() {
+            message.push(octet ^ cookie[i]);
+        }
+        let declared_len = (message.len() - 20) as u16;
+        message[2..4].copy_from_slice(&declared_len.to_be_bytes());
+        message
+    }
+
+    #[test]
+    fn parse_stun_xor_mapped_address_never_panics_on_arbitrary_input() {
+        // Parser-never-panics invariant: the STUN binding-response decoder runs
+        // on untrusted network bytes, so on any input — truncated mid-attribute,
+        // bit-flipped, or random — it must return Err, never panic.
+        let tid: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let valid = valid_stun_xor_mapped_message(tid);
+
+        for len in 0..=valid.len() {
+            let _ = parse_stun_xor_mapped_address(&valid[..len], tid);
+        }
+        for i in 0..valid.len() {
+            let mut corrupted = valid.clone();
+            corrupted[i] ^= 0xFF;
+            let _ = parse_stun_xor_mapped_address(&corrupted, tid);
+        }
+        for len in [0usize, 1, 19, 20, 21, 64, 512, 4096] {
+            let _ = parse_stun_xor_mapped_address(&vec![0u8; len], tid);
+            let _ = parse_stun_xor_mapped_address(&vec![0xFFu8; len], tid);
+        }
+        let mut seed = 0xDEAD_BEEF_CAFE_F00Du64;
+        for len in 0..384usize {
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                bytes.push((seed >> 33) as u8);
+            }
+            let _ = parse_stun_xor_mapped_address(&bytes, tid);
+        }
+    }
+
+    #[test]
+    fn parse_coordination_payload_never_panics_on_arbitrary_input() {
+        // Parser-never-panics invariant for the coordination-record payload
+        // decoder (untrusted peer input parsed before signature application).
+        let payload = super::serialize_coordination_payload(&super::ParsedCoordinationPayload {
+            session_id: [5u8; 16],
+            probe_start_unix: 1_700_000_100,
+            node_a: "node-a".to_owned(),
+            node_b: "node-b".to_owned(),
+            issued_at_unix: 1_700_000_000,
+            expires_at_unix: 1_700_000_200,
+            nonce: [0xaau8; 16],
+        });
+
+        for (offset, _) in payload
+            .char_indices()
+            .chain(std::iter::once((payload.len(), ' ')))
+        {
+            let _ = super::parse_coordination_payload(&payload[..offset]);
+        }
+        for probe in [
+            "",
+            "\n\n",
+            "novalue",
+            "version=1\nsession_id=zz",
+            &"k=v\n".repeat(20_000),
+        ] {
+            let _ = super::parse_coordination_payload(probe);
+        }
+        let mut seed = 0x0BAD_F00D_1234_5678u64;
+        for len in 0..256usize {
+            let mut s = String::with_capacity(len);
+            for _ in 0..len {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                s.push((0x20 + (seed >> 40) as u8 % 0x5f) as char);
+            }
+            let _ = super::parse_coordination_payload(&s);
+        }
+    }
 }
