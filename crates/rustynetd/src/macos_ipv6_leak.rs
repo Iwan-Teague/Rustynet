@@ -62,6 +62,12 @@ pub struct MacosIpv6LeakSnapshot {
     pub leaked_datagram_count: u32,
     /// Whether the outbound IPv6 probe reached its global target. MUST be false.
     pub probe_reached_target: bool,
+    /// Whether the active probe + capture actually executed (tcpdump spawned
+    /// AND ping6 ran). A never-run probe MUST NOT read as a clean fail-closed
+    /// result; the validator requires this true so the active probe is
+    /// load-bearing alongside the static pf-containment posture.
+    #[serde(default)]
+    pub probe_attempted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +90,7 @@ impl Default for MacosIpv6LeakOptions {
 pub fn collect_macos_ipv6_leak_snapshot(options: &MacosIpv6LeakOptions) -> MacosIpv6LeakSnapshot {
     let now_unix = current_unix_seconds();
     let pf_rules = capture_pf_anchor_rules(options.pf_anchor.as_str());
-    let (pcap_text, probe_reached) = run_ipv6_egress_probe_with_capture(
+    let (pcap_text, probe_reached, probe_attempted) = run_ipv6_egress_probe_with_capture(
         options.egress_iface.as_str(),
         options.probe_target.as_str(),
     );
@@ -96,6 +102,7 @@ pub fn collect_macos_ipv6_leak_snapshot(options: &MacosIpv6LeakOptions) -> Macos
         pf_rules.as_str(),
         pcap_text.as_str(),
         probe_reached,
+        probe_attempted,
     )
 }
 
@@ -108,6 +115,7 @@ pub fn build_macos_ipv6_leak_snapshot(
     pf_rules_stdout: &str,
     pcap_text: &str,
     probe_reached_target: bool,
+    probe_attempted: bool,
 ) -> MacosIpv6LeakSnapshot {
     MacosIpv6LeakSnapshot {
         schema_version: MACOS_IPV6_LEAK_SCHEMA_VERSION,
@@ -118,6 +126,7 @@ pub fn build_macos_ipv6_leak_snapshot(
         killswitch_v6_block_present: pf_rules_have_v6_block(pf_rules_stdout),
         leaked_datagram_count: count_pcap_datagrams(pcap_text),
         probe_reached_target,
+        probe_attempted,
     }
 }
 
@@ -194,12 +203,12 @@ fn capture_pf_anchor_rules(_anchor: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn run_ipv6_egress_probe_with_capture(egress_iface: &str, target: &str) -> (String, bool) {
+fn run_ipv6_egress_probe_with_capture(egress_iface: &str, target: &str) -> (String, bool, bool) {
     use std::thread::sleep;
     use std::time::Duration;
 
     if egress_iface.is_empty() {
-        return (String::new(), false);
+        return (String::new(), false, false);
     }
     let pcap_path = std::env::temp_dir().join(format!(
         "rustynet-macos-ipv6-leak-{}.pcap",
@@ -222,16 +231,16 @@ fn run_ipv6_egress_probe_with_capture(egress_iface: &str, target: &str) -> (Stri
         .spawn();
     let mut child = match spawn {
         Ok(child) => child,
-        Err(_) => return (String::new(), false),
+        Err(_) => return (String::new(), false, false),
     };
     sleep(Duration::from_millis(800));
-    let reached = Command::new("/sbin/ping6")
+    let ping_status = Command::new("/sbin/ping6")
         .args(["-c", "2", "-W", "2", target])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+        .status();
+    let probe_attempted = ping_status.is_ok();
+    let reached = ping_status.map(|status| status.success()).unwrap_or(false);
     sleep(Duration::from_millis(IPV6_EGRESS_CAPTURE_SECS * 1000 - 800));
     let _ = child.kill();
     let _ = child.wait();
@@ -241,12 +250,12 @@ fn run_ipv6_egress_probe_with_capture(egress_iface: &str, target: &str) -> (Stri
         .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
         .unwrap_or_default();
     let _ = std::fs::remove_file(&pcap_path);
-    (pcap_text, reached)
+    (pcap_text, reached, probe_attempted)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn run_ipv6_egress_probe_with_capture(_egress_iface: &str, _target: &str) -> (String, bool) {
-    (String::new(), false)
+fn run_ipv6_egress_probe_with_capture(_egress_iface: &str, _target: &str) -> (String, bool, bool) {
+    (String::new(), false, false)
 }
 
 #[cfg(test)]
@@ -318,10 +327,12 @@ block drop out quick inet proto udp from any to any port = 53"#;
             PF_TERMINAL_BLOCK_ALL,
             "0 packets captured\n",
             false,
+            true,
         );
         assert!(snap.killswitch_v6_block_present);
         assert_eq!(snap.leaked_datagram_count, 0);
         assert!(!snap.probe_reached_target);
+        assert!(snap.probe_attempted);
     }
 
     #[test]
@@ -334,10 +345,12 @@ block drop out quick inet proto udp from any to any port = 53"#;
             PF_INET_ONLY_BLOCK,
             "12:00:00 IP6 2001:db8::1 > 2606:4700:4700::1111: ICMP6, echo request\n",
             true,
+            true,
         );
         assert!(!snap.killswitch_v6_block_present);
         assert_eq!(snap.leaked_datagram_count, 1);
         assert!(snap.probe_reached_target);
+        assert!(snap.probe_attempted);
     }
 
     #[test]

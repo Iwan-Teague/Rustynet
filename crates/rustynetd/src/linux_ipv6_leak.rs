@@ -80,6 +80,13 @@ pub struct LinuxIpv6LeakSnapshot {
     /// Whether the outbound IPv6 probe actually reached its global target.
     /// MUST be false in a fail-closed posture (the killswitch blocked it).
     pub probe_reached_target: bool,
+    /// Whether the active probe + capture actually executed (tcpdump spawned
+    /// AND the ping probe ran). A vacuous run where the tooling never executed
+    /// MUST NOT read as a clean fail-closed result — the validator requires
+    /// this true so the active probe is load-bearing, not just the static
+    /// containment posture.
+    #[serde(default)]
+    pub probe_attempted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +110,7 @@ pub fn collect_linux_ipv6_leak_snapshot(options: &LinuxIpv6LeakOptions) -> Linux
     let now_unix = current_unix_seconds();
     let disable_stdout = capture_proc_flag("/proc/sys/net/ipv6/conf/all/disable_ipv6");
     let nft_ruleset = capture_nft_ruleset();
-    let (pcap_text, probe_reached) = run_ipv6_egress_probe_with_capture(
+    let (pcap_text, probe_reached, probe_attempted) = run_ipv6_egress_probe_with_capture(
         options.egress_iface.as_str(),
         options.probe_target.as_str(),
     );
@@ -116,6 +123,7 @@ pub fn collect_linux_ipv6_leak_snapshot(options: &LinuxIpv6LeakOptions) -> Linux
         nft_ruleset.as_str(),
         pcap_text.as_str(),
         probe_reached,
+        probe_attempted,
     )
 }
 
@@ -129,6 +137,7 @@ pub fn build_linux_ipv6_leak_snapshot(
     nft_ruleset_stdout: &str,
     pcap_text: &str,
     probe_reached_target: bool,
+    probe_attempted: bool,
 ) -> LinuxIpv6LeakSnapshot {
     LinuxIpv6LeakSnapshot {
         schema_version: LINUX_IPV6_LEAK_SCHEMA_VERSION,
@@ -140,6 +149,7 @@ pub fn build_linux_ipv6_leak_snapshot(
         killswitch_v6_drop_present: nft_ruleset_has_v6_drop(nft_ruleset_stdout, killswitch_table),
         leaked_datagram_count: count_pcap_datagrams(pcap_text),
         probe_reached_target,
+        probe_attempted,
     }
 }
 
@@ -155,43 +165,59 @@ fn parse_proc_flag(stdout: &str) -> bool {
     stdout.trim() == "1"
 }
 
-/// Detect a killswitch drop rule that covers the IPv6 family. We look inside
-/// the reviewed `rustynet_g<N>` killswitch surface for either an explicit
-/// `meta nfproto ipv6 ... drop`, an `ip6`/`inet6` saddr/daddr drop, or — for
-/// the canonical terminal `block drop out quick all` equivalent — a `drop`
-/// inside an `inet`-family table (the `inet` family covers both IPv4 and
-/// IPv6, so an `inet` killswitch drop contains v6). Fail-closed: an `ip`
-/// (IPv4-only) family table's drop does NOT count as v6 containment.
+/// Detect a killswitch drop rule that covers the IPv6 family on the EGRESS
+/// path. Two signals count:
+///   1. an explicit v6-scoped drop (`meta nfproto ipv6 ... drop`, an
+///      `ip6`/`inet6` saddr/daddr drop) — explicit intent, credited anywhere;
+///   2. the canonical family-agnostic terminal drop (the `block drop out quick
+///      all` analogue: `policy drop` / a bare `drop`) — but ONLY inside an
+///      EGRESS base chain (`hook output`/`hook postrouting`/`hook forward`) of
+///      the dual-stack `inet` killswitch table. A family-agnostic terminal drop
+///      on an `input`/`prerouting` chain, a regular (unhooked) chain, or an
+///      `ip` (IPv4-only) table does NOT contain outbound IPv6 — crediting it
+///      would be a false fail-closed positive.
 fn nft_ruleset_has_v6_drop(stdout: &str, killswitch_table: &str) -> bool {
     let mut in_inet_killswitch_table = false;
+    // Whether the chain currently being scanned is hooked on an egress path.
+    // Reset on every `table`/`chain` boundary; set by a base-chain `hook` line.
+    let mut chain_is_egress = false;
     for raw in stdout.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if line.starts_with("table ") {
-            // Enter the reviewed killswitch table only when it is the
-            // dual-stack `inet` family. `table ip <name>` is IPv4-only and
-            // must not be treated as v6 containment.
             in_inet_killswitch_table = line.starts_with("table inet ")
                 && line
                     .split_whitespace()
                     .nth(2)
                     .map(|name| name.trim_end_matches('{').trim() == killswitch_table)
                     .unwrap_or(false);
-            // An explicit v6-scoped drop anywhere is sufficient on its own.
-            if rule_is_v6_drop(line) {
-                return true;
-            }
+            chain_is_egress = false;
             continue;
         }
+        if line.starts_with("chain ") {
+            // A new chain; its hook (if any) is declared on a following line.
+            chain_is_egress = false;
+            continue;
+        }
+        // Base-chain hook declaration (may also carry `policy drop` on the
+        // same line). Only output/postrouting/forward are egress-relevant.
+        if line.contains("hook output")
+            || line.contains("hook postrouting")
+            || line.contains("hook forward")
+        {
+            chain_is_egress = true;
+        } else if line.contains("hook input") || line.contains("hook prerouting") {
+            chain_is_egress = false;
+        }
+        // Explicit v6-scoped drop: credited (explicit intent, usually oifname).
         if rule_is_v6_drop(line) {
             return true;
         }
-        // Inside the dual-stack inet killswitch table, a family-agnostic
-        // terminal `drop` (the `block drop out quick all` analogue) contains
-        // IPv6 because the inet family spans both protocols.
-        if in_inet_killswitch_table && line_is_terminal_drop(line) {
+        // Family-agnostic terminal drop: only on an egress base chain of the
+        // inet killswitch table.
+        if in_inet_killswitch_table && chain_is_egress && line_is_terminal_drop(line) {
             return true;
         }
     }
@@ -271,18 +297,19 @@ fn capture_nft_ruleset() -> String {
 }
 
 /// Run an outbound IPv6 probe to `target` while capturing the egress
-/// interface. Returns the `tcpdump -r` text and whether the probe reached the
-/// target. Argv-only; no shell construction. On any tool failure the function
-/// fails closed toward "leak unknown": it returns the empty pcap but a
-/// `reached=false`, and the validator's other signals (containment present)
-/// still gate the result.
+/// interface. Returns `(tcpdump_text, probe_reached_target, probe_attempted)`.
+/// Argv-only; no shell construction. `probe_attempted` is true only when the
+/// capture tcpdump spawned AND the ping probe actually executed — so a host
+/// missing the tooling (tcpdump/`ping -6` absent) reports `attempted=false`
+/// and the validator fails the run as inconclusive rather than treating a
+/// never-run probe as a clean fail-closed result.
 #[cfg(target_os = "linux")]
-fn run_ipv6_egress_probe_with_capture(egress_iface: &str, target: &str) -> (String, bool) {
+fn run_ipv6_egress_probe_with_capture(egress_iface: &str, target: &str) -> (String, bool, bool) {
     use std::thread::sleep;
     use std::time::Duration;
 
     if egress_iface.is_empty() {
-        return (String::new(), false);
+        return (String::new(), false, false);
     }
     let pcap_path =
         std::env::temp_dir().join(format!("rustynet-ipv6-leak-{}.pcap", std::process::id()));
@@ -304,19 +331,20 @@ fn run_ipv6_egress_probe_with_capture(egress_iface: &str, target: &str) -> (Stri
         .spawn();
     let mut child = match spawn {
         Ok(child) => child,
-        Err(_) => return (String::new(), false),
+        Err(_) => return (String::new(), false, false),
     };
     // Let tcpdump bind to the interface before probing.
     sleep(Duration::from_millis(800));
     // Real outbound IPv6 probe. `ping -6` egresses native IPv6 if the host
-    // has a global v6 route; the killswitch must drop it.
-    let reached = Command::new("ping")
+    // has a global v6 route; the killswitch must drop it. `Ok(_)` means the
+    // probe tooling executed (attempted), regardless of reachability.
+    let ping_status = Command::new("ping")
         .args(["-6", "-c", "2", "-W", "2", target])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+        .status();
+    let probe_attempted = ping_status.is_ok();
+    let reached = ping_status.map(|status| status.success()).unwrap_or(false);
     sleep(Duration::from_millis(IPV6_EGRESS_CAPTURE_SECS * 1000 - 800));
     let _ = child.kill();
     let _ = child.wait();
@@ -326,12 +354,12 @@ fn run_ipv6_egress_probe_with_capture(egress_iface: &str, target: &str) -> (Stri
         .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
         .unwrap_or_default();
     let _ = fs::remove_file(&pcap_path);
-    (pcap_text, reached)
+    (pcap_text, reached, probe_attempted)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_ipv6_egress_probe_with_capture(_egress_iface: &str, _target: &str) -> (String, bool) {
-    (String::new(), false)
+fn run_ipv6_egress_probe_with_capture(_egress_iface: &str, _target: &str) -> (String, bool, bool) {
+    (String::new(), false, false)
 }
 
 #[cfg(test)]
@@ -379,6 +407,23 @@ mod tests {
     fn nft_ruleset_explicit_v6_drop_counts() {
         assert!(nft_ruleset_has_v6_drop(
             INET_KILLSWITCH_WITH_V6_DROP,
+            "rustynet_g1"
+        ));
+    }
+
+    const INET_KILLSWITCH_INPUT_ONLY_DROP: &str = r#"table inet rustynet_g1 {
+    chain inbound {
+        type filter hook input priority 0; policy drop;
+    }
+}"#;
+
+    #[test]
+    fn nft_ruleset_terminal_drop_on_input_chain_is_not_egress_containment() {
+        // A family-agnostic terminal drop on an INPUT base chain does not
+        // contain OUTBOUND IPv6 — crediting it would be a false fail-closed
+        // positive while v6 leaks freely on egress.
+        assert!(!nft_ruleset_has_v6_drop(
+            INET_KILLSWITCH_INPUT_ONLY_DROP,
             "rustynet_g1"
         ));
     }
@@ -434,6 +479,7 @@ mod tests {
             INET_KILLSWITCH_WITH_TERMINAL_DROP,
             "reading from file /tmp/x.pcap\n0 packets captured\n",
             false,
+            true,
         );
         assert_eq!(snap.schema_version, 1);
         assert_eq!(snap.egress_iface, "enp0s1");
@@ -441,6 +487,7 @@ mod tests {
         assert!(snap.killswitch_v6_drop_present);
         assert_eq!(snap.leaked_datagram_count, 0);
         assert!(!snap.probe_reached_target);
+        assert!(snap.probe_attempted);
     }
 
     #[test]
@@ -454,11 +501,13 @@ mod tests {
             IPV4_ONLY_KILLSWITCH,
             "12:00:00 IP6 2001:db8::1 > 2606:4700:4700::1111: ICMP6, echo request\n",
             true,
+            true,
         );
         assert!(!snap.ipv6_disabled);
         assert!(!snap.killswitch_v6_drop_present);
         assert_eq!(snap.leaked_datagram_count, 1);
         assert!(snap.probe_reached_target);
+        assert!(snap.probe_attempted);
     }
 
     #[test]
