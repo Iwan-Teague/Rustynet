@@ -1040,6 +1040,34 @@ mod tests {
     }
 
     #[test]
+    fn watermark_io_error_does_not_leak_state_dir_path() {
+        // Privacy/secret-log mandate: a watermark spool i/o failure must not
+        // embed the daemon's state-dir layout in its message (the error may be
+        // surfaced to shared logs). Use a uniquely-named directory so any leak
+        // is unambiguous.
+        let dir = TempDir::new().expect("tempdir");
+        let secret_marker = "rustynet-secret-statedir-marker";
+        let blocker = dir.path().join(secret_marker);
+        fs::write(&blocker, b"regular file").expect("write blocker file");
+        let mut node = make_node(2, &blocker);
+
+        let transport = GossipTransport::bind(loopback_bind()).expect("transport");
+        let mut candidates = CandidateSet::default();
+        candidates
+            .v4_host
+            .push(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)));
+
+        let err = node
+            .maybe_mint_and_broadcast(Instant::now(), 1_700_000_000, candidates, &transport)
+            .expect_err("persist must fail");
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(secret_marker),
+            "watermark i/o error must not embed the state-dir path, got: {rendered}"
+        );
+    }
+
+    #[test]
     fn maybe_mint_emits_when_candidates_change_and_persists_sequence() {
         let dir = TempDir::new().expect("tempdir");
         let mut node = make_node(2, dir.path());

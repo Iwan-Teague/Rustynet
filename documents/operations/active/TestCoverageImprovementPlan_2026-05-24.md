@@ -195,11 +195,14 @@ and each `seen`-entry fault (missing colon, wrong id length, non-hex id,
 non-numeric sequence). Evidence: `cargo test -p rustynetd --lib
 gossip_runtime::tests` → 18/18; fmt clean; no new clippy findings in the file.
 
+The IO-error PII guard is now pinned too:
+`watermark_io_error_does_not_leak_state_dir_path` induces a spool write failure
+with a uniquely-named state dir and asserts the rendered `WatermarkIo` error
+does not embed that path (validates the docstring's secret-log claim).
+
 Remaining for P0.6: there is no on-disk digest field on the watermark spool
 (unlike the membership snapshot), so "digest-mismatch" detection would require a
 wire-format change (writer + reader) — out of scope here, tracked separately.
-The IO-error-path PII assertion (error message must not embed the state-dir
-path) is also still to add as an explicit test.
 
 ### P1 — High value
 
@@ -275,10 +278,12 @@ rustynetd --lib key_rotation::tests::load_rejects` → 4/4; fmt clean; no new
 clippy findings. (The crate's rotation drain/commit-or-none/IO-failure-rollback/
 verifier-archive-corruption/audit paths were already well covered.)
 
-Remaining for P1.3: `RotationEpoch::next()` overflow at `u64::MAX` lives in
-`rustynet-control::key_rotation` (a different crate) — test there; and the
-drain backward-clock / exact-boundary and the finalize-then-persist-fails
-cascade edges are still open.
+`RotationEpoch::next()` overflow: **already covered** — the function lives in
+`rustynet-control::key_rotation` (not the rustynetd line the plan cited) and is
+pinned by `rotation_epoch_next_rejects_overflow` + `…increments_monotonically`.
+
+Remaining for P1.3: the drain backward-clock / exact-boundary and the
+finalize-then-persist-fails cascade edges are still open.
 
 #### P1.4 — `rustynet-cli/main.rs`: user-facing control-plane logic (not lab tooling)
 Status 2026-05-27: verified the existing CLI error-classification test batch
