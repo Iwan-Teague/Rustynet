@@ -379,6 +379,13 @@ request=Mesh), wildcard vs literal selector semantics.
 
 ## Part C — Tooling and process (alongside P0/P1)
 
+**Gate status 2026-06-23:** the entire workspace's **library** clippy now passes
+`cargo clippy --workspace --lib --all-features -- -D warnings` (exit 0) — the
+`rustynet-sysinfo` (~35) and `rustynetd` lib (3) debt cleared in this pass were
+the last lib-level blockers; all other crate libs were already clean. (Not yet
+exhaustively re-verified for the full `--all-targets` scope, which additionally
+compiles the large `rustynet-cli` bin/test family.)
+
 1. **Add `cargo llvm-cov` to CI**, capture a per-crate baseline, and ratchet (fail if coverage drops). Replaces brittle count-floors with real measurement and would auto-flag the next sysinfo.
 2. **Introduce `proptest`** for serde round-trips (generalizing the per-variant tests), wire-format decoders (never-panic + round-trip), and invariants (sequence monotonicity, canonicalize idempotence).
 3. **Expand fuzzing** to 4 new decoders: gossip bundle, coordination record, STUN response, DNS zone wire bundle.
