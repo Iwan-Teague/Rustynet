@@ -73,6 +73,13 @@ pub const GOSSIP_REMINT_INTERVAL_SECS: u64 = 30;
 
 const GOSSIP_WATERMARK_WIRE_VERSION: u8 = 1;
 
+/// Maximum accepted size of an on-disk gossip watermark spool. The spool is
+/// `version` + `local_sequence` + one `seen` entry (~86 bytes) per gossip
+/// source; 256 KiB allows several thousand sources while bounding the work an
+/// attacker (or a corrupt/oversized file) can force on load. Mirrors the
+/// `MAX_ROTATION_LEDGER_BYTES` cap on the key-rotation ledger.
+const MAX_GOSSIP_WATERMARK_BYTES: usize = 256 * 1024;
+
 /// Errors surfaced by [`GossipNode`] state transitions. Distinct
 /// from `GossipError` so callers can distinguish "the local spool
 /// failed" from "the bundle was rejected".
@@ -582,9 +589,28 @@ fn decode_hex32(value: &str) -> Option<[u8; 32]> {
 /// Read a gossip watermark file. Returns `Ok(default)` if the file
 /// is absent. Returns `Err(WatermarkCorrupt)` on any structural
 /// mismatch.
+/// Read a watermark file, refusing to buffer more than
+/// [`MAX_GOSSIP_WATERMARK_BYTES`] before any structural parse. A corrupt or
+/// hostile daemon that managed to write a huge file at the spool path must not
+/// be able to exhaust memory on load (anti-DoS, fail-closed). Mirrors
+/// `key_rotation::read_bounded`.
+fn read_gossip_watermark_bounded(path: &Path) -> Result<String, GossipNodeError> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|err| GossipNodeError::WatermarkIo(err.to_string()))?;
+    let mut buf = String::new();
+    file.take(MAX_GOSSIP_WATERMARK_BYTES as u64 + 1)
+        .read_to_string(&mut buf)
+        .map_err(|err| GossipNodeError::WatermarkIo(err.to_string()))?;
+    if buf.len() > MAX_GOSSIP_WATERMARK_BYTES {
+        return Err(GossipNodeError::WatermarkCorrupt(
+            "watermark file exceeds maximum size",
+        ));
+    }
+    Ok(buf)
+}
+
 pub fn load_gossip_watermark(path: &Path) -> Result<GossipWatermark, GossipNodeError> {
-    let content =
-        fs::read_to_string(path).map_err(|err| GossipNodeError::WatermarkIo(err.to_string()))?;
+    let content = read_gossip_watermark_bounded(path)?;
     let mut version: Option<u8> = None;
     let mut local_sequence: Option<u64> = None;
     let mut seen = SeenSequenceState::new();
@@ -870,6 +896,147 @@ mod tests {
         fs::write(&path, b"version=99\nlocal_sequence=0\nseen=\n").expect("write");
         let err = load_gossip_watermark(&path).expect_err("must reject");
         assert!(matches!(err, GossipNodeError::WatermarkCorrupt(_)));
+    }
+
+    fn load_watermark_str(body: &str) -> Result<GossipWatermark, GossipNodeError> {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("g.watermark");
+        fs::write(&path, body.as_bytes()).expect("write");
+        load_gossip_watermark(&path)
+    }
+
+    fn assert_watermark_corrupt(body: &str, needle: &str) {
+        match load_watermark_str(body) {
+            Err(GossipNodeError::WatermarkCorrupt(reason)) => assert!(
+                reason.contains(needle),
+                "expected corrupt reason containing {needle:?}, got {reason:?}"
+            ),
+            other => panic!("expected WatermarkCorrupt({needle:?}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_oversized_watermark_before_parsing() {
+        // A multi-MiB file at the spool path must fail closed on size, not be
+        // buffered whole. The body need not be structurally valid — the size
+        // gate precedes the parse.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("g.watermark");
+        let body = vec![b'x'; MAX_GOSSIP_WATERMARK_BYTES + 1];
+        fs::write(&path, &body).expect("write oversized");
+        let err = load_gossip_watermark(&path).expect_err("oversized must fail closed");
+        assert!(
+            matches!(err, GossipNodeError::WatermarkCorrupt(reason) if reason.contains("exceeds maximum size")),
+            "expected size-cap rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_watermark_at_size_cap_boundary() {
+        // Exactly at the cap must still load (off-by-one guard on the bound).
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("g.watermark");
+        let mut body = String::from("version=1\nlocal_sequence=0\nseen=\n");
+        // Pad with blank lines (skipped by the parser) up to exactly the cap.
+        while body.len() < MAX_GOSSIP_WATERMARK_BYTES {
+            body.push('\n');
+        }
+        assert_eq!(body.len(), MAX_GOSSIP_WATERMARK_BYTES);
+        fs::write(&path, body.as_bytes()).expect("write at cap");
+        load_gossip_watermark(&path).expect("watermark exactly at the cap must load");
+    }
+
+    #[test]
+    fn load_rejects_line_missing_separator() {
+        assert_watermark_corrupt("version=1\nlocal_sequence", "missing key/value separator");
+    }
+
+    #[test]
+    fn load_rejects_unknown_key() {
+        assert_watermark_corrupt("version=1\nlocal_sequence=0\nrogue=1\n", "unknown key");
+    }
+
+    #[test]
+    fn load_rejects_non_numeric_local_sequence() {
+        assert_watermark_corrupt(
+            "version=1\nlocal_sequence=abc\n",
+            "local_sequence is not a u64",
+        );
+    }
+
+    #[test]
+    fn load_rejects_missing_local_sequence() {
+        assert_watermark_corrupt("version=1\nseen=\n", "missing local_sequence");
+    }
+
+    #[test]
+    fn load_rejects_seen_entry_without_colon() {
+        assert_watermark_corrupt(
+            "version=1\nlocal_sequence=0\nseen=deadbeef\n",
+            "seen entry missing colon",
+        );
+    }
+
+    #[test]
+    fn load_rejects_seen_id_wrong_length() {
+        assert_watermark_corrupt(
+            "version=1\nlocal_sequence=0\nseen=ab:5\n",
+            "id is not 64 hex chars",
+        );
+    }
+
+    #[test]
+    fn load_rejects_seen_id_non_hex() {
+        // 64 ASCII chars that are not valid hex digits.
+        let body = format!("version=1\nlocal_sequence=0\nseen={}:5\n", "z".repeat(64));
+        assert_watermark_corrupt(&body, "id is not valid hex");
+    }
+
+    #[test]
+    fn load_rejects_seen_sequence_non_numeric() {
+        let body = format!(
+            "version=1\nlocal_sequence=0\nseen={}:notanumber\n",
+            hex32(0xab)
+        );
+        assert_watermark_corrupt(&body, "sequence is not a u64");
+    }
+
+    #[test]
+    fn mint_does_not_advance_sequence_when_watermark_persist_fails() {
+        // Anti-rewind invariant: the watermark is persisted BEFORE the
+        // in-memory sequence advances, so a failed spool write must leave the
+        // sequence untouched — never half-advance into a value the daemon
+        // didn't commit to disk (which an attacker who could induce a write
+        // failure would exploit to replay an already-seen sequence).
+        let dir = TempDir::new().expect("tempdir");
+        // Point the watermark's parent at a regular FILE, so `create_dir_all`
+        // on the spool's parent fails — a deterministic persist failure.
+        let blocker = dir.path().join("not-a-dir");
+        fs::write(&blocker, b"regular file").expect("write blocker file");
+        let mut node = make_node(2, &blocker);
+        assert_eq!(node.gossip_sequence, 0);
+
+        let transport = GossipTransport::bind(loopback_bind()).expect("transport");
+        let mut candidates = CandidateSet::default();
+        candidates
+            .v4_host
+            .push(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)));
+
+        let result =
+            node.maybe_mint_and_broadcast(Instant::now(), 1_700_000_000, candidates, &transport);
+        assert!(
+            matches!(result, Err(GossipNodeError::WatermarkIo(_))),
+            "persist failure must surface as WatermarkIo, got {result:?}"
+        );
+
+        // The sequence and mint bookkeeping must be exactly as before the
+        // failed attempt — no skip, no phantom mint.
+        assert_eq!(node.gossip_sequence, 0, "sequence must not advance");
+        assert!(
+            node.last_minted_bundle.is_none(),
+            "no bundle should be recorded on a failed persist"
+        );
+        assert_eq!(node.minted_count, 0, "mint count must not advance");
     }
 
     #[test]

@@ -170,6 +170,28 @@ paths are tested.
 - `load_gossip_watermark()` (~L576) rejects corrupt / missing-field / digest-mismatch files, and enforces a max-size cap (it currently lacks the size cap `key_rotation.rs` has).
 - Confirm watermark IO error messages do not log the state-dir path (secret/PII-log mandate; flagged at ~L577).
 
+Status 2026-06-23: **size cap implemented + persistence/parse failure modes
+pinned (12 new tests).** Implemented the missing anti-DoS bound:
+`load_gossip_watermark` now reads through `read_gossip_watermark_bounded`
+(`File::take(MAX_GOSSIP_WATERMARK_BYTES + 1)` then a length check, mirroring
+`key_rotation::read_bounded`), with `MAX_GOSSIP_WATERMARK_BYTES = 256 KiB`;
+oversized files fail closed (`WatermarkCorrupt("…exceeds maximum size")`) before
+any parse, and a file exactly at the cap still loads (off-by-one boundary
+test). **Persist-failure rollback proven:** a deterministic spool-write failure
+(watermark parent pointed at a regular file) leaves `gossip_sequence`,
+`last_minted_bundle`, and `minted_count` untouched — the persist precedes the
+in-memory mutation, so no half-advance/skip. Parse reject matrix covered:
+missing key/value separator, unknown key, non-numeric/missing `local_sequence`,
+and each `seen`-entry fault (missing colon, wrong id length, non-hex id,
+non-numeric sequence). Evidence: `cargo test -p rustynetd --lib
+gossip_runtime::tests` → 18/18; fmt clean; no new clippy findings in the file.
+
+Remaining for P0.6: there is no on-disk digest field on the watermark spool
+(unlike the membership snapshot), so "digest-mismatch" detection would require a
+wire-format change (writer + reader) — out of scope here, tracked separately.
+The IO-error-path PII assertion (error message must not embed the state-dir
+path) is also still to add as an explicit test.
+
 ### P1 — High value
 
 #### P1.1 — `rustynet-sysinfo`: the largest single gap (6,677 lines, 0 tests; not in any gate)
