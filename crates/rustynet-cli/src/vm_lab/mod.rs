@@ -9399,7 +9399,11 @@ fn run_macos_orchestration_stages(
 
 const MACOS_EXIT_EVIDENCE_REMOTE_ROOT: &str = "/tmp/rustynet-macos-exit-evidence";
 const MACOS_EXIT_EVIDENCE_MESH_CIDR: &str = "100.64.0.0/10";
-const MACOS_EXIT_EVIDENCE_LAN_IFACE: &str = "en0";
+// `auto` makes the on-guest capture producer derive the live egress NIC from
+// `route -n get default` and fail loud if undetermined, instead of trusting a
+// hardcoded en0 (which would silently bind tcpdump to a wrong/absent NIC on a
+// bridged/en1 guest and turn the DNS-leak proof into a vacuous pass).
+const MACOS_EXIT_EVIDENCE_LAN_IFACE: &str = "auto";
 const MACOS_EXIT_EVIDENCE_MESH_HOSTNAME: &str = "exit-1.rustynet";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9476,7 +9480,8 @@ fn activate_macos_exit_role(
     let live_script = "set -eu; \
          RN=/usr/local/bin/rustynet; \
          sudo $RN role set admin; \
-         sudo launchctl kickstart -k system/com.rustynet.daemon; \
+         sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
+         sudo launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.daemon.plist; \
          admin_ok=0; \
          for _i in $(seq 1 30); do \
            if sudo $RN role show 2>/dev/null | grep -qiE 'current role: admin|primary=admin|node_role=admin'; then admin_ok=1; break; fi; \

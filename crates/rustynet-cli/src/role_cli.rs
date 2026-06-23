@@ -292,7 +292,11 @@ pub fn platform_default_daemon_env_path() -> &'static str {
 /// guidance a human operator follows on each platform.
 pub fn daemon_restart_instruction() -> String {
     if cfg!(target_os = "macos") {
-        "Restart the daemon so the new primary role takes effect: `sudo launchctl kickstart -k system/com.rustynet.daemon`.".to_owned()
+        // RELOAD (bootout + bootstrap), not `kickstart -k`: kickstart restarts
+        // the already-loaded launchd job with its in-memory ProgramArguments
+        // and does NOT re-read the plist file, so the rewritten `--node-role`
+        // would be ignored and the daemon would come back in its old role.
+        "Reload the daemon so the new primary role takes effect: `sudo launchctl bootout system/com.rustynet.daemon && sudo launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.daemon.plist`.".to_owned()
     } else if cfg!(target_os = "windows") {
         "Restart the daemon so the new primary role takes effect: `Restart-Service rustynetd`."
             .to_owned()
