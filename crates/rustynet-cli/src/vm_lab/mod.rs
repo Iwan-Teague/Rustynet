@@ -14466,6 +14466,79 @@ fn evaluate_linux_exit_nat_lifecycle_artifact(
     ))
 }
 
+/// Linux exit→client DEMOTION NAT-residue validator (SecurityMinimumBar
+/// §6.D.7). Companion of `scripts/e2e/capture_linux_exit_demotion_residue.sh`,
+/// which reuses the read-only `rustynetd linux-exit-nat-lifecycle-snapshot`
+/// producer to capture two phases around an in-process role demotion (exit →
+/// client) driven through the PUBLIC role surface — the daemon stays RUNNING
+/// throughout (this is NOT the daemon-stop teardown test).
+///
+/// Exit-serving NAT + forwarding MUST be torn down BEFORE `serves_exit` is
+/// removed; residue after demotion is a release-blocking open relay. Fails
+/// closed if:
+///   - `during_run` did not prove the node was actually serving exit (NAT
+///     table present + forwarding enabled) — anti-vacuous guard;
+///   - `after_demote` still shows the NAT table present, or forwarding not
+///     restored;
+///   - the demotion CLI returned non-zero;
+///   - the daemon did not stay running (else it masquerades as the
+///     daemon-stop lifecycle test).
+fn evaluate_linux_exit_demotion_residue_artifact(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse linux exit demotion residue artifact failed: {err}"))?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "linux exit demotion residue artifact returned unsupported schema_version={}",
+                require_json_u64(&report, "schema_version").unwrap_or_default()
+            )
+        })?;
+    let during = require_json_value(&report, "during_run")?;
+    if !require_json_bool(during, "nat_table_present")? {
+        return Err(
+            "linux exit demotion residue artifact did not prove exit-serving NAT present before demotion (anti-vacuous guard)"
+                .to_owned(),
+        );
+    }
+    require_forwarding_enabled_macos(during, "tunnel_forwarding")?;
+    require_forwarding_enabled_macos(during, "egress_forwarding")?;
+
+    if require_json_u64(&report, "demotion_exit_code")? != 0 {
+        return Err(
+            "linux exit demotion residue artifact recorded a non-zero demotion exit code; the role demotion itself failed"
+                .to_owned(),
+        );
+    }
+    if !require_json_bool(&report, "daemon_still_running")? {
+        return Err(
+            "linux exit demotion residue artifact reports the daemon was not running after demotion; this must prove teardown WITHOUT a daemon stop"
+                .to_owned(),
+        );
+    }
+
+    let after = require_json_value(&report, "after_demote")?;
+    if require_json_bool(after, "nat_table_present")? {
+        return Err(
+            "linux exit demotion residue artifact left the nftables NAT table present after exit→client demotion: residual open relay (release-blocker)"
+                .to_owned(),
+        );
+    }
+    if !require_json_bool(after, "forwarding_restored")? {
+        return Err(
+            "linux exit demotion residue artifact did not prove ip_forward was restored after demotion"
+                .to_owned(),
+        );
+    }
+    Ok(format!(
+        "Linux exit→client demotion residue verified on {linux_alias}: NAT torn down + forwarding restored with the daemon still running"
+    ))
+}
+
 /// Linux IPv6 tunnel-leak artefact validator. Companion of the daemon-side
 /// `rustynetd linux-ipv6-leak-capture` producer
 /// (`crates/rustynetd/src/linux_ipv6_leak.rs`).
@@ -16498,6 +16571,7 @@ fn run_linux_orchestration_stages_with_options(
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
     let exit_nat_lifecycle_log_path = logs_dir.join("validate_linux_exit_nat_lifecycle.log");
     let exit_ipv6_leak_log_path = logs_dir.join("validate_linux_ipv6_leak.log");
+    let exit_demotion_residue_log_path = logs_dir.join("validate_linux_exit_demotion_residue.log");
     let exit_dns_failclosed_log_path = logs_dir.join("validate_linux_exit_dns_failclosed.log");
     let relay_lifecycle_log_path = logs_dir.join("validate_linux_relay_service_lifecycle.log");
     let anchor_bundle_pull_log_path = logs_dir.join("validate_linux_anchor_bundle_pull.log");
@@ -16762,6 +16836,73 @@ fn run_linux_orchestration_stages_with_options(
                             "Linux IPv6 leak artifact validation failed for {linux_alias}: {reason}"
                         ),
                         vec![exit_ipv6_leak_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+
+    let exit_demotion_residue_outcome = if options.dry_run {
+        stage_outcome(
+            "validate_linux_exit_demotion_residue",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate Linux exit→client demotion residue for {linux_alias}"),
+            vec![],
+        )
+    } else if !runtime_acls_passed {
+        make_skipped(
+            "validate_linux_exit_demotion_residue",
+            "validate_linux_runtime_acls",
+        )
+    } else if !key_custody_passed {
+        make_skipped(
+            "validate_linux_exit_demotion_residue",
+            "validate_linux_key_custody",
+        )
+    } else if !hardening_passed {
+        make_skipped(
+            "validate_linux_exit_demotion_residue",
+            "validate_linux_service_hardening",
+        )
+    } else {
+        let artifact_path = report_dir
+            .join("linux_exit_evidence")
+            .join("linux_exit_demotion_residue.json");
+        if !artifact_path.exists() {
+            stage_outcome(
+                "validate_linux_exit_demotion_residue",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: Linux exit demotion residue artifact not present at {}; Linux host is not proving an exit→client demotion",
+                    artifact_path.display()
+                ),
+                vec![],
+            )
+        } else {
+            match fs::read_to_string(&artifact_path)
+                .map_err(|err| format!("read {} failed: {err}", artifact_path.display()))
+                .and_then(|raw| {
+                    evaluate_linux_exit_demotion_residue_artifact(linux_alias, raw.as_str())
+                        .map(|summary| (summary, raw))
+                }) {
+                Ok((summary, raw)) => {
+                    let _ = fs::write(&exit_demotion_residue_log_path, raw.as_str());
+                    stage_outcome(
+                        "validate_linux_exit_demotion_residue",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_demotion_residue_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_demotion_residue_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_linux_exit_demotion_residue",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "Linux exit demotion residue artifact validation failed for {linux_alias}: {reason}"
+                        ),
+                        vec![exit_demotion_residue_log_path.clone()],
                     )
                 }
             }
@@ -17060,6 +17201,7 @@ fn run_linux_orchestration_stages_with_options(
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
         exit_ipv6_leak_outcome,
+        exit_demotion_residue_outcome,
         exit_dns_failclosed_outcome,
         relay_lifecycle_outcome,
         anchor_bundle_pull_outcome,
@@ -34745,6 +34887,114 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         );
     }
 
+    fn reviewed_linux_exit_demotion_residue_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "mesh_cidr": "100.64.0.0/16",
+            "nat_table": "rustynet_nat_g1",
+            "demotion_exit_code": 0,
+            "daemon_still_running": true,
+            "during_run": {
+                "nat_table_present": true,
+                "tunnel_forwarding": "Enabled",
+                "egress_forwarding": "Enabled"
+            },
+            "after_demote": {
+                "nat_table_present": false,
+                "forwarding_restored": true,
+                "ipv6_forwarding_restored": true
+            }
+        })
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_accepts_clean_teardown() {
+        let summary = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            reviewed_linux_exit_demotion_residue_artifact()
+                .to_string()
+                .as_str(),
+        )
+        .expect("clean demotion teardown must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("daemon still running"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_residual_nat() {
+        // The bite: residual NAT after demotion = open relay.
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["after_demote"]["nat_table_present"] = serde_json::Value::Bool(true);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("residual NAT after demotion must fail closed");
+        assert!(
+            err.contains("residual open relay") || err.contains("NAT table present after"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_forwarding_not_restored() {
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["after_demote"]["forwarding_restored"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("forwarding not restored must fail closed");
+        assert!(err.contains("ip_forward"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_vacuous_during_run() {
+        // Anti-vacuous: must prove it was serving exit before demotion.
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["during_run"]["nat_table_present"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("must prove exit-serving before demotion");
+        assert!(err.contains("anti-vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_daemon_stopped() {
+        // Must prove teardown happened WITHOUT a daemon stop (else it is the
+        // daemon-stop lifecycle test in disguise).
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["daemon_still_running"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a stopped daemon must fail this stage");
+        assert!(
+            err.contains("not running after demotion"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_nonzero_demotion() {
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["demotion_exit_code"] = serde_json::Value::from(1);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a failed demotion must fail the stage");
+        assert!(
+            err.contains("non-zero demotion exit code"),
+            "unexpected error: {err}"
+        );
+    }
+
     fn reviewed_linux_ipv6_leak_artifact() -> serde_json::Value {
         serde_json::json!({
             "schema_version": 1,
@@ -37803,6 +38053,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_dns_failclosed",
             "validate_linux_exit_nat_lifecycle",
             "validate_linux_ipv6_leak",
+            "validate_linux_exit_demotion_residue",
             "validate_linux_exit_dns_failclosed",
             "validate_linux_relay_service_lifecycle",
             "validate_linux_anchor_bundle_pull",
@@ -37942,6 +38193,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",
                 "validate_linux_ipv6_leak",
+                "validate_linux_exit_demotion_residue",
                 "validate_linux_exit_dns_failclosed",
                 "validate_linux_relay_service_lifecycle",
                 "validate_linux_anchor_bundle_pull",
