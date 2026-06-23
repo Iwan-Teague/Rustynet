@@ -136,6 +136,10 @@ Primary goal:
 - A future non-WireGuard backend must be swappable with minimal changes outside backend adapter crates.
 - Cross-platform clients:
 - Linux (priority), macOS, Windows.
+- ARM architecture support (finished-product requirement, not release-blocking for current mandate):
+  - 64-bit ARM (aarch64-unknown-linux-gnu): expected to work today given boringtun support; not yet CI-gated or live-lab-evidenced.
+  - 32-bit ARM (armv7-unknown-linux-gnueabihf): currently blocked by `AtomicU64` usage and `u128`/`i128` arithmetic in daemon and CLI code. Must be resolved before this target is supported. Primary use case: low-power relay and exit/blind_exit nodes (e.g., Raspberry Pi Zero 2 W class hardware running 32-bit OS). See known blockers in `documents/operations/PlatformSupportMatrix.md`.
+  - CI coverage and live-lab evidence required before either ARM target can be called supported.
 - Cross-platform role parity (completeness mandate, release-blocking):
 - Every node role and capability (client, admin, anchor, exit, blind_exit, relay, and the service-hosting nas/llm roles) must be operable AND live-lab-proven on Linux, macOS, AND Windows. Linux is the reference and is complete; macOS and Windows must graduate from compatibility-mode client to full per-role support — each role and its platform-native dataplane (kill-switch, NAT/egress, DNS fail-closed, route advertise, signed-state verify, anti-replay) proven live in the UTM lab. No OS may limit which role a node can take. Rustynet is not cross-platform complete until this holds for every role on macOS and Windows. Single source of truth + status matrix + acceptance criteria: `operations/active/CrossPlatformRoleParityPlan_2026-06-21.md`.
 - Setup/runtime host profiling:

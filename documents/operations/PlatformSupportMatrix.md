@@ -164,6 +164,25 @@ capability truth:
 Anchor metadata is never consulted before signature verification on
 any platform; anchor is operational metadata, not trust authority.
 
+## ARM Architecture Support (Future)
+
+32-bit and 64-bit ARM Linux targets are a finished-product requirement. Current status:
+
+| Target | Triple | Status | Blocker |
+| --- | --- | --- | --- |
+| 64-bit ARM Linux | `aarch64-unknown-linux-gnu` | Unverified / no CI coverage | No known compile blockers; boringtun explicitly supports this target. Needs CI gate + live-lab evidence run. |
+| 32-bit ARM Linux | `armv7-unknown-linux-gnueabihf` | Not supported — compile blockers present | `AtomicU64` in `third_party/rustynet-alloc-meter/src/lib.rs:17-18` (not available on 32-bit ARM); `u128`/`i128` arithmetic in `crates/rustynetd/src/daemon.rs`, `crates/rustynet-cli/src/main.rs`, `crates/rustynetd/src/peer_gossip.rs`, `crates/rustynet-cli/src/ops_cross_network_reports.rs`. Upstream boringtun supports `armv7-unknown-linux-gnueabihf`. Rustynet's own code is the blocker. |
+
+Primary use case for 32-bit ARM: low-power relay and exit/blind_exit nodes (Raspberry Pi Zero 2 W class, 512 MB RAM) serving 1–3 peers. At that scale the daemon's memory and CPU budgets are comfortable; the only blocker is compilation.
+
+Fix required for 32-bit ARM:
+1. Replace `AtomicU64` in `rustynet-alloc-meter` with `AtomicU32` pair or a mutex, guarded by `#[cfg(target_pointer_width = "64")]` where needed.
+2. Refactor ~15 `u128`/`i128` sites to use `u64` pair arithmetic or add `cfg`-gated alternatives (IPv6 address math, timestamp deltas, membership counters).
+3. Add `armv7-unknown-linux-gnueabihf` to CI cross-compile matrix.
+4. Add live-lab evidence run on ARM hardware.
+
+This work is not release-blocking for the current mandate (Linux/macOS/Windows role parity). Track it as a post-parity backlog item.
+
 ## Security Notes
 - More secure than older docs/findings:
   - production in-memory backend path is blocked,
