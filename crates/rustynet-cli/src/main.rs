@@ -17273,7 +17273,7 @@ fn execute_role(cmd: RoleCommand) -> Result<String, String> {
                 current,
                 target,
                 false,
-                PathBuf::from(role_cli::DEFAULT_DAEMON_ENV_PATH),
+                PathBuf::from(role_cli::platform_default_daemon_env_path()),
             );
             Ok(role_cli::render_transition_check(&plan))
         }
@@ -17292,7 +17292,7 @@ fn execute_role(cmd: RoleCommand) -> Result<String, String> {
                 current,
                 target,
                 accept_irreversible,
-                PathBuf::from(role_cli::DEFAULT_DAEMON_ENV_PATH),
+                PathBuf::from(role_cli::platform_default_daemon_env_path()),
             );
             execute_role_plan(plan)
         }
@@ -17412,12 +17412,28 @@ fn execute_role_action(action: &role_cli::ConcreteAction) -> Result<String, Stri
             env_path,
             restart_required: _,
         } => {
-            update_node_role_env_file(env_path, new_primary.as_str())?;
-            Ok(format!(
-                "wrote NODE_ROLE={} to {}",
-                new_primary,
-                env_path.display()
-            ))
+            // macOS bakes the role into the launchd plist's
+            // `--node-role` argv pair, not an env file (launchd does
+            // not expand EnvironmentVariables into ProgramArguments and
+            // the daemon has no env-var role fallback). Writing the
+            // Linux env path on macOS lands at /etc/default/ which does
+            // not exist; rewrite the plist in place instead so the
+            // restart re-execs the daemon with the new role.
+            if cfg!(target_os = "macos") {
+                update_node_role_macos_plist(env_path, new_primary.as_str())?;
+                Ok(format!(
+                    "set --node-role {} in {} (daemon restart applies it)",
+                    new_primary,
+                    env_path.display()
+                ))
+            } else {
+                update_node_role_env_file(env_path, new_primary.as_str())?;
+                Ok(format!(
+                    "wrote NODE_ROLE={} to {}",
+                    new_primary,
+                    env_path.display()
+                ))
+            }
         }
         role_cli::ConcreteAction::AdvertiseDefaultRoute => {
             let response = send_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned()))?;
@@ -17629,6 +17645,70 @@ fn update_node_role_env_file(env_path: &Path, new_role: &str) -> Result<(), Stri
             "rename {} → {} failed: {err}",
             tmp.display(),
             env_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// macOS counterpart of [`update_node_role_env_file`]. The launchd
+/// daemon reads its primary role only from the `--node-role <value>`
+/// pair in the plist's `ProgramArguments`, so a role change must
+/// rewrite that value in place; the `RUSTYNET_NODE_ROLE`
+/// `EnvironmentVariables` entry is kept in sync for any plist reader /
+/// the hardening validator.
+///
+/// Fail-closed: a missing plist (daemon not installed) or a plist whose
+/// `ProgramArguments` has no `--node-role` pair returns `Err` rather
+/// than silently persisting a role the daemon will never read. The
+/// write is atomic (temp + rename) and preserves the plist's existing
+/// permissions (root:wheel 0644).
+fn update_node_role_macos_plist(plist_path: &Path, new_role: &str) -> Result<(), String> {
+    let existing = std::fs::read_to_string(plist_path).map_err(|err| {
+        format!(
+            "read {} failed (daemon not installed on this host?): {err}",
+            plist_path.display()
+        )
+    })?;
+
+    let (updated, node_role_replaced, _env_replaced) =
+        role_cli::rewrite_macos_plist_node_role(&existing, new_role);
+    if !node_role_replaced {
+        return Err(format!(
+            "{}: launchd ProgramArguments has no `--node-role` pair to update; \
+             refusing to persist a role the daemon will not read",
+            plist_path.display()
+        ));
+    }
+
+    let parent = plist_path.parent().ok_or_else(|| {
+        format!(
+            "plist path {} has no parent directory",
+            plist_path.display()
+        )
+    })?;
+    let tmp = parent.join(format!(
+        ".{}.role-update.tmp",
+        plist_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("com.rustynet.daemon.plist")
+    ));
+    std::fs::write(&tmp, updated.as_bytes())
+        .map_err(|err| format!("write {} failed: {err}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(plist_path) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        } else {
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644));
+        }
+    }
+    std::fs::rename(&tmp, plist_path).map_err(|err| {
+        format!(
+            "rename {} → {} failed: {err}",
+            tmp.display(),
+            plist_path.display()
         )
     })?;
     Ok(())
