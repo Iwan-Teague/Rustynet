@@ -846,6 +846,54 @@ mod tests {
     }
 
     #[test]
+    fn accept_bundle_rejects_sequence_wraparound_at_u64_max() {
+        // Anti-replay must hold at the integer boundary: once u64::MAX is
+        // accepted, an attacker cannot "wrap" the per-source counter back to 0
+        // or 1 to replay — every later sequence is <= the high-water mark and
+        // is rejected as non-monotonic.
+        let signing_key = deterministic_signing_key(9);
+        let verifying_key = signing_key.verifying_key();
+        let mut state = SeenSequenceState::new();
+        let mut known = HashMap::new();
+        known.insert(verifying_key.to_bytes(), verifying_key);
+
+        let max_bundle =
+            mint_bundle_with_timestamp(&signing_key, u64::MAX, 1_700_000_000, sample_candidates())
+                .unwrap();
+        accept_bundle_with_now(&max_bundle, &known, &mut state, 300, 1_700_000_000)
+            .expect("u64::MAX sequence accepted once");
+        assert_eq!(
+            state.highest_accepted(&verifying_key.to_bytes()),
+            Some(u64::MAX)
+        );
+
+        for wrapped in [0u64, 1u64] {
+            let bundle = mint_bundle_with_timestamp(
+                &signing_key,
+                wrapped,
+                1_700_000_050,
+                CandidateSet::default(),
+            )
+            .unwrap();
+            let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_050)
+                .expect_err("post-MAX wraparound must be rejected");
+            assert!(
+                matches!(
+                    err,
+                    GossipError::SequenceNotMonotonic { last_seen, presented }
+                        if last_seen == u64::MAX && presented == wrapped
+                ),
+                "expected SequenceNotMonotonic for {wrapped}, got {err:?}"
+            );
+        }
+        // The high-water mark is unchanged by the rejected wraparound attempts.
+        assert_eq!(
+            state.highest_accepted(&verifying_key.to_bytes()),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
     fn accept_bundle_rejects_replay_of_same_sequence() {
         let signing_key = deterministic_signing_key(5);
         let verifying_key = signing_key.verifying_key();
