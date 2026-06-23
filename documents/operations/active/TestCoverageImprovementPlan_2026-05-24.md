@@ -242,6 +242,23 @@ hazards) is still open.
 - `configure_peer()` / allowed-IP CIDR validation (~L130): overlapping CIDR, malformed CIDR.
 - `process_inbound_ciphertext()` (~L224) / `inject_plaintext_packet()` (~L282): auth-failure handling, truncation, multi-peer fan-out — using a mock boringtun seam.
 
+Status 2026-06-23: **seeded the file's first test module (12 tests) on the two
+pure/near-pure entry points.** `AllowedIpNetwork::parse` (the allowed-IP CIDR
+validator used by `configure_peer`): accepts + masks an IPv4 network (host bits
+below the prefix dropped; `contains()` membership), accepts host routes and
+IPv6, and rejects (with `BackendErrorKind::InvalidInput` + message) a missing
+`/` separator, an invalid network address, a non-numeric / out-of-u8-range
+prefix, and oversized IPv4 (>32) / IPv6 (>128) prefixes.
+`from_private_key_file`: loads a valid 32-byte base64 key, tolerates a trailing
+newline (trim), and rejects (with `Internal` + message) a missing file, invalid
+base64, and a well-formed blob that decodes to the wrong length. Evidence:
+`cargo test -p rustynet-backend-wireguard --lib` → 211/211; crate is fully
+gate-green (fmt + clippy `-D warnings` clean).
+
+Remaining for P1.2: the boringtun-seam paths — `process_inbound_ciphertext` /
+`inject_plaintext_packet` auth-failure/truncation/multi-peer fan-out — still
+need a mock seam to exercise without a live handshake.
+
 #### P1.3 — `rustynetd/src/key_rotation.rs`: rollback / crash-consistency edges
 - Ledger digest mismatch (corrupt one hex char), truncated file, field-reorder determinism (~L352).
 - Epoch overflow `RotationEpoch::next()` at u64::MAX (~L162).

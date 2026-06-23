@@ -661,3 +661,128 @@ impl fmt::Debug for PeerEngineState {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AllowedIpNetwork, UserspaceEngine};
+    use base64::Engine as _;
+    use base64::prelude::BASE64_STANDARD;
+    use rustynet_backend_api::BackendErrorKind;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    // ---- AllowedIpNetwork::parse: pure CIDR validation ----
+
+    #[test]
+    fn allowed_ip_parse_accepts_and_masks_ipv4_network() {
+        // Host bits below the prefix must be masked off: 100.64.5.5/10 is the
+        // 100.64.0.0/10 network.
+        let net = AllowedIpNetwork::parse("100.64.5.5/10").expect("valid v4 CIDR");
+        assert_eq!(net.prefix_len, 10);
+        assert_eq!(net.network, IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)));
+        assert!(net.contains(IpAddr::V4(Ipv4Addr::new(100, 64, 200, 1))));
+        assert!(!net.contains(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
+    }
+
+    #[test]
+    fn allowed_ip_parse_accepts_host_routes_and_ipv6() {
+        AllowedIpNetwork::parse("10.0.0.1/32").expect("v4 host route");
+        AllowedIpNetwork::parse("2001:db8::1/128").expect("v6 host route");
+        let v6 = AllowedIpNetwork::parse("2001:db8::/32").expect("valid v6 CIDR");
+        assert_eq!(v6.prefix_len, 32);
+    }
+
+    fn assert_parse_rejects(cidr: &str, needle: &str) {
+        let err = AllowedIpNetwork::parse(cidr).expect_err("must reject");
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput, "for {cidr:?}");
+        assert!(
+            err.message.contains(needle),
+            "for {cidr:?}: expected message containing {needle:?}, got {:?}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn allowed_ip_parse_rejects_missing_prefix_separator() {
+        assert_parse_rejects("100.64.0.0", "must be valid CIDR strings");
+    }
+
+    #[test]
+    fn allowed_ip_parse_rejects_invalid_network_address() {
+        assert_parse_rejects("not-an-ip/24", "invalid network address");
+    }
+
+    #[test]
+    fn allowed_ip_parse_rejects_non_numeric_prefix() {
+        assert_parse_rejects("10.0.0.0/ab", "invalid prefix length");
+        // Out of u8 range also fails the numeric parse, not the bound check.
+        assert_parse_rejects("10.0.0.0/256", "invalid prefix length");
+    }
+
+    #[test]
+    fn allowed_ip_parse_rejects_oversized_ipv4_prefix() {
+        assert_parse_rejects("10.0.0.0/33", "IPv4 prefix length must be <= 32");
+    }
+
+    #[test]
+    fn allowed_ip_parse_rejects_oversized_ipv6_prefix() {
+        assert_parse_rejects("2001:db8::/129", "IPv6 prefix length must be <= 128");
+    }
+
+    // ---- from_private_key_file: key-material loading ----
+
+    #[test]
+    fn from_private_key_file_loads_valid_32_byte_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg.key");
+        std::fs::write(&path, BASE64_STANDARD.encode([7u8; 32])).expect("write key");
+        UserspaceEngine::from_private_key_file(&path).expect("valid key must load");
+    }
+
+    #[test]
+    fn from_private_key_file_tolerates_trailing_whitespace() {
+        // Keys are commonly written with a trailing newline; it must be trimmed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg.key");
+        std::fs::write(&path, format!("{}\n", BASE64_STANDARD.encode([3u8; 32])))
+            .expect("write key");
+        UserspaceEngine::from_private_key_file(&path).expect("key with newline must load");
+    }
+
+    #[test]
+    fn from_private_key_file_rejects_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("absent.key");
+        let err = UserspaceEngine::from_private_key_file(&path).expect_err("missing file");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(err.message.contains("read failed"), "got {:?}", err.message);
+    }
+
+    #[test]
+    fn from_private_key_file_rejects_invalid_base64() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg.key");
+        std::fs::write(&path, "!!! not base64 !!!").expect("write");
+        let err = UserspaceEngine::from_private_key_file(&path).expect_err("bad base64");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(
+            err.message.contains("decode failed"),
+            "got {:?}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn from_private_key_file_rejects_wrong_key_length() {
+        // A well-formed base64 blob that decodes to 16 bytes, not 32.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg.key");
+        std::fs::write(&path, BASE64_STANDARD.encode([9u8; 16])).expect("write");
+        let err = UserspaceEngine::from_private_key_file(&path).expect_err("wrong length");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(
+            err.message.contains("length invalid") && err.message.contains("expected 32 bytes"),
+            "got {:?}",
+            err.message
+        );
+    }
+}
