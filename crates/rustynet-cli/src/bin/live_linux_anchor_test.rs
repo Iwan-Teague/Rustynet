@@ -601,9 +601,27 @@ fn set_membership_capabilities_linux_ops_verb(
         capabilities = shell_quote(capabilities),
         owner = shell_quote(owner_approver_id),
     );
-    capture_root(identity, known_hosts, host, &command)
-        .map(|out| out.trim().to_owned())
-        .map_err(|err| format!("membership capability mutation failed on {host}: {err}"))
+    // Transient SSH/verb hiccups on the authority intermittently fail this
+    // mutation (observed: live_anchor `revoke anchor.bundle_pull` exited
+    // status 1, classified transient_failure rc=70 "retry is likely safe" —
+    // it aborted an otherwise-green run and blocked the macOS stages). Every
+    // caller of this helper sets caps to a target state (expected-to-succeed,
+    // idempotent), so retry a few times before failing rather than letting a
+    // one-off flake fail the stage. Matches the per-call retries elsewhere in
+    // this harness.
+    let mut last_err = String::new();
+    for attempt in 1..=3u32 {
+        match capture_root(identity, known_hosts, host, &command) {
+            Ok(out) => return Ok(out.trim().to_owned()),
+            Err(err) => {
+                last_err = format!("membership capability mutation failed on {host}: {err}");
+                if attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Phase 15 — macOS path. Runs the three cross-platform CLI verbs
