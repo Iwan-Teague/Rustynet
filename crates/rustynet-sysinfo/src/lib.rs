@@ -1976,12 +1976,18 @@ fn uptime_internal() -> UptimeInfo {
 fn get_system_uptime() -> u64 {
     fs::read_to_string("/proc/uptime")
         .ok()
-        .and_then(|content| {
-            content
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<f64>().ok())
-        })
+        .map(|content| parse_proc_uptime_secs(&content))
+        .unwrap_or(0)
+}
+
+/// Parse the leading uptime-seconds field from `/proc/uptime`
+/// (`<uptime> <idle>`), truncated to whole seconds. Malformed input → 0.
+#[cfg(target_os = "linux")]
+fn parse_proc_uptime_secs(content: &str) -> u64 {
+    content
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<f64>().ok())
         .map(|uptime| uptime as u64)
         .unwrap_or(0)
 }
@@ -2261,28 +2267,7 @@ fn interface_stats_internal() -> Vec<InterfaceStats> {
     #[cfg(target_os = "linux")]
     {
         if let Ok(content) = fs::read_to_string("/proc/net/dev") {
-            for line in content.lines().skip(2) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 10 {
-                    let name = parts[0].trim_end_matches(':');
-                    let bytes_in = parts[1].parse::<u64>().unwrap_or(0);
-                    let packets_in = parts[2].parse::<u64>().unwrap_or(0);
-                    let errors_in = parts[3].parse::<u64>().unwrap_or(0);
-                    let dropped_in = parts[4].parse::<u64>().unwrap_or(0);
-                    let bytes_out = parts[9].parse::<u64>().unwrap_or(0);
-                    let packets_out = parts[10].parse::<u64>().unwrap_or(0);
-
-                    stats.push(InterfaceStats {
-                        name: name.to_string(),
-                        bytes_in,
-                        bytes_out,
-                        packets_in,
-                        packets_out,
-                        errors: errors_in,
-                        dropped: dropped_in,
-                    });
-                }
-            }
+            stats = parse_proc_net_dev(&content);
         }
     }
 
@@ -2297,6 +2282,34 @@ fn interface_stats_internal() -> Vec<InterfaceStats> {
         dropped: 0,
     });
 
+    stats
+}
+
+/// Parse `/proc/net/dev` into per-interface counters. Split from the file read
+/// so it can be exercised with golden fixtures.
+///
+/// The first two lines are headers and are skipped. A real row carries 17
+/// whitespace fields (`iface:` + 16 counters); we read up to index 10
+/// (tx packets), so the guard is `>= 11` — a short/truncated row is skipped
+/// rather than panicking on the `parts[10]` access. Non-numeric counters
+/// degrade to 0 (preserved `unwrap_or(0)` behavior).
+#[cfg(target_os = "linux")]
+fn parse_proc_net_dev(content: &str) -> Vec<InterfaceStats> {
+    let mut stats = Vec::new();
+    for line in content.lines().skip(2) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 11 {
+            stats.push(InterfaceStats {
+                name: parts[0].trim_end_matches(':').to_string(),
+                bytes_in: parts[1].parse::<u64>().unwrap_or(0),
+                bytes_out: parts[9].parse::<u64>().unwrap_or(0),
+                packets_in: parts[2].parse::<u64>().unwrap_or(0),
+                packets_out: parts[10].parse::<u64>().unwrap_or(0),
+                errors: parts[3].parse::<u64>().unwrap_or(0),
+                dropped: parts[4].parse::<u64>().unwrap_or(0),
+            });
+        }
+    }
     stats
 }
 
@@ -2346,20 +2359,28 @@ fn health_check_internal() -> HealthCheck {
     }
 }
 
+/// Parse the three load averages from `/proc/loadavg` (`1min 5min 15min ...`).
+/// A malformed/short line yields zeros. Non-numeric fields degrade to 0.0.
+#[cfg(target_os = "linux")]
+fn parse_proc_loadavg(content: &str) -> (f64, f64, f64) {
+    let parts: Vec<&str> = content.split_whitespace().collect();
+    if parts.len() >= 3 {
+        (
+            parts[0].parse().unwrap_or(0.0),
+            parts[1].parse().unwrap_or(0.0),
+            parts[2].parse().unwrap_or(0.0),
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn system_load_internal() -> SystemLoad {
-    let mut load_1 = 0.0;
-    let mut load_5 = 0.0;
-    let mut load_15 = 0.0;
-
-    if let Ok(content) = fs::read_to_string("/proc/loadavg") {
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.len() >= 3 {
-            load_1 = parts[0].parse().unwrap_or(0.0);
-            load_5 = parts[1].parse().unwrap_or(0.0);
-            load_15 = parts[2].parse().unwrap_or(0.0);
-        }
-    }
+    let (load_1, load_5, load_15) = match fs::read_to_string("/proc/loadavg") {
+        Ok(content) => parse_proc_loadavg(&content),
+        Err(_) => (0.0, 0.0, 0.0),
+    };
 
     let mem_percent = memory_info_internal().percent;
     let disk_percent = disk_info_internal()
@@ -2422,24 +2443,36 @@ fn system_load_internal() -> SystemLoad {
 
 #[cfg(target_os = "linux")]
 fn memory_info_internal() -> MemoryInfo {
+    match fs::read_to_string("/proc/meminfo") {
+        Ok(content) => parse_proc_meminfo(&content),
+        Err(_) => MemoryInfo {
+            total_mb: 0,
+            used_mb: 0,
+            available_mb: 0,
+            percent: 0.0,
+        },
+    }
+}
+
+/// Parse `MemTotal`/`MemAvailable` (kB) from `/proc/meminfo` into a
+/// [`MemoryInfo`] (MB + used percent). Missing fields default to 0.
+#[cfg(target_os = "linux")]
+fn parse_proc_meminfo(content: &str) -> MemoryInfo {
     let mut total = 0u64;
     let mut available = 0u64;
-
-    if let Ok(content) = fs::read_to_string("/proc/meminfo") {
-        for line in content.lines() {
-            if line.starts_with("MemTotal:") {
-                total = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-            } else if line.starts_with("MemAvailable:") {
-                available = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-            }
+    for line in content.lines() {
+        if line.starts_with("MemTotal:") {
+            total = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if line.starts_with("MemAvailable:") {
+            available = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
         }
     }
 
@@ -2647,27 +2680,33 @@ fn disk_info_internal() -> Vec<DiskInfo> {
 
 #[cfg(target_os = "linux")]
 fn cpu_info_internal() -> CpuInfo {
-    let mut cores = 1usize;
-    let mut model = "Unknown".to_string();
+    match fs::read_to_string("/proc/cpuinfo") {
+        Ok(content) => parse_proc_cpuinfo(&content),
+        Err(_) => CpuInfo {
+            cores: 1,
+            model: "Unknown".to_string(),
+            freq_ghz: None,
+        },
+    }
+}
 
-    if let Ok(content) = fs::read_to_string("/proc/cpuinfo") {
-        let mut proc_count = 0usize;
-        for line in content.lines() {
-            if line.starts_with("processor") {
-                proc_count += 1;
-            } else if line.starts_with("model name") {
-                if let Some(name) = line.split(':').nth(1) {
-                    model = name.trim().to_string();
-                }
-            }
-        }
-        if proc_count > 0 {
-            cores = proc_count;
+/// Parse core count (`processor` lines) and `model name` from `/proc/cpuinfo`.
+/// An empty/coreless file reports 1 core and `Unknown`.
+#[cfg(target_os = "linux")]
+fn parse_proc_cpuinfo(content: &str) -> CpuInfo {
+    let mut proc_count = 0usize;
+    let mut model = "Unknown".to_string();
+    for line in content.lines() {
+        if line.starts_with("processor") {
+            proc_count += 1;
+        } else if line.starts_with("model name")
+            && let Some(name) = line.split(':').nth(1)
+        {
+            model = name.trim().to_string();
         }
     }
-
     CpuInfo {
-        cores,
+        cores: if proc_count > 0 { proc_count } else { 1 },
         model,
         freq_ghz: None,
     }
@@ -6862,5 +6901,106 @@ mod tests {
             "rows without a usable address:port must be dropped, got {} entries",
             sockets.len()
         );
+    }
+
+    // ---- /proc parsers (Linux): golden-fixture coverage ----
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_net_dev_extracts_counters_and_skips_short_rows() {
+        // Two header lines + a real 17-field row + a deliberately short row.
+        // Before the bounds fix the short row (>=10 but <11 fields) panicked on
+        // the parts[10] access; it must now be skipped.
+        let fixture = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 123456    789   1    2    0    0     0          0         654321   321     0    0    0    0     0       0
+ short: 1 2 3 4 5 6 7 8 9
+    lo:    100      5    0    0    0    0     0          0            100      5    0    0    0    0     0       0
+";
+        let stats = super::parse_proc_net_dev(fixture);
+        assert_eq!(
+            stats.len(),
+            2,
+            "only the two full rows parse; short row skipped"
+        );
+        assert_eq!(stats[0].name, "eth0");
+        assert_eq!(stats[0].bytes_in, 123456);
+        assert_eq!(stats[0].packets_in, 789);
+        assert_eq!(stats[0].errors, 1);
+        assert_eq!(stats[0].dropped, 2);
+        assert_eq!(stats[0].bytes_out, 654321);
+        assert_eq!(stats[0].packets_out, 321);
+        assert_eq!(stats[1].name, "lo");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_net_dev_empty_and_header_only_are_safe() {
+        assert!(super::parse_proc_net_dev("").is_empty());
+        assert!(super::parse_proc_net_dev("h1\nh2\n").is_empty());
+        // A non-numeric counter degrades to 0 rather than dropping the row.
+        let stats = super::parse_proc_net_dev("h1\nh2\n eth0: NaN 2 3 4 5 6 7 8 9 10 11\n");
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].bytes_in, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_loadavg_reads_three_averages() {
+        let (l1, l5, l15) = super::parse_proc_loadavg("0.50 1.25 2.00 1/234 5678");
+        assert!((l1 - 0.50).abs() < 1e-9);
+        assert!((l5 - 1.25).abs() < 1e-9);
+        assert!((l15 - 2.00).abs() < 1e-9);
+        // Short / malformed input yields zeros, no panic.
+        assert_eq!(super::parse_proc_loadavg("0.1 0.2"), (0.0, 0.0, 0.0));
+        assert_eq!(super::parse_proc_loadavg(""), (0.0, 0.0, 0.0));
+        assert_eq!(super::parse_proc_loadavg("x y z"), (0.0, 0.0, 0.0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_meminfo_computes_used_and_percent() {
+        let info = super::parse_proc_meminfo(
+            "MemTotal:       2048 kB\nMemFree:  500 kB\nMemAvailable:    1024 kB\n",
+        );
+        assert_eq!(info.total_mb, 2); // 2048 kB / 1024
+        assert_eq!(info.available_mb, 1);
+        assert_eq!(info.used_mb, 1); // (2048-1024)/1024
+        assert!((info.percent - 50.0).abs() < 1e-9);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_meminfo_missing_fields_default_to_zero_without_div_by_zero() {
+        let info = super::parse_proc_meminfo("SomethingElse: 5 kB\n");
+        assert_eq!(info.total_mb, 0);
+        assert_eq!(info.percent, 0.0); // total==0 guarded, no NaN
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_cpuinfo_counts_cores_and_reads_model() {
+        let info = super::parse_proc_cpuinfo(
+            "processor\t: 0\nmodel name\t: Test CPU @ 3.0GHz\nprocessor\t: 1\n",
+        );
+        assert_eq!(info.cores, 2);
+        assert_eq!(info.model, "Test CPU @ 3.0GHz");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_cpuinfo_empty_reports_one_core_unknown() {
+        let info = super::parse_proc_cpuinfo("");
+        assert_eq!(info.cores, 1);
+        assert_eq!(info.model, "Unknown");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_uptime_truncates_to_whole_seconds() {
+        assert_eq!(super::parse_proc_uptime_secs("12345.67 9999.00"), 12345);
+        assert_eq!(super::parse_proc_uptime_secs(""), 0);
+        assert_eq!(super::parse_proc_uptime_secs("notanumber"), 0);
     }
 }

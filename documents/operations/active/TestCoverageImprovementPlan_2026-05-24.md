@@ -246,8 +246,24 @@ unused `&mut String` param to `&mut str`; and prefixed a stub `_drops`. Evidence
 macOS/Windows-only `#[cfg]` blocks may still carry residual `uninlined_format_
 args` findings, verifiable only when building for those targets.)
 
-Remaining for P1.1: the parse/IO split + golden-fixture parser tests (the bulk
-of the crate) is in progress.
+Status 2026-06-23 (parse/IO split batch 2): split five more Linux `/proc`
+parsers from their IO and pinned each with golden fixtures (8 tests, now 20
+total in the crate): `parse_proc_net_dev` (`/proc/net/dev`),
+`parse_proc_loadavg` (`/proc/loadavg`), `parse_proc_meminfo` (`/proc/meminfo`),
+`parse_proc_cpuinfo` (`/proc/cpuinfo`), `parse_proc_uptime_secs`
+(`/proc/uptime`). **Found + fixed a real latent panic** doing so:
+`interface_stats_internal` guarded `/proc/net/dev` rows with `parts.len() >= 10`
+but indexed `parts[10]` (tx-packets), so a row with exactly 10 whitespace
+fields panicked (index OOB) — the guard is now `>= 11` and a golden fixture with
+a deliberately-short row proves it is skipped, not panicked. Tests also cover
+non-numeric-counter→0 degradation, missing-meminfo-fields (no div-by-zero),
+empty/header-only safety, and uptime/loadavg truncation. Evidence: `cargo test
+-p rustynet-sysinfo --lib` → 20/20; fmt + clippy `-D warnings` clean.
+
+Remaining for P1.1: more IO-fused parsers still to split (`wg show`, `ip
+route`/`ip addr`, `getfacl`, `sysctl`, `df`, and the macOS/Windows variants of
+the already-split functions); the established pattern (`parse_X(&str) -> T` +
+golden fixtures) applies to each.
 
 Status 2026-06-23 (parse/IO split started): applied the split to the canonical
 example, the Linux `listening_sockets_summary_internal`. Extracted a pure
