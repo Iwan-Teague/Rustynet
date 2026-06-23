@@ -6655,9 +6655,20 @@ fn performance_regression_detection_internal(
         if values.len() >= 2 {
             let first = values[0] as f64;
             let last = values[values.len() - 1] as f64;
+            // Guard against a zero first sample (division would yield
+            // inf/NaN and never compare true against the threshold).
+            if first == 0.0 {
+                continue;
+            }
             let change_percent = ((last - first) / first) * 100.0;
 
-            if change_percent > 50.0 {
+            // A regression is a *significant change in either direction*: a
+            // metric that climbs (e.g. latency, memory) or one that falls
+            // (e.g. throughput) by more than the threshold. Gating on the
+            // signed value alone (`> 50.0`) silently dropped every decrease
+            // and made the `"decreasing"` trend arm dead code — the sign is
+            // what selects the label, the magnitude is what triggers a report.
+            if change_percent.abs() > 50.0 {
                 regressions.push(RegressionAnalysis {
                     metric: name,
                     trend: if change_percent > 0.0 {
@@ -6674,4 +6685,101 @@ fn performance_regression_detection_internal(
     }
 
     regressions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::performance_regression_detection_internal;
+
+    fn samples(name: &str, values: &[u64]) -> Vec<(String, u64)> {
+        values.iter().map(|v| (name.to_owned(), *v)).collect()
+    }
+
+    #[test]
+    fn regression_detection_needs_at_least_two_samples() {
+        assert!(performance_regression_detection_internal(&[]).is_empty());
+        assert!(performance_regression_detection_internal(&samples("latency", &[100])).is_empty());
+    }
+
+    #[test]
+    fn regression_detection_flags_large_increase_as_increasing() {
+        // 100 -> 200 is +100%, well over the 50% threshold.
+        let result = performance_regression_detection_internal(&samples("latency_ms", &[100, 200]));
+        assert_eq!(result.len(), 1, "a large increase must be reported");
+        assert_eq!(result[0].metric, "latency_ms");
+        assert_eq!(result[0].trend, "increasing");
+        assert!(
+            (result[0].slope_percent_per_day - 100.0).abs() < 1e-9,
+            "slope should be the signed change percent, got {}",
+            result[0].slope_percent_per_day
+        );
+    }
+
+    #[test]
+    fn regression_detection_flags_large_decrease_as_decreasing() {
+        // Regression guard for the dead `"decreasing"` arm: before the fix the
+        // outer `change_percent > 50.0` gate dropped every decrease, so this
+        // returned empty and the decreasing label was unreachable. 1000 -> 200
+        // is -80%, a real regression for a throughput-style metric.
+        let result =
+            performance_regression_detection_internal(&samples("throughput_rps", &[1000, 200]));
+        assert_eq!(result.len(), 1, "a large decrease must be reported");
+        assert_eq!(result[0].metric, "throughput_rps");
+        assert_eq!(result[0].trend, "decreasing");
+        assert!(
+            result[0].slope_percent_per_day < 0.0,
+            "a decrease must carry a negative slope, got {}",
+            result[0].slope_percent_per_day
+        );
+    }
+
+    #[test]
+    fn regression_detection_ignores_changes_within_threshold() {
+        // +25% and -25% are both under the 50% magnitude threshold.
+        assert!(
+            performance_regression_detection_internal(&samples("cpu_pct", &[100, 125])).is_empty()
+        );
+        assert!(
+            performance_regression_detection_internal(&samples("cpu_pct", &[100, 75])).is_empty()
+        );
+    }
+
+    #[test]
+    fn regression_detection_skips_zero_first_sample_without_panicking() {
+        // A zero baseline would divide to inf/NaN; it must be skipped, not
+        // reported and not panic.
+        let result = performance_regression_detection_internal(&samples("errors", &[0, 500]));
+        assert!(
+            result.is_empty(),
+            "zero first sample must not yield a regression, got {} entries",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn regression_detection_uses_first_and_last_sample_per_metric() {
+        // Only the first and last per-metric samples matter; intermediate
+        // values are spanned. 100 -> (150) -> 300 is +200%.
+        let result =
+            performance_regression_detection_internal(&samples("rss_mb", &[100, 150, 300]));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].trend, "increasing");
+        assert!((result[0].slope_percent_per_day - 200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn regression_detection_groups_independent_metrics() {
+        let mut history = samples("latency_ms", &[100, 300]); // +200% increasing
+        history.extend(samples("throughput_rps", &[1000, 100])); // -90% decreasing
+        history.extend(samples("cpu_pct", &[100, 110])); // +10% ignored
+
+        let mut result = performance_regression_detection_internal(&history);
+        // HashMap iteration order is unspecified — sort for a stable assertion.
+        result.sort_by(|a, b| a.metric.cmp(&b.metric));
+        assert_eq!(result.len(), 2, "only the two >50% movers are reported");
+        assert_eq!(result[0].metric, "latency_ms");
+        assert_eq!(result[0].trend, "increasing");
+        assert_eq!(result[1].metric, "throughput_rps");
+        assert_eq!(result[1].trend, "decreasing");
+    }
 }

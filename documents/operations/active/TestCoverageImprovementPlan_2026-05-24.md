@@ -166,6 +166,32 @@ The fix is architectural:
 - **Confirmed latent bug**: in `performance_regression_detection_internal` the `"decreasing"` arm is dead code (nested under `if change_percent > 50.0`), so `trend` is always `"increasing"`. A test should pin and fix this.
 - Add the crate to the coverage-gate floor set once seeded.
 
+Status 2026-06-23: **latent bug FIXED + pinned, first tests seeded.** The
+`performance_regression_detection_internal` gate was `change_percent > 50.0`,
+which not only made the `"decreasing"` arm dead code but *silently dropped every
+significant decrease* (a real regression class — e.g. throughput falling). Now
+gates on `change_percent.abs() > 50.0` with the sign selecting the trend label,
+plus a guard skipping a zero first-sample (the division would yield inf/NaN).
+Seeded the crate's first-ever `#[cfg(test)] mod tests` (7 tests): <2-sample
+no-op, large-increase→increasing, **large-decrease→decreasing (the bug-fix
+regression guard)**, within-threshold ignored both directions, zero-first-sample
+skipped without panic, first/last-span semantics, and multi-metric grouping.
+Evidence: `cargo test -p rustynet-sysinfo --lib` → 7/7. The only caller passes
+`&[]`, so the behavior change has no downstream effect.
+
+**Blocker discovered (separate from this item):** `rustynet-sysinfo` already
+fails `cargo clippy --lib --all-features -- -D warnings` with ~35 pre-existing
+findings (unused imports/vars — several platform-gated so they need per-`cfg`
+care, never-read assignments, `uninlined_format_args`). This predates the test
+work (verified: identical count with the change stashed; none reference the
+edited fn or tests). It must be cleared before the crate can join the workspace
+clippy/coverage gate — track as its own cleanup slice (mind the macOS-only
+imports: do not blind-delete).
+
+Remaining for P1.1: the parse/IO split + golden-fixture parser tests (the bulk
+of the crate, incl. the `listening_sockets_summary_internal` IPv6/`unwrap_or(0)`
+hazards) is still open.
+
 #### P1.2 — `rustynet-backend-wireguard/userspace_shared/engine.rs`: 633 lines, 0 tests, on the data path
 - `from_private_key_file()` (~L82): invalid base64, wrong key size, missing file.
 - `configure_peer()` / allowed-IP CIDR validation (~L130): overlapping CIDR, malformed CIDR.
