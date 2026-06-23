@@ -260,10 +260,17 @@ non-numeric-counter→0 degradation, missing-meminfo-fields (no div-by-zero),
 empty/header-only safety, and uptime/loadavg truncation. Evidence: `cargo test
 -p rustynet-sysinfo --lib` → 20/20; fmt + clippy `-D warnings` clean.
 
-Remaining for P1.1: more IO-fused parsers still to split (`wg show`, `ip
-route`/`ip addr`, `getfacl`, `sysctl`, `df`, and the macOS/Windows variants of
-the already-split functions); the established pattern (`parse_X(&str) -> T` +
-golden fixtures) applies to each.
+Status 2026-06-23 (parse/IO split batch 3): split the Linux `ip` parsers —
+`parse_ip_addr_inet_addresses` (`ip addr show`, extracts inet/inet6 addrs) and
+`parse_ip_route_show` (`ip route show` → routes) — with 5 golden-fixture tests
+(now 23 total). The route test also pins the pre-existing positional-heuristic
+imprecision (gateway=field 2, interface=field 4, so a `dev`-route without `via`
+mislabels them) as carried-over behavior, flagged for a future `via`-aware fix.
+Evidence: `cargo test -p rustynet-sysinfo --lib` → 23/23; fmt + clippy clean.
+
+Remaining for P1.1: more IO-fused parsers still to split (`wg show`, `getfacl`,
+`sysctl`, `df`, and the macOS/Windows variants of the already-split functions);
+the established pattern (`parse_X(&str) -> T` + golden fixtures) applies to each.
 
 Status 2026-06-23 (parse/IO split started): applied the split to the canonical
 example, the Linux `listening_sockets_summary_internal`. Extracted a pure

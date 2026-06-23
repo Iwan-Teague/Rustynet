@@ -1626,17 +1626,9 @@ fn wg_addresses_internal() -> Vec<String> {
         if let Ok(output) = std::process::Command::new("ip")
             .args(["addr", "show", "rustynet0"])
             .output()
+            && let Ok(stdout) = String::from_utf8(output.stdout)
         {
-            if let Ok(stdout) = String::from_utf8(output.stdout) {
-                for line in stdout.lines() {
-                    if line.contains("inet") {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() > 1 {
-                            addresses.push(parts[1].to_string());
-                        }
-                    }
-                }
-            }
+            addresses = parse_ip_addr_inet_addresses(&stdout);
         }
     }
 
@@ -1681,6 +1673,43 @@ fn wg_addresses_internal() -> Vec<String> {
     addresses
 }
 
+/// Extract addresses from `ip addr show <iface>` output: the second
+/// whitespace field of any line containing `inet` (covers both `inet` and
+/// `inet6`, matching the historical behavior). Lines with too few fields are
+/// skipped.
+#[cfg(target_os = "linux")]
+fn parse_ip_addr_inet_addresses(stdout: &str) -> Vec<String> {
+    let mut addresses = Vec::new();
+    for line in stdout.lines() {
+        if line.contains("inet") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() > 1 {
+                addresses.push(parts[1].to_string());
+            }
+        }
+    }
+    addresses
+}
+
+/// Parse `ip route show` output into routes. `dest [via GW] [dev IFACE] ...`:
+/// field 0 is the destination, field 2 the gateway (or `direct`), field 4 the
+/// interface (or `-`). Lines with fewer than three fields are skipped.
+#[cfg(target_os = "linux")]
+fn parse_ip_route_show(stdout: &str) -> Vec<Route> {
+    let mut routes = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 {
+            routes.push(Route {
+                destination: parts[0].to_string(),
+                gateway: parts.get(2).unwrap_or(&"direct").to_string(),
+                interface: parts.get(4).unwrap_or(&"-").to_string(),
+            });
+        }
+    }
+    routes
+}
+
 fn route_list_internal() -> Vec<Route> {
     let mut routes = vec![];
 
@@ -1689,19 +1718,9 @@ fn route_list_internal() -> Vec<Route> {
         if let Ok(output) = std::process::Command::new("ip")
             .args(["route", "show"])
             .output()
+            && let Ok(stdout) = String::from_utf8(output.stdout)
         {
-            if let Ok(stdout) = String::from_utf8(output.stdout) {
-                for line in stdout.lines() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 3 {
-                        routes.push(Route {
-                            destination: parts[0].to_string(),
-                            gateway: parts.get(2).unwrap_or(&"direct").to_string(),
-                            interface: parts.get(4).unwrap_or(&"-").to_string(),
-                        });
-                    }
-                }
-            }
+            routes = parse_ip_route_show(&stdout);
         }
     }
 
@@ -7002,5 +7021,51 @@ Inter-|   Receive                                                |  Transmit
         assert_eq!(super::parse_proc_uptime_secs("12345.67 9999.00"), 12345);
         assert_eq!(super::parse_proc_uptime_secs(""), 0);
         assert_eq!(super::parse_proc_uptime_secs("notanumber"), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_ip_addr_inet_addresses_extracts_v4_and_v6() {
+        let stdout = "\
+2: rustynet0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1420
+    inet 100.64.0.5/32 scope global rustynet0
+    inet6 fd7a:115c:a1e0::5/128 scope global
+    valid_lft forever preferred_lft forever
+";
+        let addrs = super::parse_ip_addr_inet_addresses(stdout);
+        assert_eq!(addrs, vec!["100.64.0.5/32", "fd7a:115c:a1e0::5/128"]);
+        // Empty / no-inet output yields nothing, no panic.
+        assert!(super::parse_ip_addr_inet_addresses("").is_empty());
+        assert!(super::parse_ip_addr_inet_addresses("2: eth0: <UP>\n").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_ip_route_show_extracts_default_and_mesh_routes() {
+        let stdout = "\
+default via 192.168.1.1 dev eth0 proto dhcp metric 100
+100.64.0.0/10 dev rustynet0 proto kernel scope link
+10.0.0.0/24 via 10.0.0.1 dev rustynet0
+bad
+";
+        let routes = super::parse_ip_route_show(stdout);
+        assert_eq!(routes.len(), 3, "the <3-field line is skipped");
+        assert_eq!(routes[0].destination, "default");
+        assert_eq!(routes[0].gateway, "192.168.1.1");
+        assert_eq!(routes[0].interface, "eth0");
+        // Pins the (imprecise but preserved) positional heuristic: gateway is
+        // always field 2 and interface field 4, so a `dev` route with no `via`
+        // (`100.64.0.0/10 dev rustynet0 proto kernel ...`) yields gateway
+        // "rustynet0" and interface "kernel". Behavior carried over verbatim
+        // from the pre-split code; a future change can make it `via`-aware.
+        assert_eq!(routes[1].destination, "100.64.0.0/10");
+        assert_eq!(routes[1].gateway, "rustynet0");
+        assert_eq!(routes[1].interface, "kernel");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_ip_route_show_empty_is_safe() {
+        assert!(super::parse_ip_route_show("").is_empty());
     }
 }
