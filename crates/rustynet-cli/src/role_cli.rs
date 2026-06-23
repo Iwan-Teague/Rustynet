@@ -279,10 +279,18 @@ pub const MACOS_DAEMON_PLIST_PATH: &str = "/Library/LaunchDaemons/com.rustynet.d
 ///   which does not exist on macOS, and even if it did the daemon
 ///   would never read it.
 pub fn platform_default_daemon_env_path() -> &'static str {
-    if cfg!(target_os = "macos") {
-        MACOS_DAEMON_PLIST_PATH
-    } else {
-        DEFAULT_DAEMON_ENV_PATH
+    daemon_env_path_for_os(std::env::consts::OS)
+}
+
+/// Pure per-OS resolver behind [`platform_default_daemon_env_path`].
+/// Split out so every OS branch is unit-testable (the public wrapper
+/// only ever evaluates the build-target branch). `std::env::consts::OS`
+/// reflects the build target, which on each guest is the OS the role
+/// CLI runs on.
+fn daemon_env_path_for_os(target_os: &str) -> &'static str {
+    match target_os {
+        "macos" => MACOS_DAEMON_PLIST_PATH,
+        _ => DEFAULT_DAEMON_ENV_PATH,
     }
 }
 
@@ -291,17 +299,23 @@ pub fn platform_default_daemon_env_path() -> &'static str {
 /// live-lab orchestrator restarts the daemon itself; this string is the
 /// guidance a human operator follows on each platform.
 pub fn daemon_restart_instruction() -> String {
-    if cfg!(target_os = "macos") {
+    daemon_restart_instruction_for_os(std::env::consts::OS)
+}
+
+/// Pure per-OS resolver behind [`daemon_restart_instruction`], split out
+/// so every OS branch is unit-testable.
+fn daemon_restart_instruction_for_os(target_os: &str) -> String {
+    match target_os {
         // RELOAD (bootout + bootstrap), not `kickstart -k`: kickstart restarts
         // the already-loaded launchd job with its in-memory ProgramArguments
         // and does NOT re-read the plist file, so the rewritten `--node-role`
         // would be ignored and the daemon would come back in its old role.
-        "Reload the daemon so the new primary role takes effect: `sudo launchctl bootout system/com.rustynet.daemon && sudo launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.daemon.plist`.".to_owned()
-    } else if cfg!(target_os = "windows") {
-        "Restart the daemon so the new primary role takes effect: `Restart-Service rustynetd`."
-            .to_owned()
-    } else {
-        "Restart the daemon so the new primary role takes effect: `systemctl restart rustynetd.service`.".to_owned()
+        "macos" => "Reload the daemon so the new primary role takes effect: `sudo launchctl bootout system/com.rustynet.daemon && sudo launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.daemon.plist`.".to_owned(),
+        "windows" => {
+            "Restart the daemon so the new primary role takes effect: `Restart-Service rustynetd`."
+                .to_owned()
+        }
+        _ => "Restart the daemon so the new primary role takes effect: `systemctl restart rustynetd.service`.".to_owned(),
     }
 }
 
@@ -1684,5 +1698,44 @@ mod tests {
         // --node-role marker) is never touched.
         assert!(out.contains("<string>macos-1</string>"));
         assert!(out.contains("<string>--node-role</string>\n        <string>blind_exit</string>"));
+    }
+
+    // ----- per-OS daemon role-persistence target + restart instruction -----
+
+    #[test]
+    fn daemon_env_path_is_the_launchd_plist_on_macos_and_env_file_elsewhere() {
+        // macOS persists the role in the launchd plist (the daemon reads
+        // --node-role from argv; no env-file fallback). Linux/Windows use the
+        // env file. Regression guard: a macОS env-file write would land at
+        // /etc/default/ which does not exist on the guest.
+        assert_eq!(daemon_env_path_for_os("macos"), MACOS_DAEMON_PLIST_PATH);
+        assert_eq!(daemon_env_path_for_os("linux"), DEFAULT_DAEMON_ENV_PATH);
+        assert_eq!(daemon_env_path_for_os("windows"), DEFAULT_DAEMON_ENV_PATH);
+        // The live wrapper resolves a non-empty path for the build target.
+        assert!(!platform_default_daemon_env_path().is_empty());
+    }
+
+    #[test]
+    fn macos_restart_instruction_reloads_the_plist_not_kickstart() {
+        // Regression guard for the live-lab finding: `launchctl kickstart -k`
+        // restarts the already-loaded job WITHOUT re-reading the edited plist,
+        // so the rewritten --node-role is ignored. macOS must RELOAD via
+        // bootout + bootstrap.
+        let macos = daemon_restart_instruction_for_os("macos");
+        assert!(
+            macos.contains("launchctl bootout"),
+            "macOS must bootout: {macos}"
+        );
+        assert!(
+            macos.contains("launchctl bootstrap"),
+            "macOS must bootstrap (reload the plist): {macos}"
+        );
+        assert!(
+            !macos.contains("kickstart"),
+            "macOS must NOT kickstart (it does not re-read the plist): {macos}"
+        );
+        // Other platforms keep their service-manager restart.
+        assert!(daemon_restart_instruction_for_os("windows").contains("Restart-Service"));
+        assert!(daemon_restart_instruction_for_os("linux").contains("systemctl restart"));
     }
 }
