@@ -148,6 +148,20 @@ the all-true path is tested. Add the full reject matrix:
 ACL-deny-despite-advertised. Also verify the `connect_peer()` short-circuit:
 flood-guard rejection must not bypass or hide policy evaluation (~L349-363).
 
+Status 2026-06-23: **`ensure_lan_route_allowed` default-deny truth table landed
+(7 tests).** A `lan_allow_engine()` helper builds an engine with all four
+factors satisfied (asserted to allow); each test then knocks out exactly one
+factor and asserts `Err(LanAccessDenied)`: LAN access disabled, no exit
+selected, unadvertised CIDR, **route advertised by a non-selected exit**
+(advertisement must be attributed to the active exit specifically), ACL deny
+despite an advertised route, and **a missing ACL entry → deny** (the
+`unwrap_or(false)` default-deny, not a silent allow). Evidence: `cargo test -p
+rustynetd --lib dataplane::tests::lan_route` → 7/7; fmt clean; the additions
+introduce no new `dataplane.rs` clippy findings.
+
+Remaining for P0.5: the `connect_peer()` short-circuit assertion (flood-guard
+rejection must not bypass/hide policy evaluation) is still to add.
+
 #### P0.6 — `rustynetd/src/gossip_runtime.rs`: anti-replay watermark persistence failure modes
 The watermark spool is the anti-replay authority but only in-memory happy
 paths are tested.
