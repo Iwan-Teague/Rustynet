@@ -24,8 +24,9 @@
 //! signal-handler body async-signal-safe: no allocation, no logging,
 //! no locks. The actual graceful shutdown work runs back on the main
 //! thread after the loop observes the flag.
-
-#![cfg(unix)]
+//!
+//! The module is gated at its declaration (`#[cfg(unix)] pub mod ...` in
+//! `lib.rs`), so no redundant inner `#![cfg(unix)]` is needed here.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

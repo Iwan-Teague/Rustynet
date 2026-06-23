@@ -447,13 +447,12 @@ pub fn render_service_port_tunnel_scope_table(
         });
     }
     Ok(format!(
-        "table inet {prefix}{service} {{\n\
+        "table inet {REVIEWED_SERVICE_TABLE_PREFIX}{service} {{\n\
          \tchain input {{\n\
          \t\ttype filter hook input priority -10; policy accept;\n\
          \t\ttcp dport {port} iifname != \"{tunnel_iface}\" drop\n\
          \t}}\n\
          }}\n",
-        prefix = REVIEWED_SERVICE_TABLE_PREFIX,
     ))
 }
 
