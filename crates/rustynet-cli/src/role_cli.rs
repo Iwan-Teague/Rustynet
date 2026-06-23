@@ -252,6 +252,142 @@ impl RoleCliError {
 /// main.rs internals.
 pub const DEFAULT_DAEMON_ENV_PATH: &str = "/etc/default/rustynetd";
 
+/// Reviewed launchd plist that bakes the macOS daemon's primary role
+/// into its `--node-role` `ProgramArguments` pair. `role set` rewrites
+/// that pair in place on macOS (see
+/// [`rewrite_macos_plist_node_role`]). Mirrors
+/// `REVIEWED_LAUNCHDAEMON_PLIST` in `rustynetd::macos_service_hardening`.
+pub const MACOS_DAEMON_PLIST_PATH: &str = "/Library/LaunchDaemons/com.rustynet.daemon.plist";
+
+/// Per-OS default for the file `role set` rewrites to persist the
+/// daemon's primary role across a restart. Mirrors the
+/// [`platform_default_role_audit_log_path`] pattern so the CLI lands
+/// at the correct target on each OS without operator configuration.
+///
+/// - Linux: the systemd `EnvironmentFile` (`/etc/default/rustynetd`).
+///   `rustynetd.service` substitutes `RUSTYNET_NODE_ROLE` from that
+///   file into `--node-role`, so rewriting the file changes the role
+///   the daemon reads on the next restart.
+/// - Windows: the same env-file convention (`DEFAULT_DAEMON_ENV_PATH`),
+///   preserved unchanged.
+/// - macOS: launchd does **not** expand `EnvironmentVariables` into
+///   `ProgramArguments`, and the daemon resolves its role only from the
+///   `--node-role` argv pair (`rustynetd` has no env-var role
+///   fallback). The role therefore lives in the launchd plist's
+///   `ProgramArguments`; the executor rewrites that pair in place. A
+///   plain env-file write (the Linux path) lands at `/etc/default/`,
+///   which does not exist on macOS, and even if it did the daemon
+///   would never read it.
+pub fn platform_default_daemon_env_path() -> &'static str {
+    if cfg!(target_os = "macos") {
+        MACOS_DAEMON_PLIST_PATH
+    } else {
+        DEFAULT_DAEMON_ENV_PATH
+    }
+}
+
+/// OS-appropriate operator instruction for restarting the daemon after
+/// a local-only role change so the new primary role takes effect. The
+/// live-lab orchestrator restarts the daemon itself; this string is the
+/// guidance a human operator follows on each platform.
+pub fn daemon_restart_instruction() -> String {
+    if cfg!(target_os = "macos") {
+        "Restart the daemon so the new primary role takes effect: `sudo launchctl kickstart -k system/com.rustynet.daemon`.".to_owned()
+    } else if cfg!(target_os = "windows") {
+        "Restart the daemon so the new primary role takes effect: `Restart-Service rustynetd`."
+            .to_owned()
+    } else {
+        "Restart the daemon so the new primary role takes effect: `systemctl restart rustynetd.service`.".to_owned()
+    }
+}
+
+/// Rewrite the macOS launchd daemon plist so the daemon comes up as
+/// `new_role` on its next restart.
+///
+/// The daemon reads its primary role only from the `--node-role
+/// <value>` pair in `ProgramArguments`, so we replace that value in
+/// place — and keep the informational `RUSTYNET_NODE_ROLE`
+/// `EnvironmentVariables` entry in sync so the install-hardening
+/// validator and any plist reader observe the same role. Indentation
+/// and every other line are preserved verbatim.
+///
+/// Pure (no I/O) so the rewrite is unit-testable; the filesystem
+/// wrapper that reads, atomically writes, and fail-closes on a missing
+/// `--node-role` pair lives next to `update_node_role_env_file` in
+/// `main.rs`.
+///
+/// Returns `(rewritten_xml, node_role_arg_replaced, env_value_replaced)`.
+/// `node_role_arg_replaced == false` means the plist had no
+/// `--node-role` pair — the caller must treat that as a fail-closed
+/// error rather than write a role the daemon will not read.
+pub fn rewrite_macos_plist_node_role(plist: &str, new_role: &str) -> (String, bool, bool) {
+    let mut out = String::with_capacity(plist.len() + new_role.len());
+    // Each flag is armed by the marker line and consumes only the
+    // immediately-following line, so an unrelated later `<string>` can
+    // never be mistaken for the value.
+    let mut expect_node_role_value = false;
+    let mut expect_env_value = false;
+    let mut arg_replaced = false;
+    let mut env_replaced = false;
+
+    for line in plist.split_inclusive('\n') {
+        let (content, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        let trimmed = content.trim();
+
+        if expect_node_role_value {
+            expect_node_role_value = false;
+            if let Some(rewritten) = replace_string_tag_value(content, new_role) {
+                out.push_str(&rewritten);
+                out.push_str(newline);
+                arg_replaced = true;
+                continue;
+            }
+            // Malformed plist (no value line follows the flag); fall
+            // through, leaving arg_replaced false so the caller errors.
+        }
+        if expect_env_value {
+            expect_env_value = false;
+            if let Some(rewritten) = replace_string_tag_value(content, new_role) {
+                out.push_str(&rewritten);
+                out.push_str(newline);
+                env_replaced = true;
+                continue;
+            }
+        }
+
+        if trimmed == "<string>--node-role</string>" {
+            expect_node_role_value = true;
+        } else if trimmed == "<key>RUSTYNET_NODE_ROLE</key>" {
+            expect_env_value = true;
+        }
+
+        out.push_str(content);
+        out.push_str(newline);
+    }
+
+    (out, arg_replaced, env_replaced)
+}
+
+/// If `line` contains a `<string>…</string>` tag, return the line with
+/// that tag's inner value replaced by `new_value`, preserving all
+/// surrounding whitespace and any text outside the tag. Returns `None`
+/// when the line has no `<string>` tag.
+fn replace_string_tag_value(line: &str, new_value: &str) -> Option<String> {
+    const OPEN: &str = "<string>";
+    const CLOSE: &str = "</string>";
+    let value_start = line.find(OPEN)? + OPEN.len();
+    let value_end = line[value_start..].find(CLOSE)? + value_start;
+    let mut rewritten =
+        String::with_capacity(line.len() - (value_end - value_start) + new_value.len());
+    rewritten.push_str(&line[..value_start]);
+    rewritten.push_str(new_value);
+    rewritten.push_str(&line[value_end..]);
+    Some(rewritten)
+}
+
 /// Resolve the current preset from a daemon status line.
 ///
 /// The status line is the space-separated `key=value` body of an
@@ -375,9 +511,7 @@ pub fn plan_concrete_actions(
                     env_path,
                     restart_required: true,
                 }],
-                followup_instructions: vec![format!(
-                    "Restart the daemon so the new primary role takes effect: `systemctl restart rustynetd.service`."
-                )],
+                followup_instructions: vec![daemon_restart_instruction()],
             }
         }
         TransitionKind::SignedMembership => {
@@ -1438,5 +1572,113 @@ mod tests {
                 "env-set resolve must return a non-empty path"
             );
         }
+    }
+
+    // ----- macOS launchd plist role rewrite -----
+
+    /// Minimal but representative slice of the launchd daemon plist the
+    /// install script renders: the `--node-role` ProgramArguments pair
+    /// plus the informational `RUSTYNET_NODE_ROLE` env entry, with the
+    /// same indentation the real plist uses.
+    const SAMPLE_DAEMON_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/rustynetd</string>
+        <string>daemon</string>
+        <string>--node-id</string>
+        <string>macos-1</string>
+        <string>--node-role</string>
+        <string>client</string>
+        <string>--backend</string>
+        <string>macos-wireguard-userspace-shared</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUSTYNET_NODE_ROLE</key>
+        <string>client</string>
+        <key>RUSTYNET_NETWORK_ID</key>
+        <string>lab</string>
+    </dict>
+</dict>
+</plist>
+"#;
+
+    #[test]
+    fn rewrite_macos_plist_node_role_replaces_arg_and_env() {
+        let (out, arg_replaced, env_replaced) =
+            rewrite_macos_plist_node_role(SAMPLE_DAEMON_PLIST, "admin");
+        assert!(
+            arg_replaced,
+            "expected the --node-role value to be replaced"
+        );
+        assert!(
+            env_replaced,
+            "expected the RUSTYNET_NODE_ROLE env value to be replaced"
+        );
+        // The argv pair now carries admin.
+        assert!(
+            out.contains("<string>--node-role</string>\n        <string>admin</string>"),
+            "rewritten plist must carry --node-role admin: {out}"
+        );
+        // The env entry is kept in sync.
+        assert!(
+            out.contains("<key>RUSTYNET_NODE_ROLE</key>\n        <string>admin</string>"),
+            "rewritten plist must carry RUSTYNET_NODE_ROLE=admin: {out}"
+        );
+        // No stale `client` role remains anywhere a role appears.
+        assert!(
+            !out.contains("<string>client</string>"),
+            "no stale client role may remain: {out}"
+        );
+        // Unrelated lines (the network id, backend) are untouched.
+        assert!(out.contains("<string>macos-wireguard-userspace-shared</string>"));
+        assert!(out.contains("<key>RUSTYNET_NETWORK_ID</key>\n        <string>lab</string>"));
+        // Indentation of the rewritten value line is preserved.
+        assert!(out.contains("\n        <string>admin</string>"));
+    }
+
+    #[test]
+    fn rewrite_macos_plist_node_role_is_fail_closed_when_arg_absent() {
+        // A plist with no --node-role pair must report the arg as not
+        // replaced so the I/O wrapper fails closed.
+        let plist = r#"<plist version="1.0">
+<dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/rustynetd</string>
+        <string>daemon</string>
+        <string>--backend</string>
+        <string>macos-wireguard-userspace-shared</string>
+    </array>
+</dict>
+</plist>
+"#;
+        let (out, arg_replaced, env_replaced) = rewrite_macos_plist_node_role(plist, "admin");
+        assert!(
+            !arg_replaced,
+            "no --node-role pair means no arg replacement"
+        );
+        assert!(
+            !env_replaced,
+            "no RUSTYNET_NODE_ROLE env means no env replacement"
+        );
+        // Nothing was mutated.
+        assert_eq!(out, plist);
+    }
+
+    #[test]
+    fn rewrite_macos_plist_node_role_only_rewrites_immediate_value_line() {
+        // The flag must consume only the line right after the marker,
+        // so a later unrelated <string> cannot be mistaken for the
+        // role value.
+        let (out, arg_replaced, _) =
+            rewrite_macos_plist_node_role(SAMPLE_DAEMON_PLIST, "blind_exit");
+        assert!(arg_replaced);
+        // The --node-id value (`macos-1`, which appears before the
+        // --node-role marker) is never touched.
+        assert!(out.contains("<string>macos-1</string>"));
+        assert!(out.contains("<string>--node-role</string>\n        <string>blind_exit</string>"));
     }
 }
