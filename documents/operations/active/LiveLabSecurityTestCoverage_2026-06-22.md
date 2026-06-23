@@ -370,6 +370,7 @@ finding until the fix lands — the stage is written to FAIL on today's code):
 | `validate_macos_ipv6_leak` | killswitch_leak / KL-4 (macOS half) | high | ✅ committed |
 | `validate_linux_exit_demotion_residue` | exit_nat_residue / EXNAT-1 | high | ✅ committed |
 | `validate_linux_membership_signature_forgery` | signature_forgery / SIGFORGE-1 (+2,3,4,7) | high | ✅ committed |
+| `validate_linux_policy_default_deny` | default_deny / DD (truth table) | high | ✅ committed |
 
 Each ships a daemon producer (or reuses an existing read-only snapshot), an
 orchestrator validator, a `scripts/e2e/capture_*.sh` wrapper or in-binary audit,
