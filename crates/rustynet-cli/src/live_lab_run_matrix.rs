@@ -1180,9 +1180,9 @@ fn direct_platform_stage(stage: &str) -> Option<(&'static str, &'static str)> {
         "validate_macos_exit_dns_failclosed" => Some(("macos", "managed_dns")),
         "validate_linux_relay_service_lifecycle" => Some(("linux", "relay_service_lifecycle")),
         "validate_linux_anchor_bundle_pull" => Some(("linux", "anchor")),
-        "validate_linux_exit_nat_lifecycle" | "validate_linux_ipv6_leak" => {
-            Some(("linux", "exit_handoff"))
-        }
+        "validate_linux_exit_nat_lifecycle"
+        | "validate_linux_ipv6_leak"
+        | "validate_linux_exit_demotion_residue" => Some(("linux", "exit_handoff")),
         "validate_linux_dns_failclosed" | "validate_linux_exit_dns_failclosed" => {
             Some(("linux", "managed_dns"))
         }
@@ -1210,7 +1210,9 @@ fn direct_platform_role(stage: &str) -> Option<(&'static str, &'static str)> {
         | "validate_macos_ipv6_leak" => Some(("macos", "blind_exit")),
         "validate_macos_relay_service_lifecycle" => Some(("macos", "relay")),
         "validate_macos_anchor_bundle_pull" => Some(("macos", "anchor")),
-        "validate_linux_exit_nat_lifecycle" | "validate_linux_ipv6_leak" => Some(("linux", "exit")),
+        "validate_linux_exit_nat_lifecycle"
+        | "validate_linux_ipv6_leak"
+        | "validate_linux_exit_demotion_residue" => Some(("linux", "exit")),
         "validate_linux_relay_service_lifecycle" => Some(("linux", "relay")),
         "validate_linux_anchor_bundle_pull" => Some(("linux", "anchor")),
         _ => None,
