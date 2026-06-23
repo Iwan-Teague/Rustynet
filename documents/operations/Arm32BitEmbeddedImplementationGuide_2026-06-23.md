@@ -70,7 +70,7 @@ panic, this is the correct behaviour.  The process exits, systemd restarts it,
 and the watchdog (task 6) bounds the silent-hang window.  Implications:
 
 - `std::panic::catch_unwind` degrades to abort — no callers in Rustynet use
-  it, so this is safe.
+  it (confirmed by grep; there are zero `catch_unwind` calls across all crates).
 - FFI boundaries: under `unwind`, a Rust panic crossing into a C frame is
   undefined behaviour; `abort` makes it well-defined.  Rustynet has no
   Rust→C callbacks in production paths.
@@ -241,8 +241,10 @@ in `configure_interface()`.
 
 **Prerequisite:** task 6 (`sd_notify` watchdog) must be implemented first.
 Setting `Type=notify` before the daemon sends `READY=1` causes systemd to
-wait indefinitely until `TimeoutStartSec` (default 90 s) expires.  Deploy
-tasks 4 and 6 together.
+wait until `TimeoutStartSec` (default 90 s) expires before marking the
+service failed.  Deploy tasks 4 and 6 together.  Consider adding
+`TimeoutStartSec=30s` to the `[Service]` section to bound a failed start
+to 30 seconds rather than the 90-second default.
 
 ### 4a. Service type, watchdog, and notify access
 
@@ -424,11 +426,15 @@ sd-notify = { version = "0.4", default-features = false }
 `sd-notify` itself (Rustynet uses `log` directly; no duplication concern, but
 the feature is not needed).
 
-The `sd-notify` crate is pure Rust.  It reads `NOTIFY_SOCKET` and
-`WATCHDOG_USEC` environment variables set by systemd and sends messages over
-a Unix datagram socket.  When systemd is absent (e.g., macOS, Windows,
-developer desktop), the env vars are not set and `notify()` returns
-`Ok(false)` — it is a safe no-op.
+The `sd-notify` crate is pure Rust and MIT-licensed — it passes the
+`deny.toml` license gate without any additional allow entry.  It reads
+`NOTIFY_SOCKET` and `WATCHDOG_USEC` environment variables set by systemd
+and sends messages over a Unix datagram socket.  When systemd is absent
+(e.g., macOS, Windows, developer desktop), the env vars are not set and
+`notify()` returns `Ok(false)` — it is a safe no-op.
+
+**Run `cargo deny check bans licenses sources advisories` after adding the
+dependency** to confirm the new crate passes all gates.
 
 ### 6b. Send `READY=1` and `WATCHDOG=1`
 
@@ -444,8 +450,11 @@ The main `loop {}` starts at line 9316.
 use sd_notify::NotifyState;
 ```
 
-**Step 2 — send `READY=1` just before the main loop** (add immediately before
-line 9316):
+**Step 2 — send `READY=1` just before the main loop** (add between the
+`log::info!("rustynetd startup: ... entering reconcile loop")` at line 9307
+and the `loop {` at line 9316 — the setup variables `processed`, `reconcile_interval`,
+`next_reconcile`, and `dns_buffer` are declared between these points, so place
+the `notify` call after line 9314):
 
 ```rust
 // Tell systemd the daemon has finished initialising and is ready to serve.
@@ -524,8 +533,9 @@ requests to `net.core.rmem_max` (see task 13 for raising the limit).
 **File:** `crates/rustynet-relay/Cargo.toml`
 
 `rustynet-mcp` and `rustynet-cli` already use `socket2 = "0.6"`, so the
-crate is already in the dependency tree.  Add it to `rustynet-relay` as an
-optional dependency gated on the `daemon` feature.
+crate is already in the dependency tree — `cargo deny check` will not flag
+a new crate, and no `deny.toml` change is needed.  Add it to
+`rustynet-relay` as an optional dependency gated on the `daemon` feature.
 
 **Current (relevant section):**
 
@@ -640,37 +650,96 @@ constrained after other resident costs, reduce the per-session request to
 
 ## 8. Relay Tokio Thread Stack Size
 
-**File:** `crates/rustynet-relay/src/main.rs`, line 2264.
+**Critical context before making this change:** The tokio runtime builder at
+line 2264 is inside `run_windows_relay_service_host()` — a function that only
+runs on the Windows SCM path.  On Linux (including armv7), the relay enters
+via `#[tokio::main]` at line 3519, which calls `run_relay_from_args().await`
+directly.  That path has no explicit builder, so the line 2264 change has no
+effect on Linux.
 
-**Current (Windows service runtime builder):**
+Two options — choose based on how invasive a change is acceptable:
 
-```rust
-let runtime = tokio::runtime::Builder::new_multi_thread()
-    .enable_all()
-    .build()
-    .map_err(|err| format!("build relay service runtime: {err}"))?;
+### Option A: Service file env var (no code change, Linux only)
+
+Add to `scripts/systemd/rustynet-relay.service` `[Service]` section:
+
+```ini
+Environment=RUST_MIN_STACK=524288
 ```
 
-**Change to:**
+`RUST_MIN_STACK` is the Rust standard library env var checked when
+`std::thread::Builder` spawns threads without an explicit `.stack_size()`.
+Tokio spawns its worker threads through `std::thread::Builder`, so setting
+this env var reduces the worker stack from the OS default (8 MB) to 512 KB.
+Effect: saves ~(worker-count × 7.5 MB) of virtual address space and
+reduces the chance of stack memory staying resident in physical RAM.
+
+No code change; no recompile needed.  Verify after deploy:
+
+```sh
+# Check the actual stack reservation per tokio worker thread
+cat /proc/$(pgrep rustynet-relay)/smaps | grep -A1 "stack"
+```
+
+### Option B: Explicit runtime builder (code change, affects all platforms)
+
+**File:** `crates/rustynet-relay/src/main.rs`, line 3519.
+
+Replace `#[tokio::main]` with an explicit builder.  This is the clean
+long-term fix, but is more invasive.
+
+**Before:**
 
 ```rust
-let runtime = tokio::runtime::Builder::new_multi_thread()
-    .enable_all()
-    .thread_stack_size(512 * 1024)  // 512 KB vs 8 MB default; saves ~6 MB per worker thread
-    .build()
-    .map_err(|err| format!("build relay service runtime: {err}"))?;
+#[cfg(feature = "daemon")]
+#[tokio::main]
+async fn main() {
+    let args = std::env::args().collect::<Vec<_>>();
+    let result = match daemon::select_relay_host_entry(&args) {
+        Ok(daemon::RelayHostEntrySelection::RelayArgs(args)) => {
+            daemon::run_relay_from_args(args).await
+        }
+        // ... Windows and other arms
+    };
 ```
+
+**After:**
+
+```rust
+#[cfg(feature = "daemon")]
+fn main() {
+    let args = std::env::args().collect::<Vec<_>>();
+    let result = match daemon::select_relay_host_entry(&args) {
+        Ok(daemon::RelayHostEntrySelection::RelayArgs(relay_args)) => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(512 * 1024)
+                .build()
+                .expect("build relay runtime");
+            runtime.block_on(daemon::run_relay_from_args(relay_args))
+        }
+        Ok(daemon::RelayHostEntrySelection::WindowsService(options)) => {
+            // Windows service creates its own runtime internally (line 2264)
+            daemon::run_windows_relay_service_host(options)
+        }
+        Ok(daemon::RelayHostEntrySelection::WindowsServiceHardeningCheck { fail_on_drift }) => {
+            daemon::run_windows_relay_service_hardening_check(fail_on_drift)
+        }
+        Err(err) => Err(err),
+    };
+    // ... existing error handling
+```
+
+Note: `main()` becomes synchronous (remove `async`).  The Windows service
+path already creates its own runtime at line 2264, so removing `#[tokio::main]`
+does not affect Windows.  Also add the same `.thread_stack_size(512 * 1024)`
+call in the Windows builder at line 2264 for consistency.
 
 The relay's tokio tasks have shallow call stacks: receive a UDP datagram,
 look up the session map, forward.  The 8 MB default stack per thread is
 designed for synchronous Rust with deep recursion; it wastes ~6 MB per
 worker thread on a 512 MB system.  512 KB is conservative (Embassy targets
-4–32 KB; Tokio's own examples use 128 KB for I/O-only tasks).
-
-This change applies only to the Windows service path (where the explicit
-builder is used).  The `#[tokio::main]` path at line 3519 uses tokio's
-default stack size.  To control both paths, either add a `Builder` there too,
-or document that embedded deployment uses the Windows service code path.
+4–32 KB; 512 KB is generous for async I/O tasks).
 
 ---
 
@@ -797,9 +866,11 @@ Ubuntu base versions.  The `ubuntu-latest` label tracks the newest LTS and
 can cause Docker version mismatches.  `ubuntu-22.04` is the tested runner
 version for `cross 0.2.5`.
 
-**Pin `cross 0.2.5`.**  Unpinned `cargo install cross` installs head, which
-can break CI on upstream changes.  Update intentionally with a dedicated
-commit and note.
+**Pin a specific `cross` version.**  The `0.2.5` version shown above was
+current in early 2024; verify the latest stable release on
+`https://crates.io/crates/cross` at implementation time and pin that version.
+Unpinned `cargo install cross` installs head, which can break CI on upstream
+changes.  Update intentionally with a dedicated commit and note.
 
 **Crates included:**  `rustynetd`, `rustynet-relay`, and `rustynet-cli` are
 the three crates that run on the Pi.  `rustynet-backend-wireguard` is
