@@ -216,7 +216,7 @@ pub fn evaluate_macos_blind_exit_pf_rules(
                 "pass out quick on {} inet proto {} to any port 53 keep state",
                 config.tunnel_interface, proto
             );
-            let block = format!("block drop out quick inet proto {} to any port 53", proto);
+            let block = format!("block drop out quick inet proto {proto} to any port 53");
             if !normalized.iter().any(|line| line == &pass) {
                 reasons.push(format!(
                     "blind_exit PF rules missing tunnel DNS {proto}/53 pass"
