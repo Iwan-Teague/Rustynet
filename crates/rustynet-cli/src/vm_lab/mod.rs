@@ -14734,6 +14734,71 @@ fn evaluate_privileged_helper_allowlist_report(
     ))
 }
 
+/// Pure evaluator for the JSON output of `rustynetd membership-signature-audit`.
+/// The daemon-side audit drives the REAL signed-membership verify funnel
+/// (`apply_signed_update`/`decode_signed_update`, `verify_strict`) with an
+/// adversarial forgery corpus (`SecurityMinimumBar.md` §3.2/§6.B). Fail-closed:
+///   - empty corpus, or no valid baseline accepted (the reject-all vacuous pass),
+///   - too few forgery cases (a stripped corpus must not trivially pass),
+///   - any violation (a forgery accepted, or the valid baseline rejected).
+fn evaluate_membership_signature_audit_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::membership_signature_audit::MembershipSignatureAuditReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse membership-signature-audit JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "membership-signature-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases == 0 {
+        return Err(
+            "membership-signature-audit returned an empty corpus; the forgery battery is missing"
+                .to_owned(),
+        );
+    }
+    if report.baseline_accepted == 0 {
+        return Err(
+            "membership-signature-audit accepted no valid baseline; the audit is vacuous (reject-all would pass) and proves nothing"
+                .to_owned(),
+        );
+    }
+    if report.forgeries_rejected < 10 {
+        return Err(format!(
+            "membership-signature-audit ran only {} forgery case(s); the adversarial battery is too thin to trust",
+            report.forgeries_rejected
+        ));
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| {
+                    format!(
+                        "{} (expected {}, rejected={})",
+                        v.id, v.expectation, v.rejected
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "membership signature verify funnel drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Membership signature verify funnel verified on {linux_alias}: {} forgeries rejected, valid baseline accepted",
+        report.forgeries_rejected
+    ))
+}
+
 /// macOS DNS fail-closed artefact-directory validator. Parallel to the
 /// Windows variant. Required files in the artefact directory:
 ///
@@ -16408,6 +16473,26 @@ fn run_validate_linux_privileged_helper_allowlist_stage(
         .map_err(|reason| (reason, raw))
 }
 
+fn run_validate_linux_membership_signature_forgery_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "membership-signature-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_membership_signature_audit_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
 /// Build the `--state-path / --expected-peer-id / --max-age-seconds`
 /// extras for the mesh-status subcommand from a `MeshStatusOverrides`
 /// struct. Centralizes the override-to-argv mapping so callers don't
@@ -16585,6 +16670,8 @@ fn run_linux_orchestration_stages_with_options(
     let authenticode_log_path = logs_dir.join("validate_linux_authenticode.log");
     let privileged_helper_allowlist_log_path =
         logs_dir.join("validate_linux_privileged_helper_allowlist.log");
+    let membership_signature_forgery_log_path =
+        logs_dir.join("validate_linux_membership_signature_forgery.log");
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
     let exit_nat_lifecycle_log_path = logs_dir.join("validate_linux_exit_nat_lifecycle.log");
@@ -16705,6 +16792,19 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_privileged_helper_allowlist",
             privileged_helper_allowlist_log_path.as_path(),
             run_validate_linux_privileged_helper_allowlist_stage,
+        )
+    };
+
+    let membership_signature_forgery_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_membership_signature_forgery",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_membership_signature_forgery",
+            membership_signature_forgery_log_path.as_path(),
+            run_validate_linux_membership_signature_forgery_stage,
         )
     };
 
@@ -17216,6 +17316,7 @@ fn run_linux_orchestration_stages_with_options(
         hardening_outcome,
         authenticode_outcome,
         privileged_helper_allowlist_outcome,
+        membership_signature_forgery_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
         exit_ipv6_leak_outcome,
@@ -35382,6 +35483,76 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn membership_signature_audit_producer_to_validator_round_trip_passes() {
+        // The shipped daemon audit (real verify funnel + forgery corpus)
+        // serialised into the orchestrator validator must verify clean.
+        let report = rustynetd::membership_signature_audit::run_membership_signature_audit()
+            .expect("audit runs");
+        assert!(report.overall_ok, "reviewed funnel must pass: {report:?}");
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary =
+            super::evaluate_membership_signature_audit_report("debian-headless-1", raw.as_str())
+                .expect("clean signature audit must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("forgeries rejected"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_membership_signature_audit_report_rejects_accepted_forgery() {
+        // The bite: a report carrying a violation (a forgery the funnel
+        // accepted) must Fail the stage.
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 12,
+            "forgeries_rejected": 10,
+            "baseline_accepted": 1,
+            "violations": [
+                {"id": "malleable_s_signature", "expectation": "reject", "rejected": false, "reason": "ACCEPTED", "reason_matches": false, "passed": false}
+            ]
+        }"#;
+        let err = super::evaluate_membership_signature_audit_report("debian-headless-1", raw)
+            .expect_err("an accepted forgery must fail closed");
+        assert!(
+            err.contains("verify funnel drift") && err.contains("malleable_s_signature"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_membership_signature_audit_report_rejects_vacuous_no_baseline() {
+        // A reject-all corpus with no accepted baseline proves nothing.
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 11,
+            "forgeries_rejected": 11,
+            "baseline_accepted": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_membership_signature_audit_report("debian-headless-1", raw)
+            .expect_err("a vacuous reject-all audit must fail closed");
+        assert!(err.contains("vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_membership_signature_audit_report_rejects_thin_battery() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 4,
+            "forgeries_rejected": 3,
+            "baseline_accepted": 1,
+            "violations": []
+        }"#;
+        let err = super::evaluate_membership_signature_audit_report("debian-headless-1", raw)
+            .expect_err("a thin forgery battery must fail closed");
+        assert!(err.contains("too thin"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn linux_relay_lifecycle_output_validators_accept_reviewed_dry_run_text() {
         let install = "rustynet-relay systemd unit: install+enable (dry-run) at /etc/systemd/system/rustynet-relay.service\n  - would run: systemctl daemon-reload\n  - would run: systemctl enable rustynet-relay.service\n  - would run: systemctl start rustynet-relay.service\n";
         super::validate_linux_relay_install_output(install).expect("install output validates");
@@ -38126,6 +38297,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_service_hardening",
             "validate_linux_authenticode",
             "validate_linux_privileged_helper_allowlist",
+            "validate_linux_membership_signature_forgery",
             "validate_linux_dns_failclosed",
             "validate_linux_exit_nat_lifecycle",
             "validate_linux_ipv6_leak",
@@ -38266,6 +38438,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_service_hardening",
                 "validate_linux_authenticode",
                 "validate_linux_privileged_helper_allowlist",
+                "validate_linux_membership_signature_forgery",
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",
                 "validate_linux_ipv6_leak",
