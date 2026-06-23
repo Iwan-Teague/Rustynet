@@ -227,14 +227,24 @@ skipped without panic, first/last-span semantics, and multi-metric grouping.
 Evidence: `cargo test -p rustynet-sysinfo --lib` → 7/7. The only caller passes
 `&[]`, so the behavior change has no downstream effect.
 
-**Blocker discovered (separate from this item):** `rustynet-sysinfo` already
-fails `cargo clippy --lib --all-features -- -D warnings` with ~35 pre-existing
-findings (unused imports/vars — several platform-gated so they need per-`cfg`
-care, never-read assignments, `uninlined_format_args`). This predates the test
-work (verified: identical count with the change stashed; none reference the
-edited fn or tests). It must be cleared before the crate can join the workspace
-clippy/coverage gate — track as its own cleanup slice (mind the macOS-only
-imports: do not blind-delete).
+**Clippy debt — CLEARED on Linux 2026-06-23.** `rustynet-sysinfo` previously
+failed `cargo clippy --all-targets --all-features -- -D warnings` with ~35
+findings; the crate now passes clean (exit 0). The mechanical majority (27:
+`uninlined_format_args`, redundant `trim()` before `split_whitespace`,
+`!is_ok()`→`is_err()`, returning-let, `unused_mut`, `.nth(0)`→`.next()`,
+`and_then(|x|Some(y))`→`map`, `len()>0`→`!is_empty()`) were auto-applied via
+`cargo clippy --fix` and reviewed (all behavior-preserving). The 7 judgment
+calls were fixed by hand: removed an unused `MetadataExt` import and a dead
+`stat_path` binding; turned `processes`/`is_expired` dead-stores into direct
+values (the `is_expired` case also deleted a **shadowed, nonsensical
+string-vs-epoch comparison** — dead and buggy); rewrote `tpm_present` as a
+`cfg`-split single-assignment (no dead init); changed `check_daemon_running`'s
+unused `&mut String` param to `&mut str`; and prefixed a stub `_drops`. Evidence:
+`cargo clippy -p rustynet-sysinfo --all-targets --all-features -- -D warnings`
+→ 0; `cargo test -p rustynet-sysinfo --lib` → 12/12; fmt clean. (Caveat:
+`cargo clippy --fix` only touches the Linux-compiled cfg paths, so any
+macOS/Windows-only `#[cfg]` blocks may still carry residual `uninlined_format_
+args` findings, verifiable only when building for those targets.)
 
 Remaining for P1.1: the parse/IO split + golden-fixture parser tests (the bulk
 of the crate) is in progress.
