@@ -346,7 +346,22 @@ request=Mesh), wildcard vs literal selector semantics.
 ### P2 — Robustness / breadth
 
 - **`peer_gossip.rs` / `traversal.rs` boundary & isolation tests**: sequence/nonce wraparound (u64::MAX -> 0/1), timestamp extreme drift, wire truncation inside the count field, mixed valid+invalid candidates (does iteration check all?), and isolate `verify_coordination_record_signature()` + `validate_candidates()` + the NAT-viability matrix as unit-testable functions (currently only exercised via full scenarios).
+  - Status 2026-06-23: the **sequence wraparound at `u64::MAX`** edge is now
+    pinned — `accept_bundle_rejects_sequence_wraparound_at_u64_max` accepts a
+    `u64::MAX` bundle, then asserts a wrap attempt to seq 0 and seq 1 is
+    rejected `SequenceNotMonotonic` and the high-water mark is unchanged. (The
+    rest of `peer_gossip` was already strong: replay, lower-after-higher,
+    past/future drift + boundary, unknown source, tampered candidates,
+    loopback/link-local/multicast filtering, serialise wrong-version/truncated/
+    oversized.) `traversal.rs` isolation of `verify_coordination_record_
+    signature` / `validate_candidates` / NAT-viability remains open.
 - **`enrollment_token.rs` / `relay_client.rs` / `stun_client.rs`**: expired/stale token rejection + expiry off-by-one; relay token tampering (truncated/zero HMAC); malformed STUN response decoding. Pairs well with new fuzz targets.
+  - Status 2026-06-23: **`enrollment_token.rs` is already comprehensively
+    covered** — verified existing tests for expiry + exact-expiry boundary,
+    single-use (already-consumed), wrong-secret/tampered-body tag mismatch,
+    truncated/oversized decode, future-dated, TTL bounds, Debug redaction, and
+    drop-zeroization. No gap. `relay_client` HMAC tampering and `stun_client`
+    malformed-decode remain open.
 - **`backend-userspace` delegation**: the `platform_unavailable()` contract and per-method NotRunning paths (mostly covered for Linux; document the compile-gated unsupported-OS path).
 - **`runtime.rs` worker thread**: panic recovery, channel backpressure, IPC ordering (1,180 lines / ~2 tests).
 - **`operations.rs` audit log**: digest-field tampering + entry-removal detection; complete the redaction keyword-table test (`nonce`, etc.).
