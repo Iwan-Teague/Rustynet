@@ -152,17 +152,18 @@ Rustynet has two Linux WireGuard backends:
 
 **`linux-wireguard` (default):**  
 Calls `ip link add dev rustynet0 type wireguard` via subprocess
-(`crates/rustynet-backend-wireguard/src/linux_command.rs:140-151`). Requires
-`wireguard.ko` to be loaded. On Raspberry Pi OS (Debian Bookworm, kernel 6.1),
-WireGuard is compiled in (`CONFIG_WIREGUARD=y` in Pi kernels since 5.6). On
-vanilla Debian Bookworm armhf, install `wireguard-tools` and ensure
-`linux-image-armmp` is used.
+(`crates/rustynet-backend-wireguard/src/linux_command.rs:140-147`). Requires
+`wireguard.ko` to be loaded. On Raspberry Pi OS (Debian Bookworm, kernel 6.6.x LTS),
+WireGuard is built as a module (`CONFIG_WIREGUARD=m`) and loads automatically when
+`ip link add type wireguard` is called. On vanilla Debian Bookworm armhf, install
+`wireguard-tools` and ensure `linux-image-armmp` is used.
 
 **`linux-wireguard-userspace-shared` (recommended for embedded):**  
 Runs the boringtun WireGuard implementation in pure userspace via `/dev/net/tun`
 (`CONFIG_TUN` kernel option). Does **not** require `wireguard.ko`. This is the
 correct choice for boards where kernel module availability is uncertain or for
-maximum portability.
+maximum portability. The backend constant is defined at
+`crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs:30`.
 
 Set the backend in the daemon environment file:
 
@@ -207,7 +208,11 @@ exit node that is provisioned once and runs unattended does not need this flow.
 ## 7. nftables Requirement
 
 Rustynet requires nftables exclusively. There is no iptables detection or fallback.
-The prerequisite check runs `nft --version` at startup and fails closed if absent.
+At startup, the prerequisite check (`crates/rustynetd/src/phase10.rs:1803`) runs
+`ip -V` to verify that iproute2 is present and fails closed if absent. The `nft`
+binary itself is not checked at startup — it is invoked only when exit/blind_exit
+NAT rules are applied. If `nft` is missing, the daemon starts but applying exit
+NAT rules will fail at that point.
 
 The nft commands used are standard syntax compatible with nftables 0.9.x+. Debian
 Bookworm ships nftables 1.0.6 at `/usr/sbin/nft` (the correct hardcoded path).
@@ -251,7 +256,7 @@ ships kernel 6.1 (LTS). All requirements are satisfied.
 | `clock_gettime64` (glibc 2.36+) | 5.1 | Transparent via glibc; no action needed |
 
 **Practical minimum: Linux 4.3** for exit/blind_exit. Linux 3.17 for relay-only
-deployment. In practice, Debian Bookworm armhf ships kernel 6.1 and all requirements
+deployment. Raspberry Pi OS Bookworm ships kernel 6.6.x LTS and all requirements
 are met.
 
 ---
@@ -472,7 +477,89 @@ net.netfilter.nf_conntrack_max=32768
 
 ---
 
-## 17. CI Requirements Before Claiming 32-bit ARM Support
+## 17. Pi Zero 2 W Hardware Specifics
+
+These apply specifically to the Raspberry Pi Zero 2 W and are not covered by the
+general armv7 porting work above.
+
+### NTP is a Hard Operational Dependency
+
+The Pi Zero 2 W has **no battery-backed real-time clock**. On cold boot the hardware
+clock starts at the Linux epoch (or a saved firmware timestamp). Until NTP
+synchronises, `SystemTime::now()` may return a time that is months or years in the
+past or future.
+
+Rustynet's anti-replay windows and Ed25519-signed gossip bundle freshness checks are
+both time-sensitive. A node that starts before NTP has synced will either reject all
+inbound bundles as "from the future" or emit bundles with stale timestamps that peers
+reject.
+
+**Required:** ensure `systemd-timesyncd` or `chrony` is running and the system clock
+is synchronised before `rustynetd` starts. Add the following to `rustynetd.service`:
+
+```ini
+After=network-online.target time-sync.target
+Wants=network-online.target
+```
+
+For an always-on relay with no guaranteed internet access at boot, configure `chrony`
+with `makestep 1 -1` so it corrects large clock jumps immediately rather than
+slewing slowly.
+
+### ARMv8 Crypto Extensions Are Unavailable in 32-bit Mode
+
+The Cortex-A53 supports AES hardware acceleration (ARMv8 Crypto Extensions) only in
+AArch64 mode. Running 32-bit Raspberry Pi OS disables these extensions. AES
+operations fall back to software.
+
+This is not a problem for Rustynet. **WireGuard uses ChaCha20-Poly1305**, not AES.
+The `boringtun` implementation in `third_party/boringtun/` is pure Rust and has no
+AES dependency. ChaCha20-Poly1305 performs excellently on ARMv7 with NEON (which
+*is* available in 32-bit mode on the Cortex-A53). This is the correct cipher choice
+for this target architecture and is already what boringtun selects.
+
+If a developer adds any feature that introduces AES (e.g., AES-GCM for a new
+transport), be aware that on this hardware in 32-bit mode it will be significantly
+slower than on 64-bit or x86.
+
+### WiFi and Bluetooth Radio Sharing (CYW43438)
+
+The Pi Zero 2 W uses a single CYW43438 combo chip that shares one antenna between
+**2.4 GHz 802.11n WiFi** and **Bluetooth 4.1**. When Bluetooth is active
+(BT keyboard, serial console, BT audio), the WiFi subsystem is time-multiplexed with
+the BT radio. This causes periodic gaps in WiFi transmission, which manifests as
+latency spikes and packet loss bursts on the WireGuard UDP path.
+
+For a relay or exit node, these bursts can trigger spurious WireGuard session
+keepalive timeouts and relay session expiry under light load.
+
+**Disable Bluetooth on relay/exit deployments:**
+
+```sh
+# /boot/firmware/config.txt
+dtoverlay=disable-bt
+```
+
+This frees the full WiFi radio budget to WireGuard UDP and eliminates the
+time-multiplexing interference.
+
+### WiFi-Only Networking — No Onboard Ethernet
+
+The Pi Zero 2 W has no onboard ethernet port. All WireGuard, relay, and gossip
+traffic travels over the single 2.4 GHz WiFi interface (`wlan0`). There is no USB
+ethernet built into the SoC; wired connectivity requires a USB OTG adapter.
+
+### Single USB OTG Port
+
+The Pi Zero 2 W has one micro-USB OTG port for data (separate from the power port).
+If a USB OTG ethernet adapter is used for wired connectivity, the data port is
+occupied and USB serial console access is unavailable simultaneously. For
+production relay deployments, plan remote administration over WiFi SSH. Do not
+rely on USB serial console as the primary access path on a live relay node.
+
+---
+
+## 19. CI Requirements Before Claiming 32-bit ARM Support
 
 Per `PlatformSupportMatrix.md` and `Requirements.md`, 32-bit ARM support is a
 finished-product requirement and must be gate-verified before being called supported.
@@ -494,13 +581,14 @@ mandate. Do not pick it up until that mandate is complete.
 
 ---
 
-## 18. Known Open Items (At Time of Writing)
+## 20. Known Open Items (At Time of Writing)
 
 | Item | Severity | Notes |
 |---|---|---|
 | `PlatformSupportMatrix.md` "compile blocker" language overstates severity | Documentation | Update after first successful cross-compile confirms no hard blockers |
 | No `.cargo/config.toml` in repo | Setup | Must be created before cross-compilation; do not commit host-specific paths |
 | `LimitNOFILE` missing from `rustynet-relay.service` | Operational | Add before any deployment; default 1024 is insufficient at >512 sessions |
+| `rustynetd.service` missing `After=time-sync.target` | Operational | Required on Pi Zero 2 W (no RTC); clock must be synced before daemon starts |
 | Log file has no rotation | Operational | Mitigate by redirecting to `/dev/null` or using journal-only on embedded |
 | No CI gate for armv7 target | CI | Required before 32-bit ARM can be called supported |
 | No live-lab evidence row for ARM | Evidence | Required before 32-bit ARM can be called supported |
