@@ -268,9 +268,17 @@ imprecision (gateway=field 2, interface=field 4, so a `dev`-route without `via`
 mislabels them) as carried-over behavior, flagged for a future `via`-aware fix.
 Evidence: `cargo test -p rustynet-sysinfo --lib` → 23/23; fmt + clippy clean.
 
-Remaining for P1.1: more IO-fused parsers still to split (`wg show`, `getfacl`,
-`sysctl`, `df`, and the macOS/Windows variants of the already-split functions);
-the established pattern (`parse_X(&str) -> T` + golden fixtures) applies to each.
+Status 2026-06-23 (parse/IO split batch 4): split `parse_wg_show_peers`
+(`wg show <iface>`), shared by the identical Linux + macOS call sites
+(`#[cfg(any(linux, macos))]`), with 2 golden-fixture tests (now 25 total) —
+peer extraction + header skipping, and short-first-field safety (the `[..8]`
+byte-prefix slice). The parser's heuristic/positional field mapping is pinned
+as preserved behavior.
+
+Remaining for P1.1: more IO-fused parsers still to split (`getfacl`, `sysctl`,
+`df`, `systemctl`/`launchctl` service status, and the macOS/Windows variants of
+the already-split `/proc`/`ip` functions); the established pattern
+(`parse_X(&str) -> T` + golden fixtures) applies to each.
 
 Status 2026-06-23 (parse/IO split started): applied the split to the canonical
 example, the Linux `listening_sockets_summary_internal`. Extracted a pure
