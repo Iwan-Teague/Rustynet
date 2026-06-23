@@ -2796,30 +2796,40 @@ fn cpu_info_internal() -> CpuInfo {
 
 #[cfg(target_os = "linux")]
 fn socket_stats_internal() -> SocketStats {
+    match fs::read_to_string("/proc/net/tcp") {
+        Ok(content) => parse_proc_net_tcp_states(&content),
+        Err(_) => SocketStats {
+            established: 0,
+            listening: 0,
+            time_wait: 0,
+            total: 0,
+        },
+    }
+}
+
+/// Tally TCP socket states from `/proc/net/tcp`. The header line is skipped;
+/// field 3 (`st`) is the kernel state hex — `01` established, `0A` listening,
+/// `06` time-wait. Unknown states and short lines are ignored.
+#[cfg(target_os = "linux")]
+fn parse_proc_net_tcp_states(content: &str) -> SocketStats {
     let mut established = 0usize;
     let mut listening = 0usize;
     let mut time_wait = 0usize;
-
-    if let Ok(content) = fs::read_to_string("/proc/net/tcp") {
-        for line in content.lines().skip(1) {
-            if let Some(state_str) = line.split_whitespace().nth(3) {
-                match state_str {
-                    "01" => established += 1,
-                    "0A" => listening += 1,
-                    "06" => time_wait += 1,
-                    _ => {}
-                }
+    for line in content.lines().skip(1) {
+        if let Some(state_str) = line.split_whitespace().nth(3) {
+            match state_str {
+                "01" => established += 1,
+                "0A" => listening += 1,
+                "06" => time_wait += 1,
+                _ => {}
             }
         }
     }
-
-    let total = established + listening + time_wait;
-
     SocketStats {
         established,
         listening,
         time_wait,
-        total,
+        total: established + listening + time_wait,
     }
 }
 
@@ -7100,5 +7110,34 @@ short row here
         let peers = super::parse_wg_show_peers("ab x cd ef\n");
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].name, "peer-ab");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_net_tcp_tallies_states() {
+        // Minimal /proc/net/tcp: header + rows whose field 3 is the state hex.
+        let fixture = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0
+   1: 0100007F:1F91 0100007F:C000 01 00000000:00000000 00:00000000 00000000     0
+   2: 0100007F:1F92 0100007F:C001 01 00000000:00000000 00:00000000 00000000     0
+   3: 0100007F:1F93 0100007F:C002 06 00000000:00000000 00:00000000 00000000     0
+   4: 0100007F:1F94 0100007F:C003 08 00000000:00000000 00:00000000 00000000     0
+short
+";
+        let stats = super::parse_proc_net_tcp_states(fixture);
+        assert_eq!(stats.listening, 1); // 0A
+        assert_eq!(stats.established, 2); // 01 x2
+        assert_eq!(stats.time_wait, 1); // 06
+        assert_eq!(stats.total, 4); // 08 (close-wait) and the short line ignored
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_net_tcp_empty_and_header_only_are_zero() {
+        let z = super::parse_proc_net_tcp_states("");
+        assert_eq!(z.total, 0);
+        let h = super::parse_proc_net_tcp_states("sl local rem st ...\n");
+        assert_eq!(h.total, 0);
     }
 }
