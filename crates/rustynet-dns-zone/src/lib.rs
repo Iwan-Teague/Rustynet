@@ -1186,4 +1186,57 @@ mod tests {
             dns_zone_payload_digest(&bundle)
         );
     }
+
+    #[test]
+    fn parse_wire_never_panics_on_truncations_and_arbitrary_input() {
+        // Parser-never-panics invariant (the property a fuzzer would assert):
+        // the signed-zone wire decoder parses untrusted bundle bytes, so on any
+        // input — truncated mid-field, bit-flipped, or arbitrary — it must
+        // return Err, never panic. Any panic propagates and fails the test.
+        let valid = valid_wire_bundle();
+
+        // Every char-boundary prefix of a valid wire (truncation inside any
+        // field, incl. a length/count field).
+        for (offset, _) in valid
+            .char_indices()
+            .chain(std::iter::once((valid.len(), ' ')))
+        {
+            let _ = parse_signed_dns_zone_bundle_wire(&valid[..offset]);
+        }
+
+        // Single-byte ASCII corruption at every offset (the wire is ASCII).
+        let valid_bytes = valid.as_bytes();
+        for i in 0..valid_bytes.len() {
+            let mut corrupted = valid_bytes.to_vec();
+            corrupted[i] = corrupted[i].wrapping_add(1);
+            if let Ok(text) = std::str::from_utf8(&corrupted) {
+                let _ = parse_signed_dns_zone_bundle_wire(text);
+            }
+        }
+
+        // Structural garbage: empty, whitespace, partial key=value lines, a
+        // flood of lines, and deterministic pseudo-random ASCII.
+        for probe in [
+            "",
+            "\n\n\n",
+            "version=",
+            "version=1\n",
+            "=\n=\n=\n",
+            &"a=b\n".repeat(10_000),
+        ] {
+            let _ = parse_signed_dns_zone_bundle_wire(probe);
+        }
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        for len in 0..256usize {
+            let mut s = String::with_capacity(len);
+            for _ in 0..len {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                // Printable ASCII range so we always have a valid &str.
+                s.push((0x20 + (seed >> 40) as u8 % 0x5f) as char);
+            }
+            let _ = parse_signed_dns_zone_bundle_wire(&s);
+        }
+    }
 }
