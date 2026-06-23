@@ -237,8 +237,21 @@ clippy/coverage gate — track as its own cleanup slice (mind the macOS-only
 imports: do not blind-delete).
 
 Remaining for P1.1: the parse/IO split + golden-fixture parser tests (the bulk
-of the crate, incl. the `listening_sockets_summary_internal` IPv6/`unwrap_or(0)`
-hazards) is still open.
+of the crate) is in progress.
+
+Status 2026-06-23 (parse/IO split started): applied the split to the canonical
+example, the Linux `listening_sockets_summary_internal`. Extracted a pure
+`parse_ss_listening_sockets(output: &str) -> Vec<ListeningSocket>` (the IO fn is
+now a thin wrapper: spawn `ss`, decode, delegate; empty on any failure — behavior
+identical), and pinned it with 5 golden-fixture tests: header-only/empty → no
+rows, IPv4 extraction, **bracketed-IPv6 `[::]`/`[::1]` handled correctly** (the
+`rfind(':')` edge case the audit flagged), **malformed port → 0** (documents the
+`unwrap_or(0)` hazard), and rows dropped when the address has no `:` separator
+or too few fields. Evidence: `cargo test -p rustynet-sysinfo --lib` → 12/12;
+fmt clean; refactor adds zero clippy findings (verified vs stashed baseline:
+35 == 35). The remaining `*_internal` parsers (macOS/Windows socket variants,
+`wg show`, `/proc/*`, cert, `getfacl`, `sysctl`) still need the same split, and
+the ~35-finding clippy debt still needs its own cleanup slice.
 
 #### P1.2 — `rustynet-backend-wireguard/userspace_shared/engine.rs`: 633 lines, 0 tests, on the data path
 - `from_private_key_file()` (~L82): invalid base64, wrong key size, missing file.

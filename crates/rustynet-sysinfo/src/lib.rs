@@ -4634,24 +4634,38 @@ fn arp_table_entries_internal() -> Vec<ArpEntry> {
 
 #[cfg(target_os = "linux")]
 fn listening_sockets_summary_internal() -> Vec<ListeningSocket> {
+    let Ok(output) = std::process::Command::new("ss").args(["-tlnp"]).output() else {
+        return Vec::new();
+    };
+    match String::from_utf8(output.stdout) {
+        Ok(text) => parse_ss_listening_sockets(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Parse `ss -tlnp` output into listening-socket rows. Split out from the IO so
+/// the parser can be exercised with golden fixtures (incl. IPv6 and malformed
+/// rows) without spawning `ss`. The first line is the column header and is
+/// skipped; rows with fewer than four whitespace fields, or whose
+/// address field has no `:` port separator, are dropped. A non-numeric port
+/// degrades to 0 (the long-standing `unwrap_or(0)` behavior — preserved here so
+/// the split is behavior-identical; a future change can tighten it).
+#[cfg(target_os = "linux")]
+fn parse_ss_listening_sockets(output: &str) -> Vec<ListeningSocket> {
     let mut sockets = Vec::new();
-    if let Ok(output) = std::process::Command::new("ss").args(["-tlnp"]).output() {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            for line in s.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 {
-                    if let Some(colon_idx) = parts[3].rfind(':') {
-                        let port: u16 = parts[3][colon_idx + 1..].parse().unwrap_or(0);
-                        sockets.push(ListeningSocket {
-                            protocol: parts[0].to_string(),
-                            address: parts[3][..colon_idx].to_string(),
-                            port,
-                            pid: None,
-                            process_name: None,
-                        });
-                    }
-                }
-            }
+    for line in output.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4
+            && let Some(colon_idx) = parts[3].rfind(':')
+        {
+            let port: u16 = parts[3][colon_idx + 1..].parse().unwrap_or(0);
+            sockets.push(ListeningSocket {
+                protocol: parts[0].to_string(),
+                address: parts[3][..colon_idx].to_string(),
+                port,
+                pid: None,
+                process_name: None,
+            });
         }
     }
     sockets
@@ -6781,5 +6795,84 @@ mod tests {
         assert_eq!(result[0].trend, "increasing");
         assert_eq!(result[1].metric, "throughput_rps");
         assert_eq!(result[1].trend, "decreasing");
+    }
+
+    // ---- `ss -tlnp` parser (Linux): golden-fixture coverage ----
+
+    #[cfg(target_os = "linux")]
+    const SS_HEADER: &str = "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process";
+
+    #[cfg(target_os = "linux")]
+    fn parse_ss(rows: &[&str]) -> Vec<super::ListeningSocket> {
+        let mut text = String::from(SS_HEADER);
+        for row in rows {
+            text.push('\n');
+            text.push_str(row);
+        }
+        super::parse_ss_listening_sockets(&text)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_ss_empty_or_header_only_yields_no_sockets() {
+        assert!(super::parse_ss_listening_sockets("").is_empty());
+        // Header-only output (the first line is always skipped).
+        assert!(super::parse_ss_listening_sockets(SS_HEADER).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_ss_extracts_ipv4_listening_socket() {
+        let sockets = parse_ss(&[
+            "LISTEN 0      128          0.0.0.0:22        0.0.0.0:*    users:((\"sshd\",pid=1,fd=3))",
+        ]);
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0].address, "0.0.0.0");
+        assert_eq!(sockets[0].port, 22);
+        // The current parser labels `protocol` from the State column.
+        assert_eq!(sockets[0].protocol, "LISTEN");
+        assert_eq!(sockets[0].pid, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_ss_handles_bracketed_ipv6_addresses() {
+        // The rfind(':') split must keep the bracketed IPv6 host intact and
+        // only peel the trailing port — the IPv6 edge case the audit flagged.
+        let sockets = parse_ss(&[
+            "LISTEN 0      128             [::]:443          [::]:*",
+            "LISTEN 0      128          [::1]:5432            [::]:*",
+        ]);
+        assert_eq!(sockets.len(), 2);
+        assert_eq!(sockets[0].address, "[::]");
+        assert_eq!(sockets[0].port, 443);
+        assert_eq!(sockets[1].address, "[::1]");
+        assert_eq!(sockets[1].port, 5432);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_ss_malformed_port_degrades_to_zero() {
+        // Documents the long-standing `unwrap_or(0)` behavior: a non-numeric
+        // port is not dropped, it becomes 0. The address is still extracted.
+        let sockets = parse_ss(&["LISTEN 0 128 127.0.0.1:notaport 0.0.0.0:*"]);
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0].address, "127.0.0.1");
+        assert_eq!(sockets[0].port, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_ss_drops_rows_without_port_separator_or_too_few_fields() {
+        let sockets = parse_ss(&[
+            "LISTEN 0 128 noportseparator 0.0.0.0:*", // parts[3] has no ':'
+            "LISTEN 0 128",                           // fewer than 4 fields
+            "",                                       // blank line
+        ]);
+        assert!(
+            sockets.is_empty(),
+            "rows without a usable address:port must be dropped, got {} entries",
+            sockets.len()
+        );
     }
 }
