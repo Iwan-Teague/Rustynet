@@ -1930,20 +1930,9 @@ fn wg_peers_internal() -> Vec<WireGuardPeer> {
         if let Ok(output) = std::process::Command::new("wg")
             .args(["show", "rustynet0"])
             .output()
+            && let Ok(stdout) = String::from_utf8(output.stdout)
         {
-            if let Ok(stdout) = String::from_utf8(output.stdout) {
-                for line in stdout.lines() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 4 && parts[0] != "interface:" && parts[0] != "public" {
-                        peers.push(WireGuardPeer {
-                            name: format!("peer-{}", &parts[0][..8.min(parts[0].len())]),
-                            ip: parts.get(3).unwrap_or(&"-").to_string(),
-                            allowed_ips: parts.get(2).unwrap_or(&"-").to_string(),
-                            last_handshake_ago: None,
-                        });
-                    }
-                }
-            }
+            peers = parse_wg_show_peers(&stdout);
         }
     }
 
@@ -1954,17 +1943,7 @@ fn wg_peers_internal() -> Vec<WireGuardPeer> {
             .output()
             && let Ok(stdout) = String::from_utf8(output.stdout)
         {
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 && parts[0] != "interface:" && parts[0] != "public" {
-                    peers.push(WireGuardPeer {
-                        name: format!("peer-{}", &parts[0][..8.min(parts[0].len())]),
-                        ip: parts.get(3).unwrap_or(&"-").to_string(),
-                        allowed_ips: parts.get(2).unwrap_or(&"-").to_string(),
-                        last_handshake_ago: None,
-                    });
-                }
-            }
+            peers = parse_wg_show_peers(&stdout);
         }
     }
 
@@ -1978,6 +1957,30 @@ fn wg_peers_internal() -> Vec<WireGuardPeer> {
         });
     }
 
+    peers
+}
+
+/// Parse `wg show <iface>` output into peer rows. Split from the IO so it can
+/// be exercised with golden fixtures. Lines with fewer than four whitespace
+/// fields, and the `interface:`/`public` header lines, are skipped; the name
+/// is `peer-` + the first ≤8 chars of field 0, with `allowed_ips` from field 2
+/// and `ip` from field 3. (Heuristic/positional — behavior preserved verbatim
+/// from the pre-split code, including the byte-prefix slice, which is safe on
+/// `wg`'s ASCII output.)
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn parse_wg_show_peers(stdout: &str) -> Vec<WireGuardPeer> {
+    let mut peers = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 && parts[0] != "interface:" && parts[0] != "public" {
+            peers.push(WireGuardPeer {
+                name: format!("peer-{}", &parts[0][..8.min(parts[0].len())]),
+                ip: parts.get(3).unwrap_or(&"-").to_string(),
+                allowed_ips: parts.get(2).unwrap_or(&"-").to_string(),
+                last_handshake_ago: None,
+            });
+        }
+    }
     peers
 }
 
@@ -7067,5 +7070,35 @@ bad
     #[test]
     fn parse_ip_route_show_empty_is_safe() {
         assert!(super::parse_ip_route_show("").is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parse_wg_show_peers_extracts_and_skips_headers() {
+        // A line with >=4 fields whose first token is neither `interface:` nor
+        // `public` is a peer row: name = "peer-" + first 8 chars of field 0,
+        // allowed_ips = field 2, ip = field 3 (the preserved positional rule).
+        let stdout = "\
+interface: rustynet0
+  public key: serverkeyserverkey
+abcdefghijklmnop x 100.64.0.2/32 203.0.113.9:51820
+short row here
+";
+        let peers = super::parse_wg_show_peers(stdout);
+        assert_eq!(peers.len(), 1, "only the 4+-field non-header row parses");
+        assert_eq!(peers[0].name, "peer-abcdefgh");
+        assert_eq!(peers[0].allowed_ips, "100.64.0.2/32");
+        assert_eq!(peers[0].ip, "203.0.113.9:51820");
+        assert!(peers[0].last_handshake_ago.is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parse_wg_show_peers_empty_and_short_first_field_are_safe() {
+        assert!(super::parse_wg_show_peers("").is_empty());
+        // First field shorter than the 8-char slice bound must not panic.
+        let peers = super::parse_wg_show_peers("ab x cd ef\n");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "peer-ab");
     }
 }
