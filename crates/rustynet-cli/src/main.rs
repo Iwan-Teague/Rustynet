@@ -19736,7 +19736,8 @@ mod tests {
         render_launchd_plist, required_macos_tunnel_keychain_account,
         required_macos_tunnel_keychain_service, rewrite_assignment_refresh_exit_node,
         rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
-        update_node_role_macos_plist, validate_control_socket_security, write_json_pretty_file,
+        update_node_role_env_file, update_node_role_macos_plist, validate_control_socket_security,
+        write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
@@ -24183,6 +24184,57 @@ mod tests {
         assert!(
             strays.is_empty(),
             "fail-closed must not leave a temp: {strays:?}"
+        );
+    }
+
+    // ----- Linux/Windows role-set env-file persistence (update_node_role_env_file) -----
+
+    #[test]
+    fn update_node_role_env_file_replaces_existing_role_and_preserves_other_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = dir.path().join("rustynetd");
+        std::fs::write(
+            &env,
+            "RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock\nNODE_ROLE=client\nRUSTYNET_BACKEND=linux-wireguard\n",
+        )
+        .expect("write env");
+        update_node_role_env_file(&env, "admin").expect("update should succeed");
+        let out = std::fs::read_to_string(&env).expect("read back");
+        assert!(out.contains("NODE_ROLE=admin\n"), "role updated: {out}");
+        assert!(!out.contains("NODE_ROLE=client"), "no stale role: {out}");
+        assert!(
+            out.contains("RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock\n")
+                && out.contains("RUSTYNET_BACKEND=linux-wireguard\n"),
+            "unrelated lines preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn update_node_role_env_file_preserves_the_rustynet_prefixed_key_form() {
+        // systemd's EnvironmentFile uses RUSTYNET_NODE_ROLE; the rewrite must
+        // keep that key (not silently add a second bare NODE_ROLE the unit
+        // does not read).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = dir.path().join("rustynetd");
+        std::fs::write(&env, "RUSTYNET_NODE_ROLE=client\n").expect("write env");
+        update_node_role_env_file(&env, "admin").expect("update should succeed");
+        assert_eq!(
+            std::fs::read_to_string(&env).expect("read back"),
+            "RUSTYNET_NODE_ROLE=admin\n"
+        );
+    }
+
+    #[test]
+    fn update_node_role_env_file_inserts_role_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = dir.path().join("rustynetd");
+        std::fs::write(&env, "RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock\n").expect("write env");
+        update_node_role_env_file(&env, "admin").expect("update should succeed");
+        let out = std::fs::read_to_string(&env).expect("read back");
+        assert!(out.contains("NODE_ROLE=admin\n"), "role inserted: {out}");
+        assert!(
+            out.contains("RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock\n"),
+            "{out}"
         );
     }
 }
