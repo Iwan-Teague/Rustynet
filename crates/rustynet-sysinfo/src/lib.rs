@@ -1048,12 +1048,12 @@ fn rustc_version_internal() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn wireguard_interface_info_internal(interface: &str) -> InterfaceInfo {
-    let path = format!("/sys/class/net/{}", interface);
+    let path = format!("/sys/class/net/{interface}");
     let exists = Path::new(&path).exists();
     InterfaceInfo {
         exists,
         is_up: exists
-            && fs::read_to_string(format!("{}/operstate", path))
+            && fs::read_to_string(format!("{path}/operstate"))
                 .map(|state| state.trim() == "up")
                 .unwrap_or(false),
     }
@@ -1289,7 +1289,7 @@ fn network_interfaces_internal() -> Vec<NetworkInterface> {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     let name_str = name.to_string();
-                    let up = fs::read_to_string(format!("/sys/class/net/{}/operstate", name_str))
+                    let up = fs::read_to_string(format!("/sys/class/net/{name_str}/operstate"))
                         .map(|state| state.trim() == "up")
                         .unwrap_or(false);
 
@@ -1352,8 +1352,6 @@ fn security_checks_internal(_config_path: &str) -> SecurityCheckResult {
 
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::MetadataExt;
-
         let key_paths = ["/etc/rustynet/wg.key", "/etc/rustynet/config.yaml"];
 
         for key_path in &key_paths {
@@ -1361,7 +1359,7 @@ fn security_checks_internal(_config_path: &str) -> SecurityCheckResult {
                 let perms = metadata.permissions();
                 let mode = perms.mode() & 0o777;
                 if mode & 0o077 != 0 {
-                    issues.push(format!("{} has world-readable permissions", key_path));
+                    issues.push(format!("{key_path} has world-readable permissions"));
                 }
             }
         }
@@ -1461,7 +1459,7 @@ fn daemon_health_internal() -> DaemonHealth {
 }
 
 #[cfg(target_os = "linux")]
-fn check_daemon_running(_msg: &mut String) -> bool {
+fn check_daemon_running(_msg: &mut str) -> bool {
     std::process::Command::new("pgrep")
         .arg("-x")
         .arg("rustynetd")
@@ -1471,7 +1469,7 @@ fn check_daemon_running(_msg: &mut String) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn check_daemon_running(_msg: &mut String) -> bool {
+fn check_daemon_running(_msg: &mut str) -> bool {
     std::process::Command::new("pgrep")
         .arg("-x")
         .arg("rustynetd")
@@ -1481,7 +1479,7 @@ fn check_daemon_running(_msg: &mut String) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn check_daemon_running(_msg: &mut String) -> bool {
+fn check_daemon_running(_msg: &mut str) -> bool {
     std::process::Command::new("tasklist")
         .output()
         .ok()
@@ -1501,7 +1499,7 @@ fn get_daemon_uptime() -> Option<u64> {
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .and_then(|pid_str| pid_str.trim().parse::<u32>().ok())
         .and_then(|pid| {
-            fs::read_to_string(format!("/proc/{}/stat", pid))
+            fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
                 .and_then(|content| {
                     let fields: Vec<&str> = content.split_whitespace().collect();
@@ -1510,8 +1508,8 @@ fn get_daemon_uptime() -> Option<u64> {
         })
         .map(|start_time| {
             let ticks_per_sec = 100u64;
-            let uptime = start_time / ticks_per_sec;
-            uptime
+
+            start_time / ticks_per_sec
         })
 }
 
@@ -1586,8 +1584,8 @@ fn validate_config_internal() -> ConfigValidation {
     {
         let config_paths = ["/etc/rustynet/config.yaml", "/etc/rustynet/wg.key"];
         for path in &config_paths {
-            if !fs::metadata(path).is_ok() {
-                issues.push(format!("{}: not found", path));
+            if fs::metadata(path).is_err() {
+                issues.push(format!("{path}: not found"));
             }
         }
     }
@@ -1770,7 +1768,7 @@ fn key_expiry_internal() -> KeyExpiry {
                     let days_old = (now - since_epoch) / 86400;
                     if days_old > 365 {
                         expiring_soon = true;
-                        key_details.push(format!("{}: {} days old (>1yr)", path, days_old));
+                        key_details.push(format!("{path}: {days_old} days old (>1yr)"));
                     }
                 }
             }
@@ -2063,8 +2061,7 @@ fn find_daemon_pid() -> Option<u32> {
 
 #[cfg(target_os = "linux")]
 fn get_process_stats(pid: u32) -> (Option<u64>, Option<f64>) {
-    let stat_path = format!("/proc/{}/stat", pid);
-    let status_path = format!("/proc/{}/status", pid);
+    let status_path = format!("/proc/{pid}/status");
 
     let rss = fs::read_to_string(&status_path).ok().and_then(|content| {
         for line in content.lines() {
@@ -2896,9 +2893,9 @@ fn process_list_internal() -> Vec<ProcessListEntry> {
 
             let pid_str = entry.file_name();
             if let Ok(pid) = pid_str.to_string_lossy().parse::<u32>() {
-                let status_path = format!("/proc/{}/status", pid);
+                let status_path = format!("/proc/{pid}/status");
                 if let Ok(content) = fs::read_to_string(&status_path) {
-                    let mut name = format!("pid_{}", pid);
+                    let mut name = format!("pid_{pid}");
                     let mut memory = 0u64;
 
                     for line in content.lines() {
@@ -3098,7 +3095,7 @@ fn dns_check_internal() -> DnsCheck {
             if let Some(addr) = line.strip_prefix("nameserver ") {
                 let addr = addr.trim().to_string();
                 resolvers.push(addr.clone());
-                results.push(format!("resolver: {}", addr));
+                results.push(format!("resolver: {addr}"));
             }
         }
     }
@@ -3476,7 +3473,7 @@ fn measure_packet_loss() -> (f64, usize, usize, Option<f64>, Option<f64>, Option
         .output()
     {
         if let Ok(s) = String::from_utf8(output.stdout) {
-            let mut packets_sent = 10;
+            let packets_sent = 10;
             let mut packets_received = 10;
             let mut loss_percent = 0.0;
 
@@ -3767,12 +3764,12 @@ fn tcp_connections_internal() -> Vec<TcpConnection> {
             if let Some((local_hex, local_port_hex)) = fields[1].split_once(':') {
                 let local_addr = hex_to_ip(local_hex);
                 if let Ok(port) = u16::from_str_radix(local_port_hex, 16) {
-                    let local = format!("{}:{}", local_addr, port);
+                    let local = format!("{local_addr}:{port}");
 
                     if let Some((remote_hex, remote_port_hex)) = fields[2].split_once(':') {
                         let remote_addr = hex_to_ip(remote_hex);
                         if let Ok(port) = u16::from_str_radix(remote_port_hex, 16) {
-                            let remote = format!("{}:{}", remote_addr, port);
+                            let remote = format!("{remote_addr}:{port}");
                             let state = fields[3].to_string();
                             connections.push(TcpConnection {
                                 local_addr: local,
@@ -3936,8 +3933,8 @@ fn interface_speed_internal() -> Vec<InterfaceSpeed> {
     if let Ok(entries) = fs::read_dir("/sys/class/net") {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) {
-                let speed_path = format!("/sys/class/net/{}/speed", name);
-                let mtu_path = format!("/sys/class/net/{}/mtu", name);
+                let speed_path = format!("/sys/class/net/{name}/speed");
+                let mtu_path = format!("/sys/class/net/{name}/mtu");
                 let speed_mbps = fs::read_to_string(&speed_path)
                     .ok()
                     .and_then(|s| s.trim().parse::<u64>().ok());
@@ -4075,7 +4072,6 @@ fn disk_io_stats_internal() -> Vec<DiskIoStat> {
 
 #[cfg(target_os = "linux")]
 fn process_memory_internal() -> Vec<ProcessMemory> {
-    let mut processes = Vec::new();
     let mut mem_map: Vec<(String, u32, u64)> = Vec::new();
 
     if let Ok(entries) = fs::read_dir("/proc") {
@@ -4084,7 +4080,7 @@ fn process_memory_internal() -> Vec<ProcessMemory> {
                 if metadata.is_dir() {
                     if let Some(pid_str) = entry.file_name().to_str() {
                         if let Ok(pid) = pid_str.parse::<u32>() {
-                            let status_path = format!("/proc/{}/status", pid);
+                            let status_path = format!("/proc/{pid}/status");
                             if let Ok(content) = fs::read_to_string(status_path) {
                                 let mut name = "unknown".to_string();
                                 let mut memory_kb = 0u64;
@@ -4095,9 +4091,7 @@ fn process_memory_internal() -> Vec<ProcessMemory> {
                                         }
                                     } else if line.starts_with("VmRSS:") {
                                         if let Some(mem_str) = line.strip_prefix("VmRSS:") {
-                                            if let Some(num) =
-                                                mem_str.trim().split_whitespace().next()
-                                            {
+                                            if let Some(num) = mem_str.split_whitespace().next() {
                                                 memory_kb = num.parse().unwrap_or(0);
                                             }
                                         }
@@ -4113,7 +4107,7 @@ fn process_memory_internal() -> Vec<ProcessMemory> {
     }
 
     mem_map.sort_by(|a, b| b.2.cmp(&a.2));
-    processes = mem_map
+    mem_map
         .into_iter()
         .take(10)
         .map(|(name, pid, memory_kb)| ProcessMemory {
@@ -4121,9 +4115,7 @@ fn process_memory_internal() -> Vec<ProcessMemory> {
             pid,
             memory_mb: (memory_kb / 1024).max(1),
         })
-        .collect();
-
-    processes
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -4487,7 +4479,7 @@ fn connection_state_histogram_internal() -> StateHistogram {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(1) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 0 {
+                if !parts.is_empty() {
                     match parts[0] {
                         "ESTAB" => histogram.established += 1,
                         "TIME-WAIT" => histogram.time_wait += 1,
@@ -4740,7 +4732,7 @@ fn network_drop_stats_internal() -> Vec<InterfaceDropStats> {
                 if !line.starts_with(' ') && !line.is_empty() {
                     current_iface = line.trim().to_string();
                 } else if line.contains("RX:") {
-                    if let Some(drops) = line.split("dropped").nth(0) {
+                    if let Some(_drops) = line.split("dropped").next() {
                         stats.push(InterfaceDropStats {
                             interface: current_iface.clone(),
                             rx_drops: 0,
@@ -4830,15 +4822,8 @@ fn tls_certificate_expiry_all_internal(paths: &[&str]) -> Vec<CertExpiry> {
                     }
                 }
 
-                let is_expired = expires_at
-                    < std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .and_then(|d| {
-                            let secs = d.as_secs();
-                            Some(format!("{}", secs))
-                        })
-                        .unwrap_or_default();
+                // Cert-expiry evaluation is not yet implemented; the parser
+                // records the raw `expires_at` string and reports not-expired.
                 let is_expired = false;
 
                 results.push(CertExpiry {
@@ -5055,7 +5040,7 @@ fn cryptographic_key_permissions_internal() -> Vec<KeyPermissionCheck> {
             .output()
         {
             if let Ok(s) = String::from_utf8(output.stdout) {
-                let parts: Vec<&str> = s.trim().split_whitespace().collect();
+                let parts: Vec<&str> = s.split_whitespace().collect();
                 let owner_group = parts.first().copied().unwrap_or("unknown:unknown");
                 let mode = parts.get(1).copied().unwrap_or("000");
 
@@ -5101,7 +5086,7 @@ fn cryptographic_key_permissions_internal() -> Vec<KeyPermissionCheck> {
 
 #[cfg(target_os = "linux")]
 fn tls_cipher_suite_strength_internal(host: &str, port: u16) -> CipherSuiteInfo {
-    let target = format!("{}:{}", host, port);
+    let target = format!("{host}:{port}");
 
     if let Ok(output) = std::process::Command::new("openssl")
         .args(["s_client", "-connect", &target, "-servername", host])
@@ -6483,9 +6468,14 @@ fn access_control_list_audit_internal(paths: &[&str]) -> Vec<AclInfo> {
 #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
 fn boot_integrity_check_internal() -> BootIntegrity {
     let mut secure_boot_enabled = false;
-    let mut tpm_present = false;
     let mut measurements_ok = false;
     let mut pcrs = Vec::new();
+    // `/dev/tpm0` presence is the TPM signal on Linux; other platforms report
+    // no TPM through this path.
+    #[cfg(target_os = "linux")]
+    let tpm_present = std::path::Path::new("/dev/tpm0").exists();
+    #[cfg(not(target_os = "linux"))]
+    let tpm_present = false;
 
     #[cfg(target_os = "linux")]
     {
@@ -6497,8 +6487,6 @@ fn boot_integrity_check_internal() -> BootIntegrity {
                 secure_boot_enabled = s.contains("enabled");
             }
         }
-
-        tpm_present = std::path::Path::new("/dev/tpm0").exists();
 
         if tpm_present {
             if let Ok(output) = std::process::Command::new("tpm2_pcrread")
