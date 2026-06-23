@@ -2677,6 +2677,130 @@ mod tests {
         );
     }
 
+    /// Append `node-b/c/d` as a 3-entry chained membership log under `log`,
+    /// returning the raw on-disk file contents. Each update is authored
+    /// against the post-apply state of the previous one, so the persisted
+    /// hash chain is well-formed before any test tampers it.
+    #[cfg(unix)]
+    fn write_three_entry_membership_log(log: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let guardian_key = SigningKey::from_bytes(&[2; 32]);
+        let mut state = base_state();
+        let mut now = 130u64;
+        for (idx, (node_id, key_byte)) in [("node-b", 17u8), ("node-c", 18), ("node-d", 19)]
+            .into_iter()
+            .enumerate()
+        {
+            let new_node = active_node(node_id, key_byte);
+            let mut candidate = state.clone();
+            candidate.nodes.push(new_node.clone());
+            candidate.epoch += 1;
+            let record = MembershipUpdateRecord {
+                network_id: state.network_id.clone(),
+                update_id: format!("update-chain-{idx}"),
+                operation: MembershipOperation::AddNode(new_node),
+                target: node_id.to_owned(),
+                prev_state_root: state.state_root_hex().expect("root"),
+                new_state_root: candidate.state_root_hex().expect("root"),
+                epoch_prev: state.epoch,
+                epoch_new: state.epoch + 1,
+                created_at_unix: now,
+                expires_at_unix: now + 1000,
+                reason_code: "join".to_owned(),
+                policy_context: None,
+            };
+            let signed = SignedMembershipUpdate {
+                record: record.clone(),
+                approver_signatures: vec![
+                    sign_update_record(&record, "owner-1", &owner_key).expect("sign"),
+                    sign_update_record(&record, "guardian-1", &guardian_key).expect("sign"),
+                ],
+            };
+            append_membership_log_entry(log, &signed).expect("append");
+            state = apply_signed_update(
+                &state,
+                &signed,
+                now + 1,
+                &mut MembershipReplayCache::default(),
+            )
+            .expect("apply");
+            now += 10;
+        }
+        std::fs::set_permissions(log, std::fs::Permissions::from_mode(0o600)).expect("0o600 perms");
+        std::fs::read_to_string(log).expect("read log")
+    }
+
+    /// Rewrite `log` with `version` + the given `entry=` lines, fix perms, and
+    /// assert `load_membership_log` fails closed with `IntegrityMismatch`.
+    #[cfg(unix)]
+    fn assert_tampered_log_rejected(log: &std::path::Path, entry_lines: &[&str]) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut body = format!("version={MEMBERSHIP_SCHEMA_VERSION}\n");
+        for line in entry_lines {
+            body.push_str(line);
+            body.push('\n');
+        }
+        std::fs::write(log, body).expect("rewrite log");
+        std::fs::set_permissions(log, std::fs::Permissions::from_mode(0o600)).expect("0o600 perms");
+        let err = load_membership_log(log).expect_err("tampered chain must be rejected");
+        assert_eq!(err, MembershipError::IntegrityMismatch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn membership_log_chain_tampering_is_detected() {
+        // A persisted membership log is a hash chain: each `entry=` line binds
+        // its index, the previous entry's hash, and the encoded update. Loading
+        // re-derives every per-line hash and then `verify_membership_log_chain`
+        // re-checks index ordering + back-links. Reordering or removing a
+        // middle entry, or flipping a stored hash, must all fail closed.
+        let unique = format!(
+            "membership-chain-break-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        let log = temp_dir.join("membership.log");
+
+        let contents = write_three_entry_membership_log(&log);
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines[0], format!("version={MEMBERSHIP_SCHEMA_VERSION}"));
+        let entry_lines: Vec<&str> = lines[1..].to_vec();
+        assert_eq!(entry_lines.len(), 3, "fixture must build a 3-entry chain");
+
+        // Baseline: the intact chain loads and verifies.
+        let entries = load_membership_log(&log).expect("intact chain should load");
+        assert_eq!(entries.len(), 3);
+
+        // Reorder the middle and last entries: per-line hashes stay valid (the
+        // index is embedded in each line) but the position/index check trips.
+        assert_tampered_log_rejected(&log, &[entry_lines[0], entry_lines[2], entry_lines[1]]);
+
+        // Remove the middle entry: the survivor at position 1 carries index 2.
+        assert_tampered_log_rejected(&log, &[entry_lines[0], entry_lines[2]]);
+
+        // Flip the stored entry_hash of the first entry (3rd `|`-field) to all
+        // zeros: the recomputed per-line hash no longer matches.
+        let parts: Vec<&str> = entry_lines[0]
+            .strip_prefix("entry=")
+            .expect("entry prefix")
+            .split('|')
+            .collect();
+        assert_eq!(parts.len(), 4, "entry line has 4 fields");
+        let zeroed_hash = "0".repeat(parts[2].len());
+        let tampered_first = format!(
+            "entry={}|{}|{}|{}",
+            parts[0], parts[1], zeroed_hash, parts[3]
+        );
+        assert_tampered_log_rejected(&log, &[&tampered_first, entry_lines[1], entry_lines[2]]);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     /// Regression: `load_membership_snapshot` and `load_membership_log` must
     /// reject files larger than the configured cap before any structural
     /// parse runs. The previous code path read the entire file via

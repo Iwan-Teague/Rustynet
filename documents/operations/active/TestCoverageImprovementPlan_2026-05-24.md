@@ -107,13 +107,14 @@ already pinned by `replay_cache_not_updated_on_failed_update` →
 `NewStateRootMismatch`; direct payload-capability tampering by
 `tampered_service_hosting_capability_invalidates_signature`.) Evidence:
 `cargo test -p rustynet-control --lib membership::tests` → 36/36; crate-wide
-`cargo test -p rustynet-control --all-targets --all-features` → 295/295; fmt +
+`cargo test -p rustynet-control --all-targets --all-features` → 296/296; fmt +
 clippy `-D warnings` clean.
 
-Remaining follow-up:
-- Membership-log chain break (remove/reorder a middle entry) detected via
-  `verify_membership_log_chain()` — still to add (needs a persisted-log tamper
-  fixture through the public `load_membership_log` loader).
+Follow-up landed 2026-06-23: membership-log chain-break detection is now pinned
+by `membership_log_chain_tampering_is_detected`, which builds a 3-entry chained
+log on disk and asserts `load_membership_log` fails closed
+(`IntegrityMismatch`) on each of: reordering the middle/last entries, removing
+the middle entry, and flipping a stored per-entry hash. **P0.2 complete.**
 
 #### P0.3 — `rustynet-crypto`: negative tests on verification + fail-closed CSPRNG
 Status 2026-05-27: added negative coverage for expired algorithm exceptions
