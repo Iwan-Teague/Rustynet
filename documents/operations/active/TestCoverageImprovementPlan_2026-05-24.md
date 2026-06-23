@@ -265,6 +265,21 @@ need a mock seam to exercise without a live handshake.
 - Failure during rollback (persist fails after finalize; `let _ = ...` swallows freeze errors at ~L845) — cascade is untested and can leave disk/memory divergent.
 - Drain timeout exact-boundary and backward-clock (`saturating_duration_since` masks jumps, ~L461).
 
+Status 2026-06-23: **ledger load anti-tamper paths pinned (4 tests).**
+`LocalKeyRotationLedger::load` now has explicit reject coverage: a zeroed
+`digest` field → `LedgerCorrupt("…digest mismatch")`; a mutated signed body
+field (`state=idle`→`draining`) → digest mismatch (the digest binds the whole
+body); a dropped `digest` line → missing-required-field rejection; and a file
+truncated to just the version line → `LedgerCorrupt`. Evidence: `cargo test -p
+rustynetd --lib key_rotation::tests::load_rejects` → 4/4; fmt clean; no new
+clippy findings. (The crate's rotation drain/commit-or-none/IO-failure-rollback/
+verifier-archive-corruption/audit paths were already well covered.)
+
+Remaining for P1.3: `RotationEpoch::next()` overflow at `u64::MAX` lives in
+`rustynet-control::key_rotation` (a different crate) — test there; and the
+drain backward-clock / exact-boundary and the finalize-then-persist-fails
+cascade edges are still open.
+
 #### P1.4 — `rustynet-cli/main.rs`: user-facing control-plane logic (not lab tooling)
 Status 2026-05-27: verified the existing CLI error-classification test batch
 covering BadArgs, PolicyReject, ConfigError, TransientFailure, fallback, and
