@@ -158,6 +158,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "privileged-helper-allowlist-audit" => {
                 run_privileged_helper_allowlist_audit_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "membership-signature-audit" => {
+                run_membership_signature_audit_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "key" => run_key_command(rest),
             [cmd, rest @ ..] if cmd == "membership" => run_membership_command(rest),
             [cmd, rest @ ..] if cmd == "windows-runtime-boundary-check" => {
@@ -1670,6 +1673,37 @@ fn run_privileged_helper_allowlist_audit_command(args: &[String]) -> Result<(), 
     if !report.overall_ok {
         return Err(format!(
             "privileged-helper allowlist audit failed: {} violation(s) — the argv allowlist accepted an adversarial request or rejected a reviewed one",
+            report.violations.len()
+        ));
+    }
+    Ok(())
+}
+
+fn run_membership_signature_audit_command(args: &[String]) -> Result<(), String> {
+    // Accept (ignore) --no-fail-on-drift for argv parity with the other check
+    // subcommands; the audit fails closed on its own (non-zero exit).
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!(
+                    "unknown membership-signature-audit argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = rustynetd::membership_signature_audit::run_membership_signature_audit()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|err| {
+            format!("serialize membership-signature-audit report failed: {err}")
+        })?
+    );
+    if !report.overall_ok {
+        return Err(format!(
+            "membership signature audit failed: {} violation(s) — the signed-membership verify funnel accepted a forgery or rejected the valid baseline",
             report.violations.len()
         ));
     }
@@ -3665,6 +3699,7 @@ fn help_text() -> String {
         "  rustynetd linux-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>] [--killswitch-table <name>]",
         "  rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]",
         "  rustynetd linux-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--killswitch-table <name>]",
+        "  rustynetd membership-signature-audit",
         "  rustynetd privileged-helper-allowlist-audit",
         "  rustynetd macos-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--pf-anchor <name>]",
         "  rustynetd macos-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>]",
@@ -3760,12 +3795,13 @@ mod tests {
         run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
         run_macos_exit_dns_failclosed_capture_command,
         run_macos_exit_killswitch_precedence_check_command, run_macos_ipv6_leak_capture_command,
-        run_privileged_helper_allowlist_audit_command, run_windows_authenticode_check_command,
-        run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
-        run_windows_exit_nat_lifecycle_snapshot_command, run_windows_key_custody_check_command,
-        run_windows_killswitch_assert_command, run_windows_mesh_status_check_command,
-        run_windows_named_pipe_acls_check_command, run_windows_registry_acls_check_command,
-        run_windows_runtime_acls_check_command, run_windows_service_hardening_check_command,
+        run_membership_signature_audit_command, run_privileged_helper_allowlist_audit_command,
+        run_windows_authenticode_check_command, run_windows_backend_readiness_check_command,
+        run_windows_dns_failclosed_check_command, run_windows_exit_nat_lifecycle_snapshot_command,
+        run_windows_key_custody_check_command, run_windows_killswitch_assert_command,
+        run_windows_mesh_status_check_command, run_windows_named_pipe_acls_check_command,
+        run_windows_registry_acls_check_command, run_windows_runtime_acls_check_command,
+        run_windows_service_hardening_check_command,
     };
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
@@ -4182,6 +4218,36 @@ mod tests {
         // command exits Ok on a healthy binary.
         run_privileged_helper_allowlist_audit_command(&[])
             .expect("privileged-helper allowlist audit must pass on the reviewed allowlist");
+    }
+
+    #[test]
+    fn help_text_advertises_membership_signature_audit_subcommand() {
+        assert!(
+            help_text().contains("membership-signature-audit"),
+            "help text must advertise membership-signature-audit subcommand"
+        );
+    }
+
+    #[test]
+    fn run_membership_signature_audit_command_passes_on_reviewed_funnel() {
+        run_membership_signature_audit_command(&[])
+            .expect("membership signature audit must pass against the real verify funnel");
+    }
+
+    #[test]
+    fn run_membership_signature_audit_command_accepts_no_fail_on_drift() {
+        run_membership_signature_audit_command(&["--no-fail-on-drift".to_owned()])
+            .expect("must accept --no-fail-on-drift for argv parity");
+    }
+
+    #[test]
+    fn run_membership_signature_audit_command_rejects_unknown_flags() {
+        let err = run_membership_signature_audit_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown membership-signature-audit argument"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
