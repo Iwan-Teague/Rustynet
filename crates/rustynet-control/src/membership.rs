@@ -1856,14 +1856,14 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MEMBERSHIP_LOG_BYTES, MAX_MEMBERSHIP_SNAPSHOT_BYTES, MEMBERSHIP_SCHEMA_VERSION,
-        MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipError,
-        MembershipNode, MembershipNodeStatus, MembershipOperation, MembershipReplayCache,
-        MembershipState, MembershipUpdateRecord, SignedMembershipUpdate,
-        append_membership_log_entry, apply_signed_update, decode_update_record, hex_encode,
-        load_membership_log, load_membership_snapshot, persist_membership_snapshot,
-        preview_next_state, replay_membership_snapshot_and_log, sign_update_record,
-        write_membership_audit_log,
+        MAX_MEMBERSHIP_LOG_BYTES, MAX_MEMBERSHIP_SNAPSHOT_BYTES, MEMBERSHIP_CLOCK_SKEW_SECS,
+        MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
+        MembershipApproverStatus, MembershipError, MembershipNode, MembershipNodeStatus,
+        MembershipOperation, MembershipReplayCache, MembershipSignature, MembershipState,
+        MembershipUpdateRecord, SignedMembershipUpdate, append_membership_log_entry,
+        apply_signed_update, decode_update_record, hex_encode, load_membership_log,
+        load_membership_snapshot, persist_membership_snapshot, preview_next_state,
+        replay_membership_snapshot_and_log, sign_update_record, write_membership_audit_log,
     };
     use crate::roles::{RoleCapability, anchor_role_capabilities};
     use ed25519_dalek::SigningKey;
@@ -2429,6 +2429,252 @@ mod tests {
         let applied = apply_signed_update(&state, &good_signed, 131, &mut cache)
             .expect("valid update should still apply after failed attempt");
         assert_eq!(applied.epoch, state.epoch + 1);
+    }
+
+    /// Build a base state plus a fully-signed, *valid* `AddNode` update against
+    /// it. Tests tamper a single field of the returned record (or the raw
+    /// signature bytes) to exercise one reject path in `apply_signed_update` at
+    /// a time, then assert the untampered control still applies. Owner +
+    /// guardian both sign, so the quorum (2) is met for any `AddNode`.
+    fn signed_add_node_fixture() -> (
+        MembershipState,
+        MembershipUpdateRecord,
+        Vec<MembershipSignature>,
+    ) {
+        let state = base_state();
+        let new_node = active_node("node-b", 12);
+
+        let mut candidate = state.clone();
+        candidate.nodes.push(new_node.clone());
+        candidate.epoch += 1;
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-fixture".to_owned(),
+            operation: MembershipOperation::AddNode(new_node),
+            target: "node-b".to_owned(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: candidate.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 120,
+            expires_at_unix: 600,
+            reason_code: "join".to_owned(),
+            policy_context: None,
+        };
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let guardian_key = SigningKey::from_bytes(&[2; 32]);
+        let signatures = vec![
+            sign_update_record(&record, "owner-1", &owner_key).expect("sign"),
+            sign_update_record(&record, "guardian-1", &guardian_key).expect("sign"),
+        ];
+
+        // Sanity: the fixture must apply cleanly before any test tampers it,
+        // otherwise a negative test could pass for the wrong reason.
+        let signed = SignedMembershipUpdate {
+            record: record.clone(),
+            approver_signatures: signatures.clone(),
+        };
+        apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect("untampered fixture must apply");
+
+        (state, record, signatures)
+    }
+
+    #[test]
+    fn apply_signed_update_rejects_expired_record() {
+        // `now_unix` past `expires_at_unix` fails closed before signature
+        // verification or any state mutation (freshness mandate).
+        let (state, record, signatures) = signed_add_node_fixture();
+        let signed = SignedMembershipUpdate {
+            record: record.clone(),
+            approver_signatures: signatures,
+        };
+        let err = apply_signed_update(
+            &state,
+            &signed,
+            record.expires_at_unix + 1,
+            &mut MembershipReplayCache::default(),
+        )
+        .expect_err("expired update must be rejected");
+        assert_eq!(err, MembershipError::Expired);
+    }
+
+    #[test]
+    fn apply_signed_update_rejects_future_dated_record() {
+        // `created_at_unix` beyond `now + MEMBERSHIP_CLOCK_SKEW_SECS` is a
+        // clock-skew / future-dating violation and must fail closed.
+        let (state, record, signatures) = signed_add_node_fixture();
+        let signed = SignedMembershipUpdate {
+            record: record.clone(),
+            approver_signatures: signatures,
+        };
+        // now is far enough below created_at that even the full skew window
+        // cannot bridge it: created_at(120) > now + 90.
+        let now = record.created_at_unix - MEMBERSHIP_CLOCK_SKEW_SECS - 1;
+        let err = apply_signed_update(&state, &signed, now, &mut MembershipReplayCache::default())
+            .expect_err("future-dated update must be rejected");
+        assert_eq!(err, MembershipError::FutureDated);
+
+        // Boundary: exactly at the edge of the skew window is still accepted.
+        let edge = record.created_at_unix - MEMBERSHIP_CLOCK_SKEW_SECS;
+        apply_signed_update(&state, &signed, edge, &mut MembershipReplayCache::default())
+            .expect("update at the clock-skew boundary must apply");
+    }
+
+    #[test]
+    fn apply_signed_update_rejects_prev_state_root_mismatch() {
+        // The prev-root check anchors the update to the exact state it was
+        // authored against; a mismatch is a rollback/fork attempt. It fires
+        // before signature verification, so stale signatures are irrelevant.
+        let (state, mut record, signatures) = signed_add_node_fixture();
+        record.prev_state_root = "deadbeef".to_owned();
+        let signed = SignedMembershipUpdate {
+            record,
+            approver_signatures: signatures,
+        };
+        let err = apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect_err("prev-root mismatch must be rejected");
+        assert_eq!(err, MembershipError::PrevStateRootMismatch);
+    }
+
+    #[test]
+    fn apply_signed_update_rejects_network_id_mismatch() {
+        // A bundle minted for a different network must never be applied here.
+        let (state, mut record, signatures) = signed_add_node_fixture();
+        record.network_id = "net-other".to_owned();
+        let signed = SignedMembershipUpdate {
+            record,
+            approver_signatures: signatures,
+        };
+        let err = apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect_err("network-id mismatch must be rejected");
+        assert!(
+            matches!(err, MembershipError::InvalidTransition(msg) if msg.contains("network id")),
+            "expected network-id InvalidTransition, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn apply_signed_update_rejects_epoch_chain_break() {
+        // `epoch_prev`/`epoch_new` must line up with `state.epoch` exactly.
+        // The record's own canonical form already enforces
+        // `epoch_new == epoch_prev + 1`, so to exercise the *apply-time* check
+        // we keep that internal invariant but shift the pair off the live
+        // state's epoch (skipping an epoch) — a fork/replay attempt.
+        let (state, mut record, _signatures) = signed_add_node_fixture();
+        record.epoch_prev = state.epoch + 1;
+        record.epoch_new = state.epoch + 2;
+        // Re-sign so the failure is the epoch check, not a signature mismatch.
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let guardian_key = SigningKey::from_bytes(&[2; 32]);
+        let signed = SignedMembershipUpdate {
+            approver_signatures: vec![
+                sign_update_record(&record, "owner-1", &owner_key).expect("sign"),
+                sign_update_record(&record, "guardian-1", &guardian_key).expect("sign"),
+            ],
+            record,
+        };
+        let err = apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect_err("epoch chain break must be rejected");
+        assert!(
+            matches!(err, MembershipError::InvalidTransition(msg) if msg.contains("epoch")),
+            "expected epoch InvalidTransition, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn apply_signed_update_rejects_tampered_signature_bytes() {
+        // Directly corrupt the signature material (not the signed payload):
+        // all-zero, single-bit-flip, and truncated signatures must all fail
+        // closed at verification, never apply.
+        let (state, record, signatures) = signed_add_node_fixture();
+
+        // All-zero 64-byte signature.
+        let mut zeroed = signatures.clone();
+        zeroed[1].signature_hex = "00".repeat(64);
+        let signed = SignedMembershipUpdate {
+            record: record.clone(),
+            approver_signatures: zeroed,
+        };
+        let err = apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect_err("all-zero signature must be rejected");
+        assert_eq!(err, MembershipError::SignatureInvalid);
+
+        // Single-bit flip in the last nibble of a valid signature.
+        let mut flipped = signatures.clone();
+        let original = flipped[1].signature_hex.clone();
+        let (head, last) = original.split_at(original.len() - 1);
+        let last_digit = u8::from_str_radix(last, 16).expect("hex nibble");
+        flipped[1].signature_hex = format!("{head}{:x}", last_digit ^ 0x1);
+        let signed = SignedMembershipUpdate {
+            record: record.clone(),
+            approver_signatures: flipped,
+        };
+        let err = apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect_err("bit-flipped signature must be rejected");
+        assert_eq!(err, MembershipError::SignatureInvalid);
+
+        // Truncated signature (63 bytes): fails the fixed-width hex decode and
+        // must still fail closed (any error is acceptable — never applies).
+        let mut truncated = signatures;
+        truncated[1].signature_hex.truncate(126);
+        let signed = SignedMembershipUpdate {
+            record,
+            approver_signatures: truncated,
+        };
+        assert!(
+            apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+                .is_err(),
+            "truncated signature must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_network_id() {
+        let mut state = base_state();
+        state.network_id = "   ".to_owned();
+        let err = state
+            .validate()
+            .expect_err("empty network id must be rejected");
+        assert!(matches!(err, MembershipError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn validate_rejects_zero_quorum_threshold() {
+        let mut state = base_state();
+        state.quorum_threshold = 0;
+        let err = state
+            .validate()
+            .expect_err("zero quorum threshold must be rejected");
+        assert!(matches!(err, MembershipError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_node_ids() {
+        let mut state = base_state();
+        // Same node_id, distinct key bytes — the collision is on identity.
+        state.nodes.push(active_node("node-a", 11));
+        let err = state
+            .validate()
+            .expect_err("duplicate node id must be rejected");
+        assert!(
+            matches!(err, MembershipError::InvalidFormat(ref msg) if msg.contains("duplicate node id")),
+            "expected duplicate-node-id rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_quorum_exceeding_active_approvers() {
+        let mut state = base_state();
+        // Three active approvers in the base fixture; demand four.
+        state.quorum_threshold = 4;
+        let err = state
+            .validate()
+            .expect_err("quorum above active approver count must be rejected");
+        assert!(
+            matches!(err, MembershipError::InvalidFormat(ref msg) if msg.contains("exceeds active approver count")),
+            "expected quorum-exceeds-approvers rejection, got {err:?}"
+        );
     }
 
     /// Regression: `load_membership_snapshot` and `load_membership_log` must
