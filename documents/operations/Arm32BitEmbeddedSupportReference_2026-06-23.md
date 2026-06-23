@@ -59,8 +59,10 @@ cross-compile attempt confirms this; the current matrix text overstates the seve
 
 Use **`armv7-unknown-linux-gnueabihf`** (hard-float VFPv3).
 
-- **Do not use `arm-unknown-linux-gnueabihf`** — this targets ARMv6 soft-float, which
-  is wrong for Pi Zero 2 W and any Debian armhf board.
+- **Do not use `arm-unknown-linux-gnueabihf`** — this targets the ARMv6 architecture
+  with a hard-float ABI (the `hf` suffix denotes hard-float, not soft-float), but the
+  architecture baseline is ARMv6, which is older than the ARMv7 minimum required by
+  Debian armhf and the Pi Zero 2 W's Cortex-A53.
 - **Do not use `armel`** — Debian `armel` is ARMv4T with soft-float, for very old
   hardware only.
 - **`armv7-unknown-linux-musleabihf`** works if a musl build is desired. All
@@ -184,18 +186,26 @@ is the init system and all features work. The following items depend on systemd:
   systemd 250+ encrypted credentials. Requires systemd 252 (Debian Bookworm ships
   252).
 - **`systemd-creds decrypt`** binary — called by `LinuxSystemdCredsBackend`
-  (`crates/rustynet-control/src/credential_unwrap.rs:138,222`) for membership signing
-  and trust operations. Fails closed with an explicit error if the binary is absent.
+  (`crates/rustynet-control/src/credential_unwrap.rs:150`; the binary path constant
+  `LINUX_SYSTEMD_CREDS_BIN` is at line 138, the struct at line 150, the runtime
+  path-check at line 222) for membership signing and trust operations. Fails closed
+  with an explicit error if the binary is absent.
 - **`AmbientCapabilities`**, `ProtectSystem=strict`, `NoNewPrivileges` — systemd
   sandboxing directives in the service files. Not replicable without systemd.
 - **`RuntimeDirectory=rustynet`**, `StateDirectory=rustynet` — systemd-managed
   directory creation.
 
 **For non-systemd embedded images (OpenRC, SysV init):**
-The daemon can run with a plaintext key bypass. Set `RUSTYNET_WG_KEY_PASSPHRASE`
-to point at a plaintext passphrase file, or provision the runtime key directly at
-`/run/rustynet/wireguard.key`. The daemon checks this path before attempting the
-`systemd-creds` path. Create runtime directories manually in a pre-start script.
+The daemon can run without encrypted key storage (plaintext key fallback). Set
+`RUSTYNET_WG_PRIVATE_KEY` to the path of the plaintext WireGuard private key file
+(the service file default is `/run/rustynet/wireguard.key`). The encrypted key path
+(`RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY`) and its passphrase (`RUSTYNET_WG_KEY_PASSPHRASE`)
+can be left unset or pointing at absent files — the daemon uses the plaintext key
+path directly in that case. Create runtime directories manually in a pre-start script.
+
+Note: `RUSTYNET_WG_KEY_PASSPHRASE` is the path to the passphrase used to decrypt
+the encrypted key at rest; it is unrelated to the plaintext key path.
+
 The security sandboxing (protect-system, no-new-privileges, capability bounding set)
 will be absent — document this as an accepted degradation for the specific deployment.
 
@@ -237,8 +247,9 @@ CONFIG_NFT_REDIR=m         # DNS protected-mode redirect (available since kernel
 CONFIG_NFT_NAT=m
 ```
 
-Minimum kernel version for all features: **Linux 4.3**. Debian Bookworm armhf
-ships kernel 6.1 (LTS). All requirements are satisfied.
+Minimum kernel version for all features: **Linux 4.3**. Upstream Debian Bookworm
+armhf ships kernel 6.1 LTS (`linux-image-armmp`). Raspberry Pi OS Bookworm ships
+kernel 6.6.x LTS (see §8). All requirements are satisfied on both.
 
 ---
 
@@ -366,13 +377,14 @@ patterns at 1–3 peers:
 
 | Write source | Frequency | Per-write size |
 |---|---|---|
-| Gossip watermark | Once per 30s per active peer | ~100 bytes |
+| Gossip watermark | Once per 30s (local mint) + once per accepted inbound bundle | ~100 bytes |
 | Daemon state file | Only on actual state changes | ~1–10 KB |
 | Session snapshot | Only on state changes | < 1 KB |
 | Log file (`rustynetd.log`) | Continuously (unbounded) | Line by line |
 
-At 3 peers, gossip watermarks produce approximately 6 writes/minute or ~8,640
-writes/day — well within the endurance of any modern SD card (TBW >> 10 GB),
+At 3 peers, gossip watermarks produce approximately 2 writes/minute from local
+mints plus up to 6 writes/minute from inbound bundles — well within the endurance
+of any modern SD card (TBW >> 10 GB),
 but meaningful over years of continuous operation.
 
 **Mitigations:**
@@ -453,8 +465,7 @@ Bookworm):
 ```sh
 # /etc/default/rustynet-relay
 RUSTYNET_RELAY_MAX_TOTAL_SESSIONS=32
-RUSTYNET_RELAY_PORT_RANGE_START=40000
-RUSTYNET_RELAY_PORT_RANGE_END=40031
+RUSTYNET_RELAY_PORT_RANGE=40000-40031
 MALLOC_TRIM_THRESHOLD_=131072
 MALLOC_MMAP_THRESHOLD_=131072
 ```
@@ -559,7 +570,7 @@ rely on USB serial console as the primary access path on a live relay node.
 
 ---
 
-## 19. CI Requirements Before Claiming 32-bit ARM Support
+## 18. CI Requirements Before Claiming 32-bit ARM Support
 
 Per `PlatformSupportMatrix.md` and `Requirements.md`, 32-bit ARM support is a
 finished-product requirement and must be gate-verified before being called supported.
@@ -581,7 +592,7 @@ mandate. Do not pick it up until that mandate is complete.
 
 ---
 
-## 20. WireGuard Interface MTU Not Set Automatically
+## 19. WireGuard Interface MTU Not Set Automatically
 
 **Rating: CONCERN**
 
@@ -620,7 +631,7 @@ general gap in the backend code that matters everywhere fragmentation is a conce
 
 ---
 
-## 21. WiFi Reconnection: Relay Socket Is Not Re-bound
+## 20. WiFi Reconnection: Relay Socket Is Not Re-bound
 
 **Rating: CONCERN**
 
@@ -656,7 +667,7 @@ a NetworkManager dispatcher script instead.
 
 ---
 
-## 22. dhcpcd Overwrites DNS Configuration
+## 21. dhcpcd Overwrites DNS Configuration
 
 **Rating: CONCERN**
 
@@ -664,12 +675,18 @@ Raspberry Pi OS Bookworm uses **dhcpcd** as its DHCP client, not NetworkManager.
 Rustynet's DNS fail-closed mode writes two files to protect DNS:
 
 1. `/etc/resolv.conf` — rewritten to point at `127.0.0.1` (the daemon's loopback
-   resolver, `crates/rustynetd/src/linux_dns_protect.rs:73`).
+   resolver). The path constant is at `crates/rustynetd/src/linux_dns_protect.rs:73`
+   (`RESOLV_CONF_PATH`); the actual write occurs at line 266 inside
+   `apply_dns_failclosed_file()`.
 2. `/etc/NetworkManager/conf.d/rustynet-dns-failclosed.conf` — written to prevent NM
-   from overwriting resolv.conf (`linux_dns_protect.rs:78`).
+   from overwriting resolv.conf (path constant `NETWORK_MANAGER_DNS_DROPIN_PATH` at
+   `linux_dns_protect.rs:78`).
 
-On a Pi OS system with dhcpcd, file (2) is silently ignored — NetworkManager is not
-installed. File (1) will be **overwritten by dhcpcd** on every DHCP lease renewal or
+On a Pi OS system with dhcpcd, file (2) is **not written** — the helper's
+`write_network_manager_dropin()` function checks for the `/etc/NetworkManager`
+directory and actively refuses to create the dropin when NetworkManager is not
+installed. This is the correct behaviour, but it means only file (1) is active.
+File (1) will be **overwritten by dhcpcd** on every DHCP lease renewal or
 WiFi reconnect, reverting DNS to the DHCP-provided nameserver and silently breaking
 Rustynet DNS fail-closed protection.
 
@@ -702,7 +719,7 @@ Pi-specific.
 
 ---
 
-## 23. NTP Step Corrections and Gossip Freshness Window
+## 22. NTP Step Corrections and Gossip Freshness Window
 
 **Rating: CONCERN**
 
@@ -710,14 +727,18 @@ This extends the NTP dependency documented in §17. The concern there is whether
 the daemon starts before NTP syncs. This section addresses what happens when NTP
 performs a large step correction *while the daemon is running*.
 
-Gossip bundle freshness checks (`crates/rustynetd/src/peer_gossip.rs:258`) use
-`SystemTime::now()` (wall clock). If NTP steps the clock forward by more than
-the freshness window, all currently-held gossip bundles appear stale and are
-discarded, forcing a full gossip re-sync. If NTP steps the clock backward by the
-same amount, locally-generated bundles are rejected by peers as "from the future."
+Gossip bundle freshness checks use `SystemTime::now()` (wall clock). The
+`current_unix_seconds()` helper at `crates/rustynetd/src/peer_gossip.rs:257-261`
+derives the current wall-clock time and is used for both minting bundles and
+as input to the freshness validation at `accept_bundle_with_now()` (lines
+490-497). If NTP steps the clock forward by more than the freshness window, all
+currently-held gossip bundles appear stale and are discarded, forcing a full gossip
+re-sync. If NTP steps the clock backward by the same amount, locally-generated
+bundles are rejected by peers as "from the future."
 
-The guard at `peer_gossip.rs:186` handles the extreme case of `SystemTime` being
-before the Unix epoch, but not moderate steps.
+The `current_unix_seconds()` function returns `Err(TimestampUnavailable)` (variant
+display at line 186) when `SystemTime` is before the Unix epoch, but this extreme
+guard does not cover moderate NTP step corrections.
 
 On a Pi Zero 2 W with no RTC, NTP corrections after boot are typically large
 (minutes to hours) if the board has been offline. After a correction the daemon
@@ -738,7 +759,7 @@ recovers within one gossip cycle, but during that window gossip-dependent featur
 
 ---
 
-## 24. UDP Socket Buffer Sizes
+## 23. UDP Socket Buffer Sizes
 
 **Rating: CONCERN**
 
@@ -772,7 +793,7 @@ increase alone raises the default for all new sockets.
 
 ---
 
-## 25. OOM Killer Protection
+## 24. OOM Killer Protection
 
 **Rating: ADVISORY**
 
@@ -801,7 +822,7 @@ fully preventing OOM killing in extreme scenarios.
 
 ---
 
-## 26. Watchdog and Unattended Supervision
+## 25. Watchdog and Unattended Supervision
 
 **Rating: ADVISORY**
 
@@ -848,7 +869,7 @@ interface not yet up).
 
 ---
 
-## 27. Binary Size Optimisation
+## 26. Binary Size Optimisation
 
 **Rating: ADVISORY**
 
@@ -888,7 +909,7 @@ made as a general improvement, not gated on ARM support.
 
 ---
 
-## 28. Confirmed Safe on 32-bit ARM (Third Pass)
+## 27. Confirmed Safe on 32-bit ARM (Third Pass)
 
 The following areas were investigated and found to need no action:
 
@@ -905,7 +926,7 @@ The following areas were investigated and found to need no action:
 
 ---
 
-## 29. Known Open Items (At Time of Writing)
+## 28. Known Open Items (At Time of Writing)
 
 | Item | Severity | Notes |
 |---|---|---|
