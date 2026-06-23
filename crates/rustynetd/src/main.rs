@@ -259,6 +259,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "macos-exit-nat-lifecycle-snapshot" => {
                 run_macos_exit_nat_lifecycle_snapshot_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "macos-ipv6-leak-capture" => {
+                run_macos_ipv6_leak_capture_command(rest)
+            }
             _ => Err(help_text()),
         },
     }
@@ -1581,6 +1584,59 @@ fn run_linux_ipv6_leak_capture_command(args: &[String]) -> Result<(), String> {
         "{}",
         serde_json::to_string_pretty(&snapshot)
             .map_err(|err| { format!("serialize linux-ipv6-leak snapshot failed: {err}") })?
+    );
+    Ok(())
+}
+
+fn run_macos_ipv6_leak_capture_command(args: &[String]) -> Result<(), String> {
+    let mut egress_iface: Option<String> = None;
+    let mut probe_target: Option<String> = None;
+    let mut pf_anchor: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--egress-iface") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "macos-ipv6-leak-capture: --egress-iface requires a value".to_owned()
+                })?;
+                egress_iface = Some(value.clone());
+                index += 2;
+            }
+            Some("--probe-target") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "macos-ipv6-leak-capture: --probe-target requires a value".to_owned()
+                })?;
+                probe_target = Some(value.clone());
+                index += 2;
+            }
+            Some("--pf-anchor") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "macos-ipv6-leak-capture: --pf-anchor requires a value".to_owned()
+                })?;
+                pf_anchor = Some(value.clone());
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!("unknown macos-ipv6-leak-capture argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let egress_iface = egress_iface
+        .ok_or_else(|| "macos-ipv6-leak-capture: --egress-iface is required".to_owned())?;
+    let options = rustynetd::macos_ipv6_leak::MacosIpv6LeakOptions {
+        egress_iface,
+        probe_target: probe_target
+            .unwrap_or_else(|| rustynetd::macos_ipv6_leak::DEFAULT_IPV6_PROBE_TARGET.to_owned()),
+        pf_anchor: pf_anchor.unwrap_or_else(|| {
+            rustynetd::macos_ipv6_leak::DEFAULT_MACOS_KILLSWITCH_ANCHOR.to_owned()
+        }),
+    };
+    let snapshot = rustynetd::macos_ipv6_leak::collect_macos_ipv6_leak_snapshot(&options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&snapshot)
+            .map_err(|err| { format!("serialize macos-ipv6-leak snapshot failed: {err}") })?
     );
     Ok(())
 }
@@ -3598,6 +3654,7 @@ fn help_text() -> String {
         "  rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]",
         "  rustynetd linux-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--killswitch-table <name>]",
         "  rustynetd privileged-helper-allowlist-audit",
+        "  rustynetd macos-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--pf-anchor <name>]",
         "  rustynetd macos-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>]",
         "  rustynetd macos-exit-killswitch-precedence-check --output <path> [--pf-anchor <name>]",
         "  rustynetd windows-service-hardening-check [--no-fail-on-drift]",
@@ -3690,7 +3747,7 @@ mod tests {
         classify_top_level_error, help_text, parse_daemon_config,
         run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
         run_macos_exit_dns_failclosed_capture_command,
-        run_macos_exit_killswitch_precedence_check_command,
+        run_macos_exit_killswitch_precedence_check_command, run_macos_ipv6_leak_capture_command,
         run_privileged_helper_allowlist_audit_command, run_windows_authenticode_check_command,
         run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
         run_windows_exit_nat_lifecycle_snapshot_command, run_windows_key_custody_check_command,
@@ -4113,6 +4170,38 @@ mod tests {
         // command exits Ok on a healthy binary.
         run_privileged_helper_allowlist_audit_command(&[])
             .expect("privileged-helper allowlist audit must pass on the reviewed allowlist");
+    }
+
+    #[test]
+    fn help_text_advertises_macos_ipv6_leak_capture_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("macos-ipv6-leak-capture"),
+            "help text must advertise macos-ipv6-leak-capture subcommand"
+        );
+    }
+
+    #[test]
+    fn run_macos_ipv6_leak_capture_command_rejects_unknown_flags() {
+        let err = run_macos_ipv6_leak_capture_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown macos-ipv6-leak-capture argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_macos_ipv6_leak_capture_command_requires_egress_iface() {
+        let err = run_macos_ipv6_leak_capture_command(&[
+            "--probe-target".to_owned(),
+            "2606:4700:4700::1111".to_owned(),
+        ])
+        .expect_err("missing egress iface must reject");
+        assert!(
+            err.contains("--egress-iface is required"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
