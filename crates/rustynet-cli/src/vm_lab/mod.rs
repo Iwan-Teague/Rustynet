@@ -14534,8 +14534,14 @@ fn evaluate_linux_exit_demotion_residue_artifact(
                 .to_owned(),
         );
     }
+    if !require_json_bool(after, "ipv6_forwarding_restored")? {
+        return Err(
+            "linux exit demotion residue artifact did not prove IPv6 forwarding (net.ipv6.conf.all.forwarding) was restored after demotion: residual IPv6 exit forwarding"
+                .to_owned(),
+        );
+    }
     Ok(format!(
-        "Linux exit→client demotion residue verified on {linux_alias}: NAT torn down + forwarding restored with the daemon still running"
+        "Linux exit→client demotion residue verified on {linux_alias}: NAT torn down + IPv4/IPv6 forwarding restored with the daemon still running"
     ))
 }
 
@@ -14580,6 +14586,12 @@ fn evaluate_linux_ipv6_leak_artifact(linux_alias: &str, raw_json: &str) -> Resul
         )
     })?;
 
+    if !require_json_bool(&report, "probe_attempted")? {
+        return Err(
+            "linux IPv6 leak artifact reports the active probe/capture never executed (tcpdump/`ping -6` missing); a never-run probe must not count as fail-closed — inconclusive, failing closed"
+                .to_owned(),
+        );
+    }
     let leaked = require_json_u64(&report, "leaked_datagram_count")?;
     if leaked > 0 {
         return Err(format!(
@@ -14640,6 +14652,12 @@ fn evaluate_macos_ipv6_leak_artifact(macos_alias: &str, raw_json: &str) -> Resul
             "macOS IPv6 leak artifact probe_target {probe_target:?} is not a valid IPv6 address"
         )
     })?;
+    if !require_json_bool(&report, "probe_attempted")? {
+        return Err(
+            "macOS IPv6 leak artifact reports the active probe/capture never executed (tcpdump/ping6 missing); a never-run probe must not count as fail-closed — inconclusive, failing closed"
+                .to_owned(),
+        );
+    }
     let leaked = require_json_u64(&report, "leaked_datagram_count")?;
     if leaked > 0 {
         return Err(format!(
@@ -34951,6 +34969,18 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_ipv6_forwarding_residue() {
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["after_demote"]["ipv6_forwarding_restored"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("residual IPv6 forwarding after demotion must fail closed");
+        assert!(err.contains("IPv6 forwarding"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn evaluate_linux_exit_demotion_residue_rejects_vacuous_during_run() {
         // Anti-vacuous: must prove it was serving exit before demotion.
         let mut payload = reviewed_linux_exit_demotion_residue_artifact();
@@ -35004,8 +35034,26 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "ipv6_disabled": true,
             "killswitch_v6_drop_present": false,
             "leaked_datagram_count": 0,
-            "probe_reached_target": false
+            "probe_reached_target": false,
+            "probe_attempted": true
         })
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_rejects_unattempted_probe() {
+        // A never-run probe (missing tcpdump/ping -6) must NOT count as a clean
+        // fail-closed result — the active probe is load-bearing.
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["probe_attempted"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a never-run probe must fail closed as inconclusive");
+        assert!(
+            err.contains("never executed") && err.contains("inconclusive"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -35115,6 +35163,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "",
             "reading from file /tmp/x.pcap\n0 packets captured\n",
             false,
+            true,
         );
         let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
         let summary = super::evaluate_linux_ipv6_leak_artifact("debian-headless-1", raw.as_str())
@@ -35138,6 +35187,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "table ip rustynet_g1 {\n chain killswitch {\n  policy drop;\n  ip saddr 100.64.0.0/16 accept\n }\n}\n",
             "12:00:00 IP6 2001:db8::1 > 2606:4700:4700::1111: ICMP6, echo request\n",
             true,
+            true,
         );
         let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
         let err = super::evaluate_linux_ipv6_leak_artifact("debian-headless-1", raw.as_str())
@@ -35153,8 +35203,22 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "pf_anchor": "com.apple/rustynet_g1",
             "killswitch_v6_block_present": true,
             "leaked_datagram_count": 0,
-            "probe_reached_target": false
+            "probe_reached_target": false,
+            "probe_attempted": true
         })
+    }
+
+    #[test]
+    fn evaluate_macos_ipv6_leak_artifact_rejects_unattempted_probe() {
+        let mut payload = reviewed_macos_ipv6_leak_artifact();
+        payload["probe_attempted"] = serde_json::Value::Bool(false);
+        let err =
+            super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", payload.to_string().as_str())
+                .expect_err("a never-run probe must fail closed as inconclusive");
+        assert!(
+            err.contains("never executed") && err.contains("inconclusive"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -35219,6 +35283,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "pass out quick on rustynet0 all keep state\nblock drop out quick all\n",
             "reading from file /tmp/x.pcap\n0 packets captured\n",
             false,
+            true,
         );
         let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
         let summary = super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", raw.as_str())
@@ -35230,21 +35295,32 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
-    fn macos_ipv6_leak_producer_to_validator_round_trip_detects_inet_only_leak() {
+    fn macos_ipv6_leak_producer_to_validator_round_trip_inet_only_no_containment() {
         // An inet-only pf block (IPv4-only killswitch) does not contain v6.
+        // Hold the datagram-count and probe-reached branches CLEAN (0 / false)
+        // so the producer snapshot exercises the pf-containment-absent branch
+        // (killswitch_v6_block_present=false) end-to-end, not the leak branch.
         let snapshot = rustynetd::macos_ipv6_leak::build_macos_ipv6_leak_snapshot(
             1,
             "en0",
             "2606:4700:4700::1111",
             "com.apple/rustynet_g1",
             "block drop out quick inet from any to any\n",
-            "12:00:00 IP6 2001:db8::1 > 2606:4700:4700::1111: ICMP6, echo request\n",
+            "reading from file /tmp/x.pcap\n0 packets captured\n",
+            false,
             true,
+        );
+        assert!(
+            !snapshot.killswitch_v6_block_present,
+            "inet-only pf block must not be credited as v6 containment"
         );
         let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
         let err = super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", raw.as_str())
-            .expect_err("an inet-only killswitch that leaks v6 must fail closed");
-        assert!(err.contains("cleartext IPv6 datagram"), "unexpected: {err}");
+            .expect_err("an inet-only killswitch (no v6 containment) must fail closed");
+        assert!(
+            err.contains("no pf IPv6 containment rule"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

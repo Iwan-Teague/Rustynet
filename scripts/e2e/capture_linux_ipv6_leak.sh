@@ -53,6 +53,10 @@ if ! command -v tcpdump >/dev/null 2>&1; then
     printf 'tcpdump not found on PATH; IPv6 leak capture requires tcpdump\n' >&2
     exit 1
 fi
+if ! command -v ping >/dev/null 2>&1; then
+    printf 'ping not found on PATH; IPv6 leak capture requires ping -6 for the active probe\n' >&2
+    exit 1
+fi
 
 # Auto-detect the default egress interface when not pinned explicitly.
 if [[ -z "$EGRESS_IFACE" ]]; then

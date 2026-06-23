@@ -52,6 +52,10 @@ if ! command -v /usr/sbin/tcpdump >/dev/null 2>&1; then
     printf 'tcpdump not found at /usr/sbin/tcpdump; macOS IPv6 leak capture requires it\n' >&2
     exit 1
 fi
+if ! command -v /sbin/ping6 >/dev/null 2>&1; then
+    printf 'ping6 not found at /sbin/ping6; macOS IPv6 leak capture requires it for the active probe\n' >&2
+    exit 1
+fi
 
 # Auto-detect the default IPv4 egress interface when not pinned explicitly.
 if [[ -z "$EGRESS_IFACE" ]]; then

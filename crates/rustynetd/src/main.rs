@@ -1642,10 +1642,22 @@ fn run_macos_ipv6_leak_capture_command(args: &[String]) -> Result<(), String> {
 }
 
 fn run_privileged_helper_allowlist_audit_command(args: &[String]) -> Result<(), String> {
-    if let Some(flag) = args.first() {
-        return Err(format!(
-            "unknown privileged-helper-allowlist-audit argument: {flag}"
-        ));
+    // Accept (and ignore) `--no-fail-on-drift` for argv parity with the other
+    // `*-check` daemon subcommands: the orchestrator's
+    // `build_linux_daemon_check_invocation` unconditionally appends it. The
+    // audit already fails closed on its own (non-zero exit when !overall_ok),
+    // so the flag is a no-op here. Any other argument is rejected.
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!(
+                    "unknown privileged-helper-allowlist-audit argument: {flag}"
+                ));
+            }
+            None => break,
+        }
     }
     let report =
         rustynetd::privileged_helper_allowlist_audit::run_privileged_helper_allowlist_audit();
@@ -4170,6 +4182,15 @@ mod tests {
         // command exits Ok on a healthy binary.
         run_privileged_helper_allowlist_audit_command(&[])
             .expect("privileged-helper allowlist audit must pass on the reviewed allowlist");
+    }
+
+    #[test]
+    fn run_privileged_helper_allowlist_audit_command_accepts_no_fail_on_drift() {
+        // The orchestrator's build_linux_daemon_check_invocation ALWAYS appends
+        // --no-fail-on-drift; the live stage is dead-on-arrival if the handler
+        // rejects it. This pins the exact remote argv.
+        run_privileged_helper_allowlist_audit_command(&["--no-fail-on-drift".to_owned()])
+            .expect("the audit subcommand must accept --no-fail-on-drift for argv parity");
     }
 
     #[test]
