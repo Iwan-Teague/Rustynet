@@ -14799,6 +14799,58 @@ fn evaluate_membership_signature_audit_report(
     ))
 }
 
+/// Pure evaluator for the JSON output of `rustynetd policy-default-deny-audit`.
+/// The daemon-side audit drives the REAL `rustynet_policy` evaluator with a
+/// default-deny truth table (`SecurityMinimumBar.md` §3.6). Fail-closed:
+///   - empty corpus, or no ALLOW case passed (the vacuous deny-all pass),
+///   - any case whose decision did not match expectation.
+fn evaluate_policy_default_deny_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::policy_default_deny_audit::PolicyDefaultDenyAuditReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse policy-default-deny-audit JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "policy-default-deny-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases == 0 {
+        return Err(
+            "policy-default-deny-audit returned an empty corpus; the truth table is missing"
+                .to_owned(),
+        );
+    }
+    if report.allow_cases_passed == 0 {
+        return Err(
+            "policy-default-deny-audit passed no ALLOW case; the audit is vacuous (a broken deny-all evaluator would pass) and proves nothing"
+                .to_owned(),
+        );
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| format!("{} (expected {}, got {})", v.id, v.expected, v.actual))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "policy default-deny truth table drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Policy default-deny truth table verified on {linux_alias}: {} deny + {} allow cases held",
+        report.deny_cases_passed, report.allow_cases_passed
+    ))
+}
+
 /// macOS DNS fail-closed artefact-directory validator. Parallel to the
 /// Windows variant. Required files in the artefact directory:
 ///
@@ -16493,6 +16545,26 @@ fn run_validate_linux_membership_signature_forgery_stage(
         .map_err(|reason| (reason, raw))
 }
 
+fn run_validate_linux_policy_default_deny_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "policy-default-deny-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_policy_default_deny_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
 /// Build the `--state-path / --expected-peer-id / --max-age-seconds`
 /// extras for the mesh-status subcommand from a `MeshStatusOverrides`
 /// struct. Centralizes the override-to-argv mapping so callers don't
@@ -16672,6 +16744,7 @@ fn run_linux_orchestration_stages_with_options(
         logs_dir.join("validate_linux_privileged_helper_allowlist.log");
     let membership_signature_forgery_log_path =
         logs_dir.join("validate_linux_membership_signature_forgery.log");
+    let policy_default_deny_log_path = logs_dir.join("validate_linux_policy_default_deny.log");
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
     let exit_nat_lifecycle_log_path = logs_dir.join("validate_linux_exit_nat_lifecycle.log");
@@ -16805,6 +16878,19 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_membership_signature_forgery",
             membership_signature_forgery_log_path.as_path(),
             run_validate_linux_membership_signature_forgery_stage,
+        )
+    };
+
+    let policy_default_deny_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_policy_default_deny",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_policy_default_deny",
+            policy_default_deny_log_path.as_path(),
+            run_validate_linux_policy_default_deny_stage,
         )
     };
 
@@ -17317,6 +17403,7 @@ fn run_linux_orchestration_stages_with_options(
         authenticode_outcome,
         privileged_helper_allowlist_outcome,
         membership_signature_forgery_outcome,
+        policy_default_deny_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
         exit_ipv6_leak_outcome,
@@ -35538,6 +35625,58 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn policy_default_deny_audit_producer_to_validator_round_trip_passes() {
+        let report = rustynetd::policy_default_deny_audit::run_policy_default_deny_audit();
+        assert!(
+            report.overall_ok,
+            "reviewed evaluator must pass: {report:?}"
+        );
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary = super::evaluate_policy_default_deny_report("debian-headless-1", raw.as_str())
+            .expect("clean default-deny audit must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("allow cases held"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_policy_default_deny_report_rejects_violation() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 9,
+            "allow_cases_passed": 2,
+            "deny_cases_passed": 6,
+            "violations": [
+                {"id": "empty_policy_denies_blind", "expected": "deny", "actual": "allow", "passed": false}
+            ]
+        }"#;
+        let err = super::evaluate_policy_default_deny_report("debian-headless-1", raw)
+            .expect_err("a default-deny violation must fail closed");
+        assert!(
+            err.contains("truth table drift") && err.contains("empty_policy_denies_blind"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_policy_default_deny_report_rejects_vacuous_no_allow() {
+        // No ALLOW case passed => a broken deny-all evaluator would also pass.
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 9,
+            "allow_cases_passed": 0,
+            "deny_cases_passed": 9,
+            "violations": []
+        }"#;
+        let err = super::evaluate_policy_default_deny_report("debian-headless-1", raw)
+            .expect_err("a vacuous deny-all audit must fail closed");
+        assert!(err.contains("vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn evaluate_membership_signature_audit_report_rejects_thin_battery() {
         let raw = r#"{
             "schema_version": 1,
@@ -38298,6 +38437,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_authenticode",
             "validate_linux_privileged_helper_allowlist",
             "validate_linux_membership_signature_forgery",
+            "validate_linux_policy_default_deny",
             "validate_linux_dns_failclosed",
             "validate_linux_exit_nat_lifecycle",
             "validate_linux_ipv6_leak",
@@ -38439,6 +38579,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_authenticode",
                 "validate_linux_privileged_helper_allowlist",
                 "validate_linux_membership_signature_forgery",
+                "validate_linux_policy_default_deny",
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",
                 "validate_linux_ipv6_leak",

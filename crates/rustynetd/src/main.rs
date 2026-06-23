@@ -161,6 +161,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "membership-signature-audit" => {
                 run_membership_signature_audit_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "policy-default-deny-audit" => {
+                run_policy_default_deny_audit_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "key" => run_key_command(rest),
             [cmd, rest @ ..] if cmd == "membership" => run_membership_command(rest),
             [cmd, rest @ ..] if cmd == "windows-runtime-boundary-check" => {
@@ -1704,6 +1707,35 @@ fn run_membership_signature_audit_command(args: &[String]) -> Result<(), String>
     if !report.overall_ok {
         return Err(format!(
             "membership signature audit failed: {} violation(s) — the signed-membership verify funnel accepted a forgery or rejected the valid baseline",
+            report.violations.len()
+        ));
+    }
+    Ok(())
+}
+
+fn run_policy_default_deny_audit_command(args: &[String]) -> Result<(), String> {
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!(
+                    "unknown policy-default-deny-audit argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = rustynetd::policy_default_deny_audit::run_policy_default_deny_audit();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|err| {
+            format!("serialize policy-default-deny-audit report failed: {err}")
+        })?
+    );
+    if !report.overall_ok {
+        return Err(format!(
+            "policy default-deny audit failed: {} violation(s) — the ACL evaluator's default-deny truth table regressed",
             report.violations.len()
         ));
     }
@@ -3700,6 +3732,7 @@ fn help_text() -> String {
         "  rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]",
         "  rustynetd linux-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--killswitch-table <name>]",
         "  rustynetd membership-signature-audit",
+        "  rustynetd policy-default-deny-audit",
         "  rustynetd privileged-helper-allowlist-audit",
         "  rustynetd macos-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--pf-anchor <name>]",
         "  rustynetd macos-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>]",
@@ -3795,13 +3828,13 @@ mod tests {
         run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
         run_macos_exit_dns_failclosed_capture_command,
         run_macos_exit_killswitch_precedence_check_command, run_macos_ipv6_leak_capture_command,
-        run_membership_signature_audit_command, run_privileged_helper_allowlist_audit_command,
-        run_windows_authenticode_check_command, run_windows_backend_readiness_check_command,
-        run_windows_dns_failclosed_check_command, run_windows_exit_nat_lifecycle_snapshot_command,
-        run_windows_key_custody_check_command, run_windows_killswitch_assert_command,
-        run_windows_mesh_status_check_command, run_windows_named_pipe_acls_check_command,
-        run_windows_registry_acls_check_command, run_windows_runtime_acls_check_command,
-        run_windows_service_hardening_check_command,
+        run_membership_signature_audit_command, run_policy_default_deny_audit_command,
+        run_privileged_helper_allowlist_audit_command, run_windows_authenticode_check_command,
+        run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
+        run_windows_exit_nat_lifecycle_snapshot_command, run_windows_key_custody_check_command,
+        run_windows_killswitch_assert_command, run_windows_mesh_status_check_command,
+        run_windows_named_pipe_acls_check_command, run_windows_registry_acls_check_command,
+        run_windows_runtime_acls_check_command, run_windows_service_hardening_check_command,
     };
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
@@ -4218,6 +4251,26 @@ mod tests {
         // command exits Ok on a healthy binary.
         run_privileged_helper_allowlist_audit_command(&[])
             .expect("privileged-helper allowlist audit must pass on the reviewed allowlist");
+    }
+
+    #[test]
+    fn help_text_advertises_policy_default_deny_audit_subcommand() {
+        assert!(
+            help_text().contains("policy-default-deny-audit"),
+            "help text must advertise policy-default-deny-audit subcommand"
+        );
+    }
+
+    #[test]
+    fn run_policy_default_deny_audit_command_passes_on_reviewed_evaluator() {
+        run_policy_default_deny_audit_command(&[])
+            .expect("policy default-deny audit must pass against the real evaluator");
+    }
+
+    #[test]
+    fn run_policy_default_deny_audit_command_accepts_no_fail_on_drift() {
+        run_policy_default_deny_audit_command(&["--no-fail-on-drift".to_owned()])
+            .expect("must accept --no-fail-on-drift for argv parity");
     }
 
     #[test]

@@ -50,6 +50,7 @@ pub mod membership_signature_audit;
 pub mod perf;
 pub mod phase10;
 pub mod platform;
+pub mod policy_default_deny_audit;
 pub mod port_mapper;
 pub mod privileged_helper;
 pub mod privileged_helper_allowlist_audit;
