@@ -19736,7 +19736,7 @@ mod tests {
         render_launchd_plist, required_macos_tunnel_keychain_account,
         required_macos_tunnel_keychain_service, rewrite_assignment_refresh_exit_node,
         rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
-        validate_control_socket_security, write_json_pretty_file,
+        update_node_role_macos_plist, validate_control_socket_security, write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
@@ -24101,5 +24101,88 @@ mod tests {
                 "unexpected key `{key}` in audit replay — must be deliberately added to the reviewed allowlist"
             );
         }
+    }
+
+    // ----- macOS role-set plist I/O wrapper (fail-closed verification) -----
+
+    const MACOS_DAEMON_PLIST_WITH_ROLE: &str = r#"<plist version="1.0">
+<dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/rustynetd</string>
+    <string>daemon</string>
+    <string>--node-role</string>
+    <string>client</string>
+    <string>--backend</string>
+    <string>macos-wireguard-userspace-shared</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUSTYNET_NODE_ROLE</key>
+    <string>client</string>
+  </dict>
+</dict>
+</plist>
+"#;
+
+    #[test]
+    fn update_node_role_macos_plist_rewrites_in_place_and_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plist = dir.path().join("com.rustynet.daemon.plist");
+        std::fs::write(&plist, MACOS_DAEMON_PLIST_WITH_ROLE).expect("write plist");
+        update_node_role_macos_plist(&plist, "admin").expect("rewrite should succeed");
+        let out = std::fs::read_to_string(&plist).expect("read back");
+        assert!(
+            out.contains("<string>--node-role</string>\n    <string>admin</string>"),
+            "ProgramArguments --node-role must become admin: {out}"
+        );
+        assert!(
+            out.contains("<key>RUSTYNET_NODE_ROLE</key>\n    <string>admin</string>"),
+            "env entry must be kept in sync: {out}"
+        );
+        assert!(
+            !out.contains("<string>client</string>"),
+            "no stale client role: {out}"
+        );
+        // Atomic write left no temp behind.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.contains("role-update.tmp"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "atomic rename must leave no temp: {strays:?}"
+        );
+    }
+
+    #[test]
+    fn update_node_role_macos_plist_fails_closed_without_node_role_pair() {
+        // A plist whose ProgramArguments has NO --node-role pair: the wrapper
+        // must Err rather than persist a role the daemon will never read, and
+        // must not mutate the file or leave a temp (CLAUDE.md §4 fail-closed).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plist = dir.path().join("com.rustynet.daemon.plist");
+        let body = "<plist version=\"1.0\">\n<dict>\n  <key>ProgramArguments</key>\n  <array>\n    <string>/usr/local/bin/rustynetd</string>\n    <string>daemon</string>\n    <string>--backend</string>\n    <string>macos-wireguard-userspace-shared</string>\n  </array>\n</dict>\n</plist>\n";
+        std::fs::write(&plist, body).expect("write plist");
+        let err = update_node_role_macos_plist(&plist, "admin").expect_err("must fail closed");
+        assert!(
+            err.contains("--node-role"),
+            "error must name the missing pair: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&plist).unwrap(),
+            body,
+            "the plist must be left unchanged on fail-closed"
+        );
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.contains("role-update.tmp"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "fail-closed must not leave a temp: {strays:?}"
+        );
     }
 }
