@@ -275,9 +275,21 @@ peer extraction + header skipping, and short-first-field safety (the `[..8]`
 byte-prefix slice). The parser's heuristic/positional field mapping is pinned
 as preserved behavior.
 
+Status 2026-06-23 (parse/IO split batch 5): split `parse_proc_net_tcp_states`
+(`/proc/net/tcp` TCP-state tally: 01 established / 0A listening / 06 time-wait)
+with 2 golden-fixture tests (now 27 total) — multi-state tally with
+unknown-state + short-line skipping, and empty/header-only safety.
+
+**Net P1.1 sysinfo progress: the crate went from 0 tests → 27**, with 9 pure
+parsers split from IO (`ss`, `/proc/net/dev`, `/proc/loadavg`, `/proc/meminfo`,
+`/proc/cpuinfo`, `/proc/uptime`, `ip addr`, `ip route`, `wg show`,
+`/proc/net/tcp`) plus the two analysis fns, and **2 real bugs fixed** (the
+perf-regression dead branch + the `/proc/net/dev` index-OOB panic). Crate is
+fully clippy-clean throughout.
+
 Remaining for P1.1: more IO-fused parsers still to split (`getfacl`, `sysctl`,
-`df`, `systemctl`/`launchctl` service status, and the macOS/Windows variants of
-the already-split `/proc`/`ip` functions); the established pattern
+`df`/`systemctl`/`launchctl` and other non-Linux-gated variants — note those
+need building for their target to verify); the established pattern
 (`parse_X(&str) -> T` + golden fixtures) applies to each.
 
 Status 2026-06-23 (parse/IO split started): applied the split to the canonical
