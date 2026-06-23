@@ -264,3 +264,337 @@ cargo run -p rustynet-cli -- ops vm-lab-validate-linux-security \
 After any evidence run, verify the appended row in
 `documents/operations/live_lab_run_matrix.csv` (both stages map to the
 `linux/exit` and Linux daemon-validator cells via `live_lab_run_matrix.rs`).
+
+---
+
+# Phase 2 — Exhaustive multi-agent gap audit (2026-06-23)
+
+A 42-agent adversarial workflow audited **21 security surfaces** (the 18 vuln
+classes + a control-by-control `SecurityMinimumBar` sweep + an open-RSA-finding
+sweep). Each surface got a deep mapper followed by an **adversarial verifier**
+that challenged every claimed gap (greps for coverage the mapper missed; rejects
+anything that would need a product backdoor or that wouldn't bite). Result:
+**162 gaps reviewed → 111 confirmed-implementable** (2 critical, 50 high, 52
+medium, 6 low, 1 info) + 3 backdoor/infeasible findings.
+
+Methodology borrowed (see §2): Tailscale in-policy ACL tests, WireGuard Tamarin
+verification, the VPN IPv4/IPv6/DNS leak canon, Nebula's ECDSA-malleability CRL
+bypass (the real-world parallel to RN-22 `verify_strict`), ZeroTier rumor-mill
+revocation, NetBird/Firezone default-deny.
+
+## 2.1) Verified CRITICAL findings (first-hand, on this branch's code)
+
+Two audit claims were verified directly against the current code and are
+**release-blockers**. Per the operating contract §(e) they are SURFACED here
+(not silently fixed — both touch the trust path and need owner review + lab
+validation). Together they mean **node revocation is effectively non-functional**.
+
+### FINDING-A (CRITICAL) — RSA-0009: membership Revoke/RotateKey/Restore/SetCapabilities can never apply
+
+- **Where:** `crates/rustynet-control/src/membership.rs`. `reduce_membership_state`
+  stamps `node.updated_at_unix = unix_now()` for the four trust-mutation ops
+  (lines 1149 SetNodeCapabilities, 1168 RevokeNode, 1180 RestoreNode, 1193
+  RotateNodeKey). `MembershipState::canonical_payload` hashes
+  `node.{i}.updated_at_unix` into the state root (line 285), and
+  `apply_signed_update` recomputes `new_state_root` and compares it to the
+  record's (lines 721-723).
+- **Mechanism:** the proposer reduces at T1 → `new_state_root` reflects
+  `unix_now()=T1`; the applier reduces at T2 → recomputed root reflects
+  `unix_now()=T2`. When `T1 != T2` (any wall-clock-second boundary) →
+  `MembershipError::NewStateRootMismatch` → the op is rejected. `AddNode` is
+  unaffected because it uses the record's own timestamp, which is why existing
+  enroll/genesis tests pass and this slipped through. `reduce_membership_state`
+  takes only `(&state, &operation)` and the `MembershipOperation` variants carry
+  no timestamp, so the local `unix_now()` is the only source.
+- **Impact:** revocation and key-rotation — the primary controls for withdrawing
+  trust — cannot be applied in practice. Re-confirms AUDIT-040.
+- **Repro (deterministic):** sign a `RevokeNode` record at T1 (its `new_state_root`
+  computed by the reducer), apply it ≥1s later; `apply_signed_update` returns
+  `NewStateRootMismatch`.
+- **Proposed fix:** thread the signed record's `created_at_unix` into
+  `reduce_membership_state` and stamp `updated_at_unix` from it (deterministic,
+  signed), OR exclude `updated_at_unix` from `canonical_payload`/`state_root`.
+  The first is surgical (only the four ops change; `AddNode`/genesis roots
+  unchanged). Land with the deterministic regression test + a clock seam so the
+  live `validate_linux_membership_revoke_applies` stage (audit RSA-0009) passes.
+
+### FINDING-B (CRITICAL) — DD-03 / RSA-0007/0008: dataplane/exit/LAN admission is revocation-blind
+
+- **Where:** `crates/rustynetd/src/dataplane.rs:361` (`self.policy.evaluate(...)`),
+  `crates/rustynetd/src/phase10.rs:4957` (`set_exit_node` / shared-exit) and
+  `:5027` (LAN route grant) all call the membership-**blind** `evaluate`. Only
+  `service_exposure.rs` (NAS/LLM) uses `evaluate_with_membership`.
+- **Impact:** a peer that is **revoked** in signed membership but still named by
+  a stale (or wildcard) allow rule keeps dataplane peer-admission, shared-exit,
+  and LAN access — revocation does not cut live traffic on the main data paths.
+  (The daemon's signed-bundle *provisioning* gate `check_peer_membership_active`
+  at phase10.rs:4759 does re-check membership, which contains the worst case, but
+  the per-decision ACL admission path does not.)
+- **Proposed fix:** route the dataplane/exit/LAN ACL decisions through
+  `evaluate_with_membership` (as service_exposure already does) so a revoked
+  identity is denied regardless of a residual allow rule. Then the live
+  `validate_linux_revoked_peer_denied_e2e` stage (audit DD-03) passes.
+
+## 2.2) Other audit-surfaced defect candidates (need code verification before a stage can pass)
+
+These confirmed-implementable stages bundle a product fix because the control is
+not currently observable as fail-closed through the real surface (each is its own
+finding until the fix lands — the stage is written to FAIL on today's code):
+
+- **RSA-0037 / DOS-1** — relay `HelloLimiter` (`crates/rustynet-relay/src/transport.rs`)
+  is `HashMap<String,(u32,Instant)>` with **no prune/cap** → unauthenticated
+  remote memory-exhaustion (rate is capped per node_id but map *cardinality* is
+  unbounded). Verified present. Fix: cap + prune mirroring `PreAuthHelloLimiter`.
+- **RSA-0048 / DOS-2** — LLM gateway accepts TCP with **no read/write timeout** +
+  no concurrent-connection cap → slowloris. Fix: `set_read_timeout`/`set_write_timeout`
+  + an `AtomicUsize` accept cap.
+- **RSA-0029 / RR-01-adjacent** — traversal `CoordinationReplayWindow`
+  (`crates/rustynetd/src/traversal.rs`) is **in-memory only** (reset on daemon
+  restart) → post-restart coordination-nonce replay within the 24h TTL. (Note:
+  the per-bundle *fetcher* `WatermarkStore` IS disk-backed — RR-01 tests that
+  path, which works; this is the separate traversal-nonce window.)
+- **RSA-0034 / GM-1** — gossip ingest (`peer_gossip` / `GossipNode::ingest_inbound_bundle`)
+  takes no membership argument and reads only `self.peers` → a revoked node can
+  re-advertise and be re-admitted. Fix: thread membership status / prune revoked
+  ids before ingest.
+- **RSA-0014 / CPA-2** — `emit_role_audit` (`crates/rustynet-cli/src/main.rs`) is
+  fail-open: a role transition proceeds even if the durable audit append fails,
+  contradicting §6.D.6 "MUST emit". Fix: fail-closed audit append.
+
+## 2.3) Implemented this phase (FAIL-LOUD, Skip-by-default, bite-tested)
+
+| stage | surface / audit id | severity | status |
+|---|---|---|---|
+| `validate_linux_ipv6_leak` | killswitch_leak / (Linux IPv6) | high | ✅ committed (phase 1) |
+| `validate_linux_privileged_helper_allowlist` | priv_helper / PH-1 | medium | ✅ committed (phase 1) |
+| `validate_macos_ipv6_leak` | killswitch_leak / KL-4 (macOS half) | high | ✅ committed |
+| `validate_linux_exit_demotion_residue` | exit_nat_residue / EXNAT-1 | high | ✅ committed |
+
+Each ships a daemon producer (or reuses an existing read-only snapshot), an
+orchestrator validator, a `scripts/e2e/capture_*.sh` wrapper, run-matrix
+accounting, and tampered-input bite unit tests proving the validator fails when
+the defence is absent. All gates green; default/dry runs Skip cleanly.
+
+## 2.4) Full confirmed-implementable backlog (111 gaps, by surface)
+
+The complete prioritized backlog from the audit. ✅DONE marks the four landed
+this branch. Everything else is a ready-to-implement spec (the audit result has
+the full daemon-module / validator-contract / bite-test for each). Critical/high
+first within each surface.
+
+#### default_deny  (4)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| critical | medium | DD-03 | validate_linux_revoked_peer_denied_e2e (+ macos/… | Revocation-aware default-deny end-to-end: a REVOKED node must be denied at dataplane peer-… |
+| high | medium | DD-02 | validate_linux_empty_policy_revokes_reachability… | Default-deny under POLICY MUTATION: pushing an EMPTY signed assignment bundle to a RUNNING… |
+| high | medium | DD-05 | validate_linux_malformed_bundle_failclosed | Malformed-bundle fail-closed: a signed-but-malformed bundle (bad CIDR, truncated, bad sche… |
+| medium | medium | DD-06 | validate_linux_service_context_default_deny (+ m… | Service-context default-deny end-to-end (NAS/LLM): empty/missing TrafficContext and a lega… |
+
+#### role_transition  (6)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| critical | medium | RT-1 | validate_linux_unsigned_capability_elevation_den… | SecMinBar §6.D.3 — capability changes require owner signature; local-only acceptance of ca… |
+| high | small | RT-2 | validate_linux_blind_exit_reversal_denied | SecMinBar §6.D.2 — BlindExit irreversibility: a blind_exit node MUST refuse every other-ro… |
+| high | small | RT-3 | validate_linux_exit_revoke_teardown_ordering | SecMinBar §6.D.7 — exit-serving NAT/forwarding MUST be torn down BEFORE serves_exit is rem… |
+| medium | medium | RT-5 | validate_linux_role_audit_tamper_detected | SecMinBar §6.D.6 — tamper-evident transition audit: every transition emits an append-only … |
+| medium | medium | RT-6 | validate_linux_relay_deploy_failure_aborts_trans… | SecMinBar §6.D.4/§6.D.5 — service deploy precedes capability advertisement; failure to dep… |
+| low | medium | RT-8 | validate_linux_concurrent_role_transition_resolu… | SecMinBar §6.D.1 — concurrent/racing role transitions resolve fail-closed (one outcome win… |
+
+#### signature_forgery  (7)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | SIGFORGE-1 | validate_linux_signed_bundle_forgery --bundle-ty… | SecMinBar §3.2 (signed control/trust data validated before application) + §6.B (trust anch… |
+| high | small | SIGFORGE-7 | Covered as the malleable_S attack_class WITHIN v… | RN-22 / SecMinBar §3 one-hardened-path: ed25519 signature malleability (verify_strict, not… |
+| medium | small | SIGFORGE-2 | validate_linux_signed_bundle_forgery --bundle-ty… | SecMinBar §3.8 (signed endpoint-hint/traversal bundle authenticated, replay-protected, fre… |
+| medium | small | SIGFORGE-3 | validate_linux_signed_bundle_forgery --bundle-ty… | SecMinBar §6.B (DNS-zone bundle verified against trust anchor): forged dns-zone bundle rej… |
+| medium | small | SIGFORGE-4 | validate_linux_signed_bundle_forgery --bundle-ty… | SecMinBar §6.B / gossip trust (signed peer-gossip bundle verified): forged peer-gossip bun… |
+| medium | medium | SIGFORGE-5 | validate_linux_signed_bundle_forgery --bundle-ty… | SecMinBar §3.8 (traversal/relay) + §4.7 (relay abuse controls): forged relay-session-token… |
+| medium | medium | SIGFORGE-6 | validate_linux_signed_bundle_forgery --bundle-ty… | SecMinBar §3.2 (signed control data validated before application): forged assignment bundl… |
+
+#### replay_rollback  (6)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | RR-01 | validate_linux_replay_persistence | Cross-reboot persistence of the trust/traversal/assignment/dns-zone anti-replay watermark … |
+| medium | medium | RR-02 | validate_linux_traversal_coord_replay_persistenc… | Traversal coordination replay window — daemon.rs traversal_coordination_replay_window (Coo… |
+| medium | medium | RR-03 | validate_linux_enrollment_replay_persistence | Enrollment token single-use ledger durability across reboot — enrollment_consume.rs writes… |
+| medium | large | RR-06 | validate_macos_replay_persistence / validate_win… | IPv6/cross-OS parity of cross-reboot replay-persistence (macOS LaunchDaemon restart via la… |
+| medium | large | RR-07 | implement the live body of chaos_clock_jump_back… | Live adversarial clock-rollback driving the persisted watermark window (the in-tree chaos_… |
+| low | small | RR-04 | fold into validate_linux_replay_persistence (bun… | Membership epoch-chain monotonicity + MembershipReplayCache (membership.rs apply_signed_up… |
+
+#### fail_closed_failure  (5)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | large | FCF-1 | validate_linux_crash_midapply_failclosed. New re… | SecMinBar §3.4/§4: crash mid-apply of verified-but-not-yet-applied trust/membership state … |
+| high | medium | FCF-2 | validate_linux_corrupt_state_failclosed. linux-m… | SecMinBar §3.4/§4, CLAUDE.md §10.1: corrupt/truncated/deleted persisted signed-state (trus… |
+| medium | medium | FCF-3 | validate_linux_keystore_unavailable_failclosed. … | SecMinBar §4 key custody / §3.4: keystore unreachable/locked (encrypted-at-rest key/passph… |
+| medium | medium | FCF-4 | validate_linux_replay_persistence. New read-only… | SecMinBar §3.3/§4: anti-replay/rollback protection must PERSIST across daemon restart/rebo… |
+| medium | large | FCF-7 | validate_macos_corrupt_state_failclosed and vali… | Cross-OS parity (CrossPlatformRoleParityPlan): crash-midapply / corrupt-state / keystore-u… |
+
+#### killswitch_leak  (5)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | KL-2 | validate_macos_killswitch_leak | macOS pf killswitch cleartext IPv4 leak — real egress capture (parity with Linux no-leak g… |
+| high | large | KL-3 | validate_windows_killswitch_leak | Windows WFP killswitch cleartext IPv4 leak — real egress capture (parity with Linux no-lea… |
+| high | medium | KL-4 | validate_macos_ipv6_leak and validate_windows_ip… ✅DONE | IPv6 killswitch leak parity on macOS / Windows (IPv4-only killswitch lets native IPv6 bypa… |
+| high | large | KL-5 | validate_linux_killswitch_routeflip_race (then m… | Route-flip RACE leak during tunnel bring-up / tear-down (per OS) |
+| medium | large | KL-6 | validate_linux_killswitch_midhandshake_leak (con… | Leak during the mid-handshake window (tunnel iface + route up but WireGuard handshake not … |
+
+#### dns_leak  (4)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | large | DNS-3 | validate_linux_dns_resolver_tamper (+ macos/wind… | DNS resolver config must stay fail-closed under mid-run tamper: daemon must re-assert loop… |
+| high | medium | DNS-5 | validate_macos_dns_scutil_posture (extends/super… | macOS DNS fail-closed must inspect the authoritative resolver layer (SystemConfiguration /… |
+| medium | medium | DNS-2 | validate_linux_dns_aaaa_leak (+ validate_macos_d… | DNS fail-closed must contain AAAA/IPv6 lookups, not just A records (SecMinBar 3.8/6; IPv6 … |
+| medium | large | DNS-4 | validate_linux_doh_dot_bypass (+ macos/windows s… | Encrypted-DNS bypass containment: in protected mode DoH (TCP/443 to a known DoH endpoint) … |
+
+#### relay_plaintext  (4)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | RPT-01 | validate_linux_relay_ciphertext_only | Relay-sees-only-ciphertext: relay forwards opaque WireGuard datagrams byte-for-byte, never… |
+| high | medium | RPT-02 | validate_linux_relay_token_attack | Relay session-token unforgeability + anti-replay + scope/relay-binding enforced on the LIV… |
+| medium | large | RPT-03 | validate_linux_relay_mitm_resistance | Relay-MITM resistance proven empirically: relay cannot MITM a two-hop session (no peer key… |
+| medium | large | RPT-04 | validate_macos_relay_ciphertext_only / validate_… | Per-OS parity for relay-ciphertext + token-attack assurance on macOS and Windows relays (C… |
+
+#### exit_nat_residue  (5)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | EXNAT-1 | validate_linux_exit_demotion_residue — on a live… ✅DONE | SecMinBar §6.D.7 — exit-serving NAT must be torn down (forwarding + masquerade) on serves_… |
+| high | medium | EXNAT-3 | validate_linux_exit_crash_residue — on a live Li… | SecMinBar §3.4/§4 (fail-closed) + §6.D.7 (residue) — after an ungraceful exit (SIGKILL/cra… |
+| high | medium | EXNAT-4 | validate_macos_exit_demotion_residue — serving s… | SecMinBar §6.D.7 demotion residue parity on macOS — teardown flushes the com.rustynet/nat … |
+| medium | small | EXNAT-2 | Tighten evaluate_{linux,macos,windows}_exit_nat_… | SecMinBar §6.D.7 (residue) + §8 (IPv6 leak prevention) — exit NAT teardown must restore IP… |
+| medium | medium | EXNAT-5 | validate_windows_exit_demotion_residue — snapsho… | SecMinBar §6.D.7 demotion residue parity on Windows (WinNAT MSFT_NetNat + per-interface Fo… |
+
+#### priv_helper  (8)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | PH-2 | validate_linux_privileged_helper_socket_fuzz (ne… | Live helper SOCKET frame hardening against a RUNNING helper: magic/version/type/length-bou… |
+| high | medium | PH-3 | validate_linux_privileged_helper_peer_authz (ext… | Live cross-uid peer rejection: helper accept-time peer_uid==allowed_uid||0 (privileged_hel… |
+| high | medium | PH-4 | validate_linux_privileged_helper_socket_perms (n… | Live helper socket filesystem security: owner-only / root-managed-shared perms — refuse sy… |
+| high | medium | PH-5 | validate_linux_privileged_helper_binary_integrit… | Live helper BINARY integrity: privileged programs resolved only from absolute, root-owned,… |
+| high | medium | PH-7 | validate_macos_privileged_helper_allowlist (reus… | macOS privileged-helper parity: pfctl argv allowlist (anchor-name escape, path traversal, … |
+| medium | large | PH-6 | validate_linux_privileged_helper_kill_scope — GA… | kill helper command scope: validate_kill_args (privileged_helper.rs:1853) only permits -TE… |
+| medium | small | PH-8 | validate_windows_privileged_helper_blocked (new … | Windows privileged-helper remains BLOCKED through the public surface: named-pipe helper IP… |
+| medium | small | PH-9 | folded into validate_linux_privileged_helper_soc… | Single-threaded helper accept-loop DoS resistance: a slow-loris partial frame must not wed… |
+
+#### enrollment_token  (2)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | ENR-1 | validate_linux_enrollment_replay | Single-use enrollment token (SecMinBar §6.C.3 + §3.3 anti-replay): a consumed token MUST b… |
+| medium | medium | ENR-3 | validate_linux_enrollment_freshness | SecMinBar §6.C.3 freshness + §3.3: expired and future-issue (clock-skew) tokens MUST be re… |
+
+#### gossip_membership  (2)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | GM-1 | validate_linux_gossip_revoked_readmit | SecurityMinimumBar 6.B/6.C.1 membership revocation enforced before trust-sensitive gossip … |
+| medium | medium | GM-2 | validate_linux_gossip_ingest_flood_bound | SecurityMinimumBar 4 (resource exhaustion / High) + 6.B unbounded trust-state growth: per-… |
+
+#### key_custody  (6)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | KC-02 | validate_macos_key_custody in run_macos_orchestr… | SecMinBar §4 + CrossPlatformRoleParity — macOS key custody must be FAIL-LOUD orchestrator-… |
+| high | medium | KC-04 | live_windows_key_custody_test standalone bin (pa… | SecMinBar §4 + §6.C.4 — Windows MUST reject a world-readable KEY FILE at startup (RSA-0002… |
+| medium | medium | KC-03 | live_macos_key_custody_test standalone bin (pari… | SecMinBar §4 — startup MUST reject too-broad key permissions on macOS at parity with Linux… |
+| medium | large | KC-05 | validate_linux_secret_memory_hygiene producer: r… | SecMinBar §4 'Never log secrets/private key material' — runtime key material MUST NOT leak… |
+| medium | small | KC-06 | Extend Windows + macOS collectors to include the… | SecMinBar §4 + §6.C.4 — Ed25519 OWNER/MEMBERSHIP signing-key passphrase custody must be OS… |
+| medium | medium | KC-07 | live_macos_secrets_not_in_logs_test + live_windo… | SecMinBar §4 'Never log secrets' — macOS and Windows runtime logs MUST NOT contain key mat… |
+
+#### mitm_handshake  (4)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | MITM-1 | validate_macos_endpoint_hijack — vm_lab stage_ou… | Endpoint hijack rejection on macOS (SecMinBar §3.2/§3.8): attacker-rewritten peer endpoint… |
+| high | medium | MITM-2 | validate_windows_endpoint_hijack — vm_lab stage … | Endpoint hijack rejection on Windows (SecMinBar §3.2/§3.8): tampering C:\ProgramData\Rusty… |
+| high | medium | MITM-3 | validate_linux_traversal_hint_injection — true l… | Forged / wrong-signer / stale / replayed signed traversal coordination record (endpoint-hi… |
+| medium | large | MITM-4 | validate_linux_stun_candidate_spoof — live stage… | Spoofed STUN-mapped endpoint candidate must not be gossiped as a reachable peer endpoint (… |
+
+#### toctou_races  (3)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | TOCTOU-1 | validate_linux_enrollment_concurrent_consume — L… | Enrollment single-use ledger atomicity under concurrency (SecurityMinimumBar §3.3 line 26 … |
+| high | medium | TOCTOU-2 | validate_linux_concurrent_membership_apply — Lin… | Deterministic signed-membership mutation under concurrency (SecurityMinimumBar §3 one-hard… |
+| medium | large | TOCTOU-3 | validate_linux_crash_mid_membership_apply — repl… | Crash mid-transition atomicity / fail-closed recovery (SecurityMinimumBar §3.4 fail-closed… |
+
+#### dos_resource  (2)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | large | DOS-1 | validate_linux_relay_hello_node_id_flood | Relay per-node_id HelloLimiter map must be bounded/pruned (SecMinBar §4 High relay abuse/c… |
+| high | large | DOS-2 | validate_linux_llm_gateway_slowloris | LLM gateway connection must enforce read/write timeouts and a concurrent-connection bound … |
+
+#### crossnet_traversal  (4)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | large | CNT-1 | validate_linux_upnp_ssrf — orchestrator stage ga… | uPnP IGD SSDP LOCATION/controlURL SSRF (AUDIT-051 / RSA-0035). SecMinBar §3.7 strict input… |
+| high | medium | CNT-2 | validate_linux_candidate_injection — orchestrato… | Remote candidate injection forcing unintended direct path / policy bypass. SecMinBar §3.8 … |
+| medium | large | CNT-3 | validate_linux_relay_only_no_leak — orchestrator… | Relay-only path under hostile (symmetric/hard) NAT must not leak underlay traffic and rela… |
+| medium | large | CNT-4 | validate_linux_failback_acl_bite — orchestrator … | Failover/failback transition cannot bypass ACL/trust/leak controls. SecMinBar §3.8 leak, §… |
+
+#### control_plane_audit_supply  (3)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | CPA-1 | validate_linux_audit_chain_integrity (mirror mac… ✅DONE | SecMinBar §3.9 — tamper-evident, append-only audit log with active integrity verification.… |
+| high | medium | CPA-2 | validate_linux_audit_failclosed. Render audit pa… | SecMinBar §3.9 + §6.D.6 (every role transition — success/fail/abort — MUST emit an append-… |
+| medium | medium | CPA-3 | validate_linux_control_tls_posture_failclosed. N… | SecMinBar §3.2 — TLS 1.3 enforced for control-plane (attested signed posture, not a wire h… |
+
+#### secminbar_sweep  (16)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | S3-5 | validate_windows_host_boundary (wire existing wi… | §3.5 Host-OS boundary enforcement (block Linux-only provisioning on non-Linux; never creat… |
+| high | medium | S3-9 | validate_linux_audit_integrity | §3.9 Audit/forensics (tamper-evident append-only hash-chain audit log; retention + integri… |
+| high | medium | S6B-1 | validate_linux_trust_anchor_custody (+ validate_… | §6.B Bootstrap trust anchor — daemon refuses to start until membership.owner.key.pub prese… |
+| high | small | S6D-9 | validate_windows_platform_blocked_role (+ valida… | §6.D.9 Platform-blocked roles fail closed (non-client roles on Windows, blind_exit on macO… |
+| high | large | S6E-1 | validate_linux_nas_tunnel_only_bind (+ validate_… | §6.E E1 Service endpoint binds tunnel-only (nas/llm API binds mesh tunnel addr only; non-t… |
+| high | large | S6E-2 | validate_linux_service_default_deny | §6.E E2 Default-deny per-peer service authorisation (every nas/llm session gated; empty/mi… |
+| high | large | S6E-3 | validate_linux_service_revocation_teardown | §6.E E3 Service teardown precedes capability revocation (on serves_nas/serves_llm removal:… |
+| high | large | S6E-4 | validate_linux_service_token_revocation | §6.E E4 App-layer token cannot exceed signed policy (session token re-checked vs CURRENT s… |
+| medium | medium | S3-3 | validate_linux_enrollment_rate_limit | §3.3 Auth/enrollment hardening (per-IP/per-identity rate limit, lockout/backoff, anti-repl… |
+| medium | medium | S4-7 | validate_linux_relay_flood_bound (coverage-doc G… | §4.7 High — Relay abuse/capacity controls under load + reconnect churn (RSA-0037: per-node… |
+| medium | medium | S6C-2 | validate_linux_anchor_bundle_pull_lan_refused | §6.C.2 Anchor bundle-pull default-deny (loopback bind 127.0.0.1:51822 by default; non-loop… |
+| medium | medium | S6C-4 | validate_linux_anchor_secret_custody (+ macos/wi… | §6.C.4 Anchor secret custody (HMAC secret in OS-secure custody; plaintext rejected; Win DP… |
+| medium | medium | S6C-5 | validate_linux_replay_persistence (coverage-doc … | §6.C.5 Anchor downgrade fail-closed (lower/equal-epoch bundle stripping anchor caps reject… |
+| medium | medium | S6D-4 | validate_linux_relay_deploy_abort | §6.D.4 Service deploy precedes capability advertisement (deploy+verify rustynet-relay BEFO… |
+| medium | medium | S6D-5 | validate_linux_relay_undeploy_abort | §6.D.5 Service undeploy precedes capability revocation (stop+remove relay BEFORE revocatio… |
+| low | small | S3-10 | validate_macos_codesign | §3.10 Supply-chain integrity (signed artifacts, SBOM, staged tracks) |
+
+#### rsa_open_findings  (15)
+
+| sev | eff | id | proposed stage | control |
+|---|---|---|---|---|
+| high | medium | RSA-0009 | validate_linux_membership_revoke_applies (+macos… | Membership revocation + key rotation must apply via the signed-update path (SecMinBar §3.3… |
+| high | medium | RSA-0063 | validate_macos_bootstrap_privesc_residue + stati… | Privilege boundary / fail-closed on bootstrap error (SecMinBar §3.7). macOS bootstrap must… |
+| medium | small | RSA-0031 | PRIMARY: unit test + schema/validator extension … | Exit-NAT teardown verification must fail closed (SecMinBar §6.D ctrl 7 — NAT residue after… |
+| medium | medium | RSA-0037 | PRIMARY unit bite (no VM). OPTIONAL live validat… | Relay abuse/capacity controls under churn (SecMinBar §4.7; CWE-770). Relay must bound memo… |
+| medium | medium | RSA-0023 | PRIMARY: §6-mandated concurrent-consume integrat… | One-time enrollment credential consumption must be atomic/race-safe (SecMinBar §6.C ctrl 3… |
+| medium | small | RSA-0007 | PRIMARY regression unit in rustynetd phase10: re… | Default-deny / revocation enforcement on dataplane ACL gates; one hardened path (SecMinBar… |
+| medium | medium | RSA-0046 | No live stage. Regression unit + a security_regr… | Argv-only privileged exec; no untrusted shell construction (SecMinBar §3.7; CWE-78). |
+| medium | small | RSA-0047 | No live stage. Regression unit: replace .lines()… | Bounded input on agent-facing services (SecMinBar §6; CWE-770). |
+| medium | small | RSA-0059 | No live stage. Regression unit over the script-b… | No untrusted shell construction in orchestrator (SecMinBar §3.7; CWE-78). |
+| medium | medium | RSA-0064 | No live stage. Add a supply_chain_integrity_gate… | Supply-chain integrity of bootstrap dependencies (SecMinBar §10; CWE-494). |
+| medium | medium | RSA-0025 | Windows regression test + optional extension to … | Encrypted-at-rest key custody with strict permissions on Windows (SecMinBar §3.4/§5; CWE-7… |
+| low | small | RSA-0033 | PRIMARY unit regression. Live: extend the existi… ✅DONE | Privileged-helper least privilege (SecMinBar §3.7; CWE-250). Root helper's kill builtin mu… |
+| low | medium | RSA-0008 | Regression unit ONLY (no live stage). Give Contr… | Membership-gated signed-artifact issuance (SecMinBar §3.6/§3.2; CWE-863). |
+| low | medium | RSA-0080 | No live stage. Owner decision: define a real sec… | Secret hygiene / secure deletion of key material + mandatory gate must pass (SecMinBar §4;… |
+| info | small | RSA-0011 | Regression unit only (no live stage at Info). Pe… | Anti-rollback floor on MAC-protected TrustState (SecMinBar §3.2/§3.3; CWE-294). |
+
+### Backdoor/infeasible findings (NOT auto-implementable)
+
+- **role_transition/RT-7** (infeasible): SecMinBar §6.D.8 — mobile role lock: iOS/Android FFI MUST refuse any role set != client and advertise client-only on snapshot reload.
+- **enrollment_token/ENR-4** (infeasible): SecMinBar §6.C.3 token scope / target-node binding ('over-scoped token', 'token used on WRONG node'): a token should not be redeemable beyon…
+- **dos_resource/DOS-4** (infeasible): MCP server stdin line reader must bound per-line length so a newline-less line cannot exhaust memory (RSA-0047).
