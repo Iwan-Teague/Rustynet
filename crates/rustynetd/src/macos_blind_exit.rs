@@ -93,8 +93,20 @@ pub fn build_macos_blind_exit_pf_rules(config: &MacosBlindExitPfConfig) -> Resul
             "pass out quick on {} inet proto tcp to any port 53 keep state\n",
             config.tunnel_interface
         ));
-        rules.push_str("block drop out quick inet proto udp to any port 53\n");
-        rules.push_str("block drop out quick inet proto tcp to any port 53\n");
+        // Label the LAN DNS-block rules so the macOS-exit DNS fail-closed
+        // evidence producer finds them by name in the anchor's `pfctl -s rules`
+        // dump (parse_pf_block_rule keys on these labels), matching the regular
+        // exit path. Without the labels a blind_exit node's DNS-failclosed
+        // capture reports overall_ok=false. Same shared constants as the
+        // regular-exit render so the dataplane and producer cannot drift.
+        rules.push_str(&format!(
+            "block drop out quick inet proto udp to any port 53 label \"{}\"\n",
+            crate::macos_exit_dns_failclosed::DNS_BLOCK_LAN_UDP_RULE
+        ));
+        rules.push_str(&format!(
+            "block drop out quick inet proto tcp to any port 53 label \"{}\"\n",
+            crate::macos_exit_dns_failclosed::DNS_BLOCK_LAN_TCP_RULE
+        ));
     }
 
     rules.push_str(&format!(
@@ -216,7 +228,17 @@ pub fn evaluate_macos_blind_exit_pf_rules(
                 "pass out quick on {} inet proto {} to any port 53 keep state",
                 config.tunnel_interface, proto
             );
-            let block = format!("block drop out quick inet proto {proto} to any port 53");
+            // The block rule carries the DNS fail-closed evidence label so the
+            // capture producer can find it; the evaluator enforces it is present
+            // (using the same shared constant the renderer emits).
+            let block_label = if proto == "udp" {
+                crate::macos_exit_dns_failclosed::DNS_BLOCK_LAN_UDP_RULE
+            } else {
+                crate::macos_exit_dns_failclosed::DNS_BLOCK_LAN_TCP_RULE
+            };
+            let block = format!(
+                "block drop out quick inet proto {proto} to any port 53 label \"{block_label}\""
+            );
             if !normalized.iter().any(|line| line == &pass) {
                 reasons.push(format!(
                     "blind_exit PF rules missing tunnel DNS {proto}/53 pass"
@@ -419,9 +441,9 @@ pass out quick on rustynet0 inet6 all flags S/SA keep state
 pass in quick on rustynet0 inet from 100.64.0.0/10 to any flags S/SA keep state
 pass out quick on en0 inet from 100.64.0.0/10 to any flags S/SA keep state
 pass out quick on rustynet0 inet proto udp from any to any port = 53 keep state
-block drop out quick inet proto udp from any to any port = 53
+block drop out quick inet proto udp from any to any port = 53 label \"rustynet-dns-block-lan-udp\"
 pass out quick on rustynet0 inet proto tcp from any to any port = 53 flags S/SA keep state
-block drop out quick inet proto tcp from any to any port = 53
+block drop out quick inet proto tcp from any to any port = 53 label \"rustynet-dns-block-lan-tcp\"
 block drop out quick all
 ";
         let reasons = evaluate_macos_blind_exit_pf_rules(rules, &cfg);
@@ -452,7 +474,16 @@ block drop out quick all
             rules
                 .contains("pass out quick on rustynet0 inet proto udp to any port 53 keep state\n")
         );
-        assert!(rules.contains("block drop out quick inet proto tcp to any port 53\n"));
+        // The LAN DNS-block rules carry the rustynet-dns-block-lan-* labels the
+        // DNS fail-closed evidence producer keys on (parity with the regular
+        // exit). The terminal `block drop out quick all` killswitch rule stays
+        // unlabeled.
+        assert!(rules.contains(
+            "block drop out quick inet proto udp to any port 53 label \"rustynet-dns-block-lan-udp\"\n"
+        ));
+        assert!(rules.contains(
+            "block drop out quick inet proto tcp to any port 53 label \"rustynet-dns-block-lan-tcp\"\n"
+        ));
     }
 
     #[test]
