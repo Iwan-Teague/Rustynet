@@ -9730,11 +9730,14 @@ fn activate_macos_exit_role(
          done; \
          if [ \"$admin_ok\" != 1 ]; then echo 'daemon did not report admin role after restart' >&2; sudo $RN role show 2>&1 | head -3 >&2; exit 1; fi; \
          sudo $RN role set exit; \
-         sleep 3; \
-         NAT=$(sudo pfctl -a com.rustynet/nat -s nat 2>/dev/null | grep -cE '^[[:space:]]*nat' || true); \
-         FWD=$(sysctl -n net.inet.ip.forwarding 2>/dev/null || echo 0); \
-         if [ \"$NAT\" = 0 ]; then echo 'exit NAT anchor com.rustynet/nat has no nat rule after role set exit' >&2; sudo pfctl -a com.rustynet/nat -s nat 2>&1 | head >&2; exit 1; fi; \
-         if [ \"$FWD\" != 1 ]; then echo \"net.inet.ip.forwarding=$FWD (expected 1) after role set exit\" >&2; exit 1; fi; \
+         nat_ok=0; \
+         for _i in $(seq 1 15); do \
+           NAT=$(sudo pfctl -a com.rustynet/nat -s nat 2>/dev/null | grep -cE '^[[:space:]]*nat' || true); \
+           FWD=$(sysctl -n net.inet.ip.forwarding 2>/dev/null || echo 0); \
+           if [ \"$NAT\" != 0 ] && [ \"$FWD\" = 1 ]; then nat_ok=1; break; fi; \
+           sleep 2; \
+         done; \
+         if [ \"$nat_ok\" != 1 ]; then echo \"exit NAT/forwarding not active after role set exit (com.rustynet/nat nat-rule-count=$NAT net.inet.ip.forwarding=$FWD; expected nat-rule>=1 and forwarding=1)\" >&2; sudo pfctl -a com.rustynet/nat -s nat 2>&1 | head >&2; exit 1; fi; \
          echo \"role admin->exit advertised 0.0.0.0/0; com.rustynet/nat loaded ($NAT nat rule); net.inet.ip.forwarding=$FWD\"";
 
     let out = capture_remote_shell_command_for_target(
