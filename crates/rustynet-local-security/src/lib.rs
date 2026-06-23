@@ -381,4 +381,150 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    // ---- owner-only validator: reject-branch coverage (pure, no IO) ----
+    //
+    // A valid owner-only fact set against allowed uid 501; each test below
+    // flips exactly one field so the asserted rejection is unambiguous.
+    fn owner_only_valid_facts() -> SocketSecurityFacts {
+        SocketSecurityFacts {
+            socket_mode: 0o600,
+            socket_uid: 501,
+            socket_gid: 20,
+            parent_mode: 0o700,
+            parent_uid: 501,
+            parent_gid: 20,
+        }
+    }
+
+    #[test]
+    fn owner_only_socket_facts_reject_group_or_world_accessible_socket() {
+        let path = Path::new("/tmp/rustynetd.sock");
+        for broad_mode in [0o660, 0o604, 0o660 | 0o006] {
+            let mut facts = owner_only_valid_facts();
+            facts.socket_mode = broad_mode;
+            let err =
+                validate_owner_only_socket_facts(path, "daemon socket", facts, &[501], &[501])
+                    .expect_err("non-owner-only socket mode must fail");
+            assert!(
+                err.contains("permissions too broad"),
+                "mode {broad_mode:03o} expected too-broad rejection, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_only_socket_facts_reject_socket_owner_uid_mismatch() {
+        let path = Path::new("/tmp/rustynetd.sock");
+        let mut facts = owner_only_valid_facts();
+        facts.socket_uid = 1000;
+        let err = validate_owner_only_socket_facts(path, "daemon socket", facts, &[501], &[501])
+            .expect_err("foreign socket owner must fail");
+        assert!(err.contains("owner uid mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn owner_only_socket_facts_reject_parent_owner_uid_mismatch() {
+        let path = Path::new("/tmp/rustynetd.sock");
+        let mut facts = owner_only_valid_facts();
+        facts.parent_uid = 1000;
+        let err = validate_owner_only_socket_facts(path, "daemon socket", facts, &[501], &[501])
+            .expect_err("foreign parent owner must fail");
+        assert!(
+            err.contains("parent directory owner uid mismatch"),
+            "got: {err}"
+        );
+    }
+
+    // ---- root-managed shared-runtime validator: reject-branch coverage ----
+    //
+    // Validated against allowed socket/parent uid 501 and expected gid 20,
+    // starting from the owner-only-valid accept case.
+    fn shared_runtime_valid_facts() -> SocketSecurityFacts {
+        SocketSecurityFacts {
+            socket_mode: 0o600,
+            socket_uid: 501,
+            socket_gid: 20,
+            parent_mode: 0o700,
+            parent_uid: 501,
+            parent_gid: 20,
+        }
+    }
+
+    fn assert_shared_runtime_rejects(facts: SocketSecurityFacts, needle: &str) {
+        let path = Path::new("/run/rustynet/helper.sock");
+        let err = validate_root_managed_shared_runtime_socket_facts(
+            path,
+            "privileged helper socket",
+            facts,
+            &[501],
+            &[501],
+            20,
+        )
+        .expect_err("insecure facts must be rejected");
+        assert!(
+            err.contains(needle),
+            "expected rejection containing {needle:?}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn shared_runtime_socket_facts_reject_world_accessible_socket() {
+        let mut facts = shared_runtime_valid_facts();
+        facts.socket_mode = 0o604; // world-readable
+        assert_shared_runtime_rejects(facts, "world access is forbidden");
+    }
+
+    #[test]
+    fn shared_runtime_world_access_check_precedes_root_managed_allowance() {
+        // A root-owned, correctly-grouped socket must STILL be rejected if it
+        // grants any world access — the root-managed allowance never bypasses
+        // the world-access ban (defense-in-depth, fail-closed).
+        let facts = SocketSecurityFacts {
+            socket_mode: 0o666,
+            socket_uid: 0,
+            socket_gid: 20,
+            parent_mode: 0o770,
+            parent_uid: 0,
+            parent_gid: 20,
+        };
+        assert_shared_runtime_rejects(facts, "world access is forbidden");
+    }
+
+    #[test]
+    fn shared_runtime_socket_facts_reject_foreign_socket_owner() {
+        let mut facts = shared_runtime_valid_facts();
+        facts.socket_uid = 1000; // not allowed and not root-managed
+        assert_shared_runtime_rejects(facts, "owner uid mismatch");
+    }
+
+    #[test]
+    fn shared_runtime_socket_facts_reject_group_gid_mismatch() {
+        let mut facts = shared_runtime_valid_facts();
+        facts.socket_mode = 0o640; // group-readable
+        facts.socket_gid = 99; // not the expected gid
+        assert_shared_runtime_rejects(facts, "group mismatch");
+    }
+
+    #[test]
+    fn shared_runtime_socket_facts_reject_world_writable_parent() {
+        let mut facts = shared_runtime_valid_facts();
+        facts.parent_mode = 0o702; // world-writable parent
+        assert_shared_runtime_rejects(facts, "parent directory has insecure permissions");
+    }
+
+    #[test]
+    fn shared_runtime_socket_facts_reject_foreign_parent_owner() {
+        let mut facts = shared_runtime_valid_facts();
+        facts.parent_uid = 1000; // not allowed and not root-managed
+        assert_shared_runtime_rejects(facts, "parent directory owner uid mismatch");
+    }
+
+    #[test]
+    fn shared_runtime_socket_facts_reject_parent_group_gid_mismatch() {
+        let mut facts = shared_runtime_valid_facts();
+        facts.parent_mode = 0o770; // group-writable parent
+        facts.parent_gid = 99; // not the expected gid
+        assert_shared_runtime_rejects(facts, "parent directory group mismatch");
+    }
 }

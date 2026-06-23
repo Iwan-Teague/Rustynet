@@ -221,6 +221,22 @@ relative-path rejection, root-managed wrong-gid — the complex OR-logic in
 `validate_root_managed_shared_runtime_socket_facts()` (~L146) has many
 untested branches.
 
+Status 2026-06-23: **reject-branch coverage landed for both pure fact
+validators (10 new tests, no IO).** Each test starts from a valid fact set and
+flips exactly one field so the asserted rejection is unambiguous.
+`validate_owner_only_socket_facts`: too-broad socket mode (group/world bits),
+foreign socket-owner uid, foreign parent-owner uid. `validate_root_managed_
+shared_runtime_socket_facts`: world-accessible socket, **world-access ban takes
+precedence over the root-managed allowance** (a root-owned correctly-grouped but
+world-accessible socket is still rejected — defense-in-depth), foreign
+socket-owner, group gid mismatch, world-writable parent, foreign parent-owner,
+parent group gid mismatch. Evidence: `cargo test -p rustynet-local-security
+--all-targets --all-features` → 16/16; fmt + clippy `-D warnings` clean (crate
+is fully gate-green). **P1.5 reject-path matrix complete.** (Note: the
+relative-path/symlink/non-socket rejections live in the IO layer
+`validate_socket_basics` and are already covered by the on-disk validator
+tests.)
+
 #### P1.6 — `rustynet-policy`: edge cases around membership-aware deny
 Status 2026-05-27: added membership-aware policy negative tests covering
 empty-directory node-selector denial and wildcard-rule denial for a revoked
