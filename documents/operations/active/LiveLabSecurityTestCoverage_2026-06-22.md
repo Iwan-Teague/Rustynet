@@ -369,11 +369,27 @@ finding until the fix lands — the stage is written to FAIL on today's code):
 | `validate_linux_privileged_helper_allowlist` | priv_helper / PH-1 | medium | ✅ committed (phase 1) |
 | `validate_macos_ipv6_leak` | killswitch_leak / KL-4 (macOS half) | high | ✅ committed |
 | `validate_linux_exit_demotion_residue` | exit_nat_residue / EXNAT-1 | high | ✅ committed |
+| `validate_linux_membership_signature_forgery` | signature_forgery / SIGFORGE-1 (+2,3,4,7) | high | ✅ committed |
 
 Each ships a daemon producer (or reuses an existing read-only snapshot), an
-orchestrator validator, a `scripts/e2e/capture_*.sh` wrapper, run-matrix
-accounting, and tampered-input bite unit tests proving the validator fails when
-the defence is absent. All gates green; default/dry runs Skip cleanly.
+orchestrator validator, a `scripts/e2e/capture_*.sh` wrapper or in-binary audit,
+run-matrix accounting, and tampered-input bite unit tests proving the validator
+fails when the defence is absent. All gates green; default/dry runs Skip cleanly.
+
+A self-review pass (6 skeptic agents) hardened these: the privileged-helper
+audit now accepts the orchestrator's always-appended `--no-fail-on-drift` (it was
+dead-on-arrival), the nft v6-containment detector only credits drops on egress
+base chains, and both IPv6 stages now carry a `probe_attempted` gate so a
+never-run probe is inconclusive-fail rather than a vacuous pass.
+
+The signature-forgery stage (`rustynetd membership-signature-audit`) drives the
+REAL `apply_signed_update`/`decode_signed_update` funnel with an 11-case forgery
+battery + a must-accept valid baseline, including the **malleable non-canonical
+S** case (`S' = S + ℓ`) — the RN-22 / Nebula-CRL-bypass defense. How to run live:
+`cargo run -p rustynet-cli -- ops vm-lab-validate-linux-security --linux-vm
+<alias> --ssh-identity-file <id> --report-dir <dir>` → stages
+`validate_linux_membership_signature_forgery` + `validate_linux_privileged_helper_allowlist`
+run the shipped daemon's in-binary audits over the public CLI (no artifact needed).
 
 ## 2.4) Full confirmed-implementable backlog (111 gaps, by surface)
 
