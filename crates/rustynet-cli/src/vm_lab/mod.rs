@@ -8890,6 +8890,72 @@ fn run_macos_orchestration_stages(
     };
     outcomes.push(exit_nat_lifecycle_outcome);
 
+    // ── Stage 7b: validate_macos_ipv6_leak ────────────────────────────────
+    //
+    // pf parity of the Linux `validate_linux_ipv6_leak` adversarial stage:
+    // proves the protected-mode tunnel fail-closes for IPv6, not just IPv4.
+    // Artefact `macos_ipv6_leak.json` is produced by
+    // `scripts/e2e/capture_macos_ipv6_leak.sh` on a macOS node while protected;
+    // absent ⇒ Skip cleanly (default macOS-as-client runs do not prove it).
+    let ipv6_leak_log_path = logs_dir.join("validate_macos_ipv6_leak.log");
+    let ipv6_leak_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_ipv6_leak",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate macOS IPv6 leak artifact for {macos_alias}"),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "validate_macos_ipv6_leak",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        let artifact_path = macos_exit_artifact_root.join("macos_ipv6_leak.json");
+        if !artifact_path.exists() {
+            stage_outcome(
+                "validate_macos_ipv6_leak",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: macOS IPv6 leak artifact not present at {}; macOS host is not proving IPv6 fail-closed posture",
+                    artifact_path.display()
+                ),
+                vec![],
+            )
+        } else {
+            match fs::read_to_string(&artifact_path)
+                .map_err(|err| format!("read {} failed: {err}", artifact_path.display()))
+                .and_then(|raw| {
+                    evaluate_macos_ipv6_leak_artifact(macos_alias, raw.as_str())
+                        .map(|summary| (summary, raw))
+                }) {
+                Ok((summary, raw)) => {
+                    let _ = fs::write(&ipv6_leak_log_path, raw.as_str());
+                    stage_outcome(
+                        "validate_macos_ipv6_leak",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![ipv6_leak_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&ipv6_leak_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_macos_ipv6_leak",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "macOS IPv6 leak artifact validation failed for {macos_alias}: {reason}"
+                        ),
+                        vec![ipv6_leak_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+    outcomes.push(ipv6_leak_outcome);
+
     // ── Stage 8: validate_macos_exit_dns_failclosed ───────────────────────
     let exit_dns_leak_log_path = logs_dir.join("validate_macos_exit_dns_failclosed.log");
     let exit_dns_leak_outcome = if dry_run {
@@ -14467,6 +14533,59 @@ fn evaluate_linux_ipv6_leak_artifact(linux_alias: &str, raw_json: &str) -> Resul
     };
     Ok(format!(
         "Linux IPv6 leak proof verified on {linux_alias}: 0 leaked datagrams, probe blocked, containment={containment} (egress={egress_iface})"
+    ))
+}
+
+/// macOS IPv6 tunnel-leak artefact validator (pf parity of
+/// `evaluate_linux_ipv6_leak_artifact`). Companion of the daemon-side
+/// `rustynetd macos-ipv6-leak-capture` producer
+/// (`crates/rustynetd/src/macos_ipv6_leak.rs`).
+///
+/// Fails closed (SecurityMinimumBar §8) if any global-scope IPv6 datagram
+/// leaked on egress, if the outbound IPv6 probe reached its global target, or
+/// if no pf v6-containment rule is present (a `block drop ... all` /
+/// `inet6` drop; an `inet`-only pf block does NOT count).
+fn evaluate_macos_ipv6_leak_artifact(macos_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse macOS IPv6 leak artifact failed: {err}"))?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "macOS IPv6 leak artifact returned unsupported schema_version={}",
+                require_json_u64(&report, "schema_version").unwrap_or_default()
+            )
+        })?;
+    let egress_iface = require_json_str(&report, "egress_iface")?;
+    if egress_iface.trim().is_empty() {
+        return Err("macOS IPv6 leak artifact has empty egress_iface".to_owned());
+    }
+    let probe_target = require_json_str(&report, "probe_target")?;
+    probe_target.parse::<std::net::Ipv6Addr>().map_err(|_| {
+        format!(
+            "macOS IPv6 leak artifact probe_target {probe_target:?} is not a valid IPv6 address"
+        )
+    })?;
+    let leaked = require_json_u64(&report, "leaked_datagram_count")?;
+    if leaked > 0 {
+        return Err(format!(
+            "macOS IPv6 leak artifact observed {leaked} cleartext IPv6 datagram(s) egressing on {egress_iface}: tunnel is NOT fail-closed for IPv6"
+        ));
+    }
+    if require_json_bool(&report, "probe_reached_target")? {
+        return Err(format!(
+            "macOS IPv6 leak artifact reports the outbound IPv6 probe reached {probe_target}: IPv6 traffic escaped the protected path"
+        ));
+    }
+    if !require_json_bool(&report, "killswitch_v6_block_present")? {
+        return Err(
+            "macOS IPv6 leak artifact found no pf IPv6 containment rule (no `block drop ... all`/`inet6` drop; an inet-only pf block does not contain IPv6): IPv6 is not fail-closed"
+                .to_owned(),
+        );
+    }
+    Ok(format!(
+        "macOS IPv6 leak proof verified on {macos_alias}: 0 leaked datagrams, probe blocked, pf v6 containment present (egress={egress_iface})"
     ))
 }
 
@@ -34773,6 +34892,108 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
         let err = super::evaluate_linux_ipv6_leak_artifact("debian-headless-1", raw.as_str())
             .expect_err("a leaking host must fail closed");
+        assert!(err.contains("cleartext IPv6 datagram"), "unexpected: {err}");
+    }
+
+    fn reviewed_macos_ipv6_leak_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "egress_iface": "en0",
+            "probe_target": "2606:4700:4700::1111",
+            "pf_anchor": "com.apple/rustynet_g1",
+            "killswitch_v6_block_present": true,
+            "leaked_datagram_count": 0,
+            "probe_reached_target": false
+        })
+    }
+
+    #[test]
+    fn evaluate_macos_ipv6_leak_artifact_accepts_failclosed_posture() {
+        let summary = super::evaluate_macos_ipv6_leak_artifact(
+            "macos-utm-1",
+            reviewed_macos_ipv6_leak_artifact().to_string().as_str(),
+        )
+        .expect("fail-closed macOS IPv6 posture must validate");
+        assert!(
+            summary.contains("macos-utm-1") && summary.contains("pf v6 containment present"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_ipv6_leak_artifact_rejects_leaked_datagram() {
+        let mut payload = reviewed_macos_ipv6_leak_artifact();
+        payload["leaked_datagram_count"] = serde_json::Value::from(1);
+        let err =
+            super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", payload.to_string().as_str())
+                .expect_err("a leaked IPv6 datagram must fail closed");
+        assert!(
+            err.contains("cleartext IPv6 datagram") && err.contains("NOT fail-closed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_ipv6_leak_artifact_rejects_probe_reaching_target() {
+        let mut payload = reviewed_macos_ipv6_leak_artifact();
+        payload["probe_reached_target"] = serde_json::Value::Bool(true);
+        let err =
+            super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", payload.to_string().as_str())
+                .expect_err("a probe that reaches its global target must fail closed");
+        assert!(
+            err.contains("escaped the protected path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_ipv6_leak_artifact_rejects_no_pf_v6_containment() {
+        let mut payload = reviewed_macos_ipv6_leak_artifact();
+        payload["killswitch_v6_block_present"] = serde_json::Value::Bool(false);
+        let err =
+            super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", payload.to_string().as_str())
+                .expect_err("absence of pf v6 containment must fail closed");
+        assert!(
+            err.contains("no pf IPv6 containment rule"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn macos_ipv6_leak_producer_to_validator_round_trip_failclosed() {
+        let snapshot = rustynetd::macos_ipv6_leak::build_macos_ipv6_leak_snapshot(
+            1,
+            "en0",
+            "2606:4700:4700::1111",
+            "com.apple/rustynet_g1",
+            "pass out quick on rustynet0 all keep state\nblock drop out quick all\n",
+            "reading from file /tmp/x.pcap\n0 packets captured\n",
+            false,
+        );
+        let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        let summary = super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", raw.as_str())
+            .expect("producer-built fail-closed macOS IPv6 artifact must validate");
+        assert!(
+            summary.contains("0 leaked datagrams"),
+            "unexpected: {summary}"
+        );
+    }
+
+    #[test]
+    fn macos_ipv6_leak_producer_to_validator_round_trip_detects_inet_only_leak() {
+        // An inet-only pf block (IPv4-only killswitch) does not contain v6.
+        let snapshot = rustynetd::macos_ipv6_leak::build_macos_ipv6_leak_snapshot(
+            1,
+            "en0",
+            "2606:4700:4700::1111",
+            "com.apple/rustynet_g1",
+            "block drop out quick inet from any to any\n",
+            "12:00:00 IP6 2001:db8::1 > 2606:4700:4700::1111: ICMP6, echo request\n",
+            true,
+        );
+        let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        let err = super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", raw.as_str())
+            .expect_err("an inet-only killswitch that leaks v6 must fail closed");
         assert!(err.contains("cleartext IPv6 datagram"), "unexpected: {err}");
     }
 
