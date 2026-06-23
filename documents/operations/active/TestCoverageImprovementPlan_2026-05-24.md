@@ -159,8 +159,17 @@ despite an advertised route, and **a missing ACL entry → deny** (the
 rustynetd --lib dataplane::tests::lan_route` → 7/7; fmt clean; the additions
 introduce no new `dataplane.rs` clippy findings.
 
-Remaining for P0.5: the `connect_peer()` short-circuit assertion (flood-guard
-rejection must not bypass/hide policy evaluation) is still to add.
+Follow-up landed 2026-06-23: the `connect_peer()` flood-guard short-circuit is
+now pinned (2 tests). `connect_peer_rate_limited_creates_no_session_even_when_
+policy_allows` proves a rate-limited handshake returns `HandshakeRateLimited`
+and configures no session/backend peer even under an allow-all policy (no
+bypass). `connect_peer_flood_guard_precedes_policy_and_neither_connects` proves
+ordering: under a deny-all policy the first handshake is admitted by the guard
+then `PolicyDenied`, while the second from the same source is short-circuited by
+the guard FIRST (`HandshakeRateLimited`) — and neither path connects. Both use
+a `with_security` engine with `max_attempts_per_window = 1` for determinism.
+**P0.5 complete** (`cargo test -p rustynetd --lib dataplane::tests` green; fmt +
+no new clippy findings).
 
 #### P0.6 — `rustynetd/src/gossip_runtime.rs`: anti-replay watermark persistence failure modes
 The watermark spool is the anti-replay authority but only in-memory happy

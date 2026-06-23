@@ -1227,4 +1227,105 @@ mod tests {
             Err(DataplaneError::LanAccessDenied)
         );
     }
+
+    /// Engine whose handshake flood-guard admits only one attempt per source
+    /// per window, so the second handshake from a source is deterministically
+    /// rate-limited.
+    fn single_handshake_engine(
+        policy: rustynet_policy::PolicySet,
+    ) -> LinuxDataplane<WireguardBackend> {
+        let mut dataplane = LinuxDataplane::with_security(
+            WireguardBackend::default(),
+            NodeId::new("node-a").expect("local id should be valid"),
+            "100.64.0.0/10".to_owned(),
+            policy,
+            HandshakeGuardConfig {
+                max_attempts_per_window: 1,
+                window_secs: 10,
+            },
+            RekeyConfig::default(),
+        );
+        dataplane.start().expect("dataplane should start");
+        dataplane
+    }
+
+    #[test]
+    fn connect_peer_rate_limited_creates_no_session_even_when_policy_allows() {
+        // A flood-guard rejection must NOT bypass into configuring the peer:
+        // the rate-limited handshake returns HandshakeRateLimited and leaves no
+        // session/backend peer behind, even though the policy would allow it.
+        let mut dataplane = single_handshake_engine(allow_all_policy());
+        let source = "198.51.100.10";
+
+        dataplane
+            .connect_peer(
+                peer_config("node-b", "203.0.113.10"),
+                &default_intent(),
+                source,
+                1_000,
+            )
+            .expect("first handshake from source should connect");
+        assert_eq!(
+            dataplane.backend_stats().expect("stats").peer_count,
+            1,
+            "first peer must be configured"
+        );
+
+        let node_c = NodeId::new("node-c").expect("id should parse");
+        let rate_limited = dataplane.connect_peer(
+            peer_config("node-c", "203.0.113.11"),
+            &default_intent(),
+            source, // same source within the window
+            1_001,
+        );
+        assert_eq!(rate_limited, Err(DataplaneError::HandshakeRateLimited));
+        assert!(
+            !dataplane.sessions.contains_key(&node_c),
+            "a rate-limited handshake must not create a session"
+        );
+        assert_eq!(
+            dataplane.backend_stats().expect("stats").peer_count,
+            1,
+            "rate-limited peer must not be configured on the backend"
+        );
+    }
+
+    #[test]
+    fn connect_peer_flood_guard_precedes_policy_and_neither_connects() {
+        // With a deny-all policy, the first handshake is admitted by the guard
+        // and then denied by policy (PolicyDenied); the second from the same
+        // source is short-circuited by the guard FIRST (HandshakeRateLimited),
+        // proving the guard runs ahead of policy. Neither path connects.
+        let mut dataplane = single_handshake_engine(rustynet_policy::PolicySet::default());
+        let source = "198.51.100.10";
+
+        let first = dataplane.connect_peer(
+            peer_config("node-b", "203.0.113.10"),
+            &default_intent(),
+            source,
+            2_000,
+        );
+        assert_eq!(
+            first,
+            Err(DataplaneError::PolicyDenied),
+            "first handshake passes the guard then hits policy deny"
+        );
+
+        let second = dataplane.connect_peer(
+            peer_config("node-b", "203.0.113.10"),
+            &default_intent(),
+            source,
+            2_001,
+        );
+        assert_eq!(
+            second,
+            Err(DataplaneError::HandshakeRateLimited),
+            "second handshake is rejected by the guard before policy is consulted"
+        );
+        assert_eq!(
+            dataplane.backend_stats().expect("stats").peer_count,
+            0,
+            "no peer should be configured on either denied path"
+        );
+    }
 }
