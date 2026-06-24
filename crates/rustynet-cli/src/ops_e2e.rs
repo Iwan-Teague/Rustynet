@@ -2990,9 +2990,16 @@ pub fn execute_ops_e2e_issue_dns_zone_bundles_from_env(
         })
         .transpose()?
         .unwrap_or(300);
-    if ttl_secs == 0 || ttl_secs > 86400 {
+    // The signed-zone builder hard-caps record TTL at 1..=300 s (rustynet-dns-zone
+    // rejects ttl_secs > 300 at build, parse, AND validate). Enforce that same
+    // bound HERE, at the env input boundary, so an over-large value fails with a
+    // clear, actionable message instead of passing this check and then failing
+    // deep inside `issue_dns_zone_bundle_artifacts` with the opaque
+    // "dns zone ttl must be in range 1..=300" builder error.
+    if ttl_secs == 0 || ttl_secs > 300 {
         return Err(format!(
-            "DNS_ZONE_TTL_SECS must be a positive integer <= 86400 (got: {ttl_secs})"
+            "DNS_ZONE_TTL_SECS must be a positive integer <= 300 \
+             (the signed dns-zone builder caps record TTL at 1..=300; got: {ttl_secs})"
         ));
     }
 
