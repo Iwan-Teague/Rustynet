@@ -9769,7 +9769,17 @@ fn activate_macos_exit_role(
          RN=/usr/local/bin/rustynet; \
          sudo $RN role set admin; \
          sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
-         sudo launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.daemon.plist; \
+         for _i in $(seq 1 20); do \
+           sudo launchctl print system/com.rustynet.daemon >/dev/null 2>&1 || break; \
+           sleep 1; \
+         done; \
+         boot_ok=0; boot_err=''; \
+         for _i in $(seq 1 10); do \
+           if boot_err=$(sudo launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.daemon.plist 2>&1); then boot_ok=1; break; fi; \
+           sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
+           sleep 2; \
+         done; \
+         if [ \"$boot_ok\" != 1 ]; then echo \"launchctl bootstrap failed after retries: $boot_err\" >&2; exit 1; fi; \
          admin_ok=0; \
          for _i in $(seq 1 30); do \
            if sudo $RN role show 2>/dev/null | grep -qiE 'current role: admin|primary=admin|node_role=admin'; then admin_ok=1; break; fi; \
