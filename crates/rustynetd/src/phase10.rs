@@ -67,9 +67,9 @@ use crate::macos_blind_exit::{
     is_macos_blind_exit_anchor,
 };
 use crate::macos_exit_nat::{
-    DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR, MacosExitNatPfConfig, build_macos_exit_nat_pf_rules,
-    evaluate_macos_exit_nat_pf_rules,
+    DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR, MacosExitNatPfConfig, evaluate_macos_exit_nat_pf_rules,
 };
+use crate::macos_pf_load_spec::MacosPfLoadSpec;
 use crate::privileged_helper::{
     PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram, validate_request,
 };
@@ -2701,24 +2701,26 @@ impl MacosCommandSystem {
             _ => {}
         }
 
-        let rules = self.render_pf_rules(strict_fail_closed)?;
-        let tmp_path = write_pf_rules_temp_file_securely(&rules, self.generation)?;
-        let tmp = tmp_path
-            .to_str()
-            .ok_or_else(|| SystemError::FirewallApplyFailed("pf temp path utf8".to_owned()))?;
-        if self.blind_exit_pf_config.is_some() {
-            self.run(
-                PrivilegedCommandProgram::Pfctl,
-                &["-n", "-a", next_anchor.as_str(), "-f", tmp],
-            )
+        // Hand a structured load SPEC to the privileged macOS pf builtin
+        // instead of authoring a rules file and naming a `pfctl -f` path. The
+        // helper re-renders the rule text itself from the reviewed builders,
+        // derives the anchor name from the spec kind, and owns the temp file +
+        // `pfctl` invocation end-to-end. A daemon compromised to the helper's
+        // uid can therefore only choose validated spec parameters — never inject
+        // rule text or redirect the load (audit major #5, `pfctl -f` boundary).
+        let spec = if let Some(config) = self.blind_exit_runtime_config() {
+            MacosPfLoadSpec::BlindExit { config }
+        } else {
+            MacosPfLoadSpec::Killswitch {
+                generation: self.generation,
+                strict_fail_closed,
+                spec: self.killswitch_spec(),
+            }
+        };
+        let args = spec.encode();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(PrivilegedCommandProgram::MacosPfLoad, &arg_refs)
             .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        }
-        let apply_result = self.run(
-            PrivilegedCommandProgram::Pfctl,
-            &["-a", next_anchor.as_str(), "-f", tmp],
-        );
-        let _ = fs::remove_file(&tmp_path);
-        apply_result.map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         self.anchor_name = Some(next_anchor);
         if let Some(config) = self.blind_exit_runtime_config() {
             let anchor = self
@@ -2803,7 +2805,6 @@ impl MacosCommandSystem {
         let config =
             MacosExitNatPfConfig::new(self.egress_interface.clone(), vec![mesh_cidr.to_owned()])
                 .map_err(SystemError::NatApplyFailed)?;
-        let rules = build_macos_exit_nat_pf_rules(&config).map_err(SystemError::NatApplyFailed)?;
 
         // Read the prior forwarding state FAIL-CLOSED — a read error or
         // non-zero status aborts activation rather than guessing a value, so we
@@ -2835,15 +2836,18 @@ impl MacosCommandSystem {
         self.exit_forwarding_key = Some(forwarding_key);
 
         let anchor = DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR;
-        let tmp_path = match write_pf_rules_temp_file_securely(&rules, self.generation) {
-            Ok(path) => path,
-            Err(err) => {
-                let _ = self.restore_ip_forwarding();
-                return Err(err);
-            }
+        // Load the NAT translation anchor through the privileged macOS pf
+        // builtin: the helper re-renders the translation rules from the reviewed
+        // builder and owns the temp file + `pfctl`, so the daemon never names a
+        // `pfctl -f` path (audit major #5).
+        let spec = MacosPfLoadSpec::ExitNat {
+            config: config.clone(),
         };
-        let load_result = self.load_exit_nat_anchor(anchor, tmp_path.as_path());
-        let _ = fs::remove_file(&tmp_path);
+        let args = spec.encode();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let load_result = self
+            .run(PrivilegedCommandProgram::MacosPfLoad, &arg_refs)
+            .map_err(|err| SystemError::NatApplyFailed(err.to_string()));
         if let Err(err) = load_result {
             // Flush any partial load and restore forwarding so no residue
             // outlives the failed activation. The killswitch block-all stays
@@ -2864,20 +2868,6 @@ impl MacosCommandSystem {
             return Err(err);
         }
         Ok(())
-    }
-
-    fn load_exit_nat_anchor(&self, anchor: &str, tmp_path: &Path) -> Result<(), SystemError> {
-        let tmp = tmp_path
-            .to_str()
-            .ok_or_else(|| SystemError::NatApplyFailed("exit NAT pf temp path utf8".to_owned()))?;
-        // Parse-check before committing the load.
-        self.run(
-            PrivilegedCommandProgram::Pfctl,
-            &["-n", "-a", anchor, "-f", tmp],
-        )
-        .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
-        self.run(PrivilegedCommandProgram::Pfctl, &["-a", anchor, "-f", tmp])
-            .map_err(|err| SystemError::NatApplyFailed(err.to_string()))
     }
 
     fn verify_exit_nat_anchor(
@@ -5825,10 +5815,13 @@ fn resolve_binary_path_for_program(
             DEFAULT_KILL_BINARY_PATH,
             PrivilegedCommandProgram::Kill,
         ),
-        // In-process builtin: handled before binary resolution. Fail closed if
-        // it ever reaches here.
+        // In-process builtins: handled before binary resolution. Fail closed if
+        // either ever reaches here.
         PrivilegedCommandProgram::DnsFailclosedFile => Err(SystemError::PrerequisiteCheckFailed(
             "dns-failclosed-file is an in-process builtin and has no external binary".to_owned(),
+        )),
+        PrivilegedCommandProgram::MacosPfLoad => Err(SystemError::PrerequisiteCheckFailed(
+            "macos-pf-load is an in-process builtin and has no external binary".to_owned(),
         )),
     }
 }
@@ -5904,68 +5897,6 @@ fn validate_net_device_name(value: &str) -> Result<(), &'static str> {
         return Err("device name contains invalid characters");
     }
     Ok(())
-}
-
-/// Symlink-safe tempfile writer for the rendered pf rules blob.
-///
-/// `apply_pf_rules` used to construct `temp_dir()/rustynet-pf-rules-<pid>-<gen>.conf`
-/// and call `fs::write`, which silently follows symlinks. On systems where
-/// `temp_dir()` resolves to a world-writable directory (e.g. `/tmp` when the
-/// daemon runs without `$TMPDIR` set, as commonly happens for root services),
-/// an unprivileged attacker could pre-position a symlink at the predictable
-/// path and trick a root-running daemon into overwriting an arbitrary file
-/// with the rendered pf rules. The mitigations are:
-///   1. A 16-byte CSPRNG nonce is appended to the filename so the path is
-///      not predictable from (pid, generation).
-///   2. The file is opened with `create_new(true)` (`O_CREAT|O_EXCL`), which
-///      atomically fails if any inode — including a symlink — already exists.
-///   3. The mode is set to `0o600` so only the daemon user (and root) can
-///      read the rendered rules, which would otherwise expose the SSH
-///      management allowlist and traversal-bootstrap endpoints.
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
-fn write_pf_rules_temp_file_securely(rules: &str, generation: u64) -> Result<PathBuf, SystemError> {
-    use rand::TryRngCore;
-    let mut nonce_bytes = [0u8; 16];
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut nonce_bytes)
-        .map_err(|err| {
-            SystemError::FirewallApplyFailed(format!(
-                "pf rules tempfile nonce CSPRNG unavailable: {err}"
-            ))
-        })?;
-    let mut nonce = String::with_capacity(nonce_bytes.len() * 2);
-    for byte in nonce_bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut nonce, "{byte:02x}");
-    }
-    let tmp_path = std::env::temp_dir().join(format!(
-        "rustynet-pf-rules-{}-{}-{}.conf",
-        std::process::id(),
-        generation,
-        nonce,
-    ));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&tmp_path).map_err(|err| {
-        SystemError::FirewallApplyFailed(format!(
-            "pf rules tempfile create failed at {}: {err}",
-            tmp_path.display()
-        ))
-    })?;
-    use std::io::Write as _;
-    file.write_all(rules.as_bytes()).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp_path);
-        SystemError::FirewallApplyFailed(format!(
-            "pf rules tempfile write failed at {}: {err}",
-            tmp_path.display()
-        ))
-    })?;
-    Ok(tmp_path)
 }
 
 fn validate_windows_interface_alias(value: &str) -> Result<(), &'static str> {
@@ -6710,23 +6641,6 @@ mod tests {
             pre_path.display(),
         );
         let _ = std::fs::remove_file(&pre_path);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_pf_rules_temp_file_writes_owner_only_mode() {
-        use std::os::unix::fs::PermissionsExt;
-        let path = super::write_pf_rules_temp_file_securely("pass out quick all\n", 7777)
-            .expect("pf rules tempfile creation succeeds in a writable temp dir");
-        let meta = std::fs::metadata(&path).expect("tempfile metadata readable");
-        let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "pf rules tempfile must be created with 0o600 so its contents (SSH \
-             allowlist, traversal bootstrap endpoints) are not world-readable; \
-             observed mode={mode:o}"
-        );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
