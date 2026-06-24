@@ -155,6 +155,15 @@ fn run() -> Result<(), String> {
                 })
             }
             [cmd, rest @ ..] if cmd == "privileged-helper" => run_privileged_helper_command(rest),
+            [cmd, rest @ ..] if cmd == "privileged-helper-allowlist-audit" => {
+                run_privileged_helper_allowlist_audit_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "membership-signature-audit" => {
+                run_membership_signature_audit_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "policy-default-deny-audit" => {
+                run_policy_default_deny_audit_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "key" => run_key_command(rest),
             [cmd, rest @ ..] if cmd == "membership" => run_membership_command(rest),
             [cmd, rest @ ..] if cmd == "windows-runtime-boundary-check" => {
@@ -226,6 +235,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "linux-exit-nat-lifecycle-snapshot" => {
                 run_linux_exit_nat_lifecycle_snapshot_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "linux-ipv6-leak-capture" => {
+                run_linux_ipv6_leak_capture_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "macos-runtime-acls-check" => {
                 run_macos_runtime_acls_check_command(rest)
             }
@@ -252,6 +264,9 @@ fn run() -> Result<(), String> {
             }
             [cmd, rest @ ..] if cmd == "macos-exit-nat-lifecycle-snapshot" => {
                 run_macos_exit_nat_lifecycle_snapshot_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "macos-ipv6-leak-capture" => {
+                run_macos_ipv6_leak_capture_command(rest)
             }
             _ => Err(help_text()),
         },
@@ -1523,6 +1538,207 @@ fn run_linux_exit_nat_lifecycle_snapshot_command(args: &[String]) -> Result<(), 
             format!("serialize linux-exit-nat-lifecycle snapshot failed: {err}")
         })?
     );
+    Ok(())
+}
+
+fn run_linux_ipv6_leak_capture_command(args: &[String]) -> Result<(), String> {
+    let mut egress_iface: Option<String> = None;
+    let mut probe_target: Option<String> = None;
+    let mut killswitch_table: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--egress-iface") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-ipv6-leak-capture: --egress-iface requires a value".to_owned()
+                })?;
+                egress_iface = Some(value.clone());
+                index += 2;
+            }
+            Some("--probe-target") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-ipv6-leak-capture: --probe-target requires a value".to_owned()
+                })?;
+                probe_target = Some(value.clone());
+                index += 2;
+            }
+            Some("--killswitch-table") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-ipv6-leak-capture: --killswitch-table requires a value".to_owned()
+                })?;
+                killswitch_table = Some(value.clone());
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!("unknown linux-ipv6-leak-capture argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let egress_iface = egress_iface
+        .ok_or_else(|| "linux-ipv6-leak-capture: --egress-iface is required".to_owned())?;
+    let options = rustynetd::linux_ipv6_leak::LinuxIpv6LeakOptions {
+        egress_iface,
+        probe_target: probe_target
+            .unwrap_or_else(|| rustynetd::linux_ipv6_leak::DEFAULT_IPV6_PROBE_TARGET.to_owned()),
+        killswitch_table: killswitch_table.unwrap_or_else(|| {
+            rustynetd::linux_ipv6_leak::DEFAULT_LINUX_KILLSWITCH_TABLE.to_owned()
+        }),
+    };
+    let snapshot = rustynetd::linux_ipv6_leak::collect_linux_ipv6_leak_snapshot(&options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&snapshot)
+            .map_err(|err| { format!("serialize linux-ipv6-leak snapshot failed: {err}") })?
+    );
+    Ok(())
+}
+
+fn run_macos_ipv6_leak_capture_command(args: &[String]) -> Result<(), String> {
+    let mut egress_iface: Option<String> = None;
+    let mut probe_target: Option<String> = None;
+    let mut pf_anchor: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--egress-iface") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "macos-ipv6-leak-capture: --egress-iface requires a value".to_owned()
+                })?;
+                egress_iface = Some(value.clone());
+                index += 2;
+            }
+            Some("--probe-target") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "macos-ipv6-leak-capture: --probe-target requires a value".to_owned()
+                })?;
+                probe_target = Some(value.clone());
+                index += 2;
+            }
+            Some("--pf-anchor") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "macos-ipv6-leak-capture: --pf-anchor requires a value".to_owned()
+                })?;
+                pf_anchor = Some(value.clone());
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!("unknown macos-ipv6-leak-capture argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let egress_iface = egress_iface
+        .ok_or_else(|| "macos-ipv6-leak-capture: --egress-iface is required".to_owned())?;
+    let options = rustynetd::macos_ipv6_leak::MacosIpv6LeakOptions {
+        egress_iface,
+        probe_target: probe_target
+            .unwrap_or_else(|| rustynetd::macos_ipv6_leak::DEFAULT_IPV6_PROBE_TARGET.to_owned()),
+        pf_anchor: pf_anchor.unwrap_or_else(|| {
+            rustynetd::macos_ipv6_leak::DEFAULT_MACOS_KILLSWITCH_ANCHOR.to_owned()
+        }),
+    };
+    let snapshot = rustynetd::macos_ipv6_leak::collect_macos_ipv6_leak_snapshot(&options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&snapshot)
+            .map_err(|err| { format!("serialize macos-ipv6-leak snapshot failed: {err}") })?
+    );
+    Ok(())
+}
+
+fn run_privileged_helper_allowlist_audit_command(args: &[String]) -> Result<(), String> {
+    // Accept (and ignore) `--no-fail-on-drift` for argv parity with the other
+    // `*-check` daemon subcommands: the orchestrator's
+    // `build_linux_daemon_check_invocation` unconditionally appends it. The
+    // audit already fails closed on its own (non-zero exit when !overall_ok),
+    // so the flag is a no-op here. Any other argument is rejected.
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!(
+                    "unknown privileged-helper-allowlist-audit argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report =
+        rustynetd::privileged_helper_allowlist_audit::run_privileged_helper_allowlist_audit();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|err| {
+            format!("serialize privileged-helper-allowlist-audit report failed: {err}")
+        })?
+    );
+    if !report.overall_ok {
+        return Err(format!(
+            "privileged-helper allowlist audit failed: {} violation(s) — the argv allowlist accepted an adversarial request or rejected a reviewed one",
+            report.violations.len()
+        ));
+    }
+    Ok(())
+}
+
+fn run_membership_signature_audit_command(args: &[String]) -> Result<(), String> {
+    // Accept (ignore) --no-fail-on-drift for argv parity with the other check
+    // subcommands; the audit fails closed on its own (non-zero exit).
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!(
+                    "unknown membership-signature-audit argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = rustynetd::membership_signature_audit::run_membership_signature_audit()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|err| {
+            format!("serialize membership-signature-audit report failed: {err}")
+        })?
+    );
+    if !report.overall_ok {
+        return Err(format!(
+            "membership signature audit failed: {} violation(s) — the signed-membership verify funnel accepted a forgery or rejected the valid baseline",
+            report.violations.len()
+        ));
+    }
+    Ok(())
+}
+
+fn run_policy_default_deny_audit_command(args: &[String]) -> Result<(), String> {
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!(
+                    "unknown policy-default-deny-audit argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = rustynetd::policy_default_deny_audit::run_policy_default_deny_audit();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|err| {
+            format!("serialize policy-default-deny-audit report failed: {err}")
+        })?
+    );
+    if !report.overall_ok {
+        return Err(format!(
+            "policy default-deny audit failed: {} violation(s) — the ACL evaluator's default-deny truth table regressed",
+            report.violations.len()
+        ));
+    }
     Ok(())
 }
 
@@ -3514,6 +3730,11 @@ fn help_text() -> String {
         "  rustynetd linux-dns-failclosed-check [--no-fail-on-drift]",
         "  rustynetd linux-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>] [--killswitch-table <name>]",
         "  rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]",
+        "  rustynetd linux-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--killswitch-table <name>]",
+        "  rustynetd membership-signature-audit",
+        "  rustynetd policy-default-deny-audit",
+        "  rustynetd privileged-helper-allowlist-audit",
+        "  rustynetd macos-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--pf-anchor <name>]",
         "  rustynetd macos-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>]",
         "  rustynetd macos-exit-killswitch-precedence-check --output <path> [--pf-anchor <name>]",
         "  rustynetd windows-service-hardening-check [--no-fail-on-drift]",
@@ -3604,9 +3825,11 @@ fn help_text() -> String {
 mod tests {
     use super::{
         classify_top_level_error, help_text, parse_daemon_config,
-        run_linux_exit_dns_failclosed_capture_command,
+        run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
         run_macos_exit_dns_failclosed_capture_command,
-        run_macos_exit_killswitch_precedence_check_command, run_windows_authenticode_check_command,
+        run_macos_exit_killswitch_precedence_check_command, run_macos_ipv6_leak_capture_command,
+        run_membership_signature_audit_command, run_policy_default_deny_audit_command,
+        run_privileged_helper_allowlist_audit_command, run_windows_authenticode_check_command,
         run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
         run_windows_exit_nat_lifecycle_snapshot_command, run_windows_key_custody_check_command,
         run_windows_killswitch_assert_command, run_windows_mesh_status_check_command,
@@ -3999,6 +4222,160 @@ mod tests {
         .expect_err("missing output must reject");
         assert!(
             err.contains("--output is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_privileged_helper_allowlist_audit_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("privileged-helper-allowlist-audit"),
+            "help text must advertise privileged-helper-allowlist-audit subcommand"
+        );
+    }
+
+    #[test]
+    fn run_privileged_helper_allowlist_audit_command_rejects_unknown_flags() {
+        let err = run_privileged_helper_allowlist_audit_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown privileged-helper-allowlist-audit argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_privileged_helper_allowlist_audit_command_passes_on_reviewed_allowlist() {
+        // The shipped allowlist must satisfy the adversarial corpus, so the
+        // command exits Ok on a healthy binary.
+        run_privileged_helper_allowlist_audit_command(&[])
+            .expect("privileged-helper allowlist audit must pass on the reviewed allowlist");
+    }
+
+    #[test]
+    fn help_text_advertises_policy_default_deny_audit_subcommand() {
+        assert!(
+            help_text().contains("policy-default-deny-audit"),
+            "help text must advertise policy-default-deny-audit subcommand"
+        );
+    }
+
+    #[test]
+    fn run_policy_default_deny_audit_command_passes_on_reviewed_evaluator() {
+        run_policy_default_deny_audit_command(&[])
+            .expect("policy default-deny audit must pass against the real evaluator");
+    }
+
+    #[test]
+    fn run_policy_default_deny_audit_command_accepts_no_fail_on_drift() {
+        run_policy_default_deny_audit_command(&["--no-fail-on-drift".to_owned()])
+            .expect("must accept --no-fail-on-drift for argv parity");
+    }
+
+    #[test]
+    fn help_text_advertises_membership_signature_audit_subcommand() {
+        assert!(
+            help_text().contains("membership-signature-audit"),
+            "help text must advertise membership-signature-audit subcommand"
+        );
+    }
+
+    #[test]
+    fn run_membership_signature_audit_command_passes_on_reviewed_funnel() {
+        run_membership_signature_audit_command(&[])
+            .expect("membership signature audit must pass against the real verify funnel");
+    }
+
+    #[test]
+    fn run_membership_signature_audit_command_accepts_no_fail_on_drift() {
+        run_membership_signature_audit_command(&["--no-fail-on-drift".to_owned()])
+            .expect("must accept --no-fail-on-drift for argv parity");
+    }
+
+    #[test]
+    fn run_membership_signature_audit_command_rejects_unknown_flags() {
+        let err = run_membership_signature_audit_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown membership-signature-audit argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_privileged_helper_allowlist_audit_command_accepts_no_fail_on_drift() {
+        // The orchestrator's build_linux_daemon_check_invocation ALWAYS appends
+        // --no-fail-on-drift; the live stage is dead-on-arrival if the handler
+        // rejects it. This pins the exact remote argv.
+        run_privileged_helper_allowlist_audit_command(&["--no-fail-on-drift".to_owned()])
+            .expect("the audit subcommand must accept --no-fail-on-drift for argv parity");
+    }
+
+    #[test]
+    fn help_text_advertises_macos_ipv6_leak_capture_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("macos-ipv6-leak-capture"),
+            "help text must advertise macos-ipv6-leak-capture subcommand"
+        );
+    }
+
+    #[test]
+    fn run_macos_ipv6_leak_capture_command_rejects_unknown_flags() {
+        let err = run_macos_ipv6_leak_capture_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown macos-ipv6-leak-capture argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_macos_ipv6_leak_capture_command_requires_egress_iface() {
+        let err = run_macos_ipv6_leak_capture_command(&[
+            "--probe-target".to_owned(),
+            "2606:4700:4700::1111".to_owned(),
+        ])
+        .expect_err("missing egress iface must reject");
+        assert!(
+            err.contains("--egress-iface is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_linux_ipv6_leak_capture_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("linux-ipv6-leak-capture"),
+            "help text must advertise linux-ipv6-leak-capture subcommand"
+        );
+        assert!(
+            help.contains("--egress-iface"),
+            "help text must advertise --egress-iface"
+        );
+    }
+
+    #[test]
+    fn run_linux_ipv6_leak_capture_command_rejects_unknown_flags() {
+        let err = run_linux_ipv6_leak_capture_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown linux-ipv6-leak-capture argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_linux_ipv6_leak_capture_command_requires_egress_iface() {
+        let err = run_linux_ipv6_leak_capture_command(&[
+            "--probe-target".to_owned(),
+            "2606:4700:4700::1111".to_owned(),
+        ])
+        .expect_err("missing egress iface must reject");
+        assert!(
+            err.contains("--egress-iface is required"),
             "unexpected error: {err}"
         );
     }
