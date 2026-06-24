@@ -228,8 +228,7 @@ fn role_ord(role: &str) -> u64 {
 }
 
 // ----------------------- THEME / GLOBAL CONSTANTS ----------------------
-const BG: Color32 = Color32::from_rgb(82, 87, 97); // window background (grey)
-const NEBULA: Color32 = Color32::from_rgb(104, 110, 124); // faked center-lift tint
+const BG: Color32 = Color32::from_rgb(88, 89, 92); // window background (flat neutral grey)
 const WARM_WHITE: Color32 = Color32::from_rgb(255, 248, 236); // glow highlight
 const FIBER: Color32 = Color32::from_rgb(176, 206, 236); // edge/particle tint
 const GREY_DOWN: Color32 = Color32::from_rgb(120, 126, 142); // desaturation target
@@ -239,13 +238,13 @@ const TEXT_HI: Color32 = Color32::from_rgb(232, 238, 248);
 // A light, smooth glow built from many thin layers whose radius shrinks AND
 // whose alpha fades from the core outward, so they blend into a soft aura
 // rather than reading as discrete rings.
-const GLOW_LAYERS: usize = 14;
-const GLOW_OUTER: f32 = 1.9; // outermost halo radius (x core_r)
+const GLOW_LAYERS: usize = 8;
+const GLOW_OUTER: f32 = 1.5; // outermost halo radius (x core_r) — tight, clean edge
 const GLOW_INNER: f32 = 1.0; // innermost halo radius (meets the core)
-const GLOW_PEAK: f32 = 0.06; // strongest per-layer alpha (light glow)
-const GLOW_FALLOFF: f32 = 2.6; // higher = faster fade outward (fainter halo)
-const GLOW_WARM: f32 = 0.12; // how much the inner glow warms toward WARM_WHITE
-const CORE_R_MULT: f32 = 0.9; // node ball radius (x core_r)
+const GLOW_PEAK: f32 = 0.05; // strongest per-layer alpha (subtle bloom, not a fuzzy ball)
+const GLOW_FALLOFF: f32 = 2.2; // higher = faster fade outward (fainter halo)
+const GLOW_WARM: f32 = 0.05; // how much the inner glow warms toward WARM_WHITE
+const CORE_R_MULT: f32 = 1.0; // node ball radius (x core_r) — solid sphere fills the core
 
 // ------------------------------ DEPTH ----------------------------------
 // DEPTH_FOG_MAX = how far edges fade toward BG with distance. REF_DISTANCE maps
@@ -1146,6 +1145,9 @@ impl Graph {
                 if dp[mask] == usize::MAX {
                     continue;
                 }
+                // `j` is a set-bit index (used as `1 << j`), so the range loop is
+                // the natural form here — not an array walk.
+                #[allow(clippy::needless_range_loop)]
                 for j in 0..n {
                     if mask & (1 << j) != 0 {
                         continue;
@@ -2052,7 +2054,7 @@ impl App {
                 }
 
                 // ----- background -----
-                draw_background(&painter, rect, time);
+                draw_background(&painter, rect);
 
                 // ----- project visible nodes -----
                 struct Drawn {
@@ -2535,18 +2537,34 @@ fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
     });
 }
 
-/// Draw a node core as a simple faked 3D sphere: a dark base rim, the bold body
-/// offset toward the light, then a highlight and a small specular (light from
-/// the upper-left). Four solid circles only — minimal, no gradients.
+/// Draw a node core as a simple, minimal 3D sphere: a faint contact shadow that
+/// grounds it on the plane, then a dark rim, the body offset toward the light, a
+/// soft highlight and a small specular (light from the upper-left). Solid
+/// circles only — no gradients, nothing fancy.
 fn draw_ball(painter: &egui::Painter, c: Pos2, r: f32, color: Color32, alpha: f32) {
+    // Soft contact shadow: light is upper-left, so the shadow falls lower-right.
+    // Two faint, tight circles — only the lower-right crescent shows past the body.
+    let shadow = Color32::from_rgb(24, 25, 30);
+    painter.circle_filled(
+        c + Vec2::new(r * 0.26, r * 0.40),
+        r * 0.97,
+        with_alpha(shadow, 0.10 * alpha),
+    );
+    painter.circle_filled(
+        c + Vec2::new(r * 0.16, r * 0.26),
+        r * 0.90,
+        with_alpha(shadow, 0.10 * alpha),
+    );
+
+    // Sphere body: dark rim -> body -> highlight -> small specular.
     let dir = Vec2::new(-0.40, -0.52); // light from upper-left (screen y is down)
-    let shadow = lerp_color(color, Color32::BLACK, 0.50);
-    let hi = lerp_color(color, Color32::WHITE, 0.38);
-    let spec = lerp_color(color, Color32::WHITE, 0.72);
-    painter.circle_filled(c, r, with_alpha(shadow, alpha));
-    painter.circle_filled(c + dir * (r * 0.14), r * 0.86, with_alpha(color, alpha));
-    painter.circle_filled(c + dir * (r * 0.34), r * 0.52, with_alpha(hi, alpha));
-    painter.circle_filled(c + dir * (r * 0.50), r * 0.22, with_alpha(spec, alpha));
+    let rim = lerp_color(color, Color32::BLACK, 0.52);
+    let hi = lerp_color(color, Color32::WHITE, 0.34);
+    let spec = lerp_color(color, Color32::WHITE, 0.78);
+    painter.circle_filled(c, r, with_alpha(rim, alpha));
+    painter.circle_filled(c + dir * (r * 0.12), r * 0.88, with_alpha(color, alpha));
+    painter.circle_filled(c + dir * (r * 0.32), r * 0.54, with_alpha(hi, alpha));
+    painter.circle_filled(c + dir * (r * 0.52), r * 0.24, with_alpha(spec, alpha));
 }
 
 fn draw_tooltip(painter: &egui::Painter, at: Pos2, node: &Node) {
@@ -2571,71 +2589,10 @@ fn draw_tooltip(painter: &egui::Painter, at: Pos2, node: &Node) {
     painter.galley(pos + pad + Vec2::new(10.0, 0.0), galley, Color32::WHITE);
 }
 
-/// Deep-space backdrop: BG fill + a faked nebula centre-lift + a 3-tier
-/// (parallax) starfield + corner vignette. All deterministic so stars don't
-/// jitter frame-to-frame (positions are reproduced from a fixed seed).
-fn draw_background(painter: &egui::Painter, rect: Rect, time: f32) {
-    // 1) base fill.
+/// Flat background: one solid grey fill. No pattern, no nebula, no starfield,
+/// no vignette — just the plain plane the nodes sit in.
+fn draw_background(painter: &egui::Painter, rect: Rect) {
     painter.rect_filled(rect, 0.0, BG);
-
-    // 2) nebula centre-lift: a few big, very faint circles (kept barely-there so
-    //    it reads as a smooth lift, not concentric bands, on the grey backdrop).
-    let base = rect.height().min(rect.width()) * 0.18;
-    let nebula_r = [3.4, 2.4, 1.5, 0.8];
-    let nebula_a = [0.008, 0.010, 0.012, 0.014];
-    for i in 0..4 {
-        painter.circle_filled(
-            rect.center(),
-            base * nebula_r[i],
-            with_alpha(NEBULA, nebula_a[i]),
-        );
-    }
-
-    // 3) starfield, 3 tiers (far/mid/near) for a sense of parallax.
-    let star = Color32::from_rgb(150, 170, 210);
-    let warm = Color32::from_rgb(222, 214, 196);
-    let tier =
-        |seed0: u64, count: usize, a_lo: f32, a_hi: f32, r_lo: f32, r_hi: f32, warm_frac: f32| {
-            let mut seed = seed0;
-            let mut next = move || {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                (seed >> 11) as f32 / (1u64 << 53) as f32
-            };
-            for _ in 0..count {
-                let x = rect.left() + next() * rect.width();
-                let y = rect.top() + next() * rect.height();
-                let twinkle_seed = next() * std::f32::consts::TAU;
-                let mut a = a_lo + next() * (a_hi - a_lo);
-                a *= 1.0 + (time * 1.3 + twinkle_seed).sin() * 0.1; // gentle twinkle
-                let r = r_lo + next() * (r_hi - r_lo);
-                let col = if next() < warm_frac { warm } else { star };
-                painter.circle_filled(Pos2::new(x, y), r, with_alpha(col, a));
-            }
-        };
-    tier(0x1234_5678, 150, 0.10, 0.22, 0.3, 0.8, 0.0); // far
-    tier(0x9e37_79b9, 70, 0.26, 0.46, 0.7, 1.2, 0.0); // mid
-    tier(0xa5a5_f00d, 26, 0.50, 0.80, 1.1, 1.8, 0.25); // near
-
-    // 4) corner vignette: faint dark circles centred on each corner. Pushed
-    //    large so only the gentle interior darkening shows (no hard arc band).
-    let vmax = rect.width().max(rect.height());
-    let corners = [
-        rect.left_top(),
-        rect.right_top(),
-        rect.left_bottom(),
-        rect.right_bottom(),
-    ];
-    for c in corners {
-        for _ in 0..2 {
-            painter.circle_filled(
-                c,
-                vmax * 0.85,
-                with_alpha(Color32::from_rgb(2, 3, 8), 0.035),
-            );
-        }
-    }
 }
 
 // ===========================================================================
