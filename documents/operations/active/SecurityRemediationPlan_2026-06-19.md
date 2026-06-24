@@ -50,7 +50,7 @@ Effort key: **S** ≤½ day · **M** ~1–2 days · **L** ≥3 days / needs desi
 
 **Theme E — revocation-blind issuance / consistency (mitigated downstream, fix for one-hardened-path).**
 - RSA-0007 `phase10.rs` set_exit_node/ensure_lan_route_allowed → route through `evaluate_with_membership`; revoked-node negative tests. **S** — ✅ APPLIED 2026-06-24 (both gates now membership-aware; revoked exit-node + revoked-requester negative tests).
-- RSA-0008 `rustynet-control` `ControlPlaneCore` → give it a signed `MembershipDirectory`, use `evaluate_with_membership` for issuance. **M**
+- RSA-0008 `rustynet-control` `ControlPlaneCore` → give it a signed `MembershipDirectory`, use `evaluate_with_membership` for issuance. **M** — ✅ APPLIED 2026-06-24 (code-complete): `ControlPlaneCore` carries an optional `MembershipDirectory` (`set/with_membership_directory`); `policy_allows_node_pair` fails closed unless both endpoints are `Active` when the directory is populated (Revoked/Unknown denied — covers auto-tunnel/peer-map/dns-zone/endpoint-hint/relay-fleet + relay-session token); empty directory preserves pre-membership behaviour. Tests: revoked-peer-excluded, revoked-target-no-peers, revoked/unknown relay-token denied, all-active issues, empty unchanged. **Follow-up:** operator revocation-status input at the CLI issue paths (the worst-case end-to-end bypass is already foreclosed by the daemon `check_peer_membership_active` provisioning gate, so this is defense-in-depth at the generator).
 
 **Theme F — destructive lab automation (the overnight driver).**
 - RSA-0052 overnight live path → real branch isolation (`git checkout -B overnight/<date>`, refuse `main`) + dry-run default + never push. **M**
@@ -79,7 +79,7 @@ Batch by category so each PR is coherent:
 
 | ID | Question for the owner |
 |---|---|
-| RSA-0014 | Should `emit_role_audit` fail **closed** (block the transition) when the durable audit append fails, for SignedMembership/Irreversible role changes? |
+| RSA-0014 | ✅ **DECIDED + APPLIED 2026-06-24 — fail closed.** `emit_role_audit` now returns `Result`; `finalize_role_audit` fails the transition closed when the durable append fails for a `requires_owner_signature()` transition (SignedMembership / Irreversible), and stays best-effort (warn) for reversible Identity / LocalOnly. Strictest secure default that doesn't regress local reconfiguration. Tests cover both fatal and non-fatal paths. |
 | RSA-0018 | Wire `admin.rs` `validate_privileged_command` into a real enforcement point, or document it as design-reference scaffolding (the audit catalog over-claims it)? |
 | RSA-0024 | Are the §6.E `service_exposure` controller + llm-gateway `session`-token enforcement meant to ship wired for D13 nas/llm, or are they scaffold? |
 | RSA-0034 | Should gossip ingest re-check current `Active`/`Revoked` status before applying a registered peer's state? (confirm registry pruning on revocation) |
@@ -89,6 +89,27 @@ Batch by category so each PR is coherent:
 ---
 
 ## Applied fixes (net-new, post-audit — not from RSA-0001..0074)
+
+- **2026-06-24 — macOS pf mesh egress source CIDR bound (blind_exit killswitch
+  bypass).** APPLIED (code-complete; live-lab pending). A 4-lens adversarial
+  review of the `pfctl -f` regeneration boundary (above) found a residual
+  fail-open: the daemon still chooses the `mesh_cidr` spec parameter, and the
+  `blind_exit` renderer emits `pass out quick on <egress> from <mesh_cidr> to
+  any`. A compromised daemon sending `mesh_cidr=0.0.0.0/0` (or `::/0`) renders
+  `pass out quick on en0 inet from 0.0.0.0/0 to any`; because pf `quick` is
+  first-match-wins this passes ALL local-origin egress before the terminal
+  `block drop out quick all`, silently defeating the blind_exit killswitch and
+  default-deny egress. Neither the per-module `validate_cidr` (only `prefix <=
+  max`, so prefix 0 accepted), the helper rule-shape assert, nor the dedicated
+  evaluator (which recomputes its expected rule FROM the same daemon CIDR)
+  caught it. Fix: `macos_pf_mesh_cidr::validate_mesh_egress_source_cidr`
+  requires the mesh source to be fully contained within a private/CGNAT/ULA
+  supernet (RFC1918 / RFC6598 `100.64.0.0/10` / RFC4193 `fc00::/7` / `fe80::/10`)
+  — the legitimate Rustynet mesh range passes; a global/default-route range is
+  rejected. Wired into both `validate_macos_blind_exit_pf_config` and
+  `validate_macos_exit_nat_pf_config`. Tests cover config-build, render, and the
+  `macos-pf-load` decode boundary, plus malformed input. Found via a workflow
+  adversarial review (1 confirmed HIGH of 4 lenses).
 
 - **2026-06-24 — macOS `pfctl -f` privileged-boundary (regeneration).** APPLIED
   (code-complete; live-lab pending). The macOS privileged helper previously
