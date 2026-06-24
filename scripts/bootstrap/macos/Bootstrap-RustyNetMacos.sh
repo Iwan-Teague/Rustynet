@@ -241,13 +241,21 @@ ensure_homebrew() {
     chown -R "${REAL_USER}:staff" /opt/homebrew
   fi
   # Grant temporary NOPASSWD sudo so Homebrew's sudo-access check passes
-  # without a TTY. This file is removed immediately after install.
+  # without a TTY.
   local sudoers_tmp="/etc/sudoers.d/rustynet-bootstrap-tmp"
   echo "${REAL_USER} ALL=(ALL) NOPASSWD: ALL" > "${sudoers_tmp}"
   chmod 0440 "${sudoers_tmp}"
+  # RSA-0063: remove the NOPASSWD grant on EVERY exit path — the `curl|bash`
+  # installer failing under `set -e`, a SIGINT, or any hard `exit` — so a
+  # failed/aborted bootstrap never leaves a passwordless-root sudoers file on
+  # disk (local privilege-escalation residue, CWE-250/CWE-279). The EXIT trap is
+  # registered BEFORE the curl|bash and cleared on the success path, mirroring
+  # the scoped trap idiom used by the credential-write helpers below.
+  trap 'rm -f "${sudoers_tmp}"' EXIT
   as_user env NONINTERACTIVE=1 /bin/bash -c \
     "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
   rm -f "${sudoers_tmp}"
+  trap - EXIT
 
   for prefix in /opt/homebrew /usr/local; do
     if [[ -x "${prefix}/bin/brew" ]]; then

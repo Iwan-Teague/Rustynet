@@ -1879,6 +1879,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bootstrap_removes_temporary_sudoers_grant_on_every_exit_path() {
+        // RSA-0063: the temporary `NOPASSWD: ALL` sudoers grant used so the
+        // Homebrew installer's sudo check passes must be removed on EVERY exit
+        // path — including a `curl|bash` failure under `set -e` or a SIGINT — so
+        // a failed/aborted bootstrap never leaves passwordless root on disk
+        // (local privilege-escalation residue, CWE-250/CWE-279). Assert the EXIT
+        // trap is registered, and that it appears BEFORE the curl|bash installer
+        // and is cleared on the success path.
+        let trap_idx = BOOTSTRAP_SCRIPT
+            .find("trap 'rm -f \"${sudoers_tmp}\"' EXIT")
+            .expect("bootstrap must register an EXIT trap to remove the temporary sudoers grant");
+        let write_idx = BOOTSTRAP_SCRIPT
+            .find("> \"${sudoers_tmp}\"")
+            .expect("bootstrap must write the temporary sudoers grant");
+        let curl_idx = BOOTSTRAP_SCRIPT
+            .find("install.sh)")
+            .expect("bootstrap must run the Homebrew installer via curl");
+        assert!(
+            write_idx < trap_idx && trap_idx < curl_idx,
+            "the sudoers EXIT trap must be registered after the grant is written and \
+             before the curl|bash installer (write@{write_idx} trap@{trap_idx} curl@{curl_idx})"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("trap - EXIT"),
+            "bootstrap must clear the EXIT trap on the success path"
+        );
+    }
+
     /// HIGH 1 reviewer fold-in (Phase 21 follow-up).
     ///
     /// The `chmod 0600` MUST happen BEFORE `openssl rand` writes any
