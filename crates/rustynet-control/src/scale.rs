@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
+use subtle::ConstantTimeEq;
+
 use crate::{TrustStateError, load_trust_state};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,10 +220,22 @@ impl EnterpriseAuthConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TrustHardeningConfig {
     pub enabled: bool,
     pub break_glass_secret: String,
+}
+
+// RSA-0016: hand-written redacting Debug so a `{:?}` / structured-log of the
+// config can never surface the plaintext break-glass secret (a derived Debug
+// would print it verbatim).
+impl fmt::Debug for TrustHardeningConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrustHardeningConfig")
+            .field("enabled", &self.enabled)
+            .field("break_glass_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,7 +279,15 @@ pub fn disable_trust_hardening(
     config: &mut TrustHardeningConfig,
     submitted_break_glass_secret: &str,
 ) -> Result<(), TrustHardeningError> {
-    if submitted_break_glass_secret != config.break_glass_secret {
+    // RSA-0016: constant-time compare so the break-glass secret cannot be
+    // recovered byte-by-byte via a timing oracle (a plain `!=` short-circuits on
+    // the first differing byte). Mirrors admin.rs's CSRF-token compare. ct_eq on
+    // unequal-length slices returns 0 in constant time w.r.t. content.
+    let matches: bool = submitted_break_glass_secret
+        .as_bytes()
+        .ct_eq(config.break_glass_secret.as_bytes())
+        .into();
+    if !matches {
         return Err(TrustHardeningError::BreakGlassSecretInvalid);
     }
     config.enabled = false;
@@ -442,5 +464,36 @@ mod tests {
         disable_trust_hardening(&mut config, "break-glass")
             .expect("valid break-glass should disable");
         assert!(!config.enabled);
+    }
+
+    #[test]
+    fn trust_hardening_disable_rejects_wrong_length_secret_constant_time() {
+        // RSA-0016: a different-length submission must also be rejected (the
+        // ct_eq path returns 0 for unequal lengths), not just a same-length
+        // mismatch.
+        let mut config = TrustHardeningConfig {
+            enabled: true,
+            break_glass_secret: "break-glass".to_owned(),
+        };
+        assert_eq!(
+            disable_trust_hardening(&mut config, "x").err(),
+            Some(TrustHardeningError::BreakGlassSecretInvalid)
+        );
+        assert!(config.enabled, "a wrong secret must not disable hardening");
+    }
+
+    #[test]
+    fn trust_hardening_config_debug_redacts_break_glass_secret() {
+        // RSA-0016: the secret must never appear in Debug output.
+        let config = TrustHardeningConfig {
+            enabled: true,
+            break_glass_secret: "super-secret-break-glass-value".to_owned(),
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("super-secret-break-glass-value"),
+            "Debug must not surface the break-glass secret: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 }

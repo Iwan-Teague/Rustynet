@@ -1,9 +1,84 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+
+/// Append a sqlite sidecar suffix (`-wal` / `-shm`) to a DB path.
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// RSA-0017: reject a control-plane DB / sidecar that already exists with
+/// insecure permissions (symlink, group/other-accessible, or foreign owner) on
+/// unix. A non-existent path is fine (it will be created and tightened). Fails
+/// closed: any stat error on an existing, accessible path is an error.
+fn enforce_sqlite_path_secure(path: &Path) -> Result<(), PersistenceError> {
+    let link_metadata = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {
+            return Err(PersistenceError::InvariantViolation(
+                "control-plane DB path is not statable; refusing to open (fail closed)",
+            ));
+        }
+    };
+    if link_metadata.file_type().is_symlink() {
+        return Err(PersistenceError::InvariantViolation(
+            "control-plane DB path is a symlink; refusing to open (fail closed)",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path).map_err(|_| {
+            PersistenceError::InvariantViolation(
+                "control-plane DB path is not statable; refusing to open (fail closed)",
+            )
+        })?;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(PersistenceError::InvariantViolation(
+                "control-plane DB is group/other-accessible; refusing to open (fail closed)",
+            ));
+        }
+        if metadata.uid() != nix::unistd::Uid::effective().as_raw() {
+            return Err(PersistenceError::InvariantViolation(
+                "control-plane DB is owned by another user; refusing to open (fail closed)",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Tighten an existing sqlite DB / sidecar to `0o600` (owner-only). No-op if the
+/// file does not exist or on non-unix (Windows ACL custody is RSA-0002/0025).
+fn tighten_sqlite_file(path: &Path) -> Result<(), PersistenceError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(_) => std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| {
+                    PersistenceError::InvariantViolation(
+                        "could not restrict control-plane DB permissions to 0o600 (fail closed)",
+                    )
+                })?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(PersistenceError::InvariantViolation(
+                    "control-plane DB path is not statable after open (fail closed)",
+                ));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
 
 #[derive(Debug)]
 pub enum PersistenceError {
@@ -72,7 +147,23 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PersistenceError> {
+        let path = path.as_ref();
+        // RSA-0017: the control-plane DB holds node pubkeys, user MFA posture and
+        // single-use credential state. The file-based TrustState gates access via
+        // a permission check; the sqlite path had none, and WAL mode creates
+        // group/other-readable `-wal`/`-shm` sidecars under the default umask. Fail
+        // closed on a pre-existing insecure DB or sidecar, then enforce 0o600 on
+        // the (possibly freshly created) files.
+        enforce_sqlite_path_secure(path)?;
+        let wal = sidecar_path(path, "-wal");
+        let shm = sidecar_path(path, "-shm");
+        enforce_sqlite_path_secure(&wal)?;
+        enforce_sqlite_path_secure(&shm)?;
         let conn = Connection::open(path)?;
+        // Lock down whatever `open` (or a prior WAL checkpoint) created.
+        tighten_sqlite_file(path)?;
+        tighten_sqlite_file(&wal)?;
+        tighten_sqlite_file(&shm)?;
         Ok(Self { conn })
     }
 
@@ -270,6 +361,38 @@ fn consume_single_use_credential_tx(
 #[cfg(test)]
 mod tests {
     use super::{CredentialRow, NodeRow, SqliteStore, UserRow};
+
+    #[cfg(unix)]
+    #[test]
+    fn rsa0017_open_rejects_group_readable_db() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rn-rsa0017-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db = dir.join("control.db");
+        std::fs::write(&db, b"").expect("seed db file");
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        let err = SqliteStore::open(&db).expect_err("group/other-readable DB must fail closed");
+        assert!(format!("{err}").contains("group/other-accessible"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rsa0017_open_creates_and_tightens_db_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rn-rsa0017b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db = dir.join("control.db");
+        let store = SqliteStore::open(&db).expect("fresh DB opens");
+        store.apply_migrations().expect("migrations");
+        let mode = std::fs::metadata(&db)
+            .expect("stat db")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "freshly created DB must be locked to 0o600");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sqlite_store_applies_schema_and_persists_core_records() {

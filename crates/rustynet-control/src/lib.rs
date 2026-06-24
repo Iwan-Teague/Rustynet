@@ -3024,14 +3024,24 @@ impl ControlPlaneCore {
             ));
         }
 
-        Ok(RelaySessionToken::sign_at(
+        // RSA-0010: mint via the fail-closed `try_sign_at` — a transient OS-CSPRNG
+        // fault surfaces as a structured error instead of panicking (a DoS vector
+        // on this `Result`-returning public API). The nonce is the relay's
+        // anti-replay key, so degraded entropy must fail closed, not crash.
+        RelaySessionToken::try_sign_at(
             &self.endpoint_hint_signing_key,
             request.node_id.as_str(),
             request.peer_node_id.as_str(),
             relay_id,
             request.requested_at_unix,
             request.ttl_secs,
-        ))
+        )
+        .map_err(|err| {
+            ControlPlaneError::Traversal(format!(
+                "relay token nonce minting failed: {}",
+                err.source
+            ))
+        })
     }
 
     pub fn signed_traversal_coordination_record(
