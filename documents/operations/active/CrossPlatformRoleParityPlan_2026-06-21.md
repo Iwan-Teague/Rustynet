@@ -152,3 +152,41 @@ has:
 
 Until all cells in the §3 matrix are ✅, **Rustynet is not cross-platform
 complete**, regardless of how polished Linux is.
+
+## 9. Code-state verification notes (2026-06-24, code-only review)
+
+A code-only audit (no live lab) confirmed the §3 symbols are about **live-proven**
+status and remain accurate; the notes below record what is **code-complete /
+live-PENDING** vs an actual implementation gap, so the remaining live runs are not
+mistaken for missing code. The §3 symbols are intentionally NOT flipped — ✅ still
+requires a recorded green live run.
+
+- **admin (Windows) — code-complete, live-PENDING (not a code gap).** `--admin-platform
+  windows` sets `validate_admin_issue`; the FAIL-LOUD `validate_windows_admin_issue`
+  stage (`vm_lab/mod.rs:12891`, Pass/Fail/Skip, gated on elected-admin + mesh-join)
+  drives `exercise_windows_admin_issue_live` (`:12992`) which mints signing authority
+  + issues a signed assignment bundle on the guest. The run-matrix tracks no admin
+  stage for **either** OS, so this mirrors the macOS admin pattern. Only a green live
+  run remains.
+- **admin (macOS) — still ❌ (correct).** The closest run (`livelab-1782135034`,
+  2026-06-22) was an all-Linux topology that FAILED at `deploy_macos_anchor_profile`
+  with `macos_admin=not_run`; macOS self-mint is deliberately disabled. No code claim.
+- **exit (macOS) — 🟡, security-hardened 2026-06-24.** The `pfctl -f` privileged
+  boundary is closed (regeneration via the `macos-pf-load` builtin) and the exit-NAT
+  teardown verifier now fails closed on an unverifiable capture (RSA-0031). Still needs
+  a live green run.
+- **blind_exit (macOS) — dataplane/control code-complete; orchestrator activation
+  stage still deferred.** `macos_blind_exit.rs` + daemon invariants (`daemon.rs:8297`)
+  + the immutability gate (`role_cli.rs:484-517`) + capability schema + unit tests are
+  present, and the macOS lab `NodeRole::Exit` already maps to the daemon `blind_exit`
+  role with `[BlindExit, ExitServer]` (`orchestrator/role.rs:120,148`). The remaining
+  gap is a FAIL-LOUD activation/assertion **stage** (deferred in `active_exit.rs`),
+  entangled with the macOS exit path and only meaningful live.
+- **Windows anchor / relay — real runtime still required.** Live bundle-pull serving
+  (Windows daemon loopback listener) and live relay session-forwarding (Windows service
+  + verifier-key deploy + `deploy_relay_service` adapter hook) are genuinely unbuilt;
+  the current validators are dry-run/contract only (§3 🟠 is accurate).
+- **Tooling blocker for Windows-only code:** on the dev macOS host, `cargo check
+  --target x86_64-pc-windows-gnu` fails compiling deps (`cpufeatures`/`subtle`), so new
+  `cfg(windows)`-only code (e.g. DPAPI/SDDL key custody RSA-0002/0025) is **not locally
+  gate-verifiable** — those items need a Windows builder or CI cross-check.
