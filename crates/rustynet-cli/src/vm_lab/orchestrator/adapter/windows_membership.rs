@@ -90,32 +90,16 @@ pub fn init_membership_snapshot(
         }
         let pubkey_hex = hex_32_arg(&peer.public_key_hex)?;
         let capabilities = role_capability_csv(&peer.capabilities);
-        let add_script = format!(
-            "$ErrorActionPreference = 'Stop'; \
-             $ProgressPreference = 'SilentlyContinue'; \
-             $result = Invoke-RustyNetBootstrapNative {{ \
-                 & {rustynetd_q} membership add-peer \
-                     --node-id {node_id_q} \
-                     --node-pubkey-hex {pubkey_q} \
-                     --capabilities {capabilities_q} \
-                     --owner {owner_q} \
-                     --approver-id {approver_q} \
-                     --signing-key {signing_key_q} \
-                     --signing-key-passphrase-file {passphrase_q} \
-             }}; \
-             if ($result.ExitCode -ne 0) {{ \
-                 throw ('rustynetd membership add-peer failed for {peer_id}: ' + $result.Output) \
-             }}",
-            rustynetd_q = ps_quote(WINDOWS_RUSTYNETD_PATH)?,
-            node_id_q = ps_quote(&peer.node_id)?,
-            pubkey_q = ps_quote(&pubkey_hex)?,
-            capabilities_q = ps_quote(&capabilities)?,
-            owner_q = ps_quote(exit_node_id)?,
-            approver_q = ps_quote(&approver_id)?,
-            signing_key_q = ps_quote(WINDOWS_MEMBERSHIP_OWNER_KEY_PATH)?,
-            passphrase_q = ps_quote(WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH)?,
-            peer_id = &peer.node_id,
-        );
+        let add_script = build_add_peer_script(
+            WINDOWS_RUSTYNETD_PATH,
+            peer.node_id.as_str(),
+            &pubkey_hex,
+            &capabilities,
+            exit_node_id,
+            &approver_id,
+            WINDOWS_MEMBERSHIP_OWNER_KEY_PATH,
+            WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH,
+        )?;
         // Invoke-RustyNetBootstrapNative is defined in the bootstrap script which
         // is already loaded in the SSH session.  For post-bootstrap calls we inline
         // a minimal version.
@@ -271,6 +255,50 @@ fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
     }
 }
 
+/// Build the PowerShell `membership add-peer` script for one peer. Every
+/// host-derived value — including the `node_id` embedded in the `throw`
+/// error-message literal (RSA-0059) — is `ps_quote`d, so a `node_id` containing
+/// a single quote (a compromised guest / crafted inventory) cannot break out of
+/// any PowerShell string. Pure + side-effect-free so the quoting is unit-tested
+/// without a live connection.
+#[allow(clippy::too_many_arguments)]
+fn build_add_peer_script(
+    rustynetd_path: &str,
+    node_id: &str,
+    pubkey_hex: &str,
+    capabilities: &str,
+    owner: &str,
+    approver_id: &str,
+    signing_key_path: &str,
+    passphrase_path: &str,
+) -> Result<String, AdapterError> {
+    let node_id_q = ps_quote(node_id)?;
+    Ok(format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $result = Invoke-RustyNetBootstrapNative {{ \
+             & {rustynetd_q} membership add-peer \
+                 --node-id {node_id_q} \
+                 --node-pubkey-hex {pubkey_q} \
+                 --capabilities {capabilities_q} \
+                 --owner {owner_q} \
+                 --approver-id {approver_q} \
+                 --signing-key {signing_key_q} \
+                 --signing-key-passphrase-file {passphrase_q} \
+         }}; \
+         if ($result.ExitCode -ne 0) {{ \
+             throw ('rustynetd membership add-peer failed for ' + {node_id_q} + ': ' + $result.Output) \
+         }}",
+        rustynetd_q = ps_quote(rustynetd_path)?,
+        pubkey_q = ps_quote(pubkey_hex)?,
+        capabilities_q = ps_quote(capabilities)?,
+        owner_q = ps_quote(owner)?,
+        approver_q = ps_quote(approver_id)?,
+        signing_key_q = ps_quote(signing_key_path)?,
+        passphrase_q = ps_quote(passphrase_path)?,
+    ))
+}
+
 fn hex_32_arg(value: &str) -> Result<String, AdapterError> {
     if NodeMembershipPeer::is_valid_public_key_hex(value) {
         Ok(value.to_owned())
@@ -367,6 +395,58 @@ mod tests {
                 "dst path '{dst}' must be under WINDOWS_STATE_ROOT"
             );
         }
+    }
+
+    #[test]
+    fn add_peer_script_quotes_node_id_in_throw_literal_no_breakout() {
+        // RSA-0059: a node_id containing a single quote must not break out of
+        // the PowerShell throw error-message literal (or any other PS literal).
+        let evil = "node'; Remove-Item C:\\ -Recurse -Force; #";
+        let script = build_add_peer_script(
+            r"C:\Program Files\RustyNet\rustynetd.exe",
+            evil,
+            "abcd",
+            "client",
+            "exit-1",
+            "exit-1-owner",
+            r"C:\ProgramData\RustyNet\membership\owner.key",
+            r"C:\ProgramData\RustyNet\membership\signing.pass",
+        )
+        .expect("script builds for a quote-bearing node_id");
+        // The raw (unescaped) node_id must never appear — ps_quote doubles the
+        // single quote, neutralising the breakout.
+        assert!(
+            !script.contains("node'; Remove-Item"),
+            "raw single-quote breakout present in script: {script}"
+        );
+        assert!(
+            script.contains("node''; Remove-Item"),
+            "node_id must be ps_quoted (doubled quote) everywhere it appears: {script}"
+        );
+        // It must be quoted in BOTH the --node-id arg and the throw literal.
+        assert_eq!(
+            script.matches("node''; Remove-Item").count(),
+            2,
+            "node_id must be quoted in both the --node-id arg and the throw message: {script}"
+        );
+    }
+
+    #[test]
+    fn add_peer_script_rejects_control_chars_in_node_id() {
+        // ps_quote rejects CR/LF/NUL, so a node_id carrying them fails closed.
+        assert!(
+            build_add_peer_script(
+                "x",
+                "node\ninjected",
+                "abcd",
+                "client",
+                "exit-1",
+                "exit-1-owner",
+                "k",
+                "p",
+            )
+            .is_err()
+        );
     }
 
     #[test]

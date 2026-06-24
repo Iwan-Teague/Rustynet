@@ -42,7 +42,7 @@ Effort key: **S** ≤½ day · **M** ~1–2 days · **L** ≥3 days / needs desi
 
 **Theme C — unescaped host/config values into a shell/PowerShell/env-file.**
 - RSA-0046 `rustynet-sysinfo` → replace `powershell -Command` interpolation with `-File`+`param()` or a native API (4 sites). **M**
-- RSA-0059 `windows_membership.rs` → `ps_quote` (or drop) `node_id` in the throw-literal. **S**
+- RSA-0059 `windows_membership.rs` → `ps_quote` (or drop) `node_id` in the throw-literal. **S** — ✅ APPLIED 2026-06-24 (pure `build_add_peer_script`; node_id ps_quoted in throw too; breakout + control-char tests).
 - RSA-0068 `scripts/bootstrap/linux/rn_bootstrap.sh` → strict `^[A-Z_]+=` env parser instead of `source` (chain sink for RSA-0057). **S**
   *(RSA-0051/0057 (Low) are the same chain — fix together: validate/escape `build_bootstrap_env` output.)*
 
