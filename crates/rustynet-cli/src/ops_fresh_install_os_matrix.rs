@@ -176,10 +176,7 @@ fn canonicalize_report(
                 .map(str::trim)
                 .filter(|item| !item.is_empty())
                 .ok_or_else(|| format!("{report_label} has invalid source_artifacts entry"))?;
-            let mut source = PathBuf::from(raw);
-            if !source.is_absolute() {
-                source = root.join(source);
-            }
+            let source = confine_artifact_source(raw, root, report_label)?;
             let source = require_file(
                 source.as_path(),
                 format!("{report_label} source artifact").as_str(),
@@ -211,10 +208,7 @@ fn canonicalize_report(
             .map(str::trim)
             .filter(|item| !item.is_empty())
             .ok_or_else(|| format!("{report_label} has invalid source_artifact"))?;
-        let mut source = PathBuf::from(raw);
-        if !source.is_absolute() {
-            source = root.join(source);
-        }
+        let source = confine_artifact_source(raw, root, report_label)?;
         let source = require_file(
             source.as_path(),
             format!("{report_label} source artifact").as_str(),
@@ -252,6 +246,30 @@ fn canonicalize_report(
     Ok(fs::canonicalize(&canonical_report_path).unwrap_or(canonical_report_path))
 }
 
+/// RSA-0054: confine a report-supplied source-artifact path under the report
+/// root. A crafted report must not read an arbitrary file into the matrix output
+/// via `..` traversal or an out-of-root absolute path. The orchestrator rebinds
+/// every emitted `source_artifact(s)` to a root-relative path (`normalize_path`),
+/// so a legitimate report never carries an absolute path or `..` — both are
+/// rejected here (fail closed), then the value is joined under `root`.
+fn confine_artifact_source(raw: &str, root: &Path, label: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        return Err(format!(
+            "{label} source artifact must be report-relative, not absolute: {raw}"
+        ));
+    }
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "{label} source artifact path may not contain '..': {raw}"
+        ));
+    }
+    Ok(root.join(candidate))
+}
+
 fn normalize_source_artifacts(items: &Value, root: &Path) -> Result<Vec<String>, String> {
     let Some(items) = items.as_array() else {
         return Err("report contains invalid source_artifacts entry".to_owned());
@@ -263,10 +281,7 @@ fn normalize_source_artifacts(items: &Value, root: &Path) -> Result<Vec<String>,
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "report contains invalid source_artifacts entry".to_owned())?;
-        let mut source = PathBuf::from(raw);
-        if !source.is_absolute() {
-            source = root.join(source);
-        }
+        let source = confine_artifact_source(raw, root, "report")?;
         if !source.exists() {
             return Err(format!("source artifact does not exist: {raw}"));
         }
@@ -1825,10 +1840,27 @@ pub fn execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
 mod tests {
     use super::{
         FreshInstallMeasuredChildReportView, FreshInstallOsMatrixReportView,
-        WriteFreshInstallOsMatrixReadinessFixturesConfig,
+        WriteFreshInstallOsMatrixReadinessFixturesConfig, confine_artifact_source,
         execute_ops_write_fresh_install_os_matrix_readiness_fixtures, parse_json_object,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn rsa0054_confine_artifact_source_rejects_traversal_and_absolute() {
+        let root = std::path::Path::new("/var/lib/rustynet/report");
+        // A benign report-relative path joins under root.
+        let ok = confine_artifact_source("artifacts/log.json", root, "report")
+            .expect("relative under-root path is allowed");
+        assert_eq!(ok, root.join("artifacts/log.json"));
+        // `..` traversal is rejected.
+        confine_artifact_source("../../etc/shadow", root, "report")
+            .expect_err("'..' traversal must be rejected");
+        confine_artifact_source("a/../../b", root, "report")
+            .expect_err("embedded '..' must be rejected");
+        // Absolute paths are rejected (the orchestrator emits root-relative only).
+        confine_artifact_source("/etc/shadow", root, "report")
+            .expect_err("absolute path must be rejected");
+    }
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
