@@ -1174,13 +1174,15 @@ fn direct_platform_stage(stage: &str) -> Option<(&'static str, &'static str)> {
         "amend_membership_for_macos" | "distribute_macos_bundles" => Some(("macos", "membership")),
         "validate_macos_relay_service_lifecycle" => Some(("macos", "relay_service_lifecycle")),
         "validate_macos_anchor_bundle_pull" => Some(("macos", "anchor")),
-        "capture_macos_exit_evidence_artifacts" | "validate_macos_exit_nat_lifecycle" => {
-            Some(("macos", "exit_handoff"))
-        }
+        "capture_macos_exit_evidence_artifacts"
+        | "validate_macos_exit_nat_lifecycle"
+        | "validate_macos_ipv6_leak" => Some(("macos", "exit_handoff")),
         "validate_macos_exit_dns_failclosed" => Some(("macos", "managed_dns")),
         "validate_linux_relay_service_lifecycle" => Some(("linux", "relay_service_lifecycle")),
         "validate_linux_anchor_bundle_pull" => Some(("linux", "anchor")),
-        "validate_linux_exit_nat_lifecycle" => Some(("linux", "exit_handoff")),
+        "validate_linux_exit_nat_lifecycle"
+        | "validate_linux_ipv6_leak"
+        | "validate_linux_exit_demotion_residue" => Some(("linux", "exit_handoff")),
         "validate_linux_dns_failclosed" | "validate_linux_exit_dns_failclosed" => {
             Some(("linux", "managed_dns"))
         }
@@ -1204,10 +1206,13 @@ fn direct_platform_role(stage: &str) -> Option<(&'static str, &'static str)> {
         "validate_macos_mesh_join" => Some(("macos", "client")),
         "validate_macos_exit_nat_lifecycle"
         | "validate_macos_exit_dns_failclosed"
-        | "validate_macos_exit_killswitch_precedence" => Some(("macos", "blind_exit")),
+        | "validate_macos_exit_killswitch_precedence"
+        | "validate_macos_ipv6_leak" => Some(("macos", "blind_exit")),
         "validate_macos_relay_service_lifecycle" => Some(("macos", "relay")),
         "validate_macos_anchor_bundle_pull" => Some(("macos", "anchor")),
-        "validate_linux_exit_nat_lifecycle" => Some(("linux", "exit")),
+        "validate_linux_exit_nat_lifecycle"
+        | "validate_linux_ipv6_leak"
+        | "validate_linux_exit_demotion_residue" => Some(("linux", "exit")),
         "validate_linux_relay_service_lifecycle" => Some(("linux", "relay")),
         "validate_linux_anchor_bundle_pull" => Some(("linux", "anchor")),
         _ => None,

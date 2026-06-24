@@ -9191,6 +9191,72 @@ fn run_macos_orchestration_stages(
     };
     outcomes.push(exit_nat_lifecycle_outcome);
 
+    // ── Stage 7b: validate_macos_ipv6_leak ────────────────────────────────
+    //
+    // pf parity of the Linux `validate_linux_ipv6_leak` adversarial stage:
+    // proves the protected-mode tunnel fail-closes for IPv6, not just IPv4.
+    // Artefact `macos_ipv6_leak.json` is produced by
+    // `scripts/e2e/capture_macos_ipv6_leak.sh` on a macOS node while protected;
+    // absent ⇒ Skip cleanly (default macOS-as-client runs do not prove it).
+    let ipv6_leak_log_path = logs_dir.join("validate_macos_ipv6_leak.log");
+    let ipv6_leak_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_ipv6_leak",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate macOS IPv6 leak artifact for {macos_alias}"),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "validate_macos_ipv6_leak",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        let artifact_path = macos_exit_artifact_root.join("macos_ipv6_leak.json");
+        if !artifact_path.exists() {
+            stage_outcome(
+                "validate_macos_ipv6_leak",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: macOS IPv6 leak artifact not present at {}; macOS host is not proving IPv6 fail-closed posture",
+                    artifact_path.display()
+                ),
+                vec![],
+            )
+        } else {
+            match fs::read_to_string(&artifact_path)
+                .map_err(|err| format!("read {} failed: {err}", artifact_path.display()))
+                .and_then(|raw| {
+                    evaluate_macos_ipv6_leak_artifact(macos_alias, raw.as_str())
+                        .map(|summary| (summary, raw))
+                }) {
+                Ok((summary, raw)) => {
+                    let _ = fs::write(&ipv6_leak_log_path, raw.as_str());
+                    stage_outcome(
+                        "validate_macos_ipv6_leak",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![ipv6_leak_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&ipv6_leak_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_macos_ipv6_leak",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "macOS IPv6 leak artifact validation failed for {macos_alias}: {reason}"
+                        ),
+                        vec![ipv6_leak_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+    outcomes.push(ipv6_leak_outcome);
+
     // ── Stage 8: validate_macos_exit_dns_failclosed ───────────────────────
     let exit_dns_leak_log_path = logs_dir.join("validate_macos_exit_dns_failclosed.log");
     let exit_dns_leak_outcome = if dry_run {
@@ -14719,6 +14785,391 @@ fn evaluate_linux_exit_nat_lifecycle_artifact(
     ))
 }
 
+/// Linux exit→client DEMOTION NAT-residue validator (SecurityMinimumBar
+/// §6.D.7). Companion of `scripts/e2e/capture_linux_exit_demotion_residue.sh`,
+/// which reuses the read-only `rustynetd linux-exit-nat-lifecycle-snapshot`
+/// producer to capture two phases around an in-process role demotion (exit →
+/// client) driven through the PUBLIC role surface — the daemon stays RUNNING
+/// throughout (this is NOT the daemon-stop teardown test).
+///
+/// Exit-serving NAT + forwarding MUST be torn down BEFORE `serves_exit` is
+/// removed; residue after demotion is a release-blocking open relay. Fails
+/// closed if:
+///   - `during_run` did not prove the node was actually serving exit (NAT
+///     table present + forwarding enabled) — anti-vacuous guard;
+///   - `after_demote` still shows the NAT table present, or forwarding not
+///     restored;
+///   - the demotion CLI returned non-zero;
+///   - the daemon did not stay running (else it masquerades as the
+///     daemon-stop lifecycle test).
+fn evaluate_linux_exit_demotion_residue_artifact(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse linux exit demotion residue artifact failed: {err}"))?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "linux exit demotion residue artifact returned unsupported schema_version={}",
+                require_json_u64(&report, "schema_version").unwrap_or_default()
+            )
+        })?;
+    let during = require_json_value(&report, "during_run")?;
+    if !require_json_bool(during, "nat_table_present")? {
+        return Err(
+            "linux exit demotion residue artifact did not prove exit-serving NAT present before demotion (anti-vacuous guard)"
+                .to_owned(),
+        );
+    }
+    require_forwarding_enabled_macos(during, "tunnel_forwarding")?;
+    require_forwarding_enabled_macos(during, "egress_forwarding")?;
+
+    if require_json_u64(&report, "demotion_exit_code")? != 0 {
+        return Err(
+            "linux exit demotion residue artifact recorded a non-zero demotion exit code; the role demotion itself failed"
+                .to_owned(),
+        );
+    }
+    if !require_json_bool(&report, "daemon_still_running")? {
+        return Err(
+            "linux exit demotion residue artifact reports the daemon was not running after demotion; this must prove teardown WITHOUT a daemon stop"
+                .to_owned(),
+        );
+    }
+
+    let after = require_json_value(&report, "after_demote")?;
+    if require_json_bool(after, "nat_table_present")? {
+        return Err(
+            "linux exit demotion residue artifact left the nftables NAT table present after exit→client demotion: residual open relay (release-blocker)"
+                .to_owned(),
+        );
+    }
+    if !require_json_bool(after, "forwarding_restored")? {
+        return Err(
+            "linux exit demotion residue artifact did not prove ip_forward was restored after demotion"
+                .to_owned(),
+        );
+    }
+    if !require_json_bool(after, "ipv6_forwarding_restored")? {
+        return Err(
+            "linux exit demotion residue artifact did not prove IPv6 forwarding (net.ipv6.conf.all.forwarding) was restored after demotion: residual IPv6 exit forwarding"
+                .to_owned(),
+        );
+    }
+    Ok(format!(
+        "Linux exit→client demotion residue verified on {linux_alias}: NAT torn down + IPv4/IPv6 forwarding restored with the daemon still running"
+    ))
+}
+
+/// Linux IPv6 tunnel-leak artefact validator. Companion of the daemon-side
+/// `rustynetd linux-ipv6-leak-capture` producer
+/// (`crates/rustynetd/src/linux_ipv6_leak.rs`).
+///
+/// Adversarial intent: prove the protected-mode tunnel fail-closes for IPv6,
+/// not just IPv4 (`SecurityMinimumBar.md` §8 — tunnel fail-close behaviour in
+/// protected-routing modes). The "IPv6 leak" bug is an IPv4 killswitch that
+/// silently lets native IPv6 egress in the clear.
+///
+/// Fail-closed contract (the stage Fails if ANY holds):
+///   - `leaked_datagram_count > 0` — a global-scope IPv6 datagram was seen
+///     leaving on the egress interface (link-local + multicast are excluded
+///     by the capture filter, so any count is a real leak);
+///   - `probe_reached_target == true` — the outbound IPv6 probe reached its
+///     global target, i.e. traffic escaped the tunnel;
+///   - neither containment control is present (`ipv6_disabled == false` AND
+///     `killswitch_v6_drop_present == false`) — there is nothing fail-closing
+///     IPv6 at all.
+fn evaluate_linux_ipv6_leak_artifact(linux_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse linux IPv6 leak artifact failed: {err}"))?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "linux IPv6 leak artifact returned unsupported schema_version={}",
+                require_json_u64(&report, "schema_version").unwrap_or_default()
+            )
+        })?;
+    let egress_iface = require_json_str(&report, "egress_iface")?;
+    if egress_iface.trim().is_empty() {
+        return Err("linux IPv6 leak artifact has empty egress_iface".to_owned());
+    }
+    let probe_target = require_json_str(&report, "probe_target")?;
+    probe_target.parse::<std::net::Ipv6Addr>().map_err(|_| {
+        format!(
+            "linux IPv6 leak artifact probe_target {probe_target:?} is not a valid IPv6 address"
+        )
+    })?;
+
+    if !require_json_bool(&report, "probe_attempted")? {
+        return Err(
+            "linux IPv6 leak artifact reports the active probe/capture never executed (tcpdump/`ping -6` missing); a never-run probe must not count as fail-closed — inconclusive, failing closed"
+                .to_owned(),
+        );
+    }
+    let leaked = require_json_u64(&report, "leaked_datagram_count")?;
+    if leaked > 0 {
+        return Err(format!(
+            "linux IPv6 leak artifact observed {leaked} cleartext IPv6 datagram(s) egressing on {egress_iface}: tunnel is NOT fail-closed for IPv6"
+        ));
+    }
+    if require_json_bool(&report, "probe_reached_target")? {
+        return Err(format!(
+            "linux IPv6 leak artifact reports the outbound IPv6 probe reached {probe_target}: IPv6 traffic escaped the protected path"
+        ));
+    }
+    let ipv6_disabled = require_json_bool(&report, "ipv6_disabled")?;
+    let killswitch_v6 = require_json_bool(&report, "killswitch_v6_drop_present")?;
+    if !ipv6_disabled && !killswitch_v6 {
+        return Err(
+            "linux IPv6 leak artifact found no IPv6 containment control (neither net.ipv6.conf.all.disable_ipv6 nor an inet/ip6 killswitch drop): IPv6 is not fail-closed"
+                .to_owned(),
+        );
+    }
+    let containment = if ipv6_disabled {
+        "ipv6-disabled"
+    } else {
+        "inet/ip6-killswitch-drop"
+    };
+    Ok(format!(
+        "Linux IPv6 leak proof verified on {linux_alias}: 0 leaked datagrams, probe blocked, containment={containment} (egress={egress_iface})"
+    ))
+}
+
+/// macOS IPv6 tunnel-leak artefact validator (pf parity of
+/// `evaluate_linux_ipv6_leak_artifact`). Companion of the daemon-side
+/// `rustynetd macos-ipv6-leak-capture` producer
+/// (`crates/rustynetd/src/macos_ipv6_leak.rs`).
+///
+/// Fails closed (SecurityMinimumBar §8) if any global-scope IPv6 datagram
+/// leaked on egress, if the outbound IPv6 probe reached its global target, or
+/// if no pf v6-containment rule is present (a `block drop ... all` /
+/// `inet6` drop; an `inet`-only pf block does NOT count).
+fn evaluate_macos_ipv6_leak_artifact(macos_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse macOS IPv6 leak artifact failed: {err}"))?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "macOS IPv6 leak artifact returned unsupported schema_version={}",
+                require_json_u64(&report, "schema_version").unwrap_or_default()
+            )
+        })?;
+    let egress_iface = require_json_str(&report, "egress_iface")?;
+    if egress_iface.trim().is_empty() {
+        return Err("macOS IPv6 leak artifact has empty egress_iface".to_owned());
+    }
+    let probe_target = require_json_str(&report, "probe_target")?;
+    probe_target.parse::<std::net::Ipv6Addr>().map_err(|_| {
+        format!(
+            "macOS IPv6 leak artifact probe_target {probe_target:?} is not a valid IPv6 address"
+        )
+    })?;
+    if !require_json_bool(&report, "probe_attempted")? {
+        return Err(
+            "macOS IPv6 leak artifact reports the active probe/capture never executed (tcpdump/ping6 missing); a never-run probe must not count as fail-closed — inconclusive, failing closed"
+                .to_owned(),
+        );
+    }
+    let leaked = require_json_u64(&report, "leaked_datagram_count")?;
+    if leaked > 0 {
+        return Err(format!(
+            "macOS IPv6 leak artifact observed {leaked} cleartext IPv6 datagram(s) egressing on {egress_iface}: tunnel is NOT fail-closed for IPv6"
+        ));
+    }
+    if require_json_bool(&report, "probe_reached_target")? {
+        return Err(format!(
+            "macOS IPv6 leak artifact reports the outbound IPv6 probe reached {probe_target}: IPv6 traffic escaped the protected path"
+        ));
+    }
+    if !require_json_bool(&report, "killswitch_v6_block_present")? {
+        return Err(
+            "macOS IPv6 leak artifact found no pf IPv6 containment rule (no `block drop ... all`/`inet6` drop; an inet-only pf block does not contain IPv6): IPv6 is not fail-closed"
+                .to_owned(),
+        );
+    }
+    Ok(format!(
+        "macOS IPv6 leak proof verified on {macos_alias}: 0 leaked datagrams, probe blocked, pf v6 containment present (egress={egress_iface})"
+    ))
+}
+
+/// Pure evaluator for the JSON output of
+/// `rustynetd privileged-helper-allowlist-audit`. The daemon-side audit runs
+/// an adversarial corpus through the REAL argv allowlist
+/// (`SecurityMinimumBar.md` §7) and reports any case whose outcome did not
+/// match expectation. Fail-closed: a non-empty `violations` list means the
+/// allowlist either ACCEPTED an adversarial request (privilege-escalation
+/// regression) or REJECTED a reviewed one (control-plane breakage).
+fn evaluate_privileged_helper_allowlist_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::privileged_helper_allowlist_audit::AllowlistAuditReport =
+        serde_json::from_str(raw_json).map_err(|err| {
+            format!("parse privileged-helper-allowlist-audit JSON output failed: {err}")
+        })?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "privileged-helper-allowlist-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases == 0 {
+        return Err(
+            "privileged-helper-allowlist-audit returned an empty corpus; the adversarial probe set is missing"
+                .to_owned(),
+        );
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| {
+                    format!(
+                        "{} ({}, expected {}, allowed={})",
+                        v.label, v.program, v.expectation, v.actual_allowed
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "privileged-helper argv allowlist drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Privileged-helper argv allowlist verified on {linux_alias}: {} adversarial requests denied, {} reviewed requests allowed",
+        report.malicious_denied, report.benign_allowed
+    ))
+}
+
+/// Pure evaluator for the JSON output of `rustynetd membership-signature-audit`.
+/// The daemon-side audit drives the REAL signed-membership verify funnel
+/// (`apply_signed_update`/`decode_signed_update`, `verify_strict`) with an
+/// adversarial forgery corpus (`SecurityMinimumBar.md` §3.2/§6.B). Fail-closed:
+///   - empty corpus, or no valid baseline accepted (the reject-all vacuous pass),
+///   - too few forgery cases (a stripped corpus must not trivially pass),
+///   - any violation (a forgery accepted, or the valid baseline rejected).
+fn evaluate_membership_signature_audit_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::membership_signature_audit::MembershipSignatureAuditReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse membership-signature-audit JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "membership-signature-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases == 0 {
+        return Err(
+            "membership-signature-audit returned an empty corpus; the forgery battery is missing"
+                .to_owned(),
+        );
+    }
+    if report.baseline_accepted == 0 {
+        return Err(
+            "membership-signature-audit accepted no valid baseline; the audit is vacuous (reject-all would pass) and proves nothing"
+                .to_owned(),
+        );
+    }
+    if report.forgeries_rejected < 10 {
+        return Err(format!(
+            "membership-signature-audit ran only {} forgery case(s); the adversarial battery is too thin to trust",
+            report.forgeries_rejected
+        ));
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| {
+                    format!(
+                        "{} (expected {}, rejected={})",
+                        v.id, v.expectation, v.rejected
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "membership signature verify funnel drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Membership signature verify funnel verified on {linux_alias}: {} forgeries rejected, valid baseline accepted",
+        report.forgeries_rejected
+    ))
+}
+
+/// Pure evaluator for the JSON output of `rustynetd policy-default-deny-audit`.
+/// The daemon-side audit drives the REAL `rustynet_policy` evaluator with a
+/// default-deny truth table (`SecurityMinimumBar.md` §3.6). Fail-closed:
+///   - empty corpus, or no ALLOW case passed (the vacuous deny-all pass),
+///   - any case whose decision did not match expectation.
+fn evaluate_policy_default_deny_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::policy_default_deny_audit::PolicyDefaultDenyAuditReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse policy-default-deny-audit JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "policy-default-deny-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases == 0 {
+        return Err(
+            "policy-default-deny-audit returned an empty corpus; the truth table is missing"
+                .to_owned(),
+        );
+    }
+    if report.allow_cases_passed == 0 {
+        return Err(
+            "policy-default-deny-audit passed no ALLOW case; the audit is vacuous (a broken deny-all evaluator would pass) and proves nothing"
+                .to_owned(),
+        );
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| format!("{} (expected {}, got {})", v.id, v.expected, v.actual))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "policy default-deny truth table drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Policy default-deny truth table verified on {linux_alias}: {} deny + {} allow cases held",
+        report.deny_cases_passed, report.allow_cases_passed
+    ))
+}
+
 /// macOS DNS fail-closed artefact-directory validator. Parallel to the
 /// Windows variant. Required files in the artefact directory:
 ///
@@ -16373,6 +16824,66 @@ fn run_validate_linux_runtime_acls_stage(
         .map_err(|reason| (reason, raw))
 }
 
+fn run_validate_linux_privileged_helper_allowlist_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "privileged-helper-allowlist-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_privileged_helper_allowlist_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_linux_membership_signature_forgery_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "membership-signature-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_membership_signature_audit_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_linux_policy_default_deny_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "policy-default-deny-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_policy_default_deny_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
 /// Build the `--state-path / --expected-peer-id / --max-age-seconds`
 /// extras for the mesh-status subcommand from a `MeshStatusOverrides`
 /// struct. Centralizes the override-to-argv mapping so callers don't
@@ -16548,9 +17059,16 @@ fn run_linux_orchestration_stages_with_options(
     let mesh_status_log_path = logs_dir.join("validate_linux_mesh_status.log");
     let key_custody_log_path = logs_dir.join("validate_linux_key_custody.log");
     let authenticode_log_path = logs_dir.join("validate_linux_authenticode.log");
+    let privileged_helper_allowlist_log_path =
+        logs_dir.join("validate_linux_privileged_helper_allowlist.log");
+    let membership_signature_forgery_log_path =
+        logs_dir.join("validate_linux_membership_signature_forgery.log");
+    let policy_default_deny_log_path = logs_dir.join("validate_linux_policy_default_deny.log");
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
     let exit_nat_lifecycle_log_path = logs_dir.join("validate_linux_exit_nat_lifecycle.log");
+    let exit_ipv6_leak_log_path = logs_dir.join("validate_linux_ipv6_leak.log");
+    let exit_demotion_residue_log_path = logs_dir.join("validate_linux_exit_demotion_residue.log");
     let exit_dns_failclosed_log_path = logs_dir.join("validate_linux_exit_dns_failclosed.log");
     let relay_lifecycle_log_path = logs_dir.join("validate_linux_relay_service_lifecycle.log");
     let anchor_bundle_pull_log_path = logs_dir.join("validate_linux_anchor_bundle_pull.log");
@@ -16656,6 +17174,45 @@ fn run_linux_orchestration_stages_with_options(
         )
     };
 
+    let privileged_helper_allowlist_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_privileged_helper_allowlist",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_privileged_helper_allowlist",
+            privileged_helper_allowlist_log_path.as_path(),
+            run_validate_linux_privileged_helper_allowlist_stage,
+        )
+    };
+
+    let membership_signature_forgery_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_membership_signature_forgery",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_membership_signature_forgery",
+            membership_signature_forgery_log_path.as_path(),
+            run_validate_linux_membership_signature_forgery_stage,
+        )
+    };
+
+    let policy_default_deny_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_policy_default_deny",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_policy_default_deny",
+            policy_default_deny_log_path.as_path(),
+            run_validate_linux_policy_default_deny_stage,
+        )
+    };
+
     let dns_failclosed_outcome = if !runtime_acls_passed && !options.dry_run {
         make_skipped(
             "validate_linux_dns_failclosed",
@@ -16741,6 +17298,134 @@ fn run_linux_orchestration_stages_with_options(
                             "Linux Exit NAT lifecycle artifact validation failed for {linux_alias}: {reason}"
                         ),
                         vec![exit_nat_lifecycle_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+
+    let exit_ipv6_leak_outcome = if options.dry_run {
+        stage_outcome(
+            "validate_linux_ipv6_leak",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate Linux IPv6 leak artifact for {linux_alias}"),
+            vec![],
+        )
+    } else if !runtime_acls_passed {
+        make_skipped("validate_linux_ipv6_leak", "validate_linux_runtime_acls")
+    } else if !key_custody_passed {
+        make_skipped("validate_linux_ipv6_leak", "validate_linux_key_custody")
+    } else if !hardening_passed {
+        make_skipped(
+            "validate_linux_ipv6_leak",
+            "validate_linux_service_hardening",
+        )
+    } else {
+        let artifact_path = report_dir
+            .join("linux_exit_evidence")
+            .join("linux_ipv6_leak.json");
+        if !artifact_path.exists() {
+            stage_outcome(
+                "validate_linux_ipv6_leak",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: Linux IPv6 leak artifact not present at {}; Linux host is not proving IPv6 fail-closed posture",
+                    artifact_path.display()
+                ),
+                vec![],
+            )
+        } else {
+            match fs::read_to_string(&artifact_path)
+                .map_err(|err| format!("read {} failed: {err}", artifact_path.display()))
+                .and_then(|raw| {
+                    evaluate_linux_ipv6_leak_artifact(linux_alias, raw.as_str())
+                        .map(|summary| (summary, raw))
+                }) {
+                Ok((summary, raw)) => {
+                    let _ = fs::write(&exit_ipv6_leak_log_path, raw.as_str());
+                    stage_outcome(
+                        "validate_linux_ipv6_leak",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_ipv6_leak_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_ipv6_leak_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_linux_ipv6_leak",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "Linux IPv6 leak artifact validation failed for {linux_alias}: {reason}"
+                        ),
+                        vec![exit_ipv6_leak_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+
+    let exit_demotion_residue_outcome = if options.dry_run {
+        stage_outcome(
+            "validate_linux_exit_demotion_residue",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate Linux exit→client demotion residue for {linux_alias}"),
+            vec![],
+        )
+    } else if !runtime_acls_passed {
+        make_skipped(
+            "validate_linux_exit_demotion_residue",
+            "validate_linux_runtime_acls",
+        )
+    } else if !key_custody_passed {
+        make_skipped(
+            "validate_linux_exit_demotion_residue",
+            "validate_linux_key_custody",
+        )
+    } else if !hardening_passed {
+        make_skipped(
+            "validate_linux_exit_demotion_residue",
+            "validate_linux_service_hardening",
+        )
+    } else {
+        let artifact_path = report_dir
+            .join("linux_exit_evidence")
+            .join("linux_exit_demotion_residue.json");
+        if !artifact_path.exists() {
+            stage_outcome(
+                "validate_linux_exit_demotion_residue",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: Linux exit demotion residue artifact not present at {}; Linux host is not proving an exit→client demotion",
+                    artifact_path.display()
+                ),
+                vec![],
+            )
+        } else {
+            match fs::read_to_string(&artifact_path)
+                .map_err(|err| format!("read {} failed: {err}", artifact_path.display()))
+                .and_then(|raw| {
+                    evaluate_linux_exit_demotion_residue_artifact(linux_alias, raw.as_str())
+                        .map(|summary| (summary, raw))
+                }) {
+                Ok((summary, raw)) => {
+                    let _ = fs::write(&exit_demotion_residue_log_path, raw.as_str());
+                    stage_outcome(
+                        "validate_linux_exit_demotion_residue",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_demotion_residue_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_demotion_residue_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_linux_exit_demotion_residue",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "Linux exit demotion residue artifact validation failed for {linux_alias}: {reason}"
+                        ),
+                        vec![exit_demotion_residue_log_path.clone()],
                     )
                 }
             }
@@ -17035,8 +17720,13 @@ fn run_linux_orchestration_stages_with_options(
         key_custody_outcome,
         hardening_outcome,
         authenticode_outcome,
+        privileged_helper_allowlist_outcome,
+        membership_signature_forgery_outcome,
+        policy_default_deny_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
+        exit_ipv6_leak_outcome,
+        exit_demotion_residue_outcome,
         exit_dns_failclosed_outcome,
         relay_lifecycle_outcome,
         anchor_bundle_pull_outcome,
@@ -34779,6 +35469,604 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         );
     }
 
+    fn reviewed_linux_exit_demotion_residue_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "mesh_cidr": "100.64.0.0/16",
+            "nat_table": "rustynet_nat_g1",
+            "demotion_exit_code": 0,
+            "daemon_still_running": true,
+            "during_run": {
+                "nat_table_present": true,
+                "tunnel_forwarding": "Enabled",
+                "egress_forwarding": "Enabled"
+            },
+            "after_demote": {
+                "nat_table_present": false,
+                "forwarding_restored": true,
+                "ipv6_forwarding_restored": true
+            }
+        })
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_accepts_clean_teardown() {
+        let summary = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            reviewed_linux_exit_demotion_residue_artifact()
+                .to_string()
+                .as_str(),
+        )
+        .expect("clean demotion teardown must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("daemon still running"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_residual_nat() {
+        // The bite: residual NAT after demotion = open relay.
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["after_demote"]["nat_table_present"] = serde_json::Value::Bool(true);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("residual NAT after demotion must fail closed");
+        assert!(
+            err.contains("residual open relay") || err.contains("NAT table present after"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_forwarding_not_restored() {
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["after_demote"]["forwarding_restored"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("forwarding not restored must fail closed");
+        assert!(err.contains("ip_forward"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_ipv6_forwarding_residue() {
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["after_demote"]["ipv6_forwarding_restored"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("residual IPv6 forwarding after demotion must fail closed");
+        assert!(err.contains("IPv6 forwarding"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_vacuous_during_run() {
+        // Anti-vacuous: must prove it was serving exit before demotion.
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["during_run"]["nat_table_present"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("must prove exit-serving before demotion");
+        assert!(err.contains("anti-vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_daemon_stopped() {
+        // Must prove teardown happened WITHOUT a daemon stop (else it is the
+        // daemon-stop lifecycle test in disguise).
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["daemon_still_running"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a stopped daemon must fail this stage");
+        assert!(
+            err.contains("not running after demotion"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_nonzero_demotion() {
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["demotion_exit_code"] = serde_json::Value::from(1);
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a failed demotion must fail the stage");
+        assert!(
+            err.contains("non-zero demotion exit code"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn reviewed_linux_ipv6_leak_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "egress_iface": "enp0s1",
+            "probe_target": "2606:4700:4700::1111",
+            "killswitch_table": "rustynet_g1",
+            "ipv6_disabled": true,
+            "killswitch_v6_drop_present": false,
+            "leaked_datagram_count": 0,
+            "probe_reached_target": false,
+            "probe_attempted": true
+        })
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_rejects_unattempted_probe() {
+        // A never-run probe (missing tcpdump/ping -6) must NOT count as a clean
+        // fail-closed result — the active probe is load-bearing.
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["probe_attempted"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a never-run probe must fail closed as inconclusive");
+        assert!(
+            err.contains("never executed") && err.contains("inconclusive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_accepts_failclosed_posture() {
+        let summary = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            reviewed_linux_ipv6_leak_artifact().to_string().as_str(),
+        )
+        .expect("fail-closed IPv6 posture must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("containment=ipv6-disabled"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_accepts_killswitch_drop_containment() {
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["ipv6_disabled"] = serde_json::Value::Bool(false);
+        payload["killswitch_v6_drop_present"] = serde_json::Value::Bool(true);
+        let summary = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect("inet/ip6 killswitch drop is valid IPv6 containment");
+        assert!(
+            summary.contains("containment=inet/ip6-killswitch-drop"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_rejects_leaked_datagram() {
+        // The bite: a single leaked global-scope IPv6 datagram must Fail the
+        // stage even though containment claims to be present.
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["leaked_datagram_count"] = serde_json::Value::from(1);
+        let err = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a leaked IPv6 datagram must fail closed");
+        assert!(
+            err.contains("cleartext IPv6 datagram") && err.contains("NOT fail-closed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_rejects_probe_reaching_target() {
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["probe_reached_target"] = serde_json::Value::Bool(true);
+        let err = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a probe that reaches its global target must fail closed");
+        assert!(
+            err.contains("escaped the protected path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_rejects_no_containment_control() {
+        // No disable_ipv6 AND no killswitch drop => nothing fail-closes IPv6.
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["ipv6_disabled"] = serde_json::Value::Bool(false);
+        payload["killswitch_v6_drop_present"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("absence of any IPv6 containment control must fail closed");
+        assert!(
+            err.contains("no IPv6 containment control"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_ipv6_leak_artifact_rejects_bad_probe_target() {
+        let mut payload = reviewed_linux_ipv6_leak_artifact();
+        payload["probe_target"] = serde_json::Value::String("not-an-address".into());
+        let err = super::evaluate_linux_ipv6_leak_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("a malformed probe_target must fail");
+        assert!(
+            err.contains("not a valid IPv6 address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn linux_ipv6_leak_producer_to_validator_round_trip_failclosed() {
+        // Producer builder (daemon crate) → orchestrator validator: a
+        // disabled-IPv6 host with an empty egress capture and a blocked probe
+        // is a clean fail-closed posture.
+        let snapshot = rustynetd::linux_ipv6_leak::build_linux_ipv6_leak_snapshot(
+            1,
+            "enp0s1",
+            "2606:4700:4700::1111",
+            "rustynet_g1",
+            "1\n",
+            "",
+            "reading from file /tmp/x.pcap\n0 packets captured\n",
+            false,
+            true,
+        );
+        let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        let summary = super::evaluate_linux_ipv6_leak_artifact("debian-headless-1", raw.as_str())
+            .expect("producer-built fail-closed IPv6 artifact must validate");
+        assert!(
+            summary.contains("0 leaked datagrams"),
+            "unexpected: {summary}"
+        );
+    }
+
+    #[test]
+    fn linux_ipv6_leak_producer_to_validator_round_trip_detects_leak() {
+        // Producer builder on a leaking host (IPv6 enabled, IPv4-only
+        // killswitch, a captured datagram, probe reached) → validator Fail.
+        let snapshot = rustynetd::linux_ipv6_leak::build_linux_ipv6_leak_snapshot(
+            1,
+            "enp0s1",
+            "2606:4700:4700::1111",
+            "rustynet_g1",
+            "0\n",
+            "table ip rustynet_g1 {\n chain killswitch {\n  policy drop;\n  ip saddr 100.64.0.0/16 accept\n }\n}\n",
+            "12:00:00 IP6 2001:db8::1 > 2606:4700:4700::1111: ICMP6, echo request\n",
+            true,
+            true,
+        );
+        let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        let err = super::evaluate_linux_ipv6_leak_artifact("debian-headless-1", raw.as_str())
+            .expect_err("a leaking host must fail closed");
+        assert!(err.contains("cleartext IPv6 datagram"), "unexpected: {err}");
+    }
+
+    fn reviewed_macos_ipv6_leak_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "egress_iface": "en0",
+            "probe_target": "2606:4700:4700::1111",
+            "pf_anchor": "com.apple/rustynet_g1",
+            "killswitch_v6_block_present": true,
+            "leaked_datagram_count": 0,
+            "probe_reached_target": false,
+            "probe_attempted": true
+        })
+    }
+
+    #[test]
+    fn evaluate_macos_ipv6_leak_artifact_rejects_unattempted_probe() {
+        let mut payload = reviewed_macos_ipv6_leak_artifact();
+        payload["probe_attempted"] = serde_json::Value::Bool(false);
+        let err =
+            super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", payload.to_string().as_str())
+                .expect_err("a never-run probe must fail closed as inconclusive");
+        assert!(
+            err.contains("never executed") && err.contains("inconclusive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_ipv6_leak_artifact_accepts_failclosed_posture() {
+        let summary = super::evaluate_macos_ipv6_leak_artifact(
+            "macos-utm-1",
+            reviewed_macos_ipv6_leak_artifact().to_string().as_str(),
+        )
+        .expect("fail-closed macOS IPv6 posture must validate");
+        assert!(
+            summary.contains("macos-utm-1") && summary.contains("pf v6 containment present"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_ipv6_leak_artifact_rejects_leaked_datagram() {
+        let mut payload = reviewed_macos_ipv6_leak_artifact();
+        payload["leaked_datagram_count"] = serde_json::Value::from(1);
+        let err =
+            super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", payload.to_string().as_str())
+                .expect_err("a leaked IPv6 datagram must fail closed");
+        assert!(
+            err.contains("cleartext IPv6 datagram") && err.contains("NOT fail-closed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_ipv6_leak_artifact_rejects_probe_reaching_target() {
+        let mut payload = reviewed_macos_ipv6_leak_artifact();
+        payload["probe_reached_target"] = serde_json::Value::Bool(true);
+        let err =
+            super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", payload.to_string().as_str())
+                .expect_err("a probe that reaches its global target must fail closed");
+        assert!(
+            err.contains("escaped the protected path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_ipv6_leak_artifact_rejects_no_pf_v6_containment() {
+        let mut payload = reviewed_macos_ipv6_leak_artifact();
+        payload["killswitch_v6_block_present"] = serde_json::Value::Bool(false);
+        let err =
+            super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", payload.to_string().as_str())
+                .expect_err("absence of pf v6 containment must fail closed");
+        assert!(
+            err.contains("no pf IPv6 containment rule"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn macos_ipv6_leak_producer_to_validator_round_trip_failclosed() {
+        let snapshot = rustynetd::macos_ipv6_leak::build_macos_ipv6_leak_snapshot(
+            1,
+            "en0",
+            "2606:4700:4700::1111",
+            "com.apple/rustynet_g1",
+            "pass out quick on rustynet0 all keep state\nblock drop out quick all\n",
+            "reading from file /tmp/x.pcap\n0 packets captured\n",
+            false,
+            true,
+        );
+        let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        let summary = super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", raw.as_str())
+            .expect("producer-built fail-closed macOS IPv6 artifact must validate");
+        assert!(
+            summary.contains("0 leaked datagrams"),
+            "unexpected: {summary}"
+        );
+    }
+
+    #[test]
+    fn macos_ipv6_leak_producer_to_validator_round_trip_inet_only_no_containment() {
+        // An inet-only pf block (IPv4-only killswitch) does not contain v6.
+        // Hold the datagram-count and probe-reached branches CLEAN (0 / false)
+        // so the producer snapshot exercises the pf-containment-absent branch
+        // (killswitch_v6_block_present=false) end-to-end, not the leak branch.
+        let snapshot = rustynetd::macos_ipv6_leak::build_macos_ipv6_leak_snapshot(
+            1,
+            "en0",
+            "2606:4700:4700::1111",
+            "com.apple/rustynet_g1",
+            "block drop out quick inet from any to any\n",
+            "reading from file /tmp/x.pcap\n0 packets captured\n",
+            false,
+            true,
+        );
+        assert!(
+            !snapshot.killswitch_v6_block_present,
+            "inet-only pf block must not be credited as v6 containment"
+        );
+        let raw = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        let err = super::evaluate_macos_ipv6_leak_artifact("macos-utm-1", raw.as_str())
+            .expect_err("an inet-only killswitch (no v6 containment) must fail closed");
+        assert!(
+            err.contains("no pf IPv6 containment rule"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn privileged_helper_allowlist_audit_producer_to_validator_round_trip_passes() {
+        // The shipped daemon audit (real argv allowlist + adversarial corpus)
+        // serialised into the orchestrator validator must verify clean.
+        let report =
+            rustynetd::privileged_helper_allowlist_audit::run_privileged_helper_allowlist_audit();
+        assert!(
+            report.overall_ok,
+            "reviewed allowlist must pass: {report:?}"
+        );
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary =
+            super::evaluate_privileged_helper_allowlist_report("debian-headless-1", raw.as_str())
+                .expect("clean allowlist audit must validate");
+        assert!(
+            summary.contains("debian-headless-1")
+                && summary.contains("adversarial requests denied"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_privileged_helper_allowlist_report_rejects_violation() {
+        // The bite: a report carrying a violation (an adversarial request the
+        // allowlist accepted) must Fail the stage.
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 24,
+            "malicious_denied": 14,
+            "benign_allowed": 9,
+            "violations": [
+                {"label": "nft_delete_arbitrary_table", "program": "nft", "expectation": "deny", "actual_allowed": true, "passed": false, "detail": "accepted"}
+            ]
+        }"#;
+        let err = super::evaluate_privileged_helper_allowlist_report("debian-headless-1", raw)
+            .expect_err("a violation must fail closed");
+        assert!(
+            err.contains("allowlist drift") && err.contains("nft_delete_arbitrary_table"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_privileged_helper_allowlist_report_rejects_empty_corpus() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 0,
+            "malicious_denied": 0,
+            "benign_allowed": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_privileged_helper_allowlist_report("debian-headless-1", raw)
+            .expect_err("an empty corpus must fail closed");
+        assert!(err.contains("empty corpus"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn membership_signature_audit_producer_to_validator_round_trip_passes() {
+        // The shipped daemon audit (real verify funnel + forgery corpus)
+        // serialised into the orchestrator validator must verify clean.
+        let report = rustynetd::membership_signature_audit::run_membership_signature_audit()
+            .expect("audit runs");
+        assert!(report.overall_ok, "reviewed funnel must pass: {report:?}");
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary =
+            super::evaluate_membership_signature_audit_report("debian-headless-1", raw.as_str())
+                .expect("clean signature audit must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("forgeries rejected"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_membership_signature_audit_report_rejects_accepted_forgery() {
+        // The bite: a report carrying a violation (a forgery the funnel
+        // accepted) must Fail the stage.
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 12,
+            "forgeries_rejected": 10,
+            "baseline_accepted": 1,
+            "violations": [
+                {"id": "malleable_s_signature", "expectation": "reject", "rejected": false, "reason": "ACCEPTED", "reason_matches": false, "passed": false}
+            ]
+        }"#;
+        let err = super::evaluate_membership_signature_audit_report("debian-headless-1", raw)
+            .expect_err("an accepted forgery must fail closed");
+        assert!(
+            err.contains("verify funnel drift") && err.contains("malleable_s_signature"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_membership_signature_audit_report_rejects_vacuous_no_baseline() {
+        // A reject-all corpus with no accepted baseline proves nothing.
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 11,
+            "forgeries_rejected": 11,
+            "baseline_accepted": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_membership_signature_audit_report("debian-headless-1", raw)
+            .expect_err("a vacuous reject-all audit must fail closed");
+        assert!(err.contains("vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn policy_default_deny_audit_producer_to_validator_round_trip_passes() {
+        let report = rustynetd::policy_default_deny_audit::run_policy_default_deny_audit();
+        assert!(
+            report.overall_ok,
+            "reviewed evaluator must pass: {report:?}"
+        );
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary = super::evaluate_policy_default_deny_report("debian-headless-1", raw.as_str())
+            .expect("clean default-deny audit must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("allow cases held"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_policy_default_deny_report_rejects_violation() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 9,
+            "allow_cases_passed": 2,
+            "deny_cases_passed": 6,
+            "violations": [
+                {"id": "empty_policy_denies_blind", "expected": "deny", "actual": "allow", "passed": false}
+            ]
+        }"#;
+        let err = super::evaluate_policy_default_deny_report("debian-headless-1", raw)
+            .expect_err("a default-deny violation must fail closed");
+        assert!(
+            err.contains("truth table drift") && err.contains("empty_policy_denies_blind"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_policy_default_deny_report_rejects_vacuous_no_allow() {
+        // No ALLOW case passed => a broken deny-all evaluator would also pass.
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 9,
+            "allow_cases_passed": 0,
+            "deny_cases_passed": 9,
+            "violations": []
+        }"#;
+        let err = super::evaluate_policy_default_deny_report("debian-headless-1", raw)
+            .expect_err("a vacuous deny-all audit must fail closed");
+        assert!(err.contains("vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_membership_signature_audit_report_rejects_thin_battery() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 4,
+            "forgeries_rejected": 3,
+            "baseline_accepted": 1,
+            "violations": []
+        }"#;
+        let err = super::evaluate_membership_signature_audit_report("debian-headless-1", raw)
+            .expect_err("a thin forgery battery must fail closed");
+        assert!(err.contains("too thin"), "unexpected error: {err}");
+    }
+
     #[test]
     fn linux_relay_lifecycle_output_validators_accept_reviewed_dry_run_text() {
         let install = "rustynet-relay systemd unit: install+enable (dry-run) at /etc/systemd/system/rustynet-relay.service\n  - would run: systemctl daemon-reload\n  - would run: systemctl enable rustynet-relay.service\n  - would run: systemctl start rustynet-relay.service\n";
@@ -37523,8 +38811,13 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_key_custody",
             "validate_linux_service_hardening",
             "validate_linux_authenticode",
+            "validate_linux_privileged_helper_allowlist",
+            "validate_linux_membership_signature_forgery",
+            "validate_linux_policy_default_deny",
             "validate_linux_dns_failclosed",
             "validate_linux_exit_nat_lifecycle",
+            "validate_linux_ipv6_leak",
+            "validate_linux_exit_demotion_residue",
             "validate_linux_exit_dns_failclosed",
             "validate_linux_relay_service_lifecycle",
             "validate_linux_anchor_bundle_pull",
@@ -37660,8 +38953,13 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_key_custody",
                 "validate_linux_service_hardening",
                 "validate_linux_authenticode",
+                "validate_linux_privileged_helper_allowlist",
+                "validate_linux_membership_signature_forgery",
+                "validate_linux_policy_default_deny",
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",
+                "validate_linux_ipv6_leak",
+                "validate_linux_exit_demotion_residue",
                 "validate_linux_exit_dns_failclosed",
                 "validate_linux_relay_service_lifecycle",
                 "validate_linux_anchor_bundle_pull",
