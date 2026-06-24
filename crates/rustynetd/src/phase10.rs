@@ -4617,6 +4617,11 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         {
             membership.set_node_status("node-b", MembershipStatus::Active);
             membership.set_node_status("node-c", MembershipStatus::Active);
+            // RSA-0007: the exit-node + LAN-route ACL gates now evaluate with
+            // membership, so the selectors the controller tests exercise
+            // (`node:exit-1`, `user:alice`) must resolve as Active here.
+            membership.set_node_status("exit-1", MembershipStatus::Active);
+            membership.set_selector_members("user:alice", ["node-b"]);
         }
 
         Self {
@@ -5063,12 +5068,20 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     ) -> Result<(), Phase10Error> {
         self.ensure_started()?;
 
-        let decision = self.policy.evaluate(&ContextualAccessRequest {
-            src: requester.to_owned(),
-            dst: format!("node:{}", node_id.as_str()),
-            protocol,
-            context: TrafficContext::SharedExit,
-        });
+        // RSA-0007: gate through the membership-aware evaluator (the daemon's
+        // established `evaluate_with_membership` pattern) so a revoked exit node
+        // — or a revoked requester selector — is denied at this control-plane
+        // ACL layer too, not just at peer provisioning. One hardened path
+        // (CLAUDE.md §3): no weaker revocation-blind `evaluate` branch.
+        let decision = self.policy.evaluate_with_membership(
+            &ContextualAccessRequest {
+                src: requester.to_owned(),
+                dst: format!("node:{}", node_id.as_str()),
+                protocol,
+                context: TrafficContext::SharedExit,
+            },
+            &self.membership,
+        );
         if decision != Decision::Allow {
             return Err(Phase10Error::PolicyDenied);
         }
@@ -5133,12 +5146,18 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             return Err(Phase10Error::LanAccessDenied);
         }
 
-        let decision = self.policy.evaluate(&ContextualAccessRequest {
-            src: request.user,
-            dst: request.cidr,
-            protocol: request.protocol,
-            context: request.context,
-        });
+        // RSA-0007: membership-aware evaluation so a revoked requester selector
+        // is denied at the LAN-route ACL gate too (same hardened path as
+        // set_exit_node and the daemon's auto-tunnel gates).
+        let decision = self.policy.evaluate_with_membership(
+            &ContextualAccessRequest {
+                src: request.user,
+                dst: request.cidr,
+                protocol: request.protocol,
+                context: request.context,
+            },
+            &self.membership,
+        );
         if decision != Decision::Allow {
             return Err(Phase10Error::PolicyDenied);
         }
@@ -8395,6 +8414,105 @@ mod tests {
         assert!(
             rollback_index < endpoint_bypass_index && endpoint_bypass_index < apply_routes_index,
             "route table 51820 must flush before endpoint bypass routes, and endpoint bypass routes must precede managed route re-apply"
+        );
+    }
+
+    #[test]
+    fn set_exit_node_denies_revoked_exit_node() {
+        // RSA-0007: the exit-node ACL gate is membership-aware, so a revoked
+        // exit node is denied here too — not only at peer provisioning.
+        use rustynet_policy::{MembershipDirectory, MembershipStatus};
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let exit_node = NodeId::new("exit-1").expect("node id should parse");
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+
+        // Revoke the exit node (the requester selector stays active + apply has
+        // already provisioned, so revocation is the only thing that changed).
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node-b", MembershipStatus::Active);
+        membership.set_node_status("exit-1", MembershipStatus::Revoked);
+        membership.set_selector_members("user:alice", ["node-b"]);
+        controller.set_membership(membership);
+
+        assert_eq!(
+            controller
+                .set_exit_node(exit_node, "user:alice", Protocol::Tcp)
+                .err(),
+            Some(Phase10Error::PolicyDenied),
+            "a revoked exit node must be denied at set_exit_node"
+        );
+    }
+
+    #[test]
+    fn ensure_lan_route_allowed_denies_revoked_requester() {
+        // RSA-0007: even when the toggle, advertised route, and ACL all pass, a
+        // revoked requester selector must be denied at the LAN-route gate.
+        use rustynet_policy::{MembershipDirectory, MembershipStatus};
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let exit_node = NodeId::new("exit-1").expect("node id should parse");
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+        controller
+            .set_exit_node(exit_node.clone(), "user:alice", Protocol::Tcp)
+            .expect("policy should allow selecting exit");
+        controller.set_lan_access(true);
+        controller.advertise_lan_route(exit_node, "192.168.1.0/24");
+        controller.set_lan_route_acl("user:alice", "192.168.1.0/24", true);
+
+        // Revoke the node backing the requester selector; prerequisites still
+        // pass, so only the membership-aware policy gate can deny.
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node-b", MembershipStatus::Revoked);
+        membership.set_node_status("exit-1", MembershipStatus::Active);
+        membership.set_selector_members("user:alice", ["node-b"]);
+        controller.set_membership(membership);
+
+        assert_eq!(
+            controller
+                .ensure_lan_route_allowed(RouteGrantRequest {
+                    user: "user:alice".to_owned(),
+                    cidr: "192.168.1.0/24".to_owned(),
+                    protocol: Protocol::Tcp,
+                    context: TrafficContext::SharedExit,
+                })
+                .err(),
+            Some(Phase10Error::PolicyDenied),
+            "a revoked requester must be denied at ensure_lan_route_allowed"
         );
     }
 
