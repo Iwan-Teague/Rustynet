@@ -2730,10 +2730,17 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
     ensure_safe_spec("allow-spec", allow_spec.as_str())?;
     ensure_safe_spec("assignments-spec", assignments_spec.as_str())?;
 
-    let bundle_ttl_secs: u64 = env_values
-        .get("BUNDLE_TTL_SECS")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(300);
+    // Fail loud on a present-but-malformed BUNDLE_TTL_SECS instead of silently
+    // swallowing it into the default — the TTL bounds the bundle's freshness /
+    // replay window, so a typo'd value must surface, not quietly become 300.
+    // Absent stays the explicit default. The signed-bundle builder still
+    // enforces its per-bundle upper cap.
+    let bundle_ttl_secs: u64 = match env_values.get("BUNDLE_TTL_SECS") {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|err| format!("invalid BUNDLE_TTL_SECS in assignment env: {err}"))?,
+        None => 300,
+    };
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;
     let known_node_ids = nodes
         .iter()
@@ -3145,10 +3152,17 @@ pub(crate) fn issue_assignment_bundles_locally(
     ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
     ensure_safe_spec("allow-spec", allow_spec.as_str())?;
     ensure_safe_spec("assignments-spec", assignments_spec.as_str())?;
-    let bundle_ttl_secs: u64 = env_values
-        .get("BUNDLE_TTL_SECS")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(300);
+    // Fail loud on a present-but-malformed BUNDLE_TTL_SECS instead of silently
+    // swallowing it into the default — the TTL bounds the bundle's freshness /
+    // replay window, so a typo'd value must surface, not quietly become 300.
+    // Absent stays the explicit default. The signed-bundle builder still
+    // enforces its per-bundle upper cap.
+    let bundle_ttl_secs: u64 = match env_values.get("BUNDLE_TTL_SECS") {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|err| format!("invalid BUNDLE_TTL_SECS in assignment env: {err}"))?,
+        None => 300,
+    };
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;
     let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
     let assignment_specs = parse_generic_assignment_specs(assignments_spec.as_str())?;
@@ -3197,10 +3211,14 @@ pub(crate) fn issue_traversal_bundles_locally(
     let allow_spec = env_required_value(&env_values, "ALLOW_SPEC", "traversal env")?;
     ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
     ensure_safe_spec("allow-spec", allow_spec.as_str())?;
-    let bundle_ttl_secs: u64 = env_values
-        .get("TRAVERSAL_TTL_SECS")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(120);
+    // Fail loud on a present-but-malformed TRAVERSAL_TTL_SECS instead of
+    // silently swallowing it into the default (see BUNDLE_TTL_SECS rationale).
+    let bundle_ttl_secs: u64 = match env_values.get("TRAVERSAL_TTL_SECS") {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|err| format!("invalid TRAVERSAL_TTL_SECS in traversal env: {err}"))?,
+        None => 120,
+    };
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;
     let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
     let mut signing_secret = generate_ephemeral_signing_secret()?;
