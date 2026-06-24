@@ -48,7 +48,7 @@ Effort key: **S** ≤½ day · **M** ~1–2 days · **L** ≥3 days / needs desi
 
 **Theme D — fail-open / assurance verification.**
 - RSA-0026 `secret_log_audit` gate → enumerate the *real* secret types (derive from `Zeroizing`/zeroize), multi-line scan, extend to control/relay/crypto; meta-test. **M**
-- RSA-0031 exit-NAT teardown verify (mac/win) → fail closed on `pfctl`/forwarding-capture exec error (never report `restored=true`). **S**
+- RSA-0031 exit-NAT teardown verify (mac/win) → fail closed on `pfctl`/forwarding-capture exec error (never report `restored=true`). **S** — ✅ APPLIED 2026-06-24 (code-complete; live re-proof pending): capture-failure now reads anchor/NAT as present + forwarding NOT restored; exec-failure-injection unit tests on both OS verifiers.
 
 **Theme E — revocation-blind issuance / consistency (mitigated downstream, fix for one-hardened-path).**
 - RSA-0007 `phase10.rs` set_exit_node/ensure_lan_route_allowed → route through `evaluate_with_membership`; revoked-node negative tests. **S**
