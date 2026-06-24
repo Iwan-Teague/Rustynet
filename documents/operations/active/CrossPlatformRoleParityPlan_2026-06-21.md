@@ -183,11 +183,72 @@ requires a recorded green live run.
   role with `[BlindExit, ExitServer]` (`orchestrator/role.rs:120,148`). The remaining
   gap is a FAIL-LOUD activation/assertion **stage** (deferred in `active_exit.rs`),
   entangled with the macOS exit path and only meaningful live.
-- **Windows anchor / relay — real runtime still required.** Live bundle-pull serving
-  (Windows daemon loopback listener) and live relay session-forwarding (Windows service
-  + verifier-key deploy + `deploy_relay_service` adapter hook) are genuinely unbuilt;
-  the current validators are dry-run/contract only (§3 🟠 is accurate).
+- **Windows anchor / relay — see the §10 correction (2026-06-24).** Windows
+  **anchor** bundle-pull serving IS genuinely unbuilt (the daemon loopback listener
+  is wired only into the `#[cfg(not(windows))]` main loop — needs cfg(windows)
+  wiring + a live stage). Windows **relay** lifecycle is contract-complete; its
+  only gap is HP-3 live forwarding, which is unproven on **every** OS (not a
+  Windows runtime hole — §9's "genuinely unbuilt" framing for relay was stale).
 - **Tooling blocker for Windows-only code:** on the dev macOS host, `cargo check
   --target x86_64-pc-windows-gnu` fails compiling deps (`cpufeatures`/`subtle`), so new
   `cfg(windows)`-only code (e.g. DPAPI/SDDL key custody RSA-0002/0025) is **not locally
   gate-verifiable** — those items need a Windows builder or CI cross-check.
+
+## 10. Second code audit + fixes (2026-06-24, workflow-verified, no live lab)
+
+A 7-cell parallel code audit (each agent reading the actual symbols, file:line)
+re-checked §9 and found it **partially stale**. Authoritative per-cell state and
+the fixes landed this pass (all Linux-gate-verified; live runs still pending):
+
+- **macOS blind_exit — §9 was STALE; cell is code-complete.** §9 said the live
+  stage was "deferred in `active_exit.rs`"; that inspected only the rust-native
+  stage. The FAIL-LOUD live stage exists in the legacy path
+  (`validate_macos_blind_exit` `vm_lab/mod.rs:9693` → `exercise_macos_blind_exit_live`
+  `:10371`: irreversible `role set blind_exit --accept-irreversible`, asserts the
+  pf anchor loaded + no route-to/reply-to/dup-to + the immutability gate). With
+  the runtime + the 2026-06-24 mesh-CIDR bound, only a live run remains. §3 fixed.
+- **Windows exit — WAS code-incomplete (§10.7 residue gap); NOW code-complete.**
+  `WindowsCommandSystem` had no `reconcile_exit_nat_residue` override (default
+  no-op), so a crash-while-serving-exit → restart-as-client could not self-heal
+  the fixed-name `New-NetNat` + enabled forwarding (the in-memory rollback state
+  is lost on crash). **Fixed this pass** (`phase10.rs`,
+  `windows_exit_nat_residue_plan` + the override + a Linux pure-function test):
+  when not serving, `Remove-NetNat` by fixed name + force forwarding Disabled on
+  the tunnel + egress interfaces, best-effort, only-when-not-serving. The
+  WinNAT/`MSFT_NetNat` live blocker is unchanged.
+- **Windows anchor — genuinely code-incomplete (§3 🟠 accurate).** The only
+  Windows anchor stage is the in-process `validate_windows_anchor_bundle_pull_plan_contract`
+  ("without guest mutation"). The daemon bundle-pull `TcpListener` bind + accept
+  poll live ENTIRELY in the `#[cfg(not(windows))]` Unix main-loop block
+  (`daemon.rs:9513-9532` / `9651-9691`); the `#[cfg(windows)]` reconcile loop
+  (`daemon.rs:9323-9449`) never binds/polls it, so a Windows anchor never opens
+  `127.0.0.1:51822`. The handler primitives (`handle_anchor_bundle_pull_stream`,
+  etc.) are portable `std::net` (not cfg-gated), so the gap is **wiring the
+  bind+accept into the Windows loop** + a live stage — but that wiring is
+  `cfg(windows)` and **not locally compile-verifiable** here (the Windows
+  cross-build blocker), so it needs a Windows builder. The request-probe +
+  report-validator are Linux-authorable.
+- **Windows relay — §9 was STALE (it called this "genuinely unbuilt").** The
+  cell is **lab-blocked-code-complete for lifecycle**; the real gap is HP-3 live
+  forwarding, which is unproven on **every** OS (not Windows-specific). The
+  Windows relay SCM lifecycle is contract-validated; forwarding is the
+  cross-cutting HP-3 item, not a Windows runtime hole.
+- **Windows admin / macOS admin / macOS exit / macOS relay (lifecycle) —
+  code-complete-live-pending (§9 accurate).** The only consistent CODE gap is
+  that none of the mac/win FAIL-LOUD stages have a Linux-buildable **contract
+  test for their gating decision matrix** (dry-run→Skip, not-elected→Skip,
+  mesh-join-not-pass→Skip, live-ok→Pass, live-err→Fail) — addable by factoring
+  the gating out of the live SSH call.
+- **Live cross-OS role transitions — genuinely unbuilt (Linux-authorable).**
+  `RoleSwitchMatrixStage` is a passive tunnel-health check; no stage selects a
+  mac/win node as a role-switch TARGET, drives the platform role-set flip
+  (launchd reload / `windows_service`), and re-applies signed state via
+  `StateRefresh`/`refresh_signed_state_with_reason`. Design now in
+  `CrossOsRoleSwitchPlan_2026-06-24.md`; the stage itself is the remaining work
+  (Linux-buildable, but only meaningful when run live against mac/win guests).
+
+**Net remaining parity CODE work (no live lab):** (a) the role-transition stage
+(Linux-authorable, large); (b) the mac/win stage-gating contract tests
+(Linux-authorable, small); (c) the Windows anchor daemon-loop listener wiring +
+live stage (**cfg(windows)-build-blocked**). Everything else is
+code-complete-live-pending or HP-3/WinNAT-blocked.
