@@ -1,0 +1,29 @@
+# Standalone, isolated GUI prototype — its OWN workspace root (the empty
+# [workspace] table below detaches it from the parent Rustynet workspace so its
+# heavy GUI dependency tree and assorted licenses never touch the security-gated
+# workspace). See ../../Cargo.toml `exclude = ["gui"]`.
+[workspace]
+
+[package]
+name = "rustynet-node-map"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native Rust 3D node-map visualisation for a Rustynet network (egui/eframe)."
+publish = false
+
+[[bin]]
+name = "rustynet-node-map"
+path = "src/main.rs"
+
+[dependencies]
+# Pure-Rust immediate-mode GUI. glow (OpenGL) backend only — no wgpu — to keep
+# the dependency tree and binary smaller. winit links X11/Wayland at runtime via
+# dlopen, so no display libs are needed to build.
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2

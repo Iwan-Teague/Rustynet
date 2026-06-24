@@ -1,0 +1,22 @@
+{
+  "nodes": [
+    { "id": "admin-01",   "role": "admin",      "status": "online",     "meta": { "address": "100.64.0.1",  "os": "linux" } },
+    { "id": "anchor-eu",  "role": "anchor",     "status": "online",     "meta": { "address": "100.64.0.10", "os": "linux" } },
+    { "id": "relay-home", "role": "relay",      "status": "online",     "meta": { "address": "100.64.0.20", "os": "linux" } },
+    { "id": "exit-nl",    "role": "exit",       "status": "online",     "meta": { "address": "100.64.0.30", "os": "linux" } },
+    { "id": "nas-vault",  "role": "nas",        "status": "online",     "meta": { "address": "100.64.0.40", "os": "linux" } },
+    { "id": "laptop-mac", "role": "client",     "status": "online",     "meta": { "address": "100.64.0.50", "os": "macos" } },
+    { "id": "pc-win",     "role": "client",     "status": "connecting", "meta": { "address": "100.64.0.51", "os": "windows" } },
+    { "id": "pi-sensor",  "role": "client",     "status": "offline",    "meta": { "address": "100.64.0.53", "os": "linux" } }
+  ],
+  "edges": [
+    { "from": "laptop-mac", "to": "anchor-eu",  "kind": "data_path" },
+    { "from": "anchor-eu",  "to": "relay-home", "kind": "data_path" },
+    { "from": "relay-home", "to": "exit-nl",    "kind": "data_path" },
+    { "from": "nas-vault",  "to": "anchor-eu",  "kind": "data_path" },
+    { "from": "pc-win",     "to": "anchor-eu",  "kind": "data_path" },
+    { "from": "admin-01",   "to": "anchor-eu",  "kind": "control" },
+    { "from": "admin-01",   "to": "relay-home", "kind": "control" },
+    { "from": "pi-sensor",  "to": "anchor-eu",  "kind": "potential" }
+  ]
+}
