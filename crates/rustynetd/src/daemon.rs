@@ -7495,6 +7495,13 @@ impl DaemonRuntime {
             .ok_or_else(|| "gossip subsystem not attached".to_owned())?;
         let secret = crate::enrollment_token::load_secret(secret_path)
             .map_err(|err| format!("enrollment secret load failed: {err}"))?;
+        // RSA-0023: hold an exclusive advisory lock over the ENTIRE
+        // load → check-consumed → register → write sequence so two concurrent
+        // redemptions of the same single-use token cannot both observe "not
+        // consumed". The guard is released when this scope ends (after the
+        // consume's ledger write). Mirrors resilience.rs::acquire_lock.
+        let _ledger_lock = crate::enrollment_token::acquire_ledger_lock(ledger_path)
+            .map_err(|err| format!("enrollment ledger lock failed: {err}"))?;
         let mut ledger = crate::enrollment_token::load_ledger(ledger_path)
             .map_err(|err| format!("enrollment ledger load failed: {err}"))?;
         // Decode the enrollee's 32-byte verifying key. Reject any

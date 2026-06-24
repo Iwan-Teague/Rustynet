@@ -47,7 +47,8 @@
 //!   token is opaque to the enrollee.
 
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -569,6 +570,125 @@ pub fn write_ledger(
             .map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
     }
     Ok(())
+}
+
+/// Sibling lock-file path for a ledger: `<ledger>.lock`.
+fn ledger_lock_path(ledger_path: &Path) -> PathBuf {
+    let mut raw = ledger_path.as_os_str().to_owned();
+    raw.push(".lock");
+    PathBuf::from(raw)
+}
+
+/// Exclusive advisory lock over an enrollment-ledger read-modify-write
+/// (RSA-0023). Held by the consumer for the WHOLE `load_ledger → was_consumed →
+/// record_consumed → write_ledger` sequence so two concurrent redemptions of the
+/// same single-use token cannot both observe "not consumed" and both register a
+/// peer (which would honor a one-time token twice — a fail-OPEN race,
+/// SecurityMinimumBar §3.3, CWE-362).
+///
+/// On Unix the lock is an exclusive `flock(LOCK_EX)` which the kernel releases
+/// when the descriptor closes — including on process death — so a crash never
+/// wedges a future consumer (the lock file may persist; the lock itself does
+/// not). Mirrors the hardened `resilience.rs::acquire_lock` posture. On non-Unix
+/// it falls back to an `O_EXCL` lock file removed on drop.
+#[cfg(unix)]
+pub struct LedgerLockGuard {
+    _flock: nix::fcntl::Flock<std::fs::File>,
+}
+
+#[cfg(not(unix))]
+pub struct LedgerLockGuard {
+    path: PathBuf,
+    _handle: std::fs::File,
+}
+
+#[cfg(not(unix))]
+impl Drop for LedgerLockGuard {
+    fn drop(&mut self) {
+        // No advisory-flock auto-release on this platform, so the O_EXCL lock
+        // file must be removed on clean release or it would wedge the next
+        // consumer permanently.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Acquire [`LedgerLockGuard`]. Blocks (bounded retry, 3s) on genuine live
+/// contention; fails closed on timeout or I/O error rather than proceeding
+/// without the lock.
+#[cfg(unix)]
+pub fn acquire_ledger_lock(ledger_path: &Path) -> Result<LedgerLockGuard, EnrollmentSpoolError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_path = ledger_lock_path(ledger_path);
+    const MAX_WAIT: Duration = Duration::from_secs(3);
+    const WAIT_MS: u64 = 10;
+    let deadline = Instant::now() + MAX_WAIT;
+    loop {
+        // create(true) (not create_new): a lock file may legitimately survive a
+        // crash; mutual exclusion comes from the advisory flock below.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            // The lock file is a pure mutex token; never truncate it (and there
+            // is nothing to truncate). Explicit to satisfy the open-options lint.
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|err| {
+                EnrollmentSpoolError::Io(format!(
+                    "open enrollment ledger lock {}: {err}",
+                    lock_path.display()
+                ))
+            })?;
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(flock) => return Ok(LedgerLockGuard { _flock: flock }),
+            Err((_file, _errno)) => {
+                // Held by another live descriptor; a dead holder's flock is
+                // already released, so this only loops for genuine contention.
+                if Instant::now() >= deadline {
+                    return Err(EnrollmentSpoolError::Io(
+                        "enrollment ledger lock contended (timeout)".to_owned(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(WAIT_MS));
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn acquire_ledger_lock(ledger_path: &Path) -> Result<LedgerLockGuard, EnrollmentSpoolError> {
+    let lock_path = ledger_lock_path(ledger_path);
+    const MAX_WAIT: Duration = Duration::from_secs(3);
+    const WAIT_MS: u64 = 10;
+    let deadline = Instant::now() + MAX_WAIT;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(handle) => {
+                return Ok(LedgerLockGuard {
+                    path: lock_path,
+                    _handle: handle,
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if Instant::now() >= deadline {
+                    return Err(EnrollmentSpoolError::Io(
+                        "enrollment ledger lock contended (timeout)".to_owned(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(WAIT_MS));
+            }
+            Err(err) => {
+                return Err(EnrollmentSpoolError::Io(format!(
+                    "create enrollment ledger lock {}: {err}",
+                    lock_path.display()
+                )));
+            }
+        }
+    }
 }
 
 /// Read a 32-byte enrollment secret from disk. The file must be
@@ -1126,6 +1246,60 @@ mod tests {
         assert_eq!(loaded.consumed_count(), 2);
         assert!(loaded.was_consumed(&[0xa1u8; TOKEN_ID_LEN]));
         assert!(loaded.was_consumed(&[0xb2u8; TOKEN_ID_LEN]));
+    }
+
+    #[test]
+    fn concurrent_consume_under_lock_redeems_token_exactly_once() {
+        // RSA-0023: N threads racing to redeem the SAME single-use token must
+        // yield exactly ONE success; the rest see "already consumed". Each
+        // thread mirrors the daemon's locked read-modify-write:
+        // acquire_ledger_lock -> load_ledger -> verify_and_consume -> write_ledger.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = Arc::new(dir.path().join("enrollment.ledger"));
+        let secret = [0x5au8; ENROLLMENT_SECRET_LEN];
+        let (_, encoded) = mint_token_with_clock(&secret, 600, 1_700_000_000).expect("mint");
+        let encoded = Arc::new(encoded);
+        // Seed an empty (version-tagged) ledger so every thread loads a real file.
+        write_ledger(&path, &ConsumedTokenLedger::new()).expect("seed");
+
+        let successes = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let encoded = Arc::clone(&encoded);
+                let successes = Arc::clone(&successes);
+                std::thread::spawn(move || {
+                    let _lock = acquire_ledger_lock(&path).expect("acquire ledger lock");
+                    let mut ledger = load_ledger(&path).expect("load ledger");
+                    if verify_and_consume_token_with_now(
+                        &encoded,
+                        &secret,
+                        &mut ledger,
+                        1_700_000_300,
+                    )
+                    .is_ok()
+                    {
+                        write_ledger(&path, &ledger).expect("write ledger");
+                        successes.fetch_add(1, Ordering::SeqCst);
+                    }
+                    // `_lock` drops here, AFTER the write — so the next thread
+                    // only proceeds once this consume is durably recorded.
+                })
+            })
+            .collect();
+        for handle in threads {
+            handle.join().expect("thread join");
+        }
+        assert_eq!(
+            successes.load(Ordering::SeqCst),
+            1,
+            "exactly one redemption of a single-use token may succeed under a race"
+        );
+        assert_eq!(load_ledger(&path).expect("final load").consumed_count(), 1);
     }
 
     #[test]
