@@ -485,6 +485,18 @@ pub trait DataplaneSystem {
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
         Ok(())
     }
+    /// Flush any persisted exit-NAT translation state that must not outlive the
+    /// exit capability (CLAUDE.md §10.7), given whether THIS generation serves
+    /// an exit. Called every apply before the generation stages. Default no-op;
+    /// platforms whose exit NAT lives in fixed-name kernel state that the
+    /// generation-numbered `prune_owned_tables` sweep does not reach (macOS pf
+    /// `com.rustynet/nat`) override this to flush that state when not serving,
+    /// so a crash-then-restart-as-client cannot leave a live NAT rule behind.
+    /// (Linux self-heals: its NAT tables are generation-numbered and swept by
+    /// `prune_owned_tables`.)
+    fn reconcile_exit_nat_residue(&mut self, _serving_exit: bool) -> Result<(), SystemError> {
+        Ok(())
+    }
     fn check_prerequisites(&mut self) -> Result<(), SystemError>;
     fn preflight_exit_serving(&mut self, _mesh_cidr: &str) -> Result<(), SystemError> {
         Ok(())
@@ -2920,6 +2932,31 @@ impl DataplaneSystem for MacosCommandSystem {
         Ok(())
     }
 
+    fn reconcile_exit_nat_residue(&mut self, serving_exit: bool) -> Result<(), SystemError> {
+        // The exit NAT lives in the FIXED-name `com.rustynet/nat` pf anchor.
+        // `prune_owned_tables` only sweeps the generation-numbered
+        // `com.apple/rustynet_g*` killswitch anchors, and `teardown_exit_nat`
+        // flushes the NAT anchor only through the in-memory `exit_nat_anchor`
+        // handle — which is lost on a crash/SIGKILL/OOM. So a node that crashed
+        // while serving as an exit and restarts as a client would otherwise
+        // leave the live `nat ... -> (egress)` rule installed with no owner and
+        // no code path to remove it (CLAUDE.md §10.7 residue; the Linux exit
+        // self-heals because its NAT tables are generation-numbered and swept).
+        //
+        // Flush the fixed anchor by name whenever THIS generation does not serve
+        // an exit. It is a no-op for a client that never loaded NAT, idempotent
+        // with the normal `teardown_exit_nat`, and — because it never runs for a
+        // serving-exit apply — cannot race the `activate_exit_nat` load that
+        // happens a few stages later in the same apply.
+        if !serving_exit {
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR, "-F", "all"],
+            );
+        }
+        Ok(())
+    }
+
     fn check_prerequisites(&mut self) -> Result<(), SystemError> {
         #[cfg(target_os = "macos")]
         {
@@ -4281,6 +4318,15 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn reconcile_exit_nat_residue(&mut self, serving_exit: bool) -> Result<(), SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.reconcile_exit_nat_residue(serving_exit),
+            RuntimeSystem::Linux(system) => system.reconcile_exit_nat_residue(serving_exit),
+            RuntimeSystem::Macos(system) => system.reconcile_exit_nat_residue(serving_exit),
+            RuntimeSystem::Windows(system) => system.reconcile_exit_nat_residue(serving_exit),
+        }
+    }
+
     fn check_prerequisites(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.check_prerequisites(),
@@ -4829,6 +4875,13 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     }
 
     fn rollback_obsolete_controls(&mut self, options: ApplyOptions) -> Result<(), Phase10Error> {
+        // Flush fixed-name exit-NAT residue (macOS `com.rustynet/nat`) that the
+        // NatApplied-gated branch below would miss after a crash — `active_stages`
+        // is empty on a fresh process, but the kernel anchor persists. Gated on
+        // `serve_exit_node`, so it never touches the anchor a serving-exit apply
+        // is about to (re)load. No-op on platforms that self-heal via prune.
+        self.system
+            .reconcile_exit_nat_residue(options.serve_exit_node)?;
         let previous_stages = self.active_stages.clone();
         if previous_stages.contains(&StageMarker::NatApplied)
             && options.exit_mode != ExitMode::FullTunnel
@@ -8683,6 +8736,60 @@ mod tests {
                 .iter()
                 .any(|cmd| cmd.contains("nft delete table ip rustynet_nat_g2")),
             "target nat table must not be pruned"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn macos_reconcile_exit_nat_residue_flushes_fixed_anchor_only_when_not_serving() {
+        // §10.7 regression guard. A node that crashed while serving as a macOS
+        // exit restarts with `exit_nat_anchor = None`, so the in-memory teardown
+        // is a no-op and `prune_owned_tables` only sweeps the generation-numbered
+        // killswitch anchors. `reconcile_exit_nat_residue` must still flush the
+        // FIXED `com.rustynet/nat` anchor by name when the new generation does
+        // not serve an exit — and must issue NOTHING when it does (so it never
+        // races the `activate_exit_nat` load that follows in the same apply).
+        let socket_path = phase10_test_socket_path("rnr");
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = MacosCommandSystem::new("utun9", "en0", Some(client), false, Vec::new())
+            .expect("macos command system should initialize");
+        // Simulate the post-crash restart: no in-memory NAT anchor handle.
+        assert!(system.exit_nat_anchor.is_none());
+
+        // Not serving an exit (e.g. restarted as a client) → flush the residue.
+        DataplaneSystem::reconcile_exit_nat_residue(&mut system, false)
+            .expect("reconcile should succeed");
+        let after_not_serving = commands.lock().expect("command log should lock").len();
+
+        // Serving an exit → must NOT flush (activation re-loads the anchor).
+        DataplaneSystem::reconcile_exit_nat_residue(&mut system, true)
+            .expect("reconcile should succeed");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert_eq!(
+            after_not_serving, 1,
+            "not-serving reconcile must issue exactly one command (the flush); got: {command_log:?}"
+        );
+        assert_eq!(
+            command_log.len(),
+            1,
+            "serving reconcile must issue no command; got: {command_log:?}"
+        );
+        let flush = &command_log[0];
+        assert!(
+            flush.contains("pfctl")
+                && flush.contains("com.rustynet/nat")
+                && flush.contains("-F")
+                && flush.contains("all"),
+            "the single command must be the fixed-anchor flush; got: {flush:?}"
         );
     }
 
