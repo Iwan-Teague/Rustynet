@@ -90,6 +90,33 @@ Batch by category so each PR is coherent:
 
 ---
 
+## Applied fixes (net-new, post-audit — not from RSA-0001..0074)
+
+- **2026-06-24 — macOS `pfctl -f` privileged-boundary (regeneration).** APPLIED
+  (code-complete; live-lab pending). The macOS privileged helper previously
+  accepted `pfctl -a <anchor> -f <path>` gated only by anchor/path token shape,
+  so a daemon compromised to the helper's uid could author an arbitrary rules
+  file (`pass out quick all`) and have the root helper load it into the
+  killswitch anchor, defeating default-deny egress. Ownership/`O_NOFOLLOW`
+  checks cannot fix it (the daemon legitimately authors the file). Fix:
+  **regeneration** — the daemon now sends a validated STRUCTURED spec
+  (`crates/rustynetd/src/macos_pf_load_spec.rs`, `MacosPfLoadSpec`) over the new
+  `macos-pf-load` privileged builtin; the root helper re-renders the `pf` rule
+  text from the reviewed builders, derives the anchor name itself, and owns the
+  root-only temp file + `pfctl -n`/`-f`. The `-f`/`-n -f` arms are removed from
+  `validate_pfctl_args`. Verification: spec roundtrip + reject (injected iface /
+  bad cidr / oversized list / cross-kind) + no-false-reject cartesian sweep
+  (`macos_pf_load_spec` tests) and the boundary regression
+  (`validate_request_rejects_pfctl_boundary_rule_file_load`,
+  `validate_pfctl_args_permits_nat_anchor_show_and_flush_but_not_load`). Mirrors
+  the `DnsFailclosedFile` builtin precedent. Live-lab macOS killswitch/blind/nat
+  validation on `.210` is the only remaining step. Open risk: helper+daemon must
+  upgrade together (new program rejected by an old helper → fail-closed). The
+  Linux `validate_nft_args` arg-level-only class is the same shape — tracked
+  separately, out of scope here.
+
+---
+
 ## Process notes
 - Each fix PR: small, one logical change; add the verification test in the same PR; run
   the relevant `scripts/ci/*_gates.sh` + `cargo run -p rustynet-xtask -- gates`.

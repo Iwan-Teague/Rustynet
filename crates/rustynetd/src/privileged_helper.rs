@@ -51,8 +51,8 @@ const HELPER_FRAME_TYPE_RESPONSE: u8 = 2;
 const HELPER_FRAME_HEADER_BYTES: usize = 10;
 const MAX_MESSAGE_BYTES: usize = 16_384;
 const MAX_OUTPUT_BYTES: usize = 65_536;
-const MAX_ARGS: usize = 128;
-const MAX_ARG_BYTES: usize = 256;
+pub(crate) const MAX_ARGS: usize = 128;
+pub(crate) const MAX_ARG_BYTES: usize = 256;
 const MAX_PROGRAM_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +71,13 @@ pub enum PrivilegedCommandProgram {
     /// fixed selector and the helper owns the path→content mapping, so no path
     /// or file content ever crosses the privileged boundary.
     DnsFailclosedFile,
+    /// In-helper macOS `pf` anchor load builtin (`macos_pf_load_spec`). NOT an
+    /// external binary: the arguments are a validated STRUCTURED spec; the
+    /// helper re-renders the `pf` rule text from the reviewed builders, derives
+    /// the anchor name itself, and owns the temp file + `pfctl` invocation. No
+    /// rule text, file path, or anchor name supplied by the daemon is ever
+    /// loaded — this closes the `pfctl -f` boundary (audit major #5).
+    MacosPfLoad,
 }
 
 impl PrivilegedCommandProgram {
@@ -87,6 +94,9 @@ impl PrivilegedCommandProgram {
             PrivilegedCommandProgram::Kill => "kill",
             PrivilegedCommandProgram::DnsFailclosedFile => {
                 crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM
+            }
+            PrivilegedCommandProgram::MacosPfLoad => {
+                crate::macos_pf_load_spec::MACOS_PF_LOAD_PROGRAM
             }
         }
     }
@@ -105,6 +115,9 @@ impl PrivilegedCommandProgram {
             _ if value == crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM => {
                 Some(PrivilegedCommandProgram::DnsFailclosedFile)
             }
+            _ if value == crate::macos_pf_load_spec::MACOS_PF_LOAD_PROGRAM => {
+                Some(PrivilegedCommandProgram::MacosPfLoad)
+            }
             _ => None,
         }
     }
@@ -113,7 +126,10 @@ impl PrivilegedCommandProgram {
     /// exec path (`resolve_binary` / `run_privileged_subprocess`) must never run
     /// for these — the dispatcher routes them to their in-process handler.
     fn is_builtin(self) -> bool {
-        matches!(self, PrivilegedCommandProgram::DnsFailclosedFile)
+        matches!(
+            self,
+            PrivilegedCommandProgram::DnsFailclosedFile | PrivilegedCommandProgram::MacosPfLoad
+        )
     }
 
     fn binary_candidates(self) -> &'static [&'static str] {
@@ -137,10 +153,14 @@ impl PrivilegedCommandProgram {
                 "/usr/bin/wireguard-go",
             ],
             PrivilegedCommandProgram::Kill => &["/bin/kill", "/usr/bin/kill"],
-            // In-helper builtin: no external binary. Routed to its in-process
-            // handler before exec; the empty candidate set fails closed if it
-            // ever reaches binary resolution.
-            PrivilegedCommandProgram::DnsFailclosedFile => &[],
+            // In-helper builtins: no external binary for the program itself.
+            // Routed to their in-process handler before exec; the empty
+            // candidate set fails closed if it ever reaches binary resolution.
+            // (The macOS pf-load builtin internally resolves `pfctl` via the
+            // Pfctl candidate set, not this one.)
+            PrivilegedCommandProgram::DnsFailclosedFile | PrivilegedCommandProgram::MacosPfLoad => {
+                &[]
+            }
         }
     }
 
@@ -893,9 +913,168 @@ fn execute_builtin(
                 }
             })
         }
+        PrivilegedCommandProgram::MacosPfLoad => execute_macos_pf_load(args),
         // No other builtins exist; fail closed if one is added without a handler.
         _ => Err(format!("no in-process handler for builtin {program}")),
     }
+}
+
+/// Run the macOS `pf` anchor load builtin. The `args` were already validated as
+/// a decodable spec; we re-decode (defensive), re-render the rule text from the
+/// reviewed builders, derive the anchor name from the spec kind, write the rules
+/// to a ROOT-OWNED temp in a root-only directory, and load it with `pfctl`.
+/// Nothing the daemon supplied — rule text, file path, or anchor — reaches
+/// `pfctl`.
+fn execute_macos_pf_load(args: &[&str]) -> Result<PrivilegedCommandOutput, String> {
+    let spec = crate::macos_pf_load_spec::MacosPfLoadSpec::decode(args)?;
+    let anchor = spec.anchor_name();
+    let rules = spec.render()?;
+    load_macos_pf_anchor(&anchor, &rules)?;
+    Ok(PrivilegedCommandOutput {
+        status: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    })
+}
+
+/// Path of the root-only spool directory the helper writes rendered `pf`
+/// rulesets into. Lives under `/var/run` (a root-owned system directory a
+/// non-root user cannot write to), so the helper-owned, `O_EXCL`-created temp
+/// inside it cannot be pre-planted or symlink-swapped by an unprivileged
+/// attacker.
+#[cfg(unix)]
+const MACOS_PF_SPOOL_DIR: &str = "/var/run/rustynet-pf";
+
+/// Render-to-load tail for the macOS pf builtin: own a root-only temp file and
+/// run `pfctl` against the helper-derived anchor. Unix-only; fails closed
+/// elsewhere.
+#[cfg(unix)]
+fn load_macos_pf_anchor(anchor: &str, rules: &str) -> Result<(), String> {
+    let dir = ensure_macos_pf_spool_dir()?;
+    let path = write_root_owned_pf_temp(&dir, rules)?;
+    let result = run_macos_pfctl_load(anchor, &path);
+    let _ = fs::remove_file(&path);
+    result
+}
+
+#[cfg(not(unix))]
+fn load_macos_pf_anchor(anchor: &str, rules: &str) -> Result<(), String> {
+    let _ = (anchor, rules);
+    Err("macOS pf anchor load is only supported on Unix".to_owned())
+}
+
+/// Create (if absent) and verify the root-only pf spool directory. Fails closed
+/// unless it is a real directory (not a symlink), root-owned, and not
+/// group/other accessible.
+#[cfg(unix)]
+fn ensure_macos_pf_spool_dir() -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    let dir = PathBuf::from(MACOS_PF_SPOOL_DIR);
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(format!(
+                "create macOS pf spool dir {}: {err}",
+                dir.display()
+            ));
+        }
+    }
+    let meta = fs::symlink_metadata(&dir)
+        .map_err(|err| format!("stat macOS pf spool dir {}: {err}", dir.display()))?;
+    if !meta.file_type().is_dir() {
+        return Err(format!(
+            "macOS pf spool dir {} must be a directory (not a symlink)",
+            dir.display()
+        ));
+    }
+    if meta.uid() != 0 {
+        return Err(format!(
+            "macOS pf spool dir {} must be root-owned (uid={})",
+            dir.display(),
+            meta.uid()
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "macOS pf spool dir {} must not be group/other accessible ({:03o})",
+            dir.display(),
+            meta.mode() & 0o777
+        ));
+    }
+    Ok(dir)
+}
+
+/// Write `rules` to a fresh, unpredictably-named, `0600` file in `dir`, opened
+/// `O_CREAT|O_EXCL` so any pre-existing inode (including a symlink) aborts the
+/// open. The helper owns this file end-to-end; the daemon never sees the path.
+#[cfg(unix)]
+fn write_root_owned_pf_temp(dir: &Path, rules: &str) -> Result<PathBuf, String> {
+    use rand::TryRngCore;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut nonce_bytes = [0u8; 16];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|err| format!("pf rules tempfile nonce CSPRNG unavailable: {err}"))?;
+    let mut nonce = String::with_capacity(nonce_bytes.len() * 2);
+    for byte in nonce_bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut nonce, "{byte:02x}");
+    }
+    let path = dir.join(format!("pf-{}-{nonce}.conf", std::process::id()));
+    // Best-effort sweep of a temp leaked by a crashed prior run; the O_EXCL open
+    // below is the real guard against a hostile pre-plant.
+    let _ = fs::remove_file(&path);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|err| format!("create pf rules temp {}: {err}", path.display()))?;
+    file.write_all(rules.as_bytes()).map_err(|err| {
+        let _ = fs::remove_file(&path);
+        format!("write pf rules temp {}: {err}", path.display())
+    })?;
+    file.flush()
+        .map_err(|err| format!("flush pf rules temp {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+/// Parse-check (`-n`) then load (`-f`) the rendered ruleset into the
+/// helper-derived `anchor`. The anchor and path are helper-controlled — never
+/// daemon-supplied — so this internal invocation is constructed entirely from
+/// trusted values and intentionally does NOT route through `validate_pfctl_args`
+/// (which no longer accepts `-f` from the boundary).
+#[cfg(unix)]
+fn run_macos_pfctl_load(anchor: &str, path: &Path) -> Result<(), String> {
+    let binary = PrivilegedCommandProgram::Pfctl.resolve_binary()?;
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| "pf rules temp path is not valid UTF-8".to_owned())?;
+    run_macos_pfctl(&binary, &["-n", "-a", anchor, "-f", path_str])?;
+    run_macos_pfctl(&binary, &["-a", anchor, "-f", path_str])
+}
+
+#[cfg(unix)]
+fn run_macos_pfctl(binary: &Path, args: &[&str]) -> Result<(), String> {
+    let owned: Vec<String> = args.iter().map(|value| (*value).to_owned()).collect();
+    let output = run_privileged_subprocess(
+        binary,
+        &owned,
+        Duration::from_millis(DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS),
+    )?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "pfctl {:?} failed: status={:?} stderr={}",
+        args,
+        output.status.code(),
+        truncate_lossy(&output.stderr, MAX_OUTPUT_BYTES)
+    ))
 }
 
 /// If `program` is an in-helper builtin, validate its arguments and run the
@@ -1038,7 +1217,17 @@ pub fn validate_request(program: PrivilegedCommandProgram, args: &[&str]) -> Res
         PrivilegedCommandProgram::WireguardGo => validate_wireguard_go_args(args),
         PrivilegedCommandProgram::Kill => validate_kill_args(args),
         PrivilegedCommandProgram::DnsFailclosedFile => validate_dns_failclosed_file_args(args),
+        PrivilegedCommandProgram::MacosPfLoad => validate_macos_pf_load_args(args),
     }
+}
+
+/// Validate the `macos-pf-load` builtin: the arguments must decode into a
+/// well-formed [`crate::macos_pf_load_spec::MacosPfLoadSpec`]. `decode` re-parses
+/// every field through a typed validator and bounds list lengths, so a
+/// successful decode IS the validation — the daemon can choose only spec
+/// parameters, never inject rule text, a file path, or an anchor name.
+fn validate_macos_pf_load_args(args: &[&str]) -> Result<(), String> {
+    crate::macos_pf_load_spec::MacosPfLoadSpec::decode(args).map(|_| ())
 }
 
 /// Validate the `dns-failclosed-file` builtin: EXACTLY one argument, and that
@@ -1838,10 +2027,14 @@ fn validate_pfctl_args(args: &[&str]) -> Result<(), String> {
         ["-s", "info"] => Ok(()),
         ["-s", "Anchors"] => Ok(()),
         ["-a", anchor, "-F", "all"] if is_anchor_name_token(anchor) => Ok(()),
-        ["-a", anchor, "-f", path] if is_anchor_name_token(anchor) && is_path_token(path) => Ok(()),
-        ["-n", "-a", anchor, "-f", path] if is_anchor_name_token(anchor) && is_path_token(path) => {
-            Ok(())
-        }
+        // NOTE: `-f <path>` / `-n -a <anchor> -f <path>` are DELIBERATELY NOT
+        // accepted from the privileged boundary. Loading a daemon-authored rules
+        // file let a compromised daemon inject arbitrary `pf` rules (e.g.
+        // `pass out quick all`) into the killswitch anchor (audit major #5). All
+        // rule loading now goes through the `macos-pf-load` builtin, which
+        // re-renders the rule text in the helper from a validated structured
+        // spec and owns the temp file + `pfctl -f` itself. Do not re-add a
+        // boundary-supplied `-f` arm.
         ["-a", anchor, "-s", "rules"] if is_anchor_name_token(anchor) => Ok(()),
         // Read-only NAT-rule show, used to verify the exit NAT anchor after
         // load (the filter `-s rules` show is empty for a translation anchor).
@@ -3190,18 +3383,65 @@ mod tests {
     }
 
     #[test]
-    fn validate_request_accepts_pfctl_anchor_syntax_check() {
-        validate_request(
-            PrivilegedCommandProgram::Pfctl,
-            &[
+    fn validate_request_rejects_pfctl_boundary_rule_file_load() {
+        // Audit major #5 boundary closure. The privileged boundary must NOT
+        // accept a daemon-supplied pf rules file for ANY anchor — neither the
+        // plain `-f` load nor the `-n -f` syntax check. A daemon compromised to
+        // the helper's uid could otherwise author `pass out quick all` and have
+        // the root helper load it into the killswitch anchor, defeating
+        // default-deny egress. All rule loading now goes through the
+        // `macos-pf-load` builtin, which re-renders the rule text in the helper.
+        for argv in [
+            [
                 "-n",
                 "-a",
                 "com.rustynet/blind_exit",
                 "-f",
-                "/etc/rustynet/blind-exit.pf",
-            ],
-        )
-        .expect("pfctl syntax check for reviewed anchor load should be accepted");
+                "/etc/rustynet/b.pf",
+            ]
+            .as_slice(),
+            ["-a", "com.rustynet/blind_exit", "-f", "/etc/rustynet/b.pf"].as_slice(),
+            ["-a", "com.apple/rustynet_g7", "-f", "/tmp/k.pf"].as_slice(),
+            ["-n", "-a", "com.rustynet/nat", "-f", "/tmp/nat.pf"].as_slice(),
+            ["-a", "com.rustynet/nat", "-f", "/tmp/nat.pf"].as_slice(),
+        ] {
+            let err = validate_request(PrivilegedCommandProgram::Pfctl, argv)
+                .expect_err("pfctl -f rule-file load must be rejected at the boundary");
+            assert!(
+                err.contains("unsupported pfctl argument schema"),
+                "got: {err}"
+            );
+        }
+
+        // The replacement path — the macos-pf-load builtin carrying a validated
+        // structured spec (no daemon-supplied path/anchor/rule-text) — IS
+        // accepted at the boundary.
+        let spec = crate::macos_pf_load_spec::MacosPfLoadSpec::ExitNat {
+            config: crate::macos_exit_nat::MacosExitNatPfConfig::new(
+                "en0",
+                vec!["100.64.0.0/10".to_owned()],
+            )
+            .expect("exit nat config"),
+        };
+        let encoded = spec.encode();
+        let refs: Vec<&str> = encoded.iter().map(String::as_str).collect();
+        validate_request(PrivilegedCommandProgram::MacosPfLoad, &refs)
+            .expect("a validated macos-pf-load spec is accepted at the boundary");
+
+        // ...but a macos-pf-load request whose interface token carries an
+        // injected rule line is rejected before any render.
+        let tampered = [
+            "kind=killswitch",
+            "generation=1",
+            "strict=false",
+            "interface=utun9\npass out quick all",
+            "egress=en0",
+            "dns_protected=false",
+            "allow_egress_interface=false",
+            "fail_closed_ssh_allow=false",
+            "ipv6_blocked=false",
+        ];
+        assert!(validate_request(PrivilegedCommandProgram::MacosPfLoad, &tampered).is_err());
     }
 
     #[test]
@@ -3258,11 +3498,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_pfctl_args_permits_nat_anchor_show_and_load() {
-        // The exit NAT activation loads + verifies the com.rustynet/nat anchor.
-        assert!(validate_pfctl_args(&["-a", "com.rustynet/nat", "-f", "/tmp/nat.pf"]).is_ok());
+    fn validate_pfctl_args_permits_nat_anchor_show_and_flush_but_not_load() {
+        // The exit NAT activation verifies + flushes the com.rustynet/nat anchor
+        // via the still-allowed read/flush arms.
         assert!(validate_pfctl_args(&["-a", "com.rustynet/nat", "-F", "all"]).is_ok());
         assert!(validate_pfctl_args(&["-a", "com.rustynet/nat", "-s", "nat"]).is_ok());
+        // Audit major #5: NO boundary-supplied `-f <path>` load is accepted on
+        // ANY anchor, including the NAT anchor — rule loading goes exclusively
+        // through the macos-pf-load builtin.
+        assert!(validate_pfctl_args(&["-a", "com.rustynet/nat", "-f", "/tmp/nat.pf"]).is_err());
+        assert!(validate_pfctl_args(&["-a", "com.apple/rustynet_g1", "-f", "/tmp/k.pf"]).is_err());
+        assert!(
+            validate_pfctl_args(&["-n", "-a", "com.rustynet/blind_exit", "-f", "/tmp/b.pf"])
+                .is_err()
+        );
         // A non-allowlisted anchor stays denied even for the read-only show.
         assert!(validate_pfctl_args(&["-a", "com.rustynet/other", "-s", "nat"]).is_err());
     }
