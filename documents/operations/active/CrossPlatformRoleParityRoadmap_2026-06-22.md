@@ -87,7 +87,7 @@ dry-run had masked). "Live stage" = author a fail-loud stage per §7.
 | 1 | **macOS admin** | ❌→ready | live stage only (issuing path is platform-neutral; keychain custody exists) | ~0.5–1 d | none |
 | 2 | **Windows admin** | ❌→ready | live stage only (DPAPI custody exists) | ~0.5–1 d | none |
 | 3 | **macOS blind_exit** | 🟡 (runtime exists) | live stage only, **run last** (wipes identity); disposable guest | ~0.5–1 d | none |
-| 4 | **Role transitions (macOS→Windows)** | ❌ | **design doc first** (`state/cross_os_role_switch_plan.md` missing), then a stage that drives a real flip and re-applies signed state via `refresh_signed_state_with_reason` | ~2–4 d | needs admin (#1/#2) |
+| 4 | **Role transitions (macOS→Windows)** | ❌ | **design doc** (`CrossOsRoleSwitchPlan_2026-06-24.md`, authored 2026-06-24), then a stage that drives a real flip and re-applies signed state via `refresh_signed_state_with_reason` | ~2–4 d | needs admin (#1/#2) |
 | 5 | macOS **exit** | 🟡 | just a green run with `--exit-platform macos` (no code) | ~hours | none |
 | 6 | macOS **relay** *live lifecycle* | 🟠 | upgrade dry-run → live lifecycle (active/listener/healthz on guest). **Forwarding proof is separate.** | ~1 d | forwarding 🔒 HP-3 |
 | 7 | Windows **anchor** live + macOS **anchor** live | 🟠/🟡 | convert in-process contract validators to live bundle-serving stages | ~1–2 d | sequence after anchor cell settles |
@@ -173,7 +173,7 @@ already correct (`keychain-secrets` macOS / `dpapi-secrets` Windows). Correct th
 don't silently rely on a stale "disabled" note.
 
 ### ROLE TRANSITIONS (both OS) — need a DESIGN doc first
-`state/cross_os_role_switch_plan.md` **does not exist** (the matrix cites it as "banked"
+`CrossOsRoleSwitchPlan_2026-06-24.md` now holds this design (the gitignored `state/` path could not persist; matrix cited it as "banked"
 — it isn't). The runtime to reuse exists: `refresh_signed_state_with_reason`
 (`daemon.rs:4487-4526`) is the single verified apply path (re-fetch trust → traversal →
 assignment → dns_zone, fail-closed on every error); IPC `StateRefresh`
@@ -475,7 +475,7 @@ external blockers: Windows exit WinNAT, relay forwarding HP-3).
 1. **`flock` the run-matrix append** (`live_lab_run_matrix.rs:1528-1560`) — advisory lock
    on `documents/operations/live_lab_run_matrix.csv` (or a sidecar `.lock`). The only
    host-side hazard for concurrent runs. ~20 lines + a test. **Unblocks §8.3 fully.**
-2. **Recreate `state/cross_os_role_switch_plan.md`** (the matrix cites it; it's missing) —
+2. **Authored `CrossOsRoleSwitchPlan_2026-06-24.md`** (replaces the gitignored `state/` path the matrix cited) —
    the role-transition design (§4) that cell #4 depends on.
 3. **Correct the §3 matrix** (the three corrections in §1): admin 🟡-ready (drop the stale
    "self-mint disabled"), Windows blind_exit 🚫 by-design, macOS blind_exit 🟡.
