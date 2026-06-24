@@ -3872,7 +3872,8 @@ fn tcp_connections_internal() -> Vec<TcpConnection> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(1) {
                 let fields: Vec<&str> = line.split_whitespace().collect();
-                if fields.len() < 4 {
+                // RSA-0050: indexes fields[5] (state) ⇒ needs >= 6, not >= 4.
+                if fields.len() < 6 {
                     continue;
                 }
                 connections.push(TcpConnection {
@@ -4640,20 +4641,31 @@ fn arp_table_entries_internal() -> Vec<ArpEntry> {
     if let Ok(output) = std::process::Command::new("arp").args(["-n"]).output() {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 {
-                    entries.push(ArpEntry {
-                        ip: parts[0].to_string(),
-                        mac: parts[2].to_string(),
-                        interface: parts[5].to_string(),
-                        age_secs: None,
-                        is_permanent: line.contains("PERM"),
-                    });
+                if let Some(entry) = parse_arp_n_row(line) {
+                    entries.push(entry);
                 }
             }
         }
     }
     entries
+}
+
+/// RSA-0050: parse one whitespace-columned `arp -n` row
+/// (`Address HWtype HWaddress Flags Mask Iface` — 6 columns). Pure so it is
+/// unit-testable, and FAIL-SOFT: the previous inline parser guarded
+/// `len() >= 5` but indexed `parts[5]` (the interface, needing 6 columns), so a
+/// 5-column row panicked. `.get()` skips a short/garbled row instead of
+/// panicking on locale/format variation.
+#[cfg(any(target_os = "linux", test))]
+fn parse_arp_n_row(line: &str) -> Option<ArpEntry> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    Some(ArpEntry {
+        ip: (*parts.first()?).to_owned(),
+        mac: (*parts.get(2)?).to_owned(),
+        interface: (*parts.get(5)?).to_owned(),
+        age_secs: None,
+        is_permanent: line.contains("PERM"),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -4663,9 +4675,10 @@ fn arp_table_entries_internal() -> Vec<ArpEntry> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 {
+                // RSA-0050: needs parts[5] (interface) ⇒ guard >= 6, not >= 5.
+                if parts.len() >= 6 {
                     entries.push(ArpEntry {
-                        ip: parts[0].trim_matches('(').trim_matches(')').to_owned(),
+                        ip: parts[1].trim_matches('(').trim_matches(')').to_owned(),
                         mac: parts[3].to_owned(),
                         interface: parts[5].to_owned(),
                         age_secs: None,
@@ -6767,10 +6780,26 @@ fn performance_regression_detection_internal(
 
 #[cfg(test)]
 mod tests {
+    use super::parse_arp_n_row;
     use super::performance_regression_detection_internal;
 
     fn samples(name: &str, values: &[u64]) -> Vec<(String, u64)> {
         values.iter().map(|v| (name.to_owned(), *v)).collect()
+    }
+
+    #[test]
+    fn rsa0050_arp_n_row_parses_full_row_and_skips_short_rows() {
+        // 6 columns: Address HWtype HWaddress Flags Mask Iface
+        let entry = parse_arp_n_row("192.168.1.1  ether  aa:bb:cc:dd:ee:ff  C  -  eth0")
+            .expect("full row parses");
+        assert_eq!(entry.ip, "192.168.1.1");
+        assert_eq!(entry.mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(entry.interface, "eth0");
+        // 5 columns (the off-by-one that previously panicked): skipped, not a panic.
+        assert!(parse_arp_n_row("192.168.1.1  ether  aa:bb:cc:dd:ee:ff  C  -").is_none());
+        // empty / garbled rows are skipped.
+        assert!(parse_arp_n_row("").is_none());
+        assert!(parse_arp_n_row("incomplete").is_none());
     }
 
     #[test]
