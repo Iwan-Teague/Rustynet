@@ -51,7 +51,7 @@ Effort key: **S** ≤½ day · **M** ~1–2 days · **L** ≥3 days / needs desi
 - RSA-0031 exit-NAT teardown verify (mac/win) → fail closed on `pfctl`/forwarding-capture exec error (never report `restored=true`). **S** — ✅ APPLIED 2026-06-24 (code-complete; live re-proof pending): capture-failure now reads anchor/NAT as present + forwarding NOT restored; exec-failure-injection unit tests on both OS verifiers.
 
 **Theme E — revocation-blind issuance / consistency (mitigated downstream, fix for one-hardened-path).**
-- RSA-0007 `phase10.rs` set_exit_node/ensure_lan_route_allowed → route through `evaluate_with_membership`; revoked-node negative tests. **S**
+- RSA-0007 `phase10.rs` set_exit_node/ensure_lan_route_allowed → route through `evaluate_with_membership`; revoked-node negative tests. **S** — ✅ APPLIED 2026-06-24 (both gates now membership-aware; revoked exit-node + revoked-requester negative tests).
 - RSA-0008 `rustynet-control` `ControlPlaneCore` → give it a signed `MembershipDirectory`, use `evaluate_with_membership` for issuance. **M**
 
 **Theme F — destructive lab automation (the overnight driver).**
