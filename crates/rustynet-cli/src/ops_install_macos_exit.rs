@@ -90,11 +90,18 @@ pub fn execute_install_macos_exit(
 
     match config.mode {
         LaunchdExitMode::InstallAndBootstrap => {
-            let plist_body = read_source_plist(&config.source_plist_path, config.dry_run)?;
+            let plist_body = read_source_plist(&config.source_plist_path)?;
+            let source_desc = if config.source_plist_path.exists() {
+                config.source_plist_path.display().to_string()
+            } else {
+                format!(
+                    "embedded reviewed plist ({} not present on node)",
+                    config.source_plist_path.display()
+                )
+            };
             steps.push(format!(
-                "read source plist ({} bytes) from {}",
+                "read source plist ({} bytes) from {source_desc}",
                 plist_body.len(),
-                config.source_plist_path.display()
             ));
 
             if !config.dry_run {
@@ -204,12 +211,24 @@ fn domain_target(config: &InstallMacosExitConfig) -> String {
     format!("{}/{}", config.domain, config.label)
 }
 
-fn read_source_plist(path: &Path, dry_run: bool) -> Result<String, String> {
-    if dry_run && !path.exists() {
-        return Ok(String::new());
+/// The reviewed exit launchd unit, embedded at compile time. `role set exit`
+/// invokes this installer ON THE NODE (e.g. a lab guest), where the repo source
+/// tree is NOT present at the CWD-relative `scripts/launchd/` path — reading the
+/// configured `source_plist_path` there fails with "No such file". The embedded
+/// copy is `include_str!` of the exact reviewed file the repo ships, so an
+/// on-disk source and the fallback install byte-identically.
+const REVIEWED_EXIT_PLIST: &str = include_str!("../../../scripts/launchd/com.rustynet.exit.plist");
+
+fn read_source_plist(path: &Path) -> Result<String, String> {
+    // Prefer an explicit on-disk source (operator override, or the repo path on
+    // a host that has the tree); fall back to the embedded reviewed plist when
+    // it does not resolve — the on-node `role set exit` case that previously
+    // failed closed with a misleading "No such file".
+    if path.exists() {
+        return std::fs::read_to_string(path)
+            .map_err(|err| format!("read source plist at {} failed: {err}", path.display()));
     }
-    std::fs::read_to_string(path)
-        .map_err(|err| format!("read source plist at {} failed: {err}", path.display()))
+    Ok(REVIEWED_EXIT_PLIST.to_owned())
 }
 
 fn write_plist_atomic(dest: &Path, body: &str) -> Result<(), String> {
@@ -377,5 +396,45 @@ mod tests {
         cfg.label = "com.rustynet.exit;rm".to_owned();
         let err = execute_install_macos_exit(cfg).expect_err("bad label must fail closed");
         assert!(err.contains("reverse-DNS"));
+    }
+
+    #[test]
+    fn install_falls_back_to_embedded_plist_when_source_absent() {
+        // Regression for run #10: `role set exit` runs this installer ON THE
+        // NODE, where the repo-relative `scripts/launchd/com.rustynet.exit.plist`
+        // does not resolve. It must fall back to the embedded reviewed plist
+        // rather than fail closed with "No such file".
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-macos-exit-embed-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("LaunchDaemons")).unwrap();
+        let absent_source = dir.join("absent").join("com.rustynet.exit.plist");
+        assert!(!absent_source.exists());
+        let cfg = InstallMacosExitConfig {
+            mode: LaunchdExitMode::InstallAndBootstrap,
+            source_plist_path: absent_source,
+            dest_plist_path: dir.join("LaunchDaemons").join("com.rustynet.exit.plist"),
+            label: "com.rustynet.exit".to_owned(),
+            domain: "system".to_owned(),
+            dry_run: true,
+        };
+        let report = execute_install_macos_exit(cfg).expect("install must not fail closed");
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|s| s.contains("embedded reviewed plist")),
+            "must report the embedded fallback when the source is absent: {:?}",
+            report.steps
+        );
+        // The embedded plist is the reviewed forwarding-preflight unit.
+        assert!(
+            REVIEWED_EXIT_PLIST.contains("net.inet.ip.forwarding=1")
+                && REVIEWED_EXIT_PLIST.contains("<string>com.rustynet.exit</string>"),
+            "embedded plist must be the reviewed exit unit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
