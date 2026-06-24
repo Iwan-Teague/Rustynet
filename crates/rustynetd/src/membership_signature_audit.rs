@@ -172,7 +172,9 @@ fn valid_operation() -> MembershipOperation {
 fn valid_record(update_id: &str) -> Result<(MembershipState, MembershipUpdateRecord), String> {
     let state = synthetic_state();
     let operation = valid_operation();
-    let next = preview_next_state(&state, &operation)
+    // RSA-0009: match the record's created_at_unix below so the previewed root
+    // reproduces at apply.
+    let next = preview_next_state(&state, &operation, AUDIT_NOW_UNIX - 10)
         .map_err(|err| format!("preview_next_state failed: {err}"))?;
     let prev_root = state
         .state_root_hex()

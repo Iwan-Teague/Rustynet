@@ -6255,10 +6255,16 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
                 node_id: config.node_id.clone(),
                 capabilities,
             };
-            let candidate = rustynet_control::membership::preview_next_state(&state, &operation)
-                .map_err(|err| err.to_string())?;
-            let new_root = candidate.state_root_hex().map_err(|err| err.to_string())?;
+            // RSA-0009: the timestamp fed to preview_next_state MUST equal the
+            // record's created_at_unix so the new_state_root reproduces at apply.
             let created_at_unix = unix_now();
+            let candidate = rustynet_control::membership::preview_next_state(
+                &state,
+                &operation,
+                created_at_unix,
+            )
+            .map_err(|err| err.to_string())?;
+            let new_root = candidate.state_root_hex().map_err(|err| err.to_string())?;
             let expires_at_unix = created_at_unix.saturating_add(config.expires_in_secs);
             if expires_at_unix <= created_at_unix {
                 return Err("invalid expiry window: --expires-in must be > 0".to_owned());
@@ -6396,11 +6402,16 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
             let mut candidate = state.clone();
             // Reducer legality is checked using state transition during apply later.
             // For propose, compute candidate root using deterministic transition helper.
-            candidate =
-                rustynet_control::membership::preview_next_state(&candidate, &config.operation)
-                    .map_err(|err| err.to_string())?;
-            let new_root = candidate.state_root_hex().map_err(|err| err.to_string())?;
+            // RSA-0009: feed the same created_at_unix the record carries so the
+            // new_state_root reproduces deterministically at apply time.
             let created_at_unix = unix_now();
+            candidate = rustynet_control::membership::preview_next_state(
+                &candidate,
+                &config.operation,
+                created_at_unix,
+            )
+            .map_err(|err| err.to_string())?;
+            let new_root = candidate.state_root_hex().map_err(|err| err.to_string())?;
             let expires_at_unix = created_at_unix.saturating_add(config.expires_in_secs);
             if expires_at_unix <= created_at_unix {
                 return Err("invalid expiry window: --expires-in must be > 0".to_owned());

@@ -162,7 +162,9 @@ pub fn build_add_node_record_for_enrollee(
     let prev_state_root = state
         .state_root_hex()
         .map_err(EnrollmentMembershipError::from)?;
-    let next = preview_next_state(state, &operation).map_err(EnrollmentMembershipError::from)?;
+    // RSA-0009: feed the record's created_at_unix so the root reproduces at apply.
+    let next =
+        preview_next_state(state, &operation, now_unix).map_err(EnrollmentMembershipError::from)?;
     let new_state_root = next
         .state_root_hex()
         .map_err(EnrollmentMembershipError::from)?;

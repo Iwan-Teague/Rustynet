@@ -27754,8 +27754,12 @@ mod tests {
             joined_at_unix: now_unix,
             updated_at_unix: now_unix,
         };
-        let next = preview_next_state(state, &MembershipOperation::AddNode(new_node.clone()))
-            .expect("preview next state");
+        let next = preview_next_state(
+            state,
+            &MembershipOperation::AddNode(new_node.clone()),
+            now_unix,
+        )
+        .expect("preview next state");
         MembershipUpdateRecord {
             network_id: state.network_id.clone(),
             update_id: update_id.to_owned(),

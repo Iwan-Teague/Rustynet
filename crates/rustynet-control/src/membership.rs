@@ -655,12 +655,18 @@ pub fn decode_signed_update(payload: &str) -> Result<SignedMembershipUpdate, Mem
     parse_signed_update_envelope(payload)
 }
 
+/// Preview the state that applying `operation` would produce, for computing a
+/// proposal's `new_state_root`. `op_created_at_unix` MUST be the same
+/// `created_at_unix` the resulting signed record will carry, so the previewed
+/// `state_root` reproduces at apply time (RSA-0009). The reducer stamps it into
+/// the affected node's `updated_at_unix`.
 pub fn preview_next_state(
     state: &MembershipState,
     operation: &MembershipOperation,
+    op_created_at_unix: u64,
 ) -> Result<MembershipState, MembershipError> {
     state.validate()?;
-    let mut next = reduce_membership_state(state, operation)?;
+    let mut next = reduce_membership_state(state, operation, op_created_at_unix)?;
     next.epoch = state.epoch.saturating_add(1);
     next.validate()?;
     Ok(next)
@@ -715,7 +721,10 @@ pub fn apply_signed_update(
 
     verify_membership_signatures(state, signed_update, payload.as_bytes())?;
 
-    let mut next = reduce_membership_state(state, &record.operation)?;
+    // RSA-0009: re-derive using the SIGNED record's own `created_at_unix`, the
+    // same timestamp the proposer fed `preview_next_state`, so the recomputed
+    // `state_root` reproduces the recorded `new_state_root` deterministically.
+    let mut next = reduce_membership_state(state, &record.operation, record.created_at_unix)?;
     next.epoch = record.epoch_new;
     next.validate()?;
     let computed_new_root = next.state_root_hex()?;
@@ -1117,9 +1126,22 @@ pub fn verify_epoch_tagged_bundle(
         .map_err(|_| EpochTaggedBundleError::Membership(MembershipError::SignatureInvalid))
 }
 
+/// Apply `operation` to `state`, producing the next state.
+///
+/// `op_created_at_unix` is the DETERMINISTIC timestamp the operation's signed
+/// record carries (`record.created_at_unix`). It is stamped into the affected
+/// node's `updated_at_unix` so the resulting `state_root` is a pure function of
+/// (state, operation, signed-timestamp) and reproduces identically at proposal
+/// time and apply time. RSA-0009: the reducer previously stamped `unix_now()`
+/// here, so the producer's `new_state_root` (computed at T1) never matched the
+/// applier's re-derivation (at T2 ≠ T1 second) and RevokeNode / RestoreNode /
+/// RotateNodeKey / SetNodeCapabilities could never apply — revocation and
+/// key-rotation were non-functional (CLAUDE.md §8: deterministic trust-state
+/// transitions).
 fn reduce_membership_state(
     state: &MembershipState,
     operation: &MembershipOperation,
+    op_created_at_unix: u64,
 ) -> Result<MembershipState, MembershipError> {
     let mut next = state.clone();
     match operation {
@@ -1146,7 +1168,7 @@ fn reduce_membership_state(
                 .find(|candidate| candidate.node_id == *node_id)
                 .ok_or_else(|| MembershipError::NotFound(format!("node {node_id}")))?;
             node.capabilities = canonicalize_role_capabilities(capabilities.iter().copied());
-            node.updated_at_unix = unix_now();
+            node.updated_at_unix = op_created_at_unix;
         }
         MembershipOperation::RemoveNode { node_id } => {
             let before = next.nodes.len();
@@ -1165,7 +1187,7 @@ fn reduce_membership_state(
                 return Err(MembershipError::InvalidTransition("node already revoked"));
             }
             node.status = MembershipNodeStatus::Revoked;
-            node.updated_at_unix = unix_now();
+            node.updated_at_unix = op_created_at_unix;
         }
         MembershipOperation::RestoreNode { node_id } => {
             let node = next
@@ -1177,7 +1199,7 @@ fn reduce_membership_state(
                 return Err(MembershipError::InvalidTransition("node already active"));
             }
             node.status = MembershipNodeStatus::Active;
-            node.updated_at_unix = unix_now();
+            node.updated_at_unix = op_created_at_unix;
         }
         MembershipOperation::RotateNodeKey {
             node_id,
@@ -1190,7 +1212,7 @@ fn reduce_membership_state(
                 .find(|candidate| candidate.node_id == *node_id)
                 .ok_or_else(|| MembershipError::NotFound(format!("node {node_id}")))?;
             node.node_pubkey_hex = new_pubkey_hex.clone();
-            node.updated_at_unix = unix_now();
+            node.updated_at_unix = op_created_at_unix;
         }
         MembershipOperation::RotateApprover(approver) => {
             decode_hex_to_fixed::<32>(&approver.approver_pubkey_hex)?;
@@ -1846,13 +1868,6 @@ fn sha256_hex(input: &[u8]) -> String {
     hex_encode(digest.as_slice())
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1969,7 +1984,8 @@ mod tests {
             node_id: "node-a".to_owned(),
             capabilities: anchor_role_capabilities(),
         };
-        let next = preview_next_state(&state, &operation).expect("preview should pass");
+        let next =
+            preview_next_state(&state, &operation, 1_700_000_000).expect("preview should pass");
         assert_eq!(next.epoch, state.epoch + 1);
         assert!(
             next.nodes[0]
@@ -2058,7 +2074,8 @@ mod tests {
                 node_id: "node-a".to_owned(),
                 capabilities: capabilities.clone(),
             };
-            let next = preview_next_state(&state, &operation).expect("preview should pass");
+            let next =
+                preview_next_state(&state, &operation, 1_700_000_000).expect("preview should pass");
             for capability in &capabilities {
                 assert!(next.nodes[0].capabilities.contains(capability));
             }
@@ -2911,11 +2928,16 @@ mod tests {
             .expect("node should exist")
             .updated_at_unix;
 
+        // RSA-0009: updated_at_unix is now the DETERMINISTIC op timestamp passed
+        // in (the signed record's created_at_unix), not a wall-clock read — so it
+        // reproduces identically at proposal and apply time.
+        let revoke_ts = original_updated + 100;
         let revoked = preview_next_state(
             &state,
             &MembershipOperation::RevokeNode {
                 node_id: "node-a".to_owned(),
             },
+            revoke_ts,
         )
         .expect("revoke should succeed");
         let revoked_node = revoked
@@ -2924,13 +2946,15 @@ mod tests {
             .find(|node| node.node_id == "node-a")
             .expect("node should exist");
         assert_eq!(revoked_node.status, MembershipNodeStatus::Revoked);
-        assert!(revoked_node.updated_at_unix >= original_updated);
+        assert_eq!(revoked_node.updated_at_unix, revoke_ts);
 
+        let restore_ts = revoke_ts + 100;
         let restored = preview_next_state(
             &revoked,
             &MembershipOperation::RestoreNode {
                 node_id: "node-a".to_owned(),
             },
+            restore_ts,
         )
         .expect("restore should succeed");
         let restored_node = restored
@@ -2939,7 +2963,149 @@ mod tests {
             .find(|node| node.node_id == "node-a")
             .expect("node should exist");
         assert_eq!(restored_node.status, MembershipNodeStatus::Active);
-        assert!(restored_node.updated_at_unix >= revoked_node.updated_at_unix);
+        assert_eq!(restored_node.updated_at_unix, restore_ts);
+    }
+
+    /// RSA-0009 regression: build a quorum-signed update at `created_at_unix` and
+    /// apply it at a DIFFERENT unix second. Before the fix the reducer stamped
+    /// `unix_now()` at apply time, so the recomputed `state_root` never matched
+    /// the recorded `new_state_root` and these four ops were rejected with
+    /// `NewStateRootMismatch` — revocation/key-rotation were non-functional.
+    fn rsa0009_signed_update(
+        state: &MembershipState,
+        operation: MembershipOperation,
+        target: &str,
+        created_at_unix: u64,
+    ) -> SignedMembershipUpdate {
+        let candidate =
+            preview_next_state(state, &operation, created_at_unix).expect("preview should pass");
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: format!("rsa0009-{target}-{created_at_unix}"),
+            operation,
+            target: target.to_owned(),
+            prev_state_root: state.state_root_hex().expect("prev root"),
+            new_state_root: candidate.state_root_hex().expect("new root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix,
+            expires_at_unix: created_at_unix + 600,
+            reason_code: "rsa0009".to_owned(),
+            policy_context: None,
+        };
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let guardian_key = SigningKey::from_bytes(&[2; 32]);
+        SignedMembershipUpdate {
+            record: record.clone(),
+            approver_signatures: vec![
+                sign_update_record(&record, "owner-1", &owner_key).expect("sign"),
+                sign_update_record(&record, "guardian-1", &guardian_key).expect("sign"),
+            ],
+        }
+    }
+
+    #[test]
+    fn rsa0009_revoke_applies_when_created_at_differs_from_apply_time() {
+        let state = base_state();
+        let signed = rsa0009_signed_update(
+            &state,
+            MembershipOperation::RevokeNode {
+                node_id: "node-a".to_owned(),
+            },
+            "node-a",
+            120,
+        );
+        let updated =
+            apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+                .expect("revoke must apply despite created_at != apply time");
+        let node = updated
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "node-a")
+            .expect("node-a");
+        assert_eq!(node.status, MembershipNodeStatus::Revoked);
+        assert_eq!(node.updated_at_unix, 120);
+    }
+
+    #[test]
+    fn rsa0009_restore_applies_when_created_at_differs_from_apply_time() {
+        let mut state = base_state();
+        state
+            .nodes
+            .iter_mut()
+            .find(|n| n.node_id == "node-a")
+            .expect("node-a")
+            .status = MembershipNodeStatus::Revoked;
+        let signed = rsa0009_signed_update(
+            &state,
+            MembershipOperation::RestoreNode {
+                node_id: "node-a".to_owned(),
+            },
+            "node-a",
+            120,
+        );
+        let updated =
+            apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+                .expect("restore must apply despite created_at != apply time");
+        let node = updated
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "node-a")
+            .expect("node-a");
+        assert_eq!(node.status, MembershipNodeStatus::Active);
+        assert_eq!(node.updated_at_unix, 120);
+    }
+
+    #[test]
+    fn rsa0009_rotate_key_applies_when_created_at_differs_from_apply_time() {
+        let state = base_state();
+        let new_pubkey_hex = "11".repeat(32);
+        let signed = rsa0009_signed_update(
+            &state,
+            MembershipOperation::RotateNodeKey {
+                node_id: "node-a".to_owned(),
+                new_pubkey_hex: new_pubkey_hex.clone(),
+            },
+            "node-a",
+            120,
+        );
+        let updated =
+            apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+                .expect("rotate-key must apply despite created_at != apply time");
+        let node = updated
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "node-a")
+            .expect("node-a");
+        assert_eq!(node.node_pubkey_hex, new_pubkey_hex);
+        assert_eq!(node.updated_at_unix, 120);
+    }
+
+    #[test]
+    fn rsa0009_set_capabilities_applies_when_created_at_differs_from_apply_time() {
+        let state = base_state();
+        let signed = rsa0009_signed_update(
+            &state,
+            MembershipOperation::SetNodeCapabilities {
+                node_id: "node-a".to_owned(),
+                capabilities: anchor_role_capabilities(),
+            },
+            "node-a",
+            120,
+        );
+        let updated =
+            apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+                .expect("set-capabilities must apply despite created_at != apply time");
+        let node = updated
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "node-a")
+            .expect("node-a");
+        assert!(
+            node.capabilities
+                .contains(&RoleCapability::AnchorBundlePull)
+        );
+        assert_eq!(node.updated_at_unix, 120);
     }
 
     #[test]

@@ -3316,7 +3316,9 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
     let prev_root = state
         .state_root_hex()
         .map_err(|e| format!("compute prev state root failed: {e}"))?;
-    let next = preview_next_state(&state, &operation)
+    // RSA-0009: feed the record's own created_at_unix (`now`) so the previewed
+    // new_state_root reproduces at apply time.
+    let next = preview_next_state(&state, &operation, now)
         .map_err(|e| format!("preview next state failed: {e}"))?;
     let new_root = next
         .state_root_hex()

@@ -8,9 +8,7 @@ proposed fix and the verification test that must accompany it (full observation/
 source live in the ledger finding entry). As fixes land, flip the finding's ledger row
 `open → proposed/accepted/applied` with a dated status line (append-only).
 
-**Release gate (SecurityMinimumBar §2):** no unmet Critical; **2 High** unmet on
-reachable paths — both must be fixed or carry documented risk-acceptance before the next
-security milestone.
+**Release gate (SecurityMinimumBar §2):** no unmet Critical; **2 High** were unmet on reachable paths (RSA-0009, RSA-0063) — **both APPLIED 2026-06-24** (code-complete; RSA-0009 unit-replay-validated, RSA-0063 lint-validated).
 
 Effort key: **S** ≤½ day · **M** ~1–2 days · **L** ≥3 days / needs design decision.
 
@@ -20,7 +18,7 @@ Effort key: **S** ≤½ day · **M** ~1–2 days · **L** ≥3 days / needs desi
 
 | ID | File | Fix (proposed) | Verification | Eff |
 |---|---|---|---|---|
-| **RSA-0009** | `rustynet-control/src/membership.rs` | Make the reducer deterministic for state-root purposes — derive `updated_at_unix` from the signed record (e.g. `created_at_unix`), **or** exclude it from `canonical_payload`/`state_root`, **or** carry the new timestamp in the operation. **Owner design decision (3 options).** | Success-path `apply_signed_update` **and** `replay` tests for `RevokeNode`/`RestoreNode`/`RotateNodeKey`/`SetNodeCapabilities` asserting the signed `new_state_root` matches | **L** |
+| **RSA-0009** | `rustynet-control/src/membership.rs` | Make the reducer deterministic for state-root purposes — derive `updated_at_unix` from the signed record (e.g. `created_at_unix`), **or** exclude it from `canonical_payload`/`state_root`, **or** carry the new timestamp in the operation. **Owner design decision (3 options).** | Success-path `apply_signed_update` **and** `replay` tests for `RevokeNode`/`RestoreNode`/`RotateNodeKey`/`SetNodeCapabilities` asserting the signed `new_state_root` matches | **L** ✅ APPLIED 2026-06-24 (option A: thread the signed `created_at_unix` through the reducer; 4 replay tests). |
 | **RSA-0063** | `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh` | Register `trap 'rm -f "${sudoers_tmp}"' EXIT` **before** the `curl\|bash`; prefer scoping the grant to the brew command, not `NOPASSWD: ALL` | Bootstrap-failure simulation leaves no `/etc/sudoers.d/rustynet-*`; lint asserting the trap precedes the sudoers write | **S** |
 
 > RSA-0009 is the higher-impact (revocation + key-rotation are non-functional); RSA-0063
