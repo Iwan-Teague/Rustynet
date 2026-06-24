@@ -23992,7 +23992,7 @@ fn build_repo_sync_script(
     Ok(format!(
         "set -eu; mkdir -p {parent}; \
 if [ -e {dest_dir} ] && [ ! -d {dest_dir} ]; then \
-printf '%s\\n' 'destination path exists but is not a directory: {dest_dir_literal}' >&2; \
+printf 'destination path exists but is not a directory: %s\\n' {dest_dir} >&2; \
 exit 1; \
 fi; \
 if [ -d {dest_dir} ] && [ ! -d {dest_git_dir} ]; then \
@@ -24010,7 +24010,6 @@ git -C {dest_dir} reset --hard {remote}/{branch}",
         parent = shell_quote(parent),
         dest_git_dir = shell_quote(dest_git_dir.as_str()),
         dest_dir = shell_quote(dest_dir),
-        dest_dir_literal = dest_dir,
         remote = shell_quote(remote),
         repo_url = shell_quote(repo_url),
         branch = shell_quote(branch),
@@ -24085,7 +24084,7 @@ fn build_local_source_extract_script(
     Ok(format!(
         "set -eu; mkdir -p {parent}; \
 if [ -e {dest_dir} ] && [ ! -d {dest_dir} ]; then \
-printf '%s\\n' 'destination path exists but is not a directory: {dest_dir_literal}' >&2; \
+printf 'destination path exists but is not a directory: %s\\n' {dest_dir} >&2; \
 rm -f -- {remote_archive}; \
 exit 1; \
 fi; \
@@ -24098,7 +24097,6 @@ tar -xf {remote_archive} -C {dest_dir}; \
 rm -f -- {remote_archive}",
         parent = shell_quote(parent),
         dest_dir = shell_quote(dest_dir),
-        dest_dir_literal = dest_dir,
         remote_archive = shell_quote(remote_archive_path),
     ))
 }
@@ -31650,6 +31648,25 @@ mod tests {
                 .contains("backup_path='/home/debian/Rustyfin'.prep.$(date -u +%Y%m%dT%H%M%S).$$;")
         );
         assert!(script.contains("mv -- '/home/debian/Rustyfin' \"$backup_path\";"));
+    }
+
+    #[test]
+    fn rsa0058_repo_sync_script_quotes_dest_dir_in_printf() {
+        // RSA-0058: a single quote in dest_dir must not break out of the
+        // single-quoted printf message. It is now passed as a shell-quoted %s
+        // argument instead of interpolated raw.
+        let evil = "/tmp/a'; touch /tmp/pwned; echo x";
+        let script = build_repo_sync_script("repo", evil, "main", "origin").expect("script builds");
+        assert!(
+            script.contains("printf 'destination path exists but is not a directory: %s\\n'"),
+            "must use the safe %s printf form: {script}"
+        );
+        assert!(
+            !script.contains("not a directory: /tmp/a'; touch"),
+            "raw dest_dir must not be interpolated into the single-quoted literal: {script}"
+        );
+        // The quote is escaped by shell_quote ('\'' sequence).
+        assert!(script.contains("'\\''"), "{script}");
     }
 
     #[test]
