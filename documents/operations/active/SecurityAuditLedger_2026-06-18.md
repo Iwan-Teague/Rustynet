@@ -1126,7 +1126,7 @@ _Inventory captured from `git ls-files` on 2026-06-18. 581 tracked code/config f
 ### RSA-0027 — `ipc.rs` `validate_cidr` is character-set-only, not structural (re-confirms RN-N7)
 - File: `crates/rustynetd/src/ipc.rs:272-282`
 - Date: 2026-06-18 · Severity: **Low** (re-confirms **RN-N7**)
-- Bar mapping: CLAUDE.md §10 (parse-then-validate at boundary); CWE-20. Reachability: `validate_cidr` checks only hex/dot/colon/slash chars + length, so `999.999.999.999/33` passes the pre-filter; the OS networking stack rejects it downstream, so this is a weak pre-filter, not a security gate. Proposed: parse with `ipnet` to validate structure before any privileged use. Source: RN-N7; CWE-20 — https://cwe.mitre.org/data/definitions/20.html (accessed 2026-06-18). Status: **open** (re-confirms RN-N7; 2026-06-18)
+- Bar mapping: CLAUDE.md §10 (parse-then-validate at boundary); CWE-20. Reachability: `validate_cidr` checks only hex/dot/colon/slash chars + length, so `999.999.999.999/33` passes the pre-filter; the OS networking stack rejects it downstream, so this is a weak pre-filter, not a security gate. Proposed: parse with `ipnet` to validate structure before any privileged use. Source: RN-N7; CWE-20 — https://cwe.mitre.org/data/definitions/20.html (accessed 2026-06-18). Status: **applied** (2026-06-24) — `validate_cidr` now structurally parses `base` as `IpAddr` + a family-appropriate `prefix` (≤32 v4 / ≤128 v6), rejecting `999.999.999.999/33`, over-range prefixes, and missing/empty parts; test `cidr_validation_is_structural_not_just_charset`.
 
 ### RSA-0028 — No per-peer inbound gossip rate limit (re-confirms RN-N4)
 - File: `crates/rustynetd/src/gossip_runtime.rs:321-427`, `crates/rustynetd/src/peer_gossip.rs`
@@ -1281,7 +1281,7 @@ _Inventory captured from `git ls-files` on 2026-06-18. 581 tracked code/config f
 - Proposed enforcement (review-only — do NOT apply): replace `.lines()` with a bounded `read_line`/`take(MAX)` loop that rejects (or errors) on a line exceeding a sane cap (e.g. a few MB) before buffering.
 - Justification / source: CWE-770 "Allocation of Resources Without Limits or Throttling" — https://cwe.mitre.org/data/definitions/770.html (accessed 2026-06-18); SecurityMinimumBar §6.
 - Verification method: a test feeding an oversized line and asserting bounded memory / rejection.
-- Status: **open** (net-new; 2026-06-18)
+- Status: **applied** (2026-06-24). `run_server` replaced unbounded `BufRead::lines()` with `read_bounded_line` (cap `MAX_MCP_REQUEST_LINE_BYTES` = 4 MiB): an over-cap line is reported `TooLong` (JSON-RPC parse error to the client) and the rest of the line is STREAM-drained to the next newline (never buffered) so the stream resyncs. Tests: `read_bounded_line_rejects_oversized_then_resyncs`, `read_bounded_line_oversized_unterminated_is_too_long_then_eof`, `read_bounded_line_accumulates_across_small_chunks`, `read_bounded_line_reads_lines_then_eof`.
 
 ### RSA-0048 — LLM gateway accepts TCP connections with no read/write timeout (slowloris DoS; per-connection thread)
 - File: `crates/rustynet-llm-gateway/src/main.rs:71-89,296-312`

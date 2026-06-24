@@ -694,6 +694,88 @@ pub trait McpServer {
     }
 }
 
+/// Hard cap on a single JSON-RPC request line (RSA-0047). A few MiB is far above
+/// any legitimate MCP request while bounding the per-line allocation, so one
+/// oversized line cannot exhaust the (full-host-privilege) server's memory.
+const MAX_MCP_REQUEST_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Outcome of [`read_bounded_line`].
+enum BoundedLine {
+    /// A complete line (newline stripped) within the cap.
+    Line(String),
+    /// The line exceeded `max_bytes`; it has been drained up to the next newline
+    /// so the stream stays synchronised for the following request.
+    TooLong,
+    /// Clean end of input.
+    Eof,
+    /// An I/O error while reading.
+    Io(std::io::Error),
+}
+
+/// Read one `\n`-terminated line, but never buffer more than `max_bytes`. On
+/// overflow the rest of the offending line is discarded by streaming to the next
+/// newline (never buffered), so memory stays bounded and the next line still
+/// parses. Mirrors the bounded-input posture of the relay/daemon parsers.
+fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> BoundedLine {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return BoundedLine::Io(e),
+        };
+        if available.is_empty() {
+            // EOF: emit a trailing unterminated line if any was buffered.
+            return if buf.is_empty() {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Line(String::from_utf8_lossy(&buf).into_owned())
+            };
+        }
+        if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+            if buf.len() + newline_pos > max_bytes {
+                reader.consume(newline_pos + 1);
+                return BoundedLine::TooLong;
+            }
+            buf.extend_from_slice(&available[..newline_pos]);
+            reader.consume(newline_pos + 1);
+            return BoundedLine::Line(String::from_utf8_lossy(&buf).into_owned());
+        }
+        // No newline in this chunk yet.
+        if buf.len() + available.len() > max_bytes {
+            let consume_len = available.len();
+            reader.consume(consume_len);
+            drain_to_newline(reader);
+            return BoundedLine::TooLong;
+        }
+        buf.extend_from_slice(available);
+        let consume_len = available.len();
+        reader.consume(consume_len);
+    }
+}
+
+/// Discard bytes up to and including the next newline (or EOF) without
+/// buffering, so an over-cap line cannot leave a partial fragment that would be
+/// mis-parsed as the next request.
+fn drain_to_newline<R: BufRead>(reader: &mut R) {
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        if available.is_empty() {
+            return;
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            reader.consume(pos + 1);
+            return;
+        }
+        let consume_len = available.len();
+        reader.consume(consume_len);
+    }
+}
+
 /// Run the MCP server main loop. Reads JSON-RPC requests from stdin,
 /// dispatches to the server impl, writes responses to stdout.
 pub fn run_server(server: impl McpServer) {
@@ -703,13 +785,17 @@ pub fn run_server(server: impl McpServer) {
         server.server_info().version
     );
     let stdin = std::io::stdin();
-    let reader = BufReader::new(stdin.lock());
+    let mut reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
+    loop {
+        // RSA-0047: read each JSON-RPC request line with a hard byte cap instead
+        // of the unbounded `BufRead::lines()`, which buffered an entire line
+        // before any parse — a malicious/buggy client could send one
+        // arbitrarily large line and OOM-kill the (full-host-privilege) server.
+        let line = match read_bounded_line(&mut reader, MAX_MCP_REQUEST_LINE_BYTES) {
+            BoundedLine::Eof => break,
+            BoundedLine::Io(e) => {
                 let resp = make_error(None, PARSE_ERROR, &format!("I/O error: {e}"));
                 let _ = writeln!(
                     stdout,
@@ -719,6 +805,21 @@ pub fn run_server(server: impl McpServer) {
                 let _ = stdout.flush();
                 continue;
             }
+            BoundedLine::TooLong => {
+                let resp = make_error(
+                    None,
+                    PARSE_ERROR,
+                    &format!("request line exceeds the {MAX_MCP_REQUEST_LINE_BYTES}-byte limit"),
+                );
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string(&resp).unwrap_or_default()
+                );
+                let _ = stdout.flush();
+                continue;
+            }
+            BoundedLine::Line(line) => line,
         };
 
         let line = line.trim().to_string();
@@ -949,6 +1050,53 @@ fn handle_request(server: &impl McpServer, req: &JsonRpcRequest) -> Option<JsonR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_bounded_line_reads_lines_then_eof() {
+        let mut r: &[u8] = b"hello\nworld\n";
+        assert!(matches!(read_bounded_line(&mut r, 1024), BoundedLine::Line(l) if l == "hello"));
+        assert!(matches!(read_bounded_line(&mut r, 1024), BoundedLine::Line(l) if l == "world"));
+        assert!(matches!(read_bounded_line(&mut r, 1024), BoundedLine::Eof));
+    }
+
+    #[test]
+    fn read_bounded_line_rejects_oversized_then_resyncs() {
+        // RSA-0047: a line above the cap is TooLong, and the stream resyncs so
+        // the following line still parses (no partial-fragment mis-parse).
+        let mut data = b"x".repeat(100);
+        data.push(b'\n');
+        data.extend_from_slice(b"ok\n");
+        let mut r: &[u8] = &data;
+        assert!(matches!(
+            read_bounded_line(&mut r, 16),
+            BoundedLine::TooLong
+        ));
+        assert!(matches!(read_bounded_line(&mut r, 16), BoundedLine::Line(l) if l == "ok"));
+        assert!(matches!(read_bounded_line(&mut r, 16), BoundedLine::Eof));
+    }
+
+    #[test]
+    fn read_bounded_line_oversized_unterminated_is_too_long_then_eof() {
+        let big = vec![b'y'; 100];
+        let mut r: &[u8] = &big;
+        assert!(matches!(
+            read_bounded_line(&mut r, 16),
+            BoundedLine::TooLong
+        ));
+        assert!(matches!(read_bounded_line(&mut r, 16), BoundedLine::Eof));
+    }
+
+    #[test]
+    fn read_bounded_line_accumulates_across_small_chunks() {
+        use std::io::Cursor;
+        // 4-byte buffer forces multi-chunk fill_buf, exercising accumulation.
+        let mut r = BufReader::with_capacity(4, Cursor::new(b"abcdefghij\nok\n".to_vec()));
+        assert!(
+            matches!(read_bounded_line(&mut r, 1024), BoundedLine::Line(l) if l == "abcdefghij")
+        );
+        assert!(matches!(read_bounded_line(&mut r, 1024), BoundedLine::Line(l) if l == "ok"));
+        assert!(matches!(read_bounded_line(&mut r, 1024), BoundedLine::Eof));
+    }
 
     struct TestServer;
     impl McpServer for TestServer {

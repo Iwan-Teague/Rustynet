@@ -38,7 +38,7 @@ Effort key: **S** ≤½ day · **M** ~1–2 days · **L** ≥3 days / needs desi
 **Theme B — one-time-credential / resource-bound gaps.**
 - RSA-0023 enrollment ledger → wrap the read-modify-write in an OS advisory lock (mirror `resilience.rs::acquire_lock`); add the §6 concurrent-consume race test. **M**
 - RSA-0037 relay `HelloLimiter.counts` → prune on the cleanup cadence + hard-cap `len()`; flood test for bounded map. **S** — ✅ APPLIED 2026-06-24 (cap=16384 + prune_elapsed on cleanup; flood + prune tests).
-- RSA-0047 MCP `run_server` → bounded `read_line` (reject oversized lines before buffering). **S**
+- RSA-0047 MCP `run_server` → bounded `read_line` (reject oversized lines before buffering). **S** — ✅ APPLIED 2026-06-24 (read_bounded_line, 4 MiB cap, stream-drains over-cap line + resyncs; 4 tests).
 
 **Theme C — unescaped host/config values into a shell/PowerShell/env-file.**
 - RSA-0046 `rustynet-sysinfo` → replace `powershell -Command` interpolation with `-File`+`param()` or a native API (4 sites). **M**
@@ -71,7 +71,7 @@ Batch by category so each PR is coherent:
 - **`// SAFETY:` on production FFI:** RSA-0032 (`macos_utun_helper_unsafe`), RSA-0074 (`rustynet-tun`) → add SAFETY comments; Miri where feasible. **S**
 - **Crypto/consistency:** RSA-0043 (dns-zone → `verify_strict`), RSA-0001 (envelope unambiguous v0/v1 framing + legacy-decode test, RN-08), RSA-0003 (delete/fix dead `AlgorithmPolicy::with_exceptions`), RSA-0010 (relay-token `try_sign_at`). **M**
 - **Permissions / secrets hygiene:** RSA-0017 (sqlite DB perms), RSA-0039 (Win backend redacting `Debug`), RSA-0016 (break-glass `ct_eq`+redacting Debug, unwired), RSA-0060 (real_wireguard harness key perms), RSA-0013/0020 (perm checks). **M**
-- **Input/robustness:** RSA-0027 (structural CIDR parse, RN-N7), RSA-0050 (sysinfo parser bounds), RSA-0033 (helper kill scoped to owned PIDs), RSA-0055 (CSV formula injection), RSA-0054 (matrix report path confinement), RSA-0066 (e2e host-key pinning), RSA-0041 (relay reject reflection), RSA-0056/0061 (orchestrator/e2e argv hygiene), RSA-0070/0071/0072 (script robustness/gate-drift/HB-3), RSA-0058 (printf quoting). **M total**
+- **Input/robustness:** RSA-0027 (structural CIDR parse, RN-N7 — ✅ APPLIED 2026-06-24), RSA-0050 (sysinfo parser bounds), RSA-0033 (helper kill scoped to owned PIDs), RSA-0055 (CSV formula injection), RSA-0054 (matrix report path confinement), RSA-0066 (e2e host-key pinning), RSA-0041 (relay reject reflection), RSA-0056/0061 (orchestrator/e2e argv hygiene), RSA-0070/0071/0072 (script robustness/gate-drift/HB-3), RSA-0058 (printf quoting). **M total**
 - **Gossip hardening:** RSA-0028 (per-peer inbound rate limit, RN-N4), RSA-0029 (traversal post-restart replay), RSA-0030 (RN-09 negative test). **S**
 - **Vendored hygiene:** RSA-0073 (strip/disposition boringtun dead `device/ffi/jni`). **S**
 
