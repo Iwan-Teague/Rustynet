@@ -880,6 +880,56 @@ mod tests {
         )
     }
 
+    fn build_bundle_with_ttl(
+        ttl_secs: u64,
+    ) -> Result<super::SignedDnsZoneBundle, super::DnsZoneError> {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        build_signed_dns_zone_bundle(
+            &signing_key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            ttl_secs,
+            42,
+            &[DnsZoneRecordInput {
+                label: "nas".to_owned(),
+                target_node_id: "node-nas-1".to_owned(),
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.64.0.5".to_owned(),
+                ttl_secs,
+                aliases: vec![],
+            }],
+        )
+    }
+
+    #[test]
+    fn build_bundle_rejects_ttl_above_cap() {
+        // The signed-zone TTL is hard-capped at 1..=300 s. An over-large value
+        // (e.g. an env-issuer that let DNS_ZONE_TTL_SECS through in 301..=86400)
+        // must be rejected at build time, never silently widening the bundle's
+        // freshness/replay window.
+        let err = build_bundle_with_ttl(301).expect_err("ttl above 300 must be rejected");
+        match err {
+            super::DnsZoneError::InvalidFormat(reason) => assert!(
+                reason.contains("range 1..=300"),
+                "rejection must cite the 1..=300 bound: {reason}"
+            ),
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_bundle_rejects_zero_ttl() {
+        let err = build_bundle_with_ttl(0).expect_err("zero ttl must be rejected");
+        assert!(matches!(err, super::DnsZoneError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn build_bundle_accepts_max_ttl() {
+        build_bundle_with_ttl(300).expect("ttl at the 300 s cap must be accepted");
+    }
+
     #[test]
     fn build_bundle_rejects_loopback_expected_ip() {
         let err = build_bundle_with_expected_ip("127.0.0.1")
