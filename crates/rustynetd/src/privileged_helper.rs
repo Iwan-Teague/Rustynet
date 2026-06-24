@@ -1729,15 +1729,22 @@ fn validate_sysctl_args(args: &[&str]) -> Result<(), String> {
             "-w",
             "net.ipv6.conf.all.disable_ipv6=1" | "net.ipv6.conf.all.disable_ipv6=0",
         ] => Ok(()),
-        // macOS IPv4 forwarding toggle for the regular exit NAT dataplane. The
-        // read form (`-n net.inet.ip.forwarding`) is used to cache the prior
-        // value for fail-closed restore on teardown. Only the exact `=1`/`=0`
-        // writes are permitted — arbitrary values stay default-denied.
+        // macOS IPv4/IPv6 forwarding toggles for the regular exit NAT
+        // dataplane. The read form (`-n net.inet{,6}.ip{,6}.forwarding`) caches
+        // the prior value for fail-closed restore on teardown. The exit enables
+        // the forwarding family matching its mesh prefix (v4 mesh -> IPv4, v6
+        // mesh -> IPv6). Only the exact `=1`/`=0` writes are permitted —
+        // arbitrary values stay default-denied.
         [
             "-w",
             "net.inet.ip.forwarding=1" | "net.inet.ip.forwarding=0",
         ] => Ok(()),
         ["-n", "net.inet.ip.forwarding"] => Ok(()),
+        [
+            "-w",
+            "net.inet6.ip6.forwarding=1" | "net.inet6.ip6.forwarding=0",
+        ] => Ok(()),
+        ["-n", "net.inet6.ip6.forwarding"] => Ok(()),
         _ => Err("unsupported sysctl argument schema".to_owned()),
     }
 }
@@ -3223,19 +3230,24 @@ mod tests {
 
     #[test]
     fn validate_sysctl_args_permits_only_exact_macos_forwarding_toggles() {
-        // The regular exit NAT needs to toggle + read the macOS IPv4
-        // forwarding sysctl; only the exact `=1`/`=0` writes and the `-n` read
-        // are permitted. Everything else stays default-denied.
+        // The regular exit NAT toggles + reads the macOS IPv4 AND IPv6
+        // forwarding sysctls (one family per mesh prefix); only the exact
+        // `=1`/`=0` writes and the `-n` reads are permitted. Everything else
+        // stays default-denied.
         assert!(validate_sysctl_args(&["-w", "net.inet.ip.forwarding=1"]).is_ok());
         assert!(validate_sysctl_args(&["-w", "net.inet.ip.forwarding=0"]).is_ok());
         assert!(validate_sysctl_args(&["-n", "net.inet.ip.forwarding"]).is_ok());
-        // Arbitrary values, the v6 forwarding key, and write-of-read-key must
-        // all be rejected — default-deny holds.
+        assert!(validate_sysctl_args(&["-w", "net.inet6.ip6.forwarding=1"]).is_ok());
+        assert!(validate_sysctl_args(&["-w", "net.inet6.ip6.forwarding=0"]).is_ok());
+        assert!(validate_sysctl_args(&["-n", "net.inet6.ip6.forwarding"]).is_ok());
+        // Arbitrary values, a malformed/near-miss key, and write-of-read-key
+        // must all be rejected — default-deny holds.
         for bad in [
             vec!["-w", "net.inet.ip.forwarding=2"],
             vec!["-w", "net.inet.ip.forwarding=on"],
             vec!["-w", "net.inet.ip.forwarding"],
-            vec!["-w", "net.inet.ip6.forwarding=1"],
+            vec!["-w", "net.inet6.ip6.forwarding=2"],
+            vec!["-w", "net.inet.ip6.forwarding=1"], // malformed: `inet` not `inet6`
             vec!["-n", "net.inet.ip.forwarding=1"],
         ] {
             assert!(
