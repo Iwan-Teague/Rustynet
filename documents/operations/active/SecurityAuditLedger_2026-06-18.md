@@ -1391,7 +1391,7 @@ _Inventory captured from `git ls-files` on 2026-06-18. 581 tracked code/config f
 - Proposed enforcement (review-only — do NOT apply): `ps_quote` (or omit) the `node_id` in the throw-literal too — never interpolate a host-derived value raw into any PowerShell string, even an error message. Add a test with a `'`-containing node_id asserting no breakout.
 - Justification / source: SecurityMinimumBar §3.7; CWE-78 — https://cwe.mitre.org/data/definitions/78.html (accessed 2026-06-19).
 - Verification method: unit test feeding a quote-bearing node_id; assert it is quoted/rejected.
-- Status: **open** (net-new; 2026-06-19)
+- Status: **applied** (2026-06-24). The per-peer script is now built by a pure `build_add_peer_script`, which `ps_quote`s `node_id` everywhere — including the `throw` error-message literal (concatenated as `+ {node_id_q} +` instead of raw `format!` interpolation). Tests: `add_peer_script_quotes_node_id_in_throw_literal_no_breakout` (a `'`-bearing node_id is doubled in BOTH the `--node-id` arg and the throw message; no raw breakout) and `add_peer_script_rejects_control_chars_in_node_id` (CR/LF/NUL fail closed via `ps_quote`).
 
 ### RSA-0060 — `real_wireguard` e2e harnesses write ephemeral WireGuard private keys world-readable (no chmod/umask), clean up with plain remove (HB-1)
 - File: `crates/rustynet-cli/src/bin/real_wireguard_exitnode_e2e.rs:150,552-556`; `crates/rustynet-cli/src/bin/real_wireguard_no_leak_under_load.rs:151,471-475`
