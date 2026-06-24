@@ -38,6 +38,10 @@ ParityPlan §10.
 11. `windows exit:` self-heal residual NAT + forwarding on crash-restart
     (**§10.7 parity** — the one genuine Linux-verifiable parity gap from the audit).
 12. `docs:` fold the cross-OS code audit into ParityPlan §10 + mark applied RSAs.
+13. `sysinfo:` fix off-by-one panics in the arp/tcp parsers (**RSA-0050** — pure
+    fail-soft `parse_arp_n_row` + test; macOS guard fixes).
+14. `cli:` confine report source-artifact paths against `..`/absolute traversal
+    (**RSA-0054** — `confine_artifact_source` at all 3 read sites + test).
 
 ## Security research lessons applied (industry-grounded)
 
