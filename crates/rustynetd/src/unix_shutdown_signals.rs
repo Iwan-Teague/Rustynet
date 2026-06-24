@@ -76,6 +76,24 @@ pub fn install_unix_shutdown_signals() -> Result<UnixShutdownHandle, std::io::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    // `signal_hook::flag::register` is additive and process-global, and
+    // `sigterm_delivered_to_self_flips_flag` raises a real SIGTERM at this
+    // process. Under `cargo test`'s default multi-thread harness those two
+    // tests race: the raised SIGTERM flips every registered flag — including the
+    // one `install_returns_handle_without_signalling_existing_process_state`
+    // asserts stays false — which intermittently reds the workspace test gate.
+    // Serialize the two process-global signal tests through a shared mutex so
+    // they never overlap. Recover from a poisoned lock (a prior panicking test)
+    // so serialization still holds for the rest.
+    static SIGNAL_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    fn lock_signal_tests() -> MutexGuard<'static, ()> {
+        SIGNAL_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn handle_starts_unrequested() {
@@ -99,6 +117,10 @@ mod tests {
 
     #[test]
     fn install_returns_handle_without_signalling_existing_process_state() {
+        // Serialize against sigterm_delivered_to_self_flips_flag: its raised
+        // SIGTERM is process-global and would otherwise flip this test's
+        // registered flag mid-assertion.
+        let _guard = lock_signal_tests();
         // Installing the handlers must not retroactively set the
         // flag — only an actual SIGTERM/SIGINT delivered after
         // install should flip it. Verifies the initial flag value
@@ -112,6 +134,11 @@ mod tests {
 
     #[test]
     fn sigterm_delivered_to_self_flips_flag() {
+        // Serialize against
+        // install_returns_handle_without_signalling_existing_process_state: the
+        // SIGTERM raised below is process-global and would otherwise flip that
+        // test's flag while it asserts the flag stays false.
+        let _guard = lock_signal_tests();
         // Real end-to-end coverage: install the handlers, raise
         // SIGTERM against our own process, then confirm the flag
         // observes the signal. `nix::sys::signal::raise` is the
