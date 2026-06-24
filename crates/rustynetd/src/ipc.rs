@@ -270,15 +270,26 @@ pub fn parse_command(raw: &str) -> IpcCommand {
 }
 
 pub fn validate_cidr(value: &str) -> bool {
-    if value.len() < 3 || value.len() > 43 {
+    // Structural parse (RSA-0027): a character-set-only pre-filter accepts
+    // malformed inputs like `999.999.999.999/33`. Require a parseable IP base
+    // and a family-appropriate prefix length, mirroring the privileged-helper
+    // `is_cidr_token` gate so this is an actual validation, not a weak filter.
+    if value.len() > 43 {
         return false;
     }
-    if !value.contains('/') {
+    let Some((base, prefix)) = value.split_once('/') else {
         return false;
+    };
+    let Ok(addr) = base.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match addr {
+        std::net::IpAddr::V4(_) => prefix <= 32,
+        std::net::IpAddr::V6(_) => prefix <= 128,
     }
-    value
-        .chars()
-        .all(|ch| ch.is_ascii_hexdigit() || ch == '.' || ch == ':' || ch == '/')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,6 +457,22 @@ mod tests {
         assert!(validate_cidr("fd00::/64"));
         assert!(!validate_cidr("192.168.1.0/24; rm -rf /"));
         assert!(!validate_cidr("not-a-cidr"));
+    }
+
+    #[test]
+    fn cidr_validation_is_structural_not_just_charset() {
+        // RSA-0027: the char-set-only pre-filter wrongly accepted these.
+        assert!(!validate_cidr("999.999.999.999/33"), "out-of-range octets");
+        assert!(!validate_cidr("192.168.1.0/33"), "IPv4 prefix > 32");
+        assert!(!validate_cidr("fd00::/129"), "IPv6 prefix > 128");
+        assert!(!validate_cidr("192.168.1.0"), "missing prefix");
+        assert!(!validate_cidr("192.168.1.0/"), "empty prefix");
+        assert!(!validate_cidr("/24"), "missing address");
+        assert!(!validate_cidr("dead::beef::1/64"), "malformed IPv6");
+        // Boundary values still accepted.
+        assert!(validate_cidr("0.0.0.0/0"));
+        assert!(validate_cidr("255.255.255.255/32"));
+        assert!(validate_cidr("::/0"));
     }
 
     #[test]
