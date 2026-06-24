@@ -2344,6 +2344,113 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 }
 
+/// The inputs `render_macos_killswitch_pf_rules` consumes to render the macOS
+/// killswitch filter anchor. Mirrors EXACTLY the `MacosCommandSystem` fields the
+/// renderer reads (see `MacosCommandSystem::killswitch_spec`), so the rule text
+/// is a pure, deterministic function of this spec. That lets the privileged
+/// helper RE-RENDER the killswitch rules itself from a validated spec rather
+/// than trusting daemon-supplied rule-file content (the `pfctl -f` boundary fix):
+/// a compromised daemon can only choose spec parameters — each independently
+/// validated — never inject rule text. Keep in lockstep with `killswitch_spec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MacosKillswitchSpec {
+    pub interface_name: String,
+    pub egress_interface: String,
+    pub dns_protected: bool,
+    pub allow_egress_interface: bool,
+    pub fail_closed_ssh_allow: bool,
+    pub fail_closed_ssh_allow_cidrs: Vec<ManagementCidr>,
+    pub traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
+    pub managed_peer_egress_endpoints: Vec<SocketAddr>,
+    pub ipv6_blocked: bool,
+}
+
+/// Render the macOS killswitch filter anchor ruleset from a spec. Pure +
+/// deterministic, and ALWAYS terminated by `block drop out quick all` (the
+/// default-deny egress invariant). This is the single source of truth for the
+/// killswitch rule text: both the daemon (`render_pf_rules`) and the privileged
+/// helper (which re-renders from a validated spec) call it, so the two cannot
+/// drift. Adding a new legitimate rule form = add a field here + a branch — in
+/// ONE place — never a silent divergence.
+pub(crate) fn render_macos_killswitch_pf_rules(
+    spec: &MacosKillswitchSpec,
+    strict_fail_closed: bool,
+) -> String {
+    let mut rules = String::new();
+    rules.push_str("set block-policy drop\n");
+    if !strict_fail_closed {
+        // pf grammar: `[action] [direction] [quick] [on <iface>] [<af>] …` — the
+        // address family (`inet`/`inet6`) MUST follow `on <iface>` (macOS pfctl
+        // rejects the reversed form).
+        rules.push_str("pass out quick on lo0 inet all keep state\n");
+        if spec.dns_protected {
+            rules.push_str(&format!(
+                "pass out quick on {} inet proto udp to any port 53 keep state\n",
+                spec.interface_name
+            ));
+            rules.push_str(&format!(
+                "pass out quick on {} inet proto tcp to any port 53 keep state\n",
+                spec.interface_name
+            ));
+            rules.push_str(&format!(
+                "block drop out quick inet proto udp to any port 53 label \"{}\"\n",
+                crate::macos_exit_dns_failclosed::DNS_BLOCK_LAN_UDP_RULE
+            ));
+            rules.push_str(&format!(
+                "block drop out quick inet proto tcp to any port 53 label \"{}\"\n",
+                crate::macos_exit_dns_failclosed::DNS_BLOCK_LAN_TCP_RULE
+            ));
+        }
+        rules.push_str(&format!(
+            "pass out quick on {} inet all keep state\n",
+            spec.interface_name
+        ));
+        if spec.allow_egress_interface {
+            rules.push_str(&format!(
+                "pass out quick on {} inet all keep state\n",
+                spec.egress_interface
+            ));
+        }
+    }
+    if spec.fail_closed_ssh_allow {
+        for cidr in &spec.fail_closed_ssh_allow_cidrs {
+            rules.push_str(&format!(
+                "pass in quick {} proto tcp from {} to any port 22 keep state\n",
+                cidr.pf_family(),
+                cidr
+            ));
+            rules.push_str(&format!(
+                "pass out quick {} proto tcp from any to {} port 22 keep state\n",
+                cidr.pf_family(),
+                cidr
+            ));
+        }
+    }
+    for endpoint in &spec.traversal_bootstrap_allow_endpoints {
+        rules.push_str(&format!(
+            "pass out quick on {} {} proto udp to {} port {} keep state\n",
+            spec.egress_interface,
+            pf_family_for_ip(endpoint.ip()),
+            endpoint.ip(),
+            endpoint.port()
+        ));
+    }
+    for endpoint in &spec.managed_peer_egress_endpoints {
+        rules.push_str(&format!(
+            "pass out quick on {} {} proto udp to {} port {} keep state\n",
+            spec.egress_interface,
+            pf_family_for_ip(endpoint.ip()),
+            endpoint.ip(),
+            endpoint.port()
+        ));
+    }
+    if spec.ipv6_blocked {
+        rules.push_str("block drop out quick inet6 all\n");
+    }
+    rules.push_str("block drop out quick all\n");
+    rules
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacosCommandSystem {
     interface_name: String,
@@ -2490,113 +2597,36 @@ impl MacosCommandSystem {
             .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
     }
 
+    /// Build the killswitch render spec from this system's current state. MUST
+    /// stay in lockstep with `MacosKillswitchSpec` — every field the renderer
+    /// reads is mirrored here so the daemon-side render and the privileged
+    /// helper's re-render from a transported spec produce identical text.
+    fn killswitch_spec(&self) -> MacosKillswitchSpec {
+        MacosKillswitchSpec {
+            interface_name: self.interface_name.clone(),
+            egress_interface: self.egress_interface.clone(),
+            dns_protected: self.dns_protected,
+            allow_egress_interface: self.allow_egress_interface,
+            fail_closed_ssh_allow: self.fail_closed_ssh_allow,
+            fail_closed_ssh_allow_cidrs: self.fail_closed_ssh_allow_cidrs.clone(),
+            traversal_bootstrap_allow_endpoints: self.traversal_bootstrap_allow_endpoints.clone(),
+            managed_peer_egress_endpoints: self.managed_peer_egress_endpoints.clone(),
+            ipv6_blocked: self.ipv6_blocked,
+        }
+    }
+
     fn render_pf_rules(&self, strict_fail_closed: bool) -> Result<String, SystemError> {
         if let Some(config) = self.blind_exit_runtime_config() {
             return build_macos_blind_exit_pf_rules(&config)
                 .map_err(SystemError::FirewallApplyFailed);
         }
-        let mut rules = String::new();
-        rules.push_str("set block-policy drop\n");
-        if !strict_fail_closed {
-            // pf grammar: `[action] [direction] [quick] [on <iface>] [<af>] [proto <p>] …`.
-            // The address family token (`inet`/`inet6`) MUST come after
-            // `on <iface>`, not before. macOS pfctl rejects the reversed form
-            // with `syntax error` (verified against Phase 24 lab macOS 26.5).
-            rules.push_str("pass out quick on lo0 inet all keep state\n");
-            if self.dns_protected {
-                rules.push_str(&format!(
-                    "pass out quick on {} inet proto udp to any port 53 keep state\n",
-                    self.interface_name
-                ));
-                rules.push_str(&format!(
-                    "pass out quick on {} inet proto tcp to any port 53 keep state\n",
-                    self.interface_name
-                ));
-                // Label the LAN DNS-block rules so the macOS-exit DNS
-                // fail-closed evidence producer can find them by name in the
-                // anchor's `pfctl -s rules` dump (parse_pf_block_rule keys on
-                // these exact labels), matching the Linux nft path's
-                // `rustynet-dns-block-lan-*` naming. The terminal
-                // `block drop out quick all` killswitch rule stays UNLABELED.
-                rules.push_str(&format!(
-                    "block drop out quick inet proto udp to any port 53 label \"{}\"\n",
-                    crate::macos_exit_dns_failclosed::DNS_BLOCK_LAN_UDP_RULE
-                ));
-                rules.push_str(&format!(
-                    "block drop out quick inet proto tcp to any port 53 label \"{}\"\n",
-                    crate::macos_exit_dns_failclosed::DNS_BLOCK_LAN_TCP_RULE
-                ));
-            }
-            rules.push_str(&format!(
-                "pass out quick on {} inet all keep state\n",
-                self.interface_name
-            ));
-            if self.allow_egress_interface {
-                rules.push_str(&format!(
-                    "pass out quick on {} inet all keep state\n",
-                    self.egress_interface
-                ));
-            }
-        }
-        if self.fail_closed_ssh_allow {
-            for cidr in &self.fail_closed_ssh_allow_cidrs {
-                // Allow inbound SSH connections from the management CIDR.
-                // keep state creates a state entry on the SYN that also passes
-                // the sshd reply (SYN-ACK, ACK, data) through block drop out
-                // quick all without needing a separate pass out rule.
-                rules.push_str(&format!(
-                    "pass in quick {} proto tcp from {} to any port 22 keep state\n",
-                    cidr.pf_family(),
-                    cidr
-                ));
-                // Allow node-initiated SSH connections to management hosts.
-                rules.push_str(&format!(
-                    "pass out quick {} proto tcp from any to {} port 22 keep state\n",
-                    cidr.pf_family(),
-                    cidr
-                ));
-            }
-        }
-        for endpoint in &self.traversal_bootstrap_allow_endpoints {
-            // Address family (`inet`/`inet6`) must come after `on <iface>`
-            // per the macOS pf grammar — see strict_fail_closed=false block
-            // above for the same constraint.
-            rules.push_str(&format!(
-                "pass out quick on {} {} proto udp to {} port {} keep state\n",
-                self.egress_interface,
-                pf_family_for_ip(endpoint.ip()),
-                endpoint.ip(),
-                endpoint.port()
-            ));
-        }
-        // Per-peer endpoint egress allow rules. The macOS WireGuard
-        // userspace-shared backend sends every WireGuard handshake
-        // initiation through the daemon's authoritative UDP socket
-        // (bound 0.0.0.0:51820). After full-tunnel exit mode flips the
-        // default route to the utun, the per-peer endpoint bypass
-        // route routes those datagrams back out via the egress
-        // interface — but the killswitch's terminal
-        // `block drop out quick all` rule would still drop them
-        // because no `pass out quick on <egress>` rule covers the
-        // peer endpoint. Without this allow rule the WireGuard
-        // handshake silently fails: `traversal_probe_attempts`
-        // increments (the probe runtime says it sent the packet)
-        // but tcpdump on the egress interface shows zero outbound
-        // WireGuard datagrams.
-        for endpoint in &self.managed_peer_egress_endpoints {
-            rules.push_str(&format!(
-                "pass out quick on {} {} proto udp to {} port {} keep state\n",
-                self.egress_interface,
-                pf_family_for_ip(endpoint.ip()),
-                endpoint.ip(),
-                endpoint.port()
-            ));
-        }
-        if self.ipv6_blocked {
-            rules.push_str("block drop out quick inet6 all\n");
-        }
-        rules.push_str("block drop out quick all\n");
-        Ok(rules)
+        // Delegate to the pure renderer (single source of truth shared with the
+        // privileged helper's re-render path). The blind-exit branch above uses
+        // its own reviewed builder.
+        Ok(render_macos_killswitch_pf_rules(
+            &self.killswitch_spec(),
+            strict_fail_closed,
+        ))
     }
 
     fn blind_exit_runtime_config(&self) -> Option<MacosBlindExitPfConfig> {
