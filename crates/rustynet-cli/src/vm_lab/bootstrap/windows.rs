@@ -1657,6 +1657,10 @@ impl WindowsBootstrapProvider {
             .spawn()
             .map_err(|err| format!("spawn {label} SSH command failed: {err}"))?;
         let started_at = std::time::Instant::now();
+        // Definite-assignment placeholder: every loop iteration overwrites this
+        // before the timeout branch reads it (the only non-assigning match arm
+        // returns), so the initial value is intentionally never observed.
+        #[allow(unused_assignments)]
         let mut last_report_read_error = format!("{label} report not read yet");
         loop {
             match self.read_runtime_helper_report_via_ssh(helper_context, remote_result_path) {

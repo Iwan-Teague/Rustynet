@@ -17383,7 +17383,7 @@ mod tests {
                 .expect("test private key permissions should be restrictive")
         };
 
-        let mut config = DaemonConfig {
+        let config = DaemonConfig {
             backend_mode: current_platform_production_backend_mode(),
             traversal_stun_servers: vec![
                 "127.0.0.1:3478"
@@ -17514,24 +17514,21 @@ mod tests {
         for name in ["utun0", "utun9", "utun386"] {
             assert!(
                 !super::interface_name_is_usable_for_traversal_host_candidate(name),
-                "interface {} should be rejected",
-                name
+                "interface {name} should be rejected"
             );
         }
         // macOS proprietary virtual interfaces.
         for name in ["awdl0", "llw0", "anpi0", "gif0", "stf0"] {
             assert!(
                 !super::interface_name_is_usable_for_traversal_host_candidate(name),
-                "interface {} should be rejected",
-                name
+                "interface {name} should be rejected"
             );
         }
         // Standard LAN interfaces — Linux + macOS — must remain usable.
         for name in ["eth0", "enp0s1", "wlan0", "en0", "en1", "bridge0"] {
             assert!(
                 super::interface_name_is_usable_for_traversal_host_candidate(name),
-                "interface {} should be accepted",
-                name
+                "interface {name} should be accepted"
             );
         }
     }

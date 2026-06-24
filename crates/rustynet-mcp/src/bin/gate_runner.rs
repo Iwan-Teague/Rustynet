@@ -834,7 +834,13 @@ mod tests {
 
     #[test]
     fn security_gates_are_unique_and_nonempty() {
-        assert!(!SECURITY_GATES.is_empty());
+        // SECURITY_GATES is a fixed array, so non-emptiness is guaranteed at
+        // compile time; assert a meaningful lower bound instead (clippy
+        // const_is_empty flags the vacuous `!is_empty()` check).
+        assert!(
+            SECURITY_GATES.len() >= 2,
+            "expected the security-gate list to retain its scripts"
+        );
         let mut seen = std::collections::BTreeSet::new();
         for g in SECURITY_GATES {
             assert!(g.ends_with(".sh"), "{g} should be a .sh script");

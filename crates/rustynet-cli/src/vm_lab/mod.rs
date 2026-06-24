@@ -8359,10 +8359,7 @@ fn run_macos_orchestration_stages(
             // DAEMON_NODE_ROLE is the role arg consumed by install_launchd_service
             // inside the bootstrap script (must be admin|client|blind_exit).
             let env_body = format!(
-                "ROLE=client\nNODE_ID={node_id}\nNETWORK_ID=rustynet\nSSH_ALLOW_CIDRS={ssh_allow}\nSOURCE_ARCHIVE={archive}\nDAEMON_NODE_ROLE=client\n",
-                node_id = node_id,
-                ssh_allow = ssh_allow_cidrs,
-                archive = remote_archive,
+                "ROLE=client\nNODE_ID={node_id}\nNETWORK_ID=rustynet\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE={remote_archive}\nDAEMON_NODE_ROLE=client\n",
             );
             let local_env_path = report_dir.join("state").join("macos-bootstrap.env");
             let _ = std::fs::create_dir_all(report_dir.join("state"));
@@ -10484,7 +10481,6 @@ fn exercise_macos_admin_issue_live(
          BYTES=$(sudo stat -f%z \"$WORK/bundle\" 2>/dev/null || echo unknown); \
          sudo rm -rf \"$WORK\"; \
          echo \"minted signing authority + issued a signed assignment bundle ($BYTES bytes)\"",
-        node_id = node_id,
     );
     let out = capture_remote_shell_command_for_target(
         &target,
@@ -10595,8 +10591,6 @@ fn deploy_macos_anchor_profile(
          done; \
          if [ \"$listener_up\" != \"1\" ]; then echo 'anchor bundle-pull listener did not come up on {addr}' >&2; exit 1; fi; \
          echo 'anchor bundle-pull listener up on {addr} (derived from client daemon profile)'",
-        addr = addr,
-        token = token,
     );
 
     let out = capture_remote_shell_command_for_target(
@@ -13020,7 +13014,7 @@ fn exercise_windows_admin_issue_live(
     // fail-closes ($ErrorActionPreference=Stop + explicit $LASTEXITCODE checks).
     let issue_script = format!(
         "$ErrorActionPreference='Stop'; \
-         $rn='{cli}'; \
+         $rn='{WINDOWS_RUSTYNETD_CLI_PATH}'; \
          $work=Join-Path $env:TEMP ('rn-admin-'+[guid]::NewGuid().ToString('N')); \
          New-Item -ItemType Directory -Force -Path $work | Out-Null; \
          $pass=Join-Path $work 'pass'; \
@@ -13041,8 +13035,6 @@ fn exercise_windows_admin_issue_live(
          $bytes=(Get-Item $bundle).Length; \
          Remove-Item -Recurse -Force $work; \
          Write-Output \"minted signing authority + issued a signed assignment bundle ($bytes bytes)\"",
-        cli = WINDOWS_RUSTYNETD_CLI_PATH,
-        node_id = node_id,
     );
 
     let out = capture_remote_shell_command_for_target(

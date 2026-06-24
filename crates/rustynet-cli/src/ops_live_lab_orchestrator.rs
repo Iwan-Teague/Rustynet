@@ -3277,18 +3277,12 @@ pub fn execute_ops_diff_run_summaries(config: DiffRunSummariesConfig) -> Result<
             }
         };
         out.push_str(&format!(
-            "{:<sw$}  {:<sc$}  {:<sc$}  {change}\n",
-            stage,
-            sa,
-            sb,
-            sw = stage_col,
-            sc = status_col
+            "{stage:<stage_col$}  {sa:<status_col$}  {sb:<status_col$}  {change}\n"
         ));
     }
 
     out.push_str(&format!(
-        "\n{} improved, {} regressed, {} unchanged\n",
-        improved, regressed, unchanged
+        "\n{improved} improved, {regressed} regressed, {unchanged} unchanged\n"
     ));
     Ok(out)
 }

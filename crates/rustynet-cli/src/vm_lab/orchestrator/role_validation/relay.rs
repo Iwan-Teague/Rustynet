@@ -588,11 +588,11 @@ fn stderr_snippet(stderr: &[u8]) -> String {
 /// cannot be confused for a bound listener.
 fn linux_udp_summary_contains_port(summary: &str, port: u16) -> bool {
     let needles = [
-        format!("127.0.0.1:{}", port),
-        format!("0.0.0.0:{}", port),
-        format!("*:{}", port),
-        format!("[::1]:{}", port),
-        format!("[::]:{}", port),
+        format!("127.0.0.1:{port}"),
+        format!("0.0.0.0:{port}"),
+        format!("*:{port}"),
+        format!("[::1]:{port}"),
+        format!("[::]:{port}"),
     ];
     summary.lines().any(|line| {
         let trimmed = line.trim();
@@ -605,11 +605,11 @@ fn linux_udp_summary_contains_port(summary: &str, port: u16) -> bool {
 /// number cannot satisfy the check.
 fn linux_tcp_summary_contains_listen_port(summary: &str, port: u16) -> bool {
     let needles = [
-        format!("127.0.0.1:{}", port),
-        format!("0.0.0.0:{}", port),
-        format!("*:{}", port),
-        format!("[::1]:{}", port),
-        format!("[::]:{}", port),
+        format!("127.0.0.1:{port}"),
+        format!("0.0.0.0:{port}"),
+        format!("*:{port}"),
+        format!("[::1]:{port}"),
+        format!("[::]:{port}"),
     ];
     summary.lines().any(|line| {
         let trimmed = line.trim();
@@ -667,10 +667,10 @@ fn parse_macos_launchctl_print_state(stdout: &str) -> String {
 /// outbound TCP connection on the same port cannot satisfy the check.
 fn macos_tcp_listener_summary_contains_port(summary: &str, port: u16) -> bool {
     let needles = [
-        format!("127.0.0.1:{}", port),
-        format!("*:{}", port),
-        format!("[::1]:{}", port),
-        format!("[::]:{}", port),
+        format!("127.0.0.1:{port}"),
+        format!("*:{port}"),
+        format!("[::1]:{port}"),
+        format!("[::]:{port}"),
     ];
     summary.lines().any(|line| {
         let trimmed = line.trim();
@@ -688,10 +688,10 @@ fn macos_tcp_listener_summary_contains_port(summary: &str, port: u16) -> bool {
 /// satisfy the bound-listener check.
 fn macos_udp_listener_summary_contains_port(summary: &str, port: u16) -> bool {
     let needles = [
-        format!("127.0.0.1:{}", port),
-        format!("*:{}", port),
-        format!("[::1]:{}", port),
-        format!("[::]:{}", port),
+        format!("127.0.0.1:{port}"),
+        format!("*:{port}"),
+        format!("[::1]:{port}"),
+        format!("[::]:{port}"),
     ];
     summary.lines().any(|line| {
         let trimmed = line.trim();

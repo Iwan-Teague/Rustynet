@@ -3593,15 +3593,14 @@ destination: default
             let mut buf = vec![0u8; 4096];
             let _ = stream.read(&mut buf);
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n",
-                body_bytes
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {body_bytes}\r\n\r\n"
             );
             let _ = stream.write_all(header.as_bytes());
             let payload = vec![b'X'; body_bytes];
             let _ = stream.write_all(&payload);
             let _ = stream.shutdown(std::net::Shutdown::Write);
         });
-        let url = format!("http://{}/x", addr);
+        let url = format!("http://{addr}/x");
         let err =
             http_get(&url, Duration::from_secs(3)).expect_err("oversize response must be rejected");
         match err {
@@ -3943,7 +3942,7 @@ Content-Type: text/xml
             )
             .into_bytes()
         });
-        let url = format!("http://{}/test", addr);
+        let url = format!("http://{addr}/test");
         let body = http_get(&url, Duration::from_secs(2)).expect("GET succeeds");
         assert!(body.contains("hello from gateway"), "body extracted");
         handle.join().expect("server thread joins");
@@ -3984,7 +3983,7 @@ Content-Type: text/xml
             )
             .into_bytes()
         });
-        let url = format!("http://{}/Control", addr);
+        let url = format!("http://{addr}/Control");
         let body = build_soap_envelope("urn:test", "DoStuff", &[]);
         let response = http_soap_post(&url, "urn:test#DoStuff", &body, Duration::from_secs(2))
             .expect("SOAP POST succeeds");
@@ -4039,7 +4038,7 @@ Content-Type: text/xml
                 let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
-        let control_url = format!("http://{}/Control", addr);
+        let control_url = format!("http://{addr}/Control");
         let client = UpnpIgdClient::new(control_url, UPNP_SERVICE_WANIPCONNECTION_V1.to_owned())
             .with_timeout(Duration::from_secs(2));
         let lease = client
@@ -4094,7 +4093,7 @@ Content-Type: text/xml
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.shutdown(std::net::Shutdown::Write);
         });
-        let control_url = format!("http://{}/Control", addr);
+        let control_url = format!("http://{addr}/Control");
         let client = UpnpIgdClient::new(control_url, UPNP_SERVICE_WANIPCONNECTION_V1.to_owned())
             .with_timeout(Duration::from_secs(2));
         let lease = MappingLease {
