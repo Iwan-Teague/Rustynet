@@ -1188,7 +1188,7 @@ _Inventory captured from `git ls-files` on 2026-06-18. 581 tracked code/config f
 - Proposed enforcement (review-only — do NOT apply): prune `counts` on the `cleanup_idle_sessions` cadence (drop entries whose 1s window elapsed, mirroring `PreAuthHelloLimiter::prune`) AND hard-cap `counts.len()`, rejecting new node_ids above the cap. Add a test asserting bounded map size under a flood of distinct node_ids.
 - Justification / source: SecurityMinimumBar §4.7; CWE-770 "Allocation of Resources Without Limits or Throttling" — https://cwe.mitre.org/data/definitions/770.html (accessed 2026-06-18). Reconciles AUDIT-031 (residual).
 - Verification method: flood test (distinct node_ids) asserting `counts.len()` stays bounded; `cargo test -p rustynet-relay`.
-- Status: **open** (net-new, verified first-hand; 2026-06-18)
+- Status: **applied** (2026-06-24). `HelloLimiter` now carries `max_entries = MAX_HELLO_LIMITER_ENTRIES` (16384): when a NEW node_id arrives at capacity the limiter prunes elapsed-window entries (`prune_elapsed`) and, if still full, rejects the new node_id (fail closed — never allocated above the cap). `cleanup_idle_sessions` also calls `prune_elapsed` on its cadence (mirroring `PreAuthHelloLimiter::prune` / `retain_active_nodes`). Tests: `hello_limiter_caps_distinct_node_ids_under_flood`, `hello_limiter_prune_drops_elapsed_windows`. Existing tracked node_ids are never rejected on the cap path, so no false-reject of an in-window peer.
 
 ### RSA-0039 — `WindowsWireguardBackend` derives `Debug` while holding the live runtime private key → `{:?}` leaks the key
 - File: `crates/rustynet-backend-wireguard/src/windows_command.rs:25` (`#[derive(Debug)]`), `:38` (`runtime_private_key: Option<Zeroizing<String>>`)

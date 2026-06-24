@@ -37,7 +37,7 @@ Effort key: **S** ≤½ day · **M** ~1–2 days · **L** ≥3 days / needs desi
 
 **Theme B — one-time-credential / resource-bound gaps.**
 - RSA-0023 enrollment ledger → wrap the read-modify-write in an OS advisory lock (mirror `resilience.rs::acquire_lock`); add the §6 concurrent-consume race test. **M**
-- RSA-0037 relay `HelloLimiter.counts` → prune on the cleanup cadence + hard-cap `len()`; flood test for bounded map. **S**
+- RSA-0037 relay `HelloLimiter.counts` → prune on the cleanup cadence + hard-cap `len()`; flood test for bounded map. **S** — ✅ APPLIED 2026-06-24 (cap=16384 + prune_elapsed on cleanup; flood + prune tests).
 - RSA-0047 MCP `run_server` → bounded `read_line` (reject oversized lines before buffering). **S**
 
 **Theme C — unescaped host/config values into a shell/PowerShell/env-file.**
