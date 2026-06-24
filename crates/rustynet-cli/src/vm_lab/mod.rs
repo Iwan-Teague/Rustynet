@@ -8033,6 +8033,138 @@ fn append_into_quoted_spec(key: &str, raw_value: &str, entry: &str) -> String {
     }
 }
 
+/// Issue a per-recipient dns-zone bundle for the macOS active exit on the Linux
+/// authority and fetch it into the report `state/` dir (`macos-dns-zone.bundle`
+/// + `macos-dns-zone.pub`) for `distribute_macos_bundles` to install.
+///
+/// The macOS node joins the mesh AFTER the Linux backbone issued its
+/// per-recipient dns-zone bundles, so its loopback resolver has no zone to serve
+/// (`dns_zone_state=absent`) and the exit capture stage's `tunnel_path_resolves`
+/// positive control (`dscacheutil <exit>.rustynet`) fails. We re-run the
+/// existing env-driven issuer on the authority with the macOS node appended to
+/// `NODES_SPEC` + an allow pair to the Linux exit, then fetch the macOS-subject
+/// bundle.
+///
+/// The signed-zone builder hard-caps TTL at 1..=300 s (a longer value is
+/// rejected: "dns zone ttl must be in range 1..=300"), so the issued bundle is
+/// only valid for ≤300 s and the daemon (`fetcher.rs`) rejects it once expired.
+/// This is therefore called from `distribute_macos_bundles` — the LAST stage
+/// before the activate reload + capture probe — rather than from
+/// `amend_membership_for_macos`, so the freshly-issued bundle reaches the
+/// capture stage's `tunnel_path_resolves` probe well inside its validity window
+/// (issuing in the earlier amend stage left only a thin margin).
+#[allow(clippy::too_many_arguments)]
+fn issue_macos_dns_zone_bundle(
+    inventory: &[VmInventoryEntry],
+    inventory_path: &Path,
+    macos_entry: &VmInventoryEntry,
+    macos_node_id: &str,
+    macos_pubkey_hex: &str,
+    report_dir: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    // Resolve the Linux exit (the membership/dns authority that issues bundles).
+    let exit_alias = default_inventory_alias_for_lab_roles(inventory_path, &["exit"])
+        .map_err(|e| format!("could not resolve Linux exit alias: {e}"))?
+        .ok_or_else(|| "no Linux exit alias resolvable from inventory lab_role=exit".to_owned())?;
+    let exit_entry = inventory
+        .iter()
+        .find(|e| e.alias == exit_alias)
+        .ok_or_else(|| format!("exit alias {exit_alias:?} not found in inventory"))?;
+    let exit_node_id = exit_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {exit_alias:?} has no node_id"))?;
+    let exit_target = remote_target_from_inventory_entry(exit_entry, None);
+
+    let linux_env = report_dir.join("state").join("issue_dns_zone.env");
+    if !linux_env.is_file() {
+        return Err(format!(
+            "macOS active exit needs a dns-zone bundle but the Linux issuer env {} is absent \
+             (issue_and_distribute_dns_zone must run first)",
+            linux_env.display()
+        ));
+    }
+    let env_body = std::fs::read_to_string(&linux_env)
+        .map_err(|e| format!("read {} failed: {e}", linux_env.display()))?;
+    let macos_host = macos_entry
+        .ssh_target
+        .rsplit('@')
+        .next()
+        .unwrap_or(macos_entry.ssh_target.as_str());
+    let macos_endpoint = format!("{macos_host}:51820");
+    let augmented = augment_dns_zone_env_for_macos(
+        env_body.as_str(),
+        macos_node_id,
+        macos_endpoint.as_str(),
+        macos_pubkey_hex,
+        exit_node_id,
+    )?;
+    // Leave DNS_ZONE_TTL_SECS unset so the issuer uses its default (300 s),
+    // matching the Linux path (see doc comment re: the 1..=300 cap).
+    let local_env = report_dir.join("state").join("macos-issue-dns-zone.env");
+    std::fs::write(&local_env, augmented.as_bytes())
+        .map_err(|e| format!("write {} failed: {e}", local_env.display()))?;
+    let remote_env = "/tmp/rn-macos-dns-zone.env";
+    let remote_issue_dir = "/tmp/rn-macos-dns-zone-issue";
+    ensure_success_status(
+        scp_to_remote_for_target(
+            &exit_target,
+            None,
+            Some(ssh_identity_file),
+            known_hosts_path,
+            local_env.as_path(),
+            remote_env,
+            Duration::from_secs(30),
+        )
+        .map_err(|e| format!("scp macOS dns-zone env to {exit_alias} failed: {e}"))?,
+        "scp macOS dns-zone env",
+    )?;
+    let issue_script = format!(
+        "set -eu; sudo -n rustynet ops e2e-issue-dns-zone-bundles-from-env \
+         --env-file {env} --issue-dir {dir}",
+        env = shell_quote(remote_env),
+        dir = shell_quote(remote_issue_dir),
+    );
+    capture_remote_shell_command_for_target(
+        &exit_target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        issue_script.as_str(),
+        Duration::from_secs(60),
+    )
+    .map_err(|e| format!("issue macOS dns-zone on {exit_alias} failed: {e}"))?;
+    let bundle_local = report_dir.join("state").join("macos-dns-zone.bundle");
+    capture_remote_file_to_local(
+        &exit_target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        &format!("{remote_issue_dir}/rn-dns-zone-{macos_node_id}.dns-zone"),
+        bundle_local.as_path(),
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("fetch macOS dns-zone bundle from {exit_alias} failed: {e}"))?;
+    let pub_local = report_dir.join("state").join("macos-dns-zone.pub");
+    capture_remote_file_to_local(
+        &exit_target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        &format!("{remote_issue_dir}/rn-dns-zone.pub"),
+        pub_local.as_path(),
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("fetch macOS dns-zone verifier key from {exit_alias} failed: {e}"))?;
+    Ok(format!(
+        "issued dns-zone bundle for {macos_node_id} (endpoint={macos_endpoint}) on {exit_alias} \
+         -> {}",
+        bundle_local.display()
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_macos_orchestration_stages(
     config: &VmLabOrchestrateLiveLabConfig,
@@ -8497,122 +8629,14 @@ fn run_macos_orchestration_stages(
             .map_err(|e| format!("fetch membership.snapshot from {exit_alias} failed: {e}"))?;
             amended_membership_path = Some(snapshot_path.clone());
 
-            // ── Provision a dns-zone bundle for the macOS node (Rank 2) ──
-            // The macOS node joins the mesh AFTER the Linux backbone issued its
-            // per-recipient dns-zone bundles, so its loopback resolver has no
-            // zone to serve (status `dns_zone_state=absent`) and the exit
-            // capture stage's `tunnel_path_resolves` positive control
-            // (`dscacheutil <exit>.rustynet`) fails. Re-run the existing
-            // env-driven issuer on the authority with the macOS node appended to
-            // NODES_SPEC + an allow pair to the Linux exit, then fetch the
-            // macOS-subject bundle; `distribute_macos_bundles` installs it where
-            // the daemon's `--dns-zone-bundle` reads it, and the activate
-            // stage's launchd reload makes the resolver serve it. Only the
-            // elected active exit needs this (only it runs the capture stage).
-            let dns_zone_summary = if is_macos_active_exit {
-                let linux_env = report_dir.join("state").join("issue_dns_zone.env");
-                if !linux_env.is_file() {
-                    return Err(format!(
-                        "macOS active exit needs a dns-zone bundle but the Linux issuer env {} is \
-                         absent (issue_and_distribute_dns_zone must run first)",
-                        linux_env.display()
-                    ));
-                }
-                let env_body = std::fs::read_to_string(&linux_env)
-                    .map_err(|e| format!("read {} failed: {e}", linux_env.display()))?;
-                let macos_host = macos_entry
-                    .ssh_target
-                    .rsplit('@')
-                    .next()
-                    .unwrap_or(macos_entry.ssh_target.as_str());
-                let macos_endpoint = format!("{macos_host}:51820");
-                let augmented = augment_dns_zone_env_for_macos(
-                    env_body.as_str(),
-                    macos_node_id,
-                    macos_endpoint.as_str(),
-                    pubkey_hex,
-                    exit_node_id,
-                )?;
-                // Leave DNS_ZONE_TTL_SECS unset so the issuer uses its default
-                // (300 s) — the signed-zone builder hard-caps TTL at 1..=300
-                // (a longer value is rejected: "dns zone ttl must be in range
-                // 1..=300"), matching the Linux path. The macOS pipeline issues
-                // here and the daemon serves the zone after the activate
-                // reload, so the bundle must reach the capture stage's
-                // tunnel_path_resolves probe within that 300 s window (the
-                // remaining macOS stages complete well inside it on the happy
-                // path; if a future run shows expiry, issue closer to capture).
-                let local_env = report_dir.join("state").join("macos-issue-dns-zone.env");
-                std::fs::write(&local_env, augmented.as_bytes())
-                    .map_err(|e| format!("write {} failed: {e}", local_env.display()))?;
-                let remote_env = "/tmp/rn-macos-dns-zone.env";
-                let remote_issue_dir = "/tmp/rn-macos-dns-zone-issue";
-                ensure_success_status(
-                    scp_to_remote_for_target(
-                        &exit_target,
-                        None,
-                        Some(ssh_identity_file),
-                        known_hosts_path,
-                        local_env.as_path(),
-                        remote_env,
-                        Duration::from_secs(30),
-                    )
-                    .map_err(|e| format!("scp macOS dns-zone env to {exit_alias} failed: {e}"))?,
-                    "scp macOS dns-zone env",
-                )?;
-                let issue_script = format!(
-                    "set -eu; sudo -n rustynet ops e2e-issue-dns-zone-bundles-from-env \
-                     --env-file {env} --issue-dir {dir}",
-                    env = shell_quote(remote_env),
-                    dir = shell_quote(remote_issue_dir),
-                );
-                capture_remote_shell_command_for_target(
-                    &exit_target,
-                    None,
-                    Some(ssh_identity_file),
-                    known_hosts_path,
-                    issue_script.as_str(),
-                    Duration::from_secs(60),
-                )
-                .map_err(|e| format!("issue macOS dns-zone on {exit_alias} failed: {e}"))?;
-                let bundle_local = report_dir.join("state").join("macos-dns-zone.bundle");
-                capture_remote_file_to_local(
-                    &exit_target,
-                    None,
-                    Some(ssh_identity_file),
-                    known_hosts_path,
-                    &format!("{remote_issue_dir}/rn-dns-zone-{macos_node_id}.dns-zone"),
-                    bundle_local.as_path(),
-                    Duration::from_secs(30),
-                )
-                .map_err(|e| {
-                    format!("fetch macOS dns-zone bundle from {exit_alias} failed: {e}")
-                })?;
-                let pub_local = report_dir.join("state").join("macos-dns-zone.pub");
-                capture_remote_file_to_local(
-                    &exit_target,
-                    None,
-                    Some(ssh_identity_file),
-                    known_hosts_path,
-                    &format!("{remote_issue_dir}/rn-dns-zone.pub"),
-                    pub_local.as_path(),
-                    Duration::from_secs(30),
-                )
-                .map_err(|e| {
-                    format!("fetch macOS dns-zone verifier key from {exit_alias} failed: {e}")
-                })?;
-                format!(
-                    "; issued dns-zone bundle for {macos_node_id} (endpoint={macos_endpoint}) \
-                     -> {}",
-                    bundle_local.display()
-                )
-            } else {
-                String::new()
-            };
-
+            // NB: the macOS active exit's per-recipient dns-zone bundle is NOT
+            // issued here. It is issued by `issue_macos_dns_zone_bundle` from the
+            // `distribute_macos_bundles` stage (the last stage before the
+            // activate reload + capture probe) so the ≤300 s-TTL bundle is fresh
+            // when the capture stage's `tunnel_path_resolves` probe runs.
             Ok(format!(
                 "amended Linux membership to include {macos_alias} ({macos_node_id}) on \
-                 {exit_alias}: pubkey={pubkey_hex} add_output={} snapshot={}{dns_zone_summary}",
+                 {exit_alias}: pubkey={pubkey_hex} add_output={} snapshot={}",
                 add_out.trim(),
                 snapshot_path.display(),
             ))
@@ -8773,11 +8797,36 @@ fn run_macos_orchestration_stages(
             }
 
             // dns-zone bundle (Rank 2) — present only when the macOS node is the
-            // elected active exit (amend_membership_for_macos issued it). Install
-            // it where the daemon's `--dns-zone-bundle` / `--dns-zone-verifier-key`
-            // read it, so the loopback resolver serves the mesh zone and the exit
-            // capture stage's tunnel_path_resolves positive control succeeds. The
-            // activate stage's launchd reload makes the running daemon pick it up.
+            // elected active exit. Issue it on the Linux authority HERE (the last
+            // stage before the activate reload + capture probe) so the ≤300 s-TTL
+            // bundle is fresh when the capture stage's tunnel_path_resolves probe
+            // runs — issuing it back in amend_membership_for_macos left only a
+            // thin validity margin. Only the elected active exit needs it (only
+            // it runs the capture stage).
+            if is_macos_active_exit {
+                let pubkey_hex = macos_wg_pubkey_hex.as_deref().ok_or_else(|| {
+                    "macOS active exit dns-zone issuance needs the collected WireGuard public \
+                     key but none is available"
+                        .to_owned()
+                })?;
+                let summary = issue_macos_dns_zone_bundle(
+                    &inventory,
+                    inventory_path,
+                    &macos_entry,
+                    macos_node_id.as_str(),
+                    pubkey_hex,
+                    report_dir,
+                    ssh_identity_file,
+                    known_hosts_path,
+                )?;
+                eprintln!("[vm-lab] distribute_macos_bundles: {summary}");
+            }
+
+            // Install it where the daemon's `--dns-zone-bundle` /
+            // `--dns-zone-verifier-key` read it, so the loopback resolver serves
+            // the mesh zone and the exit capture stage's tunnel_path_resolves
+            // positive control succeeds. The activate stage's launchd reload
+            // makes the running daemon pick it up.
             let dns_zone_bundle = report_dir.join("state").join("macos-dns-zone.bundle");
             let mut distributed_dns_zone = false;
             if dns_zone_bundle.is_file() {
