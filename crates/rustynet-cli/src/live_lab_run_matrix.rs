@@ -1778,10 +1778,24 @@ fn default_cell_value(column: &str) -> String {
 }
 
 fn csv_escape(value: String) -> String {
+    let value = neutralize_csv_formula(value);
     if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value
+    }
+}
+
+/// RSA-0055: neutralize spreadsheet formula injection. A CSV cell that begins
+/// with `=`, `+`, `-`, `@`, TAB or CR is interpreted as a formula by Excel /
+/// Google Sheets / LibreOffice when the matrix is opened — an attacker-supplied
+/// `notes` / `run_command` / topology value could exfiltrate data or run a
+/// command. Prefix such cells with a single quote (the OWASP-recommended
+/// neutralization), which renders as literal text and is stripped on display.
+fn neutralize_csv_formula(value: String) -> String {
+    match value.as_bytes().first() {
+        Some(b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r') => format!("'{value}"),
+        _ => value,
     }
 }
 
@@ -1815,9 +1829,37 @@ fn parse_csv_record(line: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::{
         DEFAULT_MATRIX_COLUMNS, LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome,
-        build_live_lab_run_matrix_values, parse_csv_record, render_csv_row,
+        build_live_lab_run_matrix_values, csv_escape, parse_csv_record, render_csv_row,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn rsa0055_csv_escape_neutralizes_formula_injection() {
+        // Cells beginning with =,+,-,@,TAB,CR must be prefixed with ' so a
+        // spreadsheet renders them as text, not a formula.
+        for payload in [
+            "=cmd|'/c calc'!A1",
+            "+1+1",
+            "-2+3",
+            "@SUM(A1)",
+            "\tx",
+            "\rx",
+        ] {
+            let escaped = csv_escape(payload.to_owned());
+            assert!(
+                escaped.starts_with('\'') || escaped.starts_with("\"'"),
+                "formula cell must be neutralized: {payload:?} -> {escaped:?}"
+            );
+        }
+        // Benign cells are untouched.
+        assert_eq!(
+            csv_escape("debian-headless-1".to_owned()),
+            "debian-headless-1"
+        );
+        assert_eq!(csv_escape("Pass".to_owned()), "Pass");
+        // A comma still triggers RFC4180 quoting (and a leading '=' inside is neutralized first).
+        assert_eq!(csv_escape("=a,b".to_owned()), "\"'=a,b\"");
+    }
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
