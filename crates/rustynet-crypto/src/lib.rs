@@ -2219,6 +2219,22 @@ mod tests {
         assert_eq!(a.ct_eq(&b).unwrap_u8(), 0);
     }
 
+    #[test]
+    fn secret_key_debug_redacts() {
+        // RSA-0026: SecretKey is the canonical secret type; its Debug must
+        // redact the inner bytes so a `{:?}` / structured-log call cannot leak
+        // the private key. Pin the redaction so it cannot regress to a
+        // byte-printing derive. (The secret-log-audit gate intentionally does
+        // not put redacting-Debug types in its no-Debug forbidden list.)
+        let key = super::SecretKey([0xABu8; 32]);
+        let rendered = format!("{key:?}");
+        assert_eq!(rendered, "SecretKey(REDACTED)");
+        assert!(
+            !rendered.contains("171") && !rendered.to_lowercase().contains("ab"),
+            "SecretKey Debug must not surface the inner key bytes: {rendered}"
+        );
+    }
+
     /// Add the ed25519 group order ℓ (little-endian) to the S scalar (the
     /// second 32 bytes) of a signature, with carry. For a canonical S < ℓ the
     /// result fits in 32 bytes and is a non-canonical encoding of the same

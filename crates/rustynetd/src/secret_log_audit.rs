@@ -72,6 +72,12 @@ fn audited_source_roots(workspace_root: &Path) -> Vec<PathBuf> {
     vec![
         workspace_root.join("crates/rustynetd/src"),
         workspace_root.join("crates/rustynet-cli/src"),
+        // RSA-0026: extend the placeholder / Debug / Display sweep to the
+        // secret-handling crates that were previously out of scope (these hold
+        // the key, token and signing material the gate is meant to protect).
+        workspace_root.join("crates/rustynet-crypto/src"),
+        workspace_root.join("crates/rustynet-control/src"),
+        workspace_root.join("crates/rustynet-relay/src"),
     ]
 }
 
@@ -240,33 +246,43 @@ pub(crate) fn scan_source_for_debug_on_secret_types(
     hits
 }
 
-/// Reviewed secret-bearing type names whose `Debug` exposure is
-/// forbidden across the crate. Kept narrow to the canonical
-/// passphrase / runtime-key wrappers; if a future module introduces
-/// a new wrapper, add it here.
+/// Reviewed secret-bearing type names whose ANY `Debug` impl/derive is
+/// forbidden across the workspace (the "no-Debug-at-all" policy: types whose
+/// inner bytes ARE the secret and for which no safe redaction is applied).
 ///
-/// `EnrollmentToken` and `MappingLease` are intentionally NOT in
-/// this list because they ship custom redacting `Debug` impls that
-/// the audit's substring-based matcher cannot distinguish from a
-/// dangerous one. Their redaction is pinned instead by unit tests:
-/// `enrollment_token_debug_output_redacts_tag_and_token_id` and
-/// `mapping_lease_debug_output_redacts_pcp_nonce`.
-const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[
-    "PassphraseMaterial",
-    "WrappedKeyMaterial",
-    "RuntimePrivateKey",
-    "SigningKeyMaterial",
-];
+/// RSA-0026: this list was previously populated with FOUR phantom names
+/// (`PassphraseMaterial`, `WrappedKeyMaterial`, `RuntimePrivateKey`,
+/// `SigningKeyMaterial`) — none of which are defined anywhere in the workspace
+/// — so the gate guarded zero real types while *appearing* to guard four
+/// (false assurance in a Critical §3.4 control). The real secret-bearing types
+/// do NOT belong here because they use a SAFE redaction strategy the substring
+/// matcher cannot distinguish from a dangerous impl, and so are pinned by
+/// dedicated tests instead. `SecretKey` (rustynet-crypto) has a redacting
+/// `Debug` pinned by `secret_key_debug_redacts`; `EnrollmentToken` /
+/// `MappingLease` have redacting `Debug` pinned by
+/// `enrollment_token_debug_output_redacts_tag_and_token_id` /
+/// `mapping_lease_debug_output_redacts_pcp_nonce`; passphrase material is held
+/// as `Zeroizing<String>` / `Zeroizing<Vec<u8>>` locals (no named struct to
+/// forbid) and is covered by the `FORBIDDEN_PLACEHOLDER_TOKENS` log-macro scan.
+///
+/// The `forbidden_secret_type_lists_contain_only_real_types` meta-test below
+/// now fails closed if a phantom name is ever re-added. Add a real type here
+/// only when it carries secret bytes with NO Debug (not a redacting one).
+const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[];
 
-/// Reviewed secret-bearing type names whose `Display` (and
-/// `ToString`) exposure is forbidden across the crate. A `Display`
-/// impl is just as dangerous as `Debug` because `format!("{}", x)`
-/// or `x.to_string()` would surface inner bytes.
-const FORBIDDEN_DISPLAY_SECRET_TYPES: &[&str] = &[
+/// Reviewed secret-bearing type names whose `Display`/`ToString` exposure is
+/// forbidden. Same policy + phantom-removal as `FORBIDDEN_DEBUG_SECRET_TYPES`.
+const FORBIDDEN_DISPLAY_SECRET_TYPES: &[&str] = &[];
+
+/// Sample type names used ONLY by the scanner-logic self-tests below, which
+/// feed synthetic source bodies. Kept separate from the production
+/// `FORBIDDEN_*_SECRET_TYPES` so the scanner logic is exercised independently
+/// of what the production audit currently guards (RSA-0026 decoupling).
+const SAMPLE_FORBIDDEN_SECRET_TYPES: &[&str] = &[
     "PassphraseMaterial",
-    "WrappedKeyMaterial",
-    "RuntimePrivateKey",
     "SigningKeyMaterial",
+    "RuntimePrivateKey",
+    "WrappedKeyMaterial",
 ];
 
 /// Returns true iff the given line is a call to one of the
@@ -571,6 +587,47 @@ fn no_debug_derives_on_canonical_secret_types() {
     }
 }
 
+/// RSA-0026 anti-false-assurance meta-test. The forbidden-Debug/Display lists
+/// previously named four types that are not defined anywhere in the workspace,
+/// so the gate guarded zero real types while appearing to guard four. This test
+/// fails closed if any production forbidden-type name is a phantom (has no
+/// `struct`/`enum`/`type` definition under the audited roots), so a future edit
+/// cannot re-introduce a guard that silently matches nothing.
+#[test]
+fn forbidden_secret_type_lists_contain_only_real_types() {
+    let root = workspace_root();
+    let mut sources = String::new();
+    for src_root in audited_source_roots(&root) {
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        for file in files {
+            if let Ok(body) = fs::read_to_string(&file) {
+                sources.push_str(&body);
+                sources.push('\n');
+            }
+        }
+    }
+    let type_is_defined = |name: &str| {
+        sources.contains(&format!("struct {name}"))
+            || sources.contains(&format!("enum {name}"))
+            || sources.contains(&format!("type {name}"))
+    };
+    let mut phantom: Vec<&str> = Vec::new();
+    for name in FORBIDDEN_DEBUG_SECRET_TYPES
+        .iter()
+        .chain(FORBIDDEN_DISPLAY_SECRET_TYPES.iter())
+    {
+        if !type_is_defined(name) {
+            phantom.push(name);
+        }
+    }
+    assert!(
+        phantom.is_empty(),
+        "forbidden secret-type list contains phantom name(s) that resolve to no type \
+         definition (false assurance — the gate would guard nothing): {phantom:?}"
+    );
+}
+
 // ---- Audit-logic self-tests ----------------------------------------
 
 #[test]
@@ -701,7 +758,7 @@ pub struct PassphraseMaterial {
     bytes: Vec<u8>,
 }
 "#;
-    let hits = scan_source_for_debug_on_secret_types(body, FORBIDDEN_DEBUG_SECRET_TYPES);
+    let hits = scan_source_for_debug_on_secret_types(body, SAMPLE_FORBIDDEN_SECRET_TYPES);
     assert!(
         hits.iter().any(|(_, n, _)| n == "PassphraseMaterial"),
         "derive(Debug) on PassphraseMaterial must be flagged: {hits:?}"
@@ -717,7 +774,7 @@ impl std::fmt::Debug for SigningKeyMaterial {
     }
 }
 "#;
-    let hits = scan_source_for_debug_on_secret_types(body, FORBIDDEN_DEBUG_SECRET_TYPES);
+    let hits = scan_source_for_debug_on_secret_types(body, SAMPLE_FORBIDDEN_SECRET_TYPES);
     assert!(
         hits.iter().any(|(_, n, _)| n == "SigningKeyMaterial"),
         "manual impl Debug for SigningKeyMaterial must be flagged: {hits:?}"
@@ -732,7 +789,7 @@ pub struct PublicKey {
     bytes: [u8; 32],
 }
 "#;
-    let hits = scan_source_for_debug_on_secret_types(body, FORBIDDEN_DEBUG_SECRET_TYPES);
+    let hits = scan_source_for_debug_on_secret_types(body, SAMPLE_FORBIDDEN_SECRET_TYPES);
     assert!(
         hits.is_empty(),
         "PublicKey is not on the secret list: {hits:?}"
@@ -747,7 +804,7 @@ pub struct PassphraseMaterial {
     bytes: Vec<u8>,
 }
 "#;
-    let hits = scan_source_for_debug_on_secret_types(body, FORBIDDEN_DEBUG_SECRET_TYPES);
+    let hits = scan_source_for_debug_on_secret_types(body, SAMPLE_FORBIDDEN_SECRET_TYPES);
     assert!(
         hits.is_empty(),
         "PassphraseMaterial without Debug must pass: {hits:?}"
@@ -769,7 +826,7 @@ impl std::fmt::Debug for PassphraseMaterialError {
     }
 }
 "#;
-    let hits = scan_source_for_debug_on_secret_types(body, FORBIDDEN_DEBUG_SECRET_TYPES);
+    let hits = scan_source_for_debug_on_secret_types(body, SAMPLE_FORBIDDEN_SECRET_TYPES);
     assert!(
         hits.is_empty(),
         "audit must not false-match `Debug for PassphraseMaterialError` against the `PassphraseMaterial` allowlist entry: {hits:?}"
@@ -786,7 +843,7 @@ impl std::fmt::Display for SigningKeyMaterialError {
     }
 }
 "#;
-    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    let hits = scan_source_for_display_on_secret_types(body, SAMPLE_FORBIDDEN_SECRET_TYPES);
     assert!(
         hits.is_empty(),
         "audit must not false-match `Display for SigningKeyMaterialError` against the `SigningKeyMaterial` allowlist entry: {hits:?}"
@@ -1027,7 +1084,7 @@ impl Display for PassphraseMaterial {
     }
 }
 "#;
-    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    let hits = scan_source_for_display_on_secret_types(body, SAMPLE_FORBIDDEN_SECRET_TYPES);
     assert!(
         hits.iter().any(|(_, n, _)| n == "PassphraseMaterial"),
         "impl Display for PassphraseMaterial must be flagged: {hits:?}"
@@ -1043,7 +1100,7 @@ impl fmt::Display for SigningKeyMaterial {
     }
 }
 "#;
-    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    let hits = scan_source_for_display_on_secret_types(body, SAMPLE_FORBIDDEN_SECRET_TYPES);
     assert!(
         hits.iter().any(|(_, n, _)| n == "SigningKeyMaterial"),
         "impl fmt::Display for SigningKeyMaterial must be flagged: {hits:?}"
@@ -1059,7 +1116,7 @@ impl ToString for RuntimePrivateKey {
     }
 }
 "#;
-    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    let hits = scan_source_for_display_on_secret_types(body, SAMPLE_FORBIDDEN_SECRET_TYPES);
     assert!(
         hits.iter().any(|(_, n, _)| n == "RuntimePrivateKey"),
         "impl ToString for RuntimePrivateKey must be flagged: {hits:?}"
@@ -1075,7 +1132,7 @@ impl Display for PublicKey {
     }
 }
 "#;
-    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    let hits = scan_source_for_display_on_secret_types(body, SAMPLE_FORBIDDEN_SECRET_TYPES);
     assert!(
         hits.is_empty(),
         "PublicKey is not on the secret list: {hits:?}"
@@ -1089,7 +1146,7 @@ pub struct PassphraseMaterial {
     bytes: Vec<u8>,
 }
 "#;
-    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    let hits = scan_source_for_display_on_secret_types(body, SAMPLE_FORBIDDEN_SECRET_TYPES);
     assert!(
         hits.is_empty(),
         "PassphraseMaterial without Display must pass: {hits:?}"
