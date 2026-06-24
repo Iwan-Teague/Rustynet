@@ -36,7 +36,7 @@ Effort key: **S** ≤½ day · **M** ~1–2 days · **L** ≥3 days / needs desi
   *(One fix design covers both loci + the `windows-trust-cli` / `llm-gateway` callers.)*
 
 **Theme B — one-time-credential / resource-bound gaps.**
-- RSA-0023 enrollment ledger → wrap the read-modify-write in an OS advisory lock (mirror `resilience.rs::acquire_lock`); add the §6 concurrent-consume race test. **M**
+- RSA-0023 enrollment ledger → wrap the read-modify-write in an OS advisory lock (mirror `resilience.rs::acquire_lock`); add the §6 concurrent-consume race test. **M** — ✅ APPLIED 2026-06-24 (acquire_ledger_lock flock spanning load→consume→write; 8-thread race test = exactly one redemption).
 - RSA-0037 relay `HelloLimiter.counts` → prune on the cleanup cadence + hard-cap `len()`; flood test for bounded map. **S** — ✅ APPLIED 2026-06-24 (cap=16384 + prune_elapsed on cleanup; flood + prune tests).
 - RSA-0047 MCP `run_server` → bounded `read_line` (reject oversized lines before buffering). **S** — ✅ APPLIED 2026-06-24 (read_bounded_line, 4 MiB cap, stream-drains over-cap line + resyncs; 4 tests).
 
