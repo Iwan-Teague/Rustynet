@@ -34,7 +34,10 @@ use rustynet_dns_zone::{
     DnsZoneError, DnsZoneRecordInput, build_signed_dns_zone_bundle,
     render_signed_dns_zone_bundle_wire, verify_signed_dns_zone_bundle as verify_dns_zone_bundle,
 };
-use rustynet_policy::{AccessRequest, Decision as PolicyEngineDecision, PolicySet, Protocol};
+use rustynet_policy::{
+    AccessRequest, Decision as PolicyEngineDecision, MembershipDirectory, MembershipStatus,
+    PolicySet, Protocol,
+};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
@@ -2227,6 +2230,15 @@ pub struct ControlPlaneCore {
     pub credentials: ThrowawayCredentialStore,
     pub nodes: NodeRegistry,
     pub policy: PolicySet,
+    /// Signed membership directory used to gate signed-artifact issuance
+    /// (RSA-0008). When populated, every node named in an issued bundle or
+    /// relay-session token must be `MembershipStatus::Active`; a Revoked or
+    /// Unknown endpoint is denied issuance (fail-closed, mirrors the daemon's
+    /// `evaluate_with_membership` provisioning gate). When unpopulated, the
+    /// generator behaves as a pre-membership deployment and falls back to the
+    /// default-deny ACL evaluation alone (no behavioural change), matching
+    /// [`MembershipDirectory::is_populated`] semantics.
+    membership_directory: MembershipDirectory,
     transport_policy: ControlPlaneTransportPolicy,
     assignment_signing_key: SigningKey,
     assignment_verifying_key: [u8; 32],
@@ -2266,6 +2278,7 @@ impl ControlPlaneCore {
             credentials: ThrowawayCredentialStore::default(),
             nodes: NodeRegistry::default(),
             policy,
+            membership_directory: MembershipDirectory::default(),
             transport_policy: ControlPlaneTransportPolicy::default(),
             assignment_signing_key,
             assignment_verifying_key,
@@ -2280,6 +2293,28 @@ impl ControlPlaneCore {
 
     pub fn transport_policy(&self) -> ControlPlaneTransportPolicy {
         self.transport_policy
+    }
+
+    /// Install the signed membership directory that gates signed-artifact
+    /// issuance (RSA-0008). Callers populate it from the authoritative
+    /// membership state so a Revoked or Unknown node is never named in an
+    /// issued bundle or relay-session token. See [`Self::membership_directory`].
+    pub fn set_membership_directory(&mut self, membership_directory: MembershipDirectory) {
+        self.membership_directory = membership_directory;
+    }
+
+    /// Builder form of [`Self::set_membership_directory`].
+    #[must_use]
+    pub fn with_membership_directory(mut self, membership_directory: MembershipDirectory) -> Self {
+        self.membership_directory = membership_directory;
+        self
+    }
+
+    /// `true` when the issuance membership gate is active (the directory has at
+    /// least one node registered). Exposed for callers/tests that need to assert
+    /// the gate is wired before relying on it.
+    pub fn membership_gate_active(&self) -> bool {
+        self.membership_directory.is_populated()
     }
 
     pub fn validate_transport_security(
@@ -3369,6 +3404,20 @@ impl ControlPlaneCore {
     }
 
     fn policy_allows_node_pair(&self, source: &NodeMetadata, destination: &NodeMetadata) -> bool {
+        // RSA-0008: when a signed membership directory is configured, a revoked
+        // or unknown endpoint is never eligible for issuance, regardless of which
+        // ACL selector would otherwise match. This gates signed-artifact emission
+        // at the operator/generator layer (mirroring the daemon's
+        // `check_peer_membership_active` provisioning gate) so a bundle can never
+        // name a node that is not currently Active. Empty/unpopulated directory ⇒
+        // pre-membership deployment: fall back to plain default-deny ACL
+        // evaluation alone (no behavioural change).
+        if self.membership_directory.is_populated()
+            && !(self.node_membership_active(&source.node_id)
+                && self.node_membership_active(&destination.node_id))
+        {
+            return false;
+        }
         let source_selectors = selectors_for_node(source);
         let destination_selectors = selectors_for_node(destination);
         for src in &source_selectors {
@@ -3386,6 +3435,12 @@ impl ControlPlaneCore {
             }
         }
         false
+    }
+
+    /// `true` only when the membership directory reports the node as Active.
+    /// Revoked and Unknown both fail closed (RSA-0008).
+    fn node_membership_active(&self, node_id: &str) -> bool {
+        self.membership_directory.node_status(node_id) == MembershipStatus::Active
     }
 
     fn sign_peer_map_payload(&self, payload: &str) -> String {
@@ -4261,23 +4316,26 @@ mod tests {
     use super::{
         ACCESS_TOKEN_SIGNING_SEED_INFO_V1, ASSIGNMENT_SIGNING_SEED_INFO_V1, AbuseAlertPolicy,
         ApiAbuseMonitor, AuthError, AuthRateLimitConfig, AuthSurfaceGuard, AutoTunnelBundleRequest,
-        ControlPlaneCore, ControlPlanePersistence, ControlPlaneTlsVersion, CredentialError,
-        DnsRecordRequest, DnsRecordType, DnsTargetAddrKind, ENDPOINT_HINT_SIGNING_SEED_INFO_V1,
-        EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
-        EnrollmentRequest, LockoutConfig, MAX_RELAY_SESSION_TOKEN_TTL_SECS, PolicyCheckRequest,
-        PolicyDecision, PolicyGuard, RELAY_TOKEN_SCOPE, RelayFleetBundleRequest,
-        RelayFleetNodeDescriptor, RelaySessionToken, RelaySessionTokenRequest, ReplayPolicy,
-        ReusableCredentialPolicy, ReusableCredentialRequest, RoleCapability,
-        SignedAutoTunnelBundle, SignedDnsZoneBundleRequest, SignedTokenClaims,
-        ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims, TransportPolicyError,
-        TraversalCoordinationRecord, TrustState, auto_tunnel_payload_field_matches,
-        canonical_relay_id_from_label, derive_endpoint_hint_signing_key, derive_signing_seed,
-        hex_bytes, load_trust_state, parse_relay_session_token_wire,
-        parse_signed_relay_fleet_bundle_wire, persist_trust_state, relay_session_token_to_wire,
+        ControlPlaneCore, ControlPlaneError, ControlPlanePersistence, ControlPlaneTlsVersion,
+        CredentialError, DnsRecordRequest, DnsRecordType, DnsTargetAddrKind,
+        ENDPOINT_HINT_SIGNING_SEED_INFO_V1, EndpointHintBundleRequest, EndpointHintCandidate,
+        EndpointHintCandidateType, EnrollmentRequest, LockoutConfig,
+        MAX_RELAY_SESSION_TOKEN_TTL_SECS, PolicyCheckRequest, PolicyDecision, PolicyGuard,
+        RELAY_TOKEN_SCOPE, RelayFleetBundleRequest, RelayFleetNodeDescriptor, RelaySessionToken,
+        RelaySessionTokenRequest, ReplayPolicy, ReusableCredentialPolicy,
+        ReusableCredentialRequest, RoleCapability, SignedAutoTunnelBundle,
+        SignedDnsZoneBundleRequest, SignedTokenClaims, ThrowawayCredentialState,
+        ThrowawayCredentialStore, TokenClaims, TransportPolicyError, TraversalCoordinationRecord,
+        TrustState, auto_tunnel_payload_field_matches, canonical_relay_id_from_label,
+        derive_endpoint_hint_signing_key, derive_signing_seed, hex_bytes, load_trust_state,
+        parse_relay_session_token_wire, parse_signed_relay_fleet_bundle_wire, persist_trust_state,
+        relay_session_token_to_wire,
     };
     use ed25519_dalek::SigningKey;
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
-    use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
+    use rustynet_policy::{
+        MembershipDirectory, MembershipStatus, PolicyRule, PolicySet, Protocol, RuleAction,
+    };
 
     fn payload_field(payload: &str, key: &str) -> Option<String> {
         payload.lines().find_map(|line| {
@@ -7402,6 +7460,132 @@ mod tests {
         token
             .verify_signature(&verifier)
             .expect("relay token must verify with endpoint-hint verifier");
+    }
+
+    // ---- RSA-0008: membership-gated signed-artifact issuance ----
+
+    #[test]
+    fn rsa0008_empty_membership_directory_preserves_issuance() {
+        // Backward-compat: a generator with no membership directory behaves as a
+        // pre-membership deployment and issues exactly as before.
+        let core = allow_all_control_plane();
+        enroll_relay_token_test_node(&core, "cred-a", "node-a", 70);
+        enroll_relay_token_test_node(&core, "cred-b", "node-b", 71);
+        assert!(!core.membership_gate_active());
+        core.issue_relay_session_token(RelaySessionTokenRequest {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            relay_id: "relay-eu-1".to_owned(),
+            requested_at_unix: 500,
+            ttl_secs: 60,
+        })
+        .expect("empty directory must not gate issuance");
+    }
+
+    #[test]
+    fn rsa0008_all_active_membership_directory_still_issues() {
+        let mut core = allow_all_control_plane();
+        enroll_relay_token_test_node(&core, "cred-a", "node-a", 70);
+        enroll_relay_token_test_node(&core, "cred-b", "node-b", 71);
+        let mut directory = MembershipDirectory::default();
+        directory.set_node_status("node-a", MembershipStatus::Active);
+        directory.set_node_status("node-b", MembershipStatus::Active);
+        core.set_membership_directory(directory);
+        assert!(core.membership_gate_active());
+        core.issue_relay_session_token(RelaySessionTokenRequest {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            relay_id: "relay-eu-1".to_owned(),
+            requested_at_unix: 500,
+            ttl_secs: 60,
+        })
+        .expect("active endpoints must issue");
+    }
+
+    #[test]
+    fn rsa0008_relay_token_denied_for_revoked_peer() {
+        let mut core = allow_all_control_plane();
+        enroll_relay_token_test_node(&core, "cred-a", "node-a", 70);
+        enroll_relay_token_test_node(&core, "cred-b", "node-b", 71);
+        let mut directory = MembershipDirectory::default();
+        directory.set_node_status("node-a", MembershipStatus::Active);
+        directory.set_node_status("node-b", MembershipStatus::Revoked);
+        core.set_membership_directory(directory);
+        let err = core
+            .issue_relay_session_token(RelaySessionTokenRequest {
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
+                relay_id: "relay-eu-1".to_owned(),
+                requested_at_unix: 500,
+                ttl_secs: 60,
+            })
+            .expect_err("a revoked peer must be denied a relay session token");
+        assert!(matches!(err, ControlPlaneError::Traversal(_)));
+    }
+
+    #[test]
+    fn rsa0008_relay_token_denied_for_unknown_node_when_directory_populated() {
+        // node-b is enrolled but absent from a populated directory ⇒ Unknown ⇒ deny
+        // (fail-closed: the directory is authoritative once populated).
+        let mut core = allow_all_control_plane();
+        enroll_relay_token_test_node(&core, "cred-a", "node-a", 70);
+        enroll_relay_token_test_node(&core, "cred-b", "node-b", 71);
+        let mut directory = MembershipDirectory::default();
+        directory.set_node_status("node-a", MembershipStatus::Active);
+        core.set_membership_directory(directory);
+        core.issue_relay_session_token(RelaySessionTokenRequest {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            relay_id: "relay-eu-1".to_owned(),
+            requested_at_unix: 500,
+            ttl_secs: 60,
+        })
+        .expect_err("an unknown (unlisted) peer must be denied once the gate is active");
+    }
+
+    #[test]
+    fn rsa0008_revoked_peer_excluded_from_auto_tunnel_bundle() {
+        let mut core = auto_tunnel_test_core();
+        // Give node-b an exit role so it would otherwise be a selected peer.
+        let mut exit_node = core
+            .nodes
+            .get("node-b")
+            .expect("registry access")
+            .expect("node-b exists");
+        exit_node.capabilities = vec![RoleCapability::Anchor, RoleCapability::ExitServer];
+        core.nodes.upsert(exit_node).expect("update node-b role");
+
+        let mut directory = MembershipDirectory::default();
+        directory.set_node_status("node-a", MembershipStatus::Active);
+        directory.set_node_status("node-b", MembershipStatus::Revoked);
+        core.set_membership_directory(directory);
+
+        let bundle = core
+            .signed_auto_tunnel_bundle(auto_tunnel_request())
+            .expect("bundle issues for the active target");
+        // node-b is revoked ⇒ no peer, no exit reference survives the gate.
+        assert_eq!(
+            payload_field(&bundle.payload, "peer_count").as_deref(),
+            Some("0"),
+            "a revoked peer must be excluded from the issued bundle"
+        );
+    }
+
+    #[test]
+    fn rsa0008_revoked_target_yields_no_peers() {
+        let mut core = auto_tunnel_test_core();
+        let mut directory = MembershipDirectory::default();
+        directory.set_node_status("node-a", MembershipStatus::Revoked);
+        directory.set_node_status("node-b", MembershipStatus::Active);
+        core.set_membership_directory(directory);
+        let bundle = core
+            .signed_auto_tunnel_bundle(auto_tunnel_request())
+            .expect("bundle still emits structurally");
+        assert_eq!(
+            payload_field(&bundle.payload, "peer_count").as_deref(),
+            Some("0"),
+            "a revoked target must not be paired with any peer"
+        );
     }
 
     #[test]

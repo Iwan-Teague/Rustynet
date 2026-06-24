@@ -1132,57 +1132,57 @@ const FORBIDDEN_SECRET_EQUALITY_TOKENS: &[&str] = &[
 const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, u32, &str)] = &[
     (
         "crates/rustynet-control/src/lib.rs",
-        1485,
+        1488,
         "nonce counter zero-check on relay fleet bundle u64 input (not secret material)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        1547,
+        1550,
         "canonical-payload u64 round-trip equality for nonce field (structural check, not secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        2002,
+        2005,
         "all-zero sentinel rejection on relay session token nonce field (not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        2035,
+        2038,
         "canonical-payload string equality on relay session token (structural canonicalisation check, signature handled separately via ct_eq)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        2893,
+        2928,
         "nonce counter zero-check on relay fleet request u64 input (not secret material)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3047,
+        3082,
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3052,
+        3087,
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3185,
+        3220,
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3188,
+        3223,
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        4215,
+        4270,
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        4220,
+        4275,
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
     ),
     (
