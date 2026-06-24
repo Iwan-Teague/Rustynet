@@ -96,9 +96,10 @@ pub fn collect_macos_exit_nat_lifecycle_snapshot(
 ) -> MacosExitNatLifecycleSnapshot {
     let now_unix = current_unix_seconds();
     let (pf_anchor_present, internal_prefix) =
-        capture_pf_anchor_state(options.pf_anchor.as_str()).unwrap_or((false, String::new()));
-    let forwarding_state =
-        capture_sysctl_forwarding(forwarding_sysctl_key_for_cidr(options.mesh_cidr.as_str()));
+        interpret_pf_anchor_capture(capture_pf_anchor_state(options.pf_anchor.as_str()));
+    let forwarding_state = interpret_forwarding_capture(capture_sysctl_forwarding(
+        forwarding_sysctl_key_for_cidr(options.mesh_cidr.as_str()),
+    ));
     MacosExitNatLifecycleSnapshot {
         schema_version: MACOS_EXIT_NAT_LIFECYCLE_SCHEMA_VERSION,
         captured_at_unix: now_unix,
@@ -179,6 +180,24 @@ fn current_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Interpret a pf-anchor capture result FAIL-CLOSED (RSA-0031). A `pfctl`
+/// spawn/exec *failure* (`Err`) means the daemon cannot confirm whether the
+/// exit-NAT anchor was torn down, so it must report the anchor as still present
+/// — never absent — so the teardown-verification validator does not pass an
+/// unverifiable capture. An `Ok((false, _))` is the legitimate "pfctl ran and
+/// the anchor is not loaded" case and is preserved.
+fn interpret_pf_anchor_capture(result: Result<(bool, String), ()>) -> (bool, String) {
+    result.unwrap_or((true, String::new()))
+}
+
+/// Interpret a sysctl forwarding capture FAIL-CLOSED (RSA-0031). A read failure
+/// (`None`) is reported as `"Unknown"` rather than `"Disabled"`, so the merge
+/// step does not conclude forwarding was restored on a capture it could not
+/// perform.
+fn interpret_forwarding_capture(captured: Option<String>) -> String {
+    captured.unwrap_or_else(|| "Unknown".to_owned())
+}
+
 #[cfg(target_os = "macos")]
 fn capture_pf_anchor_state(pf_anchor: &str) -> Result<(bool, String), ()> {
     let output = Command::new("/sbin/pfctl")
@@ -207,21 +226,24 @@ fn capture_pf_anchor_state(_pf_anchor: &str) -> Result<(bool, String), ()> {
 }
 
 #[cfg(target_os = "macos")]
-fn capture_sysctl_forwarding(forwarding_key: &str) -> String {
+fn capture_sysctl_forwarding(forwarding_key: &str) -> Option<String> {
     let output = Command::new("/usr/sbin/sysctl")
         .args(["-n", forwarding_key])
         .output();
     match output {
-        Ok(out) if out.status.success() => {
-            parse_sysctl_forwarding(String::from_utf8_lossy(&out.stdout).as_ref())
-        }
-        _ => "Disabled".to_owned(),
+        // Only a successful read yields a state; a spawn/exec error or non-zero
+        // status returns `None` so the caller fails closed (RSA-0031) rather
+        // than defaulting to "Disabled" (which would falsely read as restored).
+        Ok(out) if out.status.success() => Some(parse_sysctl_forwarding(
+            String::from_utf8_lossy(&out.stdout).as_ref(),
+        )),
+        _ => None,
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn capture_sysctl_forwarding(_forwarding_key: &str) -> String {
-    "Disabled".to_owned()
+fn capture_sysctl_forwarding(_forwarding_key: &str) -> Option<String> {
+    None
 }
 
 /// The macOS forwarding sysctl that governs the mesh prefix's address family:
@@ -276,8 +298,11 @@ fn parse_sysctl_forwarding(stdout: &str) -> String {
     let trimmed = stdout.trim();
     match trimmed {
         "1" => "Enabled".to_owned(),
-        "0" | "" => "Disabled".to_owned(),
-        _ => "Disabled".to_owned(),
+        "0" => "Disabled".to_owned(),
+        // Anything else — empty or malformed — is ambiguous and must NOT read as
+        // "Disabled" (RSA-0031 fail-closed): a teardown is only confirmed
+        // restored on an explicit "0".
+        _ => "Unknown".to_owned(),
     }
 }
 
@@ -326,8 +351,10 @@ mod tests {
     fn parse_sysctl_forwarding_canonicalises_enabled() {
         assert_eq!(parse_sysctl_forwarding("1\n"), "Enabled");
         assert_eq!(parse_sysctl_forwarding("0\n"), "Disabled");
-        assert_eq!(parse_sysctl_forwarding(""), "Disabled");
-        assert_eq!(parse_sysctl_forwarding("garbage"), "Disabled");
+        // RSA-0031 fail-closed: empty/garbage output is ambiguous and must NOT
+        // canonicalise to "Disabled" (which would falsely read as restored).
+        assert_eq!(parse_sysctl_forwarding(""), "Unknown");
+        assert_eq!(parse_sysctl_forwarding("garbage"), "Unknown");
     }
 
     #[test]
@@ -422,6 +449,55 @@ mod tests {
             "com.rustynet/nat",
             "",
             "1",
+        );
+        let merged = merge_macos_exit_nat_lifecycle_artifact(&during, &after);
+        assert_eq!(merged["after_stop"]["forwarding_restored"], false);
+    }
+
+    #[test]
+    fn pf_anchor_capture_failure_fails_closed_as_present() {
+        // RSA-0031: a pfctl spawn/exec FAILURE must report the anchor as still
+        // present (cannot confirm teardown), never absent.
+        assert_eq!(interpret_pf_anchor_capture(Err(())), (true, String::new()));
+        // A successful capture passes through unchanged (anchor genuinely
+        // absent stays absent).
+        assert_eq!(
+            interpret_pf_anchor_capture(Ok((false, String::new()))),
+            (false, String::new())
+        );
+        assert_eq!(
+            interpret_pf_anchor_capture(Ok((true, "100.64.0.0/16".to_owned()))),
+            (true, "100.64.0.0/16".to_owned())
+        );
+    }
+
+    #[test]
+    fn forwarding_capture_failure_fails_closed_as_unknown() {
+        // RSA-0031: a failed sysctl read must NOT read as "Disabled".
+        assert_eq!(interpret_forwarding_capture(None), "Unknown");
+        assert_eq!(
+            interpret_forwarding_capture(Some("Disabled".to_owned())),
+            "Disabled"
+        );
+    }
+
+    #[test]
+    fn merge_artifact_does_not_report_teardown_when_forwarding_unverifiable() {
+        // RSA-0031 regression: an after-stop snapshot whose forwarding could not
+        // be confirmed disabled ("Unknown") must NOT report forwarding_restored.
+        let during = build_macos_exit_nat_lifecycle_snapshot(
+            1,
+            "100.64.0.0/16",
+            "com.rustynet/nat",
+            "nat on en0 inet from 100.64.0.0/16 to any -> (en0)\n",
+            "1",
+        );
+        let after = build_macos_exit_nat_lifecycle_snapshot(
+            2,
+            "100.64.0.0/16",
+            "com.rustynet/nat",
+            "",
+            "garbage", // sysctl read returned something unparseable
         );
         let merged = merge_macos_exit_nat_lifecycle_artifact(&during, &after);
         assert_eq!(merged["after_stop"]["forwarding_restored"], false);

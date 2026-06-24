@@ -55,8 +55,8 @@ pub fn collect_windows_exit_nat_lifecycle_snapshot(
 ) -> Result<WindowsExitNatLifecycleSnapshot, String> {
     validate_windows_nat_options(options)?;
     let now = current_unix_seconds();
-    let netnat_json = capture_windows_netnat_json(options.nat_name.as_str()).unwrap_or_default();
-    let (netnat_present, internal_prefix) = parse_netnat_json(netnat_json.as_str());
+    let (netnat_present, internal_prefix) =
+        interpret_netnat_capture(capture_windows_netnat_json(options.nat_name.as_str()));
     let egress_alias = capture_windows_default_egress_alias(options.tunnel_alias.as_str())
         .unwrap_or_default()
         .trim()
@@ -115,9 +115,18 @@ pub fn merge_windows_exit_nat_lifecycle_artifact(
     during_run: &WindowsExitNatLifecycleSnapshot,
     after_stop: &WindowsExitNatLifecycleSnapshot,
 ) -> serde_json::Value {
+    // RSA-0031 fail-closed: forwarding counts as restored ONLY when both
+    // interfaces report an EXPLICIT "Disabled". The previous `!= "Enabled"`
+    // predicate was fail-open — a capture error rendered as "Error: ..." (or any
+    // non-"Enabled" value) wrongly counted as restored, masking residual
+    // forwarding the daemon could not actually confirm was torn down.
     let forwarding_restored = !after_stop.netnat_present
-        && !after_stop.tunnel_forwarding.eq_ignore_ascii_case("Enabled")
-        && !after_stop.egress_forwarding.eq_ignore_ascii_case("Enabled");
+        && after_stop
+            .tunnel_forwarding
+            .eq_ignore_ascii_case("Disabled")
+        && after_stop
+            .egress_forwarding
+            .eq_ignore_ascii_case("Disabled");
     serde_json::json!({
         "schema_version": WINDOWS_EXIT_NAT_LIFECYCLE_SCHEMA_VERSION,
         "nat_name": during_run.nat_name,
@@ -145,6 +154,18 @@ pub fn validate_windows_nat_options(
     validate_windows_safe_name(options.nat_name.as_str(), "NAT name")?;
     validate_windows_safe_name(options.tunnel_alias.as_str(), "tunnel alias")?;
     Ok(())
+}
+
+/// Interpret a `Get-NetNat` capture result FAIL-CLOSED (RSA-0031). A capture
+/// *failure* (`Err`) means the daemon cannot confirm the NAT was removed, so it
+/// must report the NAT as still present — never absent — so the teardown
+/// validator does not pass an unverifiable capture. A successful capture is
+/// parsed normally (an empty/absent NAT stays absent).
+fn interpret_netnat_capture(captured: Result<String, String>) -> (bool, String) {
+    match captured {
+        Ok(json) => parse_netnat_json(json.as_str()),
+        Err(_) => (true, String::new()),
+    }
 }
 
 pub fn parse_netnat_json(raw: &str) -> (bool, String) {
@@ -391,6 +412,80 @@ mod tests {
         assert_eq!(merged["nat_name"], DEFAULT_WINDOWS_EXIT_NAT_NAME);
         assert_eq!(merged["during_run"]["netnat_present"], true);
         assert_eq!(merged["after_stop"]["forwarding_restored"], true);
+    }
+
+    #[test]
+    fn netnat_capture_failure_fails_closed_as_present() {
+        // RSA-0031: a Get-NetNat capture FAILURE must report the NAT as still
+        // present (cannot confirm removal), never absent.
+        assert_eq!(
+            interpret_netnat_capture(Err("powershell spawn failed".to_owned())),
+            (true, String::new())
+        );
+        // A successful empty capture stays absent.
+        assert_eq!(
+            interpret_netnat_capture(Ok(String::new())),
+            (false, String::new())
+        );
+    }
+
+    #[test]
+    fn merge_artifact_does_not_report_teardown_on_unverifiable_forwarding() {
+        // RSA-0031 regression: an after-stop snapshot whose forwarding capture
+        // errored ("Error: ...") must NOT count as forwarding_restored — the old
+        // `!= "Enabled"` predicate was fail-open here.
+        let during = build_windows_exit_nat_lifecycle_snapshot(
+            1,
+            &options(),
+            r#"{"InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}"#,
+            "Enabled",
+            "Enabled",
+            "Ethernet",
+            "",
+        )
+        .unwrap();
+        let after = build_windows_exit_nat_lifecycle_snapshot(
+            2,
+            &options(),
+            "",
+            "Error: powershell capture failed",
+            "Disabled",
+            "Ethernet",
+            "",
+        )
+        .unwrap();
+        let merged = merge_windows_exit_nat_lifecycle_artifact(&during, &after);
+        assert_eq!(merged["after_stop"]["forwarding_restored"], false);
+    }
+
+    #[test]
+    fn merge_artifact_does_not_report_teardown_when_nat_residue_present() {
+        // RSA-0031: residual NAT (or an unverifiable NAT capture rendered as
+        // present) must keep forwarding_restored=false even with both forwarding
+        // flags Disabled.
+        let during = build_windows_exit_nat_lifecycle_snapshot(
+            1,
+            &options(),
+            r#"{"InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}"#,
+            "Enabled",
+            "Enabled",
+            "Ethernet",
+            "",
+        )
+        .unwrap();
+        let after = build_windows_exit_nat_lifecycle_snapshot(
+            2,
+            &options(),
+            r#"{"InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}"#,
+            "Disabled",
+            "Disabled",
+            "Ethernet",
+            "",
+        )
+        .unwrap();
+        let merged = merge_windows_exit_nat_lifecycle_artifact(&during, &after);
+        assert_eq!(merged["after_stop"]["netnat_present"], true);
+        assert_eq!(merged["after_stop"]["forwarding_restored"], false);
     }
 
     #[test]
