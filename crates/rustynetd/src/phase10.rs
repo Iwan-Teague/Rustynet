@@ -3826,6 +3826,38 @@ const WINDOWS_DNS_RULE_BLOCK_LAN_TCP: &str = "RustyNetDNS-BlockLanTcp";
 const WINDOWS_IPV6_RULE_BLOCK_LAN: &str = "RustyNetKS-BlockIpv6Lan";
 const WINDOWS_PS_REQUIRE_EXIT_CMDLETS: &str = "& { $ErrorActionPreference = 'Stop'; Get-Command Set-NetIPInterface | Out-Null; Get-Command Get-NetIPInterface | Out-Null; Get-Command New-NetNat | Out-Null; Get-Command Get-NetNat | Out-Null; Get-Command Remove-NetNat | Out-Null; try { Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat -ErrorAction Stop | Out-Null } catch { throw 'RustyNet exit serving requires the Windows WinNAT WMI provider (MSFT_NetNat in root/standardcimv2); this host lacks the Host Network Service / WinNAT networking stack, so New-NetNat fails with Invalid class. Install the WinNAT/HNS networking component to serve as a full-tunnel exit.' } }";
 const WINDOWS_PS_PREFLIGHT_EXIT_SERVING: &str = "& { param($TunnelAlias, $EgressAlias) $ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $principal = New-Object Security.Principal.WindowsPrincipal($identity); if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'RustyNet exit serving requires an elevated administrator or service token' }; foreach ($cmd in @('Set-NetIPInterface','Get-NetIPInterface','New-NetNat','Get-NetNat','Remove-NetNat','Get-NetRoute')) { Get-Command $cmd -ErrorAction Stop | Out-Null }; try { Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat -ErrorAction Stop | Out-Null } catch { throw 'RustyNet exit serving requires the Windows WinNAT WMI provider (MSFT_NetNat in root/standardcimv2); this host lacks the Host Network Service / WinNAT networking stack, so New-NetNat fails with Invalid class. Install the WinNAT/HNS networking component to serve as a full-tunnel exit.' }; if ($TunnelAlias -eq $EgressAlias) { throw 'RustyNet tunnel and outbound interface aliases must be distinct' }; Get-NetIPInterface -InterfaceAlias $TunnelAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetIPInterface -InterfaceAlias $EgressAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $EgressAlias -ErrorAction Stop | Out-Null }";
+/// §10.7 — the (script, args) command plan for flushing residual Windows exit
+/// NAT + forwarding when a generation does NOT serve an exit. Empty when it
+/// does serve, so it can never race the `activate_exit_nat` (`New-NetNat`) load
+/// that happens later in the same apply. Pure so the residue policy is
+/// unit-testable on any host without executing PowerShell (the actual
+/// `Get-NetNat`/`Set-NetIPInterface` run requires a Windows guest).
+fn windows_exit_nat_residue_plan(
+    serving_exit: bool,
+    nat_name: &str,
+    tunnel_alias: &str,
+    egress_alias: &str,
+) -> Vec<(&'static str, Vec<String>)> {
+    if serving_exit {
+        return Vec::new();
+    }
+    vec![
+        // Remove the fixed-name NetNat (no-op if absent; safe on a non-WinNAT host
+        // because WINDOWS_PS_REMOVE_NAT swallows the Get-NetNat lookup error).
+        (WINDOWS_PS_REMOVE_NAT, vec![nat_name.to_owned()]),
+        // Drive forwarding back to the secure default on both interfaces a former
+        // exit would have enabled it on (a non-exit node must not forward).
+        (
+            WINDOWS_PS_SET_FORWARDING,
+            vec![tunnel_alias.to_owned(), "Disabled".to_owned()],
+        ),
+        (
+            WINDOWS_PS_SET_FORWARDING,
+            vec![egress_alias.to_owned(), "Disabled".to_owned()],
+        ),
+    ]
+}
+
 const WINDOWS_PS_GET_FORWARDING: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding }";
 const WINDOWS_PS_SET_FORWARDING: &str = "& { param($Alias, $State) $ErrorActionPreference = 'Stop'; Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -Forwarding $State -ErrorAction Stop }";
 const WINDOWS_PS_REMOVE_NAT: &str = "& { param($Name) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction SilentlyContinue; if ($null -ne $nat) { $nat | Remove-NetNat -Confirm:$false -ErrorAction Stop } }";
@@ -3859,6 +3891,32 @@ const WINDOWS_NRPT_REG_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Services\Dnsc
 impl DataplaneSystem for WindowsCommandSystem {
     fn set_generation(&mut self, generation: u64) {
         self.generation = generation;
+    }
+
+    fn reconcile_exit_nat_residue(&mut self, serving_exit: bool) -> Result<(), SystemError> {
+        // §10.7: a node that crashed while serving as a Windows exit and restarts
+        // as a client must self-heal the fixed-name `New-NetNat` instance and the
+        // enabled IP forwarding. The normal exit→client demotion
+        // (`rollback_nat_forwarding`) relies on the in-memory `nat_applied` /
+        // `previous_forwarding` state, which a crash/SIGKILL/OOM loses, leaving a
+        // live NAT rule + forwarding with no owner. Linux self-heals via
+        // generation-numbered tables; macOS overrides this for its fixed pf
+        // anchor; Windows had no override (default no-op) — this closes that gap.
+        //
+        // Best-effort (allow-failure): a client that never served must not fail
+        // startup because the cleanup found nothing (WINDOWS_PS_REMOVE_NAT already
+        // swallows a missing NAT, and Set-NetIPInterface to the already-Disabled
+        // default is idempotent). It runs only when NOT serving an exit, so it can
+        // never race the `activate_exit_nat` load later in the same apply.
+        for (script, args) in windows_exit_nat_residue_plan(
+            serving_exit,
+            &self.nat_name,
+            &self.interface_name,
+            &self.egress_interface,
+        ) {
+            let _ = self.run_powershell(script, &args);
+        }
+        Ok(())
     }
 
     fn check_prerequisites(&mut self) -> Result<(), SystemError> {
@@ -9054,6 +9112,35 @@ mod tests {
             .expect_err("Windows NetNat must reject IPv6 mesh prefixes until supported");
         assert!(matches!(err, SystemError::NatApplyFailed(_)));
         assert!(err.to_string().contains("IPv4 mesh CIDRs only"));
+    }
+
+    #[test]
+    fn windows_exit_nat_residue_plan_flushes_only_when_not_serving() {
+        // §10.7: serving an exit ⇒ no residue cleanup (must not race activation).
+        assert!(
+            windows_exit_nat_residue_plan(true, "RustyNetExit-wg0", "wg0", "Ethernet").is_empty()
+        );
+        // Not serving ⇒ remove the fixed-name NAT + force forwarding Disabled on
+        // both the tunnel and egress interfaces (the secure default for a node
+        // that must not forward), in that order.
+        let plan = windows_exit_nat_residue_plan(false, "RustyNetExit-wg0", "wg0", "Ethernet");
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].0, WINDOWS_PS_REMOVE_NAT);
+        assert_eq!(plan[0].1, vec!["RustyNetExit-wg0".to_owned()]);
+        assert_eq!(
+            plan[1],
+            (
+                WINDOWS_PS_SET_FORWARDING,
+                vec!["wg0".to_owned(), "Disabled".to_owned()]
+            )
+        );
+        assert_eq!(
+            plan[2],
+            (
+                WINDOWS_PS_SET_FORWARDING,
+                vec!["Ethernet".to_owned(), "Disabled".to_owned()]
+            )
+        );
     }
 
     #[test]
