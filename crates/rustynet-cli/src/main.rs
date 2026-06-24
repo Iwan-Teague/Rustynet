@@ -15413,7 +15413,7 @@ fn check_linux_doctor(checks: &mut Vec<String>, all_pass: &mut bool) {
                 }
             }
             Err(e) => {
-                checks.push(format!("✗ cannot check /etc/rustynet permissions: {}", e));
+                checks.push(format!("✗ cannot check /etc/rustynet permissions: {e}"));
                 *all_pass = false;
             }
         }
@@ -17323,12 +17323,16 @@ fn execute_role_plan(plan: role_cli::RoleSetPlan) -> Result<String, String> {
 
     match plan {
         role_cli::RoleSetPlan::Blocked { from, to, error } => {
-            emit_role_audit(&RoleTransitionEvent::PresetTransition {
+            // A blocked transition applied no side-effects, so a missing audit
+            // record cannot mask a mutation — best-effort warn.
+            if let Err(audit_err) = emit_role_audit(&RoleTransitionEvent::PresetTransition {
                 from,
                 to,
                 outcome: RoleTransitionOutcome::Blocked,
                 error_category: Some(role_cli::role_cli_error_category(&error)),
-            });
+            }) {
+                eprintln!("[warn] {audit_err}");
+            }
             Err(format!(
                 "transition {from} → {to} blocked: {}",
                 error.user_message()
@@ -17337,7 +17341,7 @@ fn execute_role_plan(plan: role_cli::RoleSetPlan) -> Result<String, String> {
         role_cli::RoleSetPlan::Allowed {
             from,
             to,
-            kind: _,
+            kind,
             actions,
             followup_instructions,
         } => {
@@ -17348,12 +17352,18 @@ fn execute_role_plan(plan: role_cli::RoleSetPlan) -> Result<String, String> {
                         summary.push_str(&format!("  applied: {action_summary}\n"));
                     }
                     Err(err) => {
-                        emit_role_audit(&RoleTransitionEvent::PresetTransition {
-                            from,
-                            to,
-                            outcome: RoleTransitionOutcome::Failed,
-                            error_category: Some("side_effect_failed"),
-                        });
+                        // A side-effect already failed and we are returning Err;
+                        // the Failed audit is best-effort evidence.
+                        if let Err(audit_err) =
+                            emit_role_audit(&RoleTransitionEvent::PresetTransition {
+                                from,
+                                to,
+                                outcome: RoleTransitionOutcome::Failed,
+                                error_category: Some("side_effect_failed"),
+                            })
+                        {
+                            eprintln!("[warn] {audit_err}");
+                        }
                         return Err(err);
                     }
                 }
@@ -17364,12 +17374,16 @@ fn execute_role_plan(plan: role_cli::RoleSetPlan) -> Result<String, String> {
                     summary.push_str(&format!("  - {instruction}\n"));
                 }
             }
-            emit_role_audit(&RoleTransitionEvent::PresetTransition {
+            // RSA-0014: for security-sensitive (capability-bearing / irreversible)
+            // transitions a durable audit record is mandatory — fail closed if it
+            // cannot be written rather than reporting a silent success.
+            let audit_result = emit_role_audit(&RoleTransitionEvent::PresetTransition {
                 from,
                 to,
                 outcome: RoleTransitionOutcome::Succeeded,
                 error_category: None,
             });
+            finalize_role_audit(&kind, audit_result)?;
             Ok(summary)
         }
     }
@@ -17386,21 +17400,57 @@ fn audit_timestamp_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Append a role-transition audit entry. Failures are surfaced as a
-/// non-fatal stderr warning — audit logging is operator-visible
-/// evidence, not a security gate that should block legitimate role
-/// changes when the log path is temporarily unavailable. The chain
-/// integrity verifier (`role_audit::verify_role_audit_chain`) is
-/// what catches tampering after the fact.
-fn emit_role_audit(event: &rustynet_control::role_audit::RoleTransitionEvent) {
+/// Append a role-transition audit entry, returning the append result so the
+/// caller can decide whether a failure is fatal (RSA-0014). The chain integrity
+/// verifier (`role_audit::verify_role_audit_chain`) is what catches tampering
+/// after the fact; this function only persists the entry.
+fn emit_role_audit(
+    event: &rustynet_control::role_audit::RoleTransitionEvent,
+) -> Result<(), String> {
     let path = role_cli::resolve_audit_log_path();
-    if let Err(err) =
-        rustynet_control::role_audit::append_role_audit_entry(&path, audit_timestamp_unix(), event)
-    {
-        eprintln!(
-            "[warn] role-transition audit log append failed (path={}): {err}",
-            path.display()
-        );
+    rustynet_control::role_audit::append_role_audit_entry(&path, audit_timestamp_unix(), event)
+        .map(|_entry| ())
+        .map_err(|err| {
+            format!(
+                "role-transition audit log append failed (path={}): {err}",
+                path.display()
+            )
+        })
+}
+
+/// RSA-0014 — decide whether a durable-audit-append failure must abort the
+/// transition. SecurityMinimumBar §A1 requires *every* transition to emit a
+/// durable record; CLAUDE.md §3 requires failing closed when security-relevant
+/// state cannot be persisted. For **security-sensitive** transitions
+/// (`SignedMembership` — capability changes — and `Irreversible` — destructive
+/// one-way changes such as `blind_exit`), an un-writable audit log is treated
+/// as fail-closed: the command returns `Err` so the operator cannot believe a
+/// capability-bearing or destructive transition completed with no durable
+/// record. For lower-sensitivity transitions (`Identity`/`LocalOnly`, which are
+/// reversible local config writes with no capability or trust change) the
+/// append remains best-effort and only warns, so a transient log-path issue
+/// does not strand an operator mid-reconfigure.
+///
+/// Owner decision (was the RSA-0014 Question item): scoped fail-closed to the
+/// `requires_owner_signature()` transitions — the strictest secure default that
+/// does not regress reversible local reconfiguration.
+fn finalize_role_audit(
+    kind: &rustynet_control::role_presets::TransitionKind,
+    append_result: Result<(), String>,
+) -> Result<(), String> {
+    match append_result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if kind.requires_owner_signature() {
+                Err(format!(
+                    "fail-closed: durable audit record could not be written for a \
+                     security-sensitive role transition; refusing to report success — {err}"
+                ))
+            } else {
+                eprintln!("[warn] {err}");
+                Ok(())
+            }
+        }
     }
 }
 
@@ -17765,12 +17815,16 @@ fn execute_capability(cmd: CapabilityCommand) -> Result<String, String> {
                 CapabilityCommand::Remove(c) => (c, CapabilityMutationKind::Remove),
                 CapabilityCommand::List => unreachable!(),
             };
-            emit_role_audit(&RoleTransitionEvent::CapabilityMutation {
+            // Always Blocked pre-D11.a: no capability mutation is applied, so
+            // the audit append is best-effort (no mutation to mask).
+            if let Err(audit_err) = emit_role_audit(&RoleTransitionEvent::CapabilityMutation {
                 capability: target_cap,
                 mutation: mutation_kind,
                 outcome: RoleTransitionOutcome::Blocked,
                 error_category: Some("blocked_by_capability_schema"),
-            });
+            }) {
+                eprintln!("[warn] {audit_err}");
+            }
             let _ = cap; // Capability type used for typed parse.
             Err(format!(
                 "capability mutation for {target_cap} requires the D11.a capability schema (membership-bundle node_capabilities field). \
@@ -19737,18 +19791,18 @@ mod tests {
         build_membership_audit_replay_json, build_membership_evidence_diff_json,
         classify_cli_error, command_supports_json_render, contains_ip_rule_lookup_table,
         detect_tampered_log, execute, execute_macos_relay_service_action, extract_json_flag,
-        help_text, is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
-        load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
-        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
-        parse_prior_membership_evidence_body, parse_wireguard_go_pids_from_ps,
-        persist_encrypted_secret_material, phase6_stage_probe_from_source,
-        phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
-        phase6_validate_platform_parity_report, read_json_value, render_key_value_line_as_json,
-        render_launchd_plist, required_macos_tunnel_keychain_account,
-        required_macos_tunnel_keychain_service, rewrite_assignment_refresh_exit_node,
-        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
-        update_node_role_env_file, update_node_role_macos_plist, validate_control_socket_security,
-        write_json_pretty_file,
+        finalize_role_audit, help_text, is_interface_absent_detail, launchd_xml_escape,
+        load_dns_zone_records_manifest, load_signing_key, managed_dns_resolver_server_arg,
+        managed_dns_routing_already_absent, parse_bool_value, parse_bundle_u64_field,
+        parse_command, parse_managed_pf_anchors, parse_prior_membership_evidence_body,
+        parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
+        phase6_stage_probe_from_source, phase6_sync_platform_probe_from_inbox,
+        phase6_validate_macos_start_contract_text, phase6_validate_platform_parity_report,
+        read_json_value, render_key_value_line_as_json, render_launchd_plist,
+        required_macos_tunnel_keychain_account, required_macos_tunnel_keychain_service,
+        rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
+        rewrite_env_key_value, to_ipc_command, unix_now, update_node_role_env_file,
+        update_node_role_macos_plist, validate_control_socket_security, write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
@@ -24247,5 +24301,46 @@ mod tests {
             out.contains("RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock\n"),
             "{out}"
         );
+    }
+
+    // ---- RSA-0014: durable-audit fail-closed for security-sensitive transitions ----
+
+    #[test]
+    fn rsa0014_audit_failure_is_fatal_for_signed_membership() {
+        use rustynet_control::role_presets::TransitionKind;
+        let err = finalize_role_audit(
+            &TransitionKind::SignedMembership,
+            Err("disk full".to_owned()),
+        )
+        .expect_err("a capability-bearing transition must fail closed on audit failure");
+        assert!(err.contains("fail-closed"), "{err}");
+    }
+
+    #[test]
+    fn rsa0014_audit_failure_is_fatal_for_irreversible() {
+        use rustynet_control::role_presets::TransitionKind;
+        finalize_role_audit(
+            &TransitionKind::Irreversible("blind_exit"),
+            Err("read-only fs".to_owned()),
+        )
+        .expect_err("an irreversible transition must fail closed on audit failure");
+    }
+
+    #[test]
+    fn rsa0014_audit_failure_is_nonfatal_for_local_only() {
+        use rustynet_control::role_presets::TransitionKind;
+        // Reversible local reconfiguration is not stranded by a transient audit
+        // log problem — best-effort warn, transition still reports success.
+        finalize_role_audit(&TransitionKind::LocalOnly, Err("transient".to_owned()))
+            .expect("local-only transition stays best-effort on audit failure");
+        finalize_role_audit(&TransitionKind::Identity, Err("transient".to_owned()))
+            .expect("identity transition stays best-effort on audit failure");
+    }
+
+    #[test]
+    fn rsa0014_audit_success_always_ok() {
+        use rustynet_control::role_presets::TransitionKind;
+        finalize_role_audit(&TransitionKind::SignedMembership, Ok(())).expect("ok stays ok");
+        finalize_role_audit(&TransitionKind::Irreversible("x"), Ok(())).expect("ok stays ok");
     }
 }
