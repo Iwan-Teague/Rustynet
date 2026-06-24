@@ -2948,10 +2948,25 @@ impl DataplaneSystem for MacosCommandSystem {
         // with the normal `teardown_exit_nat`, and — because it never runs for a
         // serving-exit apply — cannot race the `activate_exit_nat` load that
         // happens a few stages later in the same apply.
+        //
+        // Also drive `net.inet.ip.forwarding` back to the secure default (0).
+        // `activate_exit_nat` caches the prior value only in memory, so after a
+        // crash a former exit that restarts as a non-exit would leave forwarding
+        // enabled with no path to restore it. A non-exit node must not forward,
+        // so 0 is the correct fail-closed default. The NORMAL exit→client
+        // demotion still restores the cached prior afterward: when `NatApplied`
+        // was recorded, `rollback_obsolete_controls` calls `rollback_nat_forwarding`
+        // → `restore_ip_forwarding` LATER in the same pass, overriding this; the
+        // crash path (empty `active_stages`) skips that branch, so this secure
+        // default stands.
         if !serving_exit {
             self.run_allow_failure(
                 PrivilegedCommandProgram::Pfctl,
                 &["-a", DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR, "-F", "all"],
+            );
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Sysctl,
+                &["-w", "net.inet.ip.forwarding=0"],
             );
         }
         Ok(())
@@ -8775,21 +8790,26 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
 
         assert_eq!(
-            after_not_serving, 1,
-            "not-serving reconcile must issue exactly one command (the flush); got: {command_log:?}"
+            after_not_serving, 2,
+            "not-serving reconcile must flush the NAT anchor AND reset forwarding; got: {command_log:?}"
         );
         assert_eq!(
             command_log.len(),
-            1,
+            2,
             "serving reconcile must issue no command; got: {command_log:?}"
         );
-        let flush = &command_log[0];
         assert!(
-            flush.contains("pfctl")
-                && flush.contains("com.rustynet/nat")
-                && flush.contains("-F")
-                && flush.contains("all"),
-            "the single command must be the fixed-anchor flush; got: {flush:?}"
+            command_log.iter().any(|c| c.contains("pfctl")
+                && c.contains("com.rustynet/nat")
+                && c.contains("-F")
+                && c.contains("all")),
+            "must flush the fixed NAT anchor; got: {command_log:?}"
+        );
+        assert!(
+            command_log
+                .iter()
+                .any(|c| c.contains("sysctl") && c.contains("net.inet.ip.forwarding=0")),
+            "must reset ip forwarding to the secure default; got: {command_log:?}"
         );
     }
 
