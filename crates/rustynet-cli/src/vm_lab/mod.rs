@@ -8526,24 +8526,22 @@ fn run_macos_orchestration_stages(
                     .next()
                     .unwrap_or(macos_entry.ssh_target.as_str());
                 let macos_endpoint = format!("{macos_host}:51820");
-                let mut augmented = augment_dns_zone_env_for_macos(
+                let augmented = augment_dns_zone_env_for_macos(
                     env_body.as_str(),
                     macos_node_id,
                     macos_endpoint.as_str(),
                     pubkey_hex,
                     exit_node_id,
                 )?;
-                // Issue with a long TTL so the bundle stays fresh from issuance
-                // here through the capture stage. The Linux path keeps its
-                // bundles fresh with dedicated refresh stages; this macOS
-                // one-shot has no refresh, so a generous window avoids a stale
-                // bundle the daemon would reject (default issuer TTL is 300 s).
-                if !augmented
-                    .lines()
-                    .any(|line| line.starts_with("DNS_ZONE_TTL_SECS="))
-                {
-                    augmented.push_str("DNS_ZONE_TTL_SECS=86400\n");
-                }
+                // Leave DNS_ZONE_TTL_SECS unset so the issuer uses its default
+                // (300 s) — the signed-zone builder hard-caps TTL at 1..=300
+                // (a longer value is rejected: "dns zone ttl must be in range
+                // 1..=300"), matching the Linux path. The macOS pipeline issues
+                // here and the daemon serves the zone after the activate
+                // reload, so the bundle must reach the capture stage's
+                // tunnel_path_resolves probe within that 300 s window (the
+                // remaining macOS stages complete well inside it on the happy
+                // path; if a future run shows expiry, issue closer to capture).
                 let local_env = report_dir.join("state").join("macos-issue-dns-zone.env");
                 std::fs::write(&local_env, augmented.as_bytes())
                     .map_err(|e| format!("write {} failed: {e}", local_env.display()))?;
