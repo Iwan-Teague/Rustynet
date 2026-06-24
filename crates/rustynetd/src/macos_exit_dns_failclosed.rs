@@ -426,11 +426,9 @@ block drop out quick on en0 inet proto tcp from any to 192.168.1.0/24 port = dom
         // explicit `from any to any`). The labels are the canonical
         // DNS_BLOCK_LAN_*_RULE constants shared with render_pf_rules.
         let body = format!(
-            "block drop out quick inet proto udp from any to any port = 53 label \"{udp}\"\n\
-             block drop out quick inet proto tcp from any to any port = 53 label \"{tcp}\"\n\
+            "block drop out quick inet proto udp from any to any port = 53 label \"{DNS_BLOCK_LAN_UDP_RULE}\"\n\
+             block drop out quick inet proto tcp from any to any port = 53 label \"{DNS_BLOCK_LAN_TCP_RULE}\"\n\
              block drop out quick all\n",
-            udp = DNS_BLOCK_LAN_UDP_RULE,
-            tcp = DNS_BLOCK_LAN_TCP_RULE,
         );
         let report = build_macos_pf_block_rules_report(body.as_str());
         assert!(report.overall_ok, "labeled rendered rules must pass");

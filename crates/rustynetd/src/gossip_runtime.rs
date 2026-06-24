@@ -822,7 +822,7 @@ mod tests {
     }
 
     fn hex32(byte: u8) -> String {
-        format!("{:02x}", byte).repeat(32)
+        format!("{byte:02x}").repeat(32)
     }
 
     fn membership_node(

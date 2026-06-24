@@ -10958,9 +10958,7 @@ mod tests {
         allow_tunnel_relay_forward: bool,
         wg_listen_port: u16,
     ) -> String {
-        let mut rules = format!(
-            "table inet rustynet_g1 {{\n  chain killswitch {{\n    type filter hook output priority 0; policy drop;\n    oifname \"lo\" accept\n"
-        );
+        let mut rules = "table inet rustynet_g1 {\n  chain killswitch {\n    type filter hook output priority 0; policy drop;\n    oifname \"lo\" accept\n".to_string();
         if wg_listen_port != 0 {
             rules.push_str(
                 format!("    oifname \"{egress_interface}\" udp dport {wg_listen_port} accept\n")

@@ -434,8 +434,7 @@ mod tests {
                     &entry.status,
                     MacosKeyCustodyEntryStatus::Missing { reason } if reason.contains("macOS runtime host")
                 ),
-                "off-macOS entry must be Missing with runtime-host reason: {:?}",
-                entry
+                "off-macOS entry must be Missing with runtime-host reason: {entry:?}"
             );
         }
     }
