@@ -24,7 +24,7 @@ Effort key: **S** ≤½ day · **M** ~1–2 days · **L** ≥3 days / needs desi
 | **RSA-0063** | `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh` | Register `trap 'rm -f "${sudoers_tmp}"' EXIT` **before** the `curl\|bash`; prefer scoping the grant to the brew command, not `NOPASSWD: ALL` | Bootstrap-failure simulation leaves no `/etc/sudoers.d/rustynet-*`; lint asserting the trap precedes the sudoers write | **S** |
 
 > RSA-0009 is the higher-impact (revocation + key-rotation are non-functional); RSA-0063
-> is the quicker win. Do RSA-0063 immediately; schedule the RSA-0009 design decision.
+> is the quicker win. Do RSA-0063 immediately; schedule the RSA-0009 design decision. **(RSA-0063 ✅ APPLIED 2026-06-24 — EXIT trap removes the temporary sudoers grant on every exit path + lint test.)**
 
 ---
 
