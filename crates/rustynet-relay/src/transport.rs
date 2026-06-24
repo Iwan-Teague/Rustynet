@@ -684,6 +684,12 @@ impl RelayTransport {
         self.rate_limiter
             .retain_active_nodes(|node_id| active_nodes.contains(node_id));
 
+        // Prune the pre-auth hello limiter's per-node_id windows on the same
+        // cadence (RSA-0037): a node_id whose one-second window has elapsed no
+        // longer needs an entry, so a churn of distinct pre-auth node_ids cannot
+        // accumulate stale windows between cleanups.
+        self.hello_limiter.prune_elapsed(now);
+
         removed
     }
 
@@ -1002,8 +1008,18 @@ fn parse_nonce_hex(value: &str) -> Result<[u8; 16], String> {
 /// because `handle_hello` performs ed25519 verification (CPU-intensive).
 /// Applying a cheap counter before verification protects against CPU-exhaustion
 /// attacks.
+/// Hard cap on the number of distinct `node_id` windows the `HelloLimiter`
+/// retains. The map is keyed on the attacker-controlled `node_id` and consulted
+/// BEFORE the ed25519 signature check, so without a bound a pre-auth attacker
+/// rotating `node_id` strings could grow it without limit (RSA-0037, CWE-770).
+/// Set well above any legitimate distinct-node cardinality in a 1-second window
+/// (the relay's session cap is `DEFAULT_MAX_TOTAL_SESSIONS` = 4096) so it never
+/// false-rejects real peers, while still bounding total memory.
+const MAX_HELLO_LIMITER_ENTRIES: usize = 16_384;
+
 struct HelloLimiter {
     max_per_sec: u32,
+    max_entries: usize,
     counts: HashMap<String, (u32, Instant)>,
 }
 
@@ -1011,6 +1027,7 @@ impl HelloLimiter {
     fn new(max_per_sec: u32) -> Self {
         Self {
             max_per_sec,
+            max_entries: MAX_HELLO_LIMITER_ENTRIES,
             counts: HashMap::new(),
         }
     }
@@ -1018,6 +1035,20 @@ impl HelloLimiter {
     /// Returns `true` if the hello should be allowed, `false` if rate-limited.
     fn check(&mut self, node_id: &str) -> bool {
         let now = Instant::now();
+
+        // RSA-0037: hard-cap the map so a pre-auth node_id flood cannot exhaust
+        // memory. When a NEW node_id arrives and the map is at capacity, first
+        // drop any windows whose one-second period has already elapsed; if it is
+        // still full, reject the new node_id (fail closed — never allocate above
+        // the cap). Existing tracked node_ids are always allowed to look up
+        // their counter, so this cannot false-reject an in-window peer.
+        if self.counts.len() >= self.max_entries && !self.counts.contains_key(node_id) {
+            self.prune_elapsed(now);
+            if self.counts.len() >= self.max_entries {
+                return false;
+            }
+        }
+
         let entry = self.counts.entry(node_id.to_owned()).or_insert((0, now));
 
         // Reset counter if the one-second window has elapsed
@@ -1030,6 +1061,14 @@ impl HelloLimiter {
         }
         entry.0 += 1;
         true
+    }
+
+    /// Drop entries whose one-second window has already elapsed. Mirrors the
+    /// per-IP `PreAuthHelloLimiter::prune` / per-node `retain_active_nodes`
+    /// pruning so the map stays bounded under churn (RSA-0037).
+    fn prune_elapsed(&mut self, now: Instant) {
+        self.counts
+            .retain(|_, (_, started)| now.duration_since(*started) < Duration::from_secs(1));
     }
 }
 
@@ -2086,6 +2125,54 @@ mod tests {
         }
         transport.cleanup_idle_sessions();
         assert_eq!(transport.session_count(), 0);
+    }
+
+    #[test]
+    fn hello_limiter_caps_distinct_node_ids_under_flood() {
+        // RSA-0037: a pre-auth flood of distinct node_ids must not grow the map
+        // without bound. Once at capacity, a brand-new node_id is rejected and
+        // never inserted.
+        let mut limiter = HelloLimiter::new(MAX_HELLOS_PER_NODE_PER_SEC);
+        limiter.max_entries = 8;
+        for i in 0..8 {
+            assert!(limiter.check(&format!("flood-node-{i}")));
+        }
+        assert_eq!(limiter.counts.len(), 8);
+        assert!(
+            !limiter.check("overflow-node"),
+            "a new node_id beyond the cap must be rejected"
+        );
+        assert!(
+            limiter.counts.len() <= 8,
+            "map must stay bounded under flood"
+        );
+        assert!(!limiter.counts.contains_key("overflow-node"));
+        // An already-tracked node_id is still allowed to look up its window (no
+        // false-reject of an in-window peer).
+        assert!(limiter.check("flood-node-0"));
+    }
+
+    #[test]
+    fn hello_limiter_prune_drops_elapsed_windows() {
+        // RSA-0037: prune_elapsed drops node_id windows whose one-second period
+        // has passed, keeping the map bounded under churn between cleanups.
+        let mut limiter = HelloLimiter::new(MAX_HELLOS_PER_NODE_PER_SEC);
+        let base = Instant::now();
+        // `stale` started at `base`; `fresh` started 2s later (relative to the
+        // `now` we prune at) — using forward offsets avoids Instant underflow.
+        limiter.counts.insert("stale".to_owned(), (1, base));
+        limiter
+            .counts
+            .insert("fresh".to_owned(), (1, base + Duration::from_secs(2)));
+        limiter.prune_elapsed(base + Duration::from_secs(2));
+        assert!(
+            !limiter.counts.contains_key("stale"),
+            "elapsed-window entry must be pruned"
+        );
+        assert!(
+            limiter.counts.contains_key("fresh"),
+            "in-window entry must be retained"
+        );
     }
 
     #[test]
