@@ -550,15 +550,20 @@ pub fn plan_concrete_actions(
                     from: current,
                     to: target,
                     kind: TransitionKind::SignedMembership,
-                    // Track B Step 3 (B1.4): advertise the default
-                    // route first so the daemon takes ownership of
-                    // exit-serving NAT/forwarding before the platform
-                    // preflight runs. This matches the ordering rule
-                    // baked into NodeRoleTaxonomy_2026-05-21.md §10:
-                    // "Service deploy precedes capability advertisement"
-                    // — the membership-signed advertisement is the
-                    // earlier signal, the platform preflight is the
-                    // follow-up that prepares the host kernel.
+                    // Track B Step 3 (B1.4): advertise the default route
+                    // FIRST. For the exit role the membership-signed
+                    // RouteAdvertise (IpcCommand::RouteAdvertise 0.0.0.0/0,
+                    // gated daemon-side to admin) IS the atomic exit-serving
+                    // NAT/forwarding bring-up and ownership signal, so it must
+                    // lead; DeployExitService installs only an install-time
+                    // platform preflight unit/plist (host-kernel evidence), NOT
+                    // the NAT owner, so it follows. NodeRoleTaxonomy_2026-05-21.md
+                    // §10 ("service deploy precedes capability advertisement")
+                    // governs capability-PROVIDING sibling services
+                    // (rustynet-relay/nas/llm), not this advertise-as-bring-up
+                    // case; the release-blocking teardown ordering (§10.7) is
+                    // preserved on the reverse Exit→Admin path below
+                    // (UndeployExitService then RetractDefaultRoute).
                     actions: vec![
                         ConcreteAction::AdvertiseDefaultRoute,
                         ConcreteAction::DeployExitService,
