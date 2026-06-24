@@ -261,7 +261,12 @@ fn validate_macos_blind_exit_pf_config(config: &MacosBlindExitPfConfig) -> Resul
     if config.tunnel_interface == config.egress_interface {
         return Err("blind_exit tunnel and egress interfaces must differ".to_owned());
     }
-    validate_cidr(config.mesh_cidr.as_str())?;
+    // The mesh CIDR becomes the SOURCE of a `pass out quick on <egress>
+    // from <mesh_cidr> to any` rule. A global/default-route source there
+    // (e.g. 0.0.0.0/0) would pass all local-origin egress past the terminal
+    // `block drop out quick all` killswitch, so it must be a bounded
+    // private/CGNAT/ULA mesh range — never just syntactically valid.
+    crate::macos_pf_mesh_cidr::validate_mesh_egress_source_cidr(config.mesh_cidr.as_str())?;
     validate_anchor_name(config.anchor_name.as_str())?;
     for cidr in &config.management_ssh_allow_cidrs {
         validate_pf_family(cidr.family)?;
@@ -395,6 +400,30 @@ mod tests {
         );
         assert!(rules.ends_with("block drop out quick all\n"));
         assert!(evaluate_macos_blind_exit_pf_rules(&rules, &config()).is_empty());
+    }
+
+    #[test]
+    fn builder_rejects_default_route_mesh_cidr_killswitch_bypass() {
+        // pfctl-boundary review finding: a daemon-chosen mesh_cidr=0.0.0.0/0
+        // would render `pass out quick on en0 inet from 0.0.0.0/0 to any` which
+        // (pf quick = first-match) passes ALL local-origin egress before the
+        // terminal block-drop, defeating the blind_exit killswitch. The config
+        // builder must reject it (and ::/0) at construction.
+        for hostile in ["0.0.0.0/0", "::/0", "0.0.0.0/1", "8.8.8.0/24"] {
+            MacosBlindExitPfConfig::new("rustynet0", "en0", hostile).expect_err(&format!(
+                "{hostile} must be rejected as a mesh egress source"
+            ));
+        }
+    }
+
+    #[test]
+    fn builder_rejects_default_route_mesh_cidr_at_render_time() {
+        // Even if a config is constructed by another path, the rule builder
+        // re-validates and refuses to render an over-wide mesh egress source.
+        let mut cfg = config();
+        cfg.mesh_cidr = "0.0.0.0/0".to_owned();
+        build_macos_blind_exit_pf_rules(&cfg)
+            .expect_err("render must fail closed on a default-route mesh CIDR");
     }
 
     #[test]

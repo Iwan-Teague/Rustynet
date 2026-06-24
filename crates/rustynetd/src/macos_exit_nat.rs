@@ -187,7 +187,12 @@ fn validate_macos_exit_nat_pf_config(config: &MacosExitNatPfConfig) -> Result<()
         return Err("exit NAT requires at least one mesh CIDR (default-deny)".to_owned());
     }
     for cidr in &config.mesh_cidrs {
-        validate_cidr(cidr.as_str())?;
+        // The mesh CIDR becomes the SOURCE of a `nat on <egress> from
+        // <mesh_cidr> to any -> (egress)` rule. Bounding it to a
+        // private/CGNAT/ULA range keeps the regular exit from masquerading
+        // local-origin / non-mesh traffic if a compromised daemon supplies a
+        // global/default-route source (mirrors the blind_exit egress guard).
+        crate::macos_pf_mesh_cidr::validate_mesh_egress_source_cidr(cidr.as_str())?;
     }
     Ok(())
 }
@@ -215,23 +220,6 @@ fn validate_anchor_name(value: &str) -> Result<(), String> {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
     {
         return Err(format!("invalid PF anchor name for exit NAT: {value:?}"));
-    }
-    Ok(())
-}
-
-fn validate_cidr(value: &str) -> Result<(), String> {
-    let (addr, prefix) = value
-        .split_once('/')
-        .ok_or_else(|| format!("invalid CIDR for exit NAT: {value:?}"))?;
-    let ip: IpAddr = addr
-        .parse()
-        .map_err(|_| format!("invalid CIDR address for exit NAT: {value:?}"))?;
-    let prefix: u8 = prefix
-        .parse()
-        .map_err(|_| format!("invalid CIDR prefix for exit NAT: {value:?}"))?;
-    let max = if ip.is_ipv4() { 32 } else { 128 };
-    if prefix > max {
-        return Err(format!("invalid CIDR prefix for exit NAT: {value:?}"));
     }
     Ok(())
 }
@@ -394,6 +382,20 @@ mod tests {
         let err = MacosExitNatPfConfig::new("en0", Vec::new())
             .expect_err("no mesh CIDR must fail closed");
         assert!(err.contains("at least one mesh CIDR"));
+    }
+
+    #[test]
+    fn global_or_default_route_mesh_cidr_fails_closed() {
+        // The mesh CIDR is the NAT source; a global/default-route source would
+        // masquerade local-origin / non-mesh egress. Mirrors the blind_exit
+        // egress guard (pfctl-boundary review).
+        for hostile in ["0.0.0.0/0", "::/0", "8.8.8.0/24", "100.0.0.0/8"] {
+            MacosExitNatPfConfig::new("en0", vec![hostile.to_owned()])
+                .expect_err(&format!("{hostile} must fail closed as a NAT source"));
+        }
+        // A legitimate CGNAT mesh range still constructs.
+        MacosExitNatPfConfig::new("en0", vec!["100.64.0.0/10".to_owned()])
+            .expect("legit CGNAT mesh must be accepted");
     }
 
     #[test]

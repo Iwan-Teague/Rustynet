@@ -38,6 +38,7 @@ pub mod macos_ipv6_leak;
 pub mod macos_key_custody;
 pub mod macos_mesh_status;
 pub mod macos_pf_load_spec;
+pub(crate) mod macos_pf_mesh_cidr;
 pub mod macos_runtime_acls;
 pub mod macos_service_hardening;
 #[cfg(target_os = "macos")]

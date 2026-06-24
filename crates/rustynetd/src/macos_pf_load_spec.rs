@@ -643,6 +643,36 @@ mod tests {
     }
 
     #[test]
+    fn blind_exit_decode_rejects_default_route_mesh_cidr() {
+        // pfctl-boundary review finding: a daemon compromised to the helper uid
+        // can encode the spec tokens directly. mesh_cidr=0.0.0.0/0 would render
+        // `pass out quick on en0 inet from 0.0.0.0/0 to any`, passing all
+        // local-origin egress past the terminal block-drop. The helper decodes
+        // (and thus re-validates) before rendering, so decode must fail closed.
+        let mut config = MacosBlindExitPfConfig::new("rustynet0", "en0", "100.64.0.0/10").unwrap();
+        config.ipv6_tunnel_allowed = false;
+        config.dns_protected = true;
+        let encoded = (MacosPfLoadSpec::BlindExit { config }).encode();
+        for hostile in ["0.0.0.0/0", "::/0", "8.8.8.0/24"] {
+            let mutated: Vec<String> = encoded
+                .iter()
+                .map(|t| {
+                    if t.starts_with("mesh_cidr=") {
+                        format!("mesh_cidr={hostile}")
+                    } else {
+                        t.clone()
+                    }
+                })
+                .collect();
+            let refs: Vec<&str> = mutated.iter().map(String::as_str).collect();
+            assert!(
+                MacosPfLoadSpec::decode(&refs).is_err(),
+                "decode must reject mesh_cidr={hostile}"
+            );
+        }
+    }
+
+    #[test]
     fn exit_nat_roundtrip_is_nat_only() {
         let config = MacosExitNatPfConfig::new("en0", vec!["100.64.0.0/10".to_owned()]).unwrap();
         let original = MacosPfLoadSpec::ExitNat { config };
