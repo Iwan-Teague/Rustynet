@@ -800,14 +800,21 @@ pub fn write_gossip_watermark(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These imports are used only by the `#[cfg(unix)]` transport-backed tests
+    // below (the gossip transport is unix-only in this slice — Track Beta), so
+    // gate them to match, or they are unused on Windows under `-D warnings`.
+    #[cfg(unix)]
     use crate::dataplane_candidates::CandidateSet;
+    #[cfg(unix)]
     use crate::gossip_transport::GossipTransport;
+    #[cfg(unix)]
     use crate::peer_gossip::mint_bundle_with_timestamp;
     use ed25519_dalek::SigningKey;
     use rustynet_control::membership::{
         MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
         MembershipApproverStatus,
     };
+    #[cfg(unix)]
     use std::net::{IpAddr, Ipv4Addr};
     use tempfile::TempDir;
 
