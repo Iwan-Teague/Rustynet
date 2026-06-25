@@ -216,18 +216,18 @@ the fixes landed this pass (all Linux-gate-verified; live runs still pending):
   when not serving, `Remove-NetNat` by fixed name + force forwarding Disabled on
   the tunnel + egress interfaces, best-effort, only-when-not-serving. The
   WinNAT/`MSFT_NetNat` live blocker is unchanged.
-- **Windows anchor — genuinely code-incomplete (§3 🟠 accurate).** The only
-  Windows anchor stage is the in-process `validate_windows_anchor_bundle_pull_plan_contract`
-  ("without guest mutation"). The daemon bundle-pull `TcpListener` bind + accept
-  poll live ENTIRELY in the `#[cfg(not(windows))]` Unix main-loop block
-  (`daemon.rs:9513-9532` / `9651-9691`); the `#[cfg(windows)]` reconcile loop
-  (`daemon.rs:9323-9449`) never binds/polls it, so a Windows anchor never opens
-  `127.0.0.1:51822`. The handler primitives (`handle_anchor_bundle_pull_stream`,
-  etc.) are portable `std::net` (not cfg-gated), so the gap is **wiring the
-  bind+accept into the Windows loop** + a live stage — but that wiring is
-  `cfg(windows)` and **not locally compile-verifiable** here (the Windows
-  cross-build blocker), so it needs a Windows builder. The request-probe +
-  report-validator are Linux-authorable.
+- **Windows anchor — daemon listener LANDED 2026-06-24; live stage still
+  required.** The bundle-pull listener was wired into the `#[cfg(windows)]`
+  reconcile loop (`daemon.rs`): the bind + accept/serve were extracted into two
+  portable, Linux-unit-tested helpers (`bind_anchor_bundle_pull_listener`,
+  `poll_anchor_bundle_pull_once`) shared by both the Unix and Windows loops, so a
+  Windows anchor now opens `127.0.0.1:51822` and serves verify-before-serve,
+  token-gated bundle-pull. **Remaining:** (a) a Windows builder / CI must
+  compile-confirm the `cfg(windows)` call sites (the documented x86_64-pc-windows-gnu
+  dep cross-build blocker means they can't be checked on the Linux dev host —
+  they mirror the verified Unix call sites exactly); (b) a live guest-touching
+  bundle-serving stage (the current `validate_windows_anchor_bundle_pull_plan_contract`
+  is in-process/"without guest mutation") + a green run on a Windows guest.
 - **Windows relay — §9 was STALE (it called this "genuinely unbuilt").** The
   cell is **lab-blocked-code-complete for lifecycle**; the real gap is HP-3 live
   forwarding, which is unproven on **every** OS (not Windows-specific). The
@@ -249,6 +249,8 @@ the fixes landed this pass (all Linux-gate-verified; live runs still pending):
 
 **Net remaining parity CODE work (no live lab):** (a) the role-transition stage
 (Linux-authorable, large); (b) the mac/win stage-gating contract tests
-(Linux-authorable, small); (c) the Windows anchor daemon-loop listener wiring +
-live stage (**cfg(windows)-build-blocked**). Everything else is
-code-complete-live-pending or HP-3/WinNAT-blocked.
+(Linux-authorable, small); (c) the Windows anchor **live** bundle-serving stage
+(the daemon listener landed 2026-06-24; a Windows builder/CI must compile-confirm
+the cfg(windows) call sites, and a guest-touching stage replaces the in-process
+contract validator). Everything else is code-complete-live-pending or
+HP-3/WinNAT-blocked.
