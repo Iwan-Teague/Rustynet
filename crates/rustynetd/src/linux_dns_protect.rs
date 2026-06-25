@@ -639,6 +639,10 @@ mod tests {
         }
     }
 
+    // Selector validation only runs on the unix (`apply_dns_failclosed_file`)
+    // path; on Windows the operation is blanket-unsupported ("only supported on
+    // Linux") and never reaches selector parsing, so this assertion is unix-only.
+    #[cfg(unix)]
     #[test]
     fn apply_rejects_unknown_selector_without_touching_the_filesystem() {
         let err = apply_dns_failclosed_file("not-a-real-selector").expect_err("must reject");

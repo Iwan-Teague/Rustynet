@@ -24,6 +24,13 @@
 //!    daemon is in Strict policy mode (the production setting).
 
 #![forbid(unsafe_code)]
+// The whole harness binds a real `GossipTransport` UDP socket, which is
+// unix-only in this slice (the Windows gossip path is queued behind Track
+// Beta — `GossipTransport::bind` returns Unsupported on non-unix). Gate the
+// entire integration-test crate off Windows so the tests, the `Peer` harness,
+// and the `loopback`/`drain_until` helpers compile only where the transport
+// exists (avoids unused-code `-D warnings` on the Windows CI build).
+#![cfg(unix)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};

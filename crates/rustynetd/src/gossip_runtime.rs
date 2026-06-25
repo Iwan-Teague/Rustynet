@@ -811,6 +811,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use tempfile::TempDir;
 
+    #[cfg(unix)]
     fn loopback_bind() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
     }
@@ -1001,6 +1002,7 @@ mod tests {
         assert_watermark_corrupt(&body, "sequence is not a u64");
     }
 
+    #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
     #[test]
     fn mint_does_not_advance_sequence_when_watermark_persist_fails() {
         // Anti-rewind invariant: the watermark is persisted BEFORE the
@@ -1039,6 +1041,7 @@ mod tests {
         assert_eq!(node.minted_count, 0, "mint count must not advance");
     }
 
+    #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
     #[test]
     fn watermark_io_error_does_not_leak_state_dir_path() {
         // Privacy/secret-log mandate: a watermark spool i/o failure must not
@@ -1067,6 +1070,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
     #[test]
     fn maybe_mint_emits_when_candidates_change_and_persists_sequence() {
         let dir = TempDir::new().expect("tempdir");
@@ -1095,6 +1099,7 @@ mod tests {
         assert!(res.is_none(), "duplicate mint must be suppressed");
     }
 
+    #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
     #[test]
     fn rebroadcast_orders_anchor_seed_peers_first() {
         let dir = TempDir::new().expect("tempdir");
@@ -1156,6 +1161,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
     #[test]
     fn ingest_rejects_self_origin_bundle() {
         let dir = TempDir::new().expect("tempdir");

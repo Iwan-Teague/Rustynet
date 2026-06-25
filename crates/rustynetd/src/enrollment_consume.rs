@@ -240,6 +240,7 @@ mod tests {
         GossipNode::new(signing_key, None).expect("ctor")
     }
 
+    #[cfg(unix)] // only the unix-only GossipTransport test below binds a loopback addr
     fn loopback_bind() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
     }
@@ -377,6 +378,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // builds the unix-only GossipTransport (Track Beta: windows path queued)
     #[test]
     fn after_consume_a_minted_bundle_reaches_the_enrollee() {
         // End-to-end smoke test that mirrors what the D2.7 integration

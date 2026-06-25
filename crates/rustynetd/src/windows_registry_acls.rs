@@ -570,16 +570,18 @@ mod tests {
                 }
             }
         }
-        // The evaluator surfaces every per-key non-Ok state as a
-        // drift reason. Accept any of the canonical surface
-        // tokens: "unobserved required key", "missing required",
-        // or "invalid required" — all three mean "the reviewed key
-        // is not in the Ok state".
+        // The evaluator surfaces every per-key non-Ok state as a drift
+        // reason. Accept any of the canonical surface tokens, matching the
+        // exact wording the evaluator emits for required keys:
+        // "unobserved required key" (off-Windows shim), "required registry
+        // key missing" (real collector, key absent — the common case on a CI
+        // runner without the RustyNet services installed), or "registry ACL
+        // invalid" — all three mean "the reviewed key is not in the Ok state".
         assert!(
             report.drift_reasons.iter().any(|r| {
                 r.contains("unobserved required key")
-                    || r.contains("missing required")
-                    || r.contains("invalid required")
+                    || r.contains("required registry key missing")
+                    || r.contains("registry ACL invalid")
             }),
             "report must surface at least one per-key drift reason: {:?}",
             report.drift_reasons
