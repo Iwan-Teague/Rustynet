@@ -8,7 +8,8 @@ use std::process::Output;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{
-    LiveLabContext, Logger, ensure_dir_secure, repo_root, write_secure_json, write_secure_text,
+    LiveLabContext, LiveLabPlatform, Logger, ensure_dir_secure, repo_root, write_secure_json,
+    write_secure_text,
 };
 use serde_json::json;
 
@@ -17,14 +18,45 @@ const LAN_TEST_GATEWAY_IP: &str = "192.168.1.1/24";
 const LAN_TEST_PROBE_IP: &str = "192.168.1.1";
 const LAN_TEST_CIDR: &str = "192.168.1.0/24";
 /// The tunnel interface the client routes LAN traffic over while LAN access is
-/// coupled on. The LAN-ON positive control asserts the LAN route goes
-/// `dev TUNNEL_IFACE`; the enforced-denial check asserts that same tunnel route
-/// is withdrawn when LAN access is off (route absent / not via the tunnel).
+/// coupled on, on Linux AND Windows. The daemon brings the WireGuard adapter up
+/// as `rustynet0` on both (`DEFAULT_WG_INTERFACE`, `rustynetd::daemon`; the
+/// Windows Wintun adapter alias is also `rustynet0` per
+/// `rustynet-backend-wireguard`). The LAN-ON positive control asserts the LAN
+/// route goes via this tunnel iface; the enforced-denial check asserts that same
+/// tunnel route is withdrawn when LAN access is off (route absent / not via the
+/// tunnel).
 const TUNNEL_IFACE: &str = "rustynet0";
+/// The macOS tunnel device prefix. macOS does NOT use a fixed `rustynet0` name —
+/// the backend validator (`rustynet-backend-wireguard::macos_command`,
+/// `rustynetd::macos_utun_helper`) requires the interface name to be `utun`
+/// followed by digits (e.g. `utun9`), assigned dynamically by the kernel. The
+/// macOS route parser therefore matches `utun<digits>` rather than a fixed name.
+const MACOS_TUNNEL_IFACE_PREFIX: &str = "utun";
 /// Canonical `inet` killswitch table name programmed by the daemon. Generation
 /// rotation appends `_g<N>` (see `rustynetd::linux_runtime_nftables`), so the
 /// matcher accepts both the bare and the rotated form.
 const KILLSWITCH_INET_TABLE: &str = "rustynet";
+/// macOS pf killswitch filter anchor prefix. The daemon loads the killswitch
+/// into a generation-numbered anchor `com.apple/rustynet_g<N>`
+/// (`MACOS_RUSTYNET_ANCHOR_PREFIX`, `rustynetd::macos_exit_killswitch_precedence`)
+/// and the blind_exit posture into the fixed `com.rustynet/blind_exit` anchor
+/// (`DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR`, `rustynetd::macos_blind_exit`). Either
+/// anchor present in `pfctl -s Anchors` is positive evidence the fail-closed pf
+/// machinery is loaded; the rendered killswitch ruleset also always terminates
+/// in `block drop out quick all` (`render_macos_killswitch_pf_rules`).
+const MACOS_KILLSWITCH_ANCHOR_PREFIX: &str = "com.apple/rustynet_g";
+const MACOS_BLIND_EXIT_ANCHOR: &str = "com.rustynet/blind_exit";
+const MACOS_KILLSWITCH_TERMINAL_RULE: &str = "block drop out quick all";
+/// Windows killswitch evidence tokens. The daemon enforces the killswitch as a
+/// default-deny outbound firewall posture (`netsh advfirewall ... firewallpolicy
+/// blockoutbound`, surfaced as `DefaultOutboundAction : Block` on every profile)
+/// plus the named allow rules `RustyNetKS-AllowLoopback` / `RustyNetKS-AllowEgress`
+/// (`WINDOWS_KS_RULE_*`, `rustynetd::phase10`) and a native WFP tunnel-permit
+/// sublayer. Either a `DefaultOutboundAction ... Block` profile line or a
+/// `RustyNetKS-` rule name is positive enforcement evidence in firewall output.
+const WINDOWS_KILLSWITCH_DEFAULT_OUTBOUND_BLOCK: &str = "DefaultOutboundAction";
+const WINDOWS_KILLSWITCH_BLOCK_TOKEN: &str = "Block";
+const WINDOWS_KILLSWITCH_RULE_PREFIX: &str = "RustyNetKS-";
 const MAX_TRAVERSAL_COORDINATION_TTL_SECS: u64 = 30;
 const DNS_ZONE_NAME: &str = "rustynet";
 const DNS_ZONE_ISSUE_DIR: &str = "/run/rustynet/dns-zone-issue-lan-toggle";
@@ -240,17 +272,21 @@ fn run() -> Result<(), String> {
         return Err("missing required argument: --ssh-identity-file".to_owned());
     }
 
-    // Track B Phase 2: dispatcher fabric — non-Linux platforms fail
-    // closed honestly until the per-platform validator lands. The
-    // orchestrator's wrapper-per-platform routing depends on this
-    // gate so a foreign-platform invocation never silently runs
-    // Linux-specific assertions (systemd / nftables / iproute2)
-    // against a macOS or Windows host.
-    live_lab_support::enforce_linux_only_until_validator_lands(
-        platform,
-        "lan-toggle",
-        "the per-platform validator lands later in Track B",
-    )?;
+    // Wave 2 (W2-C): the lan-toggle / blind_exit stage is now cross-OS. The
+    // Linux-only dispatcher gate is removed; `platform` is threaded through
+    // every OS-specific probe/route/killswitch command and parser below so a
+    // macOS or Windows invocation runs the REAL per-OS assertion logic (it will
+    // pass or fail-closed honestly on a live guest) rather than failing at the
+    // gate. The Linux command/parser branches are byte-identical to before.
+    //
+    // FAIL-CLOSED / honesty note: the SSH command transport in `live_lab_support`
+    // wraps every argv in `sudo -n sh -lc <quoted>` (POSIX-only). On macOS this
+    // is correct (sudo + sh are present). On WINDOWS this transport cannot run
+    // PowerShell/cmd as-is — there is no `sudo`/`sh`, and the daemon IPC is a
+    // named pipe, not a Unix socket — so a Windows invocation fails closed at
+    // the daemon-socket / sudo preflight with a transport error rather than a
+    // fake pass. This is flagged in the W2-C report as a daemon/transport-side
+    // gap the live Windows run will expose; it is not papered over here.
 
     if let Some(parent) = report_path.parent() {
         ensure_dir_secure(parent)?;
@@ -622,7 +658,7 @@ fn run() -> Result<(), String> {
 
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
     let mut last_traversal_refresh_unix = unix_now();
-    apply_lan_access(&ctx, &client_host, false, LAN_TEST_CIDR)?;
+    apply_lan_access(&ctx, platform, &client_host, false, LAN_TEST_CIDR)?;
     let lan_off_state = wait_for_lan_access_state(
         &ctx,
         &logger,
@@ -637,6 +673,7 @@ fn run() -> Result<(), String> {
         &logger,
         &signed_state_refresh,
         &mut last_traversal_refresh_unix,
+        platform,
         &client_host,
         "blocked",
         45,
@@ -646,7 +683,7 @@ fn run() -> Result<(), String> {
         .unwrap_or_default();
 
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
-    apply_lan_access(&ctx, &client_host, true, LAN_TEST_CIDR)?;
+    apply_lan_access(&ctx, platform, &client_host, true, LAN_TEST_CIDR)?;
     // Reset the traversal refresh timestamp after apply_lan_access returns: that
     // call may take >15s, which would cause maybe_refresh_signed_state_artifacts to
     // fire on the very first poll iteration and re-issue a no-LAN assignment from
@@ -673,6 +710,7 @@ fn run() -> Result<(), String> {
             &logger,
             &signed_state_refresh_lan_on,
             &mut last_traversal_refresh_unix,
+            platform,
             &client_host,
             "reachable",
             45,
@@ -684,15 +722,12 @@ fn run() -> Result<(), String> {
         .capture_root(&client_host, &["rustynet", "status"])
         .unwrap_or_default();
     let client_route_on = ctx
-        .capture(
-            &client_host,
-            &["ip", "-4", "route", "get", LAN_TEST_PROBE_IP],
-        )
+        .capture(&client_host, &route_to_target_argv(platform))
         .unwrap_or_default();
 
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
     last_traversal_refresh_unix = unix_now();
-    apply_lan_access(&ctx, &client_host, false, LAN_TEST_CIDR)?;
+    apply_lan_access(&ctx, platform, &client_host, false, LAN_TEST_CIDR)?;
     let lan_off_again_state = wait_for_lan_access_state(
         &ctx,
         &logger,
@@ -707,6 +742,7 @@ fn run() -> Result<(), String> {
         &logger,
         &signed_state_refresh,
         &mut last_traversal_refresh_unix,
+        platform,
         &client_host,
         "blocked",
         45,
@@ -717,7 +753,7 @@ fn run() -> Result<(), String> {
 
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
     let blind_exit_denied_status =
-        if apply_lan_access_expect_denied(&ctx, &blind_exit_host, true, LAN_TEST_CIDR)? {
+        if apply_lan_access_expect_denied(&ctx, platform, &blind_exit_host, true, LAN_TEST_CIDR)? {
             "pass"
         } else {
             "fail"
@@ -744,7 +780,7 @@ fn run() -> Result<(), String> {
     let check_lan_on_allows = if lan_on_state
         && lan_on_ping_status
         && client_status_on.contains("lan_access=on")
-        && client_route_on.contains("dev rustynet0")
+        && route_to_target_uses_tunnel(platform, &client_route_on)
     {
         "pass"
     } else {
@@ -876,11 +912,12 @@ impl Drop for LanToggleCleanup {
 
 fn apply_lan_access(
     ctx: &LiveLabContext,
+    platform: LiveLabPlatform,
     target: &str,
     enable: bool,
     lan_routes: &str,
 ) -> Result<(), String> {
-    let output = run_lan_access_command(ctx, target, enable, lan_routes, 20)?;
+    let output = run_lan_access_command(ctx, platform, target, enable, lan_routes, 20)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -891,11 +928,13 @@ fn apply_lan_access(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wait_for_lan_probe_state(
     ctx: &LiveLabContext,
     logger: &Logger,
     refresh_config: &SignedStateRefreshConfig<'_>,
     last_traversal_refresh_unix: &mut u64,
+    platform: LiveLabPlatform,
     target: &str,
     desired_state: &str,
     attempts: u32,
@@ -907,9 +946,7 @@ fn wait_for_lan_probe_state(
             refresh_config,
             last_traversal_refresh_unix,
         )?;
-        let reachable = ctx
-            .run(target, &["ping", "-c", "1", "-W", "1", LAN_TEST_PROBE_IP])
-            .is_ok();
+        let reachable = ctx.run(target, &lan_probe_argv(platform)).is_ok();
         if desired_state == "reachable" && reachable {
             return Ok(true);
         }
@@ -920,10 +957,12 @@ fn wait_for_lan_probe_state(
             // IP is proven reachable in LAN-ON) with positive evidence that the
             // block is *caused by enforcement*: the client's tunnel route to the
             // LAN target has been withdrawn (route absent / not via the tunnel,
-            // the inverse of the LAN-ON `dev rustynet0` positive control), OR the
-            // killswitch drop table is present in the runtime ruleset. "blocked"
-            // requires BOTH no-reachability AND enforcement evidence.
-            if confirm_lan_block_enforced(ctx, logger, target)? {
+            // the inverse of the LAN-ON tunnel-route positive control), OR the
+            // OS-native killswitch is present in the runtime ruleset (nft drop
+            // table on Linux, pf block-all anchor on macOS, default-deny
+            // outbound firewall on Windows). "blocked" requires BOTH
+            // no-reachability AND enforcement evidence.
+            if confirm_lan_block_enforced(ctx, logger, platform, target)? {
                 return Ok(true);
             }
         }
@@ -936,57 +975,192 @@ fn wait_for_lan_probe_state(
 /// a coincidental timeout. Two independent, argv-only signals are collected from
 /// the client and either is sufficient (both are honest enforcement evidence):
 ///
-/// 1. The client's tunnel route to the LAN target is **withdrawn** — `ip route
-///    get <target>` no longer resolves the LAN probe over `rustynet0`. This is
-///    the exact inverse of the LAN-ON positive control, which requires the route
-///    to be `dev rustynet0`; withdrawing the advertised LAN route is precisely
-///    how `ensure_lan_route_allowed` denies LAN access when it is coupled off.
-/// 2. The killswitch drop table (`inet rustynet[_g<N>]`) is present in the
-///    runtime nftables ruleset, proving the fail-closed drop machinery is loaded.
+/// 1. The client's tunnel route to the LAN target is **withdrawn** — the OS route
+///    query (`ip route get` on Linux, `route -n get` on macOS, `Get-NetRoute` on
+///    Windows) no longer resolves the LAN probe over the rustynet tunnel device.
+///    This is the exact inverse of the LAN-ON positive control, which requires
+///    the route to go via the tunnel; withdrawing the advertised LAN route is
+///    precisely how `ensure_lan_route_allowed` denies LAN access when it is
+///    coupled off.
+/// 2. The OS-native killswitch is present in the runtime ruleset — the `inet
+///    rustynet[_g<N>]` nftables drop table on Linux, the `com.apple/rustynet_g<N>`
+///    (or `com.rustynet/blind_exit`) pf block-all anchor on macOS, or the
+///    default-deny outbound firewall posture / `RustyNetKS-` rule on Windows —
+///    proving the fail-closed drop machinery is loaded.
 ///
 /// Queries use `*_allow_failure` so a transient SSH/command hiccup never throws —
 /// it simply yields no enforcement evidence on that poll, and the caller retries.
 fn confirm_lan_block_enforced(
     ctx: &LiveLabContext,
     logger: &Logger,
+    platform: LiveLabPlatform,
     target: &str,
 ) -> Result<bool, String> {
     let route_text = ctx
-        .capture_root_allow_failure(target, &["ip", "-4", "route", "get", LAN_TEST_PROBE_IP])
+        .capture_root_allow_failure(target, &route_to_target_argv(platform))
         .unwrap_or_default();
-    let tunnel_route_withdrawn = !route_to_target_uses_tunnel(&route_text);
+    let tunnel_route_withdrawn = !route_to_target_uses_tunnel(platform, &route_text);
 
     let ruleset_text = ctx
-        .capture_root_allow_failure(target, &["nft", "list", "ruleset"])
+        .capture_root_allow_failure(target, &killswitch_dump_argv(platform))
         .unwrap_or_default();
-    let killswitch_present = killswitch_drop_table_present(&ruleset_text);
+    let killswitch_present = killswitch_enforcement_present(platform, &ruleset_text);
 
     let enforced = tunnel_route_withdrawn || killswitch_present;
     logger.line(format!(
-        "LAN block enforcement check on {target}: tunnel_route_withdrawn={tunnel_route_withdrawn} killswitch_present={killswitch_present} enforced={enforced}"
+        "LAN block enforcement check on {target} ({}): tunnel_route_withdrawn={tunnel_route_withdrawn} killswitch_present={killswitch_present} enforced={enforced}",
+        platform.as_str()
     ))?;
     Ok(enforced)
 }
 
-/// True iff `ip route get <target>` output resolves the LAN probe over the
-/// rustynet tunnel interface (`dev rustynet0`). Mirrors the LAN-ON positive
-/// control's `client_route_on.contains("dev rustynet0")` assertion so the
+/// argv for the LAN reachability probe, per OS. Linux/macOS use BSD/GNU `ping`;
+/// Windows drives `Test-Connection` through PowerShell.
+///
+/// - Linux: `ping -c 1 -W 1 <ip>` — `-W` is the per-reply timeout in seconds.
+/// - macOS: `ping -c 1 -t 2 <ip>` — BSD `ping` uses `-t` as the total
+///   give-up timeout in seconds (`-W` on BSD is the per-packet wait in ms and
+///   differs from GNU semantics), so `-t 2` is the conventional bounded probe.
+/// - Windows: `Test-Connection -Count 1 -Quiet -TimeoutSeconds 2` returns a
+///   bare boolean, exit-coded by `if`. See the transport caveat in `run()`:
+///   the POSIX `sudo -n sh -lc` wrapper means this argv will not execute as-is
+///   on a Windows OpenSSH host — the Windows path fails closed at the transport
+///   preflight, which is flagged in the W2-C report.
+// REVIEW(W2-C): Windows `ping`-equivalent and its transport are unverified —
+// the live Windows run must confirm the probe command and the cross-OS shell
+// transport. There is no macOS/Windows LAN-toggle live binary in-repo yet to
+// cross-check command shapes against.
+fn lan_probe_argv(platform: LiveLabPlatform) -> Vec<&'static str> {
+    match platform {
+        LiveLabPlatform::Linux => vec!["ping", "-c", "1", "-W", "1", LAN_TEST_PROBE_IP],
+        LiveLabPlatform::MacOs => vec!["ping", "-c", "1", "-t", "2", LAN_TEST_PROBE_IP],
+        LiveLabPlatform::Windows => vec![
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "if (Test-Connection -ComputerName '192.168.1.1' -Count 1 -Quiet -TimeoutSeconds 2) { exit 0 } else { exit 1 }",
+        ],
+    }
+}
+
+/// argv to query the route to the LAN target, per OS.
+///
+/// - Linux: `ip -4 route get <ip>` — the canonical iproute2 single-route lookup.
+/// - macOS: `route -n get <ip>` — BSD route lookup (mirrors the convention in
+///   `rustynetd::macos_exit_dns_failclosed`); emits an `interface: utunN` line.
+/// - Windows: `Get-NetRoute` filtered to the rustynet0 alias — a returned row
+///   means the LAN route still resolves over the tunnel adapter.
+// REVIEW(W2-C): the Windows route query relies on the POSIX-only transport (see
+// `run()` caveat) and on the `rustynet0` Wintun alias being live; verify on a
+// real Windows guest.
+fn route_to_target_argv(platform: LiveLabPlatform) -> Vec<&'static str> {
+    match platform {
+        LiveLabPlatform::Linux => vec!["ip", "-4", "route", "get", LAN_TEST_PROBE_IP],
+        LiveLabPlatform::MacOs => vec!["route", "-n", "get", LAN_TEST_PROBE_IP],
+        LiveLabPlatform::Windows => vec![
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-NetRoute -DestinationPrefix '192.168.1.1/32' -InterfaceAlias 'rustynet0' -ErrorAction SilentlyContinue | Format-Table -HideTableHeaders | Out-String -Width 32767",
+        ],
+    }
+}
+
+/// argv to dump the OS-native killswitch enforcement state, per OS.
+///
+/// - Linux: `nft list ruleset` — the full nftables ruleset; the matcher looks
+///   for the `inet rustynet[_g<N>]` drop table.
+/// - macOS: `pfctl -s Anchors` — lists the loaded pf anchors; the matcher looks
+///   for the generation-numbered killswitch anchor `com.apple/rustynet_g<N>` or
+///   the fixed blind_exit anchor `com.rustynet/blind_exit`. (The terminal
+///   `block drop out quick all` rule is also accepted when a caller dumps the
+///   anchor rules instead.)
+/// - Windows: `Get-NetFirewallProfile` + the `RustyNetKS-` rules — the matcher
+///   looks for a `DefaultOutboundAction ... Block` profile line or a
+///   `RustyNetKS-` rule name.
+// REVIEW(W2-C): the macOS `/sbin/pfctl` path and the Windows firewall query both
+// depend on the cross-OS transport and on the daemon having loaded its
+// killswitch; verify the exact command output shape on live guests.
+fn killswitch_dump_argv(platform: LiveLabPlatform) -> Vec<&'static str> {
+    match platform {
+        LiveLabPlatform::Linux => vec!["nft", "list", "ruleset"],
+        LiveLabPlatform::MacOs => vec!["pfctl", "-s", "Anchors"],
+        LiveLabPlatform::Windows => vec![
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-NetFirewallProfile -ErrorAction SilentlyContinue | Format-List Name,DefaultOutboundAction; Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'RustyNetKS-*' } | Format-Table -HideTableHeaders DisplayName | Out-String -Width 32767",
+        ],
+    }
+}
+
+/// True iff the route-query output resolves the LAN probe over the rustynet
+/// tunnel device, per OS. Mirrors the LAN-ON positive control so the
 /// enforced-denial check is its exact inverse. Empty/garbage input is treated as
 /// "not via tunnel" (no positive evidence of a tunnel route), which fails closed
 /// toward "route withdrawn" for the denial check.
-fn route_to_target_uses_tunnel(route_get_output: &str) -> bool {
-    route_get_output
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|pair| pair[0] == "dev" && pair[1] == TUNNEL_IFACE)
+///
+/// - Linux: `ip route get` prints `... dev rustynet0 ...` — match a `dev
+///   <TUNNEL_IFACE>` token pair (NOT a substring, so `rustynet0x` cannot match).
+/// - macOS: `route -n get` prints an `interface: utunN` line — match an
+///   `interface:` line whose value is `utun<digits>` (the dynamic tunnel name).
+/// - Windows: `Get-NetRoute -InterfaceAlias rustynet0` prints a row only when the
+///   route resolves over the tunnel adapter — any non-empty data row counts.
+fn route_to_target_uses_tunnel(platform: LiveLabPlatform, route_get_output: &str) -> bool {
+    match platform {
+        LiveLabPlatform::Linux => route_get_output
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair[0] == "dev" && pair[1] == TUNNEL_IFACE),
+        LiveLabPlatform::MacOs => route_get_output.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("interface:")
+                .map(str::trim)
+                .is_some_and(is_macos_utun_iface_name)
+        }),
+        LiveLabPlatform::Windows => {
+            // `Get-NetRoute -InterfaceAlias rustynet0` already filtered to the
+            // tunnel adapter; any non-empty, non-whitespace data row means the
+            // route still resolves over the tunnel. (Headers are suppressed via
+            // `-HideTableHeaders`.) An error / empty pipeline yields no rows.
+            route_get_output.lines().any(|line| !line.trim().is_empty())
+        }
+    }
 }
 
-/// True iff the runtime nftables ruleset contains the canonical `inet` killswitch
-/// table (`rustynet` or a generation-rotated `rustynet_g<N>`). A present
-/// killswitch table is positive evidence that the fail-closed drop machinery is
-/// loaded. Empty/garbage input yields false (no enforcement evidence), so the
-/// caller falls back to the route-withdrawal signal and otherwise keeps polling.
+/// True iff `name` is a macOS utun tunnel interface name: the literal prefix
+/// `utun` followed by one or more ASCII digits (e.g. `utun9`). `utun` alone,
+/// `utunX`, or a substring like `xutun9` must NOT match.
+fn is_macos_utun_iface_name(name: &str) -> bool {
+    name.strip_prefix(MACOS_TUNNEL_IFACE_PREFIX)
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+/// True iff the killswitch-dump output is positive evidence the OS-native
+/// fail-closed drop machinery is loaded, per OS. Empty/garbage input yields false
+/// (no enforcement evidence), so the caller falls back to the route-withdrawal
+/// signal and otherwise keeps polling.
+///
+/// - Linux: the canonical `inet` killswitch table `rustynet` (or a
+///   generation-rotated `rustynet_g<N>`) appears in `nft list ruleset`.
+/// - macOS: the generation-numbered killswitch anchor `com.apple/rustynet_g<N>`
+///   or the fixed blind_exit anchor `com.rustynet/blind_exit` appears in
+///   `pfctl -s Anchors`, OR the terminal `block drop out quick all` rule appears
+///   (when anchor rules are dumped instead).
+/// - Windows: a firewall profile reports `DefaultOutboundAction ... Block`
+///   (default-deny outbound) OR a `RustyNetKS-` allow rule is present.
+fn killswitch_enforcement_present(platform: LiveLabPlatform, dump_output: &str) -> bool {
+    match platform {
+        LiveLabPlatform::Linux => killswitch_drop_table_present(dump_output),
+        LiveLabPlatform::MacOs => macos_killswitch_anchor_present(dump_output),
+        LiveLabPlatform::Windows => windows_killswitch_present(dump_output),
+    }
+}
+
+/// Linux: true iff the runtime nftables ruleset contains the canonical `inet`
+/// killswitch table (`rustynet` or a generation-rotated `rustynet_g<N>`).
 fn killswitch_drop_table_present(ruleset_output: &str) -> bool {
     ruleset_output.lines().any(|line| {
         let mut tokens = line.split_whitespace();
@@ -1011,13 +1185,67 @@ fn killswitch_drop_table_present(ruleset_output: &str) -> bool {
     })
 }
 
+/// macOS: true iff the killswitch dump shows the fail-closed pf machinery is
+/// loaded — the generation-numbered killswitch anchor `com.apple/rustynet_g<N>`
+/// (with a numeric generation) or the fixed blind_exit anchor
+/// `com.rustynet/blind_exit` in `pfctl -s Anchors`, OR the terminal
+/// `block drop out quick all` rule when anchor rules are dumped instead.
+fn macos_killswitch_anchor_present(dump_output: &str) -> bool {
+    dump_output.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed == MACOS_BLIND_EXIT_ANCHOR || trimmed.contains(MACOS_KILLSWITCH_TERMINAL_RULE) {
+            return true;
+        }
+        // A killswitch anchor line is `com.apple/rustynet_g<digits>`; require a
+        // non-empty numeric generation so the bare prefix or a confusable name
+        // (e.g. `com.apple/rustynet_gX`) does not satisfy the check.
+        trimmed
+            .strip_prefix(MACOS_KILLSWITCH_ANCHOR_PREFIX)
+            .is_some_and(|digits| {
+                !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+            })
+    })
+}
+
+/// Windows: true iff the firewall dump shows the killswitch is enforced — a
+/// firewall profile with `DefaultOutboundAction ... Block` (default-deny
+/// outbound posture) OR a `RustyNetKS-` allow rule name. A profile line whose
+/// DefaultOutboundAction is `Allow`/`NotConfigured` is NOT enforcement evidence.
+fn windows_killswitch_present(dump_output: &str) -> bool {
+    dump_output.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.contains(WINDOWS_KILLSWITCH_RULE_PREFIX) {
+            return true;
+        }
+        trimmed.contains(WINDOWS_KILLSWITCH_DEFAULT_OUTBOUND_BLOCK)
+            && trimmed.contains(WINDOWS_KILLSWITCH_BLOCK_TOKEN)
+    })
+}
+
+/// Assert the blind_exit node REFUSES LAN-access coupling. The denial is
+/// transport-agnostic: `rustynet ops apply-lan-access-coupling` queries daemon
+/// status, and when `node_role=blind_exit` it returns the exact error
+/// `"LAN access coupling is not permitted for blind_exit role"` BEFORE any
+/// OS-specific dataplane mutation (`rustynet-cli/src/main.rs`,
+/// `execute_ops_apply_lan_access_coupling`). The same string is emitted on every
+/// OS, so this assertion is portable — provided the command transport reaches
+/// the daemon and the daemon reports the blind_exit role.
+///
+/// blind_exit dataplane caveat (flagged in the W2-C report): the macOS daemon
+/// enforces the blind_exit pf posture (`com.rustynet/blind_exit` anchor), but the
+/// Windows daemon dataplane IGNORES the blind_exit flag
+/// (`WindowsCommandSystem::apply_nat_forwarding` takes `_blind_exit` and drops
+/// it) — there is no Windows blind_exit egress-block enforcement. The role-level
+/// LAN-coupling refusal still holds cross-OS, but the live Windows run will
+/// expose the missing dataplane enforcement.
 fn apply_lan_access_expect_denied(
     ctx: &LiveLabContext,
+    platform: LiveLabPlatform,
     target: &str,
     enable: bool,
     lan_routes: &str,
 ) -> Result<bool, String> {
-    let output = run_lan_access_command(ctx, target, enable, lan_routes, 20)?;
+    let output = run_lan_access_command(ctx, platform, target, enable, lan_routes, 20)?;
     if output.status.success() {
         return Ok(false);
     }
@@ -1038,17 +1266,31 @@ fn apply_lan_access_expect_denied(
 
 fn run_lan_access_command(
     ctx: &LiveLabContext,
+    platform: LiveLabPlatform,
     target: &str,
     enable: bool,
     lan_routes: &str,
     socket_wait_attempts: u32,
 ) -> Result<Output, String> {
-    ctx.wait_for_daemon_socket(
-        target,
-        "/run/rustynet/rustynetd.sock",
-        socket_wait_attempts,
-        1,
-    )?;
+    // Gate on the daemon IPC endpoint being live before issuing the mutating
+    // coupling command. Linux + macOS use a Unix domain socket (paths differ);
+    // Windows uses a named pipe, which has no Unix-socket equivalent for the
+    // POSIX `test -S` probe used by `wait_for_daemon_socket`, so we cannot
+    // (and must not pretend to) gate it here — see the per-OS path helper.
+    match daemon_socket_path(platform) {
+        Some(socket_path) => {
+            ctx.wait_for_daemon_socket(target, socket_path, socket_wait_attempts, 1)?;
+        }
+        None => {
+            // REVIEW(W2-C): Windows has no Unix daemon socket to probe (the
+            // daemon IPC is the named pipe \\.\pipe\RustyNet\rustynetd). The
+            // POSIX `sudo -n sh -lc` transport in `live_lab_support` also cannot
+            // drive the `rustynet.exe` CLI on a Windows OpenSSH host as-is, so
+            // the subsequent `run_root_allow_failure` will surface a real
+            // transport error (fail-closed) on a live Windows run rather than a
+            // fabricated pass. Flagged as a daemon/transport-side gap.
+        }
+    }
 
     let enable_flag = if enable { "true" } else { "false" };
     let mut args = vec![
@@ -1065,6 +1307,23 @@ fn run_lan_access_command(
         args.push(lan_routes);
     }
     ctx.run_root_allow_failure(target, &args)
+}
+
+/// The daemon Unix-domain socket path used to gate mutating IPC, per OS, or
+/// `None` when the OS has no Unix socket to probe.
+///
+/// - Linux: `/run/rustynet/rustynetd.sock` (`DEFAULT_SOCKET_PATH`, Linux build).
+/// - macOS: `/private/var/run/rustynet/rustynetd.sock` (`DEFAULT_SOCKET_PATH`,
+///   macOS build — `/var/run` is the `/private/var/run` symlink target).
+/// - Windows: `None` — the daemon IPC is a named pipe
+///   (`\\.\pipe\RustyNet\rustynetd`), not a Unix socket, so the POSIX
+///   `test -S` daemon-socket probe does not apply.
+fn daemon_socket_path(platform: LiveLabPlatform) -> Option<&'static str> {
+    match platform {
+        LiveLabPlatform::Linux => Some("/run/rustynet/rustynetd.sock"),
+        LiveLabPlatform::MacOs => Some("/private/var/run/rustynet/rustynetd.sock"),
+        LiveLabPlatform::Windows => None,
+    }
 }
 
 fn summarize_command_output(output: &Output) -> String {
@@ -1891,9 +2150,12 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssignmentAuthorityScope, ManagedDnsRecordTemplate, killswitch_drop_table_present,
+        AssignmentAuthorityScope, LiveLabPlatform, ManagedDnsRecordTemplate, daemon_socket_path,
+        is_macos_utun_iface_name, killswitch_drop_table_present, killswitch_dump_argv,
+        killswitch_enforcement_present, lan_probe_argv, macos_killswitch_anchor_present,
         managed_dns_base_records, managed_dns_records_manifest_for_scope,
-        parse_assignment_authority_scope, route_to_target_uses_tunnel,
+        parse_assignment_authority_scope, route_to_target_argv, route_to_target_uses_tunnel,
+        windows_killswitch_present,
     };
 
     #[test]
@@ -1965,25 +2227,35 @@ mod tests {
 
     #[test]
     fn route_via_tunnel_detected_when_dev_rustynet0_present() {
-        // The LAN-ON positive control shape: route resolves over the tunnel.
+        // The LAN-ON positive control shape (Linux): route resolves over the
+        // tunnel. Behaviour is byte-identical to the pre-Wave-2 single-OS check.
         let lan_on = "192.168.1.1 dev rustynet0 src 100.64.0.2 uid 0 \n    cache";
-        assert!(route_to_target_uses_tunnel(lan_on));
+        assert!(route_to_target_uses_tunnel(LiveLabPlatform::Linux, lan_on));
     }
 
     #[test]
     fn route_withdrawn_when_target_not_via_tunnel() {
-        // LAN-OFF: the advertised LAN route is withdrawn, so the target either
-        // resolves over a non-tunnel dev or does not resolve at all.
+        // LAN-OFF (Linux): the advertised LAN route is withdrawn, so the target
+        // either resolves over a non-tunnel dev or does not resolve at all.
         let via_lan_iface = "192.168.1.1 dev eth0 src 192.168.18.65 uid 0 \n    cache";
-        assert!(!route_to_target_uses_tunnel(via_lan_iface));
+        assert!(!route_to_target_uses_tunnel(
+            LiveLabPlatform::Linux,
+            via_lan_iface
+        ));
 
         let unreachable = "RTNETLINK answers: Network is unreachable";
-        assert!(!route_to_target_uses_tunnel(unreachable));
+        assert!(!route_to_target_uses_tunnel(
+            LiveLabPlatform::Linux,
+            unreachable
+        ));
 
         // Defense in depth: an empty/garbage capture is "not via tunnel".
-        assert!(!route_to_target_uses_tunnel(""));
-        assert!(!route_to_target_uses_tunnel("dev"));
-        assert!(!route_to_target_uses_tunnel("rustynet0"));
+        assert!(!route_to_target_uses_tunnel(LiveLabPlatform::Linux, ""));
+        assert!(!route_to_target_uses_tunnel(LiveLabPlatform::Linux, "dev"));
+        assert!(!route_to_target_uses_tunnel(
+            LiveLabPlatform::Linux,
+            "rustynet0"
+        ));
     }
 
     #[test]
@@ -1992,9 +2264,224 @@ mod tests {
         // a bare mention of the iface name outside a `dev <iface>` pair must not
         // either.
         let other_iface = "192.168.1.1 dev rustynet0x src 100.64.0.2 uid 0";
-        assert!(!route_to_target_uses_tunnel(other_iface));
+        assert!(!route_to_target_uses_tunnel(
+            LiveLabPlatform::Linux,
+            other_iface
+        ));
         let mentioned_only = "192.168.1.1 via rustynet0 dev eth0 src 192.168.18.65";
-        assert!(!route_to_target_uses_tunnel(mentioned_only));
+        assert!(!route_to_target_uses_tunnel(
+            LiveLabPlatform::Linux,
+            mentioned_only
+        ));
+    }
+
+    #[test]
+    fn macos_route_via_tunnel_detected_for_utun_interface() {
+        // Real `route -n get <ip>` block shape on macOS: an `interface: utunN`
+        // line means the LAN route resolves over the dynamic utun tunnel.
+        let lan_on = "   route to: 192.168.1.1\ndestination: 192.168.1.1\n       gateway: 100.64.0.1\n     interface: utun6\n         flags: <UP,GATEWAY,DONE>\n";
+        assert!(route_to_target_uses_tunnel(LiveLabPlatform::MacOs, lan_on));
+    }
+
+    #[test]
+    fn macos_route_withdrawn_when_interface_is_not_utun() {
+        // LAN-OFF on macOS: route resolves over the physical NIC (en0) or not at
+        // all. `utun` with no digits, a confusable name, and empty input all fail
+        // closed to "not via tunnel".
+        let via_en0 = "   route to: 192.168.1.1\ndestination: 192.168.1.1\n       gateway: 192.168.1.254\n     interface: en0\n";
+        assert!(!route_to_target_uses_tunnel(
+            LiveLabPlatform::MacOs,
+            via_en0
+        ));
+
+        let no_route = "route: writing to routing socket: not in table\n";
+        assert!(!route_to_target_uses_tunnel(
+            LiveLabPlatform::MacOs,
+            no_route
+        ));
+
+        let bare_utun = "     interface: utun\n";
+        assert!(!route_to_target_uses_tunnel(
+            LiveLabPlatform::MacOs,
+            bare_utun
+        ));
+        let confusable = "     interface: utunX\n";
+        assert!(!route_to_target_uses_tunnel(
+            LiveLabPlatform::MacOs,
+            confusable
+        ));
+        assert!(!route_to_target_uses_tunnel(LiveLabPlatform::MacOs, ""));
+    }
+
+    #[test]
+    fn macos_utun_iface_name_matcher_requires_numeric_suffix() {
+        assert!(is_macos_utun_iface_name("utun0"));
+        assert!(is_macos_utun_iface_name("utun9"));
+        assert!(is_macos_utun_iface_name("utun123"));
+        assert!(!is_macos_utun_iface_name("utun"));
+        assert!(!is_macos_utun_iface_name("utunX"));
+        assert!(!is_macos_utun_iface_name("xutun9"));
+        assert!(!is_macos_utun_iface_name("en0"));
+        assert!(!is_macos_utun_iface_name(""));
+    }
+
+    #[test]
+    fn windows_route_via_tunnel_detected_when_get_netroute_row_present() {
+        // `Get-NetRoute -InterfaceAlias rustynet0 ... -HideTableHeaders` already
+        // filtered to the tunnel adapter: a returned data row means the route
+        // still resolves over the tunnel.
+        let row = "192.168.1.1/32        0.0.0.0                rustynet0            256\n";
+        assert!(route_to_target_uses_tunnel(LiveLabPlatform::Windows, row));
+    }
+
+    #[test]
+    fn windows_route_withdrawn_when_get_netroute_returns_no_rows() {
+        // LAN-OFF on Windows: the alias-filtered query returns zero rows
+        // (empty/whitespace stdout) when the tunnel route is withdrawn.
+        assert!(!route_to_target_uses_tunnel(LiveLabPlatform::Windows, ""));
+        assert!(!route_to_target_uses_tunnel(
+            LiveLabPlatform::Windows,
+            "   \n  \n"
+        ));
+    }
+
+    #[test]
+    fn lan_probe_argv_is_per_os() {
+        assert_eq!(
+            lan_probe_argv(LiveLabPlatform::Linux),
+            vec!["ping", "-c", "1", "-W", "1", "192.168.1.1"]
+        );
+        assert_eq!(
+            lan_probe_argv(LiveLabPlatform::MacOs),
+            vec!["ping", "-c", "1", "-t", "2", "192.168.1.1"]
+        );
+        let windows = lan_probe_argv(LiveLabPlatform::Windows);
+        assert_eq!(windows[0], "powershell");
+        assert!(windows.iter().any(|arg| arg.contains("Test-Connection")));
+    }
+
+    #[test]
+    fn route_to_target_argv_is_per_os() {
+        assert_eq!(
+            route_to_target_argv(LiveLabPlatform::Linux),
+            vec!["ip", "-4", "route", "get", "192.168.1.1"]
+        );
+        assert_eq!(
+            route_to_target_argv(LiveLabPlatform::MacOs),
+            vec!["route", "-n", "get", "192.168.1.1"]
+        );
+        let windows = route_to_target_argv(LiveLabPlatform::Windows);
+        assert_eq!(windows[0], "powershell");
+        assert!(windows.iter().any(|arg| arg.contains("Get-NetRoute")));
+        assert!(windows.iter().any(|arg| arg.contains("rustynet0")));
+    }
+
+    #[test]
+    fn killswitch_dump_argv_is_per_os() {
+        assert_eq!(
+            killswitch_dump_argv(LiveLabPlatform::Linux),
+            vec!["nft", "list", "ruleset"]
+        );
+        assert_eq!(
+            killswitch_dump_argv(LiveLabPlatform::MacOs),
+            vec!["pfctl", "-s", "Anchors"]
+        );
+        let windows = killswitch_dump_argv(LiveLabPlatform::Windows);
+        assert_eq!(windows[0], "powershell");
+        assert!(
+            windows
+                .iter()
+                .any(|arg| arg.contains("Get-NetFirewallProfile"))
+        );
+        assert!(windows.iter().any(|arg| arg.contains("RustyNetKS-")));
+    }
+
+    #[test]
+    fn daemon_socket_path_is_per_os_and_none_for_windows() {
+        assert_eq!(
+            daemon_socket_path(LiveLabPlatform::Linux),
+            Some("/run/rustynet/rustynetd.sock")
+        );
+        assert_eq!(
+            daemon_socket_path(LiveLabPlatform::MacOs),
+            Some("/private/var/run/rustynet/rustynetd.sock")
+        );
+        // Windows daemon IPC is a named pipe, not a Unix socket.
+        assert_eq!(daemon_socket_path(LiveLabPlatform::Windows), None);
+    }
+
+    #[test]
+    fn macos_killswitch_anchor_present_detects_killswitch_and_blind_exit() {
+        // `pfctl -s Anchors` lists the generation-numbered killswitch anchor.
+        let anchors = "com.apple/250.AppleFirewall\ncom.apple/rustynet_g7\n";
+        assert!(macos_killswitch_anchor_present(anchors));
+
+        // The fixed blind_exit anchor is also positive enforcement evidence.
+        let blind_exit = "com.apple/250.AppleFirewall\ncom.rustynet/blind_exit\n";
+        assert!(macos_killswitch_anchor_present(blind_exit));
+
+        // Dumping the anchor rules instead yields the terminal block-all rule.
+        let rules = "set block-policy drop\nblock drop out quick all\n";
+        assert!(macos_killswitch_anchor_present(rules));
+    }
+
+    #[test]
+    fn macos_killswitch_anchor_absent_yields_no_enforcement_evidence() {
+        assert!(!macos_killswitch_anchor_present(""));
+        // Unrelated anchors only.
+        let unrelated = "com.apple/250.AppleFirewall\ncom.apple/250.PassiveFTP\n";
+        assert!(!macos_killswitch_anchor_present(unrelated));
+        // A confusable / non-numeric generation suffix must NOT match.
+        let confusable = "com.apple/rustynet_gX\ncom.apple/rustynet_g\n";
+        assert!(!macos_killswitch_anchor_present(confusable));
+    }
+
+    #[test]
+    fn windows_killswitch_present_detects_block_outbound_and_rule() {
+        // `Get-NetFirewallProfile | Format-List Name,DefaultOutboundAction`.
+        let block_profile = "Name                  : Domain\nDefaultOutboundAction : Block\n";
+        assert!(windows_killswitch_present(block_profile));
+
+        // A named RustyNetKS- allow rule is also positive evidence.
+        let rule_row = "RustyNetKS-AllowLoopback\nRustyNetKS-AllowEgress\n";
+        assert!(windows_killswitch_present(rule_row));
+    }
+
+    #[test]
+    fn windows_killswitch_absent_yields_no_enforcement_evidence() {
+        assert!(!windows_killswitch_present(""));
+        // Default outbound is Allow (not enforced) — must NOT match.
+        let allow_profile = "Name                  : Public\nDefaultOutboundAction : Allow\n";
+        assert!(!windows_killswitch_present(allow_profile));
+        // NotConfigured is also not enforcement evidence.
+        let not_configured =
+            "Name                  : Private\nDefaultOutboundAction : NotConfigured\n";
+        assert!(!windows_killswitch_present(not_configured));
+        // Unrelated firewall rule names must not match.
+        let other_rule = "Core Networking - DNS (UDP-Out)\n";
+        assert!(!windows_killswitch_present(other_rule));
+    }
+
+    #[test]
+    fn killswitch_enforcement_present_dispatches_per_os() {
+        // Each OS's positive sample is recognized only through its own branch.
+        assert!(killswitch_enforcement_present(
+            LiveLabPlatform::Linux,
+            "table inet rustynet_g3 {\n}\n"
+        ));
+        assert!(killswitch_enforcement_present(
+            LiveLabPlatform::MacOs,
+            "com.apple/rustynet_g3\n"
+        ));
+        assert!(killswitch_enforcement_present(
+            LiveLabPlatform::Windows,
+            "DefaultOutboundAction : Block\n"
+        ));
+        // Cross-OS confusion guard: a macOS anchor dump is not Linux evidence.
+        assert!(!killswitch_enforcement_present(
+            LiveLabPlatform::Linux,
+            "com.apple/rustynet_g3\n"
+        ));
     }
 
     #[test]
