@@ -230,6 +230,9 @@ fn finalise_consume(
 mod tests {
     use super::*;
     use crate::enrollment_token::{ENROLLMENT_SECRET_LEN, mint_token_with_clock};
+    // Used only by the `#[cfg(unix)]` transport-backed test below (gossip
+    // transport is unix-only — Track Beta); gate it or it is unused on Windows.
+    #[cfg(unix)]
     use crate::gossip_transport::GossipTransport;
     use ed25519_dalek::SigningKey;
     use std::net::{IpAddr, Ipv4Addr};
