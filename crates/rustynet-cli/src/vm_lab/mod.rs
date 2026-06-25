@@ -9782,6 +9782,10 @@ fn macos_exit_evidence_artifact_specs() -> &'static [MacosExitEvidenceArtifactSp
             local_relative_path: "dns_leak_proof/tcp_block_pcap.txt",
         },
         MacosExitEvidenceArtifactSpec {
+            remote_relative_path: "dns_leak_proof/dns_block_probe.json",
+            local_relative_path: "dns_leak_proof/dns_block_probe.json",
+        },
+        MacosExitEvidenceArtifactSpec {
             remote_relative_path: "dns_leak_proof/tunnel_path_resolves.json",
             local_relative_path: "dns_leak_proof/tunnel_path_resolves.json",
         },
@@ -12794,11 +12798,21 @@ fn run_windows_orchestration_stages_with_options(
     } else {
         match validate_windows_relay_service_lifecycle_contract_from_repo() {
             Ok(summary) => {
-                let _ = std::fs::write(&windows_relay_lifecycle_log_path, summary.as_str());
+                // FAIL-LOUD honesty (Roadmap §7): this stage only statically lints
+                // the in-repo SCM install/uninstall helper scripts. It performs NO
+                // ssh to the Windows guest and never installs, starts, stops, or
+                // removes the relay service. A passing static contract is therefore
+                // NOT live proof of the relay lifecycle and MUST NOT record Pass —
+                // record Skipped so the run aggregate cannot count it as a live
+                // role proof. A contract *violation* is still a real defect → Fail.
+                let message = format!(
+                    "contract-only (NOT live-proven): {summary}. Static SCM-helper contract verified but the relay service lifecycle was not exercised on {windows_alias}; live install/start/stop/remove on the guest is still required."
+                );
+                let _ = std::fs::write(&windows_relay_lifecycle_log_path, message.as_str());
                 stage_outcome(
                     "validate_windows_relay_service_lifecycle",
-                    VmLabStageStatus::Pass,
-                    summary,
+                    VmLabStageStatus::Skipped,
+                    message,
                     vec![windows_relay_lifecycle_log_path.clone()],
                 )
             }
@@ -12862,11 +12876,22 @@ fn run_windows_orchestration_stages_with_options(
     } else {
         match validate_windows_anchor_bundle_pull_plan_contract(windows_alias, inventory_path) {
             Ok(summary) => {
-                let _ = std::fs::write(&windows_anchor_bundle_pull_log_path, summary.as_str());
+                // FAIL-LOUD honesty (Roadmap §7): this stage only builds and lints
+                // the anchor-init *dry-run* plan string in-process. It performs NO
+                // ssh to the Windows guest and never binds the bundle-pull listener
+                // or serves a byte-for-byte pull there. A passing plan contract is
+                // therefore NOT live proof of the Windows anchor role and MUST NOT
+                // record Pass — record Skipped so the run aggregate cannot count it
+                // as a live role proof. A contract *violation* is still a real
+                // defect → Fail.
+                let message = format!(
+                    "contract-only (NOT live-proven): {summary}. Anchor-init dry-run plan contract verified in-process but the bundle-pull listener was not bound or served on {windows_alias}; a live guest pull is still required."
+                );
+                let _ = std::fs::write(&windows_anchor_bundle_pull_log_path, message.as_str());
                 stage_outcome(
                     "validate_windows_anchor_bundle_pull",
-                    VmLabStageStatus::Pass,
-                    summary,
+                    VmLabStageStatus::Skipped,
+                    message,
                     vec![windows_anchor_bundle_pull_log_path.clone()],
                 )
             }
@@ -13242,6 +13267,28 @@ function Get-DefaultEgressAlias {
         return ''
     }
 }
+function Test-NetNatAbsent {
+    # Fail-closed NAT presence (mirrors the RSA-0031 daemon merge in
+    # crates/rustynetd/src/windows_exit_nat_lifecycle.rs): only a query that
+    # SUCCEEDS and returns no matching NetNat proves the NAT was torn down.
+    # `Get-NetNat -ErrorAction SilentlyContinue` conflates "absent" with
+    # "provider/WMI query failed" — both return $null — which would let a query
+    # error be read as a successful teardown (fail-open). The MSFT_NetNat
+    # provider throws a CimException "No MSFT_NetNat objects found ..." for a
+    # genuinely-absent named NAT; that single message is the only error that
+    # counts as absent. Any other failure is indeterminate → treated as PRESENT
+    # (not torn down) so teardown can never be claimed from an error.
+    param([string]$Name)
+    try {
+        $existing = Get-NetNat -Name $Name -ErrorAction Stop;
+        return ($null -eq $existing);
+    } catch {
+        if ($_.Exception.Message -match 'No MSFT_NetNat') {
+            return $true;
+        }
+        return $false;
+    }
+}
 
 New-Item -ItemType Directory -Force -Path $ArtifactRoot | Out-Null;
 
@@ -13261,34 +13308,46 @@ if ($null -eq $nat) {
     } catch {
         $stopError = $_.Exception.Message;
     }
-    $afterNat = Get-NetNat -Name $NatName -ErrorAction SilentlyContinue;
+    # Fail-closed teardown evaluation (mirror of the RSA-0031 daemon merge):
+    # restoration is proven ONLY when the NAT query succeeds and shows it gone
+    # AND both interfaces report the literal 'Disabled'. A NetNat query error
+    # counts as still-present; a forwarding query error ('Error: ...') is not
+    # 'Disabled' and so cannot be read as restored.
+    $afterNatAbsent = Test-NetNatAbsent -Name $NatName;
     $afterTunnelForwarding = Get-ForwardingState -Alias $TunnelAlias;
     $afterEgressForwarding = Get-ForwardingState -Alias $egressAlias;
-    $forwardingRestored = ($null -eq $afterNat) -and
-        ($afterTunnelForwarding -ne 'Enabled') -and
-        ($afterEgressForwarding -ne 'Enabled');
-    if ([string]::IsNullOrWhiteSpace($stopError) -and $forwardingRestored) {
-        Write-JsonFile -Path (Join-Path -Path $ArtifactRoot -ChildPath 'scm_context_nat_lifecycle.json') -Value ([pscustomobject]@{
-            schema_version = 1;
-            nat_name = $NatName;
-            mesh_cidr = $MeshCidr;
-            during_run = [pscustomobject]@{
-                netnat_present = $true;
-                internal_prefix = [string]$nat.InternalIPInterfaceAddressPrefix;
-                tunnel_forwarding = $duringTunnelForwarding;
-                egress_forwarding = $duringEgressForwarding;
-                egress_alias = $egressAlias;
-            };
-            after_stop = [pscustomobject]@{
-                netnat_present = ($null -ne $afterNat);
-                forwarding_restored = $forwardingRestored;
-                tunnel_forwarding = $afterTunnelForwarding;
-                egress_forwarding = $afterEgressForwarding;
-            };
-        });
-        Add-WrittenLabel 'scm_context_nat_lifecycle';
-    } else {
-        Add-SkippedReason ('NAT lifecycle proof skipped: service stop/cleanup did not prove restoration; stop_error=' + $stopError + '; after_tunnel=' + $afterTunnelForwarding + '; after_egress=' + $afterEgressForwarding);
+    $forwardingRestored = $afterNatAbsent -and
+        ($afterTunnelForwarding -eq 'Disabled') -and
+        ($afterEgressForwarding -eq 'Disabled');
+    # The host WAS serving exit (NAT present during run), so a clean teardown is
+    # MANDATORY. Always emit the lifecycle artifact with the real measured
+    # after-stop state — never skip on a non-restoration. Writing the artifact
+    # only on success would let a genuine residual NAT (a release-blocking open
+    # relay) be masked as a Skip, because the validate stage maps an ABSENT
+    # artifact to Skipped. With the artifact always present, the validator
+    # FAILS on netnat_present=true or forwarding_restored=false.
+    Write-JsonFile -Path (Join-Path -Path $ArtifactRoot -ChildPath 'scm_context_nat_lifecycle.json') -Value ([pscustomobject]@{
+        schema_version = 1;
+        nat_name = $NatName;
+        mesh_cidr = $MeshCidr;
+        during_run = [pscustomobject]@{
+            netnat_present = $true;
+            internal_prefix = [string]$nat.InternalIPInterfaceAddressPrefix;
+            tunnel_forwarding = $duringTunnelForwarding;
+            egress_forwarding = $duringEgressForwarding;
+            egress_alias = $egressAlias;
+        };
+        after_stop = [pscustomobject]@{
+            netnat_present = (-not $afterNatAbsent);
+            forwarding_restored = $forwardingRestored;
+            tunnel_forwarding = $afterTunnelForwarding;
+            egress_forwarding = $afterEgressForwarding;
+            stop_error = $stopError;
+        };
+    });
+    Add-WrittenLabel 'scm_context_nat_lifecycle';
+    if (-not $forwardingRestored) {
+        Add-SkippedReason ('NAT lifecycle teardown did NOT prove restoration (artifact emitted for fail-closed validation); stop_error=' + $stopError + '; after_nat_absent=' + $afterNatAbsent + '; after_tunnel=' + $afterTunnelForwarding + '; after_egress=' + $afterEgressForwarding);
     }
     try {
         Start-Service -Name $ServiceName -ErrorAction Stop;
@@ -15202,6 +15261,36 @@ fn evaluate_macos_exit_dns_failclosed_artifact_dir(
         .map_err(|err| format!("read tcp_block_pcap.txt failed: {err}"))?;
     require_empty_dns_pcap("tcp_block_pcap.txt", tcp_pcap.as_str())?;
 
+    // Anti-vacuous guard: an empty egress pcap only proves the killswitch works
+    // if a real off-tunnel DNS query was actively driven during the capture.
+    // dns_block_probe.json records that probe; fail closed unless it ran AND no
+    // DNS response was observed on either transport.
+    let probe = fs::read_to_string(artifact_dir.join("dns_block_probe.json"))
+        .map_err(|err| format!("read dns_block_probe.json failed: {err}"))?;
+    let probe_report: Value = serde_json::from_str(&probe)
+        .map_err(|err| format!("parse dns_block_probe.json failed: {err}"))?;
+    require_json_u64(&probe_report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| "dns_block_probe.json returned unsupported schema_version".to_owned())?;
+    if !require_json_bool(&probe_report, "probe_attempted")? {
+        return Err(
+            "dns_block_probe.json reports the blocked-path probe never ran; an empty pcap without an active off-tunnel probe is vacuous — failing closed"
+                .to_owned(),
+        );
+    }
+    if require_json_bool(&probe_report, "udp_response_received")?
+        || require_json_bool(&probe_report, "tcp_response_received")?
+    {
+        return Err(
+            "dns_block_probe.json observed a DNS response on the off-tunnel path: LAN DNS is NOT fail-closed (leak)"
+                .to_owned(),
+        );
+    }
+    if !require_json_bool(&probe_report, "overall_ok")? {
+        return Err("dns_block_probe.json did not report overall_ok=true".to_owned());
+    }
+
     let positive_control = fs::read_to_string(artifact_dir.join("tunnel_path_resolves.json"))
         .map_err(|err| format!("read tunnel_path_resolves.json failed: {err}"))?;
     let positive_report: Value = serde_json::from_str(&positive_control)
@@ -15219,7 +15308,7 @@ fn evaluate_macos_exit_dns_failclosed_artifact_dir(
     evaluate_macos_dns_failclosed_report(macos_alias, dns_check.as_str())?;
 
     Ok(format!(
-        "macOS exit DNS leak proof verified on {macos_alias}: UDP/TCP egress pcaps empty and tunnel positive control passed"
+        "macOS exit DNS leak proof verified on {macos_alias}: off-tunnel probe driven, UDP/TCP egress pcaps empty, no probe response, and tunnel positive control passed"
     ))
 }
 
@@ -15228,6 +15317,7 @@ fn macos_exit_dns_failclosed_artifact_set_complete(artifact_dir: &Path) -> Resul
         "pf_block_rules.json",
         "udp_block_pcap.txt",
         "tcp_block_pcap.txt",
+        "dns_block_probe.json",
         "tunnel_path_resolves.json",
         "macos_dns_failclosed_check.json",
     ];
@@ -36485,6 +36575,21 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         std::fs::write(dir.join("udp_block_pcap.txt"), "0 packets captured").unwrap();
         std::fs::write(dir.join("tcp_block_pcap.txt"), "0 packets captured").unwrap();
         std::fs::write(
+            dir.join("dns_block_probe.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "overall_ok": true,
+                "probe_attempted": true,
+                "probe_target": "192.168.0.1",
+                "probe_query": "rustynet-dns-leak-probe.invalid",
+                "udp_response_received": false,
+                "tcp_response_received": false,
+                "reason": "off-tunnel DNS probe received no UDP or TCP response"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
             dir.join("tunnel_path_resolves.json"),
             serde_json::json!({ "overall_ok": true, "resolved": true }).to_string(),
         )
@@ -36501,6 +36606,110 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             summary.contains("macos-utm-1") && summary.contains("UDP/TCP egress pcaps empty"),
             "unexpected summary: {summary}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluate_macos_exit_dns_failclosed_artifact_dir_rejects_vacuous_probe() {
+        // An empty pcap with a probe that NEVER RAN is the vacuity this guard
+        // closes: the capture proves nothing if no off-tunnel DNS was attempted.
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-macos-dns-failclosed-vacuous-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pf_rules = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "rules": [
+                { "name": "rustynet-dns-block-lan-udp", "action": "block", "direction": "out", "enabled": "true" },
+                { "name": "rustynet-dns-block-lan-tcp", "action": "block", "direction": "out", "enabled": "true" }
+            ]
+        });
+        std::fs::write(dir.join("pf_block_rules.json"), pf_rules.to_string()).unwrap();
+        std::fs::write(dir.join("udp_block_pcap.txt"), "0 packets captured").unwrap();
+        std::fs::write(dir.join("tcp_block_pcap.txt"), "0 packets captured").unwrap();
+        std::fs::write(
+            dir.join("dns_block_probe.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "overall_ok": false,
+                "probe_attempted": false,
+                "probe_target": "",
+                "probe_query": "rustynet-dns-leak-probe.invalid",
+                "udp_response_received": false,
+                "tcp_response_received": false,
+                "reason": "blocked-path DNS probe did not execute"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tunnel_path_resolves.json"),
+            serde_json::json!({ "overall_ok": true, "resolved": true }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("macos_dns_failclosed_check.json"),
+            serde_json::json!({ "schema_version": 1, "overall_ok": true, "drift_reasons": [] })
+                .to_string(),
+        )
+        .unwrap();
+        let err = super::evaluate_macos_exit_dns_failclosed_artifact_dir("macos-utm-1", &dir)
+            .expect_err("a probe that never ran must fail closed");
+        assert!(err.contains("never ran"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluate_macos_exit_dns_failclosed_artifact_dir_rejects_probe_response() {
+        // A DNS response on the off-tunnel path is a leak even with an empty
+        // pcap snapshot (e.g. the response slipped just outside the capture).
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-macos-dns-failclosed-leak-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pf_rules = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "rules": [
+                { "name": "rustynet-dns-block-lan-udp", "action": "block", "direction": "out", "enabled": "true" },
+                { "name": "rustynet-dns-block-lan-tcp", "action": "block", "direction": "out", "enabled": "true" }
+            ]
+        });
+        std::fs::write(dir.join("pf_block_rules.json"), pf_rules.to_string()).unwrap();
+        std::fs::write(dir.join("udp_block_pcap.txt"), "0 packets captured").unwrap();
+        std::fs::write(dir.join("tcp_block_pcap.txt"), "0 packets captured").unwrap();
+        std::fs::write(
+            dir.join("dns_block_probe.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "overall_ok": false,
+                "probe_attempted": true,
+                "probe_target": "192.168.0.1",
+                "probe_query": "rustynet-dns-leak-probe.invalid",
+                "udp_response_received": true,
+                "tcp_response_received": false,
+                "reason": "off-tunnel DNS probe received a response: LAN DNS path is OPEN (leak)"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tunnel_path_resolves.json"),
+            serde_json::json!({ "overall_ok": true, "resolved": true }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("macos_dns_failclosed_check.json"),
+            serde_json::json!({ "schema_version": 1, "overall_ok": true, "drift_reasons": [] })
+                .to_string(),
+        )
+        .unwrap();
+        let err = super::evaluate_macos_exit_dns_failclosed_artifact_dir("macos-utm-1", &dir)
+            .expect_err("an observed off-tunnel DNS response must fail");
+        assert!(err.contains("NOT fail-closed"), "unexpected error: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -36526,6 +36735,21 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         )
         .unwrap();
         std::fs::write(dir.join("tcp_block_pcap.txt"), "0 packets captured").unwrap();
+        std::fs::write(
+            dir.join("dns_block_probe.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "overall_ok": true,
+                "probe_attempted": true,
+                "probe_target": "192.168.0.1",
+                "probe_query": "rustynet-dns-leak-probe.invalid",
+                "udp_response_received": false,
+                "tcp_response_received": false,
+                "reason": "off-tunnel DNS probe received no UDP or TCP response"
+            })
+            .to_string(),
+        )
+        .unwrap();
         std::fs::write(
             dir.join("tunnel_path_resolves.json"),
             serde_json::json!({ "overall_ok": true, "resolved": true }).to_string(),
