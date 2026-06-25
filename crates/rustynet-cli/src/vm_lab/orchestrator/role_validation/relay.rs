@@ -127,6 +127,18 @@ pub fn capture_snapshot(
 /// during-run capture → stop → after-stop capture → restart, asserting
 /// every invariant. Returns `Ok(())` when all invariants hold and the
 /// restart succeeds; otherwise `Err` with the joined failure list.
+///
+/// HONESTY NOTE (Wave-0 F0.7): this is the GENUINE live lifecycle proof — it
+/// installs/serves the real `rustynet-relay` runtime (via the deploy-relay
+/// stage) and observes a LIVE running service (active unit + bound datapath/
+/// health sockets + `/healthz` ok), stops it, and proves teardown. Because the
+/// service actually ran on the guest, an `Ok` from this validator is a real
+/// `Pass` (unlike the `ops install-systemd-relay --dry-run` PLAN-only check in
+/// `exercise_linux_relay_lifecycle_dry_run`, which is demoted to Skipped). What
+/// this validator does NOT yet prove is the end-to-end forwarded-frame path:
+/// pushing a client→relay→peer frame and proving ciphertext-only / zero-ingress
+/// forwarding. That forwarded-frame proof is a Wave 4 (cross-network/dataplane)
+/// deliverable and is intentionally out of scope here.
 pub fn validate_relay_lifecycle(
     shell: &dyn RemoteShellHost,
     platform: VmGuestPlatform,
