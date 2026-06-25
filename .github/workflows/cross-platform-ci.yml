@@ -124,7 +124,12 @@ jobs:
           cargo fmt "${PKGS[@]}" -- --check
           cargo clippy "${PKGS[@]}" --all-targets --all-features --locked -- -D warnings
           cargo check "${PKGS[@]}" --all-targets --all-features --locked
-          cargo test "${PKGS[@]}" --all-targets --all-features --locked
+          # --no-fail-fast: run EVERY package's test binary even after one fails,
+          # so a single run surfaces the complete Windows failure set instead of
+          # stopping at the first failing crate (Windows tests cannot be run
+          # locally on the macOS lab host, so each masked failure would otherwise
+          # cost a full ~12-min CI round-trip to discover).
+          cargo test "${PKGS[@]}" --all-targets --all-features --locked --no-fail-fast
       - name: Security gates
         run: |
           # cargo-audit + cargo-deny operate on Cargo.lock + the

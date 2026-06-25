@@ -1189,57 +1189,57 @@ const FORBIDDEN_SECRET_EQUALITY_TOKENS: &[&str] = &[
 const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, u32, &str)] = &[
     (
         "crates/rustynet-control/src/lib.rs",
-        1488,
+        1494,
         "nonce counter zero-check on relay fleet bundle u64 input (not secret material)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        1550,
+        1556,
         "canonical-payload u64 round-trip equality for nonce field (structural check, not secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        2005,
+        2011,
         "all-zero sentinel rejection on relay session token nonce field (not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        2038,
+        2044,
         "canonical-payload string equality on relay session token (structural canonicalisation check, signature handled separately via ct_eq)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        2928,
+        2934,
         "nonce counter zero-check on relay fleet request u64 input (not secret material)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3092,
+        3098,
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3097,
+        3103,
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3230,
+        3236,
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3233,
+        3239,
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        4280,
+        4286,
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        4285,
+        4291,
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
     ),
     (
@@ -1253,10 +1253,20 @@ const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, u32, &str)] = &[
 /// any entry in `REVIEWED_SECRET_EQUALITY_EXCEPTIONS`. Suffix-match
 /// on the path keeps entries stable across workspace-prefix changes.
 fn equality_hit_is_allowlisted(file_path_label: &str, line_number: usize) -> bool {
+    // The reviewed-exception suffixes use forward slashes, but the swept
+    // path label mixes `/` (from the sweep-root literal) with the OS-native
+    // separator from the directory walk — on Windows the filename segment
+    // arrives as `…src\transport.rs`, so a raw `ends_with` against
+    // `…src/transport.rs` would miss every reviewed exception and report the
+    // justified sites as offenders. Normalize to forward slashes so the
+    // allowlist applies identically on every host (this does not weaken the
+    // audit: equality on secret material outside the reviewed list still
+    // fails on all platforms).
+    let normalized_label = file_path_label.replace('\\', "/");
     REVIEWED_SECRET_EQUALITY_EXCEPTIONS
         .iter()
         .any(|(path, line, _why)| {
-            file_path_label.ends_with(path) && (*line as usize) == line_number
+            normalized_label.ends_with(path) && (*line as usize) == line_number
         })
 }
 

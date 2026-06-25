@@ -22,6 +22,14 @@
 //! 4. Bundle whose claimed source is unknown to the receiver → drop.
 
 #![forbid(unsafe_code)]
+// This crate drives `GossipNode` + `GossipTransport` directly; the transport
+// binds a real UDP socket and is unix-only in this slice (the Windows gossip
+// path is queued behind Track Beta — `GossipTransport::bind` returns
+// Unsupported on non-unix). Gate the entire integration-test crate off Windows
+// so every test plus the `Peer` harness and `loopback`/`unix_now`/`drain_until`
+// helpers compile only where the transport exists (no unused-code `-D warnings`
+// on the Windows CI build).
+#![cfg(unix)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

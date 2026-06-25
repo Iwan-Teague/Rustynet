@@ -25,6 +25,33 @@ rustup target add x86_64-pc-windows-gnu
 # mingw linker (Debian/Ubuntu): apt-get install -y gcc-mingw-w64-x86-64
 ```
 
+**Host caveat (the macOS lab laptop):** this runbook is **Linux-only**. On the
+`aarch64-apple-darwin` lab host the pinned `1.88.0` toolchain cannot resolve the
+windows `rust-std` even after `rustup target add` / `component add` (every
+windows-target `cargo check`/clippy — via rustup `1.88.0` too — aborts with
+`can't find crate for core` at `cfg-if`/`subtle`/`cpufeatures`). Both
+`x86_64-pc-windows-gnu` and `-msvc` fail identically, so there is **no working
+local Windows cross-check on this laptop** — Windows-targeting changes here must
+be reasoned through `cfg`-by-`cfg` and verified by the actual Windows CI job. Run
+the cross-clippy from the Linux dev box instead.
+
+**TOOLCHAIN TRAP on the macOS lab laptop (READ THIS before trusting any local
+gate result here).** `cargo`/`rustc` on `PATH` is **Homebrew's `1.94.1`**
+(`/opt/homebrew/bin/cargo`), NOT rustup — so `rust-toolchain.toml`'s pin to
+`1.88.0` is **silently ignored** and `cargo +1.88.0 …` fails (`no such command:
++1.88.0`, because Homebrew cargo is not a rustup shim). The CI runs `1.88.0`, and
+`1.94.1`'s clippy is **stricter** (e.g. it raises a `collapsible_if` let-chain
+lint on `linux_exit_dns_failclosed.rs` that `1.88.0` does not), so the Homebrew
+toolchain produces **false-positive** clippy failures that do not reflect CI. To
+gate against the CI toolchain on this host, prepend the rustup `1.88.0` bin dir:
+```
+export PATH="$HOME/.rustup/toolchains/1.88.0-aarch64-apple-darwin/bin:$PATH"
+cargo clippy --version   # must print clippy 0.1.88, not 0.1.94
+```
+(`rustup run 1.88.0 cargo clippy` is NOT enough — the `cargo clippy` subcommand
+still resolves `cargo-clippy` off `PATH` to the Homebrew driver; prepend the
+toolchain bin dir as above.)
+
 Run (the exact 10 packages the Windows CI job builds):
 ```
 CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
@@ -88,6 +115,107 @@ pass); windows-gnu cross-clippy 0; CI confirmation pending.
 
 ---
 
+## 3b. Second Windows red: relay Windows-portable tests (`7734156`)
+
+Once the persist fix (§3) let the Windows build compile *and pass*
+`rustynet-control`, the next red surfaced in `rustynet-relay`: **21 tests failed**
+on `windows-2022` (run `28179119351`). Same shape as §3 — the tests had only ever
+run on Linux/macOS until the cfg-gating made the crate compile on Windows, so they
+were written Unix-only and now hit the Windows-specific filesystem/ACL/path-root
+gates that are no-ops on Unix:
+
+- config + `parse_args_from` tests passed `/tmp/...` paths, not
+  `Path::is_absolute()` on Windows ⇒ `RelayConfig::validate()` returned the
+  absolute-path error before the assertion's target check;
+- env-file parse tests drove the full `load_windows_relay_service_args`, which on
+  Windows additionally enforces the reviewed-root path gate + SDDL ACL inspection
+  that a transient temp file cannot satisfy;
+- runtime-arg tests validated against non-existent `C:\...` files, so the Windows
+  `symlink_metadata` + `inspect_file_sddl` step failed on input the Unix no-op ACL
+  accepted.
+
+Fix (`7734156`): **no production gate weakened** — the hardened paths still call
+the same gates in the same order. The tests were made cross-platform by separating
+pure validation logic from filesystem/ACL I/O: extract
+`parse_windows_relay_service_args_from_text` (env-file grammar + JSON shape) and
+`enforce_windows_relay_env_file_size` (DoS cap) out of the loader; split
+`validate_windows_relay_service_runtime_path` into a pure `_path_policy` gate +
+the existing ACL gate; point grammar/size/shape/policy tests at the pure
+functions; use platform-absolute / reviewed-root paths in the config + entry
+tests; and keep one `#[cfg(not(windows))]` end-to-end test each for the env-file
+loader + full runtime-arg validator so the Unix I/O branch stays covered and the
+symbols stay live on Unix. SDDL ACL evaluation remains covered cross-platform by
+`relay_windows_service_runtime_acl_requires_hardened_file_and_parent`.
+
+Host gates green (fmt + clippy `-D warnings` + `cargo test -p rustynet-relay`:
+82+56 tests pass). **CI-CONFIRMED** on run `28187451302` (`7734156`): the Windows
+job's build+test step now passes every relay test (`21 passed`, `20 passed`, …) —
+the relay layer is green. Fixing it peeled the `cargo test` fail-fast back to the
+next failing crate, `rustynetd` (§3c).
+
+---
+
+## 3c. Third Windows red: rustynetd Windows-portable tests (`<next-commit>`)
+
+With the relay layer green, the Windows `cargo test` reached `rustynetd` and
+surfaced the next set of Unix-only-test failures (run `28187451302`). These were
+NOT new — `cargo test` is **fail-fast across binaries** by default, so the prior
+runs stopped at the first failing crate and never ran `rustynetd`'s tests at all
+(the prior Windows + macOS + Debian jobs all bailed earlier, which is also why
+none of these had ever been seen). Categories:
+
+- **H2 gossip transport is unix-only** (`gossip_transport.rs` returns
+  `Unsupported` on `cfg(not(unix))`, Track Beta). Tests that `.bind().expect()`
+  it panic on Windows. Gated `#[cfg(unix)]`: 5 `gossip_runtime` tests + the
+  `loopback_bind` helper; 1 `enrollment_consume` test + its `loopback_bind`; and
+  — found by the parallel audit (§below) — **2 whole integration-test crates**
+  (`tests/enrollment_two_peer_redeem.rs` 5 tests, `tests/gossip_three_peer_mesh.rs`
+  6 tests) via a crate-root `#![cfg(unix)]` (gates the tests AND their `Peer`
+  harness + helpers in one stroke, so no unused-code `-D warnings`).
+- **H3 linux-only DNS module** — `linux_dns_protect` selector-validation test
+  asserted `.contains("unsupported")`, but the `cfg(not(unix))` path returns
+  "only supported on Linux"; gated the test `#[cfg(unix)]`.
+- **H4 path-separator in a string allowlist** — `secret_log_audit`
+  `equality_hit_is_allowlisted` did `file_path_label.ends_with("crates/…/x.rs")`,
+  but on Windows the swept label mixes `/` (sweep-root literal) with `\` (dir
+  walk); normalized `\`→`/` before the suffix match. **Security-preserving** (the
+  reviewed exceptions just apply identically cross-OS; non-allowlisted secret
+  equality still fails everywhere).
+- **H4b stale line-number allowlist (also fails Linux/macOS, was masked)** —
+  the same `secret_log_audit` workspace sweep reported 11 control/lib.rs sites
+  as offenders because commit `4c3d513` (the §3 persist fix) inserted 6
+  `#[cfg(unix)]` lines into `control/src/lib.rs` and did **not** re-sync the
+  `REVIEWED_SECRET_EQUALITY_EXCEPTIONS` line numbers (a known-fragile,
+  line-numbered allowlist — git shows prior re-syncs `ccf0b4a`, `a4c0ddb`). Every
+  reviewed site drifted +6 (1488→1494, …). Re-synced all 11 (each verified still
+  a benign `nonce==0` / all-zero-sentinel / structural check, not a secret
+  compare). This had been invisible because Linux CI never runs (bootstrap fails)
+  and macOS CI fail-fast stopped at an earlier flake before this test. **Follow-up
+  filed:** make the allowlist drift-resistant (anchor on line CONTENT, not number).
+- **H5 platform error wording** — `windows_registry_acls` stub test asserted the
+  drift reason contained `"missing required"` / `"invalid required"`, but the real
+  Windows collector emits `"required registry key missing"` / `"registry ACL
+  invalid"` (the CI runner has no RustyNet services, so the real collector reports
+  `Missing`); corrected the assertion substrings to the wording the evaluator
+  actually emits.
+
+Plus a CI improvement: added **`--no-fail-fast`** to the Windows job's `cargo
+test` so one run surfaces the COMPLETE Windows failure set instead of one crate
+at a time (each masked failure otherwise costs a full ~12-min round-trip, since
+the Windows tests cannot be run locally on this host).
+
+**Parallel completeness audit.** Because fail-fast hides downstream failures and
+no local Windows test run exists, a fan-out audit (one agent per Windows-CI
+package + adversarial per-finding verify) swept all 10 packages for the H1–H7
+hazard taxonomy. It confirmed exactly the 11 integration-test H2 hazards above
+(and rejected 5 false positives), and found no hazards in the other 8 packages —
+giving confidence the fix set is complete modulo what `--no-fail-fast` will
+reveal. Host gates green on the **rustup `1.88.0`** toolchain (§1 trap): fmt +
+clippy `-D warnings` + `cargo test -p rustynetd --all-targets` = 1789 lib + all
+integration/bin tests pass, `no_secret_material_equality_in_workspace` ok.
+
+---
+
 ## 4. Remaining CI TODOs
 
 1. **macOS flaky `vm_lab` subprocess tests** (job: macOS build+security,
@@ -113,21 +241,34 @@ pass); windows-gnu cross-clippy 0; CI confirmation pending.
 
 4. **Windows "Security gates" step** (`cargo audit` + `cargo deny`) has been
    *skipped* in every run so far because the build/test step failed first. Once
-   the Windows job goes green it will run for the first time and could surface
-   pre-existing supply-chain advisories/bans. cargo-audit/cargo-deny are not
-   installed in this dev sandbox, so this could not be pre-empted locally —
-   watch the first green-build run.
+   the Windows job goes green it will run for the first time.
+   **Pre-empted 2026-06-25 on the lab host: CLEAN.** `cargo audit --deny
+   warnings` scanned 210 crate deps with no vulnerabilities; `cargo deny check
+   bans licenses sources advisories` reported `advisories ok, bans ok, licenses
+   ok, sources ok`. These operate on `Cargo.lock` + the workspace manifest, so
+   the local result is authoritative for the Windows step too — the Windows
+   Security-gates step is expected to pass once the build+test step is green.
 
 ---
 
 ## 5. CI state snapshot
 
-| Job | State @ `4c3d513` | Blocker |
+| Job | State | Blocker |
 |---|---|---|
-| Windows build+security | clippy cleared; persist fix pushed | awaiting CI confirm of persist fix; then Security gates run for the first time (§4.4) |
-| macOS build+security | red | flaky `vm_lab` subprocess tests (§4.1, left) |
+| Windows build+security | persist (§3) + relay (§3b, CI-confirmed) green; rustynetd portability fixes (§3c) + `--no-fail-fast` pushed | CI confirming §3c; Security gates pre-empted CLEAN locally (§4.4) |
+| macOS build+security | red | `vm_lab` flake (§4.1) + a `userspace_shared_macos` socket-poll-budget timing test seen failing on `7734156`'s runner — watch whether it persists (could be runner-load flake or a real budget assertion) |
 | Debian 13 build+security | red | `cargo: not found` bootstrap (§4.2, deferred) |
 | Linux real WireGuard E2E | red | `cargo: not found` bootstrap (§4.2, deferred) |
+
+> Note: the `secret_log_audit` line-drift (§3c, H4b) and these rustynetd
+> portability tests would also fail the macOS + Debian jobs once they get past
+> their own earlier blockers — the fixes in §3c are cross-OS, not Windows-only.
+
+Verified 2026-06-25 against run `28179119351` (the `3f466ec` push, before the
+relay fix): Debian + Linux-E2E failed identically at "Bootstrap CI tools"
+(`cargo: not found`), confirming §4.2 is pre-existing/infra and unchanged by the
+relay fix; macOS failed on the single `vm_lab` timeout-transition flake (§4.1);
+Windows failed only on the 21 relay tests now fixed in §3b.
 
 ---
 
