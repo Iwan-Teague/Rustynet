@@ -93,6 +93,45 @@ target's crash-safety. A malformed/oversized payload must fail-closed, never cra
   pure evaluators + their tests, any `// REVIEW:` flagged uncertainty, anything
   incomplete. Do NOT push; do NOT edit the shared harness or any other file.
 
+## 7. OUTCOME — Wave 5 chaos COMPLETE (2026-06-25)
+
+Three parallel worktree agents (disjoint binaries) + reviewer merge/gate. On `main`:
+- `f06c46e` **W5-A clock_attack** (+1196): libfaketime per-process clock skew via a
+  transient systemd drop-in (`LD_PRELOAD`+`FAKETIME`, `trap` teardown-before-fault).
+  Asserts against REAL daemon status observables (`membership_epoch`,
+  `traversal_{future_dated,stale,replay}_rejections` — verified against `daemon.rs`):
+  forward-jump → future-dated rejected + epoch held; backward-jump → watermark not
+  regressed; drift → within-window tolerated / out-of-window fail-closed. 24 new tests.
+- `609c1e4` **W5-B crash_recovery** (+1272): kill-on-fsync (`kill -9` loop while a
+  bundle/watermark/keystore write is in flight). Asserts atomic old-or-new on restart
+  — reads on-disk `assignment=<u64>` (`fetcher.rs WatermarkStore`) to catch a
+  watermark DOWNGRADE, rejects a truncated/empty bundle (`version=1`+`signature=`
+  parse) and torn keystore, and requires mesh re-convergence. 120 tests.
+- `ad601fb` **W5-C resource_exhaustion** (+1152): guest-side IPC/gossip floods beyond
+  the 4096-byte caps + endless stream; asserts cap-rejects-before-alloc + daemon
+  responsive + no panic/OOM (PID-stable + RSS≤64 MiB) + injection-actually-ran.
+  21 new tests.
+
+Gate on merged tree: fmt + clippy `-D warnings` clean; **338 tests across the 3 bins,
+0 failed**; `--dry-run` smoke preserved (`overall_status:"skipped"`, exit 0, no host
+mutation) so the orchestrator scaffold contract is unchanged. No fake-pass: each bin
+has explicit fail-closed tests for "daemon accepted the bad state" AND "injection
+never ran". These are Linux-targeted live tests — **code-complete + unit-tested here,
+the actual fault injection runs in the Linux lab**.
+
+### Honest scope note — W5-C re-declared its stages
+W5-C replaced the original *host-resource* exhaustion stages
+(`chaos_disk_full_signed_state_write`, `chaos_readonly_filesystem_state`,
+`chaos_inotify_watch_exhaustion`, `chaos_file_descriptor_exhaustion`) with
+*control-plane INGEST* exhaustion stages (IPC/gossip oversized + endless + bomb), per
+this spec's §2 methodology (TUF endless-data / decompression-bomb). Verified safe: the
+orchestrator + run-matrix key only on the **category** `chaos_resource_exhaustion` (+
+the binary), never the sub-stage names, so nothing breaks. The ingest-DoS class is the
+more security-relevant attack surface; disk-full-mid-write overlaps W5-B's torn-state
+coverage. **Follow-up (tracked, not silently dropped):** the host-resource exhaustion
+class (fd-limit / inotify-watch / read-only-fs robustness) is now uncovered and should
+be a separate test or added stages.
+
 ## 6. Definition of done (Wave 5 chaos)
 - Each of the 3 binaries injects its declared faults for real and asserts the
   security property fail-closed; none calls the inert `run_category` live path.
