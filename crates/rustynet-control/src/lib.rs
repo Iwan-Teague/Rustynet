@@ -1247,6 +1247,12 @@ fn atomic_write_secure(
         let _ = fs::remove_file(&temp_path);
         return Err(TrustStateError::PersistFailure);
     }
+    // Directory fsync is a no-op on Windows: FlushFileBuffers on a directory
+    // handle requires FILE_FLAG_BACKUP_SEMANTICS, which `File::open` does not
+    // request, so opening the parent dir here fails on Windows and the
+    // durability guarantee is already provided by the atomic rename above. Gate
+    // to unix (mirrors `rustynet-crypto::write_atomic_encrypted_key_file`).
+    #[cfg(unix)]
     if let Some(parent) = path.parent() {
         let parent_dir = fs::File::open(parent).map_err(|_| TrustStateError::PersistFailure)?;
         parent_dir
