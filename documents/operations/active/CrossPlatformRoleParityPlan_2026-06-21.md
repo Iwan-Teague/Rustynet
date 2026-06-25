@@ -254,3 +254,39 @@ the fixes landed this pass (all Linux-gate-verified; live runs still pending):
 the cfg(windows) call sites, and a guest-touching stage replaces the in-process
 contract validator). Everything else is code-complete-live-pending or
 HP-3/WinNAT-blocked.
+
+## 11. Live-lab honesty pass (2026-06-25, code-only, no live lab)
+
+A read-only "will the un-run stages pass, and do they prove what they claim?"
+audit found stages reporting a live **Pass** from checks that never touched the
+guest, fail-open teardown proofs, and vacuous captures. Fixes landed (gates
+green; cfg(macos)/cfg(windows) runtime is not Linux-compile-checkable so only the
+pure logic + non-target stubs + unit tests verify here). Full detail in
+`AutonomousSecurityParityPassLog_2026-06-24.md` (§ "Live-lab honesty pass"):
+
+- **Two Windows contract stages no longer fake a live Pass.**
+  `validate_windows_anchor_bundle_pull` (in-process anchor-init plan-string
+  check) and `validate_windows_relay_service_lifecycle` (static `.ps1` lint) now
+  record **Skipped** ("contract-only — NOT live-proven"); a contract violation
+  stays **Fail**. This means the Windows anchor/relay cells are correctly
+  **not** counted as live-proven by a run aggregate until the guest-touching
+  stages exist.
+- **Windows-exit + macOS-exit teardown captures made fail-closed** (RSA-0031
+  parity): a `Get-NetNat`/forwarding/sysctl query error is treated as
+  still-present / not-restored (no default-to-`Disabled`), and the Windows
+  lifecycle artifact is always emitted once serving so a residual NAT (open
+  relay) **Fails** instead of being masked as a Skip.
+- **macOS exit DNS leak proof is no longer vacuous:** an active off-tunnel DNS
+  probe (`dns_block_probe.json`) is now required so an empty egress pcap proves
+  the killswitch dropped real traffic.
+
+**Honestly-documented remaining gap (already fail-closed, NOT a cheat):** the
+macOS exit **client-egress NAT-session** assertion (`active_exit.rs:29-33`) —
+macOS Exit maps to `blind_exit` (enforce-time pf NAT, anchor hard-locked across
+cleanup), which does not fit the activate→assert→nat-session shape, so the macOS
+adapter keeps the fail-closed default. The exit-NAT *lifecycle* (serving during
+run + clean teardown) is proven; a live translated-client-session through the
+macOS pf NAT remains a scoped follow-up (needs the two-node activate→assert path
+reworked for macOS's enforce-time model). The same empty-pcap-vacuity fix is a
+follow-up for the **Linux** and **Windows** exit DNS proofs (this pass scoped the
+active probe to macOS as requested).
