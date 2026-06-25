@@ -4,12 +4,15 @@
 //!
 //! Companion of `evaluate_macos_exit_dns_failclosed_artifact_dir` in
 //! `crates/rustynet-cli/src/vm_lab/mod.rs`. This producer emits the
-//! four exit-mode DNS leak-proof artefacts that sit beside the existing
+//! exit-mode DNS leak-proof artefacts that sit beside the existing
 //! `macos_dns_failclosed_check.json` report:
 //!
 //! - `pf_block_rules.json`
 //! - `udp_block_pcap.txt`
 //! - `tcp_block_pcap.txt`
+//! - `dns_block_probe.json` — the ACTIVE off-tunnel probe that makes the empty
+//!   pcaps non-vacuous (we drove a real DNS query at the LAN path and it was
+//!   dropped), recording whether any response leaked back
 //! - `tunnel_path_resolves.json`
 //!
 //! All host probes use argv-only `Command` invocation. No shell string
@@ -32,6 +35,11 @@ pub const MACOS_EXIT_DNS_FAILCLOSED_SCHEMA_VERSION: u32 = 1;
 pub const DNS_BLOCK_LAN_UDP_RULE: &str = "rustynet-dns-block-lan-udp";
 pub const DNS_BLOCK_LAN_TCP_RULE: &str = "rustynet-dns-block-lan-tcp";
 pub const DEFAULT_TUNNEL_DNS_HOSTNAME: &str = "exit-1.rustynet";
+
+/// A throwaway query name for the active blocked-path probe. It is intentionally
+/// in the reserved `.invalid` TLD (RFC 6761) so that even if the probe were to
+/// escape (a leak we are trying to catch) it can never resolve to a real host.
+pub const DNS_BLOCK_PROBE_QUERY: &str = "rustynet-dns-leak-probe.invalid";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacosExitDnsFailclosedOptions {
@@ -75,6 +83,24 @@ pub struct MacosTunnelPathResolvesReport {
     pub reason: String,
 }
 
+/// Result of the ACTIVE blocked-path DNS probe. The empty-pcap leak proof is
+/// only meaningful if traffic was actually generated toward the off-tunnel DNS
+/// path during the capture window — otherwise an empty capture merely says "no
+/// DNS happened to be sent", a vacuous PASS. This report records that an
+/// off-tunnel DNS query WAS attempted and whether any DNS response came back
+/// (any response = the LAN DNS path is open = a leak, regardless of rcode).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacosDnsBlockProbeReport {
+    pub schema_version: u32,
+    pub overall_ok: bool,
+    pub probe_attempted: bool,
+    pub probe_target: String,
+    pub probe_query: String,
+    pub udp_response_received: bool,
+    pub tcp_response_received: bool,
+    pub reason: String,
+}
+
 pub fn write_macos_exit_dns_failclosed_artifacts(
     output_dir: &Path,
     options: &MacosExitDnsFailclosedOptions,
@@ -105,21 +131,47 @@ pub fn write_macos_exit_dns_failclosed_artifacts(
         "pf_block_rules.json",
     )?;
 
-    let udp_pcap = capture_dns_pcap_text(
+    // Derive an off-tunnel DNS target (the LAN default gateway) so the probe
+    // sends a real port-53 datagram toward a directly-reachable, NON-tunnel
+    // destination. If the killswitch is enforced the packet is dropped on
+    // egress (empty pcap); if it is not, the attempt appears in the capture.
+    // Failing loud when the gateway cannot be derived keeps the proof honest
+    // (no silent fall back to a probe that can't egress).
+    let probe_target = derive_macos_default_gateway()?;
+    validate_probe_target(probe_target.as_str())?;
+
+    let (udp_pcap, udp_probe_output) = capture_dns_block_path(
         lan_iface.as_str(),
         "udp",
+        probe_target.as_str(),
+        DNS_BLOCK_PROBE_QUERY,
         Duration::from_secs(options.tcpdump_secs),
     )?;
     fs::write(output_dir.join("udp_block_pcap.txt"), udp_pcap)
         .map_err(|err| format!("write udp_block_pcap.txt failed: {err}"))?;
 
-    let tcp_pcap = capture_dns_pcap_text(
+    let (tcp_pcap, tcp_probe_output) = capture_dns_block_path(
         lan_iface.as_str(),
         "tcp",
+        probe_target.as_str(),
+        DNS_BLOCK_PROBE_QUERY,
         Duration::from_secs(options.tcpdump_secs),
     )?;
     fs::write(output_dir.join("tcp_block_pcap.txt"), tcp_pcap)
         .map_err(|err| format!("write tcp_block_pcap.txt failed: {err}"))?;
+
+    let probe_report = build_macos_dns_block_probe_report(
+        probe_target.as_str(),
+        DNS_BLOCK_PROBE_QUERY,
+        true,
+        udp_probe_output.as_str(),
+        tcp_probe_output.as_str(),
+    );
+    write_json(
+        &output_dir.join("dns_block_probe.json"),
+        &probe_report,
+        "dns_block_probe.json",
+    )?;
 
     let resolve_stdout =
         capture_tunnel_dns_resolution(options.tunnel_dns_hostname.as_str()).unwrap_or_default();
@@ -176,28 +228,107 @@ pub fn build_tunnel_path_resolves_report(
     }
 }
 
+/// True when `dig` output shows a DNS message header was parsed — i.e. a
+/// response came back from the queried server. ANY rcode (NOERROR, NXDOMAIN,
+/// SERVFAIL, REFUSED) means the DNS round-trip COMPLETED over the off-tunnel
+/// path, which is a leak. `dig` only prints the `;; ->>HEADER<<-` line when it
+/// actually parses a response, so its presence is a deterministic, rcode-
+/// agnostic "the path is open" signal (a timeout/no-response never prints it).
+pub fn dns_probe_response_received(dig_output: &str) -> bool {
+    dig_output.to_ascii_lowercase().contains("->>header<<-")
+}
+
+/// Build the blocked-path probe report. `overall_ok` (the leak-proof PASS
+/// condition) requires that the probe was actually attempted AND that NEITHER
+/// the UDP nor the TCP probe received any DNS response. Fail-closed: a probe
+/// that did not run, or any observed response, is NOT ok.
+pub fn build_macos_dns_block_probe_report(
+    probe_target: &str,
+    probe_query: &str,
+    attempted: bool,
+    udp_dig_output: &str,
+    tcp_dig_output: &str,
+) -> MacosDnsBlockProbeReport {
+    let udp_response_received = attempted && dns_probe_response_received(udp_dig_output);
+    let tcp_response_received = attempted && dns_probe_response_received(tcp_dig_output);
+    let overall_ok = attempted && !udp_response_received && !tcp_response_received;
+    let reason = if !attempted {
+        "blocked-path DNS probe did not execute; an empty pcap is vacuous without an active probe"
+            .to_owned()
+    } else if udp_response_received || tcp_response_received {
+        "off-tunnel DNS probe received a response (udp_response_received or tcp_response_received): LAN DNS path is OPEN (leak)".to_owned()
+    } else {
+        "off-tunnel DNS probe received no UDP or TCP response: consistent with the killswitch dropping LAN DNS egress".to_owned()
+    };
+    MacosDnsBlockProbeReport {
+        schema_version: MACOS_EXIT_DNS_FAILCLOSED_SCHEMA_VERSION,
+        overall_ok,
+        probe_attempted: attempted,
+        probe_target: probe_target.to_owned(),
+        probe_query: probe_query.to_owned(),
+        udp_response_received,
+        tcp_response_received,
+        reason,
+    }
+}
+
+/// Extract the `gateway:` value from `route -n get default` output. Pure so it
+/// is host-testable regardless of the build target.
+pub fn parse_macos_route_gateway(route_output: &str) -> Option<String> {
+    route_output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gateway:").map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Validate the derived probe target is a literal IP address. A point-to-point
+/// default route renders `gateway: link#N` (no usable unicast target), so a
+/// non-IP gateway must fail loud rather than produce an unsendable probe.
+fn validate_probe_target(value: &str) -> Result<(), String> {
+    value
+        .parse::<std::net::IpAddr>()
+        .map(|_| ())
+        .map_err(|_| format!("derived DNS probe target {value:?} is not a usable IP address"))
+}
+
 fn parse_pf_block_rule(pfctl_rules_stdout: &str, name: &str) -> MacosPfBlockRule {
     let matched = pfctl_rules_stdout
         .lines()
         .map(str::trim)
         .find(|line| line.contains(name));
     match matched {
-        Some(line) => MacosPfBlockRule {
-            name: name.to_owned(),
-            action: if line.starts_with("block") || line.contains(" block ") {
-                "block".to_owned()
-            } else {
-                "unknown".to_owned()
-            },
-            direction: if line.contains(" out ") || line.ends_with(" out") {
-                "out".to_owned()
-            } else if line.contains(" in ") || line.ends_with(" in") {
-                "in".to_owned()
-            } else {
-                "any".to_owned()
-            },
-            enabled: "true".to_owned(),
-        },
+        Some(line) => {
+            let is_block = line.starts_with("block") || line.contains(" block ");
+            let is_drop = line.contains("drop");
+            let is_out = line.contains(" out ") || line.ends_with(" out");
+            MacosPfBlockRule {
+                name: name.to_owned(),
+                action: if is_block {
+                    "block".to_owned()
+                } else {
+                    "unknown".to_owned()
+                },
+                direction: if is_out {
+                    "out".to_owned()
+                } else if line.contains(" in ") || line.ends_with(" in") {
+                    "in".to_owned()
+                } else {
+                    "any".to_owned()
+                },
+                // Only a genuine active `block drop out` rule counts as an
+                // enforced DNS block. If the label appears on a non-blocking,
+                // non-drop, or wrong-direction line (a shadowing `pass`, a
+                // commented/log rule, or a stray match), it must NOT read as
+                // enabled — fail closed so a config-text match can't masquerade
+                // as enforcement.
+                enabled: if is_block && is_drop && is_out {
+                    "true".to_owned()
+                } else {
+                    "false".to_owned()
+                },
+            }
+        }
         None => MacosPfBlockRule {
             name: name.to_owned(),
             action: "missing".to_owned(),
@@ -337,17 +468,42 @@ fn capture_pf_rules_stdout() -> Result<String, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn capture_dns_pcap_text(
+fn derive_macos_default_gateway() -> Result<String, String> {
+    let stdout = run_route(&["-n", "get", "default"])?;
+    parse_macos_route_gateway(stdout.as_str())
+        .ok_or_else(|| "could not derive default gateway from `route -n get default`".to_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn derive_macos_default_gateway() -> Result<String, String> {
+    Err("default-gateway derivation is only supported on macOS".to_owned())
+}
+
+/// Capture DNS/53 egress on `iface` while ACTIVELY sending one off-tunnel DNS
+/// probe (to `server`) mid-window. Returns the tcpdump text plus the `dig`
+/// output. The probe makes an empty pcap meaningful: a real port-53 datagram
+/// was driven toward a reachable, non-tunnel destination, so an empty capture
+/// proves the killswitch dropped it rather than "nothing tried DNS".
+#[cfg(target_os = "macos")]
+fn capture_dns_block_path(
     iface: &str,
     protocol: &str,
+    server: &str,
+    query: &str,
     duration: Duration,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let mut child = Command::new("/usr/sbin/tcpdump")
         .args(["-n", "-i", iface, protocol, "and", "port", "53"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|err| format!("tcpdump {protocol}/53 failed to start: {err}"))?;
+    // Let tcpdump settle into the capture before generating the probe so the
+    // attempt cannot race ahead of the sniffer.
+    sleep(Duration::from_millis(500));
+    let probe_output = run_dig_probe(protocol, server, query)?;
+    // Keep capturing for the remainder of the window to catch any delayed or
+    // retried egress the probe might have triggered.
     sleep(duration);
     if child
         .try_wait()
@@ -361,16 +517,44 @@ fn capture_dns_pcap_text(
     let output = child
         .wait_with_output()
         .map_err(|err| format!("tcpdump {protocol}/53 output failed: {err}"))?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        probe_output,
+    ))
+}
+
+/// Run a single `dig` DNS probe (argv-only) for `query` against `server` over
+/// the requested transport. Combines stdout + stderr so the caller can detect a
+/// parsed response header (`;; ->>HEADER<<-`, any rcode) versus a timeout.
+#[cfg(target_os = "macos")]
+fn run_dig_probe(protocol: &str, server: &str, query: &str) -> Result<String, String> {
+    let transport = if protocol == "tcp" { "+tcp" } else { "+notcp" };
+    let at_server = format!("@{server}");
+    let output = Command::new("/usr/bin/dig")
+        .args([
+            "+time=2",
+            "+tries=1",
+            transport,
+            at_server.as_str(),
+            query,
+            "A",
+        ])
+        .output()
+        .map_err(|err| format!("dig {protocol} probe failed to start: {err}"))?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(String::from_utf8_lossy(&output.stderr).as_ref());
+    Ok(combined)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn capture_dns_pcap_text(
+fn capture_dns_block_path(
     _iface: &str,
     _protocol: &str,
+    _server: &str,
+    _query: &str,
     _duration: Duration,
-) -> Result<String, String> {
-    Ok(String::new())
+) -> Result<(String, String), String> {
+    Ok((String::new(), String::new()))
 }
 
 #[cfg(target_os = "macos")]
@@ -500,5 +684,110 @@ block drop out quick on en0 inet proto tcp from any to 192.168.1.0/24 port = dom
         assert!(validate_hostname("exit-1.rustynet").is_ok());
         assert!(validate_iface_name("en0;rm").is_err());
         assert!(validate_hostname("exit-1.rustynet;rm").is_err());
+    }
+
+    #[test]
+    fn pf_report_rejects_label_on_pass_or_inbound_rule() {
+        // A shadowing/misconfigured rule that merely CARRIES the label but is
+        // not an active `block drop out` rule must not read as enforced. The
+        // hardened parser fails closed for a `pass` line and for an inbound
+        // block — both would otherwise have reported enabled=true previously.
+        let pass_shadow = format!(
+            "pass out quick inet proto udp from any to any port = 53 label \"{DNS_BLOCK_LAN_UDP_RULE}\"\n\
+             block drop in quick inet proto tcp from any to any port = 53 label \"{DNS_BLOCK_LAN_TCP_RULE}\"\n",
+        );
+        let report = build_macos_pf_block_rules_report(pass_shadow.as_str());
+        assert!(
+            !report.overall_ok,
+            "a label on a pass/inbound rule must not satisfy the DNS-block contract"
+        );
+        assert!(
+            report.rules.iter().all(|rule| rule.enabled == "false"),
+            "neither non-block rule may report enabled=true"
+        );
+    }
+
+    #[test]
+    fn dns_probe_response_detects_completed_round_trip() {
+        // `dig` prints `;; ->>HEADER<<-` only when it parses a response, for ANY
+        // rcode — NXDOMAIN/SERVFAIL/NOERROR all mean the off-tunnel DNS path is
+        // open and therefore a leak.
+        let nxdomain = ";; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 4242\n";
+        let noerror = ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 7\n";
+        assert!(dns_probe_response_received(nxdomain));
+        assert!(dns_probe_response_received(noerror));
+    }
+
+    #[test]
+    fn dns_probe_response_absent_on_timeout() {
+        // A blocked probe yields no parsed header — only a timeout banner.
+        let timed_out = ";; communications error to 192.168.0.1#53: timed out\n;; no servers could be reached\n";
+        assert!(!dns_probe_response_received(timed_out));
+        assert!(!dns_probe_response_received(""));
+    }
+
+    #[test]
+    fn dns_block_probe_report_ok_only_when_attempted_and_silent() {
+        let blocked =
+            ";; communications error to 10.0.0.1#53: timed out\n;; no servers could be reached\n";
+        let ok = build_macos_dns_block_probe_report(
+            "10.0.0.1",
+            DNS_BLOCK_PROBE_QUERY,
+            true,
+            blocked,
+            blocked,
+        );
+        assert!(ok.overall_ok);
+        assert!(ok.probe_attempted);
+        assert!(!ok.udp_response_received && !ok.tcp_response_received);
+    }
+
+    #[test]
+    fn dns_block_probe_report_fails_closed_on_response() {
+        let answered = ";; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\n";
+        let blocked = ";; no servers could be reached\n";
+        // A response on EITHER transport is a leak.
+        let leak_udp = build_macos_dns_block_probe_report(
+            "10.0.0.1",
+            DNS_BLOCK_PROBE_QUERY,
+            true,
+            answered,
+            blocked,
+        );
+        assert!(!leak_udp.overall_ok);
+        assert!(leak_udp.udp_response_received);
+        let leak_tcp = build_macos_dns_block_probe_report(
+            "10.0.0.1",
+            DNS_BLOCK_PROBE_QUERY,
+            true,
+            blocked,
+            answered,
+        );
+        assert!(!leak_tcp.overall_ok);
+        assert!(leak_tcp.tcp_response_received);
+    }
+
+    #[test]
+    fn dns_block_probe_report_fails_closed_when_not_attempted() {
+        // An empty pcap without a proven active probe is vacuous → not ok.
+        let report =
+            build_macos_dns_block_probe_report("10.0.0.1", DNS_BLOCK_PROBE_QUERY, false, "", "");
+        assert!(!report.overall_ok);
+        assert!(!report.probe_attempted);
+    }
+
+    #[test]
+    fn route_gateway_parser_extracts_ip_and_rejects_link() {
+        let out = "   route to: default\ndestination: default\n       gateway: 192.168.0.1\n     interface: en0\n";
+        assert_eq!(
+            parse_macos_route_gateway(out).as_deref(),
+            Some("192.168.0.1")
+        );
+        assert!(validate_probe_target("192.168.0.1").is_ok());
+        // A point-to-point link gateway has no unicast target and must fail loud.
+        let link = "       gateway: link#12\n     interface: utun4\n";
+        assert_eq!(parse_macos_route_gateway(link).as_deref(), Some("link#12"));
+        assert!(validate_probe_target("link#12").is_err());
+        assert_eq!(parse_macos_route_gateway("   route to: default\n"), None);
     }
 }
