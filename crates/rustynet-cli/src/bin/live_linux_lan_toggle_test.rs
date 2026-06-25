@@ -16,6 +16,15 @@ const LAN_TEST_INTERFACE: &str = "rnlan0";
 const LAN_TEST_GATEWAY_IP: &str = "192.168.1.1/24";
 const LAN_TEST_PROBE_IP: &str = "192.168.1.1";
 const LAN_TEST_CIDR: &str = "192.168.1.0/24";
+/// The tunnel interface the client routes LAN traffic over while LAN access is
+/// coupled on. The LAN-ON positive control asserts the LAN route goes
+/// `dev TUNNEL_IFACE`; the enforced-denial check asserts that same tunnel route
+/// is withdrawn when LAN access is off (route absent / not via the tunnel).
+const TUNNEL_IFACE: &str = "rustynet0";
+/// Canonical `inet` killswitch table name programmed by the daemon. Generation
+/// rotation appends `_g<N>` (see `rustynetd::linux_runtime_nftables`), so the
+/// matcher accepts both the bare and the rotated form.
+const KILLSWITCH_INET_TABLE: &str = "rustynet";
 const MAX_TRAVERSAL_COORDINATION_TTL_SECS: u64 = 30;
 const DNS_ZONE_NAME: &str = "rustynet";
 const DNS_ZONE_ISSUE_DIR: &str = "/run/rustynet/dns-zone-issue-lan-toggle";
@@ -905,11 +914,101 @@ fn wait_for_lan_probe_state(
             return Ok(true);
         }
         if desired_state == "blocked" && !reachable {
-            return Ok(true);
+            // F0.9 fail-closed: a bare ping failure is not proof of an enforced
+            // denial — a transient loss, a downed iface, or a route flap also
+            // produces `!reachable`. Pair the positive control (the same probe
+            // IP is proven reachable in LAN-ON) with positive evidence that the
+            // block is *caused by enforcement*: the client's tunnel route to the
+            // LAN target has been withdrawn (route absent / not via the tunnel,
+            // the inverse of the LAN-ON `dev rustynet0` positive control), OR the
+            // killswitch drop table is present in the runtime ruleset. "blocked"
+            // requires BOTH no-reachability AND enforcement evidence.
+            if confirm_lan_block_enforced(ctx, logger, target)? {
+                return Ok(true);
+            }
         }
         std::thread::sleep(Duration::from_secs(1));
     }
     Ok(false)
+}
+
+/// Confirm that an observed LAN-probe block is caused by enforcement rather than
+/// a coincidental timeout. Two independent, argv-only signals are collected from
+/// the client and either is sufficient (both are honest enforcement evidence):
+///
+/// 1. The client's tunnel route to the LAN target is **withdrawn** — `ip route
+///    get <target>` no longer resolves the LAN probe over `rustynet0`. This is
+///    the exact inverse of the LAN-ON positive control, which requires the route
+///    to be `dev rustynet0`; withdrawing the advertised LAN route is precisely
+///    how `ensure_lan_route_allowed` denies LAN access when it is coupled off.
+/// 2. The killswitch drop table (`inet rustynet[_g<N>]`) is present in the
+///    runtime nftables ruleset, proving the fail-closed drop machinery is loaded.
+///
+/// Queries use `*_allow_failure` so a transient SSH/command hiccup never throws —
+/// it simply yields no enforcement evidence on that poll, and the caller retries.
+fn confirm_lan_block_enforced(
+    ctx: &LiveLabContext,
+    logger: &Logger,
+    target: &str,
+) -> Result<bool, String> {
+    let route_text = ctx
+        .capture_root_allow_failure(target, &["ip", "-4", "route", "get", LAN_TEST_PROBE_IP])
+        .unwrap_or_default();
+    let tunnel_route_withdrawn = !route_to_target_uses_tunnel(&route_text);
+
+    let ruleset_text = ctx
+        .capture_root_allow_failure(target, &["nft", "list", "ruleset"])
+        .unwrap_or_default();
+    let killswitch_present = killswitch_drop_table_present(&ruleset_text);
+
+    let enforced = tunnel_route_withdrawn || killswitch_present;
+    logger.line(format!(
+        "LAN block enforcement check on {target}: tunnel_route_withdrawn={tunnel_route_withdrawn} killswitch_present={killswitch_present} enforced={enforced}"
+    ))?;
+    Ok(enforced)
+}
+
+/// True iff `ip route get <target>` output resolves the LAN probe over the
+/// rustynet tunnel interface (`dev rustynet0`). Mirrors the LAN-ON positive
+/// control's `client_route_on.contains("dev rustynet0")` assertion so the
+/// enforced-denial check is its exact inverse. Empty/garbage input is treated as
+/// "not via tunnel" (no positive evidence of a tunnel route), which fails closed
+/// toward "route withdrawn" for the denial check.
+fn route_to_target_uses_tunnel(route_get_output: &str) -> bool {
+    route_get_output
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| pair[0] == "dev" && pair[1] == TUNNEL_IFACE)
+}
+
+/// True iff the runtime nftables ruleset contains the canonical `inet` killswitch
+/// table (`rustynet` or a generation-rotated `rustynet_g<N>`). A present
+/// killswitch table is positive evidence that the fail-closed drop machinery is
+/// loaded. Empty/garbage input yields false (no enforcement evidence), so the
+/// caller falls back to the route-withdrawal signal and otherwise keeps polling.
+fn killswitch_drop_table_present(ruleset_output: &str) -> bool {
+    ruleset_output.lines().any(|line| {
+        let mut tokens = line.split_whitespace();
+        if tokens.next() != Some("table") {
+            return false;
+        }
+        if tokens.next() != Some("inet") {
+            return false;
+        }
+        match tokens.next() {
+            Some(name) => {
+                name == KILLSWITCH_INET_TABLE
+                    || name
+                        .strip_prefix(KILLSWITCH_INET_TABLE)
+                        .and_then(|rest| rest.strip_prefix("_g"))
+                        .is_some_and(|digits| {
+                            !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+                        })
+            }
+            None => false,
+        }
+    })
 }
 
 fn apply_lan_access_expect_denied(
@@ -1792,8 +1891,9 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssignmentAuthorityScope, ManagedDnsRecordTemplate, managed_dns_base_records,
-        managed_dns_records_manifest_for_scope, parse_assignment_authority_scope,
+        AssignmentAuthorityScope, ManagedDnsRecordTemplate, killswitch_drop_table_present,
+        managed_dns_base_records, managed_dns_records_manifest_for_scope,
+        parse_assignment_authority_scope, route_to_target_uses_tunnel,
     };
 
     #[test]
@@ -1861,5 +1961,73 @@ mod tests {
         assert!(manifest.contains("target_node_id=exit-1"));
         assert!(!manifest.contains("target_node_id=client-3"));
         assert!(!manifest.contains("target_node_id=client-9"));
+    }
+
+    #[test]
+    fn route_via_tunnel_detected_when_dev_rustynet0_present() {
+        // The LAN-ON positive control shape: route resolves over the tunnel.
+        let lan_on = "192.168.1.1 dev rustynet0 src 100.64.0.2 uid 0 \n    cache";
+        assert!(route_to_target_uses_tunnel(lan_on));
+    }
+
+    #[test]
+    fn route_withdrawn_when_target_not_via_tunnel() {
+        // LAN-OFF: the advertised LAN route is withdrawn, so the target either
+        // resolves over a non-tunnel dev or does not resolve at all.
+        let via_lan_iface = "192.168.1.1 dev eth0 src 192.168.18.65 uid 0 \n    cache";
+        assert!(!route_to_target_uses_tunnel(via_lan_iface));
+
+        let unreachable = "RTNETLINK answers: Network is unreachable";
+        assert!(!route_to_target_uses_tunnel(unreachable));
+
+        // Defense in depth: an empty/garbage capture is "not via tunnel".
+        assert!(!route_to_target_uses_tunnel(""));
+        assert!(!route_to_target_uses_tunnel("dev"));
+        assert!(!route_to_target_uses_tunnel("rustynet0"));
+    }
+
+    #[test]
+    fn route_dev_match_is_not_a_substring_false_positive() {
+        // `rustynet0x` / `rustynet01` must NOT count as the tunnel device, and
+        // a bare mention of the iface name outside a `dev <iface>` pair must not
+        // either.
+        let other_iface = "192.168.1.1 dev rustynet0x src 100.64.0.2 uid 0";
+        assert!(!route_to_target_uses_tunnel(other_iface));
+        let mentioned_only = "192.168.1.1 via rustynet0 dev eth0 src 192.168.18.65";
+        assert!(!route_to_target_uses_tunnel(mentioned_only));
+    }
+
+    #[test]
+    fn killswitch_table_present_for_bare_and_rotated_generations() {
+        let bare = "table inet rustynet {\n  chain killswitch {\n  }\n}\n";
+        assert!(killswitch_drop_table_present(bare));
+
+        let rotated = "table inet rustynet_g7 {\n  chain killswitch {\n  }\n}\n";
+        assert!(killswitch_drop_table_present(rotated));
+
+        // Leading whitespace on the table line must still match.
+        let indented = "  table inet rustynet_g12 {\n  }\n";
+        assert!(killswitch_drop_table_present(indented));
+    }
+
+    #[test]
+    fn killswitch_table_absent_yields_no_enforcement_evidence() {
+        // Empty / unrelated ruleset: no killswitch table.
+        assert!(!killswitch_drop_table_present(""));
+        let unrelated = "table ip nat {\n  chain postrouting {\n  }\n}\n";
+        assert!(!killswitch_drop_table_present(unrelated));
+
+        // Wrong family for the canonical name must not match.
+        let wrong_family = "table ip rustynet {\n}\n";
+        assert!(!killswitch_drop_table_present(wrong_family));
+
+        // A confusable name (prefix-only, or a non-numeric/empty generation
+        // suffix) must NOT be treated as the canonical killswitch table.
+        let confusable_prefix = "table inet rustynetwork {\n}\n";
+        assert!(!killswitch_drop_table_present(confusable_prefix));
+        let confusable_suffix = "table inet rustynet_gabc {\n}\n";
+        assert!(!killswitch_drop_table_present(confusable_suffix));
+        let empty_generation = "table inet rustynet_g {\n}\n";
+        assert!(!killswitch_drop_table_present(empty_generation));
     }
 }
