@@ -44,17 +44,15 @@ pub fn validate_utun_interface_name(interface_name: &str) -> Result<(), String> 
     }
     if interface_name.len() > MAX_IFACE_NAME_LEN {
         return Err(format!(
-            "interface name '{}' exceeds max length {}",
-            interface_name, MAX_IFACE_NAME_LEN
+            "interface name '{interface_name}' exceeds max length {MAX_IFACE_NAME_LEN}"
         ));
     }
     let suffix = interface_name
         .strip_prefix("utun")
-        .ok_or_else(|| format!("interface name '{}' must start with 'utun'", interface_name))?;
+        .ok_or_else(|| format!("interface name '{interface_name}' must start with 'utun'"))?;
     if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!(
-            "interface name '{}' must be 'utun' followed by one or more digits",
-            interface_name
+            "interface name '{interface_name}' must be 'utun' followed by one or more digits"
         ));
     }
     Ok(())
