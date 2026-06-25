@@ -442,13 +442,15 @@ nas + llm included. Then "passed the live lab ⇒ deployable" holds.
    mismatch; the Linux socket tests that use it are latent-broken and currently
    masked by the Debian/E2E `cargo: not found` bootstrap failure. See
    `LinuxBlindExitDataplane_2026-06-25.md`.
-4. **TODO-4 — Two REVIEW items from the Windows cfg-gating cleanup.** During the
-   clippy cleanup two dead `cfg(windows)` stubs were removed (behavior-preserving,
-   no caller): `daemon::validate_parent_directory_security` and
-   `privileged_helper::validate_privileged_program_binary`. If Windows
-   parent-directory ACL hardening is actually wanted, it must be wired into the
-   Windows `validate_file_security` as a deliberate, tested behavior change.
-   Detail in `CrossPlatformCiHealth_2026-06-25.md`.
+4. **TODO-4 — Two REVIEW items from the Windows cfg-gating cleanup. RESOLVED
+   2026-06-25: both dead-stub removals confirmed SAFE, no security gap.** Windows
+   parent-directory hardening is a boot-time authoritative gate
+   (`validate_windows_runtime_startup_acls()` at `daemon.rs:9252` fails the daemon
+   closed if any of the 9 reviewed roots is missing / a symlink / has a bad ACL) +
+   reviewed-root containment + per-file ACL + NTFS inheritance — strictly stronger
+   than the removed per-file parent check. The privileged-binary stub was moot
+   (Windows has no privileged-helper exec; it is unix-only). Full verdict in
+   `CrossPlatformCiHealth_2026-06-25.md` §4.3.
 5. **TODO-5 — nas + llm service-hosting-role live stages.** Zero live coverage on
    any OS. Note the daemon's default service access-dir is unix-shaped
    (`/var/lib/rustynet-{nas,llm}/access`) with no ProgramData (Windows) /
