@@ -48,6 +48,52 @@ ParityPlan §10.
     Windows loop now opens `127.0.0.1:51822`. (cfg(windows) call sites need a
     Windows builder/CI compile-check; a live serving stage also remains.)
 
+## Live-lab honesty pass (no live run; code-only)
+
+A read-only audit of "will the un-run live stages pass, and do they prove what
+they claim?" surfaced false-passes, fail-open teardown proofs, and vacuous
+captures. Fixes landed (all gates green; macOS/Windows runtime code is cfg-gated
+so only the pure logic + non-target stubs compile-check here):
+
+16. `rustynetd:` drive an ACTIVE off-tunnel DNS probe in the macOS exit leak
+    proof. The proof passed on an EMPTY pcap with nothing generating DNS — a
+    vacuous pass. Now a real UDP+TCP `dig` query is driven at the LAN gateway
+    during capture; `dns_block_probe.json` records it ran and whether any DNS
+    response leaked back (a parsed `dig` header of ANY rcode = open path =
+    leak). Empty pcap is now meaningful (killswitch dropped real traffic).
+    Also hardened `parse_pf_block_rule` so a label on a non-`block drop out`
+    line cannot read as an enforced block.
+17. `e2e:` fail-closed macOS exit NAT lifecycle merge — the shell python merge
+    defaulted a missing forwarding field to `"Disabled"` (fail-open); now
+    defaults to `"Unknown"` and a missing after-stop `pf_anchor_present` to
+    `true`, mirroring the audited Rust RSA-0031 merge.
+18. `live-lab:` honest stage statuses in the orchestrator —
+    - `validate_windows_anchor_bundle_pull` and
+      `validate_windows_relay_service_lifecycle` recorded a live **Pass** from
+      an in-process plan-string check / a static `.ps1` lint that never touched
+      the guest. Both now record **Skipped** ("contract-only (NOT
+      live-proven)"); a contract violation is still **Fail**.
+    - Windows-exit teardown live capture made fail-closed (RSA-0031 parity): a
+      `Get-NetNat`/forwarding query error is treated as still-present /
+      not-restored (`Test-NetNatAbsent`, literal `-eq 'Disabled'`), and the
+      lifecycle artifact is ALWAYS emitted once the host was serving exit so a
+      residual NAT (open relay) **Fails** instead of being masked as a Skip.
+    - macOS exit DNS validator now requires `dns_block_probe.json`
+      (probe ran + no response) + pull-list + required-set wiring, with
+      vacuous-probe and probe-response rejection tests.
+
+### Honestly-documented remaining gap (NOT a cheat — already fail-closed)
+
+- **macOS exit client-egress NAT-session assertion.** `active_exit.rs:29-33`
+  keeps the macOS adapter's fail-closed default for the activate→assert→nat-
+  session shape, because macOS Exit maps to `blind_exit` whose pf NAT is applied
+  at enforce-time (not via route-advertise) and whose anchor is hard-locked
+  across cleanup. The macOS exit-NAT *lifecycle* (configured-to-serve during
+  run + clean teardown) is proven; a live translated-client-session assertion
+  through the macOS pf NAT remains a scoped follow-up. This is documented and
+  fails closed (it does not claim a pass), so it is not a false-pass — it needs
+  the two-node activate→assert path reworked for macOS's enforce-time pf model.
+
 ## Security research lessons applied (industry-grounded)
 
 - **Versioned/self-describing framing** (Latacora): kept in mind for RSA-0001
