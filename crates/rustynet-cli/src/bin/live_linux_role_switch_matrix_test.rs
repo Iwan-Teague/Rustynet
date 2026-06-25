@@ -18,13 +18,39 @@ use live_lab_bin_support as live_lab_support;
 use live_lab_support::{
     Logger, apply_role_coupling, assignment_bundle_path_for_platform,
     assignment_refresh_env_path_for_platform, assignment_watermark_path_for_platform,
-    capture_daemon_status_for_platform, capture_root, create_workspace,
+    capture_daemon_status_for_platform, capture_remote_stdout, capture_root, create_workspace,
     daemon_socket_path_for_platform, enforce_host, field_value, git_head_commit,
     read_last_matching_line, remote_src_dir, require_command, run_cargo_ops, run_root, scp_to,
     shell_quote, ssh_status, unix_now, wait_for_daemon_socket, write_file,
 };
 
 const ROLE_SWITCH_ROUTE_CONVERGENCE_TIMEOUT_SECS: u64 = 20;
+
+/// Tunnel-device name shared by the Linux kernel WireGuard interface and the
+/// Windows wintun adapter (both `rustynet0` — see
+/// `rustynetd::windows_tunnel_smoke` and the W2-C lan-toggle binary). macOS's
+/// userspace WireGuard backend egresses a kernel `utunN` device whose number
+/// is dynamic, so the macOS arm keys on the `interface: utun` line instead.
+const TUNNEL_IFACE: &str = "rustynet0";
+
+/// Destination probed for the default-route lookup. Matches the existing
+/// Linux/macOS `route get 1.1.1.1` convention used below; the Windows
+/// `Find-NetRoute` probe uses the same address so all three platforms test
+/// the same egress decision.
+const ROUTE_PROBE_IP: &str = "1.1.1.1";
+
+/// Windows assignment-refresh env path, under the Windows config root
+/// `C:\ProgramData\RustyNet\config` (`rustynetd::windows_paths`). The shared
+/// `assignment_refresh_env_path_for_platform` helper only branches macOS vs.
+/// Linux, so the Windows path is supplied here for the Windows lan-toggle
+/// denial probe's `--env-path` argument.
+// REVIEW(W2-E): the exact Windows assignment-refresh env filename is inferred
+// from the Windows config-root convention; confirm against the Windows
+// installer on a live guest. Because this is a DENIAL probe, a missing/wrong
+// path could mask a role-policy refusal as a file error — the live Windows run
+// must confirm the refusal reason, not merely the failure.
+const WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH: &str =
+    r"C:\ProgramData\RustyNet\config\assignment-refresh.env";
 
 /// Extract the value of a `KEY="value"` line from a refresh/issuance env body.
 fn env_file_value(content: &str, key: &str) -> Option<String> {
@@ -94,9 +120,17 @@ fn daemon_socket_for_platform(platform: &str) -> &'static str {
     daemon_socket_path_for_platform(platform)
 }
 
-/// Remote shell snippet that prints the active default route for the
-/// given platform. Linux has `ip`; macOS uses BSD `route -n get`.
+/// POSIX remote shell snippet that prints the active default route for the
+/// given platform. Linux has iproute2 `ip -4 route get`; macOS uses BSD
+/// `route -n get`. Windows is NOT handled here — it has no POSIX shell and
+/// its route lookup is dispatched as raw PowerShell through
+/// `capture_remote_stdout` (see `capture_default_route`), so calling this
+/// with `windows` is a programming error and panics in debug.
 fn route_get_command(platform: &str) -> &'static str {
+    debug_assert_ne!(
+        platform, "windows",
+        "windows route lookup uses PowerShell via capture_default_route, not the POSIX command"
+    );
     if platform == "macos" {
         "route -n get 1.1.1.1 2>/dev/null || true"
     } else {
@@ -104,16 +138,76 @@ fn route_get_command(platform: &str) -> &'static str {
     }
 }
 
-/// True when the captured route egresses the RustyNet tunnel device.
-/// Linux programs a named `rustynet0` interface; the macOS userspace
-/// WireGuard backend egresses a kernel `utun` device (the lab has
-/// exactly one RustyNet tunnel, so `interface: utun` from BSD
-/// `route get` identifies the tunnel path).
-fn route_uses_tunnel(route: &str, platform: &str) -> bool {
-    if platform == "macos" {
-        route.contains("interface: utun")
+/// PowerShell snippet that resolves the egress interface for the default
+/// route on Windows and prints the wintun adapter alias when (and only when)
+/// the route exits the RustyNet tunnel.
+///
+/// `Find-NetRoute -RemoteIPAddress` returns the route + the
+/// `InterfaceAlias` the OS would use to reach the address; we select the
+/// alias and the parser checks it equals the `rustynet0` wintun adapter
+/// (`rustynetd::windows_tunnel_smoke` brings up the adapter under that
+/// friendly name). `Out-String -Width 32767` stops PowerShell wrapping the
+/// alias at the terminal width, and `try/catch ''` collapses a failed lookup
+/// to empty stdout so the parser fails closed (no positive tunnel evidence).
+// REVIEW(W2-E): the exact `Find-NetRoute` output shape and the wintun
+// adapter alias (`rustynet0`) on a live Windows guest are inferred from the
+// in-repo wintun bring-up + the W2-C lan-toggle convention; confirm against a
+// real Windows guest. This probe is dispatched over the cross-OS
+// `capture_remote_stdout` (RemoteShellHost) seam, NOT the POSIX `sudo -n
+// sh -lc` transport, so it is runnable on a Windows OpenSSH host.
+fn windows_route_get_command() -> String {
+    format!(
+        "powershell -NoProfile -Command \"try {{ (Find-NetRoute -RemoteIPAddress '{ROUTE_PROBE_IP}' -ErrorAction Stop | Select-Object -First 1 -ExpandProperty InterfaceAlias) | Out-String -Width 32767 }} catch {{ '' }}\""
+    )
+}
+
+/// Capture the active default route on `host`, dispatching the transport by
+/// OS: Linux/macOS use the POSIX `sudo -n sh -lc` seam (`capture_root`);
+/// Windows uses the raw PowerShell seam (`capture_remote_stdout`) because a
+/// Windows OpenSSH host has neither `sudo` nor `sh`. The returned string is
+/// fed to `route_uses_tunnel`.
+fn capture_default_route(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    platform: &str,
+) -> Result<String, String> {
+    if platform == "windows" {
+        capture_remote_stdout(identity, known_hosts, host, &windows_route_get_command())
     } else {
-        route.contains("dev rustynet0")
+        capture_root(identity, known_hosts, host, route_get_command(platform))
+    }
+}
+
+/// True when the captured route egresses the RustyNet tunnel device, per OS.
+///
+/// - Linux programs a named `rustynet0` interface — `ip route get` prints
+///   `... dev rustynet0 ...` (Linux arm byte-identical to the pre-W2-E
+///   `contains("dev rustynet0")` substring check).
+/// - macOS's userspace WireGuard backend egresses a kernel `utunN` device
+///   (the lab has exactly one RustyNet tunnel, so an `interface: utun` line
+///   from BSD `route get` identifies the tunnel path — byte-identical to the
+///   prior macOS arm).
+/// - Windows wintun exposes the adapter as the `rustynet0` alias; the
+///   `Find-NetRoute` probe prints that alias when the default route exits the
+///   tunnel. The matcher accepts the alias as a standalone whitespace token
+///   (raw `Find-NetRoute` stdout) OR as the `route=rustynet0` field token (the
+///   combined `status_line route=<value>` form built by the snapshot helpers,
+///   where the single-token alias is appended after `route=`). Both are
+///   matched case-insensitively (Windows adapter aliases are not
+///   case-sensitive). Empty/garbage input is "not via tunnel" (no positive
+///   tunnel evidence), failing closed.
+fn route_uses_tunnel(route: &str, platform: &str) -> bool {
+    match platform {
+        "windows" => route.split_whitespace().any(|token| {
+            token.eq_ignore_ascii_case(TUNNEL_IFACE)
+                || token
+                    .strip_prefix("route=")
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(TUNNEL_IFACE))
+        }),
+        "macos" => route.contains("interface: utun"),
+        // Linux (and any other label): preserved exactly as before.
+        _ => route.contains("dev rustynet0"),
     }
 }
 
@@ -237,13 +331,22 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let config = Config::parse(args)?;
 
-    // Track B Phase 2: non-Linux fails closed honestly until the
-    // per-platform validator lands.
-    live_lab_support::enforce_linux_only_until_validator_lands(
-        config.platform,
-        "role-switch-matrix",
-        "the per-platform validator lands later in Track B",
-    )?;
+    // Wave 2 Batch B (W2-E): the per-OS role-switch matrix is ported —
+    // every per-host probe below threads the host `platform` through a
+    // Linux / macOS / Windows branch (modelled on `live_linux_relay_test.rs`
+    // and `live_linux_lan_toggle_test.rs`), so `--platform macos|windows`
+    // now runs the REAL matrix instead of fail-closing at the gate. The
+    // Linux path is byte-identical. The honest fail-closed discipline is
+    // preserved: a never-run/unparsed probe is a FAIL, and Windows ops
+    // whose daemon path cannot be confirmed fail closed with a specific
+    // reason (the named-pipe IPC seam) rather than a fabricated pass. The
+    // `enforce_linux_only_until_validator_lands` gate was intentionally
+    // removed here; it stays in the shared module for not-yet-ported
+    // binaries. `config.platform` is consumed below: each host's per-host
+    // `platform` string flows through every probe, and the run-level
+    // `--platform` is recorded so a deliberate non-Linux invocation is
+    // never a no-op.
+    let _ = config.platform;
 
     let root_dir = live_lab_support::repo_root()?;
 
@@ -653,6 +756,31 @@ fn process_host(
     if spec.temp_role == "blind_exit"
         && let Some(refresh) = context.signed_state_refresh
     {
+        // The assignment-refresh-env SWAP is a Linux-shaped setup-preamble
+        // step: it `cat`s the node's `/etc/rustynet/assignment-refresh.env`
+        // over the POSIX `sudo -n sh -lc` seam and reinstalls it with
+        // `install -o root -g rustynetd`. macOS skips it (it has no local
+        // assignment-refresh service — the external re-issue carries the
+        // blind_exit intent). Windows has neither the POSIX transport nor a
+        // `/etc/rustynet` env file, so fail closed here with a SPECIFIC reason
+        // rather than running POSIX commands that cannot execute on a Windows
+        // OpenSSH host.
+        // REVIEW(W2-E): the Windows blind_exit transition needs a ported
+        // refresh-env-swap preamble (Windows config-root env + named-pipe
+        // mutation). That preamble port is the separately-tracked Batch A
+        // follow-up (Linux-shaped control-plane setup), NOT this disjoint
+        // per-binary probe task — flag the Windows blind_exit cell as
+        // setup-blocked so a live Windows run reads as exposing that known
+        // gap, not a test bug.
+        if spec.platform == "windows" {
+            return Err(format!(
+                "role-switch: Windows blind_exit leg requires a ported assignment-refresh-env swap \
+                 (Linux-shaped setup preamble: POSIX `cat`/`install` of /etc/rustynet over `sudo -n \
+                 sh -lc`); not available on a Windows OpenSSH host. Host {} ({}) — tracked as the \
+                 Batch A control-plane-preamble follow-up.",
+                spec.node_id, spec.host
+            ));
+        }
         if spec.platform != "macos" {
             let special_env_path = refresh
                 .aux_blind_exit_assignment_env_file
@@ -1663,7 +1791,7 @@ fn capture_client_role_snapshot(
     if status_line.is_empty() {
         return Ok(status_line);
     }
-    let route_output = capture_root(identity, known_hosts, host, route_get_command(platform))?;
+    let route_output = capture_default_route(identity, known_hosts, host, platform)?;
     let route_line = sanitize_line(route_output.trim());
     if route_line.is_empty() {
         Ok(status_line)
@@ -1722,7 +1850,7 @@ fn wait_for_client_exit_route_convergence(
     while start.elapsed() <= timeout {
         last_status = capture_daemon_status_for_platform(identity, known_hosts, host, platform)?;
         let status_line = read_last_matching_line(&last_status, "node_id=");
-        let route = capture_root(identity, known_hosts, host, route_get_command(platform))?;
+        let route = capture_default_route(identity, known_hosts, host, platform)?;
         last_route = route.trim().to_owned();
         let combined = if last_route.is_empty() {
             status_line.clone()
@@ -1741,23 +1869,73 @@ fn wait_for_client_exit_route_convergence(
     ))
 }
 
+/// Wrap a `rustynet.exe` invocation in a PowerShell snippet that inverts the
+/// exit code so a DENIED command yields process-exit 0 (success) and an
+/// ACCEPTED command yields exit 1 — exactly mirroring the POSIX
+/// `... && exit 1 || exit 0` convention used by the Linux/macOS denial
+/// probes, so the caller's `status.success() == denied` invariant holds
+/// cross-OS. `$ErrorActionPreference='SilentlyContinue'` plus a `try/catch`
+/// classifies a PowerShell-level failure (e.g. the named-pipe IPC refusing
+/// the mutation, or the CLI rejecting the privileged op) as a denial.
+///
+/// On Windows the daemon IPC is the named pipe `\\.\pipe\RustyNet\rustynetd`
+/// (`rustynetd::windows_ipc::DEFAULT_WINDOWS_DAEMON_PIPE_PATH`), which the
+/// `rustynet.exe` CLI resolves by default — there is no `RUSTYNET_DAEMON_SOCKET`
+/// Unix-socket env to thread, so it is intentionally omitted.
+// REVIEW(W2-E): the Windows-side least-privilege DENIAL of `route advertise`,
+// `exit-node select`, and `ops apply-lan-access-coupling` is a ROLE-LEVEL
+// policy refusal that should hold cross-OS, but the Windows daemon's
+// named-pipe IPC acceptance of these exact subcommands is UNCONFIRMED here —
+// flag this cell so a live Windows run is read as exposing a real
+// daemon/CLI-side gap (if any) rather than a test bug. The probe is dispatched
+// over the cross-OS `ssh_status` raw-command (RemoteShellHost) seam, NOT the
+// POSIX `sudo -n sh -lc` transport, so it is runnable on a Windows OpenSSH host.
+fn windows_denial_command(rustynet_args: &str) -> String {
+    format!(
+        "powershell -NoProfile -Command \"$ErrorActionPreference='SilentlyContinue'; try {{ rustynet.exe {rustynet_args} *> $null; if ($LASTEXITCODE -eq 0) {{ exit 1 }} else {{ exit 0 }} }} catch {{ exit 0 }}\""
+    )
+}
+
+/// Run a least-privilege denial probe and return true iff the mutating op was
+/// DENIED. Linux/macOS dispatch the POSIX `sudo -n sh -lc` command (which has
+/// the `... && exit 1 || exit 0` inversion baked in); Windows dispatches the
+/// PowerShell `windows_denial_command` (same inversion) over the raw seam,
+/// because a Windows OpenSSH host has no `sudo`/`sh`.
+fn run_denial_probe(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    platform: &str,
+    posix_command: &str,
+    windows_rustynet_args: &str,
+) -> Result<bool, String> {
+    let wrapped = if platform == "windows" {
+        windows_denial_command(windows_rustynet_args)
+    } else {
+        format!("sudo -n sh -lc {}", shell_quote(posix_command))
+    };
+    let status = ssh_status(identity, known_hosts, host, &wrapped)?;
+    Ok(status.success())
+}
+
 fn route_advertise_denied(
     identity: &Path,
     known_hosts: &Path,
     host: &str,
     platform: &str,
 ) -> Result<bool, String> {
-    let command = format!(
+    let posix_command = format!(
         "env RUSTYNET_DAEMON_SOCKET={} rustynet route advertise 10.250.0.0/16 >/dev/null 2>&1 && exit 1 || exit 0",
         daemon_socket_path_for_platform(platform)
     );
-    let status = ssh_status(
+    run_denial_probe(
         identity,
         known_hosts,
         host,
-        &format!("sudo -n sh -lc {}", shell_quote(command.as_str())),
-    )?;
-    Ok(status.success())
+        platform,
+        posix_command.as_str(),
+        "route advertise 10.250.0.0/16",
+    )
 }
 
 fn exit_select_denied(
@@ -1770,18 +1948,23 @@ fn exit_select_denied(
     if baseline_exit.is_empty() || baseline_exit == "none" {
         return Ok(false);
     }
-    let command = format!(
+    let posix_command = format!(
         "env RUSTYNET_DAEMON_SOCKET={} rustynet exit-node select {} >/dev/null 2>&1 && exit 1 || exit 0",
         daemon_socket_path_for_platform(platform),
         shell_quote(baseline_exit)
     );
-    let status = ssh_status(
+    // The exit node id is a validated safe token (ensure_safe_token in
+    // Config::parse), so it is safe to interpolate directly into the
+    // PowerShell argument string.
+    let windows_args = format!("exit-node select {baseline_exit}");
+    run_denial_probe(
         identity,
         known_hosts,
         host,
-        &format!("sudo -n sh -lc {}", shell_quote(command.as_str())),
-    )?;
-    Ok(status.success())
+        platform,
+        posix_command.as_str(),
+        windows_args.as_str(),
+    )
 }
 
 fn lan_toggle_denied(
@@ -1790,20 +1973,29 @@ fn lan_toggle_denied(
     host: &str,
     platform: &str,
 ) -> Result<bool, String> {
-    let command = format!(
+    let posix_command = format!(
         "env RUSTYNET_SOCKET={} RUSTYNET_AUTO_TUNNEL_BUNDLE={} RUSTYNET_AUTO_TUNNEL_WATERMARK={} rustynet ops apply-lan-access-coupling --enable true --env-path {} --lan-routes 192.168.1.0/24 >/dev/null 2>&1 && exit 1 || exit 0",
         daemon_socket_path_for_platform(platform),
         assignment_bundle_path_for_platform(platform),
         assignment_watermark_path_for_platform(platform),
         assignment_refresh_env_path_for_platform(platform)
     );
-    let status = ssh_status(
+    // On Windows the assignment bundle/watermark/env are resolved by the
+    // daemon's Windows state root (`C:\ProgramData\RustyNet`), not threaded as
+    // Unix-socket envs; the CLI subcommand surface is the role-level coupling
+    // refusal under test. The shared `assignment_refresh_env_path_for_platform`
+    // only knows macOS/Linux, so the Windows config path is supplied locally.
+    let windows_args = format!(
+        "ops apply-lan-access-coupling --enable true --env-path {WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH} --lan-routes 192.168.1.0/24"
+    );
+    run_denial_probe(
         identity,
         known_hosts,
         host,
-        &format!("sudo -n sh -lc {}", shell_quote(command.as_str())),
-    )?;
-    Ok(status.success())
+        platform,
+        posix_command.as_str(),
+        windows_args.as_str(),
+    )
 }
 
 fn sanitize_line(value: &str) -> String {
@@ -1861,8 +2053,10 @@ fn utc_now_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, build_blind_exit_refresh_env, build_signed_state_refresh_context,
+        Config, ROUTE_PROBE_IP, TUNNEL_IFACE, WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH,
+        build_blind_exit_refresh_env, build_signed_state_refresh_context,
         client_exit_route_converged, env_file_value, role_runtime_ready, route_uses_tunnel,
+        windows_denial_command, windows_route_get_command,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1931,6 +2125,7 @@ mod tests {
 
     #[test]
     fn route_uses_tunnel_requires_tunnel_device() {
+        // Linux arm — byte-identical to the pre-W2-E behaviour.
         assert!(route_uses_tunnel(
             "1.1.1.1 dev rustynet0 src 100.64.0.2 uid 0",
             "linux"
@@ -1939,6 +2134,7 @@ mod tests {
             "1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.12 uid 0",
             "linux"
         ));
+        // macOS arm — byte-identical to the pre-W2-E behaviour.
         assert!(route_uses_tunnel(
             "route to: 1.1.1.1 gateway: index: 7 utun386 interface: utun386",
             "macos"
@@ -1947,6 +2143,47 @@ mod tests {
             "route to: 1.1.1.1 gateway: 192.168.0.1 interface: en0",
             "macos"
         ));
+    }
+
+    #[test]
+    fn route_uses_tunnel_windows_matches_wintun_alias_only() {
+        // `Find-NetRoute | Select InterfaceAlias` prints the egress adapter
+        // alias on its own line; the wintun tunnel adapter is `rustynet0`.
+        assert!(route_uses_tunnel("rustynet0\r\n", "windows"));
+        assert!(route_uses_tunnel("rustynet0", "windows"));
+        // PowerShell may emit a trailing blank line / CRLF — still a match.
+        assert!(route_uses_tunnel("rustynet0\r\n\r\n", "windows"));
+        // The underlay adapter (e.g. `Ethernet`) is NOT the tunnel.
+        assert!(!route_uses_tunnel("Ethernet\r\n", "windows"));
+        // A confusable alias must NOT match (exact line equality, not substring).
+        assert!(!route_uses_tunnel("rustynet0-vnic\r\n", "windows"));
+        // Empty stdout (failed lookup, `try/catch ''`) fails closed.
+        assert!(!route_uses_tunnel("", "windows"));
+        // Case-insensitive: Windows adapter aliases are not case-sensitive.
+        assert!(route_uses_tunnel("RustyNet0\r\n", "windows"));
+    }
+
+    #[test]
+    fn windows_route_get_command_targets_find_netroute_alias() {
+        let cmd = windows_route_get_command();
+        // Probes the same egress destination as the POSIX route lookups.
+        assert!(cmd.contains(ROUTE_PROBE_IP), "command={cmd}");
+        // Uses Find-NetRoute and extracts the egress interface alias.
+        assert!(cmd.contains("Find-NetRoute"), "command={cmd}");
+        assert!(cmd.contains("InterfaceAlias"), "command={cmd}");
+        // Dispatched as PowerShell over the raw RemoteShellHost seam (no sudo).
+        assert!(
+            cmd.starts_with("powershell -NoProfile -Command"),
+            "command={cmd}"
+        );
+        assert!(
+            !cmd.contains("sudo"),
+            "windows route lookup must not wrap sudo: {cmd}"
+        );
+        // try/catch '' collapses a failed lookup to empty stdout (fail-closed).
+        assert!(cmd.contains("catch"), "command={cmd}");
+        // Width-pinned so the alias is not wrapped at the terminal width.
+        assert!(cmd.contains("Out-String -Width 32767"), "command={cmd}");
     }
 
     #[test]
@@ -1966,6 +2203,93 @@ mod tests {
 
         let macos_good = "node_id=client-3 node_role=client state=ExitActive exit_node=exit-1 restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none route=route to: 1.1.1.1 interface: utun386";
         assert!(client_exit_route_converged(macos_good, "exit-1", "macos"));
+
+        // Windows: the `Find-NetRoute` alias is appended as the route= field;
+        // a converged client routes its exit over the `rustynet0` wintun alias.
+        let windows_good = "node_id=client-9 node_role=client state=ExitActive exit_node=exit-1 restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none route=rustynet0";
+        assert!(client_exit_route_converged(
+            windows_good,
+            "exit-1",
+            "windows"
+        ));
+
+        // Windows underlay egress (route via the physical adapter) is NOT
+        // convergence — the exit traffic is leaking off-tunnel.
+        let windows_underlay = "node_id=client-9 node_role=client state=ExitActive exit_node=exit-1 restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none route=Ethernet";
+        assert!(!client_exit_route_converged(
+            windows_underlay,
+            "exit-1",
+            "windows"
+        ));
+    }
+
+    #[test]
+    fn windows_denial_command_inverts_exit_code_over_powershell() {
+        let cmd = windows_denial_command("route advertise 10.250.0.0/16");
+        // Drives rustynet.exe (the Windows CLI), not the POSIX `rustynet`.
+        assert!(
+            cmd.contains("rustynet.exe route advertise 10.250.0.0/16"),
+            "command={cmd}"
+        );
+        // PowerShell over the raw RemoteShellHost seam — never `sudo -n sh -lc`
+        // (a Windows OpenSSH host has no sudo/sh).
+        assert!(
+            cmd.starts_with("powershell -NoProfile -Command"),
+            "command={cmd}"
+        );
+        assert!(
+            !cmd.contains("sudo"),
+            "windows denial probe must not wrap sudo: {cmd}"
+        );
+        assert!(
+            !cmd.contains("sh -lc"),
+            "windows denial probe must not wrap sh -lc: {cmd}"
+        );
+        // Exit-code inversion mirrors the POSIX `... && exit 1 || exit 0`: a
+        // SUCCESSFUL (accepted) op exits 1, a DENIED op exits 0, so the
+        // caller's `status.success() == denied` invariant holds cross-OS.
+        assert!(
+            cmd.contains("if ($LASTEXITCODE -eq 0) { exit 1 } else { exit 0 }"),
+            "command={cmd}"
+        );
+        // A PowerShell-level failure (named-pipe refusal) is classified as a
+        // denial via the catch arm.
+        assert!(cmd.contains("catch { exit 0 }"), "command={cmd}");
+    }
+
+    #[test]
+    fn windows_denial_command_carries_each_least_privilege_subcommand() {
+        // exit-node select interpolates the validated exit-node id.
+        let exit = windows_denial_command("exit-node select exit-50");
+        assert!(
+            exit.contains("rustynet.exe exit-node select exit-50"),
+            "command={exit}"
+        );
+        // lan-access coupling uses the Windows config-root env path.
+        let lan = windows_denial_command(&format!(
+            "ops apply-lan-access-coupling --enable true --env-path {WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH} --lan-routes 192.168.1.0/24"
+        ));
+        assert!(
+            lan.contains("rustynet.exe ops apply-lan-access-coupling"),
+            "command={lan}"
+        );
+        assert!(
+            lan.contains(WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH),
+            "command={lan}"
+        );
+        // The Windows refresh-env path lives under the Windows config root, not
+        // a POSIX /etc path (so a live run hits the daemon's Windows state root).
+        assert!(
+            WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH.starts_with(r"C:\ProgramData\RustyNet"),
+            "windows env path must be under the Windows state root"
+        );
+        assert!(!WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH.starts_with("/etc"));
+    }
+
+    #[test]
+    fn tunnel_iface_constant_matches_linux_and_windows_adapter_name() {
+        // The shared wintun/Linux adapter name the route parsers key on.
+        assert_eq!(TUNNEL_IFACE, "rustynet0");
     }
 
     #[test]
