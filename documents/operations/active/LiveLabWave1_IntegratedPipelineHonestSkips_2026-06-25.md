@@ -115,3 +115,24 @@ Owned files (single agent):
 - Threading **per-node role-runtime proof status into `NodeStatus`** so the role × OS
   *matrix* (not just the stage/run aggregate) shows each skipped cell — a richer
   follow-up; Wave 1 fixes the green-run/green-stage dishonesty, which is the headline.
+
+## 8. OUTCOME — Wave 1 COMPLETE (2026-06-25)
+
+Commit `6560ba7` on `main`. The first sub-agent hit a session limit mid-task (only
+`deploy_relay.rs` partially edited, no commit); its `deploy_relay.rs` work was sound
+(a clean pure `outcome_for(failures, reported_skips)` helper + 3 unit tests) and was
+adopted, then the reviewer completed `relay_validation.rs` and `anchor_validation.rs`
+to the same pattern and reviewed/gated the whole change.
+
+Each of the three stages now routes its final outcome through a pure
+`outcome_for(...)`: hard failure ⇒ `Failed`; else non-empty reported-skip ⇒
+`Skipped` (→ `RunStatus::Partial` via `build_live_lab_run_report`, so a Windows-relay
+/ macOS-anchor run is no longer falsely green); else `Passed`. Preserved: empty-role
+labs ⇒ `Passed` (no false Partial), hard failure trumps a skip, and `Skipped` deps
+stay non-blocking in the runner (verified by the existing `skip_cascade` runner
+tests). `anchor_validation` keeps writing its side-car note on every non-failing run.
+
+Gates: `cargo fmt --check` clean; `cargo clippy -p rustynet-cli --all-targets
+--all-features -D warnings` clean; the orchestrator stage + parity + runner suite =
+**39 passed / 0 failed** (incl. 3 new `outcome_for_*` tests per stage and the
+preserved empty-lab/​no-adapter/​side-car tests). Committed as Iwan-Teague, pushed.
