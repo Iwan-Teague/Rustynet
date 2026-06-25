@@ -229,15 +229,27 @@ integration/bin tests pass, `no_secret_material_equality_in_workspace` ok.
    with `cargo: not found` — the runner/container PATH does not expose cargo.
    Pre-existing infra defect, independent of source. **User decision: deferred.**
 
-3. **Two REVIEW items from the `f5b38be` cfg-gating cleanup** (behavior-preserving
-   dead-stub removals; flag before treating as final):
+3. **Two REVIEW items from the `f5b38be` cfg-gating cleanup** — **REVIEWED
+   2026-06-25: both removals CONFIRMED SAFE, no security gap, no action needed.**
    - `daemon::validate_parent_directory_security` (`cfg(windows)`) — removed; had
-     no caller (Windows `validate_file_security` validates path + ACL inline). If
-     Windows parent-directory ACL hardening is wanted, wire an equivalent
-     `validate_windows_runtime_acl(parent, ...)` + non-symlink-dir check into the
-     Windows `validate_file_security` as a deliberate, tested change.
+     no caller. **Verdict: safe.** Windows parent-directory hardening is provided
+     by a *stronger* boot-time authoritative gate, not a per-file parent check:
+     `validate_windows_runtime_startup_acls()` is wired into daemon startup
+     (`daemon.rs:9252`, immediately after `validate_daemon_config`, logging
+     "configuration and runtime ACLs validated") and **fails the daemon closed
+     (`DaemonError::InvalidConfig`)** if ANY of the 9 reviewed root directories
+     (`state/config/log/trust/membership/keys/secret/key-custody/credentials`,
+     `WINDOWS_RUNTIME_STARTUP_ACL_ROOTS`) is missing, a symlink, or has a
+     non-hardened ACL. Combined with reviewed-root containment (sensitive files
+     must live under those roots — `under_reviewed_root`), per-file ACL checks
+     (`validate_windows_runtime_acl` / `validate_windows_local_secret_acl`), and
+     NTFS ACL inheritance, every sensitive file's parent chain is protected. The
+     removed stub was dead code whose function is fully subsumed — re-wiring a
+     redundant per-file parent check would add nothing.
    - `privileged_helper::validate_privileged_program_binary` (`cfg(windows)`) —
-     removed; orphaned once binary resolution + exec became unix-only.
+     removed; orphaned once binary resolution + exec became unix-only. **Verdict:
+     safe.** The privileged-helper exec model is unix-only; on Windows there is
+     no privileged-helper binary to resolve/exec, so validating one is moot.
 
 4. **Windows "Security gates" step** (`cargo audit` + `cargo deny`) has been
    *skipped* in every run so far because the build/test step failed first. Once
