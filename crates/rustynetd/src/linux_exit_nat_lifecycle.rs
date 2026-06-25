@@ -75,17 +75,36 @@ pub fn collect_linux_exit_nat_lifecycle_snapshot(
     options: &LinuxExitNatLifecycleOptions,
 ) -> LinuxExitNatLifecycleSnapshot {
     let now_unix = current_unix_seconds();
-    let nft_stdout = capture_nft_nat_table(options.nat_table.as_str()).unwrap_or_default();
-    let ipv4_forwarding = capture_proc_forwarding("/proc/sys/net/ipv4/ip_forward");
-    let ipv6_forwarding = capture_proc_forwarding("/proc/sys/net/ipv6/conf/all/forwarding");
-    build_linux_exit_nat_lifecycle_snapshot(
-        now_unix,
-        options.mesh_cidr.as_str(),
-        options.nat_table.as_str(),
-        nft_stdout.as_str(),
-        ipv4_forwarding.as_str(),
-        ipv6_forwarding.as_str(),
-    )
+    // Thread the capture RESULT through (not `unwrap_or_default`) so an `nft`
+    // spawn/exec failure fails closed (RSA-0031 / F0.1) — see
+    // `interpret_nft_nat_capture`. A capture we could not perform must read as
+    // "still present", never as "torn down".
+    let nat_table_present =
+        interpret_nft_nat_capture(capture_nft_nat_table(options.nat_table.as_str()));
+    let internal_prefix = if nat_table_present {
+        options.mesh_cidr.clone()
+    } else {
+        String::new()
+    };
+    // A failed `/proc/sys` read canonicalises to "Unknown" (non-Disabled), so a
+    // capture we could not perform never reads as "restored" (RSA-0031 / F0.2).
+    let ipv4_forwarding =
+        interpret_forwarding_capture(capture_proc_forwarding("/proc/sys/net/ipv4/ip_forward"));
+    let ipv6_forwarding = interpret_forwarding_capture(capture_proc_forwarding(
+        "/proc/sys/net/ipv6/conf/all/forwarding",
+    ));
+    LinuxExitNatLifecycleSnapshot {
+        schema_version: LINUX_EXIT_NAT_LIFECYCLE_SCHEMA_VERSION,
+        captured_at_unix: now_unix,
+        mesh_cidr: options.mesh_cidr.clone(),
+        nat_table: options.nat_table.clone(),
+        nat_table_present,
+        internal_prefix,
+        tunnel_forwarding: ipv4_forwarding.clone(),
+        egress_forwarding: ipv4_forwarding,
+        ipv6_tunnel_forwarding: ipv6_forwarding.clone(),
+        ipv6_egress_forwarding: ipv6_forwarding,
+    }
 }
 
 pub fn build_linux_exit_nat_lifecycle_snapshot(
@@ -161,6 +180,33 @@ fn current_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Interpret an `nft list table` capture result FAIL-CLOSED (RSA-0031 / F0.1).
+/// An `nft` spawn/exec *failure* (`Err`) means the daemon cannot confirm whether
+/// the exit-NAT table was torn down, so it must report the table as still
+/// present — never absent — so the teardown-verification validator does not pass
+/// an unverifiable capture. Residual exit NAT after stop/demotion is a
+/// release-blocking open relay, so "cannot confirm" must read as "present".
+/// Only a *successful* `nft list table` that genuinely shows no table yields
+/// `present=false`.
+fn interpret_nft_nat_capture(result: Result<String, ()>) -> bool {
+    match result {
+        Ok(stdout) => nft_nat_table_present(stdout.as_str()),
+        // Capture failed: cannot confirm absence ⇒ fail closed as present.
+        Err(()) => true,
+    }
+}
+
+/// Interpret a `/proc/sys` forwarding read FAIL-CLOSED (RSA-0031 / F0.2). A read
+/// failure (`None`) is reported as `"Unknown"` rather than `"Disabled"`, so the
+/// merge step does not conclude forwarding was restored on a capture it could
+/// not perform. A successful read is canonicalised via `parse_proc_forwarding`.
+fn interpret_forwarding_capture(captured: Option<String>) -> String {
+    match captured {
+        Some(stdout) => parse_proc_forwarding(stdout.as_str()),
+        None => "Unknown".to_owned(),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn capture_nft_nat_table(nat_table: &str) -> Result<String, ()> {
     let output = Command::new("nft")
@@ -168,6 +214,10 @@ fn capture_nft_nat_table(nat_table: &str) -> Result<String, ()> {
         .output()
         .map_err(|_| ())?;
     if !output.status.success() {
+        // `nft list table` on a non-existent table exits non-zero. That is the
+        // legitimate "table is genuinely absent" case (the daemon ran nft and
+        // it confirmed no table), so report empty stdout ⇒ not present — NOT a
+        // capture error.
         return Ok(String::new());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -179,13 +229,16 @@ fn capture_nft_nat_table(_nat_table: &str) -> Result<String, ()> {
 }
 
 #[cfg(target_os = "linux")]
-fn capture_proc_forwarding(path: &str) -> String {
-    fs::read_to_string(path).unwrap_or_else(|_| "0".to_owned())
+fn capture_proc_forwarding(path: &str) -> Option<String> {
+    // Only a successful read yields a state; a read error returns `None` so the
+    // caller fails closed (RSA-0031) rather than defaulting to "0"/"Disabled"
+    // (which would falsely read as restored).
+    fs::read_to_string(path).ok()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn capture_proc_forwarding(_path: &str) -> String {
-    "0".to_owned()
+fn capture_proc_forwarding(_path: &str) -> Option<String> {
+    None
 }
 
 fn nft_nat_table_present(stdout: &str) -> bool {
@@ -204,8 +257,11 @@ fn nft_nat_table_present(stdout: &str) -> bool {
 fn parse_proc_forwarding(stdout: &str) -> String {
     match stdout.trim() {
         "1" => "Enabled".to_owned(),
-        "0" | "" => "Disabled".to_owned(),
-        _ => "Disabled".to_owned(),
+        "0" => "Disabled".to_owned(),
+        // Anything else — empty or malformed — is ambiguous and must NOT read as
+        // "Disabled" (RSA-0031 / F0.2 fail-closed): a teardown is only confirmed
+        // restored on an explicit "0".
+        _ => "Unknown".to_owned(),
     }
 }
 
@@ -235,7 +291,69 @@ mod tests {
     fn parse_proc_forwarding_canonicalises_enabled() {
         assert_eq!(parse_proc_forwarding("1\n"), "Enabled");
         assert_eq!(parse_proc_forwarding("0\n"), "Disabled");
-        assert_eq!(parse_proc_forwarding("garbage"), "Disabled");
+        // RSA-0031 / F0.2 fail-closed: empty/garbage output is ambiguous and must
+        // NOT canonicalise to "Disabled" (which would falsely read as restored).
+        assert_eq!(parse_proc_forwarding(""), "Unknown");
+        assert_eq!(parse_proc_forwarding("garbage"), "Unknown");
+    }
+
+    #[test]
+    fn nft_nat_capture_failure_fails_closed_as_present() {
+        // RSA-0031 / F0.1: an `nft` spawn/exec FAILURE (capture Err) must report
+        // the NAT table as still present (cannot confirm teardown), never absent.
+        assert!(interpret_nft_nat_capture(Err(())));
+        // A successful capture that genuinely shows no table stays absent.
+        assert!(!interpret_nft_nat_capture(Ok(String::new())));
+        assert!(!interpret_nft_nat_capture(Ok("# comment\n".to_owned())));
+        // A successful capture that shows a masquerade table is present.
+        assert!(interpret_nft_nat_capture(Ok(SAMPLE_NFT.to_owned())));
+    }
+
+    #[test]
+    fn forwarding_capture_failure_fails_closed_as_unknown() {
+        // RSA-0031 / F0.2: a failed `/proc/sys` read must NOT read as "Disabled".
+        assert_eq!(interpret_forwarding_capture(None), "Unknown");
+        // A successful read is canonicalised through `parse_proc_forwarding`.
+        assert_eq!(
+            interpret_forwarding_capture(Some("0\n".to_owned())),
+            "Disabled"
+        );
+        assert_eq!(
+            interpret_forwarding_capture(Some("1\n".to_owned())),
+            "Enabled"
+        );
+        // A successful-but-unparseable read stays "Unknown" (not "Disabled").
+        assert_eq!(
+            interpret_forwarding_capture(Some("garbage".to_owned())),
+            "Unknown"
+        );
+    }
+
+    #[test]
+    fn merge_artifact_does_not_report_teardown_when_forwarding_unverifiable() {
+        // RSA-0031 / F0.2 regression: an after-stop snapshot whose forwarding
+        // could not be confirmed disabled ("Unknown") must NOT report
+        // forwarding_restored.
+        let during = build_linux_exit_nat_lifecycle_snapshot(
+            1,
+            "100.64.0.0/16",
+            "rustynet_nat_g1",
+            SAMPLE_NFT,
+            "1",
+            "0",
+        );
+        let after = build_linux_exit_nat_lifecycle_snapshot(
+            2,
+            "100.64.0.0/16",
+            "rustynet_nat_g1",
+            "",
+            // A failed/garbage forwarding read canonicalises to "Unknown".
+            "garbage",
+            "garbage",
+        );
+        let merged = merge_linux_exit_nat_lifecycle_artifact(&during, &after);
+        assert_eq!(merged["after_stop"]["forwarding_restored"], false);
+        assert_eq!(merged["after_stop"]["ipv6_forwarding_restored"], false);
     }
 
     #[test]
