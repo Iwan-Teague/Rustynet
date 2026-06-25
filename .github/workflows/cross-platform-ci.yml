@@ -132,6 +132,15 @@ jobs:
           cargo test "${PKGS[@]}" --all-targets --all-features --locked --no-fail-fast
       - name: Security gates
         run: |
+          # Check out the cargo-audit / cargo-deny advisory-db clones with LF.
+          # Git-for-Windows defaults to autocrlf=true, which rewrites the
+          # RustSec advisory `.md` files with CRLF on clone; the advisory
+          # parser then fails ("failed to find toml block" parsing e.g.
+          # abi_stable/RUSTSEC-2020-0105.md) before it can scan our deps. This
+          # is a checkout-encoding issue in the advisory database, not a real
+          # advisory/ban in the workspace. Pinning autocrlf=false makes the
+          # freshly-cloned advisory-db parse identically to Linux/macOS.
+          git config --global core.autocrlf false
           # cargo-audit + cargo-deny operate on Cargo.lock + the
           # workspace manifest, so they validate the whole
           # dependency surface (including rustynet-cli's deps) even

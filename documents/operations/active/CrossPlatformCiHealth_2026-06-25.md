@@ -254,12 +254,20 @@ integration/bin tests pass, `no_secret_material_equality_in_workspace` ok.
 4. **Windows "Security gates" step** (`cargo audit` + `cargo deny`) has been
    *skipped* in every run so far because the build/test step failed first. Once
    the Windows job goes green it will run for the first time.
-   **Pre-empted 2026-06-25 on the lab host: CLEAN.** `cargo audit --deny
-   warnings` scanned 210 crate deps with no vulnerabilities; `cargo deny check
-   bans licenses sources advisories` reported `advisories ok, bans ok, licenses
-   ok, sources ok`. These operate on `Cargo.lock` + the workspace manifest, so
-   the local result is authoritative for the Windows step too — the Windows
-   Security-gates step is expected to pass once the build+test step is green.
+   **Pre-empted 2026-06-25 on the lab host: the dependency surface is CLEAN.**
+   `cargo audit --deny warnings` scanned 210 crate deps with no vulnerabilities;
+   `cargo deny check bans licenses sources advisories` reported `advisories ok,
+   bans ok, licenses ok, sources ok`.
+   **BUT the first real Windows run (3d68930) surfaced an environmental
+   advisory-db PARSE failure, not a real finding:** `failed to load advisory:
+   failed to parse advisory from '…\advisory-db\crates\abi_stable\RUSTSEC-2020-0105.md':
+   failed to find toml block` (`abi_stable` is not even a workspace dep). Cause:
+   git-for-Windows defaults to `core.autocrlf=true`, so cargo-audit's freshly
+   cloned RustSec advisory `.md` files get CRLF line endings and the TOML-block
+   parser chokes. Fixed by pinning `git config --global core.autocrlf false`
+   ahead of the Windows Security-gates `cargo audit` / `cargo deny` calls so the
+   advisory-db parses identically to Linux/macOS. (Push-and-see: cannot be
+   reproduced on the macOS lab host.)
 
 ---
 
