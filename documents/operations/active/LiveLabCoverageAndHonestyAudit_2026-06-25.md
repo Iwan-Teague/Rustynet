@@ -1,8 +1,12 @@
 # Live-Lab Coverage & Capture-Honesty Audit — 2026-06-25
 
-Status: **AUDIT / PLAN (no code changes in this pass)**. Read-only research across
-the whole live-lab surface (5 parallel audit tracks + external best-practice
-research). Author: Iwan-Teague.
+Status: **IN EXECUTION**. Original pass was read-only research across the whole
+live-lab surface (5 parallel audit tracks + external best-practice research);
+Waves 0, 1, 2 (core-role cross-OS ports + role-switch) and the Wave 5 chaos
+trio are now **code-complete + gated + pushed** (all LIVE-RUN-PENDING — code is
+verified, lab evidence per OS still to be captured). See §8 for the running
+progress log + new findings/TODOs surfaced during execution. Author:
+Iwan-Teague.
 
 Purpose: answer "are we *thoroughly* stress-testing Rustynet in the live lab, on
 **all three OSes for every role and exploitable surface**, and is the captured
@@ -322,7 +326,7 @@ Principle: **port the Linux depth to mac/win, fix the Linux honesty gaps, and ad
 the never-tested surfaces — using the active-probe / behavioural-proof shape
 everywhere, no config-text-only or empty-capture passes.**
 
-### Wave 0 — Honesty fixes (Linux + shared), small, high-value, no new lab
+### Wave 0 — Honesty fixes (Linux + shared), small, high-value, no new lab — ✅ DONE (code), LIVE-RUN-PENDING
 - Fix Linux exit-NAT teardown fail-open (#1–#3): `interpret_nft_capture(Err)⇒present`,
   `/proc` read fail ⇒ `"Unknown"`, shell merges default `"Unknown"`.
 - Port the active DNS blocked-path probe to Linux (#4) and harden the shared
@@ -331,12 +335,16 @@ everywhere, no config-text-only or empty-capture passes.**
   (#7); add a data-plane probe to two-hop (#8). These are Linux-authorable + unit-
   testable now.
 
-### Wave 1 — Make degenerate integrated-pipeline cells honest in reporting
+### Wave 1 — Make degenerate integrated-pipeline cells honest in reporting — ✅ DONE (code), LIVE-RUN-PENDING
 - Distinguish "reported-skip" from "Pass" at the `StageOutcome` level so a Windows
   relay / macOS anchor-runtime run does not show green (today only a side-car JSON
   reveals the skip). Add a `Skipped`/`NotProven` outcome surfaced in the parity diff.
 
-### Wave 2 — Cross-OS parity for the CORE roles (port Linux Rust binaries to mac/win)
+### Wave 2 — Cross-OS parity for the CORE roles (port Linux Rust binaries to mac/win) — 🟡 PARTIAL (code), LIVE-RUN-PENDING
+**Done (code, pushed):** exit-handoff *failover* (real 6 checks), two-hop,
+lan-toggle/blind_exit, managed-DNS, role-switch matrix — all now run cross-OS
+via `match platform`. **Still open:** network-flap, reboot-recovery,
+enrollment-restart cross-OS backings.
 Build real macOS+Windows backings (via the `RemoteShellHost` trait that already
 gives genuine parity for relay/mixed-topology) for: **two-hop, lan-toggle/
 blind_exit, managed-DNS, role-switch matrix, exit-handoff *failover* (the real 6
@@ -347,21 +355,28 @@ enrollment-restart.** ~~Wire the unused macOS producers.~~ **CORRECTED: not need
 finding was wrong; see §0.7). The only dead code is the unused `daemon_probe_for`
 helper, which is harmless.
 
-### Wave 3 — Cross-OS parity for the SECURITY/adversarial surfaces (highest risk)
+### Wave 3 — Cross-OS parity for the SECURITY/adversarial surfaces (highest risk) — ☐ OPEN
 Port to macOS+Windows: **endpoint-hijack, server-IP-bypass, rogue-path,
 enrollment-token replay/forge, gossip/membership adversarial, STUN/ICE traversal
 adversarial, signed-state forgery/replay, secrets-not-in-logs, control-surface
 exposure.** Add **Windows IPv6-leak** producer+validator (mirror Linux/macOS).
 
-### Wave 4 — Cross-network dataplane (the headline capability) on mac/win
+### Wave 4 — Cross-network dataplane (the headline capability) on mac/win — ☐ OPEN
 Parameterize the 8-stage cross-network suite (direct/relay remote-exit, failback/
 roaming, controller-switch, node-switch, traversal-adversarial, remote-exit DNS,
 soak) for macOS+Windows endpoints, with a Tailscale-natlab-style NAT-type matrix.
 
-### Wave 5 — Fill the all-OS holes
+### Wave 5 — Fill the all-OS holes — 🟡 PARTIAL
 Implement the 3 inert chaos scaffolds (clock-attack, crash-recovery,
 resource-exhaustion) for real, on all 3 OSes; build the **nas** and **llm**
 service-hosting-role live stages (currently zero coverage anywhere).
+- **Done (code, pushed):** all 3 chaos tests now do real fault injection
+  (W5-A/B/C). **⚠️ But they are still LINUX-ONLY** — they must be retrofitted to
+  cross-OS (`match platform`) per the hard rule that every live-lab test runs on
+  all 3 OSes. See §8 TODO-1.
+- **Still open:** nas + llm service-hosting-role live stages (zero coverage);
+  the host-resource-exhaustion class (fd / inotify / read-only-fs) is uncovered
+  even on Linux after W5-C (see Wave5Chaos doc §scope-note). See §8 TODO-5/-6.
 
 ### Definition of done (live-lab thoroughness)
 Every (role × OS) and (security-surface × OS) cell has a live stage that **actively
@@ -379,3 +394,79 @@ nas + llm included. Then "passed the live lab ⇒ deployable" holds.
 - `AutonomousSecurityParityPassLog_2026-06-24.md` (the prior honesty pass; this
   audit found the Linux twins of those same bugs)
 - `SecurityMinimumBar.md` §8 (tunnel/DNS/IPv6 fail-closed)
+- `CrossPlatformCiHealth_2026-06-25.md` (NEW — the pre-existing cross-platform-CI
+  breakage cleanup + the windows-gnu cross-clippy runbook + remaining CI TODOs)
+- `LinuxBlindExitDataplane_2026-06-25.md` (the blind_exit fail-open fix landed
+  this pass)
+
+---
+
+## 8. Progress log + new findings/TODOs (2026-06-25, during execution)
+
+### 8.1 What landed (code-complete + gated + pushed; all LIVE-RUN-PENDING)
+- **Wave 0** — Linux honesty fixes: exit-NAT teardown fail-open closed, `/proc`
+  read-fail no longer defaults to "Unknown", active DNS blocked-path probe on
+  Linux, `require_empty_dns_pcap` now requires a `probe_attempted` companion,
+  relay-lifecycle `--dry-run`-as-Pass replaced with a real forwarded-frame proof,
+  two-hop data-plane probe added.
+- **Wave 1** — integrated-pipeline degenerate cells now report a distinct
+  `Skipped`/`NotProven` outcome instead of fake green.
+- **Wave 2 (Batch A + role-switch)** — exit-handoff *real failover* (6 checks),
+  two-hop, lan-toggle/blind_exit, managed-DNS, role-switch matrix all ported to
+  genuine cross-OS via `match platform` + `RemoteShellHost`.
+- **Wave 5 chaos** — clock-attack, crash-recovery, resource-exhaustion turned
+  from inert scaffolds into real fault injection (W5-A/B/C).
+- **Linux `blind_exit` dataplane** — closed a fail-OPEN security gap (a Linux
+  blind_exit node silently got a regular NATing exit). New nftables hardened-
+  egress module mirroring the reviewed macOS PF anchor. See
+  `LinuxBlindExitDataplane_2026-06-25.md`.
+- **Cross-platform-CI breakage cleanup** — ~80+ pre-existing Windows clippy
+  errors (cfg-gating) + crypto/local-security/backend-wireguard lints + a real
+  Windows trust-state persist bug (`atomic_write_secure` parent-dir fsync gated
+  to unix). Verified via a windows-gnu cross-clippy that reproduces the Windows
+  CI lints locally with zero CI round-trips. Full detail + runbook in
+  `CrossPlatformCiHealth_2026-06-25.md`.
+
+### 8.2 New TODOs surfaced during execution (were not in the original plan)
+1. **TODO-1 — Retrofit the 3 Wave-5 chaos tests to cross-OS.** They are real now
+   but LINUX-ONLY; the hard rule is every live-lab test runs on all 3 OSes.
+   (rustynet-cli `live_chaos_*` binaries; not built by the Windows CI job — they
+   are verified by the Linux + macOS workspace jobs.)
+2. **TODO-2 — macOS CI flaky `vm_lab` subprocess tests.** Gatekeeper/`trustd`
+   first-run signing latency makes a couple of `vm_lab` subprocess-spawn tests
+   intermittently fail on the `macos-14` runner (they pass on Linux). Needs
+   macOS-CI test-env hardening (warm-up / retry / skip-on-CI gate), not a code
+   bug. Tracked in `CrossPlatformCiHealth_2026-06-25.md`.
+3. **TODO-3 — Broken `spawn_privileged_capture_helper` socket-test helper.** The
+   framed-protocol test helper for the privileged capture path has a frame
+   mismatch; the Linux socket tests that use it are latent-broken and currently
+   masked by the Debian/E2E `cargo: not found` bootstrap failure. See
+   `LinuxBlindExitDataplane_2026-06-25.md`.
+4. **TODO-4 — Two REVIEW items from the Windows cfg-gating cleanup.** During the
+   clippy cleanup two dead `cfg(windows)` stubs were removed (behavior-preserving,
+   no caller): `daemon::validate_parent_directory_security` and
+   `privileged_helper::validate_privileged_program_binary`. If Windows
+   parent-directory ACL hardening is actually wanted, it must be wired into the
+   Windows `validate_file_security` as a deliberate, tested behavior change.
+   Detail in `CrossPlatformCiHealth_2026-06-25.md`.
+5. **TODO-5 — nas + llm service-hosting-role live stages.** Zero live coverage on
+   any OS. Note the daemon's default service access-dir is unix-shaped
+   (`/var/lib/rustynet-{nas,llm}/access`) with no ProgramData (Windows) /
+   Application Support (macOS) default, and mac/win install is fail-closed
+   ("not supported on {os} yet") — both must be addressed for cross-OS nas/llm.
+6. **TODO-6 — Host-resource-exhaustion class uncovered.** W5-C covers the
+   in-process class; fd-exhaustion, inotify-watch-exhaustion, and read-only-fs
+   remain uncovered even on Linux.
+7. **TODO-7 — Windows `blind_exit` WFP dataplane.** The Linux fix landed; Windows
+   blind_exit hardened egress (WFP) is still unimplemented (out of scope for the
+   Linux fix by design, but it is a real per-role × OS gap).
+8. **TODO-8 — Debian 13 + Linux real-WireGuard-E2E CI bootstrap.** Both jobs fail
+   at "Bootstrap CI tools" with `cargo: not found` (the runner/container PATH
+   does not expose cargo). Pre-existing infra defect, independent of source.
+
+### 8.3 CI state snapshot (commit f5b38be → 4c3d513)
+- **Windows job:** clippy onion cleared; build now compiles + runs tests. Last
+  red was the 2 trust-state persist tests (TODO above) — fixed in `4c3d513`,
+  awaiting CI confirmation.
+- **macOS job:** fails only on the flaky `vm_lab` subprocess tests (TODO-2).
+- **Debian + Linux-E2E jobs:** fail at bootstrap `cargo: not found` (TODO-8).
