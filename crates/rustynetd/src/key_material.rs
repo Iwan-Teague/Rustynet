@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::Write;
+// `ErrorKind` is only matched in the `#[cfg(unix)]` permission-fixup path below.
+#[cfg(unix)]
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(windows)]
@@ -35,9 +38,14 @@ use rustynet_windows_native::{WindowsDpapiScope, dpapi_protect, dpapi_unprotect}
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
+// The systemd-credential passphrase source resolution is a unix-only path
+// (Windows uses DPAPI blobs); gate the supporting constants to match their
+// `#[cfg(not(windows))]` callers so Windows does not see them as never-used.
+#[cfg(not(windows))]
 const PASSPHRASE_CREDENTIAL_PATH_ENV: &str = "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH";
+#[cfg(not(windows))]
 const SYSTEMD_CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const DEFAULT_PASSPHRASE_CREDENTIAL_NAME: &str = "wg_key_passphrase";
 #[cfg(target_os = "macos")]
 const PASSPHRASE_KEYCHAIN_ACCOUNT_ENV: &str = "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT";
@@ -75,7 +83,7 @@ pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>, String> {
     }
     #[cfg(windows)]
     {
-        return read_windows_runtime_passphrase_source(path);
+        read_windows_runtime_passphrase_source(path)
     }
     #[cfg(not(windows))]
     {
@@ -372,11 +380,10 @@ fn decode_windows_dpapi_passphrase_blob(
     if actual_len != protected_len {
         blob.zeroize();
         return Err(format!(
-            "{source_label} Windows DPAPI blob length mismatch (declared {protected_len}, actual {})",
-            actual_len
+            "{source_label} Windows DPAPI blob length mismatch (declared {protected_len}, actual {actual_len})"
         ));
     }
-    let mut protected = Zeroizing::new(blob.split_off(data_offset));
+    let protected = Zeroizing::new(blob.split_off(data_offset));
     blob.zeroize();
     let mut plaintext = dpapi_unprotect(protected.as_slice())
         .map_err(|err| format!("unprotect Windows DPAPI passphrase blob failed: {err}"))?;
@@ -666,6 +673,9 @@ fn validate_secret_file_security(
     }
     #[cfg(not(unix))]
     {
+        // `allow_root_owner` only gates the unix ownership/mode checks above; the
+        // non-unix paths validate via OS-specific ACLs, so discard it here.
+        let _ = allow_root_owner;
         #[cfg(windows)]
         {
             validate_windows_local_secret_input_path(path, label)?;
@@ -680,7 +690,6 @@ fn validate_secret_file_security(
             validate_windows_local_secret_acl(path, label)?;
             fs::File::open(path)
                 .map_err(|err| format!("{label} is not readable by the current identity: {err}"))?;
-            return Ok(());
         }
 
         #[cfg(not(windows))]
@@ -695,23 +704,16 @@ fn validate_secret_file_security(
     Ok(())
 }
 
+// Only the `#[cfg(not(windows))]` `read_passphrase_from_source` calls this;
+// Windows resolves its passphrase through the DPAPI blob path instead.
+#[cfg(not(windows))]
 fn resolve_passphrase_source(configured_path: &Path) -> Result<PathBuf, String> {
-    #[cfg(windows)]
-    {
-        validate_windows_secret_blob_path(configured_path, "passphrase file")?;
-        if configured_path.exists() {
-            return Ok(configured_path.to_path_buf());
-        }
-        return Err(format!(
-            "Windows passphrase source must be a reviewed DPAPI blob at {}",
-            configured_path.display()
-        ));
-    }
     let explicit = std::env::var(PASSPHRASE_CREDENTIAL_PATH_ENV).ok();
     let directory = std::env::var(SYSTEMD_CREDENTIALS_DIRECTORY_ENV).ok();
     resolve_passphrase_source_from_env(configured_path, explicit.as_deref(), directory.as_deref())
 }
 
+#[cfg(not(windows))]
 fn resolve_passphrase_source_from_env(
     configured_path: &Path,
     explicit_credential_path: Option<&str>,
@@ -769,6 +771,7 @@ fn resolve_passphrase_source_from_env(
     }
 }
 
+#[cfg(not(windows))]
 fn is_systemd_credential_path(path: &Path) -> bool {
     path.starts_with("/run/credentials/")
 }
@@ -1091,7 +1094,13 @@ pub fn migrate_existing_private_key_material(
     result
 }
 
-fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+// `mode` is the unix file-permission bits applied via `OpenOptionsExt::mode`;
+// non-unix targets (Windows) set permissions through ACLs and do not consume it.
+fn write_atomic(
+    path: &Path,
+    bytes: &[u8],
+    #[cfg_attr(not(unix), allow(unused_variables))] mode: u32,
+) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("path {} has no parent", path.display()))?;
@@ -1342,11 +1351,13 @@ fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, Stri
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     use super::DEFAULT_PASSPHRASE_CREDENTIAL_NAME;
+    #[cfg(not(windows))]
+    use super::resolve_passphrase_source_from_env;
     #[cfg(target_os = "macos")]
     use super::{MACOS_PASSPHRASE_KEYCHAIN_SERVICE, normalize_macos_keychain_account};
-    use super::{remove_file_if_present, resolve_passphrase_source_from_env, validate_binary_path};
+    use super::{remove_file_if_present, validate_binary_path};
 
     fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -1504,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn resolve_passphrase_source_prefers_explicit_credential_path_env() {
         let test_dir = unique_test_dir("rustynet-passphrase-source-explicit");
         let configured = test_dir.join("configured.passphrase");
@@ -1523,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn resolve_passphrase_source_uses_credentials_directory_when_present() {
         let test_dir = unique_test_dir("rustynet-passphrase-source-credentials-dir");
         let configured = test_dir.join("configured.passphrase");
@@ -1544,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn resolve_passphrase_source_rejects_direct_configured_path_fallback() {
         let test_dir = unique_test_dir("rustynet-passphrase-source-fallback");
         let configured = test_dir.join("configured.passphrase");

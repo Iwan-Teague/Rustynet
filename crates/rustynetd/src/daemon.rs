@@ -96,8 +96,7 @@ use crate::windows_paths::{
     DEFAULT_WINDOWS_TRUST_WATERMARK_PATH, DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
     DEFAULT_WINDOWS_WG_KEY_PASSPHRASE_PATH, DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH,
     DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH, default_windows_tunnel_service_config_path,
-    validate_windows_local_secret_acl, validate_windows_runtime_acl,
-    validate_windows_runtime_file_path,
+    validate_windows_local_secret_acl, validate_windows_runtime_file_path,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -125,7 +124,7 @@ use rustynet_backend_wireguard::LinuxUserspaceSharedBackend;
 use rustynet_backend_wireguard::LinuxWireguardBackend;
 #[cfg(all(target_os = "macos", not(test)))]
 use rustynet_backend_wireguard::MacosUtunOpenerFn;
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 use rustynet_backend_wireguard::RecordedAuthoritativeTransportOperation;
 use rustynet_backend_wireguard::WireguardBackend;
 #[cfg(windows)]
@@ -298,7 +297,7 @@ pub const DEFAULT_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS: u64 = 30;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[cfg_attr(test, allow(dead_code))]
 const TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_ATTEMPTS: usize = 10;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, not(windows))))]
 const TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS: u64 = 100;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
 pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
@@ -3244,7 +3243,7 @@ impl TunnelBackend for DaemonBackend {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 impl DaemonBackend {
     fn set_test_endpoint_latest_handshake_unix(
         &mut self,
@@ -3270,6 +3269,10 @@ impl DaemonBackend {
             )),
             #[cfg(target_os = "macos")]
             DaemonBackend::MacosUserspaceShared(_) => Err(BackendError::invalid_input(
+                "test handshake injection is only supported for in-memory backend",
+            )),
+            #[cfg(windows)]
+            DaemonBackend::Windows(_) => Err(BackendError::invalid_input(
                 "test handshake injection is only supported for in-memory backend",
             )),
         }
@@ -3303,6 +3306,10 @@ impl DaemonBackend {
             DaemonBackend::MacosUserspaceShared(_) => Err(BackendError::invalid_input(
                 "authoritative shared transport test harness is only supported for in-memory backend",
             )),
+            #[cfg(windows)]
+            DaemonBackend::Windows(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
         }
     }
 
@@ -3328,6 +3335,10 @@ impl DaemonBackend {
             )),
             #[cfg(target_os = "macos")]
             DaemonBackend::MacosUserspaceShared(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+            #[cfg(windows)]
+            DaemonBackend::Windows(_) => Err(BackendError::invalid_input(
                 "authoritative shared transport test harness is only supported for in-memory backend",
             )),
         }
@@ -3358,6 +3369,10 @@ impl DaemonBackend {
             DaemonBackend::MacosUserspaceShared(_) => Err(BackendError::invalid_input(
                 "authoritative shared transport test harness is only supported for in-memory backend",
             )),
+            #[cfg(windows)]
+            DaemonBackend::Windows(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
         }
     }
 
@@ -3385,6 +3400,10 @@ impl DaemonBackend {
             DaemonBackend::MacosUserspaceShared(_) => Err(BackendError::invalid_input(
                 "authoritative shared transport test harness is only supported for in-memory backend",
             )),
+            #[cfg(windows)]
+            DaemonBackend::Windows(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
         }
     }
 
@@ -3402,6 +3421,8 @@ impl DaemonBackend {
             DaemonBackend::Macos(_) => Vec::new(),
             #[cfg(target_os = "macos")]
             DaemonBackend::MacosUserspaceShared(_) => Vec::new(),
+            #[cfg(windows)]
+            DaemonBackend::Windows(_) => Vec::new(),
         }
     }
 
@@ -8867,7 +8888,7 @@ fn ip_is_usable_for_traversal_host_candidate(ip: IpAddr) -> bool {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, not(windows))))]
 fn snapshot_has_usable_traversal_host_candidates(
     snapshot: &BTreeMap<String, Vec<std::net::IpAddr>>,
 ) -> bool {
@@ -8880,7 +8901,7 @@ fn snapshot_has_usable_traversal_host_candidates(
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, not(windows))))]
 fn collect_traversal_host_candidate_snapshot_with_retry<Collect, Wait>(
     mut collect: Collect,
     mut wait: Wait,
@@ -9051,7 +9072,9 @@ fn nat_pmp_round_trip(gateway: Ipv4Addr, request: &[u8]) -> Result<Vec<u8>, Stri
     Ok(response[..len].to_vec())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+// Only the `#[cfg(all(test, not(windows)))]` test module calls this; on Windows
+// (and in non-test builds) it has no caller, so allow dead_code there.
+#[cfg_attr(any(not(test), windows), allow(dead_code))]
 fn zeroize_optional_bytes(value: &mut Option<Vec<u8>>) {
     if let Some(bytes) = value.as_mut() {
         bytes.fill(0);
@@ -9550,7 +9573,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         }
 
         scrub_runtime_wireguard_key_after_bootstrap(&config)?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(windows))]
@@ -10796,6 +10819,10 @@ fn detect_default_egress_interface(_tunnel_alias: &str) -> Result<String, String
     Err("egress interface auto-detect is unsupported on this platform".to_string())
 }
 
+// Route-table parsing for egress auto-detect is only used by the Linux/macOS
+// `detect_default_egress_interface` implementations; Windows enumerates adapters
+// natively and never reaches this path.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn detect_route_interface(program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
         .args(args)
@@ -10814,6 +10841,7 @@ fn detect_route_interface(program: &str, args: &[&str]) -> Result<String, String
         .ok_or_else(|| "unable to detect default egress interface from route output".to_owned())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_first_route_interface(output: &str) -> Option<String> {
     output
         .lines()
@@ -10821,6 +10849,7 @@ fn parse_first_route_interface(output: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_route_interface_token(line: &str) -> Option<&str> {
     let tokens = line.split_whitespace().collect::<Vec<_>>();
     for (idx, token) in tokens.iter().enumerate() {
@@ -12819,7 +12848,7 @@ fn persist_dns_zone_watermark(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 fn load_traversal_bundle(
     path: &Path,
     verifier_key_path: &Path,
@@ -13650,7 +13679,7 @@ struct RuntimeRelayCandidate {
     relay_id: [u8; 16],
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 fn select_runtime_relay_candidate(
     candidates: &[TraversalCandidate],
 ) -> Result<Option<RuntimeRelayCandidate>, String> {
@@ -14359,33 +14388,15 @@ fn validate_parent_directory_security(
     Ok(())
 }
 
-#[cfg(windows)]
-fn validate_parent_directory_security(
-    path: &Path,
-    label: &str,
-    _allow_root_owner: bool,
-) -> Result<(), DaemonError> {
-    let parent = path.parent().ok_or_else(|| {
-        DaemonError::InvalidConfig(format!(
-            "{label} path must include a parent directory: {}",
-            path.display()
-        ))
-    })?;
-    validate_windows_runtime_file_path(parent, label).map_err(DaemonError::InvalidConfig)?;
-    let metadata = fs::symlink_metadata(parent).map_err(|err| {
-        DaemonError::InvalidConfig(format!(
-            "{label} parent directory metadata read failed for {}: {err}",
-            parent.display()
-        ))
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-        return Err(DaemonError::InvalidConfig(format!(
-            "{label} parent directory must be a non-symlink directory: {}",
-            parent.display()
-        )));
-    }
-    validate_windows_runtime_acl(parent, label).map_err(DaemonError::InvalidConfig)
-}
+// REVIEW: a Windows-specific `validate_parent_directory_security` previously
+// lived here but had no caller — the `#[cfg(windows)]` `validate_file_security`
+// above validates the file path + ACL directly and never invoked it, so it was
+// dead code on Windows (the only call site is the `#[cfg(not(windows))]`
+// `validate_file_security`). It was removed to clear the Windows dead-code lint
+// without altering behavior. If parent-directory ACL hardening on Windows is
+// desired, wire an equivalent `validate_windows_runtime_acl(parent, ...)` /
+// non-symlink-directory check into the `#[cfg(windows)]` `validate_file_security`
+// above as a deliberate behavior change with its own test.
 
 #[cfg(target_os = "linux")]
 fn is_root_managed_shared_runtime_parent(
@@ -14424,7 +14435,10 @@ fn is_root_managed_shared_runtime_parent(
         && (owner_gid == expected_gid || owner_gid == 0)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+// Only the `#[cfg(not(windows))]` `validate_parent_directory_security` calls this;
+// keep the non-linux/macOS unix fallback but exclude Windows, where there is no
+// caller (Windows validates parent directories via NTFS ACLs instead).
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn is_root_managed_shared_runtime_parent(
     _parent: &Path,
     _mode: u32,
@@ -20211,6 +20225,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn parse_route_interface_token_handles_linux_and_macos_output() {
         assert_eq!(

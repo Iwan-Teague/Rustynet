@@ -1871,15 +1871,19 @@ fn sha256_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MEMBERSHIP_LOG_BYTES, MAX_MEMBERSHIP_SNAPSHOT_BYTES, MEMBERSHIP_CLOCK_SKEW_SECS,
-        MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
-        MembershipApproverStatus, MembershipError, MembershipNode, MembershipNodeStatus,
-        MembershipOperation, MembershipReplayCache, MembershipSignature, MembershipState,
-        MembershipUpdateRecord, SignedMembershipUpdate, append_membership_log_entry,
-        apply_signed_update, decode_update_record, hex_encode, load_membership_log,
-        load_membership_snapshot, persist_membership_snapshot, preview_next_state,
-        replay_membership_snapshot_and_log, sign_update_record, write_membership_audit_log,
+        MEMBERSHIP_CLOCK_SKEW_SECS, MEMBERSHIP_SCHEMA_VERSION, MembershipApprover,
+        MembershipApproverRole, MembershipApproverStatus, MembershipError, MembershipNode,
+        MembershipNodeStatus, MembershipOperation, MembershipReplayCache, MembershipSignature,
+        MembershipState, MembershipUpdateRecord, SignedMembershipUpdate,
+        append_membership_log_entry, apply_signed_update, decode_update_record, hex_encode,
+        load_membership_log, load_membership_snapshot, persist_membership_snapshot,
+        preview_next_state, replay_membership_snapshot_and_log, sign_update_record,
+        write_membership_audit_log,
     };
+    // The size-cap constants are only exercised by the `#[cfg(unix)]` oversized-file
+    // tests below; gate the import to match so Windows does not see them as unused.
+    #[cfg(unix)]
+    use super::{MAX_MEMBERSHIP_LOG_BYTES, MAX_MEMBERSHIP_SNAPSHOT_BYTES};
     use crate::roles::{RoleCapability, anchor_role_capabilities};
     use ed25519_dalek::SigningKey;
 

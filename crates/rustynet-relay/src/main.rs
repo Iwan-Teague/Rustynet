@@ -2289,13 +2289,15 @@ mod daemon {
             RELAY_REJECT_GENERIC_REASON, RELAY_REJECT_MSG_TYPE, RelayConfig,
             RelayHostEntrySelection, RelayTransport, WindowsRelayServiceHardeningSnapshot,
             WindowsRelayServiceOptions, bind_health_listener,
-            build_windows_relay_service_hardening_report,
-            collect_windows_relay_service_hardening_snapshot,
-            evaluate_windows_relay_service_hardening, http_request_path, load_control_verifier_key,
-            load_windows_relay_service_args, parse_relay_id_arg, parse_windows_image_path_argv,
-            render_health_json, render_metrics, select_relay_host_entry, serialize_relay_reject,
-            serve_health_endpoint,
+            build_windows_relay_service_hardening_report, evaluate_windows_relay_service_hardening,
+            http_request_path, load_control_verifier_key, load_windows_relay_service_args,
+            parse_relay_id_arg, parse_windows_image_path_argv, render_health_json, render_metrics,
+            select_relay_host_entry, serialize_relay_reject, serve_health_endpoint,
         };
+        // Only the off-Windows fail-closed test calls this collector directly; on
+        // Windows the symbol is unused here, so gate the import to match its caller.
+        #[cfg(not(windows))]
+        use super::collect_windows_relay_service_hardening_snapshot;
         use ed25519_dalek::SigningKey;
         use std::collections::HashMap;
         use std::fs;

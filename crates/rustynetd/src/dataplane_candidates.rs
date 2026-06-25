@@ -607,6 +607,9 @@ mod tests {
         }
         #[cfg(target_os = "windows")]
         {
+            // The enumeration is still exercised on Windows as a smoke check;
+            // only the Loopback/LinkLocal scope assertions differ per-OS.
+            let _ = &all;
             let gossip = gather_gossip_worthy_host_candidates();
             assert!(
                 gossip

@@ -1725,11 +1725,19 @@ mod tests {
     use super::{
         AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
         Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
-        NodeKeyPair, OsStoreFallbackPolicy, SigningProvider, SigningProviderKind,
-        SigningProviderPolicy, create_provider_attestation, decrypt_private_key_envelope,
-        encrypt_private_key_envelope, generate_key_custody_material, read_encrypted_key_file,
-        try_generate_key_custody_material, validate_key_custody_permissions,
-        validate_signing_provider_policy, verify_provider_attestation, write_encrypted_key_file,
+        NodeKeyPair, SigningProvider, SigningProviderKind, SigningProviderPolicy,
+        create_provider_attestation, decrypt_private_key_envelope, encrypt_private_key_envelope,
+        generate_key_custody_material, try_generate_key_custody_material,
+        validate_signing_provider_policy, verify_provider_attestation,
+    };
+    // The encrypted-key-file custody helpers and the OS-store fallback policy are
+    // only exercised by `#[cfg(unix)]` tests below (they rely on unix permission
+    // bits / symlink semantics); gate the imports to match so Windows does not see
+    // them as unused.
+    #[cfg(unix)]
+    use super::{
+        OsStoreFallbackPolicy, read_encrypted_key_file, validate_key_custody_permissions,
+        write_encrypted_key_file,
     };
 
     /// Regression: `try_generate_key_custody_material` must (1) succeed on a
