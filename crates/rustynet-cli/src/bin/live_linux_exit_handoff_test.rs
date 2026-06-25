@@ -31,7 +31,6 @@ const DNS_ZONE_ISSUE_DIR: &str = "/run/rustynet/dns-zone-issue-handoff";
 const DNS_ZONE_RECORDS_REMOTE: &str = "/tmp/rn-exit-handoff-dns-records.manifest";
 const DNS_ZONE_VALID_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/valid.dns-zone";
 const DNS_ZONE_VERIFIER_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/rn-dns-zone.pub";
-const ASSIGNMENT_REFRESH_ENV_PATH: &str = "/etc/rustynet/assignment-refresh.env";
 const MAX_TRAVERSAL_COORDINATION_TTL_SECS: u64 = 30;
 const HANDOFF_PRE_MONITOR_TIMEOUT_SECS: u64 = 60;
 /// Upper bound on acceptable exit-failover reconvergence time (client observes
@@ -109,21 +108,25 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let config = Config::parse(args)?;
 
-    // Track B per-platform dispatch. Linux runs the full handoff
-    // validator (existing path). macOS runs the Track B Phase 4
-    // pf+sysctl lifecycle validator. Windows runs the Track B
-    // Phase 5 NetNat+forwarding lifecycle validator via PowerShell
-    // over SSH, mirroring the macOS shape using the existing
-    // `rustynetd::windows_exit_nat_lifecycle` builder helpers.
-    match config.platform {
-        ExitHandoffPlatform::Linux => {}
-        ExitHandoffPlatform::MacOs => {
-            return run_macos_exit_handoff(&config);
-        }
-        ExitHandoffPlatform::Windows => {
-            return run_windows_exit_handoff(&config);
-        }
-    }
+    // Wave 2 (W2-A): the SINGLE real A->B exit-handoff failover
+    // assertion runs for EVERY platform. There is no longer a
+    // narrower substitute validator for macOS / Windows. The audit's
+    // "deceptive false-parity" finding was that `--platform
+    // macos|windows` previously dispatched to a single-exit
+    // pf/NetNat setup-teardown lifecycle (`run_macos_exit_handoff` /
+    // `run_windows_exit_handoff`) and reported "pass" while running
+    // ZERO of the 6 real failover checks (handoff reconvergence,
+    // no-route-leak during handoff, no-restricted-safe-mode,
+    // exit_b-endpoint-visible, both-exits-NAT, managed-DNS-fresh).
+    // Those substitute validators are removed; the real flow below
+    // now threads `config.platform` through every OS-specific
+    // command via `PlatformCommands` (see
+    // `PlatformCommands::for_platform`) so the macOS / Windows paths
+    // exercise the EXACT same assertion body as Linux — failing
+    // closed honestly where the daemon lacks support rather than
+    // fake-passing. The Linux behaviour is byte-identical to before.
+    let platform = config.platform;
+    let cmds = PlatformCommands::for_platform(platform);
 
     let root_dir = live_lab_support::repo_root()?;
 
@@ -163,12 +166,39 @@ fn run() -> Result<(), String> {
         .as_str(),
     )?;
 
+    // Preflight every host with the platform-appropriate privilege
+    // verifier, modeled on `live_linux_relay_test` /
+    // `live_linux_mixed_topology_test`. `verify_sudo`'s
+    // `/etc/hosts`-hostname grep is Linux-PAM-specific and would
+    // spuriously reject a healthy macOS host, so macOS uses the
+    // minimal passwordless-sudo probe and Windows confirms
+    // BUILTIN\Administrators. A failed preflight fails closed before
+    // any capture runs, so a missing privilege cannot be silently
+    // mistaken for a failover failure.
     for host in [
         &config.exit_a_host,
         &config.exit_b_host,
         &config.client_host,
     ] {
-        live_lab_support::verify_sudo(&config.ssh_identity_file, &work_known_hosts, host)?;
+        match platform {
+            ExitHandoffPlatform::Linux => {
+                live_lab_support::verify_sudo(&config.ssh_identity_file, &work_known_hosts, host)?;
+            }
+            ExitHandoffPlatform::MacOs => {
+                live_lab_support::verify_passwordless_sudo(
+                    &config.ssh_identity_file,
+                    &work_known_hosts,
+                    host,
+                )?;
+            }
+            ExitHandoffPlatform::Windows => {
+                live_lab_support::verify_windows_admin(
+                    &config.ssh_identity_file,
+                    &work_known_hosts,
+                    host,
+                )?;
+            }
+        }
     }
 
     logger.line("[exit-handoff] collecting WireGuard public keys")?;
@@ -603,6 +633,7 @@ fn run() -> Result<(), String> {
         &work_known_hosts,
         &config.client_host,
         &config.exit_a_node_id,
+        platform,
     )?;
 
     wait_for_handoff_monitor_prereqs(
@@ -670,28 +701,26 @@ fn run() -> Result<(), String> {
                 unix_now(),
             );
         }
-        let client_status = status(
-            &config.ssh_identity_file,
+        let client_status = capture_client_status(&config, &work_known_hosts, platform)?;
+        let route_line = capture_platform_command(
+            &config,
             &work_known_hosts,
             &config.client_host,
+            cmds.route_get,
+            cmds.route_get_needs_root,
         )?;
-        let route_line = capture_root(
-            &config.ssh_identity_file,
+        let wg_endpoints = capture_platform_command(
+            &config,
             &work_known_hosts,
             &config.client_host,
-            "ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true",
-        )?;
-        let wg_endpoints = capture_root(
-            &config.ssh_identity_file,
-            &work_known_hosts,
-            &config.client_host,
-            "wg show rustynet0 endpoints 2>/dev/null || true",
+            cmds.wg_endpoints,
+            cmds.wg_endpoints_needs_root,
         )?;
         let ping_rc = match live_lab_support::ssh_status(
             &config.ssh_identity_file,
             &work_known_hosts,
             &config.client_host,
-            "ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1",
+            cmds.ping_probe,
         ) {
             Ok(status) if status.success() => 0,
             Ok(status) => live_lab_support::status_code(status),
@@ -748,37 +777,30 @@ fn run() -> Result<(), String> {
                 &work_known_hosts,
                 &config.client_host,
                 &config.exit_b_node_id,
+                platform,
             )?;
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
-    let client_status_final = status(
-        &config.ssh_identity_file,
+    let client_status_final = capture_client_status(&config, &work_known_hosts, platform)?;
+    let exit_a_status_final =
+        capture_exit_status(&config, &work_known_hosts, &config.exit_a_host, platform)?;
+    let exit_b_status_final =
+        capture_exit_status(&config, &work_known_hosts, &config.exit_b_host, platform)?;
+    let client_route_final = capture_platform_command(
+        &config,
         &work_known_hosts,
         &config.client_host,
+        cmds.route_get,
+        cmds.route_get_needs_root,
     )?;
-    let exit_a_status_final = status(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        &config.exit_a_host,
-    )?;
-    let exit_b_status_final = status(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        &config.exit_b_host,
-    )?;
-    let client_route_final = capture_root(
-        &config.ssh_identity_file,
+    let client_wg_endpoints_final = capture_platform_command(
+        &config,
         &work_known_hosts,
         &config.client_host,
-        "ip -4 route get 1.1.1.1 || true",
-    )?;
-    let client_wg_endpoints_final = capture_root(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        &config.client_host,
-        "wg show rustynet0 endpoints || true",
+        cmds.wg_endpoints,
+        cmds.wg_endpoints_needs_root,
     )?;
     let selected_exit_peer_endpoint_final =
         status_field(&client_status_final, "selected_exit_peer_endpoint").unwrap_or("none");
@@ -807,17 +829,19 @@ fn run() -> Result<(), String> {
         &config.exit_a_host,
         cleanup_dns_issue_dir_cmd.as_str(),
     );
-    let exit_a_nft = capture_root(
-        &config.ssh_identity_file,
+    let exit_a_nat = capture_platform_command(
+        &config,
         &work_known_hosts,
         &config.exit_a_host,
-        "nft list ruleset || true",
+        cmds.nat_capture,
+        cmds.nat_capture_needs_root,
     )?;
-    let exit_b_nft = capture_root(
-        &config.ssh_identity_file,
+    let exit_b_nat = capture_platform_command(
+        &config,
         &work_known_hosts,
         &config.exit_b_host,
-        "nft list ruleset || true",
+        cmds.nat_capture,
+        cmds.nat_capture_needs_root,
     )?;
 
     logger.line("[exit-handoff] final client status")?;
@@ -834,9 +858,18 @@ fn run() -> Result<(), String> {
     logger.block(&(client_wg_endpoints_final.clone() + "\n"))?;
 
     let monitor_text = read_file(&monitor_path)?;
+    // Per-OS route-leak detection. Every monitor sample's client
+    // default route MUST egress the rustynet tunnel device; any
+    // off-tunnel route (or a sample with no parseable `route=` field)
+    // is a leak. The tunnel-device token differs per OS
+    // (`dev rustynet0` on Linux, `interface: utunN` on macOS,
+    // `InterfaceAlias rustynet0` on Windows) so the predicate is
+    // selected via `platform`, not a hard-coded substring. A sample
+    // whose route never converged to the tunnel counts as a leak and
+    // fails the check closed.
     let route_leak_count = monitor_text
         .lines()
-        .filter(|line| !line.contains("route=") || !line.contains("dev rustynet0"))
+        .filter(|line| monitor_line_route_leaks(line, platform))
         .count();
     let restricted_count = monitor_text
         .lines()
@@ -888,12 +921,13 @@ fn run() -> Result<(), String> {
     } else {
         "fail"
     };
-    let check_both_exits_nat =
-        if exit_a_nft.contains("masquerade") && exit_b_nft.contains("masquerade") {
-            "pass"
-        } else {
-            "fail"
-        };
+    let check_both_exits_nat = if exit_nat_present_for_platform(platform, &exit_a_nat)
+        && exit_nat_present_for_platform(platform, &exit_b_nat)
+    {
+        "pass"
+    } else {
+        "fail"
+    };
     let check_managed_dns_fresh_all_nodes = if managed_dns_state_is_valid(&client_status_final)
         && managed_dns_state_is_valid(&exit_a_status_final)
         && managed_dns_state_is_valid(&exit_b_status_final)
@@ -958,16 +992,17 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// Target platform of the host running the active mesh exit role.
-///
-/// Today the live exit-handoff stages only have a fully-implemented
-/// Linux validator (systemd + nftables + iproute2). The `--platform`
-/// flag exists so the orchestrator's `stage_run_live_exit_handoff`
-/// can dispatch per-platform symmetrically with
-/// `stage_run_live_anchor`. Non-Linux platforms fail closed with an
-/// honest "not yet enabled" message until the per-platform
-/// validators land (Track B Phases 2 + 3). Mirrors the pattern in
-/// `live_linux_anchor_test::AnchorPlatform`.
+/// Target platform of the client failing over between the two exit
+/// hosts. As of Wave 2 (W2-A) the SINGLE real A->B failover assertion
+/// runs for every platform: `--platform` selects the per-OS command
+/// branches threaded through the 6 failover checks (see
+/// [`PlatformCommands`]), not a different/narrower validator. macOS /
+/// Windows exercise the EXACT same assertion body as Linux and fail
+/// closed honestly where the daemon lacks support (Windows-as-exit is
+/// unsupported at the role gate — see the `// REVIEW:` flags in
+/// `PlatformCommands::for_platform`). Mirrors the cross-OS
+/// `RemoteShellHost` command-branch pattern proven in
+/// `live_linux_relay_test`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitHandoffPlatform {
     Linux,
@@ -976,7 +1011,6 @@ enum ExitHandoffPlatform {
 }
 
 impl ExitHandoffPlatform {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn as_str(self) -> &'static str {
         match self {
             ExitHandoffPlatform::Linux => "linux",
@@ -994,6 +1028,302 @@ impl ExitHandoffPlatform {
                 "unsupported --platform value {other:?}; expected linux|macos|windows"
             )),
         }
+    }
+
+    /// Platform label consumed by the shared `apply_role_coupling`
+    /// helper (and its socket / bundle / watermark path selectors in
+    /// `live_lab_bin_support`). `as_str` already produces the
+    /// canonical `linux|macos|windows` token the helper matches on.
+    fn role_coupling_label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+/// Per-OS command set + tunnel-device tokens for the SINGLE real
+/// exit-handoff failover assertion. Every OS-specific command used by
+/// the 6 failover checks is selected here once via
+/// [`PlatformCommands::for_platform`] and threaded through the
+/// capture sites, mirroring the `match platform` command-branch seam
+/// proven in `live_linux_relay_test.rs`. Keeping every branch in one
+/// struct means a missing port surfaces as a compile error rather
+/// than a silently-skipped check, and keeps the Linux strings
+/// byte-identical to the pre-Wave-2 hard-coded form.
+#[derive(Debug, Clone)]
+struct PlatformCommands {
+    /// Client-side default-route inspection toward an off-mesh target
+    /// (1.1.1.1). Output feeds `route=` in the monitor line and the
+    /// route-leak detector ([`route_uses_tunnel_for_platform`]). Run
+    /// via `capture_root` (sudo) on Linux / macOS; on Windows it is a
+    /// PowerShell `Get-NetRoute` query run via `capture_remote_stdout`
+    /// against the Administrator session.
+    route_get: &'static str,
+    /// Whether `route_get` must be run through `capture_root` (sudo).
+    /// Windows captures run via `capture_remote_stdout` (no sudo verb).
+    route_get_needs_root: bool,
+    /// Debug-only WireGuard endpoint dump (never asserted on; recorded
+    /// in the monitor line for triage).
+    wg_endpoints: &'static str,
+    wg_endpoints_needs_root: bool,
+    /// Client-side reachability probe through the active exit. Run via
+    /// `ssh_status` (raw, no sudo wrapper — byte-identical to the
+    /// pre-Wave-2 Linux invocation) so only the exact rc is observed.
+    /// Linux/macOS use `ping`; Windows uses a PowerShell
+    /// `Test-Connection` whose `exit` code carries the result.
+    ping_probe: &'static str,
+    /// Exit-side NAT-presence capture. Output is fed to
+    /// [`exit_nat_present_for_platform`] which applies the per-OS
+    /// match (Linux `masquerade`, macOS pf `nat on`, Windows NetNat
+    /// object). Run via `capture_root` on Linux/macOS, via
+    /// `capture_remote_stdout` (PowerShell) on Windows.
+    nat_capture: &'static str,
+    nat_capture_needs_root: bool,
+}
+
+impl PlatformCommands {
+    fn for_platform(platform: ExitHandoffPlatform) -> Self {
+        match platform {
+            // Linux strings are byte-identical to the pre-Wave-2
+            // hard-coded captures so the Linux path does not change.
+            ExitHandoffPlatform::Linux => PlatformCommands {
+                route_get: "ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true",
+                route_get_needs_root: true,
+                wg_endpoints: "wg show rustynet0 endpoints 2>/dev/null || true",
+                wg_endpoints_needs_root: true,
+                ping_probe: "ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1",
+                nat_capture: "nft list ruleset || true",
+                nat_capture_needs_root: true,
+            },
+            // macOS: `route -n get <dst>` is the BSD equivalent of
+            // `ip route get`; its `interface: utunN` line names the
+            // egress device (the rustynet tunnel surfaces as a utun*
+            // on macOS — see `macos_exit_dns_failclosed.rs` test
+            // fixtures `interface: utun4`). `wg show` is available on
+            // macOS when wireguard-tools is installed. `ping -c 1 -t 1`
+            // — macOS `ping` spells the deadline `-t` (TTL on Linux),
+            // and has no `-W` per-probe timeout, so `-t 1` bounds the
+            // probe. NAT is captured from the daemon's pf anchor.
+            //
+            // REVIEW: macOS-as-exit maps to the `blind_exit` daemon
+            // role (role.rs `daemon_node_role_for_platform`), and this
+            // test enforces the `admin` role on both exits. The macOS
+            // daemon's admin role requires the `anchor` capability,
+            // which is Linux-only today (role.rs:61
+            // `is_supported_for_platform`). Expect the macOS exit
+            // hosts to fail closed at `enforce_host`/route-advertise
+            // on a live run; that is the honest daemon-side gap, not a
+            // test bug.
+            ExitHandoffPlatform::MacOs => PlatformCommands {
+                route_get: "/sbin/route -n get 1.1.1.1 2>/dev/null || true",
+                route_get_needs_root: true,
+                wg_endpoints: "wg show rustynet0 endpoints 2>/dev/null || true",
+                wg_endpoints_needs_root: true,
+                ping_probe: "/sbin/ping -c 1 -t 1 1.1.1.1 >/dev/null 2>&1",
+                nat_capture: "/sbin/pfctl -a com.rustynet/nat -s nat 2>/dev/null || true",
+                nat_capture_needs_root: true,
+            },
+            // Windows: PowerShell `Get-NetRoute` for the default route
+            // names the ifIndex; the route-leak detector matches the
+            // rustynet WireGuard adapter alias in the row. `ping -n 1
+            // -w 1000` is the Windows flag spelling (count `-n`,
+            // per-probe timeout `-w` in ms). `wg.exe show` is present
+            // when the WireGuard tooling is installed but the Windows
+            // backend is WFP-based, so it may be empty — debug only.
+            // NAT presence is read from `Get-NetNat`.
+            //
+            // REVIEW: Windows-as-exit is unsupported at the role gate
+            // (role.rs:65 `is_supported_for_platform` returns false
+            // for a Windows membership owner, and the exit's `admin`
+            // role requires the `anchor` capability which is Linux-only
+            // per role.rs:61). The Windows exit hosts WILL fail closed
+            // at `enforce_host`/route-advertise on a live run. This is
+            // the CORRECT, honest outcome — the ported test lights up
+            // the real daemon-side gap rather than fake-passing.
+            ExitHandoffPlatform::Windows => PlatformCommands {
+                route_get: "powershell -NoProfile -Command \"Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object -Property RouteMetric | Select-Object -First 1 | Format-List ifIndex,InterfaceAlias,NextHop | Out-String -Width 32767\"",
+                route_get_needs_root: false,
+                wg_endpoints: "powershell -NoProfile -Command \"try { wg.exe show rustynet0 endpoints } catch { '' }\"",
+                wg_endpoints_needs_root: false,
+                ping_probe: "powershell -NoProfile -Command \"if ((Test-Connection -ComputerName 1.1.1.1 -Count 1 -Quiet -ErrorAction SilentlyContinue)) { exit 0 } else { exit 1 }\"",
+                nat_capture: "powershell -NoProfile -Command \"Get-NetNat -ErrorAction SilentlyContinue | Format-List Name,InternalIPInterfaceAddressPrefix | Out-String -Width 32767\"",
+                nat_capture_needs_root: false,
+            },
+        }
+    }
+}
+
+/// Pure, unit-testable route-leak / tunnel-egress detector. Split out
+/// of [`PlatformCommands`] so it can be exercised with realistic
+/// per-OS `route_get` samples (the live commands are not runnable on
+/// this orchestrator host, so the parser is the verifiable surface).
+fn route_uses_tunnel_for_platform(platform: ExitHandoffPlatform, route: &str) -> bool {
+    match platform {
+        // Byte-identical to the pre-Wave-2 `route_uses_rustynet0`.
+        ExitHandoffPlatform::Linux => route.contains("dev rustynet0"),
+        // `route -n get` emits `  interface: utun4`. Accept any
+        // `utun*` (the rustynet macOS tunnel) OR an explicit
+        // `rustynet0` alias. Anchoring on the `interface:` KEY (and
+        // reading only the device token that immediately follows it)
+        // means a stray mention of `utun` elsewhere cannot satisfy
+        // the check. `key_value_token` works whether the capture is
+        // the raw multi-line `route -n get` block OR the
+        // newline-collapsed monitor-line `route=` field (the monitor
+        // line replaces `\n` with spaces, so the device sits inline).
+        ExitHandoffPlatform::MacOs => match key_value_token(route, "interface:") {
+            Some(iface) => iface.starts_with("utun") || iface == "rustynet0",
+            None => false,
+        },
+        // `Get-NetRoute | Format-List` emits `InterfaceAlias :
+        // rustynet0`. Match the alias key + the rustynet adapter name
+        // so a default route via the physical NIC (a leak) fails. Same
+        // raw-vs-collapsed robustness as the macOS branch.
+        ExitHandoffPlatform::Windows => match key_value_token(route, "InterfaceAlias") {
+            Some(alias) => alias.eq_ignore_ascii_case("rustynet0"),
+            None => false,
+        },
+    }
+}
+
+/// Extract the value token that follows the first occurrence of `key`
+/// in `text`, skipping a single PowerShell `Format-List` `:`
+/// separator if present. Used to read the egress device / adapter
+/// name out of either a raw multi-line route capture (`interface:
+/// utun4`) or the newline-collapsed monitor-line `route=` field, and
+/// the Windows `InterfaceAlias : rustynet0` shape alike. Returns
+/// `None` when `key` is absent or has no following value token
+/// (fail-closed: an unparsed capture is NOT a tunnel match).
+fn key_value_token<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let after = text.split(key).nth(1)?;
+    // Drop a leading `:` separator token (Format-List `Key : Value`)
+    // before reading the value, so both `interface: utun4` and
+    // `InterfaceAlias : rustynet0` yield the device/alias token.
+    after.split_whitespace().find(|tok| *tok != ":")
+}
+
+/// Pure, unit-testable exit-side NAT-presence detector.
+fn exit_nat_present_for_platform(platform: ExitHandoffPlatform, capture: &str) -> bool {
+    match platform {
+        // Byte-identical to the pre-Wave-2 `nft ... contains
+        // "masquerade"` check.
+        ExitHandoffPlatform::Linux => capture.contains("masquerade"),
+        // `pfctl -a com.rustynet/nat -s nat` prints `nat on <if> ...`
+        // when the daemon installed its egress NAT anchor.
+        ExitHandoffPlatform::MacOs => capture.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("nat on ") || trimmed.starts_with("nat-anchor")
+        }),
+        // `Get-NetNat | Format-List` prints a `Name : <nat>` line when
+        // a NetNat object exists. Empty output = no NAT.
+        ExitHandoffPlatform::Windows => capture.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("Name")
+                .map(|rest| !rest.trim_start_matches([':', ' ']).trim().is_empty())
+                .unwrap_or(false)
+        }),
+    }
+}
+
+/// Capture the client daemon `status` line on the active platform.
+/// Linux retains the byte-identical `status()` helper (sudo +
+/// `/run/rustynet/rustynetd.sock`); macOS / Windows go through the
+/// shared `capture_daemon_status_for_platform` so the correct
+/// per-OS socket / `rustynet.exe` invocation is used (the Linux-only
+/// `status()` helper hard-codes the Linux socket and would never
+/// connect on macOS/Windows — using it there would be a silent
+/// fail-closed masquerading as an empty status). A never-captured
+/// status propagates the Err so the failover assertion fails closed.
+fn capture_client_status(
+    config: &Config,
+    known_hosts: &Path,
+    platform: ExitHandoffPlatform,
+) -> Result<String, String> {
+    match platform {
+        ExitHandoffPlatform::Linux => {
+            status(&config.ssh_identity_file, known_hosts, &config.client_host)
+        }
+        ExitHandoffPlatform::MacOs | ExitHandoffPlatform::Windows => {
+            live_lab_support::capture_daemon_status_for_platform(
+                &config.ssh_identity_file,
+                known_hosts,
+                &config.client_host,
+                platform.as_str(),
+            )
+        }
+    }
+}
+
+/// Capture an exit host's daemon `status` line on the active
+/// platform. Same per-OS socket / invocation rationale as
+/// [`capture_client_status`]; split so the exit host can be targeted.
+fn capture_exit_status(
+    config: &Config,
+    known_hosts: &Path,
+    exit_host: &str,
+    platform: ExitHandoffPlatform,
+) -> Result<String, String> {
+    match platform {
+        ExitHandoffPlatform::Linux => status(&config.ssh_identity_file, known_hosts, exit_host),
+        ExitHandoffPlatform::MacOs | ExitHandoffPlatform::Windows => {
+            live_lab_support::capture_daemon_status_for_platform(
+                &config.ssh_identity_file,
+                known_hosts,
+                exit_host,
+                platform.as_str(),
+            )
+        }
+    }
+}
+
+/// Per-OS route-leak predicate over a single monitor-log line. A line
+/// "leaks" when it has no `route=` field, or when the captured route
+/// did NOT egress the rustynet tunnel device for `platform`. The
+/// monitor line embeds the (newline-collapsed) route capture as
+/// `...|route=<capture>|status=...`; extract the `route=` field up to
+/// the next `|status=` delimiter and apply
+/// [`route_uses_tunnel_for_platform`]. Pure + unit-tested with
+/// realistic per-OS monitor samples.
+fn monitor_line_route_leaks(line: &str, platform: ExitHandoffPlatform) -> bool {
+    let Some(route_field) = monitor_line_route_field(line) else {
+        return true;
+    };
+    !route_uses_tunnel_for_platform(platform, route_field)
+}
+
+/// Extract the `route=<...>` field value from a monitor line, bounded
+/// by the following `|status=` delimiter (the monitor line is
+/// `ts|iter=..|ping_rc=..|route=<route>|status=<status>|wg_endpoints=<..>`).
+/// Returns `None` when the line carries no `route=` field at all.
+fn monitor_line_route_field(line: &str) -> Option<&str> {
+    let after = line.split("route=").nth(1)?;
+    Some(match after.find("|status=") {
+        Some(end) => &after[..end],
+        None => after,
+    })
+}
+
+/// Run a per-OS capture command on `target`, choosing the sudo
+/// (`capture_root`) vs raw (`capture_remote_stdout`) seam per the
+/// command's `needs_root` flag. Linux/macOS captures that read kernel
+/// route / pf state need sudo; Windows PowerShell captures run under
+/// the Administrator SSH session and do not use a sudo verb. A failed
+/// capture propagates as Err so the dependent check fails closed
+/// rather than silently treating an unreadable probe as a pass.
+fn capture_platform_command(
+    config: &Config,
+    known_hosts: &Path,
+    target: &str,
+    command: &str,
+    needs_root: bool,
+) -> Result<String, String> {
+    if needs_root {
+        capture_root(&config.ssh_identity_file, known_hosts, target, command)
+    } else {
+        live_lab_support::capture_remote_stdout(
+            &config.ssh_identity_file,
+            known_hosts,
+            target,
+            command,
+        )
     }
 }
 
@@ -1412,7 +1742,27 @@ fn pin_client_to_expected_exit(
     known_hosts: &Path,
     client_host: &str,
     expected_exit_node_id: &str,
+    platform: ExitHandoffPlatform,
 ) -> Result<(), String> {
+    // Thread the active platform through the shared
+    // `apply_role_coupling` helper so it selects the correct per-OS
+    // daemon socket / assignment-bundle / watermark paths (the helper
+    // hard-coded "linux" before Wave 2, which would have driven the
+    // wrong socket on macOS/Windows). The env path stays platform-
+    // appropriate via the same helper's selectors on the daemon side.
+    //
+    // REVIEW: on macOS the client maps the `client` role to the
+    // `client` daemon role (role.rs `daemon_node_role_for_platform`),
+    // which the macOS daemon supports; on Windows the client role is
+    // likewise supported. The unconfirmed daemon-side surface is the
+    // *exit-route reconvergence wait* inside apply-role-coupling — the
+    // lab does not assert macOS client full-tunnel exit-route
+    // convergence (the helper passes
+    // `--skip-client-exit-route-convergence-wait` on macOS), so a
+    // macOS client pinned to a freshly-elected exit may report
+    // convergence the orchestrator did not actually verify. The
+    // failover reconvergence is still asserted independently via the
+    // monitor-line `exit_node=` transition.
     live_lab_support::apply_role_coupling(
         identity,
         known_hosts,
@@ -1420,8 +1770,8 @@ fn pin_client_to_expected_exit(
         "client",
         Some(expected_exit_node_id),
         false,
-        ASSIGNMENT_REFRESH_ENV_PATH,
-        "linux",
+        live_lab_support::assignment_refresh_env_path_for_platform(platform.role_coupling_label()),
+        platform.role_coupling_label(),
     )?;
     run_root(
         identity,
@@ -1438,6 +1788,14 @@ fn handoff_runtime_ready(status: &str) -> bool {
         && status_field(status, "state") != Some("FailClosed")
 }
 
+/// Linux-only tunnel-egress predicate, retained as the byte-identical
+/// Linux definition that `route_uses_tunnel_for_platform(Linux, ..)`
+/// must agree with. Test-only oracle pinned by
+/// `route_uses_rustynet0_requires_tunnel_device` and
+/// `route_uses_tunnel_linux_matches_byte_identical_legacy_predicate`;
+/// the production route-leak path goes through
+/// `route_uses_tunnel_for_platform`.
+#[cfg(test)]
 fn route_uses_rustynet0(route: &str) -> bool {
     route.contains("dev rustynet0")
 }
@@ -1448,9 +1806,10 @@ fn handoff_monitor_prereqs_ready(
     exit_b_status: &str,
     client_route: &str,
     exit_a_node_id: &str,
+    platform: ExitHandoffPlatform,
 ) -> bool {
     status_field(client_status, "exit_node") == Some(exit_a_node_id)
-        && route_uses_rustynet0(client_route)
+        && route_uses_tunnel_for_platform(platform, client_route)
         && handoff_runtime_ready(client_status)
         && managed_dns_state_is_valid(client_status)
         && managed_dns_state_is_valid(exit_a_status)
@@ -1470,11 +1829,14 @@ fn wait_for_handoff_monitor_expected_exit(
         )
         .as_str(),
     )?;
+    let platform = config.platform;
+    let cmds = PlatformCommands::for_platform(platform);
     pin_client_to_expected_exit(
         &config.ssh_identity_file,
         known_hosts,
         &config.client_host,
         expected_exit_node_id,
+        platform,
     )?;
     let start_ts = unix_now();
     let mut last_client_status = String::new();
@@ -1483,14 +1845,17 @@ fn wait_for_handoff_monitor_expected_exit(
     let mut last_client_route = String::new();
 
     while unix_now().saturating_sub(start_ts) < HANDOFF_REFRESH_CONVERGENCE_TIMEOUT_SECS {
-        last_client_status = status(&config.ssh_identity_file, known_hosts, &config.client_host)?;
-        last_exit_a_status = status(&config.ssh_identity_file, known_hosts, &config.exit_a_host)?;
-        last_exit_b_status = status(&config.ssh_identity_file, known_hosts, &config.exit_b_host)?;
-        last_client_route = capture_root(
-            &config.ssh_identity_file,
+        last_client_status = capture_client_status(config, known_hosts, platform)?;
+        last_exit_a_status =
+            capture_exit_status(config, known_hosts, &config.exit_a_host, platform)?;
+        last_exit_b_status =
+            capture_exit_status(config, known_hosts, &config.exit_b_host, platform)?;
+        last_client_route = capture_platform_command(
+            config,
             known_hosts,
             &config.client_host,
-            "ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true",
+            cmds.route_get,
+            cmds.route_get_needs_root,
         )?;
 
         if handoff_monitor_prereqs_ready(
@@ -1499,6 +1864,7 @@ fn wait_for_handoff_monitor_expected_exit(
             &last_exit_b_status,
             &last_client_route,
             expected_exit_node_id,
+            platform,
         ) {
             return Ok(());
         }
@@ -1537,11 +1903,14 @@ fn wait_for_handoff_monitor_prereqs(
     logger.line(
         "[exit-handoff] waiting for baseline exit route and managed DNS freshness before monitor",
     )?;
+    let platform = config.platform;
+    let cmds = PlatformCommands::for_platform(platform);
     pin_client_to_expected_exit(
         &config.ssh_identity_file,
         known_hosts,
         &config.client_host,
         &config.exit_a_node_id,
+        platform,
     )?;
     let start_ts = unix_now();
     let mut next_coordination_refresh_ts =
@@ -1583,6 +1952,7 @@ fn wait_for_handoff_monitor_prereqs(
                 known_hosts,
                 &config.client_host,
                 &config.exit_a_node_id,
+                platform,
             )?;
             next_coordination_refresh_ts = advance_periodic_refresh_deadline(
                 next_coordination_refresh_ts,
@@ -1591,14 +1961,17 @@ fn wait_for_handoff_monitor_prereqs(
             );
         }
 
-        last_client_status = status(&config.ssh_identity_file, known_hosts, &config.client_host)?;
-        last_exit_a_status = status(&config.ssh_identity_file, known_hosts, &config.exit_a_host)?;
-        last_exit_b_status = status(&config.ssh_identity_file, known_hosts, &config.exit_b_host)?;
-        last_client_route = capture_root(
-            &config.ssh_identity_file,
+        last_client_status = capture_client_status(config, known_hosts, platform)?;
+        last_exit_a_status =
+            capture_exit_status(config, known_hosts, &config.exit_a_host, platform)?;
+        last_exit_b_status =
+            capture_exit_status(config, known_hosts, &config.exit_b_host, platform)?;
+        last_client_route = capture_platform_command(
+            config,
             known_hosts,
             &config.client_host,
-            "ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true",
+            cmds.route_get,
+            cmds.route_get_needs_root,
         )?;
 
         if handoff_monitor_prereqs_ready(
@@ -1607,6 +1980,7 @@ fn wait_for_handoff_monitor_prereqs(
             &last_exit_b_status,
             &last_client_route,
             &config.exit_a_node_id,
+            platform,
         ) {
             return Ok(());
         }
@@ -1896,714 +2270,6 @@ fn validate_positive_integer(name: &str, value: usize) -> Result<(), String> {
     }
 }
 
-// ─── Track B Phase 4: macOS exit-handoff live validator ────────────
-//
-// Real (not scaffold) macOS exit-mode validator. Captures pf + sysctl
-// state on the exit_a_host while the daemon is serving exit, stops
-// the daemon via launchctl, re-captures, merges into the canonical
-// macOS_exit_nat_lifecycle artifact shape, and asserts the same
-// invariants `evaluate_macos_exit_nat_lifecycle_artifact` in
-// `crates/rustynet-cli/src/vm_lab/mod.rs` enforces for static
-// artifacts:
-//
-// * during_run:  pf anchor present, internal_prefix matches mesh_cidr,
-//                tunnel_forwarding=Enabled, egress_forwarding=Enabled.
-// * after_stop:  pf anchor removed, forwarding_restored=true (both
-//                tunnel + egress sysctl back to Disabled).
-//
-// On any assertion failure the bin returns Err so the orchestrator's
-// `assert_json_report_status_pass` helper surfaces the failure. The
-// JSON report `status` is `pass` only when every assertion holds.
-//
-// The bin reuses the pure builder helpers from
-// `rustynetd::macos_exit_nat_lifecycle` so the parser shape stays in
-// lockstep with the daemon-side single-phase snapshot collector
-// (`collect_macos_exit_nat_lifecycle_snapshot`) and the orchestrator-
-// side merger (`merge_macos_exit_nat_lifecycle_artifact`).
-// Constants are imported (not duplicated) so a future rename of the pf
-// anchor or launchd label surfaces here as a compile break.
-use rustynetd::macos_exit_nat_lifecycle::DEFAULT_MACOS_EXIT_PF_ANCHOR as MACOS_PF_ANCHOR;
-use rustynetd::macos_service_hardening::REVIEWED_SERVICE_LABEL as MACOS_DAEMON_LAUNCHD_LABEL;
-
-/// Report envelope matching the canonical live-lab shape consumed by
-/// `ops_fresh_install_os_matrix::load_json_report`. The `lifecycle`
-/// field carries the nested `during_run`/`after_stop` artefact built
-/// by `merge_macos_exit_nat_lifecycle_artifact` so the schema stays
-/// in lockstep with `evaluate_macos_exit_nat_lifecycle_artifact`.
-#[derive(Debug, serde::Serialize)]
-struct MacosExitHandoffReport {
-    schema_version: u32,
-    phase: &'static str,
-    mode: &'static str,
-    evidence_mode: &'static str,
-    status: &'static str,
-    platform: &'static str,
-    captured_at: String,
-    captured_at_unix: u64,
-    git_commit: String,
-    exit_host: String,
-    exit_node_id: String,
-    pf_anchor: String,
-    mesh_cidr: String,
-    daemon_restart_status: String,
-    lifecycle: serde_json::Value,
-    source_artifacts: Vec<String>,
-    detail: String,
-}
-
-fn run_macos_exit_handoff(config: &Config) -> Result<(), String> {
-    for command in ["ssh", "ssh-keygen"] {
-        require_command(command)?;
-    }
-    validate_identity(&config.ssh_identity_file)?;
-    let pinned_known_hosts = match config.pinned_known_hosts_file.as_ref() {
-        Some(path) => path.clone(),
-        None => load_home_known_hosts_path()?,
-    };
-    ensure_pinned_known_hosts_file(&pinned_known_hosts)?;
-    let workspace = create_workspace("macos-exit-handoff")?;
-    let work_known_hosts = workspace.path().join("known_hosts");
-    seed_known_hosts(&pinned_known_hosts, &work_known_hosts)?;
-
-    let exit_target = config.exit_a_host.as_str();
-    // Preflight: explicit passwordless-sudo check so the first
-    // pfctl/sysctl capture below fails with a precise diagnostic
-    // instead of an opaque "ssh command failed... status 1".
-    // verify_sudo (Linux) refuses hosts whose hostname is not in
-    // /etc/hosts; macOS does not maintain that mapping, so use the
-    // minimal helper that only probes `sudo -n -k true`.
-    live_lab_support::verify_passwordless_sudo(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-    )?;
-
-    let mesh_cidr = "100.64.0.0/10".to_owned(); // canonical Rustynet mesh CIDR
-
-    // Phase 1: during-run snapshot. Capture pfctl anchor state +
-    // sysctl forwarding while the daemon is serving exit. Both
-    // captures are run via sudo so the helper has the privilege to
-    // call /sbin/pfctl and read kernel sysctls.
-    let during_pf = capture_root(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        &format!("/sbin/pfctl -a {} -s nat", MACOS_PF_ANCHOR),
-    )
-    .map_err(|err| format!("macos exit-handoff: during-run pfctl capture failed: {err}"))?;
-    let during_sysctl = capture_root(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        "/usr/sbin/sysctl -n net.inet.ip.forwarding",
-    )
-    .map_err(|err| {
-        format!("macos exit-handoff: during-run sysctl forwarding capture failed: {err}")
-    })?;
-    let captured_at_during = unix_now() as i64;
-    let during_snapshot =
-        rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
-            captured_at_during,
-            mesh_cidr.as_str(),
-            MACOS_PF_ANCHOR,
-            during_pf.as_str(),
-            during_sysctl.as_str(),
-        );
-
-    // Phase 2: stop the daemon via launchctl so the killswitch
-    // teardown path runs. `bootout` is the canonical macOS daemon
-    // stop verb; we accept a non-zero exit code (daemon may already
-    // be loaded under a different domain) but we DO require the
-    // subsequent pfctl/sysctl captures to prove the cleanup happened.
-    let _ = run_root(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        &format!(
-            "/bin/launchctl bootout system/{} 2>/dev/null || /bin/launchctl unload /Library/LaunchDaemons/{}.plist 2>/dev/null || true",
-            MACOS_DAEMON_LAUNCHD_LABEL, MACOS_DAEMON_LAUNCHD_LABEL
-        ),
-    );
-    // Give the daemon a couple of seconds to release pf + sysctl.
-    std::thread::sleep(std::time::Duration::from_secs(3));
-
-    // Phase 3: after-stop snapshot. Same captures; the validator
-    // expects pf anchor gone + ip.forwarding back to 0.
-    let after_pf = capture_root(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        &format!(
-            "/sbin/pfctl -a {} -s nat 2>/dev/null || true",
-            MACOS_PF_ANCHOR
-        ),
-    )
-    .map_err(|err| format!("macos exit-handoff: after-stop pfctl capture failed: {err}"))?;
-    let after_sysctl = capture_root(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        "/usr/sbin/sysctl -n net.inet.ip.forwarding",
-    )
-    .map_err(|err| {
-        format!("macos exit-handoff: after-stop sysctl forwarding capture failed: {err}")
-    })?;
-    let captured_at_after = unix_now() as i64;
-    let after_snapshot =
-        rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
-            captured_at_after,
-            mesh_cidr.as_str(),
-            MACOS_PF_ANCHOR,
-            after_pf.as_str(),
-            after_sysctl.as_str(),
-        );
-
-    // Phase 4: restart the daemon so subsequent stages (or the
-    // operator) inherit a running mesh. Capture the restart outcome
-    // so the operator sees a `restart_failed: <reason>` value rather
-    // than a silently-stopped daemon under a passing report.
-    let daemon_restart_status = match run_root(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        &format!(
-            "/bin/launchctl bootstrap system /Library/LaunchDaemons/{}.plist 2>/dev/null || /bin/launchctl load /Library/LaunchDaemons/{}.plist",
-            MACOS_DAEMON_LAUNCHD_LABEL, MACOS_DAEMON_LAUNCHD_LABEL
-        ),
-    ) {
-        Ok(()) => "restarted".to_owned(),
-        Err(err) => format!("restart_failed: {err}"),
-    };
-
-    // Phase 5: assert invariants. Mirror
-    // `evaluate_macos_exit_nat_lifecycle_artifact` from vm_lab/mod.rs.
-    // Each failure produces a precise diagnostic.
-    let mut failures: Vec<String> = Vec::new();
-    if !during_snapshot.pf_anchor_present {
-        failures.push("during-run pf anchor was NOT present (daemon not serving exit?)".to_owned());
-    }
-    if during_snapshot.pf_anchor_present && during_snapshot.internal_prefix != mesh_cidr {
-        failures.push(format!(
-            "during-run pf NAT internal_prefix {:?} did not match mesh_cidr {:?}",
-            during_snapshot.internal_prefix, mesh_cidr
-        ));
-    }
-    if !during_snapshot
-        .tunnel_forwarding
-        .eq_ignore_ascii_case("enabled")
-    {
-        failures.push(format!(
-            "during-run tunnel_forwarding {:?} expected 'Enabled'",
-            during_snapshot.tunnel_forwarding
-        ));
-    }
-    if !during_snapshot
-        .egress_forwarding
-        .eq_ignore_ascii_case("enabled")
-    {
-        failures.push(format!(
-            "during-run egress_forwarding {:?} expected 'Enabled'",
-            during_snapshot.egress_forwarding
-        ));
-    }
-    if after_snapshot.pf_anchor_present {
-        failures.push(
-            "after-stop pf anchor was STILL present (daemon teardown leaked the anchor)".to_owned(),
-        );
-    }
-    let forwarding_restored = after_snapshot
-        .tunnel_forwarding
-        .eq_ignore_ascii_case("disabled")
-        && after_snapshot
-            .egress_forwarding
-            .eq_ignore_ascii_case("disabled");
-    if !forwarding_restored {
-        failures.push(format!(
-            "after-stop forwarding NOT restored (tunnel={:?}, egress={:?})",
-            after_snapshot.tunnel_forwarding, after_snapshot.egress_forwarding
-        ));
-    }
-    // Reviewer-flagged regression: the restart phase must assert
-    // success, not just capture the outcome. A silent launchctl
-    // bootstrap failure left the macOS exit daemon offline under a
-    // passing status.
-    if daemon_restart_status.starts_with("restart_failed:") {
-        failures.push(format!(
-            "post-test launchctl bootstrap failed; macOS exit daemon is OFFLINE — {}",
-            daemon_restart_status
-        ));
-    }
-
-    let status = if failures.is_empty() { "pass" } else { "fail" };
-    let detail = if failures.is_empty() {
-        "all invariants held".to_owned()
-    } else {
-        failures.join("; ")
-    };
-
-    let log_path = if config.log_path.is_absolute() {
-        config.log_path.clone()
-    } else {
-        live_lab_support::repo_root()?.join(&config.log_path)
-    };
-    let report_path = if config.report_path.is_absolute() {
-        config.report_path.clone()
-    } else {
-        live_lab_support::repo_root()?.join(&config.report_path)
-    };
-    let root_dir = live_lab_support::repo_root()?;
-    let git_commit = config
-        .git_commit
-        .clone()
-        .unwrap_or_else(|| git_head_commit(&root_dir).unwrap_or_else(|_| "unknown".to_owned()));
-    let lifecycle = rustynetd::macos_exit_nat_lifecycle::merge_macos_exit_nat_lifecycle_artifact(
-        &during_snapshot,
-        &after_snapshot,
-    );
-    let report = MacosExitHandoffReport {
-        schema_version: 1,
-        phase: "phase10",
-        mode: "live_macos_exit_handoff",
-        evidence_mode: "measured",
-        status,
-        platform: "macos",
-        captured_at: utc_now_string(),
-        captured_at_unix: captured_at_after as u64,
-        git_commit,
-        exit_host: config.exit_a_host.clone(),
-        exit_node_id: config.exit_a_node_id.clone(),
-        pf_anchor: MACOS_PF_ANCHOR.to_owned(),
-        mesh_cidr,
-        daemon_restart_status,
-        lifecycle,
-        source_artifacts: vec![log_path.display().to_string()],
-        detail: detail.clone(),
-    };
-    let _ = captured_at_during; // captured_at_unix carries after timestamp
-    let _ = forwarding_restored; // surfaced via merged lifecycle
-    let mut body = serde_json::to_string(&report)
-        .map_err(|err| format!("serialize macos exit-handoff report failed: {err}"))?;
-    body.push('\n');
-    write_file(&report_path, body.as_str())?;
-
-    let log_body = format!(
-        "[macos-exit-handoff] status={status} exit_host={} exit_node_id={} detail={}\n",
-        config.exit_a_host, config.exit_a_node_id, detail
-    );
-    write_file(&log_path, log_body.as_str())?;
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "macos exit-handoff invariants failed: {}",
-            failures.join("; ")
-        ))
-    }
-}
-
-// ─── Track B Phase 5: Windows exit-handoff live validator ──────────
-//
-// Mirrors run_macos_exit_handoff but uses PowerShell-over-SSH and
-// the existing `rustynetd::windows_exit_nat_lifecycle` builder.
-// Captures Get-NetNat + Get-NetIPInterface forwarding state for the
-// tunnel + egress interfaces, stops the SCM service, re-captures,
-// asserts that NetNat is gone + forwarding restored. Schema mirrors
-// the canonical envelope and embeds `merge_windows_exit_nat_lifecycle_artifact`
-// so a future change to the orchestrator-side evaluator surfaces here.
-use rustynetd::windows_exit_nat_lifecycle::DEFAULT_WINDOWS_EXIT_NAT_NAME as WINDOWS_NAT_NAME;
-use rustynetd::windows_exit_nat_lifecycle::DEFAULT_WINDOWS_TUNNEL_ALIAS as WINDOWS_TUNNEL_ALIAS;
-const WINDOWS_SCM_SERVICE: &str = "rustynetd";
-
-/// Sanitize an interface alias that came back from a previous SSH
-/// PowerShell capture so it is safe to embed inside the
-/// single-quoted PowerShell argument of the follow-up
-/// `Get-NetIPInterface -InterfaceAlias '<alias>' ...` invocation.
-/// A compromised target host could otherwise return an alias
-/// containing `'`, `;`, `"`, newline, etc. to break out of the
-/// quote and inject shell commands. CLAUDE.md mandates no shell
-/// construction with untrusted values.
-///
-/// PowerShell interface aliases are localized on non-English
-/// Windows hosts (e.g. `イーサネット`, `Ethernet-Verbindung`), so an
-/// ASCII-only allowlist would surface those healthy interfaces as
-/// missing. We use a denylist: reject the bytes that have meaning
-/// to PowerShell single-quote parsing or could terminate the outer
-/// ssh-bash command, plus any C0/C1 control character. Everything
-/// else — including non-ASCII letters/digits, paren / dot / dash /
-/// underscore / space — survives.
-///
-/// Length cap of 96 bytes mirrors the PowerShell InterfaceAlias
-/// maximum and keeps a single capture's failure from being able to
-/// inflate the formatted command beyond the SSH argv budget.
-fn sanitize_windows_interface_alias(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.len() > 96 {
-        return String::new();
-    }
-    const FORBIDDEN: &[char] = &[
-        '\'', '"', '`', '$', ';', '|', '&', '<', '>', '\\', '{', '}', '\n', '\r', '\t', '\0',
-    ];
-    if trimmed
-        .chars()
-        .any(|ch| ch.is_control() || FORBIDDEN.contains(&ch))
-    {
-        return String::new();
-    }
-    trimmed.to_owned()
-}
-
-#[derive(Debug, serde::Serialize)]
-struct WindowsExitHandoffReport {
-    schema_version: u32,
-    phase: &'static str,
-    mode: &'static str,
-    evidence_mode: &'static str,
-    status: &'static str,
-    platform: &'static str,
-    captured_at: String,
-    captured_at_unix: u64,
-    git_commit: String,
-    exit_host: String,
-    exit_node_id: String,
-    nat_name: String,
-    tunnel_alias: String,
-    mesh_cidr: String,
-    daemon_restart_status: String,
-    lifecycle: serde_json::Value,
-    source_artifacts: Vec<String>,
-    detail: String,
-}
-
-fn run_windows_exit_handoff(config: &Config) -> Result<(), String> {
-    for command in ["ssh", "ssh-keygen"] {
-        require_command(command)?;
-    }
-    validate_identity(&config.ssh_identity_file)?;
-    let pinned_known_hosts = match config.pinned_known_hosts_file.as_ref() {
-        Some(path) => path.clone(),
-        None => load_home_known_hosts_path()?,
-    };
-    ensure_pinned_known_hosts_file(&pinned_known_hosts)?;
-    let workspace = create_workspace("windows-exit-handoff")?;
-    let work_known_hosts = workspace.path().join("known_hosts");
-    seed_known_hosts(&pinned_known_hosts, &work_known_hosts)?;
-
-    let exit_target = config.exit_a_host.as_str();
-    // Preflight: confirm SSH session is in BUILTIN\Administrators
-    // before any NetNat/SCM command runs. Without admin rights those
-    // commands return access-denied opaquely.
-    live_lab_support::verify_windows_admin(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-    )?;
-    let mesh_cidr = "100.64.0.0/10".to_owned();
-    let options = rustynetd::windows_exit_nat_lifecycle::WindowsExitNatLifecycleOptions {
-        mesh_cidr: mesh_cidr.clone(),
-        nat_name: WINDOWS_NAT_NAME.to_owned(),
-        tunnel_alias: WINDOWS_TUNNEL_ALIAS.to_owned(),
-    };
-
-    // PowerShell capture commands — invoked via SSH against a
-    // Windows host where the SSH user is Administrator. Each line is
-    // a single PowerShell expression with -NoProfile -Command for
-    // hermetic behaviour. Use Compress for compact JSON so the
-    // builder's parse_netnat_json can consume it deterministically.
-    // `Out-String -Width 32767` keeps PowerShell's default
-    // Out-Default formatter from wrapping the JSON at host width
-    // (~80 in non-interactive SSH). ConvertTo-Json -Compress emits
-    // a single line but the rendering stage still wraps; the
-    // explicit Out-String + max-int width prevents the parser from
-    // seeing a truncated JSON body. Width-32767 matches the safer
-    // default the Phase 14 reviewer recommended over 4096 for
-    // long-lived per-host status lines.
-    let netnat_cmd = format!(
-        "powershell -NoProfile -Command \"Get-NetNat -Name '{}' -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4 -Compress | Out-String -Width 32767\"",
-        WINDOWS_NAT_NAME
-    );
-    let tunnel_forwarding_cmd = format!(
-        "powershell -NoProfile -Command \"(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction SilentlyContinue).Forwarding\"",
-        WINDOWS_TUNNEL_ALIAS
-    );
-    let egress_alias_cmd = format!(
-        "powershell -NoProfile -Command \"(Get-NetIPInterface -AddressFamily IPv4 -ConnectionState Connected | Where-Object {{ $_.InterfaceAlias -ne '{}' }} | Sort-Object InterfaceMetric | Select-Object -First 1).InterfaceAlias\"",
-        WINDOWS_TUNNEL_ALIAS
-    );
-    let portproxy_cmd = "netsh interface portproxy show all".to_owned();
-
-    // During-run captures.
-    let netnat_json_during = live_lab_support::capture_remote_stdout(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        netnat_cmd.as_str(),
-    )
-    .map_err(|err| format!("windows exit-handoff: during-run Get-NetNat capture failed: {err}"))?;
-    let tunnel_fwd_during = live_lab_support::capture_remote_stdout(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        tunnel_forwarding_cmd.as_str(),
-    )
-    .map_err(|err| {
-        format!("windows exit-handoff: during-run tunnel forwarding capture failed: {err}")
-    })?;
-    let egress_alias_during_raw = live_lab_support::capture_remote_stdout(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        egress_alias_cmd.as_str(),
-    )
-    .unwrap_or_default();
-    let egress_alias_during = sanitize_windows_interface_alias(egress_alias_during_raw.as_str());
-    let egress_fwd_during = if egress_alias_during.is_empty() {
-        "Error: no non-tunnel default egress interface detected".to_owned()
-    } else {
-        let cmd = format!(
-            "powershell -NoProfile -Command \"(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction SilentlyContinue).Forwarding\"",
-            egress_alias_during
-        );
-        live_lab_support::capture_remote_stdout(
-            &config.ssh_identity_file,
-            &work_known_hosts,
-            exit_target,
-            cmd.as_str(),
-        )
-        .unwrap_or_default()
-    };
-    let portproxy_during = live_lab_support::capture_remote_stdout(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        portproxy_cmd.as_str(),
-    )
-    .unwrap_or_default();
-    let captured_at_during = unix_now() as i64;
-    let during_snapshot =
-        rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
-            captured_at_during,
-            &options,
-            netnat_json_during.as_str(),
-            tunnel_fwd_during.as_str(),
-            egress_fwd_during.as_str(),
-            egress_alias_during.as_str(),
-            portproxy_during.as_str(),
-        )
-        .map_err(|err| format!("windows exit-handoff: during-run snapshot build failed: {err}"))?;
-
-    // Stop the SCM service so the daemon's exit-mode teardown runs.
-    let _ = live_lab_support::capture_remote_stdout(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        &format!(
-            "powershell -NoProfile -Command \"Stop-Service -Name '{}' -Force -ErrorAction SilentlyContinue\"",
-            WINDOWS_SCM_SERVICE
-        ),
-    );
-    std::thread::sleep(std::time::Duration::from_secs(3));
-
-    // After-stop captures.
-    let netnat_json_after = live_lab_support::capture_remote_stdout(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        netnat_cmd.as_str(),
-    )
-    .unwrap_or_default();
-    let tunnel_fwd_after = live_lab_support::capture_remote_stdout(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        tunnel_forwarding_cmd.as_str(),
-    )
-    .unwrap_or_else(|_| "Disabled".to_owned());
-    let egress_alias_after_raw = live_lab_support::capture_remote_stdout(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        egress_alias_cmd.as_str(),
-    )
-    .unwrap_or_default();
-    let egress_alias_after = sanitize_windows_interface_alias(egress_alias_after_raw.as_str());
-    let egress_fwd_after = if egress_alias_after.is_empty() {
-        "Disabled".to_owned()
-    } else {
-        let cmd = format!(
-            "powershell -NoProfile -Command \"(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction SilentlyContinue).Forwarding\"",
-            egress_alias_after
-        );
-        live_lab_support::capture_remote_stdout(
-            &config.ssh_identity_file,
-            &work_known_hosts,
-            exit_target,
-            cmd.as_str(),
-        )
-        .unwrap_or_else(|_| "Disabled".to_owned())
-    };
-    let portproxy_after = live_lab_support::capture_remote_stdout(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        portproxy_cmd.as_str(),
-    )
-    .unwrap_or_default();
-    let captured_at_after = unix_now() as i64;
-    let after_snapshot =
-        rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
-            captured_at_after,
-            &options,
-            netnat_json_after.as_str(),
-            tunnel_fwd_after.as_str(),
-            egress_fwd_after.as_str(),
-            egress_alias_after.as_str(),
-            portproxy_after.as_str(),
-        )
-        .map_err(|err| format!("windows exit-handoff: after-stop snapshot build failed: {err}"))?;
-
-    // Restart the SCM service. Capture the outcome so the operator
-    // sees `restart_failed: <reason>` rather than a silently-stopped
-    // service under a passing report.
-    let daemon_restart_status = match live_lab_support::capture_remote_stdout(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        exit_target,
-        &format!(
-            "powershell -NoProfile -Command \"Start-Service -Name '{}'\"",
-            WINDOWS_SCM_SERVICE
-        ),
-    ) {
-        Ok(_) => "restarted".to_owned(),
-        Err(err) => format!("restart_failed: {err}"),
-    };
-
-    // Assert invariants — mirrors the macOS shape.
-    let mut failures: Vec<String> = Vec::new();
-    if !during_snapshot.netnat_present {
-        failures
-            .push("during-run NetNat object was NOT present (daemon not serving exit?)".to_owned());
-    }
-    if during_snapshot.netnat_present && during_snapshot.internal_prefix != mesh_cidr {
-        failures.push(format!(
-            "during-run NetNat internal_prefix {:?} did not match mesh_cidr {:?}",
-            during_snapshot.internal_prefix, mesh_cidr
-        ));
-    }
-    if !during_snapshot
-        .tunnel_forwarding
-        .eq_ignore_ascii_case("Enabled")
-    {
-        failures.push(format!(
-            "during-run tunnel_forwarding {:?} expected 'Enabled'",
-            during_snapshot.tunnel_forwarding
-        ));
-    }
-    if !during_snapshot
-        .egress_forwarding
-        .eq_ignore_ascii_case("Enabled")
-    {
-        failures.push(format!(
-            "during-run egress_forwarding {:?} expected 'Enabled'",
-            during_snapshot.egress_forwarding
-        ));
-    }
-    if after_snapshot.netnat_present {
-        failures.push(
-            "after-stop NetNat object was STILL present (daemon teardown leaked it)".to_owned(),
-        );
-    }
-    let forwarding_restored = !after_snapshot
-        .tunnel_forwarding
-        .eq_ignore_ascii_case("Enabled")
-        && !after_snapshot
-            .egress_forwarding
-            .eq_ignore_ascii_case("Enabled");
-    if !forwarding_restored {
-        failures.push(format!(
-            "after-stop forwarding NOT restored (tunnel={:?}, egress={:?})",
-            after_snapshot.tunnel_forwarding, after_snapshot.egress_forwarding
-        ));
-    }
-    // Reviewer-flagged regression: the restart phase must assert
-    // success, not just capture the outcome. A silent SCM restart
-    // failure left the Windows exit daemon offline under a passing
-    // status.
-    if daemon_restart_status.starts_with("restart_failed:") {
-        failures.push(format!(
-            "post-test Start-Service failed; Windows exit daemon is OFFLINE — {}",
-            daemon_restart_status
-        ));
-    }
-
-    let status = if failures.is_empty() { "pass" } else { "fail" };
-    let detail = if failures.is_empty() {
-        "all invariants held".to_owned()
-    } else {
-        failures.join("; ")
-    };
-
-    let log_path = if config.log_path.is_absolute() {
-        config.log_path.clone()
-    } else {
-        live_lab_support::repo_root()?.join(&config.log_path)
-    };
-    let report_path = if config.report_path.is_absolute() {
-        config.report_path.clone()
-    } else {
-        live_lab_support::repo_root()?.join(&config.report_path)
-    };
-    let root_dir = live_lab_support::repo_root()?;
-    let git_commit = config
-        .git_commit
-        .clone()
-        .unwrap_or_else(|| git_head_commit(&root_dir).unwrap_or_else(|_| "unknown".to_owned()));
-    let lifecycle =
-        rustynetd::windows_exit_nat_lifecycle::merge_windows_exit_nat_lifecycle_artifact(
-            &during_snapshot,
-            &after_snapshot,
-        );
-    let report = WindowsExitHandoffReport {
-        schema_version: 1,
-        phase: "phase10",
-        mode: "live_windows_exit_handoff",
-        evidence_mode: "measured",
-        status,
-        platform: "windows",
-        captured_at: utc_now_string(),
-        captured_at_unix: captured_at_after as u64,
-        git_commit,
-        exit_host: config.exit_a_host.clone(),
-        exit_node_id: config.exit_a_node_id.clone(),
-        nat_name: WINDOWS_NAT_NAME.to_owned(),
-        tunnel_alias: WINDOWS_TUNNEL_ALIAS.to_owned(),
-        mesh_cidr,
-        daemon_restart_status,
-        lifecycle,
-        source_artifacts: vec![log_path.display().to_string()],
-        detail: detail.clone(),
-    };
-    let _ = captured_at_during;
-    let _ = forwarding_restored;
-    let mut body = serde_json::to_string(&report)
-        .map_err(|err| format!("serialize windows exit-handoff report failed: {err}"))?;
-    body.push('\n');
-    write_file(&report_path, body.as_str())?;
-    let log_body = format!(
-        "[windows-exit-handoff] status={status} exit_host={} exit_node_id={} detail={}\n",
-        config.exit_a_host, config.exit_a_node_id, detail
-    );
-    write_file(&log_path, log_body.as_str())?;
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "windows exit-handoff invariants failed: {}",
-            failures.join("; ")
-        ))
-    }
-}
-
 fn validate_identity(path: &Path) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("missing ssh identity file: {}", path.display()));
@@ -2819,12 +2485,14 @@ peer.1.endpoint=192.168.128.26:51820
         let exit_a_status = "dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok";
         let exit_b_status = "dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok";
         let route = "1.1.1.1 dev rustynet0 table 51820 src 100.64.0.10 uid 0";
+        let linux = super::ExitHandoffPlatform::Linux;
         assert!(handoff_monitor_prereqs_ready(
             client_status,
             exit_a_status,
             exit_b_status,
             route,
             "exit-1",
+            linux,
         ));
         assert!(!handoff_monitor_prereqs_ready(
             client_status,
@@ -2832,6 +2500,7 @@ peer.1.endpoint=192.168.128.26:51820
             exit_b_status,
             "1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.24 uid 0",
             "exit-1",
+            linux,
         ));
         assert!(!handoff_monitor_prereqs_ready(
             "exit_node=exit-1 state=ExitActive restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none dns_zone_state=invalid dns_zone_error=dns_zone_bundle_is_stale dns_alarm_state=error",
@@ -2839,6 +2508,7 @@ peer.1.endpoint=192.168.128.26:51820
             exit_b_status,
             route,
             "exit-1",
+            linux,
         ));
         assert!(!handoff_monitor_prereqs_ready(
             "exit_node=client-2 state=ExitActive restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
@@ -2846,6 +2516,7 @@ peer.1.endpoint=192.168.128.26:51820
             exit_b_status,
             route,
             "exit-1",
+            linux,
         ));
         assert!(!handoff_monitor_prereqs_ready(
             "exit_node=exit-1 state=FailClosed restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
@@ -2853,6 +2524,7 @@ peer.1.endpoint=192.168.128.26:51820
             exit_b_status,
             route,
             "exit-1",
+            linux,
         ));
     }
 
@@ -2909,426 +2581,273 @@ peer.1.endpoint=192.168.128.26:51820
         assert_eq!(super::ExitHandoffPlatform::Windows.as_str(), "windows");
     }
 
-    // ─── Track B Phase 4: macOS exit-handoff validator ────────────
+    // ─── Wave 2 (W2-A): per-OS failover command-branch parsers ────
     //
-    // The macOS run_macos_exit_handoff function is end-to-end SSH-
-    // driven and can't be exercised hermetically here, but the
-    // snapshot-parsing helpers it relies on (the
-    // `build_macos_exit_nat_lifecycle_snapshot` builder from
-    // `rustynetd::macos_exit_nat_lifecycle`) are pure-input. Pin the
-    // expected parser behaviour for the EXACT pfctl + sysctl outputs
-    // the bin captures so a future refactor of either side surfaces
-    // here.
+    // The live route / NAT capture commands can't run on this Linux
+    // orchestrator host, so the pure parsers they feed are the
+    // verifiable surface. Each is pinned with REALISTIC per-OS output
+    // samples (real `ip route get` / `route -n get` / `Get-NetRoute`
+    // / `nft` / `pfctl` / `Get-NetNat` shapes).
 
     #[test]
-    fn macos_during_run_capture_parses_pf_anchor_present() {
-        let pfctl_output = "nat-anchor \"com.rustynet/nat\" all\nnat on en0 inet from 100.64.0.0/10 to any -> en0:0\n";
-        let snapshot = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
-            100,
-            "100.64.0.0/10",
-            "com.rustynet/nat",
-            pfctl_output,
-            "1\n",
-        );
-        assert!(
-            snapshot.pf_anchor_present,
-            "pf anchor must parse as present"
-        );
-        assert_eq!(snapshot.internal_prefix, "100.64.0.0/10");
-        assert_eq!(snapshot.tunnel_forwarding, "Enabled");
-        assert_eq!(snapshot.egress_forwarding, "Enabled");
-    }
-
-    #[test]
-    fn macos_after_stop_capture_parses_anchor_absent_and_forwarding_disabled() {
-        let snapshot = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
-            200,
-            "100.64.0.0/10",
-            "com.rustynet/nat",
-            "",
-            "0\n",
-        );
-        assert!(
-            !snapshot.pf_anchor_present,
-            "empty pfctl output must parse as anchor-absent"
-        );
-        assert_eq!(snapshot.tunnel_forwarding, "Disabled");
-        assert_eq!(snapshot.egress_forwarding, "Disabled");
-    }
-
-    fn macos_lifecycle_artifact_fixture(during_present: bool, restored: bool) -> serde_json::Value {
-        let during = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
-            100,
-            "100.64.0.0/10",
-            "com.rustynet/nat",
-            if during_present {
-                "nat-anchor \"com.rustynet/nat\" all\nnat on en0 inet from 100.64.0.0/10 to any -> en0:0\n"
-            } else {
-                ""
-            },
-            "1\n",
-        );
-        let after = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
-            200,
-            "100.64.0.0/10",
-            "com.rustynet/nat",
-            "",
-            if restored { "0\n" } else { "1\n" },
-        );
-        rustynetd::macos_exit_nat_lifecycle::merge_macos_exit_nat_lifecycle_artifact(
-            &during, &after,
-        )
-    }
-
-    #[test]
-    fn macos_exit_handoff_report_serializes_with_serde() {
-        // The report struct must round-trip through serde_json so a
-        // malicious operator-supplied exit_host string can't break
-        // the report parser downstream. Envelope mirrors the canonical
-        // live-lab shape consumed by `ops_fresh_install_os_matrix::load_json_report`.
-        let report = super::MacosExitHandoffReport {
-            schema_version: 1,
-            phase: "phase10",
-            mode: "live_macos_exit_handoff",
-            evidence_mode: "measured",
-            status: "fail",
-            platform: "macos",
-            captured_at: "1970-01-01T00:00:00Z".to_owned(),
-            captured_at_unix: 200,
-            git_commit: "deadbeef".to_owned(),
-            exit_host: "admin@192.168.18.49 \" inject \n more".to_owned(),
-            exit_node_id: "exit-49".to_owned(),
-            pf_anchor: "com.rustynet/nat".to_owned(),
-            mesh_cidr: "100.64.0.0/10".to_owned(),
-            daemon_restart_status: "restart_failed: ssh down".to_owned(),
-            lifecycle: macos_lifecycle_artifact_fixture(true, true),
-            source_artifacts: vec!["live-lab/macos-exit-handoff.log".to_owned()],
-            detail: "all invariants held".to_owned(),
-        };
-        let json = serde_json::to_string(&report).expect("serialize");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("must produce valid JSON round-trip");
-        assert_eq!(parsed["status"], "fail");
-        assert_eq!(parsed["platform"], "macos");
-        assert_eq!(parsed["phase"], "phase10");
-        assert_eq!(parsed["mode"], "live_macos_exit_handoff");
-        assert_eq!(parsed["evidence_mode"], "measured");
-        assert_eq!(parsed["lifecycle"]["during_run"]["pf_anchor_present"], true);
+    fn route_uses_tunnel_linux_matches_byte_identical_legacy_predicate() {
+        // The Linux branch MUST agree with the pre-Wave-2
+        // `route_uses_rustynet0` so the Linux behaviour is unchanged.
+        let tunnel = "1.1.1.1 dev rustynet0 table 51820 src 100.64.0.10 uid 0";
+        let leak = "1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.24 uid 0";
         assert_eq!(
-            parsed["lifecycle"]["after_stop"]["forwarding_restored"],
-            true
+            super::route_uses_tunnel_for_platform(super::ExitHandoffPlatform::Linux, tunnel),
+            super::route_uses_rustynet0(tunnel),
         );
         assert_eq!(
-            parsed["daemon_restart_status"], "restart_failed: ssh down",
-            "restart failure must be visible in the report"
+            super::route_uses_tunnel_for_platform(super::ExitHandoffPlatform::Linux, leak),
+            super::route_uses_rustynet0(leak),
         );
+        assert!(super::route_uses_tunnel_for_platform(
+            super::ExitHandoffPlatform::Linux,
+            tunnel
+        ));
+        assert!(!super::route_uses_tunnel_for_platform(
+            super::ExitHandoffPlatform::Linux,
+            leak
+        ));
+    }
+
+    #[test]
+    fn route_uses_tunnel_macos_requires_utun_interface_line() {
+        // `route -n get 1.1.1.1` egressing the rustynet utun tunnel.
+        let tunnel = "   route to: 1.1.1.1\ndestination: default\n       gateway: 100.64.0.1\n     interface: utun4\n";
+        // A route via the physical en0 NIC is a LEAK and must fail.
+        let leak = "   route to: 1.1.1.1\ndestination: default\n       gateway: 192.168.64.1\n     interface: en0\n";
+        assert!(super::route_uses_tunnel_for_platform(
+            super::ExitHandoffPlatform::MacOs,
+            tunnel
+        ));
+        assert!(!super::route_uses_tunnel_for_platform(
+            super::ExitHandoffPlatform::MacOs,
+            leak
+        ));
+        // An explicit rustynet0 alias is also accepted.
+        assert!(super::route_uses_tunnel_for_platform(
+            super::ExitHandoffPlatform::MacOs,
+            "     interface: rustynet0\n"
+        ));
+        // A stray mention of utun NOT on an `interface:` line must
+        // NOT satisfy the predicate (fail-closed).
+        assert!(!super::route_uses_tunnel_for_platform(
+            super::ExitHandoffPlatform::MacOs,
+            "  note: utun4 was previously up\n     interface: en0\n"
+        ));
+        // Empty / unparsed capture fails closed.
+        assert!(!super::route_uses_tunnel_for_platform(
+            super::ExitHandoffPlatform::MacOs,
+            ""
+        ));
+    }
+
+    #[test]
+    fn route_uses_tunnel_windows_requires_rustynet_adapter_alias() {
+        // `Get-NetRoute ... | Format-List ifIndex,InterfaceAlias,NextHop`.
+        let tunnel = "ifIndex        : 27\nInterfaceAlias : rustynet0\nNextHop        : 0.0.0.0\n";
+        let leak =
+            "ifIndex        : 12\nInterfaceAlias : Ethernet\nNextHop        : 192.168.64.1\n";
+        assert!(super::route_uses_tunnel_for_platform(
+            super::ExitHandoffPlatform::Windows,
+            tunnel
+        ));
+        assert!(!super::route_uses_tunnel_for_platform(
+            super::ExitHandoffPlatform::Windows,
+            leak
+        ));
+        // Case-insensitive on the adapter name.
+        assert!(super::route_uses_tunnel_for_platform(
+            super::ExitHandoffPlatform::Windows,
+            "InterfaceAlias : RustyNet0\n"
+        ));
+        // Empty capture fails closed.
+        assert!(!super::route_uses_tunnel_for_platform(
+            super::ExitHandoffPlatform::Windows,
+            ""
+        ));
+    }
+
+    #[test]
+    fn exit_nat_present_linux_matches_masquerade_token() {
+        let with_nat = "table ip rustynet-nat {\n  chain postrouting {\n    oifname \"eth0\" masquerade\n  }\n}\n";
+        assert!(super::exit_nat_present_for_platform(
+            super::ExitHandoffPlatform::Linux,
+            with_nat
+        ));
+        // No masquerade rule = no exit NAT = fail closed.
+        assert!(!super::exit_nat_present_for_platform(
+            super::ExitHandoffPlatform::Linux,
+            "table ip filter {\n  chain input {}\n}\n"
+        ));
+        assert!(!super::exit_nat_present_for_platform(
+            super::ExitHandoffPlatform::Linux,
+            ""
+        ));
+    }
+
+    #[test]
+    fn exit_nat_present_macos_matches_pf_nat_rule() {
+        // `pfctl -a com.rustynet/nat -s nat` with the egress NAT rule.
+        let with_nat = "nat on en0 inet from 100.64.0.0/10 to any -> (en0)\n";
+        assert!(super::exit_nat_present_for_platform(
+            super::ExitHandoffPlatform::MacOs,
+            with_nat
+        ));
+        // A nat-anchor reference also counts (anchor present).
+        assert!(super::exit_nat_present_for_platform(
+            super::ExitHandoffPlatform::MacOs,
+            "nat-anchor \"com.rustynet/nat\" all\n"
+        ));
+        // Empty pf anchor = no NAT = fail closed.
+        assert!(!super::exit_nat_present_for_platform(
+            super::ExitHandoffPlatform::MacOs,
+            ""
+        ));
+        // A pass/block rule that merely mentions an interface must
+        // NOT be mistaken for a NAT rule.
+        assert!(!super::exit_nat_present_for_platform(
+            super::ExitHandoffPlatform::MacOs,
+            "pass out quick on en0 all keep state\n"
+        ));
+    }
+
+    #[test]
+    fn exit_nat_present_windows_matches_netnat_object() {
+        // `Get-NetNat | Format-List Name,InternalIPInterfaceAddressPrefix`.
+        let with_nat = "Name                            : RustyNetExit-rustynet0\nInternalIPInterfaceAddressPrefix : 100.64.0.0/10\n";
+        assert!(super::exit_nat_present_for_platform(
+            super::ExitHandoffPlatform::Windows,
+            with_nat
+        ));
+        // Zero NetNat objects = empty stdout = fail closed.
+        assert!(!super::exit_nat_present_for_platform(
+            super::ExitHandoffPlatform::Windows,
+            ""
+        ));
+        // A `Name :` line with an empty value must not count.
+        assert!(!super::exit_nat_present_for_platform(
+            super::ExitHandoffPlatform::Windows,
+            "Name                            : \n"
+        ));
+    }
+
+    #[test]
+    fn monitor_line_route_field_extracts_bounded_route_value() {
+        let line = "1700000000|iter=3|ping_rc=0|route=1.1.1.1 dev rustynet0 src 100.64.0.10|status=exit_node=exit-1 state=ExitActive|wg_endpoints=peer ...";
         assert_eq!(
-            parsed["exit_host"], "admin@192.168.18.49 \" inject \n more",
-            "embedded quote/newline must survive serde escaping"
+            super::monitor_line_route_field(line),
+            Some("1.1.1.1 dev rustynet0 src 100.64.0.10")
         );
-    }
-
-    #[test]
-    fn macos_lifecycle_merger_surfaces_failure_when_forwarding_not_restored() {
-        // Negative-path coverage of the contract our report relies on:
-        // the merger's `forwarding_restored` field must be `false`
-        // when after_stop forwarding is still Enabled. A change in
-        // `merge_macos_exit_nat_lifecycle_artifact` that breaks this
-        // would silently turn a leaked-forwarding host into a passing
-        // run, so pin the shape here.
-        let merged = macos_lifecycle_artifact_fixture(true, false);
-        assert_eq!(merged["during_run"]["pf_anchor_present"], true);
+        // A line with no route field returns None.
         assert_eq!(
-            merged["after_stop"]["forwarding_restored"], false,
-            "after_stop forwarding still Enabled must surface as restored=false"
+            super::monitor_line_route_field("1700000000|iter=3|ping_rc=0"),
+            None
         );
-    }
-
-    // ─── Track B Phase 5: Windows exit-handoff validator ──────────
-    //
-    // Mirror the macOS test shape: pin the parser behaviour for the
-    // EXACT PowerShell capture outputs that run_windows_exit_handoff
-    // feeds into rustynetd::windows_exit_nat_lifecycle, then prove
-    // the report struct survives serde with operator-supplied chars.
-    fn windows_options() -> rustynetd::windows_exit_nat_lifecycle::WindowsExitNatLifecycleOptions {
-        rustynetd::windows_exit_nat_lifecycle::WindowsExitNatLifecycleOptions {
-            mesh_cidr: "100.64.0.0/10".to_owned(),
-            nat_name: super::WINDOWS_NAT_NAME.to_owned(),
-            tunnel_alias: super::WINDOWS_TUNNEL_ALIAS.to_owned(),
-        }
-    }
-
-    #[test]
-    fn windows_during_run_capture_parses_netnat_present_and_forwarding_enabled() {
-        // The PowerShell pipe is `Get-NetNat ... | ConvertTo-Json
-        // -Depth 4 -Compress` which yields a JSON object with the
-        // InternalIPInterfaceAddressPrefix property.
-        let netnat_json = r#"{"Name":"RustyNetExit-rustynet0","InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}"#;
-        let snapshot =
-            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
-                100,
-                &windows_options(),
-                netnat_json,
-                "Enabled\n",
-                "Enabled\n",
-                "Ethernet\n",
-                "",
-            )
-            .expect("snapshot must build");
-        assert!(
-            snapshot.netnat_present,
-            "NetNat object must parse as present"
-        );
-        assert_eq!(snapshot.internal_prefix, "100.64.0.0/10");
-        assert_eq!(snapshot.tunnel_forwarding, "Enabled");
-        assert_eq!(snapshot.egress_forwarding, "Enabled");
-        assert_eq!(snapshot.egress_alias, "Ethernet");
-    }
-
-    #[test]
-    fn windows_after_stop_capture_parses_netnat_absent_and_forwarding_disabled() {
-        let snapshot =
-            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
-                200,
-                &windows_options(),
-                "",
-                "Disabled\n",
-                "Disabled\n",
-                "Ethernet\n",
-                "",
-            )
-            .expect("snapshot must build");
-        assert!(
-            !snapshot.netnat_present,
-            "empty Get-NetNat output must parse as NetNat-absent"
-        );
-        assert_eq!(snapshot.tunnel_forwarding, "Disabled");
-        assert_eq!(snapshot.egress_forwarding, "Disabled");
-    }
-
-    #[test]
-    fn windows_netnat_array_form_also_parses_present() {
-        // PowerShell sometimes emits an array when ConvertTo-Json sees
-        // a single object — pin both shapes to keep this validator in
-        // lockstep with rustynetd::windows_exit_nat_lifecycle.
-        let netnat_json = r#"[{"Name":"RustyNetExit-rustynet0","InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}]"#;
-        let snapshot =
-            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
-                300,
-                &windows_options(),
-                netnat_json,
-                "Enabled",
-                "Enabled",
-                "Ethernet",
-                "",
-            )
-            .expect("snapshot must build");
-        assert!(snapshot.netnat_present);
-        assert_eq!(snapshot.internal_prefix, "100.64.0.0/10");
-    }
-
-    fn windows_lifecycle_artifact_fixture(present: bool, restored: bool) -> serde_json::Value {
-        let during =
-            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
-                100,
-                &windows_options(),
-                if present {
-                    r#"{"Name":"RustyNetExit-rustynet0","InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}"#
-                } else {
-                    ""
-                },
-                "Enabled",
-                "Enabled",
-                "Ethernet",
-                "",
-            )
-            .expect("during snapshot");
-        let after =
-            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
-                200,
-                &windows_options(),
-                "",
-                if restored { "Disabled" } else { "Enabled" },
-                if restored { "Disabled" } else { "Enabled" },
-                "Ethernet",
-                "",
-            )
-            .expect("after snapshot");
-        rustynetd::windows_exit_nat_lifecycle::merge_windows_exit_nat_lifecycle_artifact(
-            &during, &after,
-        )
-    }
-
-    #[test]
-    fn windows_exit_handoff_report_serializes_with_serde() {
-        // Operator-supplied exit_host with embedded quote+newline must
-        // survive serde escaping. Envelope mirrors the canonical
-        // live-lab shape consumed by `ops_fresh_install_os_matrix::load_json_report`.
-        let report = super::WindowsExitHandoffReport {
-            schema_version: 1,
-            phase: "phase10",
-            mode: "live_windows_exit_handoff",
-            evidence_mode: "measured",
-            status: "fail",
-            platform: "windows",
-            captured_at: "1970-01-01T00:00:00Z".to_owned(),
-            captured_at_unix: 200,
-            git_commit: "deadbeef".to_owned(),
-            exit_host: "admin@192.168.18.40 \" inject \n more".to_owned(),
-            exit_node_id: "exit-40".to_owned(),
-            nat_name: super::WINDOWS_NAT_NAME.to_owned(),
-            tunnel_alias: super::WINDOWS_TUNNEL_ALIAS.to_owned(),
-            mesh_cidr: "100.64.0.0/10".to_owned(),
-            daemon_restart_status: "restart_failed: SCM access denied".to_owned(),
-            lifecycle: windows_lifecycle_artifact_fixture(true, true),
-            source_artifacts: vec!["live-lab/windows-exit-handoff.log".to_owned()],
-            detail: "all invariants held".to_owned(),
-        };
-        let json = serde_json::to_string(&report).expect("serialize");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("must produce valid JSON round-trip");
-        assert_eq!(parsed["status"], "fail");
-        assert_eq!(parsed["platform"], "windows");
-        assert_eq!(parsed["phase"], "phase10");
-        assert_eq!(parsed["mode"], "live_windows_exit_handoff");
-        assert_eq!(parsed["evidence_mode"], "measured");
-        assert_eq!(parsed["nat_name"], super::WINDOWS_NAT_NAME);
-        assert_eq!(parsed["tunnel_alias"], super::WINDOWS_TUNNEL_ALIAS);
-        assert_eq!(parsed["lifecycle"]["during_run"]["netnat_present"], true);
+        // A trailing route field with no following status= keeps the rest.
         assert_eq!(
-            parsed["lifecycle"]["after_stop"]["forwarding_restored"],
-            true
+            super::monitor_line_route_field("ts|route=default via utun4"),
+            Some("default via utun4")
         );
+    }
+
+    #[test]
+    fn monitor_line_route_leaks_linux_flags_off_tunnel_routes() {
+        let tunnel_line = "1700000000|iter=3|ping_rc=0|route=1.1.1.1 dev rustynet0 table 51820 src 100.64.0.10|status=exit_node=exit-1|wg_endpoints=x";
+        let leak_line = "1700000000|iter=4|ping_rc=1|route=1.1.1.1 via 192.168.64.1 dev enp0s1|status=exit_node=none|wg_endpoints=x";
+        let missing_route_line = "1700000000|iter=5|ping_rc=1|status=exit_node=none";
+        assert!(!super::monitor_line_route_leaks(
+            tunnel_line,
+            super::ExitHandoffPlatform::Linux
+        ));
+        assert!(super::monitor_line_route_leaks(
+            leak_line,
+            super::ExitHandoffPlatform::Linux
+        ));
+        // A sample with no parseable route is treated as a leak
+        // (fail-closed: a never-observed route is NOT a pass).
+        assert!(super::monitor_line_route_leaks(
+            missing_route_line,
+            super::ExitHandoffPlatform::Linux
+        ));
+    }
+
+    #[test]
+    fn monitor_line_route_leaks_macos_uses_utun_interface() {
+        // macOS route capture is multi-line; the monitor line collapses
+        // newlines to spaces, so the `interface: utunN` token survives
+        // inline in the route= field.
+        let tunnel_line = "1700000000|iter=3|ping_rc=0|route=route to: 1.1.1.1 destination: default gateway: 100.64.0.1 interface: utun4|status=exit_node=exit-1|wg_endpoints=x";
+        let leak_line = "1700000000|iter=4|ping_rc=1|route=route to: 1.1.1.1 destination: default gateway: 192.168.64.1 interface: en0|status=exit_node=none|wg_endpoints=x";
+        assert!(!super::monitor_line_route_leaks(
+            tunnel_line,
+            super::ExitHandoffPlatform::MacOs
+        ));
+        assert!(super::monitor_line_route_leaks(
+            leak_line,
+            super::ExitHandoffPlatform::MacOs
+        ));
+    }
+
+    #[test]
+    fn monitor_line_route_leaks_windows_uses_adapter_alias() {
+        let tunnel_line = "1700000000|iter=3|ping_rc=0|route=ifIndex : 27 InterfaceAlias : rustynet0 NextHop : 0.0.0.0|status=exit_node=exit-1|wg_endpoints=x";
+        let leak_line = "1700000000|iter=4|ping_rc=1|route=ifIndex : 12 InterfaceAlias : Ethernet NextHop : 192.168.64.1|status=exit_node=none|wg_endpoints=x";
+        assert!(!super::monitor_line_route_leaks(
+            tunnel_line,
+            super::ExitHandoffPlatform::Windows
+        ));
+        assert!(super::monitor_line_route_leaks(
+            leak_line,
+            super::ExitHandoffPlatform::Windows
+        ));
+    }
+
+    #[test]
+    fn platform_commands_linux_strings_are_byte_identical_to_legacy() {
+        // Guard: the Linux command strings must NOT drift from the
+        // pre-Wave-2 hard-coded captures (Linux behaviour unchanged).
+        let cmds = super::PlatformCommands::for_platform(super::ExitHandoffPlatform::Linux);
         assert_eq!(
-            parsed["daemon_restart_status"], "restart_failed: SCM access denied",
-            "SCM restart failure must be visible in the report"
+            cmds.route_get,
+            "ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true"
         );
+        assert!(cmds.route_get_needs_root);
         assert_eq!(
-            parsed["exit_host"], "admin@192.168.18.40 \" inject \n more",
-            "embedded quote/newline must survive serde escaping"
+            cmds.wg_endpoints,
+            "wg show rustynet0 endpoints 2>/dev/null || true"
         );
+        assert!(cmds.wg_endpoints_needs_root);
+        assert_eq!(cmds.ping_probe, "ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1");
+        assert_eq!(cmds.nat_capture, "nft list ruleset || true");
+        assert!(cmds.nat_capture_needs_root);
     }
 
     #[test]
-    fn windows_lifecycle_merger_surfaces_failure_when_netnat_leaks_after_stop() {
-        // Negative-path coverage: if after_stop NetNat is still
-        // present, the merger must surface forwarding_restored=false
-        // so the validator's assertion cannot pass.
-        let during =
-            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
-                100,
-                &windows_options(),
-                r#"{"Name":"RustyNetExit-rustynet0","InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}"#,
-                "Enabled",
-                "Enabled",
-                "Ethernet",
-                "",
-            )
-            .expect("during");
-        let after =
-            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
-                200,
-                &windows_options(),
-                r#"{"Name":"RustyNetExit-rustynet0","InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}"#,
-                "Disabled",
-                "Disabled",
-                "Ethernet",
-                "",
-            )
-            .expect("after");
-        let merged =
-            rustynetd::windows_exit_nat_lifecycle::merge_windows_exit_nat_lifecycle_artifact(
-                &during, &after,
-            );
-        assert_eq!(merged["after_stop"]["netnat_present"], true);
-        assert_eq!(
-            merged["after_stop"]["forwarding_restored"], false,
-            "leaked NetNat must surface as forwarding_restored=false"
-        );
+    fn platform_commands_windows_captures_run_without_sudo() {
+        // Windows PowerShell captures run under the Administrator SSH
+        // session, not a sudo verb — the route / NAT captures must be
+        // raw (`capture_remote_stdout`), and the route command must be
+        // the Get-NetRoute query, not the Linux iproute2 form.
+        let cmds = super::PlatformCommands::for_platform(super::ExitHandoffPlatform::Windows);
+        assert!(!cmds.route_get_needs_root);
+        assert!(!cmds.nat_capture_needs_root);
+        assert!(cmds.route_get.contains("Get-NetRoute"));
+        assert!(cmds.nat_capture.contains("Get-NetNat"));
+        assert!(cmds.ping_probe.contains("Test-Connection"));
     }
 
     #[test]
-    fn windows_scm_service_name_is_canonical() {
-        // Defense-in-depth: pin the SCM service identifier the
-        // validator stops/restarts so a future rename surfaces here.
-        assert_eq!(super::WINDOWS_SCM_SERVICE, "rustynetd");
-    }
-
-    #[test]
-    fn sanitize_windows_interface_alias_keeps_realistic_aliases() {
-        for ok in [
-            "Ethernet",
-            "Wi-Fi",
-            "vEthernet (Default Switch)",
-            "Local Area Connection 3",
-        ] {
-            assert_eq!(
-                super::sanitize_windows_interface_alias(ok),
-                ok,
-                "alias {ok:?} must pass"
-            );
-        }
-    }
-
-    #[test]
-    fn sanitize_windows_interface_alias_accepts_localized_unicode_aliases() {
-        // Real-world non-English Windows interface alias names.
-        // An ASCII-only allowlist would surface these as missing
-        // and cause spurious failures on JP/DE/FR/KR hosts.
-        for ok in [
-            "イーサネット",
-            "Ethernet-Verbindung",
-            "Сетевое подключение",
-            "이더넷",
-            "vEthernet (既定のスイッチ)",
-        ] {
-            assert_eq!(
-                super::sanitize_windows_interface_alias(ok),
-                ok,
-                "localized alias {ok:?} must pass the denylist sanitizer"
-            );
-        }
-    }
-
-    #[test]
-    fn sanitize_windows_interface_alias_strips_trailing_newline_carriage_return() {
-        assert_eq!(
-            super::sanitize_windows_interface_alias("Ethernet\r\n"),
-            "Ethernet"
-        );
-    }
-
-    #[test]
-    fn sanitize_windows_interface_alias_rejects_powershell_quote_escape() {
-        // A compromised target host could return an alias designed to
-        // break out of the single-quoted argument and inject
-        // additional PowerShell commands. Must collapse to empty.
-        for bad in [
-            "Ethernet'; Remove-Item C:\\Windows",
-            "evil`whoami",
-            "evil\"injection",
-            "evil$(echo pwn)",
-            "evil; del /q *",
-            "evil\\nmkdir foo",
-            "<script>",
-        ] {
-            assert_eq!(
-                super::sanitize_windows_interface_alias(bad),
-                "",
-                "alias {bad:?} must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn sanitize_windows_interface_alias_rejects_oversized_input() {
-        let long = "A".repeat(200);
-        assert_eq!(super::sanitize_windows_interface_alias(&long), "");
-    }
-
-    #[test]
-    fn sanitize_windows_interface_alias_returns_empty_for_blank() {
-        assert_eq!(super::sanitize_windows_interface_alias(""), "");
-        assert_eq!(super::sanitize_windows_interface_alias("   "), "");
+    fn platform_commands_macos_captures_use_bsd_route_and_pf() {
+        let cmds = super::PlatformCommands::for_platform(super::ExitHandoffPlatform::MacOs);
+        assert!(cmds.route_get_needs_root);
+        assert!(cmds.nat_capture_needs_root);
+        assert!(cmds.route_get.contains("route -n get"));
+        assert!(cmds.nat_capture.contains("pfctl"));
+        // macOS ping uses the `-t` deadline spelling, not Linux `-W`.
+        assert!(cmds.ping_probe.contains("-t 1"));
     }
 }
