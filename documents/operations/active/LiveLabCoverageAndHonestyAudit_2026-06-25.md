@@ -279,6 +279,34 @@ reports. Full URL citations in the research tracks; key ones inline below.)
   Linux depth already **exceeds** ZeroTier — the gap is purely cross-OS breadth +
   capture honesty, not Linux depth.
 
+### 5.6 STRATEGIC: how mature projects achieve cross-OS parity (reframes Waves 2–4)
+A survey of WireGuard, Tailscale, Headscale, Nebula, innernet, NetBird, ZeroTier
+found that **none of them boots real macOS/Windows *multi-node* topologies** in CI.
+Live multi-node topology testing is confined to **Linux** everywhere (netns / Docker
+/ KVM-QEMU: WireGuard `netns.sh` 3-namespace, Tailscale `natlab`/`vnet` + `vms`,
+Headscale `dockertest` `tsic`/`hsic`, Nebula in-process `router.R`, innernet
+NET_ADMIN Docker). Cross-OS parity is achieved two cheaper ways instead:
+1. **Isolate OS code behind a thin boundary and test the shared core once** (WireGuard
+   file-suffix `tun_{linux,darwin,windows}.go` + in-process `ChannelTUN`; wireguard-go
+   tests the portable core OS-independently).
+2. **Run the *same* assertion binary on per-OS runners** (Tailscale runs its full
+   sharded suite on Linux+Windows+macOS; Nebula unit-on-all-3, e2e Linux+macOS;
+   NetBird per-OS workflows; ZeroTier selftest on Linux+macOS).
+
+**Implication for Rustynet (cost-saving, and validating the existing design):** the
+parity mandate's "every role live-proven on macOS AND Windows" is *more aggressive
+than any of these projects' actual CI*. We do NOT need to stand up real mac/win
+*meshes*. The right shape — which Rustynet's **`RemoteShellHost` trait already
+delivers for its only two genuinely-parity areas (relay, mixed-topology)** — is one
+assertion-logic body, argv-only per-OS remote-shell transport, run against a mac/win
+node joined to an otherwise-Linux lab. So **Waves 2–3 = port the Linux assertion
+binaries to drive mac/win nodes through the shared remote-shell trait**, not
+re-implement topologies per OS. Wave 4's cross-network NAT-matrix is the one place a
+richer substrate (à la Tailscale `natlab`) is warranted, and even there the mac/win
+*endpoints* plug into a mostly-Linux fabric. Headscale's per-version-container
+`assertPingAll` is the closest external analog to our role × OS matrix and a useful
+template for the breadth waves.
+
 ---
 
 ## 6. The plan — what we build, in risk-ordered waves
