@@ -6,6 +6,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SocketSecurityFacts {
     socket_mode: u32,
@@ -55,6 +56,7 @@ fn validate_parent_basics(path: &Path, label: &str) -> Result<fs::Metadata, Stri
     Ok(metadata)
 }
 
+#[cfg(unix)]
 fn owner_allowed(owner_uid: u32, allowed_owner_uids: &[u32]) -> bool {
     allowed_owner_uids.contains(&owner_uid)
 }
@@ -73,6 +75,7 @@ fn inspect_socket_security_facts(path: &Path, label: &str) -> Result<SocketSecur
     })
 }
 
+#[cfg(unix)]
 fn validate_owner_only_socket_facts(
     path: &Path,
     label: &str,
@@ -124,10 +127,10 @@ pub fn validate_owner_only_socket(
             allowed_socket_owner_uids,
             allowed_parent_owner_uids,
         );
-        return Err(
+        Err(
             "owner-only socket validation is available only on Unix sockets; Windows must use named-pipe IPC validation"
                 .to_string(),
-        );
+        )
     }
 
     #[cfg(unix)]
@@ -143,6 +146,7 @@ pub fn validate_owner_only_socket(
     }
 }
 
+#[cfg(unix)]
 fn validate_root_managed_shared_runtime_socket_facts(
     path: &Path,
     label: &str,
@@ -221,10 +225,10 @@ pub fn validate_root_managed_shared_runtime_socket(
             allowed_parent_owner_uids,
             expected_gid,
         );
-        return Err(
+        Err(
             "root-managed shared runtime socket validation is available only on Unix sockets; Windows must use named-pipe IPC validation"
                 .to_string(),
-        );
+        )
     }
 
     #[cfg(unix)]
