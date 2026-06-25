@@ -1581,6 +1581,34 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
+        // blind_exit mesh-scoped final-hop allow: forward from the tunnel to
+        // the egress interface ONLY when the source address is inside the
+        // bounded mesh CIDR (`ip`/`ip6 saddr <cidr>`). The daemon
+        // (`linux_blind_exit`) additionally pins `<cidr>` to a private/CGNAT/ULA
+        // range before this is reached; here we enforce the argv shape +
+        // family/CIDR agreement as defense-in-depth.
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "forward",
+            "iifname",
+            incoming_interface,
+            "oifname",
+            outgoing_interface,
+            family,
+            "saddr",
+            cidr,
+            "accept",
+        ] if is_owned_failclosed_table_token(table)
+            && is_interface_name(incoming_interface)
+            && is_interface_name(outgoing_interface)
+            && is_nft_daddr_family_token(family)
+            && is_cidr_for_nft_family(cidr, family) =>
+        {
+            Ok(())
+        }
         [
             "add",
             "rule",
@@ -1855,6 +1883,14 @@ fn validate_nft_args(args: &[&str]) -> Result<(), String> {
         ["delete", "table", family, table]
             if is_nft_family_token(family) && is_owned_nft_table_token(table) =>
         {
+            Ok(())
+        }
+        // Flush the `forward` chain only (keeps the chain's `policy drop`),
+        // used by the blind_exit hardened-egress path to clear the regular-exit
+        // unrestricted tunnel->egress allow before re-authoring the
+        // mesh-scoped final-hop rule. Restricted to `forward` so it can never
+        // be used to clear the killswitch chain.
+        ["flush", "chain", "inet", table, "forward"] if is_owned_failclosed_table_token(table) => {
             Ok(())
         }
         _ if args.starts_with(&["add", "chain"]) => validate_nft_add_chain_args(args),
@@ -2439,6 +2475,108 @@ mod tests {
             ])
             .is_ok(),
             "existing killswitch chain must still validate"
+        );
+    }
+
+    #[test]
+    fn blind_exit_nft_validation_is_tightly_scoped() {
+        use super::validate_nft_args;
+        // The blind_exit forward-chain flush is permitted (it keeps policy
+        // drop while clearing the regular-exit unrestricted allow)...
+        assert!(
+            validate_nft_args(&["flush", "chain", "inet", "rustynet_g0", "forward"]).is_ok(),
+            "blind_exit forward-chain flush must validate"
+        );
+        // ...but flushing the killswitch chain (or any non-forward chain) is
+        // rejected so the default-deny posture can never be cleared this way.
+        assert!(
+            validate_nft_args(&["flush", "chain", "inet", "rustynet_g0", "killswitch"]).is_err(),
+            "flushing the killswitch chain must be rejected"
+        );
+        // A flush on a non-owned table is rejected.
+        assert!(
+            validate_nft_args(&["flush", "chain", "inet", "evil_table", "forward"]).is_err(),
+            "flush on a non-owned table must be rejected"
+        );
+        // The mesh-scoped final-hop forward allow validates for IPv4 + IPv6
+        // mesh CIDRs.
+        assert!(
+            validate_nft_args(&[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g0",
+                "forward",
+                "iifname",
+                "rustynet0",
+                "oifname",
+                "eth0",
+                "ip",
+                "saddr",
+                "100.64.0.0/10",
+                "accept",
+            ])
+            .is_ok(),
+            "IPv4 mesh-scoped forward allow must validate"
+        );
+        assert!(
+            validate_nft_args(&[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g0",
+                "forward",
+                "iifname",
+                "rustynet0",
+                "oifname",
+                "eth0",
+                "ip6",
+                "saddr",
+                "fd7a::/48",
+                "accept",
+            ])
+            .is_ok(),
+            "IPv6 mesh-scoped forward allow must validate"
+        );
+        // Family/CIDR disagreement is rejected (no `ip saddr <v6>` slippage).
+        assert!(
+            validate_nft_args(&[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g0",
+                "forward",
+                "iifname",
+                "rustynet0",
+                "oifname",
+                "eth0",
+                "ip",
+                "saddr",
+                "fd7a::/48",
+                "accept",
+            ])
+            .is_err(),
+            "family/CIDR mismatch must be rejected"
+        );
+        // A non-owned table is rejected.
+        assert!(
+            validate_nft_args(&[
+                "add",
+                "rule",
+                "inet",
+                "evil_table",
+                "forward",
+                "iifname",
+                "rustynet0",
+                "oifname",
+                "eth0",
+                "ip",
+                "saddr",
+                "100.64.0.0/10",
+                "accept",
+            ])
+            .is_err(),
+            "mesh-scoped forward allow on a non-owned table must be rejected"
         );
     }
 
