@@ -36,13 +36,21 @@
 //! not run the gossip loop. The dataplane execution plan §5.2 calls
 //! this out as part of Track Beta's follow-up backlog.
 
+use std::net::SocketAddr;
+use std::time::Duration;
+// These items are only used by the `#[cfg(unix)]` transport impl below; the
+// `#[cfg(not(unix))]` stub errors out without touching the socket or wire
+// helpers. Gate the imports to match so Windows does not see them as unused.
+#[cfg(unix)]
 use std::io::ErrorKind;
-use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::net::UdpSocket;
+#[cfg(unix)]
+use std::time::Instant;
 
-use crate::peer_gossip::{
-    GossipBundle, GossipError, MAX_GOSSIP_DATAGRAM_BYTES, deserialise_bundle, serialise_bundle,
-};
+use crate::peer_gossip::{GossipBundle, GossipError};
+#[cfg(unix)]
+use crate::peer_gossip::{MAX_GOSSIP_DATAGRAM_BYTES, deserialise_bundle, serialise_bundle};
 
 /// Default UDP port for the per-peer gossip socket. The WireGuard
 /// listen port is 51820; the gossip port is intentionally one above
@@ -108,6 +116,10 @@ impl From<std::io::Error> for TransportError {
 /// performs a single non-blocking `recv_from`. Non-zero timeouts
 /// poll until the deadline elapses or a datagram arrives.
 pub struct GossipTransport {
+    // The socket only exists on the `#[cfg(unix)]` transport path; the
+    // `#[cfg(not(unix))]` stub never constructs `Self`, so the field would
+    // otherwise read as never-used on Windows.
+    #[cfg(unix)]
     socket: UdpSocket,
 }
 

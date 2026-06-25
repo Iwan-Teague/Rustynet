@@ -1,14 +1,29 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
-use std::fs;
-use std::io::{Read, Write};
-use std::net::Shutdown;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+// `Path` is only referenced from the unix helper server / exec path and the
+// unix PF helpers; Windows uses only `PathBuf` (socket-path config fields).
+#[cfg(not(windows))]
+use std::path::Path;
+use std::time::Duration;
+// The helper *server*, its wire protocol, and subprocess exec are unix-only:
+// on Windows the client/server both fail closed via `windows_ipc_blocker_reason`
+// before touching any of this. Gate the supporting imports to match so Windows
+// does not see them as unused.
+#[cfg(not(windows))]
+use std::fs;
+#[cfg(not(windows))]
+use std::io::{Read, Write};
+#[cfg(not(windows))]
+use std::net::Shutdown;
+#[cfg(not(windows))]
 use std::process::{Command, ExitStatus, Stdio};
+#[cfg(not(windows))]
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+#[cfg(not(windows))]
+use std::time::Instant;
 
 #[cfg(not(windows))]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -34,6 +49,10 @@ use nix::sys::socket::sockopt::LocalPeerCred;
 use nix::sys::socket::sockopt::PeerCredentials;
 #[cfg(not(windows))]
 use nix::unistd::{Gid, Group, Uid, chown};
+// Socket-security validators are used only by the `#[cfg(not(windows))]`
+// `validate_privileged_helper_socket_security`; Windows validates its named-pipe
+// path separately and never binds a unix socket.
+#[cfg(not(windows))]
 use rustynet_local_security::{
     validate_owner_only_socket, validate_root_managed_shared_runtime_socket,
 };
@@ -44,15 +63,25 @@ pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = "/run/rustynet/rustynetd
 pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = DEFAULT_WINDOWS_PRIVILEGED_HELPER_PIPE_PATH;
 pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = 2_000;
 
+// The frame/size constants below describe the unix helper wire protocol, which
+// Windows never speaks (the IPC path fails closed first). Gate them to match.
+#[cfg(not(windows))]
 const HELPER_FRAME_MAGIC: [u8; 4] = *b"RNHF";
+#[cfg(not(windows))]
 const HELPER_FRAME_VERSION: u8 = 1;
+#[cfg(not(windows))]
 const HELPER_FRAME_TYPE_REQUEST: u8 = 1;
+#[cfg(not(windows))]
 const HELPER_FRAME_TYPE_RESPONSE: u8 = 2;
+#[cfg(not(windows))]
 const HELPER_FRAME_HEADER_BYTES: usize = 10;
+#[cfg(not(windows))]
 const MAX_MESSAGE_BYTES: usize = 16_384;
+#[cfg(not(windows))]
 const MAX_OUTPUT_BYTES: usize = 65_536;
 pub(crate) const MAX_ARGS: usize = 128;
 pub(crate) const MAX_ARG_BYTES: usize = 256;
+#[cfg(not(windows))]
 const MAX_PROGRAM_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +161,9 @@ impl PrivilegedCommandProgram {
         )
     }
 
+    // Binary resolution + the privileged exec path only run inside the unix
+    // helper server; Windows fails closed before any command is dispatched.
+    #[cfg(not(windows))]
     fn binary_candidates(self) -> &'static [&'static str] {
         match self {
             PrivilegedCommandProgram::Ip => &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"],
@@ -164,6 +196,7 @@ impl PrivilegedCommandProgram {
         }
     }
 
+    #[cfg(not(windows))]
     fn resolve_binary(self) -> Result<PathBuf, String> {
         if self.is_builtin() {
             return Err(format!(
@@ -231,9 +264,9 @@ impl PrivilegedCommandClient {
             let _ = program;
             let _ = args;
             let _ = self.timeout;
-            return Err(windows_ipc_blocker_reason(
+            Err(windows_ipc_blocker_reason(
                 WindowsLocalIpcRole::PrivilegedHelper,
-            ));
+            ))
         }
         #[cfg(not(windows))]
         {
@@ -358,9 +391,9 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
         let _ = config.allowed_uid;
         let _ = config.allowed_gid;
         let _ = config.io_timeout;
-        return Err(windows_ipc_blocker_reason(
+        Err(windows_ipc_blocker_reason(
             WindowsLocalIpcRole::PrivilegedHelper,
-        ));
+        ))
     }
     #[cfg(not(windows))]
     if !config.socket_path.is_absolute() {
@@ -492,12 +525,16 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
     }
 }
 
+// The request/response value types are the in-memory form of the unix helper
+// wire protocol; Windows never constructs them (its IPC path fails closed).
+#[cfg(not(windows))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HelperRequest {
     program: String,
     args: Vec<String>,
 }
 
+#[cfg(not(windows))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HelperResponse {
     ok: bool,
@@ -507,6 +544,7 @@ struct HelperResponse {
     error: Option<String>,
 }
 
+#[cfg(not(windows))]
 impl HelperResponse {
     fn error(message: String) -> Self {
         Self {
@@ -627,6 +665,9 @@ fn read_frame(stream: &mut UnixStream, expected_message_type: u8) -> Result<Vec<
     }
 }
 
+// The helper wire-protocol codec (request/response encode + decode and its
+// primitive field helpers) is unix-only — Windows never frames a helper message.
+#[cfg(not(windows))]
 fn map_read_exact_error(err: std::io::Error, label: &str) -> String {
     if err.kind() == std::io::ErrorKind::UnexpectedEof {
         return format!("truncated {label}");
@@ -634,6 +675,7 @@ fn map_read_exact_error(err: std::io::Error, label: &str) -> String {
     format!("read {label} failed: {err}")
 }
 
+#[cfg(not(windows))]
 fn encode_helper_request(request: &HelperRequest) -> Result<Vec<u8>, String> {
     let mut payload = Vec::new();
     encode_string_field(
@@ -651,6 +693,7 @@ fn encode_helper_request(request: &HelperRequest) -> Result<Vec<u8>, String> {
     Ok(payload)
 }
 
+#[cfg(not(windows))]
 fn decode_helper_request(payload: &[u8]) -> Result<HelperRequest, String> {
     let mut cursor = 0usize;
     let program = decode_string_field(payload, &mut cursor, "program", MAX_PROGRAM_BYTES)?;
@@ -671,6 +714,7 @@ fn decode_helper_request(payload: &[u8]) -> Result<HelperRequest, String> {
     Ok(HelperRequest { program, args })
 }
 
+#[cfg(not(windows))]
 fn encode_helper_response(response: &HelperResponse) -> Result<Vec<u8>, String> {
     let mut payload = Vec::new();
     payload.push(u8::from(response.ok));
@@ -681,6 +725,7 @@ fn encode_helper_response(response: &HelperResponse) -> Result<Vec<u8>, String> 
     Ok(payload)
 }
 
+#[cfg(not(windows))]
 fn decode_helper_response(payload: &[u8]) -> Result<HelperResponse, String> {
     let mut cursor = 0usize;
     let ok = decode_bool(payload, &mut cursor, "ok")?;
@@ -698,6 +743,7 @@ fn decode_helper_response(payload: &[u8]) -> Result<HelperResponse, String> {
     })
 }
 
+#[cfg(not(windows))]
 fn encode_optional_i32(payload: &mut Vec<u8>, value: Option<i32>) {
     match value {
         Some(value) => {
@@ -708,6 +754,7 @@ fn encode_optional_i32(payload: &mut Vec<u8>, value: Option<i32>) {
     }
 }
 
+#[cfg(not(windows))]
 fn decode_optional_i32(
     payload: &[u8],
     cursor: &mut usize,
@@ -719,6 +766,7 @@ fn decode_optional_i32(
     }
 }
 
+#[cfg(not(windows))]
 fn encode_optional_string_field(
     payload: &mut Vec<u8>,
     value: Option<&str>,
@@ -734,6 +782,7 @@ fn encode_optional_string_field(
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn decode_optional_string_field(
     payload: &[u8],
     cursor: &mut usize,
@@ -748,6 +797,7 @@ fn decode_optional_string_field(
     }
 }
 
+#[cfg(not(windows))]
 fn encode_string_field(
     payload: &mut Vec<u8>,
     value: &str,
@@ -765,6 +815,7 @@ fn encode_string_field(
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn decode_string_field(
     payload: &[u8],
     cursor: &mut usize,
@@ -787,6 +838,7 @@ fn decode_string_field(
         .map(str::to_string)
 }
 
+#[cfg(not(windows))]
 fn decode_bool(payload: &[u8], cursor: &mut usize, label: &str) -> Result<bool, String> {
     match decode_u8(payload, cursor, label)? {
         0 => Ok(false),
@@ -795,10 +847,12 @@ fn decode_bool(payload: &[u8], cursor: &mut usize, label: &str) -> Result<bool, 
     }
 }
 
+#[cfg(not(windows))]
 fn decode_bool_flag(payload: &[u8], cursor: &mut usize, label: &str) -> Result<bool, String> {
     decode_bool(payload, cursor, label)
 }
 
+#[cfg(not(windows))]
 fn decode_u8(payload: &[u8], cursor: &mut usize, label: &str) -> Result<u8, String> {
     let byte = *payload
         .get(*cursor)
@@ -807,16 +861,19 @@ fn decode_u8(payload: &[u8], cursor: &mut usize, label: &str) -> Result<u8, Stri
     Ok(byte)
 }
 
+#[cfg(not(windows))]
 fn decode_u16(payload: &[u8], cursor: &mut usize, label: &str) -> Result<u16, String> {
     let bytes = decode_fixed::<2>(payload, cursor, label)?;
     Ok(u16::from_be_bytes(bytes))
 }
 
+#[cfg(not(windows))]
 fn decode_i32(payload: &[u8], cursor: &mut usize, label: &str) -> Result<i32, String> {
     let bytes = decode_fixed::<4>(payload, cursor, label)?;
     Ok(i32::from_be_bytes(bytes))
 }
 
+#[cfg(not(windows))]
 fn decode_fixed<const N: usize>(
     payload: &[u8],
     cursor: &mut usize,
@@ -834,6 +891,7 @@ fn decode_fixed<const N: usize>(
         .map_err(|_| format!("invalid fixed-width payload for {label}"))
 }
 
+#[cfg(not(windows))]
 fn ensure_payload_consumed(payload: &[u8], cursor: usize) -> Result<(), String> {
     if cursor != payload.len() {
         return Err("trailing bytes after helper payload".to_owned());
@@ -841,7 +899,7 @@ fn ensure_payload_consumed(payload: &[u8], cursor: usize) -> Result<(), String> 
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 fn handle_request(request: HelperRequest) -> HelperResponse {
     handle_request_with_timeout(
         request,
@@ -849,6 +907,8 @@ fn handle_request(request: HelperRequest) -> HelperResponse {
     )
 }
 
+// Helper-side request dispatch + exec only run on unix; Windows fails closed.
+#[cfg(not(windows))]
 fn handle_request_with_timeout(request: HelperRequest, timeout: Duration) -> HelperResponse {
     let program = match PrivilegedCommandProgram::parse(&request.program) {
         Some(program) => program,
@@ -1136,14 +1196,14 @@ fn validate_privileged_program_binary(path: &Path, label: &str) -> Result<PathBu
     Ok(canonical)
 }
 
-#[cfg(windows)]
-fn validate_privileged_program_binary(path: &Path, label: &str) -> Result<PathBuf, String> {
-    let _ = path;
-    Err(format!(
-        "{label} privileged helper binary validation is Unix-only; Windows helper execution remains blocked until reviewed named-pipe IPC and backend support are implemented"
-    ))
-}
+// NOTE: a `#[cfg(windows)]` `validate_privileged_program_binary` stub previously
+// lived here to satisfy the (now `#[cfg(not(windows))]`-gated) `resolve_binary`
+// reference on Windows. With binary resolution and the exec path gated to unix,
+// the Windows stub had no caller and was dead code, so it was removed.
 
+// Privileged subprocess exec + its output helpers run only inside the unix
+// helper server; Windows never reaches the exec path (IPC fails closed first).
+#[cfg(not(windows))]
 fn run_privileged_subprocess(
     binary: &Path,
     args: &[String],
@@ -1174,10 +1234,12 @@ fn run_privileged_subprocess(
     }
 }
 
+#[cfg(not(windows))]
 fn exit_status_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(-1)
 }
 
+#[cfg(not(windows))]
 fn truncate_lossy(bytes: &[u8], max_bytes: usize) -> String {
     if bytes.len() <= max_bytes {
         return String::from_utf8_lossy(bytes).to_string();
@@ -1252,7 +1314,7 @@ fn is_safe_token(value: &str) -> bool {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 fn is_nft_token(value: &str) -> bool {
     matches!(value, "{" | "}" | ";" | "!=") || is_safe_token(value)
 }
