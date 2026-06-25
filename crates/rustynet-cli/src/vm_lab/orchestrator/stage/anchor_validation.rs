@@ -192,14 +192,38 @@ impl OrchestrationStage for AnchorValidationStage {
 
         if failures.is_empty() {
             // Record the deferred-substage note + any per-node runtime skips as
-            // evidence on a pass. Best-effort: a write failure does not fail the
-            // stage (the proofs that ran already passed), but the common path
-            // leaves a machine-readable artifact behind.
+            // evidence on a non-failing run. Best-effort: a write failure does not
+            // change the outcome (the proofs that ran already passed), but the
+            // common path leaves a machine-readable artifact behind.
             write_reported_skips_note(ctx, &runtime_skips);
-            StageOutcome::Passed
-        } else {
-            StageOutcome::Failed(failures.join("; "))
         }
+        outcome_for(&failures, &runtime_skips)
+    }
+}
+
+/// Decide the stage outcome from the per-node tally — a pure function so the
+/// skip-vs-pass-vs-fail decision is unit-testable without constructing a
+/// per-OS adapter (whose `platform()` would otherwise have to be macOS/Windows
+/// for the reported-skip case). Mirrors `deploy_relay::outcome_for`.
+///
+/// Honest cross-OS posture (Wave 1): capability-advertisement runs real on every
+/// OS, but the bundle-pull RUNTIME substages are reported-skipped on
+/// macOS/Windows anchors. So:
+///   * any hard failure (broken cap-advert / runtime probe / construction) ⇒
+///     `Failed`;
+///   * else any reported runtime-skip (a macOS/Windows anchor whose bundle-pull
+///     runtime substages did not run) ⇒ `Skipped`, so the run goes
+///     `RunStatus::Partial` instead of falsely green — the stage did NOT fully
+///     prove every anchor; the skipped nodes are named in the side-car note;
+///   * else (every anchor fully validated incl. runtime; the empty-anchor-lab
+///     no-op is handled before this) ⇒ `Passed`.
+fn outcome_for(failures: &[String], runtime_skips: &[(String, String)]) -> StageOutcome {
+    if !failures.is_empty() {
+        StageOutcome::Failed(failures.join("; "))
+    } else if !runtime_skips.is_empty() {
+        StageOutcome::Skipped
+    } else {
+        StageOutcome::Passed
     }
 }
 
@@ -322,6 +346,41 @@ mod tests {
                 assert!(msg.contains("anchor-1"), "got: {msg}");
                 assert!(msg.contains("no adapter"), "got: {msg}");
             }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_for_runtime_skip_with_no_failures_is_skipped() {
+        // A macOS/Windows anchor whose bundle-pull runtime substages were
+        // reported-skipped (no hard failure) ⇒ stage Skipped, which
+        // build_live_lab_run_report maps to RunStatus::Partial (honest: the
+        // stage did not fully prove every anchor, so the run is not green —
+        // even though capability-advertisement passed on every OS).
+        let runtime_skips = vec![("anchor-win".to_owned(), "Windows".to_owned())];
+        assert_eq!(
+            outcome_for(&[], &runtime_skips),
+            StageOutcome::Skipped,
+            "runtime reported-skip + no failures must be Skipped, not Passed"
+        );
+    }
+
+    #[test]
+    fn outcome_for_no_failures_no_skips_is_passed() {
+        // Every anchor fully validated incl. runtime (all-Linux), nothing
+        // skipped, nothing failed ⇒ Passed. The empty-anchor-lab no-op also
+        // lands on Passed (handled before outcome_for is reached).
+        assert_eq!(outcome_for(&[], &[]), StageOutcome::Passed);
+    }
+
+    #[test]
+    fn outcome_for_failure_is_failed_even_with_skips() {
+        // A hard failure (broken cap-advert / runtime probe) trumps a
+        // reported runtime-skip: the stage is Failed.
+        let failures = vec!["anchor-1: boom".to_owned()];
+        let runtime_skips = vec![("anchor-win".to_owned(), "Windows".to_owned())];
+        match outcome_for(&failures, &runtime_skips) {
+            StageOutcome::Failed(msg) => assert!(msg.contains("anchor-1: boom"), "got: {msg}"),
             other => panic!("expected Failed, got {other:?}"),
         }
     }
