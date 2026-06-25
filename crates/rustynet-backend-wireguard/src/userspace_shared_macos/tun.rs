@@ -336,6 +336,11 @@ impl MacosTunLifecycle for DirectMacosTunLifecycle {
         match result {
             Ok(()) => Ok(MacosTunDevice::real(device)),
             Err(err) => {
+                // Release the utun device (closing its owned fd) before cleanup
+                // re-touches the interface. SyncDevice has no Drop impl of its
+                // own — only its inner OwnedFd does — so clippy's drop_non_drop
+                // misreads this as a no-op; the early fd close is intentional.
+                #[allow(clippy::drop_non_drop)]
                 drop(device);
                 match self.cleanup(interface_name) {
                     Ok(()) => Err(err),

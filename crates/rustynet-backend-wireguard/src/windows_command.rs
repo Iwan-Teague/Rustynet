@@ -627,12 +627,12 @@ fn protect_config_bytes(
         // CurrentUser scope would lock the blob to the daemon's logon session
         // and the tunnel service — a different security principal — could not
         // read the config, causing the Wintun adapter to start without an IP.
-        return dpapi_protect(bytes, WindowsDpapiScope::LocalMachine, tunnel_name).map_err(|err| {
+        dpapi_protect(bytes, WindowsDpapiScope::LocalMachine, tunnel_name).map_err(|err| {
             BackendError::internal(format!(
                 "DPAPI protect failed for Windows tunnel config {}: {err}",
                 path.display()
             ))
-        });
+        })
     }
     #[cfg(not(windows))]
     {
