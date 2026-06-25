@@ -42,6 +42,11 @@ ParityPlan §10.
     fail-soft `parse_arp_n_row` + test; macOS guard fixes).
 14. `cli:` confine report source-artifact paths against `..`/absolute traversal
     (**RSA-0054** — `confine_artifact_source` at all 3 read sites + test).
+15. `windows anchor:` serve bundle-pull from the Windows reconcile loop — the
+    genuine Windows-anchor runtime gap. Extracted the bind + accept/serve into two
+    portable, Linux-unit-tested helpers shared by the Unix + Windows loops; the
+    Windows loop now opens `127.0.0.1:51822`. (cfg(windows) call sites need a
+    Windows builder/CI compile-check; a live serving stage also remains.)
 
 ## Security research lessons applied (industry-grounded)
 
