@@ -17712,7 +17712,13 @@ fn run_linux_orchestration_stages_with_options(
             }
         }
     };
-    let relay_lifecycle_passed = relay_lifecycle_outcome.status == VmLabStageStatus::Pass;
+    // A relay-lifecycle Skipped (contract-only / not-live-proven — Wave-0 F0.7
+    // honest demotion) is benign and must NOT block the downstream anchor
+    // bundle-pull stage; only a hard Fail (the relay path is actually broken)
+    // gates it. (Before the demotion this was `== Pass`, which would now skip
+    // anchor bundle-pull on every run since relay never reports Pass.)
+    let relay_lifecycle_blocks_downstream =
+        relay_lifecycle_outcome.status == VmLabStageStatus::Fail;
 
     let anchor_bundle_pull_outcome = if options.dry_run {
         stage_outcome(
@@ -17726,7 +17732,7 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_anchor_bundle_pull",
             "validate_linux_runtime_acls",
         )
-    } else if !relay_lifecycle_passed {
+    } else if relay_lifecycle_blocks_downstream {
         make_skipped(
             "validate_linux_anchor_bundle_pull",
             "validate_linux_relay_service_lifecycle",
