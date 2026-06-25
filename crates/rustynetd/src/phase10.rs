@@ -340,12 +340,13 @@ pub struct ApplyOptions {
     pub exit_mode: ExitMode,
     pub serve_exit_node: bool,
     /// True only for the irreversible `blind_exit` role. Distinguishes a
-    /// blind exit (blocks internet egress, relays mesh only) from a regular
-    /// NATing exit — both have `serve_exit_node = true` and typically
-    /// `exit_mode = Off`, so the role cannot be inferred from those two
-    /// fields alone. macOS keys its blind-vs-regular exit dataplane on this
-    /// flag; Linux/Windows ignore it (their blind-exit posture is handled on
-    /// other paths).
+    /// blind exit (hardened final-hop exit: local-origin egress tunnel-only,
+    /// mesh-scoped forwarding, no NAT translation) from a regular NATing exit —
+    /// both have `serve_exit_node = true` and typically `exit_mode = Off`, so
+    /// the role cannot be inferred from those two fields alone. Linux
+    /// (`crate::linux_blind_exit`) and macOS (`crate::macos_blind_exit`) both
+    /// key their blind-vs-regular exit dataplane on this flag; Windows
+    /// blind_exit is out of scope by design (Linux/macOS only).
     pub blind_exit: bool,
 }
 
@@ -725,6 +726,11 @@ pub struct LinuxCommandSystem {
     /// "not configured" and loopback DNS ownership refuses to apply.
     dns_resolver_port: u16,
     dns_protected: bool,
+    /// Set once the irreversible `blind_exit` hardened-egress posture has been
+    /// applied. Like the macOS PF anchor it is one-way: rollback re-applies the
+    /// hard-lock from this config instead of relaxing to an open NAT, and only a
+    /// factory reset clears it (see [`crate::linux_blind_exit`]).
+    blind_exit_config: Option<crate::linux_blind_exit::LinuxBlindExitConfig>,
     expected_management_bypass_routes: BTreeSet<ExpectedBypassRoute>,
     expected_peer_endpoint_bypass_routes: BTreeSet<ExpectedBypassRoute>,
 }
@@ -786,6 +792,7 @@ impl LinuxCommandSystem {
             wg_listen_port: 0,
             dns_resolver_port: 0,
             dns_protected: false,
+            blind_exit_config: None,
             expected_management_bypass_routes: BTreeSet::new(),
             expected_peer_endpoint_bypass_routes: BTreeSet::new(),
         })
@@ -1591,6 +1598,74 @@ impl LinuxCommandSystem {
         format!("rustynet_g{}", self.generation)
     }
 
+    /// Apply the irreversible `blind_exit` hardened-egress posture.
+    ///
+    /// A blind exit is a *final-hop exit* that forwards mesh-sourced traffic to
+    /// the internet, but locked down far tighter than a regular NATing exit:
+    /// local-origin egress stays tunnel-only (the base killswitch `oifname
+    /// <tunnel> accept` + `policy drop`), forwarded traffic is scoped to the
+    /// signed mesh CIDR, and there is NO masquerade — the mesh source is never
+    /// translated (the "blind" property). This mirrors the reviewed macOS PF
+    /// hard-lock anchor; the rule builder + evaluator live in
+    /// [`crate::linux_blind_exit`].
+    fn apply_linux_blind_exit_locked(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        let table = self.firewall_table.clone().ok_or_else(|| {
+            SystemError::NatApplyFailed(
+                "blind_exit requires the killswitch table to be applied first".to_owned(),
+            )
+        })?;
+        let config = crate::linux_blind_exit::LinuxBlindExitConfig::new(
+            self.interface_name.clone(),
+            self.egress_interface.clone(),
+            mesh_cidr.to_owned(),
+        )
+        .map_err(SystemError::NatApplyFailed)?;
+        let commands = crate::linux_blind_exit::build_linux_blind_exit_forward_commands(
+            &config,
+            table.as_str(),
+        )
+        .map_err(SystemError::NatApplyFailed)?;
+
+        // Enable IPv4 forwarding so the kernel routes tunnel->egress for the
+        // mesh-scoped final hop (record the prior value for restore). blind_exit
+        // is a final-hop exit; the hardening is the filter policy below, not
+        // disabling the forward path.
+        self.prior_ipv4_forwarding = Some(Self::read_sysctl_bool(
+            "/proc/sys/net/ipv4/ip_forward",
+            "net.ipv4.ip_forward",
+        )?);
+        self.set_ipv4_forwarding(true)
+            .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
+
+        // blind_exit NEVER NATs. Tear down any masquerade table a prior
+        // generation (or a former regular-exit posture) left behind so the mesh
+        // source is never translated.
+        if let Some(previous) = self.nat_table.take() {
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &["delete", "table", "ip", previous.as_str()],
+            );
+        }
+
+        // Re-author the forward chain: flush the regular-exit unrestricted
+        // tunnel->egress allow the base killswitch installed, then add the
+        // conntrack accept + the mesh-source-scoped final-hop allow. The chain
+        // keeps `policy drop`, so a mid-sequence failure leaves it dropping
+        // (fail-closed), and everything not explicitly allowed is dropped.
+        for argv in &commands {
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            if let Err(err) = self.run(PrivilegedCommandProgram::Nft, &args) {
+                let _ = self.restore_ipv4_forwarding();
+                return Err(SystemError::NatApplyFailed(format!(
+                    "blind_exit forward-chain apply failed: {err}"
+                )));
+            }
+        }
+
+        self.blind_exit_config = Some(config);
+        Ok(())
+    }
+
     fn nat_table_name(&self) -> String {
         format!("rustynet_nat_g{}", self.generation)
     }
@@ -2023,9 +2098,19 @@ impl DataplaneSystem for LinuxCommandSystem {
         &mut self,
         _serve_exit_node: bool,
         _exit_mode: ExitMode,
-        _blind_exit: bool,
-        _mesh_cidr: &str,
+        blind_exit: bool,
+        mesh_cidr: &str,
     ) -> Result<(), SystemError> {
+        // The irreversible `blind_exit` role is a hardened final-hop exit, NOT a
+        // regular NATing exit: it forwards only mesh-sourced traffic, keeps
+        // local-origin egress tunnel-only, and installs NO masquerade. Branch
+        // before the regular NAT setup so none of the masquerade / own-egress
+        // allow below is ever programmed for a blind_exit node. Mirrors the
+        // macOS `MacosCommandSystem::apply_nat_forwarding` blind_exit branch.
+        if blind_exit {
+            return self.apply_linux_blind_exit_locked(mesh_cidr);
+        }
+
         self.prior_ipv4_forwarding = Some(Self::read_sysctl_bool(
             "/proc/sys/net/ipv4/ip_forward",
             "net.ipv4.ip_forward",
@@ -2166,6 +2251,38 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 
     fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError> {
+        // blind_exit is irreversible: re-apply the hard-lock instead of
+        // relaxing to an open NAT (mirrors the macOS rollback that re-loads the
+        // PF anchor). Only a factory reset clears it.
+        if let Some(config) = self.blind_exit_config.clone() {
+            let table = self.firewall_table.clone().ok_or_else(|| {
+                SystemError::RollbackFailed(
+                    "blind_exit rollback requires the killswitch table".to_owned(),
+                )
+            })?;
+            // No masquerade may survive: drop any NAT table before re-locking.
+            if let Some(nat) = self.nat_table.take() {
+                self.run_allow_failure(
+                    PrivilegedCommandProgram::Nft,
+                    &["delete", "table", "ip", nat.as_str()],
+                );
+            }
+            let commands = crate::linux_blind_exit::build_linux_blind_exit_forward_commands(
+                &config,
+                table.as_str(),
+            )
+            .map_err(SystemError::RollbackFailed)?;
+            for argv in &commands {
+                let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+                self.run(PrivilegedCommandProgram::Nft, &args)
+                    .map_err(|err| {
+                        SystemError::RollbackFailed(format!(
+                            "blind_exit forward-chain re-lock failed: {err}"
+                        ))
+                    })?;
+            }
+            return Ok(());
+        }
         if let Some(table) = self.nat_table.take() {
             self.run_allow_failure(
                 PrivilegedCommandProgram::Nft,
