@@ -103,6 +103,63 @@ matrix.
 - All gates green (excluding documented env-blocked tests). Committed as
   Iwan-Teague, pushed. **Live runs against mac/win guests remain the human step.**
 
+## 8. OUTCOME — Wave 2 Batch A COMPLETE (2026-06-25)
+
+Four parallel worktree agents (disjoint binaries) + reviewer merge/gate. On `main`:
+- `b393fac` **W2-A exit-handoff** — **deleted the deceptive substitute validators**
+  (`run_macos_exit_handoff`/`run_windows_exit_handoff` + their report structs, ~700
+  lines) that ran 0/6 real checks and reported pass. Every platform now runs the
+  SINGLE real A→B 6-check failover body via per-OS `PlatformCommands`. Net −481 lines.
+  113 tests.
+- `264c108` **W2-B two-hop** — Wave-0 data-plane + TTL−2 proof made `--platform`-aware
+  (per-OS mesh-IP discovery, BSD/iputils/Windows TTL parsers). 116 tests.
+- `6291796` **W2-C lan-toggle/blind_exit** — per-OS killswitch/route assertions
+  (nft/pf-anchor/WFP), grounded in real daemon constants. 36 tests.
+- `d7e307c` **W2-D managed-DNS** — 14-check suite cross-OS; core query kept
+  OS-independent via the portable `rustynet ops e2e-dns-query` UDP client; per-OS
+  config inspection (`scutil`/`Get-DnsClientServerAddress`). 49 tests.
+
+Gate on merged tree: fmt + clippy `-D warnings` clean; **314 tests across the 4 bins,
+0 failed**. Verified: substitute validators gone, **no per-OS fake-pass shortcut**,
+Linux paths byte-identical (each agent added a Linux-byte-identical guard test).
+
+### What Batch A actually delivered (honest)
+The **assertion logic + per-OS command branches + per-OS pure parsers are now cross-OS
+and unit-tested**. macOS (POSIX) is the closer-to-runnable target. **End-to-end live
+mac/win runs are NOT yet green** — two cross-cutting blockers surfaced (consistently
+flagged by 3–4 agents), which are the real Batch-A finding:
+
+1. **Shared SSH transport is POSIX-shaped.** The older binaries (two-hop, lan-toggle,
+   managed-DNS) drive the guest through `live_lab_support`, whose transport wraps every
+   argv in `sudo -n sh -lc` — **Windows has no `sudo`/`sh`**, so the Windows path
+   fail-closes at the transport preflight (honest, not a fake-pass). True Windows
+   parity for these requires **migrating them to the `live_lab_bin_support`
+   `RemoteShellHost` seam** (the cross-OS transport relay/mixed-topology/exit-handoff
+   already use) — a shared-module refactor = a dedicated follow-up (NOT a disjoint
+   per-binary task). exit-handoff (W2-A) already uses the cross-OS seam.
+2. **Linux-shaped control-plane/setup preamble.** Bundle issuance, `enforce_host`,
+   route-advertise, and the `/run/rustynet/rustynetd.sock` path are Linux-shaped in the
+   setup preamble of each binary, so a live mac/win run fail-closes at setup before
+   reaching the (now cross-OS) assertion tail. Porting the preamble is the other
+   prerequisite for end-to-end green.
+
+### Daemon-side gaps the honest tests will surface red (tracked; some need a builder)
+- Windows-as-exit unsupported at the role gate (`role.rs:65`); macOS-exit maps to
+  `blind_exit` which needs the Linux-only `anchor` capability (`role.rs:61`) — both
+  exit-handoff hosts fail-close live at `enforce_host`/route-advertise.
+- Windows `blind_exit` dataplane unimplemented (`WindowsCommandSystem::apply_nat_forwarding`
+  ignores `_blind_exit`); macOS/Windows-as-intermediate-hop (two-hop) unconfirmed; no
+  standalone managed-DNS service on mac/win (hosted in the main daemon).
+These are real `cfg(macos)`/`cfg(windows)` daemon gaps — the honest cross-OS tests now
+expose them at live-run instead of hiding behind a blanket "not enabled".
+
+### Remaining
+- **Batch B:** role-switch matrix, network-flap, reboot-recovery, enrollment-restart +
+  wire the dead macOS producers (`macos_runtime_acls`/`macos_key_custody`/`MacosDaemonProbe`).
+- **New follow-up waves surfaced by Batch A:** (i) migrate the POSIX-transport binaries
+  to `RemoteShellHost` (Windows parity), (ii) port the Linux-shaped control-plane setup
+  preamble. Both are prerequisites for end-to-end live mac/win runs of these cells.
+
 ## 7. Honest scope note
 Porting a test ≠ the role works on that OS. Where the mac/win daemon lacks an
 operation, Wave 2 converts a blanket "not enabled" into a *specific, honest*
