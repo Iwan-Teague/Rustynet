@@ -1,8 +1,14 @@
 # Cross-Platform CI Health — pre-existing breakage cleanup + runbook — 2026-06-25
 
-Status: **IN EXECUTION**. Windows clippy + a real Windows persist bug cleared;
-macOS / Debian / Linux-E2E jobs still red on pre-existing/infra issues (tracked
-below). Author: Iwan-Teague.
+Status: **WINDOWS JOB FULLY GREEN as of `e3f99ce` (2026-06-25)** — `Build + test
+Windows-portable crates` AND `Security gates` both pass on `windows-2022` for the
+first time. All code-caused red is resolved (relay + rustynetd test-portability,
+the secret-equality line-drift + drift-resistant re-anchor, the macOS budget-test
+determinism, and the advisory-db CRLF parse fix). The only remaining red is the
+documented-environmental class: macOS = the single `vm_lab` Gatekeeper/`trustd`
+subprocess flake (§4.1, user-deferred; verified on `e3f99ce`: 1751 passed, 1
+failed — the budget-test fix landed, only the flake remains); Debian + Linux-E2E
+= `cargo: not found` bootstrap (§4.2, deferred infra). Author: Iwan-Teague.
 
 Purpose: the `cross-platform-ci.yml` workflow (jobs: **Windows build+security**,
 **macOS build+security**, **Debian 13 build+security**, **Linux real WireGuard
@@ -275,7 +281,7 @@ integration/bin tests pass, `no_secret_material_equality_in_workspace` ok.
 
 | Job | State | Blocker |
 |---|---|---|
-| Windows build+security | persist (§3) + relay (§3b, CI-confirmed) green; rustynetd portability fixes (§3c) + `--no-fail-fast` pushed | CI confirming §3c; Security gates pre-empted CLEAN locally (§4.4) |
+| Windows build+security | ✅ **GREEN @ `e3f99ce`** — build+test + Security gates both pass | none |
 | macOS build+security | red | `vm_lab` flake (§4.1) + a `userspace_shared_macos` socket-poll-budget timing test seen failing on `7734156`'s runner — watch whether it persists (could be runner-load flake or a real budget assertion) |
 | Debian 13 build+security | red | `cargo: not found` bootstrap (§4.2, deferred) |
 | Linux real WireGuard E2E | red | `cargo: not found` bootstrap (§4.2, deferred) |
