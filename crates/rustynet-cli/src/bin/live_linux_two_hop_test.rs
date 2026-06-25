@@ -947,6 +947,110 @@ fn run() -> Result<(), String> {
         &config.final_exit_host,
     )?;
 
+    // ─── F0.8: real two-hop data-plane + per-hop proof ────────────────────
+    //
+    // The status-string checks above (exit_node=…, serving_exit_node=true,
+    // state=ExitActive) and the `dev rustynet0` route only prove the control
+    // plane *intends* to two-hop; they never move a packet. Below we move
+    // real packets and assert two independent, behavioural facts:
+    //
+    //   1. END-TO-END REACHABILITY (the actual proof): from the client, ping
+    //      a PUBLIC target whose only route is `0.0.0.0/0 dev rustynet0`
+    //      (asserted as a precondition above). A returning echo reply proves
+    //      the datagram traversed client → entry(intermediate exit) →
+    //      final_exit → internet and came back — i.e. the full two-hop chain
+    //      actually forwarded traffic, not just advertised that it would.
+    //
+    //   2. PER-HOP EVIDENCE (TTL−2): the reply TTL observed at the client for
+    //      a ping to the FINAL-EXIT mesh IP is exactly 2 lower than for a ping
+    //      to the ENTRY mesh IP. Both reply originators are Linux (initial TTL
+    //      64), so the only thing that can move the delta is IP forwarding:
+    //      the entry-mesh reply is a direct tunnel peer (baseline), while the
+    //      final-exit-mesh reply crosses the entry's forwarding stack one extra
+    //      time in EACH direction (request out, reply back) — a clean −2. This
+    //      directly evidences that the entry node is *relaying onward*, which
+    //      no status string can fake.
+    //
+    // Design note (TTL−2 vs forwarded-counter): the spec offered either a TTL
+    // decrement of exactly 2 OR an entry forwarded-packet counter delta. We
+    // pick TTL−2 because the existing argv-only `capture_root`/`ssh_status`
+    // ping primitives expose the reply TTL directly and require no privileged
+    // /proc/net/snmp scraping, extra synchronisation, or assumptions about
+    // background traffic polluting a global forwarding counter. TTL−2 is a
+    // per-packet, self-contained, deterministic per-hop signal observable
+    // entirely through primitives already used by this binary.
+    //
+    // Fail-closed discipline (mirrors `probe_attempted` in the ipv6_leak
+    // tests): every probe records whether it actually executed. A probe that
+    // could not run (mesh-IP discovery failed, ping never produced parseable
+    // output) leaves `attempted=false`, and the evaluator treats a never-run
+    // probe as a FAIL — never a silent pass.
+    logger.line("[two-hop] discovering mesh tunnel addresses for data-plane probe")?;
+    let entry_mesh_ipv4 = discover_mesh_ipv4(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.entry_host,
+    )?;
+    let final_exit_mesh_ipv4 = discover_mesh_ipv4(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+    )?;
+    logger.line(
+        format!(
+            "[two-hop] entry mesh ipv4={} final-exit mesh ipv4={}",
+            entry_mesh_ipv4.as_deref().unwrap_or("<undiscovered>"),
+            final_exit_mesh_ipv4.as_deref().unwrap_or("<undiscovered>")
+        )
+        .as_str(),
+    )?;
+
+    logger.line("[two-hop] running end-to-end data-plane reachability probe through chain")?;
+    let end_to_end = probe_end_to_end_reachability(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.client_host,
+        TWO_HOP_PUBLIC_PROBE_TARGET,
+    );
+    logger.line(
+        format!(
+            "[two-hop] end-to-end probe attempted={} reachable={}",
+            end_to_end.attempted, end_to_end.reachable
+        )
+        .as_str(),
+    )?;
+
+    logger
+        .line("[two-hop] measuring per-hop TTL baseline (entry mesh) and two-hop (final exit)")?;
+    let baseline_ttl = match entry_mesh_ipv4.as_deref() {
+        Some(ip) => probe_reply_ttl(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            &config.client_host,
+            ip,
+        ),
+        None => TtlProbe::not_attempted(),
+    };
+    let two_hop_ttl = match final_exit_mesh_ipv4.as_deref() {
+        Some(ip) => probe_reply_ttl(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            &config.client_host,
+            ip,
+        ),
+        None => TtlProbe::not_attempted(),
+    };
+    logger.line(
+        format!(
+            "[two-hop] baseline(entry) ttl attempted={} ttl={:?}; two-hop(final-exit) ttl attempted={} ttl={:?}",
+            baseline_ttl.attempted, baseline_ttl.ttl, two_hop_ttl.attempted, two_hop_ttl.ttl
+        )
+        .as_str(),
+    )?;
+
+    let dataplane_proof =
+        evaluate_two_hop_dataplane_proof(&end_to_end, &baseline_ttl, &two_hop_ttl);
+
     logger.line("[two-hop] final client status")?;
     logger.block(&(client_status.clone() + "\n"))?;
     logger.line("[two-hop] final entry status")?;
@@ -963,6 +1067,8 @@ fn run() -> Result<(), String> {
     logger.block(&(entry_managed_peer_endpoints.clone() + "\n"))?;
     logger.line("[two-hop] entry wg endpoints (debug only)")?;
     logger.block(&(entry_wg_endpoints.clone() + "\n"))?;
+    logger.line("[two-hop] data-plane proof summary")?;
+    logger.block(&(dataplane_proof.summary_line() + "\n"))?;
 
     let check_client_exit_is_entry = if client_status
         .contains(&format!("exit_node={}", config.entry_node_id))
@@ -1028,6 +1134,18 @@ fn run() -> Result<(), String> {
     } else {
         "fail"
     };
+    // F0.8 behavioural proofs. These are the load-bearing data-plane
+    // assertions; the status-string checks above are now preconditions only.
+    let check_two_hop_end_to_end_reachable = if dataplane_proof.end_to_end_reachable {
+        "pass"
+    } else {
+        "fail"
+    };
+    let check_two_hop_per_hop_ttl_decrement = if dataplane_proof.per_hop_ttl_decrement_ok {
+        "pass"
+    } else {
+        "fail"
+    };
 
     let overall = [
         check_client_exit_is_entry,
@@ -1039,6 +1157,8 @@ fn run() -> Result<(), String> {
         check_managed_dns_fresh_all_nodes,
         check_entry_managed_peer_endpoints_visible,
         check_no_plaintext_passphrases,
+        check_two_hop_end_to_end_reachable,
+        check_two_hop_per_hop_ttl_decrement,
     ]
     .into_iter()
     .all(|value| value == "pass");
@@ -1053,7 +1173,7 @@ fn run() -> Result<(), String> {
     });
 
     let report = format!(
-        "{{\n  \"phase\": \"phase10\",\n  \"mode\": \"live_linux_two_hop\",\n  \"evidence_mode\": \"measured\",\n  \"captured_at\": \"{}\",\n  \"captured_at_unix\": {},\n  \"git_commit\": \"{}\",\n  \"status\": \"{}\",\n  \"final_exit_host\": \"{}\",\n  \"client_host\": \"{}\",\n  \"entry_host\": \"{}\",\n  \"second_client_host\": \"{}\",\n  \"proof_sources\": {{\n    \"entry_peer_visibility\": \"managed_peer_endpoints\",\n    \"entry_peer_visibility_error_field\": \"managed_peer_endpoints_error\",\n    \"entry_peer_visibility_debug_only\": \"wg_show_endpoints\"\n  }},\n  \"checks\": {{\n    \"client_exit_is_entry\": \"{}\",\n    \"entry_exit_is_final\": \"{}\",\n    \"entry_serves_exit\": \"{}\",\n    \"final_exit_serves\": \"{}\",\n    \"client_route_via_rustynet0\": \"{}\",\n    \"second_client_route_via_rustynet0\": \"{}\",\n    \"managed_dns_fresh_all_nodes\": \"{}\",\n    \"entry_peer_visibility\": \"{}\",\n    \"entry_managed_peer_endpoints_visible\": \"{}\",\n    \"no_plaintext_passphrase_files\": \"{}\"\n  }},\n  \"source_artifacts\": [\n    \"{}\"\n  ]\n}}\n",
+        "{{\n  \"phase\": \"phase10\",\n  \"mode\": \"live_linux_two_hop\",\n  \"evidence_mode\": \"measured\",\n  \"captured_at\": \"{}\",\n  \"captured_at_unix\": {},\n  \"git_commit\": \"{}\",\n  \"status\": \"{}\",\n  \"final_exit_host\": \"{}\",\n  \"client_host\": \"{}\",\n  \"entry_host\": \"{}\",\n  \"second_client_host\": \"{}\",\n  \"proof_sources\": {{\n    \"entry_peer_visibility\": \"managed_peer_endpoints\",\n    \"entry_peer_visibility_error_field\": \"managed_peer_endpoints_error\",\n    \"entry_peer_visibility_debug_only\": \"wg_show_endpoints\",\n    \"two_hop_end_to_end\": \"icmp_reachability_via_default_route_rustynet0\",\n    \"two_hop_per_hop\": \"reply_ttl_delta_entry_mesh_vs_final_exit_mesh\"\n  }},\n  \"dataplane\": {{\n    \"end_to_end_probe_target\": \"{}\",\n    \"end_to_end_probe_attempted\": {},\n    \"end_to_end_reachable\": {},\n    \"baseline_entry_mesh_ipv4\": \"{}\",\n    \"baseline_ttl_probe_attempted\": {},\n    \"baseline_reply_ttl\": {},\n    \"two_hop_final_exit_mesh_ipv4\": \"{}\",\n    \"two_hop_ttl_probe_attempted\": {},\n    \"two_hop_reply_ttl\": {},\n    \"per_hop_ttl_decrement\": {},\n    \"per_hop_ttl_decrement_ok\": {}\n  }},\n  \"checks\": {{\n    \"client_exit_is_entry\": \"{}\",\n    \"entry_exit_is_final\": \"{}\",\n    \"entry_serves_exit\": \"{}\",\n    \"final_exit_serves\": \"{}\",\n    \"client_route_via_rustynet0\": \"{}\",\n    \"second_client_route_via_rustynet0\": \"{}\",\n    \"managed_dns_fresh_all_nodes\": \"{}\",\n    \"entry_peer_visibility\": \"{}\",\n    \"entry_managed_peer_endpoints_visible\": \"{}\",\n    \"no_plaintext_passphrase_files\": \"{}\",\n    \"two_hop_end_to_end_reachable\": \"{}\",\n    \"two_hop_per_hop_ttl_decrement\": \"{}\"\n  }},\n  \"source_artifacts\": [\n    \"{}\"\n  ]\n}}\n",
         captured_at_utc,
         captured_at_unix,
         git_commit,
@@ -1062,6 +1182,19 @@ fn run() -> Result<(), String> {
         config.client_host,
         config.entry_host,
         config.second_client_host,
+        TWO_HOP_PUBLIC_PROBE_TARGET,
+        end_to_end.attempted,
+        end_to_end.reachable,
+        entry_mesh_ipv4.as_deref().unwrap_or(""),
+        baseline_ttl.attempted,
+        baseline_ttl.ttl.map_or(-1_i64, i64::from),
+        final_exit_mesh_ipv4.as_deref().unwrap_or(""),
+        two_hop_ttl.attempted,
+        two_hop_ttl.ttl.map_or(-1_i64, i64::from),
+        dataplane_proof
+            .per_hop_ttl_decrement
+            .map_or(-1_i64, i64::from),
+        dataplane_proof.per_hop_ttl_decrement_ok,
         check_client_exit_is_entry,
         check_entry_exit_is_final,
         check_entry_serves_exit,
@@ -1072,6 +1205,8 @@ fn run() -> Result<(), String> {
         check_entry_managed_peer_endpoints_visible,
         check_entry_managed_peer_endpoints_visible,
         check_no_plaintext_passphrases,
+        check_two_hop_end_to_end_reachable,
+        check_two_hop_per_hop_ttl_decrement,
         config.log_path.display(),
     );
     write_file(&config.report_path, &report)?;
@@ -1487,6 +1622,205 @@ fn utc_now_string() -> String {
     "1970-01-01T00:00:00Z".to_owned()
 }
 
+// ─── F0.8 data-plane probe support ────────────────────────────────────────────
+
+/// Public ICMP target for the end-to-end reachability probe. The client's only
+/// route to it is `0.0.0.0/0 dev rustynet0` (asserted as a precondition), so a
+/// returning echo reply can only mean the datagram traversed the entire
+/// client → entry → final_exit → internet chain and came back. Matches the
+/// public address already used by the route precondition (`ip route get
+/// 1.1.1.1`) and the exit-handoff data-plane ping, so we observe the same path.
+const TWO_HOP_PUBLIC_PROBE_TARGET: &str = "1.1.1.1";
+
+/// The CGNAT range the mesh assigns tunnel addresses from
+/// (`mesh_cidr=100.64.0.0/10`, see daemon membership bundles). Used to pick the
+/// rustynet0 tunnel address out of `ip -4 -o addr show dev rustynet0` output.
+const MESH_CIDR_PREFIX: &str = "100.";
+
+/// Number of expected forwarding decrements between the single-hop baseline
+/// (entry mesh IP, a direct tunnel peer) and the two-hop path (final-exit mesh
+/// IP, reached by the entry forwarding onward). The entry relays the request
+/// out and the reply back, so the reply observed at the client loses exactly
+/// two extra TTL units versus the baseline.
+const EXPECTED_PER_HOP_TTL_DECREMENT: i32 = 2;
+
+/// Outcome of the end-to-end ICMP reachability probe. `attempted` records that
+/// the probe actually ran (fail-closed discipline: a never-run probe is NOT a
+/// pass).
+struct EndToEndProbe {
+    attempted: bool,
+    reachable: bool,
+}
+
+/// Outcome of a single reply-TTL measurement. `attempted` is false when the
+/// probe could not run at all (e.g. the mesh IP was never discovered) or
+/// produced no parseable TTL — those MUST NOT be read as a clean result.
+struct TtlProbe {
+    attempted: bool,
+    ttl: Option<u8>,
+}
+
+impl TtlProbe {
+    fn not_attempted() -> Self {
+        Self {
+            attempted: false,
+            ttl: None,
+        }
+    }
+}
+
+/// Aggregated verdict for the two F0.8 behavioural assertions plus the measured
+/// TTL delta carried into the report.
+struct TwoHopDataplaneProof {
+    end_to_end_reachable: bool,
+    per_hop_ttl_decrement: Option<i32>,
+    per_hop_ttl_decrement_ok: bool,
+}
+
+impl TwoHopDataplaneProof {
+    fn summary_line(&self) -> String {
+        format!(
+            "end_to_end_reachable={} per_hop_ttl_decrement={} per_hop_ttl_decrement_ok={}",
+            self.end_to_end_reachable,
+            self.per_hop_ttl_decrement
+                .map_or_else(|| "none".to_owned(), |delta| delta.to_string()),
+            self.per_hop_ttl_decrement_ok
+        )
+    }
+}
+
+/// Pure verdict: combine the end-to-end and per-hop probes into the two
+/// behavioural pass/fail facts. Fail-closed throughout:
+///   - end-to-end passes only if it was attempted AND a reply returned;
+///   - per-hop passes only if BOTH TTL probes were attempted, BOTH parsed a
+///     TTL, and the baseline−two_hop delta is exactly the expected decrement.
+///
+/// A missing/unattempted probe yields `None`/`false`, never a silent pass.
+fn evaluate_two_hop_dataplane_proof(
+    end_to_end: &EndToEndProbe,
+    baseline_ttl: &TtlProbe,
+    two_hop_ttl: &TtlProbe,
+) -> TwoHopDataplaneProof {
+    let end_to_end_reachable = end_to_end.attempted && end_to_end.reachable;
+    let per_hop_ttl_decrement = compute_ttl_decrement(baseline_ttl, two_hop_ttl);
+    let per_hop_ttl_decrement_ok = per_hop_ttl_decrement == Some(EXPECTED_PER_HOP_TTL_DECREMENT);
+    TwoHopDataplaneProof {
+        end_to_end_reachable,
+        per_hop_ttl_decrement,
+        per_hop_ttl_decrement_ok,
+    }
+}
+
+/// `baseline_ttl − two_hop_ttl`, but only when both probes were attempted and
+/// both parsed a TTL. Returns `None` (fail-closed) otherwise.
+fn compute_ttl_decrement(baseline_ttl: &TtlProbe, two_hop_ttl: &TtlProbe) -> Option<i32> {
+    if !baseline_ttl.attempted || !two_hop_ttl.attempted {
+        return None;
+    }
+    let baseline = baseline_ttl.ttl?;
+    let two_hop = two_hop_ttl.ttl?;
+    Some(i32::from(baseline) - i32::from(two_hop))
+}
+
+/// Discover the rustynet0 tunnel (mesh) IPv4 address on `host`. Argv-only via
+/// the existing `capture_root` primitive; the command is a fixed literal with
+/// no untrusted interpolation. Returns `None` (not an error) when no mesh
+/// address is present so the caller can record the probe as not-attempted and
+/// fail closed in the evaluator rather than aborting the whole stage.
+fn discover_mesh_ipv4(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+) -> Result<Option<String>, String> {
+    let raw = capture_root(
+        identity,
+        known_hosts,
+        host,
+        "ip -4 -o addr show dev rustynet0 2>/dev/null || true",
+    )?;
+    Ok(parse_mesh_ipv4_from_ip_addr(&raw))
+}
+
+/// Parse the first mesh-range (`100.64.0.0/10`) IPv4 address out of
+/// `ip -4 -o addr show dev rustynet0` output, e.g.:
+///   `4: rustynet0    inet 100.64.0.3/32 scope global rustynet0\       valid_lft ...`
+/// Returns `None` if no `inet 100.x` token is present.
+fn parse_mesh_ipv4_from_ip_addr(output: &str) -> Option<String> {
+    let mut tokens = output.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        if token != "inet" {
+            continue;
+        }
+        if let Some(addr_with_prefix) = tokens.peek() {
+            let addr = addr_with_prefix
+                .split('/')
+                .next()
+                .unwrap_or(addr_with_prefix);
+            if addr.starts_with(MESH_CIDR_PREFIX) && addr.parse::<std::net::Ipv4Addr>().is_ok() {
+                return Some(addr.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// End-to-end reachability probe: ping `target` from `host` through the tunnel
+/// chain. Reuses the same argv-only `ssh_status` ping pattern as the
+/// exit-handoff data-plane monitor. A transport error or a non-zero ping exit
+/// records `reachable=false`; `attempted` is true whenever the ping command was
+/// dispatched (we always dispatch it here).
+fn probe_end_to_end_reachability(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    target: &str,
+) -> EndToEndProbe {
+    let command = format!("ping -c 3 -W 2 {} >/dev/null 2>&1", shell_quote(target));
+    let reachable = matches!(
+        ssh_status(identity, known_hosts, host, &command),
+        Ok(status) if status.success()
+    );
+    EndToEndProbe {
+        attempted: true,
+        reachable,
+    }
+}
+
+/// Measure the reply TTL the client observes when pinging `target`. Uses the
+/// argv-only `capture_root` primitive (fixed-shape command, `target`
+/// shell-quoted) and parses the `ttl=<n>` field from the ping reply. A probe
+/// that produces no parseable TTL is recorded `attempted=true, ttl=None`, which
+/// the evaluator treats as a fail (cannot prove the per-hop delta).
+fn probe_reply_ttl(identity: &Path, known_hosts: &Path, host: &str, target: &str) -> TtlProbe {
+    // `-c 3` tolerates a single dropped echo while the tunnel settles; the
+    // first parseable ttl= field is taken. 2>&1 so a transient error still
+    // yields parseable stdout where present.
+    let command = format!("ping -c 3 -W 2 {} 2>&1 || true", shell_quote(target));
+    match capture_root(identity, known_hosts, host, &command) {
+        Ok(output) => TtlProbe {
+            attempted: true,
+            ttl: parse_ping_reply_ttl(&output),
+        },
+        // A transport failure means the probe did not produce a measurement.
+        Err(_) => TtlProbe::not_attempted(),
+    }
+}
+
+/// Parse the reply TTL from `ping` stdout. Linux `iputils` ping prints
+/// `64 bytes from 100.64.0.3: icmp_seq=1 ttl=63 time=0.40 ms`; the field is
+/// lowercase `ttl=`. Returns the first parseable value, or `None` if absent
+/// (e.g. all requests timed out, so no reply line was printed).
+fn parse_ping_reply_ttl(output: &str) -> Option<u8> {
+    for token in output.split_whitespace() {
+        if let Some(value) = token.strip_prefix("ttl=")
+            && let Ok(ttl) = value.parse::<u8>()
+        {
+            return Some(ttl);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1614,5 +1948,161 @@ mod tests {
             "1.1.1.1 dev rustynet0",
             "1.1.1.1 dev rustynet0",
         ));
+    }
+
+    #[test]
+    fn parse_ping_reply_ttl_reads_iputils_reply_line() {
+        let out = "PING 100.64.0.3 (100.64.0.3) 56(84) bytes of data.\n\
+                   64 bytes from 100.64.0.3: icmp_seq=1 ttl=63 time=0.40 ms\n";
+        assert_eq!(super::parse_ping_reply_ttl(out), Some(63));
+    }
+
+    #[test]
+    fn parse_ping_reply_ttl_returns_none_when_all_requests_time_out() {
+        let out = "PING 100.64.0.5 (100.64.0.5) 56(84) bytes of data.\n\n\
+                   --- 100.64.0.5 ping statistics ---\n\
+                   3 packets transmitted, 0 received, 100% packet loss, time 2043ms\n";
+        assert_eq!(super::parse_ping_reply_ttl(out), None);
+    }
+
+    #[test]
+    fn parse_mesh_ipv4_picks_rustynet0_cgnat_address() {
+        let out = "4: rustynet0    inet 100.64.0.3/32 scope global rustynet0\\       valid_lft forever preferred_lft forever\n";
+        assert_eq!(
+            super::parse_mesh_ipv4_from_ip_addr(out),
+            Some("100.64.0.3".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_mesh_ipv4_ignores_non_mesh_addresses() {
+        // A stray non-mesh inet on the device must not be mistaken for the
+        // tunnel address; only the 100.x CGNAT mesh range is accepted.
+        let out = "4: rustynet0    inet 192.168.18.5/24 scope global rustynet0\n";
+        assert_eq!(super::parse_mesh_ipv4_from_ip_addr(out), None);
+    }
+
+    #[test]
+    fn parse_mesh_ipv4_returns_none_on_empty() {
+        assert_eq!(super::parse_mesh_ipv4_from_ip_addr(""), None);
+    }
+
+    #[test]
+    fn compute_ttl_decrement_requires_both_probes_attempted_and_parsed() {
+        let attempted_63 = super::TtlProbe {
+            attempted: true,
+            ttl: Some(63),
+        };
+        let attempted_61 = super::TtlProbe {
+            attempted: true,
+            ttl: Some(61),
+        };
+        assert_eq!(
+            super::compute_ttl_decrement(&attempted_63, &attempted_61),
+            Some(2)
+        );
+        // A not-attempted probe yields None (fail-closed), never a silent 0.
+        assert_eq!(
+            super::compute_ttl_decrement(&super::TtlProbe::not_attempted(), &attempted_61),
+            None
+        );
+        // Attempted but unparsed TTL also fails closed.
+        let attempted_no_ttl = super::TtlProbe {
+            attempted: true,
+            ttl: None,
+        };
+        assert_eq!(
+            super::compute_ttl_decrement(&attempted_63, &attempted_no_ttl),
+            None
+        );
+    }
+
+    #[test]
+    fn evaluate_two_hop_dataplane_proof_passes_on_reach_and_ttl_minus_two() {
+        let proof = super::evaluate_two_hop_dataplane_proof(
+            &super::EndToEndProbe {
+                attempted: true,
+                reachable: true,
+            },
+            &super::TtlProbe {
+                attempted: true,
+                ttl: Some(63),
+            },
+            &super::TtlProbe {
+                attempted: true,
+                ttl: Some(61),
+            },
+        );
+        assert!(proof.end_to_end_reachable);
+        assert_eq!(proof.per_hop_ttl_decrement, Some(2));
+        assert!(proof.per_hop_ttl_decrement_ok);
+    }
+
+    #[test]
+    fn evaluate_two_hop_dataplane_proof_fails_closed_on_unattempted_end_to_end() {
+        // A never-run end-to-end probe must NOT count as reachable, mirroring
+        // the ipv6_leak `probe_attempted` discipline.
+        let proof = super::evaluate_two_hop_dataplane_proof(
+            &super::EndToEndProbe {
+                attempted: false,
+                reachable: false,
+            },
+            &super::TtlProbe {
+                attempted: true,
+                ttl: Some(63),
+            },
+            &super::TtlProbe {
+                attempted: true,
+                ttl: Some(61),
+            },
+        );
+        assert!(!proof.end_to_end_reachable);
+        // The per-hop sub-proof can still be valid independently.
+        assert!(proof.per_hop_ttl_decrement_ok);
+    }
+
+    #[test]
+    fn evaluate_two_hop_dataplane_proof_rejects_wrong_ttl_delta() {
+        // A single-hop delta (−1) or no-forward delta (0) must not satisfy the
+        // two-hop per-hop assertion: only an exact −2 proves the entry relayed
+        // onward.
+        for (baseline, two_hop) in [(63u8, 63u8), (63, 62), (63, 60)] {
+            let proof = super::evaluate_two_hop_dataplane_proof(
+                &super::EndToEndProbe {
+                    attempted: true,
+                    reachable: true,
+                },
+                &super::TtlProbe {
+                    attempted: true,
+                    ttl: Some(baseline),
+                },
+                &super::TtlProbe {
+                    attempted: true,
+                    ttl: Some(two_hop),
+                },
+            );
+            assert!(
+                !proof.per_hop_ttl_decrement_ok,
+                "delta {} must fail the exact -2 per-hop assertion",
+                i32::from(baseline) - i32::from(two_hop)
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_two_hop_dataplane_proof_fails_closed_on_unattempted_ttl_probe() {
+        let proof = super::evaluate_two_hop_dataplane_proof(
+            &super::EndToEndProbe {
+                attempted: true,
+                reachable: true,
+            },
+            &super::TtlProbe::not_attempted(),
+            &super::TtlProbe {
+                attempted: true,
+                ttl: Some(61),
+            },
+        );
+        assert_eq!(proof.per_hop_ttl_decrement, None);
+        assert!(!proof.per_hop_ttl_decrement_ok);
     }
 }
