@@ -1577,6 +1577,16 @@ mod tests {
     #[test]
     fn macos_runtime_authoritative_socket_poll_is_budgeted_per_tick() {
         let (mut state, _tun_state, _private_key) = test_runtime_state("utun18");
+        // Raise SO_RCVBUF so all MAX+3 datagrams are buffered simultaneously
+        // before the first poll. macOS's default UDP receive buffer drops some
+        // under CI load (~28 of 67), which leaves fewer than MAX queued and so
+        // never exercises the per-tick budget cap — the source of this test's
+        // flakiness. 1 MiB holds the 67 one-byte datagrams with large margin and
+        // stays well under `kern.ipc.maxsockbuf`.
+        state
+            .authoritative_socket
+            .set_recv_buffer_size_for_test(1024 * 1024)
+            .expect("enlarge authoritative recv buffer so all datagrams queue");
         let remote = UdpSocket::bind("127.0.0.1:0").expect("remote bind");
         let target = loopback_target(
             state

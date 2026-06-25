@@ -1163,6 +1163,7 @@ dependencies = [
  "rustynet-backend-api",
  "rustynet-tun",
  "rustynet-windows-native",
+ "socket2",
  "tempfile",
  "zeroize",
 ]
