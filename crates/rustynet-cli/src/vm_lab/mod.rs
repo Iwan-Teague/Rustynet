@@ -14868,12 +14868,25 @@ fn evaluate_linux_exit_demotion_residue_artifact(
                 require_json_u64(&report, "schema_version").unwrap_or_default()
             )
         })?;
+    let mesh_cidr = require_json_str(&report, "mesh_cidr")?;
+    validate_cidr_like("mesh_cidr", mesh_cidr)?;
     let during = require_json_value(&report, "during_run")?;
     if !require_json_bool(during, "nat_table_present")? {
         return Err(
             "linux exit demotion residue artifact did not prove exit-serving NAT present before demotion (anti-vacuous guard)"
                 .to_owned(),
         );
+    }
+    // Anti-vacuous guard parity with the NAT-lifecycle validator
+    // (evaluate_linux_exit_nat_lifecycle_artifact): the during-run snapshot must
+    // also prove the NAT was translating the MESH prefix (not some unrelated
+    // table that merely happened to exist), so the "was actually serving exit"
+    // precondition cannot be satisfied by a stale/wrong-scope NAT table.
+    let internal_prefix = require_json_str(during, "internal_prefix")?;
+    if internal_prefix != mesh_cidr {
+        return Err(format!(
+            "linux exit demotion residue artifact internal_prefix {internal_prefix:?} did not match mesh_cidr {mesh_cidr:?} (during-run NAT was not scoped to the mesh prefix)"
+        ));
     }
     require_forwarding_enabled_macos(during, "tunnel_forwarding")?;
     require_forwarding_enabled_macos(during, "egress_forwarding")?;
@@ -15369,6 +15382,38 @@ fn evaluate_linux_exit_dns_failclosed_artifact_dir(
         .map_err(|err| format!("read tcp_block_pcap.txt failed: {err}"))?;
     require_empty_dns_pcap("tcp_block_pcap.txt", tcp_pcap.as_str())?;
 
+    // Anti-vacuous guard (mirrors the macOS validator): an empty egress pcap
+    // only proves the killswitch works if a real off-tunnel DNS query was
+    // actively driven during the capture. dns_block_probe.json records that
+    // probe; fail closed unless it ran AND no DNS response was observed on
+    // either transport. Without this, the require_empty_dns_pcap checks above
+    // pass on "nothing tried DNS" — a vacuous PASS, not a fail-closed proof.
+    let probe = fs::read_to_string(artifact_dir.join("dns_block_probe.json"))
+        .map_err(|err| format!("read dns_block_probe.json failed: {err}"))?;
+    let probe_report: Value = serde_json::from_str(&probe)
+        .map_err(|err| format!("parse dns_block_probe.json failed: {err}"))?;
+    require_json_u64(&probe_report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| "dns_block_probe.json returned unsupported schema_version".to_owned())?;
+    if !require_json_bool(&probe_report, "probe_attempted")? {
+        return Err(
+            "dns_block_probe.json reports the blocked-path probe never ran; an empty pcap without an active off-tunnel probe is vacuous — failing closed"
+                .to_owned(),
+        );
+    }
+    if require_json_bool(&probe_report, "udp_response_received")?
+        || require_json_bool(&probe_report, "tcp_response_received")?
+    {
+        return Err(
+            "dns_block_probe.json observed a DNS response on the off-tunnel path: LAN DNS is NOT fail-closed (leak)"
+                .to_owned(),
+        );
+    }
+    if !require_json_bool(&probe_report, "overall_ok")? {
+        return Err("dns_block_probe.json did not report overall_ok=true".to_owned());
+    }
+
     let positive_control = fs::read_to_string(artifact_dir.join("tunnel_path_resolves.json"))
         .map_err(|err| format!("read tunnel_path_resolves.json failed: {err}"))?;
     let positive_report: Value = serde_json::from_str(&positive_control)
@@ -15386,7 +15431,7 @@ fn evaluate_linux_exit_dns_failclosed_artifact_dir(
     evaluate_linux_dns_failclosed_report(linux_alias, dns_check.as_str())?;
 
     Ok(format!(
-        "Linux exit DNS leak proof verified on {linux_alias}: UDP/TCP egress pcaps empty and tunnel positive control passed"
+        "Linux exit DNS leak proof verified on {linux_alias}: off-tunnel probe driven, UDP/TCP egress pcaps empty, no probe response, and tunnel positive control passed"
     ))
 }
 
@@ -15395,6 +15440,7 @@ fn linux_exit_dns_failclosed_artifact_set_complete(artifact_dir: &Path) -> Resul
         "firewall_block_rules.json",
         "udp_block_pcap.txt",
         "tcp_block_pcap.txt",
+        "dns_block_probe.json",
         "tunnel_path_resolves.json",
         "linux_dns_failclosed_check.json",
     ];
@@ -15643,6 +15689,19 @@ fn require_dns_block_rule(rules: &[Value], expected_name: &str) -> Result<(), St
     Ok(())
 }
 
+/// Assert that a blocked-path DNS capture is empty (no DNS/53 egress was seen).
+///
+/// INVARIANT — this helper proves only HALF the DNS-leak contract and is unsafe
+/// on its own. An empty pcap is *vacuous* unless something actively drove an
+/// off-tunnel DNS query during the capture window: "no DNS egress observed"
+/// could simply mean "no DNS was ever attempted". Every caller MUST therefore
+/// pair this with a `probe_attempted` assertion over the producer's
+/// `dns_block_probe.json` artifact (probe ran AND no udp/tcp response observed)
+/// — see `evaluate_linux_exit_dns_failclosed_artifact_dir` and
+/// `evaluate_macos_exit_dns_failclosed_artifact_dir`. Do NOT weaken this helper
+/// to accept a non-empty pcap; the empty-pcap check and the active-probe check
+/// together form the proof. A future Windows caller MUST stay Skipped until its
+/// producer emits the same probe artifact.
 fn require_empty_dns_pcap(label: &str, content: &str) -> Result<(), String> {
     let trimmed = content.trim();
     if trimmed.is_empty() || trimmed.contains("0 packets captured") {
@@ -17618,11 +17677,27 @@ fn run_linux_orchestration_stages_with_options(
             known_hosts_path,
         ) {
             Ok(summary) => {
-                let _ = std::fs::write(&relay_lifecycle_log_path, summary.as_str());
+                // FAIL-LOUD honesty (Roadmap §7, Wave-0 F0.7): this stage only
+                // exercises the `ops install-systemd-relay --dry-run` +
+                // `--uninstall --dry-run` PLAN strings on the guest. It never
+                // installs the unit, starts the relay, forwards a frame, nor
+                // proves ciphertext-only/zero-ingress teardown. A passing
+                // dry-run plan is therefore NOT live proof of the relay
+                // lifecycle and MUST NOT record Pass — record Skipped so the run
+                // aggregate cannot count it as a live role proof (mirrors the
+                // 06-24 Windows-contract demotion). The REAL forwarded-frame
+                // proof (install → start → forward client→relay→peer → prove
+                // zero-ingress → uninstall → no residue) is a Wave 4
+                // (cross-network/dataplane) deliverable, NOT built here. A
+                // contract *violation* (Err) is still a real defect → Fail.
+                let message = format!(
+                    "contract-only (NOT live-proven): {summary}. Only the install/uninstall --dry-run plan was exercised on {linux_alias}; the relay was not installed, started, nor a frame forwarded — the live forwarded-frame proof is a Wave 4 deliverable."
+                );
+                let _ = std::fs::write(&relay_lifecycle_log_path, message.as_str());
                 stage_outcome(
                     "validate_linux_relay_service_lifecycle",
-                    VmLabStageStatus::Pass,
-                    summary,
+                    VmLabStageStatus::Skipped,
+                    message,
                     vec![relay_lifecycle_log_path.clone()],
                 )
             }
@@ -35577,6 +35652,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "daemon_still_running": true,
             "during_run": {
                 "nat_table_present": true,
+                "internal_prefix": "100.64.0.0/16",
                 "tunnel_forwarding": "Enabled",
                 "egress_forwarding": "Enabled"
             },
@@ -35654,6 +35730,24 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         )
         .expect_err("must prove exit-serving before demotion");
         assert!(err.contains("anti-vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_linux_exit_demotion_residue_rejects_internal_prefix_mismatch() {
+        // F0.10 parity with the NAT-lifecycle validator: the during-run NAT must
+        // be scoped to the mesh prefix. A during-run NAT whose internal_prefix
+        // does not match mesh_cidr is a wrong-scope table that must not satisfy
+        // the "was actually serving exit" guard.
+        let mut payload = reviewed_linux_exit_demotion_residue_artifact();
+        payload["during_run"]["internal_prefix"] =
+            serde_json::Value::String("10.0.0.0/8".to_owned());
+        let err = super::evaluate_linux_exit_demotion_residue_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("internal_prefix not matching mesh_cidr must fail closed");
+        assert!(err.contains("internal_prefix"), "unexpected error: {err}");
+        assert!(err.contains("mesh_cidr"), "unexpected error: {err}");
     }
 
     #[test]
@@ -38956,6 +39050,20 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             .expect("write udp pcap");
         std::fs::write(dir.join("tcp_block_pcap.txt"), "").expect("write tcp pcap");
         std::fs::write(
+            dir.join("dns_block_probe.json"),
+            r#"{
+                "schema_version": 1,
+                "overall_ok": true,
+                "probe_attempted": true,
+                "probe_target": "192.168.1.1",
+                "probe_query": "rustynet-dns-leak-probe.invalid",
+                "udp_response_received": false,
+                "tcp_response_received": false,
+                "reason": "off-tunnel DNS probe received no UDP or TCP response"
+            }"#,
+        )
+        .expect("write dns_block_probe");
+        std::fs::write(
             dir.join("tunnel_path_resolves.json"),
             r#"{
                 "schema_version": 1,
@@ -39009,6 +39117,60 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             super::evaluate_linux_exit_dns_failclosed_artifact_dir("debian-utm-1", temp.path())
                 .expect_err("DNS pcap leak must reject");
         assert!(err.contains("udp_block_pcap.txt"));
+    }
+
+    #[test]
+    fn evaluate_linux_exit_dns_failclosed_artifact_dir_rejects_vacuous_probe() {
+        // An empty pcap with a probe that NEVER RAN is the vacuity this guard
+        // closes (mirrors the macOS validator): the capture proves nothing if no
+        // off-tunnel DNS was attempted.
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        write_reviewed_linux_exit_dns_artifacts(temp.path());
+        std::fs::write(
+            temp.path().join("dns_block_probe.json"),
+            r#"{
+                "schema_version": 1,
+                "overall_ok": false,
+                "probe_attempted": false,
+                "probe_target": "",
+                "probe_query": "rustynet-dns-leak-probe.invalid",
+                "udp_response_received": false,
+                "tcp_response_received": false,
+                "reason": "blocked-path DNS probe did not execute"
+            }"#,
+        )
+        .expect("write vacuous probe");
+        let err =
+            super::evaluate_linux_exit_dns_failclosed_artifact_dir("debian-utm-1", temp.path())
+                .expect_err("a probe that never ran must fail closed");
+        assert!(err.contains("never ran"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_linux_exit_dns_failclosed_artifact_dir_rejects_probe_response() {
+        // A DNS response on the off-tunnel path is a leak even with an empty
+        // pcap snapshot (e.g. the response slipped just outside the capture).
+        // Mirrors the macOS `_rejects_probe_response` fixture test.
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        write_reviewed_linux_exit_dns_artifacts(temp.path());
+        std::fs::write(
+            temp.path().join("dns_block_probe.json"),
+            r#"{
+                "schema_version": 1,
+                "overall_ok": false,
+                "probe_attempted": true,
+                "probe_target": "192.168.1.1",
+                "probe_query": "rustynet-dns-leak-probe.invalid",
+                "udp_response_received": true,
+                "tcp_response_received": false,
+                "reason": "off-tunnel DNS probe received a response: LAN DNS path is OPEN (leak)"
+            }"#,
+        )
+        .expect("write leaking probe");
+        let err =
+            super::evaluate_linux_exit_dns_failclosed_artifact_dir("debian-utm-1", temp.path())
+                .expect_err("an observed off-tunnel DNS response must fail");
+        assert!(err.contains("NOT fail-closed"), "unexpected error: {err}");
     }
 
     #[test]
