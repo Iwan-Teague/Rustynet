@@ -61,9 +61,12 @@ reviewer — never edits the shared module (would collide).
 - **Batch A (dispatch now, 4 parallel):** exit-handoff, two-hop, lan-toggle/blind_exit,
   managed-DNS. (Highest value: exit-handoff kills the deceptive false-parity; the
   other three build on Wave-0 groundwork or are self-contained.)
-- **Batch B (after A reviewed):** role-switch matrix, network-flap, reboot-recovery,
-  enrollment-restart, + wire the dead macOS producers (`macos_runtime_acls`,
-  `macos_key_custody`, `MacosDaemonProbe`) into a macOS validate stage.
+- **Batch B (after A reviewed):** role-switch matrix (DONE, `ccf50a5`), network-flap,
+  reboot-recovery, enrollment-restart. (The planned "wire the dead macOS producers"
+  item is DROPPED — recon proved the macOS ACL/key-custody producers are ALREADY
+  live-invoked via the rust-native `ValidateBaselineRuntime`→`MacosDaemonProbe` path;
+  the audit's "dead capability" finding was wrong. Only the unused `daemon_probe_for`
+  helper is dead, and it's harmless.)
 
 ## 4. Per-agent contract
 - Remove `enforce_linux_only_until_validator_lands` from your binary's `run()`.
@@ -154,8 +157,12 @@ These are real `cfg(macos)`/`cfg(windows)` daemon gaps — the honest cross-OS t
 expose them at live-run instead of hiding behind a blanket "not enabled".
 
 ### Remaining
-- **Batch B:** role-switch matrix, network-flap, reboot-recovery, enrollment-restart +
-  wire the dead macOS producers (`macos_runtime_acls`/`macos_key_custody`/`MacosDaemonProbe`).
+- **Batch B:** role-switch matrix **DONE** (`ccf50a5`, W2-E — Windows host branch via
+  `RemoteShellHost`, 97 tests, control-plane preamble + named-pipe-IPC gaps flagged).
+  Remaining: network-flap, reboot-recovery, enrollment-restart (each needs the full
+  `--platform` scaffold added — they have NONE today — and is Windows-transport-gated;
+  best done with/after the transport migration). The "wire dead macOS producers" item
+  was DROPPED (already wired — audit finding corrected).
 - **New follow-up waves surfaced by Batch A:** (i) migrate the POSIX-transport binaries
   to `RemoteShellHost` (Windows parity), (ii) port the Linux-shaped control-plane setup
   preamble. Both are prerequisites for end-to-end live mac/win runs of these cells.

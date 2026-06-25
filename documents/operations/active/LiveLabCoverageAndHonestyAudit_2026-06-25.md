@@ -37,9 +37,16 @@ statement. This doc is the gap map + the prioritized plan we execute next.
    scaffold slice"` and never touch a host. Clock-skew and crash-recovery are
    unproven everywhere.
 6. **nas and llm service-hosting roles have ZERO live coverage on any OS.**
-7. **macOS has dead capability:** `macos_runtime_acls.rs`, `macos_key_custody.rs`,
-   and `MacosDaemonProbe` (`vm_lab/mod.rs:6230`) exist but **no orchestration
-   stage invokes them** — ACL/key-custody producers built and never run.
+7. ~~**macOS has dead capability:** `macos_runtime_acls.rs` / `macos_key_custody.rs`
+   producers never run.~~ **CORRECTED 2026-06-25 (Wave 2-B recon):** this audit
+   finding was WRONG. The macOS adapter's `run_validator` (`adapter/macos.rs:163-167`)
+   instantiates `MacosDaemonProbe` and runs `macos-runtime-acls-check` /
+   `macos-key-custody-check` via `sudo -n`, and `ValidateBaselineRuntime`
+   (`stage/validate_runtime.rs:30-48`) drives every op (RuntimeAcls, KeyCustody, …)
+   through it. So the macOS ACL + key-custody producers ARE invoked live in the
+   rust-native pipeline. The only dead code is the unused standalone
+   `daemon_probe_for` *helper* (`mod.rs:6296`, `#[allow(dead_code)]`) — harmless
+   scaffolding, not a coverage gap.
 
 Net: the live lab today proves "Linux works and is hard to break"; it does **not**
 prove the cross-platform mandate (`CrossPlatformRoleParityPlan_2026-06-21.md`: "no
@@ -121,9 +128,9 @@ producer-exists-but-unwired) · 🟥 missing.
 | 1b | IPv6 leak | ✅ | ✅ | 🟥 missing |
 | 2 | Exit-NAT teardown / no residual open relay | 🟥 **fail-open** (#1–#3) | ✅ (fixed) | ✅ (fixed) |
 | 3 | Privileged-helper boundary (argv-only) | ✅ | 🟡 no live boundary test | ✅ |
-| 4 | Key custody (storage/perms/startup) | ✅ | 🟡 producer unwired (`mod.rs:6230`) | ✅ (DPAPI) |
+| 4 | Key custody (storage/perms/startup) | ✅ | ✅ (rust-native `ValidateBaselineRuntime`→`MacosDaemonProbe`; CORRECTED) | ✅ (DPAPI) |
 | 5 | Signed trust-state: verify + anti-replay + forged-bundle reject | ✅ | 🟥 missing (authenticode stub) | 🟡 binary-signing only |
-| 6 | ACL / default-deny | ✅ | 🟡 producer unwired | ✅ |
+| 6 | ACL / default-deny | ✅ | ✅ (rust-native `ValidateBaselineRuntime`→`MacosDaemonProbe`; CORRECTED) | ✅ |
 | 7 | Endpoint hijack / server-IP bypass / rogue-path | ✅ | 🟥 missing | 🟥 missing |
 | 8 | Control-surface exposure (socket/pipe) | ✅ | 🟡 anchor listener only | ✅ (named-pipe ACL) |
 | 9 | Secrets never in logs | ✅ | 🟡 anchor-token only | 🟥 missing |
@@ -334,8 +341,11 @@ Build real macOS+Windows backings (via the `RemoteShellHost` trait that already
 gives genuine parity for relay/mixed-topology) for: **two-hop, lan-toggle/
 blind_exit, managed-DNS, role-switch matrix, exit-handoff *failover* (the real 6
 checks, not the NAT-lifecycle substitute), network-flap, reboot-recovery,
-enrollment-restart.** Wire the **unused macOS producers** (`macos_runtime_acls`,
-`macos_key_custody`, `MacosDaemonProbe`) into a macOS validate stage.
+enrollment-restart.** ~~Wire the unused macOS producers.~~ **CORRECTED: not needed**
+— the macOS ACL/key-custody producers are already live-invoked by the rust-native
+`ValidateBaselineRuntime`→`MacosDaemonProbe` path (the audit's "dead capability"
+finding was wrong; see §0.7). The only dead code is the unused `daemon_probe_for`
+helper, which is harmless.
 
 ### Wave 3 — Cross-OS parity for the SECURITY/adversarial surfaces (highest risk)
 Port to macOS+Windows: **endpoint-hijack, server-IP-bypass, rogue-path,
