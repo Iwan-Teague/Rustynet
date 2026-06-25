@@ -17498,12 +17498,16 @@ mod tests {
             ],
             wg_private_key_path: Some(private_key_path),
             privileged_helper_socket_path: Some(test_dir.join("privileged-helper.sock")),
+            // macOS uses a kernel-assigned utun interface + a real egress NIC;
+            // set them in the literal (cfg per field) so `config` stays an
+            // immutable binding and the Linux build — where these fall back to
+            // `..default()` — does not carry an unused `mut` (which would trip
+            // the workspace's `-D warnings`).
+            #[cfg(target_os = "macos")]
+            wg_interface: "utun9".to_owned(),
+            #[cfg(target_os = "macos")]
+            egress_interface: "en0".to_owned(),
             ..DaemonConfig::default()
-        };
-        #[cfg(target_os = "macos")]
-        {
-            config.wg_interface = "utun9".to_owned();
-            config.egress_interface = "en0".to_owned()
         };
 
         let runtime = DaemonRuntime::new(&config).expect("runtime should be created");

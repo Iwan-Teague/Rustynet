@@ -533,11 +533,9 @@ mod imp {
         if trimmed.is_empty() {
             return Err("registry key path must not be empty".to_owned());
         }
-        let split_at = trimmed
-            .find(|c: char| c == '\\' || c == '/')
-            .ok_or_else(|| {
-                format!("registry key path {trimmed:?} missing hive separator (\\ or /)")
-            })?;
+        let split_at = trimmed.find(['\\', '/']).ok_or_else(|| {
+            format!("registry key path {trimmed:?} missing hive separator (\\ or /)")
+        })?;
         let prefix = &trimmed[..split_at];
         let rest = &trimmed[split_at + 1..];
         if rest.is_empty() {
@@ -1341,7 +1339,7 @@ mod imp {
             let ok = unsafe {
                 ConvertStringSecurityDescriptorToSecurityDescriptorW(
                     wide_sddl.as_ptr(),
-                    SDDL_REVISION_1 as u32,
+                    SDDL_REVISION_1,
                     &mut descriptor,
                     null_mut(),
                 )
