@@ -1178,95 +1178,90 @@ const FORBIDDEN_SECRET_EQUALITY_TOKENS: &[&str] = &[
     "signature",
 ];
 
-/// Reviewed allowlist of `(file_path_suffix, line_number, justification)`
-/// triples where an `==`/`!=` on a forbidden token is intentionally
-/// not a security issue (e.g. integer counter zero-check, all-zero
-/// sentinel rejection on a public field). Updating this list is a
+/// Reviewed allowlist of `(file_path_suffix, line_content_substring,
+/// justification)` triples where an `==`/`!=` on a forbidden token is
+/// intentionally not a security issue (e.g. integer counter zero-check,
+/// all-zero sentinel rejection on a public field). Updating this list is a
 /// deliberate act — every entry must carry a one-line justification.
 ///
-/// The path is matched by suffix (`file_path_label.ends_with(path)`)
-/// so workspace-prefix moves do not silently invalidate entries.
-const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, u32, &str)] = &[
+/// The path is matched by suffix (`file_path_label.ends_with(path)`) so
+/// workspace-prefix moves do not silently invalidate entries.
+///
+/// CRUCIALLY, each entry is anchored on the offending line's **content**
+/// (a distinctive substring), NOT on an exact line number. The line-numbered
+/// scheme this replaced drifted RED three times whenever an edit added/removed
+/// lines above a reviewed site (`ccf0b4a`, `a4c0ddb`, and the 2026-06-25 +6
+/// re-sync after `4c3d513` inserted 6 `cfg(unix)` lines into
+/// `rustynet-control/src/lib.rs`). A content anchor survives those shifts and
+/// only needs revisiting when the reviewed line's *text* actually changes —
+/// which is exactly when a fresh review is warranted. Each substring is chosen
+/// to be specific to the benign expression (e.g. a compare against a literal
+/// `0` / zero-array, or a structural `iter().all(|v| *v == 0)` per-byte check),
+/// so it cannot appear inside a genuine secret-vs-secret comparison
+/// (`x == other_secret`) and therefore cannot accidentally suppress a real hit.
+const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, &str, &str)] = &[
     (
         "crates/rustynet-control/src/lib.rs",
-        1494,
-        "nonce counter zero-check on relay fleet bundle u64 input (not secret material)",
+        "nonce == 0",
+        "nonce counter zero-check on relay fleet bundle/request u64 input (compare to the literal 0, never a secret-vs-secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        1556,
-        "canonical-payload u64 round-trip equality for nonce field (structural check, not secret compare)",
+        "relay_fleet_payload_u64(bundle.payload.as_str(), \"nonce\") != Some(bundle.nonce)",
+        "canonical-payload u64 round-trip equality for the nonce field (structural re-encode check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        2011,
-        "all-zero sentinel rejection on relay session token nonce field (not a secret compare)",
+        "nonce == [0u8; 16]",
+        "all-zero sentinel rejection on relay session token nonce field (compare to a zero-array literal, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        2044,
-        "canonical-payload string equality on relay session token (structural canonicalisation check, signature handled separately via ct_eq)",
+        "token.canonical_payload() != payload",
+        "canonical-payload structural equality on relay session token (canonicalisation check; the signature is verified separately via ct_eq)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        2934,
-        "nonce counter zero-check on relay fleet request u64 input (not secret material)",
-    ),
-    (
-        "crates/rustynet-control/src/lib.rs",
-        3098,
+        "record.session_id.iter().all(|value| *value == 0)",
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3103,
-        "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
-    ),
-    (
-        "crates/rustynet-control/src/lib.rs",
-        3236,
-        "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
-    ),
-    (
-        "crates/rustynet-control/src/lib.rs",
-        3239,
-        "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
-    ),
-    (
-        "crates/rustynet-control/src/lib.rs",
-        4286,
-        "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
-    ),
-    (
-        "crates/rustynet-control/src/lib.rs",
-        4291,
+        "record.nonce.iter().all(|value| *value == 0)",
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-relay/src/transport.rs",
-        403,
+        "session_token.scope != RELAY_TOKEN_SCOPE",
         "public-scope label string equality on relay hello (relay token scope is a public domain string, not secret material)",
     ),
 ];
 
-/// Returns true iff the given `(file_path_label, line_number)` matches
-/// any entry in `REVIEWED_SECRET_EQUALITY_EXCEPTIONS`. Suffix-match
-/// on the path keeps entries stable across workspace-prefix changes.
-fn equality_hit_is_allowlisted(file_path_label: &str, line_number: usize) -> bool {
-    // The reviewed-exception suffixes use forward slashes, but the swept
-    // path label mixes `/` (from the sweep-root literal) with the OS-native
-    // separator from the directory walk — on Windows the filename segment
-    // arrives as `…src\transport.rs`, so a raw `ends_with` against
+/// Returns true iff the given `(file_path_label, line_content)` matches any
+/// entry in `REVIEWED_SECRET_EQUALITY_EXCEPTIONS`. Suffix-match on the path and
+/// substring-match on the line content keep entries stable across both
+/// workspace-prefix changes and line-number drift.
+fn equality_hit_is_allowlisted(file_path_label: &str, line_content: &str) -> bool {
+    // Path match: the reviewed-exception suffixes use forward slashes, but the
+    // swept path label mixes `/` (from the sweep-root literal) with the
+    // OS-native separator from the directory walk — on Windows the filename
+    // segment arrives as `…src\transport.rs`, so a raw `ends_with` against
     // `…src/transport.rs` would miss every reviewed exception and report the
     // justified sites as offenders. Normalize to forward slashes so the
-    // allowlist applies identically on every host (this does not weaken the
-    // audit: equality on secret material outside the reviewed list still
-    // fails on all platforms).
+    // allowlist applies identically on every host.
+    //
+    // Content match: anchor on the offending line's text (a distinctive
+    // substring), NOT a line number, so edits that shift a reviewed site up or
+    // down no longer silently re-break the gate. This does not weaken the
+    // audit: each substring is specific to a benign expression (zero/sentinel/
+    // structural check) and cannot occur inside a genuine secret-vs-secret
+    // comparison, so equality on secret material outside the reviewed list
+    // still fails on every platform.
     let normalized_label = file_path_label.replace('\\', "/");
     REVIEWED_SECRET_EQUALITY_EXCEPTIONS
         .iter()
-        .any(|(path, line, _why)| {
-            normalized_label.ends_with(path) && (*line as usize) == line_number
+        .any(|(path, snippet, _why)| {
+            normalized_label.ends_with(path) && line_content.contains(snippet)
         })
 }
 
@@ -1305,7 +1300,7 @@ pub(crate) fn scan_source_for_secret_material_equality(
             if !(rest.contains("==") || rest.contains("!=")) {
                 continue;
             }
-            if equality_hit_is_allowlisted(file_path_label, line_no) {
+            if equality_hit_is_allowlisted(file_path_label, line) {
                 continue;
             }
             hits.push((line_no, (*token).to_owned()));
@@ -1391,36 +1386,54 @@ fn secret_equality_scanner_silent_on_line_with_ct_eq() {
 
 #[test]
 fn secret_equality_scanner_silent_on_allowlisted_line() {
-    let (allowlisted_path, allowlisted_line, _) = REVIEWED_SECRET_EQUALITY_EXCEPTIONS
-        .iter()
-        .find(|(path, _line, reason)| {
-            *path == "crates/rustynet-control/src/lib.rs"
-                && reason.contains("nonce counter zero-check")
-        })
-        .expect("nonce counter zero-check allowlist entry must exist");
-    // Synthesise a body whose first executable line offends, then
-    // claim a path+line that matches a real allowlist entry. The
-    // scanner must suppress the hit because the (path, line) pair
-    // matches REVIEWED_SECRET_EQUALITY_EXCEPTIONS.
+    // Sanity: the reviewed `nonce == 0` zero-check must really be in the list,
+    // anchored on its content (not a line number).
+    assert!(
+        REVIEWED_SECRET_EQUALITY_EXCEPTIONS
+            .iter()
+            .any(|(path, snippet, _)| {
+                *path == "crates/rustynet-control/src/lib.rs" && *snippet == "nonce == 0"
+            }),
+        "the `nonce == 0` content-anchored allowlist entry must exist"
+    );
+
     let body = "if nonce == 0 { return; }";
-    let hits = scan_source_for_secret_material_equality(
-        body,
-        "workspace/crates/rustynet-control/src/lib.rs",
-    );
-    // The body's line 1 is not the reviewed allowlist line, so this
-    // body alone won't match;
-    // pad with blank lines so the offending line lands on the
-    // current reviewed allowlist line.
-    let padded = format!("{}{}", "\n".repeat((*allowlisted_line as usize) - 1), body);
-    let hits_padded =
-        scan_source_for_secret_material_equality(&padded, &format!("workspace/{allowlisted_path}"));
+
+    // The same offending content under a NON-allowlisted path still fires (the
+    // path suffix must also match — the anchor is not a global content exempt).
+    let hits_other_path =
+        scan_source_for_secret_material_equality(body, "crates/example/src/lib.rs");
     assert!(
-        !hits.is_empty(),
-        "sanity: unallowlisted nonce==0 line must still fire: {hits:?}"
+        !hits_other_path.is_empty(),
+        "sanity: nonce==0 under a non-allowlisted path must still fire: {hits_other_path:?}"
     );
+
+    // Under the reviewed control/lib.rs path: suppressed regardless of the line.
+    let path = "workspace/crates/rustynet-control/src/lib.rs";
+    let hits_line1 = scan_source_for_secret_material_equality(body, path);
     assert!(
-        hits_padded.is_empty(),
-        "allowlisted (path={allowlisted_path}, line={allowlisted_line}) must suppress the nonce==0 hit: {hits_padded:?}"
+        hits_line1.is_empty(),
+        "allowlisted nonce==0 must be suppressed under the reviewed path: {hits_line1:?}"
+    );
+
+    // The whole point of the redesign: a later edit that shifts the same content
+    // far down the file must NOT re-break the gate. The old line-numbered scheme
+    // failed here three times; the content anchor must survive it.
+    let shifted = format!("{}{}", "\n".repeat(500), body);
+    let hits_shifted = scan_source_for_secret_material_equality(&shifted, path);
+    assert!(
+        hits_shifted.is_empty(),
+        "a line shift above an allowlisted site must NOT re-break the gate: {hits_shifted:?}"
+    );
+
+    // A DIFFERENT, genuinely secret-vs-secret comparison under the SAME reviewed
+    // path is still flagged — the content anchor suppresses only its benign
+    // expression, never the whole file.
+    let real = "if computed_token == expected_token { accept(); }";
+    let hits_real = scan_source_for_secret_material_equality(real, path);
+    assert!(
+        hits_real.iter().any(|(_, t)| t == "token"),
+        "a real secret-vs-secret compare under the reviewed path must still fire: {hits_real:?}"
     );
 }
 
@@ -1435,19 +1448,34 @@ fn secret_equality_scanner_silent_on_unrelated_integer_compare() {
 }
 
 #[test]
-fn reviewed_exception_list_entries_have_justifications() {
-    for (path, line, why) in REVIEWED_SECRET_EQUALITY_EXCEPTIONS {
+fn reviewed_exception_list_entries_are_well_formed() {
+    for (path, snippet, why) in REVIEWED_SECRET_EQUALITY_EXCEPTIONS {
         assert!(
             !path.is_empty(),
-            "allowlist entry at line {line} has empty path"
+            "allowlist entry has empty path (snippet {snippet:?})"
+        );
+        // The content anchor must be specific enough not to over-match: a
+        // distinctive substring of the reviewed line, not a bare token.
+        assert!(
+            snippet.len() >= 8,
+            "allowlist content anchor for {path} too short to be specific: {snippet:?}"
+        );
+        // It must actually anchor an equality compare on a forbidden token —
+        // otherwise it could never match a real scanner hit (a self-consistency
+        // guard so an entry can't silently match nothing or, worse, anything).
+        assert!(
+            snippet.contains("==") || snippet.contains("!="),
+            "allowlist content anchor {snippet:?} for {path} must contain an equality operator"
         );
         assert!(
-            *line > 0,
-            "allowlist entry for {path} has zero/invalid line number"
+            FORBIDDEN_SECRET_EQUALITY_TOKENS
+                .iter()
+                .any(|tok| snippet.contains(tok)),
+            "allowlist content anchor {snippet:?} for {path} must contain a forbidden token it suppresses"
         );
         assert!(
             why.len() >= 16,
-            "allowlist entry {path}:{line} justification too short (need >= 16 chars): {why:?}"
+            "allowlist entry {path} ({snippet:?}) justification too short (need >= 16 chars): {why:?}"
         );
     }
 }
