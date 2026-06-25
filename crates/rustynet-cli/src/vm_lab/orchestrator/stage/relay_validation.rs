@@ -112,11 +112,30 @@ impl OrchestrationStage for RelayValidationStage {
             write_reported_skips_note(ctx, &reported_skips);
         }
 
-        if failures.is_empty() {
-            StageOutcome::Passed
-        } else {
-            StageOutcome::Failed(failures.join("; "))
-        }
+        outcome_for(&failures, &reported_skips)
+    }
+}
+
+/// Decide the stage outcome from the per-node tally — a pure function so the
+/// skip-vs-pass-vs-fail decision is unit-testable without constructing a
+/// per-OS adapter (whose `platform()` would otherwise have to be Windows for
+/// the reported-skip case). Mirrors `deploy_relay::outcome_for`.
+///
+/// Honest cross-OS posture (Wave 1):
+///   * any hard failure ⇒ `Failed` (a probe/adapter error trumps a skip);
+///   * else any reported-skip — a relay node on a platform with no relay-deploy
+///     adapter (Windows today) — ⇒ `Skipped`, so the run goes
+///     `RunStatus::Partial` instead of falsely green; the skipped
+///     `(alias, platform)` pairs are named in the side-car note;
+///   * else (no failures, no reported-skips — a genuine all-Linux/macOS
+///     validation; the empty-relay-lab no-op is handled before this) ⇒ `Passed`.
+fn outcome_for(failures: &[String], reported_skips: &[(String, String)]) -> StageOutcome {
+    if !failures.is_empty() {
+        StageOutcome::Failed(failures.join("; "))
+    } else if !reported_skips.is_empty() {
+        StageOutcome::Skipped
+    } else {
+        StageOutcome::Passed
     }
 }
 
@@ -235,6 +254,38 @@ mod tests {
             },
         ];
         assert_eq!(RelayValidationStage.execute(&mut ctx), StageOutcome::Passed);
+    }
+
+    #[test]
+    fn outcome_for_reported_skip_with_no_failures_is_skipped() {
+        // A relay node on a platform with no relay-deploy adapter (Windows) is
+        // reported-skipped with no hard failure ⇒ stage Skipped, which
+        // build_live_lab_run_report maps to RunStatus::Partial (honest: this
+        // stage did not fully prove every relay node, so the run is not green).
+        let reported_skips = vec![("relay-win".to_owned(), "Windows".to_owned())];
+        assert_eq!(
+            outcome_for(&[], &reported_skips),
+            StageOutcome::Skipped,
+            "reported-skip + no failures must be Skipped, not Passed"
+        );
+    }
+
+    #[test]
+    fn outcome_for_no_failures_no_skips_is_passed() {
+        // A genuine all-Linux/macOS validation (nothing skipped, nothing failed)
+        // stays Passed — the empty-relay-lab no-op also lands here.
+        assert_eq!(outcome_for(&[], &[]), StageOutcome::Passed);
+    }
+
+    #[test]
+    fn outcome_for_failure_is_failed_even_with_skips() {
+        // A hard failure trumps a reported-skip: the stage is Failed.
+        let failures = vec!["relay-1: boom".to_owned()];
+        let reported_skips = vec![("relay-win".to_owned(), "Windows".to_owned())];
+        match outcome_for(&failures, &reported_skips) {
+            StageOutcome::Failed(msg) => assert!(msg.contains("relay-1: boom"), "got: {msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]
