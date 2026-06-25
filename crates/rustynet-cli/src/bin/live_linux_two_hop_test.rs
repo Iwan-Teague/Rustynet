@@ -77,14 +77,28 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let config = Config::parse(args)?;
 
-    // Track B Phase 2: non-Linux fails closed honestly until the per-
-    // platform validator lands. The orchestrator dispatches per-
-    // platform via stage_run_live_two_hop wrappers.
-    live_lab_support::enforce_linux_only_until_validator_lands(
-        config.platform,
-        "two-hop",
-        "the per-platform validator lands later in Track B",
-    )?;
+    // Wave 2 (W2-B): `--platform macos|windows` now runs the REAL two-hop
+    // data-plane proof instead of fail-closing at the gate. The per-OS
+    // differences live in runtime `match config.platform` branches inside the
+    // data-plane probe helpers (mesh-IP discovery, reachability/TTL ping, and
+    // the default-route precondition), modeled on `live_linux_relay_test.rs`.
+    // Linux behaviour is byte-identical to before.
+    //
+    // REVIEW (W2-B daemon-side gap, expected to surface on a live run): the
+    // *control-plane orchestration* in this binary above the data-plane proof —
+    // signed-bundle issuance/distribution, `enforce_host`, `route advertise`,
+    // the `status` capture, and the `/run/rustynet/rustynetd.sock` socket path
+    // wrapped in POSIX `sudo -n sh -lc` — is still Linux-shaped (it predates
+    // this Wave and is out of scope for W2-B, whose owned surface is the
+    // data-plane proof). On macOS the daemon socket is
+    // `/private/var/run/rustynet/rustynetd.sock` and on Windows there is no
+    // `sudo`; those steps will fail-closed honestly on a live mac/win guest
+    // until a follow-up Wave ports the control plane. Additionally, macOS/
+    // Windows acting as the INTERMEDIATE forwarding hop (the entry node that
+    // terminates the client tunnel and re-exits onward) is NOT confirmed to be
+    // daemon-supported — if it is unsupported the live run fails-closed (no
+    // TTL-2 delta, no end-to-end reply), which is the honest, intended outcome.
+    // This is a test port, not a claim that the role works on that OS.
 
     let root_dir = live_lab_support::repo_root()?;
 
@@ -875,13 +889,13 @@ fn run() -> Result<(), String> {
             &config.ssh_identity_file,
             &work_known_hosts,
             &config.client_host,
-            "ip -4 route get 1.1.1.1 || true",
+            default_route_probe_command(config.platform, TWO_HOP_PUBLIC_PROBE_TARGET).as_str(),
         )?;
         second_client_route = capture_root(
             &config.ssh_identity_file,
             &work_known_hosts,
             &config.second_client_host,
-            "ip -4 route get 1.1.1.1 || true",
+            default_route_probe_command(config.platform, TWO_HOP_PUBLIC_PROBE_TARGET).as_str(),
         )?;
         if two_hop_runtime_ready(
             &config,
@@ -990,11 +1004,13 @@ fn run() -> Result<(), String> {
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.entry_host,
+        config.platform,
     )?;
     let final_exit_mesh_ipv4 = discover_mesh_ipv4(
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.final_exit_host,
+        config.platform,
     )?;
     logger.line(
         format!(
@@ -1011,6 +1027,7 @@ fn run() -> Result<(), String> {
         &work_known_hosts,
         &config.client_host,
         TWO_HOP_PUBLIC_PROBE_TARGET,
+        config.platform,
     );
     logger.line(
         format!(
@@ -1028,6 +1045,7 @@ fn run() -> Result<(), String> {
             &work_known_hosts,
             &config.client_host,
             ip,
+            config.platform,
         ),
         None => TtlProbe::not_attempted(),
     };
@@ -1037,6 +1055,7 @@ fn run() -> Result<(), String> {
             &work_known_hosts,
             &config.client_host,
             ip,
+            config.platform,
         ),
         None => TtlProbe::not_attempted(),
     };
@@ -1094,16 +1113,17 @@ fn run() -> Result<(), String> {
     } else {
         "fail"
     };
-    let check_client_route_rustynet = if client_route.contains("dev rustynet0") {
+    let check_client_route_rustynet = if route_uses_tunnel(config.platform, &client_route) {
         "pass"
     } else {
         "fail"
     };
-    let check_second_client_route_rustynet = if second_client_route.contains("dev rustynet0") {
-        "pass"
-    } else {
-        "fail"
-    };
+    let check_second_client_route_rustynet =
+        if route_uses_tunnel(config.platform, &second_client_route) {
+            "pass"
+        } else {
+            "fail"
+        };
     let check_managed_dns_fresh_all_nodes = if managed_dns_state_is_valid(&client_status)
         && managed_dns_state_is_valid(&entry_status)
         && managed_dns_state_is_valid(&final_exit_status)
@@ -1580,8 +1600,8 @@ fn two_hop_runtime_ready(
         && second_client_status.contains(&format!("exit_node={}", config.final_exit_node_id))
         && second_client_status.contains("state=ExitActive")
         && managed_dns_state_is_valid(second_client_status)
-        && client_route.contains("dev rustynet0")
-        && second_client_route.contains("dev rustynet0")
+        && route_uses_tunnel(config.platform, client_route)
+        && route_uses_tunnel(config.platform, second_client_route)
 }
 
 fn peer_endpoint_summary_contains(summary: &str, node_id: &str, addr: &str, port: u16) -> bool {
@@ -1622,20 +1642,35 @@ fn utc_now_string() -> String {
     "1970-01-01T00:00:00Z".to_owned()
 }
 
-// ─── F0.8 data-plane probe support ────────────────────────────────────────────
+// ─── F0.8 data-plane probe support (cross-OS, W2-B) ───────────────────────────
+
+use live_lab_support::LiveLabPlatform;
 
 /// Public ICMP target for the end-to-end reachability probe. The client's only
-/// route to it is `0.0.0.0/0 dev rustynet0` (asserted as a precondition), so a
-/// returning echo reply can only mean the datagram traversed the entire
+/// route to it is the mesh tunnel default route (asserted as a precondition), so
+/// a returning echo reply can only mean the datagram traversed the entire
 /// client → entry → final_exit → internet chain and came back. Matches the
-/// public address already used by the route precondition (`ip route get
-/// 1.1.1.1`) and the exit-handoff data-plane ping, so we observe the same path.
+/// public address already used by the route precondition and the exit-handoff
+/// data-plane ping, so we observe the same path.
 const TWO_HOP_PUBLIC_PROBE_TARGET: &str = "1.1.1.1";
 
 /// The CGNAT range the mesh assigns tunnel addresses from
 /// (`mesh_cidr=100.64.0.0/10`, see daemon membership bundles). Used to pick the
-/// rustynet0 tunnel address out of `ip -4 -o addr show dev rustynet0` output.
+/// mesh tunnel address out of the per-OS interface-address listing.
 const MESH_CIDR_PREFIX: &str = "100.";
+
+/// Logical tunnel interface name used on Linux (kernel TUN) and Windows
+/// (wintun adapter alias). On macOS the WireGuard tunnel materialises as a
+/// kernel-assigned `utunN` device, so the mesh address must be located by
+/// scanning interface output for the CGNAT range rather than by a fixed name.
+const TUNNEL_IFACE: &str = "rustynet0";
+
+/// macOS reserves the `utun` device-name family for its WireGuard tunnels.
+/// `route -n get` prints `interface: utunN` and `ifconfig utunN` carries the
+/// mesh `inet 100.x` address, so the macOS route-via-tunnel predicate keys on
+/// this prefix instead of `rustynet0` (which never appears as a kernel device
+/// on macOS).
+const MACOS_TUNNEL_IFACE_PREFIX: &str = "utun";
 
 /// Number of expected forwarding decrements between the single-hop baseline
 /// (entry mesh IP, a direct tunnel peer) and the two-hop path (final-exit mesh
@@ -1722,30 +1757,86 @@ fn compute_ttl_decrement(baseline_ttl: &TtlProbe, two_hop_ttl: &TtlProbe) -> Opt
     Some(i32::from(baseline) - i32::from(two_hop))
 }
 
-/// Discover the rustynet0 tunnel (mesh) IPv4 address on `host`. Argv-only via
-/// the existing `capture_root` primitive; the command is a fixed literal with
-/// no untrusted interpolation. Returns `None` (not an error) when no mesh
-/// address is present so the caller can record the probe as not-attempted and
-/// fail closed in the evaluator rather than aborting the whole stage.
+/// Build the per-OS command that lists the mesh tunnel's IPv4 address(es).
+/// Argv-only via `capture_root` (POSIX) or PowerShell; the command is a fixed
+/// literal with no untrusted interpolation. The result is fed to the matching
+/// per-OS parser.
+///
+///   * Linux — `ip -4 -o addr show dev rustynet0` (kernel TUN named rustynet0).
+///   * macOS — `ifconfig` (full dump): the tunnel is a kernel-assigned `utunN`
+///     device, not a fixed name, so we scan every interface for the CGNAT
+///     `inet 100.x` address. `ipconfig getifaddr` needs a known device name we
+///     do not have, so `ifconfig` is the portable choice.
+///   * Windows — `Get-NetIPAddress -InterfaceAlias rustynet0` (the wintun
+///     adapter alias, per `windows_tunnel_smoke.rs` default `rustynet0`).
+fn mesh_ipv4_discovery_command(platform: LiveLabPlatform) -> String {
+    match platform {
+        LiveLabPlatform::Linux => {
+            format!("ip -4 -o addr show dev {TUNNEL_IFACE} 2>/dev/null || true")
+        }
+        // REVIEW (W2-B): macОS WireGuard tunnels surface as utunN; we scan the
+        // whole ifconfig dump for the CGNAT mesh address rather than guessing
+        // the utun index. If the mac daemon is not up as the entry/exit, no
+        // 100.x line appears and the parser returns None → probe not-attempted
+        // → fail-closed (honest, not a fake pass).
+        LiveLabPlatform::MacOs => "/sbin/ifconfig 2>/dev/null || true".to_owned(),
+        // REVIEW (W2-B): the wintun adapter alias is `rustynet0` per the
+        // reviewed Windows tunnel-smoke default. Out-String -Width keeps the
+        // IPAddress column from wrapping.
+        LiveLabPlatform::Windows => {
+            "powershell -NoProfile -Command \"Get-NetIPAddress -InterfaceAlias rustynet0 -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty IPAddress | Out-String -Width 32767\"".to_owned()
+        }
+    }
+}
+
+/// Discover the mesh (CGNAT-range) tunnel IPv4 address on `host`. Argv-only via
+/// the existing `capture_root` (POSIX) / `capture_remote_stdout` (Windows
+/// PowerShell) primitives. Returns `None` (not an error) when no mesh address
+/// is present so the caller can record the probe as not-attempted and fail
+/// closed in the evaluator rather than aborting the whole stage.
 fn discover_mesh_ipv4(
     identity: &Path,
     known_hosts: &Path,
     host: &str,
+    platform: LiveLabPlatform,
 ) -> Result<Option<String>, String> {
-    let raw = capture_root(
-        identity,
-        known_hosts,
-        host,
-        "ip -4 -o addr show dev rustynet0 2>/dev/null || true",
-    )?;
-    Ok(parse_mesh_ipv4_from_ip_addr(&raw))
+    let command = mesh_ipv4_discovery_command(platform);
+    let raw = match platform {
+        // Linux + macOS go through sudo -n sh -lc (POSIX), matching the
+        // byte-identical Linux path that predates this Wave.
+        LiveLabPlatform::Linux | LiveLabPlatform::MacOs => {
+            capture_root(identity, known_hosts, host, command.as_str())?
+        }
+        // Windows OpenSSH sessions are Administrator already and have no sudo;
+        // run the PowerShell command directly. A transport failure collapses
+        // to empty stdout so the parser returns None (fail-closed).
+        LiveLabPlatform::Windows => {
+            live_lab_support::capture_remote_stdout(identity, known_hosts, host, command.as_str())
+                .unwrap_or_default()
+        }
+    };
+    Ok(parse_mesh_ipv4_for_platform(platform, &raw))
 }
 
-/// Parse the first mesh-range (`100.64.0.0/10`) IPv4 address out of
-/// `ip -4 -o addr show dev rustynet0` output, e.g.:
-///   `4: rustynet0    inet 100.64.0.3/32 scope global rustynet0\       valid_lft ...`
-/// Returns `None` if no `inet 100.x` token is present.
-fn parse_mesh_ipv4_from_ip_addr(output: &str) -> Option<String> {
+/// Dispatch to the per-OS mesh-address parser.
+fn parse_mesh_ipv4_for_platform(platform: LiveLabPlatform, output: &str) -> Option<String> {
+    match platform {
+        LiveLabPlatform::Linux | LiveLabPlatform::MacOs => parse_mesh_ipv4_from_inet_tokens(output),
+        LiveLabPlatform::Windows => parse_mesh_ipv4_from_windows_ipaddress(output),
+    }
+}
+
+/// Parse the first mesh-range (`100.64.0.0/10`) IPv4 address out of `inet`-token
+/// output. Handles BOTH:
+///   * Linux `ip -4 -o addr show dev rustynet0`:
+///     `4: rustynet0    inet 100.64.0.3/32 scope global rustynet0\  valid_lft ...`
+///   * macOS `ifconfig` (full dump):
+///     `utun4: flags=...\n\tinet 100.64.0.3 --> 100.64.0.3 netmask 0xffffffff`
+///
+/// In both, the address follows an `inet` token; we strip any `/prefix` (Linux)
+/// and accept the bare dotted-quad (macOS). Returns `None` if no `inet 100.x`
+/// token is present.
+fn parse_mesh_ipv4_from_inet_tokens(output: &str) -> Option<String> {
     let mut tokens = output.split_whitespace().peekable();
     while let Some(token) = tokens.next() {
         if token != "inet" {
@@ -1764,18 +1855,89 @@ fn parse_mesh_ipv4_from_ip_addr(output: &str) -> Option<String> {
     None
 }
 
+/// Parse the mesh-range IPv4 address from Windows
+/// `Get-NetIPAddress ... | Select -ExpandProperty IPAddress` output, which is a
+/// bare list of dotted-quad addresses (one per line), e.g. `100.64.0.3`.
+/// Returns the first address in the CGNAT mesh range, or `None`.
+fn parse_mesh_ipv4_from_windows_ipaddress(output: &str) -> Option<String> {
+    output.split_whitespace().find_map(|token| {
+        if token.starts_with(MESH_CIDR_PREFIX) && token.parse::<std::net::Ipv4Addr>().is_ok() {
+            Some(token.to_owned())
+        } else {
+            None
+        }
+    })
+}
+
+/// Build the per-OS end-to-end reachability ping command (success/fail only;
+/// stdout discarded). `target` is shell/PowerShell quoted by the caller's
+/// transport. The trailing `|| true` / `try`/`catch` semantics are NOT used
+/// here — we depend on the command's EXIT STATUS, so the command must propagate
+/// ping's own success/failure.
+///
+///   * Linux  — `ping -c 3 -W 2 <t>` (iputils: `-W` is seconds).
+///   * macOS  — `ping -c 3 -t 5 <t>` (BSD ping has no `-W` reply-timeout flag;
+///     `-t` is the overall deadline in seconds).
+///   * Windows— `ping -n 3 -w 2000 <t>` (`-n` count, `-w` per-reply timeout in
+///     MILLIseconds). `ping.exe` exits non-zero when every echo is lost.
+fn reachability_ping_command(platform: LiveLabPlatform, target: &str) -> String {
+    match platform {
+        LiveLabPlatform::Linux => {
+            format!("ping -c 3 -W 2 {} >/dev/null 2>&1", shell_quote(target))
+        }
+        LiveLabPlatform::MacOs => {
+            format!("ping -c 3 -t 5 {} >/dev/null 2>&1", shell_quote(target))
+        }
+        // ping.exe's exit code is reliable; we don't wrap in try/catch so the
+        // non-zero exit on total loss propagates to ssh_status.
+        LiveLabPlatform::Windows => {
+            format!("ping -n 3 -w 2000 {}", windows_ping_quote(target))
+        }
+    }
+}
+
+/// Build the per-OS reply-TTL ping command. Unlike the reachability probe this
+/// CAPTURES stdout (so the per-OS TTL field can be parsed), and tolerates a
+/// non-zero exit (a single dropped echo still prints a parseable reply line).
+///
+///   * Linux  — `ping -c 3 -W 2 <t> 2>&1 || true` (iputils `ttl=`).
+///   * macOS  — `ping -c 3 -t 5 <t> 2>&1 || true` (BSD `ttl=`).
+///   * Windows— `ping -n 3 -w 2000 <t>` (uppercase `TTL=`).
+fn reply_ttl_ping_command(platform: LiveLabPlatform, target: &str) -> String {
+    match platform {
+        LiveLabPlatform::Linux => {
+            format!("ping -c 3 -W 2 {} 2>&1 || true", shell_quote(target))
+        }
+        LiveLabPlatform::MacOs => {
+            format!("ping -c 3 -t 5 {} 2>&1 || true", shell_quote(target))
+        }
+        LiveLabPlatform::Windows => {
+            format!("ping -n 3 -w 2000 {}", windows_ping_quote(target))
+        }
+    }
+}
+
+/// Conservative double-quote wrap for a ping target passed to `ping.exe` via a
+/// PowerShell/cmd-bridged OpenSSH session. The target is already validated as a
+/// safe token (`ensure_safe_token` on hosts/ids; this constant target is the
+/// literal `1.1.1.1`), so this is defence-in-depth, not the primary guard.
+fn windows_ping_quote(target: &str) -> String {
+    format!("\"{}\"", target.replace('"', ""))
+}
+
 /// End-to-end reachability probe: ping `target` from `host` through the tunnel
-/// chain. Reuses the same argv-only `ssh_status` ping pattern as the
-/// exit-handoff data-plane monitor. A transport error or a non-zero ping exit
-/// records `reachable=false`; `attempted` is true whenever the ping command was
-/// dispatched (we always dispatch it here).
+/// chain. Reuses the argv-only `ssh_status` ping pattern as the exit-handoff
+/// data-plane monitor. A transport error or a non-zero ping exit records
+/// `reachable=false`; `attempted` is true whenever the ping command was
+/// dispatched (we always dispatch it here, fail-closed discipline preserved).
 fn probe_end_to_end_reachability(
     identity: &Path,
     known_hosts: &Path,
     host: &str,
     target: &str,
+    platform: LiveLabPlatform,
 ) -> EndToEndProbe {
-    let command = format!("ping -c 3 -W 2 {} >/dev/null 2>&1", shell_quote(target));
+    let command = reachability_ping_command(platform, target);
     let reachable = matches!(
         ssh_status(identity, known_hosts, host, &command),
         Ok(status) if status.success()
@@ -1787,30 +1949,55 @@ fn probe_end_to_end_reachability(
 }
 
 /// Measure the reply TTL the client observes when pinging `target`. Uses the
-/// argv-only `capture_root` primitive (fixed-shape command, `target`
-/// shell-quoted) and parses the `ttl=<n>` field from the ping reply. A probe
-/// that produces no parseable TTL is recorded `attempted=true, ttl=None`, which
-/// the evaluator treats as a fail (cannot prove the per-hop delta).
-fn probe_reply_ttl(identity: &Path, known_hosts: &Path, host: &str, target: &str) -> TtlProbe {
-    // `-c 3` tolerates a single dropped echo while the tunnel settles; the
-    // first parseable ttl= field is taken. 2>&1 so a transient error still
-    // yields parseable stdout where present.
-    let command = format!("ping -c 3 -W 2 {} 2>&1 || true", shell_quote(target));
-    match capture_root(identity, known_hosts, host, &command) {
+/// argv-only capture primitive and parses the per-OS TTL field from the reply.
+/// A probe that produces no parseable TTL is recorded `attempted=true,
+/// ttl=None`, which the evaluator treats as a fail (cannot prove the per-hop
+/// delta). A transport failure is recorded as not-attempted (also a fail).
+fn probe_reply_ttl(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    target: &str,
+    platform: LiveLabPlatform,
+) -> TtlProbe {
+    let command = reply_ttl_ping_command(platform, target);
+    let captured = match platform {
+        LiveLabPlatform::Linux | LiveLabPlatform::MacOs => {
+            capture_root(identity, known_hosts, host, &command)
+        }
+        LiveLabPlatform::Windows => {
+            live_lab_support::capture_remote_stdout(identity, known_hosts, host, &command)
+        }
+    };
+    match captured {
         Ok(output) => TtlProbe {
             attempted: true,
-            ttl: parse_ping_reply_ttl(&output),
+            ttl: parse_reply_ttl_for_platform(platform, &output),
         },
         // A transport failure means the probe did not produce a measurement.
         Err(_) => TtlProbe::not_attempted(),
     }
 }
 
-/// Parse the reply TTL from `ping` stdout. Linux `iputils` ping prints
-/// `64 bytes from 100.64.0.3: icmp_seq=1 ttl=63 time=0.40 ms`; the field is
-/// lowercase `ttl=`. Returns the first parseable value, or `None` if absent
-/// (e.g. all requests timed out, so no reply line was printed).
-fn parse_ping_reply_ttl(output: &str) -> Option<u8> {
+/// Dispatch to the per-OS reply-TTL parser. The TTL field casing differs by
+/// platform (iputils/BSD lowercase `ttl=` vs Windows uppercase `TTL=`); the
+/// TTL−2 decrement arithmetic downstream is identical regardless of OS.
+fn parse_reply_ttl_for_platform(platform: LiveLabPlatform, output: &str) -> Option<u8> {
+    match platform {
+        // Linux iputils and macOS BSD ping both print a lowercase `ttl=` field
+        // in the reply line, so they share one tolerant parser.
+        LiveLabPlatform::Linux | LiveLabPlatform::MacOs => parse_ping_reply_ttl_posix(output),
+        LiveLabPlatform::Windows => parse_ping_reply_ttl_windows(output),
+    }
+}
+
+/// Parse the reply TTL from POSIX `ping` stdout (Linux iputils + macOS BSD).
+/// Both print the TTL as a lowercase `ttl=<n>` token in the reply line:
+///   Linux: `64 bytes from 100.64.0.3: icmp_seq=1 ttl=63 time=0.40 ms`
+///   macOS: `64 bytes from 100.64.0.3: icmp_seq=0 ttl=63 time=0.412 ms`
+/// Returns the first parseable value, or `None` if absent (all echoes lost, so
+/// no reply line was printed).
+fn parse_ping_reply_ttl_posix(output: &str) -> Option<u8> {
     for token in output.split_whitespace() {
         if let Some(value) = token.strip_prefix("ttl=")
             && let Ok(ttl) = value.parse::<u8>()
@@ -1819,6 +2006,111 @@ fn parse_ping_reply_ttl(output: &str) -> Option<u8> {
         }
     }
     None
+}
+
+/// Parse the reply TTL from Windows `ping.exe` stdout. Windows prints an
+/// uppercase `TTL=` field embedded in the reply line with no surrounding
+/// whitespace:
+///   `Reply from 100.64.0.3: bytes=32 time=1ms TTL=63`
+/// Because `TTL=63` may be glued to the preceding token, we search each
+/// whitespace token for a `TTL=` substring rather than requiring a prefix.
+/// Returns the first parseable value, or `None` (request-timed-out lines carry
+/// no `TTL=`).
+fn parse_ping_reply_ttl_windows(output: &str) -> Option<u8> {
+    for token in output.split_whitespace() {
+        if let Some(idx) = token.find("TTL=") {
+            let value: String = token[idx + 4..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(ttl) = value.parse::<u8>() {
+                return Some(ttl);
+            }
+        }
+    }
+    None
+}
+
+/// Build the per-OS command that resolves the route to `target` (the
+/// default-route precondition: the client's traffic to a public target must
+/// egress via the mesh tunnel, never the LAN gateway).
+///
+///   * Linux  — `ip -4 route get <t>` (output contains `dev rustynet0`).
+///   * macOS  — `route -n get <t>` (output contains `interface: utunN`).
+///   * Windows— `Find-NetRoute -RemoteIPAddress <t>` then read InterfaceAlias
+///     (the wintun adapter alias is `rustynet0`).
+fn default_route_probe_command(platform: LiveLabPlatform, target: &str) -> String {
+    match platform {
+        LiveLabPlatform::Linux => format!("ip -4 route get {} || true", shell_quote(target)),
+        LiveLabPlatform::MacOs => {
+            format!("route -n get {} 2>/dev/null || true", shell_quote(target))
+        }
+        // Find-NetRoute returns the route the OS would actually use to reach
+        // the target; we surface InterfaceAlias so the tunnel-egress predicate
+        // can match the wintun adapter name. SilentlyContinue + Out-String keep
+        // the row machine-parseable and unwrapped.
+        LiveLabPlatform::Windows => format!(
+            "powershell -NoProfile -Command \"(Find-NetRoute -RemoteIPAddress {} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty InterfaceAlias) -join ' ' | Out-String -Width 32767\"",
+            windows_ping_quote(target)
+        ),
+    }
+}
+
+/// Per-OS predicate: does the resolved route to the public target egress via
+/// the mesh tunnel interface (rather than a LAN gateway)? This is the
+/// behavioural precondition that makes the end-to-end reachability proof
+/// meaningful.
+///
+///   * Linux  — route output names `dev rustynet0`. Guard against substring
+///     false-positives (`rustynet0x`) by requiring the `dev rustynet0` token
+///     with a following word boundary.
+///   * macOS  — route output names `interface: utunN`; match the `utun`
+///     device-name prefix.
+///   * Windows— Find-NetRoute InterfaceAlias is the wintun adapter `rustynet0`.
+fn route_uses_tunnel(platform: LiveLabPlatform, route_output: &str) -> bool {
+    match platform {
+        LiveLabPlatform::Linux => route_output_names_linux_tunnel_dev(route_output),
+        LiveLabPlatform::MacOs => route_output_names_macos_utun_interface(route_output),
+        LiveLabPlatform::Windows => route_output_names_windows_tunnel_alias(route_output),
+    }
+}
+
+/// Linux `ip route get` egresses the tunnel when the output names
+/// `dev rustynet0`. Require the device token to be followed by whitespace or
+/// end-of-string so `dev rustynet0x` / `dev rustynet01` do NOT match.
+fn route_output_names_linux_tunnel_dev(route_output: &str) -> bool {
+    let needle = format!("dev {TUNNEL_IFACE}");
+    route_output.match_indices(needle.as_str()).any(|(idx, _)| {
+        let after = &route_output[idx + needle.len()..];
+        after
+            .chars()
+            .next()
+            .map(|c| c.is_whitespace())
+            .unwrap_or(true)
+    })
+}
+
+/// macOS `route -n get` egresses the tunnel when the `interface:` line names a
+/// `utunN` device. Match the `interface:` key then the `utun` device-name
+/// prefix so a non-tunnel egress (`interface: en0`) does NOT satisfy the check.
+fn route_output_names_macos_utun_interface(route_output: &str) -> bool {
+    route_output.lines().any(|line| {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("interface:") {
+            rest.trim().starts_with(MACOS_TUNNEL_IFACE_PREFIX)
+        } else {
+            false
+        }
+    })
+}
+
+/// Windows `Find-NetRoute` egresses the tunnel when the resolved InterfaceAlias
+/// is the wintun adapter `rustynet0`. Match the alias as a whitespace-delimited
+/// token so `rustynet0x` cannot satisfy the check.
+fn route_output_names_windows_tunnel_alias(route_output: &str) -> bool {
+    route_output
+        .split_whitespace()
+        .any(|token| token == TUNNEL_IFACE)
 }
 
 #[cfg(test)]
@@ -1950,41 +2242,255 @@ mod tests {
         ));
     }
 
+    use super::LiveLabPlatform;
+
+    // ─── POSIX (Linux iputils) reply-TTL parser ──────────────────────────────
     #[test]
-    fn parse_ping_reply_ttl_reads_iputils_reply_line() {
+    fn parse_ping_reply_ttl_posix_reads_iputils_reply_line() {
         let out = "PING 100.64.0.3 (100.64.0.3) 56(84) bytes of data.\n\
                    64 bytes from 100.64.0.3: icmp_seq=1 ttl=63 time=0.40 ms\n";
-        assert_eq!(super::parse_ping_reply_ttl(out), Some(63));
+        assert_eq!(super::parse_ping_reply_ttl_posix(out), Some(63));
+    }
+
+    // ─── POSIX (macOS BSD) reply-TTL parser (same lowercase ttl= field) ───────
+    #[test]
+    fn parse_ping_reply_ttl_posix_reads_bsd_macos_reply_line() {
+        // Realistic macOS BSD ping output: icmp_seq starts at 0, time has more
+        // decimal places; the TTL field is still lowercase `ttl=`.
+        let out = "PING 100.64.0.3 (100.64.0.3): 56 data bytes\n\
+                   64 bytes from 100.64.0.3: icmp_seq=0 ttl=63 time=0.412 ms\n";
+        assert_eq!(super::parse_ping_reply_ttl_posix(out), Some(63));
     }
 
     #[test]
-    fn parse_ping_reply_ttl_returns_none_when_all_requests_time_out() {
+    fn parse_ping_reply_ttl_posix_returns_none_when_all_requests_time_out() {
         let out = "PING 100.64.0.5 (100.64.0.5) 56(84) bytes of data.\n\n\
                    --- 100.64.0.5 ping statistics ---\n\
                    3 packets transmitted, 0 received, 100% packet loss, time 2043ms\n";
-        assert_eq!(super::parse_ping_reply_ttl(out), None);
+        assert_eq!(super::parse_ping_reply_ttl_posix(out), None);
+    }
+
+    // ─── Windows ping.exe reply-TTL parser (uppercase glued TTL=) ─────────────
+    #[test]
+    fn parse_ping_reply_ttl_windows_reads_uppercase_glued_ttl() {
+        // Realistic Windows ping.exe output: TTL is uppercase and glued to the
+        // preceding token with no whitespace.
+        let out = "Pinging 100.64.0.3 with 32 bytes of data:\r\n\
+                   Reply from 100.64.0.3: bytes=32 time=1ms TTL=63\r\n";
+        assert_eq!(super::parse_ping_reply_ttl_windows(out), Some(63));
     }
 
     #[test]
-    fn parse_mesh_ipv4_picks_rustynet0_cgnat_address() {
+    fn parse_ping_reply_ttl_windows_returns_none_on_timeout() {
+        let out = "Pinging 100.64.0.5 with 32 bytes of data:\r\n\
+                   Request timed out.\r\n\
+                   Request timed out.\r\n\
+                   Ping statistics for 100.64.0.5:\r\n\
+                   Packets: Sent = 3, Received = 0, Lost = 3 (100% loss),\r\n";
+        assert_eq!(super::parse_ping_reply_ttl_windows(out), None);
+    }
+
+    #[test]
+    fn parse_ping_reply_ttl_windows_does_not_match_posix_lowercase() {
+        // A POSIX lowercase `ttl=` line must NOT satisfy the Windows parser
+        // (the platform dispatcher keeps them separate, but assert the guard).
+        let out = "64 bytes from 100.64.0.3: icmp_seq=1 ttl=63 time=0.40 ms";
+        assert_eq!(super::parse_ping_reply_ttl_windows(out), None);
+    }
+
+    // The TTL−2 decrement arithmetic is identical regardless of OS once a TTL
+    // is parsed; verify the per-OS dispatcher routes to the right parser.
+    #[test]
+    fn parse_reply_ttl_for_platform_dispatches_per_os() {
+        let posix = "64 bytes from 100.64.0.3: icmp_seq=1 ttl=61 time=0.40 ms";
+        let windows = "Reply from 100.64.0.3: bytes=32 time=1ms TTL=61";
+        assert_eq!(
+            super::parse_reply_ttl_for_platform(LiveLabPlatform::Linux, posix),
+            Some(61)
+        );
+        assert_eq!(
+            super::parse_reply_ttl_for_platform(LiveLabPlatform::MacOs, posix),
+            Some(61)
+        );
+        assert_eq!(
+            super::parse_reply_ttl_for_platform(LiveLabPlatform::Windows, windows),
+            Some(61)
+        );
+    }
+
+    // ─── Mesh-IP discovery: Linux `ip -4 -o addr` ────────────────────────────
+    #[test]
+    fn parse_mesh_ipv4_picks_linux_rustynet0_cgnat_address() {
         let out = "4: rustynet0    inet 100.64.0.3/32 scope global rustynet0\\       valid_lft forever preferred_lft forever\n";
         assert_eq!(
-            super::parse_mesh_ipv4_from_ip_addr(out),
+            super::parse_mesh_ipv4_from_inet_tokens(out),
+            Some("100.64.0.3".to_owned())
+        );
+    }
+
+    // ─── Mesh-IP discovery: macOS `ifconfig` utun device ──────────────────────
+    #[test]
+    fn parse_mesh_ipv4_picks_macos_utun_cgnat_address() {
+        // Realistic macOS `ifconfig` dump: the mesh address lives on a utunN
+        // device as a bare dotted-quad (no /prefix), with a `-->` peer column.
+        let out = "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+                   \tinet 192.168.18.7 netmask 0xffffff00 broadcast 192.168.18.255\n\
+                   utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280\n\
+                   \tinet 100.64.0.3 --> 100.64.0.3 netmask 0xffffffff\n";
+        assert_eq!(
+            super::parse_mesh_ipv4_from_inet_tokens(out),
             Some("100.64.0.3".to_owned())
         );
     }
 
     #[test]
-    fn parse_mesh_ipv4_ignores_non_mesh_addresses() {
+    fn parse_mesh_ipv4_inet_tokens_ignores_non_mesh_addresses() {
         // A stray non-mesh inet on the device must not be mistaken for the
         // tunnel address; only the 100.x CGNAT mesh range is accepted.
         let out = "4: rustynet0    inet 192.168.18.5/24 scope global rustynet0\n";
-        assert_eq!(super::parse_mesh_ipv4_from_ip_addr(out), None);
+        assert_eq!(super::parse_mesh_ipv4_from_inet_tokens(out), None);
     }
 
     #[test]
-    fn parse_mesh_ipv4_returns_none_on_empty() {
-        assert_eq!(super::parse_mesh_ipv4_from_ip_addr(""), None);
+    fn parse_mesh_ipv4_inet_tokens_returns_none_on_empty() {
+        assert_eq!(super::parse_mesh_ipv4_from_inet_tokens(""), None);
+    }
+
+    // ─── Mesh-IP discovery: Windows Get-NetIPAddress IPAddress list ───────────
+    #[test]
+    fn parse_mesh_ipv4_windows_picks_cgnat_address() {
+        // Get-NetIPAddress -ExpandProperty IPAddress yields bare dotted-quads.
+        let out = "169.254.12.5\r\n100.64.0.3\r\n";
+        assert_eq!(
+            super::parse_mesh_ipv4_from_windows_ipaddress(out),
+            Some("100.64.0.3".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_mesh_ipv4_windows_returns_none_without_mesh_address() {
+        let out = "192.168.18.5\r\n";
+        assert_eq!(super::parse_mesh_ipv4_from_windows_ipaddress(out), None);
+    }
+
+    #[test]
+    fn parse_mesh_ipv4_for_platform_dispatches_per_os() {
+        let posix =
+            "utun4: flags=8051 mtu 1280\n\tinet 100.64.0.7 --> 100.64.0.7 netmask 0xffffffff\n";
+        let windows = "100.64.0.7\r\n";
+        assert_eq!(
+            super::parse_mesh_ipv4_for_platform(LiveLabPlatform::MacOs, posix),
+            Some("100.64.0.7".to_owned())
+        );
+        assert_eq!(
+            super::parse_mesh_ipv4_for_platform(LiveLabPlatform::Windows, windows),
+            Some("100.64.0.7".to_owned())
+        );
+    }
+
+    // ─── route-via-tunnel precondition predicate, per OS ──────────────────────
+    #[test]
+    fn route_uses_tunnel_linux_requires_dev_rustynet0() {
+        // Realistic `ip -4 route get 1.1.1.1` egressing the tunnel.
+        let via_tunnel = "1.1.1.1 dev rustynet0 src 100.64.0.3 uid 0 \n    cache";
+        assert!(super::route_uses_tunnel(LiveLabPlatform::Linux, via_tunnel));
+        // Egressing the LAN gateway must NOT count.
+        let via_lan = "1.1.1.1 via 192.168.18.1 dev enp0s1 src 192.168.18.7 uid 0 \n    cache";
+        assert!(!super::route_uses_tunnel(LiveLabPlatform::Linux, via_lan));
+        // A look-alike device name (`rustynet0x`) must NOT match.
+        let lookalike = "1.1.1.1 dev rustynet0x src 100.64.0.3 uid 0";
+        assert!(!super::route_uses_tunnel(LiveLabPlatform::Linux, lookalike));
+    }
+
+    #[test]
+    fn route_uses_tunnel_macos_requires_utun_interface() {
+        // Realistic `route -n get 1.1.1.1` egressing the utun tunnel.
+        let via_tunnel = "   route to: 1.1.1.1\ndestination: default\n       gateway: 100.64.0.1\n     interface: utun4\n";
+        assert!(super::route_uses_tunnel(LiveLabPlatform::MacOs, via_tunnel));
+        // Egressing en0 (the LAN) must NOT count.
+        let via_lan = "   route to: 1.1.1.1\ndestination: default\n       gateway: 192.168.18.1\n     interface: en0\n";
+        assert!(!super::route_uses_tunnel(LiveLabPlatform::MacOs, via_lan));
+    }
+
+    #[test]
+    fn route_uses_tunnel_windows_requires_wintun_alias() {
+        // Find-NetRoute InterfaceAlias resolved to the wintun adapter.
+        let via_tunnel = "rustynet0\r\n";
+        assert!(super::route_uses_tunnel(
+            LiveLabPlatform::Windows,
+            via_tunnel
+        ));
+        // Egressing the physical Ethernet alias must NOT count.
+        let via_lan = "Ethernet\r\n";
+        assert!(!super::route_uses_tunnel(LiveLabPlatform::Windows, via_lan));
+        // A look-alike alias must NOT match.
+        let lookalike = "rustynet0x\r\n";
+        assert!(!super::route_uses_tunnel(
+            LiveLabPlatform::Windows,
+            lookalike
+        ));
+    }
+
+    // ─── per-OS command shape (smoke checks of the literal builders) ──────────
+    #[test]
+    fn reachability_ping_command_is_per_os_correct() {
+        assert!(
+            super::reachability_ping_command(LiveLabPlatform::Linux, "1.1.1.1")
+                .contains("-c 3 -W 2")
+        );
+        assert!(
+            super::reachability_ping_command(LiveLabPlatform::MacOs, "1.1.1.1")
+                .contains("-c 3 -t 5")
+        );
+        let win = super::reachability_ping_command(LiveLabPlatform::Windows, "1.1.1.1");
+        assert!(win.contains("-n 3 -w 2000"));
+        assert!(win.contains("\"1.1.1.1\""));
+    }
+
+    #[test]
+    fn reply_ttl_ping_command_captures_per_os() {
+        // POSIX paths keep `2>&1 || true` so a partial reply still prints a
+        // parseable line; Windows relies on ping.exe's own stdout.
+        assert!(
+            super::reply_ttl_ping_command(LiveLabPlatform::Linux, "1.1.1.1")
+                .contains("2>&1 || true")
+        );
+        assert!(
+            super::reply_ttl_ping_command(LiveLabPlatform::MacOs, "1.1.1.1")
+                .contains("2>&1 || true")
+        );
+        assert!(
+            super::reply_ttl_ping_command(LiveLabPlatform::Windows, "1.1.1.1").contains("-n 3")
+        );
+    }
+
+    #[test]
+    fn mesh_ipv4_discovery_command_is_per_os_correct() {
+        assert!(
+            super::mesh_ipv4_discovery_command(LiveLabPlatform::Linux)
+                .contains("ip -4 -o addr show dev rustynet0")
+        );
+        assert!(super::mesh_ipv4_discovery_command(LiveLabPlatform::MacOs).contains("ifconfig"));
+        assert!(
+            super::mesh_ipv4_discovery_command(LiveLabPlatform::Windows)
+                .contains("Get-NetIPAddress -InterfaceAlias rustynet0")
+        );
+    }
+
+    #[test]
+    fn default_route_probe_command_is_per_os_correct() {
+        assert!(
+            super::default_route_probe_command(LiveLabPlatform::Linux, "1.1.1.1")
+                .contains("ip -4 route get")
+        );
+        assert!(
+            super::default_route_probe_command(LiveLabPlatform::MacOs, "1.1.1.1")
+                .contains("route -n get")
+        );
+        assert!(
+            super::default_route_probe_command(LiveLabPlatform::Windows, "1.1.1.1")
+                .contains("Find-NetRoute")
+        );
     }
 
     #[test]
