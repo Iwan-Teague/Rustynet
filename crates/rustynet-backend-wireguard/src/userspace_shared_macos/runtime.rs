@@ -764,8 +764,22 @@ impl RuntimeState {
     }
 
     fn poll_authoritative_socket_with(&mut self, scratch: &mut [u8]) -> Result<(), BackendError> {
+        self.poll_authoritative_socket_with_budget(scratch, MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK)
+    }
+
+    /// Drain at most `budget` datagrams from the authoritative socket in one
+    /// tick. Production always passes `MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK`
+    /// (via `poll_authoritative_socket_with`); the `budget` parameter is the
+    /// test seam that lets the budget-cap test use a small, reliably-buffered
+    /// datagram count instead of `MAX + 3` (which a loopback UDP receive buffer
+    /// drops under CI load).
+    fn poll_authoritative_socket_with_budget(
+        &mut self,
+        scratch: &mut [u8],
+        budget: usize,
+    ) -> Result<(), BackendError> {
         let mut drained = 0usize;
-        for _ in 0..MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK {
+        for _ in 0..budget {
             let Some((len, remote_addr)) = self.authoritative_socket.try_recv_into(scratch)? else {
                 break;
             };
@@ -784,8 +798,21 @@ impl RuntimeState {
             )?;
             self.apply_engine_processing_outcome(outcome)?;
         }
-        self.udp_budget_exhausted = drained == MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK;
+        self.udp_budget_exhausted = drained == budget;
         Ok(())
+    }
+
+    /// Test seam: run one authoritative-socket poll tick with an explicit
+    /// budget, mirroring `poll_authoritative_socket`'s scratch handling.
+    #[cfg(test)]
+    fn poll_authoritative_socket_budget_for_test(
+        &mut self,
+        budget: usize,
+    ) -> Result<(), BackendError> {
+        let mut scratch = std::mem::take(&mut self.udp_recv_scratch);
+        let result = self.poll_authoritative_socket_with_budget(&mut scratch, budget);
+        self.udp_recv_scratch = scratch;
+        result
     }
 
     fn poll_tun_device(&mut self) -> Result<(), BackendError> {
@@ -1576,17 +1603,20 @@ mod tests {
 
     #[test]
     fn macos_runtime_authoritative_socket_poll_is_budgeted_per_tick() {
+        // Exercise the per-tick budget cap with a SMALL budget so the datagrams
+        // reliably queue in the default UDP receive buffer. Polling with the
+        // production budget (MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK = 64) needs
+        // 67 datagrams buffered simultaneously, which macOS's default loopback
+        // UDP buffer drops under CI load (the prior flakiness: only ~39 of 67
+        // survived, so the cap was never reached and `== 64` failed). A budget
+        // of 4 needs just 7 buffered — far below any drop threshold — while
+        // exercising the IDENTICAL capped-drain loop: the production path
+        // (`poll_authoritative_socket` → `poll_authoritative_socket_with`)
+        // delegates to the same `poll_authoritative_socket_with_budget` with
+        // MAX.
+        const TEST_BUDGET: usize = 4;
+
         let (mut state, _tun_state, _private_key) = test_runtime_state("utun18");
-        // Raise SO_RCVBUF so all MAX+3 datagrams are buffered simultaneously
-        // before the first poll. macOS's default UDP receive buffer drops some
-        // under CI load (~28 of 67), which leaves fewer than MAX queued and so
-        // never exercises the per-tick budget cap — the source of this test's
-        // flakiness. 1 MiB holds the 67 one-byte datagrams with large margin and
-        // stays well under `kern.ipc.maxsockbuf`.
-        state
-            .authoritative_socket
-            .set_recv_buffer_size_for_test(1024 * 1024)
-            .expect("enlarge authoritative recv buffer so all datagrams queue");
         let remote = UdpSocket::bind("127.0.0.1:0").expect("remote bind");
         let target = loopback_target(
             state
@@ -1595,26 +1625,28 @@ mod tests {
                 .expect("worker addr should resolve"),
         );
 
-        for index in 0..(MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK + 3) {
+        for index in 0..(TEST_BUDGET + 3) {
             remote
                 .send_to(&[index as u8], target)
                 .expect("datagram should send");
         }
 
         state
-            .poll_authoritative_socket()
+            .poll_authoritative_socket_budget_for_test(TEST_BUDGET)
             .expect("first socket poll should succeed");
         assert_eq!(
             state.recorded_peer_ciphertext_ingress().len(),
-            MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK
+            TEST_BUDGET,
+            "first poll must cap ingestion at the budget even with more queued"
         );
 
         state
-            .poll_authoritative_socket()
+            .poll_authoritative_socket_budget_for_test(TEST_BUDGET)
             .expect("second socket poll should drain remaining datagrams");
         assert_eq!(
             state.recorded_peer_ciphertext_ingress().len(),
-            MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK + 3
+            TEST_BUDGET + 3,
+            "second poll must drain the rest"
         );
     }
 

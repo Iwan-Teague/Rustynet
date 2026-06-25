@@ -65,26 +65,6 @@ impl AuthoritativeSocket {
         Self::bind_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
     }
 
-    /// Test-only: raise the kernel receive buffer (`SO_RCVBUF`) so a test can
-    /// deterministically queue many datagrams before the first poll. The
-    /// per-tick budget test sends `MAX + 3` one-byte datagrams and asserts the
-    /// first poll ingests exactly `MAX`; that only holds if all of them are
-    /// buffered simultaneously, and macOS's default UDP receive buffer drops
-    /// some under load (CI), so the budget cap is never exercised and the test
-    /// flakes. Enlarging the buffer removes the drop without touching the
-    /// production socket path. Uses the safe `socket2::SockRef` wrapper because
-    /// std `UdpSocket` has no buffer setter and `unsafe_code` is forbidden.
-    #[cfg(test)]
-    pub(crate) fn set_recv_buffer_size_for_test(&self, bytes: usize) -> Result<(), BackendError> {
-        socket2::SockRef::from(&self.socket)
-            .set_recv_buffer_size(bytes)
-            .map_err(|err| {
-                BackendError::internal(format!(
-                    "test authoritative UDP socket SO_RCVBUF resize to {bytes} bytes failed: {err}"
-                ))
-            })
-    }
-
     pub(crate) fn local_addr(&self) -> Result<SocketAddr, BackendError> {
         Ok(self.cached_local_addr)
     }
