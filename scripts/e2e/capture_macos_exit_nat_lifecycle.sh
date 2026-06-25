@@ -106,8 +106,15 @@ with open(during_path) as f:
 with open(after_path) as f:
     after = json.load(f)
 
-after_tunnel = (after.get("tunnel_forwarding") or "Disabled").lower()
-after_egress = (after.get("egress_forwarding") or "Disabled").lower()
+# Fail-closed merge (RSA-0031), mirroring the Rust producer
+# `rustynetd::macos_exit_nat_lifecycle::merge_macos_exit_nat_lifecycle_artifact`
+# and its capture layer (a failed sysctl read yields "Unknown", never
+# "Disabled"). A MISSING/empty/null forwarding field must NOT default to
+# "Disabled" — that would let a truncated or older snapshot read as restored
+# (fail-open). Default to "Unknown" so `forwarding_restored` stays false unless
+# both interfaces are the explicit literal "Disabled".
+after_tunnel = str(after.get("tunnel_forwarding") or "Unknown").lower()
+after_egress = str(after.get("egress_forwarding") or "Unknown").lower()
 forwarding_restored = after_tunnel == "disabled" and after_egress == "disabled"
 
 merged = {
@@ -115,13 +122,19 @@ merged = {
     "mesh_cidr": during.get("mesh_cidr", ""),
     "pf_anchor": during.get("pf_anchor", ""),
     "during_run": {
+        # During run we must positively prove the anchor was present; a missing
+        # field defaults to False (not-serving) so the validator's anti-vacuous
+        # guard fails rather than silently passing.
         "pf_anchor_present": bool(during.get("pf_anchor_present", False)),
         "internal_prefix": during.get("internal_prefix", ""),
-        "tunnel_forwarding": during.get("tunnel_forwarding", "Disabled"),
-        "egress_forwarding": during.get("egress_forwarding", "Disabled"),
+        "tunnel_forwarding": during.get("tunnel_forwarding") or "Unknown",
+        "egress_forwarding": during.get("egress_forwarding") or "Unknown",
     },
     "after_stop": {
-        "pf_anchor_present": bool(after.get("pf_anchor_present", False)),
+        # After stop the validator FAILS if the anchor is still present; a
+        # missing field must default to True (still-present) so an unverifiable
+        # teardown cannot be read as a clean one.
+        "pf_anchor_present": bool(after.get("pf_anchor_present", True)),
         "forwarding_restored": forwarding_restored,
     },
 }
