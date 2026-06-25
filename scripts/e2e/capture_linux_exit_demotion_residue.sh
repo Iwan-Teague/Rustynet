@@ -89,11 +89,17 @@ with open(during_path) as f:
 with open(after_path) as f:
     after = json.load(f)
 
-after_tunnel = (after.get("tunnel_forwarding") or "Disabled").lower()
-after_egress = (after.get("egress_forwarding") or "Disabled").lower()
+# Fail-closed merge (RSA-0031 / F0.3), mirroring the Rust producer
+# `rustynetd::linux_exit_nat_lifecycle::merge_linux_exit_nat_lifecycle_artifact`
+# and the already-fixed `capture_macos_exit_nat_lifecycle.sh`. A MISSING/empty/
+# null forwarding field must NOT default to "Disabled" (fail-open); default to
+# "Unknown" so `forwarding_restored` stays false unless the field is the
+# explicit literal "Disabled".
+after_tunnel = str(after.get("tunnel_forwarding") or "Unknown").lower()
+after_egress = str(after.get("egress_forwarding") or "Unknown").lower()
 forwarding_restored = after_tunnel == "disabled" and after_egress == "disabled"
-after_v6_t = (after.get("ipv6_tunnel_forwarding") or "Disabled").lower()
-after_v6_e = (after.get("ipv6_egress_forwarding") or "Disabled").lower()
+after_v6_t = str(after.get("ipv6_tunnel_forwarding") or "Unknown").lower()
+after_v6_e = str(after.get("ipv6_egress_forwarding") or "Unknown").lower()
 ipv6_forwarding_restored = after_v6_t == "disabled" and after_v6_e == "disabled"
 
 merged = {
@@ -103,12 +109,21 @@ merged = {
     "demotion_exit_code": int(os.environ.get("DEMO_EXIT", "1")),
     "daemon_still_running": os.environ.get("DAEMON_RUN", "false") == "true",
     "during_run": {
+        # During run we must positively prove the node was actually serving exit:
+        # a missing NAT field defaults to False so the validator's anti-vacuous
+        # guard fails rather than silently passing. `internal_prefix` (F0.10) is
+        # emitted here so the validator can assert internal_prefix == mesh_cidr,
+        # matching the lifecycle artifact's during-run guard.
         "nat_table_present": bool(during.get("nat_table_present", False)),
-        "tunnel_forwarding": during.get("tunnel_forwarding", "Disabled"),
-        "egress_forwarding": during.get("egress_forwarding", "Disabled"),
+        "internal_prefix": during.get("internal_prefix", ""),
+        "tunnel_forwarding": during.get("tunnel_forwarding") or "Unknown",
+        "egress_forwarding": during.get("egress_forwarding") or "Unknown",
     },
     "after_demote": {
-        "nat_table_present": bool(after.get("nat_table_present", False)),
+        # After demotion the validator FAILS if the NAT table is still present; a
+        # missing field must default to True (still-present) so an unverifiable
+        # teardown cannot be read as a clean one (residue = open relay).
+        "nat_table_present": bool(after.get("nat_table_present", True)),
         "forwarding_restored": forwarding_restored,
         "ipv6_forwarding_restored": ipv6_forwarding_restored,
     },

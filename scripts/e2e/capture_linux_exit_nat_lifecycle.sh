@@ -84,12 +84,20 @@ with open(during_path) as f:
 with open(after_path) as f:
     after = json.load(f)
 
-after_tunnel = (after.get("tunnel_forwarding") or "Disabled").lower()
-after_egress = (after.get("egress_forwarding") or "Disabled").lower()
+# Fail-closed merge (RSA-0031 / F0.3), mirroring the Rust producer
+# `rustynetd::linux_exit_nat_lifecycle::merge_linux_exit_nat_lifecycle_artifact`
+# and its capture layer (a failed `/proc/sys` read yields "Unknown", never
+# "Disabled") and the already-fixed `capture_macos_exit_nat_lifecycle.sh`. A
+# MISSING/empty/null forwarding field must NOT default to "Disabled" — that
+# would let a truncated or older snapshot read as restored (fail-open). Default
+# to "Unknown" so `forwarding_restored` stays false unless the field is the
+# explicit literal "Disabled".
+after_tunnel = str(after.get("tunnel_forwarding") or "Unknown").lower()
+after_egress = str(after.get("egress_forwarding") or "Unknown").lower()
 forwarding_restored = after_tunnel == "disabled" and after_egress == "disabled"
 
-after_v6_tunnel = (after.get("ipv6_tunnel_forwarding") or "Disabled").lower()
-after_v6_egress = (after.get("ipv6_egress_forwarding") or "Disabled").lower()
+after_v6_tunnel = str(after.get("ipv6_tunnel_forwarding") or "Unknown").lower()
+after_v6_egress = str(after.get("ipv6_egress_forwarding") or "Unknown").lower()
 ipv6_forwarding_restored = after_v6_tunnel == "disabled" and after_v6_egress == "disabled"
 
 merged = {
@@ -97,15 +105,21 @@ merged = {
     "mesh_cidr": during.get("mesh_cidr", ""),
     "nat_table": during.get("nat_table", ""),
     "during_run": {
+        # During run we must positively prove the NAT table was present; a
+        # missing field defaults to False (not-serving) so the validator's
+        # anti-vacuous guard fails rather than silently passing.
         "nat_table_present": bool(during.get("nat_table_present", False)),
         "internal_prefix": during.get("internal_prefix", ""),
-        "tunnel_forwarding": during.get("tunnel_forwarding", "Disabled"),
-        "egress_forwarding": during.get("egress_forwarding", "Disabled"),
-        "ipv6_tunnel_forwarding": during.get("ipv6_tunnel_forwarding", "Disabled"),
-        "ipv6_egress_forwarding": during.get("ipv6_egress_forwarding", "Disabled"),
+        "tunnel_forwarding": during.get("tunnel_forwarding") or "Unknown",
+        "egress_forwarding": during.get("egress_forwarding") or "Unknown",
+        "ipv6_tunnel_forwarding": during.get("ipv6_tunnel_forwarding") or "Unknown",
+        "ipv6_egress_forwarding": during.get("ipv6_egress_forwarding") or "Unknown",
     },
     "after_stop": {
-        "nat_table_present": bool(after.get("nat_table_present", False)),
+        # After stop the validator FAILS if the NAT table is still present; a
+        # missing field must default to True (still-present) so an unverifiable
+        # teardown cannot be read as a clean one.
+        "nat_table_present": bool(after.get("nat_table_present", True)),
         "forwarding_restored": forwarding_restored,
         "ipv6_forwarding_restored": ipv6_forwarding_restored,
     },
