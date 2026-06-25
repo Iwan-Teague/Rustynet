@@ -1214,32 +1214,32 @@ const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, u32, &str)] = &[
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3089,
+        3092,
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3094,
+        3097,
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
-    ),
-    (
-        "crates/rustynet-control/src/lib.rs",
-        3227,
-        "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
         3230,
-        "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
-    ),
-    (
-        "crates/rustynet-control/src/lib.rs",
-        4277,
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        4282,
+        3233,
+        "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        4280,
+        "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        4285,
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
     ),
     (
