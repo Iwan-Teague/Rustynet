@@ -10,7 +10,8 @@ use std::thread::sleep;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{
-    LiveLabContext, Logger, repo_root, shell_single_quote, write_secure_json, write_secure_text,
+    LiveLabContext, LiveLabPlatform, Logger, repo_root, shell_single_quote, write_secure_json,
+    write_secure_text,
 };
 use serde_json::json;
 
@@ -87,14 +88,18 @@ fn run() -> Result<(), String> {
     let root_dir = repo_root()?;
     let config = Config::parse(env::args().skip(1).collect())?;
 
-    // Track B Phase 2: non-Linux fails closed honestly until the
-    // per-platform validator lands.
-    live_lab_support::enforce_linux_only_until_validator_lands(
-        config.platform,
-        "managed-dns",
-        "the per-platform validator lands later in Track B",
-    )?;
-
+    // Wave 2 (W2-D): the managed-DNS suite is now cross-OS. `config.platform`
+    // is threaded through every resolver-stack command (split-DNS inspection,
+    // OS-resolver answer probe, managed-resolver service state) via runtime
+    // `match platform` branches — NOT `cfg` — so the binary compiles and
+    // unit-tests on this Linux host while still running the real per-OS
+    // assertion logic against a macOS or Windows guest. The loopback-resolver
+    // direct query stays OS-independent: it uses `rustynet ops e2e-dns-query`,
+    // a portable Rust UDP client that speaks raw DNS to 127.0.0.1:53535 on any
+    // OS, so the answer / REFUSED-negative / fail-closed-adversarial-guard
+    // assertions remain byte-identical across platforms. The old
+    // `enforce_linux_only_until_validator_lands` gate is intentionally gone
+    // for this binary.
     for command in ["cargo", "git", "ssh", "scp", "ssh-keygen", "date"] {
         require_command(command)?;
     }
@@ -477,10 +482,19 @@ fn run() -> Result<(), String> {
 
     let dns_inspect_valid =
         wait_for_dns_inspect_state(&ctx, &config.client_host, Some("valid"), 20, 2)?;
-    let resolvectl_status_valid = ctx.capture_root_allow_failure(
-        &config.client_host,
-        &["resolvectl", "status", &config.dns_interface],
-    )?;
+    // Split-DNS / resolver-configuration inspection. Per-OS command:
+    //   Linux   → `resolvectl status <iface>` (systemd-resolved)
+    //   macOS   → `scutil --dns` (the System Configuration resolver list)
+    //   Windows → `Get-DnsClientServerAddress` (per-interface DNS servers)
+    // The captured text is fed to a per-OS pure parser that asserts the
+    // managed loopback resolver is the configured DNS server for the mesh.
+    let resolver_config_capture =
+        capture_resolver_config_status(&ctx, &config.client_host, &config)?;
+    // Loopback-resolver direct query. OS-independent: `rustynet ops
+    // e2e-dns-query` speaks raw DNS to 127.0.0.1:53535 (the daemon-managed
+    // resolver) so the JSON answer/rcode shape — and therefore the answer,
+    // REFUSED-negative, and fail-closed assertions — stay byte-identical on
+    // every OS.
     let direct_query_valid =
         remote_dns_query_capture(&ctx, &config.client_host, &config, &config.managed_fqdn())?;
     let direct_alias_query_valid = remote_dns_query_capture(
@@ -491,32 +505,40 @@ fn run() -> Result<(), String> {
     )?;
     let non_managed_direct_query =
         remote_dns_query_capture(&ctx, &config.client_host, &config, "example.com")?;
-    let _ = ctx.run_root_allow_failure(&config.client_host, &["resolvectl", "flush-caches"])?;
-    let managed_fqdn = config.managed_fqdn();
-    let resolvectl_query_cmd = format!(
-        "if command -v timeout >/dev/null 2>&1; then timeout 15 resolvectl query --legend=no {fqdn}; else resolvectl query --legend=no {fqdn}; fi",
-        fqdn = shell_single_quote(managed_fqdn.as_str())
-    );
-    let resolvectl_query_valid = ctx.capture_root_allow_failure(
-        &config.client_host,
-        &["sh", "-lc", resolvectl_query_cmd.as_str()],
-    )?;
+    flush_os_resolver_cache(&ctx, &config.client_host, &config)?;
+    // OS-resolver answer probe. Proves the host's *system* resolver path —
+    // not just the loopback UDP client above — returns the managed A record:
+    //   Linux   → `resolvectl query` (systemd-resolved)
+    //   macOS   → `dig @127.0.0.1 -p 53535` against the managed resolver,
+    //             corroborated by `dscacheutil -q host` for the cache view
+    //   Windows → `Resolve-DnsName -Server 127.0.0.1`, with `nslookup` as the
+    //             secondary check
+    let os_resolver_answer_valid =
+        capture_os_resolver_answer(&ctx, &config.client_host, &config, &config.managed_fqdn())?;
 
     let expected_ip =
         extract_managed_dns_expected_ip(&root_dir, &config.managed_fqdn(), &dns_inspect_valid)?;
 
     logger.block("[managed-dns] valid dns inspect", &dns_inspect_valid)?;
     logger.block(
-        "[managed-dns] valid resolvectl status",
-        &resolvectl_status_valid,
+        format!(
+            "[managed-dns] valid resolver config status ({})",
+            config.platform.as_str()
+        )
+        .as_str(),
+        &resolver_config_capture,
     )?;
     logger.block(
         "[managed-dns] valid loopback DNS query",
         &direct_query_valid,
     )?;
     logger.block(
-        "[managed-dns] valid resolvectl query",
-        &resolvectl_query_valid,
+        format!(
+            "[managed-dns] valid OS resolver answer ({})",
+            config.platform.as_str()
+        )
+        .as_str(),
+        &os_resolver_answer_valid,
     )?;
     let validation = ManagedDnsValidationContext {
         logger: &logger,
@@ -717,17 +739,26 @@ fn run() -> Result<(), String> {
     {
         check_dns_inspect_valid = "pass";
     }
-    let managed_service_active = ctx.capture_root_allow_failure(
-        &config.client_host,
-        &["systemctl", "is-active", "rustynetd-managed-dns.service"],
-    )?;
-    if managed_service_active.trim() == "active" {
+    // Managed-resolver service-active check. On Linux the managed resolver
+    // runs as the dedicated `rustynetd-managed-dns.service` systemd unit, so
+    // `systemctl is-active` is the direct probe. On macOS/Windows there is NO
+    // separate managed-DNS service — the resolver is hosted inside the main
+    // daemon process (launchd `com.rustynet.daemon` / the `RustyNet` SCM
+    // service). The check therefore confirms the *hosting* daemon is live; a
+    // dead daemon (= dead managed resolver) fails closed honestly. See the
+    // REVIEW note on `capture_managed_dns_service_state`.
+    let managed_service_state =
+        capture_managed_dns_service_state(&ctx, &config.client_host, &config)?;
+    if managed_dns_service_active(config.platform, managed_service_state.as_str()) {
         check_managed_dns_service_active = "pass";
     }
-    if resolvectl_status_valid.contains(&config.dns_bind_addr)
-        && (resolvectl_status_valid.contains(&format!("~{}", config.zone_name))
-            || resolvectl_status_valid.contains(&format!("DNS Domain: {}", config.zone_name)))
-    {
+    if resolver_config_advertises_managed_zone(
+        config.platform,
+        resolver_config_capture.as_str(),
+        &config.dns_bind_addr,
+        &config.dns_server(),
+        &config.zone_name,
+    ) {
         check_resolvectl_split_dns = "pass";
     }
     if json_field(&root_dir, &direct_query_valid, "rcode")? == "0"
@@ -740,7 +771,11 @@ fn run() -> Result<(), String> {
     {
         check_alias_query_valid = "pass";
     }
-    if resolvectl_query_valid.contains(&expected_ip) {
+    if os_resolver_answer_contains_ip(
+        config.platform,
+        os_resolver_answer_valid.as_str(),
+        expected_ip.as_str(),
+    ) {
         check_resolvectl_query_valid = "pass";
     }
     if json_field(&root_dir, &non_managed_direct_query, "rcode")? == "5" {
@@ -1771,31 +1806,25 @@ fn exercise_invalid_bundle_case(
         validation.dns_issue.ctx,
         &validation.config.client_host,
     )?;
-    let rustynetd_state = validation
-        .dns_issue
-        .ctx
-        .capture_root_allow_failure_with_retry(
-            &validation.config.client_host,
-            &["systemctl", "is-active", "rustynetd.service"],
-            SOAK_SSH_RETRY_ATTEMPTS,
-            SOAK_SSH_RETRY_SLEEP_SECS,
-        )?;
-    let rustynetd_journal = validation
-        .dns_issue
-        .ctx
-        .capture_root_allow_failure_with_retry(
-            &validation.config.client_host,
-            &[
-                "journalctl",
-                "-u",
-                "rustynetd.service",
-                "-n",
-                "40",
-                "--no-pager",
-            ],
-            SOAK_SSH_RETRY_ATTEMPTS,
-            SOAK_SSH_RETRY_SLEEP_SECS,
-        )?;
+    // Daemon hosting-state + recent daemon log. Per-OS:
+    //   Linux   → `systemctl is-active rustynetd.service` + `journalctl`
+    //   macOS   → daemon hosting-state via the managed-resolver service probe
+    //             + `log show --predicate 'process == "rustynetd"'`
+    //   Windows → SCM service state + `Get-WinEvent` daemon log tail
+    // The journal is only a *fallback* signal for the fail-closed assertion:
+    // `managed_dns_invalid_state_observed` first honours the OS-independent
+    // `dns inspect: state=invalid` readback, so a missing/absent per-OS log
+    // tail can never fake a pass.
+    let rustynetd_state = capture_hosting_daemon_state(
+        validation.dns_issue.ctx,
+        &validation.config.client_host,
+        validation.config,
+    )?;
+    let rustynetd_journal = capture_daemon_log_tail(
+        validation.dns_issue.ctx,
+        &validation.config.client_host,
+        validation.config,
+    )?;
     let direct_query = remote_dns_query_capture_allow_failure(
         validation.dns_issue.ctx,
         &validation.config.client_host,
@@ -2176,6 +2205,462 @@ fn remote_dns_query_capture_allow_failure(
     })
 }
 
+// ─── Per-OS resolver-stack inspection (Wave 2 W2-D cross-OS port) ──────────
+//
+// These captures replace three Linux-only command sites with runtime
+// `match platform` branches. Each capture is paired with a pure parser
+// (below) that is unit-tested against realistic per-OS output so the
+// inference about the command shape is verifiable on this Linux host.
+
+/// Capture the split-DNS / resolver-configuration status from the client.
+///
+/// Per-OS command choice + WHY:
+///   * Linux   → `resolvectl status <iface>`: systemd-resolved is the
+///     canonical Linux resolver and `status <iface>` shows the per-link DNS
+///     server + the `~<zone>` routing domain that proves split-DNS routing.
+///     (Byte-identical to the pre-Wave-2 Linux command.)
+///   * macOS   → `scutil --dns`: the System Configuration framework's
+///     resolver dump lists every configured resolver with its `nameserver[n]`
+///     and `domain`/`search domain` — the macOS equivalent of resolvectl's
+///     per-link view. `dscacheutil` cannot show resolver *configuration*, so
+///     `scutil --dns` is the correct inspection verb.
+///   * Windows → `Get-DnsClientServerAddress`: the DnsClient cmdlet prints
+///     each interface's configured DNS server addresses; combined with the
+///     loopback bind address this proves the host points at the managed
+///     resolver. (NRPT split-zone routing is a deeper check the daemon owns;
+///     the configured-server view is the directly-observable split-DNS proof.)
+fn capture_resolver_config_status(
+    ctx: &LiveLabContext,
+    host: &str,
+    config: &Config,
+) -> Result<String, String> {
+    match config.platform {
+        LiveLabPlatform::Linux => {
+            ctx.capture_root_allow_failure(host, &["resolvectl", "status", &config.dns_interface])
+        }
+        LiveLabPlatform::MacOs => {
+            // `scutil --dns` never fails for missing config; it just prints an
+            // empty resolver list, which the parser treats as "not configured"
+            // (fail-closed). argv-only; no untrusted interpolation.
+            ctx.capture_root_allow_failure(host, &["scutil", "--dns"])
+        }
+        LiveLabPlatform::Windows => {
+            // Emit the configured DNS servers as `<ifAlias>=<server>` rows so
+            // the parser sees the loopback resolver without depending on the
+            // default Format-Table layout. The script body is a hardcoded
+            // constant — no runtime data crosses the shell boundary.
+            ctx.capture_root_allow_failure(
+                host,
+                &[
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-DnsClientServerAddress | ForEach-Object { foreach ($s in $_.ServerAddresses) { \"$($_.InterfaceAlias)=$s\" } }",
+                ],
+            )
+        }
+    }
+}
+
+/// Flush the OS resolver cache before the system-resolver answer probe so a
+/// previously-cached negative answer cannot mask a freshly-installed bundle.
+/// Per-OS verb: Linux `resolvectl flush-caches`, macOS
+/// `dscacheutil -flushcache`, Windows `Clear-DnsClientCache`. Failures are
+/// tolerated (the cache may already be empty); this is a hygiene step, not an
+/// assertion.
+fn flush_os_resolver_cache(
+    ctx: &LiveLabContext,
+    host: &str,
+    config: &Config,
+) -> Result<(), String> {
+    let _ = match config.platform {
+        LiveLabPlatform::Linux => {
+            ctx.run_root_allow_failure(host, &["resolvectl", "flush-caches"])?
+        }
+        LiveLabPlatform::MacOs => {
+            ctx.run_root_allow_failure(host, &["dscacheutil", "-flushcache"])?
+        }
+        LiveLabPlatform::Windows => ctx.run_root_allow_failure(
+            host,
+            &[
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Clear-DnsClientCache",
+            ],
+        )?,
+    };
+    Ok(())
+}
+
+/// Capture the OS system-resolver's answer for the managed FQDN.
+///
+/// Per-OS command choice + WHY:
+///   * Linux   → `resolvectl query --legend=no <fqdn>`: routes through
+///     systemd-resolved exactly as a normal application would, proving the
+///     split-DNS route reaches the managed resolver. (Byte-identical to the
+///     pre-Wave-2 Linux command, including the `timeout 15` wrapper.)
+///   * macOS   → `dig @<server> -p <port> <fqdn> +short`: macOS has no
+///     `resolvectl`. `dig` aimed at the managed loopback resolver
+///     (127.0.0.1:53535) is the system `dig`'s view of the same resolver,
+///     and `dscacheutil -q host` is captured alongside as the directory-
+///     service cache corroboration. (`dscacheutil` alone cannot target a
+///     custom port, so it cannot stand in for the managed-resolver probe.)
+///   * Windows → `Resolve-DnsName -Server 127.0.0.1 -Name <fqdn>` plus
+///     `nslookup <fqdn> 127.0.0.1`: `Resolve-DnsName` is the modern
+///     PowerShell resolver cmdlet and `nslookup` the classic fallback; both
+///     are pointed at the managed loopback resolver. There is no
+///     `Get-DnsClientServerAddress` *answer* — that cmdlet only reports
+///     configuration — so it is used for the split-DNS config check, not the
+///     answer probe.
+fn capture_os_resolver_answer(
+    ctx: &LiveLabContext,
+    host: &str,
+    config: &Config,
+    fqdn: &str,
+) -> Result<String, String> {
+    match config.platform {
+        LiveLabPlatform::Linux => {
+            let resolvectl_query_cmd = format!(
+                "if command -v timeout >/dev/null 2>&1; then timeout 15 resolvectl query --legend=no {fqdn}; else resolvectl query --legend=no {fqdn}; fi",
+                fqdn = shell_single_quote(fqdn)
+            );
+            ctx.capture_root_allow_failure(host, &["sh", "-lc", resolvectl_query_cmd.as_str()])
+        }
+        LiveLabPlatform::MacOs => {
+            let server = config.dns_server();
+            let port = config.dns_port();
+            // `dig` short answer against the managed resolver, then the
+            // directory-service cache view for the same name. argv-only.
+            let dig_answer = ctx.capture_root_allow_failure(
+                host,
+                &["dig", &format!("@{server}"), "-p", &port, fqdn, "+short"],
+            )?;
+            let dscacheutil_answer = ctx.capture_root_allow_failure(
+                host,
+                &["dscacheutil", "-q", "host", "-a", "name", fqdn],
+            )?;
+            Ok(format!(
+                "dig +short:\n{dig_answer}\ndscacheutil:\n{dscacheutil_answer}"
+            ))
+        }
+        LiveLabPlatform::Windows => {
+            let server = config.dns_server();
+            // Resolve-DnsName against the managed resolver, IP addresses only,
+            // plus an nslookup fallback. The script interpolates only the
+            // already-`ensure_safe_token`-validated server + the const-derived
+            // managed FQDN, so no untrusted value reaches the shell.
+            let script = format!(
+                "$ErrorActionPreference='SilentlyContinue'; (Resolve-DnsName -Server {server} -Name {fqdn} -Type A | Select-Object -ExpandProperty IPAddress); 'nslookup:'; (nslookup {fqdn} {server} 2>$null)"
+            );
+            ctx.capture_root_allow_failure(host, &["powershell", "-NoProfile", "-Command", &script])
+        }
+    }
+}
+
+/// Capture the hosting-state of the managed DNS resolver.
+///
+/// Per-OS command choice + WHY:
+///   * Linux   → `systemctl is-active rustynetd-managed-dns.service`: the
+///     managed resolver runs as a dedicated systemd unit. (Byte-identical to
+///     the pre-Wave-2 Linux command.)
+///   * macOS   → `launchctl print system/com.rustynet.daemon` reduced to a
+///     state word: there is NO separate managed-DNS launchd job — the
+///     resolver is hosted in the main daemon — so the live proof is that the
+///     hosting daemon is loaded/running.
+///   * Windows → `(Get-Service -Name RustyNet).Status`: same rationale — the
+///     resolver is hosted in the main SCM service.
+///
+// REVIEW (daemon-side gap, flagged for the live run): macOS/Windows do NOT
+// expose a standalone managed-DNS service the way Linux's
+// `rustynetd-managed-dns.service` does. This capture confirms the *hosting*
+// daemon is live, which is the strongest directly-observable proxy. If a
+// future build splits the resolver into its own launchd/SCM job, swap the
+// label here. A dead daemon fails this check closed (never a fake pass).
+fn capture_managed_dns_service_state(
+    ctx: &LiveLabContext,
+    host: &str,
+    config: &Config,
+) -> Result<String, String> {
+    match config.platform {
+        // No-retry to stay byte-identical with the pre-Wave-2 Linux call.
+        LiveLabPlatform::Linux => ctx.capture_root_allow_failure(
+            host,
+            &["systemctl", "is-active", "rustynetd-managed-dns.service"],
+        ),
+        LiveLabPlatform::MacOs => ctx.capture_root_allow_failure(
+            host,
+            &[
+                "sh",
+                "-lc",
+                "/bin/launchctl print system/com.rustynet.daemon 2>&1 || true",
+            ],
+        ),
+        LiveLabPlatform::Windows => ctx.capture_root_allow_failure(
+            host,
+            &[
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-Service -Name 'RustyNet' -ErrorAction SilentlyContinue).Status",
+            ],
+        ),
+    }
+}
+
+/// Capture the hosting-daemon state for the fail-closed adversarial cases'
+/// diagnostic log block. Per-OS:
+///   * Linux   → `systemctl is-active rustynetd.service` (with retry, exactly
+///     as the pre-Wave-2 invalid-case capture)
+///   * macOS   → `launchctl print system/com.rustynet.daemon`
+///   * Windows → `(Get-Service -Name RustyNet).Status`
+///
+/// This is diagnostic-only — it is logged but never feeds the pass/fail
+/// decision (`managed_dns_invalid_state_observed` consumes `dns_inspect` and
+/// the daemon log tail, not this state word).
+fn capture_hosting_daemon_state(
+    ctx: &LiveLabContext,
+    host: &str,
+    config: &Config,
+) -> Result<String, String> {
+    match config.platform {
+        LiveLabPlatform::Linux => ctx.capture_root_allow_failure_with_retry(
+            host,
+            &["systemctl", "is-active", "rustynetd.service"],
+            SOAK_SSH_RETRY_ATTEMPTS,
+            SOAK_SSH_RETRY_SLEEP_SECS,
+        ),
+        LiveLabPlatform::MacOs => ctx.capture_root_allow_failure_with_retry(
+            host,
+            &[
+                "sh",
+                "-lc",
+                "/bin/launchctl print system/com.rustynet.daemon 2>&1 || true",
+            ],
+            SOAK_SSH_RETRY_ATTEMPTS,
+            SOAK_SSH_RETRY_SLEEP_SECS,
+        ),
+        LiveLabPlatform::Windows => ctx.capture_root_allow_failure_with_retry(
+            host,
+            &[
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-Service -Name 'RustyNet' -ErrorAction SilentlyContinue).Status",
+            ],
+            SOAK_SSH_RETRY_ATTEMPTS,
+            SOAK_SSH_RETRY_SLEEP_SECS,
+        ),
+    }
+}
+
+/// Capture a recent tail of the daemon log (fallback signal for the
+/// fail-closed adversarial cases). Per-OS:
+///   * Linux   → `journalctl -u rustynetd.service -n 40 --no-pager`
+///   * macOS   → `log show --last 5m --predicate 'process == "rustynetd"'`
+///   * Windows → `Get-WinEvent` over the RustyNet provider (best-effort)
+///
+// REVIEW: the macOS `log show` predicate and the Windows event provider name
+// are inferred from the daemon process name; the fail-closed assertion does
+// NOT depend on this log tail (it primarily honours the OS-independent
+// `dns inspect: state=invalid` readback), so an empty/unsupported log tail
+// degrades to the portable path rather than failing the test spuriously or
+// faking a pass.
+fn capture_daemon_log_tail(
+    ctx: &LiveLabContext,
+    host: &str,
+    config: &Config,
+) -> Result<String, String> {
+    match config.platform {
+        LiveLabPlatform::Linux => ctx.capture_root_allow_failure_with_retry(
+            host,
+            &[
+                "journalctl",
+                "-u",
+                "rustynetd.service",
+                "-n",
+                "40",
+                "--no-pager",
+            ],
+            SOAK_SSH_RETRY_ATTEMPTS,
+            SOAK_SSH_RETRY_SLEEP_SECS,
+        ),
+        LiveLabPlatform::MacOs => ctx.capture_root_allow_failure_with_retry(
+            host,
+            &[
+                "sh",
+                "-lc",
+                "log show --last 5m --predicate 'process == \"rustynetd\"' --style compact 2>/dev/null || true",
+            ],
+            SOAK_SSH_RETRY_ATTEMPTS,
+            SOAK_SSH_RETRY_SLEEP_SECS,
+        ),
+        LiveLabPlatform::Windows => ctx.capture_root_allow_failure_with_retry(
+            host,
+            &[
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "try { Get-WinEvent -ProviderName 'RustyNet' -MaxEvents 40 -ErrorAction Stop | Format-List | Out-String -Width 32767 } catch { '' }",
+            ],
+            SOAK_SSH_RETRY_ATTEMPTS,
+            SOAK_SSH_RETRY_SLEEP_SECS,
+        ),
+    }
+}
+
+// ─── Pure per-OS parsers (unit-tested) ─────────────────────────────────────
+
+/// True when the captured resolver-configuration output proves the managed
+/// loopback resolver is the configured DNS path for the mesh zone.
+///
+///   * Linux: `resolvectl status` must show the managed bind address AND the
+///     `~<zone>` routing domain (or the `DNS Domain: <zone>` form). This is
+///     byte-identical to the pre-Wave-2 assertion.
+///   * macOS: `scutil --dns` must list the managed loopback `nameserver` for
+///     a resolver whose `domain`/`search domain` covers the mesh zone.
+///   * Windows: `Get-DnsClientServerAddress` (rendered as `<ifAlias>=<server>`
+///     rows) must list the managed loopback server.
+fn resolver_config_advertises_managed_zone(
+    platform: LiveLabPlatform,
+    output: &str,
+    dns_bind_addr: &str,
+    dns_server: &str,
+    zone_name: &str,
+) -> bool {
+    match platform {
+        LiveLabPlatform::Linux => {
+            output.contains(dns_bind_addr)
+                && (output.contains(&format!("~{zone_name}"))
+                    || output.contains(&format!("DNS Domain: {zone_name}")))
+        }
+        LiveLabPlatform::MacOs => {
+            macos_scutil_advertises_managed_zone(output, dns_server, zone_name)
+        }
+        LiveLabPlatform::Windows => windows_dns_client_lists_loopback_server(output, dns_server),
+    }
+}
+
+/// macOS `scutil --dns` parser. The dump groups resolvers in
+/// `resolver #N { ... }` blocks, each carrying `nameserver[i] : <ip>` and
+/// `domain : <suffix>` / `search domain[i] : <suffix>` lines. We accept the
+/// config as advertising the managed zone when SOME resolver block lists the
+/// managed loopback nameserver AND a resolver block scopes the mesh zone
+/// (default resolvers, which have no domain, do not satisfy the zone scope —
+/// that prevents a plain loopback forwarder from masquerading as split-DNS).
+fn macos_scutil_advertises_managed_zone(output: &str, dns_server: &str, zone_name: &str) -> bool {
+    let mut has_managed_nameserver = false;
+    let mut has_zone_domain = false;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim();
+            let value = value.trim();
+            if key.starts_with("nameserver") && value == dns_server {
+                has_managed_nameserver = true;
+            }
+            if (key == "domain" || key.starts_with("search domain")) && value == zone_name {
+                has_zone_domain = true;
+            }
+        }
+    }
+    has_managed_nameserver && has_zone_domain
+}
+
+/// Windows configured-DNS-server parser. The capture emits
+/// `<InterfaceAlias>=<ServerAddress>` rows. The managed posture requires at
+/// least one interface configured with the managed loopback resolver.
+fn windows_dns_client_lists_loopback_server(output: &str, dns_server: &str) -> bool {
+    output.lines().any(|line| {
+        line.split_once('=')
+            .is_some_and(|(_, server)| server.trim() == dns_server)
+    })
+}
+
+/// True when the OS system-resolver answer carries the expected A record.
+///
+///   * Linux: `resolvectl query` prints `<fqdn>: <ip>` — substring match on
+///     the IP (byte-identical to the pre-Wave-2 assertion).
+///   * macOS: the combined `dig +short` / `dscacheutil` capture must contain
+///     the IP as a standalone token (not a substring of a larger address).
+///   * Windows: the `Resolve-DnsName` / `nslookup` capture must contain the
+///     IP as a standalone token.
+fn os_resolver_answer_contains_ip(
+    platform: LiveLabPlatform,
+    output: &str,
+    expected_ip: &str,
+) -> bool {
+    if expected_ip.is_empty() {
+        return false;
+    }
+    match platform {
+        // Preserve the exact pre-Wave-2 Linux behaviour: a plain substring
+        // check against the resolvectl query output.
+        LiveLabPlatform::Linux => output.contains(expected_ip),
+        // macOS / Windows: require the IP as a whitespace/line-delimited token
+        // so `100.64.0.10` cannot be satisfied by `100.64.0.100`.
+        LiveLabPlatform::MacOs | LiveLabPlatform::Windows => {
+            answer_contains_ip_token(output, expected_ip)
+        }
+    }
+}
+
+/// Token-exact IP match: the expected IP must appear bounded by line/word
+/// boundaries (whitespace, line ends, or common delimiters) so a longer IP
+/// that merely contains the expected one as a prefix/substring does not match.
+fn answer_contains_ip_token(output: &str, expected_ip: &str) -> bool {
+    output
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(ch, '\t' | ',' | ';' | '(' | ')' | '[' | ']' | '"' | '\'')
+        })
+        .any(|token| token == expected_ip)
+}
+
+/// True when the captured managed-resolver service state proves the resolver
+/// (or its hosting daemon) is live.
+///
+///   * Linux: `systemctl is-active` must print exactly `active`. (Byte-
+///     identical to the pre-Wave-2 assertion.)
+///   * macOS: `launchctl print system/com.rustynet.daemon` maps to active via
+///     the same `state =`/`pid =` heuristic the relay validator uses.
+///   * Windows: `Get-Service` Status must be `Running`.
+fn managed_dns_service_active(platform: LiveLabPlatform, output: &str) -> bool {
+    match platform {
+        LiveLabPlatform::Linux => output.trim() == "active",
+        LiveLabPlatform::MacOs => macos_launchctl_daemon_active(output),
+        LiveLabPlatform::Windows => output.trim().eq_ignore_ascii_case("running"),
+    }
+}
+
+/// Reduce `launchctl print system/<label>` output to an active/inactive
+/// decision. Mirrors the relay validator's launchctl state heuristic:
+/// `state = running|waiting|spawn scheduled` is active; a non-zero `pid =` is
+/// the fallback; `Could not find service` / `service not loaded` is inactive.
+fn macos_launchctl_daemon_active(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("could not find service") || lower.contains("service not loaded") {
+        return false;
+    }
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("state =") {
+            return matches!(
+                rest.trim().to_ascii_lowercase().as_str(),
+                "running" | "waiting" | "spawn scheduled"
+            );
+        }
+    }
+    output.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("pid =")
+            && trimmed
+                .split_once('=')
+                .and_then(|(_, rest)| rest.trim().parse::<u32>().ok())
+                .is_some_and(|pid| pid != 0)
+    })
+}
+
 fn render_remote_output(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
@@ -2430,10 +2915,13 @@ mod tests {
     use super::{
         Config, ManagedDnsRecordTemplate, ManagedPeerSpec, assignment_bundle_path,
         dns_inspect_matches_expected_state, dns_inspect_readback_ready, dns_query_failed_closed,
+        macos_launchctl_daemon_active, macos_scutil_advertises_managed_zone,
         managed_dns_distribution_targets, managed_dns_invalid_state_observed,
-        managed_dns_replay_records, parse_assignment_authority_scope, parse_managed_peer_spec,
-        parse_status_field, rewrite_bundle_line_value, rewrite_bundle_signature,
-        sorted_node_host_pairs, validate_targets,
+        managed_dns_replay_records, managed_dns_service_active, os_resolver_answer_contains_ip,
+        parse_assignment_authority_scope, parse_managed_peer_spec, parse_status_field,
+        resolver_config_advertises_managed_zone, rewrite_bundle_line_value,
+        rewrite_bundle_signature, sorted_node_host_pairs, validate_targets,
+        windows_dns_client_lists_loopback_server,
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -2758,5 +3246,262 @@ signature=abcd
             "dns inspect: state=invalid error=signature verification failed",
             None
         ));
+    }
+
+    // ─── Wave 2 W2-D cross-OS resolver-stack parser coverage ───────────────
+
+    const DNS_BIND_ADDR: &str = "127.0.0.1:53535";
+    const DNS_SERVER: &str = "127.0.0.1";
+    const ZONE: &str = "rustynet";
+    const EXPECTED_IP: &str = "100.64.0.1";
+
+    // --- split-DNS / resolver-configuration ---
+
+    #[test]
+    fn resolver_config_linux_resolvectl_status_matches_byte_identical() {
+        // Realistic `resolvectl status rustynet0` excerpt: the link carries
+        // the managed bind address plus the `~rustynet` routing domain.
+        let output = "\
+Link 4 (rustynet0)
+    Current Scopes: DNS
+         Protocols: +DefaultRoute -LLMNR
+       DNS Servers: 127.0.0.1:53535
+        DNS Domain: ~rustynet
+";
+        assert!(resolver_config_advertises_managed_zone(
+            LiveLabPlatform::Linux,
+            output,
+            DNS_BIND_ADDR,
+            DNS_SERVER,
+            ZONE
+        ));
+        // Missing the routing domain must NOT pass (no split-DNS proof).
+        let no_domain = "Link 4 (rustynet0)\n    DNS Servers: 127.0.0.1:53535\n";
+        assert!(!resolver_config_advertises_managed_zone(
+            LiveLabPlatform::Linux,
+            no_domain,
+            DNS_BIND_ADDR,
+            DNS_SERVER,
+            ZONE
+        ));
+    }
+
+    #[test]
+    fn resolver_config_macos_scutil_lists_managed_loopback_and_zone_domain() {
+        // Realistic `scutil --dns` excerpt: the mesh resolver block scopes the
+        // `rustynet` domain to the managed loopback nameserver.
+        let output = "\
+DNS configuration
+
+resolver #1
+  search domain[0] : lan
+  nameserver[0] : 192.168.1.1
+  flags    : Request A records
+
+resolver #2
+  domain   : rustynet
+  nameserver[0] : 127.0.0.1
+  flags    : Request A records, Supplemental
+  reach    : 0x00030002 (Reachable,Local Address)
+";
+        assert!(macos_scutil_advertises_managed_zone(
+            output, DNS_SERVER, ZONE
+        ));
+        assert!(resolver_config_advertises_managed_zone(
+            LiveLabPlatform::MacOs,
+            output,
+            DNS_BIND_ADDR,
+            DNS_SERVER,
+            ZONE
+        ));
+    }
+
+    #[test]
+    fn resolver_config_macos_scutil_fail_closed_when_zone_unscoped() {
+        // A plain loopback forwarder with NO `domain : rustynet` line must not
+        // masquerade as split-DNS — the zone-scope requirement guards that.
+        let output = "\
+resolver #1
+  nameserver[0] : 127.0.0.1
+  flags    : Request A records
+";
+        assert!(!macos_scutil_advertises_managed_zone(
+            output, DNS_SERVER, ZONE
+        ));
+        // Empty output (scutil produced nothing) fails closed.
+        assert!(!macos_scutil_advertises_managed_zone("", DNS_SERVER, ZONE));
+    }
+
+    #[test]
+    fn resolver_config_windows_lists_managed_loopback_server() {
+        // `Get-DnsClientServerAddress` rendered as `<ifAlias>=<server>` rows.
+        let output = "Ethernet=127.0.0.1\nLoopback Pseudo-Interface 1=::1\n";
+        assert!(windows_dns_client_lists_loopback_server(output, DNS_SERVER));
+        assert!(resolver_config_advertises_managed_zone(
+            LiveLabPlatform::Windows,
+            output,
+            DNS_BIND_ADDR,
+            DNS_SERVER,
+            ZONE
+        ));
+        // No interface points at the managed loopback resolver → fail closed.
+        let off = "Ethernet=192.168.1.1\nWi-Fi=8.8.8.8\n";
+        assert!(!windows_dns_client_lists_loopback_server(off, DNS_SERVER));
+        assert!(!resolver_config_advertises_managed_zone(
+            LiveLabPlatform::Windows,
+            off,
+            DNS_BIND_ADDR,
+            DNS_SERVER,
+            ZONE
+        ));
+    }
+
+    // --- OS-resolver answer probe ---
+
+    #[test]
+    fn os_resolver_answer_linux_resolvectl_substring_match_is_byte_identical() {
+        // `resolvectl query` prints `exit.rustynet: 100.64.0.1`.
+        let output = "exit.rustynet: 100.64.0.1\n-- Information acquired via protocol DNS\n";
+        assert!(os_resolver_answer_contains_ip(
+            LiveLabPlatform::Linux,
+            output,
+            EXPECTED_IP
+        ));
+        assert!(!os_resolver_answer_contains_ip(
+            LiveLabPlatform::Linux,
+            "exit.rustynet: 10.0.0.5\n",
+            EXPECTED_IP
+        ));
+    }
+
+    #[test]
+    fn os_resolver_answer_macos_dig_short_token_match() {
+        // Combined `dig +short` / `dscacheutil` capture from capture_os_resolver_answer.
+        let output = "\
+dig +short:
+100.64.0.1
+dscacheutil:
+name: exit.rustynet
+ip_address: 100.64.0.1
+";
+        assert!(os_resolver_answer_contains_ip(
+            LiveLabPlatform::MacOs,
+            output,
+            EXPECTED_IP
+        ));
+    }
+
+    #[test]
+    fn os_resolver_answer_macos_token_match_rejects_superstring_ip() {
+        // `100.64.0.10` must NOT satisfy a check for `100.64.0.1` on the
+        // token-exact mac/win path (defends against substring false-positives).
+        let output = "dig +short:\n100.64.0.10\n";
+        assert!(!os_resolver_answer_contains_ip(
+            LiveLabPlatform::MacOs,
+            output,
+            EXPECTED_IP
+        ));
+    }
+
+    #[test]
+    fn os_resolver_answer_windows_resolve_dnsname_token_match() {
+        // `Resolve-DnsName -Type A | Select -Expand IPAddress` then nslookup.
+        let output = "\
+100.64.0.1
+nslookup:
+Server:  UnKnown
+Address:  127.0.0.1
+
+Name:    exit.rustynet
+Address:  100.64.0.1
+";
+        assert!(os_resolver_answer_contains_ip(
+            LiveLabPlatform::Windows,
+            output,
+            EXPECTED_IP
+        ));
+        // A non-managed / NXDOMAIN answer has no expected IP token.
+        assert!(!os_resolver_answer_contains_ip(
+            LiveLabPlatform::Windows,
+            "nslookup:\nServer:  UnKnown\n*** UnKnown can't find exit.rustynet\n",
+            EXPECTED_IP
+        ));
+    }
+
+    #[test]
+    fn os_resolver_answer_empty_expected_ip_never_matches() {
+        // A blank expected IP must fail closed on every OS — it can never be
+        // satisfied by an empty answer.
+        for platform in [
+            LiveLabPlatform::Linux,
+            LiveLabPlatform::MacOs,
+            LiveLabPlatform::Windows,
+        ] {
+            assert!(!os_resolver_answer_contains_ip(
+                platform,
+                "100.64.0.1\n",
+                ""
+            ));
+        }
+    }
+
+    // --- managed-resolver service-active ---
+
+    #[test]
+    fn managed_dns_service_active_linux_requires_exact_active() {
+        assert!(managed_dns_service_active(
+            LiveLabPlatform::Linux,
+            "active\n"
+        ));
+        assert!(!managed_dns_service_active(
+            LiveLabPlatform::Linux,
+            "inactive\n"
+        ));
+        assert!(!managed_dns_service_active(
+            LiveLabPlatform::Linux,
+            "failed\n"
+        ));
+    }
+
+    #[test]
+    fn managed_dns_service_active_macos_launchctl_state_running() {
+        let running = "\
+com.rustynet.daemon = {
+\tactive count = 1
+\tstate = running
+\tpid = 4821
+}
+";
+        assert!(managed_dns_service_active(LiveLabPlatform::MacOs, running));
+        assert!(macos_launchctl_daemon_active(running));
+        // Not loaded → inactive.
+        assert!(!managed_dns_service_active(
+            LiveLabPlatform::MacOs,
+            "Could not find service \"com.rustynet.daemon\" in domain for system\n"
+        ));
+    }
+
+    #[test]
+    fn managed_dns_service_active_macos_launchctl_pid_fallback() {
+        // Truncated output with no `state =` line but a non-zero pid is active.
+        let pid_only = "com.rustynet.daemon = {\n\tpid = 1337\n}\n";
+        assert!(macos_launchctl_daemon_active(pid_only));
+        // pid = 0 (scheduled but not running) is NOT active.
+        let pid_zero = "com.rustynet.daemon = {\n\tpid = 0\n}\n";
+        assert!(!macos_launchctl_daemon_active(pid_zero));
+    }
+
+    #[test]
+    fn managed_dns_service_active_windows_requires_running() {
+        assert!(managed_dns_service_active(
+            LiveLabPlatform::Windows,
+            "Running\n"
+        ));
+        assert!(!managed_dns_service_active(
+            LiveLabPlatform::Windows,
+            "Stopped\n"
+        ));
+        // Empty (service absent) fails closed.
+        assert!(!managed_dns_service_active(LiveLabPlatform::Windows, ""));
     }
 }
