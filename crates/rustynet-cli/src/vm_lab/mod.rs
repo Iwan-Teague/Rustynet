@@ -34088,7 +34088,10 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         )
         .expect_err("prior run state must fail closed");
 
-        assert!(err.contains("already contains run provenance"));
+        assert!(
+            err.contains("already contains run provenance"),
+            "expected run-provenance rejection, got: {err}"
+        );
 
         let _ = fs::remove_dir_all(report_dir);
         cleanup_temp_path(profile_path.as_path());

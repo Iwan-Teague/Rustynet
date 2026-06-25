@@ -1521,7 +1521,10 @@ fn write_atomic_encrypted_key_file(
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    let parent = path.parent().ok_or(CryptoError::Io)?;
+    // Bound to `_parent` because the parent directory handle is only fsynced on
+    // unix (see the `#[cfg(unix)]` block below); the path-has-a-parent check is a
+    // fail-closed validation that runs on every platform regardless.
+    let _parent = path.parent().ok_or(CryptoError::Io)?;
     let temp = temp_path_for(path);
 
     let mut options = OpenOptions::new();
@@ -1551,7 +1554,7 @@ fn write_atomic_encrypted_key_file(
     // durability guarantee is enforced by the rename above.
     #[cfg(unix)]
     {
-        let parent_dir = std::fs::File::open(parent).map_err(|_| CryptoError::Io)?;
+        let parent_dir = std::fs::File::open(_parent).map_err(|_| CryptoError::Io)?;
         parent_dir.sync_all().map_err(|_| CryptoError::Io)?
     };
     Ok(())
