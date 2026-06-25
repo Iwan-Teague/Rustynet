@@ -186,3 +186,38 @@ per logical increment as Iwan-Teague (NO Co-Authored-By trailer), then pushes.
 - F0.10: demotion-residue during-run guard asserts `internal_prefix == mesh_cidr`.
 - All workspace gates green (fmt, clippy -D warnings, scoped tests), excluding the
   documented env-blocked sandbox tests. Committed as Iwan-Teague, pushed to `main`.
+
+## 7. OUTCOME — Wave 0 COMPLETE (2026-06-25)
+
+Implemented by four parallel sub-agents in isolated worktrees (disjoint file
+ownership), then reviewed + merged + full-gated by the reviewer. Commits on `main`:
+- `f426593` W0-A — fail-closed Linux exit-NAT teardown (F0.1/0.2/0.3 + F0.10 capture
+  side): `interpret_nft_nat_capture(Err)⇒present`, `interpret_forwarding_capture(None)⇒
+  "Unknown"`, `parse_proc_forwarding` garbage⇒"Unknown", both shell merges default
+  `"Unknown"` + after-stop `nat_table_present` default `true`, `internal_prefix` added
+  to the demotion capture. 3 new fail-closed unit tests.
+- `e1bd23a` W0-B — active Linux off-tunnel DNS probe (`dns_block_probe.json`, `dig`
+  UDP+TCP mid-capture, gateway-derived target) + validator requires `probe_attempted`
+  AND no response (F0.4/0.5/0.6); relay dry-run demoted Pass→Skipped "contract-only"
+  (F0.7, real frame proof = Wave 4); demotion-residue `internal_prefix==mesh_cidr`
+  assertion (F0.10 validator). 6 producer + 3 validator unit tests.
+- `b162be0` W0-C — two-hop real data-plane proof (F0.8): end-to-end reachability past
+  the final exit + TTL−2 per-hop evidence, fail-closed `probe_attempted` (a never-run
+  probe = FAIL). 9 new unit tests.
+- `acdb197` W0-D — lan-toggle "blocked" confirms enforced denial (F0.9): requires
+  no-reachability AND (tunnel-route-withdrawn OR killswitch-drop-table-present). 5 new
+  unit tests.
+- `9ebcd2d` review fixup — the F0.7 demotion turned the relay-lifecycle outcome from
+  `Pass` to `Skipped`; the downstream gate `relay_lifecycle_passed == Pass` would then
+  skip `validate_linux_anchor_bundle_pull` on every run. Re-gated downstream on a hard
+  `Fail` only, so a benign contract-only Skipped no longer suppresses anchor coverage.
+  (Verified the Windows 06-24 demotions are terminal — no equivalent downstream gate.)
+
+Gate result on the merged tree: `cargo fmt --check` clean; `cargo clippy -p rustynetd
+-p rustynet-cli --all-targets --all-features -D warnings` clean; all new + affected
+tests green; full `rustynetd --lib` = 1743 passed / 20 failed where all 20 are the
+documented env-blocked sandbox tests (netns/nft, SO_PEERCRED, STUN, symlink,
+privileged-helper) — no new failures. Reference OS evidence is now honest:
+capture/read errors can no longer fake a clean NAT teardown, the DNS-leak proof
+requires an active probe, relay no longer Pass-from-dry-run, and two-hop/lan-toggle
+prove behaviour not config text.
