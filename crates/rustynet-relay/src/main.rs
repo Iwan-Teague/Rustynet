@@ -1110,19 +1110,42 @@ mod daemon {
                 env_file.display()
             )
         })?;
-        if metadata.len() > MAX_WINDOWS_RELAY_ENV_FILE_BYTES {
-            return Err(format!(
-                "Windows relay service env-file is too large ({} bytes > {MAX_WINDOWS_RELAY_ENV_FILE_BYTES})",
-                metadata.len()
-            ));
-        }
+        enforce_windows_relay_env_file_size(metadata.len())?;
         let text = fs::read_to_string(env_file).map_err(|err| {
             format!(
                 "failed to read Windows relay service env-file {}: {err}",
                 env_file.display()
             )
         })?;
-        let variables = parse_windows_relay_env_file(&text)?;
+        parse_windows_relay_service_args_from_text(&text)
+    }
+
+    /// Enforce the env-file byte cap before the file is read into memory.
+    /// Split out of `load_windows_relay_service_args` so the boundary is
+    /// unit-testable without materializing an oversized file under the Windows
+    /// reviewed runtime root — the env-file path gate would reject a temp-dir
+    /// file long before the size check ran, so the cap could otherwise only be
+    /// exercised on a provisioned Windows host.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    fn enforce_windows_relay_env_file_size(len: u64) -> Result<(), String> {
+        if len > MAX_WINDOWS_RELAY_ENV_FILE_BYTES {
+            return Err(format!(
+                "Windows relay service env-file is too large ({len} bytes > {MAX_WINDOWS_RELAY_ENV_FILE_BYTES})"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Parse env-file *text* into the relay argv vector. Pure: no filesystem,
+    /// ACL, path-root, or size I/O — those gates stay in
+    /// `load_windows_relay_service_args`. Split out so the env-file grammar
+    /// (comment/blank skipping, `KEY=VALUE` shape, key charset, duplicate-key
+    /// rejection, JSON string-array shape, non-empty) is verifiable on every
+    /// host OS, not only where the Windows reviewed-root / ACL gates are
+    /// no-ops.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    fn parse_windows_relay_service_args_from_text(text: &str) -> Result<Vec<String>, String> {
+        let variables = parse_windows_relay_env_file(text)?;
         let relay_args_json = variables.get(WINDOWS_RELAY_ARGS_ENV).ok_or_else(|| {
             format!(
                 "Windows relay service env-file must define {WINDOWS_RELAY_ARGS_ENV} as a JSON array of relay flags"
@@ -1154,6 +1177,35 @@ mod daemon {
             "Windows relay verifier key",
         )?;
         validate_windows_relay_service_runtime_path(
+            Path::new(replay_store),
+            "Windows relay replay store",
+        )
+    }
+
+    /// Test-only: shape + path-*policy* validation of the runtime argv, without
+    /// the filesystem ACL/existence gate that
+    /// `validate_windows_relay_service_runtime_args` applies on Windows. Lets
+    /// the argv shape and reviewed-root path policy be asserted on every host
+    /// OS; the full validator additionally requires the referenced files to
+    /// exist with the reviewed SDDL, which only holds on a provisioned Windows
+    /// relay host / in the live lab. The SDDL evaluation itself is covered by
+    /// `relay_windows_service_runtime_acl_requires_hardened_file_and_parent`.
+    #[cfg(test)]
+    fn validate_windows_relay_service_runtime_args_policy(args: &[String]) -> Result<(), String> {
+        validate_windows_relay_service_runtime_arg_shape(args)?;
+        let verifier_key =
+            extract_unique_relay_arg_value(args, "--verifier-key")?.ok_or_else(|| {
+                "Windows relay service runtime args must include --verifier-key".to_owned()
+            })?;
+        let replay_store =
+            extract_unique_relay_arg_value(args, "--replay-store")?.ok_or_else(|| {
+                "Windows relay service runtime args must include --replay-store".to_owned()
+            })?;
+        validate_windows_relay_service_runtime_path_policy(
+            Path::new(verifier_key),
+            "Windows relay verifier key",
+        )?;
+        validate_windows_relay_service_runtime_path_policy(
             Path::new(replay_store),
             "Windows relay replay store",
         )
@@ -1316,6 +1368,22 @@ mod daemon {
 
     #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     fn validate_windows_relay_service_runtime_path(path: &Path, label: &str) -> Result<(), String> {
+        validate_windows_relay_service_runtime_path_policy(path, label)?;
+        validate_windows_relay_service_runtime_file_acl(path, label)
+    }
+
+    /// Path *policy* gate for a runtime path: normalize, reject Linux roots /
+    /// UNC / named pipes / path traversal, and require containment under the
+    /// reviewed relay runtime root. No filesystem access — the ACL/existence
+    /// gate is `validate_windows_relay_service_runtime_file_acl`, applied by
+    /// `validate_windows_relay_service_runtime_path`. Split out so the path
+    /// policy is unit-testable on every host OS without a real hardened file
+    /// existing under the reviewed root.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    fn validate_windows_relay_service_runtime_path_policy(
+        path: &Path,
+        label: &str,
+    ) -> Result<(), String> {
         let normalized = normalize_windows_relay_service_path(path)?;
         if !windows_relay_service_path_under_reviewed_root(normalized.as_str()) {
             return Err(format!(
@@ -1323,7 +1391,7 @@ mod daemon {
                 path.display()
             ));
         }
-        validate_windows_relay_service_runtime_file_acl(path, label)
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -2290,14 +2358,21 @@ mod daemon {
             RelayHostEntrySelection, RelayTransport, WindowsRelayServiceHardeningSnapshot,
             WindowsRelayServiceOptions, bind_health_listener,
             build_windows_relay_service_hardening_report, evaluate_windows_relay_service_hardening,
-            http_request_path, load_control_verifier_key, load_windows_relay_service_args,
-            parse_relay_id_arg, parse_windows_image_path_argv, render_health_json, render_metrics,
+            http_request_path, load_control_verifier_key, parse_relay_id_arg,
+            parse_windows_image_path_argv, render_health_json, render_metrics,
             select_relay_host_entry, serialize_relay_reject, serve_health_endpoint,
         };
         // Only the off-Windows fail-closed test calls this collector directly; on
         // Windows the symbol is unused here, so gate the import to match its caller.
         #[cfg(not(windows))]
         use super::collect_windows_relay_service_hardening_snapshot;
+        // The full env-file loader can only be exercised end-to-end against a
+        // real temp file on platforms where the Windows reviewed-root / SDDL ACL
+        // gates are no-ops; its cross-platform grammar is covered via the pure
+        // `parse_windows_relay_service_args_from_text` parser. See
+        // `relay_windows_service_env_file_loads_from_disk_on_unix`.
+        #[cfg(not(windows))]
+        use super::load_windows_relay_service_args;
         use ed25519_dalek::SigningKey;
         use std::collections::HashMap;
         use std::fs;
@@ -2325,11 +2400,42 @@ mod daemon {
             assert!(parse_relay_id_arg("relay-éu-1").is_err());
         }
 
+        /// An absolute path on the host OS. Windows needs a drive-letter prefix
+        /// to satisfy `Path::is_absolute()`; Unix needs a leading `/`. Used where
+        /// a config validator only checks absoluteness (not existence), so the
+        /// same test passes on Linux, macOS, and Windows.
+        fn os_abs_path(name: &str) -> String {
+            #[cfg(windows)]
+            {
+                format!(r"C:\rustynet-test\{name}")
+            }
+            #[cfg(not(windows))]
+            {
+                format!("/tmp/{name}")
+            }
+        }
+
+        /// An env-file path that satisfies `validate_windows_relay_service_env_file_path`
+        /// on the host OS: on Windows it must live under the reviewed relay
+        /// runtime root, on Unix it only needs to be absolute. Lets the
+        /// argv-selection tests run cross-platform without provisioning the
+        /// reviewed root.
+        fn reviewed_env_file_path() -> String {
+            #[cfg(windows)]
+            {
+                format!(r"{}\relay.env", super::DEFAULT_WINDOWS_RELAY_ROOT)
+            }
+            #[cfg(not(windows))]
+            {
+                "/tmp/rustynet-relay.env".to_owned()
+            }
+        }
+
         fn valid_config() -> RelayConfig {
             RelayConfig {
                 relay_id: parse_relay_id_arg("relay-eu-1").expect("relay id should parse"),
-                verifier_key_path: "/tmp/rustynet-relay-verifier.pub".to_owned(),
-                replay_store_path: "/tmp/rustynet-relay-replay.store".to_owned(),
+                verifier_key_path: os_abs_path("rustynet-relay-verifier.pub"),
+                replay_store_path: os_abs_path("rustynet-relay-replay.store"),
                 ..RelayConfig::default()
             }
         }
@@ -2448,23 +2554,19 @@ mod daemon {
 
         #[test]
         fn parse_args_from_parses_loopback_health_bind() {
-            let config = super::parse_args_from(
-                [
-                    "rustynet-relay",
-                    "--relay-id",
-                    "relay-eu-1",
-                    "--verifier-key",
-                    "/tmp/rustynet-relay-verifier.pub",
-                    "--replay-store",
-                    "/tmp/rustynet-relay-replay.store",
-                    "--max-total-sessions",
-                    "32",
-                    "--health-bind",
-                    "127.0.0.1:9100",
-                ]
-                .into_iter()
-                .map(str::to_string),
-            )
+            let config = super::parse_args_from([
+                "rustynet-relay".to_owned(),
+                "--relay-id".to_owned(),
+                "relay-eu-1".to_owned(),
+                "--verifier-key".to_owned(),
+                os_abs_path("rustynet-relay-verifier.pub"),
+                "--replay-store".to_owned(),
+                os_abs_path("rustynet-relay-replay.store"),
+                "--max-total-sessions".to_owned(),
+                "32".to_owned(),
+                "--health-bind".to_owned(),
+                "127.0.0.1:9100".to_owned(),
+            ])
             .expect("health bind args should parse");
             assert_eq!(
                 config.health_bind_addr,
@@ -2475,21 +2577,17 @@ mod daemon {
 
         #[test]
         fn parse_args_from_rejects_public_health_bind() {
-            let err = super::parse_args_from(
-                [
-                    "rustynet-relay",
-                    "--relay-id",
-                    "relay-eu-1",
-                    "--verifier-key",
-                    "/tmp/rustynet-relay-verifier.pub",
-                    "--replay-store",
-                    "/tmp/rustynet-relay-replay.store",
-                    "--health-bind",
-                    "0.0.0.0:9100",
-                ]
-                .into_iter()
-                .map(str::to_string),
-            )
+            let err = super::parse_args_from([
+                "rustynet-relay".to_owned(),
+                "--relay-id".to_owned(),
+                "relay-eu-1".to_owned(),
+                "--verifier-key".to_owned(),
+                os_abs_path("rustynet-relay-verifier.pub"),
+                "--replay-store".to_owned(),
+                os_abs_path("rustynet-relay-replay.store"),
+                "--health-bind".to_owned(),
+                "0.0.0.0:9100".to_owned(),
+            ])
             .expect_err("public health bind args should fail closed");
             assert!(err.contains("loopback"));
         }
@@ -2503,11 +2601,12 @@ mod daemon {
             .expect_err("service mode without env file must fail closed");
             assert!(err.contains("--env-file"));
 
+            let env_file = reviewed_env_file_path();
             let selection = select_relay_host_entry(&[
                 "rustynet-relay".to_owned(),
                 "--windows-service".to_owned(),
                 "--env-file".to_owned(),
-                "/tmp/rustynet-relay.env".to_owned(),
+                env_file.clone(),
                 "--service-name".to_owned(),
                 "RustyNetRelayTest".to_owned(),
             ])
@@ -2516,7 +2615,7 @@ mod daemon {
                 selection,
                 RelayHostEntrySelection::WindowsService(WindowsRelayServiceOptions {
                     service_name: "RustyNetRelayTest".to_owned(),
-                    env_file: PathBuf::from("/tmp/rustynet-relay.env"),
+                    env_file: PathBuf::from(&env_file),
                 })
             );
 
@@ -2524,7 +2623,7 @@ mod daemon {
                 "rustynet-relay".to_owned(),
                 "--windows-service".to_owned(),
                 "--env-file".to_owned(),
-                "/tmp/rustynet-relay.env".to_owned(),
+                env_file.clone(),
                 "--bind".to_owned(),
                 "0.0.0.0:4500".to_owned(),
             ])
@@ -2534,28 +2633,18 @@ mod daemon {
 
         #[test]
         fn relay_windows_service_env_file_parses_json_args_and_rejects_duplicates() {
-            let dir = restricted_temp_dir("relay-service-env");
-            let env_path = dir.join("relay.env");
-            fs::write(
-                &env_path,
+            let args = super::parse_windows_relay_service_args_from_text(
                 "RUSTYNET_RELAY_ARGS_JSON=[\"--relay-id\",\"relay-eu-1\",\"--verifier-key\",\"/tmp/control.pub\",\"--replay-store\",\"/tmp/replay.store\"]\n",
             )
-            .expect("env file should be written");
-            let args = load_windows_relay_service_args(&env_path)
-                .expect("relay service env args should parse");
+            .expect("relay service env args should parse");
             assert_eq!(args[0], "--relay-id");
             assert_eq!(args[1], "relay-eu-1");
 
-            fs::write(
-                &env_path,
+            let err = super::parse_windows_relay_service_args_from_text(
                 "RUSTYNET_RELAY_ARGS_JSON=[]\nRUSTYNET_RELAY_ARGS_JSON=[]\n",
             )
-            .expect("env file should be rewritten");
-            let err = load_windows_relay_service_args(&env_path)
-                .expect_err("duplicate env keys must fail closed");
+            .expect_err("duplicate env keys must fail closed");
             assert!(err.contains("duplicate Windows relay service env-file key"));
-
-            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 
         #[test]
@@ -2563,10 +2652,7 @@ mod daemon {
             // The parser must skip `#`-prefixed comment lines and blank/whitespace
             // lines without ever splitting on `=` inside a comment body.  An
             // operator audit trail in the env file should not break loading.
-            let dir = restricted_temp_dir("relay-service-env-comments");
-            let env_path = dir.join("relay.env");
-            fs::write(
-                &env_path,
+            let args = super::parse_windows_relay_service_args_from_text(
                 "# Operator audit: relay-eu-1 enrolled 2026-05-10 — keep this comment\n\
                  \n\
                  \t  \n\
@@ -2574,12 +2660,9 @@ mod daemon {
                  RUSTYNET_RELAY_ARGS_JSON=[\"--relay-id\",\"relay-eu-1\",\"--verifier-key\",\"/tmp/v.pub\",\"--replay-store\",\"/tmp/r.store\"]\n\
                  # trailing comment\n",
             )
-            .expect("env file should be written");
-            let args = load_windows_relay_service_args(&env_path)
-                .expect("env file with comments and blank lines should parse");
+            .expect("env file with comments and blank lines should parse");
             assert_eq!(args[0], "--relay-id");
             assert_eq!(args[1], "relay-eu-1");
-            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 
         #[test]
@@ -2588,17 +2671,11 @@ mod daemon {
             // rather than silently ignore the directive.  An attacker could
             // otherwise smuggle a typo'd "RUSTYNET_RELAY_ARGS_JSON-[]" past
             // a careless reviewer.
-            let dir = restricted_temp_dir("relay-service-env-no-eq");
-            let env_path = dir.join("relay.env");
-            fs::write(
-                &env_path,
+            let err = super::parse_windows_relay_service_args_from_text(
                 "RUSTYNET_RELAY_ARGS_JSON=[]\nINVALID_LINE_WITHOUT_EQUALS\n",
             )
-            .expect("env file should be written");
-            let err = load_windows_relay_service_args(&env_path)
-                .expect_err("line without '=' must fail closed");
+            .expect_err("line without '=' must fail closed");
             assert!(err.contains("expected KEY=VALUE"));
-            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 
         #[test]
@@ -2608,19 +2685,15 @@ mod daemon {
             // letting them through would mask a typo in the canonical
             // RUSTYNET_RELAY_ARGS_JSON name and the file would silently load
             // with no relay args defined.
-            let dir = restricted_temp_dir("relay-service-env-keys");
-            let env_path = dir.join("relay.env");
             for bad_key in ["rustynet_relay_args_json", "RELAY-ARGS", "RELAY.ARGS"] {
-                fs::write(&env_path, format!("{bad_key}=[]\n"))
-                    .expect("env file should be written");
-                let err = load_windows_relay_service_args(&env_path)
-                    .expect_err("invalid env-file key must fail closed");
+                let err =
+                    super::parse_windows_relay_service_args_from_text(&format!("{bad_key}=[]\n"))
+                        .expect_err("invalid env-file key must fail closed");
                 assert!(
                     err.contains("invalid Windows relay service env-file key"),
                     "expected invalid-key error for {bad_key:?}, got: {err}"
                 );
             }
-            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 
         #[test]
@@ -2628,14 +2701,10 @@ mod daemon {
             // If the canonical RUSTYNET_RELAY_ARGS_JSON variable is not
             // defined, the loader must fail closed — there is no sensible
             // default for relay flags.
-            let dir = restricted_temp_dir("relay-service-env-missing");
-            let env_path = dir.join("relay.env");
-            fs::write(&env_path, "RUSTYNET_RELAY_OTHER=value\n")
-                .expect("env file should be written");
-            let err = load_windows_relay_service_args(&env_path)
-                .expect_err("missing required env var must fail closed");
+            let err =
+                super::parse_windows_relay_service_args_from_text("RUSTYNET_RELAY_OTHER=value\n")
+                    .expect_err("missing required env var must fail closed");
             assert!(err.contains("must define RUSTYNET_RELAY_ARGS_JSON"));
-            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 
         #[test]
@@ -2643,8 +2712,6 @@ mod daemon {
             // The JSON value must be an array of strings.  Any other shape
             // (object, number, single string, mixed-type array) must fail
             // closed because the runtime expects argv tokens.
-            let dir = restricted_temp_dir("relay-service-env-json");
-            let env_path = dir.join("relay.env");
             for bad in [
                 "RUSTYNET_RELAY_ARGS_JSON=\"--bind\"\n",
                 "RUSTYNET_RELAY_ARGS_JSON={\"flag\":\"--bind\"}\n",
@@ -2652,15 +2719,13 @@ mod daemon {
                 "RUSTYNET_RELAY_ARGS_JSON=[1, 2, 3]\n",
                 "RUSTYNET_RELAY_ARGS_JSON=[\"--bind\", null]\n",
             ] {
-                fs::write(&env_path, bad).expect("env file should be written");
-                let err = load_windows_relay_service_args(&env_path)
+                let err = super::parse_windows_relay_service_args_from_text(bad)
                     .expect_err("non-string-array JSON must fail closed");
                 assert!(
                     err.contains("must be a JSON string array"),
                     "expected JSON-shape error for {bad:?}, got: {err}"
                 );
             }
-            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 
         #[test]
@@ -2670,14 +2735,10 @@ mod daemon {
             // --replay-store, so an empty array can only mean a misconfigured
             // file.  Fail closed rather than passing an empty argv to the
             // service binary.
-            let dir = restricted_temp_dir("relay-service-env-empty");
-            let env_path = dir.join("relay.env");
-            fs::write(&env_path, "RUSTYNET_RELAY_ARGS_JSON=[]\n")
-                .expect("env file should be written");
-            let err = load_windows_relay_service_args(&env_path)
-                .expect_err("empty JSON array must fail closed");
+            let err =
+                super::parse_windows_relay_service_args_from_text("RUSTYNET_RELAY_ARGS_JSON=[]\n")
+                    .expect_err("empty JSON array must fail closed");
             assert!(err.contains("must not be empty"));
-            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 
         #[test]
@@ -2686,15 +2747,11 @@ mod daemon {
             // edited on Windows.  The loader must accept them so the operator
             // does not have to remember to convert.  (Rust's `lines()`
             // strips trailing \r already; this test pins that contract.)
-            let dir = restricted_temp_dir("relay-service-env-crlf");
-            let env_path = dir.join("relay.env");
             let crlf = "# CRLF env file\r\n\
                         RUSTYNET_RELAY_ARGS_JSON=[\"--relay-id\",\"relay-eu-1\",\"--verifier-key\",\"/tmp/v.pub\",\"--replay-store\",\"/tmp/r.store\"]\r\n";
-            fs::write(&env_path, crlf).expect("env file should be written");
-            let args =
-                load_windows_relay_service_args(&env_path).expect("CRLF env file should parse");
+            let args = super::parse_windows_relay_service_args_from_text(crlf)
+                .expect("CRLF env file should parse");
             assert_eq!(args[0], "--relay-id");
-            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 
         #[test]
@@ -2702,38 +2759,51 @@ mod daemon {
             // The env-file parser splits on the FIRST `=` only.  A JSON
             // value that contains its own `=` (for example a base64 padding
             // character) must not be truncated.
-            let dir = restricted_temp_dir("relay-service-env-eq");
-            let env_path = dir.join("relay.env");
             // The string "AB=" (3-char base64 segment) appears inside the
             // JSON value; the parser must keep it intact.
-            fs::write(
-                &env_path,
+            let args = super::parse_windows_relay_service_args_from_text(
                 "RUSTYNET_RELAY_ARGS_JSON=[\"--relay-id\",\"relay-eu-1\",\"--verifier-key\",\"/tmp/AB=/v.pub\",\"--replay-store\",\"/tmp/r.store\"]\n",
             )
-            .expect("env file should be written");
-            let args = load_windows_relay_service_args(&env_path)
-                .expect("env file with '=' inside JSON value should parse");
+            .expect("env file with '=' inside JSON value should parse");
             assert!(args.iter().any(|a| a == "/tmp/AB=/v.pub"));
-            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 
         #[test]
         fn relay_windows_service_env_file_rejects_oversized_input() {
-            // A maliciously huge env-file should be rejected before we read
-            // its contents into memory.  This is a DoS / memory-pressure
-            // guard.
-            let dir = restricted_temp_dir("relay-service-env-large");
-            let env_path = dir.join("relay.env");
-            // 64 KiB > the 32 KiB cap.
-            let mut large = String::from("RUSTYNET_RELAY_ARGS_JSON=[\"--relay-id\",\"relay-eu-1\"");
-            while large.len() < 64 * 1024 {
-                large.push_str(",\"--verifier-key\",\"/tmp/x.pub\"");
-            }
-            large.push_str("]\n");
-            fs::write(&env_path, &large).expect("env file should be written");
-            let err = load_windows_relay_service_args(&env_path)
-                .expect_err("oversized env-file must fail closed");
+            // A maliciously huge env-file must be rejected before its contents
+            // are read into memory.  This is a DoS / memory-pressure guard
+            // enforced on the file length (the size gate runs before the file
+            // is read), so the boundary is asserted directly on the gate.
+            let err = super::enforce_windows_relay_env_file_size(
+                super::MAX_WINDOWS_RELAY_ENV_FILE_BYTES + 1,
+            )
+            .expect_err("oversized env-file must fail closed");
             assert!(err.contains("env-file is too large"));
+            super::enforce_windows_relay_env_file_size(super::MAX_WINDOWS_RELAY_ENV_FILE_BYTES)
+                .expect("env-file at the cap should be accepted");
+        }
+
+        /// End-to-end loader coverage on Unix, where the Windows reviewed-root
+        /// path gate and SDDL ACL gate are no-ops, so a temp file under
+        /// `std::env::temp_dir()` exercises the full wired path
+        /// (path-check → ACL → size → read → parse). On Windows the same wiring
+        /// is exercised by the live relay service; the cross-platform grammar,
+        /// size cap, and path policy are covered by the pure-parser,
+        /// size-guard, and path-policy tests in this module.
+        #[cfg(not(windows))]
+        #[test]
+        fn relay_windows_service_env_file_loads_from_disk_on_unix() {
+            let dir = restricted_temp_dir("relay-service-env-disk");
+            let env_path = dir.join("relay.env");
+            fs::write(
+                &env_path,
+                "RUSTYNET_RELAY_ARGS_JSON=[\"--relay-id\",\"relay-eu-1\",\"--verifier-key\",\"/tmp/control.pub\",\"--replay-store\",\"/tmp/replay.store\"]\n",
+            )
+            .expect("env file should be written");
+            let args = load_windows_relay_service_args(&env_path)
+                .expect("relay service env args should load from disk");
+            assert_eq!(args[0], "--relay-id");
+            assert_eq!(args[1], "relay-eu-1");
             fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 
@@ -2747,19 +2817,19 @@ mod daemon {
                 "--replay-store".to_owned(),
                 r"C:\ProgramData\RustyNet\relay\relay-replay.nonces".to_owned(),
             ];
-            super::validate_windows_relay_service_runtime_args(&args)
+            super::validate_windows_relay_service_runtime_args_policy(&args)
                 .expect("reviewed relay runtime paths should pass");
 
             let mut outside_root = args.clone();
             outside_root[3] = r"C:\Temp\relay-verifier.key".to_owned();
-            let err = super::validate_windows_relay_service_runtime_args(&outside_root)
+            let err = super::validate_windows_relay_service_runtime_args_policy(&outside_root)
                 .expect_err("verifier key outside reviewed root must fail closed");
             assert!(err.contains("Windows relay verifier key"));
             assert!(err.contains("reviewed relay runtime root"));
 
             let mut linux_path = args.clone();
             linux_path[5] = "/var/lib/rustynet/relay-replay.nonces".to_owned();
-            let err = super::validate_windows_relay_service_runtime_args(&linux_path)
+            let err = super::validate_windows_relay_service_runtime_args_policy(&linux_path)
                 .expect_err("Linux runtime path must fail closed in Windows service mode");
             assert!(err.contains("Linux runtime roots"));
 
@@ -2768,7 +2838,7 @@ mod daemon {
                 "--replay-store".to_owned(),
                 r"C:\ProgramData\RustyNet\relay\other.nonces".to_owned(),
             ]);
-            let err = super::validate_windows_relay_service_runtime_args(&duplicate)
+            let err = super::validate_windows_relay_service_runtime_args_policy(&duplicate)
                 .expect_err("duplicate runtime path flag must fail closed");
             assert!(err.contains("--replay-store exactly once"));
         }
@@ -2789,18 +2859,18 @@ mod daemon {
                 "--max-total-sessions".to_owned(),
                 "4096".to_owned(),
             ];
-            super::validate_windows_relay_service_runtime_args(&args)
+            super::validate_windows_relay_service_runtime_args_policy(&args)
                 .expect("reviewed optional runtime args should validate");
 
             let mut help = args.clone();
             help.push("--help".to_owned());
-            let err = super::validate_windows_relay_service_runtime_args(&help)
+            let err = super::validate_windows_relay_service_runtime_args_policy(&help)
                 .expect_err("help flag must fail closed in service runtime args");
             assert!(err.contains("--help"));
 
             let mut unknown = args.clone();
             unknown.extend(["--unknown".to_owned(), "value".to_owned()]);
-            let err = super::validate_windows_relay_service_runtime_args(&unknown)
+            let err = super::validate_windows_relay_service_runtime_args_policy(&unknown)
                 .expect_err("unknown runtime flags must fail closed");
             assert!(err.contains("unsupported argument"));
 
@@ -2810,16 +2880,41 @@ mod daemon {
                 .find(|arg| arg.as_str() == "127.0.0.1:9100")
                 .expect("health bind value should exist");
             *health_value = "0.0.0.0:9100".to_owned();
-            let err = super::validate_windows_relay_service_runtime_args(&public_health)
+            let err = super::validate_windows_relay_service_runtime_args_policy(&public_health)
                 .expect_err("public health bind must fail closed");
             assert!(err.contains("--health-bind"));
 
             let mut duplicate_optional = args.clone();
             duplicate_optional.extend(["--bind".to_owned(), "0.0.0.0:4500".to_owned()]);
             duplicate_optional.extend(["--bind".to_owned(), "0.0.0.0:4501".to_owned()]);
-            let err = super::validate_windows_relay_service_runtime_args(&duplicate_optional)
-                .expect_err("duplicate optional flags must fail closed");
+            let err =
+                super::validate_windows_relay_service_runtime_args_policy(&duplicate_optional)
+                    .expect_err("duplicate optional flags must fail closed");
             assert!(err.contains("--bind at most once"));
+        }
+
+        /// End-to-end coverage of the full runtime-arg validator (shape +
+        /// path-policy + filesystem ACL) on Unix, where the ACL gate is a
+        /// no-op, so reviewed-root argv validates without provisioning real
+        /// hardened files. On Windows the ACL gate additionally requires the
+        /// referenced files to exist with the reviewed SDDL; that SDDL contract
+        /// is covered by
+        /// `relay_windows_service_runtime_acl_requires_hardened_file_and_parent`,
+        /// and the shape + reviewed-root policy is covered cross-platform by the
+        /// `_policy` tests above.
+        #[cfg(not(windows))]
+        #[test]
+        fn relay_windows_service_runtime_args_full_validation_accepts_reviewed_on_unix() {
+            let args = vec![
+                "--relay-id".to_owned(),
+                "relay-eu-1".to_owned(),
+                "--verifier-key".to_owned(),
+                r"C:\ProgramData\RustyNet\relay\relay-verifier.key".to_owned(),
+                "--replay-store".to_owned(),
+                r"C:\ProgramData\RustyNet\relay\relay-replay.nonces".to_owned(),
+            ];
+            super::validate_windows_relay_service_runtime_args(&args)
+                .expect("reviewed relay runtime paths should pass the full validator on unix");
         }
 
         #[test]
