@@ -1147,6 +1147,89 @@ fn anchor_bundle_pull_token_thumbprint(token: &str) -> String {
     encode_hex(&digest[..8])
 }
 
+/// Bind the anchor bundle-pull loopback listener if this node is configured to
+/// serve it (a configured token path implies the `anchor.bundle_pull` role).
+/// Returns `Ok(None)` when not configured. Validates the bind addr
+/// (loopback-only unless `allow_lan`) and that the token file is readable BEFORE
+/// binding, then sets the socket non-blocking — exactly the steps the Unix main
+/// loop performed inline. Kept portable (`std::net`) and outside any `cfg` so
+/// the Unix AND Windows daemon main loops share ONE verified bind path (the
+/// Windows reconcile loop had no anchor listener at all, so a Windows anchor
+/// never opened its bundle-pull port — this is the shared seam that closes it).
+fn bind_anchor_bundle_pull_listener(
+    config: &DaemonConfig,
+) -> Result<Option<TcpListener>, DaemonError> {
+    let Some(token_path) = config.anchor_bundle_pull_token_path.as_ref() else {
+        return Ok(None);
+    };
+    let addr = config.anchor_bundle_pull_addr.ok_or_else(|| {
+        DaemonError::InvalidConfig(
+            "anchor bundle-pull token path requires a listener addr".to_owned(),
+        )
+    })?;
+    validate_anchor_bundle_pull_addr(addr, config.anchor_bundle_pull_allow_lan)?;
+    // Fail fast at startup if the token file is missing/unreadable rather than
+    // discovering it per-request.
+    load_anchor_bundle_pull_token(token_path)?;
+    let listener = TcpListener::bind(addr)
+        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull bind failed: {err}")))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull nonblocking failed: {err}")))?;
+    log::info!("anchor_bundle_pull: listening addr={addr}");
+    Ok(Some(listener))
+}
+
+/// Accept and serve AT MOST ONE pending anchor bundle-pull connection on a
+/// non-blocking listener. Returns `Ok(true)` when a connection was accepted (the
+/// caller counts it as processed I/O and skips the idle sleep), `Ok(false)` on
+/// `WouldBlock` (no pending connection) or when the token path is unset, and
+/// `Err` only on a genuine (fatal) accept error — matching the inline Unix loop.
+/// Per-request failures (bad/absent token, revoked capability) are logged and
+/// swallowed (still `Ok(true)`): one malformed request must not kill the daemon.
+/// Portable so the Unix + Windows loops share one verified serve path.
+fn poll_anchor_bundle_pull_once(
+    listener: &TcpListener,
+    config: &DaemonConfig,
+) -> Result<bool, DaemonError> {
+    let Some(token_path) = config.anchor_bundle_pull_token_path.as_ref() else {
+        return Ok(false);
+    };
+    match listener.accept() {
+        Ok((stream, peer_addr)) => {
+            match handle_anchor_bundle_pull_stream(
+                stream,
+                token_path.as_path(),
+                config.membership_snapshot_path.as_path(),
+                &config.node_id,
+            ) {
+                Ok(outcome) => {
+                    log::info!(
+                        "anchor_bundle_pull: served peer={peer_addr} token_thumbprint={}",
+                        outcome.token_thumbprint
+                    );
+                }
+                Err(err) => {
+                    if let Some(token_thumbprint) = err.token_thumbprint.as_deref() {
+                        log::warn!(
+                            "anchor_bundle_pull: request failed peer={peer_addr} token_thumbprint={token_thumbprint} reason={err}"
+                        );
+                    } else {
+                        log::warn!(
+                            "anchor_bundle_pull: request failed peer={peer_addr} token_thumbprint=unavailable reason={err}"
+                        );
+                    }
+                }
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(false),
+        Err(err) => Err(DaemonError::Io(format!(
+            "anchor bundle-pull accept failed: {err}"
+        ))),
+    }
+}
+
 fn constant_time_ascii_eq(left: &str, right: &str) -> bool {
     let left = left.as_bytes();
     let right = right.as_bytes();
@@ -9315,6 +9398,15 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             "rustynetd startup: control + privileged pipe servers spawned; entering reconcile loop"
         );
 
+        // Anchor bundle-pull loopback listener. Until now the Windows reconcile
+        // loop never bound it (the listener lived only in the Unix main loop), so
+        // a Windows anchor never opened its bundle-pull port and could not serve a
+        // peer. Same shared, Linux-verified bind helper as the Unix path.
+        // (Follow-up: the DNS bind above retries on the SCM stop/start
+        // WSAEADDRINUSE race; if a live restart ever races the 51822 bind, wrap
+        // this in the same backoff — left single-attempt for parity with Unix.)
+        let anchor_bundle_pull_listener = bind_anchor_bundle_pull_listener(&config)?;
+
         let mut processed = 0usize;
         let reconcile_interval = Duration::from_millis(config.reconcile_interval_ms.get().max(100));
         let mut next_reconcile = Instant::now() + reconcile_interval;
@@ -9408,6 +9500,15 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                         return Err(DaemonError::Io(format!("dns resolver recv failed: {err}")));
                     }
                 }
+            }
+
+            // Serve one pending anchor bundle-pull connection (shared,
+            // Linux-verified serve path — same as the Unix loop).
+            if let Some(anchor_listener) = anchor_bundle_pull_listener.as_ref()
+                && poll_anchor_bundle_pull_once(anchor_listener, &config)?
+            {
+                processed = processed.saturating_add(1);
+                processed_io = true;
             }
 
             let now = Instant::now();
@@ -9510,26 +9611,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         dns_socket
             .set_nonblocking(true)
             .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
-        let anchor_bundle_pull_listener = if let Some(token_path) =
-            config.anchor_bundle_pull_token_path.as_ref()
-        {
-            let addr = config.anchor_bundle_pull_addr.ok_or_else(|| {
-                DaemonError::InvalidConfig(
-                    "anchor bundle-pull token path requires a listener addr".to_owned(),
-                )
-            })?;
-            validate_anchor_bundle_pull_addr(addr, config.anchor_bundle_pull_allow_lan)?;
-            load_anchor_bundle_pull_token(token_path)?;
-            let listener = TcpListener::bind(addr)
-                .map_err(|err| DaemonError::Io(format!("anchor bundle-pull bind failed: {err}")))?;
-            listener.set_nonblocking(true).map_err(|err| {
-                DaemonError::Io(format!("anchor bundle-pull nonblocking failed: {err}"))
-            })?;
-            log::info!("anchor_bundle_pull: listening addr={addr}");
-            Some(listener)
-        } else {
-            None
-        };
+        let anchor_bundle_pull_listener = bind_anchor_bundle_pull_listener(&config)?;
 
         let socket_owner_uid = socket_owner_uid(&config.socket_path)?;
 
@@ -9648,46 +9730,11 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                     }
                 }
             }
-            if let (Some(anchor_listener), Some(token_path)) = (
-                anchor_bundle_pull_listener.as_ref(),
-                config.anchor_bundle_pull_token_path.as_ref(),
-            ) {
-                match anchor_listener.accept() {
-                    Ok((stream, peer_addr)) => {
-                        match handle_anchor_bundle_pull_stream(
-                            stream,
-                            token_path.as_path(),
-                            config.membership_snapshot_path.as_path(),
-                            &config.node_id,
-                        ) {
-                            Ok(outcome) => {
-                                log::info!(
-                                    "anchor_bundle_pull: served peer={peer_addr} token_thumbprint={}",
-                                    outcome.token_thumbprint
-                                );
-                            }
-                            Err(err) => {
-                                if let Some(token_thumbprint) = err.token_thumbprint.as_deref() {
-                                    log::warn!(
-                                        "anchor_bundle_pull: request failed peer={peer_addr} token_thumbprint={token_thumbprint} reason={err}"
-                                    );
-                                } else {
-                                    log::warn!(
-                                        "anchor_bundle_pull: request failed peer={peer_addr} token_thumbprint=unavailable reason={err}"
-                                    );
-                                }
-                            }
-                        }
-                        processed = processed.saturating_add(1);
-                        processed_io = true;
-                    }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {}
-                    Err(err) => {
-                        return Err(DaemonError::Io(format!(
-                            "anchor bundle-pull accept failed: {err}"
-                        )));
-                    }
-                }
+            if let Some(anchor_listener) = anchor_bundle_pull_listener.as_ref()
+                && poll_anchor_bundle_pull_once(anchor_listener, &config)?
+            {
+                processed = processed.saturating_add(1);
+                processed_io = true;
             }
 
             let now = Instant::now();
@@ -14807,7 +14854,8 @@ mod tests {
         MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, MembershipWatermark, NodeRole, StateFetcher,
         TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS, TraversalCandidate, TraversalCandidateType,
         TrustEvidenceRecord, TrustPolicy, TrustWatermark, anchor_bundle_pull_token_thumbprint,
-        build_dns_response, collect_traversal_host_candidate_snapshot_with_retry,
+        bind_anchor_bundle_pull_listener, build_dns_response,
+        collect_traversal_host_candidate_snapshot_with_retry,
         enforce_overlay_exception_for_exit_routes, is_root_managed_shared_runtime_parent,
         load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_dns_zone_bundle,
         load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
@@ -14815,12 +14863,13 @@ mod tests {
         load_trust_watermark, membership_watermark_is_replay, parse_route_interface_token,
         parse_windows_default_egress_interface_output, passphrase_disallowed_mode_mask,
         persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
-        port_mapping_bring_up_skip_reason, prepare_runtime_wireguard_key_material,
-        resolve_egress_interface_value, run_daemon, run_preflight_checks,
-        sanitize_dataplane_routes_for_node_role, scrub_runtime_wireguard_key_material,
-        select_runtime_relay_candidate, select_runtime_relay_candidate_with_verified_fleet,
-        sha256_digest, snapshot_has_usable_traversal_host_candidates, trust_evidence_payload,
-        unix_now, validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
+        poll_anchor_bundle_pull_once, port_mapping_bring_up_skip_reason,
+        prepare_runtime_wireguard_key_material, resolve_egress_interface_value, run_daemon,
+        run_preflight_checks, sanitize_dataplane_routes_for_node_role,
+        scrub_runtime_wireguard_key_material, select_runtime_relay_candidate,
+        select_runtime_relay_candidate_with_verified_fleet, sha256_digest,
+        snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
+        validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
         validate_daemon_config, validate_file_security, validate_node_role_membership_alignment,
         write_anchor_bundle_pull_response, zeroize_optional_bytes,
     };
@@ -14941,6 +14990,63 @@ mod tests {
             .expect("loopback must succeed without allow-lan");
         validate_anchor_bundle_pull_addr(lo_addr, true)
             .expect("loopback must succeed with allow-lan");
+    }
+
+    // ── Shared anchor bundle-pull listener helpers (the seam the Windows
+    //    reconcile loop now reuses; verified here on Linux). ──────────────────
+
+    #[test]
+    fn bind_anchor_bundle_pull_listener_returns_none_without_token_path() {
+        // Opt-in: no token path ⇒ no listener (on every OS).
+        let config = DaemonConfig {
+            anchor_bundle_pull_token_path: None,
+            ..DaemonConfig::default()
+        };
+        let listener =
+            bind_anchor_bundle_pull_listener(&config).expect("None token path must not error");
+        assert!(listener.is_none(), "no token path ⇒ no listener");
+    }
+
+    #[test]
+    fn bind_anchor_bundle_pull_listener_rejects_non_loopback_without_allow_lan() {
+        let dir = std::env::temp_dir().join(format!("rn-anchor-bind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let token = dir.join("token");
+        std::fs::write(&token, "abcdefghijklmnopqrstuvwxyz012345\n").expect("write token");
+        let config = DaemonConfig {
+            anchor_bundle_pull_token_path: Some(token),
+            anchor_bundle_pull_addr: Some("192.168.1.10:51822".parse().expect("addr")),
+            anchor_bundle_pull_allow_lan: false,
+            ..DaemonConfig::default()
+        };
+        bind_anchor_bundle_pull_listener(&config)
+            .expect_err("a LAN bind addr without allow-lan must fail closed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bind_then_poll_anchor_bundle_pull_is_nonblocking_wouldblock() {
+        // Bind on an ephemeral loopback port, then poll with no pending
+        // connection: the shared serve path must report no I/O (WouldBlock →
+        // false), never block. This is the exact bind+accept code the Windows
+        // reconcile loop now runs.
+        let dir = std::env::temp_dir().join(format!("rn-anchor-poll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let token = dir.join("token");
+        std::fs::write(&token, "abcdefghijklmnopqrstuvwxyz012345\n").expect("write token");
+        let config = DaemonConfig {
+            anchor_bundle_pull_token_path: Some(token),
+            anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("addr")),
+            anchor_bundle_pull_allow_lan: false,
+            ..DaemonConfig::default()
+        };
+        let listener = bind_anchor_bundle_pull_listener(&config)
+            .expect("loopback bind must succeed")
+            .expect("a configured token path ⇒ a listener");
+        let processed =
+            poll_anchor_bundle_pull_once(&listener, &config).expect("poll must not error");
+        assert!(!processed, "no pending connection ⇒ no I/O (WouldBlock)");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
