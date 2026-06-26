@@ -11,6 +11,154 @@ use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, Tunnel
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Tear down any residual RustyNet `pf` killswitch / exit-NAT anchor a crashed or
+/// torn-down daemon left loaded, then any leftover mesh `utun` interface. This is
+/// the macOS analogue of the Linux `LINUX_NFT_KILLSWITCH_RESET_COMMAND` +
+/// `LINUX_INTERFACE_RESET_COMMAND`: a default-deny killswitch anchor still loaded
+/// starves the next bootstrap's egress, and a `utun` still carrying the mesh CIDR
+/// collides with the next bring-up.
+///
+/// Three RustyNet pf anchor families can be left behind (all confirmed against
+/// the daemon's own constants):
+///   - `com.apple/rustynet_g<N>` — the generation-rotated killswitch/filter
+///     anchor (`macos_exit_killswitch_precedence::MACOS_RUSTYNET_ANCHOR_PREFIX`),
+///   - `com.rustynet/nat` — the regular-exit NAT anchor
+///     (`macos_exit_nat_lifecycle::DEFAULT_MACOS_EXIT_PF_ANCHOR`),
+///   - `com.rustynet/blind_exit` — the blind-exit filter anchor
+///     (`macos_blind_exit::DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR`).
+/// Anchors are ENUMERATED from `pfctl -s Anchors` and matched on the substring
+/// `rustynet` (covers every family, including an unanticipated future
+/// generation), then flushed with `pfctl -a <anchor> -F all` — never a fixed
+/// name, so an unexpected anchor cannot be left loaded. `-F all` only flushes
+/// that anchor's own rules/state; it does not touch the base ruleset.
+///
+/// The mesh interface on macOS is a node-id-derived `utun<N>` (index 10–4095,
+/// NOT a fixed `rustynet0`; see `macos_install::utun_name_for_node_id`), so it
+/// cannot be matched by a `rustynet*` name prefix the way Linux links are.
+/// Instead a leftover mesh interface is identified by the RustyNet CGNAT mesh
+/// address it carries (`100.64.0.0/10`, RFC 6598): any `utun` with an
+/// `inet 100.64..100.127` address is a stale RustyNet device and is removed with
+/// `ifconfig <utun> destroy`. A bare `utun` without a mesh address is left alone
+/// (iCloud Private Relay / corporate VPNs also use `utun`). Best-effort and
+/// idempotent at every privileged step; runs AFTER the daemon is stopped so
+/// nothing re-creates the anchor or device mid-delete.
+const MACOS_RESET_COMMAND: &str = "rn_anchors=$(sudo -n pfctl -s Anchors 2>/dev/null \
+         | sed 's/^[[:space:]]*//' | grep -i rustynet || true); \
+     for a in $rn_anchors; do sudo -n pfctl -a \"$a\" -F all 2>/dev/null || true; done; \
+     for dev in $(ifconfig -l 2>/dev/null | tr ' ' '\\n' | grep '^utun'); do \
+         if ifconfig \"$dev\" 2>/dev/null | grep -Eq 'inet 100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.'; then \
+             sudo -n ifconfig \"$dev\" destroy 2>/dev/null || true; \
+         fi; \
+     done";
+
+/// Comprehensive post-cleanup verification probe used by [`assert_node_clean`],
+/// the macOS analogue of `linux_traffic::LINUX_NODE_CLEAN_PROBE`. Emits exactly
+/// three space-separated tokens on a single line that
+/// [`parse_macos_node_clean_probe`] interprets:
+///   `pf=<names|->`    leftover RustyNet pf anchor names, or `-` if none
+///   `daemon=<up|down>` whether a `rustynetd` process is still running
+///   `iface=<names|->`  leftover mesh `utun` interface names (a `utun` carrying a
+///                      `100.64.0.0/10` mesh address), or `-` if none
+///
+/// A node is clean only when all three are benign (`pf=-`, `daemon=down`,
+/// `iface=-`). Each sub-probe tolerates the relevant tool being absent and is
+/// read-only (mutates nothing), so it is safe to run repeatedly.
+const MACOS_NODE_CLEAN_PROBE: &str = "rn_pf=$(sudo -n pfctl -s Anchors 2>/dev/null \
+         | sed 's/^[[:space:]]*//' | grep -i rustynet | tr '\\n' ',' || true); \
+     rn_daemon=$(pgrep -x rustynetd >/dev/null 2>&1 && echo up || echo down); \
+     rn_iface=$(for dev in $(ifconfig -l 2>/dev/null | tr ' ' '\\n' | grep '^utun'); do \
+             if ifconfig \"$dev\" 2>/dev/null \
+                 | grep -Eq 'inet 100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.'; then \
+                 printf '%s,' \"$dev\"; \
+             fi; \
+         done); \
+     printf 'pf=%s daemon=%s iface=%s\\n' \
+         \"${rn_pf:--}\" \"$rn_daemon\" \"${rn_iface:--}\"";
+
+/// Pure parser for [`MACOS_NODE_CLEAN_PROBE`] output, the macOS analogue of
+/// `linux_traffic::parse_node_clean_probe`. Returns `Ok(())` when the node is
+/// verifiably clean (no leftover RustyNet pf anchor, no running `rustynetd`, no
+/// leftover mesh `utun`) and a descriptive `node still dirty: …` error listing
+/// every dirty dimension otherwise.
+///
+/// Fail closed: any token that is missing, malformed, or does not explicitly
+/// assert the benign value is treated as dirty. A truncated or garbled probe
+/// (e.g. SSH noise prepended) therefore fails the assertion rather than passing
+/// a node whose true state is unknown.
+fn parse_macos_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
+    // The probe prints a single result line; tolerate leading log/banner lines
+    // by scanning for the line that carries the three expected tokens.
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .find(|l| l.contains("pf=") && l.contains("daemon=") && l.contains("iface="));
+    let Some(line) = line else {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "node still dirty: clean-probe output unrecognised (fail closed): {:?}",
+                raw.trim()
+            ),
+        });
+    };
+
+    let mut pf: Option<&str> = None;
+    let mut daemon: Option<&str> = None;
+    let mut iface: Option<&str> = None;
+    for tok in line.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("pf=") {
+            pf = Some(v);
+        } else if let Some(v) = tok.strip_prefix("daemon=") {
+            daemon = Some(v);
+        } else if let Some(v) = tok.strip_prefix("iface=") {
+            iface = Some(v);
+        }
+    }
+
+    // `-` (or empty) is the benign "nothing leftover" sentinel; any other value
+    // is a comma-joined list of leftover resource names. Strip a trailing comma
+    // the `tr '\n' ','` / `printf '%s,'` join leaves on a non-empty list.
+    let clean_list = |v: Option<&str>| -> Option<String> {
+        match v {
+            None => None, // token absent → unknown → treat as dirty below
+            Some(s) => {
+                let s = s.trim().trim_end_matches(',');
+                if s.is_empty() || s == "-" {
+                    Some(String::new())
+                } else {
+                    Some(s.to_owned())
+                }
+            }
+        }
+    };
+
+    let mut dirty: Vec<String> = Vec::new();
+    match clean_list(pf) {
+        Some(s) if s.is_empty() => {}
+        Some(s) => dirty.push(format!("pf anchor(s): {s}")),
+        None => dirty.push("pf-anchor status unknown (probe token missing)".to_owned()),
+    }
+    match daemon {
+        Some("down") => {}
+        Some("up") => dirty.push("rustynetd still running".to_owned()),
+        _ => dirty.push("daemon status unknown (probe token missing)".to_owned()),
+    }
+    match clean_list(iface) {
+        Some(s) if s.is_empty() => {}
+        Some(s) => dirty.push(format!("mesh utun interface(s): {s}")),
+        None => dirty.push("interface status unknown (probe token missing)".to_owned()),
+    }
+
+    if dirty.is_empty() {
+        Ok(())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!("node still dirty after cleanup: {}", dirty.join("; ")),
+        })
+    }
+}
+
 /// Read the `WireGuard` public key from the macOS state root.
 /// Returns the base64-encoded key decoded to hex.
 /// The keys directory is mode 700 owned by rustynetd, so the SSH user needs
@@ -175,12 +323,30 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
 
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
-    // Stop service first (best-effort).
+    // Stop service first (best-effort). Wait until no rustynetd process remains
+    // BEFORE the pf/interface reset below, mirroring the Linux daemon-stop wait:
+    // a daemon mid-shutdown can re-load the killswitch anchor or re-create the
+    // utun after a single flush pass, tripping assert_node_clean. `bootout` is
+    // synchronous but a daemon launched outside the launchd job (or still
+    // tearing down) is waited out by keying on the actual process.
     let _ = ssh::run_remote(
         conn,
-        "sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true",
-        SHORT_TIMEOUT,
+        "sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
+         sudo -n pkill -x rustynetd 2>/dev/null || true; \
+         for _ in $(seq 1 60); do \
+             pgrep -x rustynetd >/dev/null 2>&1 && sleep 0.5 || break; \
+         done",
+        Duration::from_secs(60),
     );
+
+    // Flush every leftover RustyNet pf killswitch / exit-NAT anchor and tear down
+    // any residual mesh `utun` interface the daemon left behind. Runs AFTER the
+    // daemon-stop wait so nothing re-creates the anchor/device mid-delete. Without
+    // this a prior run's default-deny killswitch anchor starves the next
+    // bootstrap's egress (cargo registry downloads), and a stale utun still
+    // carrying the mesh CIDR collides with the fresh bring-up. Best-effort and
+    // idempotent — a clean node is a no-op.
+    let _ = ssh::run_remote(conn, MACOS_RESET_COMMAND, Duration::from_secs(30));
 
     // Remove runtime state but keep WG keys and the installation. This now
     // includes the seed trust evidence (`rustynetd.trust`) and its anti-replay
@@ -227,6 +393,19 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
         SHORT_TIMEOUT,
     )?;
     Ok(())
+}
+
+/// After cleanup, assert the node is verifiably clean across all three
+/// dimensions that break the next bootstrap, the macOS analogue of
+/// `linux_traffic::assert_node_clean`: no leftover RustyNet `pf` killswitch /
+/// exit-NAT anchor (a default-deny anchor starves egress), no running
+/// `rustynetd` (a live daemon re-loads the anchor and owns the interface), and
+/// no leftover mesh `utun` interface (a stale device carrying the mesh CIDR
+/// collides with the fresh bring-up). Fails loudly so a reset that did not take
+/// is caught here, not as a cargo DNS timeout five stages later.
+pub fn assert_node_clean(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let raw = ssh::run_remote(conn, MACOS_NODE_CLEAN_PROBE, SHORT_TIMEOUT)?;
+    parse_macos_node_clean_probe(&raw)
 }
 
 /// Best-effort: the macOS daemon's own fail-closed/startup reason, read from
@@ -491,6 +670,105 @@ fn verify_no_key_material_tarball(path: &Path) -> Result<(), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_node_clean_probe_covers_pf_daemon_and_interface() {
+        let p = MACOS_NODE_CLEAN_PROBE;
+        // pf dimension: leftover RustyNet anchors enumerated from pfctl -s Anchors.
+        assert!(p.contains("pfctl -s Anchors"));
+        assert!(p.contains("grep -i rustynet"));
+        // daemon dimension: a still-running rustynetd (same process name as Linux).
+        assert!(p.contains("pgrep -x rustynetd"));
+        // interface dimension: a utun carrying a 100.64.0.0/10 mesh address.
+        assert!(p.contains("^utun"));
+        assert!(p.contains("inet 100"));
+        // Emits the three structured tokens the parser keys on.
+        assert!(p.contains("pf=%s daemon=%s iface=%s"));
+    }
+
+    #[test]
+    fn macos_reset_command_flushes_anchors_and_destroys_mesh_utun() {
+        let cmd = MACOS_RESET_COMMAND;
+        // Enumerates RustyNet pf anchors (not a fixed name) and flushes each.
+        assert!(cmd.contains("pfctl -s Anchors"));
+        assert!(cmd.contains("grep -i rustynet"));
+        assert!(cmd.contains("pfctl -a") && cmd.contains("-F all"));
+        // Enumerates utun devices and destroys only those carrying a mesh address.
+        assert!(cmd.contains("ifconfig -l"));
+        assert!(cmd.contains("inet 100"));
+        assert!(cmd.contains("ifconfig") && cmd.contains("destroy"));
+        // Best-effort at every privileged step.
+        assert!(cmd.contains("|| true"));
+        // Captures the anchor list into a variable first, then iterates with a
+        // `for` loop — same anti-stdin-drain shape as the Linux resets.
+        assert!(cmd.contains("rn_anchors=$("));
+        assert!(cmd.contains("for a in $rn_anchors"));
+        assert!(
+            !cmd.contains("while read"),
+            "reset must not pipe into `while read` (inner sudo drains the pipe)"
+        );
+    }
+
+    #[test]
+    fn parse_macos_node_clean_probe_accepts_fully_clean_node() {
+        assert!(parse_macos_node_clean_probe("pf=- daemon=down iface=-\n").is_ok());
+        // Empty-string sentinels (shell var expanded to nothing) are also benign.
+        assert!(parse_macos_node_clean_probe("pf= daemon=down iface=").is_ok());
+        // Tolerates a leading banner/log line before the result line.
+        assert!(parse_macos_node_clean_probe("Warning: blah\npf=- daemon=down iface=-").is_ok());
+    }
+
+    #[test]
+    fn parse_macos_node_clean_probe_reports_leftover_pf_anchor() {
+        let err = parse_macos_node_clean_probe("pf=com.apple/rustynet_g1, daemon=down iface=-")
+            .expect_err("leftover pf anchor must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("node still dirty"));
+        assert!(msg.contains("com.apple/rustynet_g1"));
+        // The exit-NAT anchor family is also surfaced.
+        let err2 = parse_macos_node_clean_probe("pf=com.rustynet/nat, daemon=down iface=-")
+            .expect_err("leftover exit-nat anchor must fail");
+        assert!(err2.to_string().contains("com.rustynet/nat"));
+    }
+
+    #[test]
+    fn parse_macos_node_clean_probe_reports_running_daemon() {
+        let err = parse_macos_node_clean_probe("pf=- daemon=up iface=-")
+            .expect_err("running daemon must fail");
+        assert!(err.to_string().contains("rustynetd still running"));
+    }
+
+    #[test]
+    fn parse_macos_node_clean_probe_reports_leftover_interface() {
+        let err = parse_macos_node_clean_probe("pf=- daemon=down iface=utun12,")
+            .expect_err("leftover mesh utun must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("utun"));
+        assert!(msg.contains("utun12"));
+    }
+
+    #[test]
+    fn parse_macos_node_clean_probe_aggregates_multiple_dirty_dimensions() {
+        let err =
+            parse_macos_node_clean_probe("pf=com.rustynet/blind_exit, daemon=up iface=utun4095,")
+                .expect_err("multi-dirty must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("com.rustynet/blind_exit"));
+        assert!(msg.contains("rustynetd still running"));
+        assert!(msg.contains("utun4095"));
+    }
+
+    #[test]
+    fn parse_macos_node_clean_probe_fails_closed_on_unrecognised_output() {
+        // No result line at all → unknown state → fail closed, never pass.
+        assert!(parse_macos_node_clean_probe("").is_err());
+        assert!(parse_macos_node_clean_probe("ssh: connect timed out").is_err());
+        // Result line missing a token (e.g. daemon=) → that dimension is unknown
+        // → fail closed rather than assume clean.
+        let err = parse_macos_node_clean_probe("pf=- iface=-")
+            .expect_err("missing daemon token must fail closed");
+        assert!(err.to_string().contains("unrecognised") || err.to_string().contains("unknown"));
+    }
 
     #[test]
     fn validate_ip_arg_accepts_valid_ipv4() {

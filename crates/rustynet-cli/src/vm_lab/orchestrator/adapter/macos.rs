@@ -211,6 +211,10 @@ impl NodeAdapter for MacosNodeAdapter {
         macos_traffic::collect_daemon_failure_reason(&self.conn)
     }
 
+    fn assert_node_clean(&self) -> Result<(), AdapterError> {
+        macos_traffic::assert_node_clean(&self.conn)
+    }
+
     fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
         macos_traffic::check_ssh_reachable(&self.conn)
     }
