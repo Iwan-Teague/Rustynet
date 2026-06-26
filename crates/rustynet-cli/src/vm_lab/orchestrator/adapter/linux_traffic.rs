@@ -41,6 +41,133 @@ const LINUX_NFT_KILLSWITCH_RESET_COMMAND: &str = "if command -v nft >/dev/null 2
          done; \
      fi";
 
+/// Tear down any residual `rustynet*` WireGuard/TUN interface a crashed daemon
+/// left behind (the dataplane device is `rustynet0`, but a generation-suffixed
+/// device such as `rustynet1` from an aborted rebuild is also possible). A stale
+/// interface still carrying the mesh CIDR collides with the next bootstrap's
+/// fresh device bring-up, so it must go once the daemon is confirmed down.
+///
+/// Enumerated (not a fixed `rustynet0`) for the same reason the nft reset is:
+/// an unanticipated generation device cannot be left behind. Idempotent — no
+/// matching link is a no-op — and best-effort at every privileged step
+/// (`|| true`), so a node that never had an interface does not fail the reset.
+/// Runs AFTER the daemon-stop wait so nothing re-creates the device mid-delete.
+const LINUX_INTERFACE_RESET_COMMAND: &str = "if command -v ip >/dev/null 2>&1; then \
+         rn_links=$(ip -o link show 2>/dev/null \
+             | awk -F': ' '{print $2}' | awk -F'@' '{print $1}' \
+             | awk '/^rustynet/ {print}'); \
+         for link in $rn_links; do \
+             sudo -n ip link delete \"$link\" 2>/dev/null || true; \
+         done; \
+     fi";
+
+/// Comprehensive post-cleanup verification probe used by [`assert_node_clean`].
+/// Emits exactly three space-separated tokens on a single line that
+/// [`parse_node_clean_probe`] interprets:
+///   `nft=<names|->`   leftover `rustynet*` inet table names, or `-` if none
+///   `daemon=<up|down>` whether a `rustynetd` process is still running
+///   `iface=<names|->`  leftover `rustynet*` interface names, or `-` if none
+///
+/// A node is clean only when all three are benign (`nft=-`, `daemon=down`,
+/// `iface=-`). Each sub-probe is independent and tolerates the relevant tool
+/// (`nft`, `pgrep`, `ip`) being absent: a missing tool yields the benign token,
+/// because a host without `nft` cannot carry a leftover nft table. Read-only —
+/// it mutates nothing, so it is safe to run repeatedly.
+const LINUX_NODE_CLEAN_PROBE: &str = "rn_nft=$(command -v nft >/dev/null 2>&1 && \
+         sudo -n nft list tables 2>/dev/null \
+         | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}' | tr '\\n' ',' || true); \
+     rn_daemon=$(pgrep -x rustynetd >/dev/null 2>&1 && echo up || echo down); \
+     rn_iface=$(command -v ip >/dev/null 2>&1 && \
+         ip -o link show 2>/dev/null \
+         | awk -F': ' '{print $2}' | awk -F'@' '{print $1}' \
+         | awk '/^rustynet/ {print}' | tr '\\n' ',' || true); \
+     printf 'nft=%s daemon=%s iface=%s\\n' \
+         \"${rn_nft:--}\" \"$rn_daemon\" \"${rn_iface:--}\"";
+
+/// Pure parser for [`LINUX_NODE_CLEAN_PROBE`] output. Returns `Ok(())` when the
+/// node is verifiably clean (no leftover `rustynet*` nft table, no running
+/// `rustynetd`, no leftover `rustynet*` interface) and a descriptive
+/// `node still dirty: …` error listing every dirty dimension otherwise.
+///
+/// Fail closed: any token that is missing, malformed, or does not explicitly
+/// assert the benign value is treated as dirty. A truncated or garbled probe
+/// (e.g. SSH noise prepended) therefore fails the assertion rather than passing
+/// a node whose true state is unknown — exactly the posture `assert_node_clean`
+/// is meant to enforce.
+fn parse_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
+    // The probe prints a single result line; tolerate leading log/banner lines
+    // by scanning for the line that carries the three expected tokens.
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .find(|l| l.contains("nft=") && l.contains("daemon=") && l.contains("iface="));
+    let Some(line) = line else {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "node still dirty: clean-probe output unrecognised (fail closed): {:?}",
+                raw.trim()
+            ),
+        });
+    };
+
+    let mut nft: Option<&str> = None;
+    let mut daemon: Option<&str> = None;
+    let mut iface: Option<&str> = None;
+    for tok in line.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("nft=") {
+            nft = Some(v);
+        } else if let Some(v) = tok.strip_prefix("daemon=") {
+            daemon = Some(v);
+        } else if let Some(v) = tok.strip_prefix("iface=") {
+            iface = Some(v);
+        }
+    }
+
+    // `-` (or empty) is the benign "nothing leftover" sentinel; any other value
+    // is a comma-joined list of leftover resource names. Strip a trailing comma
+    // the `tr '\n' ','` join leaves on a non-empty list.
+    let clean_list = |v: Option<&str>| -> Option<String> {
+        match v {
+            None => None, // token absent → unknown → treat as dirty below
+            Some(s) => {
+                let s = s.trim().trim_end_matches(',');
+                if s.is_empty() || s == "-" {
+                    Some(String::new())
+                } else {
+                    Some(s.to_owned())
+                }
+            }
+        }
+    };
+
+    let mut dirty: Vec<String> = Vec::new();
+    match clean_list(nft) {
+        Some(s) if s.is_empty() => {}
+        Some(s) => dirty.push(format!("nftables table(s): {s}")),
+        None => dirty.push("nftables status unknown (probe token missing)".to_owned()),
+    }
+    match daemon {
+        Some("down") => {}
+        Some("up") => dirty.push("rustynetd still running".to_owned()),
+        _ => dirty.push("daemon status unknown (probe token missing)".to_owned()),
+    }
+    match clean_list(iface) {
+        Some(s) if s.is_empty() => {}
+        Some(s) => dirty.push(format!("interface(s): {s}")),
+        None => dirty.push("interface status unknown (probe token missing)".to_owned()),
+    }
+
+    if dirty.is_empty() {
+        Ok(())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!("node still dirty after cleanup: {}", dirty.join("; ")),
+        })
+    }
+}
+
 /// Collect `WireGuard` public key from `/var/lib/rustynet/keys/wireguard.pub`.
 /// Returns the base64-encoded key as a hex string (32-byte decode → hex).
 pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, AdapterError> {
@@ -436,6 +563,12 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
         LINUX_NFT_KILLSWITCH_RESET_COMMAND,
         Duration::from_secs(30),
     );
+    // Tear down any residual `rustynet*` WireGuard/TUN interface a crashed daemon
+    // left up. Runs AFTER the daemon-stop wait above so nothing re-creates the
+    // device mid-delete; a stale interface still carrying the mesh CIDR would
+    // collide with the next bootstrap's fresh device bring-up. Best-effort and
+    // idempotent — no matching link is a no-op.
+    let _ = ssh::run_remote(conn, LINUX_INTERFACE_RESET_COMMAND, Duration::from_secs(30));
     // Restart systemd-resolved so the next bootstrap inherits a clean DNS
     // stub. The daemon's network plumbing can leave the stub at 127.0.0.53
     // in a degraded state after teardown, causing DNS timeouts during cargo
@@ -486,27 +619,21 @@ pub fn collect_daemon_failure_reason(
     Ok(crate::vm_lab::orchestrator::adapter::node_adapter::extract_daemon_failure_reason(&tail))
 }
 
-/// nftables probe used by [`assert_node_clean`]: prints any leftover `rustynet*`
-/// inet table names (space-separated); empty output means the node is clean.
-const LINUX_NFT_LEFTOVER_PROBE: &str = "sudo -n nft list tables 2>/dev/null \
-     | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}' | tr '\\n' ' '";
-
-/// After cleanup, assert no leftover RustyNet nftables killswitch table remains
-/// (a default-deny `rustynet*` table would starve the next bootstrap's egress).
-/// Fails loudly so a reset that did not take is caught here, not as a cargo DNS
-/// timeout five stages later.
+/// After cleanup, assert the node is verifiably clean across all three
+/// dimensions that break the next bootstrap: no leftover `rustynet*` nftables
+/// killswitch table (a default-deny table starves egress), no running
+/// `rustynetd` (a live daemon re-applies the killswitch and owns the
+/// interface), and no leftover `rustynet*` WireGuard/TUN interface (a stale
+/// device collides with the fresh bring-up). Fails loudly so a reset that did
+/// not take is caught here, not as a cargo DNS timeout five stages later.
+///
+/// Checking the daemon and interface — not just the nft table — closes the gap
+/// where a daemon mid-shutdown (or relaunched inside `RestartSec`) had already
+/// re-deleted/re-added the table between the reset and an nft-only probe, so the
+/// node read "clean" while still actively dirty.
 pub fn assert_node_clean(conn: &NodeConnection) -> Result<(), AdapterError> {
-    let leftover = ssh::run_remote(conn, LINUX_NFT_LEFTOVER_PROBE, SHORT_TIMEOUT)?;
-    let leftover = leftover.trim();
-    if leftover.is_empty() {
-        Ok(())
-    } else {
-        Err(AdapterError::Protocol {
-            message: format!(
-                "node still dirty: leftover rustynet nftables table(s) after cleanup: {leftover}"
-            ),
-        })
-    }
+    let raw = ssh::run_remote(conn, LINUX_NODE_CLEAN_PROBE, SHORT_TIMEOUT)?;
+    parse_node_clean_probe(&raw)
 }
 
 /// Verify SSH connectivity by running a no-op command.
@@ -883,10 +1010,99 @@ mod tests {
     }
 
     #[test]
-    fn linux_node_clean_probe_targets_rustynet_nft_tables() {
-        let p = LINUX_NFT_LEFTOVER_PROBE;
+    fn linux_node_clean_probe_covers_nft_daemon_and_interface() {
+        let p = LINUX_NODE_CLEAN_PROBE;
+        // nft dimension: leftover rustynet inet tables.
         assert!(p.contains("nft list tables"));
         assert!(p.contains("$3 ~ /^rustynet/"));
+        // daemon dimension: a still-running rustynetd.
+        assert!(p.contains("pgrep -x rustynetd"));
+        // interface dimension: leftover rustynet* links.
+        assert!(p.contains("ip -o link show"));
+        assert!(p.contains("/^rustynet/"));
+        // Emits the three structured tokens the parser keys on.
+        assert!(p.contains("nft=%s daemon=%s iface=%s"));
+        // Tool-absence tolerant: a host without nft/ip is benign, not an error.
+        assert!(p.contains("command -v nft"));
+        assert!(p.contains("command -v ip"));
+    }
+
+    #[test]
+    fn linux_interface_reset_enumerates_and_deletes_rustynet_links() {
+        let cmd = LINUX_INTERFACE_RESET_COMMAND;
+        // Guards on `ip` presence so a node without iproute2 is a no-op.
+        assert!(cmd.contains("command -v ip"));
+        // Enumerates rustynet* links rather than a single fixed `rustynet0`.
+        assert!(cmd.contains("ip -o link show"));
+        assert!(cmd.contains("/^rustynet/"));
+        assert!(cmd.contains("ip link delete"));
+        // Best-effort: tolerates absence/permission at every privileged step.
+        assert!(cmd.contains("|| true"));
+        // Captures the link list into a variable first, then iterates with a
+        // `for` loop — same anti-stdin-drain shape as the nft reset.
+        assert!(cmd.contains("rn_links=$("));
+        assert!(cmd.contains("for link in $rn_links"));
+        assert!(
+            !cmd.contains("while read"),
+            "reset must not pipe into `while read` (inner sudo drains the pipe)"
+        );
+    }
+
+    #[test]
+    fn parse_node_clean_probe_accepts_fully_clean_node() {
+        assert!(parse_node_clean_probe("nft=- daemon=down iface=-\n").is_ok());
+        // Empty-string sentinels (when the shell var expanded to nothing despite
+        // the `:-` guard) are also benign.
+        assert!(parse_node_clean_probe("nft= daemon=down iface=").is_ok());
+        // Tolerates a leading banner/log line before the result line.
+        assert!(parse_node_clean_probe("Warning: blah\nnft=- daemon=down iface=-").is_ok());
+    }
+
+    #[test]
+    fn parse_node_clean_probe_reports_leftover_nft_table() {
+        let err = parse_node_clean_probe("nft=rustynet_boot, daemon=down iface=-")
+            .expect_err("leftover table must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("node still dirty"));
+        assert!(msg.contains("rustynet_boot"));
+    }
+
+    #[test]
+    fn parse_node_clean_probe_reports_running_daemon() {
+        let err = parse_node_clean_probe("nft=- daemon=up iface=-")
+            .expect_err("running daemon must fail");
+        assert!(err.to_string().contains("rustynetd still running"));
+    }
+
+    #[test]
+    fn parse_node_clean_probe_reports_leftover_interface() {
+        let err = parse_node_clean_probe("nft=- daemon=down iface=rustynet0,")
+            .expect_err("leftover interface must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("interface"));
+        assert!(msg.contains("rustynet0"));
+    }
+
+    #[test]
+    fn parse_node_clean_probe_aggregates_multiple_dirty_dimensions() {
+        let err = parse_node_clean_probe("nft=rustynet_g1, daemon=up iface=rustynet0,")
+            .expect_err("multi-dirty must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("rustynet_g1"));
+        assert!(msg.contains("rustynetd still running"));
+        assert!(msg.contains("rustynet0"));
+    }
+
+    #[test]
+    fn parse_node_clean_probe_fails_closed_on_unrecognised_output() {
+        // No result line at all → unknown state → fail closed, never pass.
+        assert!(parse_node_clean_probe("").is_err());
+        assert!(parse_node_clean_probe("ssh: connect timed out").is_err());
+        // Result line missing a token (e.g. daemon=) → that dimension is
+        // unknown → fail closed rather than assume clean.
+        let err = parse_node_clean_probe("nft=- iface=-")
+            .expect_err("missing daemon token must fail closed");
+        assert!(err.to_string().contains("unrecognised") || err.to_string().contains("unknown"));
     }
 
     #[test]
