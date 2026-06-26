@@ -2600,6 +2600,18 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "seed_cargo_cache".into(),
+                description: "Keep the UTM guests' OFFLINE cargo registry in sync with the workspace Cargo.lock. When the lock changes (a dep added/bumped), a guest's `cargo build --offline` fails with `error: no matching package` / `failed to download from https://index.crates.io/...` because its registry is stale. This parses the lock for crates.io packages, ensures the HOST has each one (runs `cargo fetch --locked` if not), then per node detects which crates' `.crate` blob + sparse-index entry are missing on the guest, tar+scp's ONLY the missing files into the guest's registry root (Unix `$HOME/.cargo/registry`, Windows `C:\\CargoHome\\registry` via PowerShell bsdtar), and re-probes to verify 0 remain missing. Returns PASS/FAIL per node (missing_before/seeded/missing_after) + any host-missing crates. dry_run probes without shipping. Run this after a Cargo.lock change before a live-lab run.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "nodes": json_schema_array_string("Inventory aliases to seed (default: all execution guests in the inventory)"),
+                        "cargo_lock_path": json_schema_string("Path to the Cargo.lock to read (default: <repo_root>/Cargo.lock)"),
+                        "dry_run": json_schema_boolean("Probe + report missing counts only; ship nothing (default: false)"),
+                    }),
+                    vec![],
+                ),
+            },
+            Tool {
                 name: "diagnose_live_lab_failure".into(),
                 description: "Deep triage of a failed run. `ops vm-lab-diagnose-live-lab-failure`. Only report_dir is required — profile is auto-resolved from the run's matrix row (orchestrate runs generate it internally); pass profile only to override.".into(),
                 input_schema: json_schema_object(
@@ -3146,6 +3158,7 @@ impl McpServer for LabStateServer {
                 self.run_ops("vm-lab-diagnose-live-lab-failure", &extra, 600)
             }
 
+            "seed_cargo_cache" => self.seed_cargo_cache(args),
             "start_live_lab_run" => self.start_live_lab_run(args),
             "get_job_status" => self.get_job_status(args),
             "get_run_progress" => self.get_run_progress(args),
@@ -4273,6 +4286,921 @@ fn explain_stage(stage: &str) -> ToolCallResult {
     }
 }
 
+// ── seed_cargo_cache: keep the UTM guests' offline cargo registry in sync ──
+//
+// When the workspace Cargo.lock changes (a dependency added/bumped), every
+// guest's offline registry goes stale and `cargo build --offline` fails with
+// `error: no matching package` / `failed to download from
+// https://index.crates.io/...`. This seeds the crates.io packages the lock
+// names — the `.crate` blob + the sparse-index `.cache` entry — from the HOST's
+// warm `~/.cargo/registry` into each guest's registry root, so the offline
+// build resolves again. All ssh/scp is argv-only via run_with_timeout; the only
+// caller-influenced values are crate names/versions parsed from the LOCAL lock,
+// and each is validated against `^[A-Za-z0-9_.+-]+$` before it touches a path
+// or command.
+
+/// One crates.io package from the workspace lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LockCrate {
+    name: String,
+    version: String,
+}
+
+/// A crate name/version token is safe to embed in a registry path or a guest-side
+/// probe only if it matches this conservative charset. crates.io names are
+/// `[A-Za-z0-9_-]` and semver versions add `.` and `+`; anything else (slashes,
+/// spaces, shell metacharacters, control chars) is rejected — fail closed.
+fn is_safe_crate_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'))
+}
+
+/// Parse the `[[package]]` blocks of a Cargo.lock and return only the packages
+/// whose `source` is the crates.io registry (either the git-index legacy form
+/// `registry+https://github.com/rust-lang/crates.io-index` or the sparse form
+/// `sparse+https://index.crates.io/`). Packages with NO `source` (workspace /
+/// path crates) and packages with any other source (git deps, alternate
+/// registries) are skipped — those are never in the crates.io offline cache.
+///
+/// Minimal hand parser (no new dependency): the lock is `@generated`, so each
+/// block is `[[package]]` then `key = "value"` lines until a blank line or the
+/// next block. Tokens that fail `is_safe_crate_token` are dropped (defensive;
+/// a real `@generated` lock never produces them).
+fn parse_lock_registry_crates(lock: &str) -> Vec<LockCrate> {
+    const CRATES_IO_GIT: &str = "registry+https://github.com/rust-lang/crates.io-index";
+    const CRATES_IO_SPARSE: &str = "sparse+https://index.crates.io/";
+
+    let mut out = Vec::new();
+    let mut in_pkg = false;
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut source: Option<String> = None;
+
+    // Flush the block we just finished reading.
+    let flush = |name: &mut Option<String>,
+                 version: &mut Option<String>,
+                 source: &mut Option<String>,
+                 out: &mut Vec<LockCrate>| {
+        let is_crates_io = matches!(
+            source.as_deref(),
+            Some(CRATES_IO_GIT) | Some(CRATES_IO_SPARSE)
+        );
+        if is_crates_io
+            && let (Some(n), Some(v)) = (name.as_ref(), version.as_ref())
+            && is_safe_crate_token(n)
+            && is_safe_crate_token(v)
+        {
+            out.push(LockCrate {
+                name: n.clone(),
+                version: v.clone(),
+            });
+        }
+        *name = None;
+        *version = None;
+        *source = None;
+    };
+
+    for line in lock.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[package]]" {
+            if in_pkg {
+                flush(&mut name, &mut version, &mut source, &mut out);
+            }
+            in_pkg = true;
+            continue;
+        }
+        if !in_pkg {
+            continue;
+        }
+        // A new top-level table (e.g. `[[patch.unused]]` or `[metadata]`) ends
+        // the package section; flush and stop treating lines as package fields.
+        if trimmed.starts_with('[') && trimmed != "[[package]]" {
+            flush(&mut name, &mut version, &mut source, &mut out);
+            in_pkg = false;
+            continue;
+        }
+        if let Some(v) = lock_str_field(trimmed, "name") {
+            name = Some(v);
+        } else if let Some(v) = lock_str_field(trimmed, "version") {
+            version = Some(v);
+        } else if let Some(v) = lock_str_field(trimmed, "source") {
+            source = Some(v);
+        }
+    }
+    if in_pkg {
+        flush(&mut name, &mut version, &mut source, &mut out);
+    }
+    out
+}
+
+/// Extract the value of a `key = "value"` line (returns None for any other line,
+/// including the `dependencies = [` array opener and `checksum`).
+fn lock_str_field(line: &str, key: &str) -> Option<String> {
+    let rest = line.strip_prefix(key)?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim();
+    let inner = rest.strip_prefix('"')?.strip_suffix('"')?;
+    Some(inner.to_string())
+}
+
+/// Sparse-index `.cache` shard path for a crate name, relative to the index
+/// `<hash>/.cache/` dir. Cargo lowercases the name and shards by length:
+/// len 1 → `1/<n>`, len 2 → `2/<n>`, len 3 → `3/<n[0]>/<n>`,
+/// len ≥4 → `<n[0..2]>/<n[2..4]>/<n>`. (ureq → `ur/eq/ureq`,
+/// rustls → `ru/st/rustls`, url → `3/u/url`, ab → `2/ab`, a → `1/a`.)
+fn index_shard_path(name: &str) -> String {
+    let n = name.to_ascii_lowercase();
+    let bytes = n.as_bytes();
+    match bytes.len() {
+        0 => n,
+        1 => format!("1/{n}"),
+        2 => format!("2/{n}"),
+        3 => format!("3/{}/{n}", &n[0..1]),
+        _ => format!("{}/{}/{n}", &n[0..2], &n[2..4]),
+    }
+}
+
+/// The two host-relative registry paths for one crate, relative to
+/// `~/.cargo/registry`:
+///   - `.crate` blob:  `cache/<hash>/<name>-<version>.crate`
+///   - sparse index:   `index/<hash>/.cache/<shard>`
+///
+/// The shard path returned by [`index_shard_path`] already ends in the
+/// lowercased crate name (e.g. `ur/eq/ureq`), and the index entry IS that file
+/// — there is no extra `/<name>` component. (Verified against a real
+/// `~/.cargo/registry/index/<hash>/.cache` tree: `serde` lives at
+/// `.cache/se/rd/serde`, `url` at `.cache/3/u/url`.)
+fn crate_registry_paths(hash: &str, c: &LockCrate) -> (String, String) {
+    let crate_path = format!("cache/{hash}/{}-{}.crate", c.name, c.version);
+    let index_path = format!("index/{hash}/.cache/{}", index_shard_path(&c.name));
+    (crate_path, index_path)
+}
+
+/// Given the set of lock crates and a presence map (key = a registry-relative
+/// path, value = present?), the crates whose `.crate` OR index entry is missing.
+/// A crate counts as present only when BOTH its blob and its index entry exist.
+fn missing_crates_from_presence(
+    hash: &str,
+    crates: &[LockCrate],
+    present: &std::collections::HashMap<String, bool>,
+) -> Vec<LockCrate> {
+    crates
+        .iter()
+        .filter(|c| {
+            let (cp, ip) = crate_registry_paths(hash, c);
+            !(present.get(&cp).copied().unwrap_or(false)
+                && present.get(&ip).copied().unwrap_or(false))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Detect the sparse-index `<hash>` dir name (e.g.
+/// `index.crates.io-1949cf8c6b5b557f`) under a registry root by listing its
+/// `cache/` subdir. The same hash names the `index/` subdir. The host and every
+/// guest share the same hash for the same cargo, so a per-target detection
+/// keeps the tool correct even if a future cargo changes the hash.
+fn detect_registry_hash(cache_dir: &Path) -> Option<String> {
+    let mut found: Option<String> = None;
+    for entry in std::fs::read_dir(cache_dir).ok()?.flatten() {
+        if entry.path().is_dir()
+            && let Some(name) = entry.file_name().to_str()
+            && name.starts_with("index.crates.io-")
+        {
+            // Prefer a unique hit; if several exist, the first deterministically
+            // sorted is taken (read_dir order is not sorted, so sort).
+            match &found {
+                Some(prev) if prev.as_str() <= name => {}
+                _ => found = Some(name.to_string()),
+            }
+        }
+    }
+    found
+}
+
+impl LabStateServer {
+    /// Host registry root (`~/.cargo/registry`), honoring CARGO_HOME.
+    fn host_registry_root(&self) -> PathBuf {
+        if let Ok(home) = std::env::var("CARGO_HOME") {
+            PathBuf::from(home).join("registry")
+        } else if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join(".cargo").join("registry")
+        } else {
+            PathBuf::from(".cargo").join("registry")
+        }
+    }
+
+    /// `cargo fetch --locked` in the repo root to populate `~/.cargo/registry`
+    /// from the lock — used when some lock crates are not yet on the host.
+    fn cargo_fetch_locked(&self) -> Result<(), String> {
+        let outcome = run_with_timeout(
+            "cargo",
+            &["fetch", "--locked"],
+            &self.repo_root,
+            &[("CARGO_TERM_COLOR", "never")],
+            Duration::from_secs(600),
+        )?;
+        if outcome.success {
+            Ok(())
+        } else {
+            Err(format!(
+                "cargo fetch --locked failed (exit {}): {}",
+                outcome
+                    .code
+                    .map(|c| c.to_string())
+                    .unwrap_or("killed".into()),
+                truncate_tail(outcome.stderr.trim(), 12, 2_000)
+            ))
+        }
+    }
+
+    /// Resolve an inventory alias → (ssh_target, ssh_user, platform). Only
+    /// entries that have an ssh_target are returned (path/aux LAN entries do).
+    fn alias_to_ssh(&self, alias: &str) -> Option<(String, String, String)> {
+        let s = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)).ok()?;
+        let inv: Value = serde_json::from_str(&s).ok()?;
+        inv.get("entries")?.as_array()?.iter().find_map(|e| {
+            if e.get("alias").and_then(|v| v.as_str()) != Some(alias) {
+                return None;
+            }
+            let target = e.get("ssh_target").and_then(|v| v.as_str())?.to_string();
+            let user = e
+                .get("ssh_user")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let platform = e
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .unwrap_or("linux")
+                .to_string();
+            Some((target, user, platform))
+        })
+    }
+
+    /// Every "execution" guest alias: an inventory entry that has both a
+    /// `controller.utm_name` (a real lab VM, not a bare LAN device) and an
+    /// `ssh_target`. This is the default node set for seed_cargo_cache.
+    fn execution_guest_aliases(&self) -> Vec<String> {
+        let Ok(s) = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)) else {
+            return Vec::new();
+        };
+        let Ok(inv) = serde_json::from_str::<Value>(&s) else {
+            return Vec::new();
+        };
+        inv.get("entries")
+            .and_then(|v| v.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| {
+                        e.get("controller")
+                            .and_then(|c| c.get("utm_name"))
+                            .is_some()
+                            && e.get("ssh_target").and_then(|v| v.as_str()).is_some()
+                    })
+                    .filter_map(|e| e.get("alias").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Shared ssh -o option block (key auth, strict host keys, batch mode) —
+    /// mirrors the orchestrator's transport options. Returned as owned strings so
+    /// the identity/known-hosts paths can be borrowed into the argv.
+    fn ssh_transport_opts(&self) -> Vec<String> {
+        let mut opts: Vec<String> = vec![
+            "-o".into(),
+            "LogLevel=ERROR".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=15".into(),
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
+            "-i".into(),
+            default_ssh_identity(),
+        ];
+        let kh = default_known_hosts();
+        if Path::new(&kh).exists() {
+            opts.push("-o".into());
+            opts.push(format!("UserKnownHostsFile={kh}"));
+        }
+        opts
+    }
+
+    /// One ssh exec to a guest: runs `remote_script` (a complete shell/PowerShell
+    /// program string passed as a single argv element — never built from
+    /// untrusted values). `user@target` form.
+    fn ssh_exec(
+        &self,
+        target: &str,
+        user: &str,
+        remote_script: &str,
+        timeout: Duration,
+    ) -> Result<CommandOutcome, String> {
+        let opts = self.ssh_transport_opts();
+        let dest = if user.is_empty() {
+            target.to_string()
+        } else {
+            format!("{user}@{target}")
+        };
+        let mut argv: Vec<&str> = vec!["-n"];
+        argv.extend(opts.iter().map(String::as_str));
+        argv.push("--");
+        argv.push(&dest);
+        argv.push(remote_script);
+        run_with_timeout("ssh", &argv, &self.repo_root, &[], timeout)
+    }
+
+    /// scp a local file to `user@target:dst`.
+    fn scp_to(
+        &self,
+        target: &str,
+        user: &str,
+        local: &Path,
+        dst: &str,
+        timeout: Duration,
+    ) -> Result<CommandOutcome, String> {
+        let opts = self.ssh_transport_opts();
+        let dest = if user.is_empty() {
+            format!("{target}:{dst}")
+        } else {
+            format!("{user}@{target}:{dst}")
+        };
+        let local_str = local.to_string_lossy().to_string();
+        let mut argv: Vec<&str> = vec!["-q"];
+        argv.extend(opts.iter().map(String::as_str));
+        argv.push("--");
+        argv.push(&local_str);
+        argv.push(&dest);
+        run_with_timeout("scp", &argv, &self.repo_root, &[], timeout)
+    }
+
+    /// Main tool entry: seed every target guest's offline cargo registry with the
+    /// crates.io packages named by the workspace lock so `cargo build --offline`
+    /// resolves after a Cargo.lock change.
+    fn seed_cargo_cache(&self, args: Option<&Value>) -> ToolCallResult {
+        // 1) Parse the lock.
+        let lock_path = match arg_str(args, "cargo_lock_path") {
+            Some(p) if !p.trim().is_empty() => PathBuf::from(p),
+            _ => self.repo_root.join("Cargo.lock"),
+        };
+        let lock_text = match std::fs::read_to_string(&lock_path) {
+            Ok(t) => t,
+            Err(e) => {
+                return tool_error(&format!(
+                    "cannot read Cargo.lock {}: {e}",
+                    lock_path.display()
+                ));
+            }
+        };
+        let crates = parse_lock_registry_crates(&lock_text);
+        if crates.is_empty() {
+            return tool_error(&format!(
+                "no crates.io registry packages found in {} (path/git-only lock?)",
+                lock_path.display()
+            ));
+        }
+        let dry_run = arg_bool(args, "dry_run");
+
+        // 2) Detect the host registry hash + ensure the host has the blobs;
+        //    `cargo fetch --locked` if any are missing, then recompute.
+        let host_root = self.host_registry_root();
+        let host_cache = host_root.join("cache");
+        let mut host_hash = match detect_registry_hash(&host_cache) {
+            Some(h) => h,
+            None => {
+                // No registry yet — fetch to create it.
+                if let Err(e) = self.cargo_fetch_locked() {
+                    return tool_error(&format!(
+                        "host has no cargo registry and cargo fetch failed: {e}"
+                    ));
+                }
+                match detect_registry_hash(&host_cache) {
+                    Some(h) => h,
+                    None => {
+                        return tool_error(
+                            "could not detect host cargo registry hash even after cargo fetch",
+                        );
+                    }
+                }
+            }
+        };
+        let mut host_missing = self.host_missing_crates(&host_root, &host_hash, &crates);
+        if !host_missing.is_empty() {
+            // Try one fetch to fill the gaps, then recompute (hash may have been
+            // created/extended by the fetch).
+            if let Err(e) = self.cargo_fetch_locked() {
+                return tool_error(&format!(
+                    "{} lock crate(s) missing on host and cargo fetch failed: {e}",
+                    host_missing.len()
+                ));
+            }
+            if let Some(h) = detect_registry_hash(&host_cache) {
+                host_hash = h;
+            }
+            host_missing = self.host_missing_crates(&host_root, &host_hash, &crates);
+        }
+        let host_missing_names: Vec<String> = host_missing
+            .iter()
+            .map(|c| format!("{}-{}", c.name, c.version))
+            .collect();
+
+        // 3) Resolve target nodes.
+        let requested = string_array(args, "nodes");
+        let nodes: Vec<String> = if requested.is_empty() {
+            self.execution_guest_aliases()
+        } else {
+            requested
+        };
+        if nodes.is_empty() {
+            return tool_error(
+                "no target nodes (empty `nodes` and no execution guests in the inventory)",
+            );
+        }
+
+        let mut node_reports: Vec<Value> = Vec::new();
+        let mut text = format!(
+            "# seed_cargo_cache\n\n- lock: `{}`\n- crates.io registry crates in lock: **{}**\n- host registry hash: `{host_hash}`\n",
+            lock_path.display(),
+            crates.len()
+        );
+        if !host_missing_names.is_empty() {
+            text.push_str(&format!(
+                "- ⚠️ {} lock crate(s) MISSING ON HOST even after `cargo fetch` (cannot be seeded): {}\n",
+                host_missing_names.len(),
+                truncate_output(&host_missing_names.join(", "), 1, 800)
+            ));
+        }
+        if dry_run {
+            text.push_str("- mode: **DRY RUN** (probe only, nothing shipped)\n");
+        }
+        text.push('\n');
+
+        // 4) Per node.
+        for alias in &nodes {
+            let report = self.seed_node(
+                alias,
+                &crates,
+                &host_root,
+                &host_hash,
+                &host_missing,
+                dry_run,
+            );
+            let ok = report.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            let verdict = if dry_run {
+                "DRY"
+            } else if ok {
+                "PASS"
+            } else {
+                "FAIL"
+            };
+            let os = report.get("os").and_then(|v| v.as_str()).unwrap_or("?");
+            let before = report
+                .get("missing_before")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let seeded = report.get("seeded").and_then(|v| v.as_u64()).unwrap_or(0);
+            let after = report
+                .get("missing_after")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let note = report.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            text.push_str(&format!(
+                "## {verdict} — `{alias}` ({os})\n- missing_before: {before}\n- seeded: {seeded}\n- missing_after: {after}\n"
+            ));
+            if !note.is_empty() {
+                text.push_str(&format!("- note: {note}\n"));
+            }
+            text.push('\n');
+            node_reports.push(report);
+        }
+
+        let all_ok = dry_run
+            || node_reports
+                .iter()
+                .all(|r| r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false));
+        text.push_str(if all_ok {
+            "**Result: all target nodes resolved (0 missing after seeding).**\n"
+        } else {
+            "**Result: at least one node still has missing crates — see FAIL nodes above.**\n"
+        });
+
+        let summary = json!({
+            "lock_path": lock_path.to_string_lossy(),
+            "lock_registry_crate_count": crates.len(),
+            "host_registry_hash": host_hash,
+            "host_missing": host_missing_names,
+            "dry_run": dry_run,
+            "all_ok": all_ok,
+            "nodes": node_reports,
+        });
+        text.push_str(&format!(
+            "\n<details><summary>structured</summary>\n\n```json\n{}\n```\n</details>\n",
+            serde_json::to_string_pretty(&summary).unwrap_or_default()
+        ));
+
+        ToolCallResult {
+            content: text_content(text),
+            is_error: if all_ok { None } else { Some(true) },
+        }
+    }
+
+    /// Which lock crates are absent from the HOST registry (blob OR index entry).
+    fn host_missing_crates(
+        &self,
+        host_root: &Path,
+        hash: &str,
+        crates: &[LockCrate],
+    ) -> Vec<LockCrate> {
+        crates
+            .iter()
+            .filter(|c| {
+                let (cp, ip) = crate_registry_paths(hash, c);
+                !(host_root.join(&cp).exists() && host_root.join(&ip).exists())
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Seed one node. Returns a structured per-node report (always; failures are
+    /// reported via `ok=false` + `error`, never a panic).
+    fn seed_node(
+        &self,
+        alias: &str,
+        crates: &[LockCrate],
+        host_root: &Path,
+        host_hash: &str,
+        host_missing: &[LockCrate],
+        dry_run: bool,
+    ) -> Value {
+        let mut base = json!({
+            "alias": alias,
+            "os": "?",
+            "registry_hash": Value::Null,
+            "lock_registry_crate_count": crates.len(),
+            "missing_before": 0,
+            "seeded": 0,
+            "missing_after": 0,
+            "ok": false,
+        });
+        let set_err = |mut v: Value, msg: String| -> Value {
+            v["error"] = Value::String(msg);
+            v
+        };
+
+        let Some((target, user, platform)) = self.alias_to_ssh(alias) else {
+            return set_err(
+                base,
+                format!("alias '{alias}' not in inventory or has no ssh_target"),
+            );
+        };
+        let os = if platform.eq_ignore_ascii_case("windows") {
+            "windows"
+        } else if platform.eq_ignore_ascii_case("macos") {
+            "macos"
+        } else {
+            "linux"
+        };
+        base["os"] = Value::String(os.to_string());
+        let is_windows = os == "windows";
+
+        // Guest registry root + hash.
+        let guest_root = if is_windows {
+            r"C:\CargoHome\registry".to_string()
+        } else {
+            "$HOME/.cargo/registry".to_string()
+        };
+        let guest_hash = match self.detect_guest_hash(&target, &user, is_windows) {
+            Ok(Some(h)) => h,
+            Ok(None) => host_hash.to_string(), // empty guest registry → use host hash
+            Err(e) => return set_err(base, format!("hash detection failed: {e}")),
+        };
+        base["registry_hash"] = Value::String(guest_hash.clone());
+
+        // Probe which lock crates are missing on the guest.
+        let probe = match self.probe_guest_missing(&target, &user, is_windows, &guest_hash, crates)
+        {
+            Ok(p) => p,
+            Err(e) => return set_err(base, format!("missing-probe failed: {e}")),
+        };
+        let missing_before = missing_crates_from_presence(&guest_hash, crates, &probe);
+        base["missing_before"] = json!(missing_before.len());
+
+        if dry_run {
+            base["ok"] = json!(true);
+            if !missing_before.is_empty() {
+                let sample: Vec<String> = missing_before
+                    .iter()
+                    .take(8)
+                    .map(|c| format!("{}-{}", c.name, c.version))
+                    .collect();
+                base["sample_missing"] = json!(sample);
+            }
+            return base;
+        }
+
+        // Only ship files the host actually has (skip host-missing crates).
+        let host_missing_set: std::collections::HashSet<(String, String)> = host_missing
+            .iter()
+            .map(|c| (c.name.clone(), c.version.clone()))
+            .collect();
+        let to_ship: Vec<LockCrate> = missing_before
+            .iter()
+            .filter(|c| !host_missing_set.contains(&(c.name.clone(), c.version.clone())))
+            .cloned()
+            .collect();
+
+        if !to_ship.is_empty() {
+            if let Err(e) = self.ship_crates(
+                &target,
+                &user,
+                is_windows,
+                host_root,
+                &guest_hash,
+                &guest_root,
+                &to_ship,
+            ) {
+                return set_err(base, format!("ship failed: {e}"));
+            }
+        }
+        base["seeded"] = json!(to_ship.len());
+
+        // Re-probe to verify.
+        let probe2 = match self.probe_guest_missing(&target, &user, is_windows, &guest_hash, crates)
+        {
+            Ok(p) => p,
+            Err(e) => return set_err(base, format!("verify-probe failed: {e}")),
+        };
+        let missing_after = missing_crates_from_presence(&guest_hash, crates, &probe2);
+        base["missing_after"] = json!(missing_after.len());
+        base["ok"] = json!(missing_after.is_empty());
+        if !missing_after.is_empty() {
+            let still: Vec<String> = missing_after
+                .iter()
+                .take(8)
+                .map(|c| format!("{}-{}", c.name, c.version))
+                .collect();
+            // Distinguish host-missing (unseedable) from a real ship failure.
+            let host_blocked = missing_after
+                .iter()
+                .filter(|c| host_missing_set.contains(&(c.name.clone(), c.version.clone())))
+                .count();
+            base["error"] = Value::String(format!(
+                "{} still missing after seeding ({host_blocked} of them missing on host, unseedable); sample: {}",
+                missing_after.len(),
+                still.join(", ")
+            ));
+        }
+        base
+    }
+
+    /// Detect the guest's registry `<hash>` by listing its `cache/` dir. Returns
+    /// `Ok(None)` when the guest has no registry cache yet (fresh guest).
+    fn detect_guest_hash(
+        &self,
+        target: &str,
+        user: &str,
+        is_windows: bool,
+    ) -> Result<Option<String>, String> {
+        // Static scripts — no interpolation of any caller value.
+        let script = if is_windows {
+            // PowerShell: list cache subdirs, print one name per line.
+            "if (Test-Path 'C:\\CargoHome\\registry\\cache') { Get-ChildItem -Directory 'C:\\CargoHome\\registry\\cache' | ForEach-Object { $_.Name } }"
+        } else {
+            "ls -1 \"$HOME/.cargo/registry/cache\" 2>/dev/null || true"
+        };
+        let out = self.ssh_exec(target, user, script, Duration::from_secs(30))?;
+        // Don't hard-fail on nonzero (a missing dir is normal); parse stdout.
+        let hash = out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("index.crates.io-"))
+            .max()
+            .map(String::from);
+        Ok(hash)
+    }
+
+    /// Probe presence of every lock crate's blob + index entry on the guest in
+    /// ONE ssh round-trip: stream the relative paths on stdin, the guest emits
+    /// `1 <path>` / `0 <path>` per line. Returns a path→present map.
+    fn probe_guest_missing(
+        &self,
+        target: &str,
+        user: &str,
+        is_windows: bool,
+        hash: &str,
+        crates: &[LockCrate],
+    ) -> Result<std::collections::HashMap<String, bool>, String> {
+        // Build the list of registry-relative paths to test (two per crate).
+        let mut rel_paths: Vec<String> = Vec::with_capacity(crates.len() * 2);
+        for c in crates {
+            let (cp, ip) = crate_registry_paths(hash, c);
+            rel_paths.push(cp);
+            rel_paths.push(ip);
+        }
+        // Injection-free probe: scp a newline-delimited path manifest to the
+        // guest, then run a STATIC script that reads it and tests each path. The
+        // path list is the only caller-influenced data, and every element is
+        // composed from validated crate tokens + the detected hash, so it is
+        // path-safe even before it reaches the guest file — and the guest script
+        // never interpolates it into a command, it only reads it as data.
+        let manifest = rel_paths.join("\n");
+        let tmp = self.write_temp(&manifest, "rn-seed-probe", "txt")?;
+
+        let (remote_manifest, script) = if is_windows {
+            let rm = r"C:\Windows\Temp\rn_seed_probe.txt".to_string();
+            // PowerShell: read manifest, test each path under the registry root.
+            let s = "$root='C:\\CargoHome\\registry'; \
+                 Get-Content 'C:\\Windows\\Temp\\rn_seed_probe.txt' | ForEach-Object { \
+                   $p = $_.Trim(); if ($p) { \
+                     $full = Join-Path $root $p; \
+                     if (Test-Path -LiteralPath $full) { Write-Output \"1 $p\" } else { Write-Output \"0 $p\" } \
+                   } \
+                 }"
+            .to_string();
+            (rm, s)
+        } else {
+            let rm = "/tmp/rn_seed_probe.txt".to_string();
+            let s = "root=\"$HOME/.cargo/registry\"; \
+                 while IFS= read -r p; do \
+                   [ -z \"$p\" ] && continue; \
+                   if [ -e \"$root/$p\" ]; then echo \"1 $p\"; else echo \"0 $p\"; fi; \
+                 done < /tmp/rn_seed_probe.txt"
+                .to_string();
+            (rm, s)
+        };
+
+        // Ship the manifest, then run the static probe.
+        let scp = self.scp_to(
+            target,
+            user,
+            &tmp,
+            &remote_manifest,
+            Duration::from_secs(120),
+        )?;
+        let _ = std::fs::remove_file(&tmp);
+        if !scp.success {
+            return Err(format!(
+                "scp manifest failed: {}",
+                truncate_tail(scp.stderr.trim(), 6, 800)
+            ));
+        }
+        let out = self.ssh_exec(target, user, &script, Duration::from_secs(120))?;
+        if !out.success {
+            return Err(format!(
+                "probe script exit {}: {}",
+                out.code.map(|c| c.to_string()).unwrap_or("killed".into()),
+                truncate_tail(out.stderr.trim(), 6, 800)
+            ));
+        }
+        let mut map = std::collections::HashMap::new();
+        for line in out.stdout.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("1 ") {
+                map.insert(rest.to_string(), true);
+            } else if let Some(rest) = line.strip_prefix("0 ") {
+                map.insert(rest.to_string(), false);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Tar the to-ship files (relative to the host registry root), scp the
+    /// tarball to the guest, and extract it into the guest registry root.
+    fn ship_crates(
+        &self,
+        target: &str,
+        user: &str,
+        is_windows: bool,
+        host_root: &Path,
+        guest_hash: &str,
+        guest_root: &str,
+        to_ship: &[LockCrate],
+    ) -> Result<(), String> {
+        // Build the relative path list for tar. The host stores blobs under the
+        // HOST hash; the guest expects the GUEST hash. They're normally equal,
+        // but if they differ we must not ship paths the guest can't place. Fail
+        // closed when they differ (cannot be sure of layout).
+        let host_hash = detect_registry_hash(&host_root.join("cache"))
+            .ok_or_else(|| "host registry hash vanished".to_string())?;
+        if host_hash != guest_hash {
+            return Err(format!(
+                "host registry hash {host_hash} != guest hash {guest_hash}; refusing to ship mismatched layout"
+            ));
+        }
+
+        // Collect host-relative paths that actually exist on the host.
+        let mut rel: Vec<String> = Vec::with_capacity(to_ship.len() * 2);
+        for c in to_ship {
+            let (cp, ip) = crate_registry_paths(&host_hash, c);
+            if host_root.join(&cp).exists() {
+                rel.push(cp);
+            }
+            if host_root.join(&ip).exists() {
+                rel.push(ip);
+            }
+        }
+        if rel.is_empty() {
+            return Ok(()); // nothing host has; caller already accounts for it
+        }
+
+        // Write the tar member manifest, build the tar via `tar -T <manifest>`
+        // from the host registry root (argv-only; paths come from validated
+        // tokens, never the shell).
+        let manifest = rel.join("\n");
+        let tar_list = self.write_temp(&manifest, "rn-seed-tarlist", "txt")?;
+        let tarball = self.temp_path("rn-seed", "tgz");
+        let tar_args: Vec<&str> = vec![
+            "czf",
+            tarball.to_str().ok_or("tarball path not utf-8")?,
+            "-C",
+            host_root.to_str().ok_or("host root not utf-8")?,
+            "-T",
+            tar_list.to_str().ok_or("tar list path not utf-8")?,
+        ];
+        let tar_out = run_with_timeout(
+            "tar",
+            &tar_args,
+            &self.repo_root,
+            &[],
+            Duration::from_secs(300),
+        );
+        let _ = std::fs::remove_file(&tar_list);
+        let tar_out = tar_out?;
+        if !tar_out.success {
+            let _ = std::fs::remove_file(&tarball);
+            return Err(format!(
+                "host tar failed: {}",
+                truncate_tail(tar_out.stderr.trim(), 6, 800)
+            ));
+        }
+
+        // scp the tarball to the guest + extract into the registry root.
+        let (remote_tar, extract) = if is_windows {
+            let rt = r"C:\Windows\Temp\rn_seed.tgz".to_string();
+            // bsdtar on modern Windows; -C into the registry root.
+            let ex = format!(
+                "tar -xzf C:\\Windows\\Temp\\rn_seed.tgz -C {guest_root}; Remove-Item -Force C:\\Windows\\Temp\\rn_seed.tgz"
+            );
+            (rt, ex)
+        } else {
+            let rt = "/tmp/rn_seed.tgz".to_string();
+            // cd into the registry root (here it IS $HOME/.cargo/registry).
+            let ex =
+                "mkdir -p \"$HOME/.cargo/registry\" && cd \"$HOME/.cargo/registry\" && tar xzf /tmp/rn_seed.tgz && rm -f /tmp/rn_seed.tgz"
+                    .to_string();
+            (rt, ex)
+        };
+        let scp = self.scp_to(
+            target,
+            user,
+            &tarball,
+            &remote_tar,
+            Duration::from_secs(600),
+        );
+        let _ = std::fs::remove_file(&tarball);
+        let scp = scp?;
+        if !scp.success {
+            return Err(format!(
+                "scp tarball failed: {}",
+                truncate_tail(scp.stderr.trim(), 6, 800)
+            ));
+        }
+        let out = self.ssh_exec(target, user, &extract, Duration::from_secs(300))?;
+        if !out.success {
+            return Err(format!(
+                "guest extract exit {}: {}",
+                out.code.map(|c| c.to_string()).unwrap_or("killed".into()),
+                truncate_tail(out.stderr.trim(), 6, 800)
+            ));
+        }
+        Ok(())
+    }
+
+    /// A unique host temp file path under the scratch state dir (never a guest
+    /// path). Created lazily by callers that write to it.
+    fn temp_path(&self, prefix: &str, ext: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}.{ext}", std::process::id()))
+    }
+
+    /// Write `content` to a unique host temp file and return its path.
+    fn write_temp(&self, content: &str, prefix: &str, ext: &str) -> Result<PathBuf, String> {
+        let p = self.temp_path(prefix, ext);
+        std::fs::write(&p, content)
+            .map_err(|e| format!("cannot write temp {}: {e}", p.display()))?;
+        Ok(p)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4296,6 +5224,164 @@ mod tests {
         let v = json!({"aliases": ["a", "b"]});
         assert_eq!(string_array(Some(&v), "aliases"), vec!["a", "b"]);
         assert!(string_array(Some(&v), "missing").is_empty());
+    }
+
+    // ── seed_cargo_cache pure logic ──────────────────────────────────────
+
+    #[test]
+    fn lock_parse_keeps_registry_skips_path_and_git() {
+        // Mirrors the real @generated Cargo.lock shape: registry crates (both the
+        // git-index and sparse forms), a workspace/path crate with NO source, and
+        // a git-sourced crate. Only the two crates.io entries survive.
+        let lock = r#"# This file is automatically @generated by Cargo.
+version = 4
+
+[[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "deadbeef"
+
+[[package]]
+name = "ureq"
+version = "2.10.1"
+source = "sparse+https://index.crates.io/"
+checksum = "cafef00d"
+dependencies = [
+ "base64",
+]
+
+[[package]]
+name = "boringtun"
+version = "0.7.0"
+dependencies = [
+ "aead",
+]
+
+[[package]]
+name = "rustynet-mcp"
+version = "0.1.0"
+
+[[package]]
+name = "some-git-dep"
+version = "0.1.0"
+source = "git+https://example.com/repo.git#abc123"
+checksum = "00"
+
+[metadata]
+"#;
+        let got = parse_lock_registry_crates(lock);
+        assert_eq!(
+            got,
+            vec![
+                LockCrate {
+                    name: "adler2".into(),
+                    version: "2.0.1".into()
+                },
+                LockCrate {
+                    name: "ureq".into(),
+                    version: "2.10.1".into()
+                },
+            ],
+            "only crates.io (git-index + sparse) registry packages, skipping path/workspace + git"
+        );
+    }
+
+    #[test]
+    fn lock_parse_drops_unsafe_tokens() {
+        // A defensive case: a name with a path-traversal char must never be
+        // emitted even if some malformed lock contained it.
+        let lock = r#"[[package]]
+name = "../evil"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+        assert!(parse_lock_registry_crates(lock).is_empty());
+    }
+
+    #[test]
+    fn index_shard_path_matches_cargo_layout() {
+        // Verified against a real ~/.cargo/registry/index/<hash>/.cache tree.
+        assert_eq!(index_shard_path("ureq"), "ur/eq/ureq"); // len >= 4
+        assert_eq!(index_shard_path("rustls"), "ru/st/rustls"); // len >= 4
+        assert_eq!(index_shard_path("url"), "3/u/url"); // len 3
+        assert_eq!(index_shard_path("ab"), "2/ab"); // len 2
+        assert_eq!(index_shard_path("a"), "1/a"); // len 1
+        // Uppercase names are lowercased into the shard.
+        assert_eq!(index_shard_path("Inflector"), "in/fl/inflector");
+    }
+
+    #[test]
+    fn crate_registry_paths_compose_blob_and_index() {
+        let hash = "index.crates.io-1949cf8c6b5b557f";
+        let c = LockCrate {
+            name: "Serde".into(), // exercise the case mismatch
+            version: "1.0.0".into(),
+        };
+        let (blob, index) = crate_registry_paths(hash, &c);
+        // .crate keeps the lock's exact name+version casing.
+        assert_eq!(blob, format!("cache/{hash}/Serde-1.0.0.crate"));
+        // index entry is the lowercased, sharded path — and the shard already
+        // ends in the name, so there is NO trailing duplicate `/serde`.
+        assert_eq!(index, format!("index/{hash}/.cache/se/rd/serde"));
+    }
+
+    #[test]
+    fn missing_detection_requires_both_blob_and_index() {
+        let hash = "index.crates.io-1949cf8c6b5b557f";
+        let present_full = LockCrate {
+            name: "full".into(),
+            version: "1.0.0".into(),
+        };
+        let blob_only = LockCrate {
+            name: "blobonly".into(),
+            version: "1.0.0".into(),
+        };
+        let index_only = LockCrate {
+            name: "indexonly".into(),
+            version: "1.0.0".into(),
+        };
+        let totally_missing = LockCrate {
+            name: "gone".into(),
+            version: "1.0.0".into(),
+        };
+        let crates = vec![
+            present_full.clone(),
+            blob_only.clone(),
+            index_only.clone(),
+            totally_missing.clone(),
+        ];
+
+        let mut present = std::collections::HashMap::new();
+        let mark = |present: &mut std::collections::HashMap<String, bool>,
+                    c: &LockCrate,
+                    blob: bool,
+                    index: bool| {
+            let (cp, ip) = crate_registry_paths(hash, c);
+            present.insert(cp, blob);
+            present.insert(ip, index);
+        };
+        mark(&mut present, &present_full, true, true);
+        mark(&mut present, &blob_only, true, false);
+        mark(&mut present, &index_only, false, true);
+        // totally_missing: not in the map at all → treated as absent.
+
+        let missing = missing_crates_from_presence(hash, &crates, &present);
+        // Everything except the fully-present crate is missing.
+        assert_eq!(missing, vec![blob_only, index_only, totally_missing]);
+    }
+
+    #[test]
+    fn safe_crate_token_rejects_dangerous_input() {
+        assert!(is_safe_crate_token("serde"));
+        assert!(is_safe_crate_token("x25519-dalek"));
+        assert!(is_safe_crate_token("1.0.0+build.5"));
+        assert!(!is_safe_crate_token(""));
+        assert!(!is_safe_crate_token("../etc"));
+        assert!(!is_safe_crate_token("a b"));
+        assert!(!is_safe_crate_token("a;rm -rf"));
+        assert!(!is_safe_crate_token("a/b"));
+        assert!(!is_safe_crate_token("a\nb"));
     }
 
     #[test]
