@@ -2633,6 +2633,7 @@ impl McpServer for LabStateServer {
                         "timeout_secs": json!({"type": "integer", "description": "Per-run hard cap in seconds (CLI default 86400 = 24h). Raise for a >24h soak."}),
                         "dry_run": json_schema_boolean("Plan only (default: false)"),
                         "stop_after_ready": json_schema_boolean("orchestrate: stop once VMs are ready"),
+                        "trust_inventory_ready": json_schema_boolean("orchestrate: SKIP the pre-run restart-unready gate and go straight to bootstrap. The readiness gate uses a raw TCP :22 probe that can be BLIND in this sandboxed context (probes 0 ports open) even though the bootstrap `ssh` binary reaches the nodes fine — without this flag a blind probe reboots every healthy VM and aborts. Set this when you have separately confirmed the VMs are up + SSH-reachable (e.g. preflight_check / check_vm_reachable). Bootstrap SSH then fails loudly if a node is truly unreachable. Off by default."),
                         "skip_setup": json_schema_boolean("run: skip setup stages"),
                         "skip_gates": json_schema_boolean("Skip gate stages"),
                         "skip_soak": json_schema_boolean("Skip soak stages"),
@@ -3263,6 +3264,9 @@ impl LabStateServer {
                 }
                 if arg_bool(args, "stop_after_ready") {
                     cli.push("--stop-after-ready".into());
+                }
+                if arg_bool(args, "trust_inventory_ready") {
+                    cli.push("--trust-inventory-ready".into());
                 }
                 for (flag, key) in [
                     ("--skip-gates", "skip_gates"),
