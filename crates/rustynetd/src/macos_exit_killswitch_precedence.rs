@@ -21,6 +21,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const MACOS_EXIT_KILLSWITCH_PRECEDENCE_SCHEMA_VERSION: u32 = 1;
 pub const MACOS_RUSTYNET_ANCHOR_PREFIX: &str = "com.apple/rustynet_g";
 
+/// Bounded retry budget for live anchor discovery. The macOS killswitch anchor
+/// (`com.apple/rustynet_g<N>`) rotates its generation on every (re-)apply, so a
+/// single-shot `pfctl -s Anchors` sample can land in the rotation window with no
+/// matching anchor present. Poll up to this many attempts, sleeping
+/// `MACOS_ANCHOR_POLL_INTERVAL` between tries, returning as soon as one matches.
+/// The budget is finite by construction (a `for` over a fixed count), so it can
+/// never spin forever; once exhausted it fails closed with the original error.
+#[cfg(target_os = "macos")]
+const MACOS_ANCHOR_POLL_ATTEMPTS: u32 = 15;
+#[cfg(target_os = "macos")]
+const MACOS_ANCHOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The exact error returned when no live RustyNet macOS pf anchor is ever found.
+/// Shared so the bounded poll path and any caller assert on the identical text.
+pub const MACOS_NO_ACTIVE_ANCHOR_ERROR: &str = "no active RustyNet macOS pf anchor found";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacosExitKillswitchPrecedenceOptions {
     pub pf_anchor: Option<String>,
@@ -147,6 +163,55 @@ fn parse_generation(value: &str) -> Option<u64> {
         .ok()
 }
 
+/// The outcome of one anchor-discovery poll sample, given the `pfctl -s Anchors`
+/// stdout for that attempt and whether the retry budget still has tries left.
+/// Pure so the retry decision is unit-testable without invoking `pfctl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorPollOutcome {
+    /// An anchor matched on this sample: stop polling and use it.
+    Found(String),
+    /// No match yet but the budget is not exhausted: sleep and try again.
+    Retry,
+    /// No match and the budget is exhausted: fail closed.
+    GiveUp,
+}
+
+/// Decide the next step after one poll sample. Returns [`AnchorPollOutcome::Found`]
+/// the instant any valid rotated `com.apple/rustynet_g<N>` anchor appears,
+/// [`AnchorPollOutcome::Retry`] while tries remain, and
+/// [`AnchorPollOutcome::GiveUp`] only once the bounded budget is spent. This is
+/// what keeps the loop both race-tolerant and fail-closed.
+pub fn classify_anchor_poll_sample(
+    pfctl_anchors_stdout: &str,
+    has_more_attempts: bool,
+) -> AnchorPollOutcome {
+    match select_macos_rustynet_anchor(pfctl_anchors_stdout) {
+        Some(anchor) => AnchorPollOutcome::Found(anchor),
+        None if has_more_attempts => AnchorPollOutcome::Retry,
+        None => AnchorPollOutcome::GiveUp,
+    }
+}
+
+/// Bounded poll for a live RustyNet macOS pf anchor. Re-samples
+/// `pfctl -s Anchors` up to `MACOS_ANCHOR_POLL_ATTEMPTS` times (sleeping
+/// `MACOS_ANCHOR_POLL_INTERVAL` between tries) to close the generation-rotation
+/// window, returning the matching anchor as soon as one appears. The loop bound
+/// is a fixed `for` range so it always terminates; if no anchor ever shows up
+/// the budget is exhausted and it fails closed with `MACOS_NO_ACTIVE_ANCHOR_ERROR`.
+#[cfg(target_os = "macos")]
+fn poll_for_macos_rustynet_anchor() -> Result<String, String> {
+    for attempt in 0..MACOS_ANCHOR_POLL_ATTEMPTS {
+        let anchors = run_pfctl(&["-s", "Anchors"])?;
+        let has_more_attempts = attempt + 1 < MACOS_ANCHOR_POLL_ATTEMPTS;
+        match classify_anchor_poll_sample(anchors.as_str(), has_more_attempts) {
+            AnchorPollOutcome::Found(anchor) => return Ok(anchor),
+            AnchorPollOutcome::Retry => std::thread::sleep(MACOS_ANCHOR_POLL_INTERVAL),
+            AnchorPollOutcome::GiveUp => break,
+        }
+    }
+    Err(MACOS_NO_ACTIVE_ANCHOR_ERROR.to_owned())
+}
+
 #[cfg(target_os = "macos")]
 fn collect_macos_exit_killswitch_precedence_report(
     options: &MacosExitKillswitchPrecedenceOptions,
@@ -156,11 +221,7 @@ fn collect_macos_exit_killswitch_precedence_report(
             validate_pf_anchor_name(anchor)?;
             anchor.to_owned()
         }
-        None => {
-            let anchors = run_pfctl(&["-s", "Anchors"])?;
-            select_macos_rustynet_anchor(anchors.as_str())
-                .ok_or_else(|| "no active RustyNet macOS pf anchor found".to_owned())?
-        }
+        None => poll_for_macos_rustynet_anchor()?,
     };
     validate_pf_anchor_name(anchor.as_str())?;
 
@@ -313,5 +374,62 @@ mod tests {
         assert!(validate_pf_anchor_name("com.apple/rustynet_g1").is_ok());
         assert!(validate_pf_anchor_name("com.apple/rustynet_g1;rm").is_err());
         assert!(validate_pf_anchor_name("../com.apple/rustynet_g1").is_err());
+    }
+
+    #[test]
+    fn anchor_selection_matches_rotated_generation_names() {
+        // The killswitch anchor rotates its generation on every (re-)apply; the
+        // selector must still match each rotated `com.apple/rustynet_g<N>` name
+        // and pick the highest generation. This guards the retry loop's premise.
+        for generation in [0u64, 1, 9, 42, 1000] {
+            let line = format!("{MACOS_RUSTYNET_ANCHOR_PREFIX}{generation}");
+            assert_eq!(
+                select_macos_rustynet_anchor(line.as_str()).as_deref(),
+                Some(line.as_str()),
+                "rotated anchor generation {generation} must match",
+            );
+        }
+    }
+
+    #[test]
+    fn poll_sample_returns_found_immediately_when_anchor_present() {
+        // A matching anchor short-circuits the poll regardless of remaining budget.
+        let stdout = "com.apple/rustynet_g4\n";
+        assert_eq!(
+            classify_anchor_poll_sample(stdout, true),
+            AnchorPollOutcome::Found("com.apple/rustynet_g4".to_owned()),
+        );
+        assert_eq!(
+            classify_anchor_poll_sample(stdout, false),
+            AnchorPollOutcome::Found("com.apple/rustynet_g4".to_owned()),
+        );
+    }
+
+    #[test]
+    fn poll_sample_retries_within_budget_then_gives_up() {
+        // No anchor + tries remaining => Retry (close the rotation window).
+        assert_eq!(
+            classify_anchor_poll_sample("", true),
+            AnchorPollOutcome::Retry,
+        );
+        // No anchor + budget exhausted => GiveUp (fail closed, bounded).
+        assert_eq!(
+            classify_anchor_poll_sample("", false),
+            AnchorPollOutcome::GiveUp,
+        );
+        // Non-matching noise is treated as "no anchor" the same way.
+        assert_eq!(
+            classify_anchor_poll_sample("com.apple/250.ApplicationFirewall\n", false),
+            AnchorPollOutcome::GiveUp,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn poll_budget_is_bounded() {
+        // Guard against an accidental zero/unbounded budget: a finite, positive
+        // attempt count is what guarantees the poll loop always terminates.
+        assert!(MACOS_ANCHOR_POLL_ATTEMPTS > 0);
+        assert!(MACOS_ANCHOR_POLL_ATTEMPTS <= 60);
     }
 }
