@@ -121,25 +121,32 @@ fn run() -> Result<(), i32> {
         &[],
     )?;
 
+    // RN-02: the phase-4 dataplane controls (exit-node selection/clear,
+    // LAN-route toggle, Magic DNS hostname determinism, tunnel/DNS fail-close)
+    // are enforced by the LIVE Phase10Controller path
+    // (crates/rustynetd/src/phase10.rs) and the signed-zone builder
+    // (crates/rustynet-dns-zone), NOT the removed dead `dataplane.rs` module.
+    // Point the gate at the live tests so it validates the code that actually
+    // runs in production, not a parallel implementation that never executes.
     run_required_test(
         &root_dir,
         "rustynetd",
-        "dataplane::tests::phase4_exit_node_selection_and_lan_toggle_are_enforced",
+        "phase10::tests::set_and_clear_exit_node_track_exit_mode_and_assert_measured_policy",
     )?;
     run_required_test(
         &root_dir,
         "rustynetd",
-        "dataplane::tests::phase4_magic_dns_handles_duplicate_hostnames_deterministically",
+        "phase10::tests::lan_toggle_requires_toggle_route_advertisement_acl_and_policy",
+    )?;
+    run_required_test(
+        &root_dir,
+        "rustynet-dns-zone",
+        "tests::bundle_builder_rejects_alias_collision",
     )?;
     run_required_test(
         &root_dir,
         "rustynetd",
-        "dataplane::tests::phase4_fail_close_blocks_tunnel_and_dns_when_required",
-    )?;
-    run_required_test(
-        &root_dir,
-        "rustynetd",
-        "dataplane::tests::phase4_exit_node_clear_removes_selection",
+        "phase10::tests::full_tunnel_dns_assert_failure_holds_dns_fail_closed_and_blocks_exit_mode",
     )?;
     run_required_test(
         &root_dir,
