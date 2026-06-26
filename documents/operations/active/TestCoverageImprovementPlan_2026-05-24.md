@@ -159,6 +159,13 @@ despite an advertised route, and **a missing ACL entry → deny** (the
 rustynetd --lib dataplane::tests::lan_route` → 7/7; fmt clean; the additions
 introduce no new `dataplane.rs` clippy findings.
 
+> RN-02 update (2026-06-26): `dataplane.rs` was an unused parallel implementation
+> (the live dataplane is `phase10.rs`) and has been removed, so the
+> `dataplane::tests::lan_route` suite above is retired. The live LAN-route
+> default-deny ACL is enforced and tested in `phase10.rs`
+> (`ensure_lan_route_allowed_denies_revoked_requester`,
+> `lan_toggle_requires_toggle_route_advertisement_acl_and_policy`).
+
 Follow-up landed 2026-06-23: the `connect_peer()` flood-guard short-circuit is
 now pinned (2 tests). `connect_peer_rate_limited_creates_no_session_even_when_
 policy_allows` proves a rate-limited handshake returns `HandshakeRateLimited`

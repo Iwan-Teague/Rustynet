@@ -411,12 +411,14 @@ pub const COMPARATIVE_COMMAND_SPECS: &[ComparativeCommandSpec] = &[
     ComparativeCommandSpec {
         key: "phase4_fail_closed",
         label: "Dataplane fail-closed tunnel and DNS behavior",
+        // RN-02: validate the LIVE Phase10Controller fail-close path, not the
+        // removed dead `dataplane.rs` module.
         argv: &[
             "cargo",
             "test",
             "-p",
             "rustynetd",
-            "dataplane::tests::phase4_fail_close_blocks_tunnel_and_dns_when_required",
+            "phase10::tests::full_tunnel_dns_assert_failure_holds_dns_fail_closed_and_blocks_exit_mode",
             "--",
             "--nocapture",
         ],

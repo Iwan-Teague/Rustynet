@@ -1,7 +1,6 @@
 #![deny(unsafe_code)]
 
 pub mod daemon;
-pub mod dataplane;
 pub mod dataplane_candidates;
 pub mod enrollment_consume;
 pub mod enrollment_token;
