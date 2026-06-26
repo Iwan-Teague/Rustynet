@@ -257,7 +257,29 @@ integration/bin tests pass, `no_secret_material_equality_in_workspace` ok.
      safe.** The privileged-helper exec model is unix-only; on Windows there is
      no privileged-helper binary to resolve/exec, so validating one is moot.
 
-4. **Windows "Security gates" step** (`cargo audit` + `cargo deny`) has been
+4. **macOS "Workspace validation" clippy — code-caused, FIXED 2026-06-27.**
+   The macOS red was previously attributed to the `vm_lab` Gatekeeper flake
+   (§4.1). That was wrong: Workspace-validation runs `cargo fmt` + `cargo
+   clippy --workspace --all-targets --all-features --locked -- -D warnings`
+   (compile-only), so a subprocess-spawn *test* flake cannot fail it. The real
+   blocker was clippy `-D warnings` errors that cargo's per-crate fail ordering
+   surfaced one crate at a time (CI showed only the first). Three crates were
+   red, all introduced by the recent MCP + macOS/Windows-traffic work:
+   - `rustynet-mcp`: deepseek.rs doc-list overindentation (×9) + the 8-arg
+     `ship_crates` cache-seeding helper (`too_many_arguments`, justified
+     targeted allow — host-side dev tooling, not a production path).
+   - `rustynetd`: `assert!(MACOS_ANCHOR_POLL_ATTEMPTS …)` on a constant
+     (`assertions_on_constants`). Replaced the runtime test with a
+     compile-time `const _: () = assert!(…)` at the constant — strictly
+     stronger (build-time, platform-independent).
+   - `rustynet-cli`: macos_traffic.rs doc-list-without-indentation (×5, fixed
+     with blank `///` separators + col-0 list items) + a windows_traffic.rs
+     uninlined `format!` arg.
+   Verified: full-workspace `cargo clippy … -D warnings` green + `cargo fmt`
+   clean on the rustup `1.88.0` (CI) toolchain. The `vm_lab` Gatekeeper flake
+   (§4.1) is a separate *test-run* concern and remains deferred.
+
+5. **Windows "Security gates" step** (`cargo audit` + `cargo deny`) has been
    *skipped* in every run so far because the build/test step failed first. Once
    the Windows job goes green it will run for the first time.
    **Pre-empted 2026-06-25 on the lab host: the dependency surface is CLEAN.**
@@ -282,7 +304,7 @@ integration/bin tests pass, `no_secret_material_equality_in_workspace` ok.
 | Job | State | Blocker |
 |---|---|---|
 | Windows build+security | ✅ **GREEN @ `e3f99ce`** — build+test + Security gates both pass | none |
-| macOS build+security | red | `vm_lab` flake (§4.1) + a `userspace_shared_macos` socket-poll-budget timing test seen failing on `7734156`'s runner — watch whether it persists (could be runner-load flake or a real budget assertion) |
+| macOS build+security | clippy GREEN @ 2026-06-27 (§4.4); test-run TBD | Workspace-validation clippy red was **code-caused** (3 crates), NOT the `vm_lab` flake — fixed 2026-06-27 (§4.4). Remaining macOS concerns are in the *test-run* step (after clippy): the `vm_lab` Gatekeeper flake (§4.1) + a `userspace_shared_macos` socket-poll-budget timing test seen on `7734156` — both surface only once clippy is green, which it now is. |
 | Debian 13 build+security | red | `cargo: not found` bootstrap (§4.2, deferred) |
 | Linux real WireGuard E2E | red | `cargo: not found` bootstrap (§4.2, deferred) |
 

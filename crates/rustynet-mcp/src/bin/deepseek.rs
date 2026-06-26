@@ -6,16 +6,13 @@
 //! - `deepseek_read`       — analysis/research only (explain, assess, review)
 //! - `deepseek_write`      — generation only (code, docs, config, tests)
 //! - `deepseek_read_write` — full autonomy: analyze existing content then generate output
-//! - `deepseek_agent`      — READ-ONLY autonomous research agent: DeepSeek drives an
-//!                           OpenAI-style tool-calling loop against a confined,
-//!                           read-only tool set (read_file/list_dir/grep/git/
-//!                           find_files/find_definition/utm_vm_status/
-//!                           lab_node_reachable/host_system_info/host_disk_status/
-//!                           lab_run_status/lab_run_detail/lab_loop_journal/
-//!                           lab_inventory/lab_jobs/lab_guest_exec/lab_job_log/
-//!                           lab_stage_log/lab_report_grep/lab_report_artifacts)
-//!                           that inspects the LOCAL Rustynet repo + UTM lab. It
-//!                           cannot write.
+//! - `deepseek_agent` — READ-ONLY autonomous research agent: DeepSeek drives an
+//!   OpenAI-style tool-calling loop against a confined, read-only tool set
+//!   (read_file/list_dir/grep/git/find_files/find_definition/utm_vm_status/
+//!   lab_node_reachable/host_system_info/host_disk_status/lab_run_status/
+//!   lab_run_detail/lab_loop_journal/lab_inventory/lab_jobs/lab_guest_exec/
+//!   lab_job_log/lab_stage_log/lab_report_grep/lab_report_artifacts) that
+//!   inspects the LOCAL Rustynet repo + UTM lab. It cannot write.
 //!
 //! Model selection per call:
 //! - `"flash"` → deepseek-chat (fast, low cost — default)

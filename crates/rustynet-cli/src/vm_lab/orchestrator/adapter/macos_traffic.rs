@@ -20,12 +20,14 @@ const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 ///
 /// Three RustyNet pf anchor families can be left behind (all confirmed against
 /// the daemon's own constants):
-///   - `com.apple/rustynet_g<N>` — the generation-rotated killswitch/filter
-///     anchor (`macos_exit_killswitch_precedence::MACOS_RUSTYNET_ANCHOR_PREFIX`),
-///   - `com.rustynet/nat` — the regular-exit NAT anchor
-///     (`macos_exit_nat_lifecycle::DEFAULT_MACOS_EXIT_PF_ANCHOR`),
-///   - `com.rustynet/blind_exit` — the blind-exit filter anchor
-///     (`macos_blind_exit::DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR`).
+///
+/// - `com.apple/rustynet_g<N>` — the generation-rotated killswitch/filter anchor
+///   (`macos_exit_killswitch_precedence::MACOS_RUSTYNET_ANCHOR_PREFIX`),
+/// - `com.rustynet/nat` — the regular-exit NAT anchor
+///   (`macos_exit_nat_lifecycle::DEFAULT_MACOS_EXIT_PF_ANCHOR`),
+/// - `com.rustynet/blind_exit` — the blind-exit filter anchor
+///   (`macos_blind_exit::DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR`).
+///
 /// Anchors are ENUMERATED from `pfctl -s Anchors` and matched on the substring
 /// `rustynet` (covers every family, including an unanticipated future
 /// generation), then flushed with `pfctl -a <anchor> -F all` — never a fixed
