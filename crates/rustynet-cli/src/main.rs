@@ -6673,11 +6673,35 @@ fn execute_enrollment(command: EnrollmentCliCommand) -> Result<String, String> {
     }
 }
 
+/// RSA-0023: verify + consume a one-time enrollment token under an exclusive
+/// ledger lock held across the WHOLE load -> check-consumed -> write sequence,
+/// so two concurrent CLI admits (or a CLI admit racing the daemon's IPC
+/// enrollment path) cannot both observe the same single-use token as
+/// unconsumed and double-spend it. Mirrors the daemon's locked redemption
+/// (rustynetd/src/daemon.rs, RSA-0023). The guard releases when this function
+/// returns — after the consume is durably written — so the next contender only
+/// proceeds once the consume is recorded.
+fn consume_enrollment_token_locked(
+    ledger_path: &std::path::Path,
+    token: &str,
+    secret: &[u8; rustynetd::enrollment_token::ENROLLMENT_SECRET_LEN],
+) -> Result<(), String> {
+    use rustynetd::enrollment_token::{
+        acquire_ledger_lock, load_ledger, verify_and_consume_token, write_ledger,
+    };
+    let _ledger_lock = acquire_ledger_lock(ledger_path)
+        .map_err(|err| format!("enrollment ledger lock failed: {err}"))?;
+    let mut ledger = load_ledger(ledger_path).map_err(|err| err.to_string())?;
+    verify_and_consume_token(token, secret, &mut ledger)
+        .map_err(|err| format!("enrollment token rejected: {err}"))?;
+    write_ledger(ledger_path, &ledger)
+        .map_err(|err| format!("enrollment ledger persistence failed: {err}"))?;
+    Ok(())
+}
+
 fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
     use rustynet_control::enrollment::{EnrolleeAdmitContext, build_add_node_record_for_enrollee};
-    use rustynetd::enrollment_token::{
-        load_ledger, load_secret, verify_and_consume_token, write_ledger,
-    };
+    use rustynetd::enrollment_token::load_secret;
     let now_unix = unix_now();
     // Decode the enrollee pubkey early so a malformed input fails
     // before we burn a token.
@@ -6693,13 +6717,11 @@ fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
     }
     let pubkey_hex: String = pubkey_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-    // Step 1 — verify + consume the token + persist ledger.
+    // Step 1 — verify + consume the token + persist ledger under the ledger
+    // lock so concurrent admits cannot double-spend a single-use token
+    // (RSA-0023).
     let secret = load_secret(&config.secret_path).map_err(|err| err.to_string())?;
-    let mut ledger = load_ledger(&config.ledger_path).map_err(|err| err.to_string())?;
-    verify_and_consume_token(&config.token, &secret, &mut ledger)
-        .map_err(|err| format!("enrollment token rejected: {err}"))?;
-    write_ledger(&config.ledger_path, &ledger)
-        .map_err(|err| format!("enrollment ledger persistence failed: {err}"))?;
+    consume_enrollment_token_locked(&config.ledger_path, &config.token, &secret)?;
 
     // Step 2 — load current membership state.
     let paths = MembershipPaths {
@@ -19789,24 +19811,81 @@ mod tests {
         MembershipEvidenceSummary, MembershipOperation, PHASE6_MAX_EVIDENCE_AGE_SECS,
         Phase6Platform, Phase6ProbeMetadataView, RoleCapability,
         build_membership_audit_replay_json, build_membership_evidence_diff_json,
-        classify_cli_error, command_supports_json_render, contains_ip_rule_lookup_table,
-        detect_tampered_log, execute, execute_macos_relay_service_action, extract_json_flag,
-        finalize_role_audit, help_text, is_interface_absent_detail, launchd_xml_escape,
-        load_dns_zone_records_manifest, load_signing_key, managed_dns_resolver_server_arg,
-        managed_dns_routing_already_absent, parse_bool_value, parse_bundle_u64_field,
-        parse_command, parse_managed_pf_anchors, parse_prior_membership_evidence_body,
-        parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
-        phase6_stage_probe_from_source, phase6_sync_platform_probe_from_inbox,
-        phase6_validate_macos_start_contract_text, phase6_validate_platform_parity_report,
-        read_json_value, render_key_value_line_as_json, render_launchd_plist,
-        required_macos_tunnel_keychain_account, required_macos_tunnel_keychain_service,
-        rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
-        rewrite_env_key_value, to_ipc_command, unix_now, update_node_role_env_file,
-        update_node_role_macos_plist, validate_control_socket_security, write_json_pretty_file,
+        classify_cli_error, command_supports_json_render, consume_enrollment_token_locked,
+        contains_ip_rule_lookup_table, detect_tampered_log, execute,
+        execute_macos_relay_service_action, extract_json_flag, finalize_role_audit, help_text,
+        is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
+        load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
+        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
+        parse_prior_membership_evidence_body, parse_wireguard_go_pids_from_ps,
+        persist_encrypted_secret_material, phase6_stage_probe_from_source,
+        phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
+        phase6_validate_platform_parity_report, read_json_value, render_key_value_line_as_json,
+        render_launchd_plist, required_macos_tunnel_keychain_account,
+        required_macos_tunnel_keychain_service, rewrite_assignment_refresh_exit_node,
+        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
+        update_node_role_env_file, update_node_role_macos_plist, validate_control_socket_security,
+        write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
     use std::fs;
+
+    #[test]
+    fn cli_enrollment_admit_redeems_token_exactly_once_under_race() {
+        // RSA-0023: the CLI `enrollment admit` path must redeem a one-time token
+        // under the exclusive ledger lock held across the whole
+        // load -> consume -> write, so concurrent admits (separate processes or
+        // a CLI admit racing the daemon) cannot both observe the same token as
+        // unconsumed and double-spend it. N threads race to redeem the SAME
+        // token through the production helper; exactly one must win.
+        use rustynetd::enrollment_token::{
+            ConsumedTokenLedger, ENROLLMENT_SECRET_LEN, load_ledger, mint_token_with_clock,
+            write_ledger,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = Arc::new(dir.path().join("enrollment.ledger"));
+        let secret = [0x5au8; ENROLLMENT_SECRET_LEN];
+        // Mint against the real clock (the helper verifies against the real
+        // clock) with a generous TTL so the token is valid through the race.
+        let (_, encoded) =
+            mint_token_with_clock(&secret, 3600, unix_now()).expect("mint enrollment token");
+        let encoded = Arc::new(encoded);
+        // Seed an empty version-tagged ledger so every thread loads a real file.
+        write_ledger(&path, &ConsumedTokenLedger::new()).expect("seed ledger");
+
+        let successes = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let encoded = Arc::clone(&encoded);
+                let successes = Arc::clone(&successes);
+                std::thread::spawn(move || {
+                    if consume_enrollment_token_locked(&path, &encoded, &secret).is_ok() {
+                        successes.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for handle in threads {
+            handle.join().expect("thread join");
+        }
+        assert_eq!(
+            successes.load(Ordering::SeqCst),
+            1,
+            "exactly one CLI admit may redeem a single-use token under a race"
+        );
+        assert_eq!(
+            load_ledger(&path)
+                .expect("final ledger load")
+                .consumed_count(),
+            1
+        );
+    }
 
     #[test]
     fn parse_supports_phase10_route_advertise_command() {
