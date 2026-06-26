@@ -3368,9 +3368,12 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             (_, _, None) => ProbeState::Missing {
                 reason: "no-ssh-target".to_owned(),
             },
-            (_, _, Some(_)) if ssh_port_status != "open" => ProbeState::Missing {
-                reason: format!("ssh-port-status={ssh_port_status}"),
-            },
+            // Always attempt the real ssh-binary auth probe when we have a
+            // live_ip + ssh_user + ssh_target. The raw-TCP `probe_tcp_port_status`
+            // can be blind (sandboxed / odd-routing context) and report "closed"
+            // even though the same ssh the bootstrap path uses can reach the node.
+            // ssh-auth success is strictly stronger evidence than a raw socket
+            // connect, so do NOT veto the auth probe on the raw-TCP result.
             (Some(_), Some(ssh_user), Some(ssh_target)) => {
                 match ssh_auth_probe_command(discovery_platform_profile) {
                     Ok(probe_command) => match run_remote_shell_command(
@@ -3407,16 +3410,23 @@ pub fn execute_ops_vm_lab_discover_local_utm(
         if ssh_port_status == "open" {
             ssh_port_open_count += 1;
         }
+        let ssh_auth_ok = matches!(
+            &ssh_auth_state,
+            ProbeState::Ok { value } if value == "ok" || value == "ready"
+        );
         let ready = if discovery_platform == VmGuestPlatform::Windows {
             readiness.execution_ready
         } else {
-            process_present
-                && matches!(
+            discover_local_utm_target_ready(
+                process_present,
+                matches!(
                     live_ip_state,
                     ProbeState::Ok { .. } | ProbeState::Fallback { .. }
-                )
-                && ssh_port_status == "open"
-                && authoritative_target_present
+                ),
+                ssh_port_status == "open",
+                ssh_auth_ok,
+                authoritative_target_present,
+            )
         };
         if ready {
             ready_count += 1;
@@ -8679,7 +8689,15 @@ fn run_macos_orchestration_stages(
                 .ok_or_else(|| format!("inventory entry for {exit_alias:?} has no node_id"))?;
             let exit_target = remote_target_from_inventory_entry(&exit_entry, None);
 
-            let pubkey_hex = macos_wg_pubkey_hex.as_deref().unwrap();
+            // Guaranteed Some by the upstream collect step, but resolve with
+            // `ok_or_else` instead of `unwrap()` so a future stage-ordering
+            // refactor that breaks the invariant fails LOUD rather than
+            // panicking (matches the dns-zone issuance site below).
+            let pubkey_hex = macos_wg_pubkey_hex.as_deref().ok_or_else(|| {
+                "macOS assignment issuance needs the collected WireGuard public key but none is \
+                 available"
+                    .to_owned()
+            })?;
             let owner_approver_id = format!("{exit_node_id}-owner");
             // Grant the capabilities the macOS node's elected role needs in
             // signed membership; the daemon fails closed (`forbidden`) for a
@@ -12532,27 +12550,27 @@ fn run_windows_orchestration_stages_with_options(
             vec![],
         )
     } else {
-        let exit_alias = options.linux_exit_alias.as_deref().unwrap();
-        let wg_hex = windows_wg_pubkey_hex.as_deref().unwrap();
-        match issue_assignment_for_windows_node(
-            windows_alias,
-            exit_alias,
-            wg_hex,
-            inventory_path,
-            ssh_identity_file,
-            known_hosts_path,
-            report_dir,
-            &mut issued_assignment_path,
-        ) {
-            Ok(summary) => {
-                let _ = std::fs::write(&issue_assignment_log_path, summary.as_str());
-                stage_outcome(
-                    "issue_windows_assignment",
-                    VmLabStageStatus::Pass,
-                    summary,
-                    vec![issue_assignment_log_path.clone()],
-                )
-            }
+        // These two are guaranteed Some by the earlier `is_none()` /
+        // `amend_membership_passed` guards above, but resolve them with
+        // `ok_or_else` instead of `unwrap()` so a future stage-ordering
+        // refactor that breaks the invariant fails LOUD (a Fail stage outcome)
+        // rather than panicking the whole orchestrator run.
+        match options
+            .linux_exit_alias
+            .as_deref()
+            .ok_or_else(|| {
+                "internal: issue_windows_assignment reached without a linux_exit_alias".to_owned()
+            })
+            .and_then(|exit_alias| {
+                windows_wg_pubkey_hex
+                    .as_deref()
+                    .ok_or_else(|| {
+                        "internal: issue_windows_assignment reached without a collected Windows \
+                         WireGuard public key"
+                            .to_owned()
+                    })
+                    .map(|wg_hex| (exit_alias, wg_hex))
+            }) {
             Err(reason) => {
                 let _ = std::fs::write(&issue_assignment_log_path, reason.as_str());
                 stage_outcome(
@@ -12562,6 +12580,35 @@ fn run_windows_orchestration_stages_with_options(
                     vec![issue_assignment_log_path.clone()],
                 )
             }
+            Ok((exit_alias, wg_hex)) => match issue_assignment_for_windows_node(
+                windows_alias,
+                exit_alias,
+                wg_hex,
+                inventory_path,
+                ssh_identity_file,
+                known_hosts_path,
+                report_dir,
+                &mut issued_assignment_path,
+            ) {
+                Ok(summary) => {
+                    let _ = std::fs::write(&issue_assignment_log_path, summary.as_str());
+                    stage_outcome(
+                        "issue_windows_assignment",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![issue_assignment_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = std::fs::write(&issue_assignment_log_path, reason.as_str());
+                    stage_outcome(
+                        "issue_windows_assignment",
+                        VmLabStageStatus::Fail,
+                        format!("Windows assignment issuance failed for {windows_alias}: {reason}"),
+                        vec![issue_assignment_log_path.clone()],
+                    )
+                }
+            },
         }
     };
 
@@ -21115,6 +21162,29 @@ fn build_utm_readiness(inputs: UtmReadinessInputs<'_>) -> VmLabReadiness {
     }
 }
 
+/// Pure readiness predicate for the non-Windows discover surface.
+///
+/// A node is execution-ready when it is powered, networked (live_ip present),
+/// has an authoritative ssh target, AND ssh is reachable. ssh-reachability is
+/// satisfied by EITHER the raw-TCP probe seeing the port open OR — strictly
+/// stronger evidence — the real ssh-binary auth probe succeeding. The auth
+/// override exists because `probe_tcp_port_status` can be blind in a
+/// sandboxed / odd-routing context and report the port "closed" even though
+/// the same ssh the bootstrap path uses can reach the node.
+///
+/// A genuinely unreachable node (auth ALSO fails) keeps `ssh_reachable=false`,
+/// so the restart / fail-loud path still triggers exactly as before.
+fn discover_local_utm_target_ready(
+    process_present: bool,
+    live_ip_authoritative: bool,
+    ssh_port_open: bool,
+    ssh_auth_ok: bool,
+    authoritative_target_present: bool,
+) -> bool {
+    let ssh_reachable = ssh_port_open || ssh_auth_ok;
+    process_present && live_ip_authoritative && ssh_reachable && authoritative_target_present
+}
+
 fn stage_status_from_record(record: &LiveLabStageRecord) -> VmLabStageStatus {
     match record.status.as_str() {
         "pass" => VmLabStageStatus::Pass,
@@ -23067,7 +23137,11 @@ fn observe_local_utm_target_ready(
         match (live_ip.as_deref(), target.ssh_user.as_deref()) {
             (None, _) => "skipped-no-live-ip".to_owned(),
             (_, None) => "skipped-no-ssh-user".to_owned(),
-            (_, Some(_)) if ssh_port_status != "open" => "skipped-port-not-open".to_owned(),
+            // Always attempt the real ssh-binary auth probe when we have a
+            // live_ip + ssh_user. The raw-TCP `probe_tcp_port_status` can be
+            // blind in a sandboxed / odd-routing context and report "closed"
+            // even though the same ssh the bootstrap path uses reaches the
+            // node. Do NOT veto the auth probe on the raw-TCP result.
             (Some(ip), Some(ssh_user)) => match ssh_auth_probe_command(target.platform_profile) {
                 Ok(probe_command) => match run_remote_shell_command(
                     ip,
@@ -23103,7 +23177,15 @@ fn local_utm_ready_state_is_ready(state: &LocalUtmReadyState) -> bool {
     // Windows VMs are ready once powered and networked; SSH is not required.
     match state.platform {
         VmGuestPlatform::Linux | VmGuestPlatform::Macos => {
-            state.ssh_port_status == "open" && state.ssh_auth_status == "ok"
+            // ssh-reachability is satisfied by the real ssh-binary auth probe
+            // succeeding ("ok"). `probe_tcp_port_status` can be blind in a
+            // sandboxed / odd-routing context and report the port "closed"
+            // even though the same ssh the bootstrap path uses reaches the
+            // node, so a successful auth overrides a "closed" raw-TCP result.
+            // ssh-auth success is strictly stronger evidence than a raw socket
+            // connect; a genuinely unreachable node (auth NOT "ok") stays
+            // unready, so the restart / fail-loud path still triggers.
+            state.ssh_auth_status == "ok"
         }
         _ => true,
     }
@@ -32654,6 +32736,171 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
                 .reason_codes
                 .contains(&"ssh-auth-not-ready".to_owned())
         );
+    }
+
+    // ── Readiness-decision regression tests for the orchestrator-robustness fix
+    //
+    // Root cause that motivated these: the readiness gate trusted only the
+    // blind raw-TCP `probe_tcp_port_status`. In a sandboxed / odd-routing
+    // context that probe can report the ssh port "closed" even though the real
+    // ssh-binary auth (the same ssh the bootstrap path uses) reaches the node.
+    // The old gate then marked healthy nodes unready, rebooted them, and
+    // aborted. The fix: a successful ssh-binary auth overrides a "closed"
+    // raw-TCP result — but a genuinely unreachable node (auth ALSO fails) must
+    // still be marked unready so the restart / fail-loud path still triggers.
+    //
+    // These predicates are pure (no live node, no network).
+
+    fn linux_ready_state(
+        ssh_port_status: &str,
+        ssh_auth_status: &str,
+    ) -> super::LocalUtmReadyState {
+        super::LocalUtmReadyState {
+            alias: "node".to_owned(),
+            utm_name: "node".to_owned(),
+            process_present: true,
+            live_ip: Some("192.168.64.3".to_owned()),
+            ssh_port_status: ssh_port_status.to_owned(),
+            ssh_auth_status: ssh_auth_status.to_owned(),
+            platform: super::VmGuestPlatform::Linux,
+        }
+    }
+
+    #[test]
+    fn discover_ready_auth_ok_overrides_closed_raw_tcp() {
+        // (a) auth-OK + raw-TCP port-closed => READY. ssh-binary auth success
+        // is strictly stronger evidence than a blind raw socket connect.
+        assert!(super::discover_local_utm_target_ready(
+            true,  // process_present
+            true,  // live_ip_authoritative
+            false, // ssh_port_open (blind raw-TCP said closed)
+            true,  // ssh_auth_ok
+            true,  // authoritative_target_present
+        ));
+    }
+
+    #[test]
+    fn discover_unready_auth_fail_and_closed_raw_tcp() {
+        // (b) auth-Fail/Missing + port-closed => UNREADY. A genuinely
+        // unreachable node still trips the restart / fail-loud path.
+        assert!(!super::discover_local_utm_target_ready(
+            true, true, false, // ssh_port_open
+            false, // ssh_auth_ok (auth failed/missing)
+            true,
+        ));
+    }
+
+    #[test]
+    fn discover_ready_auth_ok_and_open_raw_tcp() {
+        // (c) auth-OK + port-open => READY (the all-green path, unchanged).
+        assert!(super::discover_local_utm_target_ready(
+            true, true, true, // ssh_port_open
+            true, // ssh_auth_ok
+            true,
+        ));
+    }
+
+    #[test]
+    fn discover_ready_port_open_even_without_auth() {
+        // The raw-TCP path is preserved: an open port alone still satisfies
+        // ssh-reachability (this is how the gate behaved before the fix and
+        // remains true). Auth is the *additional* override, not a new gate.
+        assert!(super::discover_local_utm_target_ready(
+            true, true, true,  // ssh_port_open
+            false, // ssh_auth_ok
+            true,
+        ));
+    }
+
+    #[test]
+    fn discover_unready_when_unpowered_or_unnetworked_or_no_target() {
+        // (d) all-down => UNREADY. Auth-OK must NOT paper over a node that is
+        // not powered, not networked, or has no authoritative ssh target.
+        assert!(!super::discover_local_utm_target_ready(
+            false, // process_present
+            true, false, true, true,
+        ));
+        assert!(!super::discover_local_utm_target_ready(
+            true, false, // live_ip_authoritative
+            false, true, true,
+        ));
+        assert!(!super::discover_local_utm_target_ready(
+            true, true, false, true, false, // authoritative_target_present
+        ));
+        // Fully down: nothing true.
+        assert!(!super::discover_local_utm_target_ready(
+            false, false, false, false, false,
+        ));
+    }
+
+    #[test]
+    fn wait_ready_auth_ok_overrides_closed_raw_tcp() {
+        // (a) auth-OK + raw-TCP port-closed => READY on the post-restart wait
+        // loop predicate too (same defect, same fix).
+        assert!(super::local_utm_ready_state_is_ready(&linux_ready_state(
+            "closed", "ok",
+        )));
+        // A blind raw-TCP "unknown" must not veto a successful auth either.
+        assert!(super::local_utm_ready_state_is_ready(&linux_ready_state(
+            "unknown", "ok",
+        )));
+    }
+
+    #[test]
+    fn wait_unready_auth_fail_and_closed_raw_tcp() {
+        // (b) auth-Fail/Missing + port-closed => UNREADY. Genuinely-down node
+        // keeps tripping the restart / fail-loud path.
+        assert!(!super::local_utm_ready_state_is_ready(&linux_ready_state(
+            "closed",
+            "skipped-port-not-open",
+        )));
+        assert!(!super::local_utm_ready_state_is_ready(&linux_ready_state(
+            "closed",
+            "failed-exit-255",
+        )));
+        // Even with the port reported open, a non-"ok" auth is unready: auth
+        // success is the authoritative signal, never the raw-TCP result alone.
+        assert!(!super::local_utm_ready_state_is_ready(&linux_ready_state(
+            "open",
+            "failed-exit-255",
+        )));
+    }
+
+    #[test]
+    fn wait_ready_auth_ok_and_open_raw_tcp() {
+        // (c) auth-OK + port-open => READY (all-green path, unchanged).
+        assert!(super::local_utm_ready_state_is_ready(&linux_ready_state(
+            "open", "ok",
+        )));
+    }
+
+    #[test]
+    fn wait_unready_when_unpowered_or_unnetworked() {
+        // (d) all-down => UNREADY even if a stale auth string says "ok": the
+        // process-present + live_ip gate runs first and fails closed.
+        let mut down = linux_ready_state("open", "ok");
+        down.process_present = false;
+        assert!(!super::local_utm_ready_state_is_ready(&down));
+
+        let mut no_ip = linux_ready_state("open", "ok");
+        no_ip.live_ip = None;
+        assert!(!super::local_utm_ready_state_is_ready(&no_ip));
+    }
+
+    #[test]
+    fn wait_ready_windows_does_not_require_ssh() {
+        // Windows readiness is unchanged by this fix: powered + networked is
+        // sufficient; ssh fields are ignored.
+        let win = super::LocalUtmReadyState {
+            alias: "win".to_owned(),
+            utm_name: "win".to_owned(),
+            process_present: true,
+            live_ip: Some("192.168.64.14".to_owned()),
+            ssh_port_status: "n/a".to_owned(),
+            ssh_auth_status: "n/a".to_owned(),
+            platform: super::VmGuestPlatform::Windows,
+        };
+        assert!(super::local_utm_ready_state_is_ready(&win));
     }
 
     #[test]
