@@ -5072,6 +5072,12 @@ impl LabStateServer {
 
     /// Tar the to-ship files (relative to the host registry root), scp the
     /// tarball to the guest, and extract it into the guest registry root.
+    // Internal host-side cache-seeding helper (dev tooling, not a production or
+    // security path): the guest-connection triple (target/user/is_windows) and
+    // the registry-layout triple (host_root/guest_hash/guest_root) are passed
+    // explicitly for clarity. Grouping them into a struct would add indirection
+    // without removing any real coupling, so the lint is suppressed locally.
+    #[allow(clippy::too_many_arguments)]
     fn ship_crates(
         &self,
         target: &str,

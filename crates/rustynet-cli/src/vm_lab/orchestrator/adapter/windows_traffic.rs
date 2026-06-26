@@ -403,7 +403,7 @@ fn windows_node_clean_assert_script() -> String {
          $rules = @(& netsh advfirewall firewall show rule name=all dir=out | Select-String 'RustyNet'); \
          $pol = @(& netsh advfirewall show allprofiles | Select-String 'Firewall Policy'); \
          $blocked = @($pol | Where-Object {{ $_ -match 'BlockOutbound' }}); \
-         $svc = Get-Service -Name '{svc}' -ErrorAction SilentlyContinue; \
+         $svc = Get-Service -Name '{WINDOWS_SERVICE_NAME}' -ErrorAction SilentlyContinue; \
          if (-not $svc) {{ $svcState = 'absent' }} \
          elseif ($svc.Status -eq 'Running') {{ $svcState = 'running' }} \
          else {{ $svcState = 'stopped' }}; \
@@ -413,8 +413,7 @@ fn windows_node_clean_assert_script() -> String {
          $adapterTok = if ($adapters.Count -gt 0) {{ ($adapters -join ',') }} else {{ '-' }}; \
          $outboundTok = if ($blocked.Count -gt 0) {{ 'block' }} else {{ 'allow' }}; \
          Write-Output ('rules=' + $rules.Count + ' outbound=' + $outboundTok + \
-             ' service=' + $svcState + ' adapter=' + $adapterTok)",
-        svc = WINDOWS_SERVICE_NAME
+             ' service=' + $svcState + ' adapter=' + $adapterTok)"
     )
 }
 
