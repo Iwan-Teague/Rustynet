@@ -58,7 +58,7 @@ pub fn ssh_params(
 /// which on macOS is long) so the resulting Unix-socket path stays well under
 /// the ~104-char `sun_path` limit. `%C` is a short hash of (host, port, user,
 /// local host), giving one master per distinct target.
-fn attach_control_master(cmd: &mut Command) {
+fn attach_control_master(cmd: &mut Command) -> Option<String> {
     let dir = format!("/tmp/rn_ssh_cm_{}", std::process::id());
     if std::fs::create_dir_all(&dir).is_ok() {
         #[cfg(unix)]
@@ -66,11 +66,48 @@ fn attach_control_master(cmd: &mut Command) {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         }
+        let control_path = format!("{dir}/cm-%C");
         cmd.args(["-o", "ControlMaster=auto", "-o", "ControlPersist=30s"]);
-        cmd.arg("-o").arg(format!("ControlPath={dir}/cm-%C"));
+        cmd.arg("-o").arg(format!("ControlPath={control_path}"));
+        return Some(control_path);
     }
     // If the control dir cannot be created we simply omit multiplexing and
     // fall back to a fresh connection per command — correct, just slower.
+    None
+}
+
+/// Everything needed to tear down a ControlMaster master process with a single
+/// argv-only `ssh -O exit` invocation. `ControlPersist=30s` keeps the master —
+/// and its copies of the foreground child's stdout/stderr pipe write-ends —
+/// alive for up to 30s after the foreground ssh is killed on a per-command
+/// timeout. That would block the drain threads' `join()` for the full persist
+/// window. Closing the master promptly closes those write-ends so the drains
+/// unblock immediately.
+struct ControlMasterTeardown {
+    host: String,
+    port: u16,
+    user: Option<String>,
+    control_path: String,
+}
+
+impl ControlMasterTeardown {
+    /// Build the `ssh -O exit` command (argv-only; no shell construction).
+    fn into_exit_command(self) -> Command {
+        let mut cmd = Command::new("ssh");
+        cmd.args(["-o", "LogLevel=ERROR", "-o", "BatchMode=yes"]);
+        cmd.arg("-O").arg("exit");
+        cmd.arg("-o")
+            .arg(format!("ControlPath={}", self.control_path));
+        cmd.arg("-p").arg(self.port.to_string());
+        if let Some(user) = self.user.as_deref() {
+            cmd.arg("-l").arg(user);
+        }
+        cmd.arg("--").arg(&self.host);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        cmd
+    }
 }
 
 fn base_ssh_command(
@@ -79,7 +116,7 @@ fn base_ssh_command(
     user: Option<&str>,
     identity_file: &Path,
     known_hosts: &Path,
-) -> Command {
+) -> (Command, Option<ControlMasterTeardown>) {
     let mut cmd = Command::new("ssh");
     cmd.args([
         "-n",
@@ -103,12 +140,17 @@ fn base_ssh_command(
     cmd.arg("-i").arg(identity_file);
     cmd.arg("-o")
         .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
-    attach_control_master(&mut cmd);
+    let teardown = attach_control_master(&mut cmd).map(|control_path| ControlMasterTeardown {
+        host: host.to_owned(),
+        port,
+        user: user.map(str::to_owned),
+        control_path,
+    });
     if let Some(u) = user {
         cmd.arg("-l").arg(u);
     }
     cmd.arg("--").arg(host);
-    cmd
+    (cmd, teardown)
 }
 
 fn base_scp_command(
@@ -136,7 +178,10 @@ fn base_scp_command(
     cmd.arg("-i").arg(identity_file);
     cmd.arg("-o")
         .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
-    attach_control_master(&mut cmd);
+    // scp reuses any master opened by the ssh path; it does not need its own
+    // teardown handle (scp runs short and its child exits before any timeout
+    // path that would block on a lingering master).
+    let _ = attach_control_master(&mut cmd);
     if let Some(u) = user {
         cmd.arg("-o").arg(format!("User={u}"));
     }
@@ -178,13 +223,13 @@ fn run_remote_inner(
     log_sink: Option<&Path>,
 ) -> Result<String, AdapterError> {
     let (host, port, user, identity_file, known_hosts) = ssh_params(conn)?;
-    let mut cmd = base_ssh_command(host, port, user, identity_file, known_hosts);
+    let (mut cmd, control_master_teardown) =
+        base_ssh_command(host, port, user, identity_file, known_hosts);
     cmd.arg(script);
-    let output = run_output_with_timeout(&mut cmd, timeout, log_sink).map_err(|message| {
-        AdapterError::Ssh {
+    let output = run_output_with_timeout(&mut cmd, timeout, log_sink, control_master_teardown)
+        .map_err(|message| AdapterError::Ssh {
             message: format!("SSH spawn failed for {host}: {message}"),
-        }
-    })?;
+        })?;
     if !output.status.success() {
         let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         // Windows PowerShell over OpenSSH frequently writes diagnostic
@@ -347,6 +392,7 @@ fn run_output_with_timeout(
     command: &mut Command,
     timeout: Duration,
     log_sink: Option<&Path>,
+    control_master_teardown: Option<ControlMasterTeardown>,
 ) -> Result<std::process::Output, String> {
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -428,6 +474,16 @@ fn run_output_with_timeout(
                 if started_at.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Killing the foreground ssh child does NOT close the
+                    // ControlMaster master's copies of the stdout/stderr pipe
+                    // write-ends; with ControlPersist=30s the drain threads
+                    // would otherwise block on join() until the master expires.
+                    // Tear the master down now (argv-only `ssh -O exit`) so the
+                    // write-ends close and the drains unblock promptly. Best
+                    // effort: a missing/already-gone master is harmless.
+                    if let Some(teardown) = control_master_teardown {
+                        let _ = teardown.into_exit_command().status();
+                    }
                     // Flush remaining log data before returning.
                     let _ = stdout_thread.join();
                     let _ = stderr_thread.join();
@@ -537,7 +593,61 @@ pub fn remote_home_for_user(user: Option<&str>, heap_user: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::validator_report_ok;
+    use super::{ControlMasterTeardown, validator_report_ok};
+
+    #[test]
+    fn control_master_teardown_builds_argv_only_ssh_o_exit() {
+        // The control-socket teardown that runs on a per-command timeout must
+        // be argv-only `ssh -O exit` for the exact ControlPath — never shell
+        // construction. Verify the argv carries `-O exit`, the ControlPath, the
+        // port, the user, and the host past the `--` separator, with no shell.
+        let teardown = ControlMasterTeardown {
+            host: "192.168.64.3".to_owned(),
+            port: 22,
+            user: Some("debian".to_owned()),
+            control_path: "/tmp/rn_ssh_cm_4242/cm-%C".to_owned(),
+        };
+        let cmd = teardown.into_exit_command();
+        assert_eq!(cmd.get_program(), "ssh");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // `-O exit` tears down the master.
+        let o_idx = args.iter().position(|a| a == "-O").expect("-O present");
+        assert_eq!(args[o_idx + 1], "exit");
+        // Exact ControlPath so we target the right socket.
+        assert!(
+            args.iter()
+                .any(|a| a == "ControlPath=/tmp/rn_ssh_cm_4242/cm-%C"),
+            "argv must carry the exact ControlPath: {args:?}"
+        );
+        // Port + user + host present, host after the `--` separator.
+        assert!(args.iter().any(|a| a == "22"), "port present: {args:?}");
+        assert!(args.iter().any(|a| a == "debian"), "user present: {args:?}");
+        let sep = args.iter().position(|a| a == "--").expect("-- present");
+        assert_eq!(args[sep + 1], "192.168.64.3");
+    }
+
+    #[test]
+    fn control_master_teardown_omits_user_when_none() {
+        let teardown = ControlMasterTeardown {
+            host: "host.example".to_owned(),
+            port: 2200,
+            user: None,
+            control_path: "/tmp/rn_ssh_cm_1/cm-%C".to_owned(),
+        };
+        let cmd = teardown.into_exit_command();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a == "-l"),
+            "no -l when user None: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "2200"));
+    }
 
     #[test]
     fn validator_report_ok_true_only_on_explicit_overall_ok_true() {
