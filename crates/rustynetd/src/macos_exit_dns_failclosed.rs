@@ -423,21 +423,47 @@ fn validate_hostname(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Bounded retry budget for live anchor discovery. The killswitch anchor's
+/// generation rotates on every (re-)apply, so a single-shot `pfctl -s Anchors`
+/// sample can land in the rotation window with no matching anchor present. Poll
+/// up to this many attempts, sleeping `DNS_ANCHOR_POLL_INTERVAL` between tries,
+/// returning as soon as one matches. The bound is a fixed `for` range so the
+/// loop always terminates; once exhausted it fails closed with the original
+/// "no active …" error (no silent empty ruleset that would mask an absent block).
+#[cfg(target_os = "macos")]
+const DNS_ANCHOR_POLL_ATTEMPTS: u32 = 15;
+#[cfg(target_os = "macos")]
+const DNS_ANCHOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 #[cfg(target_os = "macos")]
 fn capture_pf_rules_stdout() -> Result<String, String> {
     use crate::macos_exit_killswitch_precedence::{
-        select_macos_rustynet_anchor, validate_pf_anchor_name,
+        AnchorPollOutcome, classify_anchor_poll_sample, validate_pf_anchor_name,
     };
     // The macOS exit dataplane loads its filter rules — including the labeled
     // LAN DNS-block rules `render_pf_rules` emits — into a generation-numbered
     // anchor `com.apple/rustynet_g<N>`, NOT the main ruleset. A bare
     // `pfctl -s rules` therefore never observes them. Enumerate the live
     // anchors, select the highest-generation rustynet anchor, and dump ITS
-    // rules. Fail loud when no rustynet anchor is active: the producer must
-    // observe the real filter rules rather than silently reporting an empty
-    // ruleset that would mask an absent DNS block.
-    let anchors = run_pfctl(&["-s", "Anchors"])?;
-    let anchor = select_macos_rustynet_anchor(anchors.as_str()).ok_or_else(|| {
+    // rules. The anchor generation rotates on every (re-)apply, so a single
+    // sample can race the rotation window; poll a bounded number of times,
+    // returning the instant one matches. Fail loud once the budget is spent:
+    // the producer must observe the real filter rules rather than silently
+    // reporting an empty ruleset that would mask an absent DNS block.
+    let mut anchor: Option<String> = None;
+    for attempt in 0..DNS_ANCHOR_POLL_ATTEMPTS {
+        let anchors = run_pfctl(&["-s", "Anchors"])?;
+        let has_more_attempts = attempt + 1 < DNS_ANCHOR_POLL_ATTEMPTS;
+        match classify_anchor_poll_sample(anchors.as_str(), has_more_attempts) {
+            AnchorPollOutcome::Found(found) => {
+                anchor = Some(found);
+                break;
+            }
+            AnchorPollOutcome::Retry => sleep(DNS_ANCHOR_POLL_INTERVAL),
+            AnchorPollOutcome::GiveUp => break,
+        }
+    }
+    let anchor = anchor.ok_or_else(|| {
         "no active com.apple/rustynet_g<N> pf anchor found; daemon killswitch path not active"
             .to_owned()
     })?;
