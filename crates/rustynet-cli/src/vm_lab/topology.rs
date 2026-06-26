@@ -886,6 +886,7 @@ mod tests {
             skip_diagnose_on_failure: false,
             stop_after_ready: false,
             dry_run: false,
+            trust_inventory_ready: false,
             windows_vm: None,
             macos_vm: None,
             windows_only: false,

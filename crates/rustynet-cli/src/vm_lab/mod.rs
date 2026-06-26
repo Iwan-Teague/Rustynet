@@ -853,6 +853,20 @@ pub struct VmLabOrchestrateLiveLabConfig {
     pub skip_diagnose_on_failure: bool,
     pub stop_after_ready: bool,
     pub dry_run: bool,
+    /// `--trust-inventory-ready`: skip the pre-run restart-unready gate.
+    ///
+    /// The readiness gate keys off `probe_tcp_port_status`, a raw `TcpStream`
+    /// connect to `:22` that can be BLIND in a sandboxed / odd-routing context
+    /// (e.g. an MCP-launched process that cannot reach the bridged lab subnet
+    /// with an unbound socket) even though the `ssh` binary the real bootstrap
+    /// uses reaches the same nodes fine. When that happens the gate reboots
+    /// every (healthy) VM and aborts. With this flag set the orchestrator emits
+    /// a warning + a `restart_unready_vms = Skipped` outcome and proceeds to
+    /// bootstrap, letting the real bootstrap SSH be the source of truth — a
+    /// genuinely unreachable node then fails bootstrap loudly instead of
+    /// silently triggering a destructive restart-all. Off by default; the gate
+    /// stays strict unless the operator opts out.
+    pub trust_inventory_ready: bool,
     /// Alias of an optional Windows 11 UTM VM to bootstrap and validate as a client node.
     /// When set, the orchestrator includes this VM in UTM discovery/restart, then runs
     /// Windows-specific bootstrap and validation stages after all Linux stages pass.
@@ -4642,6 +4656,55 @@ fn not_execution_ready_aliases(summary: &LocalUtmSelectedReadinessSummary) -> Ve
         .collect()
 }
 
+/// What the orchestrator should do with the pre-run readiness gate once it has
+/// computed `unready_aliases` from the (raw-TCP) discovery probe.
+///
+/// The readiness probe (`probe_tcp_port_status`) is a raw `TcpStream` connect
+/// that can be BLIND in a sandboxed / odd-routing execution context (e.g. an
+/// MCP-launched process that cannot reach the bridged lab subnet with an
+/// unbound socket) even while the `ssh` binary used by the real bootstrap path
+/// reaches the same nodes fine. In that case the probe reports every node
+/// `ssh-tcp-not-open`, the gate restarts and re-probes (still blind), and the
+/// run aborts after needlessly rebooting healthy VMs.
+///
+/// `--trust-inventory-ready` is the opt-in escape hatch: skip the
+/// restart-and-rediscover gate and let the real bootstrap SSH be the source of
+/// truth. A genuinely unreachable node then fails bootstrap loudly instead of
+/// triggering a destructive restart-all. Default behaviour is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartUnreadyDecision {
+    /// All selected aliases were execution-ready; nothing to do.
+    AllReady,
+    /// Dry-run: record a Skipped outcome describing the restart that would run.
+    DryRunSkip,
+    /// `--trust-inventory-ready`: skip the restart gate by operator request and
+    /// proceed straight to bootstrap.
+    TrustInventorySkip,
+    /// Restart the unready aliases and re-discover (the historical default).
+    Restart,
+}
+
+/// Pure decision for the pre-run readiness gate. Extracted so the restart
+/// branch is unit-testable without touching utmctl / SSH / the live lab.
+fn decide_restart_unready(
+    unready_empty: bool,
+    dry_run: bool,
+    trust_inventory_ready: bool,
+) -> RestartUnreadyDecision {
+    if unready_empty {
+        RestartUnreadyDecision::AllReady
+    } else if trust_inventory_ready {
+        // Operator opt-out wins over dry-run: when the operator has asserted the
+        // inventory is ready, we never reboot and we let bootstrap be the
+        // arbiter, even in a dry run (where a restart would not happen anyway).
+        RestartUnreadyDecision::TrustInventorySkip
+    } else if dry_run {
+        RestartUnreadyDecision::DryRunSkip
+    } else {
+        RestartUnreadyDecision::Restart
+    }
+}
+
 fn stage_outcome(
     stage: &str,
     status: VmLabStageStatus,
@@ -7111,81 +7174,176 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         );
     }
 
-    if !unready_aliases.is_empty() {
-        warnings.push(format!(
-            "selected local UTM VMs were not execution-ready and required restart: {}",
-            unready_aliases.join(", ")
-        ));
-        if config.dry_run {
-            let restart_outcome = stage_outcome(
-                "restart_unready_vms",
-                VmLabStageStatus::Skipped,
-                format!(
-                    "dry-run: would restart aliases {}",
+    let restart_decision = decide_restart_unready(
+        unready_aliases.is_empty(),
+        config.dry_run,
+        config.trust_inventory_ready,
+    );
+    if restart_decision != RestartUnreadyDecision::AllReady {
+        match restart_decision {
+            RestartUnreadyDecision::AllReady => unreachable!("handled by the outer guard"),
+            RestartUnreadyDecision::TrustInventorySkip => {
+                // The TCP readiness probe (probe_tcp_port_status) is a raw
+                // unbound-socket connect that can be blind in this execution
+                // context even though the bootstrap `ssh` binary reaches the
+                // nodes. The operator passed --trust-inventory-ready, so skip the
+                // restart-and-rediscover gate and let bootstrap be the arbiter.
+                warnings.push(format!(
+                    "selected local UTM VMs probed as not execution-ready, but \
+                     --trust-inventory-ready was set; SKIPPING restart and proceeding to \
+                     bootstrap (probe may be blind; bootstrap SSH is the source of truth): {}",
                     unready_aliases.join(", ")
-                ),
-                vec![initial_discovery_path.clone()],
-            );
-            emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
-            outcomes.push(restart_outcome);
-        } else {
-            let restart_output = execute_ops_vm_lab_restart(VmLabRestartConfig {
-                inventory_path: inventory_path.clone(),
-                vm_aliases: unready_aliases.clone(),
-                raw_targets: Vec::new(),
-                select_all: false,
-                utmctl_path: config
-                    .utmctl_path
-                    .clone()
-                    .unwrap_or_else(default_utmctl_path),
-                service: None,
-                wait_ready: true,
-                ssh_port: config.ssh_port,
-                ready_timeout_secs: ready_timeout,
-                ssh_user: None,
-                ssh_identity_file: Some(config.ssh_identity_file.clone()),
-                known_hosts_path: config.known_hosts_path.clone(),
-                timeout_secs: config.timeout_secs,
-                json_output: false,
-                report_dir: Some(pre_setup_orchestration_dir.clone()),
-            });
-            let restart_path = orchestration_dir.join("restart_unready_vms.txt");
-            match restart_output {
-                Ok(output) => {
-                    write_orchestration_artifact(
-                        pre_setup_orchestration_dir
-                            .join("restart_unready_vms.txt")
-                            .as_path(),
-                        output.as_str(),
-                    )?;
-                    let restart_outcome = stage_outcome(
-                        "restart_unready_vms",
-                        VmLabStageStatus::Pass,
-                        format!("restarted aliases {}", unready_aliases.join(", ")),
-                        vec![restart_path.clone()],
-                    );
-                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
-                    outcomes.push(restart_outcome);
+                ));
+                let restart_outcome = stage_outcome(
+                    "restart_unready_vms",
+                    VmLabStageStatus::Skipped,
+                    format!(
+                        "skipped by --trust-inventory-ready: not restarting probed-unready \
+                         aliases {}; bootstrap SSH will fail loudly if a node is truly \
+                         unreachable",
+                        unready_aliases.join(", ")
+                    ),
+                    vec![initial_discovery_path.clone()],
+                );
+                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
+                outcomes.push(restart_outcome);
+            }
+            RestartUnreadyDecision::DryRunSkip => {
+                warnings.push(format!(
+                    "selected local UTM VMs were not execution-ready and required restart: {}",
+                    unready_aliases.join(", ")
+                ));
+                let restart_outcome = stage_outcome(
+                    "restart_unready_vms",
+                    VmLabStageStatus::Skipped,
+                    format!(
+                        "dry-run: would restart aliases {}",
+                        unready_aliases.join(", ")
+                    ),
+                    vec![initial_discovery_path.clone()],
+                );
+                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
+                outcomes.push(restart_outcome);
+            }
+            RestartUnreadyDecision::Restart => {
+                warnings.push(format!(
+                    "selected local UTM VMs were not execution-ready and required restart: {}",
+                    unready_aliases.join(", ")
+                ));
+                let restart_output = execute_ops_vm_lab_restart(VmLabRestartConfig {
+                    inventory_path: inventory_path.clone(),
+                    vm_aliases: unready_aliases.clone(),
+                    raw_targets: Vec::new(),
+                    select_all: false,
+                    utmctl_path: config
+                        .utmctl_path
+                        .clone()
+                        .unwrap_or_else(default_utmctl_path),
+                    service: None,
+                    wait_ready: true,
+                    ssh_port: config.ssh_port,
+                    ready_timeout_secs: ready_timeout,
+                    ssh_user: None,
+                    ssh_identity_file: Some(config.ssh_identity_file.clone()),
+                    known_hosts_path: config.known_hosts_path.clone(),
+                    timeout_secs: config.timeout_secs,
+                    json_output: false,
+                    report_dir: Some(pre_setup_orchestration_dir.clone()),
+                });
+                let restart_path = orchestration_dir.join("restart_unready_vms.txt");
+                match restart_output {
+                    Ok(output) => {
+                        write_orchestration_artifact(
+                            pre_setup_orchestration_dir
+                                .join("restart_unready_vms.txt")
+                                .as_path(),
+                            output.as_str(),
+                        )?;
+                        let restart_outcome = stage_outcome(
+                            "restart_unready_vms",
+                            VmLabStageStatus::Pass,
+                            format!("restarted aliases {}", unready_aliases.join(", ")),
+                            vec![restart_path.clone()],
+                        );
+                        emit_vm_lab_progress_outcome(
+                            "vm-lab-orchestrate-live-lab",
+                            &restart_outcome,
+                        );
+                        outcomes.push(restart_outcome);
+                    }
+                    Err(err) => {
+                        write_orchestration_artifact(
+                            pre_setup_orchestration_dir
+                                .join("restart_unready_vms.txt")
+                                .as_path(),
+                            err.as_str(),
+                        )?;
+                        let restart_outcome = stage_outcome(
+                            "restart_unready_vms",
+                            VmLabStageStatus::Fail,
+                            format!("restart failed for aliases {}", unready_aliases.join(", ")),
+                            vec![initial_discovery_path.clone(), restart_path],
+                        );
+                        emit_vm_lab_progress_outcome(
+                            "vm-lab-orchestrate-live-lab",
+                            &restart_outcome,
+                        );
+                        outcomes.push(restart_outcome);
+                        next_actions.push(format!(
+                            "Inspect {} and {}",
+                            initial_discovery_path.display(),
+                            orchestration_dir.join("restart_unready_vms.txt").display()
+                        ));
+                        materialize_orchestration_staging_dir(
+                            pre_setup_orchestration_dir.as_path(),
+                            orchestration_dir.as_path(),
+                        )?;
+                        return finalize_vm_lab_orchestration_result(
+                            "vm-lab-orchestrate-live-lab",
+                            report_dir.as_path(),
+                            orchestration_dir.as_path(),
+                            outcomes,
+                            warnings,
+                            next_actions,
+                        );
+                    }
                 }
-                Err(err) => {
-                    write_orchestration_artifact(
-                        pre_setup_orchestration_dir
-                            .join("restart_unready_vms.txt")
-                            .as_path(),
-                        err.as_str(),
-                    )?;
-                    let restart_outcome = stage_outcome(
-                        "restart_unready_vms",
-                        VmLabStageStatus::Fail,
-                        format!("restart failed for aliases {}", unready_aliases.join(", ")),
-                        vec![initial_discovery_path.clone(), restart_path],
-                    );
-                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
-                    outcomes.push(restart_outcome);
+
+                let rediscovery = execute_ops_vm_lab_discover_local_utm(discover_config)?;
+                let rediscovery_path = orchestration_dir.join("discover_post_restart.json");
+                write_orchestration_artifact(
+                    pre_setup_orchestration_dir
+                        .join("discover_post_restart.json")
+                        .as_path(),
+                    rediscovery.as_str(),
+                )?;
+                let post_restart_readiness = selected_local_utm_readiness_from_report(
+                    rediscovery.as_str(),
+                    &discovery_aliases,
+                )?;
+                final_readiness = post_restart_readiness.clone();
+                final_readiness_artifact = rediscovery_path.clone();
+                let still_unready = not_execution_ready_aliases(&post_restart_readiness);
+                let rediscovery_status = if still_unready.is_empty() {
+                    VmLabStageStatus::Pass
+                } else {
+                    VmLabStageStatus::Fail
+                };
+                let rediscovery_outcome = stage_outcome(
+                    "rediscover_local_utm",
+                    rediscovery_status.clone(),
+                    format!(
+                        "selected aliases readiness after restart: {}",
+                        render_selected_local_utm_readiness(&post_restart_readiness)
+                    ),
+                    vec![rediscovery_path.clone()],
+                );
+                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &rediscovery_outcome);
+                outcomes.push(rediscovery_outcome);
+                if rediscovery_status == VmLabStageStatus::Fail {
                     next_actions.push(format!(
-                        "Inspect {} and {}",
-                        initial_discovery_path.display(),
-                        orchestration_dir.join("restart_unready_vms.txt").display()
+                        "Inspect {} for remaining readiness blockers",
+                        rediscovery_path.display()
                     ));
                     materialize_orchestration_staging_dir(
                         pre_setup_orchestration_dir.as_path(),
@@ -7200,54 +7358,6 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                         next_actions,
                     );
                 }
-            }
-
-            let rediscovery = execute_ops_vm_lab_discover_local_utm(discover_config)?;
-            let rediscovery_path = orchestration_dir.join("discover_post_restart.json");
-            write_orchestration_artifact(
-                pre_setup_orchestration_dir
-                    .join("discover_post_restart.json")
-                    .as_path(),
-                rediscovery.as_str(),
-            )?;
-            let post_restart_readiness =
-                selected_local_utm_readiness_from_report(rediscovery.as_str(), &discovery_aliases)?;
-            final_readiness = post_restart_readiness.clone();
-            final_readiness_artifact = rediscovery_path.clone();
-            let still_unready = not_execution_ready_aliases(&post_restart_readiness);
-            let rediscovery_status = if still_unready.is_empty() {
-                VmLabStageStatus::Pass
-            } else {
-                VmLabStageStatus::Fail
-            };
-            let rediscovery_outcome = stage_outcome(
-                "rediscover_local_utm",
-                rediscovery_status.clone(),
-                format!(
-                    "selected aliases readiness after restart: {}",
-                    render_selected_local_utm_readiness(&post_restart_readiness)
-                ),
-                vec![rediscovery_path.clone()],
-            );
-            emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &rediscovery_outcome);
-            outcomes.push(rediscovery_outcome);
-            if rediscovery_status == VmLabStageStatus::Fail {
-                next_actions.push(format!(
-                    "Inspect {} for remaining readiness blockers",
-                    rediscovery_path.display()
-                ));
-                materialize_orchestration_staging_dir(
-                    pre_setup_orchestration_dir.as_path(),
-                    orchestration_dir.as_path(),
-                )?;
-                return finalize_vm_lab_orchestration_result(
-                    "vm-lab-orchestrate-live-lab",
-                    report_dir.as_path(),
-                    orchestration_dir.as_path(),
-                    outcomes,
-                    warnings,
-                    next_actions,
-                );
             }
         }
     }
@@ -29279,20 +29389,20 @@ fn execute_bootstrap_phase_for_target(
 mod tests {
     use super::{
         DaemonProbe as _, LiveLabStageRecord, LiveLabStageSummary, PortStatus, ProbeState,
-        RemoteExec as _, RepoSyncDispatchKind, RepoSyncMode, RuntimePaths as _,
-        ServiceManager as _, StageOrchestrator as _, UtmReadinessInputs, VmGuestExecMode,
-        VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
-        VmLabIterationValidationStep, VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig,
-        VmLabStageOutcome, VmLabStageStatus, VmLabValidateLiveLabProfileConfig,
-        VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe,
-        append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
-        build_local_source_extract_script, build_remote_argv_script,
+        RemoteExec as _, RepoSyncDispatchKind, RepoSyncMode, RestartUnreadyDecision,
+        RuntimePaths as _, ServiceManager as _, StageOrchestrator as _, UtmReadinessInputs,
+        VmGuestExecMode, VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus,
+        VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep, VmLabRunLiveLabConfig,
+        VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
+        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
+        VmServiceManager, WindowsSshReadinessProbe, append_unique_stage_outcomes_collect_new,
+        build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
         build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
         build_vm_lab_topology, build_windows_local_source_extract_result_script,
         build_windows_local_source_extract_script, collect_live_lab_stage_local_bundle,
-        create_orchestration_staging_dir, default_inventory_path,
+        create_orchestration_staging_dir, decide_restart_unready, default_inventory_path,
         default_live_lab_iteration_profile_path, default_live_lab_iteration_report_dir,
         default_live_lab_orchestrator_path, default_platform_profile, default_utmctl_path,
         discover_local_utm_bundle_paths, discover_local_utm_bundle_paths_bounded,
@@ -31584,6 +31694,56 @@ mod tests {
         assert_eq!(
             summary.unready_entries[0].reason_codes,
             vec!["ssh-auth-rejected".to_owned()]
+        );
+    }
+
+    #[test]
+    fn decide_restart_unready_all_ready_short_circuits() {
+        // No unready aliases: never restart, regardless of the other flags.
+        assert_eq!(
+            decide_restart_unready(true, false, false),
+            RestartUnreadyDecision::AllReady
+        );
+        assert_eq!(
+            decide_restart_unready(true, true, true),
+            RestartUnreadyDecision::AllReady
+        );
+    }
+
+    #[test]
+    fn decide_restart_unready_default_restarts_when_unready() {
+        // Historical default: unready + no opt-outs => destructive restart gate.
+        assert_eq!(
+            decide_restart_unready(false, false, false),
+            RestartUnreadyDecision::Restart
+        );
+    }
+
+    #[test]
+    fn decide_restart_unready_dry_run_skips_without_restart() {
+        assert_eq!(
+            decide_restart_unready(false, true, false),
+            RestartUnreadyDecision::DryRunSkip
+        );
+    }
+
+    #[test]
+    fn decide_restart_unready_trust_inventory_skips_restart() {
+        // --trust-inventory-ready must skip the restart gate even though the
+        // (possibly blind) probe reported unready nodes — bootstrap is then the
+        // source of truth instead of a destructive restart-all.
+        assert_eq!(
+            decide_restart_unready(false, false, true),
+            RestartUnreadyDecision::TrustInventorySkip
+        );
+    }
+
+    #[test]
+    fn decide_restart_unready_trust_inventory_wins_over_dry_run() {
+        // When both are set, trust-inventory wins: we never reboot, dry-run or not.
+        assert_eq!(
+            decide_restart_unready(false, true, true),
+            RestartUnreadyDecision::TrustInventorySkip
         );
     }
 
@@ -39838,6 +39998,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             skip_diagnose_on_failure: false,
             stop_after_ready: false,
             dry_run: false,
+            trust_inventory_ready: false,
             windows_vm: None,
             macos_vm: None,
             windows_only: false,
