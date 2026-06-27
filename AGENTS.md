@@ -462,9 +462,10 @@ emits nothing). Use `cp … bin/x.new && mv -f bin/x.new bin/x`. Then reconnect 
 server (`/mcp` → reconnect, or restart the client — killing the process does NOT
 auto-respawn, and there is no `claude mcp` reconnect subcommand). When you can't
 reconnect (e.g. a remote client), drive the freshly built binary **directly over
-stdio** instead — JSON-RPC `initialize` → `notifications/initialized` →
-`tools/call`; `deepseek_live_lab` returns a job_id, then poll
-`deepseek_live_lab_result`. The API key resolves from `DEEPSEEK_API_KEY` or
+stdio** instead — `scripts/mcp/drive_deepseek.py --tool <name> --args '<json>'`
+spawns the latest binary, does the JSON-RPC handshake, calls the tool, and
+auto-polls `deepseek_live_lab_result` for the async run/triage tools, so the
+newest tools are reachable with NO client reconnect. The API key resolves from `DEEPSEEK_API_KEY` or
 `~/Desktop/deepseek_api.md`; **never commit, log, or write it into the repo or any
 artifact.**
 
