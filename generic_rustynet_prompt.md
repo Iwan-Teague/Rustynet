@@ -226,20 +226,31 @@ Read the docs in this precedence order when a decision is ambiguous:
 ═══════════════════════════════════════════
 3) DEEPSEEK — VIA MCP (your research / summarizing / info-gathering layer; use it constantly)
 ═══════════════════════════════════════════
-DeepSeek runs as an MCP server (`rustynet-deepseek`). The three *proxy* tools take `prompt`, optional
-`context` (paste code/diffs/logs/journals), and `model` — they see ONLY what you paste. The fourth tool,
-the *agent*, inspects the repo + lab itself:
+DeepSeek runs as an MCP server (`rustynet-deepseek`) with SEVEN tools. The three *proxy* tools take
+`prompt`, optional `context` (paste code/diffs/logs), and `model` — they see ONLY what you paste. The
+*agent* and the *live-lab family* inspect the repo + lab themselves. The live-lab tools are your loop
+driver — list them first:
 
 | Tool | Intent |
 |---|---|
-| `mcp__rustynet-deepseek__deepseek_read` | Analysis, code review, security review, second opinion, risk ID — read-only (proxy) |
-| `mcp__rustynet-deepseek__deepseek_write` | Generate boilerplate, test scaffolds, doc drafts — advisory only (proxy) |
-| `mcp__rustynet-deepseek__deepseek_read_write` | Analyze existing code then generate changes (review-then-fix, audit-then-patch) (proxy) |
-| `mcp__rustynet-deepseek__deepseek_agent` | **Read-only autonomous research agent** — drives DeepSeek's tool-calling loop over ~20 confined read-only tools to inspect the LOCAL repo + UTM lab *itself* and answer with cited evidence + an audit trace. It can read files, grep, find a symbol's definition, find files, read git history, check VM power + TCP reachability, run a FIXED read-only command inside a running Linux guest, read the lab inventory, the run-matrix, a run's per-stage + validator results, background-job state, a stage log, the orchestrator job log, grep a run's report, and the loop journal. **Unlike the proxies (which only reason over what you paste), the agent GROUND-TRUTHS a claim against the actual code/lab** — "does this fn really do X?", "did that stage really fail because Y?", "is this node actually reachable?". Prefer it whenever you want DeepSeek to *verify against reality* rather than opine on a snippet. (A rebuilt agent binary is only live after the MCP server reloads.) |
+| `mcp__rustynet-deepseek__deepseek_lab_run` | **THE loop driver — ONE call = launch the lab + triage on fail → ONE report.** Give it an `area` (+ optional `macos`/`windows` or `macos_vm`/`windows_vm`, `exit_vm`/`client_vm`, `rebuild_nodes`, `dry_run`, and `allow_concurrent` for the macOS↔Windows pipeline on disjoint guests). A DETERMINISTIC worker launches the hardened orchestrator (NO LLM in the deploy/monitor path — it can't hallucinate a deploy action), waits, and on FAILURE runs the rigid triage automatically. **Async → returns a `job_id`; poll `deepseek_live_lab_result`.** Green run = PASS + evidence, ZERO LLM. Singleton by default; `allow_concurrent:true` allows ≤3 overlapping runs. |
+| `mcp__rustynet-deepseek__deepseek_live_lab` | The rigid, non-negotiable failure-triage pipeline on a failure you ALREADY have (`target` + `failure_context`): three grounded read-only sub-agents in FIXED order — v4-flash research (why/where/what) → v4-flash verify-every-claim-against-the-repo/lab → v4-pro@MAX review (re-verify + judge the best fix) — into ONE evidence-cited report (root cause + file:line + suspected fix). Async → `job_id`. `deepseek_lab_run` calls this internally on failure; call it directly when you already hold the evidence. |
+| `mcp__rustynet-deepseek__deepseek_live_lab_result` | Poll either async tool above by `job_id` (non-blocking: the report when done, else "still running Ns"). |
+| `mcp__rustynet-deepseek__deepseek_agent` | **Read-only autonomous research agent** — drives a tool-calling loop over a confined read-only toolset (23 tools) to inspect the LOCAL repo + lab *itself* + answer with cited evidence + an audit trace. Code: read_file (line ranges), grep (+`context` lines), list_dir, find_files, **find_definition + find_references** (declaration + call-sites). History: read-only git (log/show/diff/**blame**/cat-file). **Grounding-by-execution: `cargo_check`** (does it COMPILE + the real compiler error — host = macOS+common, `target:windows` = the x86_64-pc-windows-gnu cross-target) and scoped **`cargo_test`**. **LIVE cross-OS runtime: `lab_guest_exec`** runs a fixed read-only diagnostic on ANY guest — Linux via utmctl, macOS/Windows via SSH — check = network/routes/dns/service/ports/firewall. Plus the lab run-reports / stage logs / inventory / jobs. **Unlike the proxies (which only reason over what you paste), the agent GROUND-TRUTHS a claim against the actual code/lab** — and now confirms compile/test/runtime by RUNNING it, cross-OS. |
+| `mcp__rustynet-deepseek__deepseek_read` | Analysis, code review, security review, second opinion, risk ID — read-only (proxy; sees only pasted context). |
+| `mcp__rustynet-deepseek__deepseek_write` | Generate boilerplate, test scaffolds, doc drafts — advisory only (proxy). |
+| `mcp__rustynet-deepseek__deepseek_read_write` | Analyze pasted content then generate changes (review-then-fix, audit-then-patch) (proxy). |
+
+The MCP server runs `bin/rustynet-mcp-deepseek`; a rebuilt binary is only live in-session after a `/mcp`
+reconnect (kill ≠ auto-respawn; `claude mcp` has no reconnect). When you can't reconnect, drive the latest
+binary directly via `scripts/mcp/drive_deepseek.py --tool <name> --args '<json>'` — it does the JSON-RPC
+handshake + auto-polls `deepseek_live_lab_result` for the async run/triage tools, so the newest tools are
+reachable with NO reconnect. Install a rebuilt binary with an atomic **`mv`, never in-place `cp`** (the
+client mmaps the running binary, so `cp` corrupts it).
 
 **Model selection — know what each is good for:**
 
-- `model: "flash"` = `deepseek-chat` — **fast, cheap, your default for breadth.** Fan it
+- `model: "flash"` = `deepseek-v4-flash` — **fast, cheap, your default for breadth.** Fan it
   liberally and concurrently for: digesting long CI logs / daemon journals / nft-pf dumps /
   large diffs into salient facts; per-finding root-cause triage (one call per finding — you
   confirm + fix); researching unfamiliar error strings, platform quirks (WFP, PF/launchd, nft,
@@ -248,7 +259,7 @@ the *agent*, inspects the repo + lab itself:
   this patch" adversarial cross-checks. Flash handles the parallel research layer — run
   several calls at once.
 
-- `model: "pro"` = `deepseek-reasoner` — chain-of-thought, slower, for genuinely HARD
+- `model: "pro"` = `deepseek-v4-pro` (at MAX reasoning effort) — chain-of-thought, slower, for genuinely HARD
   multi-step reasoning: a gnarly multi-commit root-cause spanning many files, subtle
   protocol/security-logic analysis where flash keeps giving conflicting answers, or a complex
   bisect hypothesis where the answer is genuinely non-obvious. Reserve it — don't use pro for
