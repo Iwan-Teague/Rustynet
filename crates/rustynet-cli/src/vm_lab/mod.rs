@@ -7866,6 +7866,10 @@ fn run_windows_orchestration_with_pulled_bundles(
             .admin_platform
             .as_deref()
             .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
+        anchor_platform: config
+            .anchor_platform
+            .as_deref()
+            .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
         ..WindowsOrchestrationOptions::default()
     };
 
@@ -11841,6 +11845,11 @@ pub struct WindowsOrchestrationOptions {
     /// the mint/issue/sign path runs natively on Windows. Default (false) skips
     /// it. Self-contained: needs no exit/peer.
     pub validate_admin_issue: bool,
+    /// Elect the Windows host as the anchor (`--anchor-platform windows`).
+    /// When true the orchestrator runs `deploy_windows_anchor_service` and
+    /// `exercise_windows_anchor_bundle_pull_live` to live-prove the anchor
+    /// bundle-pull listener. Default (false) skips.
+    pub anchor_platform: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13472,6 +13481,13 @@ fn run_windows_orchestration_stages_with_options(
             format!(
                 "dry-run: would validate Windows anchor bundle-pull dry-run plan for {windows_alias} without guest mutation"
             ),
+            vec![],
+        )
+    } else if !options.anchor_platform {
+        stage_outcome(
+            "validate_windows_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!("skipped: {windows_alias} is not the elected anchor (anchor_platform != windows)"),
             vec![],
         )
     } else if !bootstrap_passed {
