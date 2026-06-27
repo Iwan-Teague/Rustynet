@@ -393,7 +393,7 @@ code change, the security call, and the live lab. If you catch yourself reading
 a long log / journal / diff / doc just to understand it, hand it to DeepSeek
 first and act on the distilled output.
 
-Four tools (`mcp__rustynet-deepseek__*`), each taking `prompt`, optional
+Five tools (`mcp__rustynet-deepseek__*`). The first four take `prompt`, optional
 `context`, and `model`:
 - `deepseek_read` — analysis / review / second opinion / risk ID (read-only).
 - `deepseek_write` — generate boilerplate / test scaffolds / doc drafts.
@@ -408,6 +408,19 @@ Four tools (`mcp__rustynet-deepseek__*`), each taking `prompt`, optional
   because Y?", "is this node reachable?"). Prefer it whenever you want DeepSeek
   to check the real code/lab, not opine on a pasted snippet.
 
+The fifth tool is the live-lab failure-triage **orchestrator** (different
+signature — `target`, `failure_context`, optional `max_steps`):
+- `deepseek_live_lab` — **the rigid, non-negotiable failure-triage pipeline.**
+  Hand it a failed live-lab stage's evidence as `failure_context`; it runs three
+  grounded read-only sub-agents in fixed order — v4-flash research (why/where/what,
+  + optional fix) → v4-flash verify-every-claim-against-the-repo/lab → v4-pro at
+  MAX reasoning re-verify + judge-the-best-fix — and returns ONE evidence-cited
+  report (root cause, file:line, suspected fix). No step writes the repo, runs
+  gates, or makes the security call. Use it for END-OF-RUN triage instead of a
+  bare flash fan-out; you still verify each cited claim against the real code
+  before acting. (A v4-pro layer that also *launches + drives* the lab is being
+  built on top of it.)
+
 Use it for: digesting CI logs / daemon journals / nft-pf dumps / large diffs;
 per-finding root-cause triage (one call each); researching unfamiliar errors +
 platform quirks (WFP / PF-launchd / nft / WireGuard); proactively hunting latent
@@ -416,10 +429,11 @@ platform-cfg cases"); drafting test scaffolds; and — before committing a
 security-sensitive patch — 3–5 concurrent "REFUTE this patch" cross-checks
 (disagreement = dig deeper first).
 
-Model: `model: "flash"` (deepseek-chat — fast, cheap; the DEFAULT, fan liberally
-and concurrently for breadth). `model: "pro"` (deepseek-reasoner —
-chain-of-thought, slow; reserve for genuinely hard multi-step root-cause /
-protocol-logic reasoning where flash keeps giving conflicting answers).
+Model: `model: "flash"` (deepseek-v4-flash — fast, cheap; the DEFAULT, fan
+liberally and concurrently for breadth). `model: "pro"` (deepseek-v4-pro at max
+reasoning effort — chain-of-thought, slow; reserve for genuinely hard multi-step
+root-cause / protocol-logic reasoning where flash keeps giving conflicting
+answers).
 
 **Hard limits — DeepSeek output is UNTRUSTED.** It never makes the security call,
 never writes the repo, never runs gates. It *proposes*; you verify against the

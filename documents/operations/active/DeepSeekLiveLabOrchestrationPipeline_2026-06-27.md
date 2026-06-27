@@ -1,8 +1,16 @@
 # DeepSeek Live-Lab Orchestration Pipeline — Design
 
-- Status: **DESIGN / pre-build** (2026-06-27)
+- Status: **BUILDING — Layer A + the rigid triage pipeline landed & live-verified; the v4-pro lab-orchestration launch is the next phase** (2026-06-27)
 - Owner surface: `crates/rustynet-mcp` (the `rustynet-mcp-deepseek` server, binary `bin/rustynet-mcp-deepseek`)
 - Related: [§12.5 DeepSeek MCP](../../../CLAUDE.md) · [LiveLabExecutionEfficiencyPlan](LiveLabExecutionEfficiencyPlan_2026-06-20.md) · [CrossPlatformRoleParityPlan](CrossPlatformRoleParityPlan_2026-06-21.md) · [CrossPlatformRoleParityRoadmap](CrossPlatformRoleParityRoadmap_2026-06-22.md)
+
+## 0. Implementation status (2026-06-27)
+
+Landed + verified on `claude/cross-platform-parity-hardening`:
+- **Layer A** (`82a9bfa`): canonical `deepseek-v4-pro` / `deepseek-v4-flash` ids; `reasoning_effort:"max"` on every Pro call (the highest level per the Thinking-Mode docs — confirmed accepted by the live endpoint); a unit test locking the proxy tools out of any agent's tool-set.
+- **The rigid triage pipeline** (`e98b919`): `run_triage()` runs Flash research → Flash verify → v4-pro(max) review as deterministic control flow (never model-chosen); each step is a read-only grounded agent reusing the generalized `run_grounded()` loop. Exposed as the **`deepseek_live_lab`** MCP tool (v1 triages a caller-supplied `failure_context`). Per-step stderr tracing (`[live-lab] agent '<role>' step n/N → tools`) for live observability; a `strip_dsml_markup` guard cleans DeepSeek-native tool markup that leaks into budget-exhausted answers. **Live-verified end-to-end over real MCP** against the macOS-relay false-fail: all three sub-agents launch in order and ground themselves in the real repo *and* lab (`find_files`/`grep`/`read_file`/`find_definition`/`git` + `lab_run_status`/`lab_inventory`/`lab_run_detail`/`lab_stage_log`), producing a correct, file:line-cited root-cause report.
+
+Next phase (the launch half of §6/§7 below — designed, not yet built): the **v4-pro lab-orchestration launch** — the confined lab-action tools (`lab_run_stage`/`lab_recover_vm`/`lab_clean_env`/…) + the stage-by-stage orchestration loop so `deepseek_live_lab` also *runs* the lab (setup/run-split profile invocation), with the first full live run as the verification trigger.
 
 ## 1. Intent
 
