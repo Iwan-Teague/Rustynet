@@ -67,6 +67,8 @@ const LAB_KNOWN_HOSTS_REL: &str = ".ssh/known_hosts";
 /// Timeout for the agents' `cargo check`/`cargo test` grounding tools. Generous —
 /// a cold cross-target check can run minutes; the step budget caps how many run.
 const CARGO_TOOL_TIMEOUT_SECS: u64 = 420;
+/// Timeout for a single SSH guest-diagnostic round trip (connect + one command).
+const GUEST_SSH_TIMEOUT_SECS: u64 = 45;
 
 /// State of an async triage job: still running (with its start time, for elapsed
 /// reporting) or finished with its assembled report.
@@ -1672,76 +1674,125 @@ impl DeepSeekServer {
             ));
         }
         let check = arg_str(args, "check").ok_or("missing 'check'")?.trim();
-        // The enum maps to a HARD-CODED command — never caller-supplied argv.
-        let cmd: &[&str] = match check {
-            "network" => &["/usr/sbin/ip", "-br", "addr"],
-            "routes" => &["/usr/sbin/ip", "route"],
-            "dns" => &["/bin/cat", "/etc/resolv.conf"],
-            "daemon" => &["/usr/bin/systemctl", "is-active", "rustynetd"],
-            other => {
-                return Err(format!(
-                    "invalid check '{other}': must be one of network|routes|dns|daemon"
-                ));
-            }
-        };
-
-        // Resolve alias → (utm_name, platform) from the inventory.
-        let (utm_name, platform) = self
-            .lab_inventory_alias(vm_alias)?
+        let conn = self
+            .lab_guest_conn(vm_alias)?
             .ok_or_else(|| format!("unknown vm_alias '{vm_alias}' (not in inventory)"))?;
-        // Linux-only: macOS UTM uses Apple Virtualization (no utmctl exec);
-        // Windows guests do not run these Linux commands. Fail closed.
-        if platform != "linux" {
-            return Err(format!(
-                "vm_alias '{vm_alias}' is platform '{platform}'; lab_guest_exec only targets Linux guests (utmctl exec)"
-            ));
-        }
 
-        let utmctl = utmctl_path();
-        // Require the guest to be running — utmctl exec only answers a started VM.
-        let power = self.utm_power_status(&utmctl, &utm_name)?;
-        if power.as_deref() != Some("started") {
-            return Err(format!(
-                "VM '{vm_alias}' (utm_name={utm_name}) is '{}', not started — cannot exec into a non-running guest",
-                power.as_deref().unwrap_or("unknown")
-            ));
+        match conn.platform.as_str() {
+            "linux" => {
+                // Linux: utmctl exec — out-of-band, works even if SSH is wedged.
+                let cmd = linux_guest_cmd(check).ok_or_else(|| {
+                    format!("invalid check '{check}' for linux: network|routes|dns|service|ports|firewall")
+                })?;
+                let utm_name = conn
+                    .utm_name
+                    .as_deref()
+                    .ok_or("linux guest has no controller.utm_name in inventory")?;
+                let utmctl = utmctl_path();
+                let power = self.utm_power_status(&utmctl, utm_name)?;
+                if power.as_deref() != Some("started") {
+                    return Err(format!(
+                        "VM '{vm_alias}' (utm_name={utm_name}) is '{}', not started",
+                        power.as_deref().unwrap_or("unknown")
+                    ));
+                }
+                let mut argv: Vec<&str> = vec!["exec", utm_name, "--cmd"];
+                argv.extend_from_slice(cmd);
+                let outcome = run_with_timeout(
+                    &utmctl,
+                    &argv,
+                    &self.repo_root,
+                    &[],
+                    Duration::from_secs(SUBPROC_TIMEOUT_SECS),
+                )?;
+                Ok(format_guest_output(
+                    vm_alias,
+                    check,
+                    "linux",
+                    &cmd.join(" "),
+                    &outcome.stdout,
+                    &outcome.stderr,
+                ))
+            }
+            platform @ ("macos" | "windows") => {
+                // macOS/Windows: no utmctl exec → SSH. Fixed (non-caller) command;
+                // password from the inventory passed via the SSHPASS env var, never
+                // in argv or logs. PubkeyAuthentication=no so we don't leak a key.
+                let remote = ssh_guest_cmd(platform, check).ok_or_else(|| {
+                    format!("invalid check '{check}' for {platform}: network|routes|dns|service|ports|firewall")
+                })?;
+                let target = conn
+                    .ssh_target
+                    .as_deref()
+                    .ok_or("no ssh_target/last_known_ip in inventory for this guest")?;
+                if !is_valid_host(target) {
+                    return Err(format!("invalid ssh_target '{target}' in inventory"));
+                }
+                let user = conn
+                    .ssh_user
+                    .as_deref()
+                    .ok_or("no ssh_user in inventory for this guest")?;
+                if user.is_empty()
+                    || user.len() > 64
+                    || !user
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+                {
+                    return Err(format!("invalid ssh_user '{user}' in inventory"));
+                }
+                let pw = conn
+                    .ssh_password
+                    .as_deref()
+                    .ok_or("no ssh_password in inventory for this guest (SSH exec needs it)")?;
+                if !which("sshpass") {
+                    return Err(
+                        "sshpass not on PATH — required for macOS/Windows guest SSH (e.g. brew install sshpass)".into(),
+                    );
+                }
+                let userhost = format!("{user}@{target}");
+                let env: Vec<(&str, &str)> = vec![("SSHPASS", pw)];
+                let argv: Vec<&str> = vec![
+                    "-e",
+                    "ssh",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "PreferredAuthentications=password",
+                    "-o",
+                    "PubkeyAuthentication=no",
+                    &userhost,
+                    remote,
+                ];
+                let outcome = run_with_timeout(
+                    "sshpass",
+                    &argv,
+                    &self.repo_root,
+                    &env,
+                    Duration::from_secs(GUEST_SSH_TIMEOUT_SECS),
+                )?;
+                Ok(format_guest_output(
+                    vm_alias,
+                    check,
+                    platform,
+                    remote,
+                    &outcome.stdout,
+                    &outcome.stderr,
+                ))
+            }
+            other => Err(format!(
+                "vm_alias '{vm_alias}' has unknown platform '{other}'"
+            )),
         }
-
-        // argv-only utmctl exec: utm_name + the fixed command, no shell.
-        let mut argv: Vec<&str> = vec!["exec", &utm_name, "--cmd"];
-        argv.extend_from_slice(cmd);
-        let outcome = run_with_timeout(
-            &utmctl,
-            &argv,
-            &self.repo_root,
-            &[],
-            Duration::from_secs(SUBPROC_TIMEOUT_SECS),
-        )?;
-        let mut out = format!(
-            "# lab_guest_exec {vm_alias} [{check}] (utm_name={utm_name})\n\n`{}`\n\n",
-            cmd.join(" ")
-        );
-        let stdout = outcome.stdout.trim();
-        if !stdout.is_empty() {
-            out.push_str(&format!("```\n{stdout}\n```\n"));
-        }
-        let stderr = outcome.stderr.trim();
-        if !stderr.is_empty() {
-            out.push_str(&format!(
-                "\n_stderr:_ {}\n",
-                truncate_output(stderr, 10, 1000)
-            ));
-        }
-        if stdout.is_empty() && stderr.is_empty() {
-            out.push_str("(no output)\n");
-        }
-        Ok(out)
     }
 
-    /// Resolve an inventory alias → (utm_name, platform). Mirrors lab_state's
-    /// inventory parse: Linux entries have no `platform` field → "linux". Returns
-    /// Ok(None) when the alias is absent. The inventory path is confined.
-    fn lab_inventory_alias(&self, alias: &str) -> Result<Option<(String, String)>, String> {
+    /// Resolve an inventory alias → its connection details (platform, utm_name,
+    /// ssh_target/user/password). Linux entries have no `platform` field → "linux".
+    /// Returns Ok(None) when the alias is absent. The inventory path is confined;
+    /// the ssh_password (a pre-existing lab-inventory field) is only ever read here
+    /// and handed to sshpass via the SSHPASS env var — never logged or returned.
+    fn lab_guest_conn(&self, alias: &str) -> Result<Option<GuestConn>, String> {
         let canon = self.confine(LAB_INVENTORY_PATH)?;
         let body = rustynet_mcp::read_file_capped(&canon, 4 * 1024 * 1024)?;
         let inv: Value =
@@ -1753,23 +1804,31 @@ impl DeepSeekServer {
             if e.get("alias").and_then(|v| v.as_str()) != Some(alias) {
                 continue;
             }
-            // utm_name is required to exec — its absence means no controller.
-            let Some(utm_name) = e
-                .get("controller")
-                .and_then(|c| c.get("utm_name"))
-                .and_then(|v| v.as_str())
-            else {
-                return Err(format!(
-                    "alias '{alias}' has no controller.utm_name (not a local UTM guest)"
-                ));
-            };
+            let s = |k: &str| e.get(k).and_then(|v| v.as_str()).map(String::from);
             let platform = e
                 .get("platform")
                 .and_then(|v| v.as_str())
                 .filter(|p| !p.is_empty())
                 .unwrap_or("linux")
                 .to_string();
-            return Ok(Some((utm_name.to_string(), platform)));
+            let ssh_target = s("ssh_target").or_else(|| s("last_known_ip")).or_else(|| {
+                e.get("live_ips")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
+            return Ok(Some(GuestConn {
+                platform,
+                utm_name: e
+                    .get("controller")
+                    .and_then(|c| c.get("utm_name"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                ssh_target,
+                ssh_user: s("ssh_user"),
+                ssh_password: s("ssh_password"),
+            }));
         }
         Ok(None)
     }
@@ -2536,6 +2595,92 @@ fn build_orchestrator_args(
     a
 }
 
+/// Resolved connection details for a lab guest, parsed from the inventory.
+struct GuestConn {
+    platform: String,
+    utm_name: Option<String>,
+    ssh_target: Option<String>,
+    ssh_user: Option<String>,
+    ssh_password: Option<String>,
+}
+
+/// Fixed read-only diagnostic command (argv) for a Linux guest, run via
+/// `utmctl exec` (out-of-band — works even when the guest's SSH is wedged).
+fn linux_guest_cmd(check: &str) -> Option<&'static [&'static str]> {
+    Some(match check {
+        "network" => &["/usr/sbin/ip", "-br", "addr"],
+        "routes" => &["/usr/sbin/ip", "route"],
+        "dns" => &["/bin/cat", "/etc/resolv.conf"],
+        "service" | "daemon" => &["/usr/bin/systemctl", "is-active", "rustynetd"],
+        "ports" => &["/usr/bin/ss", "-tlnp"],
+        "firewall" => &["/usr/sbin/nft", "list", "ruleset"],
+        _ => return None,
+    })
+}
+
+/// Fixed read-only diagnostic command (one remote-shell string) for a macOS or
+/// Windows guest, run over SSH. NOT caller-controlled — a closed enum, so even
+/// though SSH invokes the remote shell there is nothing to inject.
+fn ssh_guest_cmd(platform: &str, check: &str) -> Option<&'static str> {
+    Some(match (platform, check) {
+        ("macos", "network") => "ifconfig -a",
+        ("macos", "routes") => "netstat -rn",
+        ("macos", "dns") => "scutil --dns",
+        ("macos", "service" | "daemon") => {
+            "launchctl list | grep -i rustynet || echo '(no rustynet launchd job listed)'"
+        }
+        ("macos", "ports") => "lsof -nP -iTCP -sTCP:LISTEN",
+        ("macos", "firewall") => {
+            "sudo -n pfctl -sr 2>&1 || echo '(pf rules need sudo; add a NOPASSWD sudoers line for /sbin/pfctl to inspect them)'"
+        }
+        ("windows", "network") => "powershell -NoProfile -Command \"ipconfig /all\"",
+        ("windows", "routes") => "powershell -NoProfile -Command \"route print\"",
+        ("windows", "dns") => {
+            "powershell -NoProfile -Command \"Get-DnsClientServerAddress | Format-Table -AutoSize | Out-String -Width 200\""
+        }
+        ("windows", "service" | "daemon") => {
+            "powershell -NoProfile -Command \"Get-Service rustynet* | Format-Table -AutoSize | Out-String\""
+        }
+        ("windows", "ports") => {
+            "powershell -NoProfile -Command \"netstat -ano | Select-String LISTENING\""
+        }
+        ("windows", "firewall") => {
+            "powershell -NoProfile -Command \"Get-NetFirewallRule -DisplayName 'rustynet*' -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String\""
+        }
+        _ => return None,
+    })
+}
+
+/// Format a guest-diagnostic command outcome into a report block.
+fn format_guest_output(
+    vm_alias: &str,
+    check: &str,
+    platform: &str,
+    cmd: &str,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    let mut out = format!("# lab_guest_exec {vm_alias} [{check}] ({platform})\n\n`{cmd}`\n\n");
+    let stdout = stdout.trim();
+    if !stdout.is_empty() {
+        out.push_str(&format!(
+            "```\n{}\n```\n",
+            truncate_output(stdout, 200, 12 * 1024)
+        ));
+    }
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        out.push_str(&format!(
+            "\n_stderr:_ {}\n",
+            truncate_output(stderr, 20, 2000)
+        ));
+    }
+    if stdout.is_empty() && stderr.is_empty() {
+        out.push_str("(no output)\n");
+    }
+    out
+}
+
 /// Validate a workspace crate name for the cargo grounding tools: ASCII
 /// alphanumeric + '-'/'_' only (no path, no flags, no shell metacharacters).
 fn validate_crate_name(s: &str) -> Option<&str> {
@@ -2660,11 +2805,12 @@ Tools available to you on EVERY turn: \
 - lab_inventory — the lab roster: alias, platform, OS, lab_role, ssh_user, mesh_ip, IPs \
   (credentials omitted). USE THIS to learn which nodes/roles/OSes exist. \
 - lab_node_reachable — TCP-probe a lab host (is its :22 / daemon port up?). \
-- lab_guest_exec — run ONE fixed read-only command inside a running LINUX guest via \
-  utmctl exec: check=network|routes|dns|daemon ONLY (ip -br addr / ip route / \
-  cat /etc/resolv.conf / systemctl is-active rustynetd). The command is fixed, not \
-  caller-controlled; it cannot write or run arbitrary commands. USE THIS for live \
-  Linux-guest network/DNS/daemon state. \
+- lab_guest_exec — run ONE fixed read-only diagnostic inside a running guest of ANY \
+  OS (Linux via utmctl exec; macOS/Windows over SSH), for LIVE state. \
+  check=network|routes|dns|service|ports|firewall, mapped per-OS (e.g. firewall = nft \
+  ruleset on Linux, pf rules on macOS, Get-NetFirewallRule on Windows). The command is \
+  fixed, not caller-controlled; it cannot write or run arbitrary commands. USE THIS for \
+  live cross-OS network/DNS/service/ports/firewall state. \
 - lab_run_status — recent live-lab run results from the run matrix: commit, overall \
   pass/fail, first-failed stage, and per-stage status (e.g. two_hop, relay). USE THIS \
   for 'what's the latest lab status / did stage X pass'. \
@@ -2833,14 +2979,17 @@ fn agent_tool_definitions() -> Value {
         ),
         fn_tool(
             "lab_guest_exec",
-            "Run ONE fixed read-only diagnostic command inside a named, running LINUX UTM guest via \
-             utmctl exec. The command is selected by `check` (network=`ip -br addr`, routes=`ip route`, \
-             dns=`cat /etc/resolv.conf`, daemon=`systemctl is-active rustynetd`) and is NOT \
-             caller-controlled — there is no arbitrary exec, no writes. Fails closed if the guest is \
-             absent, not running, or not Linux.",
+            "Run ONE fixed read-only diagnostic command inside a running lab guest of ANY OS, to \
+             gather LIVE runtime state. Linux via utmctl exec (out-of-band); macOS + Windows over \
+             SSH (creds from the inventory). The command is selected by `check`, NOT \
+             caller-controlled — there is no arbitrary exec and no writes. checks: network \
+             (ip/ifconfig/ipconfig), routes, dns (resolv.conf / scutil / Get-DnsClientServerAddress), \
+             service (rustynetd / launchd / Windows service), ports (ss/lsof/netstat listeners), \
+             firewall (nft ruleset / pf rules / Get-NetFirewallRule). Use this to ground a cross-OS \
+             diagnosis in the guest's actual state. Fails closed if absent / not running / no creds.",
             json!({
-                "vm_alias": {"type": "string", "description": "Inventory alias of a Linux guest, e.g. 'debian-headless-1'"},
-                "check": {"type": "string", "enum": ["network", "routes", "dns", "daemon"], "description": "Which fixed read-only command to run"}
+                "vm_alias": {"type": "string", "description": "Inventory alias of any lab guest, e.g. 'debian-headless-1', 'macos-utm-1', 'windows-utm-1'"},
+                "check": {"type": "string", "enum": ["network", "routes", "dns", "service", "ports", "firewall"], "description": "Which fixed read-only diagnostic to run (mapped per-OS)"}
             }),
             &["vm_alias", "check"],
         ),
@@ -3045,7 +3194,8 @@ impl McpServer for DeepSeekServer {
                     confined, read-only tool set that inspects THIS machine's local Rustynet repo and UTM \
                     lab (read_file, list_dir, grep, find_files, find_definition, read-only git, \
                     utm_vm_status, lab_inventory, lab_node_reachable, lab_guest_exec [fixed read-only \
-                    Linux-guest commands], host_system_info, host_disk_status, lab_run_status, \
+                    any-OS guest diagnostics: Linux via utmctl, macOS/Windows via SSH], \
+                    host_system_info, host_disk_status, lab_run_status, \
                     lab_run_detail, lab_jobs, lab_loop_journal, lab_job_log, lab_stage_log, \
                     lab_report_grep, lab_report_artifacts) and returns an evidence-backed answer plus an \
                     audit trace of what it inspected. It CANNOT write/edit/delete anything. \
