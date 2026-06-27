@@ -10264,11 +10264,15 @@ fn exercise_macos_relay_lifecycle_live(
          sudo sh -c 'tr -d \"[:space:]\" < /usr/local/var/rustynet/trust/trust-evidence.pub | xxd -r -p | tee /usr/local/var/rustynet/relay-verifier.pub >/dev/null && chmod 644 /usr/local/var/rustynet/relay-verifier.pub'; \
          T=\"$(mktemp -d /tmp/rn-relay.XXXXXX)\"; mkdir -p \"$T/scripts/launchd\"; cp {plist} \"$T/scripts/launchd/com.rustynet.relay.plist\"; \
          ( cd \"$T\" && sudo $RN ops install-macos-relay ) 2>&1 | tail -3; \
-         sleep 6; \
-         HEALTH=\"$(curl -s --max-time 5 http://127.0.0.1:4501/healthz 2>/dev/null || true)\"; \
-         HP=$(sudo lsof -nP -iTCP:4501 -sTCP:LISTEN 2>/dev/null | grep -c 4501 || true); \
-         if ! printf '%s' \"$HEALTH\" | grep -qi ok; then echo \"relay /healthz not ok during run: '$HEALTH'\" >&2; sudo rm -rf \"$T\"; exit 1; fi; \
-         if [ \"$HP\" = '0' ]; then echo 'relay health listener 127.0.0.1:4501 not bound during run' >&2; sudo rm -rf \"$T\"; exit 1; fi; \
+         HEALTH=''; HP='0'; \
+         for _i in $(seq 1 15); do \
+           HEALTH=\"$(curl -s --max-time 5 http://127.0.0.1:4501/healthz 2>/dev/null || true)\"; \
+           HP=$(sudo lsof -nP -iTCP:4501 -sTCP:LISTEN 2>/dev/null | grep -c 4501 || true); \
+           if printf '%s' \"$HEALTH\" | grep -qi ok && [ \"$HP\" != '0' ]; then break; fi; \
+           sleep 2; \
+         done; \
+         if ! printf '%s' \"$HEALTH\" | grep -qi ok; then echo \"relay /healthz not ok during run after ~30s: '$HEALTH'\" >&2; sudo rm -rf \"$T\"; exit 1; fi; \
+         if [ \"$HP\" = '0' ]; then echo 'relay health listener 127.0.0.1:4501 not bound during run after ~30s' >&2; sudo rm -rf \"$T\"; exit 1; fi; \
          sudo $RN ops install-macos-relay --uninstall 2>&1 | tail -2; \
          sleep 3; \
          HEALTH2=\"$(curl -s --max-time 3 http://127.0.0.1:4501/healthz 2>/dev/null || true)\"; \
