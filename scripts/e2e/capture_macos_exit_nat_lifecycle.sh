@@ -36,6 +36,13 @@ PF_ANCHOR="com.rustynet/nat"
 SERVICE_LABEL="com.rustynet.daemon"
 SERVICE_PLIST="/Library/LaunchDaemons/com.rustynet.daemon.plist"
 SETTLE_SECS=4
+# The admin->exit role transition's launchd restarts can briefly leave the daemon
+# fail-closed (membership reconcile racing the snapshot write -> restrict_recoverable
+# -> NAT anchor torn down) before it self-heals into a stable exit-mode. Poll the
+# during_run snapshot up to MAX_ATTEMPTS x RETRY_SECS so we capture the SETTLED
+# exit-mode, not a transient restriction window. The assertion is unchanged.
+DURING_RUN_MAX_ATTEMPTS=20
+DURING_RUN_RETRY_SECS=3
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -45,6 +52,8 @@ while [[ $# -gt 0 ]]; do
         --service-label)    SERVICE_LABEL="$2"; shift 2 ;;
         --service-plist)    SERVICE_PLIST="$2"; shift 2 ;;
         --settle-secs)      SETTLE_SECS="$2"; shift 2 ;;
+        --during-run-max-attempts) DURING_RUN_MAX_ATTEMPTS="$2"; shift 2 ;;
+        --during-run-retry-secs)   DURING_RUN_RETRY_SECS="$2"; shift 2 ;;
         *)
             printf 'unknown argument: %s\n' "$1" >&2
             exit 1
@@ -76,9 +85,30 @@ after_path="$snapshot_dir/after.json"
 trap 'rm -rf "$snapshot_dir"' EXIT
 
 printf '[capture] during_run snapshot (daemon expected exit-mode)\n'
-rustynetd macos-exit-nat-lifecycle-snapshot \
-    --mesh-cidr "$MESH_CIDR" \
-    --pf-anchor "$PF_ANCHOR" > "$during_path"
+# Poll until the daemon has settled into exit-mode (pf NAT anchor loaded). The
+# admin->exit transition's launchd restarts can briefly leave the daemon
+# fail-closed (reconcile racing the snapshot write -> restricted -> NAT torn
+# down) and a single-shot snapshot can land in that ~seconds-long window and read
+# no anchor. We retry the SAME assertion (the snapshot subcommand still requires
+# the anchor) until exit-mode is live or the bounded window elapses -- this waits
+# out a fail-CLOSED transient, it does not weaken the proof.
+during_ok=0
+during_err="$snapshot_dir/during.err"
+for _attempt in $(seq 1 "$DURING_RUN_MAX_ATTEMPTS"); do
+    if rustynetd macos-exit-nat-lifecycle-snapshot \
+        --mesh-cidr "$MESH_CIDR" \
+        --pf-anchor "$PF_ANCHOR" > "$during_path" 2>"$during_err"; then
+        during_ok=1
+        break
+    fi
+    sleep "$DURING_RUN_RETRY_SECS"
+done
+if [[ "$during_ok" != 1 ]]; then
+    printf '[capture] during_run snapshot never observed exit-mode after %s attempts (~%ss):\n' \
+        "$DURING_RUN_MAX_ATTEMPTS" "$((DURING_RUN_MAX_ATTEMPTS * DURING_RUN_RETRY_SECS))" >&2
+    cat "$during_err" >&2 2>/dev/null || true
+    exit 1
+fi
 
 printf '[capture] stopping launchd service %s\n' "$SERVICE_LABEL"
 launchctl bootout "system/${SERVICE_LABEL}" >/dev/null 2>&1 || true
