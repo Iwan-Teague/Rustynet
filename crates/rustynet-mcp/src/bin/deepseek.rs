@@ -896,7 +896,11 @@ impl DeepSeekServer {
         );
         let worker = self.clone();
         let jid = job_id.clone();
-        let report_dir = format!("state/deepseek-lab-{job_id}");
+        // Suffix the report dir with the server PID so it is unique across MCP
+        // restarts: the job counter resets to 0 each restart, so without this the
+        // first run after every restart would reuse `deepseek-lab-labrun-1` and the
+        // orchestrator (which refuses a non-empty report dir) would fail.
+        let report_dir = format!("state/deepseek-lab-{job_id}-{}", std::process::id());
         std::thread::spawn(move || {
             let ssh = home_path(LAB_SSH_IDENTITY_REL);
             let kh = home_path(LAB_KNOWN_HOSTS_REL);
