@@ -422,7 +422,18 @@ The remaining three are the live-lab family. The **loop driver** you normally ca
   `relay_platform` / `anchor_platform` / `blind_exit_platform` (each
   `linux|macos|windows`), or `macos_promote_exit: true` (+ `entry_vm` in the
   Option-B exit topology) — to ELECT a mac/win node into that role so the cell
-  runs live instead of skipping.
+  runs live instead of skipping. (`legacy_bash: true` routes the Linux live suite
+  through the legacy bash orchestrator instead of the default Rust one; BOTH paths
+  run the mac/win role stages — `activate_macos_exit_role` + capture, the
+  relay/anchor lifecycle — when `--macos-vm` + the role selector are set, so
+  `legacy_bash` is OPTIONAL. The early `macos_preflight_check` logging "no macOS
+  nodes in topology — skipping" is a benign Linux-preflight artifact, NOT the
+  macOS role stages.) The run is RELOAD-PROOF: the orchestrator
+  is spawned detached (own process group, stdout→a log file, no pipe to the MCP
+  server) so an MCP-server recycle mid-run no longer SIGPIPE-kills it, and async
+  jobs persist to `state/deepseek-mcp-jobs/{job_id}.json` (ids
+  `labrun-{millis}-{pid}-{seq}`) so `deepseek_live_lab_result` recovers the job
+  after a reload.
 - `deepseek_live_lab` — **the rigid, non-negotiable failure-triage pipeline** on a
   failure you ALREADY have (hand it `target` + `failure_context`). Three grounded
   read-only sub-agents in fixed order — v4-flash research (why/where/what) →
