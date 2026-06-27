@@ -8545,7 +8545,24 @@ main() {
   fi
 
   if has_four_node_live_topology; then
-    run_stage hard live_two_hop 'run live two-hop validation' stage_run_live_two_hop
+    # two_hop's end-to-end proof pings a PUBLIC target (1.1.1.1) THROUGH the exit
+    # chain. In an air-gapped lab (the UTM guests sit on an isolated host-only
+    # bridge with no internet egress — a clean guest here cannot even reach the
+    # default gateway) that target is unreachable no matter how correct the
+    # forwarding is, so the stage would hard-FAIL for an ENVIRONMENTAL reason and
+    # abort the whole run before every later stage (incl. the macOS/Windows role
+    # validators). Probe the exit node's egress to the public target first; only
+    # run two_hop when egress is genuinely available, otherwise record an honest
+    # SKIP (env-unavailable, not a product defect) so the run continues. The exit
+    # is already exit-active from baseline, and a de-killswitched guest here is
+    # equally unreachable, so this is a true network-egress check. (Caveat: a lab
+    # WITH egress whose exit killswitch denies locally-originated egress could
+    # over-skip; refine to probe the NAT-forwarded path if such an env appears.)
+    if live_lab_run_root "$(node_target_for_label exit)" 'root ping -c1 -W2 1.1.1.1' >/dev/null 2>&1; then
+      run_stage hard live_two_hop 'run live two-hop validation' stage_run_live_two_hop
+    else
+      record_stage_skip live_two_hop hard 'internet egress unavailable: exit node cannot reach the public two-hop probe target 1.1.1.1 (air-gapped host-only lab); public end-to-end two-hop routing is not validatable in this environment'
+    fi
     run_stage hard live_lan_toggle 'run LAN access toggle / blind-exit validation' stage_run_live_lan_toggle
   else
     record_stage_skip live_two_hop hard 'requires entry and aux targets'
