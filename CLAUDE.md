@@ -446,11 +446,17 @@ any claim driving a security or code change, YOUR verification against the real
 code stays mandatory. If the server is down, proceed without it.
 
 Operational: the servers run pre-built binaries at `bin/rustynet-mcp-*` (config in
-`mcp/mcp.json`). If `deepseek_agent` is absent (only the three proxies present),
-`bin/rustynet-mcp-deepseek` is stale — rebuild (`cargo build --release --bin
-rustynet-mcp-deepseek`), install over `bin/rustynet-mcp-deepseek`, then reconnect
-the server (`/mcp` → reconnect, or restart the client — killing the process does
-NOT auto-respawn). The API key resolves from `DEEPSEEK_API_KEY` or
+`mcp/mcp.json`). If `deepseek_agent`/`deepseek_live_lab` is absent or stale,
+rebuild (`cargo build --release --bin rustynet-mcp-deepseek`) and install via an
+atomic **`mv`, NOT in-place `cp`** — the client keeps the running binary mmap'd,
+so `cp` truncates it in place and CORRUPTS it (symptom: the server starts but
+emits nothing). Use `cp … bin/x.new && mv -f bin/x.new bin/x`. Then reconnect the
+server (`/mcp` → reconnect, or restart the client — killing the process does NOT
+auto-respawn, and there is no `claude mcp` reconnect subcommand). When you can't
+reconnect (e.g. a remote client), drive the freshly built binary **directly over
+stdio** instead — JSON-RPC `initialize` → `notifications/initialized` →
+`tools/call`; `deepseek_live_lab` returns a job_id, then poll
+`deepseek_live_lab_result`. The API key resolves from `DEEPSEEK_API_KEY` or
 `~/Desktop/deepseek_api.md`; **never commit, log, or write it into the repo or any
 artifact.**
 
