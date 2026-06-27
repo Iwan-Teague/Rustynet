@@ -13,6 +13,12 @@
 //!   lab_run_detail/lab_loop_journal/lab_inventory/lab_jobs/lab_guest_exec/
 //!   lab_job_log/lab_stage_log/lab_report_grep/lab_report_artifacts) that
 //!   inspects the LOCAL Rustynet repo + UTM lab. It cannot write.
+//! - `deepseek_doc_sync` — PROPOSE-ONLY, READ-ONLY docs-sync: after a
+//!   lab-verified fix, a grounded agent (same loop, but the repo-reads-only tool
+//!   subset — NO lab/guest/cargo tools) reads the current docs and proposes the
+//!   exact docs-only edits (file/old_string/new_string/rationale) to keep them in
+//!   sync. It writes nothing; a human applies the edits. Async — poll
+//!   `deepseek_live_lab_result` for the structured proposal.
 //!
 //! Model selection per call:
 //! - `"flash"` → deepseek-v4-flash (fast, low cost — default)
@@ -78,6 +84,58 @@ enum TriageJob {
 }
 
 type JobMap = Arc<Mutex<HashMap<String, TriageJob>>>;
+
+/// Which confined, read-only tool repertoire a grounded agent run is allowed to
+/// use. Both variants are READ-ONLY (no tool mutates the repo, the lab, or any
+/// guest); the variant only restricts WHICH read-only tools are exposed.
+#[derive(Clone, Copy)]
+enum AgentToolset {
+    /// The full grounding repertoire: repo reads + read-only git + live-lab/guest
+    /// diagnostics + cargo grounding. Used by deepseek_agent and the triage
+    /// pipeline, which need to inspect real lab/run state.
+    Full,
+    /// REPO-READS-ONLY subset: read_file / list_dir / grep / find_files /
+    /// find_definition / find_references / read-only git. No lab, guest, host,
+    /// or cargo tools. Used by deepseek_doc_sync so a docs-sync proposal can only
+    /// read repo files — it can touch no lab/guest surface at all.
+    DocsRepoReadOnly,
+}
+
+impl AgentToolset {
+    /// The OpenAI-style tool-definition array advertised to the model for this
+    /// toolset. `DocsRepoReadOnly` is the filtered repo-reads-only subset.
+    fn definitions(self) -> Value {
+        match self {
+            AgentToolset::Full => agent_tool_definitions(),
+            AgentToolset::DocsRepoReadOnly => doc_sync_tool_definitions(),
+        }
+    }
+
+    /// Whether a tool name is permitted under this toolset. The dispatch path
+    /// gates on this so that even if the model emits a tool name outside the
+    /// advertised set, a disallowed (e.g. lab/guest/cargo) tool is rejected
+    /// rather than executed.
+    fn allows(self, name: &str) -> bool {
+        match self {
+            AgentToolset::Full => true,
+            AgentToolset::DocsRepoReadOnly => DOC_SYNC_TOOL_NAMES.contains(&name),
+        }
+    }
+}
+
+/// The exact repo-reads-only tool names doc_sync may call. Kept in lockstep with
+/// `doc_sync_tool_definitions()`; the dispatch gate (`AgentToolset::allows`)
+/// rejects anything not in this list, so no lab/guest/host/cargo tool is
+/// reachable from a docs-sync run.
+const DOC_SYNC_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "grep",
+    "git",
+    "find_files",
+    "find_definition",
+    "find_references",
+];
 
 #[derive(Clone)]
 struct DeepSeekServer {
@@ -180,13 +238,22 @@ impl DeepSeekServer {
     /// `tool_calls` (which we execute locally and feed back) or with a final
     /// `content` answer (which we return). Bounded by `max_steps`.
     fn run_agent(&self, prompt: &str, model: &str, max_steps: u64) -> Result<String, String> {
-        self.run_grounded("agent", AGENT_SYSTEM_PROMPT, prompt, model, max_steps)
+        self.run_grounded(
+            "agent",
+            AGENT_SYSTEM_PROMPT,
+            prompt,
+            model,
+            max_steps,
+            AgentToolset::Full,
+        )
     }
 
     /// The grounded read-only tool-calling loop, parameterized by system prompt
-    /// so the failure-triage roles (research / verify / review) reuse the exact
-    /// same confined, read-only tool set + loop, swapping only the instructions.
-    /// No role can write — the tool set is read-only for every system prompt.
+    /// AND tool set so the failure-triage roles (research / verify / review) and
+    /// the docs-sync role reuse the exact same confined, read-only loop, swapping
+    /// only the instructions and which read-only tools are exposed. No role can
+    /// write — every tool in every set is read-only; `toolset` only narrows WHICH
+    /// read-only tools are reachable (docs-sync gets repo-reads only).
     fn run_grounded(
         &self,
         label: &str,
@@ -194,8 +261,9 @@ impl DeepSeekServer {
         prompt: &str,
         model: &str,
         max_steps: u64,
+        toolset: AgentToolset,
     ) -> Result<String, String> {
-        let tools = agent_tool_definitions();
+        let tools = toolset.definitions();
         // Budget-aware system prompt: without this, flash agents tend to spend
         // EVERY step on tool calls and then, when forced to answer with no tools
         // left, emit tool-call markup instead of prose (→ an empty budget note).
@@ -257,7 +325,18 @@ impl DeepSeekServer {
                         let args_raw = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
                         let args: Value = serde_json::from_str(args_raw).unwrap_or(Value::Null);
 
-                        let result = self.dispatch_agent_tool(name, &args);
+                        // Gate on the run's toolset so a disallowed tool (e.g. a
+                        // lab/guest/cargo tool requested from a docs-sync run) is
+                        // refused rather than executed — defense in depth on top
+                        // of only advertising the permitted definitions.
+                        let result = if toolset.allows(name) {
+                            self.dispatch_agent_tool(name, &args)
+                        } else {
+                            format!(
+                                "ERROR: tool '{name}' is not available in this run's tool set \
+                                 (docs-sync is restricted to repo reads only)"
+                            )
+                        };
                         let bounded = truncate_output(&result, 400, TOOL_RESULT_MAX_BYTES);
                         trace.push(format!(
                             "- `{name}`({}) → {} bytes",
@@ -387,6 +466,7 @@ impl DeepSeekServer {
                 &format!("Live-lab failure to triage:\n\n{failure_context}"),
                 FLASH_MODEL,
                 max_steps,
+                AgentToolset::Full,
             )
             .unwrap_or_else(|e| format!("(research step failed: {e})"));
 
@@ -401,6 +481,7 @@ impl DeepSeekServer {
                 ),
                 FLASH_MODEL,
                 max_steps,
+                AgentToolset::Full,
             )
             .unwrap_or_else(|e| format!("(verification step failed: {e})"));
 
@@ -416,6 +497,7 @@ impl DeepSeekServer {
                 ),
                 PRO_MODEL,
                 max_steps,
+                AgentToolset::Full,
             )
             .unwrap_or_else(|e| format!("(review step failed: {e})"));
 
@@ -520,6 +602,117 @@ impl DeepSeekServer {
         }
     }
 
+    /// Run the docs-sync grounded agent: a single read-only, repo-reads-only
+    /// pass that PROPOSES (never applies) the exact documentation edits needed to
+    /// keep the repo docs in sync with a lab-verified fix. Reuses the same
+    /// grounded loop as deepseek_agent but with the docs-sync system prompt and
+    /// the repo-reads-only tool set (no lab/guest/cargo tools). Writes nothing.
+    fn run_doc_sync(&self, prompt: &str, model: &str, max_steps: u64) -> Result<String, String> {
+        self.run_grounded(
+            "doc-sync",
+            DOC_SYNC_SYSTEM_PROMPT,
+            prompt,
+            model,
+            max_steps,
+            AgentToolset::DocsRepoReadOnly,
+        )
+    }
+
+    /// Entry point for the `deepseek_doc_sync` tool. PROPOSE-ONLY and READ-ONLY:
+    /// given a lab-verified fix (`change_summary` + optional commit/evidence/
+    /// doc_hints), it proposes the exact docs-only edits to keep the repo docs in
+    /// sync. It writes NOTHING — a human applies the proposed edits. Runs ASYNC
+    /// like deepseek_live_lab: returns a job_id immediately; the caller polls the
+    /// existing `deepseek_live_lab_result` tool for the structured report.
+    fn call_doc_sync(&self, args: &Value) -> ToolCallResult {
+        let change_summary = match get_str(args, "change_summary") {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => {
+                return tool_error(
+                    "'change_summary' is required: describe what was fixed/patched/verified so the \
+                     docs-sync agent knows what the docs must now reflect.",
+                );
+            }
+        };
+        let commit = get_str(args, "commit")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(not provided)")
+            .to_string();
+        let evidence = get_str(args, "evidence")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(not provided)")
+            .to_string();
+        let doc_hints = get_str(args, "doc_hints")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(none — survey the active ledgers + indexes yourself)")
+            .to_string();
+        let model = resolve_model(get_str(args, "model").unwrap_or("flash"));
+        let max_steps = args
+            .get("max_steps")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.clamp(1, AGENT_HARD_MAX_STEPS))
+            .unwrap_or(AGENT_DEFAULT_MAX_STEPS);
+
+        // The grounded pass reads several docs before proposing edits, so it can
+        // run past the MCP request timeout. Run it ASYNC exactly like the triage
+        // pipeline: store a Running job, spawn the worker, return the job id; the
+        // caller polls the SAME `deepseek_live_lab_result` tool.
+        let job_id = format!(
+            "docsync-{}",
+            self.job_counter.fetch_add(1, Ordering::Relaxed)
+        );
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.insert(
+                job_id.clone(),
+                TriageJob::Running {
+                    started: Instant::now(),
+                },
+            );
+        }
+
+        let user_prompt = format!(
+            "A lab-verified fix has landed. Propose the docs-only edits to keep the repo docs in \
+             sync with it.\n\n\
+             ## Change summary (what was fixed/patched/verified)\n{change_summary}\n\n\
+             ## Commit(s)\n{commit}\n\n\
+             ## Verifying evidence (lab run id / run-matrix row / stage)\n{evidence}\n\n\
+             ## Doc hints (likely-affected docs)\n{doc_hints}\n\n\
+             Follow your docs-sync instructions exactly: FIRST read the current docs, then emit the \
+             structured edit list (file / old_string / new_string / rationale) and the \
+             considered-but-no-change list. Do NOT invent evidence, status, dates, or commit SHAs \
+             beyond what is asserted above. You PROPOSE ONLY — you write nothing; a human applies \
+             your edits."
+        );
+
+        let worker = self.clone();
+        let jid = job_id.clone();
+        let model_owned = model.to_string();
+        std::thread::spawn(move || {
+            let report = worker
+                .run_doc_sync(&user_prompt, &model_owned, max_steps)
+                .unwrap_or_else(|e| format!("(docs-sync proposal failed: {e})"));
+            let body = format!(
+                "[deepseek/{model_owned} | DOC-SYNC (propose-only, read-only) | budget={max_steps}/step]\n\n{report}"
+            );
+            if let Ok(mut jobs) = worker.jobs.lock() {
+                jobs.insert(jid, TriageJob::Done(body));
+            }
+        });
+
+        ToolCallResult {
+            content: text_content(format!(
+                "Docs-sync proposal started: `{job_id}` (model: {model}). A read-only, \
+                 repo-reads-only agent reads the current docs, then proposes the exact docs-only \
+                 edits — it writes NOTHING; you apply them. Poll `deepseek_live_lab_result` with \
+                 job_id=\"{job_id}\" every ~20-40s until it returns the structured edit list."
+            )),
+            is_error: None,
+        }
+    }
+
     /// Resolve the lab inventory alias for a platform ("macos"/"windows"/"linux").
     /// Linux entries carry no `platform` field (→ "linux"). Read-only; confined.
     fn inventory_alias_for_platform(&self, platform: &str) -> Option<String> {
@@ -533,10 +726,10 @@ impl DeepSeekServer {
                 .and_then(|v| v.as_str())
                 .filter(|p| !p.is_empty())
                 .unwrap_or("linux");
-            if p == platform {
-                if let Some(a) = e.get("alias").and_then(|v| v.as_str()) {
-                    return Some(a.to_string());
-                }
+            if p == platform
+                && let Some(a) = e.get("alias").and_then(|v| v.as_str())
+            {
+                return Some(a.to_string());
             }
         }
         None
@@ -2371,16 +2564,15 @@ impl DeepSeekServer {
         let filter = arg_str(args, "test_filter")
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        if let Some(f) = filter {
-            if f.len() > 128
+        if let Some(f) = filter
+            && (f.len() > 128
                 || !f
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
-            {
-                return Err(format!(
-                    "invalid test_filter '{f}': only letters, digits, '_' and ':' allowed"
-                ));
-            }
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':'))
+        {
+            return Err(format!(
+                "invalid test_filter '{f}': only letters, digits, '_' and ':' allowed"
+            ));
         }
         let target = resolve_cargo_target(arg_str(args, "target"))?;
         let mut argv: Vec<&str> = vec!["test", "--quiet", "-p", crate_name];
@@ -2843,6 +3035,78 @@ log). Outputs are size-bounded; if truncated, narrow the range or grep. \
 Work within the step budget: plan, inspect with tools, then give a precise \
 evidence-backed answer. When you have enough, stop calling tools and answer.";
 
+/// System prompt for the `deepseek_doc_sync` tool: a PROPOSE-ONLY, READ-ONLY
+/// docs-sync role. It reuses the same grounded loop as the agent but with the
+/// repo-reads-only tool set (no lab/guest/cargo tools) and must emit a structured
+/// list of exact docs-only edits a human can apply by string replacement.
+const DOC_SYNC_SYSTEM_PROMPT: &str = "\
+You are the Rustynet DOCUMENTATION-SYNC assistant. After a lab-verified fix/patch lands, \
+your job is to PROPOSE the exact documentation edits that keep the repo's docs in sync \
+with that change. Rustynet is a security-first, Rust-first mesh-VPN codebase. \
+\
+You are PROPOSE-ONLY and READ-ONLY. You have ONLY repo-reads-only tools (read_file, \
+list_dir, grep, find_files, find_definition, find_references, and read-only git). You \
+have NO write/edit tool and NO lab/guest tool — you CANNOT change any file and you write \
+NOTHING to disk. A human applies your proposed edits. Never claim you changed, fixed, or \
+wrote anything. \
+\
+FOLLOW THESE RULES EXACTLY: \
+\
+1) READ THE CURRENT DOCS FIRST, before proposing anything. At minimum survey: the active \
+   ledgers under documents/operations/active/ (especially \
+   CrossPlatformRoleParityPlan_2026-06-21.md and \
+   CrossPlatformRoleParityRoadmap_2026-06-22.md), documents/CODE_MAP.md, the root \
+   README.md, AGENTS.md, CLAUDE.md, the index files documents/README.md, \
+   documents/operations/README.md, documents/operations/active/README.md, and the \
+   run-matrix doc documents/operations/LiveLabRunMatrix.md. Read with read_file/grep so \
+   your old_strings are copied verbatim from the CURRENT text. Use doc_hints to prioritize \
+   which docs to open first, but still survey the indexes for ripple effects. \
+\
+2) PROPOSE A STRUCTURED LIST OF EXACT EDITS. For EACH edit emit a clearly labeled block \
+   with four fields: \
+     - file: the repo-relative path (e.g. documents/operations/active/Foo.md). \
+     - old_string: text copied VERBATIM from the current doc, character-for-character, \
+       long/unique enough to locate deterministically (include enough surrounding context \
+       that it appears exactly once in that file). \
+     - new_string: the replacement text. \
+     - rationale: one line on why this edit is needed. \
+   The old_string MUST be copy-paste-applicable by a human or tool doing an EXACT string \
+   replacement — if you are unsure the text is current, read the file again rather than \
+   guess. Present each edit so a reader can apply it mechanically. \
+\
+3) DOCS ONLY. Only propose edits to files under documents/** or the root README.md / \
+   AGENTS.md / CLAUDE.md. NEVER propose an edit to source code, scripts, configs, \
+   Cargo.toml, or anything outside docs. If you believe code/tests/scripts also need to \
+   change, SAY SO IN PROSE in a separate note — do NOT emit it as a structured edit. \
+\
+4) MIRROR RULE. AGENTS.md and CLAUDE.md are byte-for-byte mirrored. ANY proposed edit to \
+   one MUST be accompanied by the IDENTICAL edit to the other (same old_string/new_string), \
+   as a separate edit block for each file. \
+\
+5) INDEX-SYNC. If the change adds, removes, renames, or repurposes a doc, propose the \
+   matching update to the relevant index file (documents/README.md, \
+   documents/operations/README.md, documents/operations/active/README.md) so the docs map \
+   does not drift. \
+\
+6) DO NOT INVENT evidence, status, dates, or commit SHAs. Reflect ONLY what the provided \
+   change_summary + commit + evidence assert. If a doc currently claims something the new \
+   evidence contradicts, propose the correction. If you CANNOT verify a claim against the \
+   repo, FLAG it in prose rather than fabricating a value. Never upgrade a status cell or \
+   invent a run id the inputs did not give you. \
+\
+7) YOU PROPOSE ONLY — you write nothing to disk; a human applies your edits. END YOUR \
+   ANSWER WITH TWO SECTIONS: \
+     (a) ## Proposed edits — the structured edit list from rule 2 (or 'No edits needed' \
+         with the reason if the docs are already in sync). \
+     (b) ## Considered, no change needed — name every doc you actually opened/checked that \
+         needs no edit, so the human knows your coverage. \
+   If rule 3 surfaced any non-doc change, add a short ## Out-of-scope note (prose) naming \
+   it. \
+\
+Ground every old_string in text you actually read this run. Stay within the step budget: \
+read the relevant docs, then write the structured proposal as plain prose (no tool-call \
+syntax in the final answer).";
+
 /// The OpenAI-style tool-definition array advertised to DeepSeek. All read-only.
 fn agent_tool_definitions() -> Value {
     json!([
@@ -3093,6 +3357,31 @@ fn agent_tool_definitions() -> Value {
     ])
 }
 
+/// The REPO-READS-ONLY subset of the tool definitions for `deepseek_doc_sync`.
+/// It exposes ONLY repo-inspection tools (read_file / list_dir / grep /
+/// find_files / find_definition / find_references + read-only git) — NO lab,
+/// guest, host, or cargo tools — so a docs-sync proposal can only read repo
+/// files. The names here MUST stay in lockstep with `DOC_SYNC_TOOL_NAMES`, which
+/// the dispatch gate enforces. Built by filtering `agent_tool_definitions()` so
+/// the per-tool schemas never drift from the full set.
+fn doc_sync_tool_definitions() -> Value {
+    let all = agent_tool_definitions();
+    let filtered: Vec<Value> = all
+        .as_array()
+        .map(|defs| {
+            defs.iter()
+                .filter(|d| {
+                    d["function"]["name"]
+                        .as_str()
+                        .is_some_and(|n| DOC_SYNC_TOOL_NAMES.contains(&n))
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(filtered)
+}
+
 /// Build one OpenAI-style function-tool definition object.
 fn fn_tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
@@ -3288,6 +3577,40 @@ impl McpServer for DeepSeekServer {
                     vec!["area"],
                 ),
             },
+            Tool {
+                name: "deepseek_doc_sync".into(),
+                description: "\
+                    Propose docs-only edits to keep the repo in sync with a lab-verified fix. \
+                    READ-ONLY + PROPOSE-ONLY: a grounded agent reads the CURRENT docs (active \
+                    ledgers, CODE_MAP, README/AGENTS/CLAUDE, the doc indexes, run-matrix) over a \
+                    repo-reads-only tool set — NO lab/guest/cargo tools — and returns a STRUCTURED \
+                    list of exact edits (file / old_string / new_string / rationale, each \
+                    copy-paste-applicable by exact string replacement) plus a 'considered, no \
+                    change' coverage list. It writes NOTHING to disk; a human applies the edits. \
+                    Docs-only (documents/** + root README.md/AGENTS.md/CLAUDE.md); enforces the \
+                    AGENTS.md↔CLAUDE.md mirror and index-sync, and never invents evidence/status/ \
+                    dates/SHAs. UNTRUSTED output — review before applying. Runs ASYNC: returns a \
+                    job_id immediately; poll 'deepseek_live_lab_result' for the report."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "change_summary": json_schema_string(
+                            "REQUIRED: what was fixed/patched/verified — the change the docs must now reflect."),
+                        "commit": json_schema_string(
+                            "Optional commit SHA(s) of the fix (reflected verbatim; not invented)."),
+                        "evidence": json_schema_string(
+                            "Optional verifying lab run id / run-matrix row / stage that proves the fix."),
+                        "doc_hints": json_schema_string(
+                            "Optional hint at which docs are likely affected, e.g. 'CrossPlatformRoleParityPlan'."),
+                        "model": model_schema(),
+                        "max_steps": json!({
+                            "type": "integer",
+                            "description": "Max tool-calling steps before forcing the proposal (default 12, cap 20).",
+                        }),
+                    }),
+                    vec!["change_summary"],
+                ),
+            },
         ]
     }
 
@@ -3306,6 +3629,9 @@ impl McpServer for DeepSeekServer {
         }
         if name == "deepseek_lab_run" {
             return self.call_lab_run(&args);
+        }
+        if name == "deepseek_doc_sync" {
+            return self.call_doc_sync(&args);
         }
 
         let prompt = match get_str(&args, "prompt") {
@@ -3635,6 +3961,117 @@ mod tests {
                 "proxy/top-level tool {forbidden} must NOT be in the agent tool-set"
             );
         }
+    }
+
+    #[test]
+    fn doc_sync_tool_set_is_repo_reads_only() {
+        // The docs-sync tool set is the REPO-READS-ONLY subset: only repo-read
+        // tools + read-only git. It must expose NO lab/guest/host/cargo tool, so a
+        // docs-sync run can touch no lab or guest surface at all.
+        let defs = doc_sync_tool_definitions();
+        let names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["function"]["name"].as_str().unwrap())
+            .collect();
+
+        // Exactly the allowed names, and nothing else.
+        for expected in DOC_SYNC_TOOL_NAMES {
+            assert!(
+                names.contains(expected),
+                "docs-sync set missing repo-read tool {expected}"
+            );
+        }
+        assert_eq!(
+            names.len(),
+            DOC_SYNC_TOOL_NAMES.len(),
+            "docs-sync set has an unexpected tool: {names:?}"
+        );
+
+        // No lab/guest/host/cargo tool may leak in.
+        for forbidden in [
+            "lab_guest_exec",
+            "lab_node_reachable",
+            "utm_vm_status",
+            "host_system_info",
+            "host_disk_status",
+            "lab_run_status",
+            "lab_run_detail",
+            "lab_jobs",
+            "lab_loop_journal",
+            "lab_inventory",
+            "lab_job_log",
+            "lab_stage_log",
+            "lab_report_grep",
+            "lab_report_artifacts",
+            "cargo_check",
+            "cargo_test",
+        ] {
+            assert!(
+                !names.contains(&forbidden),
+                "docs-sync set must NOT expose lab/guest/cargo tool {forbidden}"
+            );
+        }
+
+        // Every docs-sync definition is also in the full set (so schemas never
+        // drift) and is well-formed.
+        let full: Vec<String> = agent_tool_definitions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        for d in defs.as_array().unwrap() {
+            let func = &d["function"];
+            let name = func["name"].as_str().unwrap();
+            assert!(
+                full.iter().any(|n| n == name),
+                "docs-sync tool {name} is not derived from the full set"
+            );
+            assert!(func["description"].is_string());
+            assert!(func["parameters"]["properties"].is_object());
+        }
+    }
+
+    #[test]
+    fn doc_sync_toolset_gate_rejects_non_repo_tools() {
+        // The dispatch gate must allow ONLY the repo-read tools for docs-sync and
+        // refuse any lab/guest/cargo tool, even if the model emits its name.
+        for allowed in DOC_SYNC_TOOL_NAMES {
+            assert!(
+                AgentToolset::DocsRepoReadOnly.allows(allowed),
+                "docs-sync gate must allow {allowed}"
+            );
+        }
+        for forbidden in [
+            "lab_guest_exec",
+            "lab_inventory",
+            "utm_vm_status",
+            "cargo_check",
+            "cargo_test",
+            "host_disk_status",
+        ] {
+            assert!(
+                !AgentToolset::DocsRepoReadOnly.allows(forbidden),
+                "docs-sync gate must reject {forbidden}"
+            );
+            // The full agent set, by contrast, allows everything.
+            assert!(AgentToolset::Full.allows(forbidden));
+        }
+    }
+
+    #[test]
+    fn doc_sync_requires_change_summary() {
+        let s = server();
+        // Missing / blank change_summary → error result (so the caller can fix it),
+        // and no job is spawned.
+        assert!(s.call_doc_sync(&json!({})).is_error.is_some());
+        assert!(
+            s.call_doc_sync(&json!({"change_summary": "   "}))
+                .is_error
+                .is_some()
+        );
     }
 
     #[test]

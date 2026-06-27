@@ -21,7 +21,7 @@ Exit code 0 on a delivered result; non-zero on transport/timeout failure.
 import argparse, json, os, re, select, subprocess, sys, time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-JOB_RE = re.compile(r"\b(?:triage|labrun)-\d+\b")  # deepseek async job ids
+JOB_RE = re.compile(r"\b(?:triage|labrun|docsync)-\d+\b")  # deepseek async job ids
 
 
 def main() -> int:
