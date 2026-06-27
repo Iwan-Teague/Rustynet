@@ -65,21 +65,21 @@ most secure option, and proceed. Do NOT pause for confirmation. Do NOT write sta
 direction. When a lab surfaces both security and functional defects, patch security first.
 
 **DIVISION OF LABOR — who does what; do not blur these:**
-- **YOU, the main agent, own ALL CODE CHANGES and ALL LIVE-LAB ORCHESTRATION.** You write and review every
-  patch (you are the reviewer of record), and you personally drive every live-lab run — launch it, watch
-  each stage, diagnose each failure, and react. **The live lab is NEVER handed off to a sub-agent.**
-  Orchestrating the lab and judging each stage's result is high-judgment work that stays in the main loop;
-  a sub-agent is not trusted to run, babysit, or interpret the lab.
-- **DeepSeek (the `rustynet-deepseek` MCP) is your research / triage / summarizing layer.** Its headline
-  tool is **`deepseek_live_lab`** — the rigid failure-triage orchestrator: hand it a failed stage's
-  evidence as `failure_context` and it runs DeepSeek-v4-flash research → a second flash that verifies every
-  claim against the real repo/lab → v4-pro at MAX reasoning that re-verifies and judges the best fix,
-  returning ONE evidence-cited report (root cause, file:line, suspected fix). It also exposes the read-only
-  grounded `deepseek_agent` and the flash/pro `deepseek_read/write/read_write` proxies for ad-hoc research,
-  log digests, error-string research, and defect hunting. It proposes; you verify against the real code and
-  decide. It never makes the security call, never edits the repo, never runs gates. (A v4-pro layer that
-  also *launches + drives* the live lab is being built on top of `deepseek_live_lab`; until it lands you
-  still drive the run yourself — see below — and hand only the triage to the orchestrator.)
+- **YOU, the main agent, own ALL CODE CHANGES, the SECURITY call, and the loop.** You write and review every
+  patch (you are the reviewer of record) and decide which area to run next. You drive each live-lab cycle by
+  calling **`deepseek_lab_run(area=...)`** — one call DETERMINISTICALLY launches + monitors the run and
+  auto-triages a failure → ONE report you verify, patch from, and re-run. **No LLM ever drives the lab:** the
+  launch/monitor is deterministic code (no LLM in the deploy path — it can't hallucinate a deploy action),
+  and the LLM does ONLY the triage. Judging the result and every code/security decision stay with you.
+- **DeepSeek (the `rustynet-deepseek` MCP) is your research / triage / run-driver layer.** Its headline tool
+  is **`deepseek_lab_run`** — one call launches the lab (deterministic) and, on failure, runs the rigid
+  triage → ONE evidence-cited report (root cause, file:line, suspected fix); async, so poll
+  `deepseek_live_lab_result`. **`deepseek_live_lab`** is that same rigid triage on a failure you ALREADY hold
+  (v4-flash research → v4-flash verify-every-claim → v4-pro@MAX review). It also exposes the read-only
+  grounded **`deepseek_agent`** (now grounded across code + git history + cross-OS compile/test + LIVE
+  any-OS guest diagnostics) and the flash/pro `deepseek_read/write/read_write` proxies for ad-hoc research.
+  It proposes; you verify against the real code and decide. It NEVER makes the security call, writes the
+  repo, or runs the authoritative gates. (Full tool table + grounding details below.)
 - **Any info-gathering / research worker should go through DeepSeek where possible** — prefer the DeepSeek
   agent (to ground-truth against the repo/lab) or the proxies (to analyze pasted context) over spending a
   full Claude sub-agent on pure research/summarization. Reserve Claude sub-agents for concrete CODE patches
@@ -331,9 +331,10 @@ Commit + push as **Iwan-Teague**. No PR unless asked.
 ═══════════════════════════════════════════
 5) THE LAB — ACCESS AND HOW TO DRIVE IT
 ═══════════════════════════════════════════
-**You — the main agent — drive every live-lab run yourself: launch it, watch each stage, diagnose each
-failure, react. The lab is NEVER delegated to a sub-agent (§0).** Use DeepSeek to summarize/triage the
-failures it surfaces; use Claude sub-agents only to patch the code (§8).
+**You drive each live-lab cycle by CALLING `deepseek_lab_run(area=...)` — one call deterministically
+launches + monitors the run and auto-triages a failure → ONE report (§0). No LLM drives the lab: the
+launch/monitor is deterministic code, only the triage is DeepSeek.** You verify each cited claim against the
+real code, patch, gate, and re-run. Use Claude sub-agents only to patch code (§8).
 
 SSH key: `/Users/iwan/.ssh/rustynet_lab_ed25519`. Known-hosts: `/Users/iwan/.ssh/known_hosts`.
 
