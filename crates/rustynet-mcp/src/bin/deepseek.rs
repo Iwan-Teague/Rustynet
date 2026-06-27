@@ -33,7 +33,8 @@
 
 use rustynet_mcp::{
     McpServer, ServerInfo, Tool, ToolCallResult, json_schema_object, json_schema_string, repo_root,
-    run_server, run_with_timeout, text_content, tool_error, truncate_output,
+    run_server, run_with_timeout, spawn_logged, tail_file, text_content, tool_error,
+    truncate_output,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -75,6 +76,17 @@ const LAB_KNOWN_HOSTS_REL: &str = ".ssh/known_hosts";
 const CARGO_TOOL_TIMEOUT_SECS: u64 = 420;
 /// Timeout for a single SSH guest-diagnostic round trip (connect + one command).
 const GUEST_SSH_TIMEOUT_SECS: u64 = 45;
+/// Where THIS server's async-job records are persisted (repo-relative; under
+/// gitignored state/). Distinct from `JOBS_SUBDIR` (`state/mcp-jobs`, which is
+/// the LAB-STATE MCP's job dir the grounding agent reads via `lab_job_log`).
+/// Mirrors the lab-state pattern so a deepseek job survives an MCP-server reload:
+/// the in-memory map is the fast path, this dir is the durable record
+/// `deepseek_live_lab_result` falls back to.
+const DEEPSEEK_JOBS_SUBDIR: &str = "state/deepseek-mcp-jobs";
+/// Completion artifact the orchestrator writes inside a run's report dir. Its
+/// presence after a reload proves the orphaned orchestrator finished even though
+/// the in-memory worker that was waiting on it died.
+const ORCHESTRATE_RESULT_REL: &str = "orchestration/orchestrate_result.json";
 
 /// State of an async triage job: still running (with its start time, for elapsed
 /// reporting) or finished with its assembled report.
@@ -143,10 +155,16 @@ struct DeepSeekServer {
     agent: ureq::Agent,
     repo_root: PathBuf,
     /// Async triage jobs keyed by job id. Shared (Arc) so a clone handed to a
-    /// worker thread mutates the same map the poll tool reads.
+    /// worker thread mutates the same map the poll tool reads. This is the fast
+    /// path only — every job is ALSO persisted under [`DEEPSEEK_JOBS_SUBDIR`] so it
+    /// survives an MCP-server reload (the in-memory map is wiped on restart).
     jobs: JobMap,
-    /// Monotonic counter for unique triage job ids within a server lifetime.
-    job_counter: Arc<AtomicU64>,
+    /// Per-process monotonic sequence for the trailing token of a job id. NOT
+    /// the whole id: ids embed a wall-clock millis + the pid (see [`new_job_id`])
+    /// so they neither collide nor become unfindable across server restarts —
+    /// the bare counter used to reset to 1 every start, colliding ids and
+    /// reusing report dirs across reloads.
+    job_seq: Arc<AtomicU64>,
 }
 
 impl DeepSeekServer {
@@ -164,8 +182,117 @@ impl DeepSeekServer {
             agent,
             repo_root: repo_root(),
             jobs: Arc::new(Mutex::new(HashMap::new())),
-            job_counter: Arc::new(AtomicU64::new(1)),
+            job_seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Build a unique, reload-stable async-job id with the given prefix
+    /// (`labrun` / `triage` / `docsync` — the prefix MUST remain the first token
+    /// because drive_deepseek.py's JOB_RE and the `lab_run_status` filter key on
+    /// it). The id embeds a wall-clock millis + the pid + a per-process sequence,
+    /// mirroring the lab-state MCP's `ll-{millis}-{pid}-{seq}` scheme: each piped
+    /// client request is a fresh server process whose `job_seq` restarts at 0, so
+    /// without the pid + millis two same-process-lifetime ids would collide and
+    /// silently overwrite each other's persisted record.
+    fn new_job_id(&self, prefix: &str) -> String {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let seq = self.job_seq.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{millis}-{}-{seq}", std::process::id())
+    }
+
+    /// Directory where THIS server's async-job records are persisted
+    /// (repo-relative under gitignored state/). Mirrors lab-state's `jobs_dir`.
+    fn jobs_dir(&self) -> PathBuf {
+        self.repo_root.join(DEEPSEEK_JOBS_SUBDIR)
+    }
+
+    /// Per-job record path: `<DEEPSEEK_JOBS_SUBDIR>/<job_id>.json`.
+    fn job_record_path(&self, job_id: &str) -> PathBuf {
+        self.jobs_dir().join(format!("{job_id}.json"))
+    }
+
+    /// Persist a job record durably (so a reloaded server can still find it).
+    /// Written atomically-ish — to a sibling `.tmp` then renamed — so a
+    /// concurrent poll never reads a half-written record. Best-effort: a write
+    /// failure is logged, not fatal (the in-memory map remains the fast path).
+    fn write_job_record(&self, job_id: &str, rec: &Value) {
+        let dir = self.jobs_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!(
+                "DeepSeek MCP: cannot create jobs dir {}: {e}",
+                dir.display()
+            );
+            return;
+        }
+        let final_path = self.job_record_path(job_id);
+        let tmp_path = dir.join(format!("{job_id}.json.tmp"));
+        let body = serde_json::to_string_pretty(rec).unwrap_or_default();
+        if let Err(e) = std::fs::write(&tmp_path, body) {
+            eprintln!("DeepSeek MCP: cannot write job record tmp: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+            eprintln!("DeepSeek MCP: cannot finalize job record: {e}");
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
+
+    /// Read a persisted job record back (the reload-survival fallback path).
+    fn read_job_record(&self, job_id: &str) -> Option<Value> {
+        let s = std::fs::read_to_string(self.job_record_path(job_id)).ok()?;
+        serde_json::from_str(&s).ok()
+    }
+
+    /// Mark a job DONE both in memory (fast path) and on disk (reload-survival).
+    /// Reads the existing record so static fields (area, report_dir, started_unix)
+    /// are preserved; if no record exists (legacy / write failed) it writes a
+    /// minimal one so the report is still recoverable.
+    fn finish_job(&self, job_id: &str, report: String) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.insert(job_id.to_string(), TriageJob::Done(report.clone()));
+        }
+        let mut rec = self
+            .read_job_record(job_id)
+            .unwrap_or_else(|| json!({ "job_id": job_id, "started_unix": now_unix() }));
+        if let Some(obj) = rec.as_object_mut() {
+            obj.insert("state".into(), json!("done"));
+            obj.insert("report_text".into(), json!(report));
+            obj.insert("finished_unix".into(), json!(now_unix()));
+        }
+        self.write_job_record(job_id, &rec);
+    }
+
+    /// Read the orchestrator's completion artifact for a run, if it exists. After
+    /// a server reload the in-memory worker is gone, but the detached orchestrator
+    /// keeps running and writes `orchestration/orchestrate_result.json` when it
+    /// finishes; its presence + contents let the poll path surface the OUTCOME of
+    /// an orphaned run. Returns (overall_status, first_failed_stage).
+    fn read_orchestrate_outcome(&self, report_dir: &str) -> Option<(String, Option<String>)> {
+        let path = self.repo_root.join(report_dir).join(ORCHESTRATE_RESULT_REL);
+        let body = std::fs::read_to_string(path).ok()?;
+        let v: Value = serde_json::from_str(&body).ok()?;
+        let overall = v
+            .get("overall_status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let first_failed = v
+            .get("outcomes")
+            .and_then(|o| o.as_array())
+            .and_then(|arr| {
+                arr.iter().find_map(|st| {
+                    let status = st.get("status").and_then(|s| s.as_str())?;
+                    if status.eq_ignore_ascii_case("fail") {
+                        st.get("stage").and_then(|s| s.as_str()).map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            });
+        Some((overall, first_failed))
     }
 
     fn call(&self, system: &str, user: &str, model: &str) -> Result<String, String> {
@@ -533,10 +660,7 @@ impl DeepSeekServer {
         // reasoning) — far past the MCP client's request timeout. So run it ASYNC:
         // store a Running job, spawn the pipeline on a worker thread, and return the
         // job id immediately. The caller polls `deepseek_live_lab_result`.
-        let job_id = format!(
-            "triage-{}",
-            self.job_counter.fetch_add(1, Ordering::Relaxed)
-        );
+        let job_id = self.new_job_id("triage");
         if let Ok(mut jobs) = self.jobs.lock() {
             jobs.insert(
                 job_id.clone(),
@@ -545,6 +669,16 @@ impl DeepSeekServer {
                 },
             );
         }
+        self.write_job_record(
+            &job_id,
+            &json!({
+                "job_id": job_id,
+                "kind": "triage",
+                "state": "running",
+                "area": target,
+                "started_unix": now_unix(),
+            }),
+        );
 
         let worker = self.clone();
         let jid = job_id.clone();
@@ -555,9 +689,7 @@ impl DeepSeekServer {
             let body = format!(
                 "[deepseek live-lab triage | target={target_label} | budget={max_steps}/step]\n\n{report}"
             );
-            if let Ok(mut jobs) = worker.jobs.lock() {
-                jobs.insert(jid, TriageJob::Done(body));
-            }
+            worker.finish_job(&jid, body);
         });
 
         ToolCallResult {
@@ -579,26 +711,97 @@ impl DeepSeekServer {
             Some(j) if !j.trim().is_empty() => j.trim(),
             _ => return tool_error("'job_id' is required (from the deepseek_live_lab response)."),
         };
-        let jobs = match self.jobs.lock() {
-            Ok(j) => j,
-            Err(_) => return tool_error("triage job store is poisoned"),
+
+        // Fast path: the in-memory map (this server lifetime). A poisoned lock is
+        // not fatal here — fall through to the on-disk record instead of erroring.
+        if let Ok(jobs) = self.jobs.lock() {
+            match jobs.get(job_id) {
+                Some(TriageJob::Done(report)) => {
+                    return ToolCallResult {
+                        content: text_content(report.clone()),
+                        is_error: None,
+                    };
+                }
+                Some(TriageJob::Running { started }) => {
+                    return ToolCallResult {
+                        content: text_content(format!(
+                            "Job `{job_id}` still running ({}s elapsed). Poll again in ~30-60s.",
+                            started.elapsed().as_secs()
+                        )),
+                        is_error: None,
+                    };
+                }
+                None => {}
+            }
+        }
+
+        // Reload-survival fallback: the in-memory map was wiped on a server
+        // restart, but every job persists a record under DEEPSEEK_JOBS_SUBDIR.
+        let Some(rec) = self.read_job_record(job_id) else {
+            return tool_error(&format!(
+                "unknown job_id '{job_id}' — no in-memory entry and no persisted record under \
+                 {DEEPSEEK_JOBS_SUBDIR}/. It was likely never started under this id; re-run the \
+                 originating tool."
+            ));
         };
-        match jobs.get(job_id) {
-            Some(TriageJob::Done(report)) => ToolCallResult {
-                content: text_content(report.clone()),
+        let state = rec.get("state").and_then(|s| s.as_str()).unwrap_or("");
+        if state == "done" {
+            // The worker finished and persisted its report before (or after) the
+            // reload — return it verbatim.
+            let report = rec
+                .get("report_text")
+                .and_then(|s| s.as_str())
+                .unwrap_or("(job record marked done but carried no report_text)");
+            return ToolCallResult {
+                content: text_content(report.to_string()),
                 is_error: None,
-            },
-            Some(TriageJob::Running { started }) => ToolCallResult {
+            };
+        }
+
+        // state == running, but the in-memory worker is gone (reload). For a
+        // lab_run, the detached orchestrator may have finished anyway and written
+        // its completion artifact — surface that outcome so the run isn't orphaned.
+        let area = rec
+            .get("area")
+            .and_then(|s| s.as_str())
+            .unwrap_or("(unknown)");
+        if let Some(report_dir) = rec.get("report_dir").and_then(|s| s.as_str())
+            && let Some((overall, first_failed)) = self.read_orchestrate_outcome(report_dir)
+        {
+            let failed_line = first_failed
+                .as_deref()
+                .map(|s| format!("First failed stage: `{s}`.\n"))
+                .unwrap_or_default();
+            return ToolCallResult {
                 content: text_content(format!(
-                    "Triage job `{job_id}` still running ({}s elapsed). Poll again in ~30-60s.",
-                    started.elapsed().as_secs()
+                    "# Live-lab run `{job_id}` (area: {area}) — orchestrator FINISHED, but the \
+                     deepseek MCP server RELOADED mid-run so auto-triage did NOT run.\n\n\
+                     Overall status: **{overall}**.\n{failed_line}\n\
+                     The detached orchestrator survived the reload and wrote its report to \
+                     `{report_dir}` (completion artifact `{ORCHESTRATE_RESULT_REL}` present). \
+                     Auto-triage was lost with the in-memory worker.\n\n\
+                     Next: inspect the report dir (run_summary.md / state/stages.tsv / per-stage \
+                     logs under it), or call `deepseek_live_lab` manually with the failing stage's \
+                     evidence + this report_dir to get the triage report."
                 )),
                 is_error: None,
-            },
-            None => tool_error(&format!(
-                "unknown job_id '{job_id}' — not found (it may have been lost on an MCP-server \
-                 reload; re-run deepseek_live_lab)"
+            };
+        }
+
+        // state == running, no completion artifact yet → genuinely still in flight
+        // (the orchestrator re-parented to init and is still working).
+        let elapsed = rec
+            .get("started_unix")
+            .and_then(|v| v.as_u64())
+            .map(|s| now_unix().saturating_sub(s))
+            .unwrap_or(0);
+        ToolCallResult {
+            content: text_content(format!(
+                "Job `{job_id}` (area: {area}) still running ({elapsed}s elapsed since start; the \
+                 deepseek MCP server reloaded but the detached orchestrator survives). No \
+                 completion artifact yet — poll again in ~30-60s."
             )),
+            is_error: None,
         }
     }
 
@@ -660,10 +863,7 @@ impl DeepSeekServer {
         // run past the MCP request timeout. Run it ASYNC exactly like the triage
         // pipeline: store a Running job, spawn the worker, return the job id; the
         // caller polls the SAME `deepseek_live_lab_result` tool.
-        let job_id = format!(
-            "docsync-{}",
-            self.job_counter.fetch_add(1, Ordering::Relaxed)
-        );
+        let job_id = self.new_job_id("docsync");
         if let Ok(mut jobs) = self.jobs.lock() {
             jobs.insert(
                 job_id.clone(),
@@ -672,6 +872,16 @@ impl DeepSeekServer {
                 },
             );
         }
+        self.write_job_record(
+            &job_id,
+            &json!({
+                "job_id": job_id,
+                "kind": "docsync",
+                "state": "running",
+                "area": change_summary,
+                "started_unix": now_unix(),
+            }),
+        );
 
         let user_prompt = format!(
             "A lab-verified fix has landed. Propose the docs-only edits to keep the repo docs in \
@@ -697,9 +907,7 @@ impl DeepSeekServer {
             let body = format!(
                 "[deepseek/{model_owned} | DOC-SYNC (propose-only, read-only) | budget={max_steps}/step]\n\n{report}"
             );
-            if let Ok(mut jobs) = worker.jobs.lock() {
-                jobs.insert(jid, TriageJob::Done(body));
-            }
+            worker.finish_job(&jid, body);
         });
 
         ToolCallResult {
@@ -736,18 +944,52 @@ impl DeepSeekServer {
     }
 
     /// Count in-flight lab-run jobs — the lab is a singleton, never two
-    /// orchestrations on the VMs at once.
+    /// orchestrations on the VMs at once. Unions the in-memory map (this server
+    /// lifetime) with the persisted records under DEEPSEEK_JOBS_SUBDIR, so a reloaded
+    /// server still sees an orphaned-but-still-running orchestrator from a prior
+    /// lifetime and the singleton gate keeps holding. A disk record counts as
+    /// in-flight only while state==running AND its report dir has NOT yet produced
+    /// the completion artifact (otherwise the orchestrator already finished).
     fn running_lab_jobs(&self) -> usize {
-        self.jobs
-            .lock()
-            .map(|jobs| {
-                jobs.iter()
-                    .filter(|(id, j)| {
-                        id.starts_with("labrun-") && matches!(j, TriageJob::Running { .. })
-                    })
-                    .count()
-            })
-            .unwrap_or(0)
+        use std::collections::HashSet;
+        let mut running: HashSet<String> = HashSet::new();
+        if let Ok(jobs) = self.jobs.lock() {
+            for (id, j) in jobs.iter() {
+                if id.starts_with("labrun-") && matches!(j, TriageJob::Running { .. }) {
+                    running.insert(id.clone());
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(self.jobs_dir()) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let Some(job_id) = name.strip_suffix(".json") else {
+                    continue;
+                };
+                if !job_id.starts_with("labrun-") || running.contains(job_id) {
+                    continue;
+                }
+                let Some(rec) = self.read_job_record(job_id) else {
+                    continue;
+                };
+                if rec.get("state").and_then(|s| s.as_str()) != Some("running") {
+                    continue;
+                }
+                // Still running per the record — but if its orchestrator already
+                // wrote the completion artifact, the run is effectively done and
+                // must not peg the singleton slot.
+                let still_in_flight = rec
+                    .get("report_dir")
+                    .and_then(|s| s.as_str())
+                    .map(|rd| self.read_orchestrate_outcome(rd).is_none())
+                    .unwrap_or(true);
+                if still_in_flight {
+                    running.insert(job_id.to_string());
+                }
+            }
+        }
+        running.len()
     }
 
     /// Entry point for `deepseek_lab_run`: the WHOLE pipeline in one call. The
@@ -849,6 +1091,10 @@ impl DeepSeekServer {
             .get("macos_promote_exit")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let legacy_bash = args
+            .get("legacy_bash")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let entry_vm = get_str(args, "entry_vm")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -873,10 +1119,13 @@ impl DeepSeekServer {
             ));
         }
 
-        let job_id = format!(
-            "labrun-{}",
-            self.job_counter.fetch_add(1, Ordering::Relaxed)
-        );
+        let job_id = self.new_job_id("labrun");
+        // The report dir derives from the job_id ALONE (which is already unique
+        // across restarts via the millis+pid+seq id), so it is reconstructable
+        // from the persisted record after a reload. No pid suffix needed — the id
+        // carries the uniqueness; the bare-derived dir is what the poll fallback
+        // reads `orchestration/orchestrate_result.json` from.
+        let report_dir = format!("state/deepseek-lab-{job_id}");
         if let Ok(mut jobs) = self.jobs.lock() {
             jobs.insert(
                 job_id.clone(),
@@ -885,6 +1134,18 @@ impl DeepSeekServer {
                 },
             );
         }
+        self.write_job_record(
+            &job_id,
+            &json!({
+                "job_id": job_id,
+                "kind": "labrun",
+                "state": "running",
+                "area": area,
+                "report_dir": report_dir,
+                "log_path": self.jobs_dir().join(format!("{job_id}.log")).to_string_lossy(),
+                "started_unix": now_unix(),
+            }),
+        );
 
         // Build the ack message before `area` moves into the worker closure.
         let started_msg = format!(
@@ -896,11 +1157,6 @@ impl DeepSeekServer {
         );
         let worker = self.clone();
         let jid = job_id.clone();
-        // Suffix the report dir with the server PID so it is unique across MCP
-        // restarts: the job counter resets to 0 each restart, so without this the
-        // first run after every restart would reuse `deepseek-lab-labrun-1` and the
-        // orchestrator (which refuses a non-empty report dir) would fail.
-        let report_dir = format!("state/deepseek-lab-{job_id}-{}", std::process::id());
         std::thread::spawn(move || {
             let ssh = home_path(LAB_SSH_IDENTITY_REL);
             let kh = home_path(LAB_KNOWN_HOSTS_REL);
@@ -933,53 +1189,121 @@ impl DeepSeekServer {
                 blind_exit_platform.as_deref(),
                 entry_vm.as_deref(),
                 macos_promote_exit,
+                legacy_bash,
                 dry_run,
             ));
             let arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
 
-            let body = match run_with_timeout(
-                "cargo",
-                &arg_refs,
-                &worker.repo_root,
-                &env,
-                Duration::from_secs(LAB_ORCHESTRATOR_TIMEOUT_SECS),
-            ) {
-                Ok(o) if o.success => format!(
+            // Spawn the orchestrator DETACHED — stdin null, stdout+stderr to a log
+            // FILE (under the jobs dir, NOT the report dir, whose empty-dir
+            // precondition the orchestrator enforces), its own process group. This
+            // is the critical reload-survival change: previously the orchestrator's
+            // pipes were captured by the server process (run_with_timeout →
+            // Command::output()), so when the deepseek MCP server reloaded mid-run
+            // the read end closed and the orchestrator got SIGPIPE on its next
+            // write (observed as `bootstrap_hosts FAIL rc=141`). With the I/O on a
+            // file, a server reload can no longer SIGPIPE-kill the run; the
+            // detached orchestrator re-parents to init, runs to completion, and
+            // writes its report dir, which the poll fallback then surfaces.
+            let log_path = worker.jobs_dir().join(format!("{jid}.log"));
+            if let Err(e) = std::fs::create_dir_all(worker.jobs_dir()) {
+                worker.finish_job(
+                    &jid,
+                    format!(
+                        "# Live-lab run: {area} — could not create the orchestrator log dir: {e}\n\n\
+                         (infrastructure error, not a lab failure.)"
+                    ),
+                );
+                return;
+            }
+            let mut child =
+                match spawn_logged("cargo", &arg_refs, &worker.repo_root, &env, &log_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        worker.finish_job(
+                        &jid,
+                        format!(
+                            "# Live-lab run: {area} — could not launch the orchestrator: {e}\n\n\
+                             (Is `cargo` on PATH, the inventory ready, and SSH material present? \
+                             This is an infrastructure error, not a lab failure.)"
+                        ),
+                    );
+                        return;
+                    }
+                };
+
+            // Wait for the detached child with a wall-clock cap. Only a genuine
+            // TIMEOUT kills the (process-group) tree; a normal exit leaves the
+            // orchestrator's report dir intact. If the SERVER reloads here the
+            // whole worker thread dies WITHOUT killing the child (no pipe, own
+            // group), so the orchestrator keeps running — exactly the survival we
+            // want; the poll fallback recovers the outcome from the report dir.
+            let start = Instant::now();
+            let timeout = Duration::from_secs(LAB_ORCHESTRATOR_TIMEOUT_SECS);
+            let (success, timed_out) = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break (status.success(), false),
+                    Ok(None) => {
+                        if start.elapsed() >= timeout {
+                            kill_child_group(&mut child);
+                            let _ = child.wait();
+                            break (false, true);
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    Err(e) => {
+                        worker.finish_job(
+                            &jid,
+                            format!(
+                                "# Live-lab run: {area} — error waiting on the orchestrator: {e}\n\n\
+                                 (infrastructure error; inspect the log at `{}`.)",
+                                log_path.display()
+                            ),
+                        );
+                        return;
+                    }
+                }
+            };
+
+            let log_tail = tail_file(&log_path, 120).unwrap_or_default();
+            let body = if timed_out {
+                format!(
+                    "# Live-lab run: {area} — TIMED OUT after {}s (orchestrator process group \
+                     killed)\n\nEvidence (partial) in `{report_dir}`; orchestrator log: `{}`.\n\n\
+                     _log tail:_\n{}",
+                    timeout.as_secs(),
+                    log_path.display(),
+                    truncate_output(&log_tail, 60, 4000)
+                )
+            } else if success {
+                format!(
                     "# Live-lab run: {area} — PASS\n\nThe orchestration completed successfully. \
                      Evidence in `{report_dir}` (verify the matrix row + per-stage results before \
-                     trusting). No triage needed.\n\n_stdout tail:_\n{}",
-                    truncate_output(&o.stdout, 60, 4000)
-                ),
-                Ok(o) if dry_run => format!(
+                     trusting). No triage needed.\n\n_log tail:_\n{}",
+                    truncate_output(&log_tail, 60, 4000)
+                )
+            } else if dry_run {
+                format!(
                     "# Live-lab run: {area} — DRY-RUN wiring check complete\n\nThe orchestrator's \
                      non-zero exit is EXPECTED in --dry-run (every stage is skipped, so the \
                      setup-complete check can't pass). The launch → wait → capture → report path is \
-                     verified; no triage is run for a dry run.\n\n_output tail:_\n{}",
-                    truncate_output(&o.stdout, 60, 4000)
-                ),
-                Ok(o) => {
-                    // Real run FAILED → feed the evidence to the rigid triage pipeline.
-                    let failure_context = format!(
-                        "Live-lab orchestration for area '{area}' FAILED (orchestrator exited \
-                         non-zero). Report dir the grounded agents can read: {report_dir}. \
-                         Orchestrator output tail:\n{}\n{}",
-                        truncate_output(&o.stdout, 80, 6000),
-                        truncate_output(&o.stderr, 40, 3000)
-                    );
-                    let triage = worker.run_triage(&failure_context, max_steps);
-                    format!(
-                        "# Live-lab run: {area} — FAIL → triage\n\nReport dir: `{report_dir}`\n\n{triage}"
-                    )
-                }
-                Err(e) => format!(
-                    "# Live-lab run: {area} — could not launch the orchestrator: {e}\n\n(Is `cargo` \
-                     on PATH, the inventory ready, and SSH material present? This is an \
-                     infrastructure error, not a lab failure.)"
-                ),
+                     verified; no triage is run for a dry run.\n\n_log tail:_\n{}",
+                    truncate_output(&log_tail, 60, 4000)
+                )
+            } else {
+                // Real run FAILED → feed the evidence to the rigid triage pipeline.
+                let failure_context = format!(
+                    "Live-lab orchestration for area '{area}' FAILED (orchestrator exited \
+                     non-zero). Report dir the grounded agents can read: {report_dir}. \
+                     Orchestrator log tail:\n{}",
+                    truncate_output(&log_tail, 120, 9000)
+                );
+                let triage = worker.run_triage(&failure_context, max_steps);
+                format!(
+                    "# Live-lab run: {area} — FAIL → triage\n\nReport dir: `{report_dir}`\n\n{triage}"
+                )
             };
-            if let Ok(mut jobs) = worker.jobs.lock() {
-                jobs.insert(jid, TriageJob::Done(body));
-            }
+            worker.finish_job(&jid, body);
         });
 
         ToolCallResult {
@@ -2785,6 +3109,44 @@ fn home_path(rel: &str) -> String {
     format!("{home}/{rel}")
 }
 
+/// Current wall-clock time as unix seconds (0 on a clock-before-epoch error).
+/// Used to stamp persisted job records (started/finished).
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// TERM-then-KILL the child's whole process group (the orchestrator spawns bash
+/// workers + utmctl pushes; killing only the leader orphans them). Only invoked
+/// on a genuine wall-clock timeout — a normal exit never reaches here.
+/// `spawn_logged` makes the child a process-group leader, so `-pid` targets the
+/// tree. Mirrors the lib's private `kill_child_tree`.
+#[cfg(unix)]
+fn kill_child_group(child: &mut std::process::Child) {
+    let group = format!("-{}", child.id());
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", "--", &group])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    std::thread::sleep(Duration::from_millis(50));
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &group])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_child_group(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
 /// Build the `ops vm-lab-orchestrate-live-lab` argument vector (everything after
 /// `cargo run --quiet -p rustynet-cli -- ops`) for a deepseek_lab_run. Pure +
 /// deterministic so it is unit-testable: there is NO LLM in this deploy path —
@@ -2808,6 +3170,7 @@ fn build_orchestrator_args(
     blind_exit_platform: Option<&str>,
     entry_vm: Option<&str>,
     macos_promote_exit: bool,
+    legacy_bash: bool,
     dry_run: bool,
 ) -> Vec<String> {
     let mut a: Vec<String> = vec!["vm-lab-orchestrate-live-lab".to_string()];
@@ -2856,6 +3219,14 @@ fn build_orchestrator_args(
     }
     if macos_promote_exit {
         a.push("--macos-promote-exit".to_string());
+    }
+    // The proven orchestrator path for the mac/win ROLE stages
+    // (activate_macos_exit_role + capture, the relay/anchor lifecycle). The
+    // default Rust path may not drive every role stage; the legacy bash
+    // orchestrator does (it flipped relay + reached every prior macOS role
+    // stage). Mutually exclusive with --node (deepseek_lab_run never uses --node).
+    if legacy_bash {
+        a.push("--legacy-bash-orchestrator".to_string());
     }
     if dry_run {
         a.push("--dry-run".to_string());
@@ -3652,6 +4023,7 @@ impl McpServer for DeepSeekServer {
                         "blind_exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the BLIND_EXIT role so the focused mac/win blind-exit cell runs live instead of skipping."),
                         "macos_promote_exit": json!({"type": "boolean", "description": "Option-B selector: elect macOS as a SECONDARY exit so the macOS exit cell runs live (drives is_macos_active_exit). Use alongside exit_vm/client_vm/entry_vm."}),
                         "entry_vm": json_schema_string("Linux entry-node alias for the Option-B exit topology (used alongside exit_vm/client_vm + macos_promote_exit)."),
+                        "legacy_bash": json!({"type": "boolean", "description": "Use the proven --legacy-bash-orchestrator path, which drives the mac/win ROLE stages (activate_macos_exit_role + capture, relay/anchor lifecycle). Set true for focused role-cell runs (exit/relay/anchor/blind_exit); the default Rust path may not run every role stage."}),
                         "allow_concurrent": json!({"type": "boolean", "description": "Opt into PARALLEL runs (default false = singleton). When true, up to 3 runs may overlap — you MUST give each disjoint guests (e.g. the macOS↔Windows pipeline: macOS on one Debian backbone, Windows on another). Each concurrent run gets its own CARGO_TARGET_DIR + report dir."}),
                         "dry_run": json!({"type": "boolean", "description": "Run the orchestrator in --dry-run mode (fast; verifies the launch wiring without a real lab pass)."}),
                         "max_steps": json!({"type": "integer", "description": "Max tool-calling steps per triage agent on failure (default 12, cap 20)."}),
@@ -4253,6 +4625,7 @@ mod tests {
             None,             // blind_exit_platform
             Some("debian-3"), // entry_vm
             true,             // macos_promote_exit
+            true,             // legacy_bash
             false,            // dry_run
         );
         assert_eq!(a[0], "vm-lab-orchestrate-live-lab");
@@ -4272,6 +4645,7 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--exit-platform", "macos"]));
         assert!(a.windows(2).any(|w| w == ["--entry-vm", "debian-3"]));
         assert!(a.iter().any(|x| x == "--macos-promote-exit"));
+        assert!(a.iter().any(|x| x == "--legacy-bash-orchestrator"));
         // Selectors NOT provided do not appear.
         assert!(!a.iter().any(|x| x == "--windows-vm"));
         assert!(!a.iter().any(|x| x == "--client-vm"));
@@ -4283,7 +4657,7 @@ mod tests {
         // selectors (incl. --macos-promote-exit) when omitted.
         let d = build_orchestrator_args(
             "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None,
-            false, true,
+            false, false, true,
         );
         assert!(d.iter().any(|x| x == "--dry-run"));
         assert!(!d.iter().any(|x| x == "--macos-vm"));
@@ -4291,6 +4665,7 @@ mod tests {
         assert!(!d.iter().any(|x| x == "--exit-platform"));
         assert!(!d.iter().any(|x| x == "--entry-vm"));
         assert!(!d.iter().any(|x| x == "--macos-promote-exit"));
+        assert!(!d.iter().any(|x| x == "--legacy-bash-orchestrator"));
     }
 
     #[test]
@@ -4713,6 +5088,168 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.contains("leakdir")),
             "symlinked dir must NOT be walked: {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A server rooted at a throwaway temp dir, so job-record writes land in the
+    /// temp tree (never the real repo's state/). Mirrors `new()` but overrides
+    /// `repo_root`.
+    fn server_rooted(root: &Path) -> DeepSeekServer {
+        let agent = ureq::AgentBuilder::new().build();
+        DeepSeekServer {
+            api_key: String::new(),
+            agent,
+            repo_root: root.to_path_buf(),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            job_seq: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn new_job_id_is_unique_and_prefixed() {
+        let s = server();
+        let a = s.new_job_id("labrun");
+        let b = s.new_job_id("labrun");
+        // The prefix must remain the FIRST token (drive_deepseek.py's JOB_RE and
+        // the lab_run_status filter key on it).
+        assert!(a.starts_with("labrun-"), "got {a}");
+        assert!(b.starts_with("labrun-"), "got {b}");
+        // The trailing sequence differs, so two ids in one lifetime never collide.
+        assert_ne!(a, b);
+        // Other prefixes are honored too.
+        assert!(s.new_job_id("triage").starts_with("triage-"));
+        assert!(s.new_job_id("docsync").starts_with("docsync-"));
+    }
+
+    #[test]
+    fn persisted_done_job_round_trips_after_reload() {
+        // A done record written by one server instance must be readable — and
+        // surfaced by deepseek_live_lab_result — from a FRESH instance whose
+        // in-memory map is empty (the reload-survival contract).
+        let root = std::env::temp_dir().join(format!(
+            "deepseek_jobrec_done_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let writer = server_rooted(&root);
+        let job_id = writer.new_job_id("triage");
+        writer.write_job_record(
+            &job_id,
+            &json!({
+                "job_id": job_id,
+                "kind": "triage",
+                "state": "running",
+                "area": "macOS relay",
+                "started_unix": now_unix(),
+            }),
+        );
+        writer.finish_job(&job_id, "THE DONE REPORT".to_string());
+
+        // Fresh instance = empty in-memory map, same repo_root → must read disk.
+        let reader = server_rooted(&root);
+        assert!(
+            reader.jobs.lock().unwrap().is_empty(),
+            "fresh instance must start with an empty in-memory map"
+        );
+        let rec = reader.read_job_record(&job_id).expect("record on disk");
+        assert_eq!(rec.get("state").and_then(|s| s.as_str()), Some("done"));
+        assert_eq!(
+            rec.get("report_text").and_then(|s| s.as_str()),
+            Some("THE DONE REPORT")
+        );
+        // The static fields written at creation survive the done update.
+        assert_eq!(
+            rec.get("area").and_then(|s| s.as_str()),
+            Some("macOS relay")
+        );
+
+        // The poll tool, with no in-memory entry, returns the stored report.
+        let res = reader.call_live_lab_result(&json!({"job_id": job_id}));
+        assert!(res.is_error.is_none(), "done record must poll non-error");
+        let body = res
+            .content
+            .first()
+            .map(|c| c.text.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(body.contains("THE DONE REPORT"), "got: {body}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn poll_surfaces_orphaned_run_outcome_from_report_dir() {
+        // A labrun whose record is still "running" (the worker died on a reload)
+        // but whose detached orchestrator already wrote orchestrate_result.json:
+        // the poll fallback must surface the OUTCOME (overall_status + first
+        // failed stage) + a "auto-triage did not run" note, not "still running".
+        let root = std::env::temp_dir().join(format!(
+            "deepseek_jobrec_orphan_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let reader = server_rooted(&root);
+
+        let job_id = reader.new_job_id("labrun");
+        let report_dir = format!("state/deepseek-lab-{job_id}");
+        // Persist a "running" record (as the worker did before the reload).
+        reader.write_job_record(
+            &job_id,
+            &json!({
+                "job_id": job_id,
+                "kind": "labrun",
+                "state": "running",
+                "area": "macOS exit",
+                "report_dir": report_dir,
+                "started_unix": now_unix(),
+            }),
+        );
+        // The orphaned-but-finished orchestrator's completion artifact.
+        let orch_dir = root.join(&report_dir).join("orchestration");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        std::fs::write(
+            orch_dir.join("orchestrate_result.json"),
+            json!({
+                "command": "vm-lab-orchestrate-live-lab",
+                "overall_status": "fail",
+                "report_dir": report_dir,
+                "outcomes": [
+                    {"stage": "bootstrap", "status": "pass", "summary": "", "artifacts": []},
+                    {"stage": "macos_exit_nat", "status": "fail", "summary": "", "artifacts": []}
+                ],
+                "warnings": [],
+                "next_actions": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let res = reader.call_live_lab_result(&json!({"job_id": job_id}));
+        assert!(res.is_error.is_none(), "orphan outcome must poll non-error");
+        let body = res
+            .content
+            .first()
+            .map(|c| c.text.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(body.contains("fail"), "must surface overall_status: {body}");
+        assert!(
+            body.contains("macos_exit_nat"),
+            "must surface first failed stage: {body}"
+        );
+        assert!(
+            body.contains("auto-triage did NOT run") || body.contains("RELOADED"),
+            "must note the reload + missing auto-triage: {body}"
+        );
+        assert!(
+            body.contains(&report_dir),
+            "must point at the report dir: {body}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
