@@ -32,8 +32,10 @@ pub const MACOS_RUSTYNET_ANCHOR_PREFIX: &str = "com.apple/rustynet_g";
 const MACOS_ANCHOR_POLL_ATTEMPTS: u32 = 15;
 // Compile-time invariant: the poll budget must be finite and positive so the
 // anchor poll loop is always bounded (fail-closed termination). A const assert
-// catches an accidental zero/unbounded budget at build time — strictly stronger
-// than a runtime test, and checked on every platform this module compiles on.
+// catches an accidental zero/unbounded budget at build time — stronger than a
+// runtime test. Gated to macOS to match the constant it checks (the const is
+// `cfg(target_os = "macos")`, so an ungated assert is an E0425 on Linux).
+#[cfg(target_os = "macos")]
 const _: () = assert!(MACOS_ANCHOR_POLL_ATTEMPTS > 0 && MACOS_ANCHOR_POLL_ATTEMPTS <= 60);
 #[cfg(target_os = "macos")]
 const MACOS_ANCHOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
