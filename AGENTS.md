@@ -385,6 +385,59 @@ Authoritative gate definitions live in §7. This section is the fast-path map.
 - Interactive wizard: `./start.sh`.
 - Rust-native operator menu: `rustynet operator menu`.
 
+### 12.5 Research & Triage — the DeepSeek MCP (`rustynet-mcp-deepseek`)
+
+DeepSeek is the **research / triage / summarizing layer**: offload the
+token-heavy *reading* to it and reserve your own (expensive) context for the
+code change, the security call, and the live lab. If you catch yourself reading
+a long log / journal / diff / doc just to understand it, hand it to DeepSeek
+first and act on the distilled output.
+
+Four tools (`mcp__rustynet-deepseek__*`), each taking `prompt`, optional
+`context`, and `model`:
+- `deepseek_read` — analysis / review / second opinion / risk ID (read-only).
+- `deepseek_write` — generate boilerplate / test scaffolds / doc drafts.
+- `deepseek_read_write` — analyze existing content, then generate (review-then-fix).
+- `deepseek_agent` — **READ-ONLY autonomous agent that GROUNDS against the actual
+  local repo + UTM lab.** Drives a tool-calling loop over ~20 confined read-only
+  tools (read_file / grep / find_definition / git / find_files + lab_inventory /
+  lab_run_status / lab_stage_log / lab_report_grep / lab_guest_exec /
+  utm_vm_status / lab_node_reachable / …) and answers with cited evidence + an
+  audit trace. **The three proxies see only what you paste; the agent verifies a
+  claim against reality** ("does this fn really do X?", "did that stage fail
+  because Y?", "is this node reachable?"). Prefer it whenever you want DeepSeek
+  to check the real code/lab, not opine on a pasted snippet.
+
+Use it for: digesting CI logs / daemon journals / nft-pf dumps / large diffs;
+per-finding root-cause triage (one call each); researching unfamiliar errors +
+platform quirks (WFP / PF-launchd / nft / WireGuard); proactively hunting latent
+bugs ("given this crate, list the 10 most likely fail-open paths / missing
+platform-cfg cases"); drafting test scaffolds; and — before committing a
+security-sensitive patch — 3–5 concurrent "REFUTE this patch" cross-checks
+(disagreement = dig deeper first).
+
+Model: `model: "flash"` (deepseek-chat — fast, cheap; the DEFAULT, fan liberally
+and concurrently for breadth). `model: "pro"` (deepseek-reasoner —
+chain-of-thought, slow; reserve for genuinely hard multi-step root-cause /
+protocol-logic reasoning where flash keeps giving conflicting answers).
+
+**Hard limits — DeepSeek output is UNTRUSTED.** It never makes the security call,
+never writes the repo, never runs gates. It *proposes*; you verify against the
+real code and *dispose*. A grounded "DeepSeek-verifies-DeepSeek" chain (flash
+proxy finds candidates → `deepseek_agent` confirms each against the repo/lab → you
+do the final security check) cuts false positives but **certifies nothing** — for
+any claim driving a security or code change, YOUR verification against the real
+code stays mandatory. If the server is down, proceed without it.
+
+Operational: the servers run pre-built binaries at `bin/rustynet-mcp-*` (config in
+`mcp/mcp.json`). If `deepseek_agent` is absent (only the three proxies present),
+`bin/rustynet-mcp-deepseek` is stale — rebuild (`cargo build --release --bin
+rustynet-mcp-deepseek`), install over `bin/rustynet-mcp-deepseek`, then reconnect
+the server (`/mcp` → reconnect, or restart the client — killing the process does
+NOT auto-respawn). The API key resolves from `DEEPSEEK_API_KEY` or
+`~/Desktop/deepseek_api.md`; **never commit, log, or write it into the repo or any
+artifact.**
+
 ## 13) Keeping AGENTS.md / CLAUDE.md In Sync
 `AGENTS.md` and `CLAUDE.md` are intentionally byte-for-byte mirrored. Any edit to
 one MUST be applied identically to the other in the same change. When you add,
