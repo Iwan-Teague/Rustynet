@@ -428,6 +428,24 @@ The remaining three are the live-lab family. The **loop driver** you normally ca
 - `deepseek_live_lab_result` — poll either of the above by `job_id` (non-blocking:
   the report when done, else "still running Ns").
 
+After a lab-verified fix, the **docs-sync proposer**:
+- `deepseek_doc_sync` — **PROPOSE-ONLY, READ-ONLY docs-sync.** Give it
+  `change_summary` (REQUIRED: what was fixed/patched/verified) + optional `commit`
+  / `evidence` (the verifying lab run id / run-matrix row / stage) / `doc_hints`
+  (likely-affected docs, e.g. "CrossPlatformRoleParityPlan") / `model` / `max_steps`.
+  It runs the SAME grounded agent loop as `deepseek_agent` but on the
+  **repo-reads-only** subset (read_file/list_dir/grep/find_files/find_definition/
+  find_references + read-only git — NO lab/guest/cargo tools): it reads the CURRENT
+  docs (active ledgers, CODE_MAP, README/AGENTS/CLAUDE, the doc indexes, the
+  run-matrix) and returns a STRUCTURED list of exact docs-only edits
+  (`file`/`old_string`/`new_string`/`rationale`, each copy-paste-applicable by exact
+  string replacement) plus a "considered, no change" coverage list. Docs-only
+  (`documents/**` + root `README.md`/`AGENTS.md`/`CLAUDE.md`); enforces the
+  AGENTS.md↔CLAUDE.md mirror + index-sync, and never invents evidence/status/dates/
+  SHAs. It writes NOTHING — a human applies the edits. Async like the others:
+  returns a `job_id`; poll `deepseek_live_lab_result` for the proposal. UNTRUSTED
+  output — review before applying.
+
 No live-lab step writes the repo, runs gates, or makes the security call — DeepSeek
 proposes, you verify each cited claim against the real code and dispose.
 
