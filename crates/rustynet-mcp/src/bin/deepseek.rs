@@ -815,6 +815,44 @@ impl DeepSeekServer {
         let client_vm = get_str(args, "client_vm")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+
+        // Role-platform selectors: ELECT a mac/win node into the exit/relay/anchor/
+        // blind_exit role so the focused role cell runs LIVE instead of skipping.
+        // Each must be exactly one of {linux, macos, windows} — fail closed on any
+        // other value rather than passing junk to the orchestrator.
+        let validate_role_platform = |key: &str| -> Result<Option<String>, String> {
+            match get_str(args, key).map(str::trim).filter(|s| !s.is_empty()) {
+                None => Ok(None),
+                Some(v @ ("linux" | "macos" | "windows")) => Ok(Some(v.to_string())),
+                Some(other) => Err(format!(
+                    "invalid {key} '{other}': must be one of linux|macos|windows"
+                )),
+            }
+        };
+        let exit_platform = match validate_role_platform("exit_platform") {
+            Ok(v) => v,
+            Err(e) => return tool_error(&e),
+        };
+        let relay_platform = match validate_role_platform("relay_platform") {
+            Ok(v) => v,
+            Err(e) => return tool_error(&e),
+        };
+        let anchor_platform = match validate_role_platform("anchor_platform") {
+            Ok(v) => v,
+            Err(e) => return tool_error(&e),
+        };
+        let blind_exit_platform = match validate_role_platform("blind_exit_platform") {
+            Ok(v) => v,
+            Err(e) => return tool_error(&e),
+        };
+        let macos_promote_exit = args
+            .get("macos_promote_exit")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let entry_vm = get_str(args, "entry_vm")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let allow_concurrent = args
             .get("allow_concurrent")
             .and_then(|v| v.as_bool())
@@ -885,6 +923,12 @@ impl DeepSeekServer {
                 exit_vm.as_deref(),
                 client_vm.as_deref(),
                 rebuild.as_deref(),
+                exit_platform.as_deref(),
+                relay_platform.as_deref(),
+                anchor_platform.as_deref(),
+                blind_exit_platform.as_deref(),
+                entry_vm.as_deref(),
+                macos_promote_exit,
                 dry_run,
             ));
             let arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
@@ -2754,6 +2798,12 @@ fn build_orchestrator_args(
     exit_vm: Option<&str>,
     client_vm: Option<&str>,
     rebuild_nodes: Option<&str>,
+    exit_platform: Option<&str>,
+    relay_platform: Option<&str>,
+    anchor_platform: Option<&str>,
+    blind_exit_platform: Option<&str>,
+    entry_vm: Option<&str>,
+    macos_promote_exit: bool,
     dry_run: bool,
 ) -> Vec<String> {
     let mut a: Vec<String> = vec!["vm-lab-orchestrate-live-lab".to_string()];
@@ -2780,6 +2830,28 @@ fn build_orchestrator_args(
     }
     if let Some(r) = rebuild_nodes {
         a.extend(["--rebuild-nodes".to_string(), r.to_string()]);
+    }
+    // Role-platform selectors: elect a mac/win node into the role so the focused
+    // role cell runs live instead of skipping (validated upstream to linux|macos|
+    // windows). Bare --macos-promote-exit is the Option-B macOS secondary-exit
+    // selector (is_macos_active_exit = config.macos_promote_exit).
+    if let Some(p) = exit_platform {
+        a.extend(["--exit-platform".to_string(), p.to_string()]);
+    }
+    if let Some(p) = relay_platform {
+        a.extend(["--relay-platform".to_string(), p.to_string()]);
+    }
+    if let Some(p) = anchor_platform {
+        a.extend(["--anchor-platform".to_string(), p.to_string()]);
+    }
+    if let Some(p) = blind_exit_platform {
+        a.extend(["--blind-exit-platform".to_string(), p.to_string()]);
+    }
+    if let Some(e) = entry_vm {
+        a.extend(["--entry-vm".to_string(), e.to_string()]);
+    }
+    if macos_promote_exit {
+        a.push("--macos-promote-exit".to_string());
     }
     if dry_run {
         a.push("--dry-run".to_string());
@@ -3570,6 +3642,12 @@ impl McpServer for DeepSeekServer {
                         "rebuild_nodes": json_schema_string("Comma-separated node aliases to redeploy ONLY (fast re-verify after a per-node patch)."),
                         "exit_vm": json_schema_string("Linux exit-node alias for this run's backbone (use a DISJOINT exit_vm/client_vm per run when running concurrently)."),
                         "client_vm": json_schema_string("Linux client-node alias for this run's backbone."),
+                        "exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the EXIT role so the focused mac/win exit cell runs live instead of skipping."),
+                        "relay_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the RELAY role so the focused mac/win relay cell runs live instead of skipping."),
+                        "anchor_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the ANCHOR role so the focused mac/win anchor cell runs live instead of skipping."),
+                        "blind_exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the BLIND_EXIT role so the focused mac/win blind-exit cell runs live instead of skipping."),
+                        "macos_promote_exit": json!({"type": "boolean", "description": "Option-B selector: elect macOS as a SECONDARY exit so the macOS exit cell runs live (drives is_macos_active_exit). Use alongside exit_vm/client_vm/entry_vm."}),
+                        "entry_vm": json_schema_string("Linux entry-node alias for the Option-B exit topology (used alongside exit_vm/client_vm + macos_promote_exit)."),
                         "allow_concurrent": json!({"type": "boolean", "description": "Opt into PARALLEL runs (default false = singleton). When true, up to 3 runs may overlap — you MUST give each disjoint guests (e.g. the macOS↔Windows pipeline: macOS on one Debian backbone, Windows on another). Each concurrent run gets its own CARGO_TARGET_DIR + report dir."}),
                         "dry_run": json!({"type": "boolean", "description": "Run the orchestrator in --dry-run mode (fast; verifies the launch wiring without a real lab pass)."}),
                         "max_steps": json!({"type": "integer", "description": "Max tool-calling steps per triage agent on failure (default 12, cap 20)."}),
@@ -4165,7 +4243,13 @@ mod tests {
             Some("debian-2"),
             None,
             Some("ll-3"),
-            false,
+            Some("macos"),    // exit_platform
+            None,             // relay_platform
+            None,             // anchor_platform
+            None,             // blind_exit_platform
+            Some("debian-3"), // entry_vm
+            true,             // macos_promote_exit
+            false,            // dry_run
         );
         assert_eq!(a[0], "vm-lab-orchestrate-live-lab");
         for flag in [
@@ -4180,14 +4264,29 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--macos-vm", "macos-utm-1"]));
         assert!(a.windows(2).any(|w| w == ["--exit-vm", "debian-2"]));
         assert!(a.windows(2).any(|w| w == ["--rebuild-nodes", "ll-3"]));
+        // Role-platform selectors present when provided.
+        assert!(a.windows(2).any(|w| w == ["--exit-platform", "macos"]));
+        assert!(a.windows(2).any(|w| w == ["--entry-vm", "debian-3"]));
+        assert!(a.iter().any(|x| x == "--macos-promote-exit"));
+        // Selectors NOT provided do not appear.
         assert!(!a.iter().any(|x| x == "--windows-vm"));
         assert!(!a.iter().any(|x| x == "--client-vm"));
+        assert!(!a.iter().any(|x| x == "--relay-platform"));
+        assert!(!a.iter().any(|x| x == "--anchor-platform"));
+        assert!(!a.iter().any(|x| x == "--blind-exit-platform"));
         assert!(!a.iter().any(|x| x == "--dry-run"));
-        // dry_run adds the flag; no macOS/Windows/backbone/rebuild when omitted.
-        let d = build_orchestrator_args("inv", "s", "k", "r", None, None, None, None, None, true);
+        // dry_run adds the flag; no macOS/Windows/backbone/rebuild/role-platform
+        // selectors (incl. --macos-promote-exit) when omitted.
+        let d = build_orchestrator_args(
+            "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None,
+            false, true,
+        );
         assert!(d.iter().any(|x| x == "--dry-run"));
         assert!(!d.iter().any(|x| x == "--macos-vm"));
         assert!(!d.iter().any(|x| x == "--exit-vm"));
+        assert!(!d.iter().any(|x| x == "--exit-platform"));
+        assert!(!d.iter().any(|x| x == "--entry-vm"));
+        assert!(!d.iter().any(|x| x == "--macos-promote-exit"));
     }
 
     #[test]
