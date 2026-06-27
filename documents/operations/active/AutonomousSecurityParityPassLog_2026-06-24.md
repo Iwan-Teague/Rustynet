@@ -131,8 +131,9 @@ and the `macos-pf-load` decode boundary.
 ## Code-complete vs blocked (parity — authoritative, see ParityPlan §10)
 
 - **code-complete, live-run pending:** macOS admin, macOS anchor (bundle-pull),
-  macOS exit, macOS blind_exit, macOS relay (lifecycle), Windows admin, Windows
+  macOS exit, macOS blind_exit, Windows admin, Windows
   exit (now incl. §10.7 self-heal — WinNAT live still blocked).
+- **NOW LIVE-PROVEN (2026-06-27):** macOS relay (lifecycle) — `validate_macos_relay_service_lifecycle` PASS, run `livelab-1782571161`.
 - **genuinely unbuilt (Linux-authorable):** live cross-OS role transitions (a
   stage that flips a mac/win node + re-applies signed state); design now in
   `CrossOsRoleSwitchPlan_2026-06-24.md`.
