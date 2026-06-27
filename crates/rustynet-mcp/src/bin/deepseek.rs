@@ -201,7 +201,17 @@ impl DeepSeekServer {
              efficiently, then write your FINAL answer as plain prose well before the budget runs \
              out — a grounded conclusion from what you have already gathered beats spending every \
              step on more tools. In a final answer, output prose ONLY: never emit tool-call or \
-             function-call syntax."
+             function-call syntax.\n\nTOOLS — you have a rich READ-ONLY repertoire for grounding; \
+             USE IT AGGRESSIVELY: read_file (with offset/max_bytes for a line range), list_dir, \
+             grep (with optional `context` lines for surrounding code), find_files, find_definition \
+             (where a symbol is DECLARED), find_references (where a symbol is USED — call sites / \
+             impact), read-only git (log / show / diff / blame / cat-file — history and \
+             'did this regress, and in which commit?'), plus the live-lab tools (lab_inventory, \
+             lab_run_status, lab_run_detail, lab_stage_log, lab_report_grep, lab_report_artifacts, \
+             lab_guest_exec, utm_vm_status, lab_node_reachable). Ground EVERY claim in a file:line or \
+             log line you actually opened — never infer from memory — and cross-check with a second \
+             tool (grep → read_file, or find_definition → find_references, or git blame on the line) \
+             before asserting it."
         );
         let mut messages = json!([
             {"role": "system", "content": system_with_budget},
@@ -752,6 +762,7 @@ impl DeepSeekServer {
             "lab_report_grep" => self.tool_lab_report_grep(args),
             "lab_report_artifacts" => self.tool_lab_report_artifacts(args),
             "find_definition" => self.tool_find_definition(args),
+            "find_references" => self.tool_find_references(args),
             other => Err(format!("unknown tool '{other}'")),
         };
         match result {
@@ -859,39 +870,42 @@ impl DeepSeekServer {
         // Pass the confined path as an absolute argv element so the search never
         // escapes the repo even though cwd=repo_root.
         let canon_str = canon.to_string_lossy().to_string();
+        // Optional surrounding-context lines (rg/grep -C N), so the agent can see
+        // the code around a match and ground claims more precisely.
+        let context = args
+            .get("context")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.clamp(0, 10))
+            .unwrap_or(0);
+        let context_str = context.to_string();
 
         // Prefer ripgrep; fall back to grep -rn. argv-only: the pattern is a
         // separate argument and is NEVER interpolated into a shell string.
         let (program, argv): (&str, Vec<&str>) = if which("rg") {
-            (
-                "rg",
-                vec![
-                    // Ignore any ambient RIPGREP_CONFIG_PATH that could inject a
-                    // preprocessor (`--pre`) command — keep grep read-only.
-                    "--no-config",
-                    "--no-heading",
-                    "--line-number",
-                    "--color=never",
-                    "--max-count",
-                    "200",
-                    "-e",
-                    pattern,
-                    "--",
-                    canon_str.as_str(),
-                ],
-            )
+            // Ignore any ambient RIPGREP_CONFIG_PATH that could inject a
+            // preprocessor (`--pre`) command — keep grep read-only.
+            let mut v = vec![
+                "--no-config",
+                "--no-heading",
+                "--line-number",
+                "--color=never",
+                "--max-count",
+                "200",
+            ];
+            if context > 0 {
+                v.push("-C");
+                v.push(context_str.as_str());
+            }
+            v.extend(["-e", pattern, "--", canon_str.as_str()]);
+            ("rg", v)
         } else {
-            (
-                "grep",
-                vec![
-                    "-rn",
-                    "--color=never",
-                    "-e",
-                    pattern,
-                    "--",
-                    canon_str.as_str(),
-                ],
-            )
+            let mut v = vec!["-rn", "--color=never"];
+            if context > 0 {
+                v.push("-C");
+                v.push(context_str.as_str());
+            }
+            v.extend(["-e", pattern, "--", canon_str.as_str()]);
+            ("grep", v)
         };
         let outcome = run_with_timeout(
             program,
@@ -2144,6 +2158,89 @@ impl DeepSeekServer {
             lines.join("\n")
         ))
     }
+
+    /// Find REFERENCES (usages / call sites) of a Rust symbol across the repo —
+    /// every `\bsymbol\b` occurrence, the definition included. Complements
+    /// find_definition (which locates where a symbol is DECLARED): this shows where
+    /// it is USED, so an agent can ground claims about impact and call sites.
+    /// Read-only; the symbol is validated to the Rust-identifier charset so the
+    /// fixed regex template is injection-safe.
+    fn tool_find_references(&self, args: &Value) -> Result<String, String> {
+        let symbol = arg_str(args, "symbol").ok_or("missing 'symbol'")?.trim();
+        if symbol.is_empty()
+            || symbol.len() > 128
+            || !symbol
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(format!(
+                "invalid symbol '{symbol}': only ASCII letters, digits and '_' allowed (Rust identifier)"
+            ));
+        }
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.clamp(1, 300) as usize)
+            .unwrap_or(80);
+        if !which("rg") {
+            return Ok(format!(
+                "# find_references \"{symbol}\"\n\n(ripgrep `rg` not on PATH — grep for the name instead)\n"
+            ));
+        }
+        // FIXED word-boundary template; the validated symbol is the only
+        // interpolation and contains no regex metacharacters.
+        let pattern = format!(r"\b{symbol}\b");
+        let outcome = run_with_timeout(
+            "rg",
+            &[
+                "--no-config",
+                "--no-heading",
+                "--line-number",
+                "--color=never",
+                "--max-count",
+                "300",
+                "-e",
+                pattern.as_str(),
+                "--",
+                ".",
+            ],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(SUBPROC_TIMEOUT_SECS),
+        )?;
+        let mapped: Vec<&str> = outcome
+            .stdout
+            .lines()
+            .map(strip_repo_prefix_in_line(&self.repo_root))
+            .collect();
+        let total = mapped.len();
+        if total == 0 {
+            if !outcome.success && outcome.code != Some(1) {
+                return Err(format!(
+                    "rg failed (exit {:?}): {}",
+                    outcome.code,
+                    outcome.stderr.trim()
+                ));
+            }
+            return Ok(format!(
+                "# find_references \"{symbol}\"\n\n(no references found)\n"
+            ));
+        }
+        let shown = &mapped[..total.min(limit)];
+        let note = if total > shown.len() {
+            format!(
+                " — {total} total, showing {}; raise `limit` or narrow with grep",
+                shown.len()
+            )
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "# find_references \"{symbol}\" ({} line(s){note})\n\n{}\n",
+            shown.len(),
+            shown.join("\n")
+        ))
+    }
 }
 
 /// Repo-relative path to the UTM VM lab inventory (mirrors lab_state's
@@ -2492,7 +2589,8 @@ fn agent_tool_definitions() -> Value {
             json!({
                 "pattern": {"type": "string", "description": "Regex/text pattern to search for"},
                 "path": {"type": "string", "description": "Optional repo-relative subdirectory or file to confine the search (default: whole repo)"},
-                "max_results": {"type": "integer", "description": "Max match lines to return (default 80, cap 500)"}
+                "max_results": {"type": "integer", "description": "Max match lines to return (default 80, cap 500)"},
+                "context": {"type": "integer", "description": "Optional surrounding context lines per match (-C N, 0-10), to see the code around a hit"}
             }),
             &["pattern"],
         ),
@@ -2666,6 +2764,18 @@ fn agent_tool_definitions() -> Value {
             json!({
                 "symbol": {"type": "string", "description": "Rust identifier to find the definition of, e.g. 'DeepSeekServer' or 'run_with_timeout'"},
                 "limit": {"type": "integer", "description": "Max result lines to return (default 40, cap 200)"}
+            }),
+            &["symbol"],
+        ),
+        fn_tool(
+            "find_references",
+            "Find every USAGE / call site of a Rust symbol across the repo (\\bsymbol\\b, the \
+             definition included) via ripgrep. Complements find_definition: that shows where a \
+             symbol is DECLARED, this shows where it is USED — for impact + call-site grounding. \
+             The symbol must be a Rust identifier. Returns repo-relative path:line. Read-only.",
+            json!({
+                "symbol": {"type": "string", "description": "Rust identifier to find usages of, e.g. 'run_triage' or 'MacosKillswitchSpec'"},
+                "limit": {"type": "integer", "description": "Max result lines to return (default 80, cap 300)"}
             }),
             &["symbol"],
         ),
@@ -3147,7 +3257,7 @@ mod tests {
     fn agent_tool_definitions_are_well_formed() {
         let defs = agent_tool_definitions();
         let arr = defs.as_array().unwrap();
-        assert_eq!(arr.len(), 20);
+        assert_eq!(arr.len(), 21);
         for d in arr {
             assert_eq!(d["type"], "function");
             assert!(d["function"]["name"].is_string());
@@ -3179,6 +3289,7 @@ mod tests {
             "lab_report_grep",
             "lab_report_artifacts",
             "find_definition",
+            "find_references",
         ] {
             assert!(names.contains(&n), "tool {n} missing from definitions");
         }
