@@ -11236,7 +11236,7 @@ fn deploy_windows_anchor_service(
          if($s.Status -eq 'Running'){{ & sc.exe stop $svc | Out-Null; Start-Sleep -Seconds 2 }}; \
          & sc.exe start $svc | Out-Null; \
          $up=$false; \
-         for($i=0;$i -lt 20;$i++){{ \
+         for($i=0;$i -lt 60;$i++){{ \
            $c=Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue; \
            if($c){{ foreach($x in $c){{ if($x.LocalAddress -eq '127.0.0.1' -or $x.LocalAddress -eq '::1'){{$up=$true;break}} }} }}; \
            if($up){{break}}; \
