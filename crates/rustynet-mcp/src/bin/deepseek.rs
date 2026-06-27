@@ -181,8 +181,20 @@ impl DeepSeekServer {
         max_steps: u64,
     ) -> Result<String, String> {
         let tools = agent_tool_definitions();
+        // Budget-aware system prompt: without this, flash agents tend to spend
+        // EVERY step on tool calls and then, when forced to answer with no tools
+        // left, emit tool-call markup instead of prose (→ an empty budget note).
+        // Telling them the budget up front makes them synthesize a real conclusion
+        // before they run out.
+        let system_with_budget = format!(
+            "{system}\n\nSTEP BUDGET: you have at most {max_steps} tool-calling steps. Investigate \
+             efficiently, then write your FINAL answer as plain prose well before the budget runs \
+             out — a grounded conclusion from what you have already gathered beats spending every \
+             step on more tools. In a final answer, output prose ONLY: never emit tool-call or \
+             function-call syntax."
+        );
         let mut messages = json!([
-            {"role": "system", "content": system},
+            {"role": "system", "content": system_with_budget},
             {"role": "user", "content": prompt},
         ]);
         let mut trace: Vec<String> = Vec::new();
@@ -271,7 +283,7 @@ impl DeepSeekServer {
         if let Some(arr) = messages.as_array_mut() {
             arr.push(json!({
                 "role": "user",
-                "content": "Step budget reached. Give your best final answer now using only what you have already gathered. Do not request more tools.",
+                "content": "You have used all your tool-calling steps and have NO further tool access. Write your final analysis NOW as plain prose only, based on what you already gathered. Do NOT output any tool-call or function-call syntax — it will be discarded.",
             }));
         }
         let parsed = self.chat(messages, None, model)?;
