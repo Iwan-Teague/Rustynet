@@ -393,7 +393,7 @@ code change, the security call, and the live lab. If you catch yourself reading
 a long log / journal / diff / doc just to understand it, hand it to DeepSeek
 first and act on the distilled output.
 
-Five tools (`mcp__rustynet-deepseek__*`). The first four take `prompt`, optional
+Seven tools (`mcp__rustynet-deepseek__*`). The first four take `prompt`, optional
 `context`, and `model`:
 - `deepseek_read` — analysis / review / second opinion / risk ID (read-only).
 - `deepseek_write` — generate boilerplate / test scaffolds / doc drafts.
@@ -408,20 +408,28 @@ Five tools (`mcp__rustynet-deepseek__*`). The first four take `prompt`, optional
   because Y?", "is this node reachable?"). Prefer it whenever you want DeepSeek
   to check the real code/lab, not opine on a pasted snippet.
 
-The fifth tool is the live-lab failure-triage **orchestrator** (different
-signature — `target`, `failure_context`, optional `max_steps`):
-- `deepseek_live_lab` — **the rigid, non-negotiable failure-triage pipeline.**
-  Hand it a failed live-lab stage's evidence as `failure_context`; it runs three
-  grounded read-only sub-agents in fixed order — v4-flash research (why/where/what,
-  + optional fix) → v4-flash verify-every-claim-against-the-repo/lab → v4-pro at
-  MAX reasoning re-verify + judge-the-best-fix — into ONE evidence-cited report
-  (root cause, file:line, suspected fix). It runs ASYNC (the pipeline takes
-  minutes, past the MCP timeout): the call returns a `job_id`, then poll
-  `deepseek_live_lab_result` for the report. No step writes the repo, runs gates,
-  or makes the security call. Use it for END-OF-RUN triage instead of a
-  bare flash fan-out; you still verify each cited claim against the real code
-  before acting. (A v4-pro layer that also *launches + drives* the lab is being
-  built on top of it.)
+The remaining three are the live-lab family. The **loop driver** you normally call:
+- `deepseek_lab_run` — **one call runs the WHOLE pipeline.** Give it an `area`
+  (e.g. "macOS relay") + optional selectors (`macos`/`windows`/`macos_vm`/
+  `windows_vm`/`exit_vm`/`client_vm`/`rebuild_nodes`); a DETERMINISTIC worker
+  launches the hardened orchestrator (NO LLM in the deploy/monitor path), waits,
+  and on FAILURE runs the rigid triage below. Async: returns a `job_id`, poll
+  `deepseek_live_lab_result`. Singleton by default; `allow_concurrent: true` +
+  disjoint guests (a separate `exit_vm` per run) runs the macOS↔Windows pipeline
+  (≤3 overlapping). `dry_run` is a fast wiring check. On a green run, ZERO LLM
+  calls — you just get PASS + evidence.
+- `deepseek_live_lab` — **the rigid, non-negotiable failure-triage pipeline** on a
+  failure you ALREADY have (hand it `target` + `failure_context`). Three grounded
+  read-only sub-agents in fixed order — v4-flash research (why/where/what) →
+  v4-flash verify-every-claim-against-the-repo/lab → v4-pro at MAX reasoning
+  re-verify + judge-the-best-fix — into ONE evidence-cited report (root cause,
+  file:line, suspected fix). Async (job_id → poll). `deepseek_lab_run` calls this
+  internally on failure; call it directly when you already have the evidence.
+- `deepseek_live_lab_result` — poll either of the above by `job_id` (non-blocking:
+  the report when done, else "still running Ns").
+
+No live-lab step writes the repo, runs gates, or makes the security call — DeepSeek
+proposes, you verify each cited claim against the real code and dispose.
 
 Use it for: digesting CI logs / daemon journals / nft-pf dumps / large diffs;
 per-finding root-cause triage (one call each); researching unfamiliar errors +
