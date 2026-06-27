@@ -931,3 +931,16 @@ timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
 2026-06-27T20:33:31Z,36a5ba8,dirty,prime_remote_access,deepseek-lab-labrun-1-99961,45,pass
 2026-06-27T20:34:17Z,36a5ba8,dirty,macos_preflight_check,deepseek-lab-labrun-1-99961,0,pass
 2026-06-27T20:34:18Z,36a5ba8,dirty,cleanup_hosts,deepseek-lab-labrun-1-99961,35,pass
+2026-06-27T20:34:53Z,36a5ba8,dirty,bootstrap_hosts,deepseek-lab-labrun-1-99961,746,pass
+2026-06-27T20:47:27Z,36a5ba8,dirty,collect_pubkeys,deepseek-lab-labrun-1-99961,23,pass
+2026-06-27T20:47:50Z,36a5ba8,dirty,membership_setup,deepseek-lab-labrun-1-99961,27,pass
+2026-06-27T20:48:17Z,36a5ba8,dirty,distribute_membership_state,deepseek-lab-labrun-1-99961,38,pass
+2026-06-27T20:48:55Z,36a5ba8,dirty,issue_and_distribute_assignments,deepseek-lab-labrun-1-99961,96,pass
+2026-06-27T20:50:32Z,36a5ba8,dirty,issue_and_distribute_traversal,deepseek-lab-labrun-1-99961,69,pass
+2026-06-27T20:52:07Z,,clean,preflight,deepseek-lab-labrun-1782593507838-33914-0,0,pass
+2026-06-27T20:52:08Z,3d2c752,dirty,prepare_source_archive,deepseek-lab-labrun-1782593507838-33914-0,1,pass
+2026-06-27T20:52:10Z,3d2c752,dirty,verify_ssh_reachability,deepseek-lab-labrun-1782593507838-33914-0,1,pass
+2026-06-27T20:51:45Z,36a5ba8,dirty,issue_and_distribute_dns_zone,deepseek-lab-labrun-1-99961,68,pass
+2026-06-27T20:52:11Z,3d2c752,dirty,prime_remote_access,deepseek-lab-labrun-1782593507838-33914-0,46,pass
+2026-06-27T20:52:58Z,3d2c752,dirty,macos_preflight_check,deepseek-lab-labrun-1782593507838-33914-0,0,pass
+2026-06-27T20:52:59Z,3d2c752,dirty,cleanup_hosts,deepseek-lab-labrun-1782593507838-33914-0,32,pass

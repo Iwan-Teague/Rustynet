@@ -65,6 +65,11 @@ codegen-units = 1
 [profile.release.package.rustynet-relay]
 codegen-units = 1
 
+# rustynet-cli links ~30 crates; with thin LTO on a 2Gi VM the linker OOMs.
+# codegen-units=16 keeps per-unit memory ~16x smaller so lab VMs can build it.
+[profile.release.package.rustynet-cli]
+codegen-units = 16
+
 [profile.bench]
 lto = "thin"
 
