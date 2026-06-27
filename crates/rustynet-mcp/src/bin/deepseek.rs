@@ -64,6 +64,9 @@ const MAX_CONCURRENT_LAB_RUNS: usize = 3;
 /// Standard lab SSH material + inventory (mirrors the lab-state MCP defaults).
 const LAB_SSH_IDENTITY_REL: &str = ".ssh/rustynet_lab_ed25519";
 const LAB_KNOWN_HOSTS_REL: &str = ".ssh/known_hosts";
+/// Timeout for the agents' `cargo check`/`cargo test` grounding tools. Generous —
+/// a cold cross-target check can run minutes; the step budget caps how many run.
+const CARGO_TOOL_TIMEOUT_SECS: u64 = 420;
 
 /// State of an async triage job: still running (with its start time, for elapsed
 /// reporting) or finished with its assembled report.
@@ -208,10 +211,14 @@ impl DeepSeekServer {
              impact), read-only git (log / show / diff / blame / cat-file — history and \
              'did this regress, and in which commit?'), plus the live-lab tools (lab_inventory, \
              lab_run_status, lab_run_detail, lab_stage_log, lab_report_grep, lab_report_artifacts, \
-             lab_guest_exec, utm_vm_status, lab_node_reachable). Ground EVERY claim in a file:line or \
-             log line you actually opened — never infer from memory — and cross-check with a second \
-             tool (grep → read_file, or find_definition → find_references, or git blame on the line) \
-             before asserting it."
+             lab_guest_exec, utm_vm_status, lab_node_reachable), AND grounding-by-EXECUTION: \
+             cargo_check (does it COMPILE — host = macOS+common code, target='windows' = the \
+             x86_64-pc-windows-gnu cross-target for Windows cfg code — and what is the REAL compiler \
+             error?) and cargo_test (does a scoped test currently pass/fail?). Ground EVERY claim in \
+             a file:line, a log line, or a check/test you actually RAN — never infer from memory. \
+             When a claim is about compiling or a test outcome, RUN cargo_check / cargo_test to \
+             confirm it instead of guessing; and cross-check with a second tool (grep → read_file, \
+             find_definition → find_references, or git blame on the line) before asserting it."
         );
         let mut messages = json!([
             {"role": "system", "content": system_with_budget},
@@ -763,6 +770,8 @@ impl DeepSeekServer {
             "lab_report_artifacts" => self.tool_lab_report_artifacts(args),
             "find_definition" => self.tool_find_definition(args),
             "find_references" => self.tool_find_references(args),
+            "cargo_check" => self.tool_cargo_check(args),
+            "cargo_test" => self.tool_cargo_test(args),
             other => Err(format!("unknown tool '{other}'")),
         };
         match result {
@@ -2241,6 +2250,111 @@ impl DeepSeekServer {
             shown.join("\n")
         ))
     }
+
+    /// Run `cargo check` as a GROUNDING aid — confirm code compiles (and see the
+    /// real compiler errors) for a crate, on the host (macOS+common) or the
+    /// Windows cross-target (`target: "windows"` → x86_64-pc-windows-gnu). argv-only,
+    /// validated scope, bounded; writes only to `target/`. Output is UNTRUSTED like
+    /// any tool result — the authoritative pre-commit gate stays with the main agent.
+    fn tool_cargo_check(&self, args: &Value) -> Result<String, String> {
+        let crate_name = arg_str(args, "crate").and_then(validate_crate_name);
+        let target = resolve_cargo_target(arg_str(args, "target"))?;
+        let mut argv: Vec<&str> = vec!["check", "--quiet"];
+        match crate_name {
+            Some(c) => {
+                argv.push("-p");
+                argv.push(c);
+            }
+            None => argv.push("--workspace"),
+        }
+        if let Some(t) = target {
+            argv.push("--target");
+            argv.push(t);
+        }
+        let outcome = run_with_timeout(
+            "cargo",
+            &argv,
+            &self.repo_root,
+            &[],
+            Duration::from_secs(CARGO_TOOL_TIMEOUT_SECS),
+        )?;
+        let scope = format!(
+            "{}{}",
+            crate_name
+                .map(|c| format!("-p {c}"))
+                .unwrap_or_else(|| "--workspace".into()),
+            target.map(|t| format!(" --target {t}")).unwrap_or_default()
+        );
+        let diags = truncate_output(&outcome.stderr, 120, 12 * 1024);
+        Ok(format!(
+            "# cargo check {scope}\n\n{}\n\n{}",
+            if outcome.success {
+                "RESULT: OK — compiles."
+            } else {
+                "RESULT: FAILED — compile errors below (this is GROUND TRUTH for the diagnosis)."
+            },
+            if diags.trim().is_empty() {
+                "(no diagnostics)".to_string()
+            } else {
+                format!("```\n{diags}\n```")
+            }
+        ))
+    }
+
+    /// Run a SCOPED `cargo test` as a grounding aid — confirm a specific test's
+    /// current pass/fail (e.g. "does this test reproduce the bug?"). A `crate` is
+    /// REQUIRED (full-workspace test is too heavy); an optional `test_filter`
+    /// narrows it. argv-only, validated, bounded. UNTRUSTED output.
+    fn tool_cargo_test(&self, args: &Value) -> Result<String, String> {
+        let crate_name = arg_str(args, "crate").and_then(validate_crate_name).ok_or(
+            "'crate' is required and must be a workspace crate name (alphanumeric/-/_); a full-workspace test run is too heavy",
+        )?;
+        let filter = arg_str(args, "test_filter")
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(f) = filter {
+            if f.len() > 128
+                || !f
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
+            {
+                return Err(format!(
+                    "invalid test_filter '{f}': only letters, digits, '_' and ':' allowed"
+                ));
+            }
+        }
+        let target = resolve_cargo_target(arg_str(args, "target"))?;
+        let mut argv: Vec<&str> = vec!["test", "--quiet", "-p", crate_name];
+        if let Some(t) = target {
+            argv.push("--target");
+            argv.push(t);
+        }
+        if let Some(f) = filter {
+            argv.push(f);
+        }
+        let outcome = run_with_timeout(
+            "cargo",
+            &argv,
+            &self.repo_root,
+            &[],
+            Duration::from_secs(CARGO_TOOL_TIMEOUT_SECS),
+        )?;
+        let scope = format!(
+            "-p {crate_name}{}{}",
+            target.map(|t| format!(" --target {t}")).unwrap_or_default(),
+            filter.map(|f| format!(" '{f}'")).unwrap_or_default()
+        );
+        let out = truncate_output(&outcome.stdout, 80, 8 * 1024);
+        let err = truncate_output(&outcome.stderr, 40, 4 * 1024);
+        Ok(format!(
+            "# cargo test {scope}\n\n{}\n\n```\n{out}\n{err}\n```",
+            if outcome.success {
+                "RESULT: tests PASSED."
+            } else {
+                "RESULT: tests FAILED / errored (ground truth)."
+            }
+        ))
+    }
 }
 
 /// Repo-relative path to the UTM VM lab inventory (mirrors lab_state's
@@ -2420,6 +2534,29 @@ fn build_orchestrator_args(
         a.push("--dry-run".to_string());
     }
     a
+}
+
+/// Validate a workspace crate name for the cargo grounding tools: ASCII
+/// alphanumeric + '-'/'_' only (no path, no flags, no shell metacharacters).
+fn validate_crate_name(s: &str) -> Option<&str> {
+    let t = s.trim();
+    (!t.is_empty()
+        && t.len() <= 64
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    .then_some(t)
+}
+
+/// Resolve a cargo `--target` from a friendly OS name. Only the host (default)
+/// and the Windows cross-target are allowed — never an arbitrary triple.
+fn resolve_cargo_target(s: Option<&str>) -> Result<Option<&'static str>, String> {
+    match s.map(str::trim) {
+        None | Some("") | Some("host") | Some("macos") | Some("mac") => Ok(None),
+        Some("windows") | Some("win") => Ok(Some("x86_64-pc-windows-gnu")),
+        Some(other) => Err(format!(
+            "unsupported target '{other}': use 'host'/'macos' (this machine) or 'windows' (x86_64-pc-windows-gnu cross-check)"
+        )),
+    }
 }
 
 fn resolve_model(model_str: &str) -> &'static str {
@@ -2778,6 +2915,31 @@ fn agent_tool_definitions() -> Value {
                 "limit": {"type": "integer", "description": "Max result lines to return (default 80, cap 300)"}
             }),
             &["symbol"],
+        ),
+        fn_tool(
+            "cargo_check",
+            "GROUNDING aid: run `cargo check` to confirm code COMPILES (and see the real compiler \
+             errors) — on the host (macOS + common code) or, with target='windows', the \
+             x86_64-pc-windows-gnu cross-target (Windows cfg code). Scope to a crate for speed. \
+             Confirms a compile claim by RUNNING it instead of inferring. Read-only w.r.t. the repo \
+             (writes only target/); output is UNTRUSTED like any tool result.",
+            json!({
+                "crate": {"type": "string", "description": "Workspace crate to check (e.g. 'rustynetd'); omit to check the whole --workspace (slower)"},
+                "target": {"type": "string", "description": "'host'/'macos' (default, this machine) or 'windows' (x86_64-pc-windows-gnu cross-check)"}
+            }),
+            &[],
+        ),
+        fn_tool(
+            "cargo_test",
+            "GROUNDING aid: run a SCOPED `cargo test` to confirm a specific test's current pass/fail \
+             (e.g. 'does this test reproduce the bug?'). A `crate` is REQUIRED; a `test_filter` \
+             narrows to matching tests. Confirms behavior by RUNNING it. Output is UNTRUSTED.",
+            json!({
+                "crate": {"type": "string", "description": "Workspace crate whose tests to run, e.g. 'rustynetd' (required — a full-workspace test is too heavy)"},
+                "test_filter": {"type": "string", "description": "Optional test-name substring to narrow the run, e.g. 'killswitch' or 'macos_render_pf'"},
+                "target": {"type": "string", "description": "'host'/'macos' (default) or 'windows' (x86_64-pc-windows-gnu)"}
+            }),
+            &["crate"],
         ),
     ])
 }
@@ -3257,7 +3419,7 @@ mod tests {
     fn agent_tool_definitions_are_well_formed() {
         let defs = agent_tool_definitions();
         let arr = defs.as_array().unwrap();
-        assert_eq!(arr.len(), 21);
+        assert_eq!(arr.len(), 23);
         for d in arr {
             assert_eq!(d["type"], "function");
             assert!(d["function"]["name"].is_string());
@@ -3290,6 +3452,8 @@ mod tests {
             "lab_report_artifacts",
             "find_definition",
             "find_references",
+            "cargo_check",
+            "cargo_test",
         ] {
             assert!(names.contains(&n), "tool {n} missing from definitions");
         }
