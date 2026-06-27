@@ -13157,14 +13157,18 @@ fn run_windows_orchestration_stages_with_options(
     ]
 }
 
-/// Prove the Windows node can act as ADMIN by minting its own assignment
-/// signing authority and issuing a cryptographically signed assignment bundle
-/// on the guest — the Windows analogue of `exercise_macos_admin_issue_live`,
-/// using the platform-neutral `assignment init-signing-secret` + `assignment
-/// issue` verbs via PowerShell. The passphrase is a 64-hex-char throwaway
-/// written to the per-invocation work dir; `assignment issue` signs internally
-/// and fails closed on a bad key, so a non-empty signed bundle + verifier key
-/// is the live proof the mint/issue/sign path runs natively on Windows.
+/// Prove the Windows node can act as ADMIN by minting its own DPAPI-backed
+/// signing authority and issuing a cryptographically signed bundle on the guest
+/// — the Windows analogue of `exercise_macos_admin_issue_live`. The installed
+/// Windows `rustynet.exe` is the dedicated DPAPI trust CLI
+/// (`trust <keygen|export-verifier-key|issue>`); the unix `assignment
+/// init-signing-secret`/`issue` verbs (encrypted-at-rest file key custody) do
+/// not exist on Windows, so admin authority is proven via `trust keygen` (mint
+/// a signing key + verifier key) + `trust issue` (sign a bundle) instead. The
+/// passphrase is a 64-hex-char throwaway in the per-invocation work dir; `trust
+/// issue` signs internally and fails closed on a bad key, so a non-empty signed
+/// bundle + verifier key is the live proof the mint/issue/sign path runs
+/// natively on Windows.
 fn exercise_windows_admin_issue_live(
     windows_alias: &str,
     inventory_path: &Path,
@@ -13201,22 +13205,17 @@ fn exercise_windows_admin_issue_live(
          New-Item -ItemType Directory -Force -Path $work | Out-Null; \
          $pass=Join-Path $work 'pass'; \
          [IO.File]::WriteAllText($pass,([guid]::NewGuid().ToString('N')+[guid]::NewGuid().ToString('N'))); \
-         $secret=Join-Path $work 'secret'; \
-         & $rn assignment init-signing-secret --output $secret --signing-secret-passphrase-file $pass --force; \
-         if($LASTEXITCODE -ne 0){{throw 'init-signing-secret failed'}}; \
-         $b=[Convert]::FromBase64String((Get-Content -LiteralPath 'C:\\ProgramData\\RustyNet\\keys\\wireguard.pub' -Raw).Trim()); \
-         $pubhex=-join($b|%{{$_.ToString('x2')}}); \
-         $nid='{node_id}'; \
-         $nodes=\"$nid|127.0.0.1:51820|$pubhex|$nid|$nid|windows||client\"; \
-         $allow=\"$nid|$nid\"; \
-         $bundle=Join-Path $work 'bundle'; $vpub=Join-Path $work 'vpub'; \
-         & $rn assignment issue --target-node-id $nid --nodes $nodes --allow $allow --signing-secret $secret --signing-secret-passphrase-file $pass --output $bundle --verifier-key-output $vpub --ttl-secs 300; \
-         if($LASTEXITCODE -ne 0){{throw 'assignment issue failed'}}; \
+         $key=Join-Path $work 'signing.key'; $vpub=Join-Path $work 'vpub'; \
+         & $rn trust keygen --signing-key-output $key --signing-key-passphrase-file $pass --verifier-key-output $vpub --force; \
+         if($LASTEXITCODE -ne 0){{throw 'trust keygen failed'}}; \
+         $bundle=Join-Path $work 'bundle'; \
+         & $rn trust issue --signing-key $key --signing-key-passphrase-file $pass --output $bundle; \
+         if($LASTEXITCODE -ne 0){{throw 'trust issue failed'}}; \
          if(-not(Test-Path $bundle) -or (Get-Item $bundle).Length -eq 0){{throw 'issued bundle missing or empty'}}; \
          if(-not(Test-Path $vpub) -or (Get-Item $vpub).Length -eq 0){{throw 'verifier key missing or empty'}}; \
          $bytes=(Get-Item $bundle).Length; \
          Remove-Item -Recurse -Force $work; \
-         Write-Output \"minted signing authority + issued a signed assignment bundle ($bytes bytes)\"",
+         Write-Output \"minted signing authority + issued a signed trust bundle ($bytes bytes)\"",
     );
 
     let out = capture_remote_shell_command_for_target(
