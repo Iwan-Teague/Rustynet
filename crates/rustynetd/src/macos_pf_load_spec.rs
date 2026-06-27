@@ -615,7 +615,41 @@ mod tests {
             true,
         );
         let rules = spec.render().unwrap();
-        assert_eq!(rules, "set block-policy drop\nblock drop out quick all\n");
+        // Even strict-fail-closed exempts loopback (host-internal, never leaves
+        // the box) — otherwise local IPC / loopback resolver / loopback health
+        // checks die. Everything else still default-denies via the terminal block.
+        assert_eq!(
+            rules,
+            "set block-policy drop\npass quick on lo0 all\nblock drop out quick all\n"
+        );
+    }
+
+    #[test]
+    fn killswitch_always_exempts_loopback_bidirectionally() {
+        // The loopback exemption must be present in BOTH strict and non-strict
+        // modes, scoped to lo0 (not a blanket pass), and BEFORE the terminal
+        // default-deny. Regression guard for the macOS relay loopback
+        // health-check false-fail (SYN_RCVD on 127.0.0.1:4501).
+        for strict in [false, true] {
+            let rules = render_macos_killswitch_pf_rules(&rich_killswitch_spec(), strict);
+            assert!(
+                rules.contains("pass quick on lo0 all\n"),
+                "loopback exemption missing (strict={strict}): {rules}"
+            );
+            let lo_pos = rules.find("pass quick on lo0 all").unwrap();
+            let block_pos = rules.rfind("block drop out quick all").unwrap();
+            assert!(
+                lo_pos < block_pos,
+                "loopback rule must precede the terminal block (strict={strict})"
+            );
+            // render() runs the anti-tamper invariants; equality proves they pass.
+            assert_eq!(
+                killswitch(rich_killswitch_spec(), 1, strict)
+                    .render()
+                    .unwrap(),
+                rules
+            );
+        }
     }
 
     #[test]

@@ -2495,11 +2495,20 @@ pub(crate) fn render_macos_killswitch_pf_rules(
 ) -> String {
     let mut rules = String::new();
     rules.push_str("set block-policy drop\n");
+    // Loopback is host-internal and never leaves the box. Allow it in BOTH
+    // directions and BOTH address families, UNCONDITIONALLY (incl.
+    // strict-fail-closed), so the daemon's local IPC, the loopback DNS resolver,
+    // and loopback health checks (e.g. the relay's 127.0.0.1:4501 /healthz) keep
+    // working — without this an inbound SYN-ACK on lo0 has no matching pass and a
+    // localhost handshake stalls in SYN_RCVD. `quick` short-circuits; scoping to
+    // `on lo0` keeps this from being a blanket `pass` (the terminal
+    // `block drop out quick all` still default-denies every other egress). This
+    // mirrors Linux's `oifname "lo" accept` + `ct state established,related accept`.
+    rules.push_str("pass quick on lo0 all\n");
     if !strict_fail_closed {
         // pf grammar: `[action] [direction] [quick] [on <iface>] [<af>] …` — the
         // address family (`inet`/`inet6`) MUST follow `on <iface>` (macOS pfctl
         // rejects the reversed form).
-        rules.push_str("pass out quick on lo0 inet all keep state\n");
         if spec.dns_protected {
             rules.push_str(&format!(
                 "pass out quick on {} inet proto udp to any port 53 keep state\n",
@@ -11854,7 +11863,7 @@ mod tests {
         assert_eq!(
             rules,
             "set block-policy drop\n\
-             pass out quick on lo0 inet all keep state\n\
+             pass quick on lo0 all\n\
              pass out quick on utun9 inet proto udp to any port 53 keep state\n\
              pass out quick on utun9 inet proto tcp to any port 53 keep state\n\
              block drop out quick inet proto udp to any port 53 label \"rustynet-dns-block-lan-udp\"\n\
@@ -11888,7 +11897,10 @@ mod tests {
             .render_pf_rules(true)
             .expect("rule render should succeed");
 
-        assert_eq!(rules, "set block-policy drop\nblock drop out quick all\n");
+        assert_eq!(
+            rules,
+            "set block-policy drop\npass quick on lo0 all\nblock drop out quick all\n"
+        );
     }
 
     #[test]
@@ -11904,7 +11916,7 @@ mod tests {
         assert_eq!(
             rules,
             "set block-policy drop\n\
-             pass out quick on lo0 inet all keep state\n\
+             pass quick on lo0 all\n\
              pass out quick on utun9 inet all keep state\n\
              pass out quick on en0 inet all keep state\n\
              block drop out quick all\n"
