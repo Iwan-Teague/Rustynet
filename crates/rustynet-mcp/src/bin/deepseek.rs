@@ -54,6 +54,13 @@ const AGENT_DEFAULT_MAX_STEPS: u64 = 12;
 const AGENT_HARD_MAX_STEPS: u64 = 20;
 /// Timeout for any local subprocess the agent tools spawn (grep/git/uname/utmctl).
 const SUBPROC_TIMEOUT_SECS: u64 = 30;
+/// Wall-clock cap for a full live-lab orchestration launched by deepseek_lab_run.
+/// Generous (90 min) — a 3-OS pass + diagnose can run long; the worker thread
+/// blocks on it while the MCP call already returned a job_id.
+const LAB_ORCHESTRATOR_TIMEOUT_SECS: u64 = 5400;
+/// Standard lab SSH material + inventory (mirrors the lab-state MCP defaults).
+const LAB_SSH_IDENTITY_REL: &str = ".ssh/rustynet_lab_ed25519";
+const LAB_KNOWN_HOSTS_REL: &str = ".ssh/known_hosts";
 
 /// State of an async triage job: still running (with its start time, for elapsed
 /// reporting) or finished with its assembled report.
@@ -488,6 +495,201 @@ impl DeepSeekServer {
                 "unknown job_id '{job_id}' — not found (it may have been lost on an MCP-server \
                  reload; re-run deepseek_live_lab)"
             )),
+        }
+    }
+
+    /// Resolve the lab inventory alias for a platform ("macos"/"windows"/"linux").
+    /// Linux entries carry no `platform` field (→ "linux"). Read-only; confined.
+    fn inventory_alias_for_platform(&self, platform: &str) -> Option<String> {
+        let canon = self.confine(LAB_INVENTORY_PATH).ok()?;
+        let body = rustynet_mcp::read_file_capped(&canon, 4 * 1024 * 1024).ok()?;
+        let inv: Value = serde_json::from_str(&body).ok()?;
+        let entries = inv.get("entries")?.as_array()?;
+        for e in entries {
+            let p = e
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .filter(|p| !p.is_empty())
+                .unwrap_or("linux");
+            if p == platform {
+                if let Some(a) = e.get("alias").and_then(|v| v.as_str()) {
+                    return Some(a.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Count in-flight lab-run jobs — the lab is a singleton, never two
+    /// orchestrations on the VMs at once.
+    fn running_lab_jobs(&self) -> usize {
+        self.jobs
+            .lock()
+            .map(|jobs| {
+                jobs.iter()
+                    .filter(|(id, j)| {
+                        id.starts_with("labrun-") && matches!(j, TriageJob::Running { .. })
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Entry point for `deepseek_lab_run`: the WHOLE pipeline in one call. The
+    /// worker thread launches the hardened orchestrator (DETERMINISTIC — no LLM in
+    /// the deploy path), waits for it, and on FAILURE runs the rigid triage
+    /// pipeline on the run's evidence; on success it reports the pass. Async: the
+    /// call returns a job_id, the caller polls deepseek_live_lab_result.
+    fn call_lab_run(&self, args: &Value) -> ToolCallResult {
+        let area = get_str(args, "area")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(unspecified)")
+            .to_string();
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let rebuild = get_str(args, "rebuild_nodes")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let max_steps = args
+            .get("max_steps")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.clamp(1, AGENT_HARD_MAX_STEPS))
+            .unwrap_or(AGENT_DEFAULT_MAX_STEPS);
+
+        // Resolve macOS/Windows guests: explicit alias wins; `macos:true` /
+        // `windows:true` auto-resolves from the inventory.
+        let macos_vm = match get_str(args, "macos_vm") {
+            Some(a) if !a.trim().is_empty() => Some(a.trim().to_string()),
+            _ if args.get("macos").and_then(|v| v.as_bool()).unwrap_or(false) => {
+                match self.inventory_alias_for_platform("macos") {
+                    Some(a) => Some(a),
+                    None => {
+                        return tool_error("macos requested but no macOS guest in the inventory");
+                    }
+                }
+            }
+            _ => None,
+        };
+        let windows_vm = match get_str(args, "windows_vm") {
+            Some(a) if !a.trim().is_empty() => Some(a.trim().to_string()),
+            _ if args
+                .get("windows")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false) =>
+            {
+                match self.inventory_alias_for_platform("windows") {
+                    Some(a) => Some(a),
+                    None => {
+                        return tool_error(
+                            "windows requested but no Windows guest in the inventory",
+                        );
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        if self.running_lab_jobs() >= 1 {
+            return tool_error(
+                "a deepseek lab run is already in flight (the lab is a singleton) — poll \
+                 deepseek_live_lab_result for it, or wait for it to finish",
+            );
+        }
+
+        let job_id = format!(
+            "labrun-{}",
+            self.job_counter.fetch_add(1, Ordering::Relaxed)
+        );
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.insert(
+                job_id.clone(),
+                TriageJob::Running {
+                    started: Instant::now(),
+                },
+            );
+        }
+
+        // Build the ack message before `area` moves into the worker closure.
+        let started_msg = format!(
+            "Live-lab run started: `{job_id}` (area: {area}{}). The orchestrator runs \
+             deterministically (no LLM in the deploy path); on failure the rigid triage pipeline \
+             runs automatically. This takes many minutes — poll `deepseek_live_lab_result` with \
+             job_id=\"{job_id}\" until it returns the report.",
+            if dry_run { ", DRY-RUN" } else { "" }
+        );
+        let worker = self.clone();
+        let jid = job_id.clone();
+        let report_dir = format!("state/deepseek-lab-{job_id}");
+        std::thread::spawn(move || {
+            let ssh = home_path(LAB_SSH_IDENTITY_REL);
+            let kh = home_path(LAB_KNOWN_HOSTS_REL);
+            let mut cargo_args: Vec<String> = ["run", "--quiet", "-p", "rustynet-cli", "--", "ops"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            cargo_args.extend(build_orchestrator_args(
+                LAB_INVENTORY_PATH,
+                &ssh,
+                &kh,
+                &report_dir,
+                macos_vm.as_deref(),
+                windows_vm.as_deref(),
+                rebuild.as_deref(),
+                dry_run,
+            ));
+            let arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
+
+            let body = match run_with_timeout(
+                "cargo",
+                &arg_refs,
+                &worker.repo_root,
+                &[],
+                Duration::from_secs(LAB_ORCHESTRATOR_TIMEOUT_SECS),
+            ) {
+                Ok(o) if o.success => format!(
+                    "# Live-lab run: {area} — PASS\n\nThe orchestration completed successfully. \
+                     Evidence in `{report_dir}` (verify the matrix row + per-stage results before \
+                     trusting). No triage needed.\n\n_stdout tail:_\n{}",
+                    truncate_output(&o.stdout, 60, 4000)
+                ),
+                Ok(o) if dry_run => format!(
+                    "# Live-lab run: {area} — DRY-RUN wiring check complete\n\nThe orchestrator's \
+                     non-zero exit is EXPECTED in --dry-run (every stage is skipped, so the \
+                     setup-complete check can't pass). The launch → wait → capture → report path is \
+                     verified; no triage is run for a dry run.\n\n_output tail:_\n{}",
+                    truncate_output(&o.stdout, 60, 4000)
+                ),
+                Ok(o) => {
+                    // Real run FAILED → feed the evidence to the rigid triage pipeline.
+                    let failure_context = format!(
+                        "Live-lab orchestration for area '{area}' FAILED (orchestrator exited \
+                         non-zero). Report dir the grounded agents can read: {report_dir}. \
+                         Orchestrator output tail:\n{}\n{}",
+                        truncate_output(&o.stdout, 80, 6000),
+                        truncate_output(&o.stderr, 40, 3000)
+                    );
+                    let triage = worker.run_triage(&failure_context, max_steps);
+                    format!(
+                        "# Live-lab run: {area} — FAIL → triage\n\nReport dir: `{report_dir}`\n\n{triage}"
+                    )
+                }
+                Err(e) => format!(
+                    "# Live-lab run: {area} — could not launch the orchestrator: {e}\n\n(Is `cargo` \
+                     on PATH, the inventory ready, and SSH material present? This is an \
+                     infrastructure error, not a lab failure.)"
+                ),
+            };
+            if let Ok(mut jobs) = worker.jobs.lock() {
+                jobs.insert(jid, TriageJob::Done(body));
+            }
+        });
+
+        ToolCallResult {
+            content: text_content(started_msg),
+            is_error: None,
         }
     }
 
@@ -2033,6 +2235,53 @@ fn assemble_triage_report(research: &str, verified: &str, final_review: &str) ->
     )
 }
 
+fn home_path(rel: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/{rel}")
+}
+
+/// Build the `ops vm-lab-orchestrate-live-lab` argument vector (everything after
+/// `cargo run --quiet -p rustynet-cli -- ops`) for a deepseek_lab_run. Pure +
+/// deterministic so it is unit-testable: there is NO LLM in this deploy path —
+/// the worker shells out to the same hardened orchestrator the lab-state MCP
+/// drives. Safe defaults: trust the prepared inventory, skip the slow gates/soak/
+/// cross-network legs, and ship the working tree (so uncommitted patches deploy).
+#[allow(clippy::too_many_arguments)] // a flat, deterministic CLI-arg builder; each arg is distinct.
+fn build_orchestrator_args(
+    inventory: &str,
+    ssh_identity: &str,
+    known_hosts: &str,
+    report_dir: &str,
+    macos_vm: Option<&str>,
+    windows_vm: Option<&str>,
+    rebuild_nodes: Option<&str>,
+    dry_run: bool,
+) -> Vec<String> {
+    let mut a: Vec<String> = vec!["vm-lab-orchestrate-live-lab".to_string()];
+    a.extend(["--inventory".to_string(), inventory.to_string()]);
+    a.extend(["--ssh-identity-file".to_string(), ssh_identity.to_string()]);
+    a.extend(["--known-hosts-file".to_string(), known_hosts.to_string()]);
+    a.extend(["--report-dir".to_string(), report_dir.to_string()]);
+    a.push("--trust-inventory-ready".to_string());
+    a.push("--skip-gates".to_string());
+    a.push("--skip-soak".to_string());
+    a.push("--skip-cross-network".to_string());
+    a.extend(["--source-mode".to_string(), "working-tree".to_string()]);
+    if let Some(m) = macos_vm {
+        a.extend(["--macos-vm".to_string(), m.to_string()]);
+    }
+    if let Some(w) = windows_vm {
+        a.extend(["--windows-vm".to_string(), w.to_string()]);
+    }
+    if let Some(r) = rebuild_nodes {
+        a.extend(["--rebuild-nodes".to_string(), r.to_string()]);
+    }
+    if dry_run {
+        a.push("--dry-run".to_string());
+    }
+    a
+}
+
 fn resolve_model(model_str: &str) -> &'static str {
     match model_str.to_lowercase().as_str() {
         "pro" | "reasoner" | "deepseek-reasoner" | "deepseek-v4-pro" => PRO_MODEL,
@@ -2545,6 +2794,32 @@ impl McpServer for DeepSeekServer {
                     vec!["job_id"],
                 ),
             },
+            Tool {
+                name: "deepseek_lab_run".into(),
+                description: "\
+                    Run the WHOLE live-lab pipeline in one call: launch the hardened orchestrator for \
+                    an area, wait for it, and on failure run the rigid triage pipeline automatically — \
+                    you get back ONE report (PASS evidence, or root cause + file:line + suspected fix). \
+                    The launch + wait are DETERMINISTIC (no LLM in the deploy path); only the triage \
+                    uses DeepSeek. Async: returns a job_id immediately; poll deepseek_live_lab_result \
+                    for the report (a run takes many minutes). The lab is a singleton — one run at a \
+                    time. UNTRUSTED triage output — verify before changing code."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "area": json_schema_string(
+                            "What area of the lab to work on (e.g. 'macOS relay', 'Windows admin') — the report header + triage focus."),
+                        "macos": json!({"type": "boolean", "description": "Include the macOS guest (auto-resolved from the inventory)."}),
+                        "windows": json!({"type": "boolean", "description": "Include the Windows guest (auto-resolved from the inventory)."}),
+                        "macos_vm": json_schema_string("Explicit macOS guest alias (overrides `macos` auto-resolution)."),
+                        "windows_vm": json_schema_string("Explicit Windows guest alias (overrides `windows` auto-resolution)."),
+                        "rebuild_nodes": json_schema_string("Comma-separated node aliases to redeploy ONLY (fast re-verify after a per-node patch)."),
+                        "dry_run": json!({"type": "boolean", "description": "Run the orchestrator in --dry-run mode (fast; verifies the launch wiring without a real lab pass)."}),
+                        "max_steps": json!({"type": "integer", "description": "Max tool-calling steps per triage agent on failure (default 12, cap 20)."}),
+                    }),
+                    vec!["area"],
+                ),
+            },
         ]
     }
 
@@ -2560,6 +2835,9 @@ impl McpServer for DeepSeekServer {
         }
         if name == "deepseek_live_lab_result" {
             return self.call_live_lab_result(&args);
+        }
+        if name == "deepseek_lab_run" {
+            return self.call_lab_run(&args);
         }
 
         let prompt = match get_str(&args, "prompt") {
@@ -2879,6 +3157,7 @@ mod tests {
             "deepseek_agent",
             "deepseek_live_lab",
             "deepseek_live_lab_result",
+            "deepseek_lab_run",
         ] {
             assert!(
                 !names.contains(&forbidden),
@@ -2932,6 +3211,38 @@ mod tests {
                 .is_error
                 .is_none()
         );
+    }
+
+    #[test]
+    fn orchestrator_args_are_safe_and_well_formed() {
+        let a = build_orchestrator_args(
+            "documents/operations/active/vm_lab_inventory.json",
+            "/home/u/.ssh/id",
+            "/home/u/.ssh/known_hosts",
+            "state/deepseek-lab-labrun-1",
+            Some("macos-utm-1"),
+            None,
+            Some("ll-3"),
+            false,
+        );
+        assert_eq!(a[0], "vm-lab-orchestrate-live-lab");
+        for flag in [
+            "--trust-inventory-ready",
+            "--skip-gates",
+            "--skip-soak",
+            "--skip-cross-network",
+        ] {
+            assert!(a.iter().any(|x| x == flag), "missing {flag}: {a:?}");
+        }
+        assert!(a.windows(2).any(|w| w == ["--source-mode", "working-tree"]));
+        assert!(a.windows(2).any(|w| w == ["--macos-vm", "macos-utm-1"]));
+        assert!(a.windows(2).any(|w| w == ["--rebuild-nodes", "ll-3"]));
+        assert!(!a.iter().any(|x| x == "--windows-vm"));
+        assert!(!a.iter().any(|x| x == "--dry-run"));
+        // dry_run adds the flag; no macOS/Windows/rebuild when omitted.
+        let d = build_orchestrator_args("inv", "s", "k", "r", None, None, None, true);
+        assert!(d.iter().any(|x| x == "--dry-run"));
+        assert!(!d.iter().any(|x| x == "--macos-vm"));
     }
 
     #[test]
