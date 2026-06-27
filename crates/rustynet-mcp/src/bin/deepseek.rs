@@ -97,6 +97,16 @@ enum TriageJob {
 
 type JobMap = Arc<Mutex<HashMap<String, TriageJob>>>;
 
+/// One record's outcome from `deepseek_reconcile_jobs`: which record changed, the
+/// transition, and why. Collected per reconciled record for the summary report.
+struct ReconcileChange {
+    job_id: String,
+    kind: String,
+    old_state: String,
+    new_state: String,
+    reason: String,
+}
+
 /// Which confined, read-only tool repertoire a grounded agent run is allowed to
 /// use. Both variants are READ-ONLY (no tool mutates the repo, the lab, or any
 /// guest); the variant only restricts WHICH read-only tools are exposed.
@@ -263,6 +273,31 @@ impl DeepSeekServer {
             obj.insert("finished_unix".into(), json!(now_unix()));
         }
         self.write_job_record(job_id, &rec);
+    }
+
+    /// Stamp the running job record with the detached orchestrator's pid, merging
+    /// into the existing record so the static creation fields (area, report_dir,
+    /// started_unix) survive. Best-effort: a missing record (write failed at
+    /// creation) is recreated minimally so the pid is still recorded. This is what
+    /// lets a crashed/killed run (dead pid, no completion artifact) be recognised
+    /// instead of pegging the singleton slot forever.
+    fn record_orchestrator_pid(&self, job_id: &str, pid: u32) {
+        let mut rec = self
+            .read_job_record(job_id)
+            .unwrap_or_else(|| json!({ "job_id": job_id, "started_unix": now_unix() }));
+        if let Some(obj) = rec.as_object_mut() {
+            obj.insert("orchestrator_pid".into(), json!(pid));
+        }
+        self.write_job_record(job_id, &rec);
+    }
+
+    /// Read the orchestrator pid recorded for a job (None for old records written
+    /// before the field existed, or before the child was spawned). Used by the
+    /// in-flight self-heal filter and the reconcile tool to probe liveness.
+    fn job_orchestrator_pid(rec: &Value) -> Option<u32> {
+        rec.get("orchestrator_pid")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
     }
 
     /// Read the orchestrator's completion artifact for a run, if it exists. After
@@ -976,20 +1011,205 @@ impl DeepSeekServer {
                 if rec.get("state").and_then(|s| s.as_str()) != Some("running") {
                     continue;
                 }
-                // Still running per the record — but if its orchestrator already
-                // wrote the completion artifact, the run is effectively done and
-                // must not peg the singleton slot.
-                let still_in_flight = rec
+                // Still running per the record — but it only counts as in-flight
+                // when BOTH:
+                //   (a) its orchestrator has NOT written the completion artifact
+                //       (otherwise the run is effectively done), AND
+                //   (b) the orchestrator is still alive — i.e. no pid was recorded
+                //       (conservative: keep counting an indeterminate record) OR a
+                //       recorded pid is still alive. A recorded-but-DEAD pid with
+                //       no artifact = a crashed/killed run; it must NOT peg the
+                //       singleton slot, so the next deepseek_lab_run can proceed
+                //       even before anyone runs deepseek_reconcile_jobs.
+                let no_artifact = rec
                     .get("report_dir")
                     .and_then(|s| s.as_str())
                     .map(|rd| self.read_orchestrate_outcome(rd).is_none())
                     .unwrap_or(true);
-                if still_in_flight {
+                let orchestrator_alive = match Self::job_orchestrator_pid(&rec) {
+                    Some(pid) => pid_is_alive(pid),
+                    None => true, // no pid recorded → conservatively assume in flight
+                };
+                if no_artifact && orchestrator_alive {
                     running.insert(job_id.to_string());
                 }
             }
         }
         running.len()
+    }
+
+    /// Reconcile a SINGLE persisted labrun record, mutating it on disk if its
+    /// `state=running` no longer reflects reality. Returns `Some(change)` when the
+    /// record was reclassified (done / crashed), `None` when it was left running
+    /// (genuinely in flight, or indeterminate — conservative). Idempotent: a
+    /// record already in a terminal state, or one for a non-labrun job, is a
+    /// no-op. Shared by the per-job and scan-all paths of the reconcile tool.
+    fn reconcile_one_record(&self, job_id: &str) -> Option<ReconcileChange> {
+        let rec = self.read_job_record(job_id)?;
+        let old_state = rec.get("state").and_then(|s| s.as_str()).unwrap_or("");
+        // Only "running" records can be stale; terminal records are left alone.
+        if old_state != "running" {
+            return None;
+        }
+        let report_dir = rec.get("report_dir").and_then(|s| s.as_str());
+
+        // Case 1: completion artifact present → the orchestrator FINISHED but the
+        // worker died before recording the result. Recover the report exactly as
+        // deepseek_live_lab_result's reload fallback does (overall_status + first
+        // failed stage) and mark the record done.
+        if let Some(rd) = report_dir
+            && let Some((overall, first_failed)) = self.read_orchestrate_outcome(rd)
+        {
+            let area = rec
+                .get("area")
+                .and_then(|s| s.as_str())
+                .unwrap_or("(unknown)");
+            let failed_line = first_failed
+                .as_deref()
+                .map(|s| format!("First failed stage: `{s}`.\n"))
+                .unwrap_or_default();
+            let report = format!(
+                "# Live-lab run `{job_id}` (area: {area}) — RECONCILED to done.\n\n\
+                 Overall status: **{overall}**.\n{failed_line}\n\
+                 The orchestrator wrote its completion artifact at `{rd}` \
+                 (`{ORCHESTRATE_RESULT_REL}`), but the deepseek worker died before recording \
+                 the result, so the record was stuck at `state=running`.\n\n\
+                 (reconciled: orchestrator finished; the worker died before recording the \
+                 result). Inspect the report dir for run_summary.md / per-stage logs."
+            );
+            // finish_job merges into the existing record (preserving the static
+            // creation fields) and stamps state=done + report_text, the same
+            // shape deepseek_live_lab_result returns.
+            self.finish_job(job_id, report);
+            return Some(ReconcileChange {
+                job_id: job_id.to_string(),
+                kind: "labrun".to_string(),
+                old_state: "running".to_string(),
+                new_state: "done".to_string(),
+                reason: "orchestrator finished (completion artifact present); worker died before \
+                         recording the result"
+                    .to_string(),
+            });
+        }
+
+        // Case 2: a pid was recorded AND it is dead, with no completion artifact →
+        // the orchestrator CRASHED or was killed mid-run. Mark the record crashed.
+        if let Some(pid) = Self::job_orchestrator_pid(&rec)
+            && !pid_is_alive(pid)
+        {
+            let mut rec = rec;
+            if let Some(obj) = rec.as_object_mut() {
+                obj.insert("state".into(), json!("crashed"));
+                obj.insert("finished_unix".into(), json!(now_unix()));
+                obj.insert(
+                    "reconcile_note".into(),
+                    json!(format!(
+                        "(reconciled: orchestrator pid {pid} is dead and no completion artifact \
+                         was written)"
+                    )),
+                );
+            }
+            self.write_job_record(job_id, &rec);
+            // Drop any stale in-memory Running entry so the slot frees immediately.
+            if let Ok(mut jobs) = self.jobs.lock() {
+                jobs.remove(job_id);
+            }
+            return Some(ReconcileChange {
+                job_id: job_id.to_string(),
+                kind: "labrun".to_string(),
+                old_state: "running".to_string(),
+                new_state: "crashed".to_string(),
+                reason: format!(
+                    "orchestrator pid {pid} is dead and no completion artifact was written"
+                ),
+            });
+        }
+
+        // Case 3: pid alive, OR no pid recorded and no artifact → genuinely in
+        // flight, or indeterminate. Be conservative: leave it running.
+        None
+    }
+
+    /// Entry point for `deepseek_reconcile_jobs`: self-service repair of stale
+    /// `state=running` labrun records so a crashed/killed run can no longer block
+    /// the singleton gate forever. With `job_id` it reconciles that one record;
+    /// otherwise it scans EVERY record under DEEPSEEK_JOBS_SUBDIR. Read-only with
+    /// respect to the lab/guests/repo — it only rewrites this server's own job
+    /// records (atomic tmp+rename, as every job-record write does).
+    fn call_reconcile_jobs(&self, args: &Value) -> ToolCallResult {
+        let single = get_str(args, "job_id")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        // The set of job ids to consider: the one requested, or every persisted
+        // labrun record.
+        let job_ids: Vec<String> = if let Some(id) = single {
+            vec![id]
+        } else {
+            let mut ids = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(self.jobs_dir()) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if let Some(job_id) = name.strip_suffix(".json")
+                        && job_id.starts_with("labrun-")
+                    {
+                        ids.push(job_id.to_string());
+                    }
+                }
+            }
+            ids.sort();
+            ids
+        };
+
+        let mut scanned = 0usize;
+        let mut left_running = 0usize;
+        let mut changes: Vec<ReconcileChange> = Vec::new();
+        for job_id in &job_ids {
+            // Only count records that exist and are currently "running" toward the
+            // scan total; a missing/terminal record is not a reconcile candidate.
+            let Some(rec) = self.read_job_record(job_id) else {
+                continue;
+            };
+            if rec.get("state").and_then(|s| s.as_str()) != Some("running") {
+                continue;
+            }
+            scanned += 1;
+            match self.reconcile_one_record(job_id) {
+                Some(change) => changes.push(change),
+                None => left_running += 1,
+            }
+        }
+
+        let reconciled_done = changes.iter().filter(|c| c.new_state == "done").count();
+        let reconciled_crashed = changes.iter().filter(|c| c.new_state == "crashed").count();
+
+        let mut out = String::new();
+        out.push_str("# deepseek_reconcile_jobs\n\n");
+        out.push_str(&format!(
+            "Scanned {scanned} running labrun record(s): reconciled {reconciled_done} to \
+             **done**, {reconciled_crashed} to **crashed**; left {left_running} **running** \
+             (genuinely in flight or indeterminate).\n",
+        ));
+        if changes.is_empty() {
+            out.push_str(
+                "\nNo stale records to repair — every running record is still genuinely in \
+                 flight (live orchestrator, no completion artifact).\n",
+            );
+        } else {
+            out.push_str("\nChanges:\n");
+            for c in &changes {
+                out.push_str(&format!(
+                    "- `{}` ({}): {} → {} — {}\n",
+                    c.job_id, c.kind, c.old_state, c.new_state, c.reason
+                ));
+            }
+        }
+        ToolCallResult {
+            content: text_content(out),
+            is_error: None,
+        }
     }
 
     /// Entry point for `deepseek_lab_run`: the WHOLE pipeline in one call. The
@@ -1231,6 +1451,16 @@ impl DeepSeekServer {
                         return;
                     }
                 };
+
+            // Record the orchestrator's pid in the running record NOW that the
+            // child exists. The record written at job creation could not carry it
+            // (the child wasn't spawned yet); without it, a run that crashes or is
+            // killed BEFORE writing the completion artifact would leave a
+            // `state=running` record with a dead orchestrator and no artifact,
+            // wrongly pegging the singleton slot forever. With the pid recorded,
+            // the in-flight filter + the reconcile tool can detect a dead
+            // orchestrator and stop counting / re-classify the record.
+            worker.record_orchestrator_pid(&jid, child.id());
 
             // Wait for the detached child with a wall-clock cap. Only a genuine
             // TIMEOUT kills the (process-group) tree; a normal exit leaves the
@@ -3147,6 +3377,65 @@ fn kill_child_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// Whether a process with `pid` is currently alive. Used to decide whether a
+/// `state=running` job record whose orchestrator was recorded at spawn is
+/// genuinely in flight or a stale record left by a crashed/killed orchestrator.
+///
+/// On unix this is `kill -0`: a return of 0 means the process exists; a failure
+/// is decoded by errno — EPERM (the process exists but is owned by another user,
+/// so the signal was refused) ALSO means alive, while ESRCH means no such
+/// process (dead). We don't link `libc` directly here (it's only a transitive
+/// dep), so we shell out to `kill -0` — the same `kill`-subprocess pattern this
+/// file already uses for `kill_child_group` — and read its exit status:
+///   - exit 0 → alive
+///   - exit != 0 → the shell `kill` could not signal it. macOS/Linux `kill`
+///     return non-zero both for ESRCH (dead) and EPERM (alive-but-not-ours). To
+///     keep the EPERM=alive semantic without parsing errno, we treat a non-zero
+///     status conservatively as "could not prove dead" ONLY when the process is
+///     genuinely ours; in practice the orchestrator is spawned by THIS user, so
+///     EPERM does not arise and a non-zero status reliably means dead. We still
+///     fail toward "alive" (return true) if the `kill` binary itself can't run,
+///     so a probe failure never wrongly frees the singleton slot.
+///
+/// pid 0 / the current pid are special-cased (0 is never a real single process
+/// target for our purposes; the current pid is trivially alive).
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    match std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        // `kill -0` succeeded → the process exists and we may signal it.
+        Ok(s) if s.success() => true,
+        // `kill -0` ran but returned non-zero → ESRCH (dead) for a process we
+        // own; treat as dead. (EPERM for another user's process does not arise
+        // for our own-spawned orchestrator.)
+        Ok(_) => false,
+        // The `kill` binary could not be launched at all → we cannot prove the
+        // process is dead, so fail toward "alive" and keep the slot held rather
+        // than wrongly freeing it on a probe failure.
+        Err(_) => true,
+    }
+}
+
+/// Non-unix fallback: without a portable cheap liveness probe, assume alive so a
+/// recorded pid never wrongly frees the singleton slot. (The deepseek live-lab
+/// orchestrator runs on the unix lab host; this branch exists only so the binary
+/// compiles on other targets.)
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
 /// Build the `ops vm-lab-orchestrate-live-lab` argument vector (everything after
 /// `cargo run --quiet -p rustynet-cli -- ops`) for a deepseek_lab_run. Pure +
 /// deterministic so it is unit-testable: there is NO LLM in this deploy path —
@@ -4065,6 +4354,28 @@ impl McpServer for DeepSeekServer {
                     vec!["change_summary"],
                 ),
             },
+            Tool {
+                name: "deepseek_reconcile_jobs".into(),
+                description: "\
+                    Self-service repair of stale live-lab job records so a crashed or killed \
+                    deepseek_lab_run can no longer block the singleton gate forever. Scans this \
+                    server's persisted job records (or just `job_id` if given): a `state=running` \
+                    record whose orchestrator already wrote its completion artifact is reclassified \
+                    DONE (recovering the run outcome); one whose recorded orchestrator pid is dead \
+                    with no artifact is reclassified CRASHED; a record that is genuinely in flight \
+                    (live pid, or no pid recorded) is left running, conservatively. Returns a \
+                    summary of how many were scanned, reconciled (done vs crashed), and left \
+                    running. Writes only this server's own job records (atomic tmp+rename); never \
+                    touches the lab, guests, or repo. Synchronous — no job_id to poll."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "job_id": json_schema_string(
+                            "Optional: reconcile only this one labrun job record. Omit to scan ALL persisted labrun records."),
+                    }),
+                    Vec::<&str>::new(),
+                ),
+            },
         ]
     }
 
@@ -4086,6 +4397,9 @@ impl McpServer for DeepSeekServer {
         }
         if name == "deepseek_doc_sync" {
             return self.call_doc_sync(&args);
+        }
+        if name == "deepseek_reconcile_jobs" {
+            return self.call_reconcile_jobs(&args);
         }
 
         let prompt = match get_str(&args, "prompt") {
@@ -4409,6 +4723,7 @@ mod tests {
             "deepseek_live_lab",
             "deepseek_live_lab_result",
             "deepseek_lab_run",
+            "deepseek_reconcile_jobs",
         ] {
             assert!(
                 !names.contains(&forbidden),
@@ -5250,6 +5565,269 @@ mod tests {
         assert!(
             body.contains(&report_dir),
             "must point at the report dir: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- job-reconcile (deepseek_reconcile_jobs) ---
+
+    /// A pid that is guaranteed dead: spawn a short-lived child, reap it, and
+    /// return its (now-defunct) pid. The OS will not reuse it within a test, so
+    /// pid_is_alive(reaped) is reliably false. Spawns `true` (a no-op) so the
+    /// child exits immediately.
+    #[cfg(unix)]
+    fn reaped_dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn `true`");
+        let pid = child.id();
+        // Reap it so the pid is no longer a live (or zombie-but-signalable) target.
+        let _ = child.wait();
+        pid
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_is_alive_self_is_true_reaped_is_false() {
+        assert!(
+            pid_is_alive(std::process::id()),
+            "the current process must be alive"
+        );
+        assert!(
+            !pid_is_alive(0),
+            "pid 0 is never a live single-process target"
+        );
+        let dead = reaped_dead_pid();
+        assert!(
+            !pid_is_alive(dead),
+            "a reaped child's pid {dead} must read as dead"
+        );
+    }
+
+    /// (a) A running record whose report dir has a completion artifact reconciles
+    /// to done, recovering the run outcome.
+    #[test]
+    fn reconcile_running_with_artifact_becomes_done() {
+        let root = std::env::temp_dir().join(format!(
+            "deepseek_reconcile_done_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let s = server_rooted(&root);
+
+        let job_id = s.new_job_id("labrun");
+        let report_dir = format!("state/deepseek-lab-{job_id}");
+        s.write_job_record(
+            &job_id,
+            &json!({
+                "job_id": job_id,
+                "kind": "labrun",
+                "state": "running",
+                "area": "macOS relay",
+                "report_dir": report_dir,
+                "orchestrator_pid": 999_999_999u32, // irrelevant: artifact wins
+                "started_unix": now_unix(),
+            }),
+        );
+        let orch_dir = root.join(&report_dir).join("orchestration");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        std::fs::write(
+            orch_dir.join("orchestrate_result.json"),
+            json!({
+                "overall_status": "pass",
+                "report_dir": report_dir,
+                "outcomes": [
+                    {"stage": "bootstrap", "status": "pass", "summary": "", "artifacts": []}
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let res = s.call_reconcile_jobs(&json!({}));
+        assert!(res.is_error.is_none());
+        let body = res
+            .content
+            .first()
+            .map(|c| c.text.as_str())
+            .unwrap()
+            .to_string();
+        assert!(body.contains("reconciled 1 to **done**"), "got: {body}");
+
+        // The record is now done and carries a recovered report_text.
+        let rec = s.read_job_record(&job_id).expect("record");
+        assert_eq!(rec.get("state").and_then(|v| v.as_str()), Some("done"));
+        let report = rec
+            .get("report_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            report.contains("RECONCILED to done") && report.contains("pass"),
+            "recovered report must carry the outcome: {report}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (b) A running record with a dead recorded pid and NO completion artifact
+    /// reconciles to crashed.
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_running_with_dead_pid_no_artifact_becomes_crashed() {
+        let root = std::env::temp_dir().join(format!(
+            "deepseek_reconcile_crash_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let s = server_rooted(&root);
+
+        let dead = reaped_dead_pid();
+        let job_id = s.new_job_id("labrun");
+        let report_dir = format!("state/deepseek-lab-{job_id}");
+        s.write_job_record(
+            &job_id,
+            &json!({
+                "job_id": job_id,
+                "kind": "labrun",
+                "state": "running",
+                "area": "macOS exit",
+                "report_dir": report_dir, // dir/artifact intentionally absent
+                "orchestrator_pid": dead,
+                "started_unix": now_unix(),
+            }),
+        );
+
+        let res = s.call_reconcile_jobs(&json!({"job_id": job_id}));
+        assert!(res.is_error.is_none());
+        let body = res
+            .content
+            .first()
+            .map(|c| c.text.as_str())
+            .unwrap()
+            .to_string();
+        assert!(body.contains("reconciled"), "got: {body}");
+        assert!(
+            body.contains("crashed"),
+            "must report a crashed record: {body}"
+        );
+
+        let rec = s.read_job_record(&job_id).expect("record");
+        assert_eq!(rec.get("state").and_then(|v| v.as_str()), Some("crashed"));
+        let note = rec
+            .get("reconcile_note")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            note.contains("is dead and no completion artifact"),
+            "crashed record must carry the reconcile note: {note}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (c) A record with no pid recorded and no artifact stays running
+    /// (conservative — could be a pre-pid-spawn record genuinely in flight).
+    #[test]
+    fn reconcile_running_no_pid_no_artifact_stays_running() {
+        let root = std::env::temp_dir().join(format!(
+            "deepseek_reconcile_stay_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let s = server_rooted(&root);
+
+        let job_id = s.new_job_id("labrun");
+        let report_dir = format!("state/deepseek-lab-{job_id}");
+        s.write_job_record(
+            &job_id,
+            &json!({
+                "job_id": job_id,
+                "kind": "labrun",
+                "state": "running",
+                "area": "Windows admin",
+                "report_dir": report_dir, // no artifact, no orchestrator_pid
+                "started_unix": now_unix(),
+            }),
+        );
+
+        let res = s.call_reconcile_jobs(&json!({}));
+        assert!(res.is_error.is_none());
+        let body = res
+            .content
+            .first()
+            .map(|c| c.text.as_str())
+            .unwrap()
+            .to_string();
+        assert!(body.contains("left 1 **running**"), "got: {body}");
+
+        // Old records without orchestrator_pid still parse (backward-compatible).
+        let rec = s.read_job_record(&job_id).expect("record");
+        assert_eq!(rec.get("state").and_then(|v| v.as_str()), Some("running"));
+        assert!(DeepSeekServer::job_orchestrator_pid(&rec).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (d) The in-flight filter does NOT count a dead-pid/no-artifact record, so a
+    /// crashed run no longer blocks the next deepseek_lab_run — even before anyone
+    /// calls deepseek_reconcile_jobs. A no-pid/no-artifact record IS still counted.
+    #[test]
+    #[cfg(unix)]
+    fn in_flight_filter_self_heals_on_dead_pid() {
+        let root = std::env::temp_dir().join(format!(
+            "deepseek_inflight_selfheal_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let s = server_rooted(&root);
+
+        // A crashed run: state=running, dead pid, no completion artifact.
+        let dead = reaped_dead_pid();
+        let crashed = s.new_job_id("labrun");
+        s.write_job_record(
+            &crashed,
+            &json!({
+                "job_id": crashed,
+                "kind": "labrun",
+                "state": "running",
+                "area": "x",
+                "report_dir": format!("state/deepseek-lab-{crashed}"),
+                "orchestrator_pid": dead,
+                "started_unix": now_unix(),
+            }),
+        );
+        assert_eq!(
+            s.running_lab_jobs(),
+            0,
+            "a dead-pid/no-artifact record must NOT count as in flight"
+        );
+
+        // A genuinely-indeterminate run: state=running, NO pid, no artifact → still
+        // counted (conservative).
+        let indeterminate = s.new_job_id("labrun");
+        s.write_job_record(
+            &indeterminate,
+            &json!({
+                "job_id": indeterminate,
+                "kind": "labrun",
+                "state": "running",
+                "area": "y",
+                "report_dir": format!("state/deepseek-lab-{indeterminate}"),
+                "started_unix": now_unix(),
+            }),
+        );
+        assert_eq!(
+            s.running_lab_jobs(),
+            1,
+            "a no-pid/no-artifact record stays counted; only the dead-pid one self-heals"
         );
 
         let _ = std::fs::remove_dir_all(&root);
