@@ -26,9 +26,9 @@ program and to **concurrent Windows+macOS** runs.
   fail loud*, not new runtime code.
 - **Ordered program (after the in-flight macOS anchor):** macOS admin → Windows
   admin → macOS blind_exit → cross-OS role transitions (needs a design doc first) →
-  macOS relay *live lifecycle* (forwarding stays HP-3-gated) → Windows/macOS anchor
-  live. Relay forwarding and Windows exit/blind_exit are explicitly parked with
-  reasons.
+  Windows/macOS anchor live. (macOS relay *live lifecycle* is **DONE** — see §1
+  matrix flip. Relay forwarding and Windows exit/blind_exit remain explicitly
+  parked with reasons.)
 - **Pipeline:** run a **Windows lab and a macOS lab simultaneously** on disjoint
   Debian backbones, iterate each role with **standalone SSH wrappers** against an
   already-warm guest (seconds, no 9-min bootstrap), and **write the next cell's code
@@ -62,7 +62,7 @@ untested/not implemented · 🔒 blocked):
 | anchor (gossip/bundle-pull/enrollment) | ✅ | 🟡→ landing now (live bundle-pull stage) | 🟠 dry-run plan contract only |
 | exit (NAT egress + killswitch) | ✅ | 🟡 implemented — needs a green live run | 🟡 implemented but **🔒 lab guest lacks WinNAT/`MSFT_NetNat`** |
 | blind_exit (irreversible exit) | ✅ | ❌ live stage missing — **runtime already exists** (`macos_blind_exit.rs`) | 🚫 **blocked by design** (`main.rs:11768` hard-errors; macOS/Linux only) |
-| relay (live session forwarding) | ✅ *(lifecycle only — no live forwarding proof anywhere; see §4)* | 🟠 lifecycle dry-run | 🟠 SCM lifecycle contract only |
+| relay (live session forwarding) | ✅ *(lifecycle only — no live forwarding proof anywhere; see §4)* | ✅ **lifecycle LIVE-PROVEN 2026-06-27** (run `livelab-1782571161`, `validate_macos_relay_service_lifecycle` PASS). **Live session forwarding remains HP-3-gated** (same cross-OS gate as Linux ✅). | 🟠 SCM lifecycle contract only |
 | live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | ❌ | ❌ (banked design file is **missing**) |
 
 **Three corrections this roadmap makes to the matrix (apply when landing each cell):**
@@ -89,15 +89,15 @@ dry-run had masked). "Live stage" = author a fail-loud stage per §7.
 | 3 | **macOS blind_exit** | 🟡 (runtime exists) | live stage only, **run last** (wipes identity); disposable guest | ~0.5–1 d | none |
 | 4 | **Role transitions (macOS→Windows)** | ❌ | **design doc** (`CrossOsRoleSwitchPlan_2026-06-24.md`, authored 2026-06-24), then a stage that drives a real flip and re-applies signed state via `refresh_signed_state_with_reason` | ~2–4 d | needs admin (#1/#2) |
 | 5 | macOS **exit** | 🟡 | just a green run with `--exit-platform macos` (no code) | ~hours | none |
-| 6 | macOS **relay** *live lifecycle* | 🟠 | upgrade dry-run → live lifecycle (active/listener/healthz on guest). **Forwarding proof is separate.** | ~1 d | forwarding 🔒 HP-3 |
+| 6 | macOS **relay** *live lifecycle* | ✅ **DONE** (2026-06-27) | ✅ live lifecycle proven: `validate_macos_relay_service_lifecycle` PASS (run `livelab-1782571161`). **Forwarding proof remains HP-3-gated, same as Linux.** | — | — |
 | 7 | Windows **anchor** live + macOS **anchor** live | 🟠/🟡 | convert in-process contract validators to live bundle-serving stages | ~1–2 d | sequence after anchor cell settles |
 | 🔒 | Windows **relay** forwarding | 🟠 | nothing to author until a Linux live two-peer forwarding stage exists | — | **HP-3** (`MasterWorkPlan` HP-3 — "most substantial remaining code item"; weeks) |
 | 🔒 | Windows **exit** | 🟡 | code done (`promote_windows_exit_active`); needs a WinNAT-capable guest | — | lab env (`MSFT_NetNat` absent) |
 | 🚫 | Windows **blind_exit** | — | out of scope by design (`main.rs:11768`) | — | n/a |
 
-**Bottom line:** ~6–10 focused days of implementable parity work (cells 1–7), gated
-behind HP-3 only for *relay live forwarding* and behind a lab-env fix for *Windows exit*.
-Plus ~1 day of small enabling infra (§8.3, §11).
+**Bottom line:** ~5–8 focused days of implementable parity work (cells 1–5 + 7; cell 6
+macOS relay lifecycle is **DONE**), gated behind HP-3 only for *relay live forwarding*
+and behind a lab-env fix for *Windows exit*. Plus ~1 day of small enabling infra (§8.3, §11).
 
 ---
 
@@ -153,11 +153,13 @@ relay**. Real forwarding is **HP-3 "Production Relay Transport Service"** in
 `MasterWorkPlan_2026-03-22.md` ("the most substantial remaining code item … relay path
 is just a routing label — no actual packets are relayed"). Code modules exist
 (`rustynet-relay/src/{transport,session,rate_limit}.rs`) but live cross-network evidence
-is pending. **Conclusion:** macOS/Windows relay *live forwarding* parity cannot be
-authored until HP-3 lands a Linux two-peer forwarding stage; once that's green and a
-`--relay-platform` selector points it at a mac/win relay, parity is a port. Until then,
-upgrade the mac/win relay dry-run to a **live lifecycle** stage (strictly better than
-today) and label it as lifecycle-not-forwarding.
+is pending. **Status update (2026-06-27): macOS relay *lifecycle* is now LIVE-PROVEN**
+(run `livelab-1782571161`, `validate_macos_relay_service_lifecycle` PASS —
+install/bootstrap → active `/healthz` → stop/release). The loopback `/healthz` wedge was
+fixed by `574eaac` (loopback exemption in `render_macos_killswitch_pf_rules`). **Conclusion:**
+macOS relay lifecycle is at parity with Linux. macOS/Windows relay *live forwarding*
+parity cannot be authored until HP-3 lands a Linux two-peer forwarding stage; once that's
+green and a `--relay-platform` selector points it at a mac/win relay, parity is a port.
 
 ### ADMIN (both OS) — IN SCOPE; "consumer-only" framing is stale
 The matrix note "macOS is a pure consumer; self-mint deliberately disabled" is **not**
@@ -207,7 +209,7 @@ Rank = value ÷ (tractability · safety). After **anchor (in flight)** and **mac
 | 2 | **Windows admin** | same platform-neutral issuing code; DPAPI custody exists |
 | 3 | **macOS blind_exit** | runtime exists; only the live stage missing; safe on disposable guest; run last |
 | 4 | **Role transitions (macOS→Windows)** | reuses `refresh_signed_state_with_reason`; depends on admin; needs design doc |
-| 5 | **macOS relay live lifecycle** | upgrade dry-run→live now; forwarding stays HP-3-gated; label clearly |
+| 5 | **macOS relay live lifecycle** | ✅ **DONE** (live-proven 2026-06-27); forwarding stays HP-3-gated |
 | 6 | **Windows + macOS anchor live** | convert contract validators to live bundle-serving; sequence after anchor settles |
 | 🔒 | Windows relay forwarding | blocked on HP-3 (no live forwarding proof anywhere) |
 | 🔒 | Windows exit | blocked on WinNAT guest (code done) |
