@@ -295,12 +295,12 @@ pub fn build_linux_dns_block_probe_report(
 pub fn parse_linux_route_gateway(route_output: &str) -> Option<String> {
     let mut tokens = route_output.split_whitespace();
     while let Some(token) = tokens.next() {
-        if token == "via" {
-            if let Some(gw) = tokens.next() {
-                let trimmed = gw.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_owned());
-                }
+        if token == "via"
+            && let Some(gw) = tokens.next()
+        {
+            let trimmed = gw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
             }
         }
     }
