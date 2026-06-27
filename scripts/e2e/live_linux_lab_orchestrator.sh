@@ -8586,7 +8586,19 @@ main() {
   fi
 
   if has_five_node_release_gate_topology; then
-    run_stage hard fresh_install_os_matrix_report 'generate commit-bound fresh install OS matrix report' stage_generate_fresh_install_os_matrix_report
+    if [[ -f "$REPORT_DIR/live_linux_two_hop_report.json" ]]; then
+      run_stage hard fresh_install_os_matrix_report 'generate commit-bound fresh install OS matrix report' stage_generate_fresh_install_os_matrix_report
+    else
+      # The fresh-install OS matrix report aggregates the two_hop report
+      # (rebind-linux-fresh-install-os-matrix-inputs --two-hop-report). When
+      # live_two_hop is SKIPPED — e.g. an air-gapped lab with no internet egress
+      # to the public probe target, see the two_hop egress gate above — that
+      # report is never produced, so this commit-bound report cannot be
+      # generated. Record an honest Skip (dependency-unavailable) instead of a
+      # hard Fail that would abort the run before the remaining per-OS role
+      # stages (macOS/Windows admin/exit/relay/anchor).
+      record_stage_skip fresh_install_os_matrix_report hard 'skipped: live_two_hop produced no report to aggregate (e.g. air-gapped lab without internet egress); the commit-bound OS matrix report cannot be generated'
+    fi
   else
     record_stage_skip fresh_install_os_matrix_report hard 'requires the full five-node topology (entry, aux, and extra targets)'
   fi
