@@ -58,6 +58,9 @@ const SUBPROC_TIMEOUT_SECS: u64 = 30;
 /// Generous (90 min) — a 3-OS pass + diagnose can run long; the worker thread
 /// blocks on it while the MCP call already returned a job_id.
 const LAB_ORCHESTRATOR_TIMEOUT_SECS: u64 = 5400;
+/// Concurrency cap for opt-in parallel lab runs (e.g. the macOS↔Windows pipeline
+/// on disjoint guests). Default is still a singleton (1) unless `allow_concurrent`.
+const MAX_CONCURRENT_LAB_RUNS: usize = 3;
 /// Standard lab SSH material + inventory (mirrors the lab-state MCP defaults).
 const LAB_SSH_IDENTITY_REL: &str = ".ssh/rustynet_lab_ed25519";
 const LAB_KNOWN_HOSTS_REL: &str = ".ssh/known_hosts";
@@ -592,11 +595,32 @@ impl DeepSeekServer {
             _ => None,
         };
 
-        if self.running_lab_jobs() >= 1 {
-            return tool_error(
-                "a deepseek lab run is already in flight (the lab is a singleton) — poll \
-                 deepseek_live_lab_result for it, or wait for it to finish",
-            );
+        // Linux backbone selectors (for disjoint concurrent runs) + the opt-in
+        // concurrency switch. Default stays a singleton.
+        let exit_vm = get_str(args, "exit_vm")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let client_vm = get_str(args, "client_vm")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let allow_concurrent = args
+            .get("allow_concurrent")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let limit = if allow_concurrent {
+            MAX_CONCURRENT_LAB_RUNS
+        } else {
+            1
+        };
+        let in_flight = self.running_lab_jobs();
+        if in_flight >= limit {
+            return tool_error(&format!(
+                "{in_flight} deepseek lab run(s) already in flight (limit {limit}{}) — poll \
+                 deepseek_live_lab_result, or wait. For a parallel run pass allow_concurrent=true \
+                 AND disjoint guests (a separate exit_vm/client_vm per run, e.g. macOS on one \
+                 Debian backbone, Windows on another).",
+                if allow_concurrent { "" } else { ", singleton" }
+            ));
         }
 
         let job_id = format!(
@@ -626,6 +650,15 @@ impl DeepSeekServer {
         std::thread::spawn(move || {
             let ssh = home_path(LAB_SSH_IDENTITY_REL);
             let kh = home_path(LAB_KNOWN_HOSTS_REL);
+            // Concurrent runs get their own CARGO_TARGET_DIR so two `cargo run`s
+            // don't serialize on the same build lock; the singleton default shares
+            // the workspace target dir (faster — cargo cache hit, no recompile).
+            let target_dir = format!("target-deepseek-{jid}");
+            let env: Vec<(&str, &str)> = if allow_concurrent {
+                vec![("CARGO_TARGET_DIR", target_dir.as_str())]
+            } else {
+                Vec::new()
+            };
             let mut cargo_args: Vec<String> = ["run", "--quiet", "-p", "rustynet-cli", "--", "ops"]
                 .iter()
                 .map(|s| s.to_string())
@@ -637,6 +670,8 @@ impl DeepSeekServer {
                 &report_dir,
                 macos_vm.as_deref(),
                 windows_vm.as_deref(),
+                exit_vm.as_deref(),
+                client_vm.as_deref(),
                 rebuild.as_deref(),
                 dry_run,
             ));
@@ -646,7 +681,7 @@ impl DeepSeekServer {
                 "cargo",
                 &arg_refs,
                 &worker.repo_root,
-                &[],
+                &env,
                 Duration::from_secs(LAB_ORCHESTRATOR_TIMEOUT_SECS),
             ) {
                 Ok(o) if o.success => format!(
@@ -2254,6 +2289,8 @@ fn build_orchestrator_args(
     report_dir: &str,
     macos_vm: Option<&str>,
     windows_vm: Option<&str>,
+    exit_vm: Option<&str>,
+    client_vm: Option<&str>,
     rebuild_nodes: Option<&str>,
     dry_run: bool,
 ) -> Vec<String> {
@@ -2272,6 +2309,12 @@ fn build_orchestrator_args(
     }
     if let Some(w) = windows_vm {
         a.extend(["--windows-vm".to_string(), w.to_string()]);
+    }
+    if let Some(e) = exit_vm {
+        a.extend(["--exit-vm".to_string(), e.to_string()]);
+    }
+    if let Some(c) = client_vm {
+        a.extend(["--client-vm".to_string(), c.to_string()]);
     }
     if let Some(r) = rebuild_nodes {
         a.extend(["--rebuild-nodes".to_string(), r.to_string()]);
@@ -2814,6 +2857,9 @@ impl McpServer for DeepSeekServer {
                         "macos_vm": json_schema_string("Explicit macOS guest alias (overrides `macos` auto-resolution)."),
                         "windows_vm": json_schema_string("Explicit Windows guest alias (overrides `windows` auto-resolution)."),
                         "rebuild_nodes": json_schema_string("Comma-separated node aliases to redeploy ONLY (fast re-verify after a per-node patch)."),
+                        "exit_vm": json_schema_string("Linux exit-node alias for this run's backbone (use a DISJOINT exit_vm/client_vm per run when running concurrently)."),
+                        "client_vm": json_schema_string("Linux client-node alias for this run's backbone."),
+                        "allow_concurrent": json!({"type": "boolean", "description": "Opt into PARALLEL runs (default false = singleton). When true, up to 3 runs may overlap — you MUST give each disjoint guests (e.g. the macOS↔Windows pipeline: macOS on one Debian backbone, Windows on another). Each concurrent run gets its own CARGO_TARGET_DIR + report dir."}),
                         "dry_run": json!({"type": "boolean", "description": "Run the orchestrator in --dry-run mode (fast; verifies the launch wiring without a real lab pass)."}),
                         "max_steps": json!({"type": "integer", "description": "Max tool-calling steps per triage agent on failure (default 12, cap 20)."}),
                     }),
@@ -3214,6 +3260,38 @@ mod tests {
     }
 
     #[test]
+    fn lab_run_concurrency_gate_rejects_at_limit() {
+        // Reject paths only — they return before spawning a real orchestrator.
+        let s = server();
+        // One run in flight → the default (singleton) rejects a second.
+        s.jobs.lock().unwrap().insert(
+            "labrun-1".into(),
+            TriageJob::Running {
+                started: Instant::now(),
+            },
+        );
+        assert!(
+            s.call_lab_run(&json!({"area": "x"})).is_error.is_some(),
+            "singleton must reject a 2nd run"
+        );
+        // Fill to the concurrent cap → even allow_concurrent rejects past it.
+        for i in 2..=MAX_CONCURRENT_LAB_RUNS {
+            s.jobs.lock().unwrap().insert(
+                format!("labrun-{i}"),
+                TriageJob::Running {
+                    started: Instant::now(),
+                },
+            );
+        }
+        assert!(
+            s.call_lab_run(&json!({"area": "x", "allow_concurrent": true}))
+                .is_error
+                .is_some(),
+            "allow_concurrent must still reject once at the cap"
+        );
+    }
+
+    #[test]
     fn orchestrator_args_are_safe_and_well_formed() {
         let a = build_orchestrator_args(
             "documents/operations/active/vm_lab_inventory.json",
@@ -3221,6 +3299,8 @@ mod tests {
             "/home/u/.ssh/known_hosts",
             "state/deepseek-lab-labrun-1",
             Some("macos-utm-1"),
+            None,
+            Some("debian-2"),
             None,
             Some("ll-3"),
             false,
@@ -3236,13 +3316,16 @@ mod tests {
         }
         assert!(a.windows(2).any(|w| w == ["--source-mode", "working-tree"]));
         assert!(a.windows(2).any(|w| w == ["--macos-vm", "macos-utm-1"]));
+        assert!(a.windows(2).any(|w| w == ["--exit-vm", "debian-2"]));
         assert!(a.windows(2).any(|w| w == ["--rebuild-nodes", "ll-3"]));
         assert!(!a.iter().any(|x| x == "--windows-vm"));
+        assert!(!a.iter().any(|x| x == "--client-vm"));
         assert!(!a.iter().any(|x| x == "--dry-run"));
-        // dry_run adds the flag; no macOS/Windows/rebuild when omitted.
-        let d = build_orchestrator_args("inv", "s", "k", "r", None, None, None, true);
+        // dry_run adds the flag; no macOS/Windows/backbone/rebuild when omitted.
+        let d = build_orchestrator_args("inv", "s", "k", "r", None, None, None, None, None, true);
         assert!(d.iter().any(|x| x == "--dry-run"));
         assert!(!d.iter().any(|x| x == "--macos-vm"));
+        assert!(!d.iter().any(|x| x == "--exit-vm"));
     }
 
     #[test]
