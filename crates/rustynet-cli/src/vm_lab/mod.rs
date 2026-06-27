@@ -10108,6 +10108,26 @@ ROOT={remote_root}
 rm -rf "$ROOT"
 mkdir -p "$ROOT/dns_leak_proof"
 chmod 700 {nat_script} {dns_script} {killswitch_script}
+# Re-assert exit-serving before capture: the activate stage brings the daemon
+# into exit mode, but a daemon restart between activate and capture loses the
+# IPC-driven RouteAdvertise 0.0.0.0/0.  Re-issuing `role set exit` is idempotent
+# when the daemon is already serving and restores it when it is not.  This does
+# NOT weaken any security control: the daemon already passed membership + role
+# validation during activate; we only re-assert the previously-authorised state.
+RN=/usr/local/bin/rustynet
+reassert_ok=0
+for _i in $(seq 1 10); do
+  NAT=$(sudo pfctl -a com.rustynet/nat -s nat 2>/dev/null | grep -cE '^[[:space:]]*nat' || true)
+  FWD=$(sysctl -n net.inet.ip.forwarding 2>/dev/null || echo 0)
+  if [ "$NAT" != 0 ] && [ "$FWD" = 1 ]; then reassert_ok=1; break; fi
+  # Daemon may have restarted and lost exit-serving; re-assert.
+  sudo "$RN" role set exit 2>/dev/null || true
+  sleep 3
+done
+if [ "$reassert_ok" != 1 ]; then
+  echo 'pre-capture exit re-assertion failed: daemon not serving exit after 10 attempts (~30s)' >&2
+  exit 1
+fi
 sudo bash {nat_script} --mesh-cidr {mesh_cidr} --output "$ROOT/macos_exit_nat_lifecycle.json"
 sudo bash {dns_script} --output "$ROOT/dns_leak_proof" --lan-iface {lan_iface} --mesh-hostname {mesh_hostname}
 sudo bash {killswitch_script} --output "$ROOT/macos_exit_killswitch_precedence.json"
@@ -11058,6 +11078,461 @@ fn validate_windows_anchor_bundle_pull_plan_contract(
     Ok(format!(
         "Windows anchor bundle-pull dry-run plan contract verified without guest mutation for {windows_alias}: node_id={node_id} bind=127.0.0.1:51822"
     ))
+}
+
+// ── Reviewed Windows anchor bundle-pull constants ────────────────────────────
+//
+// These mirror the rustynetd Windows path constants
+// (`crates/rustynetd/src/windows_paths.rs`) and the bundle-pull endpoint the
+// daemon enforces (`validate_anchor_bundle_pull_addr`, daemon.rs:964). The
+// loopback-only bind + LAN-deny + present-token posture is a security boundary,
+// asserted before the service is (re)started (verify-before-serve), exactly as
+// `deploy_macos_anchor_profile` (mod.rs:10657) asserts `GOT_ADDR`/`GOT_LAN`
+// before `launchctl bootstrap`.
+const WINDOWS_ANCHOR_BUNDLE_PULL_ADDR: &str = "127.0.0.1:51822";
+const WINDOWS_ANCHOR_BUNDLE_PULL_PORT: u16 = 51822;
+const WINDOWS_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str =
+    r"C:\ProgramData\RustyNet\config\anchor-bundle-pull.token";
+const WINDOWS_ANCHOR_MEMBERSHIP_ROOT: &str = r"C:\ProgramData\RustyNet\membership";
+const WINDOWS_ANCHOR_MEMBERSHIP_SNAPSHOT_PATH: &str =
+    r"C:\ProgramData\RustyNet\membership\membership.snapshot";
+const WINDOWS_ANCHOR_MEMBERSHIP_LOG_PATH: &str =
+    r"C:\ProgramData\RustyNet\membership\membership.log";
+const WINDOWS_ANCHOR_MEMBERSHIP_WATERMARK_PATH: &str =
+    r"C:\ProgramData\RustyNet\membership\membership.watermark";
+const WINDOWS_ANCHOR_MEMBERSHIP_OWNER_KEY_PATH: &str =
+    r"C:\ProgramData\RustyNet\membership\membership.owner.key";
+/// Reviewed name of the installed Windows daemon SCM service
+/// (`REVIEWED_WINDOWS_SERVICE_NAME`, windows_service_hardening.rs:22).
+const WINDOWS_ANCHOR_SERVICE_NAME: &str = "RustyNet";
+
+/// Make the Windows host actually SERVE the anchor bundle-pull listener before
+/// the live validation runs — the Windows analogue of
+/// `deploy_macos_anchor_profile` (mod.rs:10657).
+///
+/// The Windows orchestration purges the membership snapshot on install
+/// (`Install-RustyNetWindowsService.ps1`) and does not add the node to the mesh
+/// with `anchor.bundle_pull` until a LATER stage (amend_membership_for_windows,
+/// mod.rs:12461, hardcodes `--capabilities client`). The daemon's serve path
+/// fails closed (`ERR forbidden after revocation`) unless the SERVING node's own
+/// membership entry holds `AnchorBundlePull`
+/// (`snapshot_bytes_have_bundle_pull_capability`, daemon.rs:1126). So — exactly
+/// like the macOS elected anchor, which has `anchor.bundle_pull` in the snapshot
+/// the daemon serves before the anchor profile is deployed — this helper mints a
+/// SELF-CONTAINED genesis membership snapshot whose genesis node is THIS node and
+/// therefore holds the full anchor capability set incl. `AnchorBundlePull`
+/// (`rustynetd membership init`, main.rs:3553). It then seeds the loopback
+/// authority token, appends ONLY the three reviewed bundle-pull flags to the
+/// service's `RUSTYNETD_DAEMON_ARGS_JSON`, asserts the loopback addr +
+/// allow-lan=false + present token-path BEFORE start (verify-before-serve, the
+/// `GOT_ADDR`/`GOT_LAN` analogue at mod.rs:10715), restarts the `RustyNet`
+/// service, and polls the `:51822` listener up to 20x.
+///
+/// Inline base64 `-EncodedCommand` PowerShell (the Windows admin-issue pattern,
+/// `exercise_windows_admin_issue_live`, mod.rs:13176) is used so SSH transport is
+/// oblivious to PS quoting; the reviewed standalone equivalent lives at
+/// `scripts/windows/Install-RustyNetWindowsAnchorService.ps1`.
+fn deploy_windows_anchor_service(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let windows_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == windows_alias)
+        .ok_or_else(|| format!("inventory entry for {windows_alias:?} not found"))?
+        .clone();
+    if windows_entry.platform_profile().platform != VmGuestPlatform::Windows {
+        return Err(format!(
+            "alias {windows_alias} resolved to non-Windows platform: {}",
+            windows_entry.platform_profile().platform.as_str()
+        ));
+    }
+    let node_id = windows_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {windows_alias:?} has no node_id"))?
+        .to_owned();
+    validate_mesh_node_id(node_id.as_str())?;
+    let target = remote_target_from_inventory_entry(&windows_entry, None);
+
+    // node_id is a validated mesh id (ASCII alnum + [-_.]); every other value is
+    // a reviewed constant. The PS body fail-closes
+    // ($ErrorActionPreference=Stop) and performs verify-before-serve before any
+    // service restart. The token never enters argv — it is referenced by path.
+    let deploy_script = format!(
+        "$ErrorActionPreference='Stop'; \
+         $rn='{daemon}'; \
+         $svc='{service}'; \
+         $env_file='{env_file}'; \
+         $snap='{snapshot}'; \
+         $node='{node}'; \
+         $addr='{addr}'; \
+         $token_path='{token_path}'; \
+         New-Item -ItemType Directory -Force -Path '{membership_root}' | Out-Null; \
+         $pass=Join-Path $env:TEMP ('rn-anchor-pass-'+[guid]::NewGuid().ToString('N')); \
+         [IO.File]::WriteAllText($pass,([guid]::NewGuid().ToString('N')+[guid]::NewGuid().ToString('N'))); \
+         try {{ \
+           & $rn membership init --snapshot $snap --log '{log_path}' --watermark '{watermark_path}' --owner-signing-key '{owner_key_path}' --owner-signing-key-passphrase-file $pass --node-id $node --network-id 'windows-anchor-local' --force; \
+           if($LASTEXITCODE -ne 0){{throw 'membership init failed'}}; \
+         }} finally {{ if(Test-Path -LiteralPath $pass){{Remove-Item -Force -LiteralPath $pass}} }}; \
+         if(-not(Test-Path -LiteralPath $snap)){{throw 'membership snapshot missing after init'}}; \
+         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $token_path) | Out-Null; \
+         if(-not(Test-Path -LiteralPath $token_path)){{ \
+           $bytes=New-Object 'System.Byte[]' 32; \
+           [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes); \
+           $tok=-join($bytes|%{{$_.ToString('x2')}}); \
+           [IO.File]::WriteAllText($token_path,$tok); \
+         }}; \
+         $acl=New-Object System.Security.AccessControl.FileSecurity; \
+         $acl.SetAccessRuleProtection($true,$false); \
+         foreach($sid in @('S-1-5-18','S-1-5-32-544')){{ \
+           $id=New-Object System.Security.Principal.SecurityIdentifier($sid); \
+           $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($id,'FullControl','Allow'); \
+           $acl.AddAccessRule($rule); \
+         }}; \
+         Set-Acl -LiteralPath $token_path -AclObject $acl; \
+         $tc=(Get-Content -LiteralPath $token_path -Raw).Trim(); \
+         if($tc.Length -lt 32){{throw 'anchor token shorter than 32 bytes'}}; \
+         if(-not(Test-Path -LiteralPath $env_file)){{throw 'reviewed env-file missing'}}; \
+         $lines=Get-Content -LiteralPath $env_file; \
+         $argsLine=$lines|Where-Object {{$_ -like 'RUSTYNETD_DAEMON_ARGS_JSON=*'}}|Select-Object -First 1; \
+         if(-not $argsLine){{throw 'RUSTYNETD_DAEMON_ARGS_JSON not present in env-file'}}; \
+         $jsonValue=$argsLine.Substring('RUSTYNETD_DAEMON_ARGS_JSON='.Length); \
+         $raw=@($jsonValue|ConvertFrom-Json); \
+         $cur=New-Object 'System.Collections.Generic.List[string]'; \
+         for($j=0;$j -lt $raw.Count;$j++){{ \
+           $elem=[string]$raw[$j]; \
+           if($elem.Contains(' ')){{ \
+             $tokens=$elem -split ' +'; \
+             foreach($t in $tokens){{if($t){{$cur.Add($t)}}}} \
+           }}else{{ \
+             $cur.Add($elem) \
+           }} \
+         }}; \
+         $f=New-Object 'System.Collections.Generic.List[string]'; \
+         for($i=0;$i -lt $cur.Count;$i++){{ \
+           $a=$cur[$i]; \
+           if($a -in @('--anchor-bundle-pull-addr','--anchor-bundle-pull-token-path','--anchor-bundle-pull-allow-lan')){{$i++;continue}}; \
+           $f.Add([string]$a); \
+         }}; \
+         $f.Add('--anchor-bundle-pull-addr'); $f.Add($addr); \
+         $f.Add('--anchor-bundle-pull-token-path'); $f.Add($token_path); \
+         $f.Add('--anchor-bundle-pull-allow-lan'); $f.Add('false'); \
+         $newArgs=$f.ToArray(); \
+         $gotAddr=$null; $gotLan=$null; $gotTok=$null; \
+         for($i=0;$i -lt $newArgs.Count;$i++){{ \
+           if($newArgs[$i] -eq '--anchor-bundle-pull-addr'){{$gotAddr=$newArgs[$i+1]}}; \
+           if($newArgs[$i] -eq '--anchor-bundle-pull-allow-lan'){{$gotLan=$newArgs[$i+1]}}; \
+           if($newArgs[$i] -eq '--anchor-bundle-pull-token-path'){{$gotTok=$newArgs[$i+1]}}; \
+         }}; \
+         if($gotAddr -ne $addr -or $gotLan -ne 'false' -or [string]::IsNullOrWhiteSpace($gotTok)){{throw \"anchor verify-before-serve failed: addr=$gotAddr allow_lan=$gotLan token=$gotTok (expected loopback + deny-LAN + present token)\"}}; \
+         $newJson=ConvertTo-Json -InputObject $newArgs -Compress; \
+         $rewritten=$lines|ForEach-Object {{ if($_ -like 'RUSTYNETD_DAEMON_ARGS_JSON=*'){{ 'RUSTYNETD_DAEMON_ARGS_JSON='+$newJson }} else {{ $_ }} }}; \
+         Set-Content -LiteralPath $env_file -Value $rewritten -Encoding ascii; \
+         $s=Get-Service -Name $svc -ErrorAction Stop; \
+         if($s.Status -eq 'Running'){{ & sc.exe stop $svc | Out-Null; Start-Sleep -Seconds 2 }}; \
+         & sc.exe start $svc | Out-Null; \
+         $up=$false; \
+         for($i=0;$i -lt 20;$i++){{ \
+           $c=Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue; \
+           if($c){{ foreach($x in $c){{ if($x.LocalAddress -eq '127.0.0.1' -or $x.LocalAddress -eq '::1'){{$up=$true;break}} }} }}; \
+           if($up){{break}}; \
+           Start-Sleep -Seconds 2; \
+         }}; \
+         if(-not $up){{throw \"anchor bundle-pull listener did not come up on $addr\"}}; \
+         Write-Output \"anchor bundle-pull listener up on $addr (genesis snapshot + verify-before-serve asserted)\"",
+        daemon = WINDOWS_RUSTYNETD_EXE_PATH,
+        service = WINDOWS_ANCHOR_SERVICE_NAME,
+        env_file = WINDOWS_RUSTYNETD_ENV_PATH,
+        snapshot = WINDOWS_ANCHOR_MEMBERSHIP_SNAPSHOT_PATH,
+        membership_root = WINDOWS_ANCHOR_MEMBERSHIP_ROOT,
+        log_path = WINDOWS_ANCHOR_MEMBERSHIP_LOG_PATH,
+        watermark_path = WINDOWS_ANCHOR_MEMBERSHIP_WATERMARK_PATH,
+        owner_key_path = WINDOWS_ANCHOR_MEMBERSHIP_OWNER_KEY_PATH,
+        token_path = WINDOWS_ANCHOR_BUNDLE_PULL_TOKEN_PATH,
+        addr = WINDOWS_ANCHOR_BUNDLE_PULL_ADDR,
+        node = node_id,
+        port = WINDOWS_ANCHOR_BUNDLE_PULL_PORT,
+    );
+    let invocation = build_ssh_powershell_encoded_invocation(deploy_script.as_str())?;
+    let out = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        Duration::from_secs(180),
+    )
+    .map_err(|e| format!("Windows anchor deploy on {windows_alias} failed: {e}"))?;
+
+    Ok(format!(
+        "Windows anchor service reconfigured on {windows_alias}: self-contained genesis snapshot \
+         (node holds anchor.bundle_pull) + loopback {addr} bundle-pull listener (allow-lan=false, \
+         verify-before-serve asserted), token ACL locked; {out}",
+        addr = WINDOWS_ANCHOR_BUNDLE_PULL_ADDR,
+        out = out.trim()
+    ))
+}
+
+/// Drive the LIVE Windows anchor bundle-pull proof — the Windows analogue of
+/// `exercise_macos_anchor_bundle_pull_live` (mod.rs:10758). SSHes to the guest
+/// via inline base64 `-EncodedCommand` PowerShell (the Windows admin-issue
+/// pattern, mod.rs:13176), presents the seeded authority token over the loopback
+/// `127.0.0.1:51822` listener, and asserts every fail-closed control LIVE:
+///
+///   1. loopback byte-for-byte: the served body SHA256 equals the on-disk
+///      membership snapshot SHA256 (verify-before-serve; no truncation-as-pass).
+///   2. token gate: a wrong/short token is rejected (non-`OK` header).
+///   3. LAN refused: `rustynetd daemon` with a non-loopback bundle-pull addr and
+///      no `--anchor-bundle-pull-allow-lan` exits non-zero with the loopback-only
+///      diagnostic (`validate_anchor_bundle_pull_addr`, daemon.rs:964) — the
+///      analogue of the macOS bin's `validate_lan_bind_refused`.
+///   4. secrets hygiene: the served bytes never contain the raw token.
+///
+/// The PS body emits a typed JSON report — stage tag
+/// `live_windows_anchor_bundle_pull` plus a `subchecks` array of the four named
+/// controls, each `pass`. This fn pulls it back, parses it, and calls
+/// `validate_windows_anchor_bundle_pull_report`.
+fn exercise_windows_anchor_bundle_pull_live(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    report_dir: &Path,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let windows_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == windows_alias)
+        .ok_or_else(|| format!("inventory entry for {windows_alias:?} not found"))?
+        .clone();
+    if windows_entry.platform_profile().platform != VmGuestPlatform::Windows {
+        return Err(format!(
+            "alias {windows_alias} resolved to non-Windows platform: {}",
+            windows_entry.platform_profile().platform.as_str()
+        ));
+    }
+    let node_id = windows_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {windows_alias:?} has no node_id"))?
+        .to_owned();
+    validate_mesh_node_id(node_id.as_str())?;
+    let target = remote_target_from_inventory_entry(&windows_entry, None);
+
+    std::fs::create_dir_all(report_dir)
+        .map_err(|err| format!("create report dir {} failed: {err}", report_dir.display()))?;
+    let report_path = report_dir.join("live_windows_anchor_bundle_pull_report.json");
+
+    // node_id is a validated mesh id; every other value is a reviewed constant.
+    // The PS body fail-closes ($ErrorActionPreference=Stop) and asserts every
+    // control before emitting status=pass. A wrong-token probe uses a fixed
+    // 32-byte ASCII literal (never the real token). The LAN-refusal probe never
+    // mutates host state — `validate_daemon_config` rejects the non-loopback
+    // addr before any bind (daemon.rs:964).
+    let exercise_script = format!(
+        "$ErrorActionPreference='Stop'; \
+         $rn='{daemon}'; \
+         $addr_host='127.0.0.1'; $addr_port={port}; \
+         $token_path='{token_path}'; \
+         $snap='{snapshot}'; \
+         $node='{node}'; \
+         function Pull([byte[]]$req){{ \
+           $cli=New-Object System.Net.Sockets.TcpClient; \
+           $cli.Connect($addr_host,$addr_port); \
+           $st=$cli.GetStream(); $st.Write($req,0,$req.Length); \
+           $ms=New-Object System.IO.MemoryStream; \
+           $buf=New-Object 'System.Byte[]' 4096; \
+           $cli.ReceiveTimeout=5000; \
+           while($true){{ \
+             try{{ $n=$st.Read($buf,0,$buf.Length) }}catch{{ break }}; \
+             if($n -le 0){{break}}; \
+             $ms.Write($buf,0,$n); \
+           }}; \
+           $cli.Close(); \
+           return ,$ms.ToArray(); \
+         }}; \
+         function SplitResp([byte[]]$resp){{ \
+           $idx=-1; \
+           for($i=0;$i -lt $resp.Length;$i++){{ if($resp[$i] -eq 10){{$idx=$i;break}} }}; \
+           if($idx -lt 0){{ return @{{header=$resp; body=(New-Object 'System.Byte[]' 0)}} }}; \
+           $he=$idx; if($he -gt 0 -and $resp[$he-1] -eq 13){{$he--}}; \
+           $header=$resp[0..([math]::Max($he-1,0))]; if($he -eq 0){{$header=New-Object 'System.Byte[]' 0}}; \
+           $bs=$idx+1; \
+           if($bs -lt $resp.Length){{ $body=$resp[$bs..($resp.Length-1)] }} else {{ $body=New-Object 'System.Byte[]' 0 }}; \
+           return @{{header=$header; body=$body}}; \
+         }}; \
+         function Sha256Hex([byte[]]$b){{ \
+           $h=[System.Security.Cryptography.SHA256]::Create(); \
+           $d=$h.ComputeHash($b); \
+           return (-join($d|%{{$_.ToString('x2')}})); \
+         }}; \
+         function Contains([byte[]]$hay,[byte[]]$needle){{ \
+           if($needle.Length -eq 0 -or $needle.Length -gt $hay.Length){{return $false}}; \
+           for($i=0;$i -le ($hay.Length-$needle.Length);$i++){{ \
+             $m=$true; for($j=0;$j -lt $needle.Length;$j++){{ if($hay[$i+$j] -ne $needle[$j]){{$m=$false;break}} }}; \
+             if($m){{return $true}}; \
+           }}; \
+           return $false; \
+         }}; \
+         $subchecks=New-Object 'System.Collections.Generic.List[object]'; \
+         $tokenRaw=(Get-Content -LiteralPath $token_path -Raw); \
+         $tokenTrim=$tokenRaw.TrimEnd(\"`r\",\"`n\"); \
+         $tokenBytes=[System.Text.Encoding]::ASCII.GetBytes($tokenTrim); \
+         $snapBytes=[IO.File]::ReadAllBytes($snap); \
+         $snapDigest=Sha256Hex $snapBytes; \
+         $req=New-Object 'System.Byte[]' ($tokenBytes.Length+1); \
+         [Array]::Copy($tokenBytes,$req,$tokenBytes.Length); $req[$tokenBytes.Length]=10; \
+         $resp=Pull $req; $sp=SplitResp $resp; \
+         $headerStr=[System.Text.Encoding]::ASCII.GetString($sp.header); \
+         if(-not $headerStr.StartsWith('OK ')){{throw \"loopback pull header not OK: $headerStr\"}}; \
+         $bodyDigest=Sha256Hex $sp.body; \
+         if($bodyDigest -ne $snapDigest){{throw \"loopback pull body digest mismatch: body=$bodyDigest snapshot=$snapDigest\"}}; \
+         $subchecks.Add(@{{name='validate_windows_anchor_bundle_pull_loopback';status='pass';detail=\"bundle_digest=$snapDigest bytes=$($sp.body.Length)\"}}); \
+         $wrong=[System.Text.Encoding]::ASCII.GetBytes('ABCDEFGHIJKLMNOPQRSTUVWXYZ012345'+\"`n\"); \
+         $wr=Pull $wrong; $wsp=SplitResp $wr; $wh=[System.Text.Encoding]::ASCII.GetString($wsp.header); \
+         if($wh.StartsWith('OK ')){{throw \"wrong token unexpectedly served: $wh\"}}; \
+         $short=[System.Text.Encoding]::ASCII.GetBytes('tooshort'+\"`n\"); \
+         $shr=Pull $short; $ssp=SplitResp $shr; $sh=[System.Text.Encoding]::ASCII.GetString($ssp.header); \
+         if($sh.StartsWith('OK ')){{throw \"short token unexpectedly served: $sh\"}}; \
+         $subchecks.Add(@{{name='validate_windows_anchor_bundle_pull_token_gate';status='pass';detail=\"wrong_header=$wh short_header=$sh\"}}); \
+         $lanExit=0; $lanOut=''; \
+         try{{ \
+           $lanOut=(& $rn daemon --node-id $node --node-role admin --backend windows-unsupported --membership-snapshot $snap --anchor-bundle-pull-addr '0.0.0.0:51822' --anchor-bundle-pull-token-path $token_path --anchor-bundle-pull-allow-lan false 2>&1 | Out-String); \
+           $lanExit=$LASTEXITCODE; \
+         }}catch{{ $lanOut=$_.Exception.Message; $lanExit=1 }}; \
+         if($lanExit -eq 0){{throw 'LAN bind unexpectedly accepted without --anchor-bundle-pull-allow-lan'}}; \
+         if($lanOut -notmatch 'loopback'){{throw \"LAN refusal did not cite the loopback-only rule: $lanOut\"}}; \
+         $subchecks.Add(@{{name='validate_windows_anchor_bundle_pull_lan_refused';status='pass';detail=\"lan_bind_refused exit=$lanExit\"}}); \
+         $resp2=Pull $req; $sp2=SplitResp $resp2; \
+         if(Contains $sp2.header $tokenBytes){{throw 'served header leaked the raw token'}}; \
+         if(Contains $sp2.body $tokenBytes){{throw 'served body leaked the raw token'}}; \
+         $thumb=(Sha256Hex $tokenBytes).Substring(0,16); \
+         $subchecks.Add(@{{name='validate_windows_anchor_bundle_pull_secrets_hygiene';status='pass';detail=\"raw_token_in_served_bytes=false token_thumbprint=$thumb\"}}); \
+         $report=[ordered]@{{schema_version=1;stage='live_windows_anchor_bundle_pull';status='pass';platform='windows';node_id=$node;bundle_pull_addr='{addr}';snapshot_path=$snap;subchecks=$subchecks}}; \
+         Write-Output ($report|ConvertTo-Json -Depth 8)",
+        daemon = WINDOWS_RUSTYNETD_EXE_PATH,
+        port = WINDOWS_ANCHOR_BUNDLE_PULL_PORT,
+        token_path = WINDOWS_ANCHOR_BUNDLE_PULL_TOKEN_PATH,
+        snapshot = WINDOWS_ANCHOR_MEMBERSHIP_SNAPSHOT_PATH,
+        node = node_id,
+        addr = WINDOWS_ANCHOR_BUNDLE_PULL_ADDR,
+    );
+    let invocation = build_ssh_powershell_encoded_invocation(exercise_script.as_str())?;
+    let report_body = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        Duration::from_secs(180),
+    )
+    .map_err(|e| {
+        format!("Windows anchor bundle-pull live exercise on {windows_alias} failed: {e}")
+    })?;
+
+    // Persist the typed report for evidence, then validate it.
+    let trimmed = extract_trailing_json_object(report_body.as_str()).unwrap_or(report_body.clone());
+    let _ = std::fs::write(&report_path, trimmed.as_str());
+    validate_windows_anchor_bundle_pull_report(trimmed.as_str(), windows_alias)?;
+    Ok(format!(
+        "Windows anchor bundle-pull live-proven on {windows_alias}: node_id={node_id} \
+         bind={addr} (loopback byte-for-byte + token gate + LAN refused + secrets hygiene); report={}",
+        report_path.display(),
+        addr = WINDOWS_ANCHOR_BUNDLE_PULL_ADDR,
+    ))
+}
+
+/// Pure validator for the Windows anchor bundle-pull JSON report — a direct port
+/// of `validate_macos_anchor_bundle_pull_report` (mod.rs:10854). Asserts the
+/// stage tag, overall `status==pass`, AND every one of the four bundle-pull
+/// controls reported `pass` (NOT `skipped` — a skipped control is a silent
+/// coverage gap = not a pass). Extracted so a contract test can pin the
+/// consumption logic without an SSH round-trip.
+fn validate_windows_anchor_bundle_pull_report(
+    report_body: &str,
+    windows_alias: &str,
+) -> Result<(), String> {
+    let parsed: serde_json::Value = serde_json::from_str(report_body)
+        .map_err(|err| format!("parse Windows anchor bundle-pull report failed: {err}"))?;
+    if parsed.get("stage").and_then(|value| value.as_str())
+        != Some("live_windows_anchor_bundle_pull")
+    {
+        return Err("Windows anchor bundle-pull report has unexpected stage tag".to_owned());
+    }
+    if parsed.get("status").and_then(|value| value.as_str()) != Some("pass") {
+        return Err(format!(
+            "Windows anchor bundle-pull report status was not pass: {}",
+            parsed
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("<missing>")
+        ));
+    }
+    let required = [
+        "validate_windows_anchor_bundle_pull_loopback",
+        "validate_windows_anchor_bundle_pull_token_gate",
+        "validate_windows_anchor_bundle_pull_lan_refused",
+        "validate_windows_anchor_bundle_pull_secrets_hygiene",
+    ];
+    let subchecks = parsed
+        .get("subchecks")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "Windows anchor bundle-pull report missing subchecks array".to_owned())?;
+    for name in required {
+        let passed = subchecks.iter().any(|entry| {
+            entry.get("name").and_then(|value| value.as_str()) == Some(name)
+                && entry.get("status").and_then(|value| value.as_str()) == Some("pass")
+        });
+        if !passed {
+            return Err(format!(
+                "Windows anchor bundle-pull control {name} did not pass on {windows_alias}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Extract the first balanced top-level JSON object from a PowerShell stdout
+/// blob. `ConvertTo-Json` emits one object; the SSH/UTM transport may prepend
+/// banner/warning lines or append a trailing newline. Scans forward from the
+/// first `{`, tracking string state + escapes so braces inside string values do
+/// not unbalance the scan. Returns the balanced `{...}` substring, or `None` if
+/// no complete object is present.
+fn extract_trailing_json_object(output: &str) -> Option<String> {
+    let bytes = output.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for idx in start..bytes.len() {
+        let ch = bytes[idx] as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(output[start..=idx].to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn validate_windows_relay_service_lifecycle_contract_from_repo() -> Result<String, String> {
@@ -13035,33 +13510,67 @@ fn run_windows_orchestration_stages_with_options(
             vec![],
         )
     } else {
-        match validate_windows_anchor_bundle_pull_plan_contract(windows_alias, inventory_path) {
+        // FAIL-LOUD (CrossPlatformRoleParityRoadmap §7): the LIVE bundle-pull
+        // proof IS the stage status, mirroring the macOS shape
+        // (validate_macos_anchor_bundle_pull, mod.rs:9662). Reconfigure the
+        // Windows daemon service to SERVE the loopback listener
+        // (deploy_windows_anchor_service: self-contained genesis snapshot so the
+        // node holds anchor.bundle_pull + verify-before-serve), then a peer pulls
+        // the signed membership snapshot byte-for-byte with the seeded token and
+        // every fail-closed control is asserted live
+        // (exercise_windows_anchor_bundle_pull_live). The in-process anchor-init
+        // dry-run plan check is captured ONLY as an INFORMATIONAL note in the log
+        // on failure; it must NEVER turn a live failure into a Pass or a Skip.
+        let live_report_dir = report_dir.join("windows_anchor_bundle_pull");
+        let live_result = deploy_windows_anchor_service(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        )
+        .and_then(|deploy_summary| {
+            exercise_windows_anchor_bundle_pull_live(
+                windows_alias,
+                inventory_path,
+                ssh_identity_file,
+                known_hosts_path,
+                &live_report_dir,
+            )
+            .map(|exercise_summary| format!("{deploy_summary}; {exercise_summary}"))
+        });
+        match live_result {
             Ok(summary) => {
-                // FAIL-LOUD honesty (Roadmap §7): this stage only builds and lints
-                // the anchor-init *dry-run* plan string in-process. It performs NO
-                // ssh to the Windows guest and never binds the bundle-pull listener
-                // or serves a byte-for-byte pull there. A passing plan contract is
-                // therefore NOT live proof of the Windows anchor role and MUST NOT
-                // record Pass — record Skipped so the run aggregate cannot count it
-                // as a live role proof. A contract *violation* is still a real
-                // defect → Fail.
-                let message = format!(
-                    "contract-only (NOT live-proven): {summary}. Anchor-init dry-run plan contract verified in-process but the bundle-pull listener was not bound or served on {windows_alias}; a live guest pull is still required."
-                );
-                let _ = std::fs::write(&windows_anchor_bundle_pull_log_path, message.as_str());
+                let _ = std::fs::write(&windows_anchor_bundle_pull_log_path, summary.as_str());
                 stage_outcome(
                     "validate_windows_anchor_bundle_pull",
-                    VmLabStageStatus::Skipped,
-                    message,
+                    VmLabStageStatus::Pass,
+                    summary,
                     vec![windows_anchor_bundle_pull_log_path.clone()],
                 )
             }
-            Err(reason) => {
+            Err(live_reason) => {
+                // Live failure = stage Fail. Build the in-process dry-run plan
+                // contract ONLY to attach contract-level context to the log; it
+                // does not affect status (no live-failure-as-pass).
+                let plan_note = match validate_windows_anchor_bundle_pull_plan_contract(
+                    windows_alias,
+                    inventory_path,
+                ) {
+                    Ok(plan_summary) => format!(
+                        "; informational dry-run plan contract (does not affect status): {plan_summary}"
+                    ),
+                    Err(plan_reason) => {
+                        format!("; dry-run plan contract also failed: {plan_reason}")
+                    }
+                };
+                let reason = format!(
+                    "Windows anchor bundle-pull live proof FAILED for {windows_alias}: {live_reason}{plan_note}"
+                );
                 let _ = std::fs::write(&windows_anchor_bundle_pull_log_path, reason.as_str());
                 stage_outcome(
                     "validate_windows_anchor_bundle_pull",
                     VmLabStageStatus::Fail,
-                    format!("Windows anchor bundle-pull plan validation failed: {reason}"),
+                    reason,
                     vec![windows_anchor_bundle_pull_log_path.clone()],
                 )
             }
@@ -36860,6 +37369,106 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             err.contains("unexpected stage tag"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── Windows anchor bundle-pull LIVE report consumption contract ─────
+
+    fn reviewed_windows_anchor_bundle_pull_report() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "stage": "live_windows_anchor_bundle_pull",
+            "status": "pass",
+            "platform": "windows",
+            "node_id": "windows-anchor-1",
+            "bundle_pull_addr": "127.0.0.1:51822",
+            "subchecks": [
+                { "name": "validate_windows_anchor_bundle_pull_loopback", "status": "pass" },
+                { "name": "validate_windows_anchor_bundle_pull_token_gate", "status": "pass" },
+                { "name": "validate_windows_anchor_bundle_pull_lan_refused", "status": "pass" },
+                { "name": "validate_windows_anchor_bundle_pull_secrets_hygiene", "status": "pass" }
+            ]
+        })
+    }
+
+    #[test]
+    fn validate_windows_anchor_bundle_pull_report_accepts_reviewed_pass() {
+        let body = reviewed_windows_anchor_bundle_pull_report().to_string();
+        super::validate_windows_anchor_bundle_pull_report(&body, "windows-utm-1")
+            .expect("reviewed Windows anchor bundle-pull report should validate");
+    }
+
+    #[test]
+    fn validate_windows_anchor_bundle_pull_report_rejects_overall_fail() {
+        let mut payload = reviewed_windows_anchor_bundle_pull_report();
+        payload["status"] = serde_json::Value::from("fail");
+        let err = super::validate_windows_anchor_bundle_pull_report(
+            &payload.to_string(),
+            "windows-utm-1",
+        )
+        .expect_err("overall-fail report must be rejected");
+        assert!(
+            err.contains("status was not pass"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_windows_anchor_bundle_pull_report_rejects_skipped_secrets_control() {
+        // A skipped secrets-hygiene control is a silent coverage gap and must
+        // fail the consumer — the served bytes must be asserted token-free live,
+        // not skipped.
+        let mut payload = reviewed_windows_anchor_bundle_pull_report();
+        payload["subchecks"][3]["status"] = serde_json::Value::from("skipped");
+        let err = super::validate_windows_anchor_bundle_pull_report(
+            &payload.to_string(),
+            "windows-utm-1",
+        )
+        .expect_err("skipped secrets-hygiene control must be rejected");
+        assert!(
+            err.contains("validate_windows_anchor_bundle_pull_secrets_hygiene"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_windows_anchor_bundle_pull_report_rejects_wrong_stage_tag() {
+        let mut payload = reviewed_windows_anchor_bundle_pull_report();
+        payload["stage"] = serde_json::Value::from("live_macos_anchor_bundle_pull");
+        let err = super::validate_windows_anchor_bundle_pull_report(
+            &payload.to_string(),
+            "windows-utm-1",
+        )
+        .expect_err("wrong stage tag must be rejected");
+        assert!(
+            err.contains("unexpected stage tag"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_trailing_json_object_strips_banner_and_trailing_noise() {
+        let body = reviewed_windows_anchor_bundle_pull_report().to_string();
+        let blob = format!("WARNING: banner line\r\nanother\r\n{body}\r\n");
+        let extracted =
+            super::extract_trailing_json_object(&blob).expect("must extract the JSON object");
+        super::validate_windows_anchor_bundle_pull_report(&extracted, "windows-utm-1")
+            .expect("extracted JSON should validate");
+    }
+
+    #[test]
+    fn extract_trailing_json_object_handles_braces_inside_strings() {
+        let blob = "noise {\"detail\":\"value with } brace\",\"stage\":\"x\"} trailing";
+        let extracted =
+            super::extract_trailing_json_object(blob).expect("must extract balanced object");
+        assert_eq!(
+            extracted,
+            "{\"detail\":\"value with } brace\",\"stage\":\"x\"}"
+        );
+    }
+
+    #[test]
+    fn extract_trailing_json_object_returns_none_without_object() {
+        assert!(super::extract_trailing_json_object("no json here").is_none());
     }
 
     #[test]
