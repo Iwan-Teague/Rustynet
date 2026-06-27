@@ -15,8 +15,8 @@
 //!   inspects the LOCAL Rustynet repo + UTM lab. It cannot write.
 //!
 //! Model selection per call:
-//! - `"flash"` → deepseek-chat (fast, low cost — default)
-//! - `"pro"`   → deepseek-reasoner (deep chain-of-thought, slower)
+//! - `"flash"` → deepseek-v4-flash (fast, low cost — default)
+//! - `"pro"`   → deepseek-v4-pro (deep chain-of-thought at max reasoning effort, slower)
 //!
 //! API key resolution order:
 //! 1. DEEPSEEK_API_KEY env var
@@ -34,8 +34,8 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const FLASH_MODEL: &str = "deepseek-chat";
-const PRO_MODEL: &str = "deepseek-reasoner";
+const FLASH_MODEL: &str = "deepseek-v4-flash";
+const PRO_MODEL: &str = "deepseek-v4-pro";
 const API_URL: &str = "https://api.deepseek.com/chat/completions";
 const REQUEST_TIMEOUT_SECS: u64 = 180;
 
@@ -115,6 +115,13 @@ impl DeepSeekServer {
             "messages": messages,
             "max_tokens": 8192,
         });
+        // V4 Pro honors `reasoning_effort`; "max" is the highest level (docs:
+        // high|max — max is for the hardest planning / multi-step coding agents).
+        // Flash ignores it. Pro is only ever used for hard reasoning, so always
+        // drive it at max.
+        if model == PRO_MODEL {
+            body["reasoning_effort"] = json!("max");
+        }
         if let Some(tools) = tools {
             body["tools"] = tools.clone();
         }
@@ -1744,7 +1751,7 @@ fn load_api_key() -> Result<String, String> {
 
 fn resolve_model(model_str: &str) -> &'static str {
     match model_str.to_lowercase().as_str() {
-        "pro" | "reasoner" | "deepseek-reasoner" => PRO_MODEL,
+        "pro" | "reasoner" | "deepseek-reasoner" | "deepseek-v4-pro" => PRO_MODEL,
         _ => FLASH_MODEL,
     }
 }
@@ -2109,7 +2116,7 @@ fn model_schema() -> Value {
     json!({
         "type": "string",
         "enum": ["flash", "pro"],
-        "description": "'flash' = deepseek-chat (fast, low cost, default). 'pro' = deepseek-reasoner (chain-of-thought, slower, for hard reasoning tasks).",
+        "description": "'flash' = deepseek-v4-flash (fast, low cost, default). 'pro' = deepseek-v4-pro (chain-of-thought at max reasoning effort, slower, for hard reasoning tasks).",
     })
 }
 
@@ -2515,6 +2522,32 @@ mod tests {
             "find_definition",
         ] {
             assert!(names.contains(&n), "tool {n} missing from definitions");
+        }
+    }
+
+    #[test]
+    fn agent_tool_set_excludes_deepseek_proxy_tools() {
+        // The read/write/read_write/agent proxies + the live-lab orchestrator are
+        // top-level MCP tools the *main agent* drives — a DeepSeek agent must never
+        // be able to recursively call them from inside its own tool-calling loop.
+        let defs = agent_tool_definitions();
+        let names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["function"]["name"].as_str().unwrap())
+            .collect();
+        for forbidden in [
+            "deepseek_read",
+            "deepseek_write",
+            "deepseek_read_write",
+            "deepseek_agent",
+            "deepseek_live_lab",
+        ] {
+            assert!(
+                !names.contains(&forbidden),
+                "proxy/top-level tool {forbidden} must NOT be in the agent tool-set"
+            );
         }
     }
 
