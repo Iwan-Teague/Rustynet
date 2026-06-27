@@ -417,7 +417,12 @@ The remaining three are the live-lab family. The **loop driver** you normally ca
   `deepseek_live_lab_result`. Singleton by default; `allow_concurrent: true` +
   disjoint guests (a separate `exit_vm` per run) runs the macOS↔Windows pipeline
   (≤3 overlapping). `dry_run` is a fast wiring check. On a green run, ZERO LLM
-  calls — you just get PASS + evidence.
+  calls — you just get PASS + evidence. To drive a FOCUSED mac/win role cell (not
+  just a comprehensive run), pass a role-platform selector — `exit_platform` /
+  `relay_platform` / `anchor_platform` / `blind_exit_platform` (each
+  `linux|macos|windows`), or `macos_promote_exit: true` (+ `entry_vm` in the
+  Option-B exit topology) — to ELECT a mac/win node into that role so the cell
+  runs live instead of skipping.
 - `deepseek_live_lab` — **the rigid, non-negotiable failure-triage pipeline** on a
   failure you ALREADY have (hand it `target` + `failure_context`). Three grounded
   read-only sub-agents in fixed order — v4-flash research (why/where/what) →
