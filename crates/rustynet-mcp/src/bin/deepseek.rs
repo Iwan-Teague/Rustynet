@@ -30,9 +30,12 @@ use rustynet_mcp::{
     run_server, run_with_timeout, text_content, tool_error, truncate_output,
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FLASH_MODEL: &str = "deepseek-v4-flash";
 const PRO_MODEL: &str = "deepseek-v4-pro";
@@ -52,10 +55,25 @@ const AGENT_HARD_MAX_STEPS: u64 = 20;
 /// Timeout for any local subprocess the agent tools spawn (grep/git/uname/utmctl).
 const SUBPROC_TIMEOUT_SECS: u64 = 30;
 
+/// State of an async triage job: still running (with its start time, for elapsed
+/// reporting) or finished with its assembled report.
+enum TriageJob {
+    Running { started: Instant },
+    Done(String),
+}
+
+type JobMap = Arc<Mutex<HashMap<String, TriageJob>>>;
+
+#[derive(Clone)]
 struct DeepSeekServer {
     api_key: String,
     agent: ureq::Agent,
     repo_root: PathBuf,
+    /// Async triage jobs keyed by job id. Shared (Arc) so a clone handed to a
+    /// worker thread mutates the same map the poll tool reads.
+    jobs: JobMap,
+    /// Monotonic counter for unique triage job ids within a server lifetime.
+    job_counter: Arc<AtomicU64>,
 }
 
 impl DeepSeekServer {
@@ -72,6 +90,8 @@ impl DeepSeekServer {
             api_key,
             agent,
             repo_root: repo_root(),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            job_counter: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -369,9 +389,10 @@ impl DeepSeekServer {
         let target = get_str(args, "target")
             .map(str::trim)
             .filter(|t| !t.is_empty())
-            .unwrap_or("(unspecified)");
+            .unwrap_or("(unspecified)")
+            .to_string();
         let failure_context = match get_str(args, "failure_context") {
-            Some(c) if !c.trim().is_empty() => c,
+            Some(c) if !c.trim().is_empty() => c.to_string(),
             _ => {
                 return tool_error(
                     "'failure_context' is required: provide the failed run's stage output / report \
@@ -385,13 +406,76 @@ impl DeepSeekServer {
             .map(|n| n.clamp(1, AGENT_HARD_MAX_STEPS))
             .unwrap_or(AGENT_DEFAULT_MAX_STEPS);
 
+        // The pipeline runs for minutes (three grounded agents incl. v4-pro at max
+        // reasoning) — far past the MCP client's request timeout. So run it ASYNC:
+        // store a Running job, spawn the pipeline on a worker thread, and return the
+        // job id immediately. The caller polls `deepseek_live_lab_result`.
+        let job_id = format!(
+            "triage-{}",
+            self.job_counter.fetch_add(1, Ordering::Relaxed)
+        );
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.insert(
+                job_id.clone(),
+                TriageJob::Running {
+                    started: Instant::now(),
+                },
+            );
+        }
+
+        let worker = self.clone();
+        let jid = job_id.clone();
+        let target_label = target.clone();
         let ctx = format!("Target under test: {target}\n\n{failure_context}");
-        let report = self.run_triage(&ctx, max_steps);
+        std::thread::spawn(move || {
+            let report = worker.run_triage(&ctx, max_steps);
+            let body = format!(
+                "[deepseek live-lab triage | target={target_label} | budget={max_steps}/step]\n\n{report}"
+            );
+            if let Ok(mut jobs) = worker.jobs.lock() {
+                jobs.insert(jid, TriageJob::Done(body));
+            }
+        });
+
         ToolCallResult {
             content: text_content(format!(
-                "[deepseek live-lab triage | target={target} | budget={max_steps}/step]\n\n{report}"
+                "Triage job started: `{job_id}` (target: {target}). The rigid pipeline (flash \
+                 research → flash verify → v4-pro max review) runs ~1-3 min. Poll \
+                 `deepseek_live_lab_result` with job_id=\"{job_id}\" every ~30-60s until it returns \
+                 the report."
             )),
             is_error: None,
+        }
+    }
+
+    /// Poll an async triage job. Non-blocking: returns the report when done, or a
+    /// "still running" status with elapsed seconds — never blocks, so the poll
+    /// itself can't trip the MCP request timeout.
+    fn call_live_lab_result(&self, args: &Value) -> ToolCallResult {
+        let job_id = match get_str(args, "job_id") {
+            Some(j) if !j.trim().is_empty() => j.trim(),
+            _ => return tool_error("'job_id' is required (from the deepseek_live_lab response)."),
+        };
+        let jobs = match self.jobs.lock() {
+            Ok(j) => j,
+            Err(_) => return tool_error("triage job store is poisoned"),
+        };
+        match jobs.get(job_id) {
+            Some(TriageJob::Done(report)) => ToolCallResult {
+                content: text_content(report.clone()),
+                is_error: None,
+            },
+            Some(TriageJob::Running { started }) => ToolCallResult {
+                content: text_content(format!(
+                    "Triage job `{job_id}` still running ({}s elapsed). Poll again in ~30-60s.",
+                    started.elapsed().as_secs()
+                )),
+                is_error: None,
+            },
+            None => tool_error(&format!(
+                "unknown job_id '{job_id}' — not found (it may have been lost on an MCP-server \
+                 reload; re-run deepseek_live_lab)"
+            )),
         }
     }
 
@@ -2416,7 +2500,9 @@ impl McpServer for DeepSeekServer {
                     READ-ONLY, no code changes, every claim evidence-cited. Hand it the failed run's \
                     stage output / report excerpt / daemon logs (and/or a report_dir the agents can \
                     read) as 'failure_context'; it returns one verified report for you to act on. \
-                    UNTRUSTED output — you verify before changing any code."
+                    UNTRUSTED output — you verify before changing any code. Runs ASYNC (the pipeline \
+                    takes minutes, longer than the MCP request timeout): returns a job_id \
+                    immediately; poll 'deepseek_live_lab_result' for the report."
                     .into(),
                 input_schema: json_schema_object(
                     json!({
@@ -2432,6 +2518,21 @@ impl McpServer for DeepSeekServer {
                     vec!["target", "failure_context"],
                 ),
             },
+            Tool {
+                name: "deepseek_live_lab_result".into(),
+                description: "\
+                    Poll an async deepseek_live_lab triage job. Non-blocking: returns the verified \
+                    multi-section report once the pipeline finishes, or a 'still running' status \
+                    (with elapsed seconds) to poll again. Pass the job_id returned by \
+                    deepseek_live_lab."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "job_id": json_schema_string("The job id returned by deepseek_live_lab."),
+                    }),
+                    vec!["job_id"],
+                ),
+            },
         ]
     }
 
@@ -2444,6 +2545,9 @@ impl McpServer for DeepSeekServer {
         // The live-lab triage pipeline has its own arg schema (no prompt/model).
         if name == "deepseek_live_lab" {
             return self.call_live_lab(&args);
+        }
+        if name == "deepseek_live_lab_result" {
+            return self.call_live_lab_result(&args);
         }
 
         let prompt = match get_str(&args, "prompt") {
@@ -2762,6 +2866,7 @@ mod tests {
             "deepseek_read_write",
             "deepseek_agent",
             "deepseek_live_lab",
+            "deepseek_live_lab_result",
         ] {
             assert!(
                 !names.contains(&forbidden),
@@ -2780,6 +2885,40 @@ mod tests {
         assert_eq!(
             strip_dsml_markup("<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>x"),
             ""
+        );
+    }
+
+    #[test]
+    fn live_lab_result_polls_job_state() {
+        let s = server();
+        // Missing / unknown job id → error result (so the caller can recover).
+        assert!(s.call_live_lab_result(&json!({})).is_error.is_some());
+        assert!(
+            s.call_live_lab_result(&json!({"job_id": "nope"}))
+                .is_error
+                .is_some()
+        );
+        // A finished job → non-error result carrying the report.
+        s.jobs.lock().unwrap().insert(
+            "triage-1".to_string(),
+            TriageJob::Done("THE REPORT".to_string()),
+        );
+        assert!(
+            s.call_live_lab_result(&json!({"job_id": "triage-1"}))
+                .is_error
+                .is_none()
+        );
+        // A running job → non-error "still running" status.
+        s.jobs.lock().unwrap().insert(
+            "triage-2".to_string(),
+            TriageJob::Running {
+                started: Instant::now(),
+            },
+        );
+        assert!(
+            s.call_live_lab_result(&json!({"job_id": "triage-2"}))
+                .is_error
+                .is_none()
         );
     }
 
