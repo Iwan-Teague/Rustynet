@@ -414,9 +414,11 @@ signature — `target`, `failure_context`, optional `max_steps`):
   Hand it a failed live-lab stage's evidence as `failure_context`; it runs three
   grounded read-only sub-agents in fixed order — v4-flash research (why/where/what,
   + optional fix) → v4-flash verify-every-claim-against-the-repo/lab → v4-pro at
-  MAX reasoning re-verify + judge-the-best-fix — and returns ONE evidence-cited
-  report (root cause, file:line, suspected fix). No step writes the repo, runs
-  gates, or makes the security call. Use it for END-OF-RUN triage instead of a
+  MAX reasoning re-verify + judge-the-best-fix — into ONE evidence-cited report
+  (root cause, file:line, suspected fix). It runs ASYNC (the pipeline takes
+  minutes, past the MCP timeout): the call returns a `job_id`, then poll
+  `deepseek_live_lab_result` for the report. No step writes the repo, runs gates,
+  or makes the security call. Use it for END-OF-RUN triage instead of a
   bare flash fan-out; you still verify each cited claim against the real code
   before acting. (A v4-pro layer that also *launches + drives* the lab is being
   built on top of it.)
