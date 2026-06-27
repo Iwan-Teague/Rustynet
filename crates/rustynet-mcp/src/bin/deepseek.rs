@@ -145,12 +145,28 @@ impl DeepSeekServer {
     /// `tool_calls` (which we execute locally and feed back) or with a final
     /// `content` answer (which we return). Bounded by `max_steps`.
     fn run_agent(&self, prompt: &str, model: &str, max_steps: u64) -> Result<String, String> {
+        self.run_grounded("agent", AGENT_SYSTEM_PROMPT, prompt, model, max_steps)
+    }
+
+    /// The grounded read-only tool-calling loop, parameterized by system prompt
+    /// so the failure-triage roles (research / verify / review) reuse the exact
+    /// same confined, read-only tool set + loop, swapping only the instructions.
+    /// No role can write — the tool set is read-only for every system prompt.
+    fn run_grounded(
+        &self,
+        label: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        max_steps: u64,
+    ) -> Result<String, String> {
         let tools = agent_tool_definitions();
         let mut messages = json!([
-            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ]);
         let mut trace: Vec<String> = Vec::new();
+        eprintln!("[live-lab] agent '{label}' ({model}) started — step budget {max_steps}");
 
         for step in 1..=max_steps {
             let parsed = self.chat(messages.clone(), Some(&tools), model)?;
@@ -159,6 +175,15 @@ impl DeepSeekServer {
             let tool_calls = message.get("tool_calls").and_then(|v| v.as_array());
             match tool_calls {
                 Some(calls) if !calls.is_empty() => {
+                    let called: Vec<&str> = calls
+                        .iter()
+                        .filter_map(|c| c["function"]["name"].as_str())
+                        .collect();
+                    eprintln!(
+                        "[live-lab] agent '{label}' step {step}/{max_steps}: {} tool call(s) -> {}",
+                        called.len(),
+                        called.join(", ")
+                    );
                     // Append the assistant message verbatim so the tool_call_ids
                     // it references resolve against the tool replies we add next.
                     if let Some(arr) = messages.as_array_mut() {
@@ -189,10 +214,22 @@ impl DeepSeekServer {
                 }
                 _ => {
                     // No tool calls → final answer.
-                    let content = message["content"].as_str().unwrap_or("").trim();
-                    let reasoning = message["reasoning_content"].as_str().unwrap_or("").trim();
+                    eprintln!(
+                        "[live-lab] agent '{label}' final answer at step {step} ({} tool call(s) total)",
+                        trace.len()
+                    );
+                    let content = strip_dsml_markup(message["content"].as_str().unwrap_or(""));
+                    let reasoning =
+                        strip_dsml_markup(message["reasoning_content"].as_str().unwrap_or(""));
+                    let content = if content.is_empty() {
+                        "(the agent tried to call more tools instead of answering; the step budget \
+                         is likely too low for this investigation — raise max_steps)"
+                            .to_string()
+                    } else {
+                        content
+                    };
                     let answer = if reasoning.is_empty() {
-                        content.to_string()
+                        content
                     } else {
                         format!("<reasoning>\n{reasoning}\n</reasoning>\n\n{content}")
                     };
@@ -218,11 +255,19 @@ impl DeepSeekServer {
             }));
         }
         let parsed = self.chat(messages, None, model)?;
-        let content = parsed["choices"][0]["message"]["content"]
+        let raw = parsed["choices"][0]["message"]["content"]
             .as_str()
-            .unwrap_or("(no answer produced before the step budget was exhausted)")
-            .trim()
-            .to_string();
+            .unwrap_or("");
+        let content = {
+            let stripped = strip_dsml_markup(raw);
+            if stripped.is_empty() {
+                "(the agent exhausted its step budget mid-investigation and produced no final \
+                 synthesis — raise max_steps for a deeper triage)"
+                    .to_string()
+            } else {
+                stripped
+            }
+        };
         Ok(format!(
             "{content}\n\n## Tools used ({} call(s); step budget of {max_steps} reached)\n{}",
             trace.len(),
@@ -232,6 +277,122 @@ impl DeepSeekServer {
                 trace.join("\n")
             }
         ))
+    }
+
+    /// Run the RIGID, non-negotiable failure-triage pipeline on a live-lab
+    /// failure. The three steps ALWAYS run, in this exact order — it is
+    /// deterministic server control flow, never model-chosen:
+    ///
+    /// 1. Flash research — why/where/what failed (+ optional fix), grounded.
+    /// 2. Flash verify — scrutinize every claim against the real repo/lab.
+    /// 3. v4-pro review — independently re-verify + judge the fix (max reasoning).
+    ///
+    /// NO code changes at any step. Every step is a read-only grounded agent;
+    /// none can write the repo. The later steps receive the earlier outputs as
+    /// context. Returns the assembled multi-section report for the main agent to
+    /// verify and act on.
+    fn run_triage(&self, failure_context: &str, max_steps: u64) -> String {
+        const RESEARCH_SYSTEM: &str = "\
+            You are a live-lab failure researcher for the RustyNet project. You are READ-ONLY: \
+            your tools only inspect the local repo + UTM lab; you CANNOT edit, write, or run the \
+            lab. Given a live-lab failure, determine WHY it failed, WHERE (exact file:line and/or \
+            stage/log), and WHAT happened. Ground EVERY claim in evidence you actually read via \
+            your tools (cite file:line and log excerpts) — never guess or rely on memory. You MAY \
+            propose how to fix it; more grounded detail helps the human engineer. End with a \
+            concise numbered claims list, each claim paired with its evidence citation.";
+        const VERIFY_SYSTEM: &str = "\
+            You are a skeptical verifier for the RustyNet project. You are READ-ONLY. You are given \
+            a draft research report about a live-lab failure. Scrutinize EVERY claim against the \
+            actual repo + lab using your tools: is the code really at the file:line it cites? did \
+            that stage/log really show what is claimed? is the root cause actually supported, or \
+            merely plausible? For each claim, mark it CONFIRMED (with the evidence you re-checked) \
+            or REFUTED/UNSUPPORTED (with what you actually found instead). Correct any claim not \
+            grounded in truth. Do not invent new fixes — your job is to make the report truthful.";
+        const REVIEW_SYSTEM: &str = "\
+            You are the senior reviewer for the RustyNet project. You are READ-ONLY and MUST NOT \
+            change code. You are given a failure's draft research and an independent verification \
+            pass. Independently re-verify the surviving claims against the actual repo + lab with \
+            your tools, resolve any disagreement between the two passes, and judge whether the \
+            proposed fix is actually the BEST option (or propose a better-grounded one). Produce \
+            the FINAL report for the human engineer: root cause, exact location(s) (file:line), \
+            the recommended fix and why it is best, your confidence, and any residual uncertainty \
+            the engineer must check before changing code. You propose; the human verifies and disposes.";
+
+        // Step 1 — Flash research (grounded, read-only).
+        let research = self
+            .run_grounded(
+                "research",
+                RESEARCH_SYSTEM,
+                &format!("Live-lab failure to triage:\n\n{failure_context}"),
+                FLASH_MODEL,
+                max_steps,
+            )
+            .unwrap_or_else(|e| format!("(research step failed: {e})"));
+
+        // Step 2 — Flash verification of the research claims (grounded, read-only).
+        let verified = self
+            .run_grounded(
+                "verify",
+                VERIFY_SYSTEM,
+                &format!(
+                    "Original failure context:\n\n{failure_context}\n\n\
+                     ## Draft research report to scrutinize\n\n{research}"
+                ),
+                FLASH_MODEL,
+                max_steps,
+            )
+            .unwrap_or_else(|e| format!("(verification step failed: {e})"));
+
+        // Step 3 — v4-pro review at max reasoning (grounded, read-only).
+        let final_review = self
+            .run_grounded(
+                "review",
+                REVIEW_SYSTEM,
+                &format!(
+                    "Original failure context:\n\n{failure_context}\n\n\
+                     ## Draft research\n\n{research}\n\n\
+                     ## Independent verification pass\n\n{verified}"
+                ),
+                PRO_MODEL,
+                max_steps,
+            )
+            .unwrap_or_else(|e| format!("(review step failed: {e})"));
+
+        assemble_triage_report(&research, &verified, &final_review)
+    }
+
+    /// Entry point for the `deepseek_live_lab` tool. v1 runs the rigid triage
+    /// pipeline (§run_triage) on a caller-supplied failure context and returns the
+    /// verified multi-section report. (The v4-pro lab-orchestration layer — which
+    /// launches + drives the run to PRODUCE the failure context — is wired next.)
+    fn call_live_lab(&self, args: &Value) -> ToolCallResult {
+        let target = get_str(args, "target")
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or("(unspecified)");
+        let failure_context = match get_str(args, "failure_context") {
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                return tool_error(
+                    "'failure_context' is required: provide the failed run's stage output / report \
+                     excerpt / daemon logs (or a report_dir path the grounded agents can read).",
+                );
+            }
+        };
+        let max_steps = args
+            .get("max_steps")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.clamp(1, AGENT_HARD_MAX_STEPS))
+            .unwrap_or(AGENT_DEFAULT_MAX_STEPS);
+
+        let ctx = format!("Target under test: {target}\n\n{failure_context}");
+        let report = self.run_triage(&ctx, max_steps);
+        ToolCallResult {
+            content: text_content(format!(
+                "[deepseek live-lab triage | target={target} | budget={max_steps}/step]\n\n{report}"
+            )),
+            is_error: None,
+        }
     }
 
     /// Execute one read-only agent tool locally. Always returns a string (errors
@@ -1749,6 +1910,33 @@ fn load_api_key() -> Result<String, String> {
     Err("No DeepSeek API key found (checked DEEPSEEK_API_KEY, ~/Desktop/deepseek_api.md, ~/.deepseek_api_key)".into())
 }
 
+/// Strip DeepSeek-native tool-call markup (`<｜｜DSML｜｜…>`) that leaks into the
+/// content field when the model tries to invoke tools but none are advertised
+/// (the budget-exhausted final answer disables tools, so a model that still wants
+/// a tool emits it as text). Everything from the first such marker on is non-prose
+/// tool markup, so we keep only the trimmed prose before it.
+fn strip_dsml_markup(s: &str) -> String {
+    const MARKER: &str = "\u{ff5c}\u{ff5c}DSML";
+    match s.find(MARKER) {
+        Some(i) => s[..i].trim_end_matches('<').trim().to_string(),
+        None => s.trim().to_string(),
+    }
+}
+
+/// Assemble the three triage-pipeline step outputs into the final multi-section
+/// report. Pure (no I/O) so the report shape is unit-testable offline.
+fn assemble_triage_report(research: &str, verified: &str, final_review: &str) -> String {
+    format!(
+        "# Live-lab failure triage\n\
+         _Rigid pipeline: Flash research -> Flash verify -> v4-pro review (max reasoning). \
+         All steps read-only + grounded; no code changes. UNTRUSTED — the main agent verifies \
+         every claim before acting._\n\n\
+         ## 1. Research — deepseek-v4-flash\n\n{research}\n\n\
+         ## 2. Verification — deepseek-v4-flash\n\n{verified}\n\n\
+         ## 3. Final review — deepseek-v4-pro (max reasoning)\n\n{final_review}\n"
+    )
+}
+
 fn resolve_model(model_str: &str) -> &'static str {
     match model_str.to_lowercase().as_str() {
         "pro" | "reasoner" | "deepseek-reasoner" | "deepseek-v4-pro" => PRO_MODEL,
@@ -2218,6 +2406,32 @@ impl McpServer for DeepSeekServer {
                     vec!["prompt"],
                 ),
             },
+            Tool {
+                name: "deepseek_live_lab".into(),
+                description: "\
+                    Run the RIGID live-lab failure-triage pipeline. DeepSeek v4-flash researches \
+                    why/where/what failed (grounded in the real local repo + UTM lab), a second \
+                    v4-flash independently verifies every claim against the repo/lab, then v4-pro at \
+                    MAX reasoning reviews, re-verifies, and judges the best fix — all three steps \
+                    READ-ONLY, no code changes, every claim evidence-cited. Hand it the failed run's \
+                    stage output / report excerpt / daemon logs (and/or a report_dir the agents can \
+                    read) as 'failure_context'; it returns one verified report for you to act on. \
+                    UNTRUSTED output — you verify before changing any code."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "target": json_schema_string(
+                            "What was under test (e.g. 'macOS relay lifecycle') — for the report header and to focus the triage."),
+                        "failure_context": json_schema_string(
+                            "The failed run's evidence to triage: stage output, report excerpt, daemon/journal logs, and/or a report_dir path the grounded agents can read."),
+                        "max_steps": json!({
+                            "type": "integer",
+                            "description": "Max tool-calling steps per triage agent before forcing an answer (default 12, cap 20).",
+                        }),
+                    }),
+                    vec!["target", "failure_context"],
+                ),
+            },
         ]
     }
 
@@ -2226,6 +2440,11 @@ impl McpServer for DeepSeekServer {
             Some(v) => v,
             None => return tool_error("missing arguments"),
         };
+
+        // The live-lab triage pipeline has its own arg schema (no prompt/model).
+        if name == "deepseek_live_lab" {
+            return self.call_live_lab(&args);
+        }
 
         let prompt = match get_str(&args, "prompt") {
             Some(p) if !p.trim().is_empty() => p,
@@ -2549,6 +2768,40 @@ mod tests {
                 "proxy/top-level tool {forbidden} must NOT be in the agent tool-set"
             );
         }
+    }
+
+    #[test]
+    fn strip_dsml_markup_removes_native_tool_markup() {
+        let s = "Here is my conclusion.\n<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>\njunk";
+        assert_eq!(strip_dsml_markup(s), "Here is my conclusion.");
+        // Clean prose is unchanged (trimmed).
+        assert_eq!(strip_dsml_markup("  clean answer  "), "clean answer");
+        // Pure markup → empty, so the caller substitutes a budget note.
+        assert_eq!(
+            strip_dsml_markup("<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>x"),
+            ""
+        );
+    }
+
+    #[test]
+    fn triage_report_has_all_three_sections_in_order() {
+        let r = assemble_triage_report("RESEARCH_BODY", "VERIFY_BODY", "REVIEW_BODY");
+        assert!(
+            r.contains("RESEARCH_BODY") && r.contains("VERIFY_BODY") && r.contains("REVIEW_BODY")
+        );
+        // Rigid pipeline order: research before verify before review.
+        let (ir, iv, ire) = (
+            r.find("RESEARCH_BODY").unwrap(),
+            r.find("VERIFY_BODY").unwrap(),
+            r.find("REVIEW_BODY").unwrap(),
+        );
+        assert!(
+            ir < iv && iv < ire,
+            "sections must be research -> verify -> review"
+        );
+        // Labels the models + the read-only/untrusted posture.
+        assert!(r.contains("deepseek-v4-flash") && r.contains("deepseek-v4-pro"));
+        assert!(r.to_lowercase().contains("untrusted"));
     }
 
     #[test]
