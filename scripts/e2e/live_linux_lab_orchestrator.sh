@@ -2285,7 +2285,7 @@ run_root rm -f \
 run_root_timed 30 systemctl daemon-reload >/dev/null 2>&1 || true
 run_root rm -rf /etc/rustynet /var/lib/rustynet /run/rustynet
 run_root rm -f /usr/local/bin/rustynet /usr/local/bin/rustynetd
-rm -f /tmp/rn_bootstrap.env /tmp/rn_bootstrap.sh /tmp/rn_source.tar.gz
+run_root rm -f /tmp/rn_bootstrap.env /tmp/rn_bootstrap.sh /tmp/rn_source.tar.gz
 run_root rm -rf "${HOME}/Rustynet"
 EOF_CLEANUP
   chmod 700 "$STATE_DIR/rn_cleanup.sh"
