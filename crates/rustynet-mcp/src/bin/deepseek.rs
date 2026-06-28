@@ -1318,6 +1318,10 @@ impl DeepSeekServer {
         let entry_vm = get_str(args, "entry_vm")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let windows_only = args
+            .get("windows_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let allow_concurrent = args
             .get("allow_concurrent")
@@ -1411,6 +1415,7 @@ impl DeepSeekServer {
                 macos_promote_exit,
                 legacy_bash,
                 dry_run,
+                windows_only,
             ));
             let arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
 
@@ -3461,6 +3466,7 @@ fn build_orchestrator_args(
     macos_promote_exit: bool,
     legacy_bash: bool,
     dry_run: bool,
+    windows_only: bool,
 ) -> Vec<String> {
     let mut a: Vec<String> = vec!["vm-lab-orchestrate-live-lab".to_string()];
     a.extend(["--inventory".to_string(), inventory.to_string()]);
@@ -3516,6 +3522,9 @@ fn build_orchestrator_args(
     // stage). Mutually exclusive with --node (deepseek_lab_run never uses --node).
     if legacy_bash {
         a.push("--legacy-bash-orchestrator".to_string());
+    }
+    if windows_only {
+        a.push("--windows-only".to_string());
     }
     if dry_run {
         a.push("--dry-run".to_string());
@@ -4942,6 +4951,7 @@ mod tests {
             true,             // macos_promote_exit
             true,             // legacy_bash
             false,            // dry_run
+            false,            // windows_only
         );
         assert_eq!(a[0], "vm-lab-orchestrate-live-lab");
         for flag in [
@@ -4972,7 +4982,7 @@ mod tests {
         // selectors (incl. --macos-promote-exit) when omitted.
         let d = build_orchestrator_args(
             "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None,
-            false, false, true,
+            false, false, true, false,
         );
         assert!(d.iter().any(|x| x == "--dry-run"));
         assert!(!d.iter().any(|x| x == "--macos-vm"));
