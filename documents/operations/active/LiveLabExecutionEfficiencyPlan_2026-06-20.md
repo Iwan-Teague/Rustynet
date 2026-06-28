@@ -35,6 +35,7 @@ forward.
 | **Setup/run split** | MCP `start_live_lab_run mode=setup` once → `mode=run --skip-setup`; or CLI `--skip-setup` | daemon source unchanged, or redeployed via per-node rebuild | ~12–25 min/iter (skips cleanup+bootstrap) |
 | **Per-node rebuild** | MCP `start_live_lab_run` with `nodes=[topology] rebuild_nodes=[patched] skip_soak` — redeploys ONLY patched node, others keep state | a daemon fix that affects specific node(s) | (full multi-node rebuild) − (one node) |
 | **Single-stage re-run** | invoke the stage wrapper directly: `scripts/e2e/live_<os>_<stage>_test.sh` against the live mesh (the bash orchestrator calls these per stage, e.g. `stage_run_live_two_hop` → `live_linux_two_hop_test.sh`) | mesh is up + setup intact; retrying the one failed stage | ~30–60 min (skips all prior stages) |
+| **Skip Linux live suite** | CLI `--skip-linux-live-suite` on `vm-lab-orchestrate-live-lab`, or `deepseek_lab_run skip_linux_live_suite=true` (pair with a role-platform selector to target ONE mac/win cell) | iterating a mac/win cell from a fresh run | ~30–45 min (skips the whole Linux live-validation suite; setup still runs) |
 | **Deploy preview** | MCP `what_will_deploy` (tracked-vs-HEAD that WILL ship + untracked that will NOT) | before every run | prevents silently shipping stale code / leaving a new file behind |
 | **Setup-stage resume** | CLI `--resume-from <stage>` / `--rerun-stage <stage>` (SETUP stages only: cleanup/bootstrap/membership/assignments/baseline) | a setup stage failed; reuse provenance-bound report dir | re-bootstrap avoided for setup re-tries |
 
@@ -47,6 +48,13 @@ Notes:
 - Standalone stage bins exist (`crates/rustynet-cli/src/bin/live_linux_*_test.rs`) and
   are driven by the wrapper scripts. Some harness-coupled stages (chaos, soak) do **not**
   run cleanly standalone — fall back to a scoped `mode=run` for those.
+- `--skip-linux-live-suite` is the cleanest lever when the cell under test is a **mac/win**
+  one: it runs setup (bootstrap + membership + signed-bundle distribution + baseline) then
+  jumps straight to the mac/win role stages, skipping the entire `execute_ops_vm_lab_run_live_lab`
+  Linux suite. Setup is kept on purpose — the mac/win stages gate on setup's `distribute_*`
+  outcomes, not on the Linux suite, so the targeted cell stays fully exercised. Do **not**
+  confuse it with `--windows-only`, which skips Linux **including** membership (breaks
+  `mesh_join` unless the Windows guest is already joined from a prior run).
 
 ---
 

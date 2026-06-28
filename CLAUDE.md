@@ -422,7 +422,16 @@ The remaining three are the live-lab family. The **loop driver** you normally ca
   `relay_platform` / `anchor_platform` / `blind_exit_platform` (each
   `linux|macos|windows`), or `macos_promote_exit: true` (+ `entry_vm` in the
   Option-B exit topology) — to ELECT a mac/win node into that role so the cell
-  runs live instead of skipping. (`legacy_bash: true` routes the Linux live suite
+  runs live instead of skipping. Pair the selector with
+  `skip_linux_live_suite: true` to SKIP the ~30-45 min Linux live-validation
+  suite (anchor/role-switch/exit-handoff/relay/two-hop/managed-dns/chaos) and run
+  ONLY setup + the targeted mac/win cell — the fast inner loop when you are
+  iterating a mac/win stage and the whole Linux lab would just be wasted time.
+  Setup (bootstrap + membership + signed-bundle distribution) STILL runs because
+  the mac/win stages need the mesh; they gate on setup's `distribute_*` outcomes,
+  not on the Linux suite, so the cell stays fully exercised. (Distinct from
+  `windows_only`, which skips ALL Linux incl. membership and only works on an
+  already-mesh-joined Windows guest.) (`legacy_bash: true` routes the Linux live suite
   through the legacy bash orchestrator instead of the default Rust one; BOTH paths
   run the mac/win role stages — `activate_macos_exit_role` + capture, the
   relay/anchor lifecycle — when `--macos-vm` + the role selector are set, so
