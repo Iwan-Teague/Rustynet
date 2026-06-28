@@ -2257,6 +2257,17 @@ if command -v nft >/dev/null 2>&1; then
     exit 1
   fi
 fi
+# Ensure /etc/resolv.conf is a regular file before the daemon starts.
+# systemd-resolved often manages it as a symlink to its stub resolver;
+# the daemon's DNS apply uses O_NOFOLLOW in-place write (correct security
+# behavior — must not follow a symlink into a different filesystem), so
+# a symlink causes reconcile to fail-closed with ELOOP.
+if [[ -L /etc/resolv.conf ]]; then
+  echo "replacing resolv.conf symlink with regular file for daemon write compatibility" >&2
+  run_root rm -f /etc/resolv.conf
+  printf 'nameserver 127.0.0.1\n' | run_root tee /etc/resolv.conf >/dev/null
+  run_root chmod 644 /etc/resolv.conf
+fi
 run_root rm -f \
   /etc/systemd/system/rustynetd.service \
   /etc/systemd/system/rustynetd-privileged-helper.service \
