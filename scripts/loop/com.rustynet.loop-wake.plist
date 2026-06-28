@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rustynet.loop-wake</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/iwan/Desktop/Rustynet/scripts/loop/wake_on_event.sh</string>
+        <string>poll</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/iwan/Desktop/Rustynet/state/loop-wake.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/iwan/Desktop/Rustynet/state/loop-wake.log</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/iwan</string>
+    </dict>
+</dict>
+</plist>
