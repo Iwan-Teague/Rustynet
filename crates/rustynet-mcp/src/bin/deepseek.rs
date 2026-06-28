@@ -68,6 +68,17 @@ const LAB_ORCHESTRATOR_TIMEOUT_SECS: u64 = 5400;
 /// Concurrency cap for opt-in parallel lab runs (e.g. the macOS↔Windows pipeline
 /// on disjoint guests). Default is still a singleton (1) unless `allow_concurrent`.
 const MAX_CONCURRENT_LAB_RUNS: usize = 3;
+/// A deepseek_lab_run worker records the orchestrator pid within ~1s of spawning
+/// it (`record_orchestrator_pid` runs immediately after the non-blocking spawn).
+/// A `state=running` record with NO pid recorded and no completion artifact that
+/// is older than this is therefore a phantom — the worker died BEFORE the spawn
+/// (e.g. a stdio driver disconnected right after the async ack, killing the
+/// server before its worker thread launched the detached orchestrator). Such a
+/// record can never be repaired by the pid-liveness path, so it would peg the
+/// singleton gate forever. Reclassify it crashed once this much time has passed —
+/// set well above any real startup window so a genuinely-starting run is never
+/// false-crashed.
+const RECONCILE_NO_PID_STALE_SECS: u64 = 180;
 /// Standard lab SSH material + inventory (mirrors the lab-state MCP defaults).
 const LAB_SSH_IDENTITY_REL: &str = ".ssh/rustynet_lab_ed25519";
 const LAB_KNOWN_HOSTS_REL: &str = ".ssh/known_hosts";
@@ -298,6 +309,24 @@ impl DeepSeekServer {
         rec.get("orchestrator_pid")
             .and_then(|v| v.as_u64())
             .and_then(|n| u32::try_from(n).ok())
+    }
+
+    /// True when a record has NO orchestrator pid recorded and is older than
+    /// [`RECONCILE_NO_PID_STALE_SECS`] — i.e. the worker died before it could
+    /// spawn the orchestrator and record its pid. Such a record can never be
+    /// repaired by the pid-liveness path, so both the in-flight gate and the
+    /// reconcile tool treat it as a crashed phantom once aged. A record with a
+    /// recorded pid, or one still inside the startup window, returns false.
+    /// Missing/zero `started_unix` returns false (cannot age it — stay safe).
+    fn record_no_pid_stale(rec: &Value) -> bool {
+        if Self::job_orchestrator_pid(rec).is_some() {
+            return false;
+        }
+        let started = rec
+            .get("started_unix")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        started > 0 && now_unix().saturating_sub(started) > RECONCILE_NO_PID_STALE_SECS
     }
 
     /// Read the orchestrator's completion artifact for a run, if it exists. After
@@ -1028,7 +1057,16 @@ impl DeepSeekServer {
                     .unwrap_or(true);
                 let orchestrator_alive = match Self::job_orchestrator_pid(&rec) {
                     Some(pid) => pid_is_alive(pid),
-                    None => true, // no pid recorded → conservatively assume in flight
+                    None => {
+                        // No pid recorded. The worker records it within ~1s of
+                        // spawning the orchestrator, so a no-pid record older than
+                        // RECONCILE_NO_PID_STALE_SECS is a phantom (the worker died
+                        // before the spawn) and must NOT peg the slot — let the
+                        // gate self-heal even before deepseek_reconcile_jobs runs.
+                        // A younger no-pid record is still in its startup window;
+                        // count it conservatively as in flight.
+                        !Self::record_no_pid_stale(&rec)
+                    }
                 };
                 if no_artifact && orchestrator_alive {
                     running.insert(job_id.to_string());
@@ -1125,8 +1163,51 @@ impl DeepSeekServer {
             });
         }
 
-        // Case 3: pid alive, OR no pid recorded and no artifact → genuinely in
-        // flight, or indeterminate. Be conservative: leave it running.
+        // Case 2.5: NO pid was ever recorded, no artifact, and the record is older
+        // than RECONCILE_NO_PID_STALE_SECS. The worker records the orchestrator pid
+        // within ~1s of spawning it, so a no-pid record this old means the worker
+        // died BEFORE the spawn (e.g. a stdio driver disconnected right after the
+        // async ack, killing the server before the detached orchestrator launched).
+        // It can never be repaired by the pid-liveness path (Case 2), so it would
+        // peg the singleton forever. Reclassify it crashed.
+        if Self::record_no_pid_stale(&rec) {
+            let started = rec
+                .get("started_unix")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let age = now_unix().saturating_sub(started);
+            let mut rec = rec;
+            if let Some(obj) = rec.as_object_mut() {
+                obj.insert("state".into(), json!("crashed"));
+                obj.insert("finished_unix".into(), json!(now_unix()));
+                obj.insert(
+                    "reconcile_note".into(),
+                    json!(format!(
+                        "(reconciled: no orchestrator pid was ever recorded and no completion \
+                         artifact was written {age}s after start — the worker died before \
+                         spawning the orchestrator)"
+                    )),
+                );
+            }
+            self.write_job_record(job_id, &rec);
+            if let Ok(mut jobs) = self.jobs.lock() {
+                jobs.remove(job_id);
+            }
+            return Some(ReconcileChange {
+                job_id: job_id.to_string(),
+                kind: "labrun".to_string(),
+                old_state: "running".to_string(),
+                new_state: "crashed".to_string(),
+                reason: format!(
+                    "no orchestrator pid ever recorded and no completion artifact {age}s after \
+                     start (worker died before spawning the orchestrator)"
+                ),
+            });
+        }
+
+        // Case 3: pid alive, OR no pid recorded but still inside the startup window
+        // (younger than RECONCILE_NO_PID_STALE_SECS) → genuinely in flight, or
+        // indeterminate. Be conservative: leave it running.
         None
     }
 
@@ -5862,6 +5943,79 @@ mod tests {
             s.running_lab_jobs(),
             1,
             "a no-pid/no-artifact record stays counted; only the dead-pid one self-heals"
+        );
+
+        // An AGED no-pid/no-artifact record (older than the startup window) is a
+        // phantom — the worker died before recording a pid — and must NOT count,
+        // so the gate self-heals without an explicit reconcile call. The running
+        // total stays 1 (the young indeterminate one above).
+        let aged_phantom = s.new_job_id("labrun");
+        s.write_job_record(
+            &aged_phantom,
+            &json!({
+                "job_id": aged_phantom,
+                "kind": "labrun",
+                "state": "running",
+                "area": "z",
+                "report_dir": format!("state/deepseek-lab-{aged_phantom}"),
+                "started_unix": now_unix().saturating_sub(RECONCILE_NO_PID_STALE_SECS + 60),
+            }),
+        );
+        assert_eq!(
+            s.running_lab_jobs(),
+            1,
+            "an aged no-pid/no-artifact phantom must NOT count as in flight"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (e) A no-pid/no-artifact record OLDER than the startup window is a phantom
+    /// (worker died before spawning the orchestrator) and reconcile reclassifies it
+    /// crashed, so it stops pegging the singleton gate permanently.
+    #[test]
+    fn reconcile_running_no_pid_no_artifact_aged_becomes_crashed() {
+        let root = std::env::temp_dir().join(format!(
+            "deepseek_reconcile_aged_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let s = server_rooted(&root);
+
+        let job_id = s.new_job_id("labrun");
+        let report_dir = format!("state/deepseek-lab-{job_id}");
+        s.write_job_record(
+            &job_id,
+            &json!({
+                "job_id": job_id,
+                "kind": "labrun",
+                "state": "running",
+                "area": "macOS anchor",
+                "report_dir": report_dir, // no artifact, no orchestrator_pid
+                "started_unix": now_unix().saturating_sub(RECONCILE_NO_PID_STALE_SECS + 120),
+            }),
+        );
+
+        let res = s.call_reconcile_jobs(&json!({"job_id": job_id}));
+        assert!(res.is_error.is_none());
+        let body = res
+            .content
+            .first()
+            .map(|c| c.text.as_str())
+            .unwrap()
+            .to_string();
+        assert!(body.contains("crashed"), "must report crashed: {body}");
+
+        let rec = s.read_job_record(&job_id).expect("record");
+        assert_eq!(rec.get("state").and_then(|v| v.as_str()), Some("crashed"));
+        let note = rec
+            .get("reconcile_note")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            note.contains("no orchestrator pid was ever recorded"),
+            "aged phantom must carry the reconcile note: {note}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
