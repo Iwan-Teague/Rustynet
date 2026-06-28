@@ -864,6 +864,7 @@ mod tests {
             aux_vm: None,
             extra_vm: None,
             fifth_client_vm: None,
+            relay_vm: None,
             ssh_identity_file: PathBuf::from("/dev/null"),
             known_hosts_path: None,
             require_same_network: false,
