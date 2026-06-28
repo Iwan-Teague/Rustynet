@@ -10223,6 +10223,8 @@ fi
 (sudo bash {killswitch_script} --output "$ROOT/macos_exit_killswitch_precedence.json") || echo "[capture] killswitch capture failed (non-fatal)" >&2
 (sudo bash {dns_script} --output "$ROOT/dns_leak_proof" --lan-iface {lan_iface} --mesh-hostname {mesh_hostname}) || echo "[capture] DNS capture failed (non-fatal)" >&2
 (sudo bash {nat_script} --mesh-cidr {mesh_cidr} --output "$ROOT/macos_exit_nat_lifecycle.json") || echo "[capture] NAT lifecycle capture failed (non-fatal)" >&2
+# Make artifacts readable by the SSH user for SCP copy-back.
+sudo chown -R $(whoami) "$ROOT"
 find "$ROOT" -type f -print | sort
 "#
     );
