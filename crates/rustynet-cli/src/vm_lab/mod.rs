@@ -9975,6 +9975,8 @@ const MACOS_EXIT_EVIDENCE_MESH_HOSTNAME: &str = "exit-1.rustynet";
 struct MacosExitEvidenceArtifactSpec {
     remote_relative_path: &'static str,
     local_relative_path: &'static str,
+    /// Optional artifacts are skipped (not failed) when the remote file is missing.
+    optional: bool,
 }
 
 fn macos_exit_evidence_artifact_specs() -> &'static [MacosExitEvidenceArtifactSpec] {
@@ -9982,34 +9984,42 @@ fn macos_exit_evidence_artifact_specs() -> &'static [MacosExitEvidenceArtifactSp
         MacosExitEvidenceArtifactSpec {
             remote_relative_path: "macos_exit_nat_lifecycle.json",
             local_relative_path: "macos_exit_nat_lifecycle.json",
+            optional: false,
         },
         MacosExitEvidenceArtifactSpec {
             remote_relative_path: "dns_leak_proof/pf_block_rules.json",
             local_relative_path: "dns_leak_proof/pf_block_rules.json",
+            optional: false,
         },
         MacosExitEvidenceArtifactSpec {
             remote_relative_path: "dns_leak_proof/udp_block_pcap.txt",
             local_relative_path: "dns_leak_proof/udp_block_pcap.txt",
+            optional: false,
         },
         MacosExitEvidenceArtifactSpec {
             remote_relative_path: "dns_leak_proof/tcp_block_pcap.txt",
             local_relative_path: "dns_leak_proof/tcp_block_pcap.txt",
+            optional: false,
         },
         MacosExitEvidenceArtifactSpec {
             remote_relative_path: "dns_leak_proof/dns_block_probe.json",
             local_relative_path: "dns_leak_proof/dns_block_probe.json",
+            optional: false,
         },
         MacosExitEvidenceArtifactSpec {
             remote_relative_path: "dns_leak_proof/tunnel_path_resolves.json",
             local_relative_path: "dns_leak_proof/tunnel_path_resolves.json",
+            optional: false,
         },
         MacosExitEvidenceArtifactSpec {
             remote_relative_path: "dns_leak_proof/macos_dns_failclosed_check.json",
             local_relative_path: "dns_leak_proof/macos_dns_failclosed_check.json",
+            optional: false,
         },
         MacosExitEvidenceArtifactSpec {
             remote_relative_path: "macos_exit_killswitch_precedence.json",
             local_relative_path: "macos_exit_killswitch_precedence.json",
+            optional: true,
         },
     ]
 }
@@ -10250,7 +10260,7 @@ find "$ROOT" -type f -print | sort
             MACOS_EXIT_EVIDENCE_REMOTE_ROOT, spec.remote_relative_path
         );
         let local_path = local_artifact_root.join(Path::new(spec.local_relative_path));
-        let status = scp_from_remote(
+        let status = match scp_from_remote(
             &target,
             target.ssh_user.as_deref(),
             Some(ssh_identity_file),
@@ -10258,14 +10268,22 @@ find "$ROOT" -type f -print | sort
             remote_path.as_str(),
             local_path.as_path(),
             timeout,
-        )
-        .map_err(|err| {
-            (
-                format!("copy macOS Exit evidence artifact {remote_path} failed: {err}"),
-                raw_output.clone(),
-            )
-        })?;
+        ) {
+            Ok(s) => s,
+            Err(err) => {
+                if spec.optional {
+                    continue;
+                }
+                return Err((
+                    format!("copy macOS Exit evidence artifact {remote_path} failed: {err}"),
+                    raw_output.clone(),
+                ));
+            }
+        };
         if !status.success() {
+            if spec.optional {
+                continue;
+            }
             return Err((
                 format!(
                     "copy macOS Exit evidence artifact {remote_path} exited non-zero: {}",
@@ -10275,6 +10293,9 @@ find "$ROOT" -type f -print | sort
             ));
         }
         if !local_path.is_file() {
+            if spec.optional {
+                continue;
+            }
             return Err((
                 format!(
                     "copy macOS Exit evidence artifact {remote_path} reported success but local file is missing: {}",
