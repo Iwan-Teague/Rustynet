@@ -904,6 +904,7 @@ mod tests {
             macos_promote_exit: false,
             enable_chaos_suite: false,
             stage_timeout_secs: 0,
+            skip_linux_live_suite: false,
         }
     }
 

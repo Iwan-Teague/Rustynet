@@ -969,6 +969,16 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// probe wedged against a Windows guest) fails the stage instead of
     /// stalling the whole run for hours.
     pub stage_timeout_secs: u64,
+    /// Skip the Linux LIVE-VALIDATION SUITE (the `execute_ops_vm_lab_run_live_lab`
+    /// call: anchor / role-switch / exit-handoff / relay / two-hop / managed-dns /
+    /// network-flap / reboot-recovery / key-custody / secrets / chaos stages — the
+    /// ~30-45 min time sink) while STILL running setup (bootstrap + membership +
+    /// signed-bundle distribution + baseline) and then the mac/win role stages.
+    /// Use ONLY to iterate a macOS/Windows role cell against a freshly-set-up
+    /// mesh; the mac/win stages gate on setup's `distribute_*` outcomes, not on
+    /// the Linux live suite, so skipping the suite leaves them fully exercised.
+    /// A full Linux live suite still runs when this is `false` (the default).
+    pub skip_linux_live_suite: bool,
 }
 
 /// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.
@@ -7595,6 +7605,78 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         }
     }
 
+    // --skip-linux-live-suite: setup (bootstrap + membership + signed-bundle
+    // distribution + baseline) has already completed above; skip the Linux
+    // live-validation suite (the ~30-45 min `execute_ops_vm_lab_run_live_lab`
+    // call) and jump straight to the mac/win role stages. Those stages gate on
+    // setup's `distribute_*` outcomes (see `run_windows_orchestration_with_pulled_bundles`
+    // / `run_macos_orchestration_stages`), NOT on the live suite, so the
+    // targeted cell is still fully exercised against the freshly-set-up mesh.
+    // This mirrors the run-Ok arm below minus the `execute_ops_vm_lab_run_live_lab`
+    // invocation. Used for fast mac/win cell iteration (e.g. deepseek_lab_run
+    // with a role-platform selector).
+    if config.skip_linux_live_suite {
+        let skip_outcome = stage_outcome(
+            "linux_live_suite",
+            VmLabStageStatus::Skipped,
+            "skipped by --skip-linux-live-suite; setup ran, mac/win role stages still execute",
+            vec![],
+        );
+        emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &skip_outcome);
+        outcomes.push(skip_outcome);
+        if let Some(ref windows_alias) = config.windows_vm {
+            let windows_outcomes = run_windows_orchestration_with_pulled_bundles(
+                &config,
+                inventory_path.as_path(),
+                report_dir.as_path(),
+                windows_alias.as_str(),
+                outcomes.as_slice(),
+            );
+            for outcome in &windows_outcomes {
+                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+            }
+            outcomes.extend(windows_outcomes);
+        }
+        if let Some(ref macos_alias) = config.macos_vm {
+            let macos_outcomes = run_macos_orchestration_stages(
+                &config,
+                macos_alias.as_str(),
+                inventory_path.as_path(),
+                config.ssh_identity_file.as_path(),
+                config.known_hosts_path.as_deref(),
+                config.dry_run,
+                report_dir.as_path(),
+                &outcomes,
+            );
+            for outcome in &macos_outcomes {
+                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+            }
+            outcomes.extend(macos_outcomes);
+        }
+        if config.validate_linux_daemon_state && !selected_aliases.is_empty() {
+            let linux_outcomes = run_linux_daemon_validators_for_aliases(
+                selected_aliases.as_slice(),
+                inventory_path.as_path(),
+                config.ssh_identity_file.as_path(),
+                config.known_hosts_path.as_deref(),
+                report_dir.as_path(),
+                config.dry_run,
+            );
+            for outcome in &linux_outcomes {
+                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+            }
+            outcomes.extend(linux_outcomes);
+        }
+        return finalize_vm_lab_orchestration_result(
+            "vm-lab-orchestrate-live-lab",
+            report_dir.as_path(),
+            orchestration_dir.as_path(),
+            outcomes,
+            warnings,
+            next_actions,
+        );
+    }
+
     let run_config = VmLabRunLiveLabConfig {
         profile_path: effective_profile_path.clone(),
         script_path: config.script_path.clone(),
@@ -13487,7 +13569,9 @@ fn run_windows_orchestration_stages_with_options(
         stage_outcome(
             "validate_windows_anchor_bundle_pull",
             VmLabStageStatus::Skipped,
-            format!("skipped: {windows_alias} is not the elected anchor (anchor_platform != windows)"),
+            format!(
+                "skipped: {windows_alias} is not the elected anchor (anchor_platform != windows)"
+            ),
             vec![],
         )
     } else if !bootstrap_passed {
@@ -40891,6 +40975,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             macos_promote_exit: false,
             enable_chaos_suite: false,
             stage_timeout_secs: 0,
+            skip_linux_live_suite: false,
         }
     }
 
