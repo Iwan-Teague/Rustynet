@@ -10224,14 +10224,13 @@ if [ "$reassert_ok" != 1 ]; then
   echo 'pre-capture exit re-assertion failed: daemon not serving exit after 10 attempts (~30s)' >&2
   exit 1
 fi
-# Capture order: killswitch (snapshots + flushes + restores pf anchor, so it
-# must run while the daemon is in exit mode, before the NAT lifecycle stop),
-# then DNS (reads pf state only), then NAT lifecycle (stops daemon, takes
-# after_stop snapshot, restarts — after this the daemon is in client mode).
+# Capture order: DNS first (reads pf rules before any destructive step),
+# then killswitch (flushes pf anchor — destructive, runs after DNS),
+# then NAT lifecycle (stops daemon — destructive, runs last).
 # Each capture runs in its own error context so a failure in one does not
 # prevent the others from producing evidence.
-(sudo bash {killswitch_script} --output "$ROOT/macos_exit_killswitch_precedence.json") || echo "[capture] killswitch capture failed (non-fatal)" >&2
 (sudo bash {dns_script} --output "$ROOT/dns_leak_proof" --lan-iface {lan_iface} --mesh-hostname {mesh_hostname}) || echo "[capture] DNS capture failed (non-fatal)" >&2
+(sudo bash {killswitch_script} --output "$ROOT/macos_exit_killswitch_precedence.json") || echo "[capture] killswitch capture failed (non-fatal)" >&2
 (sudo bash {nat_script} --mesh-cidr {mesh_cidr} --output "$ROOT/macos_exit_nat_lifecycle.json") || echo "[capture] NAT lifecycle capture failed (non-fatal)" >&2
 # Make artifacts readable by the SSH user for SCP copy-back.
 sudo chown -R $(whoami) "$ROOT"
