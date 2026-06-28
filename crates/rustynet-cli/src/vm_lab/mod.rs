@@ -10252,7 +10252,7 @@ find "$ROOT" -type f -print | sort
         let local_path = local_artifact_root.join(Path::new(spec.local_relative_path));
         let status = scp_from_remote(
             &target,
-            None,
+            target.ssh_user.as_deref(),
             Some(ssh_identity_file),
             known_hosts_path,
             remote_path.as_str(),
