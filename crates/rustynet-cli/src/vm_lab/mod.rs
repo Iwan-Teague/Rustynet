@@ -202,6 +202,8 @@ pub struct VmLabWriteLiveLabProfileConfig {
     pub extra_target: Option<String>,
     pub fifth_client_vm: Option<String>,
     pub fifth_client_target: Option<String>,
+    pub relay_vm: Option<String>,
+    pub relay_target: Option<String>,
     pub require_same_network: bool,
     pub ssh_identity_file: PathBuf,
     pub ssh_known_hosts_file: Option<PathBuf>,
@@ -249,6 +251,7 @@ pub struct VmLabSetupLiveLabConfig {
     pub aux_vm: Option<String>,
     pub extra_vm: Option<String>,
     pub fifth_client_vm: Option<String>,
+    pub relay_vm: Option<String>,
     pub ssh_identity_file: PathBuf,
     pub known_hosts_path: Option<PathBuf>,
     pub require_same_network: bool,
@@ -826,6 +829,7 @@ pub struct VmLabOrchestrateLiveLabConfig {
     pub aux_vm: Option<String>,
     pub extra_vm: Option<String>,
     pub fifth_client_vm: Option<String>,
+    pub relay_vm: Option<String>,
     pub ssh_identity_file: PathBuf,
     pub known_hosts_path: Option<PathBuf>,
     pub require_same_network: bool,
@@ -4298,6 +4302,12 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
         config.fifth_client_vm.as_deref(),
         config.fifth_client_target.as_deref(),
     )?;
+    let relay_target = resolve_optional_role_target(
+        config.inventory_path.as_path(),
+        "relay",
+        config.relay_vm.as_deref(),
+        config.relay_target.as_deref(),
+    )?;
 
     let role_targets = [
         Some(exit_target.clone()),
@@ -4306,6 +4316,7 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
         aux_target.clone(),
         extra_target.clone(),
         fifth_client_target.clone(),
+        relay_target.clone(),
     ];
     if config.require_same_network {
         ensure_role_targets_share_network(role_targets.as_slice())?;
@@ -4418,6 +4429,16 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
             lines.push(format_env_assignment("FIFTH_CLIENT_UTM_NAME", "")?);
             append_empty_target_platform_metadata(&mut lines, "FIFTH_CLIENT")?;
         }
+    }
+    if let Some(target) = relay_target {
+        lines.push(format_env_assignment(
+            "RELAY_TARGET",
+            target.normalized_target.as_str(),
+        )?);
+        if let Some(utm_name) = target.utm_name.as_deref() {
+            lines.push(format_env_assignment("RELAY_UTM_NAME", utm_name)?);
+        }
+        append_target_platform_metadata(&mut lines, "RELAY", &target)?;
     }
     if let Some(path) = config.ssh_known_hosts_file.as_deref() {
         lines.push(format_env_assignment(
@@ -5066,6 +5087,8 @@ fn resolve_setup_live_lab_selection(
             extra_target: None,
             fifth_client_vm,
             fifth_client_target: None,
+            relay_vm: config.relay_vm.clone(),
+            relay_target: None,
             require_same_network: config.require_same_network,
             ssh_identity_file: config.ssh_identity_file.clone(),
             ssh_known_hosts_file: config.known_hosts_path.clone(),
@@ -7444,6 +7467,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         aux_vm: config.aux_vm.clone(),
         extra_vm: config.extra_vm.clone(),
         fifth_client_vm: config.fifth_client_vm.clone(),
+        relay_vm: config.relay_vm.clone(),
         ssh_identity_file: config.ssh_identity_file.clone(),
         known_hosts_path: config.known_hosts_path.clone(),
         require_same_network: config.require_same_network,
@@ -18945,6 +18969,8 @@ pub fn execute_ops_vm_lab_iterate_live_lab(
             extra_target: config.extra_target.clone(),
             fifth_client_vm: config.fifth_client_vm.clone(),
             fifth_client_target: config.fifth_client_target.clone(),
+            relay_vm: None,
+            relay_target: None,
             require_same_network: config.require_same_network,
             ssh_identity_file: config.ssh_identity_file.clone(),
             ssh_known_hosts_file: config.ssh_known_hosts_file.clone(),
@@ -33011,6 +33037,8 @@ directory = "vendor"
             extra_target: None,
             fifth_client_vm: None,
             fifth_client_target: None,
+            relay_vm: None,
+            relay_target: None,
             require_same_network: true,
             ssh_identity_file: identity.clone(),
             ssh_known_hosts_file: Some(known_hosts.clone()),
@@ -34735,6 +34763,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             aux_vm: None,
             extra_vm: None,
             fifth_client_vm: None,
+            relay_vm: None,
             ssh_identity_file: identity_path,
             known_hosts_path: None,
             require_same_network: false,
@@ -40963,6 +40992,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             aux_vm: None,
             extra_vm: None,
             fifth_client_vm: None,
+            relay_vm: None,
             ssh_identity_file: PathBuf::from("/dev/null"),
             known_hosts_path: None,
             require_same_network: false,
