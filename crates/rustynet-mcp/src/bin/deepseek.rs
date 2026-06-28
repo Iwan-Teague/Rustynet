@@ -1322,6 +1322,14 @@ impl DeepSeekServer {
             .get("windows_only")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Skip the ~30-45 min Linux live-validation suite and jump straight to
+        // the mac/win role stages after setup. Pair with a role-platform
+        // selector (exit_platform/relay_platform/anchor_platform/...) to drive
+        // ONE mac/win cell fast instead of paying for the whole Linux lab.
+        let skip_linux_live_suite = args
+            .get("skip_linux_live_suite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let allow_concurrent = args
             .get("allow_concurrent")
@@ -1416,6 +1424,7 @@ impl DeepSeekServer {
                 legacy_bash,
                 dry_run,
                 windows_only,
+                skip_linux_live_suite,
             ));
             let arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
 
@@ -3467,6 +3476,7 @@ fn build_orchestrator_args(
     legacy_bash: bool,
     dry_run: bool,
     windows_only: bool,
+    skip_linux_live_suite: bool,
 ) -> Vec<String> {
     let mut a: Vec<String> = vec!["vm-lab-orchestrate-live-lab".to_string()];
     a.extend(["--inventory".to_string(), inventory.to_string()]);
@@ -3525,6 +3535,15 @@ fn build_orchestrator_args(
     }
     if windows_only {
         a.push("--windows-only".to_string());
+    }
+    // Skip the Linux LIVE-VALIDATION SUITE (anchor/role-switch/exit-handoff/
+    // relay/two-hop/managed-dns/chaos — the ~30-45 min time sink) while still
+    // running setup (bootstrap + membership + signed-bundle distribution) and
+    // the mac/win role stages. Use with a role-platform selector to iterate a
+    // single mac/win cell fast; the mac/win stages gate on setup's distribute_*
+    // outcomes, not on the Linux live suite, so they stay fully exercised.
+    if skip_linux_live_suite {
+        a.push("--skip-linux-live-suite".to_string());
     }
     if dry_run {
         a.push("--dry-run".to_string());
@@ -4322,6 +4341,8 @@ impl McpServer for DeepSeekServer {
                         "macos_promote_exit": json!({"type": "boolean", "description": "Option-B selector: elect macOS as a SECONDARY exit so the macOS exit cell runs live (drives is_macos_active_exit). Use alongside exit_vm/client_vm/entry_vm."}),
                         "entry_vm": json_schema_string("Linux entry-node alias for the Option-B exit topology (used alongside exit_vm/client_vm + macos_promote_exit)."),
                         "legacy_bash": json!({"type": "boolean", "description": "Route the Linux live suite through the legacy bash orchestrator instead of the default Rust one. OPTIONAL: both paths run the mac/win ROLE stages (activate_macos_exit_role + capture, relay/anchor lifecycle) when macos_vm + the role selector are set. The early 'no macOS nodes in topology' preflight line is a benign Linux-preflight artifact, not a skip of the macOS role stages."}),
+                        "skip_linux_live_suite": json!({"type": "boolean", "description": "FAST mac/win cell iteration: skip the ~30-45 min Linux live-validation suite (anchor/role-switch/exit-handoff/relay/two-hop/managed-dns/chaos) and jump straight to the mac/win role stages AFTER setup (bootstrap + membership + signed-bundle distribution still run, because the mac/win stages need the mesh). Pair with a role-platform selector (exit_platform/relay_platform/anchor_platform/blind_exit_platform or macos_promote_exit) to drive ONE mac/win cell live without paying for the whole Linux lab. The mac/win stages gate on setup's distribute_* outcomes, not the Linux suite, so they stay fully exercised. Use this whenever you are failing on a mac/win stage and the Linux suite would just be wasted time."}),
+                        "windows_only": json!({"type": "boolean", "description": "Skip ALL Linux stages (incl. membership setup) and run ONLY the Windows bootstrap + validation stages; requires windows_vm. NOTE: this also skips membership distribution, so it only works when the Windows guest is already mesh-joined from a prior run — for a fresh Windows cell use skip_linux_live_suite instead (keeps setup)."}),
                         "allow_concurrent": json!({"type": "boolean", "description": "Opt into PARALLEL runs (default false = singleton). When true, up to 3 runs may overlap — you MUST give each disjoint guests (e.g. the macOS↔Windows pipeline: macOS on one Debian backbone, Windows on another). Each concurrent run gets its own CARGO_TARGET_DIR + report dir."}),
                         "dry_run": json!({"type": "boolean", "description": "Run the orchestrator in --dry-run mode (fast; verifies the launch wiring without a real lab pass)."}),
                         "max_steps": json!({"type": "integer", "description": "Max tool-calling steps per triage agent on failure (default 12, cap 20)."}),
@@ -4952,6 +4973,7 @@ mod tests {
             true,             // legacy_bash
             false,            // dry_run
             false,            // windows_only
+            true,             // skip_linux_live_suite
         );
         assert_eq!(a[0], "vm-lab-orchestrate-live-lab");
         for flag in [
@@ -4971,6 +4993,7 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--entry-vm", "debian-3"]));
         assert!(a.iter().any(|x| x == "--macos-promote-exit"));
         assert!(a.iter().any(|x| x == "--legacy-bash-orchestrator"));
+        assert!(a.iter().any(|x| x == "--skip-linux-live-suite"));
         // Selectors NOT provided do not appear.
         assert!(!a.iter().any(|x| x == "--windows-vm"));
         assert!(!a.iter().any(|x| x == "--client-vm"));
@@ -4982,7 +5005,7 @@ mod tests {
         // selectors (incl. --macos-promote-exit) when omitted.
         let d = build_orchestrator_args(
             "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None,
-            false, false, true, false,
+            false, false, true, false, false,
         );
         assert!(d.iter().any(|x| x == "--dry-run"));
         assert!(!d.iter().any(|x| x == "--macos-vm"));
@@ -4991,6 +5014,7 @@ mod tests {
         assert!(!d.iter().any(|x| x == "--entry-vm"));
         assert!(!d.iter().any(|x| x == "--macos-promote-exit"));
         assert!(!d.iter().any(|x| x == "--legacy-bash-orchestrator"));
+        assert!(!d.iter().any(|x| x == "--skip-linux-live-suite"));
     }
 
     #[test]
