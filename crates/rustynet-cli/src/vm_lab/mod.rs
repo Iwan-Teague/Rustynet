@@ -10214,9 +10214,13 @@ if [ "$reassert_ok" != 1 ]; then
   echo 'pre-capture exit re-assertion failed: daemon not serving exit after 10 attempts (~30s)' >&2
   exit 1
 fi
-sudo bash {nat_script} --mesh-cidr {mesh_cidr} --output "$ROOT/macos_exit_nat_lifecycle.json"
+# Run non-destructive captures first (DNS + killswitch only read pf state),
+# then the destructive NAT lifecycle capture (stops + restarts the daemon).
+# Order matters: the NAT lifecycle restart leaves the daemon in client mode,
+# so DNS/killswitch captures that need the exit pf anchor must run BEFORE it.
 sudo bash {dns_script} --output "$ROOT/dns_leak_proof" --lan-iface {lan_iface} --mesh-hostname {mesh_hostname}
 sudo bash {killswitch_script} --output "$ROOT/macos_exit_killswitch_precedence.json"
+sudo bash {nat_script} --mesh-cidr {mesh_cidr} --output "$ROOT/macos_exit_nat_lifecycle.json"
 find "$ROOT" -type f -print | sort
 "#
     );
