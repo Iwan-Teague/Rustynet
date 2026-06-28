@@ -299,9 +299,11 @@ ENDUNKNOWN
     log "wrote $PROMPT ($(wc -c < "$PROMPT" | tr -d ' ') bytes)"
 }
 # ── AppleScript paste into Zed ───────────────────────────────────────
+# paste_zed [file]  — paste the given file (default: the per-cycle $PROMPT).
 paste_zed() {
-    log "pasting into Zed..."
-    cat "$PROMPT" | pbcopy
+    local file="${1:-$PROMPT}"
+    log "pasting into Zed ($file)..."
+    pbcopy < "$file"
     osascript -e 'tell application "Zed" to activate' 2>/dev/null || true
     sleep 2
     osascript -e 'tell application "System Events" to tell process "Zed" to keystroke "v" using command down' 2>/dev/null || true
@@ -395,6 +397,19 @@ main() {
 
     log "=== AUTO LOOP: $area ==="
     log "args: $args_json"
+
+    # ── Orient the agent ONCE with the initial prompt (script-driven role) while
+    #    the first run executes. Pastes the fenced prompt body from
+    #    scripts/loop/initial_prompt.md if present; skip silently if absent. ──
+    local init_src="$REPO/scripts/loop/initial_prompt.md"
+    if [ -f "$init_src" ]; then
+        local init_tmp; init_tmp="$(dirname "$PROMPT")/loop-initial-prompt.txt"
+        awk '/^```/{f=!f; next} f' "$init_src" > "$init_tmp"
+        [ -s "$init_tmp" ] || cp "$init_src" "$init_tmp"
+        log "orienting agent with initial prompt"
+        paste_zed "$init_tmp"
+        sleep 3
+    fi
 
     # ── Launch the FIRST run ourselves (blocking poll via drive_deepseek; the
     #    polling keeps the MCP server alive long enough for the detached
