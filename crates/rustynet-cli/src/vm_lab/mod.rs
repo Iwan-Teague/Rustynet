@@ -10218,9 +10218,11 @@ fi
 # must run while the daemon is in exit mode, before the NAT lifecycle stop),
 # then DNS (reads pf state only), then NAT lifecycle (stops daemon, takes
 # after_stop snapshot, restarts — after this the daemon is in client mode).
-sudo bash {killswitch_script} --output "$ROOT/macos_exit_killswitch_precedence.json"
-sudo bash {dns_script} --output "$ROOT/dns_leak_proof" --lan-iface {lan_iface} --mesh-hostname {mesh_hostname}
-sudo bash {nat_script} --mesh-cidr {mesh_cidr} --output "$ROOT/macos_exit_nat_lifecycle.json"
+# Each capture runs in its own error context so a failure in one does not
+# prevent the others from producing evidence.
+(sudo bash {killswitch_script} --output "$ROOT/macos_exit_killswitch_precedence.json") || echo "[capture] killswitch capture failed (non-fatal)" >&2
+(sudo bash {dns_script} --output "$ROOT/dns_leak_proof" --lan-iface {lan_iface} --mesh-hostname {mesh_hostname}) || echo "[capture] DNS capture failed (non-fatal)" >&2
+(sudo bash {nat_script} --mesh-cidr {mesh_cidr} --output "$ROOT/macos_exit_nat_lifecycle.json") || echo "[capture] NAT lifecycle capture failed (non-fatal)" >&2
 find "$ROOT" -type f -print | sort
 "#
     );
