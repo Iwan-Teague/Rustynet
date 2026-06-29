@@ -627,6 +627,11 @@ impl App {
                 self.focused_panel = Panel::Jobs;
             }
             KeyCode::Char(_) if plain_char == Some('a') => {
+                if self.roles_locked_by_active_lab() {
+                    self.log_lines =
+                        vec!["VM roles locked to active live lab; cannot auto-reassign".into()];
+                    return;
+                }
                 self.auto_select_next_target();
             }
             KeyCode::Char(_) if plain_char == Some('c') => {
@@ -889,70 +894,35 @@ impl App {
     }
 
     pub fn role_for_vm(&self, alias: &str) -> String {
-        if let Some(role) = self.vm_role_overrides.get(alias) {
+        let config = self.config_for_role_display();
+        if !self.roles_locked_by_active_lab()
+            && let Some(role) = self.vm_role_overrides.get(alias)
+        {
             return role.clone();
         }
-        if alias == self.config.macos_vm {
-            if self.config.macos_promote_exit || self.config.exit_platform == "macos" {
-                return "exit".into();
-            }
-            if self.config.relay_platform == "macos" {
-                return "relay".into();
-            }
-            if self.config.anchor_platform == "macos" {
-                return "anchor".into();
-            }
-            if self.config.admin_platform == "macos" {
-                return "admin".into();
-            }
-            if self.config.blind_exit_platform == "macos" {
-                return "blind_exit".into();
-            }
-            return "macos-target".into();
+        role_for_vm_from_config(alias, &config)
+    }
+
+    pub fn roles_locked_by_active_lab(&self) -> bool {
+        self.active_job.is_some() || self.orchestrator_pgid.is_some()
+    }
+
+    fn config_for_role_display(&self) -> MonitorConfig {
+        let mut config = self.config.clone();
+        if let Some(job) = &self.active_job
+            && let Some(args) = &job.request_args
+        {
+            config.apply_request_args(args);
         }
-        if alias == self.config.windows_vm {
-            if self.config.exit_platform == "windows" {
-                return "exit".into();
-            }
-            if self.config.relay_platform == "windows" {
-                return "relay".into();
-            }
-            if self.config.anchor_platform == "windows" {
-                return "anchor".into();
-            }
-            if self.config.admin_platform == "windows" {
-                return "admin".into();
-            }
-            if self.config.blind_exit_platform == "windows" {
-                return "blind_exit".into();
-            }
-            return "windows-target".into();
-        }
-        if alias == self.config.exit_vm {
-            if self.config.relay_platform == "linux" {
-                return "relay".into();
-            }
-            if self.config.anchor_platform == "linux" {
-                return "anchor".into();
-            }
-            if self.config.admin_platform == "linux" {
-                return "admin".into();
-            }
-            if self.config.blind_exit_platform == "linux" {
-                return "blind_exit".into();
-            }
-            if self.config.exit_platform == "linux" || self.config.exit_platform.is_empty() {
-                return "exit".into();
-            }
-            return "linux-target".into();
-        }
-        if alias == self.config.client_vm {
-            return "client".into();
-        }
-        "—".into()
+        config
     }
 
     fn cycle_selected_vm_role(&mut self, direction: isize) {
+        if self.roles_locked_by_active_lab() {
+            self.log_lines =
+                vec!["VM roles locked to active live lab; wait for lab to finish".into()];
+            return;
+        }
         let Some(vm) = self.vm_statuses.get(self.selected_vm).cloned() else {
             return;
         };
@@ -1037,6 +1007,11 @@ impl App {
     }
 
     fn auto_select_next_target(&mut self) {
+        if self.roles_locked_by_active_lab() {
+            self.log_lines =
+                vec!["VM roles locked to active live lab; cannot auto-reassign".into()];
+            return;
+        }
         if let Ok(matrix) = crate::data::run_matrix::load_parity_matrix(&self.repo_root) {
             self.parity_matrix = matrix;
         }
@@ -1147,6 +1122,67 @@ impl App {
             tracing::error!(%e, "failed to save monitor config");
         }
     }
+}
+
+fn role_for_vm_from_config(alias: &str, config: &MonitorConfig) -> String {
+    if alias == config.macos_vm {
+        if config.macos_promote_exit || config.exit_platform == "macos" {
+            return "exit".into();
+        }
+        if config.relay_platform == "macos" {
+            return "relay".into();
+        }
+        if config.anchor_platform == "macos" {
+            return "anchor".into();
+        }
+        if config.admin_platform == "macos" {
+            return "admin".into();
+        }
+        if config.blind_exit_platform == "macos" {
+            return "blind_exit".into();
+        }
+        return "macos-target".into();
+    }
+    if alias == config.windows_vm {
+        if config.exit_platform == "windows" {
+            return "exit".into();
+        }
+        if config.relay_platform == "windows" {
+            return "relay".into();
+        }
+        if config.anchor_platform == "windows" {
+            return "anchor".into();
+        }
+        if config.admin_platform == "windows" {
+            return "admin".into();
+        }
+        if config.blind_exit_platform == "windows" {
+            return "blind_exit".into();
+        }
+        return "windows-target".into();
+    }
+    if alias == config.exit_vm {
+        if config.relay_platform == "linux" {
+            return "relay".into();
+        }
+        if config.anchor_platform == "linux" {
+            return "anchor".into();
+        }
+        if config.admin_platform == "linux" {
+            return "admin".into();
+        }
+        if config.blind_exit_platform == "linux" {
+            return "blind_exit".into();
+        }
+        if config.exit_platform == "linux" || config.exit_platform.is_empty() {
+            return "exit".into();
+        }
+        return "linux-target".into();
+    }
+    if alias == config.client_vm {
+        return "client".into();
+    }
+    "—".into()
 }
 
 fn set_role_platform(config: &mut MonitorConfig, role: &str, platform: &str) {
@@ -1577,6 +1613,59 @@ mod tests {
         app.assign_vm_role(&vm, "relay");
 
         assert_eq!(app.role_for_vm("debian-headless-1"), "relay");
+    }
+
+    #[test]
+    fn active_lab_roles_ignore_stale_user_overrides() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.vm_role_overrides
+            .insert("windows-utm-1".to_owned(), "relay".to_owned());
+        app.active_job = Some(JobState {
+            job_id: "labrun-test".to_owned(),
+            state: "running".to_owned(),
+            pid: Some(std::process::id()),
+            started_unix: Some(1),
+            area: "Windows admin".to_owned(),
+            report_dir: "state/deepseek-lab-labrun-test".to_owned(),
+            request_args: Some(HashMap::from([
+                ("area".to_owned(), json!("Windows admin")),
+                ("windows_vm".to_owned(), json!("windows-utm-1")),
+                ("admin_platform".to_owned(), json!("windows")),
+            ])),
+        });
+
+        assert_eq!(app.role_for_vm("windows-utm-1"), "admin");
+    }
+
+    #[test]
+    fn active_lab_blocks_vm_role_cycling() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.vm_statuses.push(crate::data::vm_prober::VmStatus {
+            alias: "debian-headless-1".into(),
+            ip: "192.168.0.200".into(),
+            platform: "linux".into(),
+            ssh_ok: true,
+            git_commit: Some("abc1234".into()),
+        });
+        let overrides_before = app.vm_role_overrides.clone();
+        app.active_job = Some(JobState {
+            job_id: "labrun-test".to_owned(),
+            state: "running".to_owned(),
+            pid: Some(std::process::id()),
+            started_unix: Some(1),
+            area: "macOS exit".to_owned(),
+            report_dir: "state/deepseek-lab-labrun-test".to_owned(),
+            request_args: None,
+        });
+
+        app.cycle_selected_vm_role(1);
+
+        assert_eq!(app.role_for_vm("debian-headless-1"), "exit");
+        assert_eq!(app.vm_role_overrides, overrides_before);
+        assert_eq!(
+            app.log_lines,
+            vec!["VM roles locked to active live lab; wait for lab to finish".to_owned()]
+        );
     }
 
     #[test]
