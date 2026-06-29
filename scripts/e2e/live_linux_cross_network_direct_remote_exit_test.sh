@@ -254,13 +254,13 @@ main() {
   live_lab_capture_root "$EXIT_HOST" "root cat /run/rustynet/assignment-issue/rn-assignment-$CLIENT_NODE_ID.assignment" > "$client_assignment_local"
 
   live_lab_log "Distributing signed assignments"
-  live_lab_install_assignment_bundle "$EXIT_HOST" "$assign_pub_local" "$exit_assignment_local"
-  live_lab_install_assignment_bundle "$CLIENT_HOST" "$assign_pub_local" "$client_assignment_local"
+  live_lab_install_assignment_bundle "$EXIT_HOST" "$assign_pub_local" "$exit_assignment_local" "$EXIT_NODE_ID"
+  live_lab_install_assignment_bundle "$CLIENT_HOST" "$assign_pub_local" "$client_assignment_local" "$CLIENT_NODE_ID"
 
   live_lab_write_assignment_refresh_env "$exit_refresh_local" "$EXIT_NODE_ID" "$NODES_SPEC" "$ALLOW_SPEC"
   live_lab_write_assignment_refresh_env "$client_refresh_local" "$CLIENT_NODE_ID" "$NODES_SPEC" "$ALLOW_SPEC" "$EXIT_NODE_ID"
-  live_lab_install_assignment_refresh_env "$EXIT_HOST" "$exit_refresh_local"
-  live_lab_install_assignment_refresh_env "$CLIENT_HOST" "$client_refresh_local"
+  live_lab_install_assignment_refresh_env "$EXIT_HOST" "$exit_refresh_local" "$EXIT_NODE_ID"
+  live_lab_install_assignment_refresh_env "$CLIENT_HOST" "$client_refresh_local" "$CLIENT_NODE_ID"
 
   : > "$traversal_env"
   live_lab_append_env_assignment "$traversal_env" "NODES_SPEC" "$NODES_SPEC"
