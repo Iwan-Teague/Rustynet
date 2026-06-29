@@ -11,8 +11,13 @@ use crate::app::{App, Panel};
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let count = app.vm_statuses.len();
     let focused = app.focused_panel == Panel::VmStatus;
+    let role_hint = if app.roles_locked_by_active_lab() {
+        "roles locked to active lab"
+    } else {
+        "←→ role"
+    };
     let title = format!(
-        "VM STATUS [1/V] ({})  ↑↓ select  ←→ role  c fetch commits",
+        "VM STATUS [1/V] ({})  ↑↓ select  {role_hint}  c fetch commits",
         count
     );
 
