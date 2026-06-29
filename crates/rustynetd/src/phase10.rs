@@ -3241,6 +3241,10 @@ impl DataplaneSystem for MacosCommandSystem {
             // Regular NATing exit: enable IPv4 forwarding and load the
             // com.rustynet/nat translation anchor.
             self.activate_exit_nat(mesh_cidr)?;
+            // Apply DNS protection inline as part of the exit-role transition
+            // so that DNS-block-LAN rules are present in the killswitch anchor
+            // immediately, rather than waiting for the reconcile loop.
+            self.apply_dns_protection()?;
         } else {
             // Full-tunnel client consuming a remote exit: no local NAT or
             // forwarding. Tear down any exit NAT left from a prior generation
