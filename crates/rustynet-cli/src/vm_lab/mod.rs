@@ -8500,10 +8500,32 @@ fn run_macos_orchestration_stages(
             // Locate and upload the source archive prepared for Linux.
             let source_archive = report_dir.join("state").join("rustynet-source.tar.gz");
             if !source_archive.is_file() {
-                return Err(format!(
-                    "source archive not found at {}; Linux setup stages must produce it first",
-                    source_archive.display()
-                ));
+                // The Linux setup stages did not produce the archive (setup
+                // may have failed early or was skipped). Build it directly
+                // from the workspace HEAD so macOS bootstrap can proceed.
+                if let Some(parent) = source_archive.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let workspace_root = workspace_root_path();
+                let status = std::process::Command::new("git")
+                    .args(["archive", "--format=tar.gz", "--output"])
+                    .arg(&source_archive)
+                    .arg("HEAD")
+                    .current_dir(&workspace_root)
+                    .status()
+                    .map_err(|e| {
+                        format!(
+                            "source archive not found at {} and git archive spawn failed: {e}",
+                            source_archive.display()
+                        )
+                    })?;
+                if !status.success() {
+                    return Err(format!(
+                        "source archive not found at {} and git archive exited with {}",
+                        source_archive.display(),
+                        status
+                    ));
+                }
             }
             let remote_archive = format!("/tmp/rustynet-src-{}.tar.gz", unique_suffix());
             ensure_success_status(

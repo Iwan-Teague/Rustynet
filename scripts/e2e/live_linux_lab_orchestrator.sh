@@ -2177,8 +2177,7 @@ validate_topology_inputs() {
     if awk -F '\t' -v host="$host" '($1 == host) { found=1; exit } END { exit(found ? 0 : 1) }' "$seen_hosts_file"; then
       local prior_label
       prior_label="$(awk -F '\t' -v host="$host" '($1 == host) { print $2; exit }' "$seen_hosts_file")"
-      printf 'duplicate host configured for %s and %s: %s\n' "$prior_label" "$label" "$host" >&2
-      return 1
+      printf 'duplicate host configured for %s and %s: %s (multi-instance on same VM — allowed)\n' "$prior_label" "$label" "$host" >&2
     fi
     printf '%s\t%s\n' "$host" "$label" >> "$seen_hosts_file"
   done < "$NODES_TSV"
