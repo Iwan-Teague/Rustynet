@@ -3,7 +3,7 @@
 # See README.md for architecture. Run in a dedicated terminal.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../.." && /bin/pwd -P)"
 DRIVER="$REPO/scripts/mcp/drive_deepseek.py"
 BIN="$REPO/bin/rustynet-mcp-deepseek"
 PROMPT="$REPO/state/loop-cycle-prompt.md"
@@ -13,6 +13,12 @@ POLL=20
 RELAUNCH_POLL=10
 MAX_RUN_WAIT=5400
 MAX_RELAUNCH_WAIT=900
+PROMPT_CLICK_Y_OFFSET="${PROMPT_CLICK_Y_OFFSET:-80}"
+PROMPT_CLICK_DELAY="${PROMPT_CLICK_DELAY:-0.20}"
+CURRENT_ARGS_JSON=""
+CURRENT_AREA=""
+OPENCODE_REVIEW_ON_FAIL="${OPENCODE_REVIEW_ON_FAIL:-1}"
+OPENCODE_REVIEW_SCRIPT="$REPO/scripts/loop/opencode_report_review.sh"
 
 log() { printf '[AUTO %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -21,18 +27,130 @@ git_sha() { git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo "unknown";
 # ── build deepseek_lab_run args JSON ──────────────────────────────────
 build_args() {
     local area="$1"; shift
-    local json="{\"area\":\"$area\""
-    for pair in "$@"; do
-        local k="${pair%%=*}" v="${pair#*=}"
-        case "$k" in
-            macos|windows|macos_promote_exit|allow_concurrent|dry_run|skip_linux_live_suite|windows_only)
-                { [ "$v" = "true" ] || [ "$v" = "1" ]; } && json+=",\"$k\":true" ;;
-            exit_vm|client_vm|entry_vm|macos_vm|windows_vm|exit_platform|relay_platform|anchor_platform|blind_exit_platform|rebuild_nodes)
-                json+=",\"$k\":\"$v\"" ;;
-        esac
-    done
-    json+="}"
-    echo "$json"
+    python3 - "$area" "$@" <<'PY'
+import json, sys
+
+area = sys.argv[1]
+bool_keys = {
+    "macos", "windows", "macos_promote_exit", "allow_concurrent", "dry_run",
+    "skip_linux_live_suite", "windows_only", "legacy_bash", "triage_on_failure",
+}
+str_keys = {
+    "exit_vm", "client_vm", "entry_vm", "macos_vm", "windows_vm",
+    "exit_platform", "relay_platform", "anchor_platform", "blind_exit_platform",
+    "admin_platform", "rebuild_nodes",
+}
+out = {"area": area}
+for pair in sys.argv[2:]:
+    if "=" not in pair:
+        continue
+    key, val = pair.split("=", 1)
+    if key in bool_keys:
+        out[key] = val.strip().lower() in {"1", "true", "yes", "on"}
+    elif key in str_keys and val:
+        out[key] = val
+print(json.dumps(out, separators=(",", ":")))
+PY
+}
+
+extract_job_id() {
+    python3 -c '
+import re, sys
+text = sys.stdin.read()
+m = re.search(r"`(labrun-[^`]+)`", text) or re.search(r"\b(labrun-\d+-\d+-\d+)\b", text)
+print(m.group(1) if m else "")
+'
+}
+
+job_record_path() {
+    local jid="$1"
+    printf '%s/%s.json\n' "$JOBS_DIR" "$jid"
+}
+
+job_field() {
+    local jid="$1" field="$2" default="${3:-}"
+    python3 - "$JOBS_DIR" "$jid" "$field" "$default" <<'PY'
+import json, pathlib, sys
+jobs, jid, field, default = sys.argv[1:5]
+path = pathlib.Path(jobs) / f"{jid}.json"
+try:
+    data = json.loads(path.read_text())
+    value = data
+    for part in field.split("."):
+        value = value[part]
+except Exception:
+    print(default)
+    raise SystemExit
+if isinstance(value, (dict, list)):
+    print(json.dumps(value, separators=(",", ":")))
+elif value is None:
+    print(default)
+else:
+    print(value)
+PY
+}
+
+refresh_current_context() {
+    local jid="$1" fallback_area="$2" fallback_args="$3"
+    CURRENT_AREA="$(job_field "$jid" area "$fallback_area")"
+    CURRENT_ARGS_JSON="$(job_field "$jid" request_args "$fallback_args")"
+    [ -n "$CURRENT_AREA" ] || CURRENT_AREA="$fallback_area"
+    [ -n "$CURRENT_ARGS_JSON" ] || CURRENT_ARGS_JSON="$fallback_args"
+}
+
+reverify_args_json() {
+    local area="$1" rebuild_alias="$2" base="${CURRENT_ARGS_JSON:-}"
+    [ -n "$base" ] || base="$(build_args "$area" "${LAUNCH_PARAMS[@]:-}")"
+    python3 - "$area" "$rebuild_alias" "$base" <<'PY'
+import json, sys
+
+area, rebuild, raw = sys.argv[1:4]
+try:
+    args = json.loads(raw)
+except Exception:
+    args = {"area": area}
+args["area"] = args.get("area") or area
+lower = args["area"].lower()
+if rebuild and rebuild != "unknown-node":
+    args["rebuild_nodes"] = rebuild
+if "linux" in lower and "macos" not in lower and "windows" not in lower:
+    args.pop("skip_linux_live_suite", None)
+else:
+    args["skip_linux_live_suite"] = True
+print(json.dumps(args, indent=2, sort_keys=True))
+PY
+}
+
+review_output_path() {
+    local jid="$1"
+    printf '%s/state/opencode-report-reviews/%s/report-review.md\n' "$REPO" "$jid"
+}
+
+run_opencode_review_for_job() {
+    local jid="$1"
+    [ "${OPENCODE_REVIEW_ON_FAIL:-1}" = "1" ] || return 0
+    [[ "$jid" == labrun-* ]] || return 0
+    [ -x "$OPENCODE_REVIEW_SCRIPT" ] || {
+        log "OpenCode review script missing/not executable: $OPENCODE_REVIEW_SCRIPT"
+        return 0
+    }
+    log "running OpenCode report review for $jid..."
+    if "$OPENCODE_REVIEW_SCRIPT" --job-id "$jid" --wait; then
+        log "OpenCode report review complete for $jid"
+    else
+        log "OpenCode report review failed for $jid; continuing with raw lab report"
+    fi
+}
+
+append_opencode_review_to_report() {
+    local jid="$1" report="$2" review_path
+    review_path="$(review_output_path "$jid")"
+    if [ -s "$review_path" ]; then
+        printf '%s\n\n---\n\n## OpenCode Flash Report Review\n\nReview file: `%s`\n\n%s\n' \
+            "$report" "$review_path" "$(cat "$review_path")"
+    else
+        printf '%s\n' "$report"
+    fi
 }
 
 # ── classify report ──────────────────────────────────────────────────
@@ -43,18 +161,25 @@ build_args() {
 # "— FAIL → triage", "— TIMED OUT after", "— DRY-RUN wiring check".
 classify() {
     local report="$1"
-    if   echo "$report" | grep -qiE 'TIMED OUT after|still running|timed out after [0-9]'; then echo "timeout"
-    elif echo "$report" | grep -qiE 'FAIL → triage|FAIL -> triage';                         then echo "fail"
-    elif echo "$report" | grep -qiE 'DRY-RUN wiring check';                                  then echo "dryrun"
+    if   echo "$report" | grep -qiE 'DRY-RUN wiring check';                                  then echo "dryrun"
     elif echo "$report" | grep -qiE 'The orchestration completed successfully|— PASS|: PASS'; then echo "pass"
+    elif echo "$report" | grep -qiE 'FAIL → triage|FAIL -> triage|FAIL \(triage disabled\)';  then echo "fail"
+    elif echo "$report" | grep -qiE 'TIMED OUT after|still running|timed out after [0-9]';    then echo "timeout"
     else echo "unknown"; fi
 }
 
 # ── append cycle to history ──────────────────────────────────────────
 record_history() {
     local cycle="$1" area="$2" result="$3" job="$4" sha="$5"
-    printf '{"cycle":%s,"at":"%s","area":"%s","result":"%s","job":"%s","sha":"%s"}\n' \
-        "$cycle" "$(now_utc)" "$area" "$result" "$job" "$sha" >> "$HISTORY"
+    python3 - "$HISTORY" "$cycle" "$(now_utc)" "$area" "$result" "$job" "$sha" <<'PY'
+import json, sys
+path, cycle, at, area, result, job, sha = sys.argv[1:8]
+with open(path, "a", encoding="utf-8") as f:
+    f.write(json.dumps({
+        "cycle": int(cycle), "at": at, "area": area, "result": result,
+        "job": job, "sha": sha,
+    }, separators=(",", ":")) + "\n")
+PY
 }
 
 # ── read last N cycles from history ──────────────────────────────────
@@ -85,15 +210,22 @@ rebuild_nodes_for() {
     # Args: area_label (e.g. "Windows anchor", "macOS exit")
     local area_lower; area_lower=$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')
 
-    # Map platform -> VM alias from LAUNCH_PARAMS
+    # Map platform -> VM alias from the current job request if available; fall
+    # back to initial launch params for older job records.
     local win_vm="" mac_vm=""
-    for pair in "${LAUNCH_PARAMS[@]}"; do
-        local k="${pair%%=*}" v="${pair#*=}"
-        case "$k" in
-            windows_vm) win_vm="$v" ;;
-            macos_vm)   mac_vm="$v" ;;
-        esac
-    done
+    if [ -n "${CURRENT_ARGS_JSON:-}" ]; then
+        win_vm=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("windows_vm",""))' "$CURRENT_ARGS_JSON" 2>/dev/null || true)
+        mac_vm=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("macos_vm",""))' "$CURRENT_ARGS_JSON" 2>/dev/null || true)
+    fi
+    if [ -z "$win_vm$mac_vm" ]; then
+        for pair in "${LAUNCH_PARAMS[@]:-}"; do
+            local k="${pair%%=*}" v="${pair#*=}"
+            case "$k" in
+                windows_vm) win_vm="$v" ;;
+                macos_vm)   mac_vm="$v" ;;
+            esac
+        done
+    fi
 
     # Determine which platform this area targets
     if echo "$area_lower" | grep -q "windows"; then
@@ -113,7 +245,16 @@ write_prompt() {
 
     {
         printf '# Loop Cycle %s -- %s (%s)\n' "$cycle" "$area" "$result"
-        printf '**Commit:** `%s` | **Phase:** %s | **Time:** %s\n\n' "$sha" "$phase" "$(now_utc)"
+        printf '**Commit:** `%s` | **Phase:** %s | **Job:** `%s` | **Time:** %s\n\n' "$sha" "$phase" "$jid" "$(now_utc)"
+
+        echo "## Current Run Metadata"
+        printf -- '- Area: `%s`\n' "$area"
+        printf -- '- Job record: `%s`\n' "$(job_record_path "$jid")"
+        if [ -n "${CURRENT_ARGS_JSON:-}" ]; then
+            echo "- Original deepseek_lab_run args:"
+            printf '```json\n%s\n```\n' "$(printf '%s' "$CURRENT_ARGS_JSON" | python3 -m json.tool 2>/dev/null || printf '%s' "$CURRENT_ARGS_JSON")"
+        fi
+        echo ""
 
         echo "## Recent History"
         recent_history 5
@@ -137,8 +278,9 @@ write_prompt() {
    evidence="<run id / matrix row>"). Apply the reviewed edits only. Keep
    AGENTS.md and CLAUDE.md byte-mirrored; update the parity matrix cell
    (CrossPlatformRoleParityPlan) from ❌/🟡 to ✅.
-3. PICK the next unproven cell: find_untested_work — choose a role×OS still
-   ❌/🟡 in the parity matrix. Do not re-run a cell already green.
+3. PICK the next unproven cell: choose a role×OS still
+   ❌/🟡 in the parity matrix. Prefer `deepseek_next_live_lab_target` because it
+   returns exact supported `deepseek_lab_run` JSON. Do not re-run a green cell.
 4. LAUNCH it — TEST ONLY THAT CELL, do not pay for the whole Linux lab:
    - mac/win cell:
        deepseek_lab_run(area="<role> <OS>", <OS>=true, <role>_platform=<OS>,
@@ -158,6 +300,7 @@ ENDPASS
     # Substitute REBUILD_ALIAS placeholder
     local rebuild_alias; rebuild_alias=$(rebuild_nodes_for "$area" 2>/dev/null || echo "")
     [ -z "$rebuild_alias" ] && rebuild_alias="unknown-node"
+    local reverify_json; reverify_json="$(reverify_args_json "$area" "$rebuild_alias")"
                 cat << 'ENDFAIL'
 ## Action - FAIL (needs patch)
 
@@ -193,15 +336,19 @@ as a patch is a SECURITY INCIDENT.
    - Imperative mood, what AND why in the message.
    - Keep AGENTS.md and CLAUDE.md mirrored if you change either.
 
-5. RE-LAUNCH the re-verify run — TEST ONLY WHAT YOU CHANGED:
-   deepseek_lab_run(area="<same area>", <same platform + role_platform args>,
-       rebuild_nodes="REBUILD_ALIAS", skip_linux_live_suite=true)
+5. RE-LAUNCH the re-verify run — TEST ONLY WHAT YOU CHANGED.
+   Use this exact JSON unless your patch touched a different node:
+ENDFAIL
+                printf '```json\n%s\n```\n' "$reverify_json"
+                cat << 'ENDFAIL2'
+   Call:
+   deepseek_lab_run(<json above>)
    - skip_linux_live_suite=true SKIPS the entire ~30-45min Linux live suite
      (anchor/role-switch/exit-handoff/relay/two-hop/managed-dns/chaos). Setup
      (bootstrap + membership + signed-bundle distribution) STILL runs because the
      mac/win stages need the mesh — then ONLY the <role>_platform cell you patched
      runs. This is the minimal run that proves your fix.
-   - rebuild_nodes="REBUILD_ALIAS" redeploys code to ONLY the node you patched;
+   - rebuild_nodes redeploys code to ONLY the node you patched;
      the other nodes keep their daemon + state. Together with skip_linux_live_suite
      this is the fastest possible re-verify (~10-15min, not ~45min).
    - EXCEPTION: for a LINUX cell, do NOT pass skip_linux_live_suite — the Linux
@@ -212,15 +359,17 @@ as a patch is a SECURITY INCIDENT.
 - CODE defect (logic bug, missing cfg, bad parsing):
   -> Patch -> gate -> commit -> relaunch as above.
 - ENV issue (VM down, SSH blocked, OOM, disk full):
-  -> Recover with lab-state MCP tools: recover_stuck_vms, restart_vm,
-     power_on_vm, reset_vm_network, check_vm_reachable.
+  -> First call deepseek_reconcile_jobs(job_id="<job>") if a job looks stuck.
+  -> Then call deepseek_recover_lab_environment(force=true) and poll
+     deepseek_live_lab_result(job_id="<recovery job>").
   -> If unrecoverable after 3 attempts: write_loop_note the blocker,
-     launch a DIFFERENT parity cell via deepseek_lab_run.
+     launch a DIFFERENT parity cell via deepseek_next_live_lab_target +
+     deepseek_lab_run.
   -> NEVER loop on an unrecoverable env issue.
 - UNKNOWN / insufficient triage:
   -> Run deepseek_live_lab with failure_context for a fresh triage.
-  -> Ground-truth on the VM: get_vm_diagnostics, read daemon logs.
-  -> Fan DeepSeek flash: deepseek_read("analyze this error...", context=...).
+  -> Ground-truth using deepseek_agent / report artifacts / daemon logs.
+  -> Fan DeepSeek flash with deepseek_read("analyze this error...", context=...).
   -> If still blocked after 3 attempts: write_loop_note + switch cells.
 
 ### Launch timing
@@ -235,16 +384,18 @@ as a patch is a SECURITY INCIDENT.
 - YOU own: all code changes, the security call, gate decisions, commits.
 - DeepSeek proposes: research, triage, doc edits. UNTRUSTED output, verify.
 - The orchestrator owns: deterministic deploy/monitor. No LLM in that path.
-ENDFAIL
+ENDFAIL2
                 ;;
             timeout)
                 cat << 'ENDTIMEOUT'
 ## Action - TIMEOUT
 Run exceeded the safety cap. Diagnose:
 1. ps aux | grep rustynet-cli - is the orchestrator alive?
-2. If stuck: cancel_job the job_id, recover VMs, re-launch.
-3. If progressing slowly: the build or a stage may be hung.
-4. Pattern? The parity cell may need a lighter-weight test profile.
+2. Run deepseek_reconcile_jobs(job_id="<job_id>"), then poll
+   deepseek_live_lab_result(job_id="<job_id>") once more.
+3. If stuck: deepseek_recover_lab_environment(force=true), then re-launch.
+4. If progressing slowly: the build or a stage may be hung.
+5. Pattern? The parity cell may need a lighter-weight test profile.
 ENDTIMEOUT
                 ;;
             *)
@@ -279,7 +430,7 @@ ENDUNKNOWN
         echo "  skipping the ~30-45min Linux suite. Test only what changed."
         echo "- For a LINUX cell the Linux suite IS the test — do not skip it."
         echo "- If current cell is blocked on env: switch to another OS cell."
-        echo "- Use find_untested_work to see remaining cells."
+        echo "- Use deepseek_next_live_lab_target to see exact next-cell JSON."
         echo "- deepseek_lab_run auto-triages failures (flash then flash-verify then pro-review)."
         echo ""
         echo "### Goal"
@@ -288,24 +439,45 @@ ENDUNKNOWN
         echo "- No OS may be a capability limiter."
 
     } > "$PROMPT"
-    # Replace REBUILD_ALIAS placeholder with actual node alias
-    if [ -n "${rebuild_alias:-}" ]; then
-        sed -i '' "s/REBUILD_ALIAS/${rebuild_alias}/g" "$PROMPT" 2>/dev/null || true
-    else
-        # Linux area or unknown platform — replace rebuild instruction with a note
-        sed -i '' '/REBUILD_ALIAS/d' "$PROMPT" 2>/dev/null || true
-        sed -i '' 's/- deploys code to ONLY that node.*/- (no single VM to rebuild — full run needed)/' "$PROMPT" 2>/dev/null || true
-    fi
     log "wrote $PROMPT ($(wc -c < "$PROMPT" | tr -d ' ') bytes)"
 }
 # ── AppleScript paste into Zed ───────────────────────────────────────
+focus_zed_prompt_box() {
+    osascript - "$PROMPT_CLICK_Y_OFFSET" "$PROMPT_CLICK_DELAY" <<'APPLESCRIPT' 2>/dev/null || return 1
+on run argv
+    set yOffset to (item 1 of argv) as integer
+    set pauseSeconds to (item 2 of argv) as real
+    tell application "Zed" to activate
+    delay 0.8
+    tell application "System Events"
+        tell process "Zed"
+            set frontmost to true
+            if (count of windows) is 0 then return
+            set {wx, wy} to position of window 1
+            set {ww, wh} to size of window 1
+            set clickX to wx + (ww div 2)
+            set clickY to wy + wh - yOffset
+            click at {clickX, clickY}
+            delay pauseSeconds
+            click at {clickX, clickY}
+        end tell
+    end tell
+end run
+APPLESCRIPT
+}
+
 # paste_zed [file]  — paste the given file (default: the per-cycle $PROMPT).
 paste_zed() {
     local file="${1:-$PROMPT}"
     log "pasting into Zed ($file)..."
     pbcopy < "$file"
-    osascript -e 'tell application "Zed" to activate' 2>/dev/null || true
-    sleep 2
+    if focus_zed_prompt_box; then
+        log "focused Zed prompt box (${PROMPT_CLICK_Y_OFFSET}px above bottom, double-click)"
+    else
+        log "focus click failed; falling back to Cmd-V into active Zed window"
+        osascript -e 'tell application "Zed" to activate' 2>/dev/null || true
+        sleep 2
+    fi
     osascript -e 'tell application "System Events" to tell process "Zed" to keystroke "v" using command down' 2>/dev/null || true
     sleep 0.5
     osascript -e 'tell application "System Events" to tell process "Zed" to keystroke return' 2>/dev/null || true
@@ -319,12 +491,14 @@ detect_new_job() {
     while [ "$waited" -lt "$MAX_RELAUNCH_WAIT" ]; do
         sleep "$RELAUNCH_POLL"; waited=$((waited + RELAUNCH_POLL))
         [ ! -d "$JOBS_DIR" ] && continue
-        for f in "$JOBS_DIR"/labrun-*.json; do
+        local files
+        files=$(ls -t "$JOBS_DIR"/labrun-*.json 2>/dev/null || true)
+        for f in $files; do
             [ -f "$f" ] || continue
             local jid; jid=$(basename "$f" .json)
             if ! echo "$known" | grep -qF "$jid"; then
                 local state; state=$(python3 -c "import json; print(json.load(open('$f')).get('state','?'))" 2>/dev/null || echo "?")
-                if [ "$state" = "running" ]; then
+                if [ "$state" = "running" ] || [ "$state" = "done" ]; then
                     log "detected new job: $jid"
                     echo "$jid"; return 0
                 fi
@@ -344,8 +518,19 @@ poll_until_done() {
         local r elapsed; elapsed=$(($(date +%s) - t0))
         # Bound the wait so an orphaned/hung re-verify can't spin forever overnight.
         if [ "$elapsed" -gt "$MAX_RUN_WAIT" ]; then
-            log "poll of $jid exceeded ${MAX_RUN_WAIT}s — giving up"
+            log "poll of $jid exceeded ${MAX_RUN_WAIT}s — reconciling once before giving up"
+            "$DRIVER" --bin "$BIN" --tool deepseek_reconcile_jobs \
+                --args "{\"job_id\":\"$jid\"}" --no-poll >/dev/null 2>&1 || true
+            r=$("$DRIVER" --bin "$BIN" --tool deepseek_live_lab_result \
+                --args "{\"job_id\":\"$jid\"}" --no-poll 2>/dev/null || true)
+            if [ -n "$r" ] && ! echo "$r" | grep -qi "still running"; then
+                echo "$r"; return 0
+            fi
             return 1
+        fi
+        if [ "$elapsed" -gt 0 ] && [ $((elapsed % 180)) -lt "$POLL" ]; then
+            "$DRIVER" --bin "$BIN" --tool deepseek_reconcile_jobs \
+                --args "{\"job_id\":\"$jid\"}" --no-poll >/dev/null 2>&1 || true
         fi
         r=$("$DRIVER" --bin "$BIN" --tool deepseek_live_lab_result \
             --args "{\"job_id\":\"$jid\"}" --no-poll 2>/dev/null) || { sleep "$POLL"; continue; }
@@ -375,13 +560,21 @@ main() {
     # mac/win cell is wasted time. A Linux area keeps the suite (it IS the cell).
     local area_lower; area_lower=$(printf '%s' "$area" | tr '[:upper:]' '[:lower:]')
     local has_skip=""
+    local has_triage=""
     for p in "${params[@]}"; do [ "${p%%=*}" = "skip_linux_live_suite" ] && has_skip=1; done
+    for p in "${params[@]}"; do [ "${p%%=*}" = "triage_on_failure" ] && has_triage=1; done
     if [ -z "$has_skip" ] && printf '%s' "$area_lower" | grep -qE 'macos|windows'; then
         params+=("skip_linux_live_suite=true")
         log "auto-enabled skip_linux_live_suite=true for mac/win area '$area'"
     fi
+    if [ -z "$has_triage" ] && [ "${OPENCODE_REVIEW_ON_FAIL:-1}" = "1" ]; then
+        params+=("triage_on_failure=false")
+        log "auto-disabled paid DeepSeek MCP triage; OpenCode report review handles failures"
+    fi
     LAUNCH_PARAMS=("${params[@]}")  # global, used by rebuild_nodes_for()
     local args_json; args_json=$(build_args "$area" "${params[@]}")
+    CURRENT_AREA="$area"
+    CURRENT_ARGS_JSON="$args_json"
     local cycle=0
 
     mkdir -p "$JOBS_DIR" "$(dirname "$PROMPT")" "$(dirname "$HISTORY")"
@@ -424,6 +617,13 @@ main() {
             log "initial launch failed again — aborting"; return 1
         }
     }
+    local parsed_jid; parsed_jid="$(printf '%s' "$report" | extract_job_id)"
+    if [ -n "$parsed_jid" ]; then
+        jid="$parsed_jid"
+        refresh_current_context "$jid" "$area" "$args_json"
+        area="$CURRENT_AREA"
+        args_json="$CURRENT_ARGS_JSON"
+    fi
 
     # ── Shepherd loop: classify -> prompt -> paste -> wait for the AGENT's next
     #    run -> poll it. The agent drives every launch from here on. ──
@@ -431,8 +631,16 @@ main() {
         cycle=$((cycle + 1))
         local sha; sha=$(git_sha)
         local result; result=$(classify "$report")
-        local phase; if [ "$jid" = "initial" ]; then phase="initial"; else phase="reverify"; fi
+        local phase; if [ "$cycle" -eq 1 ]; then phase="initial"; else phase="reverify"; fi
+        refresh_current_context "$jid" "$area" "$args_json"
+        area="$CURRENT_AREA"
+        args_json="$CURRENT_ARGS_JSON"
         log "=== CYCLE $cycle: $result (job=$jid, sha=$sha) ==="
+
+        if [ "$result" = "fail" ]; then
+            run_opencode_review_for_job "$jid"
+            report="$(append_opencode_review_to_report "$jid" "$report")"
+        fi
 
         record_history "$cycle" "$area" "$result" "$jid" "$sha"
         write_prompt "$cycle" "$area" "$result" "$report" "$phase" "$sha"
@@ -455,6 +663,9 @@ main() {
             fi
         fi
         jid="$new_jid"
+        refresh_current_context "$jid" "$area" "$args_json"
+        area="$CURRENT_AREA"
+        args_json="$CURRENT_ARGS_JSON"
 
         # Poll the agent's run to completion; its report drives the next cycle.
         if ! report=$(poll_until_done "$new_jid"); then

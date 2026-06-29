@@ -393,7 +393,7 @@ code change, the security call, and the live lab. If you catch yourself reading
 a long log / journal / diff / doc just to understand it, hand it to DeepSeek
 first and act on the distilled output.
 
-Seven tools (`mcp__rustynet-deepseek__*`). The first four take `prompt`, optional
+Twelve tools (`mcp__rustynet-deepseek__*`). The first four take `prompt`, optional
 `context`, and `model`:
 - `deepseek_read` — analysis / review / second opinion / risk ID (read-only).
 - `deepseek_write` — generate boilerplate / test scaffolds / doc drafts.
@@ -408,7 +408,18 @@ Seven tools (`mcp__rustynet-deepseek__*`). The first four take `prompt`, optiona
   because Y?", "is this node reachable?"). Prefer it whenever you want DeepSeek
   to check the real code/lab, not opine on a pasted snippet.
 
-The remaining three are the live-lab family. The **loop driver** you normally call:
+The live-lab family is standardized for simple agents. The **default loop step** is
+`deepseek_autonomous_live_lab_loop`: it reconciles stale/interrupted lab jobs,
+chooses the next run-matrix target, launches `deepseek_lab_run`, and on failure the
+run auto-triages. Use `deepseek_next_live_lab_target` when you only want to see the
+chosen target and exact `deepseek_lab_run` JSON. Use `deepseek_recover_lab_environment`
+after an interrupted lab when the environment may be stale; it runs a stop-after-ready
+recovery job and polls through `deepseek_live_lab_result`. Use
+`deepseek_reconcile_jobs` when a stale running record blocks the singleton gate.
+Set `triage_on_failure=false` for a real lab run when external DeepSeek API triage
+has not been explicitly approved; the run returns local report/log pointers instead.
+
+The lower-level **loop driver** is:
 - `deepseek_lab_run` — **one call runs the WHOLE pipeline.** Give it an `area`
   (e.g. "macOS relay") + optional selectors (`macos`/`windows`/`macos_vm`/
   `windows_vm`/`exit_vm`/`client_vm`/`rebuild_nodes`); a DETERMINISTIC worker
@@ -419,7 +430,8 @@ The remaining three are the live-lab family. The **loop driver** you normally ca
   (≤3 overlapping). `dry_run` is a fast wiring check. On a green run, ZERO LLM
   calls — you just get PASS + evidence. To drive a FOCUSED mac/win role cell (not
   just a comprehensive run), pass a role-platform selector — `exit_platform` /
-  `relay_platform` / `anchor_platform` / `blind_exit_platform` (each
+  `relay_platform` / `anchor_platform` / `admin_platform` /
+  `blind_exit_platform` (each
   `linux|macos|windows`), or `macos_promote_exit: true` (+ `entry_vm` in the
   Option-B exit topology) — to ELECT a mac/win node into that role so the cell
   runs live instead of skipping. Pair the selector with
@@ -452,6 +464,8 @@ The remaining three are the live-lab family. The **loop driver** you normally ca
   internally on failure; call it directly when you already have the evidence.
 - `deepseek_live_lab_result` — poll either of the above by `job_id` (non-blocking:
   the report when done, else "still running Ns").
+- `deepseek_reconcile_jobs` — repair stale `labrun-*` records after an MCP reload,
+  killed worker, or interrupted lab so the singleton gate stops blocking.
 
 After a lab-verified fix, the **docs-sync proposer**:
 - `deepseek_doc_sync` — **PROPOSE-ONLY, READ-ONLY docs-sync.** Give it
