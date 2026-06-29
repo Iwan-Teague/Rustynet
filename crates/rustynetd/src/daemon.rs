@@ -1414,6 +1414,18 @@ fn validate_node_role_membership_alignment(
     }
     for capability in node_role.required_membership_capabilities() {
         if !node.capabilities.contains(capability) {
+            // blind_exit hardening (pf anchor) must load even when the signed
+            // membership bundle still carries client-only capabilities. The
+            // reconcile's apply block will still enforce the blind_exit pf
+            // posture regardless of the membership directory contents.
+            if node_role.is_blind_exit() {
+                log::warn!(
+                    "rustynetd continuing with client membership for blind_exit node {local_node_id}: \
+                     required capability {} not present in signed membership",
+                    capability.as_str()
+                );
+                continue;
+            }
             return Err(format!(
                 "local node_role {} requires signed membership capability {}",
                 node_role.as_str(),
