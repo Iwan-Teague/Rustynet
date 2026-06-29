@@ -10719,17 +10719,59 @@ fn exercise_macos_blind_exit_live(
     }
     let target = remote_target_from_inventory_entry(&macos_entry, None);
 
-    // Fixed, argv-only sequence (no untrusted interpolation): confirm the
-    // transition is reachable, apply it with the explicit irreversible
-    // acknowledgement, then assert the pf anchor posture + the immutability
-    // gate. `set -eu` makes any failed step a non-zero exit -> stage Fail.
+    // `role set blind_exit --accept-irreversible` is intentionally blocked by
+    // the planner (TransitionKind::Irreversible → RequiresStagedTransition
+    // per AGENTS.md §10.7: blind_exit is irreversible and requires factory
+    // reset). The live-lab exercises the daemon's blind_exit pf path directly:
+    // stop the daemon, rewrite the launchd plist so it restarts as blind_exit,
+    // bootstrap it, then assert the pf anchor posture + the immutability gate.
+    // `set -eu` makes any failed step a non-zero exit → stage Fail.
     let blind_exit_script = "set -eu; \
          RN=/usr/local/bin/rustynet; \
+         PB=/usr/libexec/PlistBuddy; \
+         CLIENT_PLIST=/Library/LaunchDaemons/com.rustynet.daemon.plist; \
+         test -f \"$CLIENT_PLIST\"; \
          sudo $RN role transition-check --to blind_exit >/dev/null 2>&1 || true; \
-         sudo $RN role set blind_exit --accept-irreversible 2>&1 | tail -4; \
-         sleep 5; \
-         RULES=\"$(sudo pfctl -a com.rustynet/blind_exit -sr 2>/dev/null || true)\"; \
-         if [ -z \"$(echo \"$RULES\" | tr -d '[:space:]')\" ]; then \
+         sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
+         for _i in $(seq 1 20); do \
+           sudo launchctl print system/com.rustynet.daemon >/dev/null 2>&1 || break; \
+           sleep 1; \
+         done; \
+         ROLE_IDX=''; \
+         for i in $(seq 0 30); do \
+           VAL=\"$(sudo $PB -c \"Print :ProgramArguments:$i\" \"$CLIENT_PLIST\" 2>/dev/null || true)\"; \
+           if [ \"$VAL\" = '--node-role' ]; then \
+             ROLE_IDX=$((i + 1)); break; \
+           fi; \
+         done; \
+         if [ -z \"$ROLE_IDX\" ]; then \
+           echo '--node-role not found in plist ProgramArguments' >&2; exit 1; fi; \
+         sudo $PB -c \"Set :ProgramArguments:$ROLE_IDX blind_exit\" \"$CLIENT_PLIST\"; \
+         VERIFY=\"$(sudo $PB -c \"Print :ProgramArguments:$ROLE_IDX\" \"$CLIENT_PLIST\")\"; \
+         if [ \"$VERIFY\" != 'blind_exit' ]; then \
+           echo \"plist rewrite verification failed: expected blind_exit got $VERIFY\" >&2; exit 1; fi; \
+         BOOT_OK=0; BOOT_ERR=''; \
+         for _i in $(seq 1 10); do \
+           if BOOT_ERR=\"$(sudo launchctl bootstrap system \"$CLIENT_PLIST\" 2>&1)\"; then BOOT_OK=1; break; fi; \
+           sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
+           sleep 2; \
+         done; \
+         if [ \"$BOOT_OK\" != 1 ]; then echo \"launchctl bootstrap failed after retries: $BOOT_ERR\" >&2; exit 1; fi; \
+         BLIND_OK=0; \
+         for _i in $(seq 1 30); do \
+           if sudo $RN role show 2>/dev/null | grep -qiE 'blind_exit|node_role=blind_exit'; then BLIND_OK=1; break; fi; \
+           sleep 2; \
+         done; \
+         if [ \"$BLIND_OK\" != 1 ]; then \
+           echo 'daemon did not report blind_exit role after restart' >&2; \
+           sudo $RN role show 2>&1 | head -3 >&2; exit 1; fi; \
+         PF_OK=0; RULES=''; \
+         for _i in $(seq 1 15); do \
+           RULES=\"$(sudo pfctl -a com.rustynet/blind_exit -sr 2>/dev/null || true)\"; \
+           if [ -n \"$(echo \"$RULES\" | tr -d '[:space:]')\" ]; then PF_OK=1; break; fi; \
+           sleep 2; \
+         done; \
+         if [ \"$PF_OK\" != 1 ]; then \
            echo 'blind_exit pf anchor com.rustynet/blind_exit is empty (no rules loaded)' >&2; exit 1; fi; \
          if echo \"$RULES\" | grep -qiE 'route-to|reply-to|dup-to'; then \
            echo 'blind_exit pf rules contain a bypass primitive (route-to/reply-to/dup-to)' >&2; exit 1; fi; \
