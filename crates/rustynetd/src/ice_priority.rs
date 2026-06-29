@@ -212,7 +212,7 @@ pub fn prioritize_candidate_set(
             "srflx-v6",
         ));
     }
-    out.sort_by(|a, b| b.priority.cmp(&a.priority));
+    out.sort_by_key(|b| std::cmp::Reverse(b.priority));
     out
 }
 
@@ -285,7 +285,7 @@ pub fn prioritize_traversal_candidates(
             foundation,
         });
     }
-    out.sort_by(|a, b| b.priority.cmp(&a.priority));
+    out.sort_by_key(|b| std::cmp::Reverse(b.priority));
     out
 }
 
@@ -348,7 +348,7 @@ pub fn generate_candidate_pairs(
             });
         }
     }
-    out.sort_by(|a, b| b.pair_priority.cmp(&a.pair_priority));
+    out.sort_by_key(|b| std::cmp::Reverse(b.pair_priority));
     out.truncate(MAX_CANDIDATE_PAIRS);
     out
 }

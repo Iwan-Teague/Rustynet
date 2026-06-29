@@ -4212,7 +4212,7 @@ fn process_memory_internal() -> Vec<ProcessMemory> {
                 mem_data.push((name, pid, memory_mb));
             }
         }
-        mem_data.sort_by(|a, b| b.2.cmp(&a.2));
+        mem_data.sort_by_key(|b| std::cmp::Reverse(b.2));
         processes = mem_data
             .into_iter()
             .take(10)

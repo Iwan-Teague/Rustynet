@@ -10102,15 +10102,30 @@ fn activate_macos_exit_role(
          done; \
          if [ \"$admin_ok\" != 1 ]; then echo 'daemon did not report admin role after restart' >&2; sudo $RN role show 2>&1 | head -3 >&2; exit 1; fi; \
          sudo $RN role set exit; \
-         nat_ok=0; \
-         for _i in $(seq 1 15); do \
+         exit_dataplane_ok=0; \
+         for _i in $(seq 1 20); do \
            NAT=$(sudo pfctl -a com.rustynet/nat -s nat 2>/dev/null | grep -cE '^[[:space:]]*nat' || true); \
            FWD=$(sysctl -n net.inet.ip.forwarding 2>/dev/null || echo 0); \
-           if [ \"$NAT\" != 0 ] && [ \"$FWD\" = 1 ]; then nat_ok=1; break; fi; \
+           if [ \"$NAT\" != 0 ] && [ \"$FWD\" = 1 ]; then \
+             KANCHOR=$(sudo pfctl -s Anchors 2>/dev/null | grep 'com.apple/rustynet_g' | sort -t'g' -k2 -n | tail -1 | tr -d ' '); \
+             if [ -n \"$KANCHOR\" ]; then \
+               DNS_RULES=$(sudo pfctl -a \"$KANCHOR\" -s rules 2>/dev/null | grep -c 'rustynet-dns-block-lan' || true); \
+               if [ \"$DNS_RULES\" -ge 2 ]; then exit_dataplane_ok=1; break; fi; \
+               echo \"[activate-macos-exit] attempt $_i: NAT/forwarding ok, anchor $KANCHOR dns-block-lan count=$DNS_RULES (need >=2)\" >&2; \
+             else \
+               echo \"[activate-macos-exit] attempt $_i: NAT/forwarding ok, no killswitch anchor found yet\" >&2; \
+             fi; \
+           fi; \
            sleep 2; \
          done; \
-         if [ \"$nat_ok\" != 1 ]; then echo \"exit NAT/forwarding not active after role set exit (com.rustynet/nat nat-rule-count=$NAT net.inet.ip.forwarding=$FWD; expected nat-rule>=1 and forwarding=1)\" >&2; sudo pfctl -a com.rustynet/nat -s nat 2>&1 | head >&2; exit 1; fi; \
-         echo \"role admin->exit advertised 0.0.0.0/0; com.rustynet/nat loaded ($NAT nat rule); net.inet.ip.forwarding=$FWD\"";
+         if [ \"$exit_dataplane_ok\" != 1 ]; then \
+           echo \"exit dataplane not fully active after role set exit\" >&2; \
+           echo \"NAT=$NAT FWD=$FWD KANCHOR=$KANCHOR DNS_RULES=$DNS_RULES\" >&2; \
+           sudo pfctl -a com.rustynet/nat -s nat 2>&1 | head >&2; \
+           sudo pfctl -s Anchors 2>&1 | grep 'com.apple/rustynet_g' >&2; \
+           exit 1; \
+         fi; \
+         echo \"role admin->exit advertised 0.0.0.0/0; com.rustynet/nat loaded ($NAT nat rule); net.inet.ip.forwarding=$FWD; killswitch anchor $KANCHOR dns-block-lan rules=$DNS_RULES\"";
 
     let out = capture_remote_shell_command_for_target(
         &target,
