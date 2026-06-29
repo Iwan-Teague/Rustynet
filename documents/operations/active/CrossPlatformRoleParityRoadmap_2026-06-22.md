@@ -25,7 +25,8 @@ program and to **concurrent Windows+macOS** runs.
   (Windows blind_exit). The rest is mostly *authoring live-lab stages that
   fail loud*, not new runtime code.
 - **Ordered program (after the in-flight macOS anchor):** macOS admin → Windows
-  admin → macOS blind_exit → cross-OS role transitions (needs a design doc first) →
+  admin → macOS blind_exit → ✅ **macOS blind_exit DONE 2026-06-29** → cross-OS
+  role transitions (design doc at `CrossOsRoleSwitchPlan_2026-06-24.md`) →
   Windows/macOS anchor live. (macOS relay *live lifecycle* is **DONE** — see §1
   matrix flip. Relay forwarding and Windows exit/blind_exit remain explicitly
   parked with reasons.)
@@ -61,7 +62,7 @@ untested/not implemented · 🔒 blocked):
 | admin (mint/issue signed bundles) | ✅ | ❌ *(see §4 — "self-mint disabled" framing is **stale**, not a posture)* | ❌ (trust keygen works; live issuing untested) |
 | anchor (gossip/bundle-pull/enrollment) | ✅ | 🟡→ landing now (live bundle-pull stage) | 🟠 dry-run plan contract only |
 | exit (NAT egress + killswitch) | ✅ | 🟡 implemented — needs a green live run | 🟡 implemented but **🔒 lab guest lacks WinNAT/`MSFT_NetNat`** |
-| blind_exit (irreversible exit) | ✅ | ❌ live stage missing — **runtime already exists** (`macos_blind_exit.rs`) | 🚫 **blocked by design** (`main.rs:11768` hard-errors; macOS/Linux only) |
+| blind_exit (irreversible exit) | ✅ | ✅ **LIVE-PROVEN 2026-06-29** (run `labrun-1782770042330-16244-0`, `--blind-exit-platform macos`): `validate_macos_blind_exit` PASS — irreversible transition applied, pf anchor hardened (9 rules, no route-to/reply-to/dup-to), immutability gate enforced | 🚫 **blocked by design** (`main.rs:11768` hard-errors; macOS/Linux only) |
 | relay (live session forwarding) | ✅ *(lifecycle only — no live forwarding proof anywhere; see §4)* | ✅ **lifecycle LIVE-PROVEN 2026-06-27** (run `livelab-1782571161`, `validate_macos_relay_service_lifecycle` PASS). **Live session forwarding remains HP-3-gated** (same cross-OS gate as Linux ✅). | 🟠 SCM lifecycle contract only |
 | live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | ❌ | ❌ (banked design file is **missing**) |
 
@@ -70,8 +71,7 @@ untested/not implemented · 🔒 blocked):
    note has **no backing** in code or `SecurityMinimumBar` (§4). Re-label as 🟡-ready.
 2. **Windows blind_exit** is not a gap to close — it is an intentional platform
    exclusion (`main.rs:11768`). Re-label ❌ → 🚫 (out of scope, like mobile clients).
-3. macOS **blind_exit** runtime already exists (`crates/rustynetd/src/macos_blind_exit.rs`,
-   wired in `phase10.rs:2457,2653,2967`); only the live stage is missing → it's 🟡, not ❌.
+3. macOS **blind_exit** is now ✅ Live-Proven (2026-06-29, run `labrun-1782770042330-16244-0`); cell 3 closed.
 
 ---
 
@@ -86,7 +86,7 @@ dry-run had masked). "Live stage" = author a fail-loud stage per §7.
 | — | macOS anchor | 🟡 landing | confirm live (not dry-run-fallback) PASS, fold in fail-loud fix, push | in flight | — |
 | 1 | **macOS admin** | ❌→ready | live stage only (issuing path is platform-neutral; keychain custody exists) | ~0.5–1 d | none |
 | 2 | **Windows admin** | ❌→ready | live stage only (DPAPI custody exists) | ~0.5–1 d | none |
-| 3 | **macOS blind_exit** | 🟡 (runtime exists) | live stage only, **run last** (wipes identity); disposable guest | ~0.5–1 d | none |
+| 3 | **macOS blind_exit** | ✅ DONE (2026-06-29) | live-proven: `labrun-1782770042330-16244-0`, `ed3ed7e` | — | — |
 | 4 | **Role transitions (macOS→Windows)** | ❌ | **design doc** (`CrossOsRoleSwitchPlan_2026-06-24.md`, authored 2026-06-24), then a stage that drives a real flip and re-applies signed state via `refresh_signed_state_with_reason` | ~2–4 d | needs admin (#1/#2) |
 | 5 | macOS **exit** | 🟡 | just a green run with `--exit-platform macos` (no code) | ~hours | none |
 | 6 | macOS **relay** *live lifecycle* | ✅ **DONE** (2026-06-27) | ✅ live lifecycle proven: `validate_macos_relay_service_lifecycle` PASS (run `livelab-1782571161`). **Forwarding proof remains HP-3-gated, same as Linux.** | — | — |
