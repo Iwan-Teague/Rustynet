@@ -445,16 +445,16 @@ EOF
   live_lab_capture_root "$EXIT_HOST" "root cat /run/rustynet/assignment-issue/rn-assignment-$RELAY_NODE_ID.assignment" > "$relay_assignment_local"
   live_lab_capture_root "$EXIT_HOST" "root cat /run/rustynet/assignment-issue/rn-assignment-$CLIENT_NODE_ID.assignment" > "$client_assignment_local"
 
-  live_lab_install_assignment_bundle "$EXIT_HOST" "$assign_pub_local" "$exit_assignment_local"
-  live_lab_install_assignment_bundle "$RELAY_HOST" "$assign_pub_local" "$relay_assignment_local"
-  live_lab_install_assignment_bundle "$CLIENT_HOST" "$assign_pub_local" "$client_assignment_local"
+  live_lab_install_assignment_bundle "$EXIT_HOST" "$assign_pub_local" "$exit_assignment_local" "$EXIT_NODE_ID"
+  live_lab_install_assignment_bundle "$RELAY_HOST" "$assign_pub_local" "$relay_assignment_local" "$RELAY_NODE_ID"
+  live_lab_install_assignment_bundle "$CLIENT_HOST" "$assign_pub_local" "$client_assignment_local" "$CLIENT_NODE_ID"
 
   live_lab_write_assignment_refresh_env "$exit_refresh_local" "$EXIT_NODE_ID" "$NODES_SPEC" "$ALLOW_SPEC"
   live_lab_write_assignment_refresh_env "$relay_refresh_local" "$RELAY_NODE_ID" "$NODES_SPEC" "$ALLOW_SPEC" "$EXIT_NODE_ID"
   live_lab_write_assignment_refresh_env "$client_refresh_local" "$CLIENT_NODE_ID" "$NODES_SPEC" "$ALLOW_SPEC" "$EXIT_NODE_ID"
-  live_lab_install_assignment_refresh_env "$EXIT_HOST" "$exit_refresh_local"
-  live_lab_install_assignment_refresh_env "$RELAY_HOST" "$relay_refresh_local"
-  live_lab_install_assignment_refresh_env "$CLIENT_HOST" "$client_refresh_local"
+  live_lab_install_assignment_refresh_env "$EXIT_HOST" "$exit_refresh_local" "$EXIT_NODE_ID"
+  live_lab_install_assignment_refresh_env "$RELAY_HOST" "$relay_refresh_local" "$RELAY_NODE_ID"
+  live_lab_install_assignment_refresh_env "$CLIENT_HOST" "$client_refresh_local" "$CLIENT_NODE_ID"
 
   live_lab_enforce_host "$EXIT_HOST" "admin" "$EXIT_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$EXIT_HOST")"
   live_lab_enforce_host "$RELAY_HOST" "admin" "$RELAY_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$RELAY_HOST")"

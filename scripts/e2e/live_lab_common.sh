@@ -1243,13 +1243,24 @@ live_lab_scp_to_via_ssh() {
     -i "$LIVE_LAB_SSH_IDENTITY_FILE"
     -- "$src" "${target}:${dst}"
   )
-  local attempt rc
+  local attempt rc output
   live_lab_require_pinned_host_entry "$target" || return 1
   for attempt in 1 2 3; do
-    if "${scp_args[@]}"; then
-      return 0
+    output="$(mktemp "${LIVE_LAB_WORK_DIR}/scp-to.XXXXXX")" || return 1
+    if "${scp_args[@]}" >"$output" 2>&1; then
+      rc=0
     else
       rc=$?
+    fi
+    if [[ -s "$output" ]]; then
+      cat "$output" >&2
+    fi
+    if grep -Eiq '(^|[[:space:]])scp: (write remote .*Failure|failed to upload|.*No space left on device|.*Permission denied)' "$output"; then
+      rc=1
+    fi
+    rm -f "$output"
+    if [[ "$rc" -eq 0 ]]; then
+      return 0
     fi
     if [[ "$rc" -ne 255 ]]; then
       return "$rc"
@@ -1258,7 +1269,7 @@ live_lab_scp_to_via_ssh() {
       sleep 2
     fi
   done
-  "${scp_args[@]}"
+  return "$rc"
 }
 
 live_lab_scp_from_via_ssh() {
@@ -1281,13 +1292,24 @@ live_lab_scp_from_via_ssh() {
     -i "$LIVE_LAB_SSH_IDENTITY_FILE"
     -- "${target}:${src}" "$dst"
   )
-  local attempt rc
+  local attempt rc output
   live_lab_require_pinned_host_entry "$target" || return 1
   for attempt in 1 2 3; do
-    if "${scp_args[@]}"; then
-      return 0
+    output="$(mktemp "${LIVE_LAB_WORK_DIR}/scp-from.XXXXXX")" || return 1
+    if "${scp_args[@]}" >"$output" 2>&1; then
+      rc=0
     else
       rc=$?
+    fi
+    if [[ -s "$output" ]]; then
+      cat "$output" >&2
+    fi
+    if grep -Eiq '(^|[[:space:]])scp: (read remote .*Failure|failed to download|.*No space left on device|.*Permission denied)' "$output"; then
+      rc=1
+    fi
+    rm -f "$output"
+    if [[ "$rc" -eq 0 ]]; then
+      return 0
     fi
     if [[ "$rc" -ne 255 ]]; then
       return "$rc"
@@ -1296,7 +1318,7 @@ live_lab_scp_from_via_ssh() {
       sleep 2
     fi
   done
-  "${scp_args[@]}"
+  return "$rc"
 }
 
 live_lab_capture_via_ssh() {
@@ -1823,7 +1845,8 @@ live_lab_install_assignment_bundle() {
   local target="$1"
   local assignment_pub_local="$2"
   local assignment_bundle_local="$3"
-  local platform="${4:-linux}"
+  local node_id="$4"
+  local platform="${5:-linux}"
   live_lab_ensure_rustynetd_group "$target" "$platform" || return 1
   local assignment_pub_path bundle_path watermark_path config_dir state_root
   assignment_pub_path="$(rustynet_assignment_pub_path "$platform")"
@@ -1836,8 +1859,8 @@ live_lab_install_assignment_bundle() {
   if [[ "$platform" == "macos" ]]; then
     staging_dir="/private/var/tmp"
   fi
-  remote_pub="${staging_dir}/rn-assignment.pub"
-  remote_bundle="${staging_dir}/rn-assignment.bundle"
+  remote_pub="${staging_dir}/rn-assignment-${node_id}.pub"
+  remote_bundle="${staging_dir}/rn-assignment-${node_id}.bundle"
   case "$platform" in
     macos)
       live_lab_scp_to "$assignment_pub_local" "$target" "$remote_pub" || return 1
@@ -1871,7 +1894,8 @@ root rm -f '${watermark_path}' '${remote_pub}' '${remote_bundle}'
 live_lab_install_assignment_refresh_env() {
   local target="$1"
   local env_local="$2"
-  local platform="${3:-linux}"
+  local node_id="$3"
+  local platform="${4:-linux}"
   local refresh_path config_dir
   refresh_path="$(rustynet_assignment_refresh_env_path "$platform")"
   config_dir="$(rustynet_config_dir "$platform")"
@@ -1880,7 +1904,7 @@ live_lab_install_assignment_refresh_env() {
   if [[ "$platform" == "macos" ]]; then
     staging_dir="/private/var/tmp"
   fi
-  remote_env="${staging_dir}/rn-assignment-refresh.env"
+  remote_env="${staging_dir}/rn-assignment-refresh-${node_id}.env"
   case "$platform" in
     macos)
       live_lab_scp_to "$env_local" "$target" "$remote_env" || return 1

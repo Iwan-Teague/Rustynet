@@ -3536,9 +3536,9 @@ stage_upgrade_admin_node_membership() {
     refresh_env="$STATE_DIR/upgrade-admin-assignment-refresh-${node_id}.env"
     platform="$(node_platform_for_label "$label")" || return 1
     live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/assignment-issue/rn-assignment-${node_id}.assignment" "$bundle_local" || return 1
-    live_lab_install_assignment_bundle "$target" "$admin_verifier_local" "$bundle_local" "$platform" || return 1
+    live_lab_install_assignment_bundle "$target" "$admin_verifier_local" "$bundle_local" "$node_id" "$platform" || return 1
     live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$updated_nodes_spec" "$ALLOW_SPEC" "$exit_node_id"
-    live_lab_install_assignment_refresh_env "$target" "$refresh_env" "$platform" || return 1
+    live_lab_install_assignment_refresh_env "$target" "$refresh_env" "$node_id" "$platform" || return 1
   done
 
   local snapshot_local log_local
@@ -3604,13 +3604,13 @@ distribute_assignment_worker() {
   platform="$(node_platform_for_label "${label}")" || return 1
   printf '[assignment-distribute] %s %s platform=%s\n' "$node_id" "$target" "$platform"
   live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/assignment-issue/rn-assignment-${node_id}.assignment" "$bundle_local" || return 1
-  live_lab_install_assignment_bundle "$target" "$STATE_DIR/assignment.pub" "$bundle_local" "$platform"
+  live_lab_install_assignment_bundle "$target" "$STATE_DIR/assignment.pub" "$bundle_local" "$node_id" "$platform" || return 1
   if [[ "$node_id" == "$exit_node_id" ]]; then
     live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$NODES_SPEC" "$ALLOW_SPEC"
   else
     live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$NODES_SPEC" "$ALLOW_SPEC" "$exit_node_id"
   fi
-  live_lab_install_assignment_refresh_env "$target" "$refresh_env" "$platform"
+  live_lab_install_assignment_refresh_env "$target" "$refresh_env" "$node_id" "$platform" || return 1
 }
 
 issue_and_distribute_traversal_snapshot() {
