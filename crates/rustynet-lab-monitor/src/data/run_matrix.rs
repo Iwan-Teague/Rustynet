@@ -1,0 +1,315 @@
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Role {
+    Client,
+    Admin,
+    Exit,
+    BlindExit,
+    Relay,
+    Anchor,
+    Nas,
+    Llm,
+}
+
+impl Role {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Role::Client => "client",
+            Role::Admin => "admin",
+            Role::Exit => "exit",
+            Role::BlindExit => "blind_exit",
+            Role::Relay => "relay",
+            Role::Anchor => "anchor",
+            Role::Nas => "nas",
+            Role::Llm => "llm",
+        }
+    }
+
+    pub fn all() -> [Role; 8] {
+        [
+            Role::Client,
+            Role::Admin,
+            Role::Exit,
+            Role::BlindExit,
+            Role::Relay,
+            Role::Anchor,
+            Role::Nas,
+            Role::Llm,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Os {
+    Linux,
+    Macos,
+    Windows,
+}
+
+impl Os {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Os::Linux => "linux",
+            Os::Macos => "macos",
+            Os::Windows => "windows",
+        }
+    }
+
+    pub fn csv_prefix(&self) -> &'static str {
+        self.label()
+    }
+
+    pub fn all() -> [Os; 3] {
+        [Os::Linux, Os::Macos, Os::Windows]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParityState {
+    Proven,
+    Failed,
+    Unproven,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageProgress {
+    pub passed: usize,
+    pub total: usize,
+}
+
+pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), ParityState>> {
+    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_path(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+
+    let headers = reader.headers().ok().cloned();
+
+    let mut rows: Vec<csv::StringRecord> = Vec::new();
+    for result in reader.records() {
+        match result {
+            Ok(r) => rows.push(r),
+            Err(_) => continue,
+        }
+    }
+    rows.reverse();
+
+    let mut matrix: HashMap<(Role, Os), ParityState> = HashMap::new();
+
+    let header_index = |name: &str| {
+        headers
+            .as_ref()
+            .and_then(|h| h.iter().position(|header| header == name))
+    };
+
+    for role in Role::all() {
+        for os in Os::all() {
+            let col_names = role_stage_columns(role, os);
+            let key = (role, os);
+            let mut state = ParityState::Unproven;
+
+            for row in &rows {
+                let val = col_names
+                    .iter()
+                    .filter_map(|col| header_index(col))
+                    .filter_map(|idx| row.get(idx))
+                    .find(|value| matches!(*value, "pass" | "fail"))
+                    .unwrap_or("");
+                match val {
+                    "pass" => {
+                        state = ParityState::Proven;
+                        break;
+                    }
+                    "fail" => {
+                        state = ParityState::Failed;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            matrix.insert(key, state);
+        }
+    }
+
+    Ok(matrix)
+}
+
+pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
+    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    if !path.exists() {
+        return Ok(StageProgress::default());
+    }
+
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_path(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let headers = reader
+        .headers()
+        .with_context(|| format!("reading headers from {}", path.display()))?
+        .clone();
+    let mut rows: Vec<csv::StringRecord> = Vec::new();
+    for result in reader.records() {
+        match result {
+            Ok(r) => rows.push(r),
+            Err(_) => continue,
+        }
+    }
+
+    let mut total = 0usize;
+    let mut passed = 0usize;
+    for (idx, header) in headers.iter().enumerate() {
+        if !stage_progress_column(header, &rows, idx) {
+            continue;
+        }
+        total += 1;
+        if latest_decisive_value(&rows, idx) == Some("pass") {
+            passed += 1;
+        }
+    }
+    Ok(StageProgress { passed, total })
+}
+
+fn role_stage_columns(role: Role, os: Os) -> Vec<String> {
+    let prefix = os.csv_prefix();
+    match role {
+        Role::Client => ["bootstrap", "membership", "assignments", "baseline_runtime"]
+            .into_iter()
+            .map(|suffix| format!("{prefix}_stage_{suffix}"))
+            .collect(),
+        Role::Admin => vec![format!("{prefix}_stage_role_switch_matrix")],
+        Role::Exit => vec![format!("{prefix}_stage_exit_handoff")],
+        Role::BlindExit => vec![format!("{prefix}_blind_exit")],
+        Role::Relay => vec![format!("{prefix}_stage_relay_service_lifecycle")],
+        Role::Anchor => vec![format!("{prefix}_stage_anchor")],
+        Role::Nas => vec![format!("{prefix}_stage_nas")],
+        Role::Llm => vec![format!("{prefix}_stage_llm")],
+    }
+}
+
+fn stage_progress_column(header: &str, rows: &[csv::StringRecord], idx: usize) -> bool {
+    if matches!(
+        header,
+        "overall_result" | "linux_present" | "macos_present" | "windows_present"
+    ) {
+        return false;
+    }
+    rows.iter().any(|row| {
+        row.get(idx).is_some_and(|value| {
+            matches!(
+                value.trim(),
+                "pass" | "fail" | "not_run" | "skip" | "skipped"
+            )
+        })
+    })
+}
+
+fn latest_decisive_value(rows: &[csv::StringRecord], idx: usize) -> Option<&str> {
+    rows.iter()
+        .rev()
+        .find_map(|row| match row.get(idx)?.trim() {
+            "pass" => Some("pass"),
+            "fail" => Some("fail"),
+            _ => None,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_matrix_csv(dir: &std::path::Path, content: &str) {
+        let docs = dir.join("documents").join("operations");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("live_lab_run_matrix.csv"), content).unwrap();
+    }
+
+    #[test]
+    fn parity_empty_csv_returns_unproven() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(dir.path(), "overall_result,macos_stage_anchor\n");
+        let matrix = load_parity_matrix(dir.path()).unwrap();
+        assert_eq!(
+            matrix.get(&(Role::Anchor, Os::Macos)),
+            Some(&ParityState::Unproven)
+        );
+    }
+
+    #[test]
+    fn parity_proven_when_pass_row_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,macos_stage_anchor,windows_stage_relay\npass,pass,not_run\n",
+        );
+        let matrix = load_parity_matrix(dir.path()).unwrap();
+        assert_eq!(
+            matrix.get(&(Role::Anchor, Os::Macos)),
+            Some(&ParityState::Proven)
+        );
+    }
+
+    #[test]
+    fn parity_failed_overrides_unproven() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(dir.path(), "overall_result,macos_stage_anchor\npass,fail\n");
+        let matrix = load_parity_matrix(dir.path()).unwrap();
+        assert_eq!(
+            matrix.get(&(Role::Anchor, Os::Macos)),
+            Some(&ParityState::Failed)
+        );
+    }
+
+    #[test]
+    fn parity_uses_headers_when_overall_result_is_not_first_column() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "run_id,started_at_utc,overall_result,macos_stage_exit_handoff\nrun-1,now,pass,pass\n",
+        );
+        let matrix = load_parity_matrix(dir.path()).unwrap();
+        assert_eq!(
+            matrix.get(&(Role::Exit, Os::Macos)),
+            Some(&ParityState::Proven)
+        );
+    }
+
+    #[test]
+    fn parity_latest_stage_failure_is_red() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "run_id,overall_result,windows_stage_relay_service_lifecycle\nold,pass,pass\nnew,fail,fail\n",
+        );
+        let matrix = load_parity_matrix(dir.path()).unwrap();
+        assert_eq!(
+            matrix.get(&(Role::Relay, Os::Windows)),
+            Some(&ParityState::Failed)
+        );
+    }
+
+    #[test]
+    fn stage_progress_counts_latest_green_outcome_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "run_id,overall_result,linux_present,linux_client,macos_stage_anchor,cross_os_dns,windows_stage_exit_handoff,linux_client_alias\n\
+             old,pass,pass,pass,fail,pass,pass,debian-headless-1\n\
+             new,fail,pass,pass,pass,fail,not_run,debian-headless-1\n",
+        );
+
+        let progress = load_stage_progress(dir.path()).unwrap();
+
+        assert_eq!(progress.total, 4);
+        assert_eq!(progress.passed, 3);
+    }
+}

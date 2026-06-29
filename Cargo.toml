@@ -22,12 +22,12 @@ members = [
 ]
 resolver = "2"
 
-# `gui/` holds standalone, isolated GUI prototypes (their own workspaces with
-# their own Cargo.lock). They are intentionally NOT members of the security-
-# gated workspace: GUI stacks pull in large transitive dependency trees with
-# assorted licenses, which would conflict with this workspace's strict license
-# allowlist and `unsafe_code = "forbid"` policy. Keep them excluded.
-exclude = ["gui"]
+# `gui/` and `crates/rustynet-lab-monitor/` hold standalone operator-side UI
+# tools (their own workspaces with their own Cargo.lock). They are intentionally
+# NOT members of the security-gated workspace: UI stacks pull in large
+# transitive dependency trees with assorted licenses, and lab target VMs must
+# not resolve UI-only crates while building rustynetd/rustynet-cli offline.
+exclude = ["gui", "crates/rustynet-lab-monitor"]
 
 [workspace.package]
 edition = "2024"
