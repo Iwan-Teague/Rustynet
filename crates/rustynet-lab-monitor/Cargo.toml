@@ -1,0 +1,30 @@
+[package]
+name = "rustynet-lab-monitor"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal UI for the Rustynet live-lab loop"
+
+[[bin]]
+name = "rustynet-lab-monitor"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+csv = "1.3"
+notify = "6"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+anyhow = "1"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28", features = ["signal", "process"] }
+
+[dev-dependencies]
+tempfile = "3"
