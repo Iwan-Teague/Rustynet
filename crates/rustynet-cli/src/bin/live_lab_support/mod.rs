@@ -112,6 +112,9 @@ fn env_flag_truthy(value: Option<&str>) -> bool {
 }
 
 fn utm_transport_enabled() -> bool {
+    if env_flag_truthy(env::var("LIVE_LAB_FORCE_SSH_TRANSPORT").ok().as_deref()) {
+        return false;
+    }
     env_flag_truthy(env::var("LIVE_LAB_ENABLE_UTM_TRANSPORT").ok().as_deref())
 }
 

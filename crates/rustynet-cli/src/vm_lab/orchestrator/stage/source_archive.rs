@@ -76,19 +76,84 @@ fn build_source_tarball(
     out_path: &Path,
 ) -> Result<(), String> {
     let tree_ish = resolve_source_tree_ish(repo_dir, mode)?;
+    let mut tar_path = out_path.to_path_buf();
+    tar_path.set_extension("tar");
+    let _ = std::fs::remove_file(&tar_path);
     let status = std::process::Command::new("git")
-        .args(["archive", "--format=tar.gz", "-o"])
-        .arg(out_path)
+        .args(["archive", "--format=tar", "-o"])
+        .arg(&tar_path)
         .arg(&tree_ish)
         .current_dir(repo_dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map_err(|e| format!("git archive spawn failed: {e}"))?;
+    if !status.success() {
+        return Err(format!("git archive exited with {status}"));
+    }
+
+    append_source_commit_marker(repo_dir, &tar_path, &tree_ish)?;
+
+    let output = std::process::Command::new("gzip")
+        .args(["-c"])
+        .arg(&tar_path)
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("gzip spawn failed: {e}"))?;
+    let _ = std::fs::remove_file(&tar_path);
+    if !output.status.success() {
+        return Err(format!("gzip exited with {}", output.status));
+    }
+    std::fs::write(out_path, output.stdout)
+        .map_err(|e| format!("write compressed source archive failed: {e}"))?;
+    Ok(())
+}
+
+fn append_source_commit_marker(
+    repo_dir: &Path,
+    tar_path: &Path,
+    tree_ish: &str,
+) -> Result<(), String> {
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short", tree_ish])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("git rev-parse --short {tree_ish} spawn failed: {e}"))?;
+    if !commit.status.success() {
+        return Err(format!(
+            "git rev-parse --short {tree_ish} exited with {}",
+            commit.status
+        ));
+    }
+    let commit = String::from_utf8(commit.stdout)
+        .map_err(|e| format!("git rev-parse --short {tree_ish} returned non-UTF-8 output: {e}"))?;
+
+    let marker_dir =
+        std::env::temp_dir().join(format!("rustynet-source-marker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&marker_dir);
+    std::fs::create_dir_all(&marker_dir)
+        .map_err(|e| format!("create source commit marker tempdir failed: {e}"))?;
+    let marker = marker_dir.join("RUSTYNET_SOURCE_COMMIT");
+    std::fs::write(&marker, commit.trim())
+        .map_err(|e| format!("write source commit marker failed: {e}"))?;
+
+    let status = std::process::Command::new("tar")
+        .args(["-rf"])
+        .arg(tar_path)
+        .args(["-C"])
+        .arg(&marker_dir)
+        .arg("RUSTYNET_SOURCE_COMMIT")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("tar append source commit marker spawn failed: {e}"))?;
+    let _ = std::fs::remove_dir_all(&marker_dir);
     if status.success() {
         Ok(())
     } else {
-        Err(format!("git archive exited with {status}"))
+        Err(format!(
+            "tar append source commit marker exited with {status}"
+        ))
     }
 }
 
@@ -242,6 +307,21 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
+    fn marker_from_built_archive(repo: &Path, mode: ArchiveSourceMode) -> String {
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        build_source_tarball(repo, mode, archive.path()).unwrap();
+        let extract = tempfile::tempdir().unwrap();
+        let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(archive.path())
+            .arg("-C")
+            .arg(extract.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "tar extract failed");
+        std::fs::read_to_string(extract.path().join("RUSTYNET_SOURCE_COMMIT")).unwrap()
+    }
+
     #[test]
     fn worktree_mode_includes_dirty_tracked_file_head_omits() {
         let tmp = tempfile::tempdir().unwrap();
@@ -286,5 +366,31 @@ mod tests {
         // Clean tree: `git stash create` prints nothing, so resolve to HEAD.
         let tree_ish = resolve_source_tree_ish(repo, ArchiveSourceMode::WorkingTree).unwrap();
         assert_eq!(tree_ish, "HEAD");
+    }
+
+    #[test]
+    fn source_archive_marker_matches_worktree_snapshot_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        let tracked = repo.join("tracked.txt");
+        std::fs::write(&tracked, b"committed\n").unwrap();
+        git(repo, &["add", "tracked.txt"]);
+        git(repo, &["commit", "-q", "-m", "initial"]);
+
+        std::fs::write(&tracked, b"dirty\n").unwrap();
+        let tree_ish = resolve_source_tree_ish(repo, ArchiveSourceMode::WorkingTree).unwrap();
+        assert_ne!(tree_ish, "HEAD");
+        let expected = Command::new("git")
+            .args(["rev-parse", "--short", &tree_ish])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(expected.status.success());
+        let expected = String::from_utf8(expected.stdout).unwrap();
+
+        let marker = marker_from_built_archive(repo, ArchiveSourceMode::WorkingTree);
+
+        assert_eq!(marker.trim(), expected.trim());
     }
 }
