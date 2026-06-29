@@ -1,17 +1,18 @@
 # DeepSeek Live-Lab Orchestration Pipeline — Design
 
-- Status: **BUILDING — Layer A + the rigid triage pipeline landed & live-verified; the v4-pro lab-orchestration launch is the next phase** (2026-06-27)
+- Status: **ACTIVE — rigid triage + deterministic lab launch + standardized loop/recovery entrypoints landed; stage-by-stage v4-pro orchestration remains future work** (2026-06-28)
 - Owner surface: `crates/rustynet-mcp` (the `rustynet-mcp-deepseek` server, binary `bin/rustynet-mcp-deepseek`)
 - Related: [§12.5 DeepSeek MCP](../../../CLAUDE.md) · [LiveLabExecutionEfficiencyPlan](LiveLabExecutionEfficiencyPlan_2026-06-20.md) · [CrossPlatformRoleParityPlan](CrossPlatformRoleParityPlan_2026-06-21.md) · [CrossPlatformRoleParityRoadmap](CrossPlatformRoleParityRoadmap_2026-06-22.md)
 
-## 0. Implementation status (2026-06-27)
+## 0. Implementation status (2026-06-28)
 
 Landed + verified on `claude/cross-platform-parity-hardening`:
 - **Layer A** (`82a9bfa`): canonical `deepseek-v4-pro` / `deepseek-v4-flash` ids; `reasoning_effort:"max"` on every Pro call (the highest level per the Thinking-Mode docs — confirmed accepted by the live endpoint); a unit test locking the proxy tools out of any agent's tool-set.
 - **The rigid triage pipeline** (`e98b919`): `run_triage()` runs Flash research → Flash verify → v4-pro(max) review as deterministic control flow (never model-chosen); each step is a read-only grounded agent reusing the generalized `run_grounded()` loop. Exposed as the **`deepseek_live_lab`** MCP tool (v1 triages a caller-supplied `failure_context`). Per-step stderr tracing (`[live-lab] agent '<role>' step n/N → tools`) for live observability; a `strip_dsml_markup` guard cleans DeepSeek-native tool markup that leaks into budget-exhausted answers. **Live-verified end-to-end over real MCP** against the macOS-relay false-fail: all three sub-agents launch in order and ground themselves in the real repo *and* lab (`find_files`/`grep`/`read_file`/`find_definition`/`git` + `lab_run_status`/`lab_inventory`/`lab_run_detail`/`lab_stage_log`), producing a correct, file:line-cited root-cause report.
 - **Async execution** (`4a1e4fc`): the pipeline runs for minutes (v4-pro at max reasoning has unpredictable ~70s–200s+ latency), past the MCP request timeout — so `deepseek_live_lab` returns a `job_id` immediately and the new `deepseek_live_lab_result(job_id)` tool polls non-blocking (the report when done, else a "still running" status). Same async job pattern as the lab-state MCP; jobs are in-memory (lost on a server reload → re-run on miss). Verified live over real MCP: 0.4s call return, poll → full report at ~195s.
+- **Deterministic launch + standardized loop helpers** (2026-06-28): `deepseek_lab_run` launches `vm-lab-orchestrate-live-lab` detached, records the orchestrator pid, writes durable job records under `state/deepseek-mcp-jobs/`, survives MCP-server reloads via report-dir completion artifacts, and runs the rigid triage pipeline only on real failures unless `triage_on_failure=false` is set for no-external-API safe mode. `deepseek_next_live_lab_target` reads the run matrix and returns exact focused `deepseek_lab_run` JSON. `deepseek_autonomous_live_lab_loop` performs one simple-agent loop step: reconcile stale records, refuse duplicate singleton launch, choose the next target, launch. `deepseek_recover_lab_environment` now reconciles records, kills stale DeepSeek-owned `live_linux_lab_orchestrator.sh` process groups from interrupted runs, and then runs an async `--stop-after-ready` recovery pass. `deepseek_reconcile_jobs` repairs stale `labrun-*` records whose orchestrator finished, crashed, or never spawned.
 
-Next phase (the launch half of §6/§7 below — designed, not yet built): the **v4-pro lab-orchestration launch** — the confined lab-action tools (`lab_run_stage`/`lab_recover_vm`/`lab_clean_env`/…) + the stage-by-stage orchestration loop so `deepseek_live_lab` also *runs* the lab (setup/run-split profile invocation), with the first full live run as the verification trigger.
+Remaining future phase: the **v4-pro stage-by-stage orchestrator** described in §6/§7 (`lab_run_stage`/`lab_recover_vm`/`lab_clean_env` as model-called tools). Current production path is more conservative: Rust code chooses the target and launches the hardened Rust orchestrator deterministically; DeepSeek only triages failures or proposes docs.
 
 ## 1. Intent
 
@@ -36,18 +37,18 @@ Confirmed model facts (probed 2026-06-27 against `api.deepseek.com`):
 
 ## 3. The single entry point
 
-One new MCP tool on `rustynet-mcp-deepseek`:
+Primary MCP entrypoints on `rustynet-mcp-deepseek`:
 
 ```
-deepseek_live_lab(
-  target:        string,        // what to test next, e.g. "macos relay lifecycle" or a stage name
-  brief:         string|null,   // OPTIONAL main-agent-provided "what to do next" (overrides auto-fetch)
-  prompt_tweak:  string|null,   // OPTIONAL main-agent addendum to the structured runbook prompt
-  options:       { ... }        // skip-soak, source-mode, target OS/role, etc. — orchestrator passthrough
-) -> StructuredReport
+deepseek_autonomous_live_lab_loop(target?, dry_run?, allow_concurrent?, max_steps?) -> job_id
+deepseek_next_live_lab_target(target?) -> exact deepseek_lab_run JSON
+deepseek_lab_run(area, role/platform selectors...) -> job_id
+deepseek_live_lab(target, failure_context) -> triage job_id
+deepseek_recover_lab_environment(dry_run?, force?) -> recovery job_id
+deepseek_reconcile_jobs(job_id?) -> stale-record repair report
 ```
 
-Calling it runs the **entire pipeline** server-side and returns one verified report. The main agent awaits it (likely as a long-running background task, as orchestrator runs are today).
+Calling the autonomous loop runs one deterministic loop step server-side and returns a job id. Poll `deepseek_live_lab_result` for every async job type.
 
 **Two ways the orchestrator learns "what's next" (both supported):**
 1. **Provided** (default, most common): the main agent passes `brief` ("prove the macOS relay cell; relay_capable was false in inventory but the cross-OS stage exercises it"). v4-pro orchestrates exactly that.

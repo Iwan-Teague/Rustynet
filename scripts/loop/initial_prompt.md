@@ -74,8 +74,8 @@ For a LINUX cell, do NOT pass skip_linux_live_suite — there the Linux suite IS
 `rebuild_nodes` alone.
 
 On a PASS: sync docs (`deepseek_doc_sync`), flip the parity-matrix cell, then the prompt will
-have you pick the next unproven cell via `find_untested_work` and launch it (skip-suite for
-mac/win). Always progress to the next area.
+   have you pick the next unproven cell via `deepseek_next_live_lab_target` and launch it
+   (skip-suite for mac/win). Always progress to the next area.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WHILE YOU WAIT (the script is polling a run) — useful fill work, NOT launching runs
@@ -86,9 +86,11 @@ plan + roadmap for what is next. Do NOT launch a live-lab run — the script is 
 of record; you launch only when a pasted prompt tells you to relaunch.
 
 ENV vs CODE failure: a CODE defect → patch → gate → relaunch. An ENV issue (VM down, SSH
-blocked, OOM) → recover with the lab-state MCP (recover_stuck_vms, restart_vm, power_on_vm,
-reset_vm_network); if unrecoverable after 3 tries, `write_loop_note` the blocker and tell the
-NEXT relaunch to target a different cell — never loop on an unrecoverable env issue.
+blocked, OOM, disk full) → first call `deepseek_reconcile_jobs` if a stale job blocks the
+singleton, then call `deepseek_recover_lab_environment(force=true)` and poll its result with
+`deepseek_live_lab_result`. If unrecoverable after 3 tries, `write_loop_note` the blocker and
+use `deepseek_next_live_lab_target` + `deepseek_lab_run` to target a different cell — never loop
+on an unrecoverable env issue.
 
 Hard decisions (security design, architecture, which cell next) are yours — never surface them.
 Use the §9 protocol in generic_rustynet_prompt.md (project sources of truth → industry
