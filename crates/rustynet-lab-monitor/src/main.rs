@@ -1,4 +1,14 @@
 use anyhow::{Context, Result};
+use crossterm::{
+    cursor::{Hide, Show},
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
+};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 use std::path::PathBuf;
 
@@ -41,6 +51,32 @@ fn init_logging(repo_root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    enable_raw_mode().context("enabling raw terminal mode")?;
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        Hide,
+        Clear(ClearType::All),
+        Clear(ClearType::Purge)
+    )
+    .context("entering terminal UI mode")?;
+
+    Terminal::new(CrosstermBackend::new(stdout)).context("creating terminal backend")
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        Show,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let repo_root = if let Some(idx) = args.iter().position(|a| a == "--repo-root") {
@@ -54,7 +90,7 @@ fn main() -> Result<()> {
     // Set panic hook to restore terminal before printing panic
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
+        restore_terminal();
         prev_hook(info);
     }));
 
@@ -66,14 +102,15 @@ fn main() -> Result<()> {
     let result = rt.block_on(async {
         let mut app = app::App::new(repo_root.clone())?;
 
-        let mut terminal = ratatui::init();
+        let mut terminal = init_terminal()?;
 
         let result = app.run_event_loop(&mut terminal).await;
 
-        ratatui::restore();
+        restore_terminal();
         result
     });
 
+    restore_terminal();
     result?;
     Ok(())
 }
