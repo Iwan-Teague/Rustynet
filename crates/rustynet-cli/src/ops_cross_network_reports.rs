@@ -1940,13 +1940,13 @@ fn validate_report_payload(
                         );
                     }
                 }
-                "cross_network_failback_roaming" if status == CHECK_PASS => {
-                    if path_mode != "direct_active" {
-                        problems.push(
-                            "failback pass reports require path_evidence.path_mode=direct_active"
-                                .to_owned(),
-                        );
-                    }
+                "cross_network_failback_roaming"
+                    if status == CHECK_PASS && path_mode != "direct_active" =>
+                {
+                    problems.push(
+                        "failback pass reports require path_evidence.path_mode=direct_active"
+                            .to_owned(),
+                    );
                 }
                 _ => {}
             }

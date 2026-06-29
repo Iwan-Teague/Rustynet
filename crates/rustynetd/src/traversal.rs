@@ -1164,7 +1164,7 @@ impl TraversalEngine {
                 base_pairs.push((*local, *remote, score));
             }
         }
-        base_pairs.sort_by(|left, right| right.2.cmp(&left.2));
+        base_pairs.sort_by_key(|right| std::cmp::Reverse(right.2));
         base_pairs.truncate(self.config.max_probe_pairs);
 
         let mut plan_pairs = Vec::new();
