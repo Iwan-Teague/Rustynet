@@ -21,7 +21,7 @@ Exit code 0 on a delivered result; non-zero on transport/timeout failure.
 import argparse, json, os, re, select, subprocess, sys, time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-JOB_RE = re.compile(r"\b(?:triage|labrun|docsync)-\d+(?:-\d+)*\b")  # deepseek async job ids (incl. -millis-pid-seq)
+JOB_RE = re.compile(r"\b(?:triage|labrun|docsync|recover)-\d+(?:-\d+)*\b")  # deepseek async job ids (incl. -millis-pid-seq)
 
 
 def main() -> int:
@@ -92,7 +92,18 @@ def main() -> int:
         m = read_id(2, 180)
         text = result_text(m)
 
-        job = None if a.no_poll else (JOB_RE.search(text or "") if text else None)
+        job = JOB_RE.search(text or "") if text else None
+        if a.no_poll:
+            if job:
+                # This direct stdio driver owns the MCP server process. Async
+                # tools spawn a worker thread after returning the job id; exiting
+                # immediately can kill the server before the worker records the
+                # detached orchestrator pid. Hold the process briefly so --no-poll
+                # stays safe for labrun/recover/docsync/triage launches.
+                time.sleep(3)
+            print(text)
+            return 0
+
         if not job:
             print(text)
             return 0

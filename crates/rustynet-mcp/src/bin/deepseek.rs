@@ -1,7 +1,7 @@
 //! DeepSeek MCP Server — calls the DeepSeek API as a first-class sub-agent tool.
 //!
-//! Four tools with explicit intent levels so the calling agent can choose the
-//! right level of access:
+//! Explicit DeepSeek + live-lab tools so the calling agent can choose the right
+//! level of access:
 //!
 //! - `deepseek_read`       — analysis/research only (explain, assess, review)
 //! - `deepseek_write`      — generation only (code, docs, config, tests)
@@ -13,6 +13,11 @@
 //!   lab_run_detail/lab_loop_journal/lab_inventory/lab_jobs/lab_guest_exec/
 //!   lab_job_log/lab_stage_log/lab_report_grep/lab_report_artifacts) that
 //!   inspects the LOCAL Rustynet repo + UTM lab. It cannot write.
+//! - `deepseek_lab_run` — deterministic live-lab launch + auto-triage on fail.
+//! - `deepseek_next_live_lab_target` — read-only next target chooser from the run matrix.
+//! - `deepseek_autonomous_live_lab_loop` — reconcile stale jobs, choose target, launch.
+//! - `deepseek_recover_lab_environment` — async stop-after-ready recovery pass.
+//! - `deepseek_reconcile_jobs` — repair stale labrun records after interruption.
 //! - `deepseek_doc_sync` — PROPOSE-ONLY, READ-ONLY docs-sync: after a
 //!   lab-verified fix, a grounded agent (same loop, but the repo-reads-only tool
 //!   subset — NO lab/guest/cargo tools) reads the current docs and proposes the
@@ -32,11 +37,11 @@
 #![forbid(unsafe_code)]
 
 use rustynet_mcp::{
-    McpServer, ServerInfo, Tool, ToolCallResult, json_schema_object, json_schema_string, repo_root,
-    run_server, run_with_timeout, spawn_logged, tail_file, text_content, tool_error,
-    truncate_output,
+    McpServer, ServerInfo, Tool, ToolCallResult, json_schema_boolean, json_schema_object,
+    json_schema_string, repo_root, run_server, run_with_timeout, spawn_logged, tail_file,
+    text_content, tool_error, truncate_output,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -75,10 +80,10 @@ const MAX_CONCURRENT_LAB_RUNS: usize = 3;
 /// (e.g. a stdio driver disconnected right after the async ack, killing the
 /// server before its worker thread launched the detached orchestrator). Such a
 /// record can never be repaired by the pid-liveness path, so it would peg the
-/// singleton gate forever. Reclassify it crashed once this much time has passed —
-/// set well above any real startup window so a genuinely-starting run is never
-/// false-crashed.
-const RECONCILE_NO_PID_STALE_SECS: u64 = 180;
+/// singleton gate forever. Reclassify it crashed once this much time has passed.
+/// Keep this above the expected spawn window, but short enough that a direct
+/// stdio driver that exits after the async ack cannot block the lab for minutes.
+const RECONCILE_NO_PID_STALE_SECS: u64 = 30;
 /// Standard lab SSH material + inventory (mirrors the lab-state MCP defaults).
 const LAB_SSH_IDENTITY_REL: &str = ".ssh/rustynet_lab_ed25519";
 const LAB_KNOWN_HOSTS_REL: &str = ".ssh/known_hosts";
@@ -116,6 +121,16 @@ struct ReconcileChange {
     old_state: String,
     new_state: String,
     reason: String,
+}
+
+/// One deterministic live-lab target selected from the run matrix or an explicit
+/// operator key. The `args` object is fed directly to `deepseek_lab_run`.
+#[derive(Clone)]
+struct LiveLabTarget {
+    key: String,
+    area: String,
+    reason: String,
+    args: Value,
 }
 
 /// Which confined, read-only tool repertoire a grounded agent run is allowed to
@@ -832,6 +847,15 @@ impl DeepSeekServer {
         if let Some(report_dir) = rec.get("report_dir").and_then(|s| s.as_str())
             && let Some((overall, first_failed)) = self.read_orchestrate_outcome(report_dir)
         {
+            let dry_run = rec
+                .get("dry_run")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let verdict = if dry_run {
+                "DRY-RUN finished (not live evidence)".to_string()
+            } else {
+                overall
+            };
             let failed_line = first_failed
                 .as_deref()
                 .map(|s| format!("First failed stage: `{s}`.\n"))
@@ -840,7 +864,7 @@ impl DeepSeekServer {
                 content: text_content(format!(
                     "# Live-lab run `{job_id}` (area: {area}) — orchestrator FINISHED, but the \
                      deepseek MCP server RELOADED mid-run so auto-triage did NOT run.\n\n\
-                     Overall status: **{overall}**.\n{failed_line}\n\
+                     Overall status: **{verdict}**.\n{failed_line}\n\
                      The detached orchestrator survived the reload and wrote its report to \
                      `{report_dir}` (completion artifact `{ORCHESTRATE_RESULT_REL}` present). \
                      Auto-triage was lost with the in-memory worker.\n\n\
@@ -1007,6 +1031,260 @@ impl DeepSeekServer {
         None
     }
 
+    /// Recovery-only stale process cleanup. Interrupted/reloaded runs can leave
+    /// `live_linux_lab_orchestrator.sh` children alive after the DeepSeek job
+    /// record is terminal or absent. Kill only process groups tied to a
+    /// DeepSeek-owned report dir whose job record is not currently running.
+    fn terminate_stale_lab_orchestrators(&self) -> Vec<String> {
+        let outcome = run_with_timeout(
+            "ps",
+            &["-axo", "pid,ppid,pgid,command"],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(SUBPROC_TIMEOUT_SECS),
+        );
+        let Ok(outcome) = outcome else {
+            return vec!["ps unavailable; skipped stale process cleanup".to_string()];
+        };
+        if !outcome.success {
+            return vec![format!(
+                "ps failed; skipped stale process cleanup: {}",
+                outcome.stderr.trim()
+            )];
+        }
+
+        let mut groups = std::collections::HashSet::new();
+        let mut notes = Vec::new();
+        for line in outcome.stdout.lines() {
+            if !line.contains("live_linux_lab_orchestrator.sh")
+                || !line.contains("state/deepseek-lab-labrun-")
+            {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let _pid = parts.next();
+            let _ppid = parts.next();
+            let Some(pgid_s) = parts.next() else {
+                continue;
+            };
+            let Ok(pgid) = pgid_s.parse::<i32>() else {
+                continue;
+            };
+            let Some(job_id) = extract_labrun_job_id(line) else {
+                continue;
+            };
+            let is_running = self
+                .read_job_record(&job_id)
+                .and_then(|r| r.get("state").and_then(|s| s.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("running");
+            if is_running {
+                continue;
+            }
+            if groups.insert(pgid) {
+                terminate_process_group(pgid);
+                notes.push(format!("killed stale pgid {pgid} for `{job_id}`"));
+            }
+        }
+        notes
+    }
+
+    /// Resolve a Linux backbone alias by its lab_role (exit/client/relay/aux).
+    /// Used by the next-target chooser so generated runs carry the same explicit
+    /// topology humans use in the runbooks.
+    fn inventory_alias_for_lab_role(&self, role: &str) -> Option<String> {
+        let canon = self.confine(LAB_INVENTORY_PATH).ok()?;
+        let body = rustynet_mcp::read_file_capped(&canon, 4 * 1024 * 1024).ok()?;
+        let inv: Value = serde_json::from_str(&body).ok()?;
+        let entries = inv.get("entries")?.as_array()?;
+        for e in entries {
+            let platform = e
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .filter(|p| !p.is_empty())
+                .unwrap_or("linux");
+            if platform == "linux"
+                && e.get("lab_role").and_then(|v| v.as_str()) == Some(role)
+                && let Some(a) = e.get("alias").and_then(|v| v.as_str())
+            {
+                return Some(a.to_string());
+            }
+        }
+        None
+    }
+
+    fn next_live_lab_target(&self, force: Option<&str>) -> Result<LiveLabTarget, String> {
+        if let Some(key) = force {
+            return self.target_from_key(key, "explicit operator target");
+        }
+
+        let matrix = self.read_run_matrix_rows()?;
+        if let Some((header, rows)) = matrix.as_ref()
+            && let Some(latest) = rows.last()
+        {
+            let col = |name: &str| header.iter().position(|c| c == name);
+            let g = |name: &str| {
+                col(name)
+                    .and_then(|i| latest.get(i))
+                    .map(|s| s.trim())
+                    .unwrap_or("")
+            };
+            let overall = g("overall_result").to_ascii_lowercase();
+            let failed = g("first_failed_stage");
+            if !failed.is_empty()
+                && !overall.contains("pass")
+                && let Some(key) = key_for_stage_or_cell(failed)
+            {
+                return self.target_from_key(
+                    key,
+                    &format!("latest run failed at `{failed}`; retry focused cell"),
+                );
+            }
+
+            // Release-blocking macOS/Windows role cells first. Windows blind_exit
+            // is intentionally unsupported by design, so it is not auto-targeted.
+            for (cell, key) in [
+                ("macos_exit", "macos_exit"),
+                ("macos_blind_exit", "macos_blind_exit"),
+                ("macos_anchor", "macos_anchor"),
+                ("windows_anchor", "windows_anchor"),
+                ("windows_relay", "windows_relay"),
+                ("windows_exit", "windows_exit"),
+            ] {
+                let status = g(cell).to_ascii_lowercase();
+                if !status.contains("pass") && !status.contains('✅') {
+                    return self.target_from_key(
+                        key,
+                        &format!("matrix cell `{cell}` is not currently pass (`{}`)", g(cell)),
+                    );
+                }
+            }
+        }
+
+        self.target_from_key("full", "no failing focused cell found; run full matrix")
+    }
+
+    fn read_run_matrix_rows(&self) -> Result<Option<(Vec<String>, Vec<Vec<String>>)>, String> {
+        let path = self
+            .repo_root
+            .join("documents/operations/live_lab_run_matrix.csv");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let body = rustynet_mcp::read_file_capped(&path, 16 * 1024 * 1024)?;
+        let mut lines = body.lines();
+        let header = parse_csv_line(lines.next().unwrap_or(""));
+        let rows: Vec<Vec<String>> = lines
+            .filter(|l| !l.trim().is_empty())
+            .map(parse_csv_line)
+            .collect();
+        Ok(Some((header, rows)))
+    }
+
+    fn target_from_key(&self, key: &str, reason: &str) -> Result<LiveLabTarget, String> {
+        let mut m = Map::new();
+        let area: String;
+        match key {
+            "macos_admin" => {
+                area = "macOS admin live issue".into();
+                m.insert("macos".into(), json!(true));
+                m.insert("admin_platform".into(), json!("macos"));
+                m.insert("skip_linux_live_suite".into(), json!(true));
+                m.insert("legacy_bash".into(), json!(true));
+            }
+            "windows_admin" => {
+                area = "Windows admin live issue".into();
+                m.insert("windows".into(), json!(true));
+                m.insert("admin_platform".into(), json!("windows"));
+                m.insert("skip_linux_live_suite".into(), json!(true));
+            }
+            "macos_exit" => {
+                area = "macOS exit live verification".into();
+                m.insert("macos".into(), json!(true));
+                m.insert("macos_promote_exit".into(), json!(true));
+                m.insert("skip_linux_live_suite".into(), json!(true));
+                m.insert("legacy_bash".into(), json!(true));
+                self.add_default_backbone(&mut m, true);
+            }
+            "windows_exit" => {
+                area = "Windows exit live verification".into();
+                m.insert("windows".into(), json!(true));
+                m.insert("exit_platform".into(), json!("windows"));
+                m.insert("skip_linux_live_suite".into(), json!(true));
+                self.add_default_backbone(&mut m, false);
+            }
+            "macos_blind_exit" => {
+                area = "macOS blind_exit live verification".into();
+                m.insert("macos".into(), json!(true));
+                m.insert("blind_exit_platform".into(), json!("macos"));
+                m.insert("skip_linux_live_suite".into(), json!(true));
+                m.insert("legacy_bash".into(), json!(true));
+            }
+            "macos_anchor" => {
+                area = "macOS anchor live bundle-pull".into();
+                m.insert("macos".into(), json!(true));
+                m.insert("anchor_platform".into(), json!("macos"));
+                m.insert("skip_linux_live_suite".into(), json!(true));
+                m.insert("legacy_bash".into(), json!(true));
+            }
+            "windows_anchor" => {
+                area = "Windows anchor live bundle-pull".into();
+                m.insert("windows".into(), json!(true));
+                m.insert("anchor_platform".into(), json!("windows"));
+                m.insert("skip_linux_live_suite".into(), json!(true));
+            }
+            "macos_relay" => {
+                area = "macOS relay lifecycle".into();
+                m.insert("macos".into(), json!(true));
+                m.insert("relay_platform".into(), json!("macos"));
+                m.insert("skip_linux_live_suite".into(), json!(true));
+                m.insert("legacy_bash".into(), json!(true));
+            }
+            "windows_relay" => {
+                area = "Windows relay lifecycle".into();
+                m.insert("windows".into(), json!(true));
+                m.insert("relay_platform".into(), json!("windows"));
+                m.insert("skip_linux_live_suite".into(), json!(true));
+            }
+            "full" => {
+                area = "full cross-platform live lab".into();
+                m.insert("macos".into(), json!(true));
+                m.insert("windows".into(), json!(true));
+                self.add_default_backbone(&mut m, true);
+            }
+            other => {
+                return Err(format!(
+                    "unknown target '{other}'; use one of macos_admin|windows_admin|macos_exit|\
+                     windows_exit|macos_blind_exit|macos_anchor|windows_anchor|macos_relay|\
+                     windows_relay|full"
+                ));
+            }
+        }
+        m.insert("area".into(), json!(area.clone()));
+        Ok(LiveLabTarget {
+            key: key.to_string(),
+            area,
+            reason: reason.to_string(),
+            args: Value::Object(m),
+        })
+    }
+
+    fn add_default_backbone(&self, m: &mut Map<String, Value>, include_entry: bool) {
+        if let Some(exit) = self.inventory_alias_for_lab_role("exit") {
+            m.insert("exit_vm".into(), json!(exit));
+        }
+        if let Some(client) = self.inventory_alias_for_lab_role("client") {
+            m.insert("client_vm".into(), json!(client));
+        }
+        if include_entry
+            && let Some(entry) = self
+                .inventory_alias_for_lab_role("relay")
+                .or_else(|| self.inventory_alias_for_lab_role("aux"))
+        {
+            m.insert("entry_vm".into(), json!(entry));
+        }
+    }
+
     /// Count in-flight lab-run jobs — the lab is a singleton, never two
     /// orchestrations on the VMs at once. Unions the in-memory map (this server
     /// lifetime) with the persisted records under DEEPSEEK_JOBS_SUBDIR, so a reloaded
@@ -1098,6 +1376,15 @@ impl DeepSeekServer {
         if let Some(rd) = report_dir
             && let Some((overall, first_failed)) = self.read_orchestrate_outcome(rd)
         {
+            let dry_run = rec
+                .get("dry_run")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let verdict = if dry_run {
+                "DRY-RUN finished (not live evidence)".to_string()
+            } else {
+                overall
+            };
             let area = rec
                 .get("area")
                 .and_then(|s| s.as_str())
@@ -1108,7 +1395,7 @@ impl DeepSeekServer {
                 .unwrap_or_default();
             let report = format!(
                 "# Live-lab run `{job_id}` (area: {area}) — RECONCILED to done.\n\n\
-                 Overall status: **{overall}**.\n{failed_line}\n\
+                 Overall status: **{verdict}**.\n{failed_line}\n\
                  The orchestrator wrote its completion artifact at `{rd}` \
                  (`{ORCHESTRATE_RESULT_REL}`), but the deepseek worker died before recording \
                  the result, so the record was stuck at `state=running`.\n\n\
@@ -1293,6 +1580,211 @@ impl DeepSeekServer {
         }
     }
 
+    /// Read-only next-target chooser for the autonomous loop. It prefers the
+    /// latest failed stage, then role cells whose current matrix status is not
+    /// pass, using explicit role-platform selectors so the launched run is
+    /// focused and cheap instead of a blind full sweep.
+    fn call_next_live_lab_target(&self, args: &Value) -> ToolCallResult {
+        let force = get_str(args, "target")
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let target = match self.next_live_lab_target(force) {
+            Ok(t) => t,
+            Err(e) => return tool_error(&e),
+        };
+        ToolCallResult {
+            content: text_content(format!(
+                "# deepseek_next_live_lab_target\n\n\
+                 key: `{}`\narea: `{}`\nreason: {}\n\n\
+                 deepseek_lab_run args:\n```json\n{}\n```\n",
+                target.key,
+                target.area,
+                target.reason,
+                serde_json::to_string_pretty(&target.args).unwrap_or_else(|_| "{}".into())
+            )),
+            is_error: None,
+        }
+    }
+
+    /// One-call autonomous loop driver for simple agents:
+    /// 1. reconcile stale labrun records after interruption,
+    /// 2. refuse to launch if a labrun is genuinely in flight,
+    /// 3. pick the next matrix-backed target,
+    /// 4. call deepseek_lab_run with the right selectors.
+    fn call_autonomous_live_lab_loop(&self, args: &Value) -> ToolCallResult {
+        let _ = self.call_reconcile_jobs(&json!({}));
+        let in_flight = self.running_lab_jobs();
+        if in_flight > 0 {
+            return ToolCallResult {
+                content: text_content(format!(
+                    "# deepseek_autonomous_live_lab_loop\n\n\
+                     {in_flight} labrun already in flight. Do not launch another singleton run.\n\n\
+                     Next call: `deepseek_live_lab_result` on the running job, or \
+                     `deepseek_reconcile_jobs` if the prior run was interrupted."
+                )),
+                is_error: None,
+            };
+        }
+
+        let force = get_str(args, "target")
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let mut target = match self.next_live_lab_target(force) {
+            Ok(t) => t,
+            Err(e) => return tool_error(&e),
+        };
+        overlay_loop_options(&mut target.args, args);
+        self.call_lab_run(&target.args)
+    }
+
+    /// Async recovery pass for interrupted labs. This is deliberately separate
+    /// from `deepseek_lab_run`: it repairs stale DeepSeek job records, then runs
+    /// the Rust orchestrator only to the ready gate (`--stop-after-ready`) so VMs
+    /// are powered/reachable before the next labrun. It never calls DeepSeek.
+    fn call_recover_lab_environment(&self, args: &Value) -> ToolCallResult {
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let in_flight = self.running_lab_jobs();
+        if in_flight > 0 && !force {
+            return tool_error(
+                "a deepseek_lab_run is still in flight; poll deepseek_live_lab_result or pass \
+                 force=true only after proving the run is dead/interrupted",
+            );
+        }
+        let _ = self.call_reconcile_jobs(&json!({}));
+        let stale_kills = self.terminate_stale_lab_orchestrators();
+
+        let job_id = self.new_job_id("recover");
+        let report_dir = format!("state/deepseek-recover-{job_id}");
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.insert(
+                job_id.clone(),
+                TriageJob::Running {
+                    started: Instant::now(),
+                },
+            );
+        }
+        self.write_job_record(
+            &job_id,
+            &json!({
+                "job_id": job_id,
+                "kind": "recover",
+                "state": "running",
+                "area": "lab environment recovery",
+                "report_dir": report_dir,
+                "log_path": self.jobs_dir().join(format!("{job_id}.log")).to_string_lossy(),
+                "started_unix": now_unix(),
+            }),
+        );
+
+        let worker = self.clone();
+        let jid = job_id.clone();
+        std::thread::spawn(move || {
+            let stale_cleanup = if stale_kills.is_empty() {
+                "- none".to_string()
+            } else {
+                stale_kills
+                    .iter()
+                    .map(|s| format!("- {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let stale_count = stale_kills.len();
+            let ssh = home_path(LAB_SSH_IDENTITY_REL);
+            let kh = home_path(LAB_KNOWN_HOSTS_REL);
+            let mut cargo_args: Vec<String> = ["run", "--quiet", "-p", "rustynet-cli", "--", "ops"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            cargo_args.extend(recovery_orchestrator_args(
+                LAB_INVENTORY_PATH,
+                &ssh,
+                &kh,
+                &report_dir,
+                dry_run,
+            ));
+            let arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
+            let log_path = worker.jobs_dir().join(format!("{jid}.log"));
+            if let Err(e) = std::fs::create_dir_all(worker.jobs_dir()) {
+                worker.finish_job(
+                    &jid,
+                    format!("# Lab recovery — could not create log dir: {e}"),
+                );
+                return;
+            }
+            let mut child =
+                match spawn_logged("cargo", &arg_refs, &worker.repo_root, &[], &log_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        worker.finish_job(
+                            &jid,
+                            format!("# Lab recovery — could not launch stop-after-ready pass: {e}"),
+                        );
+                        return;
+                    }
+                };
+            worker.record_orchestrator_pid(&jid, child.id());
+            let start = Instant::now();
+            let timeout = Duration::from_secs(LAB_ORCHESTRATOR_TIMEOUT_SECS);
+            let (success, timed_out) = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break (status.success(), false),
+                    Ok(None) => {
+                        if start.elapsed() >= timeout {
+                            kill_child_group(&mut child);
+                            let _ = child.wait();
+                            break (false, true);
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    Err(e) => {
+                        worker.finish_job(
+                            &jid,
+                            format!("# Lab recovery — error waiting on stop-after-ready pass: {e}"),
+                        );
+                        return;
+                    }
+                }
+            };
+            let tail = tail_file(&log_path, 120).unwrap_or_default();
+            let verdict = if timed_out {
+                "TIMED OUT"
+            } else if dry_run {
+                "DRY-RUN"
+            } else if success {
+                "PASS"
+            } else {
+                "FAIL"
+            };
+            worker.finish_job(
+                &jid,
+                format!(
+                    "# Lab environment recovery — {verdict}\n\n\
+                     Reconciled stale DeepSeek lab records, stopped stale orchestrator process \
+                     groups ({stale_count}), then ran \
+                     `vm-lab-orchestrate-live-lab --stop-after-ready{}`.\n\n\
+                     Stale process cleanup:\n{stale_cleanup}\n\n\
+                     Report dir: `{report_dir}`\nLog: `{}`\n\n_log tail:_\n{}",
+                    if dry_run { " --dry-run" } else { "" },
+                    log_path.display(),
+                    truncate_output(&tail, 80, 5000)
+                ),
+            );
+        });
+
+        ToolCallResult {
+            content: text_content(format!(
+                "Lab recovery started: `{job_id}`. It reconciles stale DeepSeek job records and \
+                 runs the orchestrator to `--stop-after-ready`. Poll `deepseek_live_lab_result` \
+                 with job_id=\"{job_id}\"."
+            )),
+            is_error: None,
+        }
+    }
+
     /// Entry point for `deepseek_lab_run`: the WHOLE pipeline in one call. The
     /// worker thread launches the hardened orchestrator (DETERMINISTIC — no LLM in
     /// the deploy path), waits for it, and on FAILURE runs the rigid triage
@@ -1316,6 +1808,10 @@ impl DeepSeekServer {
             .and_then(|v| v.as_u64())
             .map(|n| n.clamp(1, AGENT_HARD_MAX_STEPS))
             .unwrap_or(AGENT_DEFAULT_MAX_STEPS);
+        let triage_on_failure = args
+            .get("triage_on_failure")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         // Resolve macOS/Windows guests: explicit alias wins; `macos:true` /
         // `windows:true` auto-resolves from the inventory.
@@ -1381,6 +1877,10 @@ impl DeepSeekServer {
             Err(e) => return tool_error(&e),
         };
         let anchor_platform = match validate_role_platform("anchor_platform") {
+            Ok(v) => v,
+            Err(e) => return tool_error(&e),
+        };
+        let admin_platform = match validate_role_platform("admin_platform") {
             Ok(v) => v,
             Err(e) => return tool_error(&e),
         };
@@ -1454,7 +1954,10 @@ impl DeepSeekServer {
                 "kind": "labrun",
                 "state": "running",
                 "area": area,
+                "request_args": args.clone(),
                 "report_dir": report_dir,
+                "dry_run": dry_run,
+                "triage_on_failure": triage_on_failure,
                 "log_path": self.jobs_dir().join(format!("{job_id}.log")).to_string_lossy(),
                 "started_unix": now_unix(),
             }),
@@ -1499,6 +2002,7 @@ impl DeepSeekServer {
                 exit_platform.as_deref(),
                 relay_platform.as_deref(),
                 anchor_platform.as_deref(),
+                admin_platform.as_deref(),
                 blind_exit_platform.as_deref(),
                 entry_vm.as_deref(),
                 macos_promote_exit,
@@ -1600,6 +2104,16 @@ impl DeepSeekServer {
                     log_path.display(),
                     truncate_output(&log_tail, 60, 4000)
                 )
+            } else if dry_run {
+                format!(
+                    "# Live-lab run: {area} — DRY-RUN wiring check complete\n\n\
+                     The orchestrator was launched with --dry-run, so skipped stages are NOT live \
+                     evidence and must never be treated as a lab PASS. Exit status: {}. The launch \
+                     → wait → capture → report path is verified; no triage is run for a dry run.\n\n\
+                     _log tail:_\n{}",
+                    if success { "0" } else { "non-zero" },
+                    truncate_output(&log_tail, 60, 4000)
+                )
             } else if success {
                 format!(
                     "# Live-lab run: {area} — PASS\n\nThe orchestration completed successfully. \
@@ -1607,15 +2121,7 @@ impl DeepSeekServer {
                      trusting). No triage needed.\n\n_log tail:_\n{}",
                     truncate_output(&log_tail, 60, 4000)
                 )
-            } else if dry_run {
-                format!(
-                    "# Live-lab run: {area} — DRY-RUN wiring check complete\n\nThe orchestrator's \
-                     non-zero exit is EXPECTED in --dry-run (every stage is skipped, so the \
-                     setup-complete check can't pass). The launch → wait → capture → report path is \
-                     verified; no triage is run for a dry run.\n\n_log tail:_\n{}",
-                    truncate_output(&log_tail, 60, 4000)
-                )
-            } else {
+            } else if triage_on_failure {
                 // Real run FAILED → feed the evidence to the rigid triage pipeline.
                 let failure_context = format!(
                     "Live-lab orchestration for area '{area}' FAILED (orchestrator exited \
@@ -1626,6 +2132,16 @@ impl DeepSeekServer {
                 let triage = worker.run_triage(&failure_context, max_steps);
                 format!(
                     "# Live-lab run: {area} — FAIL → triage\n\nReport dir: `{report_dir}`\n\n{triage}"
+                )
+            } else {
+                format!(
+                    "# Live-lab run: {area} — FAIL (triage disabled)\n\n\
+                     Report dir: `{report_dir}`\nOrchestrator log: `{}`\n\n\
+                     `triage_on_failure=false` was set, so no external DeepSeek API call was made. \
+                     Inspect the report locally, or call `deepseek_live_lab` manually after approving \
+                     external triage of the selected failure context.\n\n_log tail:_\n{}",
+                    log_path.display(),
+                    truncate_output(&log_tail, 120, 9000)
                 )
             };
             worker.finish_job(&jid, body);
@@ -3443,6 +3959,72 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+fn overlay_loop_options(target_args: &mut Value, user_args: &Value) {
+    let Some(obj) = target_args.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "dry_run",
+        "allow_concurrent",
+        "max_steps",
+        "triage_on_failure",
+    ] {
+        if let Some(v) = user_args.get(key) {
+            obj.insert(key.to_string(), v.clone());
+        }
+    }
+}
+
+fn key_for_stage_or_cell(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    if n.contains("macos") {
+        if n.contains("blind_exit") || n.contains("blind-exit") {
+            return Some("macos_blind_exit");
+        }
+        if n.contains("admin") {
+            return Some("macos_admin");
+        }
+        if n.contains("anchor") {
+            return Some("macos_anchor");
+        }
+        if n.contains("relay") {
+            return Some("macos_relay");
+        }
+        if n.contains("exit") || n.contains("nat") || n.contains("killswitch") {
+            return Some("macos_exit");
+        }
+    }
+    if n.contains("windows") {
+        if n.contains("admin") {
+            return Some("windows_admin");
+        }
+        if n.contains("anchor") {
+            return Some("windows_anchor");
+        }
+        if n.contains("relay") {
+            return Some("windows_relay");
+        }
+        if n.contains("exit") || n.contains("nat") || n.contains("killswitch") {
+            return Some("windows_exit");
+        }
+    }
+    None
+}
+
+fn extract_labrun_job_id(s: &str) -> Option<String> {
+    let start = s.find("labrun-")?;
+    let tail = &s[start..];
+    let id: String = tail
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if id.starts_with("labrun-") && id.len() > "labrun-".len() {
+        Some(id)
+    } else {
+        None
+    }
+}
+
 /// TERM-then-KILL the child's whole process group (the orchestrator spawns bash
 /// workers + utmctl pushes; killing only the leader orphans them). Only invoked
 /// on a genuine wall-clock timeout — a normal exit never reaches here.
@@ -3466,6 +4048,30 @@ fn kill_child_group(child: &mut std::process::Child) {
         .status();
     let _ = child.kill();
 }
+
+#[cfg(unix)]
+fn terminate_process_group(pgid: i32) {
+    if pgid <= 1 || pgid == std::process::id() as i32 {
+        return;
+    }
+    let group = format!("-{pgid}");
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", "--", &group])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    std::thread::sleep(Duration::from_millis(50));
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &group])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_pgid: i32) {}
 
 #[cfg(not(unix))]
 fn kill_child_group(child: &mut std::process::Child) {
@@ -3551,6 +4157,7 @@ fn build_orchestrator_args(
     exit_platform: Option<&str>,
     relay_platform: Option<&str>,
     anchor_platform: Option<&str>,
+    admin_platform: Option<&str>,
     blind_exit_platform: Option<&str>,
     entry_vm: Option<&str>,
     macos_promote_exit: bool,
@@ -3597,6 +4204,9 @@ fn build_orchestrator_args(
     if let Some(p) = anchor_platform {
         a.extend(["--anchor-platform".to_string(), p.to_string()]);
     }
+    if let Some(p) = admin_platform {
+        a.extend(["--admin-platform".to_string(), p.to_string()]);
+    }
     if let Some(p) = blind_exit_platform {
         a.extend(["--blind-exit-platform".to_string(), p.to_string()]);
     }
@@ -3626,6 +4236,26 @@ fn build_orchestrator_args(
     if skip_linux_live_suite {
         a.push("--skip-linux-live-suite".to_string());
     }
+    if dry_run {
+        a.push("--dry-run".to_string());
+    }
+    a
+}
+
+fn recovery_orchestrator_args(
+    inventory: &str,
+    ssh_identity: &str,
+    known_hosts: &str,
+    report_dir: &str,
+    dry_run: bool,
+) -> Vec<String> {
+    let mut a: Vec<String> = vec!["vm-lab-orchestrate-live-lab".to_string()];
+    a.extend(["--inventory".to_string(), inventory.to_string()]);
+    a.extend(["--ssh-identity-file".to_string(), ssh_identity.to_string()]);
+    a.extend(["--known-hosts-file".to_string(), known_hosts.to_string()]);
+    a.extend(["--report-dir".to_string(), report_dir.to_string()]);
+    a.push("--stop-after-ready".to_string());
+    a.extend(["--source-mode".to_string(), "working-tree".to_string()]);
     if dry_run {
         a.push("--dry-run".to_string());
     }
@@ -4418,6 +5048,7 @@ impl McpServer for DeepSeekServer {
                         "exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the EXIT role so the focused mac/win exit cell runs live instead of skipping."),
                         "relay_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the RELAY role so the focused mac/win relay cell runs live instead of skipping."),
                         "anchor_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the ANCHOR role so the focused mac/win anchor cell runs live instead of skipping."),
+                        "admin_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the ADMIN role so the focused mac/win admin issue cell runs live instead of skipping."),
                         "blind_exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the BLIND_EXIT role so the focused mac/win blind-exit cell runs live instead of skipping."),
                         "macos_promote_exit": json!({"type": "boolean", "description": "Option-B selector: elect macOS as a SECONDARY exit so the macOS exit cell runs live (drives is_macos_active_exit). Use alongside exit_vm/client_vm/entry_vm."}),
                         "entry_vm": json_schema_string("Linux entry-node alias for the Option-B exit topology (used alongside exit_vm/client_vm + macos_promote_exit)."),
@@ -4426,9 +5057,63 @@ impl McpServer for DeepSeekServer {
                         "windows_only": json!({"type": "boolean", "description": "Skip ALL Linux stages (incl. membership setup) and run ONLY the Windows bootstrap + validation stages; requires windows_vm. NOTE: this also skips membership distribution, so it only works when the Windows guest is already mesh-joined from a prior run — for a fresh Windows cell use skip_linux_live_suite instead (keeps setup)."}),
                         "allow_concurrent": json!({"type": "boolean", "description": "Opt into PARALLEL runs (default false = singleton). When true, up to 3 runs may overlap — you MUST give each disjoint guests (e.g. the macOS↔Windows pipeline: macOS on one Debian backbone, Windows on another). Each concurrent run gets its own CARGO_TARGET_DIR + report dir."}),
                         "dry_run": json!({"type": "boolean", "description": "Run the orchestrator in --dry-run mode (fast; verifies the launch wiring without a real lab pass)."}),
+                        "triage_on_failure": json!({"type": "boolean", "description": "Default true. When false, a failed live lab returns local report/log pointers without calling the external DeepSeek API. Use this when external triage has not been explicitly approved."}),
                         "max_steps": json!({"type": "integer", "description": "Max tool-calling steps per triage agent on failure (default 12, cap 20)."}),
                     }),
                     vec!["area"],
+                ),
+            },
+            Tool {
+                name: "deepseek_next_live_lab_target".into(),
+                description: "\
+                    Read-only chooser for the next live-lab target. It inspects the run matrix, \
+                    prefers the latest failed stage, then release-blocking macOS/Windows role \
+                    cells that are not currently pass, and returns the exact deepseek_lab_run \
+                    JSON args a simple agent should call. Pass target=<key> to render an explicit \
+                    target (macos_exit, windows_anchor, full, ...)."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "target": json_schema_string("Optional explicit key: macos_admin|windows_admin|macos_exit|windows_exit|macos_blind_exit|macos_anchor|windows_anchor|macos_relay|windows_relay|full"),
+                    }),
+                    vec![],
+                ),
+            },
+            Tool {
+                name: "deepseek_autonomous_live_lab_loop".into(),
+                description: "\
+                    One-call autonomous loop step for simple agents: reconcile stale/interrupted \
+                    DeepSeek labrun records, refuse to double-launch if a run is still in flight, \
+                    choose the next matrix-backed live-lab target, then launch deepseek_lab_run \
+                    with the right focused role selector. On pass, call again to progress to the \
+                    next target; on fail, the launched run auto-triages with DeepSeek."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "target": json_schema_string("Optional explicit key instead of matrix selection."),
+                        "dry_run": json_schema_boolean("Pass through to deepseek_lab_run for wiring checks."),
+                        "triage_on_failure": json_schema_boolean("Pass through to deepseek_lab_run; false disables external DeepSeek API triage on failure."),
+                        "allow_concurrent": json_schema_boolean("Pass through to deepseek_lab_run; use only with disjoint guests."),
+                        "max_steps": json!({"type": "integer", "description": "Max tool-calling steps per triage agent on failure."}),
+                    }),
+                    vec![],
+                ),
+            },
+            Tool {
+                name: "deepseek_recover_lab_environment".into(),
+                description: "\
+                    Async recovery function for interrupted live-lab loops. Reconciles stale \
+                    DeepSeek job records, then runs the Rust orchestrator to --stop-after-ready \
+                    so VMs are powered/reachable before the next labrun. Use when a prior lab was \
+                    interrupted and the next launch is blocked or guests may be stale. Poll \
+                    deepseek_live_lab_result with the returned recover-* job id."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "dry_run": json_schema_boolean("Plan-only recovery wiring check."),
+                        "force": json_schema_boolean("Allow recovery launch even if a labrun still appears in flight; only use after proving it is dead/interrupted."),
+                    }),
+                    vec![],
                 ),
             },
             Tool {
@@ -4505,6 +5190,15 @@ impl McpServer for DeepSeekServer {
         }
         if name == "deepseek_lab_run" {
             return self.call_lab_run(&args);
+        }
+        if name == "deepseek_next_live_lab_target" {
+            return self.call_next_live_lab_target(&args);
+        }
+        if name == "deepseek_autonomous_live_lab_loop" {
+            return self.call_autonomous_live_lab_loop(&args);
+        }
+        if name == "deepseek_recover_lab_environment" {
+            return self.call_recover_lab_environment(&args);
         }
         if name == "deepseek_doc_sync" {
             return self.call_doc_sync(&args);
@@ -4834,6 +5528,9 @@ mod tests {
             "deepseek_live_lab",
             "deepseek_live_lab_result",
             "deepseek_lab_run",
+            "deepseek_next_live_lab_target",
+            "deepseek_autonomous_live_lab_loop",
+            "deepseek_recover_lab_environment",
             "deepseek_reconcile_jobs",
         ] {
             assert!(
@@ -5048,6 +5745,7 @@ mod tests {
             Some("macos"),    // exit_platform
             None,             // relay_platform
             None,             // anchor_platform
+            Some("macos"),    // admin_platform
             None,             // blind_exit_platform
             Some("debian-3"), // entry_vm
             true,             // macos_promote_exit
@@ -5071,6 +5769,7 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--rebuild-nodes", "ll-3"]));
         // Role-platform selectors present when provided.
         assert!(a.windows(2).any(|w| w == ["--exit-platform", "macos"]));
+        assert!(a.windows(2).any(|w| w == ["--admin-platform", "macos"]));
         assert!(a.windows(2).any(|w| w == ["--entry-vm", "debian-3"]));
         assert!(a.iter().any(|x| x == "--macos-promote-exit"));
         assert!(a.iter().any(|x| x == "--legacy-bash-orchestrator"));
@@ -5085,13 +5784,14 @@ mod tests {
         // dry_run adds the flag; no macOS/Windows/backbone/rebuild/role-platform
         // selectors (incl. --macos-promote-exit) when omitted.
         let d = build_orchestrator_args(
-            "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None,
+            "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None, None,
             false, false, true, false, false,
         );
         assert!(d.iter().any(|x| x == "--dry-run"));
         assert!(!d.iter().any(|x| x == "--macos-vm"));
         assert!(!d.iter().any(|x| x == "--exit-vm"));
         assert!(!d.iter().any(|x| x == "--exit-platform"));
+        assert!(!d.iter().any(|x| x == "--admin-platform"));
         assert!(!d.iter().any(|x| x == "--entry-vm"));
         assert!(!d.iter().any(|x| x == "--macos-promote-exit"));
         assert!(!d.iter().any(|x| x == "--legacy-bash-orchestrator"));
