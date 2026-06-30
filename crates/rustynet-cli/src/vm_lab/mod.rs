@@ -10126,7 +10126,7 @@ fn activate_macos_exit_role(
          sudo $RN role set exit; \
           exit_dataplane_ok=0; \
           DNS_RULES=0; \
-          for _i in $(seq 1 20); do \
+          for _i in $(seq 1 60); do \
             NAT=$(sudo pfctl -a com.rustynet/nat -s nat 2>/dev/null | grep -cE '^[[:space:]]*nat' || true); \
             FWD=$(sysctl -n net.inet.ip.forwarding 2>/dev/null || echo 0); \
             if [ \"$NAT\" != 0 ] && [ \"$FWD\" = 1 ]; then \
