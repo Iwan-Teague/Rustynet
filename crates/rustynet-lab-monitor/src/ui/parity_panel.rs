@@ -2,12 +2,12 @@ use ratatui::{
     Frame,
     layout::{Constraint, Rect},
     style::{Color, Style},
-    text::Span,
-    widgets::{Block, Borders, Paragraph, Row, Table},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 
 use crate::app::{App, Panel};
-use crate::data::run_matrix::{Os, ParityState, Role};
+use crate::data::run_matrix::{CellOutcome, Os, ParityState, Role};
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focused_panel == Panel::Parity;
@@ -33,49 +33,72 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let header =
         Row::new(vec!["ROLE", "LINUX", "MACOS", "WIN"]).style(Style::default().fg(Color::Cyan));
 
-    let mut rows: Vec<Row> = Vec::new();
-    for role in Role::all() {
-        let linux = app
-            .parity_matrix
-            .get(&(role, Os::Linux))
-            .map(|s| cell_span(*s))
-            .unwrap_or_else(|| Span::styled("[  ]", Style::default().fg(Color::DarkGray)));
-        let macos = app
-            .parity_matrix
-            .get(&(role, Os::Macos))
-            .map(|s| cell_span(*s))
-            .unwrap_or_else(|| Span::styled("[  ]", Style::default().fg(Color::DarkGray)));
-        let win = app
-            .parity_matrix
-            .get(&(role, Os::Windows))
-            .map(|s| cell_span(*s))
-            .unwrap_or_else(|| Span::styled("[  ]", Style::default().fg(Color::DarkGray)));
+    let empty_history: Vec<CellOutcome> = Vec::new();
 
-        rows.push(Row::new(vec![
-            Span::styled(role.label(), Style::default().fg(Color::White)),
-            linux,
-            macos,
-            win,
-        ]));
-    }
+    let rows: Vec<Row> = Role::all()
+        .into_iter()
+        .map(|role| {
+            let role_cell = Cell::new(Text::from(role.label()))
+                .style(Style::default().fg(Color::White));
+            let os_cells: Vec<Cell> = Os::all()
+                .into_iter()
+                .map(|os| {
+                    let state = app
+                        .parity_matrix
+                        .get(&(role, os))
+                        .copied()
+                        .unwrap_or(ParityState::Unproven);
+                    let history = app
+                        .parity_sparklines
+                        .get(&(role, os))
+                        .map(Vec::as_slice)
+                        .unwrap_or(empty_history.as_slice());
+                    Cell::new(parity_cell_text(state, history))
+                })
+                .collect();
+
+            let mut cells: Vec<Cell> = vec![role_cell];
+            cells.extend(os_cells);
+            Row::new(cells).height(2)
+        })
+        .collect();
 
     let widths = [
-        Constraint::Length(12),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(9),
     ];
 
     let table = Table::new(rows, widths).header(header).column_spacing(1);
-
     f.render_widget(table, inner);
 }
 
-fn cell_span(state: ParityState) -> Span<'static> {
+fn parity_cell_text(state: ParityState, history: &[CellOutcome]) -> Text<'static> {
+    Text::from(vec![state_line(state), sparkline(history)])
+}
+
+fn state_line(state: ParityState) -> Line<'static> {
     let (symbol, color) = match state {
-        ParityState::Proven => ("[ ██ ]", Color::Green),
-        ParityState::Failed => ("[ ✗✗ ]", Color::Red),
-        ParityState::Unproven => ("[ ░░ ]", Color::DarkGray),
+        ParityState::Proven => ("[██]", Color::Green),
+        ParityState::Failed => ("[✗✗]", Color::Red),
+        ParityState::Unproven => ("[░░]", Color::DarkGray),
     };
-    Span::styled(symbol, Style::default().fg(color))
+    Line::from(Span::styled(symbol, Style::default().fg(color)))
+}
+
+fn sparkline(history: &[CellOutcome]) -> Line<'static> {
+    if history.is_empty() {
+        return Line::from(Span::styled("—", Style::default().fg(Color::DarkGray)));
+    }
+    let spans: Vec<Span<'static>> = history
+        .iter()
+        .copied()
+        .map(|outcome| match outcome {
+            CellOutcome::Pass => Span::styled("▇", Style::default().fg(Color::Green)),
+            CellOutcome::Fail => Span::styled("▄", Style::default().fg(Color::Red)),
+            CellOutcome::NotRun => Span::styled("░", Style::default().fg(Color::DarkGray)),
+        })
+        .collect();
+    Line::from(spans)
 }

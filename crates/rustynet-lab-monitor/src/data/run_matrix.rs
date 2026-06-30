@@ -74,6 +74,13 @@ pub enum ParityState {
     Unproven,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellOutcome {
+    Pass,
+    Fail,
+    NotRun,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StageProgress {
     pub passed: usize,
@@ -179,6 +186,67 @@ pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
     Ok(StageProgress { passed, total })
 }
 
+pub fn load_sparklines(
+    repo_root: &Path,
+    n: usize,
+) -> Result<HashMap<(Role, Os), Vec<CellOutcome>>> {
+    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_path(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+
+    let headers = reader.headers().ok().cloned();
+
+    let mut rows: Vec<csv::StringRecord> = Vec::new();
+    for result in reader.records() {
+        match result {
+            Ok(r) => rows.push(r),
+            Err(_) => continue,
+        }
+    }
+
+    let start = rows.len().saturating_sub(n);
+    let rows_slice = &rows[start..];
+
+    let header_index = |name: &str| {
+        headers
+            .as_ref()
+            .and_then(|h| h.iter().position(|header| header == name))
+    };
+
+    let mut sparklines: HashMap<(Role, Os), Vec<CellOutcome>> = HashMap::new();
+
+    for role in Role::all() {
+        for os in Os::all() {
+            let col_names = role_stage_columns(role, os);
+            let history: Vec<CellOutcome> = rows_slice
+                .iter()
+                .map(|row| {
+                    let val = col_names
+                        .iter()
+                        .filter_map(|col| header_index(col))
+                        .filter_map(|idx| row.get(idx))
+                        .find(|v| matches!(*v, "pass" | "fail"))
+                        .unwrap_or("");
+                    match val {
+                        "pass" => CellOutcome::Pass,
+                        "fail" => CellOutcome::Fail,
+                        _ => CellOutcome::NotRun,
+                    }
+                })
+                .collect();
+            sparklines.insert((role, os), history);
+        }
+    }
+
+    Ok(sparklines)
+}
+
 fn role_stage_columns(role: Role, os: Os) -> Vec<String> {
     let prefix = os.csv_prefix();
     match role {
@@ -231,6 +299,47 @@ mod tests {
         let docs = dir.join("documents").join("operations");
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("live_lab_run_matrix.csv"), content).unwrap();
+    }
+
+    #[test]
+    fn sparkline_captures_last_n_outcomes_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,macos_stage_anchor\npass,pass\npass,fail\npass,pass\n",
+        );
+        let sparklines = load_sparklines(dir.path(), 8).unwrap();
+        let history = sparklines.get(&(Role::Anchor, Os::Macos)).unwrap();
+        assert_eq!(
+            history,
+            &[CellOutcome::Pass, CellOutcome::Fail, CellOutcome::Pass]
+        );
+    }
+
+    #[test]
+    fn sparkline_truncates_to_n_most_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,macos_stage_anchor\n\
+             pass,pass\npass,pass\npass,pass\npass,fail\npass,pass\n",
+        );
+        let sparklines = load_sparklines(dir.path(), 3).unwrap();
+        let history = sparklines.get(&(Role::Anchor, Os::Macos)).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history,
+            &[CellOutcome::Pass, CellOutcome::Fail, CellOutcome::Pass]
+        );
+    }
+
+    #[test]
+    fn sparkline_missing_column_yields_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(dir.path(), "overall_result,macos_stage_anchor\npass,pass\n");
+        let sparklines = load_sparklines(dir.path(), 4).unwrap();
+        let windows_relay = sparklines.get(&(Role::Relay, Os::Windows)).unwrap();
+        assert!(windows_relay.iter().all(|o| *o == CellOutcome::NotRun));
     }
 
     #[test]

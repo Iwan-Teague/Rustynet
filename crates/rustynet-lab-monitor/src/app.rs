@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::config::MonitorConfig;
 use crate::data::job_watcher::JobState;
-use crate::data::run_matrix::{Os, ParityState, Role, StageProgress};
+use crate::data::run_matrix::{CellOutcome, Os, ParityState, Role, StageProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -49,6 +49,7 @@ pub struct App {
     pub vm_role_overrides: HashMap<String, String>,
 
     pub parity_matrix: HashMap<(Role, Os), ParityState>,
+    pub parity_sparklines: HashMap<(Role, Os), Vec<CellOutcome>>,
     pub stage_progress: StageProgress,
     pub stage_timings: HashMap<String, u64>,
 
@@ -71,6 +72,8 @@ impl App {
         config.apply_fast_stage_defaults();
         let parity_matrix =
             crate::data::run_matrix::load_parity_matrix(&repo_root).unwrap_or_default();
+        let parity_sparklines =
+            crate::data::run_matrix::load_sparklines(&repo_root, 8).unwrap_or_default();
         let stage_progress =
             crate::data::run_matrix::load_stage_progress(&repo_root).unwrap_or_default();
         let stage_timings =
@@ -90,6 +93,7 @@ impl App {
             selected_vm: 0,
             vm_role_overrides,
             parity_matrix,
+            parity_sparklines,
             stage_progress,
             stage_timings,
             focused_panel: Panel::VmStatus,
@@ -517,6 +521,9 @@ impl App {
 
         if let Ok(matrix) = crate::data::run_matrix::load_parity_matrix(&self.repo_root) {
             self.parity_matrix = matrix;
+        }
+        if let Ok(sparklines) = crate::data::run_matrix::load_sparklines(&self.repo_root, 8) {
+            self.parity_sparklines = sparklines;
         }
         if let Ok(progress) = crate::data::run_matrix::load_stage_progress(&self.repo_root) {
             self.stage_progress = progress;
