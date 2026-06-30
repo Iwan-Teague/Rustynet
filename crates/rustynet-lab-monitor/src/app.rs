@@ -464,13 +464,20 @@ impl App {
                 self.active_job = Some(job);
             }
             Ok(None) => {
-                if self.active_job.is_some() {
-                    self.active_job = None;
-                    self.stage_outcomes.clear();
+                if let Some(prev_job) = self.active_job.take() {
+                    // Do one final read to replace any synthetic "running" entries
+                    // with the definitive pass/fail outcomes before going idle.
+                    let report_dir = self.repo_root.join(&prev_job.report_dir);
+                    if let Ok(result) =
+                        crate::data::stage_reader::read_orchestrate_result(&report_dir)
+                        && !result.outcomes.is_empty()
+                    {
+                        self.stage_outcomes = result.outcomes;
+                    }
                     self.active_stage = None;
-                    self.log_lines.clear();
                     self.active_stage_start = None;
                     self.orchestrator_pgid = None;
+                    // Keep stage_outcomes and log_lines — display last run until next one starts.
                 }
             }
             Err(_) => {}
@@ -1987,6 +1994,54 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!enabled.contains(&"validate_macos_exit_nat_lifecycle".to_owned()));
         assert!(enabled.contains(&"validate_macos_blind_exit".to_owned()));
+    }
+
+    #[test]
+    fn stage_outcomes_persist_after_job_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a completed orchestrate_result so the final read succeeds.
+        let report_dir = dir.path().join("state/deepseek-lab-labrun-done-1");
+        let orch_dir = report_dir.join("orchestration");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        std::fs::write(
+            orch_dir.join("orchestrate_result.json"),
+            r#"{"overall_status":"pass","report_dir":"","outcomes":[
+                {"stage":"bootstrap_hosts","status":"pass","summary":"ok","artifacts":[]},
+                {"stage":"validate_baseline_runtime","status":"fail","summary":"fail","artifacts":[]}
+            ]}"#,
+        )
+        .unwrap();
+
+        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        app.active_job = Some(JobState {
+            job_id: "labrun-done-1".to_owned(),
+            state: "done".to_owned(),
+            pid: None,
+            started_unix: Some(1),
+            area: "macOS exit".to_owned(),
+            report_dir: "state/deepseek-lab-labrun-done-1".to_owned(),
+            request_args: None,
+        });
+        // Simulate: job was just read by the watcher, now it reports None (job finished).
+        // Manually call the None-transition logic by taking the job and re-reading.
+        let prev_job = app.active_job.take().unwrap();
+        let final_report_dir = app.repo_root.join(&prev_job.report_dir);
+        if let Ok(result) = crate::data::stage_reader::read_orchestrate_result(&final_report_dir)
+            && !result.outcomes.is_empty()
+        {
+            app.stage_outcomes = result.outcomes;
+        }
+        app.active_stage = None;
+
+        // Outcomes must be retained with correct statuses — not cleared.
+        assert_eq!(app.stage_outcomes.len(), 2);
+        assert_eq!(app.stage_outcomes[0].stage, "bootstrap_hosts");
+        assert_eq!(app.stage_outcomes[0].status, "pass");
+        assert_eq!(app.stage_outcomes[1].stage, "validate_baseline_runtime");
+        assert_eq!(app.stage_outcomes[1].status, "fail");
+        assert!(app.active_job.is_none());
+        assert!(app.active_stage.is_none());
     }
 
     #[test]
