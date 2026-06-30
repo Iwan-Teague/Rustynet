@@ -440,32 +440,25 @@ fn capture_pf_rules_stdout() -> Result<String, String> {
     use crate::macos_exit_killswitch_precedence::validate_pf_anchor_name;
     // The macOS exit dataplane loads its filter rules — including the labeled
     // LAN DNS-block rules `render_pf_rules` emits — into a generation-numbered
-    // anchor `com.apple/rustynet_g<N>`, NOT the main ruleset. A bare
-    // `pfctl -s rules` therefore never observes them. Enumerate the live
-    // anchors and dump each one's rules, sorted by generation descending so
-    // the newest anchor is tried first. The anchor generation rotates on every
-    // (re-)apply, and between anchor creation and rule load the newest anchor
-    // can exist empty — a single "found anchor → break" can land in that
-    // window and report rules as missing even though the killswitch is
-    // functionally active and a sibling anchor still holds the rules. Poll a
-    // bounded number of times, probing ALL matching anchors on each sample
-    // (not just the highest generation), and only accept a sample when a
-    // matching anchor's rules contain the expected DNS-block labels. Fail loud
-    // once the budget is spent: the producer must observe the real filter
-    // rules rather than silently reporting an empty ruleset that would mask
-    // an absent DNS block.
-    //
-    // Use `select_macos_rustynet_anchors` (plural) instead of
-    // `select_macos_rustynet_anchor` (singular) so that a daemon restart
-    // which leaves the old anchor with rules while creating a new (higher-gen)
-    // empty anchor does not cause a false negative: we probe ALL the anchors
-    // this generation knows about, not just the top-ranked one.
+    // SUB-anchor `com.apple/rustynet_g<N>` (child of the `com.apple` anchor),
+    // NOT the main ruleset. A bare `pfctl -s rules` or `pfctl -s Anchors`
+    // therefore never observes them: `-s Anchors` lists only top-level anchors
+    // (`com.apple`, `com.rustynet`), while the daemon's rules live in a sub-
+    // anchor. Use `pfctl -a com.apple -s Anchors` to enumerate sub-anchors,
+    // then sort by generation descending so the newest anchor is tried first.
+    // The anchor generation rotates on every (re-)apply, so a sibling anchor
+    // may still hold the rules while a newer one is empty — probe ALL matching
+    // anchors on each sample. Poll a bounded number of times and only accept a
+    // sample when a matching anchor's rules contain the expected DNS-block
+    // labels. Fail loud once the budget is spent.
     let mut rules: Option<String> = None;
     for attempt in 0..DNS_ANCHOR_POLL_ATTEMPTS {
-        let anchors_stdout = run_pfctl(&["-s", "Anchors"])?;
+        // Query sub-anchors under `com.apple` — this is where the daemon
+        // installs its generation-numbered filter anchors.
+        let sub_anchors_stdout = run_pfctl(&["-a", "com.apple", "-s", "Anchors"])?;
         let candidates: Vec<String> =
             crate::macos_exit_killswitch_precedence::select_macos_rustynet_anchors(
-                anchors_stdout.as_str(),
+                sub_anchors_stdout.as_str(),
             );
         if !candidates.is_empty() {
             for anchor in &candidates {
@@ -477,8 +470,6 @@ fn capture_pf_rules_stdout() -> Result<String, String> {
                     rules = Some(candidate);
                     break;
                 }
-                // A sibling anchor that flushes between poll attempts
-                // returns a non-zero exit + empty stdout; skip it silently.
             }
             if rules.is_some() {
                 break;
@@ -489,7 +480,7 @@ fn capture_pf_rules_stdout() -> Result<String, String> {
         }
     }
     rules.ok_or_else(|| {
-        "no active com.apple/rustynet_g<N> pf anchor with DNS block rules found; daemon killswitch path not active or rules not yet loaded"
+        "no active com.apple/rustynet_g<N> pf sub-anchor with DNS block rules found; daemon killswitch path not active or rules not yet loaded"
             .to_owned()
     })
 }
