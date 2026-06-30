@@ -186,6 +186,145 @@ pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
     Ok(StageProgress { passed, total })
 }
 
+/// Summary of a single completed lab run, for the Previous Runs panel.
+#[derive(Debug, Clone)]
+pub struct RunSummary {
+    pub run_id: String,
+    /// Short (7-char) git commit SHA.
+    pub git_commit: String,
+    pub overall_result: String,
+    /// Name of the first stage that failed, if any.
+    pub first_failed_stage: String,
+    /// Number of stages with a "pass" outcome.
+    pub passed_stages: usize,
+    /// Total stages with any decisive outcome in the run.
+    pub total_stages: usize,
+}
+
+fn is_meta_column(header: &str) -> bool {
+    matches!(
+        header,
+        "run_id"
+            | "run_started_utc"
+            | "run_finished_utc"
+            | "git_commit"
+            | "git_branch"
+            | "git_dirty_state"
+            | "operator"
+            | "profile_path"
+            | "inventory_path"
+            | "report_dir"
+            | "run_command"
+            | "topology_summary"
+            | "overall_result"
+            | "first_failed_stage"
+            | "failure_digest_path"
+            | "evidence_bundle_path"
+            | "notes"
+            | "linux_present"
+            | "macos_present"
+            | "windows_present"
+    )
+}
+
+fn is_stage_value(v: &str) -> bool {
+    matches!(
+        v.trim(),
+        "pass" | "fail" | "not_run" | "na" | "skip" | "skipped"
+    )
+}
+
+pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
+    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_path(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+
+    let headers = reader
+        .headers()
+        .with_context(|| format!("reading headers from {}", path.display()))?
+        .clone();
+
+    let col_idx = |name: &str| headers.iter().position(|h| h == name);
+    let git_commit_idx = col_idx("git_commit");
+    let overall_idx = col_idx("overall_result");
+    let first_failed_idx = col_idx("first_failed_stage");
+    let run_id_idx = col_idx("run_id");
+
+    let stage_col_indices: Vec<usize> = headers
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| !is_meta_column(h))
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut rows: Vec<csv::StringRecord> = Vec::new();
+    for result in reader.records() {
+        match result {
+            Ok(r) => rows.push(r),
+            Err(_) => continue,
+        }
+    }
+
+    let start = rows.len().saturating_sub(n);
+    let summaries: Vec<RunSummary> = rows[start..]
+        .iter()
+        .rev()
+        .map(|row| {
+            let git_commit: String = git_commit_idx
+                .and_then(|i| row.get(i))
+                .unwrap_or("")
+                .chars()
+                .take(7)
+                .collect();
+
+            let overall_result = overall_idx
+                .and_then(|i| row.get(i))
+                .unwrap_or("")
+                .to_owned();
+
+            let first_failed_stage = first_failed_idx
+                .and_then(|i| row.get(i))
+                .unwrap_or("")
+                .to_owned();
+
+            let run_id = run_id_idx
+                .and_then(|i| row.get(i))
+                .unwrap_or("")
+                .to_owned();
+
+            let mut passed = 0usize;
+            let mut total = 0usize;
+            for &idx in &stage_col_indices {
+                if let Some(val) = row.get(idx) {
+                    if is_stage_value(val) {
+                        total += 1;
+                        if val.trim() == "pass" {
+                            passed += 1;
+                        }
+                    }
+                }
+            }
+
+            RunSummary {
+                run_id,
+                git_commit,
+                overall_result,
+                first_failed_stage,
+                passed_stages: passed,
+                total_stages: total,
+            }
+        })
+        .collect();
+
+    Ok(summaries)
+}
+
 pub fn load_sparklines(
     repo_root: &Path,
     n: usize,
@@ -340,6 +479,32 @@ mod tests {
         let sparklines = load_sparklines(dir.path(), 4).unwrap();
         let windows_relay = sparklines.get(&(Role::Relay, Os::Windows)).unwrap();
         assert!(windows_relay.iter().all(|o| *o == CellOutcome::NotRun));
+    }
+
+    #[test]
+    fn recent_runs_most_recent_first_with_stage_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "run_id,git_commit,overall_result,first_failed_stage,macos_stage_anchor,linux_stage_bootstrap,linux_stage_exit_handoff\n\
+             run-old,aaa1111,pass,,pass,pass,pass\n\
+             run-new,bbb2222,fail,linux_stage_exit_handoff,not_run,pass,fail\n",
+        );
+        let runs = load_recent_runs(dir.path(), 3).unwrap();
+        assert_eq!(runs.len(), 2);
+        // Most recent first
+        assert_eq!(runs[0].run_id, "run-new");
+        assert_eq!(runs[0].git_commit, "bbb2222");
+        assert_eq!(runs[0].overall_result, "fail");
+        assert_eq!(runs[0].first_failed_stage, "linux_stage_exit_handoff");
+        // not_run + pass + fail = 3 total, 1 passed
+        assert_eq!(runs[0].total_stages, 3);
+        assert_eq!(runs[0].passed_stages, 1);
+        // Second is older
+        assert_eq!(runs[1].run_id, "run-old");
+        assert_eq!(runs[1].overall_result, "pass");
+        assert_eq!(runs[1].passed_stages, 3);
+        assert_eq!(runs[1].total_stages, 3);
     }
 
     #[test]

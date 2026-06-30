@@ -7,9 +7,9 @@ use ratatui::{
 };
 
 pub fn render(f: &mut Frame, full_area: Rect) {
-    // Center a 50x20 popup
-    let popup_w = 50u16.min(full_area.width);
-    let popup_h = 20u16.min(full_area.height);
+    // Center a 56x22 popup
+    let popup_w = 56u16.min(full_area.width);
+    let popup_h = 22u16.min(full_area.height);
     let x = (full_area.width.saturating_sub(popup_w)) / 2;
     let y = (full_area.height.saturating_sub(popup_h)) / 2;
     let popup_area = Rect::new(full_area.x + x, full_area.y + y, popup_w, popup_h);
@@ -43,7 +43,8 @@ pub fn render(f: &mut Frame, full_area: Rect) {
         ("Stage Enter", "Open stage detail overlay (summary + artifacts)"),
         ("VM ↑↓", "Select VM row"),
         ("VM ←→", "Cycle selected VM role"),
-        ("Log ↑↓", "Scroll log"),
+        ("Log ↑↓", "Scroll log (pauses autoscroll)"),
+        ("Log G/End", "Resume tail-follow (clear pin)"),
         ("?", "Toggle this help overlay"),
         ("q / ^Q", "Quit"),
     ];
