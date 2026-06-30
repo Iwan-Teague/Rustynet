@@ -2,12 +2,15 @@ use ratatui::{
     Frame,
     layout::{Constraint, Rect},
     style::{Color, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 
 use crate::app::{App, Panel};
 use crate::data::run_matrix::{CellOutcome, Os, ParityState, Role};
+
+// chars inside the brackets — [██████] = 8 chars total
+const BAR_WIDTH: usize = 6;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focused_panel == Panel::Parity;
@@ -38,8 +41,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let rows: Vec<Row> = Role::all()
         .into_iter()
         .map(|role| {
-            let role_cell = Cell::new(Text::from(role.label()))
-                .style(Style::default().fg(Color::White));
+            let role_cell = Cell::new(role.label()).style(Style::default().fg(Color::White));
             let os_cells: Vec<Cell> = Os::all()
                 .into_iter()
                 .map(|os| {
@@ -53,52 +55,69 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                         .get(&(role, os))
                         .map(Vec::as_slice)
                         .unwrap_or(empty_history.as_slice());
-                    Cell::new(parity_cell_text(state, history))
+                    Cell::new(progress_bar(state, history))
                 })
                 .collect();
 
             let mut cells: Vec<Cell> = vec![role_cell];
             cells.extend(os_cells);
-            Row::new(cells).height(2)
+            Row::new(cells)
         })
         .collect();
 
+    // 10 + 8 + 8 + 8 + 3 spacing = 37 — fits in 38-char inner at 34% of 120
     let widths = [
         Constraint::Length(10),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(9),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(8),
     ];
 
     let table = Table::new(rows, widths).header(header).column_spacing(1);
     f.render_widget(table, inner);
 }
 
-fn parity_cell_text(state: ParityState, history: &[CellOutcome]) -> Text<'static> {
-    Text::from(vec![state_line(state), sparkline(history)])
-}
+/// Single-line `[██████]` progress bar encoding parity state + run history.
+///
+/// - Proven  → full bright-green block
+/// - Failed  → red fill (pass ratio) + red dim remainder — entire bar stays red
+/// - Unproven → gray fill (pass ratio) + dark-gray remainder
+fn progress_bar(state: ParityState, history: &[CellOutcome]) -> Line<'static> {
+    let relevant = history.iter().filter(|o| **o != CellOutcome::NotRun).count();
+    let passes = history.iter().filter(|o| **o == CellOutcome::Pass).count();
 
-fn state_line(state: ParityState) -> Line<'static> {
-    let (symbol, color) = match state {
-        ParityState::Proven => ("[██]", Color::Green),
-        ParityState::Failed => ("[✗✗]", Color::Red),
-        ParityState::Unproven => ("[░░]", Color::DarkGray),
-    };
-    Line::from(Span::styled(symbol, Style::default().fg(color)))
-}
-
-fn sparkline(history: &[CellOutcome]) -> Line<'static> {
-    if history.is_empty() {
-        return Line::from(Span::styled("—", Style::default().fg(Color::DarkGray)));
+    match state {
+        ParityState::Proven => Line::from(Span::styled(
+            format!("[{}]", "█".repeat(BAR_WIDTH)),
+            Style::default().fg(Color::Green),
+        )),
+        ParityState::Failed => build_bar(passes, relevant, Color::Red, Color::Red),
+        ParityState::Unproven => build_bar(passes, relevant, Color::Gray, Color::DarkGray),
     }
-    let spans: Vec<Span<'static>> = history
-        .iter()
-        .copied()
-        .map(|outcome| match outcome {
-            CellOutcome::Pass => Span::styled("▇", Style::default().fg(Color::Green)),
-            CellOutcome::Fail => Span::styled("▄", Style::default().fg(Color::Red)),
-            CellOutcome::NotRun => Span::styled("░", Style::default().fg(Color::DarkGray)),
-        })
-        .collect();
+}
+
+fn build_bar(passes: usize, relevant: usize, fill_color: Color, empty_color: Color) -> Line<'static> {
+    let ratio = if relevant > 0 {
+        passes as f64 / relevant as f64
+    } else {
+        0.0
+    };
+    let filled = ((ratio * BAR_WIDTH as f64).round() as usize).min(BAR_WIDTH);
+    let empty = BAR_WIDTH - filled;
+
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("[")];
+    if filled > 0 {
+        spans.push(Span::styled(
+            "█".repeat(filled),
+            Style::default().fg(fill_color),
+        ));
+    }
+    if empty > 0 {
+        spans.push(Span::styled(
+            "░".repeat(empty),
+            Style::default().fg(empty_color),
+        ));
+    }
+    spans.push(Span::raw("]"));
     Line::from(spans)
 }
