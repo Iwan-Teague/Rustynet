@@ -19,10 +19,8 @@ pub struct StageOutcome {
     pub stage: String,
     pub status: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub summary: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub artifacts: Vec<String>,
 }
 

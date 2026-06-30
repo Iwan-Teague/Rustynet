@@ -57,6 +57,8 @@ pub struct App {
     pub page: Page,
     pub stage_cursor: usize,
     pub show_help: bool,
+    pub show_stage_detail: bool,
+    pub stage_detail_scroll: usize,
     pub should_quit: bool,
 
     pub orchestrator_pgid: Option<u32>,
@@ -100,6 +102,8 @@ impl App {
             page: Page::Overview,
             stage_cursor: 0,
             show_help: false,
+            show_stage_detail: false,
+            stage_detail_scroll: 0,
             should_quit: false,
             orchestrator_pgid: None,
             stop_after_current: false,
@@ -183,6 +187,18 @@ impl App {
                 summary: "active stage".to_owned(),
                 artifacts: Vec::new(),
             });
+    }
+
+    pub fn selected_stage_outcome(
+        &self,
+    ) -> Option<&crate::data::stage_reader::StageOutcome> {
+        let stages = self.planned_stages();
+        let stage = stages.get(self.stage_cursor)?;
+        self.stage_outcomes.iter().find(|o| &o.stage == stage)
+    }
+
+    fn selected_stage_has_outcome(&self) -> bool {
+        self.selected_stage_outcome().is_some()
     }
 
     pub fn pipeline_steps(&self) -> Vec<(&'static str, bool, bool)> {
@@ -585,8 +601,26 @@ impl App {
             return;
         }
 
+        if self.show_stage_detail {
+            match code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.show_stage_detail = false;
+                    self.stage_detail_scroll = 0;
+                }
+                KeyCode::Up => {
+                    self.stage_detail_scroll = self.stage_detail_scroll.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.stage_detail_scroll += 1;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if code == KeyCode::Char('?') {
             self.show_help = true;
+            self.show_stage_detail = false;
             return;
         }
 
@@ -709,7 +743,12 @@ impl App {
                 self.toggle_selected_stage();
             }
             KeyCode::Enter if self.focused_panel == Panel::StageGrid => {
-                self.toggle_selected_stage();
+                if self.selected_stage_has_outcome() {
+                    self.show_stage_detail = true;
+                    self.stage_detail_scroll = 0;
+                } else {
+                    self.toggle_selected_stage();
+                }
             }
             _ => {}
         }
@@ -1503,6 +1542,9 @@ pub fn render_ui(f: &mut Frame, app: &App) {
 
     if app.show_help {
         crate::ui::help_overlay::render(f, area);
+    }
+    if app.show_stage_detail {
+        crate::ui::stage_detail_overlay::render(f, area, app);
     }
 }
 
