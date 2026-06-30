@@ -10140,7 +10140,7 @@ fn activate_macos_exit_role(
                 done; \
               fi; \
               if [ -n \"$KANCHOR\" ]; then \
-                DNS_RULES=$(sudo pfctl -a \"$KANCHOR\" -s rules 2>/dev/null | grep -cE 'block.*(inet|inet6).*proto (udp|tcp).*53' || true); \
+                DNS_RULES=$(sudo pfctl -a \"$KANCHOR\" -s rules 2>/dev/null | grep -cE 'block.*(inet|inet6).*proto (udp|tcp).*port.*(domain|53)' || true); \
                 if [ \"$DNS_RULES\" -ge 2 ]; then exit_dataplane_ok=1; break; fi; \
                 echo \"[activate-macos-exit] attempt $_i: NAT/forwarding ok, anchor $KANCHOR dns-block rules=$DNS_RULES (need >=2)\" >&2; \
               else \
