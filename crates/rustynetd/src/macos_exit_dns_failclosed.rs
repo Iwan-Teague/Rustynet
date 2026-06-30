@@ -599,11 +599,24 @@ fn capture_dns_block_path(
 
 #[cfg(target_os = "macos")]
 fn capture_tunnel_dns_resolution(hostname: &str) -> Result<String, String> {
-    let output = Command::new("/usr/bin/dscacheutil")
-        .args(["-q", "host", "-a", "name", hostname])
-        .output()
-        .map_err(|err| format!("dscacheutil host lookup failed to start: {err}"))?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let max_attempts: u32 = 15;
+    let retry_sleep = Duration::from_secs(2);
+    let mut last_stdout = String::new();
+    for attempt in 1..=max_attempts {
+        let output = Command::new("/usr/bin/dscacheutil")
+            .args(["-q", "host", "-a", "name", hostname])
+            .output()
+            .map_err(|err| format!("dscacheutil host lookup failed to start: {err}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if stdout.contains("ip_address") {
+            return Ok(stdout);
+        }
+        last_stdout = stdout;
+        if attempt < max_attempts {
+            sleep(retry_sleep);
+        }
+    }
+    Ok(last_stdout)
 }
 
 #[cfg(not(target_os = "macos"))]
