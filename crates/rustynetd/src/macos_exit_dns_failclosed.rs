@@ -445,30 +445,43 @@ fn capture_pf_rules_stdout() -> Result<String, String> {
     // anchor `com.apple/rustynet_g<N>`, NOT the main ruleset. A bare
     // `pfctl -s rules` therefore never observes them. Enumerate the live
     // anchors, select the highest-generation rustynet anchor, and dump ITS
-    // rules. The anchor generation rotates on every (re-)apply, so a single
-    // sample can race the rotation window; poll a bounded number of times,
-    // returning the instant one matches. Fail loud once the budget is spent:
-    // the producer must observe the real filter rules rather than silently
-    // reporting an empty ruleset that would mask an absent DNS block.
-    let mut anchor: Option<String> = None;
+    // rules. The anchor generation rotates on every (re-)apply, and between
+    // anchor creation and rule load the anchor can exist empty — a single
+    // "found anchor → break" can land in that window and report rules as
+    // missing even though the killswitch is functionally active. Poll a
+    // bounded number of times and only accept a sample when the anchor exists
+    // AND its rules contain the expected DNS-block labels. Fail loud once the
+    // budget is spent: the producer must observe the real filter rules rather
+    // than silently reporting an empty ruleset that would mask an absent DNS
+    // block.
+    let mut rules: Option<String> = None;
     for attempt in 0..DNS_ANCHOR_POLL_ATTEMPTS {
         let anchors = run_pfctl(&["-s", "Anchors"])?;
         let has_more_attempts = attempt + 1 < DNS_ANCHOR_POLL_ATTEMPTS;
         match classify_anchor_poll_sample(anchors.as_str(), has_more_attempts) {
             AnchorPollOutcome::Found(found) => {
-                anchor = Some(found);
-                break;
+                validate_pf_anchor_name(found.as_str())?;
+                let candidate = run_pfctl(&["-a", found.as_str(), "-s", "rules"])?;
+                // Anchor existence alone is not enough: the daemon creates the
+                // anchor first and loads rules second, so there is a race window
+                // where the anchor is present but empty. Only accept a sample
+                // whose rules actually contain the labelled block entries.
+                if candidate.contains(DNS_BLOCK_LAN_UDP_RULE)
+                    && candidate.contains(DNS_BLOCK_LAN_TCP_RULE)
+                {
+                    rules = Some(candidate);
+                    break;
+                }
+                sleep(DNS_ANCHOR_POLL_INTERVAL);
             }
             AnchorPollOutcome::Retry => sleep(DNS_ANCHOR_POLL_INTERVAL),
             AnchorPollOutcome::GiveUp => break,
         }
     }
-    let anchor = anchor.ok_or_else(|| {
-        "no active com.apple/rustynet_g<N> pf anchor found; daemon killswitch path not active"
+    rules.ok_or_else(|| {
+        "no active com.apple/rustynet_g<N> pf anchor with DNS block rules found; daemon killswitch path not active or rules not yet loaded"
             .to_owned()
-    })?;
-    validate_pf_anchor_name(anchor.as_str())?;
-    run_pfctl(&["-a", anchor.as_str(), "-s", "rules"])
+    })
 }
 
 #[cfg(target_os = "macos")]
