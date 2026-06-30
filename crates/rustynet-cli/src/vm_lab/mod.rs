@@ -10143,6 +10143,7 @@ fn activate_macos_exit_role(
                 DNS_RULES=$(sudo pfctl -a \"$KANCHOR\" -s rules 2>/dev/null | grep -cE 'block.*(inet|inet6).*proto (udp|tcp).*port.*(domain|53)' || true); \
                 if [ \"$DNS_RULES\" -ge 2 ]; then exit_dataplane_ok=1; break; fi; \
                 echo \"[activate-macos-exit] attempt $_i: NAT/forwarding ok, anchor $KANCHOR dns-block rules=$DNS_RULES (need >=2)\" >&2; \
+                sudo pfctl -a \"$KANCHOR\" -s rules 2>&1 | head -20 >&2; \
               else \
                 echo \"[activate-macos-exit] attempt $_i: NAT/forwarding ok, no killswitch anchor found yet\" >&2; \
               fi; \
@@ -10152,8 +10153,10 @@ fn activate_macos_exit_role(
           if [ \"$exit_dataplane_ok\" != 1 ]; then \
             echo \"exit dataplane not fully active after role set exit\" >&2; \
             echo \"NAT=$NAT FWD=$FWD KANCHOR=$KANCHOR DNS_RULES=$DNS_RULES\" >&2; \
-            sudo pfctl -a com.rustynet/nat -s nat 2>&1 | head >&2; \
-            sudo pfctl -s Anchors 2>&1 | grep 'com.apple/rustynet_g' >&2; \
+             sudo pfctl -a com.rustynet/nat -s nat 2>&1 | head >&2; \
+             sudo pfctl -s Anchors 2>&1 | grep 'com.apple/rustynet_g' >&2; \
+             echo \"[diagnostic] killswitch anchor $KANCHOR rules:\" >&2; \
+             sudo pfctl -a \"$KANCHOR\" -s rules 2>&1 | head -30 >&2; \
             exit 1; \
           fi; \
          echo \"role admin->exit advertised 0.0.0.0/0; com.rustynet/nat loaded ($NAT nat rule); net.inet.ip.forwarding=$FWD; killswitch anchor $KANCHOR dns-block-lan rules=$DNS_RULES\"";
