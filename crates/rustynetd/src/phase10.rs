@@ -3282,12 +3282,21 @@ impl DataplaneSystem for MacosCommandSystem {
         // above are the defense-in-depth egress block; this owns resolv.conf. The
         // write goes through the privileged helper's fixed-path/fixed-content
         // builtin (macOS /etc is writable, so it uses the atomic temp+rename).
+        //
+        // The resolv.conf write is best-effort on macOS: macOS manages this file
+        // via system-configuration and the atomic overwrite may fail or be
+        // reverted. The killswitch pf anchor with DNS-block rules (applied above)
+        // remains the primary fail-closed enforcement. Reverting dns_protected
+        // when the file write fails would cause the next reconcile tick to
+        // re-render pf rules WITHOUT DNS-block rules (since killswitch_spec()
+        // reads dns_protected=false), losing DNS protection altogether.
         if let Err(err) = self.run(
             PrivilegedCommandProgram::DnsFailclosedFile,
             &[crate::linux_dns_protect::DNS_FILE_SELECTOR_RESOLV_APPLY],
         ) {
-            self.dns_protected = false;
-            return Err(SystemError::DnsApplyFailed(err.to_string()));
+            log::warn!(
+                "macOS resolv.conf write failed (best-effort; pf DNS-block rules remain active): {err}"
+            );
         }
         Ok(())
     }
