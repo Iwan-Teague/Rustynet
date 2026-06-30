@@ -12,7 +12,7 @@ use crate::app::{App, Panel};
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focused_panel == Panel::StageGrid;
     let block = Block::default()
-        .title("STAGE GRID [3] ↑↓ select  Space/Enter toggle")
+        .title("STAGE GRID [3] ↑↓ select  Space toggle  Enter detail")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused {
             Color::Yellow
