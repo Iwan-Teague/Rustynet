@@ -9,8 +9,29 @@ use crossterm::{
     },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Terminal size (cols, rows) before we enlarged it at startup.
+static ORIGINAL_SIZE: OnceLock<(u16, u16)> = OnceLock::new();
+
+/// Grow the terminal window by `extra_cols` × `extra_rows` using the xterm
+/// resize escape (`\x1b[8;<rows>;<cols>t`).  Saves the original size so
+/// `restore_terminal` can shrink it back.  Silently ignored by terminals that
+/// don't support the sequence (tmux, VS Code integrated terminal, etc.).
+fn resize_terminal_window(extra_cols: u16, extra_rows: u16) {
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        ORIGINAL_SIZE.set((cols, rows)).ok();
+        let new_cols = cols.saturating_add(extra_cols);
+        let new_rows = rows.saturating_add(extra_rows);
+        print!("\x1b[8;{new_rows};{new_cols}t");
+        let _ = io::stdout().flush();
+        // Give the terminal emulator a moment to process the resize before
+        // we query the new size for layout.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+}
 
 mod app;
 mod config;
@@ -75,6 +96,11 @@ fn restore_terminal() {
         DisableMouseCapture,
         LeaveAlternateScreen
     );
+    // Restore window to its pre-launch size (no-op if we never resized).
+    if let Some(&(cols, rows)) = ORIGINAL_SIZE.get() {
+        print!("\x1b[8;{rows};{cols}t");
+        let _ = io::stdout().flush();
+    }
 }
 
 fn main() -> Result<()> {
@@ -98,6 +124,10 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("building tokio runtime")?;
+
+    // Expand the terminal window before entering the TUI so the layout
+    // has room for the prev-runs panel row at the bottom.
+    resize_terminal_window(5, 5);
 
     let result = rt.block_on(async {
         let mut app = app::App::new(repo_root.clone())?;
