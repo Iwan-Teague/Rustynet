@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::config::MonitorConfig;
 use crate::data::job_watcher::JobState;
-use crate::data::run_matrix::{CellOutcome, Os, ParityState, Role, StageProgress};
+use crate::data::run_matrix::{CellOutcome, Os, ParityState, Role, RunSummary, StageProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -42,7 +42,11 @@ pub struct App {
     pub stage_outcomes: Vec<crate::data::stage_reader::StageOutcome>,
     pub active_stage: Option<String>,
     pub log_lines: Vec<String>,
+    /// Lines above the bottom (0 = follow tail). Positive = user scrolled up / pinned.
     pub log_scroll: usize,
+    /// Total line count when the user first scrolled away from the tail.
+    pub log_scroll_anchor: usize,
+    pub recent_runs: Vec<RunSummary>,
 
     pub vm_statuses: Vec<crate::data::vm_prober::VmStatus>,
     pub selected_vm: usize,
@@ -82,6 +86,8 @@ impl App {
             crate::data::timings::load_stage_timings(&repo_root).unwrap_or_default();
 
         let vm_role_overrides = default_vm_role_overrides(&config);
+        let recent_runs =
+            crate::data::run_matrix::load_recent_runs(&repo_root, 3).unwrap_or_default();
 
         Ok(Self {
             repo_root,
@@ -91,6 +97,8 @@ impl App {
             active_stage: None,
             log_lines: Vec::new(),
             log_scroll: 0,
+            log_scroll_anchor: 0,
+            recent_runs,
             vm_statuses: Vec::new(),
             selected_vm: 0,
             vm_role_overrides,
@@ -554,6 +562,9 @@ impl App {
         if let Ok(stage_timings) = crate::data::timings::load_stage_timings(&self.repo_root) {
             self.stage_timings = stage_timings;
         }
+        if let Ok(runs) = crate::data::run_matrix::load_recent_runs(&self.repo_root, 3) {
+            self.recent_runs = runs;
+        }
         if self.active_job.is_none() {
             self.advance_if_current_target_proven();
         }
@@ -711,8 +722,11 @@ impl App {
                 Panel::StageGrid if self.stage_cursor > 0 => {
                     self.stage_cursor -= 1;
                 }
-                Panel::Log if self.log_scroll > 0 => {
-                    self.log_scroll = self.log_scroll.saturating_sub(1);
+                Panel::Log => {
+                    if self.log_scroll == 0 {
+                        self.log_scroll_anchor = self.log_lines.len();
+                    }
+                    self.log_scroll += 1;
                 }
                 Panel::VmStatus if self.selected_vm > 0 => {
                     self.selected_vm -= 1;
@@ -725,13 +739,24 @@ impl App {
                     self.stage_cursor = (self.stage_cursor + 1).min(max);
                 }
                 Panel::Log => {
-                    self.log_scroll += 1;
+                    self.log_scroll = self.log_scroll.saturating_sub(1);
+                    if self.log_scroll == 0 {
+                        self.log_scroll_anchor = 0;
+                    }
                 }
                 Panel::VmStatus if self.selected_vm + 1 < self.vm_statuses.len() => {
                     self.selected_vm += 1;
                 }
                 _ => {}
             },
+            KeyCode::End if self.focused_panel == Panel::Log => {
+                self.log_scroll = 0;
+                self.log_scroll_anchor = 0;
+            }
+            KeyCode::Char(_) if plain_char == Some('g') && self.focused_panel == Panel::Log => {
+                self.log_scroll = 0;
+                self.log_scroll_anchor = 0;
+            }
             KeyCode::Left if self.focused_panel == Panel::VmStatus => {
                 self.cycle_selected_vm_role(-1);
             }
@@ -842,6 +867,7 @@ impl App {
                 });
                 self.active_stage = None;
                 self.log_scroll = 0;
+                self.log_scroll_anchor = 0;
                 let unsupported_disabled = config
                     .disabled_stages
                     .iter()
@@ -1524,14 +1550,19 @@ pub fn render_ui(f: &mut Frame, app: &App) {
             crate::ui::agents_panel::render(f, lower[1], app);
         }
         Page::Run => {
-            let rows = Layout::vertical([Constraint::Percentage(48), Constraint::Percentage(52)])
-                .split(body_area);
+            let rows = Layout::vertical([
+                Constraint::Percentage(48),
+                Constraint::Percentage(30),
+                Constraint::Percentage(22),
+            ])
+            .split(body_area);
             let lower =
                 Layout::horizontal([Constraint::Percentage(72), Constraint::Percentage(28)])
                     .split(rows[1]);
             crate::ui::stage_grid::render(f, rows[0], app);
             crate::ui::log_panel::render(f, lower[0], app);
             crate::ui::jobs_panel::render(f, lower[1], app);
+            crate::ui::prev_runs_panel::render(f, rows[2], app);
         }
     }
 

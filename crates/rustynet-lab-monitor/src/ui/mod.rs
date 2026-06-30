@@ -1,4 +1,5 @@
 pub mod agents_panel;
+pub mod prev_runs_panel;
 pub mod stage_detail_overlay;
 pub mod header;
 pub mod help_overlay;
