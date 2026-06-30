@@ -193,45 +193,20 @@ pub struct RunSummary {
     /// Short (7-char) git commit SHA.
     pub git_commit: String,
     pub overall_result: String,
-    /// Name of the first stage that failed, if any.
+    /// Name of the first stage that failed (from the `first_failed_stage` CSV column).
     pub first_failed_stage: String,
-    /// Number of stages with a "pass" outcome.
+    /// Number of `_stage_` / `cross_os_*` columns with outcome "pass".
     pub passed_stages: usize,
-    /// Total stages with any decisive outcome in the run.
+    /// Count of stage columns with a decisive outcome (pass/fail/skip) — NOT counting not_run.
     pub total_stages: usize,
+    /// Column name of the last stage that ran (any non-not_run value), for PASS run display.
+    pub last_ran_stage: String,
 }
 
-fn is_meta_column(header: &str) -> bool {
-    matches!(
-        header,
-        "run_id"
-            | "run_started_utc"
-            | "run_finished_utc"
-            | "git_commit"
-            | "git_branch"
-            | "git_dirty_state"
-            | "operator"
-            | "profile_path"
-            | "inventory_path"
-            | "report_dir"
-            | "run_command"
-            | "topology_summary"
-            | "overall_result"
-            | "first_failed_stage"
-            | "failure_digest_path"
-            | "evidence_bundle_path"
-            | "notes"
-            | "linux_present"
-            | "macos_present"
-            | "windows_present"
-    )
-}
-
-fn is_stage_value(v: &str) -> bool {
-    matches!(
-        v.trim(),
-        "pass" | "fail" | "not_run" | "na" | "skip" | "skipped"
-    )
+/// True for columns that represent actual orchestrator stages (not role-presence summaries).
+/// Only `*_stage_*` and `cross_os_*` columns count as lab stages.
+fn is_lab_stage_column(header: &str) -> bool {
+    header.contains("_stage_") || header.starts_with("cross_os_")
 }
 
 pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
@@ -256,11 +231,12 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
     let first_failed_idx = col_idx("first_failed_stage");
     let run_id_idx = col_idx("run_id");
 
-    let stage_col_indices: Vec<usize> = headers
+    // Ordered list of (column_index, header_name) for lab stage columns only.
+    let stage_cols: Vec<(usize, String)> = headers
         .iter()
         .enumerate()
-        .filter(|(_, h)| !is_meta_column(h))
-        .map(|(i, _)| i)
+        .filter(|(_, h)| is_lab_stage_column(h))
+        .map(|(i, h)| (i, h.to_owned()))
         .collect();
 
     let mut rows: Vec<csv::StringRecord> = Vec::new();
@@ -300,14 +276,22 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
 
             let mut passed = 0usize;
             let mut total = 0usize;
-            for &idx in &stage_col_indices {
-                if let Some(val) = row.get(idx) {
-                    if is_stage_value(val) {
+            let mut last_ran_stage = String::new();
+
+            for (idx, col_name) in &stage_cols {
+                let v = row.get(*idx).unwrap_or("").trim();
+                match v {
+                    "pass" => {
+                        passed += 1;
                         total += 1;
-                        if val.trim() == "pass" {
-                            passed += 1;
-                        }
+                        last_ran_stage = col_name.clone();
                     }
+                    "fail" | "skip" | "skipped" => {
+                        total += 1;
+                        last_ran_stage = col_name.clone();
+                    }
+                    // "not_run" / "na" / "" → don't count, don't update last_ran
+                    _ => {}
                 }
             }
 
@@ -318,6 +302,7 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
                 first_failed_stage,
                 passed_stages: passed,
                 total_stages: total,
+                last_ran_stage,
             }
         })
         .collect();
@@ -486,7 +471,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_matrix_csv(
             dir.path(),
-            "run_id,git_commit,overall_result,first_failed_stage,macos_stage_anchor,linux_stage_bootstrap,linux_stage_exit_handoff\n\
+            "run_id,git_commit,overall_result,first_failed_stage,\
+             macos_stage_anchor,linux_stage_bootstrap,linux_stage_exit_handoff\n\
              run-old,aaa1111,pass,,pass,pass,pass\n\
              run-new,bbb2222,fail,linux_stage_exit_handoff,not_run,pass,fail\n",
         );
@@ -497,14 +483,16 @@ mod tests {
         assert_eq!(runs[0].git_commit, "bbb2222");
         assert_eq!(runs[0].overall_result, "fail");
         assert_eq!(runs[0].first_failed_stage, "linux_stage_exit_handoff");
-        // not_run + pass + fail = 3 total, 1 passed
-        assert_eq!(runs[0].total_stages, 3);
+        // not_run is excluded from total; pass=1 fail=1 → total=2
         assert_eq!(runs[0].passed_stages, 1);
-        // Second is older
+        assert_eq!(runs[0].total_stages, 2);
+        assert_eq!(runs[0].last_ran_stage, "linux_stage_exit_handoff");
+        // Older pass run: 3 stage columns all pass
         assert_eq!(runs[1].run_id, "run-old");
         assert_eq!(runs[1].overall_result, "pass");
         assert_eq!(runs[1].passed_stages, 3);
         assert_eq!(runs[1].total_stages, 3);
+        assert_eq!(runs[1].last_ran_stage, "linux_stage_exit_handoff");
     }
 
     #[test]
