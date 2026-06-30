@@ -10565,9 +10565,11 @@ fn resolve_configured_egress_interface(config: &mut DaemonConfig) -> Result<(), 
 /// Pin the loopback DNS resolver to port 53 for the Windows backend.
 ///
 /// Windows points host DNS at a resolver through interface settings that encode
-/// only an IP address, not a port — and Windows advfirewall cannot redirect a
-/// port the way Linux `nft` and macOS `pf` send `:53`→`:53535`. So the rustynet
-/// loopback resolver MUST listen on `:53` for Windows DNS ownership to work at
+/// only an IP address, not a port — and Windows advfirewall cannot reach the
+/// resolver's `:53535` bind the way Linux does (an `nft` `:53`→`:53535` redirect)
+/// or macOS does (an `/etc/resolver/<domain>` scoped resolver with a `port`
+/// directive; see `linux_dns_protect::macos_scoped_resolver_contents`). So the
+/// rustynet loopback resolver MUST listen on `:53` for Windows DNS ownership to work at
 /// all; `apply_dns_loopback` enforces this and otherwise fail-closes the whole
 /// dataplane on every reconcile (which is exactly what happened when the Windows
 /// backend was left on the cross-platform default `127.0.0.1:53535`). When the

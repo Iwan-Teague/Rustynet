@@ -3298,6 +3298,26 @@ impl DataplaneSystem for MacosCommandSystem {
                 "macOS resolv.conf write failed (best-effort; pf DNS-block rules remain active): {err}"
             );
         }
+        // Write the macOS scoped resolver (/etc/resolver/rustynet → loopback
+        // resolver:53535) so the OS resolver (mDNSResponder / dscacheutil /
+        // getaddrinfo) can actually resolve mesh `*.rustynet` names. Unlike
+        // /etc/resolv.conf — which macOS largely ignores for the primary lookup
+        // path — `/etc/resolver/<domain>` is the mechanism the OS honors, and,
+        // because the daemon runs unprivileged (cannot bind :53) and macOS
+        // installs no `:53`→resolver redirect, it is the ONLY route from the OS
+        // resolver to the resolver's :53535 bind. Best-effort like the
+        // resolv.conf write: the pf LAN-DNS block remains the fail-closed
+        // enforcement, so a write failure must NOT revert dns_protected (which
+        // would drop the egress block on the next reconcile). Scoped to the
+        // `rustynet` domain only — no other domain's resolution changes.
+        if let Err(err) = self.run(
+            PrivilegedCommandProgram::DnsFailclosedFile,
+            &[crate::linux_dns_protect::DNS_FILE_SELECTOR_MACOS_RESOLVER_APPLY],
+        ) {
+            log::warn!(
+                "macOS scoped resolver write failed (best-effort; mesh DNS OS-path unavailable): {err}"
+            );
+        }
         Ok(())
     }
 
@@ -3331,6 +3351,13 @@ impl DataplaneSystem for MacosCommandSystem {
         self.run_allow_failure(
             PrivilegedCommandProgram::DnsFailclosedFile,
             &[crate::linux_dns_protect::DNS_FILE_SELECTOR_RESOLV_RESTORE],
+        );
+        // Remove the macOS scoped resolver so a torn-down node stops routing
+        // `*.rustynet` at the (now stopped) loopback resolver. Best-effort: a
+        // missing file is a no-op, so teardown never fails closed.
+        self.run_allow_failure(
+            PrivilegedCommandProgram::DnsFailclosedFile,
+            &[crate::linux_dns_protect::DNS_FILE_SELECTOR_MACOS_RESOLVER_REMOVE],
         );
         self.apply_pf_rules(false)
             .map_err(|err| SystemError::RollbackFailed(err.to_string()))

@@ -169,6 +169,34 @@ pub fn network_manager_dns_none_dropin() -> String {
     "[main]\ndns=none\n".to_owned()
 }
 
+/// macOS per-domain scoped-resolver directory + file. macOS routes queries for a
+/// domain via `/etc/resolver/<domain>` (honored by mDNSResponder /
+/// `getaddrinfo` / `dscacheutil`), UNLIKE `/etc/resolv.conf`, which the
+/// system-configuration framework largely ignores for the primary lookup path.
+/// The mesh DNS zone is the `rustynet` suffix (`<host>.rustynet`), so the file
+/// is named `rustynet`.
+pub const MACOS_SCOPED_RESOLVER_DIR: &str = "/etc/resolver";
+pub const MACOS_SCOPED_RESOLVER_PATH: &str = "/etc/resolver/rustynet";
+
+/// Loopback port the macOS scoped resolver forwards `*.rustynet` queries to —
+/// the rustynet resolver's bind port. macOS runs the daemon UNPRIVILEGED
+/// (`UserName=rustynetd`) so it cannot bind `:53`, and — unlike Linux — installs
+/// no `:53`→resolver redirect; the OS reaches the resolver ONLY via this scoped
+/// resolver's `port` directive. Pinned to the cross-platform resolver default
+/// (`crate::daemon::DEFAULT_DNS_RESOLVER_BIND_ADDR`); a unit test asserts they
+/// stay in lockstep so a future bind-port change cannot silently desync.
+pub const MACOS_SCOPED_RESOLVER_LOOPBACK_PORT: u16 = 53535;
+
+/// `/etc/resolver/rustynet` contents: route the mesh `rustynet` domain to the
+/// loopback rustynet resolver on its bind port. Scoped to `rustynet` ONLY, so it
+/// never changes the default resolver for any other domain (no leak surface);
+/// the killswitch pf LAN-DNS block remains the egress fail-closed enforcement.
+pub fn macos_scoped_resolver_contents() -> String {
+    format!(
+        "# rustynet mesh scoped resolver\nnameserver {DNS_REDIRECT_LOOPBACK_IP}\nport {MACOS_SCOPED_RESOLVER_LOOPBACK_PORT}\n"
+    )
+}
+
 // ===========================================================================
 // Protected-mode DNS file-write builtin (privileged boundary)
 // ===========================================================================
@@ -178,13 +206,13 @@ pub fn network_manager_dns_none_dropin() -> String {
 // resolv.conf management — requires writing files, which no exec'd binary can do
 // safely (`tee`/`cp` with caller-supplied content would be an arbitrary-write
 // hole). Instead the helper grows ONE tightly-constrained builtin: the caller
-// passes a single *selector* token naming one of four fixed operations; the
+// passes a single *selector* token naming one of six fixed operations; the
 // helper owns the path→content mapping entirely. No path and no file content
 // ever crosses the privileged boundary, so the only attack surface is the
 // finite selector set — validated against [`DNS_FAILCLOSED_FILE_SELECTORS`].
 
 /// Privileged-helper "program" token for the DNS fail-closed file-write builtin.
-/// Not an external binary: it is an in-helper operation that writes ONLY the two
+/// Not an external binary: it is an in-helper operation that writes ONLY the
 /// reviewed fixed paths with ONLY the byte-exact fixed contents this module
 /// produces.
 pub const DNS_FAILCLOSED_FILE_PROGRAM: &str = "dns-failclosed-file";
@@ -199,6 +227,14 @@ pub const DNS_FILE_SELECTOR_RESOLV_RESTORE: &str = "resolv-conf-restore";
 pub const DNS_FILE_SELECTOR_NM_APPLY: &str = "nm-dropin-apply";
 /// Selector: remove the NetworkManager `dns=none` drop-in (teardown).
 pub const DNS_FILE_SELECTOR_NM_REMOVE: &str = "nm-dropin-remove";
+/// Selector: write the macOS `/etc/resolver/rustynet` scoped resolver pointing
+/// the mesh `rustynet` domain at the loopback resolver's bind port
+/// ([`macos_scoped_resolver_contents`]). macOS-only; the daemon requests it only
+/// from the macOS DNS-protection path.
+pub const DNS_FILE_SELECTOR_MACOS_RESOLVER_APPLY: &str = "macos-resolver-apply";
+/// Selector: remove the macOS `/etc/resolver/rustynet` scoped resolver
+/// (teardown).
+pub const DNS_FILE_SELECTOR_MACOS_RESOLVER_REMOVE: &str = "macos-resolver-remove";
 
 /// Fixed path where the pre-fail-closed resolv.conf is stashed so teardown can
 /// restore the host's original resolver configuration. Root-only (0o600). Lives
@@ -219,11 +255,13 @@ pub const RESOLV_CONF_FAILCLOSED_BACKUP_PATH: &str = "/tmp/rustynet-resolv.conf.
 /// The complete, fixed set of selectors the builtin accepts. Anything outside
 /// this set is rejected at the privileged boundary, so callers can never name a
 /// path or supply content of their own.
-pub const DNS_FAILCLOSED_FILE_SELECTORS: [&str; 4] = [
+pub const DNS_FAILCLOSED_FILE_SELECTORS: [&str; 6] = [
     DNS_FILE_SELECTOR_RESOLV_APPLY,
     DNS_FILE_SELECTOR_RESOLV_RESTORE,
     DNS_FILE_SELECTOR_NM_APPLY,
     DNS_FILE_SELECTOR_NM_REMOVE,
+    DNS_FILE_SELECTOR_MACOS_RESOLVER_APPLY,
+    DNS_FILE_SELECTOR_MACOS_RESOLVER_REMOVE,
 ];
 
 /// True iff `selector` is exactly one of the four reviewed builtin operations.
@@ -275,6 +313,12 @@ pub(crate) fn apply_dns_failclosed_file(selector: &str) -> Result<(), String> {
         DNS_FILE_SELECTOR_NM_REMOVE => {
             remove_file_if_present(Path::new(NETWORK_MANAGER_DNS_DROPIN_PATH))
         }
+        // macOS scoped resolver: write/remove /etc/resolver/rustynet so the OS
+        // resolver (mDNSResponder) routes *.rustynet to the loopback resolver's
+        // bind port. The daemon requests these only from the macOS DNS-protection
+        // path; on Linux they fail loud (no /etc/resolver mechanism).
+        DNS_FILE_SELECTOR_MACOS_RESOLVER_APPLY => apply_macos_scoped_resolver(),
+        DNS_FILE_SELECTOR_MACOS_RESOLVER_REMOVE => remove_macos_scoped_resolver(),
         // Unreachable: the guard above already rejected unknown selectors.
         other => Err(format!(
             "unsupported dns-failclosed-file selector: {other:?}"
@@ -313,6 +357,42 @@ fn write_network_manager_dropin() -> Result<(), String> {
         let _ = std::fs::set_permissions(conf_d, std::fs::Permissions::from_mode(0o755));
     }
     atomically_replace_file(path, network_manager_dns_none_dropin().as_bytes(), 0o644)
+}
+
+/// Write the macOS `/etc/resolver/rustynet` scoped resolver, creating the
+/// `/etc/resolver` directory (0o755) when absent. Fixed path, fixed content
+/// ([`macos_scoped_resolver_contents`]) — no caller value crosses the boundary.
+/// Scoped to the `rustynet` domain only, so the host's default resolver for
+/// every other domain is untouched (no DNS-leak surface).
+#[cfg(target_os = "macos")]
+fn apply_macos_scoped_resolver() -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Path::new(MACOS_SCOPED_RESOLVER_DIR);
+    if !dir.is_dir() {
+        std::fs::create_dir_all(dir).map_err(|err| format!("create {}: {err}", dir.display()))?;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    }
+    atomically_replace_file(
+        Path::new(MACOS_SCOPED_RESOLVER_PATH),
+        macos_scoped_resolver_contents().as_bytes(),
+        0o644,
+    )
+}
+
+/// Non-macOS Unix stub: the `/etc/resolver` per-domain mechanism is macOS-only,
+/// so a misrouted request fails loud rather than littering a foreign filesystem.
+/// (On non-Unix the whole builtin chain is the non-Unix stub, so this is not
+/// compiled there.)
+#[cfg(all(unix, not(target_os = "macos")))]
+fn apply_macos_scoped_resolver() -> Result<(), String> {
+    Err("macOS scoped resolver write is only supported on macOS".to_owned())
+}
+
+/// Remove the macOS `/etc/resolver/rustynet` scoped resolver (teardown). A
+/// missing file is a no-op, so teardown never fails closed and strands the node.
+#[cfg(unix)]
+fn remove_macos_scoped_resolver() -> Result<(), String> {
+    remove_file_if_present(Path::new(MACOS_SCOPED_RESOLVER_PATH))
 }
 
 /// Atomically replace `path` with `contents` at `mode`. Security-critical: the
@@ -595,23 +675,58 @@ mod tests {
     // ---- file-write builtin: selector allowlist (cross-platform) ----------
 
     #[test]
-    fn selector_allowlist_is_exactly_the_four_reviewed_operations() {
-        assert!(is_valid_dns_failclosed_file_selector(
-            DNS_FILE_SELECTOR_RESOLV_APPLY
-        ));
-        assert!(is_valid_dns_failclosed_file_selector(
-            DNS_FILE_SELECTOR_RESOLV_RESTORE
-        ));
-        assert!(is_valid_dns_failclosed_file_selector(
-            DNS_FILE_SELECTOR_NM_APPLY
-        ));
-        assert!(is_valid_dns_failclosed_file_selector(
-            DNS_FILE_SELECTOR_NM_REMOVE
-        ));
+    fn selector_allowlist_is_exactly_the_six_reviewed_operations() {
+        for selector in [
+            DNS_FILE_SELECTOR_RESOLV_APPLY,
+            DNS_FILE_SELECTOR_RESOLV_RESTORE,
+            DNS_FILE_SELECTOR_NM_APPLY,
+            DNS_FILE_SELECTOR_NM_REMOVE,
+            DNS_FILE_SELECTOR_MACOS_RESOLVER_APPLY,
+            DNS_FILE_SELECTOR_MACOS_RESOLVER_REMOVE,
+        ] {
+            assert!(
+                is_valid_dns_failclosed_file_selector(selector),
+                "selector {selector:?} must be accepted"
+            );
+        }
         assert_eq!(
             DNS_FAILCLOSED_FILE_SELECTORS.len(),
-            4,
-            "the reviewed selector set is fixed at four operations"
+            6,
+            "the reviewed selector set is fixed at six operations"
+        );
+    }
+
+    #[test]
+    fn macos_scoped_resolver_contents_routes_rustynet_to_loopback_port() {
+        // Exact, byte-stable content: scope `rustynet` to the loopback resolver
+        // on its bind port. The `port` directive is what makes mDNSResponder
+        // reach the unprivileged resolver (no :53 bind / no redirect on macOS).
+        let body = macos_scoped_resolver_contents();
+        assert_eq!(
+            body,
+            format!(
+                "# rustynet mesh scoped resolver\nnameserver 127.0.0.1\nport {MACOS_SCOPED_RESOLVER_LOOPBACK_PORT}\n"
+            )
+        );
+        assert!(body.contains("nameserver 127.0.0.1"));
+        assert!(body.contains("port 53535"));
+        // Scoped resolver must never name an off-host nameserver (leak guard).
+        assert!(!body.contains("nameserver 8."));
+    }
+
+    #[test]
+    fn macos_scoped_resolver_port_tracks_the_daemon_resolver_default() {
+        // The scoped-resolver `port` MUST equal the rustynet resolver's actual
+        // loopback bind port, or mDNSResponder forwards `*.rustynet` to a dead
+        // port. Pin it to the single cross-platform default so a future
+        // bind-port change cannot silently desync the macOS OS-resolver path.
+        let default_port = crate::daemon::DEFAULT_DNS_RESOLVER_BIND_ADDR
+            .parse::<std::net::SocketAddr>()
+            .expect("daemon default resolver bind addr parses")
+            .port();
+        assert_eq!(
+            MACOS_SCOPED_RESOLVER_LOOPBACK_PORT, default_port,
+            "macOS scoped-resolver port must track DEFAULT_DNS_RESOLVER_BIND_ADDR"
         );
     }
 
