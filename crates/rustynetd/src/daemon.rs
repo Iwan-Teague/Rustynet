@@ -704,19 +704,6 @@ impl StateFetcher {
                     let previous = load_dns_zone_watermark(&self.dns_zone_watermark_path)
                         .map_err(|e| format!("read previous dns watermark failed: {e}"))?;
 
-                    let dummy_bundle = AutoTunnelBundle {
-                        node_id: String::new(),
-                        node_capabilities: Vec::new(),
-                        mesh_cidr: String::new(),
-                        assigned_cidr: String::new(),
-                        peers: Vec::new(),
-                        routes: Vec::new(),
-                        signed_exit_node_id: None,
-                        signed_exit_node_capabilities: Vec::new(),
-                        selected_exit_node: None,
-                    };
-                    let context_bundle = auto_bundle.unwrap_or(&dummy_bundle);
-
                     match load_dns_zone_bundle(DnsZoneLoadContext {
                         path: &tmp,
                         verifier_key_path: &self.dns_zone_verifier_key_path,
@@ -728,7 +715,7 @@ impl StateFetcher {
                         previous_watermark: previous,
                         expected_zone_name: &self.dns_zone_name,
                         local_node_id: &self.local_node_id,
-                        auto_tunnel: context_bundle,
+                        auto_tunnel: auto_bundle,
                     }) {
                         Ok(envelope) => {
                             std::fs::rename(&tmp, &self.dns_zone_bundle_path)
@@ -1947,7 +1934,9 @@ struct DnsZoneLoadContext<'a> {
     previous_watermark: Option<DnsZoneWatermark>,
     expected_zone_name: &'a str,
     local_node_id: &'a str,
-    auto_tunnel: &'a AutoTunnelBundle,
+    /// Assignment context for DNS record IP validation.
+    /// When `None`, the assignment-based IP cross-check is skipped.
+    auto_tunnel: Option<&'a AutoTunnelBundle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4179,13 +4168,6 @@ impl DaemonRuntime {
             return;
         }
 
-        let Some(auto_tunnel) = auto_tunnel else {
-            self.dns_zone_error = Some(
-                "dns zone bundle present but signed assignment context is unavailable".to_owned(),
-            );
-            return;
-        };
-
         let previous_watermark = match load_dns_zone_watermark(&self.dns_zone_watermark_path) {
             Ok(value) => value,
             Err(err) => {
@@ -4194,6 +4176,9 @@ impl DaemonRuntime {
             }
         };
 
+        // When auto_tunnel_enforce=false, pass None for assignment-based
+        // IP validation; the independently-signed DNS zone is still loaded.
+        let auto_tunnel_bundle = auto_tunnel.map(|envelope| &envelope.bundle);
         match load_dns_zone_bundle(DnsZoneLoadContext {
             path: &self.dns_zone_bundle_path,
             verifier_key_path: &self.dns_zone_verifier_key_path,
@@ -4202,7 +4187,7 @@ impl DaemonRuntime {
             previous_watermark,
             expected_zone_name: &self.dns_zone_name,
             local_node_id: &self.local_node_id,
-            auto_tunnel: &auto_tunnel.bundle,
+            auto_tunnel: auto_tunnel_bundle,
         }) {
             Ok(envelope) => {
                 if let Err(err) =
@@ -11074,26 +11059,21 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
             DaemonError::InvalidConfig(format!("dns zone watermark preflight failed: {err}"))
         })?;
     if config.dns_zone_bundle_path.exists() {
-        if let Some(auto_tunnel) = auto_tunnel_preflight.as_ref() {
-            if let Err(err) = load_dns_zone_bundle(DnsZoneLoadContext {
-                path: &config.dns_zone_bundle_path,
-                verifier_key_path: &config.dns_zone_verifier_key_path,
-                max_age_secs: config.dns_zone_max_age_secs.get(),
-                trust_policy: TrustPolicy::default(),
-                previous_watermark: dns_zone_watermark,
-                expected_zone_name: &config.dns_zone_name,
-                local_node_id: &config.node_id,
-                auto_tunnel: &auto_tunnel.bundle,
-            }) {
-                // Managed DNS must fail closed for managed names, but stale/invalid bundles
-                // should not prevent daemon startup or dataplane reconciliation.
-                eprintln!(
-                    "rustynetd startup warning: dns zone preflight skipped invalid managed DNS bundle: {err}"
-                );
-            }
-        } else {
+        let auto_tunnel_bundle = auto_tunnel_preflight.as_ref().map(|a| &a.bundle);
+        if let Err(err) = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &config.dns_zone_bundle_path,
+            verifier_key_path: &config.dns_zone_verifier_key_path,
+            max_age_secs: config.dns_zone_max_age_secs.get(),
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: dns_zone_watermark,
+            expected_zone_name: &config.dns_zone_name,
+            local_node_id: &config.node_id,
+            auto_tunnel: auto_tunnel_bundle,
+        }) {
+            // Managed DNS must fail closed for managed names, but stale/invalid bundles
+            // should not prevent daemon startup or dataplane reconciliation.
             eprintln!(
-                "rustynetd startup warning: dns zone bundle present without signed assignment context; managed DNS remains fail-closed"
+                "rustynetd startup warning: dns zone preflight skipped invalid managed DNS bundle: {err}"
             );
         }
     }
@@ -12692,23 +12672,29 @@ fn load_dns_zone_bundle(
         return Err(DnsZoneBootstrapError::Stale);
     }
 
-    let assignment_ip_map = collect_assignment_mesh_ip_map(auto_tunnel)?;
-    for record in &bundle.records {
-        NodeId::new(record.target_node_id.clone())
-            .map_err(|err| DnsZoneBootstrapError::InvalidFormat(err.to_string()))?;
-        let assigned_ip = assignment_ip_map
-            .get(&record.target_node_id)
-            .ok_or_else(|| {
-                DnsZoneBootstrapError::AssignmentMismatch(format!(
-                    "target node {} is not present in signed assignment state",
-                    record.target_node_id
-                ))
-            })?;
-        if assigned_ip != &record.expected_ip {
-            return Err(DnsZoneBootstrapError::AssignmentMismatch(format!(
-                "target node {} expected ip {} does not match signed assignment {}",
-                record.target_node_id, record.expected_ip, assigned_ip
-            )));
+    // Assignment-based IP cross-validation: only enforced when assignment
+    // context is available (auto_tunnel_enforce mode). Without it, the
+    // independently-signed DNS zone is still loaded but records are not
+    // validated against the assignment mesh IP map.
+    if let Some(auto_tunnel) = auto_tunnel {
+        let assignment_ip_map = collect_assignment_mesh_ip_map(auto_tunnel)?;
+        for record in &bundle.records {
+            NodeId::new(record.target_node_id.clone())
+                .map_err(|err| DnsZoneBootstrapError::InvalidFormat(err.to_string()))?;
+            let assigned_ip = assignment_ip_map
+                .get(&record.target_node_id)
+                .ok_or_else(|| {
+                    DnsZoneBootstrapError::AssignmentMismatch(format!(
+                        "target node {} is not present in signed assignment state",
+                        record.target_node_id
+                    ))
+                })?;
+            if assigned_ip != &record.expected_ip {
+                return Err(DnsZoneBootstrapError::AssignmentMismatch(format!(
+                    "target node {} expected ip {} does not match signed assignment {}",
+                    record.target_node_id, record.expected_ip, assigned_ip
+                )));
+            }
         }
     }
 
@@ -25345,7 +25331,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect_err("dns zone with assignment mismatch must be rejected");
         assert!(
@@ -25405,7 +25391,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect("fresh dns zone bundle should load");
 
@@ -25429,7 +25415,7 @@ mod tests {
             previous_watermark: Some(valid.watermark),
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect_err("equal watermark with mismatched payload digest must fail");
         assert!(matches!(err, DnsZoneBootstrapError::ReplayDetected));
@@ -25485,7 +25471,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect("first load should succeed");
 
@@ -25506,7 +25492,7 @@ mod tests {
             previous_watermark: Some(synthetic_newer),
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect_err("strictly older bundle must be rejected as replay");
         assert!(matches!(err, DnsZoneBootstrapError::ReplayDetected));
@@ -25561,7 +25547,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect("first load should succeed");
 
@@ -25582,7 +25568,7 @@ mod tests {
             previous_watermark: Some(synthetic_newer_by_nonce),
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect_err("same generated_at with smaller nonce must be rejected as replay");
         assert!(matches!(err, DnsZoneBootstrapError::ReplayDetected));
@@ -25638,7 +25624,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect("baseline load should succeed");
 
@@ -25656,7 +25642,7 @@ mod tests {
             previous_watermark: Some(strictly_older),
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect("strictly newer generated_at_unix must be accepted");
         assert_eq!(envelope2.watermark, envelope.watermark);
@@ -25711,7 +25697,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect("baseline load should succeed");
 
@@ -25729,7 +25715,7 @@ mod tests {
             previous_watermark: Some(smaller_nonce),
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect("same generated_at with larger nonce must be accepted");
         assert_eq!(envelope2.watermark.nonce, envelope.watermark.nonce);
@@ -25784,7 +25770,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect("first load should succeed");
 
@@ -25796,7 +25782,7 @@ mod tests {
             previous_watermark: Some(envelope.watermark),
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect("equal watermark with matching digest must be accepted");
         assert_eq!(envelope2.watermark, envelope.watermark);
@@ -25866,7 +25852,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect_err("future-dated bundle must be rejected");
         assert!(matches!(err, DnsZoneBootstrapError::FutureDated));
@@ -25933,7 +25919,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect_err("bundle older than max_age must be rejected as stale");
         assert!(matches!(err, DnsZoneBootstrapError::Stale));
@@ -25998,7 +25984,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect_err("bundle past expires_at_unix must be rejected as stale");
         assert!(matches!(err, DnsZoneBootstrapError::Stale));
@@ -26053,7 +26039,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect_err("tampered bundle must fail signature verification");
         assert!(matches!(err, DnsZoneBootstrapError::SignatureInvalid));
@@ -26135,7 +26121,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect_err("bundle signed with a non-trusted key must be rejected");
         assert!(matches!(err, DnsZoneBootstrapError::SignatureInvalid));
@@ -26240,7 +26226,7 @@ mod tests {
             previous_watermark: None,
             expected_zone_name: "rustynet",
             local_node_id: "daemon-local",
-            auto_tunnel: &assignment.bundle,
+            auto_tunnel: Some(&assignment.bundle),
         })
         .expect_err("corrupt signature hex must fail");
         assert!(
