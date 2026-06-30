@@ -9040,7 +9040,13 @@ fn run_macos_orchestration_stages(
                 );
             }
 
-            // Assignment bundle.
+            // Assignment bundle — the daemon needs signed assignment context to
+            // validate the dns-zone bundle (fail-closed: without it dns_zone_state
+            // stays invalid and the loopback resolver serves nothing). When this
+            // macOS node is the elected active exit, the standard issue stage ran
+            // before the macOS node was added to membership, so no per-node
+            // assignment bundle was produced. Issue one on the Linux authority
+            // now, exactly like the dns-zone bundle issuance below.
             let assignment_bundle = report_dir
                 .join("state")
                 .join(format!("assignment-{macos_node_id}.bundle"));
@@ -9051,6 +9057,37 @@ fn run_macos_orchestration_stages(
                     &format!("{MACOS_STATE_ROOT}/rustynetd.assignment"),
                     "0640",
                 )?;
+            } else if is_macos_active_exit {
+                let pubkey_hex = macos_wg_pubkey_hex.as_deref().ok_or_else(|| {
+                    "macOS active exit assignment issuance needs the collected WireGuard public \
+                     key but none is available"
+                        .to_owned()
+                })?;
+                let exit_alias = default_inventory_alias_for_lab_roles(inventory_path, &["exit"])
+                    .map_err(|e| format!("resolve exit alias for macOS assignment: {e}"))?
+                    .ok_or_else(|| {
+                        "no Linux exit alias resolvable from inventory lab_role=exit".to_owned()
+                    })?;
+                let mut out_path = None;
+                issue_assignment_for_windows_node(
+                    macos_alias,
+                    exit_alias.as_str(),
+                    pubkey_hex,
+                    inventory_path,
+                    ssh_identity_file,
+                    known_hosts_path,
+                    report_dir,
+                    &mut out_path,
+                )
+                .map_err(|e| format!("issue macOS assignment bundle failed: {e}"))?;
+                if let Some(ref bundle_path) = out_path {
+                    stage_and_install(
+                        "assignment bundle (issued on-demand for macOS active exit)",
+                        bundle_path.as_path(),
+                        &format!("{MACOS_STATE_ROOT}/rustynetd.assignment"),
+                        "0640",
+                    )?;
+                }
             }
 
             // dns-zone bundle (Rank 2) — present only when the macOS node is the

@@ -601,17 +601,52 @@ fn capture_dns_block_path(
 fn capture_tunnel_dns_resolution(hostname: &str) -> Result<String, String> {
     let max_attempts: u32 = 15;
     let retry_sleep = Duration::from_secs(2);
+    let call_timeout = Duration::from_secs(5);
     let mut last_stdout = String::new();
     for attempt in 1..=max_attempts {
-        let output = Command::new("/usr/bin/dscacheutil")
+        let mut child = Command::new("/usr/bin/dscacheutil")
             .args(["-q", "host", "-a", "name", hostname])
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .map_err(|err| format!("dscacheutil host lookup failed to start: {err}"))?;
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        if stdout.contains("ip_address") {
-            return Ok(stdout);
+        let start = std::time::Instant::now();
+        let mut exited = false;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exited = true;
+                    if status.success() {
+                        let output = child
+                            .wait_with_output()
+                            .map_err(|err| format!("dscacheutil output read failed: {err}"))?;
+                        let stdout =
+                            String::from_utf8_lossy(&output.stdout).into_owned();
+                        if stdout.contains("ip_address") {
+                            return Ok(stdout);
+                        }
+                        last_stdout = stdout;
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    if start.elapsed() >= call_timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    sleep(Duration::from_millis(200));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
         }
-        last_stdout = stdout;
+        if exited && last_stdout.contains("ip_address") {
+            return Ok(last_stdout);
+        }
         if attempt < max_attempts {
             sleep(retry_sleep);
         }
