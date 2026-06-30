@@ -148,6 +148,31 @@ pub fn select_macos_rustynet_anchor(pfctl_anchors_stdout: &str) -> Option<String
         .map(ToOwned::to_owned)
 }
 
+/// Return ALL valid `com.apple/rustynet_g<N>` anchors present in the
+/// `pfctl -s Anchors` output, sorted by generation descending (newest first).
+///
+/// Unlike [`select_macos_rustynet_anchor`] which returns only the single
+/// highest-generation anchor, this returns every matched anchor so callers can
+/// probe each one. When a daemon restart leaves an old anchor (with rules) still
+/// present while the new higher-generation anchor is still empty, probing only
+/// the highest-gen anchor misses the still-in-force rules on the sibling anchor
+/// — a false negative.
+pub fn select_macos_rustynet_anchors(pfctl_anchors_stdout: &str) -> Vec<String> {
+    let mut candidates: Vec<(u64, String)> = pfctl_anchors_stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with(MACOS_RUSTYNET_ANCHOR_PREFIX))
+        .filter(|line| validate_pf_anchor_name(line).is_ok())
+        .filter_map(|line| {
+            let gen_n = parse_generation(line)?;
+            Some((gen_n, line.to_owned()))
+        })
+        .collect();
+    candidates.sort_by_key(|(gen_n, _)| *gen_n);
+    candidates.reverse();
+    candidates.into_iter().map(|(_, anchor)| anchor).collect()
+}
+
 pub fn validate_pf_anchor_name(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 96
