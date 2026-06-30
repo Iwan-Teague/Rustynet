@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph},
 };
 
 use crate::app::App;
@@ -75,65 +75,69 @@ fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize) {
     let empty = bar_w - filled;
     let bar_color = if is_pass { Color::Green } else { Color::Red };
 
-    let mut lines: Vec<Line> = vec![
+    // Truncate stage names to one line — area.width minus symbol prefix.
+    let max_name = (area.width as usize).saturating_sub(3).max(8);
+
+    // Stage line goes BEFORE the bar so it's visible even in short panels.
+    let stage_line: Line = if !is_pass && !run.first_failed_stage.is_empty() {
+        let name = truncate(&short_stage_name(&run.first_failed_stage), max_name);
+        Line::from(vec![
+            Span::styled("⊗ ", Style::default().fg(Color::Red)),
+            Span::styled(name, Style::default().fg(Color::Red)),
+        ])
+    } else if is_pass && !run.last_ran_stage.is_empty() {
+        let name = truncate(&short_stage_name(&run.last_ran_stage), max_name);
+        Line::from(vec![
+            Span::styled("✓ ", Style::default().fg(Color::Green)),
+            Span::styled(name, Style::default().fg(Color::Green)),
+        ])
+    } else {
+        Line::from(Span::styled("—", Style::default().fg(Color::DarkGray)))
+    };
+
+    // For failed runs show which stage number it was; inline with bar.
+    let stage_pos = if !is_pass && run.total_stages > 0 {
+        format!(" ({}/{})", run.passed_stages + 1, run.total_stages)
+    } else {
+        String::new()
+    };
+
+    let lines: Vec<Line> = vec![
+        // 1: run label
         Line::from(Span::styled(label, Style::default().fg(Color::Cyan))),
+        // 2: status + commit
         Line::from(vec![
             Span::styled(result_sym, Style::default().fg(result_color)),
             Span::styled("  @ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                if run.git_commit.is_empty() {
-                    "-------".into()
-                } else {
-                    run.git_commit.clone()
-                },
+                if run.git_commit.is_empty() { "-------".into() } else { run.git_commit.clone() },
                 Style::default().fg(Color::White),
             ),
         ]),
-        // Progress bar + count
+        // 3: stage name — always before the bar
+        stage_line,
+        // 4: progress bar + passed/total count + optional fail position
         Line::from(vec![
             Span::raw("["),
             Span::styled("█".repeat(filled), Style::default().fg(bar_color)),
             Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
             Span::raw("]"),
             Span::styled(count_str, Style::default().fg(Color::Gray)),
+            Span::styled(stage_pos, Style::default().fg(Color::DarkGray)),
         ]),
     ];
 
-    if !is_pass && !run.first_failed_stage.is_empty() {
-        // Show failed stage name and its position in the run.
-        let failed_num = run.passed_stages + 1;
-        lines.push(Line::from(vec![
-            Span::styled("⊗ ", Style::default().fg(Color::Red)),
-            Span::styled(
-                short_stage_name(&run.first_failed_stage),
-                Style::default().fg(Color::Red),
-            ),
-        ]));
-        lines.push(Line::from(Span::styled(
-            format!("  stage {}/{}", failed_num, run.total_stages),
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else if is_pass && !run.last_ran_stage.is_empty() {
-        // Show last stage that ran so user knows how far the run got.
-        lines.push(Line::from(vec![
-            Span::styled("✓ ", Style::default().fg(Color::Green)),
-            Span::styled(
-                short_stage_name(&run.last_ran_stage),
-                Style::default().fg(Color::Green),
-            ),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "  last stage",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else if is_pass {
-        lines.push(Line::from(Span::styled(
-            "all stages passed",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
+    f.render_widget(Paragraph::new(lines), area);
+}
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    }
 }
 
 /// Strip common OS/type prefixes from a stage column name for compact display.
