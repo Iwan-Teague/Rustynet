@@ -437,45 +437,55 @@ const DNS_ANCHOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[cfg(target_os = "macos")]
 fn capture_pf_rules_stdout() -> Result<String, String> {
-    use crate::macos_exit_killswitch_precedence::{
-        AnchorPollOutcome, classify_anchor_poll_sample, validate_pf_anchor_name,
-    };
+    use crate::macos_exit_killswitch_precedence::validate_pf_anchor_name;
     // The macOS exit dataplane loads its filter rules — including the labeled
     // LAN DNS-block rules `render_pf_rules` emits — into a generation-numbered
     // anchor `com.apple/rustynet_g<N>`, NOT the main ruleset. A bare
     // `pfctl -s rules` therefore never observes them. Enumerate the live
-    // anchors, select the highest-generation rustynet anchor, and dump ITS
-    // rules. The anchor generation rotates on every (re-)apply, and between
-    // anchor creation and rule load the anchor can exist empty — a single
-    // "found anchor → break" can land in that window and report rules as
-    // missing even though the killswitch is functionally active. Poll a
-    // bounded number of times and only accept a sample when the anchor exists
-    // AND its rules contain the expected DNS-block labels. Fail loud once the
-    // budget is spent: the producer must observe the real filter rules rather
-    // than silently reporting an empty ruleset that would mask an absent DNS
-    // block.
+    // anchors and dump each one's rules, sorted by generation descending so
+    // the newest anchor is tried first. The anchor generation rotates on every
+    // (re-)apply, and between anchor creation and rule load the newest anchor
+    // can exist empty — a single "found anchor → break" can land in that
+    // window and report rules as missing even though the killswitch is
+    // functionally active and a sibling anchor still holds the rules. Poll a
+    // bounded number of times, probing ALL matching anchors on each sample
+    // (not just the highest generation), and only accept a sample when a
+    // matching anchor's rules contain the expected DNS-block labels. Fail loud
+    // once the budget is spent: the producer must observe the real filter
+    // rules rather than silently reporting an empty ruleset that would mask
+    // an absent DNS block.
+    //
+    // Use `select_macos_rustynet_anchors` (plural) instead of
+    // `select_macos_rustynet_anchor` (singular) so that a daemon restart
+    // which leaves the old anchor with rules while creating a new (higher-gen)
+    // empty anchor does not cause a false negative: we probe ALL the anchors
+    // this generation knows about, not just the top-ranked one.
     let mut rules: Option<String> = None;
     for attempt in 0..DNS_ANCHOR_POLL_ATTEMPTS {
-        let anchors = run_pfctl(&["-s", "Anchors"])?;
-        let has_more_attempts = attempt + 1 < DNS_ANCHOR_POLL_ATTEMPTS;
-        match classify_anchor_poll_sample(anchors.as_str(), has_more_attempts) {
-            AnchorPollOutcome::Found(found) => {
-                validate_pf_anchor_name(found.as_str())?;
-                let candidate = run_pfctl(&["-a", found.as_str(), "-s", "rules"])?;
-                // Anchor existence alone is not enough: the daemon creates the
-                // anchor first and loads rules second, so there is a race window
-                // where the anchor is present but empty. Only accept a sample
-                // whose rules actually contain the labelled block entries.
-                if candidate.contains(DNS_BLOCK_LAN_UDP_RULE)
+        let anchors_stdout = run_pfctl(&["-s", "Anchors"])?;
+        let candidates: Vec<String> =
+            crate::macos_exit_killswitch_precedence::select_macos_rustynet_anchors(
+                anchors_stdout.as_str(),
+            );
+        if !candidates.is_empty() {
+            for anchor in &candidates {
+                validate_pf_anchor_name(anchor.as_str())?;
+                if let Ok(candidate) = run_pfctl(&["-a", anchor.as_str(), "-s", "rules"])
+                    && candidate.contains(DNS_BLOCK_LAN_UDP_RULE)
                     && candidate.contains(DNS_BLOCK_LAN_TCP_RULE)
                 {
                     rules = Some(candidate);
                     break;
                 }
-                sleep(DNS_ANCHOR_POLL_INTERVAL);
+                // A sibling anchor that flushes between poll attempts
+                // returns a non-zero exit + empty stdout; skip it silently.
             }
-            AnchorPollOutcome::Retry => sleep(DNS_ANCHOR_POLL_INTERVAL),
-            AnchorPollOutcome::GiveUp => break,
+            if rules.is_some() {
+                break;
+            }
+        }
+        if attempt + 1 < DNS_ANCHOR_POLL_ATTEMPTS {
+            sleep(DNS_ANCHOR_POLL_INTERVAL);
         }
     }
     rules.ok_or_else(|| {
