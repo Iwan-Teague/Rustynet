@@ -10827,7 +10827,12 @@ fn exercise_macos_blind_exit_live(
            sleep 2; \
          done; \
          if [ \"$PF_OK\" != 1 ]; then \
-           echo 'blind_exit pf anchor com.rustynet/blind_exit is empty (no rules loaded)' >&2; exit 1; fi; \
+           echo 'blind_exit pf anchor com.rustynet/blind_exit is empty (no rules loaded)' >&2; \
+           echo '--- diag: role show ---' >&2; sudo $RN role show 2>&1 | head -5 >&2 || true; \
+           echo '--- diag: pfctl -s info (pf enabled?) ---' >&2; sudo pfctl -s info 2>&1 | head -3 >&2 || true; \
+           echo '--- diag: rustynet pf anchors ---' >&2; sudo pfctl -sA 2>&1 | grep -iE 'rustynet|com.apple' >&2 || true; \
+           echo '--- diag: rustynetd journal (last 3m) ---' >&2; sudo log show --last 3m --predicate 'process == \"rustynetd\"' 2>/dev/null | tail -30 >&2 || true; \
+           exit 1; fi; \
          if echo \"$RULES\" | grep -qiE 'route-to|reply-to|dup-to'; then \
            echo 'blind_exit pf rules contain a bypass primitive (route-to/reply-to/dup-to)' >&2; exit 1; fi; \
          if sudo $RN role transition-check --to exit 2>&1 | grep -qiE 'immutable|factory.?reset|blocked'; then \
