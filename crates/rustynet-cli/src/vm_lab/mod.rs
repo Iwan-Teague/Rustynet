@@ -10132,8 +10132,14 @@ fn activate_macos_exit_role(
             if [ \"$NAT\" != 0 ] && [ \"$FWD\" = 1 ]; then \
               KANCHOR=$(sudo pfctl -s Anchors 2>/dev/null | grep 'com.apple/rustynet_g' | sort -t'g' -k2 -n | tail -1 | tr -d ' '); \
               if [ -z \"$KANCHOR\" ]; then \
-                for gen in $(seq 1 32); do \
-                  if sudo pfctl -a \"com.apple/rustynet_g${gen}\" -s rules >/dev/null 2>&1; then \
+                KANCHOR_GEN=$(sudo $RN status 2>/dev/null | grep -oE 'generation=[0-9]+' | cut -d= -f2 || echo 0); \
+                if [ -n \"$KANCHOR_GEN\" ] && [ \"$KANCHOR_GEN\" -gt 0 ] 2>/dev/null; then \
+                  KANCHOR=\"com.apple/rustynet_g${KANCHOR_GEN}\"; \
+                fi; \
+              fi; \
+              if [ -z \"$KANCHOR\" ]; then \
+                for gen in $(seq 32 -1 1); do \
+                  if sudo pfctl -a \"com.apple/rustynet_g${gen}\" -s rules 2>/dev/null | grep -qE '(block|pass)'; then \
                     KANCHOR=\"com.apple/rustynet_g${gen}\"; \
                     break; \
                   fi; \
