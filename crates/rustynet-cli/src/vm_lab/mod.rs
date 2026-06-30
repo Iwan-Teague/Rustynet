@@ -10140,9 +10140,9 @@ fn activate_macos_exit_role(
                 done; \
               fi; \
               if [ -n \"$KANCHOR\" ]; then \
-                DNS_RULES=$(sudo pfctl -a \"$KANCHOR\" -s rules 2>/dev/null | grep -c 'rustynet-dns-block-lan' || true); \
+                DNS_RULES=$(sudo pfctl -a \"$KANCHOR\" -s rules 2>/dev/null | grep -cE 'block.*(inet|inet6).*proto (udp|tcp).*53' || true); \
                 if [ \"$DNS_RULES\" -ge 2 ]; then exit_dataplane_ok=1; break; fi; \
-                echo \"[activate-macos-exit] attempt $_i: NAT/forwarding ok, anchor $KANCHOR dns-block-lan count=$DNS_RULES (need >=2)\" >&2; \
+                echo \"[activate-macos-exit] attempt $_i: NAT/forwarding ok, anchor $KANCHOR dns-block rules=$DNS_RULES (need >=2)\" >&2; \
               else \
                 echo \"[activate-macos-exit] attempt $_i: NAT/forwarding ok, no killswitch anchor found yet\" >&2; \
               fi; \
