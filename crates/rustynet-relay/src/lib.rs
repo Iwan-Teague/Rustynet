@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "daemon")]
+pub mod hello_limiter_audit;
 pub mod rate_limit;
 pub mod session;
 pub mod transport;

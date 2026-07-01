@@ -16378,6 +16378,65 @@ fn evaluate_enrollment_replay_report(linux_alias: &str, raw_json: &str) -> Resul
     ))
 }
 
+/// Pure evaluator for the JSON output of `rustynet-relay hello-limiter-audit`.
+/// The relay-side audit drives the REAL `HelloLimiter` pre-auth flood guard
+/// (`SecurityMinimumBar.md` §3.3, CWE-770, RSA-0037) with the production cap
+/// value. Fail-closed:
+///   - unsupported schema, or fewer than 2 cases (thin battery),
+///   - the flood-beyond-cap case did not deny,
+///   - the single-node baseline was wrongly denied (vacuous guard).
+fn evaluate_hello_limiter_flood_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynet_relay::hello_limiter_audit::HelloLimiterAuditReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse hello-limiter-audit JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "hello-limiter-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases < 2 {
+        return Err(format!(
+            "hello-limiter-audit ran only {} case(s); expected the full flood + baseline battery",
+            report.total_cases
+        ));
+    }
+    if report.flood_denied < 1 {
+        return Err(
+            "hello-limiter-audit did not deny the beyond-cap flood case — DOS-1/RSA-0037 regression suspected"
+                .to_owned(),
+        );
+    }
+    if report.baseline_accepted < 1 {
+        return Err(
+            "hello-limiter-audit denied the single-node baseline case; the guard is vacuous (would deny everything) or over-broad"
+                .to_owned(),
+        );
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| format!("{} (expected {}, got {})", v.id, v.expectation, v.outcome))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "hello-limiter audit drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Relay HelloLimiter node_id flood cap verified on {linux_alias}: cap enforced beyond MAX_HELLO_LIMITER_ENTRIES, single-node baseline still accepted (DOS-1/RSA-0037 proven live)",
+    ))
+}
+
 /// Pure evaluator for the JSON output of `rustynetd policy-default-deny-audit`.
 /// The daemon-side audit drives the REAL `rustynet_policy` evaluator with a
 /// default-deny truth table (`SecurityMinimumBar.md` §3.6). Fail-closed:
@@ -17848,6 +17907,12 @@ fn issue_assignment_for_windows_node(
 /// rather than silently dispatching against a stale path.
 pub const LINUX_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
 
+/// Canonical install path of `rustynet-relay` on Linux peers, mirroring
+/// `ExecStart=/usr/local/bin/rustynet-relay …` in
+/// `scripts/systemd/rustynet-relay.service`. Pinned in source for the same
+/// reason as [`LINUX_RUSTYNETD_PATH`].
+pub const LINUX_RUSTYNET_RELAY_PATH: &str = "/usr/local/bin/rustynet-relay";
+
 /// Build the POSIX-shell invocation that calls one of the `linux-*-check`
 /// subcommands on the live Linux peer. Centralizes argv-only discipline
 /// so every stage helper goes through the same audited path: the
@@ -17917,6 +17982,43 @@ fn run_linux_daemon_check_remote(
     let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
     let invocation =
         build_linux_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand, extra_args)?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("remote dispatch of {subcommand} failed: {err}"))?;
+    Ok(raw_output.trim().to_owned())
+}
+
+/// Generic SSH dispatcher for a `rustynet-relay <subcommand>` audit, mirroring
+/// [`run_linux_daemon_check_remote`] but targeting the relay binary
+/// ([`LINUX_RUSTYNET_RELAY_PATH`]) instead of `rustynetd`.
+fn run_linux_relay_check_remote(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    subcommand: &str,
+    extra_args: &[String],
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[linux_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {linux_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Linux {
+        return Err(format!(
+            "alias {linux_alias} resolved to non-Linux platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let invocation =
+        build_linux_daemon_check_invocation(LINUX_RUSTYNET_RELAY_PATH, subcommand, extra_args)?;
     let raw_output = capture_remote_shell_command_for_target(
         &target,
         None,
@@ -18301,6 +18403,26 @@ fn run_validate_linux_enrollment_replay_stage(
         .map_err(|reason| (reason, raw))
 }
 
+fn run_validate_linux_hello_limiter_flood_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_relay_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "hello-limiter-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_hello_limiter_flood_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
 fn run_validate_linux_policy_default_deny_stage(
     linux_alias: &str,
     inventory_path: &Path,
@@ -18508,6 +18630,7 @@ fn run_linux_orchestration_stages_with_options(
     let gossip_revoked_readmit_log_path =
         logs_dir.join("validate_linux_gossip_revoked_readmit.log");
     let enrollment_replay_log_path = logs_dir.join("validate_linux_enrollment_replay.log");
+    let hello_limiter_flood_log_path = logs_dir.join("validate_linux_hello_limiter_flood.log");
     let policy_default_deny_log_path = logs_dir.join("validate_linux_policy_default_deny.log");
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
@@ -18707,6 +18830,19 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_enrollment_replay",
             enrollment_replay_log_path.as_path(),
             run_validate_linux_enrollment_replay_stage,
+        )
+    };
+
+    let hello_limiter_flood_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_hello_limiter_flood",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_hello_limiter_flood",
+            hello_limiter_flood_log_path.as_path(),
+            run_validate_linux_hello_limiter_flood_stage,
         )
     };
 
@@ -19259,6 +19395,7 @@ fn run_linux_orchestration_stages_with_options(
         blind_exit_reversal_denied_outcome,
         gossip_revoked_readmit_outcome,
         enrollment_replay_outcome,
+        hello_limiter_flood_outcome,
         policy_default_deny_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
@@ -38245,6 +38382,69 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn hello_limiter_flood_audit_producer_to_validator_round_trip_passes() {
+        let report = rustynet_relay::hello_limiter_audit::run_hello_limiter_flood_audit();
+        assert!(report.overall_ok, "reviewed funnel must pass: {report:?}");
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary = super::evaluate_hello_limiter_flood_report("debian-headless-1", raw.as_str())
+            .expect("clean hello-limiter audit must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("DOS-1"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_hello_limiter_flood_report_rejects_regressed_denial() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 2,
+            "flood_denied": 0,
+            "baseline_accepted": 1,
+            "violations": [
+                {"id": "distinct_node_id_flood_denied_beyond_cap", "expectation": "reject", "outcome": "accepted", "reason": "VIOLATION: node_id beyond the cap was admitted", "passed": false}
+            ]
+        }"#;
+        let err = super::evaluate_hello_limiter_flood_report("debian-headless-1", raw)
+            .expect_err("a regressed denial case must fail closed");
+        assert!(
+            err.contains("did not deny the beyond-cap flood case"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_hello_limiter_flood_report_rejects_vacuous_deny_all() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 2,
+            "flood_denied": 1,
+            "baseline_accepted": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_hello_limiter_flood_report("debian-headless-1", raw)
+            .expect_err("zero accepted baseline must fail closed");
+        assert!(err.contains("vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_hello_limiter_flood_report_rejects_thin_battery() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 1,
+            "flood_denied": 1,
+            "baseline_accepted": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_hello_limiter_flood_report("debian-headless-1", raw)
+            .expect_err("fewer than 2 cases must fail closed");
+        assert!(err.contains("expected the full"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn linux_relay_lifecycle_output_validators_accept_reviewed_dry_run_text() {
         let install = "rustynet-relay systemd unit: install+enable (dry-run) at /etc/systemd/system/rustynet-relay.service\n  - would run: systemctl daemon-reload\n  - would run: systemctl enable rustynet-relay.service\n  - would run: systemctl start rustynet-relay.service\n";
         super::validate_linux_relay_install_output(install).expect("install output validates");
@@ -41297,6 +41497,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_blind_exit_reversal_denied",
             "validate_linux_gossip_revoked_readmit",
             "validate_linux_enrollment_replay",
+            "validate_linux_hello_limiter_flood",
             "validate_linux_policy_default_deny",
             "validate_linux_dns_failclosed",
             "validate_linux_exit_nat_lifecycle",
@@ -41444,6 +41645,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_blind_exit_reversal_denied",
                 "validate_linux_gossip_revoked_readmit",
                 "validate_linux_enrollment_replay",
+                "validate_linux_hello_limiter_flood",
                 "validate_linux_policy_default_deny",
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",
