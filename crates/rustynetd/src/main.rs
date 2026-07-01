@@ -161,6 +161,12 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "membership-signature-audit" => {
                 run_membership_signature_audit_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "membership-revoke-audit" => {
+                run_membership_revoke_audit_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "revoked-peer-denied-audit" => {
+                run_revoked_peer_denied_audit_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "policy-default-deny-audit" => {
                 run_policy_default_deny_audit_command(rest)
             }
@@ -1707,6 +1713,64 @@ fn run_membership_signature_audit_command(args: &[String]) -> Result<(), String>
     if !report.overall_ok {
         return Err(format!(
             "membership signature audit failed: {} violation(s) — the signed-membership verify funnel accepted a forgery or rejected the valid baseline",
+            report.violations.len()
+        ));
+    }
+    Ok(())
+}
+
+fn run_membership_revoke_audit_command(args: &[String]) -> Result<(), String> {
+    // Accept (ignore) --no-fail-on-drift for argv parity with the other check
+    // subcommands; the audit fails closed on its own (non-zero exit).
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!("unknown membership-revoke-audit argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let report = rustynetd::membership_revoke_audit::run_membership_revoke_audit()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize membership-revoke-audit report failed: {err}"))?
+    );
+    if !report.overall_ok {
+        return Err(format!(
+            "membership revoke audit failed: {} violation(s) — RSA-0009's delayed-apply fix regressed or state-root integrity weakened",
+            report.violations.len()
+        ));
+    }
+    Ok(())
+}
+
+fn run_revoked_peer_denied_audit_command(args: &[String]) -> Result<(), String> {
+    // Accept (ignore) --no-fail-on-drift for argv parity with the other check
+    // subcommands; the audit fails closed on its own (non-zero exit).
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!(
+                    "unknown revoked-peer-denied-audit argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = rustynetd::revoked_peer_denied_audit::run_revoked_peer_denied_audit()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize revoked-peer-denied-audit report failed: {err}"))?
+    );
+    if !report.overall_ok {
+        return Err(format!(
+            "revoked-peer-denied audit failed: {} violation(s) — DD-03/RSA-0007's membership-aware ACL fix regressed or is over-broad",
             report.violations.len()
         ));
     }
@@ -3734,6 +3798,8 @@ fn help_text() -> String {
         "  rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]",
         "  rustynetd linux-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--killswitch-table <name>]",
         "  rustynetd membership-signature-audit",
+        "  rustynetd membership-revoke-audit",
+        "  rustynetd revoked-peer-denied-audit",
         "  rustynetd policy-default-deny-audit",
         "  rustynetd privileged-helper-allowlist-audit",
         "  rustynetd macos-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--pf-anchor <name>]",
@@ -3830,8 +3896,9 @@ mod tests {
         run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
         run_macos_exit_dns_failclosed_capture_command,
         run_macos_exit_killswitch_precedence_check_command, run_macos_ipv6_leak_capture_command,
-        run_membership_signature_audit_command, run_policy_default_deny_audit_command,
-        run_privileged_helper_allowlist_audit_command, run_windows_authenticode_check_command,
+        run_membership_revoke_audit_command, run_membership_signature_audit_command,
+        run_policy_default_deny_audit_command, run_privileged_helper_allowlist_audit_command,
+        run_revoked_peer_denied_audit_command, run_windows_authenticode_check_command,
         run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
         run_windows_exit_nat_lifecycle_snapshot_command, run_windows_key_custody_check_command,
         run_windows_killswitch_assert_command, run_windows_mesh_status_check_command,
@@ -4301,6 +4368,66 @@ mod tests {
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown membership-signature-audit argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_membership_revoke_audit_subcommand() {
+        assert!(
+            help_text().contains("membership-revoke-audit"),
+            "help text must advertise membership-revoke-audit subcommand"
+        );
+    }
+
+    #[test]
+    fn run_membership_revoke_audit_command_passes_on_reviewed_funnel() {
+        run_membership_revoke_audit_command(&[])
+            .expect("membership revoke audit must pass against the real fixed reducer");
+    }
+
+    #[test]
+    fn run_membership_revoke_audit_command_accepts_no_fail_on_drift() {
+        run_membership_revoke_audit_command(&["--no-fail-on-drift".to_owned()])
+            .expect("must accept --no-fail-on-drift for argv parity");
+    }
+
+    #[test]
+    fn run_membership_revoke_audit_command_rejects_unknown_flags() {
+        let err = run_membership_revoke_audit_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown membership-revoke-audit argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_revoked_peer_denied_audit_subcommand() {
+        assert!(
+            help_text().contains("revoked-peer-denied-audit"),
+            "help text must advertise revoked-peer-denied-audit subcommand"
+        );
+    }
+
+    #[test]
+    fn run_revoked_peer_denied_audit_command_passes_on_reviewed_funnel() {
+        run_revoked_peer_denied_audit_command(&[])
+            .expect("revoked-peer-denied audit must pass against the real fixed ACL gates");
+    }
+
+    #[test]
+    fn run_revoked_peer_denied_audit_command_accepts_no_fail_on_drift() {
+        run_revoked_peer_denied_audit_command(&["--no-fail-on-drift".to_owned()])
+            .expect("must accept --no-fail-on-drift for argv parity");
+    }
+
+    #[test]
+    fn run_revoked_peer_denied_audit_command_rejects_unknown_flags() {
+        let err = run_revoked_peer_denied_audit_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown revoked-peer-denied-audit argument"),
             "unexpected error: {err}"
         );
     }

@@ -4234,6 +4234,28 @@ static STAGE_INFO: &[StageInfo] = &[
             "artifact collection failed or report directory is not writable",
         ],
     },
+    StageInfo {
+        name: "validate_linux_membership_revoke_applies",
+        aliases: &["membership_revoke_applies", "revoke_applies"],
+        checks: "Drives rustynetd membership-revoke-audit on the Linux node: signs Revoke/RotateKey/Restore/SetCapabilities updates and applies them strictly later than signing, proving RSA-0009's fix (the reducer used to stamp apply-time instead of the signed record's own timestamp, so these four ops were rejected with NewStateRootMismatch and revocation/key-rotation were non-functional).",
+        owning: "crates/rustynetd/src/membership_revoke_audit.rs (daemon audit); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_membership_revoke_audit_report (orchestrator validator)",
+        causes: &[
+            "RSA-0009 regressed: a delayed-apply case is rejected with NewStateRootMismatch again",
+            "the 2 negative cases (tampered new_state_root, stale prev_state_root) stopped rejecting — state-root integrity weakened",
+            "gated on validate_linux_runtime_acls passing first",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_revoked_peer_denied_e2e",
+        aliases: &["revoked_peer_denied", "dd-03", "rsa-0007"],
+        checks: "Drives rustynetd revoked-peer-denied-audit on the Linux node: builds a real Phase10Controller with a broad/wildcard ACL allow rule, then proves a REVOKED peer is denied at set_exit_node/ensure_lan_route_allowed (DD-03/RSA-0007's fix — these call sites used to evaluate ACLs membership-blind) while an ACTIVE peer in the identical scenario is still allowed (anti-vacuous baseline).",
+        owning: "crates/rustynetd/src/revoked_peer_denied_audit.rs (daemon audit); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_revoked_peer_denied_report (orchestrator validator)",
+        causes: &[
+            "DD-03/RSA-0007 regressed: a revoked peer is granted exit-node or LAN-route access again",
+            "the active-peer baseline case stopped being allowed — the ACL gate became over-broad/vacuous-deny",
+            "gated on validate_linux_runtime_acls passing first",
+        ],
+    },
 ];
 
 // `aliases` are &'static str but `norm` is borrowed from a local, so
@@ -5552,6 +5574,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
                 .text
                 .contains("Unknown stage")
         );
+    }
+
+    #[test]
+    fn explain_stage_covers_tier0_revocation_audits() {
+        let revoke = explain_stage("validate_linux_membership_revoke_applies");
+        assert!(
+            revoke.content[0]
+                .text
+                .contains("membership_revoke_audit.rs")
+        );
+        assert!(revoke.content[0].text.contains("RSA-0009"));
+
+        let denied = explain_stage("validate_linux_revoked_peer_denied_e2e");
+        assert!(
+            denied.content[0]
+                .text
+                .contains("revoked_peer_denied_audit.rs")
+        );
+        assert!(denied.content[0].text.contains("RSA-0007"));
     }
 
     #[test]

@@ -1,7 +1,112 @@
 # Live-Lab Security Test Coverage & Threat Matrix — 2026-06-22
 
 Status: **active**. Owner track: security test engineering. Branch:
-`claude/livelab-security-tests`.
+`claude/livelab-security-tests` (original); reprioritized + extended
+2026-07-01 on `claude/cross-platform-parity-hardening`.
+
+## Priority order — build sequence (reprioritized 2026-07-01)
+
+The full backlog below (§2.4, 111 confirmed-implementable gaps) is organized
+by surface, not by priority. This section is the build order — cross-checked
+2026-07-01 against the current orchestrator stage catalog, `SecurityMinimumBar`/
+`Requirements`, every active execution ledger, the MCP orchestration surface,
+and the lab-monitor GUI schema, then verified against the actual code (not
+taken on a report's word — see the inline verification notes below and in
+Phase 3, §9). Stage IDs are the ones already assigned below; this section
+orders them, it does not invent new ones.
+
+### Tier 0 — verify the two already-fixed CRITICAL bugs (build first)
+
+Both are already fixed in code but have **zero live-lab proof**, so revocation
+being "done" currently rests on unit tests alone:
+
+1. **RSA-0009** → `validate_linux_membership_revoke_applies` — apply a signed
+   Revoke/RotateKey/Restore/SetCapabilities update against a live daemon,
+   assert it lands. Fix (`a23df5f`, 2026-06-24) verified present in
+   `crates/rustynet-control/src/membership.rs::reduce_membership_state` as of
+   2026-07-01: the function now takes `op_created_at_unix: u64` and stamps it
+   instead of calling `unix_now()` — the nondeterministic-state-root bug
+   described in FINDING-A (§2.1) is closed in code.
+2. **DD-03** → `validate_linux_revoked_peer_denied_e2e` — revoke a live peer,
+   then prove its real WireGuard traffic is denied by dataplane/exit/LAN ACL
+   admission, not just that its config went stale. Fix (`92e5748`,
+   2026-06-24) verified present as of 2026-07-01: both ACL call sites in
+   `crates/rustynetd/src/phase10.rs` (`set_exit_node`, `ensure_lan_route_allowed`)
+   now call `evaluate_with_membership`; no remaining production call to the
+   membership-blind `evaluate()` exists in `rustynetd` (the one hit,
+   `policy_default_deny_audit.rs:198`, is the truth-table audit harness
+   deliberately exercising both evaluators for comparison, not a trust
+   decision path).
+
+### Tier 1 — adversarial stages that attack a control, not just exercise it
+
+In rough priority order; all IDs already carry full spec + bite-test in §2.4:
+
+| Priority | ID | Stage | Attacks |
+|---|---|---|---|
+| 1 | GM-1 | `validate_linux_gossip_revoked_readmit` | Gossip re-admitting a revoked node — `ingest_inbound_bundle` never checks membership; defense-in-depth gap right next to DD-03 |
+| 2 | ENR-1 | `validate_linux_enrollment_replay` | Presenting an already-consumed enrollment token again |
+| 3 | TOCTOU-1 | `validate_linux_enrollment_concurrent_consume` | Two processes redeeming one token simultaneously (RSA-0023, no file lock on the ledger) |
+| 4 | DOS-1 | `validate_linux_relay_hello_node_id_flood` | Unauthenticated memory exhaustion via relay `HelloLimiter` (RSA-0037, confirmed-unbounded map) |
+| 5 | RT-2 | `validate_linux_blind_exit_reversal_denied` | Every non-blind_exit transition after going blind — today only the "stays blind_exit" positive path is proven |
+| 6 | RR-01/02/03 | `validate_linux_replay_persistence` (+ traversal/enrollment variants) | Replaying a stale/consumed bundle after reboot — watermark is in-memory only (RSA-0029) |
+| 7 | FCF-1/2/3 | `validate_linux_crash_midapply_failclosed` / `_corrupt_state_failclosed` / `_keystore_unavailable_failclosed` | `kill -9` mid-signed-state-write, truncated trust state, locked keystore — daemon must refuse to boot into an inconsistent trust state |
+| 8 | RPT-01 | `validate_linux_relay_ciphertext_only` | **See correction below — this is currently the ONLY relay-forwarding proof of any kind on any OS, not just the ciphertext-only property** |
+| 9 | S3-10 | `validate_macos_codesign` (+ Windows Authenticode deploy-time equivalent) | Tampered/unsigned binary landing on a node — today's checks are CI-gate-only |
+| 10 | RSA-0063 | `validate_macos_bootstrap_privesc_residue` | Leftover `NOPASSWD: ALL` sudoers file after a failed Homebrew install — confirmed-present, CRITICAL/High severity, zero coverage |
+| 11 | KC-04 | Windows key-custody negative path | `validate_key_custody_permissions` no-ops on non-Unix (RSA-0002) — a world-readable key silently passes on Windows |
+| 12 | PH-7 | `validate_macos_privileged_helper_allowlist` | Same adversarial argv corpus already proven on Linux, ported to `pfctl` |
+| 13 | KL-2/KL-3/KL-4 | macOS/Windows killswitch-leak parity | Linux now has full v4+v6 active-probe+capture; other OSes don't |
+| 14 | KC-07 | macOS/Windows secrets-not-in-logs parity | Linux-only today; the Linux gate is also currently RED (RSA-0080 — macOS bootstrap `rm -f`'s the WG passphrase, no secure-erase) — fix alongside |
+| 15 | CNT-1 | `validate_linux_upnp_ssrf` | Confirmed-present SSDP LOCATION/controlURL SSRF (RSA-0035), zero live coverage |
+| 16 | PH-2/PH-3 | Privileged-helper live socket fuzz + cross-UID rejection | Today's helper coverage is argv-only — nothing attacks the live IPC socket itself |
+
+**Correction to item 8 / §3 vuln-class-8, verified 2026-07-01:** the existing
+"✅ forwarding" coverage claim for relay is not accurate. `live_linux_relay_test.rs`
+proves the systemd/launchd unit is active, `/healthz` answers, and stop/uninstall
+cleanly tears down — service **lifecycle** only, no traffic. `live_linux_two_hop_test.rs`
+tests `client → entry(also serving exit) → final_exit → internet` — exit-role
+*chaining*, a different subsystem from the dedicated `rustynet-relay`
+frame-forwarding service. **No stage on any OS has ever driven a real peer's
+session through the relay role and proven a frame was forwarded.** This was
+already flagged once (`LiveLabCoverageAndHonestyAudit_2026-06-25.md` findings
+#7/#8) and partially addressed since — the two-hop test now does a real ICMP
+probe + per-hop TTL-delta measurement (not just status-string checks), and
+relay lifecycle is now genuinely live-proven (not dry-run-as-pass) — but the
+frame-forwarding property itself is still unproven. This is the same gap
+tracked as `HP-3` in `MasterWorkPlan_2026-03-22.md` and
+`CrossPlatformRoleParityRoadmap_2026-06-22.md` ("most substantial remaining
+code item"). RPT-01 above is the closest existing spec; building it (or a
+plain `validate_linux_relay_forwards_frame` proof first, with ciphertext-only
+as a follow-on assertion) closes both RPT-01 and HP-3 at once.
+
+### Tier 2 — larger, infra-gated items (design mostly done, needs a prerequisite first)
+
+- **HP-3 relay live packet-forwarding proof** — see correction above; arguably
+  the single biggest "looks done but isn't" gap in the whole matrix.
+- **nas/llm M5 live evidence chain** (deploy→authorize→use→revoke→undeploy) —
+  last milestone blocking the service-hosting program
+  (`ServiceHostingRolesRoadmap_2026-06-11.md`).
+- **Cross-network NAT-profile substrate (X1–X3)** — needed before
+  `cross_network_cold_enroll`/`anchor_renumber`/`double_nat_anchor` can produce
+  real evidence instead of `fail`-by-default
+  (`CrossNetworkSubstrateIntegrationSpec_2026-06-21.md`).
+- **Real cross-OS role-switch** — macOS/Windows actually flipping role, not
+  just "tunnel stays up" (`CrossOsRoleSwitchPlan_2026-06-24.md` exists, no
+  stage yet).
+
+### Needs verification, not a build item — check before trusting
+
+- **CPA-1** (`validate_linux_audit_chain_integrity`) is marked ✅DONE in §2.3,
+  but a 2026-07-01 grep of `crates/rustynet-cli/src/vm_lab/mod.rs` and
+  `crates/rustynet-cli/src/bin/` found **zero references** to
+  `audit_chain_integrity` anywhere in the orchestrator. Either a standalone
+  e2e script exists outside those paths and wasn't found, or the ✅DONE marker
+  is wrong. Confirm one way or the other before relying on it — do not
+  re-mark it done again without finding the actual wired stage.
+
+Full mechanics for wiring any of the above into the orchestrator, both MCP
+servers, and the lab-monitor GUI: Phase 3, §9 below.
 
 ## 0) Purpose & scope
 
@@ -118,7 +223,7 @@ adversarial stage) · 🆕 added on this branch · ⚠️ gap (see §5).
 | 5 | Fail-open under failure | §3.4, §4 (fail-closed) | `live_chaos_crash_recovery`, `live_chaos_daemon_fault`, `live_chaos_resource_exhaustion`; `force_fail_closed_or_restrict` | — | ✅ |
 | 6 | Killswitch / traffic leak (v4 **&v6**) | §3.8, §6 (leak tests) | v4: `real_wireguard_no_leak_under_load.sh`, `capture_*_exit_killswitch_precedence`, `no_leak_dataplane_gate.sh`, `live_linux_path_handoff_under_load_test.sh` | **🆕 `validate_linux_ipv6_leak`** (IPv6 leak) | ✅ v4; **🆕 v6 (was ⚠️ GAP-1)**; ⚠️ v6 macOS/Windows parity (GAP-4) |
 | 7 | DNS leak / DNS fail-closed | §3.8, §6 | `validate_{linux,macos,windows}_exit_dns_failclosed`, `validate_*_dns_failclosed`, `live_*_managed_dns_test.sh` | — | ✅ (A records); ⚠️ AAAA/IPv6-DNS not separately asserted (GAP-4) |
-| 8 | Relay-sees-plaintext | §3 (relay), Dataplane plan | `live_linux_two_hop_test.sh`, relay membership-binding gate; relay zero-copy forward unit | — | ✅ forwarding; 🧪 explicit "relay cannot decrypt" assertion is structural |
+| 8 | Relay-sees-plaintext | §3 (relay), Dataplane plan | `live_linux_relay_test.rs` (service lifecycle: active/`healthz`/clean stop, live-proven, not dry-run); `live_linux_two_hop_test.sh` (separate subsystem — exit-role chaining, real ICMP+TTL-delta probe); relay zero-copy forward unit | — | ⚠️ **corrected 2026-07-01**: relay *lifecycle* ✅ live-proven; relay *frame-forwarding* is ⚠️ unproven on every OS — no stage has ever driven a real peer's session through the relay role (see priority-order section above, RPT-01/HP-3). Previous "✅ forwarding" here conflated lifecycle + an unrelated exit-chaining test with actual relay forwarding. |
 | 9 | Exit NAT residue | §6.D.7 | `validate_{linux,macos,windows}_exit_nat_lifecycle` (two-phase: present during / gone after); RSA-0031 teardown-verify | — | ✅ |
 | 10 | Privilege escalation / helper abuse | §3.7, §7 (argv-only) | unit: 36 `validate_request` adversarial cases + `fuzzgate_*`; live: `live_chaos_privileged_boundary` | **🆕 `validate_linux_privileged_helper_allowlist`** (corpus vs real allowlist, FAIL-LOUD, per-OS) | ✅ + **🆕 orchestrator-integrated stage** |
 | 11 | Role-transition abuse | §6.D | gates: `role_taxonomy_gates.sh`, `role_transition_audit_gates.sh`, `blind_exit_irreversibility_gates.sh`; live: `live_*_role_switch_matrix_test.sh` | — | ✅ |
@@ -317,6 +422,14 @@ validation). Together they mean **node revocation is effectively non-functional*
   The first is surgical (only the four ops change; `AddNode`/genesis roots
   unchanged). Land with the deterministic regression test + a clock seam so the
   live `validate_linux_membership_revoke_applies` stage (audit RSA-0009) passes.
+- **STATUS UPDATE (2026-07-01):** fix landed in `a23df5f` ("membership: make
+  the reducer state-root deterministic so revocation applies"). Verified
+  present in current code: `reduce_membership_state` now takes
+  `op_created_at_unix: u64` and stamps it on `SetNodeCapabilities`/`RevokeNode`/
+  `RestoreNode`/`RotateNodeKey` instead of calling `unix_now()`. **The code fix
+  is real; `validate_linux_membership_revoke_applies` still does not exist**
+  (zero hits in `vm_lab/mod.rs`) — this is Tier 0 priority 1 above. Until that
+  stage exists and passes live, the fix's correctness rests on unit tests only.
 
 ### FINDING-B (CRITICAL) — DD-03 / RSA-0007/0008: dataplane/exit/LAN admission is revocation-blind
 
@@ -334,6 +447,16 @@ validation). Together they mean **node revocation is effectively non-functional*
   `evaluate_with_membership` (as service_exposure already does) so a revoked
   identity is denied regardless of a residual allow rule. Then the live
   `validate_linux_revoked_peer_denied_e2e` stage (audit DD-03) passes.
+- **STATUS UPDATE (2026-07-01):** fix landed in `92e5748` ("phase10: gate
+  exit-node + LAN-route ACLs with membership"). Verified present in current
+  code: both `Phase10Controller::set_exit_node` and `ensure_lan_route_allowed`
+  in `crates/rustynetd/src/phase10.rs` now call `evaluate_with_membership`; a
+  repo-wide grep of `rustynetd` found no remaining production call to the
+  membership-blind `evaluate()` (the sole hit, `policy_default_deny_audit.rs:198`,
+  is the truth-table audit harness deliberately exercising both evaluators for
+  comparison — not a live trust decision path). **The code fix is real;
+  `validate_linux_revoked_peer_denied_e2e` still does not exist** (zero hits
+  in `vm_lab/mod.rs`) — this is Tier 0 priority 2 above.
 
 ## 2.2) Other audit-surfaced defect candidates (need code verification before a stage can pass)
 
@@ -565,7 +688,7 @@ first within each surface.
 
 | sev | eff | id | proposed stage | control |
 |---|---|---|---|---|
-| high | medium | CPA-1 | validate_linux_audit_chain_integrity (mirror mac… ✅DONE | SecMinBar §3.9 — tamper-evident, append-only audit log with active integrity verification.… |
+| high | medium | CPA-1 | validate_linux_audit_chain_integrity (mirror mac… ⚠️UNVERIFIED (was ✅DONE) | SecMinBar §3.9 — tamper-evident, append-only audit log with active integrity verification.… **2026-07-01: grepped `vm_lab/mod.rs` + `src/bin/` for `audit_chain_integrity` — zero hits. Either a standalone script exists outside those paths, or this marker is wrong. Confirm before trusting; see priority-order section above.** |
 | high | medium | CPA-2 | validate_linux_audit_failclosed. Render audit pa… | SecMinBar §3.9 + §6.D.6 (every role transition — success/fail/abort — MUST emit an append-… |
 | medium | medium | CPA-3 | validate_linux_control_tls_posture_failclosed. N… | SecMinBar §3.2 — TLS 1.3 enforced for control-plane (attested signed posture, not a wire h… |
 
@@ -615,3 +738,107 @@ first within each surface.
 - **role_transition/RT-7** (infeasible): SecMinBar §6.D.8 — mobile role lock: iOS/Android FFI MUST refuse any role set != client and advertise client-only on snapshot reload.
 - **enrollment_token/ENR-4** (infeasible): SecMinBar §6.C.3 token scope / target-node binding ('over-scoped token', 'token used on WRONG node'): a token should not be redeemable beyon…
 - **dos_resource/DOS-4** (infeasible): MCP server stdin line reader must bound per-line length so a newline-less line cannot exhaust memory (RSA-0047).
+
+---
+
+# Phase 3 — Prioritization, verification, and stage-onboarding mechanics (2026-07-01)
+
+A cross-cutting review answered: what's the build order across everything above,
+are the "done" claims still true, and — since ~15 new stages are queued —
+what has to change in the orchestrator, both MCP servers, and the lab-monitor
+GUI to onboard them efficiently. The priority order itself, the FINDING-A/
+FINDING-B fix-landed verification, the relay-forwarding correction, and the
+CPA-1 flag are already folded into the top of this document (see "Priority
+order" section) and inline into §2.1/§3/§2.4 rather than duplicated here. This
+section is the supporting mechanics.
+
+## 9) Stage-onboarding mechanics — orchestrator, MCP, GUI
+
+There is **no single canonical stage registry**. Adding one new stage touches
+up to four independent, hand-maintained places, and nothing enforces they stay
+in sync:
+
+1. **Orchestrator (`rustynet-cli`, source of truth)** — implement the stage,
+   register it in the orchestrator's sequence in `crates/rustynet-cli/src/vm_lab/mod.rs`,
+   have it write a row to `state/stages.tsv` under a specific name string.
+2. **`rustynet-mcp-deepseek` (`crates/rustynet-mcp/src/bin/deepseek.rs`)** — only
+   needed if the stage should be selectable as a role-platform cell:
+   - Extend the `deepseek_lab_run` input schema (around line 5048-5057) and
+     `build_orchestrator_args` (around line 4147-4243, mirror the existing
+     `--<role>-platform` push pattern at lines 4198-4211).
+   - If it deserves a canonical shortcut key, add a branch to `target_from_key`
+     (lines 1184-1270).
+   - To make it auto-selectable when it fails, extend the substring heuristic
+     in `key_for_stage_or_cell` (lines 3978-4012) — it matches on
+     `n.contains("macos")`/`n.contains("windows")` + a role keyword, not a
+     structured lookup. **Practical convention: name new stages so they
+     contain the OS + role keyword** (e.g. `validate_macos_privileged_helper_allowlist`)
+     so autonomous failure-routing picks them up for free, with zero extra code.
+3. **`rustynet-mcp-lab-state` (`crates/rustynet-mcp/src/bin/lab_state.rs`)** —
+   add an entry to the static `STAGE_INFO` array (lines 4032-4237) so
+   `explain_stage` describes the new stage instead of falling into "Unknown
+   stage" (lines 4275-4285). Read-only/descriptive, no functional gating.
+4. **`rustynet-mcp-repo-context` (`crates/rustynet-mcp/src/bin/repo_context.rs`)** —
+   add a row to the hardcoded `ORCHESTRATOR_STAGES` markdown table constant
+   (lines 2061-2094), returned verbatim by `get_orchestrator_stages`. Also a
+   static string literal, not derived from code.
+
+Polling tools need **zero changes** for a new stage — `deepseek_live_lab_result`,
+`get_stage_log`, `get_run_matrix`, and `grep_report` are all generic tsv/csv/log
+readers that pick up any new stage name automatically once the orchestrator
+writes rows for it.
+
+**No per-stage isolation exists for live-validation/adversarial stages.** Only
+*setup* stages (`preflight`, `bootstrap_hosts`, `membership_setup`, etc. — the
+full list is `setup_stage_names()` in `vm_lab/mod.rs:2207-2227`) support
+`--rerun-stage`/`--resume-from` via `start_live_lab_run`. For a test stage
+(traffic, role_switch, exit_handoff, relay, anchor, the new adversarial stages
+above), the closest approximation is `rebuild_nodes` + `skip_soak`, which still
+replays the *entire* live suite rather than isolating one stage. Given ~15
+new adversarial stages are queued above, each needing the same iterate-fix-
+reverify cycle the Windows anchor stage needed this session, **building a
+lightweight per-stage isolation mechanism for test stages (not just setup
+stages) is the single highest-leverage infra investment before starting Tier 1**.
+
+**Dead config found, not wired to either MCP server:** `disabled_stages` exists
+in the lab-monitor GUI's own config (`crates/rustynet-lab-monitor/src/config.rs`,
+`app.rs`, `ui/config_panel.rs`) but has no effect on `deepseek_lab_run` or
+`start_live_lab_run` — the control looks functional in the GUI but does
+nothing. Either wire it up for real or remove it before it misleads whoever's
+watching the monitor.
+
+## 10) GUI representation — `rustynet-lab-monitor` `run_matrix.rs`
+
+Adding a new stage to the FULL STAGE MATRIX tab:
+
+- **Generic stage, applies uniformly to all 3 OSes**: add the suffix string to
+  `GENERIC_STAGE_ORDER` (`crates/rustynet-lab-monitor/src/data/run_matrix.rs:410-432`).
+  Everything else (`load_full_stage_matrix`, the header-bar counter) derives
+  automatically. Bump the two hardcoded test totals (`21` → `21+N`,
+  `78` → `78+N` in `full_stage_matrix_has_21_generic_stages_per_os_in_canonical_order`
+  and `stage_progress_agrees_with_full_stage_matrix_total_on_a_complete_csv`).
+- **Single-OS one-off security column**: add to `MACOS_ONEOFF_COLUMNS` /
+  `WINDOWS_ONEOFF_COLUMNS` (lines 436-443) — same auto-derivation. There is
+  **no `LINUX_ONEOFF_COLUMNS` list today**; several Tier-1 stages above
+  (bootstrap privesc residue, Linux-specific key custody) are Linux-only
+  security checks with nowhere to go in the current schema — create that list
+  (mirroring lines 436-443) before those land, not after.
+- **No functional-vs-security category exists.** `StageMatrixEntry` has no
+  category/kind field — every stage in `GENERIC_STAGE_ORDER` and both one-off
+  lists renders identically in the FULL STAGE MATRIX tab today. Given this
+  document's whole purpose is closing security gaps, tag stages now: add a
+  `StageCategory::{Functional, Security}` field to `StageMatrixEntry`,
+  retroactively tag the existing security-flavored entries (`key_custody`,
+  `secrets_not_in_logs`, all 4 one-off columns), and the GUI can grow a
+  visually distinct SECURITY section immediately — each of the ~15 Tier-1
+  stages above then just needs a tag, not a structural change, when it lands.
+
+## 11) Verification ledger for this phase (what was checked against real code, not taken on a report's word)
+
+| Claim | Verified how | Result |
+|---|---|---|
+| FINDING-A (RSA-0009) fixed | Read current `membership.rs::reduce_membership_state`, confirmed `op_created_at_unix` param + usage on all 4 mutation ops | Confirmed fixed, `a23df5f` present in HEAD history |
+| FINDING-B (DD-03/RSA-0007) fixed | Grepped `rustynetd` for `.evaluate(` vs `.evaluate_with_membership(`, read `phase10.rs` call sites | Confirmed fixed, `92e5748` present in HEAD history; sole remaining blind-`evaluate` call is the audit harness itself |
+| `validate_linux_membership_revoke_applies` / `validate_linux_revoked_peer_denied_e2e` exist | Grepped `crates/rustynet-cli/src/` + `documents/` | Zero hits outside this document — neither stage is built |
+| Relay forwarding is live-proven ("✅" in §3 row 8) | Read `live_linux_relay_test.rs` (lifecycle/healthz only) and `live_linux_two_hop_test.rs` (separate exit-chaining subsystem) | Claim was inaccurate — corrected in §3; cross-referenced against `LiveLabCoverageAndHonestyAudit_2026-06-25.md` findings #7/#8 and `MasterWorkPlan_2026-03-22.md` HP-3 |
+| CPA-1 (`validate_linux_audit_chain_integrity`) is ✅DONE | Grepped `vm_lab/mod.rs` + `src/bin/` for `audit_chain_integrity` | Zero hits — flagged ⚠️UNVERIFIED in §2.4, not re-asserted as done |

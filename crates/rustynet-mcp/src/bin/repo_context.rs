@@ -2086,6 +2086,27 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 20 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
 | 21 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
+## Daemon Security-Validator Stages (Linux)
+
+A separate family of stages, not `OrchestrationStage` trait impls — each drives
+a `rustynetd <name>-audit` in-binary self-audit over SSH and is dispatched via
+the Linux daemon-validator chain in `crates/rustynet-cli/src/vm_lab/mod.rs`
+(gated on `validate_linux_runtime_acls` passing first). Two are Tier-0
+priority, added 2026-07-01 to prove previously-unverified critical fixes live:
+
+| Stage | Proves | Daemon audit | Orchestrator validator |
+|---|---|---|---|
+| `validate_linux_membership_revoke_applies` | RSA-0009: Revoke/RotateKey/Restore/SetCapabilities apply even when signed strictly before the apply time | `crates/rustynetd/src/membership_revoke_audit.rs` | `evaluate_membership_revoke_audit_report` in `vm_lab/mod.rs` |
+| `validate_linux_revoked_peer_denied_e2e` | DD-03/RSA-0007: a revoked peer is denied at `Phase10Controller::set_exit_node`/`ensure_lan_route_allowed` despite a broad ACL allow rule | `crates/rustynetd/src/revoked_peer_denied_audit.rs` | `evaluate_revoked_peer_denied_report` in `vm_lab/mod.rs` |
+
+Other stages in this family (`validate_linux_membership_signature_forgery`,
+`validate_linux_privileged_helper_allowlist`, `validate_linux_policy_default_deny`,
+`validate_linux_runtime_acls`, `validate_linux_service_hardening`,
+`validate_linux_authenticode`, `validate_linux_key_custody`,
+`validate_linux_membership_genesis`, `validate_linux_mesh_status`) exist and
+run but are not yet documented here or in `explain_stage`'s `STAGE_INFO` —
+tracked as a follow-up, not done as part of this addition.
+
 ## VM Lab Entry Points (CLI / lab-state MCP)
 - `ops vm-lab-discover-local-utm-summary` — discover VMs, quick summary
 - `ops vm-lab-orchestrate-live-lab` — one-shot: discover → restart → setup → run → diagnose

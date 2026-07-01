@@ -48,6 +48,7 @@ pub mod macos_utun_helper_server;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub(crate) mod macos_utun_helper_unsafe;
+pub mod membership_revoke_audit;
 pub mod membership_signature_audit;
 pub mod perf;
 pub mod phase10;
@@ -58,6 +59,7 @@ pub mod privileged_helper;
 pub mod privileged_helper_allowlist_audit;
 pub mod relay_client;
 pub mod resilience;
+pub mod revoked_peer_denied_audit;
 pub mod secret_log_audit;
 pub mod service_access_state;
 pub mod service_exposure;

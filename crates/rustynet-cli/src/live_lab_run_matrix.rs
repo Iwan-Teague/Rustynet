@@ -140,6 +140,17 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "windows_dpapi_key_custody",
     "macos_keychain_key_custody",
     "macos_pf_killswitch",
+    "linux_membership_revoke_applies",
+    "linux_revoked_peer_denied_e2e",
+    "linux_membership_signature_forgery",
+    "linux_privileged_helper_allowlist",
+    "linux_policy_default_deny",
+    "linux_runtime_acls",
+    "linux_service_hardening",
+    "linux_authenticode",
+    "linux_key_custody",
+    "linux_membership_genesis",
+    "linux_mesh_status",
     "regression_reference_commit",
     "regression_notes",
     "linux_client_alias",
@@ -1395,6 +1406,12 @@ fn set_special_stage_values(
         "validate_macos_exit_killswitch_precedence" => {
             set_status(values, schema, "macos_pf_killswitch", status)
         }
+        "validate_linux_membership_revoke_applies" => {
+            set_status(values, schema, "linux_membership_revoke_applies", status)
+        }
+        "validate_linux_revoked_peer_denied_e2e" => {
+            set_status(values, schema, "linux_revoked_peer_denied_e2e", status)
+        }
         _ if stage.starts_with("validate_") => {
             let _ = platform;
         }
@@ -1830,8 +1847,44 @@ mod tests {
     use super::{
         DEFAULT_MATRIX_COLUMNS, LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome,
         build_live_lab_run_matrix_values, csv_escape, parse_csv_record, render_csv_row,
+        set_special_stage_values,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn tier0_revocation_stages_map_to_dedicated_csv_columns() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let mut values = BTreeMap::new();
+        set_special_stage_values(
+            &mut values,
+            &schema,
+            "linux",
+            "validate_linux_membership_revoke_applies",
+            "pass",
+        );
+        set_special_stage_values(
+            &mut values,
+            &schema,
+            "linux",
+            "validate_linux_revoked_peer_denied_e2e",
+            "fail",
+        );
+        assert_eq!(
+            values
+                .get("linux_membership_revoke_applies")
+                .map(String::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            values
+                .get("linux_revoked_peer_denied_e2e")
+                .map(String::as_str),
+            Some("fail")
+        );
+    }
 
     #[test]
     fn rsa0055_csv_escape_neutralizes_formula_injection() {
