@@ -93,6 +93,7 @@ mod daemon {
         RelayArgs(Vec<String>),
         WindowsService(WindowsRelayServiceOptions),
         WindowsServiceHardeningCheck { fail_on_drift: bool },
+        HelloLimiterAudit,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1023,9 +1024,35 @@ mod daemon {
         Ok(Some(fail_on_drift))
     }
 
+    /// Accepts (ignoring) `--no-fail-on-drift` for argv parity with the
+    /// orchestrator's `build_linux_daemon_check_invocation`, which always
+    /// appends that flag regardless of target binary — this is an
+    /// adversarial security audit, not a drift check, so it always fails
+    /// closed on `!overall_ok`.
+    fn parse_hello_limiter_audit_args(args: &[String]) -> Result<Option<()>, String> {
+        let Some(command) = args.get(1) else {
+            return Ok(None);
+        };
+        if command != "hello-limiter-audit" {
+            return Ok(None);
+        }
+        for flag in &args[2..] {
+            match flag.as_str() {
+                "--no-fail-on-drift" => {}
+                _ => {
+                    return Err(format!("unknown hello-limiter-audit argument: {flag}"));
+                }
+            }
+        }
+        Ok(Some(()))
+    }
+
     pub fn select_relay_host_entry(args: &[String]) -> Result<RelayHostEntrySelection, String> {
         if let Some(fail_on_drift) = parse_windows_relay_service_hardening_check_args(args)? {
             return Ok(RelayHostEntrySelection::WindowsServiceHardeningCheck { fail_on_drift });
+        }
+        if parse_hello_limiter_audit_args(args)?.is_some() {
+            return Ok(RelayHostEntrySelection::HelloLimiterAudit);
         }
         let (relay_args, service) = strip_windows_service_args(args)?;
         if let Some(service) = service {
@@ -2082,6 +2109,22 @@ mod daemon {
         }
     }
 
+    pub fn run_hello_limiter_audit_command() -> Result<(), String> {
+        let report = rustynet_relay::hello_limiter_audit::run_hello_limiter_flood_audit();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|err| format!("serialize hello-limiter-audit report failed: {err}"))?
+        );
+        if !report.overall_ok {
+            return Err(format!(
+                "hello-limiter audit failed: {} violation(s) — DOS-1/RSA-0037 node_id flood cap regressed",
+                report.violations.len()
+            ));
+        }
+        Ok(())
+    }
+
     pub fn run_windows_relay_service_hardening_check(fail_on_drift: bool) -> Result<(), String> {
         let snapshot = collect_windows_relay_service_hardening_snapshot()?;
         let report = build_windows_relay_service_hardening_report(snapshot);
@@ -2360,7 +2403,8 @@ mod daemon {
             build_windows_relay_service_hardening_report, evaluate_windows_relay_service_hardening,
             http_request_path, load_control_verifier_key, parse_relay_id_arg,
             parse_windows_image_path_argv, render_health_json, render_metrics,
-            select_relay_host_entry, serialize_relay_reject, serve_health_endpoint,
+            run_hello_limiter_audit_command, select_relay_host_entry, serialize_relay_reject,
+            serve_health_endpoint,
         };
         // Only the off-Windows fail-closed test calls this collector directly; on
         // Windows the symbol is unused here, so gate the import to match its caller.
@@ -3046,6 +3090,38 @@ mod daemon {
         }
 
         #[test]
+        fn relay_hello_limiter_audit_entry_parses_flags() {
+            let selection = select_relay_host_entry(&[
+                "rustynet-relay".to_owned(),
+                "hello-limiter-audit".to_owned(),
+            ])
+            .expect("hello-limiter-audit should parse");
+            assert_eq!(selection, RelayHostEntrySelection::HelloLimiterAudit);
+
+            let selection = select_relay_host_entry(&[
+                "rustynet-relay".to_owned(),
+                "hello-limiter-audit".to_owned(),
+                "--no-fail-on-drift".to_owned(),
+            ])
+            .expect("hello-limiter-audit should accept --no-fail-on-drift for argv parity");
+            assert_eq!(selection, RelayHostEntrySelection::HelloLimiterAudit);
+
+            let err = select_relay_host_entry(&[
+                "rustynet-relay".to_owned(),
+                "hello-limiter-audit".to_owned(),
+                "--bogus".to_owned(),
+            ])
+            .expect_err("unknown hello-limiter-audit flag must fail closed");
+            assert!(err.contains("unknown hello-limiter-audit argument"));
+        }
+
+        #[test]
+        fn run_hello_limiter_audit_command_passes_on_reviewed_funnel() {
+            run_hello_limiter_audit_command()
+                .expect("hello-limiter audit must pass against the real fixed HelloLimiter");
+        }
+
+        #[test]
         fn relay_windows_service_hardening_evaluator_accepts_reviewed_snapshot() {
             evaluate_windows_relay_service_hardening(&reviewed_relay_service_snapshot())
                 .expect("reviewed relay service snapshot should validate");
@@ -3625,6 +3701,9 @@ async fn main() {
         }
         Ok(daemon::RelayHostEntrySelection::WindowsServiceHardeningCheck { fail_on_drift }) => {
             daemon::run_windows_relay_service_hardening_check(fail_on_drift)
+        }
+        Ok(daemon::RelayHostEntrySelection::HelloLimiterAudit) => {
+            daemon::run_hello_limiter_audit_command()
         }
         Err(err) => Err(err),
     };

@@ -1015,16 +1015,16 @@ fn parse_nonce_hex(value: &str) -> Result<[u8; 16], String> {
 /// Set well above any legitimate distinct-node cardinality in a 1-second window
 /// (the relay's session cap is `DEFAULT_MAX_TOTAL_SESSIONS` = 4096) so it never
 /// false-rejects real peers, while still bounding total memory.
-const MAX_HELLO_LIMITER_ENTRIES: usize = 16_384;
+pub(crate) const MAX_HELLO_LIMITER_ENTRIES: usize = 16_384;
 
-struct HelloLimiter {
+pub(crate) struct HelloLimiter {
     max_per_sec: u32,
     max_entries: usize,
     counts: HashMap<String, (u32, Instant)>,
 }
 
 impl HelloLimiter {
-    fn new(max_per_sec: u32) -> Self {
+    pub(crate) fn new(max_per_sec: u32) -> Self {
         Self {
             max_per_sec,
             max_entries: MAX_HELLO_LIMITER_ENTRIES,
@@ -1033,7 +1033,7 @@ impl HelloLimiter {
     }
 
     /// Returns `true` if the hello should be allowed, `false` if rate-limited.
-    fn check(&mut self, node_id: &str) -> bool {
+    pub(crate) fn check(&mut self, node_id: &str) -> bool {
         let now = Instant::now();
 
         // RSA-0037: hard-cap the map so a pre-auth node_id flood cannot exhaust
@@ -1069,6 +1069,14 @@ impl HelloLimiter {
     fn prune_elapsed(&mut self, now: Instant) {
         self.counts
             .retain(|_, (_, started)| now.duration_since(*started) < Duration::from_secs(1));
+    }
+
+    /// Number of distinct `node_id` windows currently tracked. Exposed for the
+    /// DOS-1 flood audit (`crate::hello_limiter_audit`) to observe the map
+    /// size without reaching into the private `counts` field.
+    #[cfg(feature = "daemon")]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.counts.len()
     }
 }
 
