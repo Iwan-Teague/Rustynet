@@ -96,5 +96,27 @@
         }
       }
     }
+  },
+  "mcp": {
+    "rustynet-repo-context": {
+      "type": "local",
+      "command": ["/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-repo-context"],
+      "enabled": true
+    },
+    "rustynet-gate-runner": {
+      "type": "local",
+      "command": ["/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-gate-runner"],
+      "enabled": true
+    },
+    "rustynet-lab-state": {
+      "type": "local",
+      "command": ["/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-lab-state"],
+      "enabled": true
+    },
+    "rustynet-deepseek": {
+      "type": "local",
+      "command": ["/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-deepseek"],
+      "enabled": true
+    }
   }
 }
