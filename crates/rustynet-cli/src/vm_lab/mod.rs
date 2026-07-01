@@ -16206,6 +16206,64 @@ fn evaluate_revoked_peer_denied_report(
     ))
 }
 
+/// Pure evaluator for the JSON output of `rustynetd blind-exit-reversal-audit`.
+/// Proves RT-2/SecMinBar §6.D.2: once a node is blind_exit, every other role
+/// transition attempt (client/admin/exit/relay/anchor/nas/llm) must be
+/// rejected at the signed-membership-state layer, while an ordinary
+/// non-blind_exit node's capability change still succeeds (anti-vacuous).
+fn evaluate_blind_exit_reversal_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::blind_exit_reversal_audit::BlindExitReversalAuditReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse blind-exit-reversal-audit JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "blind-exit-reversal-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases < 8 {
+        return Err(format!(
+            "blind-exit-reversal-audit ran only {} case(s); expected the full 7 reversal + 1 baseline battery",
+            report.total_cases
+        ));
+    }
+    if report.reversal_denied < 7 {
+        return Err(format!(
+            "blind-exit-reversal-audit only denied {} of the 7 reversal attempts — RT-2/SecMinBar §6.D.2 regression suspected",
+            report.reversal_denied
+        ));
+    }
+    if report.baseline_accepted < 1 {
+        return Err(
+            "blind-exit-reversal-audit denied the non-blind_exit baseline case; the guard is vacuous (would deny everything) or over-broad"
+                .to_owned(),
+        );
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| format!("{} (expected {}, got {})", v.id, v.expectation, v.outcome))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "blind-exit-reversal audit drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Blind_exit irreversibility verified on {linux_alias}: {} reversal attempts denied, non-blind_exit baseline still allowed (RT-2 fix proven live)",
+        report.reversal_denied
+    ))
+}
+
 /// Pure evaluator for the JSON output of `rustynetd policy-default-deny-audit`.
 /// The daemon-side audit drives the REAL `rustynet_policy` evaluator with a
 /// default-deny truth table (`SecurityMinimumBar.md` §3.6). Fail-closed:
@@ -18069,6 +18127,26 @@ fn run_validate_linux_revoked_peer_denied_stage(
         .map_err(|reason| (reason, raw))
 }
 
+fn run_validate_linux_blind_exit_reversal_denied_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "blind-exit-reversal-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_blind_exit_reversal_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
 fn run_validate_linux_policy_default_deny_stage(
     linux_alias: &str,
     inventory_path: &Path,
@@ -18271,6 +18349,8 @@ fn run_linux_orchestration_stages_with_options(
     let membership_revoke_applies_log_path =
         logs_dir.join("validate_linux_membership_revoke_applies.log");
     let revoked_peer_denied_log_path = logs_dir.join("validate_linux_revoked_peer_denied_e2e.log");
+    let blind_exit_reversal_denied_log_path =
+        logs_dir.join("validate_linux_blind_exit_reversal_denied.log");
     let policy_default_deny_log_path = logs_dir.join("validate_linux_policy_default_deny.log");
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
@@ -18431,6 +18511,19 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_revoked_peer_denied_e2e",
             revoked_peer_denied_log_path.as_path(),
             run_validate_linux_revoked_peer_denied_stage,
+        )
+    };
+
+    let blind_exit_reversal_denied_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_blind_exit_reversal_denied",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_blind_exit_reversal_denied",
+            blind_exit_reversal_denied_log_path.as_path(),
+            run_validate_linux_blind_exit_reversal_denied_stage,
         )
     };
 
@@ -18980,6 +19073,7 @@ fn run_linux_orchestration_stages_with_options(
         membership_signature_forgery_outcome,
         membership_revoke_applies_outcome,
         revoked_peer_denied_outcome,
+        blind_exit_reversal_denied_outcome,
         policy_default_deny_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
@@ -37773,6 +37867,70 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn blind_exit_reversal_audit_producer_to_validator_round_trip_passes() {
+        let report = rustynetd::blind_exit_reversal_audit::run_blind_exit_reversal_audit()
+            .expect("audit runs");
+        assert!(report.overall_ok, "reviewed funnel must pass: {report:?}");
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary = super::evaluate_blind_exit_reversal_report("debian-headless-1", raw.as_str())
+            .expect("clean blind-exit-reversal audit must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("RT-2"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_blind_exit_reversal_report_rejects_regressed_denial() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 8,
+            "reversal_denied": 5,
+            "baseline_accepted": 1,
+            "violations": [
+                {"id": "blind_exit_to_client_denied", "expectation": "reject", "outcome": "accepted", "reason": "ACCEPTED: blind_exit capabilities were reversed", "passed": false}
+            ]
+        }"#;
+        let err = super::evaluate_blind_exit_reversal_report("debian-headless-1", raw)
+            .expect_err("a regressed reversal case must fail closed");
+        assert!(
+            err.contains("only denied 5 of the 7"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_blind_exit_reversal_report_rejects_vacuous_deny_all() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 8,
+            "reversal_denied": 7,
+            "baseline_accepted": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_blind_exit_reversal_report("debian-headless-1", raw)
+            .expect_err("zero accepted baseline must fail closed");
+        assert!(err.contains("vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_blind_exit_reversal_report_rejects_thin_battery() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 3,
+            "reversal_denied": 3,
+            "baseline_accepted": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_blind_exit_reversal_report("debian-headless-1", raw)
+            .expect_err("fewer than 8 cases must fail closed");
+        assert!(err.contains("expected the full"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn linux_relay_lifecycle_output_validators_accept_reviewed_dry_run_text() {
         let install = "rustynet-relay systemd unit: install+enable (dry-run) at /etc/systemd/system/rustynet-relay.service\n  - would run: systemctl daemon-reload\n  - would run: systemctl enable rustynet-relay.service\n  - would run: systemctl start rustynet-relay.service\n";
         super::validate_linux_relay_install_output(install).expect("install output validates");
@@ -40822,6 +40980,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_membership_signature_forgery",
             "validate_linux_membership_revoke_applies",
             "validate_linux_revoked_peer_denied_e2e",
+            "validate_linux_blind_exit_reversal_denied",
             "validate_linux_policy_default_deny",
             "validate_linux_dns_failclosed",
             "validate_linux_exit_nat_lifecycle",
@@ -40966,6 +41125,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_membership_signature_forgery",
                 "validate_linux_membership_revoke_applies",
                 "validate_linux_revoked_peer_denied_e2e",
+                "validate_linux_blind_exit_reversal_denied",
                 "validate_linux_policy_default_deny",
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",
