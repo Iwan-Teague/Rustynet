@@ -27046,8 +27046,15 @@ fn capture_remote_shell_command_with_channel_retry(
     remote_script: &str,
     timeout: Duration,
 ) -> Result<String, String> {
-    const MAX_ATTEMPTS: u32 = 3;
-    const RETRY_BACKOFF: Duration = Duration::from_secs(5);
+    // Live evidence (2026-07-01, 3 consecutive runs): the channel rejection
+    // survived a 3-attempt/5s-backoff budget (~15s total). A benign command
+    // of identical encoded length ran clean 3/3 times against an idle guest
+    // immediately after, ruling out a payload-size limit — so the rejection
+    // window during a live run (reached only after ~30 min of sustained
+    // bootstrap/enforce load on the resource-constrained UTM guest) can
+    // outlast a short retry. Widen the budget rather than guess further.
+    const MAX_ATTEMPTS: u32 = 6;
+    const RETRY_BACKOFF: Duration = Duration::from_secs(10);
     let mut last_error = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         match capture_remote_shell_command_for_target(
