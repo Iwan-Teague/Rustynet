@@ -189,6 +189,8 @@ pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
 /// Summary of a single completed lab run, for the Previous Runs panel.
 #[derive(Debug, Clone)]
 pub struct RunSummary {
+    /// Not currently rendered by any panel; kept for tests/future display.
+    #[allow(dead_code)]
     pub run_id: String,
     /// Short (7-char) git commit SHA.
     pub git_commit: String,
@@ -207,6 +209,20 @@ pub struct RunSummary {
 /// Only `*_stage_*` and `cross_os_*` columns count as lab stages.
 fn is_lab_stage_column(header: &str) -> bool {
     header.contains("_stage_") || header.starts_with("cross_os_")
+}
+
+/// The full, authoritative "does this column represent a real pass/fail
+/// check" definition shared by [`load_stage_progress`] (the header bar
+/// counter) and [`load_full_stage_matrix`] (the FULL STAGE MATRIX tab), so
+/// the two always agree. Deliberately excludes role-presence columns
+/// (`linux_client`, `macos_admin`, ...) — those record "was this role
+/// elected for this run", not a pass/fail outcome, even though they use the
+/// same `pass`/`not_run` vocabulary.
+fn is_full_stage_matrix_column(header: &str) -> bool {
+    is_lab_stage_column(header)
+        || LINUX_ONEOFF_COLUMNS.iter().any(|(col, _)| *col == header)
+        || MACOS_ONEOFF_COLUMNS.iter().any(|(col, _)| *col == header)
+        || WINDOWS_ONEOFF_COLUMNS.iter().any(|(col, _)| *col == header)
 }
 
 pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
@@ -269,10 +285,7 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
                 .unwrap_or("")
                 .to_owned();
 
-            let run_id = run_id_idx
-                .and_then(|i| row.get(i))
-                .unwrap_or("")
-                .to_owned();
+            let run_id = run_id_idx.and_then(|i| row.get(i)).unwrap_or("").to_owned();
 
             let mut passed = 0usize;
             let mut total = 0usize;
@@ -371,6 +384,154 @@ pub fn load_sparklines(
     Ok(sparklines)
 }
 
+/// One row in the full stage matrix: a stage's display name plus its
+/// current pass/fail/untested state (same [`ParityState`] semantics used
+/// elsewhere — latest decisive `pass`/`fail` in run history wins; `skip`
+/// and `not_run` both read as `Unproven`, matching [`latest_decisive_value`]).
+#[derive(Debug, Clone)]
+pub struct StageMatrixEntry {
+    pub name: String,
+    pub state: ParityState,
+}
+
+/// The complete "what needs to pass" grid: every real live-lab stage
+/// check, bucketed by the OS it validates. `cross_os` holds the shared
+/// interop checks that don't belong to a single OS.
+#[derive(Debug, Clone, Default)]
+pub struct FullStageMatrix {
+    pub linux: Vec<StageMatrixEntry>,
+    pub macos: Vec<StageMatrixEntry>,
+    pub windows: Vec<StageMatrixEntry>,
+    pub cross_os: Vec<StageMatrixEntry>,
+}
+
+/// Canonical order for the 21 stage suffixes shared by all three OS
+/// columns, so row N means the same stage in every column — required for
+/// the "Windows is ahead, macOS still has gaps" at-a-glance comparison.
+const GENERIC_STAGE_ORDER: &[&str] = &[
+    "bootstrap",
+    "membership",
+    "assignments",
+    "baseline_runtime",
+    "anchor",
+    "relay_service_lifecycle",
+    "exit_handoff",
+    "lan_toggle",
+    "two_hop",
+    "role_switch_matrix",
+    "managed_dns",
+    "mixed_topology",
+    "reboot_recovery",
+    "extended_soak",
+    "chaos",
+    "secrets_not_in_logs",
+    "key_custody",
+    "enrollment_restart",
+    "network_flap",
+    "traversal",
+    "cleanup",
+];
+
+/// One-off platform-specific security checks that aren't `_stage_`-prefixed
+/// in the CSV but clearly belong to one OS. `(csv_column, display_name)`.
+const LINUX_ONEOFF_COLUMNS: &[(&str, &str)] = &[
+    (
+        "linux_membership_revoke_applies",
+        "membership_revoke_applies",
+    ),
+    ("linux_revoked_peer_denied_e2e", "revoked_peer_denied_e2e"),
+];
+const MACOS_ONEOFF_COLUMNS: &[(&str, &str)] = &[
+    ("macos_keychain_key_custody", "keychain_key_custody"),
+    ("macos_pf_killswitch", "pf_killswitch"),
+];
+const WINDOWS_ONEOFF_COLUMNS: &[(&str, &str)] = &[
+    ("windows_named_pipe_acl", "named_pipe_acl"),
+    ("windows_dpapi_key_custody", "dpapi_key_custody"),
+];
+
+/// Load the full per-OS stage matrix (every `{os}_stage_*` column in
+/// canonical order, plus each OS's one-off security columns, plus
+/// `cross_os_*` as a shared bucket). This is deliberately independent of
+/// [`role_stage_columns`] — that function maps a coarse role to a
+/// representative stage for the 8x3 parity view; this loads every
+/// individual stage check for the full matrix view.
+pub fn load_full_stage_matrix(repo_root: &Path) -> Result<FullStageMatrix> {
+    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    if !path.exists() {
+        return Ok(FullStageMatrix::default());
+    }
+
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_path(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let headers = reader
+        .headers()
+        .with_context(|| format!("reading headers from {}", path.display()))?
+        .clone();
+
+    let mut rows: Vec<csv::StringRecord> = Vec::new();
+    for r in reader.records().flatten() {
+        rows.push(r);
+    }
+
+    let state_for = |column: &str| -> ParityState {
+        let Some(idx) = headers.iter().position(|h| h == column) else {
+            return ParityState::Unproven;
+        };
+        match latest_decisive_value(&rows, idx) {
+            Some("pass") => ParityState::Proven,
+            Some("fail") => ParityState::Failed,
+            _ => ParityState::Unproven,
+        }
+    };
+
+    let mut matrix = FullStageMatrix::default();
+    for suffix in GENERIC_STAGE_ORDER {
+        matrix.linux.push(StageMatrixEntry {
+            name: (*suffix).to_owned(),
+            state: state_for(&format!("linux_stage_{suffix}")),
+        });
+        matrix.macos.push(StageMatrixEntry {
+            name: (*suffix).to_owned(),
+            state: state_for(&format!("macos_stage_{suffix}")),
+        });
+        matrix.windows.push(StageMatrixEntry {
+            name: (*suffix).to_owned(),
+            state: state_for(&format!("windows_stage_{suffix}")),
+        });
+    }
+    for (column, name) in LINUX_ONEOFF_COLUMNS {
+        matrix.linux.push(StageMatrixEntry {
+            name: (*name).to_owned(),
+            state: state_for(column),
+        });
+    }
+    for (column, name) in MACOS_ONEOFF_COLUMNS {
+        matrix.macos.push(StageMatrixEntry {
+            name: (*name).to_owned(),
+            state: state_for(column),
+        });
+    }
+    for (column, name) in WINDOWS_ONEOFF_COLUMNS {
+        matrix.windows.push(StageMatrixEntry {
+            name: (*name).to_owned(),
+            state: state_for(column),
+        });
+    }
+    for header in headers.iter() {
+        if let Some(name) = header.strip_prefix("cross_os_") {
+            matrix.cross_os.push(StageMatrixEntry {
+                name: name.to_owned(),
+                state: state_for(header),
+            });
+        }
+    }
+
+    Ok(matrix)
+}
+
 fn role_stage_columns(role: Role, os: Os) -> Vec<String> {
     let prefix = os.csv_prefix();
     match role {
@@ -389,10 +550,7 @@ fn role_stage_columns(role: Role, os: Os) -> Vec<String> {
 }
 
 fn stage_progress_column(header: &str, rows: &[csv::StringRecord], idx: usize) -> bool {
-    if matches!(
-        header,
-        "overall_result" | "linux_present" | "macos_present" | "windows_present"
-    ) {
+    if !is_full_stage_matrix_column(header) {
         return false;
     }
     rows.iter().any(|row| {
@@ -571,7 +729,182 @@ mod tests {
 
         let progress = load_stage_progress(dir.path()).unwrap();
 
-        assert_eq!(progress.total, 4);
-        assert_eq!(progress.passed, 3);
+        // Only macos_stage_anchor, cross_os_dns, windows_stage_exit_handoff are
+        // real stage columns; linux_present/linux_client are role-presence
+        // flags and must not count (see next test).
+        assert_eq!(progress.total, 3);
+        // macos_stage_anchor latest=pass, cross_os_dns latest=fail,
+        // windows_stage_exit_handoff latest row is not_run so falls back to
+        // the earlier decisive "pass".
+        assert_eq!(progress.passed, 2);
+    }
+
+    #[test]
+    fn stage_progress_excludes_role_presence_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,linux_present,linux_client,linux_admin,macos_present,macos_exit,windows_present,windows_relay\n\
+             pass,pass,pass,pass,pass,pass,pass,pass\n",
+        );
+
+        let progress = load_stage_progress(dir.path()).unwrap();
+
+        // Every column here is a role-presence/summary flag; none are real
+        // stage checks, so the header bar's counter must read 0/0, not 8/8.
+        assert_eq!(progress.total, 0);
+        assert_eq!(progress.passed, 0);
+    }
+
+    #[test]
+    fn stage_progress_agrees_with_full_stage_matrix_total_on_a_complete_csv() {
+        // Build a CSV containing every real stage column (all 3 OS x the 21
+        // canonical suffixes, plus the one-offs, plus a couple of
+        // cross_os_* columns) -- i.e. the shape of the real, mature
+        // production CSV -- alongside a couple of role-presence columns that
+        // must NOT be counted. On a CSV this complete, load_stage_progress's
+        // total (columns that actually exist) and load_full_stage_matrix's
+        // total (the fixed canonical list) must agree, since every column
+        // the matrix expects is present. This is the exact invariant behind
+        // "why does the top bar show 96 but the matrix shows 78".
+        let mut headers = vec!["overall_result".to_owned(), "linux_present".to_owned()];
+        for suffix in GENERIC_STAGE_ORDER {
+            headers.push(format!("linux_stage_{suffix}"));
+            headers.push(format!("macos_stage_{suffix}"));
+            headers.push(format!("windows_stage_{suffix}"));
+        }
+        for (col, _) in LINUX_ONEOFF_COLUMNS {
+            headers.push((*col).to_owned());
+        }
+        for (col, _) in MACOS_ONEOFF_COLUMNS {
+            headers.push((*col).to_owned());
+        }
+        for (col, _) in WINDOWS_ONEOFF_COLUMNS {
+            headers.push((*col).to_owned());
+        }
+        for suffix in [
+            "bootstrap",
+            "membership_convergence",
+            "peer_visibility",
+            "direct_path",
+            "relay_path",
+            "exit_path",
+            "dns",
+            "lan_toggle",
+            "role_switch",
+            "anchor_bundle_pull",
+            "anchor_enrollment",
+        ] {
+            headers.push(format!("cross_os_{suffix}"));
+        }
+
+        let values: Vec<&str> = headers.iter().map(|_| "pass").collect();
+        let csv = format!("{}\n{}\n", headers.join(","), values.join(","));
+
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(dir.path(), &csv);
+
+        let progress = load_stage_progress(dir.path()).unwrap();
+        let matrix = load_full_stage_matrix(dir.path()).unwrap();
+        let matrix_total =
+            matrix.linux.len() + matrix.macos.len() + matrix.windows.len() + matrix.cross_os.len();
+
+        assert_eq!(progress.total, matrix_total);
+        assert_eq!(matrix_total, 80);
+    }
+
+    #[test]
+    fn full_stage_matrix_has_21_generic_stages_per_os_in_canonical_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,linux_stage_bootstrap\npass,pass\n",
+        );
+        let matrix = load_full_stage_matrix(dir.path()).unwrap();
+        // 21 generic stages in canonical order, plus Linux's own one-off
+        // security columns (LINUX_ONEOFF_COLUMNS) appended after them —
+        // present unconditionally (as Unproven here, since this CSV doesn't
+        // set them), same as macOS/Windows's one-offs.
+        assert_eq!(matrix.linux.len(), 21 + 2);
+        assert_eq!(matrix.linux[0].name, "bootstrap");
+        assert_eq!(matrix.linux[1].name, "membership");
+        assert_eq!(matrix.linux[20].name, "cleanup");
+    }
+
+    #[test]
+    fn full_stage_matrix_computes_latest_decisive_state_per_column() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,macos_stage_anchor,windows_stage_bootstrap\n\
+             pass,pass,fail\n\
+             pass,fail,not_run\n",
+        );
+        let matrix = load_full_stage_matrix(dir.path()).unwrap();
+        let macos_anchor = matrix.macos.iter().find(|e| e.name == "anchor").unwrap();
+        assert_eq!(macos_anchor.state, ParityState::Failed);
+        let windows_bootstrap = matrix
+            .windows
+            .iter()
+            .find(|e| e.name == "bootstrap")
+            .unwrap();
+        // Latest row is not_run; falls back to the earlier decisive "fail".
+        assert_eq!(windows_bootstrap.state, ParityState::Failed);
+    }
+
+    #[test]
+    fn full_stage_matrix_missing_column_is_unproven() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(dir.path(), "overall_result\npass\n");
+        let matrix = load_full_stage_matrix(dir.path()).unwrap();
+        assert!(
+            matrix
+                .linux
+                .iter()
+                .all(|e| e.state == ParityState::Unproven)
+        );
+    }
+
+    #[test]
+    fn full_stage_matrix_places_oneoff_columns_in_the_right_os_and_cross_os_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,windows_named_pipe_acl,windows_dpapi_key_custody,\
+             macos_keychain_key_custody,macos_pf_killswitch,\
+             linux_membership_revoke_applies,linux_revoked_peer_denied_e2e,cross_os_dns\n\
+             pass,pass,fail,pass,fail,pass,fail,pass\n",
+        );
+        let matrix = load_full_stage_matrix(dir.path()).unwrap();
+        assert_eq!(matrix.windows.len(), 21 + 2);
+        assert_eq!(matrix.macos.len(), 21 + 2);
+        assert_eq!(matrix.linux.len(), 21 + 2);
+        assert!(
+            matrix
+                .windows
+                .iter()
+                .any(|e| e.name == "named_pipe_acl" && e.state == ParityState::Proven)
+        );
+        assert!(
+            matrix
+                .macos
+                .iter()
+                .any(|e| e.name == "pf_killswitch" && e.state == ParityState::Failed)
+        );
+        assert!(
+            matrix
+                .linux
+                .iter()
+                .any(|e| e.name == "membership_revoke_applies" && e.state == ParityState::Proven)
+        );
+        assert!(
+            matrix
+                .linux
+                .iter()
+                .any(|e| e.name == "revoked_peer_denied_e2e" && e.state == ParityState::Failed)
+        );
+        assert_eq!(matrix.cross_os.len(), 1);
+        assert_eq!(matrix.cross_os[0].name, "dns");
+        assert_eq!(matrix.cross_os[0].state, ParityState::Proven);
     }
 }

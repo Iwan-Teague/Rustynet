@@ -89,13 +89,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(visible), content_area);
 
     if let Some(pill_rect) = pill_area {
-        let pill = format!(" ↓ {} new line{}  G/End to follow ", new_lines, if new_lines == 1 { "" } else { "s" });
+        let pill = format!(
+            " ↓ {} new line{}  G/End to follow ",
+            new_lines,
+            if new_lines == 1 { "" } else { "s" }
+        );
         f.render_widget(
             Paragraph::new(Span::styled(
                 pill,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow),
+                Style::default().fg(Color::Black).bg(Color::Yellow),
             )),
             pill_rect,
         );

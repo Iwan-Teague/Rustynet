@@ -64,8 +64,7 @@ fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize) {
     let count_str = format!(" {}/{}", run.passed_stages, run.total_stages);
     let bar_w = (area.width as usize)
         .saturating_sub(2 + count_str.len()) // brackets + count
-        .min(20)
-        .max(4);
+        .clamp(4, 20);
     let ratio = if run.total_stages > 0 {
         run.passed_stages as f64 / run.total_stages as f64
     } else {
@@ -110,7 +109,11 @@ fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize) {
             Span::styled(result_sym, Style::default().fg(result_color)),
             Span::styled("  @ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                if run.git_commit.is_empty() { "-------".into() } else { run.git_commit.clone() },
+                if run.git_commit.is_empty() {
+                    "-------".into()
+                } else {
+                    run.git_commit.clone()
+                },
                 Style::default().fg(Color::White),
             ),
         ]),
@@ -145,11 +148,7 @@ fn truncate(s: &str, max: usize) -> String {
 ///      "cross_os_dns"                 → "x: dns"
 ///      "validate_macos_exit_foo"      → "validate_macos_exit_foo" (kept as-is)
 fn short_stage_name(name: &str) -> String {
-    for prefix in &[
-        "linux_stage_",
-        "macos_stage_",
-        "windows_stage_",
-    ] {
+    for prefix in &["linux_stage_", "macos_stage_", "windows_stage_"] {
         if let Some(rest) = name.strip_prefix(prefix) {
             return rest.to_owned();
         }

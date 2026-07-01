@@ -83,7 +83,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 /// - Failed  → red fill (pass ratio) + red dim remainder — entire bar stays red
 /// - Unproven → gray fill (pass ratio) + dark-gray remainder
 fn progress_bar(state: ParityState, history: &[CellOutcome]) -> Line<'static> {
-    let relevant = history.iter().filter(|o| **o != CellOutcome::NotRun).count();
+    let relevant = history
+        .iter()
+        .filter(|o| **o != CellOutcome::NotRun)
+        .count();
     let passes = history.iter().filter(|o| **o == CellOutcome::Pass).count();
 
     match state {
@@ -96,7 +99,12 @@ fn progress_bar(state: ParityState, history: &[CellOutcome]) -> Line<'static> {
     }
 }
 
-fn build_bar(passes: usize, relevant: usize, fill_color: Color, empty_color: Color) -> Line<'static> {
+fn build_bar(
+    passes: usize,
+    relevant: usize,
+    fill_color: Color,
+    empty_color: Color,
+) -> Line<'static> {
     let ratio = if relevant > 0 {
         passes as f64 / relevant as f64
     } else {
