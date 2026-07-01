@@ -2098,14 +2098,15 @@ priority, added 2026-07-01 to prove previously-unverified critical fixes live:
 |---|---|---|---|
 | `validate_linux_membership_revoke_applies` | RSA-0009: Revoke/RotateKey/Restore/SetCapabilities apply even when signed strictly before the apply time | `crates/rustynetd/src/membership_revoke_audit.rs` | `evaluate_membership_revoke_audit_report` in `vm_lab/mod.rs` |
 | `validate_linux_revoked_peer_denied_e2e` | DD-03/RSA-0007: a revoked peer is denied at `Phase10Controller::set_exit_node`/`ensure_lan_route_allowed` despite a broad ACL allow rule | `crates/rustynetd/src/revoked_peer_denied_audit.rs` | `evaluate_revoked_peer_denied_report` in `vm_lab/mod.rs` |
-
-Other stages in this family (`validate_linux_membership_signature_forgery`,
-`validate_linux_privileged_helper_allowlist`, `validate_linux_policy_default_deny`,
-`validate_linux_runtime_acls`, `validate_linux_service_hardening`,
-`validate_linux_authenticode`, `validate_linux_key_custody`,
-`validate_linux_membership_genesis`, `validate_linux_mesh_status`) exist and
-run but are not yet documented here or in `explain_stage`'s `STAGE_INFO` —
-tracked as a follow-up, not done as part of this addition.
+| `validate_linux_runtime_acls` | The canonical Linux runtime roots (`/etc/rustynet`, `/var/lib/rustynet`) match their reviewed owner/group/mode | `crates/rustynetd/src/linux_runtime_acls.rs` | `evaluate_linux_runtime_acls_report` in `vm_lab/mod.rs` |
+| `validate_linux_key_custody` | The WireGuard private key is encrypted-at-rest with reviewed mode/ownership and no legacy plaintext copy remains | `crates/rustynetd/src/linux_key_custody.rs` | `evaluate_linux_key_custody_report` in `vm_lab/mod.rs` |
+| `validate_linux_service_hardening` | The installed systemd unit's hardening directives match the shipped baseline | `crates/rustynetd/src/linux_service_hardening.rs` | `evaluate_linux_service_hardening_report` in `vm_lab/mod.rs` |
+| `validate_linux_authenticode` | Honest not-applicable verdict for runtime binary-signature enforcement (Windows-specific; Linux relies on dpkg/rpm install-time verification) | `crates/rustynetd/src/linux_authenticode.rs` | `evaluate_linux_authenticode_report` in `vm_lab/mod.rs` |
+| `validate_linux_privileged_helper_allowlist` | SecMinBar §7: the argv allowlist denies every adversarial request and allows every reviewed one | `crates/rustynetd/src/privileged_helper_allowlist_audit.rs` | `evaluate_privileged_helper_allowlist_report` in `vm_lab/mod.rs` |
+| `validate_linux_membership_signature_forgery` | SecMinBar §3.2/§6.B: the signed-membership verify funnel rejects every forgery case and accepts the valid baseline | `crates/rustynetd/src/membership_signature_audit.rs` | `evaluate_membership_signature_audit_report` in `vm_lab/mod.rs` |
+| `validate_linux_policy_default_deny` | SecMinBar §3.6: the real `rustynet_policy` evaluator matches a default-deny truth table (no vacuous deny-all pass) | `crates/rustynetd/src/policy_default_deny_audit.rs` | `evaluate_policy_default_deny_report` in `vm_lab/mod.rs` |
+| `validate_linux_membership_genesis` | The canonical membership files (`membership.snapshot`/`.log`/`.watermark`) have reviewed mode/ownership and yield a readable signed snapshot via `rustynet membership status` | n/a (direct SSH check, no `rustynetd` subcommand) | `exercise_linux_membership_genesis_validation` + `validate_linux_membership_genesis_output` in `vm_lab/mod.rs` |
+| `validate_linux_mesh_status` | The daemon's mesh-status view reports no drift (optionally against expected-peer-id / max-age overrides) | `crates/rustynetd/src/linux_mesh_status.rs` | `evaluate_linux_mesh_status_report` in `vm_lab/mod.rs` |
 
 ## VM Lab Entry Points (CLI / lab-state MCP)
 - `ops vm-lab-discover-local-utm-summary` — discover VMs, quick summary

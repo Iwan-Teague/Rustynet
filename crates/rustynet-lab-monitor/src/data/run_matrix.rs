@@ -440,6 +440,21 @@ const LINUX_ONEOFF_COLUMNS: &[(&str, &str)] = &[
         "membership_revoke_applies",
     ),
     ("linux_revoked_peer_denied_e2e", "revoked_peer_denied_e2e"),
+    (
+        "linux_membership_signature_forgery",
+        "membership_signature_forgery",
+    ),
+    (
+        "linux_privileged_helper_allowlist",
+        "privileged_helper_allowlist",
+    ),
+    ("linux_policy_default_deny", "policy_default_deny"),
+    ("linux_runtime_acls", "runtime_acls"),
+    ("linux_service_hardening", "service_hardening"),
+    ("linux_authenticode", "authenticode"),
+    ("linux_key_custody", "key_custody"),
+    ("linux_membership_genesis", "membership_genesis"),
+    ("linux_mesh_status", "mesh_status"),
 ];
 const MACOS_ONEOFF_COLUMNS: &[(&str, &str)] = &[
     ("macos_keychain_key_custody", "keychain_key_custody"),
@@ -810,7 +825,7 @@ mod tests {
             matrix.linux.len() + matrix.macos.len() + matrix.windows.len() + matrix.cross_os.len();
 
         assert_eq!(progress.total, matrix_total);
-        assert_eq!(matrix_total, 80);
+        assert_eq!(matrix_total, 89);
     }
 
     #[test]
@@ -825,7 +840,7 @@ mod tests {
         // security columns (LINUX_ONEOFF_COLUMNS) appended after them —
         // present unconditionally (as Unproven here, since this CSV doesn't
         // set them), same as macOS/Windows's one-offs.
-        assert_eq!(matrix.linux.len(), 21 + 2);
+        assert_eq!(matrix.linux.len(), 21 + 11);
         assert_eq!(matrix.linux[0].name, "bootstrap");
         assert_eq!(matrix.linux[1].name, "membership");
         assert_eq!(matrix.linux[20].name, "cleanup");
@@ -878,7 +893,7 @@ mod tests {
         let matrix = load_full_stage_matrix(dir.path()).unwrap();
         assert_eq!(matrix.windows.len(), 21 + 2);
         assert_eq!(matrix.macos.len(), 21 + 2);
-        assert_eq!(matrix.linux.len(), 21 + 2);
+        assert_eq!(matrix.linux.len(), 21 + 11);
         assert!(
             matrix
                 .windows

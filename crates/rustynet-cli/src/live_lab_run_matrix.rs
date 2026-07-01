@@ -1412,6 +1412,25 @@ fn set_special_stage_values(
         "validate_linux_revoked_peer_denied_e2e" => {
             set_status(values, schema, "linux_revoked_peer_denied_e2e", status)
         }
+        "validate_linux_membership_signature_forgery" => {
+            set_status(values, schema, "linux_membership_signature_forgery", status)
+        }
+        "validate_linux_privileged_helper_allowlist" => {
+            set_status(values, schema, "linux_privileged_helper_allowlist", status)
+        }
+        "validate_linux_policy_default_deny" => {
+            set_status(values, schema, "linux_policy_default_deny", status)
+        }
+        "validate_linux_runtime_acls" => set_status(values, schema, "linux_runtime_acls", status),
+        "validate_linux_service_hardening" => {
+            set_status(values, schema, "linux_service_hardening", status)
+        }
+        "validate_linux_authenticode" => set_status(values, schema, "linux_authenticode", status),
+        "validate_linux_key_custody" => set_status(values, schema, "linux_key_custody", status),
+        "validate_linux_membership_genesis" => {
+            set_status(values, schema, "linux_membership_genesis", status)
+        }
+        "validate_linux_mesh_status" => set_status(values, schema, "linux_mesh_status", status),
         _ if stage.starts_with("validate_") => {
             let _ = platform;
         }
@@ -1884,6 +1903,48 @@ mod tests {
                 .map(String::as_str),
             Some("fail")
         );
+    }
+
+    #[test]
+    fn daemon_security_validator_stages_map_to_dedicated_csv_columns() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let mut values = BTreeMap::new();
+        for (stage, column) in [
+            (
+                "validate_linux_membership_signature_forgery",
+                "linux_membership_signature_forgery",
+            ),
+            (
+                "validate_linux_privileged_helper_allowlist",
+                "linux_privileged_helper_allowlist",
+            ),
+            (
+                "validate_linux_policy_default_deny",
+                "linux_policy_default_deny",
+            ),
+            ("validate_linux_runtime_acls", "linux_runtime_acls"),
+            (
+                "validate_linux_service_hardening",
+                "linux_service_hardening",
+            ),
+            ("validate_linux_authenticode", "linux_authenticode"),
+            ("validate_linux_key_custody", "linux_key_custody"),
+            (
+                "validate_linux_membership_genesis",
+                "linux_membership_genesis",
+            ),
+            ("validate_linux_mesh_status", "linux_mesh_status"),
+        ] {
+            set_special_stage_values(&mut values, &schema, "linux", stage, "pass");
+            assert_eq!(
+                values.get(column).map(String::as_str),
+                Some("pass"),
+                "stage {stage} did not populate column {column}"
+            );
+        }
     }
 
     #[test]
