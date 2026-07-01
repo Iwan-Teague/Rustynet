@@ -16322,6 +16322,62 @@ fn evaluate_gossip_revoked_readmit_report(
     ))
 }
 
+/// Pure evaluator for the JSON output of `rustynetd enrollment-replay-audit`.
+/// The daemon-side audit drives the REAL enrollment-token consume path
+/// (`SecurityMinimumBar.md` §3.3, CWE-362, RSA-0023) with a throwaway on-disk
+/// ledger. Fail-closed:
+///   - unsupported schema, or fewer than 3 cases (thin battery),
+///   - the sequential-replay or concurrent-race denial case did not deny,
+///   - the distinct-tokens baseline was wrongly denied (vacuous guard).
+fn evaluate_enrollment_replay_report(linux_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: rustynetd::enrollment_replay_audit::EnrollmentReplayAuditReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse enrollment-replay-audit JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "enrollment-replay-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases < 3 {
+        return Err(format!(
+            "enrollment-replay-audit ran only {} case(s); expected the full sequential-replay + toctou-race + baseline battery",
+            report.total_cases
+        ));
+    }
+    if report.replay_denied < 2 {
+        return Err(format!(
+            "enrollment-replay-audit denied only {} of 2 required cases (sequential replay, concurrent race) — ENR-1/TOCTOU-1/RSA-0023 regression suspected",
+            report.replay_denied
+        ));
+    }
+    if report.baseline_accepted < 1 {
+        return Err(
+            "enrollment-replay-audit denied the distinct-tokens baseline case; the guard is vacuous (would deny everything) or over-broad"
+                .to_owned(),
+        );
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| format!("{} (expected {}, got {})", v.id, v.expectation, v.outcome))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "enrollment-replay audit drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Enrollment single-use token replay + concurrent-race denial verified on {linux_alias}: sequential replay denied, concurrent race yields exactly one winner, distinct-tokens baseline still accepted (ENR-1/TOCTOU-1 proven live)",
+    ))
+}
+
 /// Pure evaluator for the JSON output of `rustynetd policy-default-deny-audit`.
 /// The daemon-side audit drives the REAL `rustynet_policy` evaluator with a
 /// default-deny truth table (`SecurityMinimumBar.md` §3.6). Fail-closed:
@@ -18225,6 +18281,26 @@ fn run_validate_linux_gossip_revoked_readmit_stage(
         .map_err(|reason| (reason, raw))
 }
 
+fn run_validate_linux_enrollment_replay_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "enrollment-replay-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_enrollment_replay_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
 fn run_validate_linux_policy_default_deny_stage(
     linux_alias: &str,
     inventory_path: &Path,
@@ -18431,6 +18507,7 @@ fn run_linux_orchestration_stages_with_options(
         logs_dir.join("validate_linux_blind_exit_reversal_denied.log");
     let gossip_revoked_readmit_log_path =
         logs_dir.join("validate_linux_gossip_revoked_readmit.log");
+    let enrollment_replay_log_path = logs_dir.join("validate_linux_enrollment_replay.log");
     let policy_default_deny_log_path = logs_dir.join("validate_linux_policy_default_deny.log");
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
@@ -18617,6 +18694,19 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_gossip_revoked_readmit",
             gossip_revoked_readmit_log_path.as_path(),
             run_validate_linux_gossip_revoked_readmit_stage,
+        )
+    };
+
+    let enrollment_replay_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_enrollment_replay",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_enrollment_replay",
+            enrollment_replay_log_path.as_path(),
+            run_validate_linux_enrollment_replay_stage,
         )
     };
 
@@ -19168,6 +19258,7 @@ fn run_linux_orchestration_stages_with_options(
         revoked_peer_denied_outcome,
         blind_exit_reversal_denied_outcome,
         gossip_revoked_readmit_outcome,
+        enrollment_replay_outcome,
         policy_default_deny_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
@@ -38090,6 +38181,70 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn enrollment_replay_audit_producer_to_validator_round_trip_passes() {
+        let report =
+            rustynetd::enrollment_replay_audit::run_enrollment_replay_audit().expect("audit runs");
+        assert!(report.overall_ok, "reviewed funnel must pass: {report:?}");
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary = super::evaluate_enrollment_replay_report("debian-headless-1", raw.as_str())
+            .expect("clean enrollment-replay audit must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("ENR-1"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_enrollment_replay_report_rejects_regressed_denial() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 3,
+            "replay_denied": 1,
+            "baseline_accepted": 1,
+            "violations": [
+                {"id": "sequential_replay_denied", "expectation": "reject", "outcome": "accepted", "reason": "VIOLATION: single-use token redeemed twice", "passed": false}
+            ]
+        }"#;
+        let err = super::evaluate_enrollment_replay_report("debian-headless-1", raw)
+            .expect_err("a regressed denial case must fail closed");
+        assert!(
+            err.contains("denied only 1 of 2 required cases"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_enrollment_replay_report_rejects_vacuous_deny_all() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 3,
+            "replay_denied": 2,
+            "baseline_accepted": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_enrollment_replay_report("debian-headless-1", raw)
+            .expect_err("zero accepted baseline must fail closed");
+        assert!(err.contains("vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_enrollment_replay_report_rejects_thin_battery() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 2,
+            "replay_denied": 2,
+            "baseline_accepted": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_enrollment_replay_report("debian-headless-1", raw)
+            .expect_err("fewer than 3 cases must fail closed");
+        assert!(err.contains("expected the full"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn linux_relay_lifecycle_output_validators_accept_reviewed_dry_run_text() {
         let install = "rustynet-relay systemd unit: install+enable (dry-run) at /etc/systemd/system/rustynet-relay.service\n  - would run: systemctl daemon-reload\n  - would run: systemctl enable rustynet-relay.service\n  - would run: systemctl start rustynet-relay.service\n";
         super::validate_linux_relay_install_output(install).expect("install output validates");
@@ -41141,6 +41296,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_revoked_peer_denied_e2e",
             "validate_linux_blind_exit_reversal_denied",
             "validate_linux_gossip_revoked_readmit",
+            "validate_linux_enrollment_replay",
             "validate_linux_policy_default_deny",
             "validate_linux_dns_failclosed",
             "validate_linux_exit_nat_lifecycle",
@@ -41287,6 +41443,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_revoked_peer_denied_e2e",
                 "validate_linux_blind_exit_reversal_denied",
                 "validate_linux_gossip_revoked_readmit",
+                "validate_linux_enrollment_replay",
                 "validate_linux_policy_default_deny",
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",
