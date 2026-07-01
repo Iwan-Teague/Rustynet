@@ -228,25 +228,37 @@ $rewritten = $envLines | ForEach-Object {
 Set-Content -LiteralPath $ReviewedEnvFile -Value $rewritten -Encoding ascii
 
 # ── Step 5: restart the service and poll the loopback listener. ──
-$svc = Get-Service -Name $ReviewedServiceName -ErrorAction Stop
-if ($svc.Status -eq 'Running') {
-    & sc.exe stop $ReviewedServiceName | Out-Null
-    Start-Sleep -Seconds 2
-}
-& sc.exe start $ReviewedServiceName | Out-Null
-
+# Wrapped in up to 3 restart attempts (each polling only 10x2s, not a single
+# 60/40x2s poll): live-reproduced startup race where the daemon's FIRST
+# reconcile tick can run before the just-written membership snapshot is
+# visible, logging "membership reconcile failed: membership snapshot is
+# missing" and fail-closing (the correct security posture -- never serve on
+# unproven trust state) -- but the daemon does not recover within the same
+# process lifetime, so the listener never binds. A FRESH restart against the
+# by-then-stable snapshot file reliably binds within ~7s (confirmed live), so
+# a bounded number of restart attempts is the safe mitigation here without
+# touching the daemon's core reconcile fail-closed path.
 $listenerUp = $false
-for ($attempt = 0; $attempt -lt 20; $attempt++) {
-    $conns = Get-NetTCPConnection -State Listen -LocalPort $ReviewedBundlePullPort -ErrorAction SilentlyContinue
-    if ($conns) {
-        foreach ($c in $conns) {
-            if ($c.LocalAddress -eq '127.0.0.1' -or $c.LocalAddress -eq '::1') {
-                $listenerUp = $true; break
+for ($restart = 0; $restart -lt 3 -and -not $listenerUp; $restart++) {
+    $svc = Get-Service -Name $ReviewedServiceName -ErrorAction Stop
+    if ($svc.Status -eq 'Running') {
+        & sc.exe stop $ReviewedServiceName | Out-Null
+        Start-Sleep -Seconds 2
+    }
+    & sc.exe start $ReviewedServiceName | Out-Null
+
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        $conns = Get-NetTCPConnection -State Listen -LocalPort $ReviewedBundlePullPort -ErrorAction SilentlyContinue
+        if ($conns) {
+            foreach ($c in $conns) {
+                if ($c.LocalAddress -eq '127.0.0.1' -or $c.LocalAddress -eq '::1') {
+                    $listenerUp = $true; break
+                }
             }
         }
+        if ($listenerUp) { break }
+        Start-Sleep -Seconds 2
     }
-    if ($listenerUp) { break }
-    Start-Sleep -Seconds 2
 }
 if (-not $listenerUp) {
     throw "anchor bundle-pull listener did not come up on $ReviewedBundlePullAddr"
