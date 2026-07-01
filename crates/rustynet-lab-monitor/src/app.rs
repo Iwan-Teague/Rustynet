@@ -11,7 +11,9 @@ use std::path::PathBuf;
 
 use crate::config::MonitorConfig;
 use crate::data::job_watcher::JobState;
-use crate::data::run_matrix::{CellOutcome, Os, ParityState, Role, RunSummary, StageProgress};
+use crate::data::run_matrix::{
+    CellOutcome, FullStageMatrix, Os, ParityState, Role, RunSummary, StageProgress,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -20,12 +22,14 @@ pub enum Panel {
     Parity,
     Log,
     Jobs,
+    StageMatrix,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Overview,
     Run,
+    Matrix,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +60,8 @@ pub struct App {
     pub parity_sparklines: HashMap<(Role, Os), Vec<CellOutcome>>,
     pub stage_progress: StageProgress,
     pub stage_timings: HashMap<String, u64>,
+    pub full_stage_matrix: FullStageMatrix,
+    pub stage_matrix_scroll: usize,
 
     pub focused_panel: Panel,
     pub page: Page,
@@ -84,6 +90,8 @@ impl App {
             crate::data::run_matrix::load_stage_progress(&repo_root).unwrap_or_default();
         let stage_timings =
             crate::data::timings::load_stage_timings(&repo_root).unwrap_or_default();
+        let full_stage_matrix =
+            crate::data::run_matrix::load_full_stage_matrix(&repo_root).unwrap_or_default();
 
         let vm_role_overrides = default_vm_role_overrides(&config);
         let recent_runs =
@@ -106,6 +114,8 @@ impl App {
             parity_sparklines,
             stage_progress,
             stage_timings,
+            full_stage_matrix,
+            stage_matrix_scroll: 0,
             focused_panel: Panel::VmStatus,
             page: Page::Overview,
             stage_cursor: 0,
@@ -197,9 +207,7 @@ impl App {
             });
     }
 
-    pub fn selected_stage_outcome(
-        &self,
-    ) -> Option<&crate::data::stage_reader::StageOutcome> {
+    pub fn selected_stage_outcome(&self) -> Option<&crate::data::stage_reader::StageOutcome> {
         let stages = self.planned_stages();
         let stage = stages.get(self.stage_cursor)?;
         self.stage_outcomes.iter().find(|o| &o.stage == stage)
@@ -562,6 +570,11 @@ impl App {
         if let Ok(stage_timings) = crate::data::timings::load_stage_timings(&self.repo_root) {
             self.stage_timings = stage_timings;
         }
+        if let Ok(full_stage_matrix) =
+            crate::data::run_matrix::load_full_stage_matrix(&self.repo_root)
+        {
+            self.full_stage_matrix = full_stage_matrix;
+        }
         if let Ok(runs) = crate::data::run_matrix::load_recent_runs(&self.repo_root, 3) {
             self.recent_runs = runs;
         }
@@ -667,6 +680,10 @@ impl App {
                 self.page = Page::Run;
                 self.focused_panel = Panel::Jobs;
             }
+            KeyCode::Char('6') => {
+                self.page = Page::Matrix;
+                self.focused_panel = Panel::StageMatrix;
+            }
 
             // Single letter shortcuts. Accept plain, Shift, or Ctrl variants.
             KeyCode::Char(_) if plain_char == Some('l') => {
@@ -684,6 +701,10 @@ impl App {
             KeyCode::Char(_) if plain_char == Some('j') => {
                 self.page = Page::Run;
                 self.focused_panel = Panel::Jobs;
+            }
+            KeyCode::Char(_) if plain_char == Some('m') => {
+                self.page = Page::Matrix;
+                self.focused_panel = Panel::StageMatrix;
             }
             KeyCode::Char(_) if plain_char == Some('a') => {
                 if self.roles_locked_by_active_lab() {
@@ -731,6 +752,9 @@ impl App {
                 Panel::VmStatus if self.selected_vm > 0 => {
                     self.selected_vm -= 1;
                 }
+                Panel::StageMatrix => {
+                    self.stage_matrix_scroll = self.stage_matrix_scroll.saturating_sub(1);
+                }
                 _ => {}
             },
             KeyCode::Down => match self.focused_panel {
@@ -746,6 +770,9 @@ impl App {
                 }
                 Panel::VmStatus if self.selected_vm + 1 < self.vm_statuses.len() => {
                     self.selected_vm += 1;
+                }
+                Panel::StageMatrix => {
+                    self.stage_matrix_scroll += 1;
                 }
                 _ => {}
             },
@@ -786,6 +813,10 @@ impl App {
                 self.focused_panel = Panel::StageGrid;
             }
             Page::Run => {
+                self.page = Page::Matrix;
+                self.focused_panel = Panel::StageMatrix;
+            }
+            Page::Matrix => {
                 self.page = Page::Overview;
                 self.focused_panel = Panel::VmStatus;
             }
@@ -1563,6 +1594,9 @@ pub fn render_ui(f: &mut Frame, app: &App) {
             crate::ui::log_panel::render(f, lower[0], app);
             crate::ui::jobs_panel::render(f, lower[1], app);
             crate::ui::prev_runs_panel::render(f, rows[2], app);
+        }
+        Page::Matrix => {
+            crate::ui::stage_matrix_panel::render(f, body_area, app);
         }
     }
 
