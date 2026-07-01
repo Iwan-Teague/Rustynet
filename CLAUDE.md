@@ -526,7 +526,59 @@ newest tools are reachable with NO client reconnect. The API key resolves from `
 `~/Desktop/deepseek_api.md`; **never commit, log, or write it into the repo or any
 artifact.**
 
-## 13) Keeping AGENTS.md / CLAUDE.md In Sync
+## 13) Operating Checklists
+
+### 13.1 Live-Lab Hardening Loop
+Per patch inside a live-lab loop:
+1. Targeted first: scoped `cargo check -p <crate>` / `cargo test -p <crate>`, or
+   `cargo run -p rustynet-xtask -- gates --skip-test -p <crate>` — don't run the
+   full `--all-targets --all-features` suite every iteration; batch it
+   periodically instead (§7, fast-fail runner).
+2. Before landing: the full §7 gate list — `cargo fmt --all -- --check`,
+   `cargo check --workspace --all-targets --all-features`,
+   `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+   `cargo test --workspace --all-targets --all-features`.
+3. Live-lab: check state first (`get_lab_status` / `vm-lab-discover-local-utm-summary`),
+   then `start_live_lab_run` → `wait_for_job` (`rustynet-mcp-lab-state` MCP
+   tools; §12.3).
+4. Verify the appended row in `documents/operations/live_lab_run_matrix.csv`
+   (§2, §10.9).
+5. If a guest shows SSH timeout but is visible in `arp -a`:
+   `scripts/vm_lab/probe_and_recover_local_utm.sh` (§10.9) before retrying.
+
+### 13.2 Security Review
+Before any code change that touches crypto, auth, or policy:
+1. Read `documents/SecurityMinimumBar.md` and the relevant part of
+   `documents/Requirements.md` (§2 precedence order).
+2. Run `cargo audit --deny warnings` and
+   `cargo deny check bans licenses sources advisories` (§7).
+3. Never log secrets or private key material (§4); check the diff doesn't
+   Debug-print anything holding key material (§10.6).
+4. No `unwrap()`/`expect()` in production paths for security-sensitive code
+   (§10.2).
+5. Run `scripts/ci/secrets_hygiene_gates.sh` and, if touching backend types,
+   `scripts/ci/check_backend_boundary_leakage.sh` (§10.3/§10.6).
+
+### 13.3 Release Checklist
+Before any release commit, re-check the Definition of Done (§9) in full rather
+than a parallel list — in particular, all mandatory gates pass (or the blocker
+is explicitly documented outside the claimed completion) and the live-lab run
+matrix reflects a verifying run.
+
+### 13.4 Documentation Sync
+- Behavior change → update the owning ledger in `documents/operations/active/`.
+- New file/module → update `documents/CODE_MAP.md`.
+- Any edit to AGENTS.md or CLAUDE.md → apply identically to the other (§14).
+
+### 13.5 Context Recovery
+Long-running loop work survives context compaction via the durable journal at
+`state/mcp-loop-journal.jsonl` (`rustynet-mcp-lab-state` MCP tools
+`write_loop_note` / `get_loop_journal` — not CLI subcommands). Record each
+iteration's hypothesis, patch, and result with `write_loop_note`; after a
+compaction, read it back with `get_loop_journal` before continuing so you
+don't repeat a fix you already tried.
+
+## 14) Keeping AGENTS.md / CLAUDE.md In Sync
 `AGENTS.md` and `CLAUDE.md` are intentionally byte-for-byte mirrored. Any edit to
 one MUST be applied identically to the other in the same change. When you add,
 move, or rename a crate, ledger, or top-level directory, update §2/§11/§12 here
