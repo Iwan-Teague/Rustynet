@@ -4256,6 +4256,105 @@ static STAGE_INFO: &[StageInfo] = &[
             "gated on validate_linux_runtime_acls passing first",
         ],
     },
+    StageInfo {
+        name: "validate_linux_runtime_acls",
+        aliases: &["runtime_acls"],
+        checks: "Drives rustynetd linux-runtime-acls-check on the Linux node: walks the canonical Linux runtime roots (/etc/rustynet, /var/lib/rustynet, per scripts/systemd/rustynetd.service + scripts/e2e/live_lab_common.sh) and fails if any reviewed root is missing or its owner/group/mode has drifted from the reviewed posture.",
+        owning: "crates/rustynetd/src/linux_runtime_acls.rs (daemon probe); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_linux_runtime_acls_report (orchestrator validator)",
+        causes: &[
+            "a reviewed root is missing, or its owner/group/mode drifted from the reviewed posture",
+            "unsupported schema_version returned (daemon/orchestrator skew) or an empty roots list",
+            "this stage gates most of the rest of the daemon-security-validator family — its failure cascades to make_skipped downstream",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_key_custody",
+        aliases: &["key_custody"],
+        checks: "Drives rustynetd linux-key-custody-check on the Linux node: confirms the encrypted WireGuard private key (/var/lib/rustynet/keys/wireguard.key.enc, 0600), the public key, and the keys directory (0700) all match the reviewed custody contract, and that the legacy plaintext private-key path is absent.",
+        owning: "crates/rustynetd/src/linux_key_custody.rs (daemon probe); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_linux_key_custody_report (orchestrator validator)",
+        causes: &[
+            "a key artifact drifted from its reviewed owner/mode, or the plaintext legacy private-key path is present at rest",
+            "unsupported schema_version returned",
+            "gated on validate_linux_runtime_acls passing first",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_service_hardening",
+        aliases: &["service_hardening"],
+        checks: "Drives rustynetd linux-service-hardening-check on the Linux node: probes the installed systemd unit's hardening directives and fails if the probe couldn't run (systemctl show failed / unit not installed) or overall_ok is false.",
+        owning: "crates/rustynetd/src/linux_service_hardening.rs (daemon probe); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_linux_service_hardening_report (orchestrator validator)",
+        causes: &[
+            "probe could not run (systemctl show failed, unit not installed)",
+            "a hardening directive drifted from the shipped unit file",
+            "gated on validate_linux_runtime_acls passing first",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_authenticode",
+        aliases: &["authenticode"],
+        checks: "Drives rustynetd linux-authenticode-check on the Linux node. Linux has no runtime binary-signature enforcement (that's Windows-specific), so the daemon always reports applicable=false; the validator passes the not-applicable verdict through honestly rather than silently passing, and only fails if a future dpkg/rpm-signature slice flips applicable=true with overall_ok=false.",
+        owning: "crates/rustynetd/src/linux_authenticode.rs (daemon probe); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_linux_authenticode_report (orchestrator validator)",
+        causes: &[
+            "unsupported schema_version returned",
+            "a future dpkg/rpm signature-verification slice reports applicable=true, overall_ok=false",
+            "gated on validate_linux_runtime_acls passing first",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_privileged_helper_allowlist",
+        aliases: &["privileged_helper_allowlist"],
+        checks: "Drives rustynetd privileged-helper-allowlist-audit on the Linux node: runs an adversarial request corpus through the REAL argv allowlist (SecurityMinimumBar.md §7) and fails if any adversarial request was accepted (privilege-escalation regression) or any reviewed request was rejected (control-plane breakage).",
+        owning: "crates/rustynetd/src/privileged_helper_allowlist_audit.rs (daemon audit); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_privileged_helper_allowlist_report (orchestrator validator)",
+        causes: &[
+            "an adversarial request was accepted by the allowlist (privilege-escalation regression)",
+            "a reviewed/benign request was rejected (control-plane breakage)",
+            "gated on validate_linux_runtime_acls passing first",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_membership_signature_forgery",
+        aliases: &["membership_signature_forgery"],
+        checks: "Drives rustynetd membership-signature-audit on the Linux node: runs an adversarial forgery corpus through the REAL signed-membership verify funnel (apply_signed_update/decode_signed_update, verify_strict; SecurityMinimumBar.md §3.2/§6.B) and fails on an accepted forgery, a rejected valid baseline, or too small/vacuous a corpus.",
+        owning: "crates/rustynetd/src/membership_signature_audit.rs (daemon audit); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_membership_signature_audit_report (orchestrator validator)",
+        causes: &[
+            "a forged/tampered membership update was accepted",
+            "the valid baseline update was rejected, or the corpus was too small/vacuous to be meaningful",
+            "gated on validate_linux_runtime_acls passing first",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_policy_default_deny",
+        aliases: &["policy_default_deny"],
+        checks: "Drives rustynetd policy-default-deny-audit on the Linux node: runs a default-deny truth table through the REAL rustynet_policy evaluator (SecurityMinimumBar.md §3.6) and fails on an empty/vacuous corpus (no ALLOW case exercised) or any case whose decision didn't match expectation.",
+        owning: "crates/rustynetd/src/policy_default_deny_audit.rs (daemon audit); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_policy_default_deny_report (orchestrator validator)",
+        causes: &[
+            "a case's decision didn't match its expected ALLOW/DENY outcome",
+            "empty corpus, or no ALLOW case exercised (the vacuous deny-all pass)",
+            "gated on validate_linux_runtime_acls passing first",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_membership_genesis",
+        aliases: &["membership_genesis"],
+        checks: "SSHes the Linux node directly (no rustynetd subcommand) and asserts the canonical membership files (membership.snapshot/.log/.watermark under /var/lib/rustynet) exist with mode 600 owned by rustynetd:rustynetd, then runs `rustynet membership status` against them and confirms it reports a readable signed snapshot (network_id/epoch/active_nodes present).",
+        owning: "crates/rustynet-cli/src/vm_lab/mod.rs::exercise_linux_membership_genesis_validation + validate_linux_membership_genesis_output",
+        causes: &[
+            "a membership file has drifted from mode 600 / rustynetd:rustynetd ownership",
+            "`rustynet membership status` output doesn't prove a readable signed snapshot",
+            "gated on validate_linux_runtime_acls and validate_linux_key_custody passing first",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_mesh_status",
+        aliases: &["mesh_status"],
+        checks: "Drives rustynetd linux-mesh-status-check on the Linux node (optionally with --state-path/--expected-peer-id/--max-age-seconds overrides) and fails if overall_ok=false, surfacing the reported drift_reasons.",
+        owning: "crates/rustynetd/src/linux_mesh_status.rs (daemon probe); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_linux_mesh_status_report (orchestrator validator)",
+        causes: &[
+            "mesh status reports drift (e.g. missing expected peer, stale state)",
+            "unsupported schema_version returned",
+            "gated on validate_linux_runtime_acls passing first",
+        ],
+    },
 ];
 
 // `aliases` are &'static str but `norm` is borrowed from a local, so
@@ -5593,6 +5692,63 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
                 .contains("revoked_peer_denied_audit.rs")
         );
         assert!(denied.content[0].text.contains("RSA-0007"));
+    }
+
+    #[test]
+    fn explain_stage_covers_daemon_security_validator_family() {
+        for (stage, expected_fragment) in [
+            ("validate_linux_runtime_acls", "linux_runtime_acls.rs"),
+            ("validate_linux_key_custody", "linux_key_custody.rs"),
+            (
+                "validate_linux_service_hardening",
+                "linux_service_hardening.rs",
+            ),
+            ("validate_linux_authenticode", "linux_authenticode.rs"),
+            (
+                "validate_linux_privileged_helper_allowlist",
+                "privileged_helper_allowlist_audit.rs",
+            ),
+            (
+                "validate_linux_membership_signature_forgery",
+                "membership_signature_audit.rs",
+            ),
+            (
+                "validate_linux_policy_default_deny",
+                "policy_default_deny_audit.rs",
+            ),
+            (
+                "validate_linux_membership_genesis",
+                "exercise_linux_membership_genesis_validation",
+            ),
+            ("validate_linux_mesh_status", "linux_mesh_status.rs"),
+        ] {
+            let txt = explain_stage(stage).content[0].text.clone();
+            assert!(
+                txt.starts_with("# Stage:"),
+                "{stage} should resolve, got: {txt}"
+            );
+            assert!(
+                txt.contains(expected_fragment),
+                "{stage} should mention {expected_fragment}, got: {txt}"
+            );
+        }
+        // never falls into "Unknown stage" for this family.
+        for s in [
+            "runtime_acls",
+            "key_custody",
+            "service_hardening",
+            "authenticode",
+            "privileged_helper_allowlist",
+            "membership_signature_forgery",
+            "policy_default_deny",
+            "membership_genesis",
+            "mesh_status",
+        ] {
+            assert!(
+                !explain_stage(s).content[0].text.contains("Unknown stage"),
+                "alias {s} should resolve"
+            );
+        }
     }
 
     #[test]
