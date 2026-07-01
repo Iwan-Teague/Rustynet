@@ -4355,6 +4355,50 @@ static STAGE_INFO: &[StageInfo] = &[
             "gated on validate_linux_runtime_acls passing first",
         ],
     },
+    StageInfo {
+        name: "validate_linux_blind_exit_reversal_denied",
+        aliases: &["blind_exit_reversal_denied", "rt-2"],
+        checks: "Drives rustynetd blind-exit-reversal-audit on the Linux node: runs an adversarial corpus of SetNodeCapabilities updates through the REAL preview_next_state/reduce_membership_state funnel, proving RT-2's fix (blind_exit is immutable at the signed-state layer — reversing it away requires factory reset + fresh enrollment, not just a signed capability update) against client/admin/exit/relay/anchor/nas/llm reversal targets, plus a baseline case proving a non-blind_exit node's capabilities can still be changed.",
+        owning: "crates/rustynet-control/src/membership.rs::reduce_membership_state (fix); crates/rustynetd/src/blind_exit_reversal_audit.rs (daemon audit); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_blind_exit_reversal_report (orchestrator validator)",
+        causes: &[
+            "RT-2 regressed: a SetNodeCapabilities update reversing blind_exit away from a node was accepted",
+            "the non-blind_exit baseline case stopped being accepted — the guard became over-broad",
+            "gated on validate_linux_runtime_acls passing first",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_gossip_revoked_readmit",
+        aliases: &["gossip_revoked_readmit", "gm-1", "rsa-0034"],
+        checks: "Drives rustynetd gossip-revoked-readmit-audit on the Linux node: builds a real GossipNode with synthetic Ed25519 keys and a loopback transport, proving GM-1's fix (ingest_inbound_bundle now checks signed membership status, not just routing/verification state, before admitting a bundle) — a bundle from a peer marked Revoked in membership is denied, while the identical scenario with an Active peer is still accepted (anti-vacuous baseline).",
+        owning: "crates/rustynetd/src/gossip_runtime.rs::ingest_inbound_bundle (fix); crates/rustynetd/src/gossip_revoked_readmit_audit.rs (daemon audit); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_gossip_revoked_readmit_report (orchestrator validator)",
+        causes: &[
+            "GM-1/RSA-0034 regressed: a bundle from a revoked peer was admitted again",
+            "the active-peer baseline case stopped being accepted — the guard became over-broad/vacuous-deny",
+            "gossip is a wired-but-not-yet-daemon-integrated subsystem (no production call sites for attach_gossip_runtime yet)",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_enrollment_replay",
+        aliases: &["enrollment_replay", "enr-1", "toctou-1", "rsa-0023"],
+        checks: "Drives rustynetd enrollment-replay-audit on the Linux node: drives the REAL enrollment-token consume path (acquire_ledger_lock -> load_ledger -> verify_and_consume_token_with_now -> write_ledger) against a throwaway on-disk ledger, proving ENR-1 (sequential replay of the same token is denied with AlreadyConsumed) and TOCTOU-1 (8 threads racing to redeem the same token yield exactly one winner), plus a baseline case proving two distinct tokens can both be redeemed.",
+        owning: "crates/rustynetd/src/enrollment_token.rs::acquire_ledger_lock (RSA-0023 fix, pre-existing); crates/rustynetd/src/enrollment_replay_audit.rs (daemon audit); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_enrollment_replay_report (orchestrator validator)",
+        causes: &[
+            "ENR-1 regressed: sequential replay of the same token succeeded twice",
+            "TOCTOU-1 regressed: concurrent racers double-spent the single-use token (lock no longer serializes the read-modify-write)",
+            "the distinct-tokens baseline case stopped being accepted — the guard became over-broad",
+        ],
+    },
+    StageInfo {
+        name: "validate_linux_hello_limiter_flood",
+        aliases: &["hello_limiter_flood", "dos-1", "rsa-0037"],
+        checks: "Drives rustynet-relay hello-limiter-audit on the Linux node: floods the REAL HelloLimiter (relay's pre-auth Hello rate limiter) with MAX_HELLO_LIMITER_ENTRIES distinct node_id strings, proving DOS-1/RSA-0037's fix (the map is hard-capped and prunes-then-rejects a new node_id once at capacity) — one more node_id beyond the cap is denied, while a baseline case on a fresh limiter proves a single legitimate node_id's first hello is still allowed.",
+        owning: "crates/rustynet-relay/src/transport.rs::HelloLimiter (fix, pre-existing); crates/rustynet-relay/src/hello_limiter_audit.rs (daemon audit); crates/rustynet-cli/src/vm_lab/mod.rs::evaluate_hello_limiter_flood_report (orchestrator validator)",
+        causes: &[
+            "DOS-1/RSA-0037 regressed: a node_id beyond MAX_HELLO_LIMITER_ENTRIES was admitted, growing the map without bound",
+            "the single-node baseline case stopped being accepted — the guard became over-broad/vacuous-deny",
+            "this stage targets the rustynet-relay binary, not rustynetd — no validate_linux_runtime_acls gating",
+        ],
+    },
 ];
 
 // `aliases` are &'static str but `norm` is borrowed from a local, so
@@ -5743,6 +5787,55 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             "policy_default_deny",
             "membership_genesis",
             "mesh_status",
+        ] {
+            assert!(
+                !explain_stage(s).content[0].text.contains("Unknown stage"),
+                "alias {s} should resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_stage_covers_tier1_security_stages() {
+        for (stage, expected_fragment) in [
+            (
+                "validate_linux_blind_exit_reversal_denied",
+                "blind_exit_reversal_audit.rs",
+            ),
+            (
+                "validate_linux_gossip_revoked_readmit",
+                "gossip_revoked_readmit_audit.rs",
+            ),
+            (
+                "validate_linux_enrollment_replay",
+                "enrollment_replay_audit.rs",
+            ),
+            (
+                "validate_linux_hello_limiter_flood",
+                "hello_limiter_audit.rs",
+            ),
+        ] {
+            let txt = explain_stage(stage).content[0].text.clone();
+            assert!(
+                txt.starts_with("# Stage:"),
+                "{stage} should resolve, got: {txt}"
+            );
+            assert!(
+                txt.contains(expected_fragment),
+                "{stage} should mention {expected_fragment}, got: {txt}"
+            );
+        }
+        // never falls into "Unknown stage" for this family.
+        for s in [
+            "blind_exit_reversal_denied",
+            "gossip_revoked_readmit",
+            "enrollment_replay",
+            "hello_limiter_flood",
+            "rt-2",
+            "gm-1",
+            "enr-1",
+            "toctou-1",
+            "dos-1",
         ] {
             assert!(
                 !explain_stage(s).content[0].text.contains("Unknown stage"),
