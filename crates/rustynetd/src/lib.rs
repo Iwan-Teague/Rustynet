@@ -7,6 +7,7 @@ pub mod enrollment_consume;
 pub mod enrollment_token;
 pub mod exit_codes;
 pub mod fetcher;
+pub mod gossip_revoked_readmit_audit;
 pub mod gossip_runtime;
 pub mod gossip_transport;
 pub mod ice_priority;

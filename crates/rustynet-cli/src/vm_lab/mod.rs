@@ -16264,6 +16264,64 @@ fn evaluate_blind_exit_reversal_report(
     ))
 }
 
+/// Pure evaluator for the JSON output of `rustynetd gossip-revoked-readmit-audit`.
+/// Proves GM-1/RSA-0034: `GossipNode` must refuse to (re-)admit a peer
+/// currently Revoked/Quarantined in signed membership even when its bundle
+/// passes signature/freshness/sequence checks, while an active peer's
+/// otherwise-identical bundle is still accepted.
+fn evaluate_gossip_revoked_readmit_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::gossip_revoked_readmit_audit::GossipRevokedReadmitAuditReport =
+        serde_json::from_str(raw_json).map_err(|err| {
+            format!("parse gossip-revoked-readmit-audit JSON output failed: {err}")
+        })?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "gossip-revoked-readmit-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases < 2 {
+        return Err(format!(
+            "gossip-revoked-readmit-audit ran only {} case(s); expected the full revoked + active-baseline battery",
+            report.total_cases
+        ));
+    }
+    if report.revoked_denied < 1 {
+        return Err(
+            "gossip-revoked-readmit-audit did not deny the revoked-peer case — GM-1/RSA-0034 regression suspected"
+                .to_owned(),
+        );
+    }
+    if report.active_accepted < 1 {
+        return Err(
+            "gossip-revoked-readmit-audit denied the active-peer baseline case; the guard is vacuous (would deny everything) or over-broad"
+                .to_owned(),
+        );
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| format!("{} (expected {}, got {})", v.id, v.expectation, v.outcome))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "gossip-revoked-readmit audit drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Gossip revoked-peer readmission denial verified on {linux_alias}: revoked bundle denied, active baseline still accepted (GM-1 fix proven live)",
+    ))
+}
+
 /// Pure evaluator for the JSON output of `rustynetd policy-default-deny-audit`.
 /// The daemon-side audit drives the REAL `rustynet_policy` evaluator with a
 /// default-deny truth table (`SecurityMinimumBar.md` §3.6). Fail-closed:
@@ -18147,6 +18205,26 @@ fn run_validate_linux_blind_exit_reversal_denied_stage(
         .map_err(|reason| (reason, raw))
 }
 
+fn run_validate_linux_gossip_revoked_readmit_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "gossip-revoked-readmit-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_gossip_revoked_readmit_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
 fn run_validate_linux_policy_default_deny_stage(
     linux_alias: &str,
     inventory_path: &Path,
@@ -18351,6 +18429,8 @@ fn run_linux_orchestration_stages_with_options(
     let revoked_peer_denied_log_path = logs_dir.join("validate_linux_revoked_peer_denied_e2e.log");
     let blind_exit_reversal_denied_log_path =
         logs_dir.join("validate_linux_blind_exit_reversal_denied.log");
+    let gossip_revoked_readmit_log_path =
+        logs_dir.join("validate_linux_gossip_revoked_readmit.log");
     let policy_default_deny_log_path = logs_dir.join("validate_linux_policy_default_deny.log");
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
@@ -18524,6 +18604,19 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_blind_exit_reversal_denied",
             blind_exit_reversal_denied_log_path.as_path(),
             run_validate_linux_blind_exit_reversal_denied_stage,
+        )
+    };
+
+    let gossip_revoked_readmit_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_gossip_revoked_readmit",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_gossip_revoked_readmit",
+            gossip_revoked_readmit_log_path.as_path(),
+            run_validate_linux_gossip_revoked_readmit_stage,
         )
     };
 
@@ -19074,6 +19167,7 @@ fn run_linux_orchestration_stages_with_options(
         membership_revoke_applies_outcome,
         revoked_peer_denied_outcome,
         blind_exit_reversal_denied_outcome,
+        gossip_revoked_readmit_outcome,
         policy_default_deny_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
@@ -37931,6 +38025,71 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn gossip_revoked_readmit_audit_producer_to_validator_round_trip_passes() {
+        let report = rustynetd::gossip_revoked_readmit_audit::run_gossip_revoked_readmit_audit()
+            .expect("audit runs");
+        assert!(report.overall_ok, "reviewed funnel must pass: {report:?}");
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary =
+            super::evaluate_gossip_revoked_readmit_report("debian-headless-1", raw.as_str())
+                .expect("clean gossip-revoked-readmit audit must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("GM-1"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_gossip_revoked_readmit_report_rejects_regressed_denial() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 2,
+            "revoked_denied": 0,
+            "active_accepted": 1,
+            "violations": [
+                {"id": "revoked_peer_bundle_denied", "expectation": "reject", "outcome": "accepted", "reason": "ACCEPTED: bundle admitted, endpoints applied", "passed": false}
+            ]
+        }"#;
+        let err = super::evaluate_gossip_revoked_readmit_report("debian-headless-1", raw)
+            .expect_err("a regressed denial case must fail closed");
+        assert!(
+            err.contains("did not deny the revoked-peer case"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_gossip_revoked_readmit_report_rejects_vacuous_deny_all() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 2,
+            "revoked_denied": 1,
+            "active_accepted": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_gossip_revoked_readmit_report("debian-headless-1", raw)
+            .expect_err("zero accepted baseline must fail closed");
+        assert!(err.contains("vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_gossip_revoked_readmit_report_rejects_thin_battery() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 1,
+            "revoked_denied": 1,
+            "active_accepted": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_gossip_revoked_readmit_report("debian-headless-1", raw)
+            .expect_err("fewer than 2 cases must fail closed");
+        assert!(err.contains("expected the full"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn linux_relay_lifecycle_output_validators_accept_reviewed_dry_run_text() {
         let install = "rustynet-relay systemd unit: install+enable (dry-run) at /etc/systemd/system/rustynet-relay.service\n  - would run: systemctl daemon-reload\n  - would run: systemctl enable rustynet-relay.service\n  - would run: systemctl start rustynet-relay.service\n";
         super::validate_linux_relay_install_output(install).expect("install output validates");
@@ -40981,6 +41140,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_membership_revoke_applies",
             "validate_linux_revoked_peer_denied_e2e",
             "validate_linux_blind_exit_reversal_denied",
+            "validate_linux_gossip_revoked_readmit",
             "validate_linux_policy_default_deny",
             "validate_linux_dns_failclosed",
             "validate_linux_exit_nat_lifecycle",
@@ -41126,6 +41286,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_membership_revoke_applies",
                 "validate_linux_revoked_peer_denied_e2e",
                 "validate_linux_blind_exit_reversal_denied",
+                "validate_linux_gossip_revoked_readmit",
                 "validate_linux_policy_default_deny",
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",

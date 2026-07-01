@@ -116,6 +116,14 @@ pub struct GossipBundle {
 pub enum GossipError {
     /// The bundle's claimed source is not in our known-peer set.
     UnknownSource,
+    /// GM-1 / RSA-0034: the bundle's claimed source IS a known peer, but
+    /// signed membership currently marks it Revoked/Quarantined. Distinct
+    /// from `UnknownSource` (which means "we've never heard of this peer")
+    /// so the rejection reason is precise and separately counted —
+    /// defense-in-depth alongside the dataplane ACL revocation check
+    /// (DD-03/RSA-0007): a revoked node must not be able to re-advertise
+    /// itself and be re-admitted via gossip alone.
+    RevokedSource,
     /// The Ed25519 signature failed verification under the claimed
     /// source's verifying key.
     SignatureInvalid,
@@ -159,6 +167,9 @@ impl std::fmt::Display for GossipError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GossipError::UnknownSource => write!(f, "gossip bundle source is not a known peer"),
+            GossipError::RevokedSource => {
+                write!(f, "gossip bundle source is revoked in signed membership")
+            }
             GossipError::SignatureInvalid => {
                 write!(f, "gossip bundle signature verification failed")
             }
