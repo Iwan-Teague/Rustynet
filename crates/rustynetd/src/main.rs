@@ -170,6 +170,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "blind-exit-reversal-audit" => {
                 run_blind_exit_reversal_audit_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "gossip-revoked-readmit-audit" => {
+                run_gossip_revoked_readmit_audit_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "policy-default-deny-audit" => {
                 run_policy_default_deny_audit_command(rest)
             }
@@ -1804,6 +1807,37 @@ fn run_blind_exit_reversal_audit_command(args: &[String]) -> Result<(), String> 
     if !report.overall_ok {
         return Err(format!(
             "blind-exit-reversal audit failed: {} violation(s) — RT-2/SecMinBar §6.D.2 blind_exit immutability regressed",
+            report.violations.len()
+        ));
+    }
+    Ok(())
+}
+
+fn run_gossip_revoked_readmit_audit_command(args: &[String]) -> Result<(), String> {
+    // Accept (ignore) --no-fail-on-drift for argv parity with the other check
+    // subcommands; the audit fails closed on its own (non-zero exit).
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!(
+                    "unknown gossip-revoked-readmit-audit argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = rustynetd::gossip_revoked_readmit_audit::run_gossip_revoked_readmit_audit()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|err| {
+            format!("serialize gossip-revoked-readmit-audit report failed: {err}")
+        })?
+    );
+    if !report.overall_ok {
+        return Err(format!(
+            "gossip-revoked-readmit audit failed: {} violation(s) — GM-1/RSA-0034 gossip membership check regressed",
             report.violations.len()
         ));
     }
@@ -3834,6 +3868,7 @@ fn help_text() -> String {
         "  rustynetd membership-revoke-audit",
         "  rustynetd revoked-peer-denied-audit",
         "  rustynetd blind-exit-reversal-audit",
+        "  rustynetd gossip-revoked-readmit-audit",
         "  rustynetd policy-default-deny-audit",
         "  rustynetd privileged-helper-allowlist-audit",
         "  rustynetd macos-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--pf-anchor <name>]",
@@ -3927,8 +3962,9 @@ fn help_text() -> String {
 mod tests {
     use super::{
         classify_top_level_error, help_text, parse_daemon_config,
-        run_blind_exit_reversal_audit_command, run_linux_exit_dns_failclosed_capture_command,
-        run_linux_ipv6_leak_capture_command, run_macos_exit_dns_failclosed_capture_command,
+        run_blind_exit_reversal_audit_command, run_gossip_revoked_readmit_audit_command,
+        run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
+        run_macos_exit_dns_failclosed_capture_command,
         run_macos_exit_killswitch_precedence_check_command, run_macos_ipv6_leak_capture_command,
         run_membership_revoke_audit_command, run_membership_signature_audit_command,
         run_policy_default_deny_audit_command, run_privileged_helper_allowlist_audit_command,
@@ -4492,6 +4528,36 @@ mod tests {
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown blind-exit-reversal-audit argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_gossip_revoked_readmit_audit_subcommand() {
+        assert!(
+            help_text().contains("gossip-revoked-readmit-audit"),
+            "help text must advertise gossip-revoked-readmit-audit subcommand"
+        );
+    }
+
+    #[test]
+    fn run_gossip_revoked_readmit_audit_command_passes_on_reviewed_funnel() {
+        run_gossip_revoked_readmit_audit_command(&[])
+            .expect("gossip-revoked-readmit audit must pass against the real fixed GossipNode");
+    }
+
+    #[test]
+    fn run_gossip_revoked_readmit_audit_command_accepts_no_fail_on_drift() {
+        run_gossip_revoked_readmit_audit_command(&["--no-fail-on-drift".to_owned()])
+            .expect("must accept --no-fail-on-drift for argv parity");
+    }
+
+    #[test]
+    fn run_gossip_revoked_readmit_audit_command_rejects_unknown_flags() {
+        let err = run_gossip_revoked_readmit_audit_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown gossip-revoked-readmit-audit argument"),
             "unexpected error: {err}"
         );
     }

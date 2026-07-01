@@ -156,6 +156,14 @@ pub struct GossipNode {
     /// peer id. A spoofed transport sender cannot influence this:
     /// only already-verified membership state updates the set.
     pub anchor_gossip_seed_peer_ids: HashSet<[u8; 32]>,
+    /// GM-1 / RSA-0034: peers currently Revoked/Quarantined in signed
+    /// membership. Checked on every inbound bundle, defense-in-depth
+    /// alongside the dataplane ACL revocation check (DD-03/RSA-0007) — a
+    /// revoked node must not be able to re-advertise itself via gossip and
+    /// be re-admitted into `applied_endpoints`. Populated the same way as
+    /// `anchor_gossip_seed_peer_ids`: derived from verified membership
+    /// state via `set_revoked_peer_ids`, never from the wire.
+    pub revoked_peer_ids: HashSet<[u8; 32]>,
     /// Last endpoints accepted from each remote source. Read by the
     /// connect path; the integration test asserts against this.
     pub applied_endpoints: HashMap<[u8; 32], Vec<SocketAddr>>,
@@ -189,6 +197,7 @@ impl GossipNode {
             signing_key,
             peers: HashMap::new(),
             anchor_gossip_seed_peer_ids: HashSet::new(),
+            revoked_peer_ids: HashSet::new(),
             applied_endpoints: HashMap::new(),
             gossip_sequence: 0,
             seen_gossip_sequences: SeenSequenceState::new(),
@@ -234,6 +243,14 @@ impl GossipNode {
         peer_ids: impl IntoIterator<Item = [u8; 32]>,
     ) {
         self.anchor_gossip_seed_peer_ids = peer_ids.into_iter().collect();
+    }
+
+    /// Replace the revoked-peer set from verified membership state (GM-1 /
+    /// RSA-0034). Unknown peer ids are harmless; `ingest_inbound_bundle`
+    /// only consults this set for bundles whose source is already a known
+    /// peer (an unknown source is rejected earlier, by `accept_bundle`).
+    pub fn set_revoked_peer_ids(&mut self, peer_ids: impl IntoIterator<Item = [u8; 32]>) {
+        self.revoked_peer_ids = peer_ids.into_iter().collect();
     }
 
     /// Snapshot of all currently-registered peers' verifying keys
@@ -388,6 +405,23 @@ impl GossipNode {
             );
             return Err(GossipNodeError::Bundle(err));
         }
+        // GM-1 / RSA-0034: signature/freshness/sequence all passed, but a
+        // node currently Revoked/Quarantined in signed membership must
+        // still be refused — defense-in-depth alongside the dataplane ACL
+        // revocation check (DD-03/RSA-0007). Checked AFTER signature
+        // verification (a forged bundle is rejected on its own merits
+        // first) and BEFORE any state mutation (no watermark advance, no
+        // endpoint admission, no re-push) so a revoked node gets zero
+        // observable effect from presenting a bundle.
+        if self.revoked_peer_ids.contains(&bundle.source_node_id) {
+            self.bump_reject_counter("revoked_source");
+            log::warn!(
+                "gossip_reject_revoked_source source={} sender={:?}",
+                short_id(&bundle.source_node_id),
+                sender
+            );
+            return Err(GossipNodeError::Bundle(GossipError::RevokedSource));
+        }
         // accept_bundle_with_now passed against a clone of the
         // seen-state; commit it to the real ledger only after the
         // watermark spool write succeeds.
@@ -503,6 +537,26 @@ pub fn anchor_gossip_seed_peer_ids_from_membership(state: &MembershipState) -> V
     ids
 }
 
+/// GM-1 / RSA-0034: raw pubkeys of every node currently Revoked or
+/// Quarantined in signed membership, for [`GossipNode::set_revoked_peer_ids`].
+/// Mirrors [`anchor_gossip_seed_peer_ids_from_membership`]'s shape exactly.
+pub fn revoked_peer_ids_from_membership(state: &MembershipState) -> Vec<[u8; 32]> {
+    let mut ids = state
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.status,
+                MembershipNodeStatus::Revoked | MembershipNodeStatus::Quarantined
+            )
+        })
+        .filter_map(|node| decode_hex32(node.node_pubkey_hex.as_str()))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 pub fn select_port_mapping_authority_node_id(nodes: &[MembershipNode]) -> Option<String> {
     nodes
         .iter()
@@ -533,6 +587,7 @@ pub struct GossipIngestSummary {
 pub fn error_kind(err: &GossipError) -> &'static str {
     match err {
         GossipError::UnknownSource => "unknown_source",
+        GossipError::RevokedSource => "revoked_source",
         GossipError::SignatureInvalid => "signature_invalid",
         GossipError::TimestampOutsideWindow { .. } => "timestamp_outside_window",
         GossipError::SequenceNotMonotonic { .. } => "sequence_not_monotonic",
@@ -1185,5 +1240,75 @@ mod tests {
             GossipNodeError::Bundle(GossipError::UnknownSource)
         ));
         assert_eq!(node.rejected_counts.get("self_origin"), Some(&1));
+    }
+
+    #[test]
+    fn revoked_peer_ids_from_membership_filters_by_status() {
+        let state = membership_state(vec![
+            membership_node("node-active", 0x11, vec![RoleCapability::Anchor]),
+            {
+                let mut n = membership_node("node-revoked", 0x22, vec![RoleCapability::Anchor]);
+                n.status = MembershipNodeStatus::Revoked;
+                n
+            },
+            {
+                let mut n = membership_node("node-quarantined", 0x33, vec![RoleCapability::Anchor]);
+                n.status = MembershipNodeStatus::Quarantined;
+                n
+            },
+        ]);
+        let revoked = revoked_peer_ids_from_membership(&state);
+        assert_eq!(revoked, vec![[0x22u8; 32], [0x33u8; 32]]);
+    }
+
+    #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
+    #[test]
+    fn ingest_rejects_revoked_source_bundle() {
+        // GM-1 / RSA-0034: a bundle that passes signature/freshness/sequence
+        // must still be rejected if signed membership marks the source
+        // Revoked — defense-in-depth alongside the dataplane ACL revocation
+        // check (DD-03/RSA-0007).
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(4, dir.path());
+        let sender_key = SigningKey::from_bytes(&[7u8; 32]);
+        let sender_id = sender_key.verifying_key().to_bytes();
+        node.register_peer(sender_id, sender_key.verifying_key(), loopback_bind());
+        node.set_revoked_peer_ids([sender_id]);
+        let bundle =
+            mint_bundle_with_timestamp(&sender_key, 1, 1_700_000_000, CandidateSet::default())
+                .unwrap();
+        let transport = GossipTransport::bind(loopback_bind()).expect("transport");
+        let err = node
+            .ingest_inbound_bundle(None, bundle, &transport, 1_700_000_000)
+            .expect_err("must reject revoked source");
+        assert!(matches!(
+            err,
+            GossipNodeError::Bundle(GossipError::RevokedSource)
+        ));
+        assert_eq!(node.rejected_counts.get("revoked_source"), Some(&1));
+        assert!(
+            !node.applied_endpoints.contains_key(&sender_id),
+            "a revoked source's endpoints must never be admitted"
+        );
+    }
+
+    #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
+    #[test]
+    fn ingest_accepts_active_source_not_vacuously_revoked() {
+        // Anti-vacuous: an otherwise-identical bundle from a NON-revoked
+        // known peer must still be accepted — proves the check above isn't
+        // "always reject" and doesn't regress the ordinary accept path.
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(5, dir.path());
+        let sender_key = SigningKey::from_bytes(&[8u8; 32]);
+        let sender_id = sender_key.verifying_key().to_bytes();
+        node.register_peer(sender_id, sender_key.verifying_key(), loopback_bind());
+        let bundle =
+            mint_bundle_with_timestamp(&sender_key, 1, 1_700_000_000, CandidateSet::default())
+                .unwrap();
+        let transport = GossipTransport::bind(loopback_bind()).expect("transport");
+        node.ingest_inbound_bundle(None, bundle, &transport, 1_700_000_000)
+            .expect("a non-revoked known peer's bundle must be accepted");
+        assert!(node.applied_endpoints.contains_key(&sender_id));
     }
 }
