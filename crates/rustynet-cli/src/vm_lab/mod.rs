@@ -73,6 +73,7 @@ const WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE: &str = "Collect-RustyNetWindowsDi
 const WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE: &str = "Smoke-RustyNetWindowsServiceHost.ps1";
 const WINDOWS_TUNNEL_SMOKE_HELPER_FILE: &str = "Invoke-RustyNetWindowsTunnelSmoke.ps1";
 const WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE: &str = "Invoke-RustyNetWindowsKillswitchSmoke.ps1";
+const WINDOWS_ANCHOR_INSTALL_HELPER_FILE: &str = "Install-RustyNetWindowsAnchorService.ps1";
 const SETUP_MANIFEST_RELATIVE_PATH: &str = "state/setup_manifest.json";
 const REPORT_STATE_RELATIVE_PATH: &str = "state/report_state.json";
 const RELEASE_GATE_COMPLETENESS_RELATIVE_PATH: &str = "state/release_gate_completeness.json";
@@ -11370,18 +11371,8 @@ const WINDOWS_ANCHOR_BUNDLE_PULL_ADDR: &str = "127.0.0.1:51822";
 const WINDOWS_ANCHOR_BUNDLE_PULL_PORT: u16 = 51822;
 const WINDOWS_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str =
     r"C:\ProgramData\RustyNet\config\anchor-bundle-pull.token";
-const WINDOWS_ANCHOR_MEMBERSHIP_ROOT: &str = r"C:\ProgramData\RustyNet\membership";
 const WINDOWS_ANCHOR_MEMBERSHIP_SNAPSHOT_PATH: &str =
     r"C:\ProgramData\RustyNet\membership\membership.snapshot";
-const WINDOWS_ANCHOR_MEMBERSHIP_LOG_PATH: &str =
-    r"C:\ProgramData\RustyNet\membership\membership.log";
-const WINDOWS_ANCHOR_MEMBERSHIP_WATERMARK_PATH: &str =
-    r"C:\ProgramData\RustyNet\membership\membership.watermark";
-const WINDOWS_ANCHOR_MEMBERSHIP_OWNER_KEY_PATH: &str =
-    r"C:\ProgramData\RustyNet\membership\membership.owner.key";
-/// Reviewed name of the installed Windows daemon SCM service
-/// (`REVIEWED_WINDOWS_SERVICE_NAME`, windows_service_hardening.rs:22).
-const WINDOWS_ANCHOR_SERVICE_NAME: &str = "RustyNet";
 
 /// Make the Windows host actually SERVE the anchor bundle-pull listener before
 /// the live validation runs — the Windows analogue of
@@ -11403,12 +11394,16 @@ const WINDOWS_ANCHOR_SERVICE_NAME: &str = "RustyNet";
 /// service's `RUSTYNETD_DAEMON_ARGS_JSON`, asserts the loopback addr +
 /// allow-lan=false + present token-path BEFORE start (verify-before-serve, the
 /// `GOT_ADDR`/`GOT_LAN` analogue at mod.rs:10715), restarts the `RustyNet`
-/// service, and polls the `:51822` listener up to 20x.
+/// service (up to 3 attempts, each polling the `:51822` listener up to 10x, to
+/// absorb a startup reconcile race — see the script's own comment), and polls
+/// the loopback listener.
 ///
-/// Inline base64 `-EncodedCommand` PowerShell (the Windows admin-issue pattern,
-/// `exercise_windows_admin_issue_live`, mod.rs:13176) is used so SSH transport is
-/// oblivious to PS quoting; the reviewed standalone equivalent lives at
-/// `scripts/windows/Install-RustyNetWindowsAnchorService.ps1`.
+/// The actual logic lives in the reviewed, version-controlled script
+/// `scripts/bootstrap/windows/Install-RustyNetWindowsAnchorService.ps1`, staged
+/// to the guest and invoked by path (`-File`) with a single `-NodeId`
+/// argument — not inlined as a base64 `-EncodedCommand` blob (that shape
+/// previously hit a live, reproducible SSH exec-channel rejection; see the
+/// comment in the function body).
 fn deploy_windows_anchor_service(
     windows_alias: &str,
     inventory_path: &Path,
@@ -11435,137 +11430,68 @@ fn deploy_windows_anchor_service(
     validate_mesh_node_id(node_id.as_str())?;
     let target = remote_target_from_inventory_entry(&windows_entry, None);
 
-    // node_id is a validated mesh id (ASCII alnum + [-_.]); every other value is
-    // a reviewed constant. The PS body fail-closes
-    // ($ErrorActionPreference=Stop) and performs verify-before-serve before any
-    // service restart. The token never enters argv — it is referenced by path.
-    //
-    // The service restart is wrapped in up to 3 attempts (each polling only
-    // 10x2s, not the old single 60x2s): live-reproduced startup race where the
-    // daemon's FIRST reconcile tick can run before the just-written membership
-    // snapshot is visible, logging "membership reconcile failed: membership
-    // snapshot is missing" and fail-closing (the correct security posture --
-    // never serve on unproven trust state) -- but the daemon does not recover
-    // within the same process lifetime, so the anchor listener never binds. A
-    // FRESH restart against the by-then-stable snapshot file reliably binds
-    // within ~7s (confirmed live), so a bounded number of restart attempts is
-    // the safe mitigation here without touching the daemon's core reconcile
-    // fail-closed path.
-    let deploy_script = format!(
-        "$ErrorActionPreference='Stop'; \
-         $rn='{daemon}'; \
-         $svc='{service}'; \
-         $env_file='{env_file}'; \
-         $snap='{snapshot}'; \
-         $node='{node}'; \
-         $addr='{addr}'; \
-         $token_path='{token_path}'; \
-         New-Item -ItemType Directory -Force -Path '{membership_root}' | Out-Null; \
-         $pass=Join-Path $env:TEMP ('rn-anchor-pass-'+[guid]::NewGuid().ToString('N')); \
-         [IO.File]::WriteAllText($pass,([guid]::NewGuid().ToString('N')+[guid]::NewGuid().ToString('N'))); \
-         try {{ \
-           & $rn membership init --snapshot $snap --log '{log_path}' --watermark '{watermark_path}' --owner-signing-key '{owner_key_path}' --owner-signing-key-passphrase-file $pass --node-id $node --network-id 'windows-anchor-local' --force; \
-           if($LASTEXITCODE -ne 0){{throw 'membership init failed'}}; \
-         }} finally {{ if(Test-Path -LiteralPath $pass){{Remove-Item -Force -LiteralPath $pass}} }}; \
-         if(-not(Test-Path -LiteralPath $snap)){{throw 'membership snapshot missing after init'}}; \
-         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $token_path) | Out-Null; \
-         if(-not(Test-Path -LiteralPath $token_path)){{ \
-           $bytes=New-Object 'System.Byte[]' 32; \
-           [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes); \
-           $tok=-join($bytes|%{{$_.ToString('x2')}}); \
-           [IO.File]::WriteAllText($token_path,$tok); \
-         }}; \
-         $acl=New-Object System.Security.AccessControl.FileSecurity; \
-         $acl.SetAccessRuleProtection($true,$false); \
-         foreach($sid in @('S-1-5-18','S-1-5-32-544')){{ \
-           $id=New-Object System.Security.Principal.SecurityIdentifier($sid); \
-           $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($id,'FullControl','Allow'); \
-           $acl.AddAccessRule($rule); \
-         }}; \
-         Set-Acl -LiteralPath $token_path -AclObject $acl; \
-         $tc=(Get-Content -LiteralPath $token_path -Raw).Trim(); \
-         if($tc.Length -lt 32){{throw 'anchor token shorter than 32 bytes'}}; \
-         if(-not(Test-Path -LiteralPath $env_file)){{throw 'reviewed env-file missing'}}; \
-         $lines=Get-Content -LiteralPath $env_file; \
-         $argsLine=$lines|Where-Object {{$_ -like 'RUSTYNETD_DAEMON_ARGS_JSON=*'}}|Select-Object -First 1; \
-         if(-not $argsLine){{throw 'RUSTYNETD_DAEMON_ARGS_JSON not present in env-file'}}; \
-         $jsonValue=$argsLine.Substring('RUSTYNETD_DAEMON_ARGS_JSON='.Length); \
-         $raw=@($jsonValue|ConvertFrom-Json); \
-         $cur=New-Object 'System.Collections.Generic.List[string]'; \
-         for($j=0;$j -lt $raw.Count;$j++){{ \
-           $elem=[string]$raw[$j]; \
-           if($elem.Contains(' ')){{ \
-             $tokens=$elem -split ' +'; \
-             foreach($t in $tokens){{if($t){{$cur.Add($t)}}}} \
-           }}else{{ \
-             $cur.Add($elem) \
-           }} \
-         }}; \
-         $f=New-Object 'System.Collections.Generic.List[string]'; \
-         for($i=0;$i -lt $cur.Count;$i++){{ \
-           $a=$cur[$i]; \
-           if($a -in @('--anchor-bundle-pull-addr','--anchor-bundle-pull-token-path','--anchor-bundle-pull-allow-lan')){{$i++;continue}}; \
-           $f.Add([string]$a); \
-         }}; \
-         $f.Add('--anchor-bundle-pull-addr'); $f.Add($addr); \
-         $f.Add('--anchor-bundle-pull-token-path'); $f.Add($token_path); \
-         $f.Add('--anchor-bundle-pull-allow-lan'); $f.Add('false'); \
-         $newArgs=$f.ToArray(); \
-         $gotAddr=$null; $gotLan=$null; $gotTok=$null; \
-         for($i=0;$i -lt $newArgs.Count;$i++){{ \
-           if($newArgs[$i] -eq '--anchor-bundle-pull-addr'){{$gotAddr=$newArgs[$i+1]}}; \
-           if($newArgs[$i] -eq '--anchor-bundle-pull-allow-lan'){{$gotLan=$newArgs[$i+1]}}; \
-           if($newArgs[$i] -eq '--anchor-bundle-pull-token-path'){{$gotTok=$newArgs[$i+1]}}; \
-         }}; \
-         if($gotAddr -ne $addr -or $gotLan -ne 'false' -or [string]::IsNullOrWhiteSpace($gotTok)){{throw \"anchor verify-before-serve failed: addr=$gotAddr allow_lan=$gotLan token=$gotTok (expected loopback + deny-LAN + present token)\"}}; \
-         $newJson=ConvertTo-Json -InputObject $newArgs -Compress; \
-         $rewritten=$lines|ForEach-Object {{ if($_ -like 'RUSTYNETD_DAEMON_ARGS_JSON=*'){{ 'RUSTYNETD_DAEMON_ARGS_JSON='+$newJson }} else {{ $_ }} }}; \
-         Set-Content -LiteralPath $env_file -Value $rewritten -Encoding ascii; \
-         $up=$false; \
-         for($restart=0;$restart -lt 3 -and -not $up;$restart++){{ \
-           $s=Get-Service -Name $svc -ErrorAction Stop; \
-           if($s.Status -eq 'Running'){{ & sc.exe stop $svc | Out-Null; Start-Sleep -Seconds 2 }}; \
-           & sc.exe start $svc | Out-Null; \
-           for($i=0;$i -lt 10;$i++){{ \
-             $c=Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue; \
-             if($c){{ foreach($x in $c){{ if($x.LocalAddress -eq '127.0.0.1' -or $x.LocalAddress -eq '::1'){{$up=$true;break}} }} }}; \
-             if($up){{break}}; \
-             Start-Sleep -Seconds 2; \
-           }}; \
-         }}; \
-         if(-not $up){{throw \"anchor bundle-pull listener did not come up on $addr\"}}; \
-         Write-Output \"anchor bundle-pull listener up on $addr (genesis snapshot + verify-before-serve asserted)\"",
-        daemon = WINDOWS_RUSTYNETD_EXE_PATH,
-        service = WINDOWS_ANCHOR_SERVICE_NAME,
-        env_file = WINDOWS_RUSTYNETD_ENV_PATH,
-        snapshot = WINDOWS_ANCHOR_MEMBERSHIP_SNAPSHOT_PATH,
-        membership_root = WINDOWS_ANCHOR_MEMBERSHIP_ROOT,
-        log_path = WINDOWS_ANCHOR_MEMBERSHIP_LOG_PATH,
-        watermark_path = WINDOWS_ANCHOR_MEMBERSHIP_WATERMARK_PATH,
-        owner_key_path = WINDOWS_ANCHOR_MEMBERSHIP_OWNER_KEY_PATH,
-        token_path = WINDOWS_ANCHOR_BUNDLE_PULL_TOKEN_PATH,
-        addr = WINDOWS_ANCHOR_BUNDLE_PULL_ADDR,
-        node = node_id,
-        port = WINDOWS_ANCHOR_BUNDLE_PULL_PORT,
-    );
-    let invocation = build_ssh_powershell_encoded_invocation(deploy_script.as_str())?;
-    // Retry on a bare SSH channel-open rejection ("exec request failed on
-    // channel 0"), observed live against a resource-pressured Windows guest:
-    // the TCP+auth handshake succeeds but the server transiently refuses the
-    // new session channel before the remote script ever runs. The deploy
-    // script itself is idempotent (filters+re-appends its own flags, verifies
-    // equality, restarts the same service), so re-issuing the whole exec on a
-    // fresh connection is safe. A live-caused code fault (bad PowerShell,
-    // wrong path) fails identically every attempt and still surfaces after
-    // the budget is spent.
-    let out = capture_remote_shell_command_with_channel_retry(
-        &target,
-        ssh_identity_file,
+    // node_id is a validated mesh id (ASCII alnum + [-_.]); passed as a single
+    // -NodeId argument, never interpolated into script text. The reviewed,
+    // version-controlled installer (scripts/bootstrap/windows/
+    // Install-RustyNetWindowsAnchorService.ps1) is staged to the guest and run
+    // by path (`-File`) instead of being inlined as a large base64
+    // `-EncodedCommand` blob: repeated live failures showed the SSH exec
+    // request itself getting rejected ("exec request failed on channel 0")
+    // before the script ever ran, on this one large-inline-payload call while
+    // dozens of other, shorter SSH commands against the same guest in the
+    // same run succeeded — the same shape as an open, unresolved upstream
+    // issue (ansible/ansible#83958) where a command that controls another
+    // process/service works over WinRM and interactively but fails
+    // specifically over SSH exec on Win32-OpenSSH. Moving to file-staging +
+    // a short `-File` invocation removes the large-inline-command shape
+    // entirely. The script itself is unchanged in behavior: fail-closes
+    // ($ErrorActionPreference=Stop), performs verify-before-serve before any
+    // service restart, and never puts the token in argv (referenced by
+    // path). The service-restart race fix (retry the restart, not a single
+    // long poll) lives inside the script now, not duplicated here.
+    let context = RemoteFallbackContext {
+        target: &target,
+        ssh_user_override: None,
+        ssh_identity_file: Some(ssh_identity_file),
         known_hosts_path,
-        invocation.as_str(),
-        Duration::from_secs(180),
-    )
-    .map_err(|e| format!("Windows anchor deploy on {windows_alias} failed: {e}"))?;
+        timeout: Duration::from_secs(180),
+    };
+    let local_path = windows_helper_script_local_path(WINDOWS_ANCHOR_INSTALL_HELPER_FILE);
+    let args = vec!["-NodeId".to_owned(), node_id.clone()];
+    // Retry on a bare SSH channel-open rejection ("exec request failed on
+    // channel 0") only -- the installer script is idempotent (filters+
+    // re-appends its own flags, verifies equality, restarts the same
+    // service), so re-issuing the whole staged invocation on a fresh
+    // connection is safe. A genuine code fault (bad PowerShell, wrong path)
+    // fails identically every attempt and still surfaces after the budget is
+    // spent.
+    const MAX_ATTEMPTS: u32 = 3;
+    const RETRY_BACKOFF: Duration = Duration::from_secs(10);
+    let mut last_err = String::new();
+    let mut out = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match capture_windows_helper_script_output_from_path(
+            &context,
+            local_path.as_path(),
+            WINDOWS_ANCHOR_INSTALL_HELPER_FILE,
+            &args,
+        ) {
+            Ok(output) => {
+                out = Some(output);
+                break;
+            }
+            Err(err) => {
+                let retryable = err.contains(SSH_CHANNEL_OPEN_REJECTED_MARKER);
+                last_err = err;
+                if !retryable || attempt == MAX_ATTEMPTS {
+                    break;
+                }
+                thread::sleep(RETRY_BACKOFF);
+            }
+        }
+    }
+    let out =
+        out.ok_or_else(|| format!("Windows anchor deploy on {windows_alias} failed: {last_err}"))?;
 
     Ok(format!(
         "Windows anchor service reconfigured on {windows_alias}: self-contained genesis snapshot \
@@ -27044,54 +26970,6 @@ fn capture_remote_shell_command_for_target(
 /// remote script never ran. Distinct from an auth failure or the remote
 /// command's own non-zero exit.
 const SSH_CHANNEL_OPEN_REJECTED_MARKER: &str = "exec request failed on channel";
-
-/// Bounded retry wrapper around [`capture_remote_shell_command_for_target`]
-/// for callers whose remote script is idempotent and therefore safe to
-/// re-issue on a fresh connection. Retries ONLY on
-/// [`SSH_CHANNEL_OPEN_REJECTED_MARKER`] (observed live: a resource-pressured
-/// guest transiently rejects the exec channel before any remote code runs);
-/// every other failure — including the remote script's own error output —
-/// propagates immediately on the first attempt, so a genuine code fault is
-/// never masked or retried away.
-fn capture_remote_shell_command_with_channel_retry(
-    target: &RemoteTarget,
-    ssh_identity_file: &Path,
-    known_hosts_path: Option<&Path>,
-    remote_script: &str,
-    timeout: Duration,
-) -> Result<String, String> {
-    // Live evidence (2026-07-01, 3 consecutive runs): the channel rejection
-    // survived a 3-attempt/5s-backoff budget (~15s total). A benign command
-    // of identical encoded length ran clean 3/3 times against an idle guest
-    // immediately after, ruling out a payload-size limit — so the rejection
-    // window during a live run (reached only after ~30 min of sustained
-    // bootstrap/enforce load on the resource-constrained UTM guest) can
-    // outlast a short retry. Widen the budget rather than guess further.
-    const MAX_ATTEMPTS: u32 = 6;
-    const RETRY_BACKOFF: Duration = Duration::from_secs(10);
-    let mut last_error = String::new();
-    for attempt in 1..=MAX_ATTEMPTS {
-        match capture_remote_shell_command_for_target(
-            target,
-            None,
-            Some(ssh_identity_file),
-            known_hosts_path,
-            remote_script,
-            timeout,
-        ) {
-            Ok(out) => return Ok(out),
-            Err(err) => {
-                let retryable = err.contains(SSH_CHANNEL_OPEN_REJECTED_MARKER);
-                last_error = err;
-                if !retryable || attempt == MAX_ATTEMPTS {
-                    break;
-                }
-                thread::sleep(RETRY_BACKOFF);
-            }
-        }
-    }
-    Err(last_error)
-}
 
 fn scp_to_remote_for_target_with_phase(
     context: &RemoteFallbackContext<'_>,
