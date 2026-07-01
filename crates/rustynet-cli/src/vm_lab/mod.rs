@@ -11535,10 +11535,18 @@ fn deploy_windows_anchor_service(
         port = WINDOWS_ANCHOR_BUNDLE_PULL_PORT,
     );
     let invocation = build_ssh_powershell_encoded_invocation(deploy_script.as_str())?;
-    let out = capture_remote_shell_command_for_target(
+    // Retry on a bare SSH channel-open rejection ("exec request failed on
+    // channel 0"), observed live against a resource-pressured Windows guest:
+    // the TCP+auth handshake succeeds but the server transiently refuses the
+    // new session channel before the remote script ever runs. The deploy
+    // script itself is idempotent (filters+re-appends its own flags, verifies
+    // equality, restarts the same service), so re-issuing the whole exec on a
+    // fresh connection is safe. A live-caused code fault (bad PowerShell,
+    // wrong path) fails identically every attempt and still surfaces after
+    // the budget is spent.
+    let out = capture_remote_shell_command_with_channel_retry(
         &target,
-        None,
-        Some(ssh_identity_file),
+        ssh_identity_file,
         known_hosts_path,
         invocation.as_str(),
         Duration::from_secs(180),
@@ -27015,6 +27023,53 @@ fn capture_remote_shell_command_for_target(
         timeout,
         RemoteTransportPhase::PostBootstrap,
     )
+}
+
+/// Substring the OpenSSH client prints when the server refuses to open a new
+/// session channel on an otherwise-successful (TCP+auth) connection — the
+/// remote script never ran. Distinct from an auth failure or the remote
+/// command's own non-zero exit.
+const SSH_CHANNEL_OPEN_REJECTED_MARKER: &str = "exec request failed on channel";
+
+/// Bounded retry wrapper around [`capture_remote_shell_command_for_target`]
+/// for callers whose remote script is idempotent and therefore safe to
+/// re-issue on a fresh connection. Retries ONLY on
+/// [`SSH_CHANNEL_OPEN_REJECTED_MARKER`] (observed live: a resource-pressured
+/// guest transiently rejects the exec channel before any remote code runs);
+/// every other failure — including the remote script's own error output —
+/// propagates immediately on the first attempt, so a genuine code fault is
+/// never masked or retried away.
+fn capture_remote_shell_command_with_channel_retry(
+    target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    remote_script: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const RETRY_BACKOFF: Duration = Duration::from_secs(5);
+    let mut last_error = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        match capture_remote_shell_command_for_target(
+            target,
+            None,
+            Some(ssh_identity_file),
+            known_hosts_path,
+            remote_script,
+            timeout,
+        ) {
+            Ok(out) => return Ok(out),
+            Err(err) => {
+                let retryable = err.contains(SSH_CHANNEL_OPEN_REJECTED_MARKER);
+                last_error = err;
+                if !retryable || attempt == MAX_ATTEMPTS {
+                    break;
+                }
+                thread::sleep(RETRY_BACKOFF);
+            }
+        }
+    }
+    Err(last_error)
 }
 
 fn scp_to_remote_for_target_with_phase(
