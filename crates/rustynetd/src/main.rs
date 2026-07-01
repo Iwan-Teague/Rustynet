@@ -167,6 +167,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "revoked-peer-denied-audit" => {
                 run_revoked_peer_denied_audit_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "blind-exit-reversal-audit" => {
+                run_blind_exit_reversal_audit_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "policy-default-deny-audit" => {
                 run_policy_default_deny_audit_command(rest)
             }
@@ -1771,6 +1774,36 @@ fn run_revoked_peer_denied_audit_command(args: &[String]) -> Result<(), String> 
     if !report.overall_ok {
         return Err(format!(
             "revoked-peer-denied audit failed: {} violation(s) — DD-03/RSA-0007's membership-aware ACL fix regressed or is over-broad",
+            report.violations.len()
+        ));
+    }
+    Ok(())
+}
+
+fn run_blind_exit_reversal_audit_command(args: &[String]) -> Result<(), String> {
+    // Accept (ignore) --no-fail-on-drift for argv parity with the other check
+    // subcommands; the audit fails closed on its own (non-zero exit).
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!(
+                    "unknown blind-exit-reversal-audit argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = rustynetd::blind_exit_reversal_audit::run_blind_exit_reversal_audit()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize blind-exit-reversal-audit report failed: {err}"))?
+    );
+    if !report.overall_ok {
+        return Err(format!(
+            "blind-exit-reversal audit failed: {} violation(s) — RT-2/SecMinBar §6.D.2 blind_exit immutability regressed",
             report.violations.len()
         ));
     }
@@ -3800,6 +3833,7 @@ fn help_text() -> String {
         "  rustynetd membership-signature-audit",
         "  rustynetd membership-revoke-audit",
         "  rustynetd revoked-peer-denied-audit",
+        "  rustynetd blind-exit-reversal-audit",
         "  rustynetd policy-default-deny-audit",
         "  rustynetd privileged-helper-allowlist-audit",
         "  rustynetd macos-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--pf-anchor <name>]",
@@ -3893,8 +3927,8 @@ fn help_text() -> String {
 mod tests {
     use super::{
         classify_top_level_error, help_text, parse_daemon_config,
-        run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
-        run_macos_exit_dns_failclosed_capture_command,
+        run_blind_exit_reversal_audit_command, run_linux_exit_dns_failclosed_capture_command,
+        run_linux_ipv6_leak_capture_command, run_macos_exit_dns_failclosed_capture_command,
         run_macos_exit_killswitch_precedence_check_command, run_macos_ipv6_leak_capture_command,
         run_membership_revoke_audit_command, run_membership_signature_audit_command,
         run_policy_default_deny_audit_command, run_privileged_helper_allowlist_audit_command,
@@ -4428,6 +4462,36 @@ mod tests {
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown revoked-peer-denied-audit argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_blind_exit_reversal_audit_subcommand() {
+        assert!(
+            help_text().contains("blind-exit-reversal-audit"),
+            "help text must advertise blind-exit-reversal-audit subcommand"
+        );
+    }
+
+    #[test]
+    fn run_blind_exit_reversal_audit_command_passes_on_reviewed_funnel() {
+        run_blind_exit_reversal_audit_command(&[])
+            .expect("blind-exit reversal audit must pass against the real fixed reducer");
+    }
+
+    #[test]
+    fn run_blind_exit_reversal_audit_command_accepts_no_fail_on_drift() {
+        run_blind_exit_reversal_audit_command(&["--no-fail-on-drift".to_owned()])
+            .expect("must accept --no-fail-on-drift for argv parity");
+    }
+
+    #[test]
+    fn run_blind_exit_reversal_audit_command_rejects_unknown_flags() {
+        let err = run_blind_exit_reversal_audit_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown blind-exit-reversal-audit argument"),
             "unexpected error: {err}"
         );
     }

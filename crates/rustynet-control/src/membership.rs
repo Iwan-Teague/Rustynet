@@ -1167,6 +1167,20 @@ fn reduce_membership_state(
                 .iter_mut()
                 .find(|candidate| candidate.node_id == *node_id)
                 .ok_or_else(|| MembershipError::NotFound(format!("node {node_id}")))?;
+            // RT-2 / SecMinBar §6.D.2: blind_exit is immutable — the ONLY way
+            // out is factory reset + fresh enrollment under a new identity,
+            // never a capability-set update on the existing node. Without
+            // this check, `transition_plan()` (rustynet-control::role_presets,
+            // a CLI-facing advisory planner) refuses to construct a reversing
+            // transition, but nothing stopped a validly-signed
+            // SetNodeCapabilities update from reversing it directly at the
+            // membership-state layer — the same class of gap as RSA-0009/
+            // DD-03: enforcement lived in a helper, not the trust boundary.
+            if node.capabilities.contains(&RoleCapability::BlindExit) {
+                return Err(MembershipError::InvalidTransition(
+                    "blind_exit is immutable; factory reset and fresh enrollment are required to change capabilities",
+                ));
+            }
             node.capabilities = canonicalize_role_capabilities(capabilities.iter().copied());
             node.updated_at_unix = op_created_at_unix;
         }
@@ -1877,8 +1891,8 @@ mod tests {
         MembershipState, MembershipUpdateRecord, SignedMembershipUpdate,
         append_membership_log_entry, apply_signed_update, decode_update_record, hex_encode,
         load_membership_log, load_membership_snapshot, persist_membership_snapshot,
-        preview_next_state, replay_membership_snapshot_and_log, sign_update_record,
-        write_membership_audit_log,
+        preview_next_state, reduce_membership_state, replay_membership_snapshot_and_log,
+        sign_update_record, write_membership_audit_log,
     };
     // The size-cap constants are only exercised by the `#[cfg(unix)]` oversized-file
     // tests below; gate the import to match so Windows does not see them as unused.
@@ -3110,6 +3124,65 @@ mod tests {
                 .contains(&RoleCapability::AnchorBundlePull)
         );
         assert_eq!(node.updated_at_unix, 120);
+    }
+
+    /// RT-2 / SecMinBar §6.D.2: blind_exit is immutable. `transition_plan()`
+    /// (rustynet-control::role_presets) refuses to construct a blind_exit ->
+    /// anything transition, but that is a CLI-facing advisory planner, not an
+    /// enforcement point on the signed-update apply path. Before this fix,
+    /// nothing stopped a validly-signed `SetNodeCapabilities` update from
+    /// reversing it directly at the membership-state layer.
+    #[test]
+    fn set_node_capabilities_rejects_reversal_of_blind_exit() {
+        let mut state = base_state();
+        state.nodes[0].capabilities = vec![RoleCapability::BlindExit, RoleCapability::ExitServer];
+
+        for attempted in [
+            vec![RoleCapability::ExitServer],
+            vec![RoleCapability::Client],
+            vec![RoleCapability::Anchor],
+            vec![RoleCapability::RelayHost],
+            vec![],
+        ] {
+            let operation = MembershipOperation::SetNodeCapabilities {
+                node_id: "node-a".to_owned(),
+                capabilities: attempted.clone(),
+            };
+            let err = reduce_membership_state(&state, &operation, 200).expect_err(&format!(
+                "reversing blind_exit to {attempted:?} must be rejected"
+            ));
+            assert!(
+                matches!(err, MembershipError::InvalidTransition(_)),
+                "expected InvalidTransition, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("blind_exit is immutable"),
+                "unexpected error message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_node_capabilities_still_applies_to_non_blind_exit_nodes() {
+        // Anti-vacuous: the blind_exit guard above must not accidentally
+        // block ordinary capability updates on a node that was never
+        // blind_exit — covered already by
+        // rsa0009_set_capabilities_applies_when_created_at_differs_from_apply_time,
+        // this test pins the same invariant directly against
+        // reduce_membership_state without the RSA-0009 timing angle.
+        let state = base_state();
+        let operation = MembershipOperation::SetNodeCapabilities {
+            node_id: "node-a".to_owned(),
+            capabilities: vec![RoleCapability::Client],
+        };
+        let updated = reduce_membership_state(&state, &operation, 200)
+            .expect("non-blind_exit capability change must still apply");
+        let node = updated
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "node-a")
+            .expect("node-a");
+        assert_eq!(node.capabilities, vec![RoleCapability::Client]);
     }
 
     #[test]
