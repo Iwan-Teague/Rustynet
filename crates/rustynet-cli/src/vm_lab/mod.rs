@@ -11439,6 +11439,18 @@ fn deploy_windows_anchor_service(
     // a reviewed constant. The PS body fail-closes
     // ($ErrorActionPreference=Stop) and performs verify-before-serve before any
     // service restart. The token never enters argv — it is referenced by path.
+    //
+    // The service restart is wrapped in up to 3 attempts (each polling only
+    // 10x2s, not the old single 60x2s): live-reproduced startup race where the
+    // daemon's FIRST reconcile tick can run before the just-written membership
+    // snapshot is visible, logging "membership reconcile failed: membership
+    // snapshot is missing" and fail-closing (the correct security posture --
+    // never serve on unproven trust state) -- but the daemon does not recover
+    // within the same process lifetime, so the anchor listener never binds. A
+    // FRESH restart against the by-then-stable snapshot file reliably binds
+    // within ~7s (confirmed live), so a bounded number of restart attempts is
+    // the safe mitigation here without touching the daemon's core reconcile
+    // fail-closed path.
     let deploy_script = format!(
         "$ErrorActionPreference='Stop'; \
          $rn='{daemon}'; \
@@ -11509,15 +11521,17 @@ fn deploy_windows_anchor_service(
          $newJson=ConvertTo-Json -InputObject $newArgs -Compress; \
          $rewritten=$lines|ForEach-Object {{ if($_ -like 'RUSTYNETD_DAEMON_ARGS_JSON=*'){{ 'RUSTYNETD_DAEMON_ARGS_JSON='+$newJson }} else {{ $_ }} }}; \
          Set-Content -LiteralPath $env_file -Value $rewritten -Encoding ascii; \
-         $s=Get-Service -Name $svc -ErrorAction Stop; \
-         if($s.Status -eq 'Running'){{ & sc.exe stop $svc | Out-Null; Start-Sleep -Seconds 2 }}; \
-         & sc.exe start $svc | Out-Null; \
          $up=$false; \
-         for($i=0;$i -lt 60;$i++){{ \
-           $c=Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue; \
-           if($c){{ foreach($x in $c){{ if($x.LocalAddress -eq '127.0.0.1' -or $x.LocalAddress -eq '::1'){{$up=$true;break}} }} }}; \
-           if($up){{break}}; \
-           Start-Sleep -Seconds 2; \
+         for($restart=0;$restart -lt 3 -and -not $up;$restart++){{ \
+           $s=Get-Service -Name $svc -ErrorAction Stop; \
+           if($s.Status -eq 'Running'){{ & sc.exe stop $svc | Out-Null; Start-Sleep -Seconds 2 }}; \
+           & sc.exe start $svc | Out-Null; \
+           for($i=0;$i -lt 10;$i++){{ \
+             $c=Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue; \
+             if($c){{ foreach($x in $c){{ if($x.LocalAddress -eq '127.0.0.1' -or $x.LocalAddress -eq '::1'){{$up=$true;break}} }} }}; \
+             if($up){{break}}; \
+             Start-Sleep -Seconds 2; \
+           }}; \
          }}; \
          if(-not $up){{throw \"anchor bundle-pull listener did not come up on $addr\"}}; \
          Write-Output \"anchor bundle-pull listener up on $addr (genesis snapshot + verify-before-serve asserted)\"",
