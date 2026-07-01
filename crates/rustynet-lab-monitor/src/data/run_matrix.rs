@@ -455,6 +455,13 @@ const LINUX_ONEOFF_COLUMNS: &[(&str, &str)] = &[
     ("linux_key_custody", "key_custody"),
     ("linux_membership_genesis", "membership_genesis"),
     ("linux_mesh_status", "mesh_status"),
+    (
+        "linux_blind_exit_reversal_denied",
+        "blind_exit_reversal_denied",
+    ),
+    ("linux_gossip_revoked_readmit", "gossip_revoked_readmit"),
+    ("linux_enrollment_replay", "enrollment_replay"),
+    ("linux_hello_limiter_flood", "hello_limiter_flood"),
 ];
 const MACOS_ONEOFF_COLUMNS: &[(&str, &str)] = &[
     ("macos_keychain_key_custody", "keychain_key_custody"),
@@ -825,7 +832,7 @@ mod tests {
             matrix.linux.len() + matrix.macos.len() + matrix.windows.len() + matrix.cross_os.len();
 
         assert_eq!(progress.total, matrix_total);
-        assert_eq!(matrix_total, 89);
+        assert_eq!(matrix_total, 93);
     }
 
     #[test]
@@ -840,7 +847,7 @@ mod tests {
         // security columns (LINUX_ONEOFF_COLUMNS) appended after them —
         // present unconditionally (as Unproven here, since this CSV doesn't
         // set them), same as macOS/Windows's one-offs.
-        assert_eq!(matrix.linux.len(), 21 + 11);
+        assert_eq!(matrix.linux.len(), 21 + 15);
         assert_eq!(matrix.linux[0].name, "bootstrap");
         assert_eq!(matrix.linux[1].name, "membership");
         assert_eq!(matrix.linux[20].name, "cleanup");
@@ -893,7 +900,7 @@ mod tests {
         let matrix = load_full_stage_matrix(dir.path()).unwrap();
         assert_eq!(matrix.windows.len(), 21 + 2);
         assert_eq!(matrix.macos.len(), 21 + 2);
-        assert_eq!(matrix.linux.len(), 21 + 11);
+        assert_eq!(matrix.linux.len(), 21 + 15);
         assert!(
             matrix
                 .windows

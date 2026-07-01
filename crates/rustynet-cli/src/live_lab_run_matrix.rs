@@ -151,6 +151,10 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_key_custody",
     "linux_membership_genesis",
     "linux_mesh_status",
+    "linux_blind_exit_reversal_denied",
+    "linux_gossip_revoked_readmit",
+    "linux_enrollment_replay",
+    "linux_hello_limiter_flood",
     "regression_reference_commit",
     "regression_notes",
     "linux_client_alias",
@@ -1431,6 +1435,18 @@ fn set_special_stage_values(
             set_status(values, schema, "linux_membership_genesis", status)
         }
         "validate_linux_mesh_status" => set_status(values, schema, "linux_mesh_status", status),
+        "validate_linux_blind_exit_reversal_denied" => {
+            set_status(values, schema, "linux_blind_exit_reversal_denied", status)
+        }
+        "validate_linux_gossip_revoked_readmit" => {
+            set_status(values, schema, "linux_gossip_revoked_readmit", status)
+        }
+        "validate_linux_enrollment_replay" => {
+            set_status(values, schema, "linux_enrollment_replay", status)
+        }
+        "validate_linux_hello_limiter_flood" => {
+            set_status(values, schema, "linux_hello_limiter_flood", status)
+        }
         _ if stage.starts_with("validate_") => {
             let _ = platform;
         }
@@ -1937,6 +1953,40 @@ mod tests {
                 "linux_membership_genesis",
             ),
             ("validate_linux_mesh_status", "linux_mesh_status"),
+        ] {
+            set_special_stage_values(&mut values, &schema, "linux", stage, "pass");
+            assert_eq!(
+                values.get(column).map(String::as_str),
+                Some("pass"),
+                "stage {stage} did not populate column {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier1_security_stages_map_to_dedicated_csv_columns() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let mut values = BTreeMap::new();
+        for (stage, column) in [
+            (
+                "validate_linux_blind_exit_reversal_denied",
+                "linux_blind_exit_reversal_denied",
+            ),
+            (
+                "validate_linux_gossip_revoked_readmit",
+                "linux_gossip_revoked_readmit",
+            ),
+            (
+                "validate_linux_enrollment_replay",
+                "linux_enrollment_replay",
+            ),
+            (
+                "validate_linux_hello_limiter_flood",
+                "linux_hello_limiter_flood",
+            ),
         ] {
             set_special_stage_values(&mut values, &schema, "linux", stage, "pass");
             assert_eq!(
