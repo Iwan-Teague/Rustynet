@@ -1026,9 +1026,12 @@ mod tests {
     #[test]
     fn live_lab_macos_signed_artifact_distribution_uses_writable_staging() {
         for needle in [
-            "remote_pub=\"${staging_dir}/rn-assignment.pub\"",
-            "remote_bundle=\"${staging_dir}/rn-assignment.bundle\"",
-            "remote_env=\"${staging_dir}/rn-assignment-refresh.env\"",
+            // Assignment staging paths are node_id-scoped (commit 29ef235) to
+            // prevent a parallel-worker race when multiple nodes stage
+            // concurrently on the same shared /tmp.
+            "remote_pub=\"${staging_dir}/rn-assignment-${node_id}.pub\"",
+            "remote_bundle=\"${staging_dir}/rn-assignment-${node_id}.bundle\"",
+            "remote_env=\"${staging_dir}/rn-assignment-refresh-${node_id}.env\"",
             "remote_pub=\"${staging_dir}/rn-dns-zone.pub\"",
             "remote_bundle=\"${staging_dir}/rn-dns-zone.bundle\"",
         ] {
