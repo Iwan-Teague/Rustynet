@@ -16090,6 +16090,122 @@ fn evaluate_membership_signature_audit_report(
     ))
 }
 
+/// Pure evaluator for the JSON output of `rustynetd membership-revoke-audit`.
+/// Proves RSA-0009's fix: signed Revoke/RotateKey/Restore/SetCapabilities
+/// updates must apply even when applied strictly later than the record's
+/// signed `created_at_unix` (the realistic propose→sign→transport→apply gap
+/// that made these four ops non-functional before the fix).
+fn evaluate_membership_revoke_audit_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::membership_revoke_audit::MembershipRevokeAuditReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse membership-revoke-audit JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "membership-revoke-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases < 6 {
+        return Err(format!(
+            "membership-revoke-audit ran only {} case(s); expected the full 4 delayed-apply + 2 negative battery",
+            report.total_cases
+        ));
+    }
+    if report.delayed_apply_accepted < 4 {
+        return Err(format!(
+            "membership-revoke-audit only accepted {} of the 4 delayed-apply ops (Revoke/Restore/RotateKey/SetCapabilities) — RSA-0009 regression suspected",
+            report.delayed_apply_accepted
+        ));
+    }
+    if report.reject_cases_passed < 2 {
+        return Err(format!(
+            "membership-revoke-audit only rejected {} of the 2 required negative cases; the audit is vacuous (would pass even with broken state-root checks) or state-root integrity has weakened",
+            report.reject_cases_passed
+        ));
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| format!("{} (expected {}, got {})", v.id, v.expectation, v.outcome))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "membership revoke-applies audit drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Membership revoke/rotate/restore/set-capabilities apply verified on {linux_alias}: {} delayed-apply ops accepted, {} negative cases correctly rejected (RSA-0009 fix proven live)",
+        report.delayed_apply_accepted, report.reject_cases_passed
+    ))
+}
+
+/// Pure evaluator for the JSON output of `rustynetd revoked-peer-denied-audit`.
+/// Proves DD-03/RSA-0007's fix: `Phase10Controller::set_exit_node` and
+/// `ensure_lan_route_allowed` must deny a peer revoked in signed membership
+/// even when it still matches a broad/wildcard ACL allow rule, while an
+/// active (non-revoked) peer in the identical scenario is still allowed.
+fn evaluate_revoked_peer_denied_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::revoked_peer_denied_audit::RevokedPeerDeniedAuditReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse revoked-peer-denied-audit JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "revoked-peer-denied-audit returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.total_cases < 4 {
+        return Err(format!(
+            "revoked-peer-denied-audit ran only {} case(s); expected the full 2 revoked + 2 active-baseline battery",
+            report.total_cases
+        ));
+    }
+    if report.revoked_denied < 2 {
+        return Err(format!(
+            "revoked-peer-denied-audit only denied {} of the 2 revoked-peer cases (exit-node, LAN-route) — DD-03/RSA-0007 regression suspected",
+            report.revoked_denied
+        ));
+    }
+    if report.active_allowed < 2 {
+        return Err(format!(
+            "revoked-peer-denied-audit only allowed {} of the 2 active-peer baseline cases; the ACL gate is vacuous (would deny everything) or over-broad",
+            report.active_allowed
+        ));
+    }
+    if !report.overall_ok {
+        let summary = if report.violations.is_empty() {
+            "report set overall_ok=false but listed no violations; output is inconsistent"
+                .to_owned()
+        } else {
+            report
+                .violations
+                .iter()
+                .map(|v| format!("{} (expected {}, got {})", v.id, v.expectation, v.outcome))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!(
+            "revoked-peer-denied audit drift on {linux_alias}: {summary}"
+        ));
+    }
+    Ok(format!(
+        "Revoked-peer dataplane ACL denial verified on {linux_alias}: {} revoked cases denied, {} active baseline cases still allowed (DD-03/RSA-0007 fix proven live)",
+        report.revoked_denied, report.active_allowed
+    ))
+}
+
 /// Pure evaluator for the JSON output of `rustynetd policy-default-deny-audit`.
 /// The daemon-side audit drives the REAL `rustynet_policy` evaluator with a
 /// default-deny truth table (`SecurityMinimumBar.md` §3.6). Fail-closed:
@@ -17913,6 +18029,46 @@ fn run_validate_linux_membership_signature_forgery_stage(
         .map_err(|reason| (reason, raw))
 }
 
+fn run_validate_linux_membership_revoke_applies_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "membership-revoke-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_membership_revoke_audit_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_linux_revoked_peer_denied_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "revoked-peer-denied-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_revoked_peer_denied_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
 fn run_validate_linux_policy_default_deny_stage(
     linux_alias: &str,
     inventory_path: &Path,
@@ -18112,6 +18268,9 @@ fn run_linux_orchestration_stages_with_options(
         logs_dir.join("validate_linux_privileged_helper_allowlist.log");
     let membership_signature_forgery_log_path =
         logs_dir.join("validate_linux_membership_signature_forgery.log");
+    let membership_revoke_applies_log_path =
+        logs_dir.join("validate_linux_membership_revoke_applies.log");
+    let revoked_peer_denied_log_path = logs_dir.join("validate_linux_revoked_peer_denied_e2e.log");
     let policy_default_deny_log_path = logs_dir.join("validate_linux_policy_default_deny.log");
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
@@ -18246,6 +18405,32 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_membership_signature_forgery",
             membership_signature_forgery_log_path.as_path(),
             run_validate_linux_membership_signature_forgery_stage,
+        )
+    };
+
+    let membership_revoke_applies_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_membership_revoke_applies",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_membership_revoke_applies",
+            membership_revoke_applies_log_path.as_path(),
+            run_validate_linux_membership_revoke_applies_stage,
+        )
+    };
+
+    let revoked_peer_denied_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_revoked_peer_denied_e2e",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_revoked_peer_denied_e2e",
+            revoked_peer_denied_log_path.as_path(),
+            run_validate_linux_revoked_peer_denied_stage,
         )
     };
 
@@ -18793,6 +18978,8 @@ fn run_linux_orchestration_stages_with_options(
         authenticode_outcome,
         privileged_helper_allowlist_outcome,
         membership_signature_forgery_outcome,
+        membership_revoke_applies_outcome,
+        revoked_peer_denied_outcome,
         policy_default_deny_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
@@ -37439,6 +37626,153 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn membership_revoke_audit_producer_to_validator_round_trip_passes() {
+        // The shipped daemon audit (real fixed reducer + delayed-apply
+        // battery) serialised into the orchestrator validator must verify
+        // clean — proves RSA-0009's fix live, not just in the daemon's own
+        // unit tests.
+        let report =
+            rustynetd::membership_revoke_audit::run_membership_revoke_audit().expect("audit runs");
+        assert!(report.overall_ok, "reviewed funnel must pass: {report:?}");
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary =
+            super::evaluate_membership_revoke_audit_report("debian-headless-1", raw.as_str())
+                .expect("clean revoke-applies audit must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("RSA-0009"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_membership_revoke_audit_report_rejects_regressed_delayed_apply() {
+        // The bite: if a delayed-apply op regresses back to
+        // NewStateRootMismatch, the stage must fail, not silently pass.
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 6,
+            "delayed_apply_accepted": 3,
+            "reject_cases_passed": 2,
+            "violations": [
+                {"id": "revoke_delayed_apply", "expectation": "accept", "outcome": "rejected", "reason": "new state root mismatch", "passed": false}
+            ]
+        }"#;
+        let err = super::evaluate_membership_revoke_audit_report("debian-headless-1", raw)
+            .expect_err("a regressed delayed-apply case must fail closed");
+        assert!(
+            err.contains("only accepted 3 of the 4"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_membership_revoke_audit_report_rejects_vacuous_no_negative_cases() {
+        // If neither negative case actually rejects, the audit proves
+        // nothing (a harness bug reporting "accepted" for everything would
+        // also produce delayed_apply_accepted=4).
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 6,
+            "delayed_apply_accepted": 4,
+            "reject_cases_passed": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_membership_revoke_audit_report("debian-headless-1", raw)
+            .expect_err("zero rejected negative cases must fail closed");
+        assert!(err.contains("vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_membership_revoke_audit_report_rejects_thin_battery() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 4,
+            "delayed_apply_accepted": 4,
+            "reject_cases_passed": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_membership_revoke_audit_report("debian-headless-1", raw)
+            .expect_err("fewer than 6 cases must fail closed");
+        assert!(err.contains("expected the full"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn revoked_peer_denied_audit_producer_to_validator_round_trip_passes() {
+        // The shipped daemon audit (real Phase10Controller + fixed ACL gates)
+        // serialised into the orchestrator validator must verify clean —
+        // proves DD-03/RSA-0007's fix live, not just in the daemon's own
+        // unit tests.
+        let report = rustynetd::revoked_peer_denied_audit::run_revoked_peer_denied_audit()
+            .expect("audit runs");
+        assert!(report.overall_ok, "reviewed funnel must pass: {report:?}");
+        let raw = serde_json::to_string(&report).expect("report serializes");
+        let summary = super::evaluate_revoked_peer_denied_report("debian-headless-1", raw.as_str())
+            .expect("clean revoked-peer-denied audit must validate");
+        assert!(
+            summary.contains("debian-headless-1") && summary.contains("RSA-0007"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_revoked_peer_denied_report_rejects_regressed_denial() {
+        // The bite: if a revoked peer is ever allowed again, the stage must
+        // fail, not silently pass.
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "total_cases": 4,
+            "revoked_denied": 1,
+            "active_allowed": 2,
+            "violations": [
+                {"id": "set_exit_node_denies_revoked_exit_node", "expectation": "deny", "outcome": "allowed", "reason": "ACCEPTED: request was allowed", "passed": false}
+            ]
+        }"#;
+        let err = super::evaluate_revoked_peer_denied_report("debian-headless-1", raw)
+            .expect_err("a regressed denial case must fail closed");
+        assert!(
+            err.contains("only denied 1 of the 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_revoked_peer_denied_report_rejects_vacuous_deny_all() {
+        // If neither active-baseline case is allowed, the "revoked is
+        // denied" result proves nothing (an over-broad or plain-broken
+        // deny-all gate would also produce revoked_denied=2).
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 4,
+            "revoked_denied": 2,
+            "active_allowed": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_revoked_peer_denied_report("debian-headless-1", raw)
+            .expect_err("zero allowed baseline cases must fail closed");
+        assert!(err.contains("vacuous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_revoked_peer_denied_report_rejects_thin_battery() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "total_cases": 2,
+            "revoked_denied": 2,
+            "active_allowed": 0,
+            "violations": []
+        }"#;
+        let err = super::evaluate_revoked_peer_denied_report("debian-headless-1", raw)
+            .expect_err("fewer than 4 cases must fail closed");
+        assert!(err.contains("expected the full"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn linux_relay_lifecycle_output_validators_accept_reviewed_dry_run_text() {
         let install = "rustynet-relay systemd unit: install+enable (dry-run) at /etc/systemd/system/rustynet-relay.service\n  - would run: systemctl daemon-reload\n  - would run: systemctl enable rustynet-relay.service\n  - would run: systemctl start rustynet-relay.service\n";
         super::validate_linux_relay_install_output(install).expect("install output validates");
@@ -40486,6 +40820,8 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_authenticode",
             "validate_linux_privileged_helper_allowlist",
             "validate_linux_membership_signature_forgery",
+            "validate_linux_membership_revoke_applies",
+            "validate_linux_revoked_peer_denied_e2e",
             "validate_linux_policy_default_deny",
             "validate_linux_dns_failclosed",
             "validate_linux_exit_nat_lifecycle",
@@ -40628,6 +40964,8 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_authenticode",
                 "validate_linux_privileged_helper_allowlist",
                 "validate_linux_membership_signature_forgery",
+                "validate_linux_membership_revoke_applies",
+                "validate_linux_revoked_peer_denied_e2e",
                 "validate_linux_policy_default_deny",
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",
