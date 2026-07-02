@@ -35,6 +35,8 @@ OPENCODE_REVIEW_MODEL="${OPENCODE_REVIEW_MODEL:-opencode/deepseek-v4-flash-free}
 OPENCODE_REVIEW_ON_FAIL="${OPENCODE_REVIEW_ON_FAIL:-1}"
 OPENCODE_LOOP_REPORT_INLINE_LIMIT="${OPENCODE_LOOP_REPORT_INLINE_LIMIT:-25000}"
 OPENCODE_LOOP_REVIEW_INLINE_LIMIT="${OPENCODE_LOOP_REVIEW_INLINE_LIMIT:-25000}"
+OPENCODE_MAIN_ITERATIONS="${OPENCODE_MAIN_ITERATIONS:-1}"
+OPENCODE_REVIEW_ITERATIONS="${OPENCODE_REVIEW_ITERATIONS:-1}"
 
 log() { printf '[OCLOOP %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -82,6 +84,8 @@ Env:
   OPENCODE_LOOP_MAIN_AGENT_RETRIES default 2
   OPENCODE_LOOP_REPORT_INLINE_LIMIT default 25000 bytes
   OPENCODE_LOOP_REVIEW_INLINE_LIMIT default 25000 bytes
+  OPENCODE_MAIN_ITERATIONS          default 1 (sequential patch agent calls per cycle)
+  OPENCODE_REVIEW_ITERATIONS        default 1 (sequential review calls per cycle; 0=skip)
   state/opencode-loop/stop-after-current requests graceful exit after current lab
 EOF
 }
@@ -408,7 +412,7 @@ PY
 }
 
 write_main_prompt() {
-    local cycle="$1" jid="$2" area="$3" args_json="$4" result="$5" report="$6" review_path="$7"
+    local cycle="$1" jid="$2" area="$3" args_json="$4" result="$5" report="$6" review_path="$7" main_iter="$8"
     local exact_reverify report_dir orchestrate_result run_summary stage_logs evidence_dir clean_report clean_review
     exact_reverify="$(reverify_json "$area" "$args_json")"
     report_dir="$(job_field "$jid" report_dir "$REPO/state/deepseek-lab-$jid")"
@@ -423,11 +427,12 @@ write_main_prompt() {
         clean_review=""
     fi
     {
-        printf '# Rustynet OpenCode Loop Cycle %s\n\n' "$cycle"
+        printf '# Rustynet OpenCode Loop Cycle %s Iteration %s\n\n' "$cycle" "${main_iter:-1}"
         printf -- '- Job: `%s`\n' "$jid"
         printf -- '- Area: `%s`\n' "$area"
         printf -- '- Result: `%s`\n' "$result"
         printf -- '- Commit: `%s`\n' "$(git_sha)"
+        printf -- '- Iteration: `%s`\n' "${main_iter:-1}"
         printf -- '- Time: `%s`\n\n' "$(now_utc)"
         printf -- '- Report dir: `%s`\n' "$report_dir"
         printf -- '- Orchestrate result: `%s`\n' "$orchestrate_result"
@@ -781,47 +786,60 @@ main() {
         review_path="$(review_path_for "$jid")"
         log "cycle=$cycle job=$jid area=$current_area result=$result"
         write_history "$cycle" "$jid" "$current_area" "$result"
-        run_review_if_needed "$jid" "$result" || log "review failed; continuing"
-        write_main_prompt "$cycle" "$jid" "$current_area" "$current_args" "$result" "$report" "$review_path"
 
-        if [ -f "$STOP_AFTER_CURRENT" ]; then
-            log "stop-after-current requested; exiting after completed job $jid"
-            rm -f "$STOP_AFTER_CURRENT"
-            exit 0
-        fi
+        # Review iterations (0 = skip this phase)
+        review_iter=0
+        while [ "$review_iter" -lt "$OPENCODE_REVIEW_ITERATIONS" ]; do
+            review_iter=$((review_iter + 1))
+            run_review_if_needed "$jid" "$result" || log "review iter $review_iter failed; continuing"
+        done
 
-        [ "$cmd" = "once" ] && {
-            log "once mode wrote prompt: $PROMPT"
-            exit 0
-        }
-        [ "$MAX_CYCLES" -gt 0 ] && [ "$cycle" -ge "$MAX_CYCLES" ] && {
-            log "max cycles reached: $MAX_CYCLES"
-            exit 0
-        }
+        # Main/patch iterations (0 = skip, lab only)
+        main_iter=0
+        while [ "$main_iter" -lt "$OPENCODE_MAIN_ITERATIONS" ]; do
+            main_iter=$((main_iter + 1))
+            review_path="$(review_path_for "$jid")"
+            write_main_prompt "$cycle" "$jid" "$current_area" "$current_args" "$result" "$report" "$review_path" "$main_iter"
 
-        local known agent_attempt
-        known="$(known_jobs)"
-        new_jid=""
-        agent_attempt=1
-        while [ "$agent_attempt" -le "$MAIN_AGENT_RETRIES" ]; do
-            if new_jid="$(run_main_agent "$known")"; then
-                break
+            if [ -f "$STOP_AFTER_CURRENT" ]; then
+                log "stop-after-current requested; exiting after cycle $cycle iter $main_iter"
+                rm -f "$STOP_AFTER_CURRENT"
+                exit 0
             fi
-            log "main agent attempt $agent_attempt did not launch a new lab"
-            agent_attempt=$((agent_attempt + 1))
-            if [ "$agent_attempt" -le "$MAIN_AGENT_RETRIES" ]; then
-                prepend_retry_instruction "$agent_attempt"
-                log "retrying OpenCode main agent with watchdog prompt"
+
+            [ "$cmd" = "once" ] && {
+                log "once mode wrote prompt: $PROMPT"
+                exit 0
+            }
+            [ "$MAX_CYCLES" -gt 0 ] && [ "$cycle" -ge "$MAX_CYCLES" ] && {
+                log "max cycles reached: $MAX_CYCLES"
+                exit 0
+            }
+
+            local known agent_attempt
+            known="$(known_jobs)"
+            new_jid=""
+            agent_attempt=1
+            while [ "$agent_attempt" -le "$MAIN_AGENT_RETRIES" ]; do
+                if new_jid="$(run_main_agent "$known")"; then
+                    break
+                fi
+                log "main agent attempt $agent_attempt did not launch a new lab"
+                agent_attempt=$((agent_attempt + 1))
+                if [ "$agent_attempt" -le "$MAIN_AGENT_RETRIES" ]; then
+                    prepend_retry_instruction "$agent_attempt"
+                    log "retrying OpenCode main agent with watchdog prompt"
+                fi
+            done
+            if [ -z "$new_jid" ]; then
+                log "main agent did not launch a new lab after ${MAIN_AGENT_RETRIES} attempt(s); prompt remains at $PROMPT"
+                exit 1
+            fi
+            jid="$new_jid"
+            if ! report="$(poll_until_done "$jid")"; then
+                report=$(printf '# Live-lab run `%s` — POLL TIMEOUT.\n\nRun deepseek_reconcile_jobs and recover before relaunching.' "$jid")
             fi
         done
-        if [ -z "$new_jid" ]; then
-            log "main agent did not launch a new lab after ${MAIN_AGENT_RETRIES} attempt(s); prompt remains at $PROMPT"
-            exit 1
-        fi
-        jid="$new_jid"
-        if ! report="$(poll_until_done "$jid")"; then
-            report=$(printf '# Live-lab run `%s` — POLL TIMEOUT.\n\nRun deepseek_reconcile_jobs and recover before relaunching.' "$jid")
-        fi
     done
 }
 

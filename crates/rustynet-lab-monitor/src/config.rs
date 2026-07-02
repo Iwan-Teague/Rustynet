@@ -28,6 +28,16 @@ pub struct MonitorConfig {
     pub dry_run: bool,
     #[serde(default)]
     pub disabled_stages: Vec<String>,
+    #[serde(default)]
+    pub patch_model_idx: usize,
+    #[serde(default)]
+    pub patch_variant_idx: usize,
+    #[serde(default)]
+    pub review_model_idx: usize,
+    #[serde(default)]
+    pub patch_iterations: u8,
+    #[serde(default)]
+    pub review_iterations: u8,
 }
 
 impl Default for MonitorConfig {
@@ -50,6 +60,11 @@ impl Default for MonitorConfig {
             triage_on_failure: false,
             dry_run: false,
             disabled_stages: Vec::new(),
+            patch_model_idx: 0,
+            patch_variant_idx: 0,
+            review_model_idx: 0,
+            patch_iterations: 1,
+            review_iterations: 1,
         }
     }
 }
