@@ -6416,8 +6416,28 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             stream
                 .set_write_timeout(Some(Duration::from_secs(5)))
                 .map_err(|err| format!("set anchor bundle-pull write timeout failed: {err}"))?;
+            // FIS-0020: conditional pull. When a previous bundle exists at
+            // the output path AND the forced-full counter permits, send
+            // `have <epoch> <root>` so an unchanged server replies with a
+            // hash-sized UNCHANGED instead of the full bundle. The counter
+            // is pure client-local monotonic state that no server response
+            // can reset or influence: every Nth pull is unconditionally
+            // full, bounding silent staleness from a lying UNCHANGED to
+            // <= N cycles.
+            let pull_count = increment_anchor_bundle_pull_counter(&output_path);
+            let have_identity = if anchor_bundle_pull_must_force_full(pull_count) {
+                None
+            } else {
+                std::fs::read(&output_path).ok().and_then(|bytes| {
+                    rustynet_control::membership::snapshot_bytes_state_identity(&bytes)
+                })
+            };
+            let mut request = format!("{token}\n");
+            if let Some((epoch, root)) = &have_identity {
+                request.push_str(&format!("have {epoch} {root}\n"));
+            }
             stream
-                .write_all(format!("{token}\n").as_bytes())
+                .write_all(request.as_bytes())
                 .map_err(|err| format!("write anchor bundle-pull token failed: {err}"))?;
             let mut response = Vec::new();
             stream
@@ -6429,6 +6449,19 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             };
             let header = std::str::from_utf8(&response[..header_end])
                 .map_err(|_| "anchor bundle-pull response header is not utf8".to_owned())?;
+            if header == "UNCHANGED" {
+                if have_identity.is_none() {
+                    return Err(
+                        "anchor bundle-pull returned UNCHANGED to a full pull (protocol violation)"
+                            .to_owned(),
+                    );
+                }
+                return Ok(format!(
+                    "anchor bundle unchanged: {} matches the server (epoch {})",
+                    output_path.display(),
+                    have_identity.map(|(epoch, _)| epoch).unwrap_or_default()
+                ));
+            }
             let Some(size_raw) = header.strip_prefix("OK ") else {
                 return Err(format!("anchor bundle-pull failed: {header}"));
             };
@@ -6457,6 +6490,28 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             Ok(render_anchor_init_plan(&plan))
         }
     }
+}
+
+/// FIS-0020: every Nth pull is unconditionally full — the counter is
+/// client-local and monotonic, so no server response can extend the
+/// staleness bound past N cycles.
+const ANCHOR_BUNDLE_PULL_FORCE_FULL_EVERY: u64 = 10;
+
+fn anchor_bundle_pull_must_force_full(pull_count: u64) -> bool {
+    pull_count.is_multiple_of(ANCHOR_BUNDLE_PULL_FORCE_FULL_EVERY)
+}
+
+/// Increment and persist the client-local pull counter beside the output
+/// bundle. Any I/O failure degrades to 0 — which forces a full pull, the
+/// safe direction.
+fn increment_anchor_bundle_pull_counter(output_path: &Path) -> u64 {
+    let counter_path = output_path.with_extension("pulls");
+    let next = std::fs::read_to_string(&counter_path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(0, |count| count.wrapping_add(1));
+    let _ = std::fs::write(&counter_path, next.to_string());
+    next
 }
 
 fn execute_membership(command: MembershipCommand) -> Result<String, String> {
@@ -20078,6 +20133,38 @@ mod phase18_socket_allowlist_tests {
                 "attacker-controlled path must NEVER be allowlisted: {path}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod anchor_bundle_pull_counter_tests {
+    use super::{anchor_bundle_pull_must_force_full, increment_anchor_bundle_pull_counter};
+
+    #[test]
+    fn forced_full_pull_counter_immune_to_unchanged() {
+        // Every 10th pull (and the very first) is unconditionally full; the
+        // counter is pure client-local state — nothing a server sends can
+        // reset it, so silent staleness from a lying UNCHANGED is bounded
+        // to <= 10 cycles.
+        assert!(anchor_bundle_pull_must_force_full(0), "first pull is full");
+        for count in 1..10u64 {
+            assert!(!anchor_bundle_pull_must_force_full(count));
+        }
+        assert!(anchor_bundle_pull_must_force_full(10));
+        assert!(anchor_bundle_pull_must_force_full(20));
+
+        // The persisted counter increments monotonically and survives
+        // re-reads; a missing file starts at 0 (forced full — the safe
+        // direction).
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-pull-counter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let output = dir.join("membership.snapshot");
+        assert_eq!(increment_anchor_bundle_pull_counter(&output), 0);
+        assert_eq!(increment_anchor_bundle_pull_counter(&output), 1);
+        assert_eq!(increment_anchor_bundle_pull_counter(&output), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
