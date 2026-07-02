@@ -1069,6 +1069,14 @@ impl App {
         let Some(stage) = self.selected_stage_name() else {
             return;
         };
+        // A stage that isn't possible for the current config (wrong
+        // platform, wrong role target, etc.) can't be toggled on/off --
+        // that's a config-driven fact, not a user choice. Only stages that
+        // ARE possible but the user wants to skip anyway go through
+        // disabled_stages.
+        if !self.stage_selected_for_current_target(&stage) {
+            return;
+        }
         if let Some(idx) = self
             .config
             .disabled_stages
@@ -1315,11 +1323,10 @@ impl App {
     /// Keep `stage_grid_row[col]` within the given group's actual stage
     /// count -- needed on a Left/Right column switch, since each group can
     /// have a different length and a stale row index from a longer group
-    /// would otherwise point past the end of a shorter one. Also snaps
-    /// onto the nearest enabled stage if the clamped position lands on a
-    /// disabled one (e.g. entering LIVE LAB by default when macOS isn't
-    /// targeted puts row 0 on a macOS-only stage) -- the cursor should
-    /// never rest on something that isn't possible for the current config.
+    /// would otherwise point past the end of a shorter one. The cursor is
+    /// free to rest on a disabled/not-possible stage -- only *acting* on
+    /// one (Space to toggle) is blocked, not navigating to it -- so this
+    /// only clamps bounds, it doesn't hunt for an enabled stage.
     fn clamp_stage_grid_row(&mut self, col: usize) {
         let groups = self.planned_stage_groups();
         let Some(group) = groups.get(col) else {
@@ -1327,23 +1334,13 @@ impl App {
         };
         let max = group.stages.len().saturating_sub(1);
         self.stage_grid_row[col] = self.stage_grid_row[col].min(max);
-        if group.stages.is_empty() || self.stage_enabled(&group.stages[self.stage_grid_row[col]]) {
-            return;
-        }
-        if let Some(nearest) = group
-            .stages
-            .iter()
-            .position(|stage| self.stage_enabled(stage))
-        {
-            self.stage_grid_row[col] = nearest;
-        }
     }
 
-    /// Move `stage_grid_row[col]` to the next enabled stage in the given
-    /// direction (+1 = Down, -1 = Up), skipping disabled ones entirely --
-    /// the cursor must never land on a stage that isn't possible for the
-    /// current config. If every remaining stage in that direction is
-    /// disabled, the cursor stays put.
+    /// Move `stage_grid_row[col]` by one step (+1 = Down, -1 = Up), clamped
+    /// to the column's bounds. Deliberately does NOT skip disabled stages
+    /// -- the user should be able to navigate to and see every stage,
+    /// possible or not; only toggling one (see `toggle_selected_stage`) is
+    /// restricted to stages that are actually possible for this config.
     fn move_stage_grid_cursor(&mut self, col: usize, direction: isize) {
         let groups = self.planned_stage_groups();
         let Some(group) = groups.get(col) else {
@@ -1353,17 +1350,8 @@ impl App {
         if len == 0 {
             return;
         }
-        let mut idx = self.stage_grid_row[col].min(len - 1) as isize;
-        loop {
-            idx += direction;
-            if idx < 0 || idx >= len as isize {
-                return;
-            }
-            if self.stage_enabled(&group.stages[idx as usize]) {
-                self.stage_grid_row[col] = idx as usize;
-                return;
-            }
-        }
+        let idx = self.stage_grid_row[col].min(len - 1) as isize + direction;
+        self.stage_grid_row[col] = idx.clamp(0, len as isize - 1) as usize;
     }
 
     fn cycle_selected_vm_role(&mut self, direction: isize) {
@@ -2252,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_grid_down_skips_disabled_stages_entirely() {
+    fn stage_grid_down_moves_freely_onto_disabled_stages() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.focused_panel = Panel::StageGrid;
         // Default area is "macOS exit", which makes wants_macos() true --
@@ -2264,17 +2252,16 @@ mod tests {
 
         app.handle_key(KeyCode::Down, KeyModifiers::empty());
 
-        // Must land on the first enabled Windows bootstrap stage (index
-        // 14), never resting on any of the 5 disabled macOS ones (9-13) in
-        // between -- the cursor can't select something not possible.
+        // Must land on index 9, the first (disabled) macOS bootstrap stage
+        // -- the user can see and navigate to it, it's just not toggleable.
         let group = &app.planned_stage_groups()[1];
-        assert_eq!(app.stage_grid_row[1], 14);
-        assert!(app.stage_enabled(&group.stages[14]));
-        assert_eq!(group.stages[14], "bootstrap_windows_host");
+        assert_eq!(app.stage_grid_row[1], 9);
+        assert!(!app.stage_enabled(&group.stages[9]));
+        assert_eq!(group.stages[9], "bootstrap_macos_host");
     }
 
     #[test]
-    fn stage_grid_up_skips_disabled_stages_entirely() {
+    fn stage_grid_up_moves_freely_onto_disabled_stages() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.focused_panel = Panel::StageGrid;
         app.config.area = "Windows exit".to_owned();
@@ -2284,9 +2271,45 @@ mod tests {
 
         app.handle_key(KeyCode::Up, KeyModifiers::empty());
 
-        // Must skip back over the 5 disabled macOS stages (9-13) and land
-        // on the last enabled base stage (8), not stop on a disabled one.
-        assert_eq!(app.stage_grid_row[1], 8);
+        // Must land on index 13, the last (disabled) macOS bootstrap stage
+        // -- not skip straight back to the last enabled base stage (8).
+        assert_eq!(app.stage_grid_row[1], 13);
+    }
+
+    #[test]
+    fn toggle_selected_stage_is_a_noop_on_a_not_possible_stage() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.page = Page::Run; // Space only toggles on the Run page
+        app.focused_panel = Panel::StageGrid;
+        app.config.area = "Windows exit".to_owned();
+        app.config.exit_platform = "windows".to_owned();
+        app.stage_grid_col = 1;
+        app.stage_grid_row[1] = 9; // bootstrap_macos_host: not possible here
+
+        app.handle_key(KeyCode::Char(' '), KeyModifiers::empty());
+
+        assert!(
+            !app.config
+                .disabled_stages
+                .contains(&"bootstrap_macos_host".to_owned()),
+            "toggling a not-possible stage must not add it to disabled_stages: {:?}",
+            app.config.disabled_stages
+        );
+    }
+
+    #[test]
+    fn toggle_selected_stage_still_works_on_a_possible_stage() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.page = Page::Run; // Space only toggles on the Run page
+        app.focused_panel = Panel::StageGrid;
+        app.stage_grid_col = 0; // PRE: all 5 stages are always possible
+        app.stage_grid_row[0] = 0; // "preflight"
+
+        app.handle_key(KeyCode::Char(' '), KeyModifiers::empty());
+        assert!(app.config.disabled_stages.contains(&"preflight".to_owned()));
+
+        app.handle_key(KeyCode::Char(' '), KeyModifiers::empty());
+        assert!(!app.config.disabled_stages.contains(&"preflight".to_owned()));
     }
 
     #[test]
