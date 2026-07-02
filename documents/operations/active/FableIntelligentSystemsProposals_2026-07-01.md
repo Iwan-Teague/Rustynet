@@ -1310,3 +1310,54 @@ Three proposals, ranked by impact. All three are distinct from the earlier FIS-0
 - FIS-0021 leans on FIS-0013's first-hand trace of the phase10 migration commit path (single-slot flip, session-survival, re-race recovery) rather than re-verifying it this pass — flagged as `[verified: own-tools, prior pass FIS-0013]` where relied upon; a fresh reviewer should re-confirm before Phase 4.
 - Exact existing-test names for FIS-0020's gossip/bundle-pull "must keep passing" set were located by function, not enumerated by test name this pass (budget) — a patch-time step.
 - Method: four own-tools checks (maybe_mint_and_broadcast full read; heartbeat cost shape; the two stats() sites + repo-wide loss/rtt reader sweep; bundle-pull protocol shape) + two native-subagent adversarial reviews. `b79cac1` tree confirmed byte-identical to `5868a09`; line numbers verified 2026-07-02, they will drift.
+
+# Implementation status — 2026-07-02 (Fable 5 implementation session)
+
+All commits on `claude/cross-platform-parity-hardening`, each with the full
+scoped gate suite green at commit time (fmt / workspace check / workspace
+clippy `-D warnings` / owning-crate tests; full `--all-targets --all-features`
+workspace suites batched periodically per the recorded test-cadence
+discipline). Two pre-existing gate failures documented at handoff remain and
+were NOT introduced or touched here: `secrets_hygiene_gates.sh` (RSA-0080,
+owner decision) and `check_backend_boundary_leakage.sh` (WireGuard-referencing
+comments in crypto/control, none of which this work touches).
+
+## Landed
+
+| FIS | Commits | Delivered / remaining |
+|---|---|---|
+| FIS-0014 | `615d757`, `db9ef43`, `cf49392` | Commits 1-3 done (capability + validation, Pin-then-Seniority comparator, `role pin-port-mapping-authority` verb + docs sync). Commit 4 (live-lab pin assertions) lab-gated, open. |
+| FIS-0016 | `1f0f458` | Jittered primitive + 4 tests + five deliberately-independent cross-references + CODE_MAP adoption rule. Zero migrations, per the census. First consumer landed with FIS-0010 (deterministic ladder). |
+| FIS-0017 | `536944c` | Phase 1 (rustynet-nas relay-pattern harmonization + 8 parser tests incl. ExecStart parity). clap confirmed absent workspace-wide. Phase 2 (llm-gateway) gated on nas being live-proven. |
+| FIS-0015 | `0edc50c`, `20b20c5`, `d79430a` | Commits 1-3 done (pure censored-gap estimator + site-1 subsumption; per-peer relay keepalive wiring; `PeerConfig.persistent_keepalive_secs` + command-backend plumbing, None default = behavior-identical). Commit 4 (userspace send path) sign-off-gated; commit 5 lab-gated. |
+| FIS-0018 | `290800e` | Batched socket-path gather + budget-sliced round-trip, 7 tests. Commit 3 (preflight adoption) optional, open. |
+| FIS-0011 | `dca13a0` | Fire-all + RFC 5389 RTO ladder in the traversal gatherer, 3 live-socket tests (retransmit recovery, starvation fix, Rc cap). Phase 4 (converge stun_client) already covered by FIS-0018. |
+| FIS-0009 | `a3ca824`, `92bb366` | Phases 1-3 (prior store fail-open + digest-checked; outcome recording always-on; slot-bounded re-rank + front-float behind `--traversal-prior-rerank`, default OFF). Phase 4 (classify_nat wiring + relay-skip) needs its design decision, open. |
+| FIS-0010 | `173c143` | Phases 1-2 (FlapBreaker EWMA + ladder via the FIS-0016 primitive; consult behind `--traversal-flap-breaker`, default OFF; intensity always tracked + transition logs). Phase 3 (stability-gate commit rewiring) sign-off-gated; phase 4 lab-gated. |
+| FIS-0012 | `99968d1`, `a76b36b` | Commits 1-2 (fair_drain DRR module + engine metadata seams, 7 tests). Commits 3-7 (runtime pump wiring behind Option-None, macOS mirror, benches, evidence-gated default flip) open. |
+| FIS-0004 | `6a8efe1` | Phases 1-2 (engine PeerPathQuality: debounced loss hysteresis + RFC 6298, handshake-advance dedupe; `peer_path_health` trait default-None; runtime request + macOS mirror). Phase 3 subsumed by the FIS-0013 trigger (one decision surface); phase 4 (pacing) bench-gated, open. |
+| FIS-0013/0021 | `6a8efe1`, `0a7cd3f`, `e04437e` | Backend `peer_path_sample` + daemon PathQualityTracker (loss + RTT arms, 5-poll streak, 300s dwell), quality re-race with incumbent demotion + skipped fresh-handshake short-circuit, breaker suppress-only interplay. FIS-0021 delta 3 (sticky-RTT dedupe + ingest-age gate) landed; deltas 1/2/4 gate the full migration feature (Phase 4), open with it. |
+| FIS-0002/0019 | `d07e291` | formal/ artifacts committed (explorer re-verified at commit: 11,446 states green, buggy mode re-finds RSA-0009); conformance suite landed (stamping-ops RSA-0009 pin, 216-sequence bounded exhaustion, cache-poisoning pin); docs index updated. TLC-proper run still pending a machine with the jar. |
+| FIS-0020 | `c53c8e8` | Commit 1 (conditional bundle-pull have/UNCHANGED + client forced-full counter — the live path) with all three review fixes. Commits 2-3 (gossip IHAVE/GRAFT digest heartbeat) gated on D2.7 gossip attachment. |
+| FIS-0003 | `adb4aa8` | Phase 1: outbound revoked exclusion + `unregister_peer`. Deliberate deviation recorded: the seen-sequence anti-replay ledger is NOT pruned (pruning would enable replay across revoke->restore). Phases 2-3 gated on D2.7 attachment. |
+| FIS-0006 | `179bcf1` | run_history SPRT/CUSUM classifier + `ops live-lab-flake-report`; Bernoulli only on mixed cells, all-fail cells classify on failure-mode churn, held-out pooled p0. Backlog PriorVerdict wiring (scheduling behavior) a separate decision. |
+| FIS-0005 | `ed9cbe8` | rustynet-advisor crate (MCDA scorer, honesty rules, deny-by-empty) + `role recommend` phase-1 ADVISORY verb; AGENTS/CLAUDE/CODE_MAP synced. Phases 2-4 (collectors, Brandes centrality, succession) open. |
+
+## Not started
+
+- **FIS-0008** (multi-instance service routing) and **FIS-0007** (load-aware
+  relay selection): both are wire-format changes with open protocol
+  questions recorded in the grounding notes — `RelayHelloAck` today has only
+  `session_id` + `allocated_port` (`rustynet-relay/src/transport.rs`), so
+  `version`/`hello_interval_secs` must be designed in before `load_hint`;
+  `DnsZoneRecord` has eight fields of which only `target_node_id` changes;
+  the unsigned beacon needs a NEW UDP port plus per-OS firewall rules.
+  Deferred whole rather than landed rushed.
+
+## Cross-cutting hygiene landed alongside
+
+- `3738377` — pre-existing clippy 1.96 lints in the MCP bins cleared so
+  workspace `clippy -D warnings` runs green.
+- Live-lab verification stages for the landed FIS items (the per-FIS rows in
+  the verification matrix) remain to be run in a lab window; unit/negative
+  coverage landed with each commit per §4's enforcement+verification rule.
