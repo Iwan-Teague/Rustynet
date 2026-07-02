@@ -31,6 +31,18 @@ use rustynet_nas::store::NasStore;
 const ACCESS_GRANTS_FILE: &str = "grants.v1";
 const ACCESS_PEERS_FILE: &str = "peers.v1";
 
+/// Workspace CLI convention (FIS-0017 "relay pattern"): a usage constant,
+/// `--help`/`-h`, and an argv-injectable parse seam with unit tests.
+const USAGE: &str = "Usage: rustynet-nas [OPTIONS]\n\n\
+Options:\n  \
+  --bind <ADDR>                    Tunnel-address TCP bind (required; wildcard/loopback refused)\n  \
+  --data-root <PATH>               Storage root directory (required)\n  \
+  --access-dir <PATH>              Daemon-materialised access-state directory (required)\n  \
+  --at-rest-key-credential <NAME>  systemd credential name holding the 32-byte at-rest key\n  \
+  --at-rest-key-file <PATH>        File holding the 32-byte at-rest key (mode 0600)\n                                   \
+  (one of --at-rest-key-credential / --at-rest-key-file is required)\n  \
+  --help, -h                       Show this help";
+
 fn main() {
     let exit_code = match run() {
         Ok(()) => 0,
@@ -49,8 +61,40 @@ struct Config {
     key: [u8; 32],
 }
 
+/// Parse outcome: either a validated config or an explicit help request.
+/// A separate variant (rather than `exit(0)` inside the parser) keeps the
+/// parse seam pure and unit-testable.
+enum ParseOutcome {
+    Config(Config),
+    Help,
+}
+
+// Manual impl, never derived: `Config` carries the 32-byte at-rest key,
+// which must never appear in Debug output (SecurityMinimumBar secrets
+// hygiene).
+impl std::fmt::Debug for ParseOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseOutcome::Config(config) => f
+                .debug_struct("Config")
+                .field("bind", &config.bind)
+                .field("data_root", &config.data_root)
+                .field("access_dir", &config.access_dir)
+                .field("key", &"[redacted]")
+                .finish(),
+            ParseOutcome::Help => f.write_str("Help"),
+        }
+    }
+}
+
 fn run() -> Result<(), String> {
-    let config = parse_and_validate_config()?;
+    let config = match parse_and_validate_config_from(std::env::args().skip(1))? {
+        ParseOutcome::Help => {
+            eprintln!("{USAGE}");
+            return Ok(());
+        }
+        ParseOutcome::Config(config) => config,
+    };
     let store = NasStore::open(&config.data_root, config.key)
         .map_err(|err| format!("store open refused: {err}"))?;
     let store = Arc::new(store);
@@ -81,14 +125,16 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn parse_and_validate_config() -> Result<Config, String> {
+fn parse_and_validate_config_from(
+    args: impl IntoIterator<Item = String>,
+) -> Result<ParseOutcome, String> {
     let mut bind: Option<SocketAddr> = None;
     let mut data_root: Option<PathBuf> = None;
     let mut access_dir: Option<PathBuf> = None;
     let mut key_credential: Option<String> = None;
     let mut key_file: Option<PathBuf> = None;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let mut value = |name: &str| {
             args.next()
@@ -106,7 +152,8 @@ fn parse_and_validate_config() -> Result<Config, String> {
             "--access-dir" => access_dir = Some(PathBuf::from(value("--access-dir")?)),
             "--at-rest-key-credential" => key_credential = Some(value("--at-rest-key-credential")?),
             "--at-rest-key-file" => key_file = Some(PathBuf::from(value("--at-rest-key-file")?)),
-            other => return Err(format!("unknown argument {other:?}")),
+            "--help" | "-h" => return Ok(ParseOutcome::Help),
+            other => return Err(format!("unknown argument: {other}")),
         }
     }
 
@@ -116,12 +163,12 @@ fn parse_and_validate_config() -> Result<Config, String> {
     let access_dir = access_dir.ok_or("--access-dir is required")?;
     let key = load_at_rest_key(key_credential.as_deref(), key_file.as_deref())?;
 
-    Ok(Config {
+    Ok(ParseOutcome::Config(Config {
         bind,
         data_root,
         access_dir,
         key,
-    })
+    }))
 }
 
 /// E1 (bin-side layer): refuse bind shapes that can never be the
@@ -369,4 +416,190 @@ fn write_frame(stream: &mut TcpStream, body: &[u8]) -> Result<(), String> {
         .write_all(&(body.len() as u32).to_be_bytes())
         .and_then(|_| stream.write_all(body))
         .map_err(|err| format!("frame write failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ParseOutcome, USAGE, parse_and_validate_config_from};
+    use std::path::PathBuf;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    /// 32-byte 0600 key file at a unique temp path (std-only; the crate has
+    /// no tempfile dev-dependency).
+    fn write_key_file(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rustynet-nas-test-key-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::write(&path, [0x42u8; 32]).expect("write key file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod key file");
+        }
+        path
+    }
+
+    #[test]
+    fn nas_args_parse_full_valid_argv() {
+        let key = write_key_file("full");
+        let key_arg = key.to_str().expect("utf8 temp path");
+        let parsed = parse_and_validate_config_from(args(&[
+            "--bind",
+            "100.64.0.7:7423",
+            "--data-root",
+            "/var/lib/rustynet-nas/data",
+            "--access-dir",
+            "/var/lib/rustynet-nas/access",
+            "--at-rest-key-file",
+            key_arg,
+        ]))
+        .expect("valid argv parses");
+        let ParseOutcome::Config(config) = parsed else {
+            panic!("expected config outcome");
+        };
+        assert_eq!(config.bind.to_string(), "100.64.0.7:7423");
+        assert_eq!(
+            config.data_root,
+            PathBuf::from("/var/lib/rustynet-nas/data")
+        );
+        assert_eq!(
+            config.access_dir,
+            PathBuf::from("/var/lib/rustynet-nas/access")
+        );
+        assert_eq!(config.key, [0x42u8; 32]);
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[test]
+    fn nas_args_each_required_flag_missing_errors_verbatim() {
+        let key = write_key_file("required");
+        let key_arg = key.to_str().expect("utf8 temp path");
+
+        let err = parse_and_validate_config_from(args(&[
+            "--data-root",
+            "d",
+            "--access-dir",
+            "a",
+            "--at-rest-key-file",
+            key_arg,
+        ]))
+        .expect_err("missing --bind must refuse");
+        assert_eq!(err, "--bind is required");
+
+        let err = parse_and_validate_config_from(args(&[
+            "--bind",
+            "100.64.0.7:7423",
+            "--access-dir",
+            "a",
+            "--at-rest-key-file",
+            key_arg,
+        ]))
+        .expect_err("missing --data-root must refuse");
+        assert_eq!(err, "--data-root is required");
+
+        let err = parse_and_validate_config_from(args(&[
+            "--bind",
+            "100.64.0.7:7423",
+            "--data-root",
+            "d",
+            "--at-rest-key-file",
+            key_arg,
+        ]))
+        .expect_err("missing --access-dir must refuse");
+        assert_eq!(err, "--access-dir is required");
+
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[test]
+    fn nas_args_key_source_exactly_one_required() {
+        let err = parse_and_validate_config_from(args(&[
+            "--bind",
+            "100.64.0.7:7423",
+            "--data-root",
+            "d",
+            "--access-dir",
+            "a",
+        ]))
+        .expect_err("missing key source must refuse");
+        assert_eq!(
+            err,
+            "one of --at-rest-key-credential / --at-rest-key-file is required"
+        );
+    }
+
+    #[test]
+    fn nas_args_unknown_argument_rejected() {
+        let err = parse_and_validate_config_from(args(&["--bogus"]))
+            .expect_err("unknown flag must refuse");
+        assert_eq!(err, "unknown argument: --bogus");
+    }
+
+    #[test]
+    fn nas_args_missing_value_rejected() {
+        let err = parse_and_validate_config_from(args(&["--bind"]))
+            .expect_err("flag without value must refuse");
+        assert_eq!(err, "missing value for --bind");
+    }
+
+    #[test]
+    fn nas_args_help_flag_short_and_long() {
+        assert!(matches!(
+            parse_and_validate_config_from(args(&["--help"])).expect("help parses"),
+            ParseOutcome::Help
+        ));
+        assert!(matches!(
+            parse_and_validate_config_from(args(&["-h"])).expect("help parses"),
+            ParseOutcome::Help
+        ));
+        // Help wins even alongside other (possibly incomplete) flags.
+        assert!(matches!(
+            parse_and_validate_config_from(args(&["--bind", "100.64.0.7:7423", "--help"]))
+                .expect("help parses"),
+            ParseOutcome::Help
+        ));
+    }
+
+    #[test]
+    fn nas_args_systemd_execstart_shape_parses() {
+        // The exact argv shape from scripts/systemd/rustynet-nas.service
+        // ExecStart (placeholder values). The credential path needs
+        // CREDENTIALS_DIRECTORY at runtime, deliberately absent here —
+        // reaching the key-loading error proves every ExecStart flag parsed.
+        let err = parse_and_validate_config_from(args(&[
+            "--bind",
+            "100.64.0.7:7423",
+            "--data-root",
+            "/var/lib/rustynet-nas/data",
+            "--access-dir",
+            "/var/lib/rustynet-nas/access",
+            "--at-rest-key-credential",
+            "nas_at_rest_key",
+        ]))
+        .expect_err("credential load must fail outside systemd");
+        assert!(
+            err.contains("CREDENTIALS_DIRECTORY") || err.contains("at-rest key unavailable"),
+            "expected key-loading error (all flags parsed), got: {err}"
+        );
+    }
+
+    #[test]
+    fn nas_args_help_text_snapshot() {
+        for token in [
+            "--bind",
+            "--data-root",
+            "--access-dir",
+            "--at-rest-key-credential",
+            "--at-rest-key-file",
+            "--help",
+        ] {
+            assert!(USAGE.contains(token), "usage text missing {token}");
+        }
+        assert!(USAGE.contains("one of --at-rest-key-credential / --at-rest-key-file"));
+    }
 }
