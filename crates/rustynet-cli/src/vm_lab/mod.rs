@@ -217,6 +217,7 @@ pub struct VmLabWriteLiveLabProfileConfig {
     pub fifth_client_target: Option<String>,
     pub relay_vm: Option<String>,
     pub relay_target: Option<String>,
+    pub linux_blind_exit_vm: Option<String>,
     pub require_same_network: bool,
     pub ssh_identity_file: PathBuf,
     pub ssh_known_hosts_file: Option<PathBuf>,
@@ -265,6 +266,7 @@ pub struct VmLabSetupLiveLabConfig {
     pub extra_vm: Option<String>,
     pub fifth_client_vm: Option<String>,
     pub relay_vm: Option<String>,
+    pub linux_blind_exit_vm: Option<String>,
     pub ssh_identity_file: PathBuf,
     pub known_hosts_path: Option<PathBuf>,
     pub require_same_network: bool,
@@ -4248,6 +4250,42 @@ fn append_target_platform_metadata(
     Ok(())
 }
 
+fn resolve_linux_blind_exit_profile_label<'a>(
+    blind_exit_alias: Option<&str>,
+    candidates: impl IntoIterator<Item = (&'static str, Option<&'a str>, Option<&'a RoleTarget>)>,
+) -> Result<Option<String>, String> {
+    let Some(alias) = blind_exit_alias else {
+        return Ok(None);
+    };
+    ensure_inventory_alias(alias)?;
+
+    for (label, configured_alias, target) in candidates {
+        let Some(target) = target else {
+            continue;
+        };
+        let alias_matches = configured_alias == Some(alias) || target.label == alias;
+        if !alias_matches {
+            continue;
+        }
+        if !matches!(label, "aux" | "fifth_client") {
+            return Err(format!(
+                "Linux blind_exit alias {alias:?} resolves to {label}; only aux/fifth_client may host the lab blind_exit because membership_setup grants blind_exit only to those labels"
+            ));
+        }
+        if target.platform_profile.platform != VmGuestPlatform::Linux {
+            return Err(format!(
+                "Linux blind_exit alias {alias:?} resolves to {label} with platform={}; expected linux",
+                target.platform_profile.platform.as_str()
+            ));
+        }
+        return Ok(Some(label.to_owned()));
+    }
+
+    Err(format!(
+        "Linux blind_exit alias {alias:?} is not part of the selected Linux live-lab topology"
+    ))
+}
+
 fn append_empty_target_platform_metadata(
     lines: &mut Vec<String>,
     env_prefix: &str,
@@ -4320,6 +4358,21 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
         "relay",
         config.relay_vm.as_deref(),
         config.relay_target.as_deref(),
+    )?;
+    let linux_blind_exit_label = resolve_linux_blind_exit_profile_label(
+        config.linux_blind_exit_vm.as_deref(),
+        [
+            ("exit", config.exit_vm.as_deref(), Some(&exit_target)),
+            ("client", config.client_vm.as_deref(), Some(&client_target)),
+            ("entry", config.entry_vm.as_deref(), entry_target.as_ref()),
+            ("aux", config.aux_vm.as_deref(), aux_target.as_ref()),
+            ("extra", config.extra_vm.as_deref(), extra_target.as_ref()),
+            (
+                "fifth_client",
+                config.fifth_client_vm.as_deref(),
+                fifth_client_target.as_ref(),
+            ),
+        ],
     )?;
 
     let role_targets = [
@@ -4452,6 +4505,9 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
             lines.push(format_env_assignment("RELAY_UTM_NAME", utm_name)?);
         }
         append_target_platform_metadata(&mut lines, "RELAY", &target)?;
+    }
+    if let Some(label) = linux_blind_exit_label.as_deref() {
+        lines.push(format_env_assignment("LINUX_BLIND_EXIT_LABEL", label)?);
     }
     if let Some(path) = config.ssh_known_hosts_file.as_deref() {
         lines.push(format_env_assignment(
@@ -5102,6 +5158,7 @@ fn resolve_setup_live_lab_selection(
             fifth_client_target: None,
             relay_vm: config.relay_vm.clone(),
             relay_target: None,
+            linux_blind_exit_vm: config.linux_blind_exit_vm.clone(),
             require_same_network: config.require_same_network,
             ssh_identity_file: config.ssh_identity_file.clone(),
             ssh_known_hosts_file: config.known_hosts_path.clone(),
@@ -7090,10 +7147,18 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         config.extra_vm.as_deref(),
         config.fifth_client_vm.as_deref(),
     )?;
-    let linux_blind_exit_alias = topology_resolution
-        .blind_exit_alias()
-        .filter(|alias| selected_aliases.iter().any(|selected| selected == *alias))
-        .map(str::to_owned);
+    let linux_blind_exit_alias = match topology_resolution.blind_exit_alias() {
+        Some(alias) if selected_aliases.iter().any(|selected| selected == alias) => {
+            Some(alias.to_owned())
+        }
+        Some(alias) if config.validate_linux_daemon_state => {
+            return Err(format!(
+                "topology blind_exit alias {alias:?} is not part of the selected Linux live-lab topology"
+            ));
+        }
+        Some(_) => None,
+        None => None,
+    };
     // Build discovery alias list: Linux nodes + optional Windows/macOS nodes.
     // selected_aliases (Linux only) continues to be used for profile/setup.
     let mut discovery_aliases = selected_aliases.clone();
@@ -7511,6 +7576,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         extra_vm: config.extra_vm.clone(),
         fifth_client_vm: config.fifth_client_vm.clone(),
         relay_vm: config.relay_vm.clone(),
+        linux_blind_exit_vm: linux_blind_exit_alias.clone(),
         ssh_identity_file: config.ssh_identity_file.clone(),
         known_hosts_path: config.known_hosts_path.clone(),
         require_same_network: config.require_same_network,
@@ -21213,6 +21279,7 @@ pub fn execute_ops_vm_lab_iterate_live_lab(
             fifth_client_target: config.fifth_client_target.clone(),
             relay_vm: None,
             relay_target: None,
+            linux_blind_exit_vm: None,
             require_same_network: config.require_same_network,
             ssh_identity_file: config.ssh_identity_file.clone(),
             ssh_known_hosts_file: config.ssh_known_hosts_file.clone(),
@@ -35603,6 +35670,7 @@ directory = "vendor"
             fifth_client_target: None,
             relay_vm: None,
             relay_target: None,
+            linux_blind_exit_vm: None,
             require_same_network: true,
             ssh_identity_file: identity.clone(),
             ssh_known_hosts_file: Some(known_hosts.clone()),
@@ -35642,6 +35710,70 @@ directory = "vendor"
         assert!(body.contains("SSH_IDENTITY_FILE="));
         assert!(body.contains("RUSTYNET_BACKEND=\"linux-wireguard-userspace-shared\""));
         assert!(body.contains("SOURCE_MODE=\"local-head\""));
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn live_lab_profile_writer_emits_linux_blind_exit_label_for_aux_only() {
+        let inventory = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {"alias": "exit-vm", "ssh_target": "debian@192.168.64.3", "lab_role": "exit", "network_group": "lan-a"},
+    {"alias": "client-vm", "ssh_target": "debian@192.168.64.4", "lab_role": "client", "network_group": "lan-a"},
+    {"alias": "aux-vm", "ssh_target": "debian@192.168.64.5", "lab_role": "aux", "network_group": "lan-a"}
+  ]
+}"#,
+        );
+        let dir = inventory.parent().expect("inventory temp parent");
+        let output = dir.join("linux_blind_exit.env");
+        let identity = dir.join("id_ed25519");
+        fs::write(&identity, "dummy-key").expect("identity should be written");
+
+        let base = VmLabWriteLiveLabProfileConfig {
+            inventory_path: inventory.clone(),
+            output_path: output.clone(),
+            exit_vm: Some("exit-vm".to_owned()),
+            exit_target: None,
+            client_vm: Some("client-vm".to_owned()),
+            client_target: None,
+            entry_vm: None,
+            entry_target: None,
+            aux_vm: Some("aux-vm".to_owned()),
+            aux_target: None,
+            extra_vm: None,
+            extra_target: None,
+            fifth_client_vm: None,
+            fifth_client_target: None,
+            relay_vm: None,
+            relay_target: None,
+            linux_blind_exit_vm: Some("aux-vm".to_owned()),
+            require_same_network: true,
+            ssh_identity_file: identity.clone(),
+            ssh_known_hosts_file: None,
+            ssh_allow_cidrs: None,
+            network_id: None,
+            traversal_ttl_secs: None,
+            cross_network_nat_profiles: None,
+            cross_network_required_nat_profiles: None,
+            cross_network_impairment_profile: None,
+            backend: None,
+            source_mode: Some("local-head".to_owned()),
+            repo_ref: None,
+            report_dir: None,
+        };
+
+        execute_ops_vm_lab_write_live_lab_profile(base.clone())
+            .expect("aux blind_exit should write");
+        let body = fs::read_to_string(&output).expect("profile should be readable");
+        assert!(body.contains("LINUX_BLIND_EXIT_LABEL=\"aux\""));
+
+        let mut bad = base;
+        bad.linux_blind_exit_vm = Some("exit-vm".to_owned());
+        let err = execute_ops_vm_lab_write_live_lab_profile(bad)
+            .expect_err("exit label must not host Linux blind_exit");
+        assert!(err.contains("only aux/fifth_client may host the lab blind_exit"));
+
         cleanup_temp_inventory(inventory.as_path());
     }
 
@@ -37328,6 +37460,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             extra_vm: None,
             fifth_client_vm: None,
             relay_vm: None,
+            linux_blind_exit_vm: None,
             ssh_identity_file: identity_path,
             known_hosts_path: None,
             require_same_network: false,
