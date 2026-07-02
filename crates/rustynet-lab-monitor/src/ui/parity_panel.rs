@@ -14,14 +14,14 @@ const BAR_WIDTH: usize = 6;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focused_panel == Panel::Parity;
+    let border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let block = Block::default()
-        .title("PARITY MATRIX [2/P]")
+        .title(Span::styled(
+            "PARITY MATRIX [2/P]",
+            Style::default().fg(border_fg),
+        ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        }));
+        .border_style(Style::default().fg(border_fg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -34,7 +34,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let header =
-        Row::new(vec!["ROLE", "LINUX", "MACOS", "WIN"]).style(Style::default().fg(Color::Cyan));
+        Row::new(vec!["ROLE", "LINUX", "MACOS", "WIN"]).style(Style::default().fg(Color::Blue));
 
     let empty_history: Vec<CellOutcome> = Vec::new();
 

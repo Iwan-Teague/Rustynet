@@ -11,9 +11,9 @@ use crate::data::run_matrix::RunSummary;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
-        .title("PREV RUNS")
+        .title(Span::styled("PREV RUNS", Style::default().fg(Color::Cyan)))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     f.render_widget(block, area);
 

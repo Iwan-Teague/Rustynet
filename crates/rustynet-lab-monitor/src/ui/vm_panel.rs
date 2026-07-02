@@ -21,14 +21,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         count
     );
 
+    let border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let block = Block::default()
-        .title(title.as_str())
+        .title(Span::styled(title, Style::default().fg(border_fg)))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        }));
+        .border_style(Style::default().fg(border_fg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 

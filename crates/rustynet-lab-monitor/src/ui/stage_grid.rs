@@ -33,14 +33,14 @@ fn spinner_glyph() -> &'static str {
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focused_panel == Panel::StageGrid;
+    let border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let block = Block::default()
-        .title("STAGE GRID [3] ←→ column  ↑↓ select  Space toggle  Enter detail")
+        .title(Span::styled(
+            "STAGE GRID [3] ←→ column  ↑↓ select  Space toggle  Enter detail",
+            Style::default().fg(border_fg),
+        ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        }));
+        .border_style(Style::default().fg(border_fg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -99,14 +99,22 @@ fn render_planned_with_statuses(
             .iter()
             .filter(|stage| status_by_stage.get(stage.as_str()) == Some(&"skipped"))
             .count();
+        // A column that has finished every one of its currently-enabled
+        // stages (and none failed) reads as done-and-green, regardless of
+        // the group's full catalog size -- a failure still wins over
+        // "everything ran", so a fully-completed-but-failing column stays
+        // red rather than misreporting success as green.
+        let all_enabled_complete = enabled > 0 && failed == 0 && completed >= enabled;
         let header_style = if col_focused {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
-        } else if status_by_stage.is_empty() {
-            Style::default().fg(Color::Cyan)
         } else if failed > 0 {
             Style::default().fg(Color::Red)
+        } else if all_enabled_complete {
+            Style::default().fg(Color::Green)
+        } else if status_by_stage.is_empty() {
+            Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::White)
         };
