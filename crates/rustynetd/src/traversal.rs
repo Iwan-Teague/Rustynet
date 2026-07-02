@@ -1188,6 +1188,125 @@ pub fn keepalive_prior_for_nat(
     }
 }
 
+/// FIS-0010: direct↔relay flap-damping circuit breaker (Nygard's Circuit
+/// Breaker driven by an EWMA failure-intensity estimator).
+///
+/// A bare consecutive-failure counter resets on one success, so the exact
+/// pathology that hurts users — a path good enough to occasionally
+/// handshake but too flaky to hold — never trips it. The EWMA of the
+/// failure indicator captures RATE: sustained flapping pushes intensity
+/// over the open threshold, the breaker opens, and the daemon stops
+/// re-racing the known-flaky direct path for an exponentially growing
+/// cooldown (deterministic ladder from `resilience::next_reconnect_delay_ms`
+/// — the FIS-0016 primitive — plus additive quarter-jitter; Full Jitter is
+/// deliberately NOT used here because a uniform-from-zero draw could yield
+/// a ~0s cooldown and defeat the hold-down). Cooldown expiry is the
+/// half-open state: one direct trial is allowed; success closes the
+/// breaker immediately, failure re-opens with a longer cooldown. Below
+/// threshold the daemon's behavior is byte-identical to today. Every
+/// uncertain state biases toward relay — the available, safe choice.
+///
+/// Lives OUTSIDE `TraversalProbeStatus` on purpose: that map is rebuilt
+/// from scratch every sync pass; cross-pass state must survive it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlapBreaker {
+    intensity: f32,
+    open_until: u64,
+    exponent: u8,
+    consecutive_good: u16,
+}
+
+impl Default for FlapBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FlapBreaker {
+    const ALPHA: f32 = 0.3;
+    const THETA_OPEN: f32 = 0.6;
+    const THETA_CLOSE: f32 = 0.3;
+    const BASE_COOLDOWN_SECS: u64 = 10;
+    const MAX_EXPONENT: u8 = 6;
+    const FULL_RECOVERY_INTERVALS: u16 = 10;
+
+    pub fn new() -> Self {
+        Self {
+            intensity: 0.0,
+            open_until: 0,
+            exponent: 0,
+            consecutive_good: 0,
+        }
+    }
+
+    /// Record one race outcome (failure = the race ended on relay/stale
+    /// instead of a fresh direct handshake).
+    pub fn record_outcome(&mut self, is_failure: bool, now_unix: u64) {
+        let indicator = if is_failure { 1.0 } else { 0.0 };
+        self.intensity = (1.0 - Self::ALPHA) * self.intensity + Self::ALPHA * indicator;
+
+        if is_failure {
+            if self.intensity > Self::THETA_OPEN && self.open_until <= now_unix {
+                let policy = crate::resilience::ReconnectPolicy {
+                    initial_backoff_ms: Self::BASE_COOLDOWN_SECS * 1_000,
+                    multiplier: 2,
+                    max_backoff_ms: Self::BASE_COOLDOWN_SECS * 1_000 * (1 << Self::MAX_EXPONENT),
+                };
+                let cooldown_secs =
+                    crate::resilience::next_reconnect_delay_ms(policy, u32::from(self.exponent))
+                        / 1_000;
+                // Additive quarter-jitter, fail-soft to zero on CSPRNG
+                // failure (decorrelation aid, not a security primitive —
+                // same rationale as schedule_proactive_refresh).
+                let jitter = {
+                    let mut buf = [0u8; 8];
+                    match rand::rngs::OsRng.try_fill_bytes(&mut buf) {
+                        Ok(()) => u64::from_le_bytes(buf) % (cooldown_secs / 4 + 1),
+                        Err(_) => 0,
+                    }
+                };
+                self.open_until = now_unix.saturating_add(cooldown_secs + jitter);
+                self.exponent = (self.exponent + 1).min(Self::MAX_EXPONENT);
+                self.consecutive_good = 0;
+            }
+        } else {
+            // A success arrives only while closed or on the half-open
+            // trial — either way the breaker closes immediately.
+            self.open_until = 0;
+            if self.intensity < Self::THETA_CLOSE {
+                self.consecutive_good =
+                    (self.consecutive_good + 1).min(Self::FULL_RECOVERY_INTERVALS);
+                if self.consecutive_good >= Self::FULL_RECOVERY_INTERVALS {
+                    // Sustained recovery: the backoff ladder resets.
+                    self.exponent = 0;
+                }
+            } else {
+                self.consecutive_good = 0;
+            }
+        }
+    }
+
+    /// While open, the daemon withholds direct re-races (stays on relay).
+    pub fn is_open(&self, now_unix: u64) -> bool {
+        self.open_until > now_unix && self.intensity > Self::THETA_CLOSE
+    }
+
+    pub fn intensity(&self) -> f32 {
+        self.intensity
+    }
+
+    /// Observability label: closed / open / half_open.
+    pub fn state_label(&self, now_unix: u64) -> &'static str {
+        if self.is_open(now_unix) {
+            "open"
+        } else if self.intensity > Self::THETA_OPEN {
+            "half_open"
+        } else {
+            "closed"
+        }
+    }
+}
+
 /// FIS-0009 Phase 3 input: the peer's cross-session traversal prior,
 /// reduced to what the pair race needs. `None` (or the flag being off)
 /// ranks exactly as today.
@@ -2605,6 +2724,91 @@ mod tests {
             },
             pair_priority: priority,
         }
+    }
+
+    #[test]
+    fn flap_breaker_steady_good_never_opens() {
+        let mut breaker = super::FlapBreaker::new();
+        for tick in 0..100u64 {
+            breaker.record_outcome(false, tick);
+            assert!(!breaker.is_open(tick));
+            assert_eq!(breaker.state_label(tick), "closed");
+        }
+        assert!(breaker.intensity() < 0.01);
+    }
+
+    #[test]
+    fn flap_breaker_single_failure_does_not_open() {
+        let mut breaker = super::FlapBreaker::new();
+        breaker.record_outcome(true, 10);
+        // One failure: intensity = 0.3, under the 0.6 open threshold.
+        assert!(!breaker.is_open(11));
+    }
+
+    #[test]
+    fn flap_breaker_sustained_flapping_opens_and_holds_relay() {
+        let mut breaker = super::FlapBreaker::new();
+        // Six rapid failures (a flap burst inside one reconcile window):
+        // intensity 1 - 0.7^3 = 0.657 crosses theta_open on the third.
+        for now in 0..6u64 {
+            breaker.record_outcome(true, now);
+        }
+        // Opened at now=2 with cooldown 10s + <=25% jitter: open_until in
+        // [12, 14].
+        assert!(breaker.is_open(6), "sustained failures must open");
+        assert_eq!(breaker.state_label(6), "open");
+        assert!(breaker.is_open(11), "must still hold at 11s");
+        assert!(!breaker.is_open(17), "first cooldown is bounded by 14s");
+    }
+
+    #[test]
+    fn flap_breaker_half_open_success_closes_failure_reopens_longer() {
+        let mut breaker = super::FlapBreaker::new();
+        for now in 0..6u64 {
+            breaker.record_outcome(true, now);
+        }
+        // Opened at now=2, open_until in [12, 14]. Cooldown expires ->
+        // half-open: one trial allowed.
+        let now = 20u64;
+        assert!(!breaker.is_open(now));
+        assert_eq!(breaker.state_label(now), "half_open");
+
+        // Trial FAILURE re-opens with the NEXT ladder step (20s + jitter,
+        // open_until in [40, 45]) — strictly longer than the first.
+        breaker.record_outcome(true, now);
+        assert!(breaker.is_open(now));
+        assert!(
+            breaker.is_open(now + 15),
+            "second cooldown must exceed the first ladder step"
+        );
+
+        // Wait out the longer cooldown, then a trial SUCCESS closes it.
+        let now = 120u64;
+        assert!(!breaker.is_open(now));
+        breaker.record_outcome(false, now);
+        assert!(!breaker.is_open(now));
+        assert_eq!(breaker.open_until, 0, "success must clear the hold-down");
+    }
+
+    #[test]
+    fn flap_breaker_sustained_recovery_resets_backoff_ladder() {
+        let mut breaker = super::FlapBreaker::new();
+        let mut now = 0u64;
+        for _ in 0..8 {
+            breaker.record_outcome(true, now);
+            now += 200; // wait out each cooldown so the ladder climbs
+        }
+        let climbed_exponent = breaker.exponent;
+        assert!(climbed_exponent >= 2, "ladder should have climbed");
+
+        // Long run of successes: intensity decays below theta_close and
+        // after 10 consecutive good intervals the ladder fully resets.
+        for _ in 0..20 {
+            breaker.record_outcome(false, now);
+            now += 30;
+        }
+        assert_eq!(breaker.exponent, 0, "sustained recovery resets backoff");
+        assert_eq!(breaker.state_label(now), "closed");
     }
 
     #[test]
