@@ -9201,7 +9201,8 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
 /// Decide whether this node should call `PortMappingSupervisor::bring_up`.
 ///
 /// Returns `None` (proceed) when:
-/// - Self is the elected lex-min authority node.
+/// - Self is the elected Pin-then-Seniority authority node (see
+///   `gossip_runtime::select_port_mapping_authority_node_id`).
 ///
 /// Returns `Some(reason)` (skip) when membership is unavailable, no authority
 /// is advertised, or another node is the elected authority.
@@ -9216,7 +9217,7 @@ fn port_mapping_bring_up_skip_reason(
         .port_mapping_authority_node_id;
     match authority_id.as_deref() {
         None => Some("deferred: no anchor port-mapping authority".to_owned()),
-        // Self is the elected lex-min authority: proceed.
+        // Self is the elected Pin-then-Seniority authority: proceed.
         Some(node_id) if node_id == self_node_id => None,
         // Another node is the elected authority: defer.
         Some(node_id) => Some(format!("deferred to authority node={node_id}")),
@@ -15118,6 +15119,24 @@ mod tests {
         }
     }
 
+    fn make_membership_state_with_nodes(nodes: Vec<MembershipNode>) -> MembershipState {
+        MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-test".to_owned(),
+            epoch: 1,
+            nodes,
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: "bb".repeat(32),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 1,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        }
+    }
+
     #[test]
     fn port_mapping_skipped_when_non_authority() {
         // Another node holds AnchorPortMappingAuthoritative — self must not
@@ -15171,6 +15190,108 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("authority unavailable")),
             "skip reason must fail closed when membership is unavailable: {reason_no_state:?}"
+        );
+    }
+
+    #[test]
+    fn port_mapping_authority_follows_pin() {
+        // FIS-0014: a pinned-but-junior node must win port-mapping authority
+        // over a senior unpinned node.
+        let senior_unpinned = MembershipNode {
+            node_id: "node-senior".to_owned(),
+            node_pubkey_hex: "aa".repeat(32),
+            owner: "owner@test.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec![],
+            capabilities: vec![RoleCapability::AnchorPortMappingAuthoritative],
+            joined_at_unix: 10,
+            updated_at_unix: 10,
+        };
+        let junior_pinned = MembershipNode {
+            node_id: "node-pinned".to_owned(),
+            node_pubkey_hex: "cc".repeat(32),
+            owner: "owner@test.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec![],
+            capabilities: vec![
+                RoleCapability::AnchorPortMappingAuthoritative,
+                RoleCapability::AnchorPortMappingPinned,
+            ],
+            joined_at_unix: 500,
+            updated_at_unix: 500,
+        };
+        let state = make_membership_state_with_nodes(vec![senior_unpinned, junior_pinned]);
+
+        let reason_pinned = port_mapping_bring_up_skip_reason("node-pinned", Some(&state));
+        assert!(
+            reason_pinned.is_none(),
+            "pinned node must proceed: {reason_pinned:?}"
+        );
+        let reason_senior = port_mapping_bring_up_skip_reason("node-senior", Some(&state));
+        assert!(
+            reason_senior
+                .as_deref()
+                .is_some_and(|value| value.contains("node-pinned")),
+            "senior unpinned node must defer to the pin: {reason_senior:?}"
+        );
+    }
+
+    #[test]
+    fn port_mapping_pin_fallback_all_nodes_agree() {
+        // FIS-0014 determinism walkthrough as an executable assertion: a
+        // 3-anchor fleet where the pinned node has been revoked must have
+        // every node's independent evaluation agree on exactly one
+        // authority (the seniority winner among the remaining eligible set).
+        let pinned_revoked = MembershipNode {
+            node_id: "node-pinned".to_owned(),
+            node_pubkey_hex: "aa".repeat(32),
+            owner: "owner@test.local".to_owned(),
+            status: MembershipNodeStatus::Revoked,
+            roles: vec![],
+            capabilities: vec![
+                RoleCapability::AnchorPortMappingAuthoritative,
+                RoleCapability::AnchorPortMappingPinned,
+            ],
+            joined_at_unix: 500,
+            updated_at_unix: 500,
+        };
+        let senior = MembershipNode {
+            node_id: "node-senior".to_owned(),
+            node_pubkey_hex: "bb".repeat(32),
+            owner: "owner@test.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec![],
+            capabilities: vec![RoleCapability::AnchorPortMappingAuthoritative],
+            joined_at_unix: 10,
+            updated_at_unix: 10,
+        };
+        let junior = MembershipNode {
+            node_id: "node-junior".to_owned(),
+            node_pubkey_hex: "cc".repeat(32),
+            owner: "owner@test.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec![],
+            capabilities: vec![RoleCapability::AnchorPortMappingAuthoritative],
+            joined_at_unix: 100,
+            updated_at_unix: 100,
+        };
+        let state = make_membership_state_with_nodes(vec![
+            pinned_revoked.clone(),
+            senior.clone(),
+            junior.clone(),
+        ]);
+
+        let none_count = [pinned_revoked, senior, junior]
+            .iter()
+            .filter(|node| port_mapping_bring_up_skip_reason(&node.node_id, Some(&state)).is_none())
+            .count();
+        assert_eq!(
+            none_count, 1,
+            "exactly one node in the fleet must independently conclude it is the authority"
+        );
+        assert!(
+            port_mapping_bring_up_skip_reason("node-senior", Some(&state)).is_none(),
+            "the revoked pin must fall back to the seniority winner, not any other node"
         );
     }
 

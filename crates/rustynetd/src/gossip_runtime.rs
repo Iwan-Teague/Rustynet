@@ -557,6 +557,16 @@ pub fn revoked_peer_ids_from_membership(state: &MembershipState) -> Vec<[u8; 32]
     ids
 }
 
+/// Pin-then-Seniority: pinned nodes (via `AnchorPortMappingPinned`) sort
+/// first; among pinned or among unpinned nodes, longest membership
+/// (`joined_at_unix` ascending) wins, node_id as final deterministic
+/// tie-break. Pure function over the signed membership snapshot only —
+/// every node evaluates it independently against the same state and
+/// gets the same answer, with zero coordination. Pin fallback is not a
+/// separate branch: a pinned node that fails the eligibility filters
+/// (revoked, quarantined, capability stripped) simply drops out of the
+/// `min_by_key` scan, landing on the same seniority winner every other
+/// node would compute.
 pub fn select_port_mapping_authority_node_id(nodes: &[MembershipNode]) -> Option<String> {
     nodes
         .iter()
@@ -565,9 +575,13 @@ pub fn select_port_mapping_authority_node_id(nodes: &[MembershipNode]) -> Option
             node.capabilities
                 .contains(&RoleCapability::AnchorPortMappingAuthoritative)
         })
-        .map(|node| node.node_id.as_str())
-        .min()
-        .map(str::to_owned)
+        .min_by_key(|node| {
+            let pinned = node
+                .capabilities
+                .contains(&RoleCapability::AnchorPortMappingPinned);
+            (!pinned, node.joined_at_unix, node.node_id.as_str())
+        })
+        .map(|node| node.node_id.clone())
 }
 
 /// One-shot result of an accepted inbound bundle. Returned by
@@ -1221,6 +1235,141 @@ mod tests {
             view.anchor_gossip_seed_peer_ids,
             vec![[0x22u8; 32], [0x33u8; 32]]
         );
+    }
+
+    #[test]
+    fn authority_seniority_beats_lex_min() {
+        // node-z is lexically LARGER than node-a but joined first: seniority
+        // must win over the old lex-min behavior.
+        let older_larger_id = MembershipNode {
+            joined_at_unix: 50,
+            ..membership_node(
+                "node-z",
+                0x11,
+                vec![RoleCapability::AnchorPortMappingAuthoritative],
+            )
+        };
+        let younger_smaller_id = MembershipNode {
+            joined_at_unix: 200,
+            ..membership_node(
+                "node-a",
+                0x22,
+                vec![RoleCapability::AnchorPortMappingAuthoritative],
+            )
+        };
+        let winner = select_port_mapping_authority_node_id(&[older_larger_id, younger_smaller_id]);
+        assert_eq!(winner, Some("node-z".to_owned()));
+    }
+
+    #[test]
+    fn authority_seniority_tie_breaks_on_node_id() {
+        let same_age_a = MembershipNode {
+            joined_at_unix: 100,
+            ..membership_node(
+                "node-a",
+                0x11,
+                vec![RoleCapability::AnchorPortMappingAuthoritative],
+            )
+        };
+        let same_age_z = MembershipNode {
+            joined_at_unix: 100,
+            ..membership_node(
+                "node-z",
+                0x22,
+                vec![RoleCapability::AnchorPortMappingAuthoritative],
+            )
+        };
+        let winner = select_port_mapping_authority_node_id(&[same_age_z, same_age_a]);
+        assert_eq!(winner, Some("node-a".to_owned()));
+    }
+
+    #[test]
+    fn authority_pin_overrides_seniority() {
+        // node-a is both senior AND lexically smaller; node-z is pinned.
+        // The pin must win over both.
+        let senior_unpinned = MembershipNode {
+            joined_at_unix: 10,
+            ..membership_node(
+                "node-a",
+                0x11,
+                vec![RoleCapability::AnchorPortMappingAuthoritative],
+            )
+        };
+        let junior_pinned = MembershipNode {
+            joined_at_unix: 500,
+            ..membership_node(
+                "node-z",
+                0x22,
+                vec![
+                    RoleCapability::AnchorPortMappingAuthoritative,
+                    RoleCapability::AnchorPortMappingPinned,
+                ],
+            )
+        };
+        let winner = select_port_mapping_authority_node_id(&[senior_unpinned, junior_pinned]);
+        assert_eq!(winner, Some("node-z".to_owned()));
+    }
+
+    #[test]
+    fn authority_pin_on_inactive_node_falls_back_to_seniority() {
+        let mut pinned_but_revoked = MembershipNode {
+            joined_at_unix: 500,
+            ..membership_node(
+                "node-z",
+                0x11,
+                vec![
+                    RoleCapability::AnchorPortMappingAuthoritative,
+                    RoleCapability::AnchorPortMappingPinned,
+                ],
+            )
+        };
+        pinned_but_revoked.status = MembershipNodeStatus::Revoked;
+        let senior_eligible = MembershipNode {
+            joined_at_unix: 10,
+            ..membership_node(
+                "node-a",
+                0x22,
+                vec![RoleCapability::AnchorPortMappingAuthoritative],
+            )
+        };
+        let winner = select_port_mapping_authority_node_id(&[pinned_but_revoked, senior_eligible]);
+        assert_eq!(winner, Some("node-a".to_owned()));
+    }
+
+    #[test]
+    fn authority_multi_pin_resolves_by_seniority_then_id() {
+        let pinned_junior = MembershipNode {
+            joined_at_unix: 500,
+            ..membership_node(
+                "node-z",
+                0x11,
+                vec![
+                    RoleCapability::AnchorPortMappingAuthoritative,
+                    RoleCapability::AnchorPortMappingPinned,
+                ],
+            )
+        };
+        let pinned_senior = MembershipNode {
+            joined_at_unix: 50,
+            ..membership_node(
+                "node-b",
+                0x22,
+                vec![
+                    RoleCapability::AnchorPortMappingAuthoritative,
+                    RoleCapability::AnchorPortMappingPinned,
+                ],
+            )
+        };
+        let winner = select_port_mapping_authority_node_id(&[pinned_junior, pinned_senior]);
+        assert_eq!(winner, Some("node-b".to_owned()));
+    }
+
+    #[test]
+    fn authority_empty_or_no_eligible_input_yields_none() {
+        assert_eq!(select_port_mapping_authority_node_id(&[]), None);
+
+        let ineligible = membership_node("node-a", 0x11, vec![RoleCapability::AnchorGossipSeed]);
+        assert_eq!(select_port_mapping_authority_node_id(&[ineligible]), None);
     }
 
     #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
