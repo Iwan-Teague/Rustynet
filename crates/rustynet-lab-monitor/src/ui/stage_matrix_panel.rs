@@ -16,6 +16,7 @@ use crate::data::run_matrix::{ParityState, StageMatrixEntry};
 /// stage so gaps between OSes are visible at a glance.
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focused_panel == Panel::StageMatrix;
+    let sel = app.stage_matrix_os_col;
     let matrix = &app.full_stage_matrix;
     let total =
         matrix.linux.len() + matrix.macos.len() + matrix.windows.len() + matrix.cross_os.len();
@@ -53,26 +54,35 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     ])
     .split(rows[0]);
 
-    render_os_column(
+    // All 3 columns share the same vertical space (only width differs via
+    // the horizontal split), so any one of them tells the real visible
+    // row count -- stash it so the up/down key handlers (which run before
+    // the next render) can clamp scroll to the real max immediately
+    // instead of only at render time.
+    let visible = render_os_column(
         f,
         columns[0],
         "LINUX",
         &matrix.linux,
-        app.stage_matrix_scroll,
+        app.stage_matrix_scroll[0],
+        focused && sel == 0,
     );
+    app.stage_matrix_visible_rows.set(visible);
     render_os_column(
         f,
         columns[1],
         "MACOS",
         &matrix.macos,
-        app.stage_matrix_scroll,
+        app.stage_matrix_scroll[1],
+        focused && sel == 1,
     );
     render_os_column(
         f,
         columns[2],
         "WINDOWS",
         &matrix.windows,
-        app.stage_matrix_scroll,
+        app.stage_matrix_scroll[2],
+        focused && sel == 2,
     );
     render_cross_os_strip(f, rows[1], &matrix.cross_os);
 }
@@ -83,12 +93,17 @@ fn render_os_column(
     label: &str,
     stages: &[StageMatrixEntry],
     scroll: usize,
-) {
+    selected: bool,
+) -> usize {
     let passed = count_passed(stages);
     let block = Block::default()
         .title(format!("{label} {passed}/{}", stages.len()))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(if selected {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        }));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -103,6 +118,7 @@ fn render_os_column(
         .map(stage_line)
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
+    visible
 }
 
 fn render_cross_os_strip(f: &mut Frame, area: Rect, cross_os: &[StageMatrixEntry]) {
