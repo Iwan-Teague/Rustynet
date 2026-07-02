@@ -425,6 +425,9 @@ impl App {
         if stage == "validate_macos_blind_exit" {
             return self.config.blind_exit_platform == "macos";
         }
+        if stage == "validate_macos_key_custody" {
+            return self.config.wants_macos();
+        }
         if matches!(
             stage,
             "validate_windows_client_install"
@@ -453,7 +456,10 @@ impl App {
         if stage == "validate_windows_admin_issue" {
             return self.config.admin_platform == "windows";
         }
-        stage == "linux_live_suite" && !self.config.skip_linux_live_suite
+        if stage == "linux_live_suite" {
+            return !self.config.skip_linux_live_suite;
+        }
+        linux_live_lab_catalog().contains(&stage) && !self.config.skip_linux_live_suite
     }
 
     /// The full stage catalog, every group unconditional -- whether a
@@ -527,6 +533,11 @@ impl App {
                 .map(|stage| (*stage).to_owned()),
         );
         live_lab.push("linux_live_suite".to_owned());
+        live_lab.extend(
+            linux_live_lab_catalog()
+                .iter()
+                .map(|stage| (*stage).to_owned()),
+        );
 
         vec![
             StageGroup {
@@ -833,7 +844,7 @@ impl App {
             KeyCode::Up => match self.focused_panel {
                 Panel::StageGrid => {
                     let col = self.stage_grid_col;
-                    self.stage_grid_row[col] = self.stage_grid_row[col].saturating_sub(1);
+                    self.move_stage_grid_cursor(col, -1);
                 }
                 Panel::Log => {
                     if self.log_scroll == 0 {
@@ -867,12 +878,7 @@ impl App {
             KeyCode::Down => match self.focused_panel {
                 Panel::StageGrid => {
                     let col = self.stage_grid_col;
-                    let max = self
-                        .planned_stage_groups()
-                        .get(col)
-                        .map(|group| group.stages.len().saturating_sub(1))
-                        .unwrap_or(0);
-                    self.stage_grid_row[col] = (self.stage_grid_row[col] + 1).min(max);
+                    self.move_stage_grid_cursor(col, 1);
                 }
                 Panel::Log => {
                     self.log_scroll = self.log_scroll.saturating_sub(1);
@@ -1309,14 +1315,55 @@ impl App {
     /// Keep `stage_grid_row[col]` within the given group's actual stage
     /// count -- needed on a Left/Right column switch, since each group can
     /// have a different length and a stale row index from a longer group
-    /// would otherwise point past the end of a shorter one.
+    /// would otherwise point past the end of a shorter one. Also snaps
+    /// onto the nearest enabled stage if the clamped position lands on a
+    /// disabled one (e.g. entering LIVE LAB by default when macOS isn't
+    /// targeted puts row 0 on a macOS-only stage) -- the cursor should
+    /// never rest on something that isn't possible for the current config.
     fn clamp_stage_grid_row(&mut self, col: usize) {
-        let max = self
-            .planned_stage_groups()
-            .get(col)
-            .map(|group| group.stages.len().saturating_sub(1))
-            .unwrap_or(0);
+        let groups = self.planned_stage_groups();
+        let Some(group) = groups.get(col) else {
+            return;
+        };
+        let max = group.stages.len().saturating_sub(1);
         self.stage_grid_row[col] = self.stage_grid_row[col].min(max);
+        if group.stages.is_empty() || self.stage_enabled(&group.stages[self.stage_grid_row[col]]) {
+            return;
+        }
+        if let Some(nearest) = group
+            .stages
+            .iter()
+            .position(|stage| self.stage_enabled(stage))
+        {
+            self.stage_grid_row[col] = nearest;
+        }
+    }
+
+    /// Move `stage_grid_row[col]` to the next enabled stage in the given
+    /// direction (+1 = Down, -1 = Up), skipping disabled ones entirely --
+    /// the cursor must never land on a stage that isn't possible for the
+    /// current config. If every remaining stage in that direction is
+    /// disabled, the cursor stays put.
+    fn move_stage_grid_cursor(&mut self, col: usize, direction: isize) {
+        let groups = self.planned_stage_groups();
+        let Some(group) = groups.get(col) else {
+            return;
+        };
+        let len = group.stages.len();
+        if len == 0 {
+            return;
+        }
+        let mut idx = self.stage_grid_row[col].min(len - 1) as isize;
+        loop {
+            idx += direction;
+            if idx < 0 || idx >= len as isize {
+                return;
+            }
+            if self.stage_enabled(&group.stages[idx as usize]) {
+                self.stage_grid_row[col] = idx as usize;
+                return;
+            }
+        }
     }
 
     fn cycle_selected_vm_role(&mut self, direction: isize) {
@@ -1704,6 +1751,7 @@ fn macos_live_lab_catalog() -> &'static [&'static str] {
         "validate_macos_anchor_bundle_pull",
         "validate_macos_admin_issue",
         "validate_macos_blind_exit",
+        "validate_macos_key_custody",
     ]
 }
 
@@ -1721,6 +1769,32 @@ fn windows_live_lab_catalog() -> &'static [&'static str] {
         "validate_windows_relay_service_lifecycle",
         "validate_windows_anchor_bundle_pull",
         "validate_windows_admin_issue",
+    ]
+}
+
+/// Linux one-off security/protocol audit stages -- distinct from
+/// `linux_live_suite` (the coarse "did the whole Linux live-lab pipeline
+/// pass" flag). Each maps to its own CSV column via
+/// rustynet-cli's `set_special_stage_values` (see live_lab_run_matrix.rs)
+/// and is gated on the same `!skip_linux_live_suite` condition, since they
+/// only ever run as part of that suite.
+fn linux_live_lab_catalog() -> &'static [&'static str] {
+    &[
+        "validate_linux_membership_revoke_applies",
+        "validate_linux_revoked_peer_denied_e2e",
+        "validate_linux_membership_signature_forgery",
+        "validate_linux_privileged_helper_allowlist",
+        "validate_linux_policy_default_deny",
+        "validate_linux_runtime_acls",
+        "validate_linux_service_hardening",
+        "validate_linux_authenticode",
+        "validate_linux_key_custody",
+        "validate_linux_membership_genesis",
+        "validate_linux_mesh_status",
+        "validate_linux_blind_exit_reversal_denied",
+        "validate_linux_gossip_revoked_readmit",
+        "validate_linux_enrollment_replay",
+        "validate_linux_hello_limiter_flood",
     ]
 }
 
@@ -2178,6 +2252,60 @@ mod tests {
     }
 
     #[test]
+    fn stage_grid_down_skips_disabled_stages_entirely() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.focused_panel = Panel::StageGrid;
+        // Default area is "macOS exit", which makes wants_macos() true --
+        // override it so only Windows is wanted here.
+        app.config.area = "Windows exit".to_owned();
+        app.config.exit_platform = "windows".to_owned(); // wants_windows() true, wants_macos() false
+        app.stage_grid_col = 1; // BOOTSTRAP: 9 base + 5 macos (disabled) + 5 windows (enabled)
+        app.stage_grid_row[1] = 8; // last base stage, "validate_baseline_runtime"
+
+        app.handle_key(KeyCode::Down, KeyModifiers::empty());
+
+        // Must land on the first enabled Windows bootstrap stage (index
+        // 14), never resting on any of the 5 disabled macOS ones (9-13) in
+        // between -- the cursor can't select something not possible.
+        let group = &app.planned_stage_groups()[1];
+        assert_eq!(app.stage_grid_row[1], 14);
+        assert!(app.stage_enabled(&group.stages[14]));
+        assert_eq!(group.stages[14], "bootstrap_windows_host");
+    }
+
+    #[test]
+    fn stage_grid_up_skips_disabled_stages_entirely() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.focused_panel = Panel::StageGrid;
+        app.config.area = "Windows exit".to_owned();
+        app.config.exit_platform = "windows".to_owned();
+        app.stage_grid_col = 1;
+        app.stage_grid_row[1] = 14; // first enabled Windows bootstrap stage
+
+        app.handle_key(KeyCode::Up, KeyModifiers::empty());
+
+        // Must skip back over the 5 disabled macOS stages (9-13) and land
+        // on the last enabled base stage (8), not stop on a disabled one.
+        assert_eq!(app.stage_grid_row[1], 8);
+    }
+
+    #[test]
+    fn linux_oneoff_security_stages_are_listed_and_gated_with_linux_live_suite() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.config.skip_linux_live_suite = true;
+
+        assert!(
+            app.planned_stages()
+                .contains(&"validate_linux_membership_revoke_applies".to_owned())
+        );
+        assert!(!app.stage_enabled("validate_linux_membership_revoke_applies"));
+
+        app.config.skip_linux_live_suite = false;
+        assert!(app.stage_enabled("validate_linux_membership_revoke_applies"));
+        assert!(app.stage_enabled("validate_linux_hello_limiter_flood"));
+    }
+
+    #[test]
     fn c_key_forces_vm_commit_probe() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.last_vm_probe = Some(std::time::Instant::now());
@@ -2561,7 +2689,11 @@ mod tests {
 
         let labels = app.stage_timer_labels();
 
-        assert_eq!(labels[2], ("LAB", "18m".to_owned()));
+        // 21m, not the pre-catalog-expansion 18m: validate_macos_key_custody
+        // is now a real, always-listed LIVE LAB stage (previously missing
+        // from macos_live_lab_catalog entirely), and it's enabled here via
+        // macos_promote_exit -> wants_macos().
+        assert_eq!(labels[2], ("LAB", "21m".to_owned()));
     }
 
     #[test]

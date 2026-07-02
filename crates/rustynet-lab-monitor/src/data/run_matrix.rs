@@ -196,11 +196,15 @@ pub struct RunSummary {
     pub first_failed_stage: String,
     /// Number of `_stage_` / `cross_os_*` columns with outcome "pass".
     pub passed_stages: usize,
-    /// Count of stage columns that actually ran with a pass/fail outcome —
-    /// `skip`/`skipped` (deliberately not applicable to this run's
-    /// topology/flags) and `not_run` are excluded from both this and
-    /// `passed_stages`, so a run that skips half the catalog on purpose
-    /// doesn't read as if it only got halfway through.
+    /// Count of stage columns that were possible for this run: `pass`,
+    /// `fail`, and `not_run` all count (not_run means "never reached" --
+    /// e.g. the pipeline stopped early after an earlier failure -- which
+    /// is still a stage that COULD have run, just didn't get there). Only
+    /// `skip`/`skipped` (the orchestrator itself deciding this stage
+    /// doesn't apply to this run's topology/flags) is excluded, so a run
+    /// that deliberately skips half the catalog doesn't shrink the
+    /// denominator, but a run that fails early and never reaches the rest
+    /// still reports against the full possible count.
     pub total_stages: usize,
     /// Column name of the last stage with outcome "pass", for PASS run
     /// display — not just "the last non-not_run column", since that could
@@ -345,12 +349,17 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
                         total += 1;
                         last_passed_stage = col_name.clone();
                     }
-                    "fail" => {
+                    // "fail" counts against the total (it was possible, it
+                    // just didn't pass). "not_run"/"na"/"" also count --
+                    // never reached (e.g. the pipeline stopped early after
+                    // an earlier failure) still means this stage WAS part
+                    // of the possible plan, just didn't get attempted.
+                    "fail" | "not_run" | "na" | "" => {
                         total += 1;
                     }
-                    // "skip"/"skipped" -> deliberately not applicable to this
-                    // run (topology/flags), not counted at all, same as
-                    // "not_run"/"na"/"". Neither updates last_passed_stage.
+                    // Only "skip"/"skipped" -- the orchestrator itself
+                    // deciding this doesn't apply to this run's
+                    // topology/flags -- is excluded entirely.
                     _ => {}
                 }
             }
@@ -867,9 +876,11 @@ mod tests {
         assert_eq!(runs[0].git_commit, "bbb2222");
         assert_eq!(runs[0].overall_result, "fail");
         assert_eq!(runs[0].first_failed_stage, "linux_stage_exit_handoff");
-        // not_run is excluded from total; pass=1 fail=1 → total=2
+        // not_run still counts toward total (it was possible, just never
+        // reached after the earlier failure) -- pass=1 fail=1 not_run=1 →
+        // total=3.
         assert_eq!(runs[0].passed_stages, 1);
-        assert_eq!(runs[0].total_stages, 2);
+        assert_eq!(runs[0].total_stages, 3);
         // The last column with outcome "fail" doesn't count as a passed
         // stage -- last_passed_stage must be the actual last PASS, not
         // just the last column that ran at all.
@@ -899,6 +910,27 @@ mod tests {
         assert_eq!(runs[0].passed_stages, 1);
         assert_eq!(runs[0].total_stages, 1);
         assert_eq!(runs[0].last_passed_stage, "macos_stage_anchor");
+    }
+
+    #[test]
+    fn recent_runs_counts_not_run_toward_total_but_not_skip() {
+        // A run that fails partway through: 3 stages passed, 1 failed, 2
+        // were skipped (not applicable to this run's topology), and the 2
+        // after the failure never ran. total_stages must be 6 (everything
+        // possible except the 2 skips), not 4 (only decisive pass/fail).
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "run_id,overall_result,\
+             linux_stage_bootstrap,linux_stage_membership,linux_stage_assignments,\
+             macos_stage_anchor,macos_stage_exit_handoff,\
+             windows_stage_bootstrap,windows_stage_membership,windows_stage_assignments\n\
+             run-1,fail,pass,pass,pass,fail,skip,not_run,not_run,skip\n",
+        );
+        let runs = load_recent_runs(dir.path(), 1).unwrap();
+
+        assert_eq!(runs[0].passed_stages, 3);
+        assert_eq!(runs[0].total_stages, 6);
     }
 
     #[test]
