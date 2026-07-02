@@ -95,6 +95,10 @@ fn progress_bar(state: ParityState, history: &[CellOutcome]) -> Line<'static> {
             Style::default().fg(Color::Green),
         )),
         ParityState::Failed => build_bar(passes, relevant, Color::Red, Color::Red),
+        // load_parity_matrix never produces Flaky today (it only ever reads
+        // the latest decisive value, not a classified history) -- handled
+        // here only so this match stays exhaustive if that changes.
+        ParityState::Flaky => build_bar(passes, relevant, Color::Yellow, Color::Yellow),
         ParityState::Unproven => build_bar(passes, relevant, Color::Gray, Color::DarkGray),
     }
 }
