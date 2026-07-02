@@ -2766,6 +2766,28 @@ mod tests {
     }
 
     #[test]
+    fn group_eta_is_based_on_the_enabled_subset_not_the_full_group_catalog() {
+        // The BOOTSTRAP header line shows "x/y" against the enabled subset
+        // (see stage_group_header_spans); the top-bar timer must agree --
+        // narrowing the target to Linux-only must shrink the BOOTSTRAP
+        // estimate below what it'd be with macOS also enabled, not silently
+        // sum the whole 19-stage catalog (base + macos + windows
+        // candidates) regardless of what's actually planned to run.
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.stage_timings.clear();
+        app.config.area = "Linux exit".to_owned();
+        let linux_only_boot = app.stage_timer_labels()[1].1.clone();
+
+        app.config.area = "macOS exit".to_owned();
+        let with_macos_boot = app.stage_timer_labels()[1].1.clone();
+
+        assert_ne!(
+            linux_only_boot, with_macos_boot,
+            "enabling macOS must change the BOOTSTRAP estimate, proving it's not a fixed full-catalog number"
+        );
+    }
+
+    #[test]
     fn stage_timers_do_not_subtract_whole_job_elapsed_before_live_lab() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.config.macos_promote_exit = true;

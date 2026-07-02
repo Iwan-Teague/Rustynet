@@ -2742,7 +2742,23 @@ ssh_reachability_worker() {
   printf '[ssh-reachable] %s %s platform=%s\n' "$label" "$target" "$platform"
   # Windows role nodes must not be probed with the POSIX `true`-over-ssh path
   # (default-shell PowerShell launch can hang the stage); route per platform.
-  ssh_wait_for_host_for_platform "$target" "$platform" 120 5 || return 1
+  local probe_log probe_rc=0
+  probe_log="$(mktemp "${LIVE_LAB_STAGE_DIR:-${TMPDIR:-/tmp}}/ssh-reachability-${label}.XXXXXX")" || return 1
+  if ssh_wait_for_host_for_platform "$target" "$platform" 120 5 >"$probe_log" 2>&1; then
+    probe_rc=0
+  else
+    probe_rc=$?
+  fi
+  if [[ -s "$probe_log" ]]; then
+    cat "$probe_log"
+  fi
+  if grep -Eiq '(Operation not permitted|Abort trap: [0-9]+)' "$probe_log"; then
+    printf '[ssh-reachable] %s local transport denied; rerun outside the sandbox or without shell redirection\n' "$label" >&2
+    rm -f "$probe_log"
+    return 1
+  fi
+  rm -f "$probe_log"
+  return "$probe_rc"
 }
 
 prime_remote_access_worker() {
