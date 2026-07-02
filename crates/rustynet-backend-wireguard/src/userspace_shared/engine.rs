@@ -61,6 +61,7 @@ pub(crate) struct UserspaceEngine {
     local_static_public: PublicKey,
     next_tunnel_index: u32,
     peer_states: BTreeMap<NodeId, PeerEngineState>,
+    path_quality: BTreeMap<NodeId, PeerPathQuality>,
     recorded_peer_ciphertext_ingress: Vec<RecordedPeerCiphertextIngress>,
     recorded_tunnel_plaintext_packets: Vec<RecordedTunnelPlaintextPacket>,
     // Long-lived per-engine scratch buffers reused across every packet instead
@@ -81,6 +82,82 @@ struct PeerEngineState {
     endpoint: SocketAddr,
     allowed_ips: Vec<AllowedIpNetwork>,
     tunnel: Tunn,
+}
+
+/// FIS-0004: engine-local per-peer path-quality estimator. The rich state
+/// stays inside the backend crate; only the coarse [`PathHealth`] verdict
+/// and the raw [`PeerPathSample`] cross the backend-api boundary.
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerPathQuality {
+    /// Consecutive rekey windows with EWMA loss above threshold
+    /// (hysteresis counter, saturating).
+    loss_degraded_windows: u8,
+    /// Total windows ever ingested (health is Unknown until >= 1).
+    windows_ingested: u8,
+    /// RFC 6298 smoothed RTT / RTT variation, milliseconds.
+    srtt_ms: Option<u32>,
+    rttvar_ms: Option<u32>,
+    /// Dedupe guard: evidence is consumed once per handshake advance
+    /// (boringtun's loss EWMA and RTT sample change only per rekey, so
+    /// correlated 1s polls must not re-count one window).
+    last_ingested_handshake_unix: Option<u64>,
+}
+
+impl PeerPathQuality {
+    /// 2% EWMA loss = degraded window (TCP-Reno-style debounced threshold,
+    /// not a rate controller).
+    const LOSS_THRESHOLD: f32 = 0.02;
+    /// Two consecutive degraded windows flag Degrading; one clean window
+    /// steps back toward Healthy.
+    const DEGRADE_WINDOWS: u8 = 2;
+    /// RFC 6298 constants (Jacobson/Karels).
+    const RTT_ALPHA: f32 = 0.125;
+    const RTT_BETA: f32 = 0.25;
+
+    fn ingest_window(&mut self, loss: f32, rtt_sample_ms: Option<u32>) {
+        self.windows_ingested = self.windows_ingested.saturating_add(1);
+        if loss > Self::LOSS_THRESHOLD {
+            self.loss_degraded_windows = self
+                .loss_degraded_windows
+                .saturating_add(1)
+                .min(Self::DEGRADE_WINDOWS + 1);
+        } else {
+            self.loss_degraded_windows = self.loss_degraded_windows.saturating_sub(1);
+        }
+        if let Some(sample) = rtt_sample_ms {
+            match self.srtt_ms {
+                None => {
+                    self.srtt_ms = Some(sample);
+                    self.rttvar_ms = Some(sample / 2);
+                }
+                Some(srtt) => {
+                    let abs_diff = srtt.abs_diff(sample);
+                    let rttvar = self.rttvar_ms.unwrap_or(sample / 2);
+                    self.rttvar_ms = Some(
+                        ((1.0 - Self::RTT_BETA) * rttvar as f32 + Self::RTT_BETA * abs_diff as f32)
+                            as u32,
+                    );
+                    self.srtt_ms = Some(
+                        ((1.0 - Self::RTT_ALPHA) * srtt as f32 + Self::RTT_ALPHA * sample as f32)
+                            as u32,
+                    );
+                }
+            }
+        }
+    }
+
+    fn health(&self) -> rustynet_backend_api::PathHealth {
+        if self.windows_ingested == 0 {
+            // Zero evidence is never fabricated Healthy.
+            rustynet_backend_api::PathHealth::Unknown
+        } else if self.loss_degraded_windows >= Self::DEGRADE_WINDOWS {
+            rustynet_backend_api::PathHealth::Degrading
+        } else if self.loss_degraded_windows == 0 {
+            rustynet_backend_api::PathHealth::Healthy
+        } else {
+            rustynet_backend_api::PathHealth::Unknown
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +210,7 @@ impl UserspaceEngine {
             local_static_public,
             next_tunnel_index: 1,
             peer_states: BTreeMap::new(),
+            path_quality: BTreeMap::new(),
             recorded_peer_ciphertext_ingress: Vec::new(),
             recorded_tunnel_plaintext_packets: Vec::new(),
             decrypt_scratch: vec![0u8; MAX_DECRYPTED_PACKET_BYTES],
@@ -232,6 +310,7 @@ impl UserspaceEngine {
     }
 
     pub(crate) fn remove_peer(&mut self, node_id: &NodeId) -> bool {
+        self.path_quality.remove(node_id);
         self.peer_states.remove(node_id).is_some()
     }
 
@@ -342,11 +421,44 @@ impl UserspaceEngine {
         let mut bytes_tx = 0u64;
         let mut bytes_rx = 0u64;
         for peer_state in self.peer_states.values() {
+            // loss/rtt are consumed per-peer by peer_path_quality
+            // (FIS-0004/0013); this engine-wide aggregate needs bytes only.
             let (_handshake, peer_tx, peer_rx, _loss, _rtt) = peer_state.tunnel.stats();
             bytes_tx = bytes_tx.saturating_add(peer_tx as u64);
             bytes_rx = bytes_rx.saturating_add(peer_rx as u64);
         }
         EngineStats { bytes_tx, bytes_rx }
+    }
+
+    /// FIS-0004/0013: per-peer path-quality read. Un-discards boringtun's
+    /// per-peer `(loss, rtt)` (computed free at each rekey), ingests one
+    /// estimator window when the handshake advanced, and returns the raw
+    /// sample plus the coarse health verdict. Runs at the daemon's poll
+    /// cadence via a runtime request — never per-packet, never per-tick.
+    pub(crate) fn peer_path_quality(
+        &mut self,
+        node_id: &NodeId,
+        latest_handshake_unix: Option<u64>,
+    ) -> Option<(
+        rustynet_backend_api::PeerPathSample,
+        rustynet_backend_api::PathHealth,
+    )> {
+        let state = self.peer_states.get(node_id)?;
+        let (_since_handshake, _tx, _rx, loss, rtt) = state.tunnel.stats();
+        let quality = self.path_quality.entry(node_id.clone()).or_default();
+        if let Some(handshake_unix) = latest_handshake_unix
+            && quality.last_ingested_handshake_unix != Some(handshake_unix)
+        {
+            quality.last_ingested_handshake_unix = Some(handshake_unix);
+            quality.ingest_window(loss, rtt);
+        }
+        let sample = rustynet_backend_api::PeerPathSample {
+            loss,
+            rtt,
+            rttvar: quality.rttvar_ms,
+            latest_handshake: latest_handshake_unix,
+        };
+        Some((sample, quality.health()))
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -692,6 +804,99 @@ mod tests {
     use base64::prelude::BASE64_STANDARD;
     use rustynet_backend_api::BackendErrorKind;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn peer_path_quality_hysteresis_and_rfc6298_tracking() {
+        use super::PeerPathQuality;
+        use rustynet_backend_api::PathHealth;
+
+        let mut quality = PeerPathQuality::default();
+        assert_eq!(quality.health(), PathHealth::Unknown, "zero evidence");
+
+        // One clean window: Healthy.
+        quality.ingest_window(0.0, Some(40));
+        assert_eq!(quality.health(), PathHealth::Healthy);
+        assert_eq!(quality.srtt_ms, Some(40));
+        assert_eq!(quality.rttvar_ms, Some(20));
+
+        // One degraded window: debounced — not yet Degrading.
+        quality.ingest_window(0.05, Some(40));
+        assert_eq!(quality.health(), PathHealth::Unknown);
+        // Second consecutive degraded window trips the flag.
+        quality.ingest_window(0.05, Some(40));
+        assert_eq!(quality.health(), PathHealth::Degrading);
+
+        // One clean window steps back toward Healthy (counter 2 -> 1).
+        quality.ingest_window(0.0, Some(40));
+        assert_eq!(quality.health(), PathHealth::Unknown);
+        quality.ingest_window(0.0, Some(40));
+        assert_eq!(quality.health(), PathHealth::Healthy);
+
+        // RFC 6298: a 120ms spike moves SRTT by alpha=1/8 (40 -> 50) and
+        // RTTVAR toward |srtt - sample| by beta=1/4.
+        let mut tracker = PeerPathQuality::default();
+        tracker.ingest_window(0.0, Some(40));
+        tracker.ingest_window(0.0, Some(120));
+        assert_eq!(tracker.srtt_ms, Some(50));
+        assert_eq!(tracker.rttvar_ms, Some(35)); // 0.75*20 + 0.25*80
+    }
+
+    #[test]
+    fn peer_path_quality_accessor_dedupes_by_handshake_advance() {
+        use rustynet_backend_api::{NodeId, PathHealth, PeerConfig, SocketEndpoint};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg.key");
+        std::fs::write(&path, BASE64_STANDARD.encode([9u8; 32])).expect("write key");
+        let mut engine = UserspaceEngine::from_private_key_file(&path).expect("engine");
+        let node_id = NodeId::new("peer-q").expect("node id");
+        engine
+            .configure_peer(&PeerConfig {
+                node_id: node_id.clone(),
+                endpoint: SocketEndpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+                    port: 51820,
+                },
+                public_key: [0x22; 32],
+                allowed_ips: vec!["100.64.8.0/24".to_owned()],
+                persistent_keepalive_secs: None,
+            })
+            .expect("peer configures");
+
+        // Unknown peer: no sample at all.
+        let ghost = NodeId::new("ghost").expect("node id");
+        assert!(engine.peer_path_quality(&ghost, Some(100)).is_none());
+
+        // No handshake yet: sample exists but zero evidence -> Unknown.
+        let (sample, health) = engine
+            .peer_path_quality(&node_id, None)
+            .expect("configured peer samples");
+        assert_eq!(health, PathHealth::Unknown);
+        assert_eq!(sample.latest_handshake, None);
+
+        // A handshake advance ingests exactly ONE window (idle tunnel:
+        // loss 0.0 -> Healthy)...
+        let (_, health) = engine
+            .peer_path_quality(&node_id, Some(1_000))
+            .expect("sample");
+        assert_eq!(health, PathHealth::Healthy);
+        let ingested = engine.path_quality[&node_id].windows_ingested;
+        assert_eq!(ingested, 1);
+
+        // ...and correlated re-polls of the SAME handshake never re-count.
+        for _ in 0..5 {
+            let _ = engine.peer_path_quality(&node_id, Some(1_000));
+        }
+        assert_eq!(engine.path_quality[&node_id].windows_ingested, 1);
+
+        // The next rekey ingests the next window.
+        let _ = engine.peer_path_quality(&node_id, Some(1_120));
+        assert_eq!(engine.path_quality[&node_id].windows_ingested, 2);
+
+        // remove_peer clears the estimator state.
+        assert!(engine.remove_peer(&node_id));
+        assert!(!engine.path_quality.contains_key(&node_id));
+    }
 
     #[test]
     fn fis0012_metadata_seams_classify_without_processing() {
