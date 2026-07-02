@@ -111,7 +111,6 @@ pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), Parity
             Err(_) => continue,
         }
     }
-    rows.reverse();
 
     let mut matrix: HashMap<(Role, Os), ParityState> = HashMap::new();
 
@@ -123,31 +122,25 @@ pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), Parity
 
     for role in Role::all() {
         for os in Os::all() {
-            let col_names = role_stage_columns(role, os);
-            let key = (role, os);
-            let mut state = ParityState::Unproven;
-
-            for row in &rows {
-                let val = col_names
-                    .iter()
-                    .filter_map(|col| header_index(col))
-                    .filter_map(|idx| row.get(idx))
-                    .find(|value| matches!(*value, "pass" | "fail"))
-                    .unwrap_or("");
-                match val {
-                    "pass" => {
-                        state = ParityState::Proven;
-                        break;
-                    }
-                    "fail" => {
-                        state = ParityState::Failed;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            matrix.insert(key, state);
+            let col_indices: Vec<usize> = role_stage_columns(role, os)
+                .iter()
+                .filter_map(|col| header_index(col))
+                .collect();
+            // Per row (oldest first, matching decisive_history's
+            // convention), the same "first decisive of this role's
+            // representative columns wins" rule as before -- just now
+            // building the full history instead of stopping at the latest.
+            let history: Vec<bool> = rows
+                .iter()
+                .filter_map(|row| {
+                    col_indices
+                        .iter()
+                        .filter_map(|&idx| row.get(idx))
+                        .find(|value| matches!(*value, "pass" | "fail"))
+                })
+                .map(|value| value == "fail")
+                .collect();
+            matrix.insert((role, os), classify_recent_history(&history));
         }
     }
 
@@ -940,6 +933,28 @@ mod tests {
         assert_eq!(
             matrix.get(&(Role::Relay, Os::Windows)),
             Some(&ParityState::Failed)
+        );
+    }
+
+    #[test]
+    fn parity_matrix_flags_a_flaky_role_os_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec!["run_id,overall_result,windows_stage_anchor".to_owned()];
+        for (i, outcome) in [
+            "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "pass",
+        ]
+        .iter()
+        .enumerate()
+        {
+            lines.push(format!("run-{i},pass,{outcome}"));
+        }
+        write_matrix_csv(dir.path(), &format!("{}\n", lines.join("\n")));
+
+        let matrix = load_parity_matrix(dir.path()).unwrap();
+
+        assert_eq!(
+            matrix.get(&(Role::Anchor, Os::Windows)),
+            Some(&ParityState::Flaky)
         );
     }
 

@@ -81,6 +81,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 ///
 /// - Proven  → full bright-green block
 /// - Failed  → red fill (pass ratio) + red dim remainder — entire bar stays red
+/// - Flaky   → yellow fill (pass ratio) + yellow dim remainder — elevated recent
+///   failure rate without being consistently broken (see `classify_recent_history`)
 /// - Unproven → gray fill (pass ratio) + dark-gray remainder
 fn progress_bar(state: ParityState, history: &[CellOutcome]) -> Line<'static> {
     let relevant = history
@@ -95,9 +97,6 @@ fn progress_bar(state: ParityState, history: &[CellOutcome]) -> Line<'static> {
             Style::default().fg(Color::Green),
         )),
         ParityState::Failed => build_bar(passes, relevant, Color::Red, Color::Red),
-        // load_parity_matrix never produces Flaky today (it only ever reads
-        // the latest decisive value, not a classified history) -- handled
-        // here only so this match stays exhaustive if that changes.
         ParityState::Flaky => build_bar(passes, relevant, Color::Yellow, Color::Yellow),
         ParityState::Unproven => build_bar(passes, relevant, Color::Gray, Color::DarkGray),
     }
