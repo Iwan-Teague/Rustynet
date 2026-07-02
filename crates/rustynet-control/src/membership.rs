@@ -1737,6 +1737,14 @@ fn validate_membership_node_capabilities(node: &MembershipNode) -> Result<(), Me
             node.node_id
         )));
     }
+    if capabilities.contains(&RoleCapability::AnchorPortMappingPinned)
+        && !capabilities.contains(&RoleCapability::AnchorPortMappingAuthoritative)
+    {
+        return Err(MembershipError::InvalidFormat(format!(
+            "node {} anchor.port_mapping_pinned requires anchor.port_mapping_authoritative capability",
+            node.node_id
+        )));
+    }
     if capabilities.contains(&RoleCapability::BlindExit)
         && capabilities
             .iter()
@@ -1889,10 +1897,11 @@ mod tests {
         MembershipApproverRole, MembershipApproverStatus, MembershipError, MembershipNode,
         MembershipNodeStatus, MembershipOperation, MembershipReplayCache, MembershipSignature,
         MembershipState, MembershipUpdateRecord, SignedMembershipUpdate,
-        append_membership_log_entry, apply_signed_update, decode_update_record, hex_encode,
-        load_membership_log, load_membership_snapshot, persist_membership_snapshot,
-        preview_next_state, reduce_membership_state, replay_membership_snapshot_and_log,
-        sign_update_record, write_membership_audit_log,
+        append_membership_log_entry, apply_signed_update, decode_membership_state,
+        decode_update_record, encode_membership_state, hex_encode, load_membership_log,
+        load_membership_snapshot, persist_membership_snapshot, preview_next_state,
+        reduce_membership_state, replay_membership_snapshot_and_log, sign_update_record,
+        write_membership_audit_log,
     };
     // The size-cap constants are only exercised by the `#[cfg(unix)]` oversized-file
     // tests below; gate the import to match so Windows does not see them as unused.
@@ -2208,6 +2217,34 @@ mod tests {
         state.nodes[0].capabilities = vec![RoleCapability::BlindExit];
         let err = state.validate().expect_err("state should be rejected");
         assert!(matches!(err, MembershipError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn membership_validate_rejects_pinned_without_authoritative() {
+        let mut state = base_state();
+        state.nodes[0].capabilities = vec![RoleCapability::AnchorPortMappingPinned];
+        let err = state.validate().expect_err("state should be rejected");
+        assert!(matches!(err, MembershipError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn membership_state_with_pinned_capability_encodes_decodes_and_revalidates() {
+        let mut state = base_state();
+        state.nodes[0].capabilities = vec![
+            RoleCapability::AnchorPortMappingAuthoritative,
+            RoleCapability::AnchorPortMappingPinned,
+        ];
+        state.validate().expect("pinned + authoritative is valid");
+
+        let payload = encode_membership_state(&state).expect("state should encode");
+        assert!(payload.contains("anchor.port_mapping_authoritative,anchor.port_mapping_pinned"));
+
+        let decoded = decode_membership_state(&payload).expect("decode should revalidate and pass");
+        assert_eq!(decoded.nodes[0].capabilities, state.nodes[0].capabilities);
+        assert_eq!(
+            decoded.state_root_hex().expect("root"),
+            state.state_root_hex().expect("root")
+        );
     }
 
     #[test]
