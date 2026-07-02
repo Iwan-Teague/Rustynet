@@ -99,25 +99,13 @@ fn render_planned_with_statuses(
             .iter()
             .filter(|stage| status_by_stage.get(stage.as_str()) == Some(&"skipped"))
             .count();
-        // A column that has finished every one of its currently-enabled
-        // stages (and none failed) reads as done-and-green, regardless of
-        // the group's full catalog size -- a failure still wins over
-        // "everything ran", so a fully-completed-but-failing column stays
-        // red rather than misreporting success as green.
-        let all_enabled_complete = enabled > 0 && failed == 0 && completed >= enabled;
-        let header_style = if col_focused {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else if failed > 0 {
-            Style::default().fg(Color::Red)
-        } else if all_enabled_complete {
-            Style::default().fg(Color::Green)
-        } else if status_by_stage.is_empty() {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::White)
-        };
+        let header_style = stage_group_header_style(
+            col_focused,
+            enabled,
+            completed,
+            failed,
+            !status_by_stage.is_empty(),
+        );
         lines.push(Line::from(stage_group_header_spans(
             group.name,
             completed,
@@ -238,6 +226,34 @@ fn progress_bar_string(done: usize, total: usize, width: usize) -> String {
         "█".repeat(filled),
         "░".repeat(width.saturating_sub(filled))
     )
+}
+
+/// Decides the color for a group's header (bar + title): a column that has
+/// finished every one of its currently-enabled stages (and none failed)
+/// reads as done-and-green, regardless of the group's full catalog size --
+/// a failure still wins over "everything ran", so a fully-completed-but-
+/// failing column stays red rather than misreporting success as green.
+fn stage_group_header_style(
+    col_focused: bool,
+    enabled: usize,
+    completed: usize,
+    failed: usize,
+    has_any_status: bool,
+) -> Style {
+    let all_enabled_complete = enabled > 0 && failed == 0 && completed >= enabled;
+    if col_focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if failed > 0 {
+        Style::default().fg(Color::Red)
+    } else if all_enabled_complete {
+        Style::default().fg(Color::Green)
+    } else if !has_any_status {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::White)
+    }
 }
 
 /// Builds a group's header line: bar + "x/y" against `enabled` (the subset
