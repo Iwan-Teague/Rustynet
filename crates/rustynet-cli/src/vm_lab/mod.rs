@@ -18206,6 +18206,20 @@ fn build_linux_daemon_check_invocation(
     Ok(command)
 }
 
+/// Wrap a reviewed Linux daemon-check invocation in a non-interactive sudo
+/// guard. Used only for validators that must inspect root-owned runtime state;
+/// permissions stay locked down and the lab fails closed if sudo is unavailable.
+fn build_sudo_linux_daemon_check_invocation(
+    daemon_path: &str,
+    subcommand: &str,
+    extra_args: &[String],
+) -> Result<String, String> {
+    let invocation = build_linux_daemon_check_invocation(daemon_path, subcommand, extra_args)?;
+    Ok(format!(
+        "set -eu; if ! sudo -n true >/dev/null 2>&1; then echo 'sudo -n required for Linux root-state validator' >&2; exit 1; fi; sudo -n {invocation}"
+    ))
+}
+
 /// Generic SSH dispatcher for a Linux daemon-check subcommand. Resolves
 /// the alias, asserts the platform is Linux, builds the POSIX
 /// invocation, and returns the trimmed raw stdout. Stage runners parse
@@ -18232,6 +18246,43 @@ fn run_linux_daemon_check_remote(
     let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
     let invocation =
         build_linux_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand, extra_args)?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("remote dispatch of {subcommand} failed: {err}"))?;
+    Ok(raw_output.trim().to_owned())
+}
+
+/// Linux daemon-check dispatcher for validators that need root-owned files or
+/// kernel state. It uses the same quoted argv builder as the unprivileged path,
+/// then adds a sudo -n preflight so failures are explicit and non-interactive.
+fn run_linux_daemon_check_remote_privileged(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    subcommand: &str,
+    extra_args: &[String],
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[linux_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {linux_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Linux {
+        return Err(format!(
+            "alias {linux_alias} resolved to non-Linux platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let invocation =
+        build_sudo_linux_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand, extra_args)?;
     let raw_output = capture_remote_shell_command_for_target(
         &target,
         None,
@@ -18773,7 +18824,7 @@ fn run_validate_linux_mesh_status_stage_with_overrides(
     overrides: &MeshStatusOverrides,
 ) -> Result<(String, String), (String, String)> {
     let extras = build_linux_mesh_status_extra_args(overrides);
-    let raw = run_linux_daemon_check_remote(
+    let raw = run_linux_daemon_check_remote_privileged(
         linux_alias,
         inventory_path,
         ssh_identity_file,
@@ -18798,7 +18849,7 @@ fn run_validate_linux_key_custody_stage(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<(String, String), (String, String)> {
-    let raw = run_linux_daemon_check_remote(
+    let raw = run_linux_daemon_check_remote_privileged(
         linux_alias,
         inventory_path,
         ssh_identity_file,
@@ -18858,7 +18909,7 @@ fn run_validate_linux_dns_failclosed_stage(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<(String, String), (String, String)> {
-    let raw = run_linux_daemon_check_remote(
+    let raw = run_linux_daemon_check_remote_privileged(
         linux_alias,
         inventory_path,
         ssh_identity_file,
@@ -41832,6 +41883,24 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         assert!(script.contains("'peer-a'"));
         assert!(script.contains("'--max-age-seconds'"));
         assert!(script.contains("'300'"));
+    }
+
+    #[test]
+    fn build_sudo_linux_daemon_check_invocation_wraps_reviewed_argv() {
+        let script = super::build_sudo_linux_daemon_check_invocation(
+            super::LINUX_RUSTYNETD_PATH,
+            "linux-key-custody-check",
+            &[],
+        )
+        .expect("well-formed privileged invocation must build");
+        assert!(
+            script.starts_with("set -eu; if ! sudo -n true"),
+            "script must fail closed before privileged dispatch: {script:?}"
+        );
+        assert!(
+            script.ends_with("sudo -n '/usr/local/bin/rustynetd' 'linux-key-custody-check' --no-fail-on-drift"),
+            "script must preserve quoted daemon argv under sudo: {script:?}"
+        );
     }
 
     #[test]
