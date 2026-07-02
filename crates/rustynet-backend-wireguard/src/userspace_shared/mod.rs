@@ -458,6 +458,24 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
         self.with_runtime_recovery(|control| control.peer_latest_handshake_unix(node_id.clone()))
     }
 
+    fn peer_path_health(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<rustynet_backend_api::PathHealth>, BackendError> {
+        Ok(self
+            .with_runtime_recovery(|control| control.peer_path_quality(node_id.clone()))?
+            .map(|(_sample, health)| health))
+    }
+
+    fn peer_path_sample(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<rustynet_backend_api::PeerPathSample>, BackendError> {
+        Ok(self
+            .with_runtime_recovery(|control| control.peer_path_quality(node_id.clone()))?
+            .map(|(sample, _health)| sample))
+    }
+
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
         if !self.desired_peers.contains_key(node_id) {
             return Err(BackendError::invalid_input("peer is not configured"));
