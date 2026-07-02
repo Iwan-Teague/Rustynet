@@ -13,6 +13,7 @@ pub fn render(f: &mut Frame, area: Rect, _app: &App) {
         ("Tab", "page"),
         ("s", "start"),
         ("x", "stop"),
+        ("y", "copy logs"),
         ("a", "auto target"),
         ("?", "help"),
         ("q", "quit"),
