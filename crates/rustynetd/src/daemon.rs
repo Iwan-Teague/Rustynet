@@ -1546,6 +1546,10 @@ pub struct DaemonConfig {
     /// pairs. Default OFF — recording always runs (observability first);
     /// only the re-rank consumption is gated.
     pub traversal_prior_rerank: bool,
+    /// FIS-0010: enable the direct-relay flap-damping circuit breaker.
+    /// Default OFF — intensity tracking always runs (observability first);
+    /// only the stay-on-relay consult is gated.
+    pub traversal_flap_breaker: bool,
     pub relay_fleet_bundle_path: Option<PathBuf>,
     pub relay_fleet_watermark_path: Option<PathBuf>,
     pub traversal_max_age_secs: NonZeroU64,
@@ -1642,6 +1646,7 @@ impl Default for DaemonConfig {
             traversal_verifier_key_path: PathBuf::from(DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH),
             traversal_watermark_path: PathBuf::from(DEFAULT_TRAVERSAL_WATERMARK_PATH),
             traversal_prior_rerank: false,
+            traversal_flap_breaker: false,
             relay_fleet_bundle_path: Some(relay_fleet_default_path_from_env(
                 RELAY_FLEET_BUNDLE_PATH_ENV,
                 DEFAULT_RELAY_FLEET_BUNDLE_PATH,
@@ -3506,6 +3511,11 @@ struct DaemonRuntime {
     /// FIS-0009: persisted cross-session traversal priors (fail-open store).
     peer_prior_store: crate::peer_traversal_prior::PeerPriorStore,
     traversal_prior_rerank: bool,
+    /// FIS-0010: per-peer flap breakers. Persists across sync passes
+    /// (unlike `traversal_probe_statuses`, rebuilt each pass); in-memory
+    /// only — a restart starts every breaker closed.
+    flap_breakers: BTreeMap<NodeId, crate::traversal::FlapBreaker>,
+    traversal_flap_breaker: bool,
     traversal_max_age_secs: u64,
     traversal_probe_config: TraversalEngineConfig,
     traversal_probe_handshake_freshness_secs: u64,
@@ -3882,6 +3892,8 @@ impl DaemonRuntime {
                     .with_file_name("peer_traversal_priors.v1"),
             ),
             traversal_prior_rerank: config.traversal_prior_rerank,
+            flap_breakers: BTreeMap::new(),
+            traversal_flap_breaker: config.traversal_flap_breaker,
             traversal_max_age_secs: config.traversal_max_age_secs.get(),
             traversal_probe_config: TraversalEngineConfig {
                 max_candidates: config.traversal_probe_max_candidates.get(),
@@ -5845,7 +5857,17 @@ impl DaemonRuntime {
                 existing_status,
                 now_unix,
                 force_reprobe,
-            );
+            )
+                // FIS-0010: while a peer's breaker is open, withhold the
+                // direct re-race (stay on relay) — unless the operator
+                // forced a reprobe, which stays an escape hatch. Cooldown
+                // expiry (half-open) allows exactly the next race through.
+                && (force_reprobe
+                    || !self.traversal_flap_breaker
+                    || !self
+                        .flap_breakers
+                        .get(&remote_node_id)
+                        .is_some_and(|breaker| breaker.is_open(now_unix)));
             let relay_keepalive_recovery_due =
                 relay_keepalive_failed_peers.contains(&remote_node_id);
 
@@ -5995,6 +6017,27 @@ impl DaemonRuntime {
             if report.attempts > 0 {
                 let handshake_fresh =
                     self.traversal_handshake_is_fresh(report.latest_handshake_unix, now_unix);
+                // FIS-0010: feed the flap breaker (always on — consult is
+                // what the flag gates). Failure = the race did not end on a
+                // fresh direct handshake.
+                let race_failed =
+                    !(report.decision == TraversalProbeDecision::Direct && handshake_fresh);
+                let breaker = self
+                    .flap_breakers
+                    .entry(remote_node_id.clone())
+                    .or_default();
+                let state_before = breaker.state_label(now_unix);
+                breaker.record_outcome(race_failed, now_unix);
+                let state_after = breaker.state_label(now_unix);
+                if state_before != state_after {
+                    eprintln!(
+                        "rustynetd: flap breaker for peer {} {} -> {} (intensity {:.2})",
+                        remote_node_id.as_str(),
+                        state_before,
+                        state_after,
+                        breaker.intensity()
+                    );
+                }
                 let (winning_class, tried_classes) = race_outcome_classes(
                     &direct_candidates,
                     report.decision,
