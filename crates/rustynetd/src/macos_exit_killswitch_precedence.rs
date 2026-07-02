@@ -230,6 +230,10 @@ pub fn classify_anchor_poll_sample(
 /// window, returning the matching anchor as soon as one appears. The loop bound
 /// is a fixed `for` range so it always terminates; if no anchor ever shows up
 /// the budget is exhausted and it fails closed with `MACOS_NO_ACTIVE_ANCHOR_ERROR`.
+///
+/// Fixed-interval polling is deliberately independent of
+/// `resilience::next_reconnect_delay_jittered_ms`: local condition-poll where
+/// backoff growth only slows detection — see the FIS-0016 classification.
 #[cfg(target_os = "macos")]
 fn poll_for_macos_rustynet_anchor() -> Result<String, String> {
     for attempt in 0..MACOS_ANCHOR_POLL_ATTEMPTS {

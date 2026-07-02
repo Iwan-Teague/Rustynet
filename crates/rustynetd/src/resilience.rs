@@ -65,6 +65,32 @@ pub fn next_reconnect_delay_ms(policy: ReconnectPolicy, attempt: u32) -> u64 {
     backoff.min(policy.max_backoff_ms)
 }
 
+/// AWS Full Jitter (Brooker 2015): `uniform_random(0, min(cap, base ·
+/// multiplier^attempt))`, with [`next_reconnect_delay_ms`] as the
+/// deterministic ceiling (FIS-0016).
+///
+/// `entropy` is caller-supplied — a CSPRNG draw in production, fixed values
+/// in tests — so the function stays pure. On entropy-source failure pass
+/// `u64::MAX`, which maps to exactly the deterministic ceiling (the old
+/// unjittered behavior): fail-soft never shortens nor exceeds the envelope.
+/// Range reduction is the unbiased 128-bit multiply-shift (Lemire 2019), not
+/// modulo.
+///
+/// Adoption rule: any NEW reconnect loop with inter-attempt delays MUST use
+/// this function. Existing receive-timeout ladders (NAT-PMP/PCP RFC timing),
+/// local condition-polls, and single-host race retries were censused in
+/// FIS-0016 and deliberately left independent — see the per-site
+/// classification in
+/// `documents/operations/active/FableIntelligentSystemsProposals_2026-07-01.md`.
+pub fn next_reconnect_delay_jittered_ms(
+    policy: ReconnectPolicy,
+    attempt: u32,
+    entropy: u64,
+) -> u64 {
+    let ceiling = next_reconnect_delay_ms(policy, attempt);
+    ((u128::from(entropy) * (u128::from(ceiling) + 1)) >> 64) as u64
+}
+
 pub fn persist_session_snapshot(
     snapshot: &SessionStateSnapshot,
     path: impl AsRef<Path>,
@@ -385,7 +411,8 @@ mod tests {
 
     use super::{
         ReconnectPolicy, ResilienceError, SessionStateSnapshot, acquire_lock,
-        load_session_snapshot, lock_path_for, next_reconnect_delay_ms, persist_session_snapshot,
+        load_session_snapshot, lock_path_for, next_reconnect_delay_jittered_ms,
+        next_reconnect_delay_ms, persist_session_snapshot,
     };
 
     #[test]
@@ -399,6 +426,64 @@ mod tests {
         assert_eq!(next_reconnect_delay_ms(policy, 1), 400);
         assert_eq!(next_reconnect_delay_ms(policy, 2), 800);
         assert_eq!(next_reconnect_delay_ms(policy, 3), 1_000);
+    }
+
+    #[test]
+    fn jittered_delay_never_exceeds_deterministic_ceiling() {
+        let policy = ReconnectPolicy::default();
+        for entropy in [0u64, 1, 1 << 32, 1 << 63, u64::MAX] {
+            for attempt in 0..8u32 {
+                let jittered = next_reconnect_delay_jittered_ms(policy, attempt, entropy);
+                assert!(
+                    jittered <= next_reconnect_delay_ms(policy, attempt),
+                    "entropy={entropy} attempt={attempt} jittered={jittered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jittered_delay_entropy_extremes_map_to_zero_and_ceiling() {
+        let policy = ReconnectPolicy::default();
+        for attempt in 0..8u32 {
+            assert_eq!(next_reconnect_delay_jittered_ms(policy, attempt, 0), 0);
+            // u64::MAX is the fail-soft entropy value: it must reproduce the
+            // deterministic (unjittered) ceiling exactly.
+            assert_eq!(
+                next_reconnect_delay_jittered_ms(policy, attempt, u64::MAX),
+                next_reconnect_delay_ms(policy, attempt)
+            );
+        }
+    }
+
+    #[test]
+    fn jittered_delay_cap_holds_at_saturating_attempts() {
+        let policy = ReconnectPolicy::default();
+        for entropy in [0u64, 1 << 63, u64::MAX] {
+            let jittered = next_reconnect_delay_jittered_ms(policy, u32::MAX, entropy);
+            assert!(jittered <= policy.max_backoff_ms);
+        }
+        assert_eq!(
+            next_reconnect_delay_jittered_ms(policy, u32::MAX, u64::MAX),
+            policy.max_backoff_ms
+        );
+    }
+
+    #[test]
+    fn jittered_delay_spans_distinct_values_deterministically() {
+        // Deterministic by injected entropy — no statistical flake. For a
+        // ceiling ≥ 4 the four spread-out entropy points must land on at
+        // least 3 distinct delays, or the jitter is not actually spreading.
+        let policy = ReconnectPolicy::default();
+        let attempt = 2; // ceiling = 1000ms with the default policy
+        assert!(next_reconnect_delay_ms(policy, attempt) >= 4);
+        let mut values: Vec<u64> = [0u64, 1 << 62, 1 << 63, u64::MAX]
+            .into_iter()
+            .map(|entropy| next_reconnect_delay_jittered_ms(policy, attempt, entropy))
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+        assert!(values.len() >= 3, "values: {values:?}");
     }
 
     #[test]

@@ -9279,7 +9279,10 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     {
         use std::sync::mpsc;
 
-        // Retry the DNS bind with backoff.  When the SCM stops the previous daemon instance and
+        // Retry the DNS bind with backoff (deliberately independent of
+        // resilience::next_reconnect_delay_jittered_ms: local bind-vs-SCM-restart
+        // race, no herd possible — see the FIS-0016 classification).
+        // When the SCM stops the previous daemon instance and
         // immediately starts the new one there is a brief race: the SCM marks the service Stopped
         // before the old process fully terminates, so the old socket may still be bound
         // (WSAEADDRINUSE / os error 10048).  Retrying for ~10 s covers this window.
