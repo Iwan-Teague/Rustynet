@@ -805,6 +805,20 @@ pub fn snapshot_bytes_have_bundle_pull_capability(bytes: &[u8], node_id: &str) -
         .unwrap_or(false)
 }
 
+/// FIS-0020: (epoch, state_root_hex) identity of a membership snapshot's
+/// state, for the conditional bundle-pull digest comparison. `None` on any
+/// parse/validation failure — the caller then serves/pulls the full bundle
+/// (fail toward full data, never toward a wrong UNCHANGED).
+pub fn snapshot_bytes_state_identity(bytes: &[u8]) -> Option<(u64, String)> {
+    let content = std::str::from_utf8(bytes).ok()?;
+    if content.len() > MAX_MEMBERSHIP_SNAPSHOT_BYTES {
+        return None;
+    }
+    let state = parse_snapshot_content(content).ok()?;
+    let root = state.state_root_hex().ok()?;
+    Some((state.epoch, root))
+}
+
 pub fn append_membership_log_entry(
     path: impl AsRef<Path>,
     signed_update: &SignedMembershipUpdate,

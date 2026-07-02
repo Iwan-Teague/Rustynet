@@ -1007,6 +1007,35 @@ pub fn write_anchor_bundle_pull_response<W: Write>(
     expected_token: &str,
     bundle: &[u8],
 ) -> Result<(), DaemonError> {
+    write_anchor_bundle_pull_response_with_have(
+        writer_by_ref(&mut writer),
+        presented_token,
+        expected_token,
+        bundle,
+        None,
+    )
+}
+
+fn writer_by_ref<W: Write>(writer: &mut W) -> &mut W {
+    writer
+}
+
+/// FIS-0020: conditional bundle-pull. `client_have` is the client's optional
+/// `have <epoch> <state_root_hex>` line (raw, without the keyword prefix
+/// already stripped — pass the full trimmed line). When it names EXACTLY the
+/// state this server is about to send, the reply is `UNCHANGED\n` (a
+/// hash-sized round trip instead of the full signed bundle). Any parse
+/// failure or mismatch falls through to the full bundle — the digest can
+/// only ever save bytes, never gate or substitute the accept pipeline.
+/// Token auth runs FIRST regardless: an unauthorized client learns nothing
+/// about the state identity from this path.
+pub fn write_anchor_bundle_pull_response_with_have<W: Write>(
+    mut writer: W,
+    presented_token: &str,
+    expected_token: &str,
+    bundle: &[u8],
+    client_have: Option<&str>,
+) -> Result<(), DaemonError> {
     if !constant_time_ascii_eq(presented_token.trim(), expected_token.trim()) {
         writer
             .write_all(b"ERR unauthorized\n")
@@ -1015,11 +1044,39 @@ pub fn write_anchor_bundle_pull_response<W: Write>(
             "anchor bundle-pull token rejected".to_owned(),
         ));
     }
+    if let Some(have_line) = client_have
+        && let Some(claim) = parse_anchor_bundle_pull_have_line(have_line)
+        && let Some(identity) = rustynet_control::membership::snapshot_bytes_state_identity(bundle)
+        && claim == identity
+    {
+        writer
+            .write_all(b"UNCHANGED\n")
+            .map_err(|err| DaemonError::Io(format!("anchor bundle-pull response failed: {err}")))?;
+        return Ok(());
+    }
     writer
         .write_all(format!("OK {}\n", bundle.len()).as_bytes())
         .and_then(|_| writer.write_all(bundle))
         .map_err(|err| DaemonError::Io(format!("anchor bundle-pull response failed: {err}")))?;
     Ok(())
+}
+
+/// Parse `have <epoch> <state_root_hex>` (lowercase hex, 64 chars). `None`
+/// on any deviation — malformed input degrades to the full bundle.
+fn parse_anchor_bundle_pull_have_line(line: &str) -> Option<(u64, String)> {
+    let rest = line.trim().strip_prefix("have ")?;
+    let mut parts = rest.split_ascii_whitespace();
+    let epoch = parts.next()?.parse::<u64>().ok()?;
+    let root = parts.next()?;
+    if parts.next().is_some()
+        || root.len() != 64
+        || !root
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some((epoch, root.to_owned()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1082,6 +1139,38 @@ fn read_anchor_bundle_pull_request_token(stream: &mut TcpStream) -> Result<Strin
     })
 }
 
+/// FIS-0020: best-effort read of the optional second request line. Any
+/// error (timeout against an old client, EOF, oversize, non-utf8) yields
+/// `None` — the server then sends the full bundle. The stream's read
+/// timeout is restored afterwards.
+fn read_optional_anchor_bundle_pull_have_line(stream: &mut TcpStream) -> Option<String> {
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .is_err()
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    let line = loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break None,
+            Ok(_) if byte[0] == b'\n' => {
+                break String::from_utf8(bytes).ok();
+            }
+            Ok(_) => {
+                bytes.push(byte[0]);
+                if bytes.len() > MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES {
+                    break None;
+                }
+            }
+            Err(_) => break None,
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    line
+}
+
 fn handle_anchor_bundle_pull_stream(
     mut stream: TcpStream,
     token_path: &Path,
@@ -1122,9 +1211,20 @@ fn handle_anchor_bundle_pull_stream(
     let expected_token = load_anchor_bundle_pull_token(token_path).map_err(|source| {
         AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone())
     })?;
-    write_anchor_bundle_pull_response(stream, &presented_token, &expected_token, &bundle).map_err(
-        |source| AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone()),
-    )?;
+    // FIS-0020: optionally read the client's `have <epoch> <root>` line
+    // under a SHORT timeout — a pre-FIS-0020 client sends only the token
+    // and waits, so the cost of the optional read against an old client is
+    // bounded at 150ms (mixed-version only). Timeout/EOF/garbage all
+    // degrade to the full bundle.
+    let client_have = read_optional_anchor_bundle_pull_have_line(&mut stream);
+    write_anchor_bundle_pull_response_with_have(
+        stream,
+        &presented_token,
+        &expected_token,
+        &bundle,
+        client_have.as_deref(),
+    )
+    .map_err(|source| AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone()))?;
     Ok(AnchorBundlePullOutcome { token_thumbprint })
 }
 
@@ -15230,7 +15330,8 @@ mod tests {
         snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
         validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
         validate_daemon_config, validate_file_security, validate_node_role_membership_alignment,
-        write_anchor_bundle_pull_response, zeroize_optional_bytes,
+        write_anchor_bundle_pull_response, write_anchor_bundle_pull_response_with_have,
+        zeroize_optional_bytes,
     };
     use crate::phase10::{
         DataplaneState, PathMode, RuntimeSystem, TraversalProbeDecision, TraversalProbeReason,
@@ -15305,6 +15406,122 @@ mod tests {
         assert_eq!(thumbprint.len(), 16);
         assert_ne!(thumbprint, token);
         assert!(thumbprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    // ── FIS-0020: conditional bundle-pull (have/UNCHANGED) ──────────────────
+
+    fn conditional_pull_snapshot_bytes() -> Vec<u8> {
+        let state = MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-pull".to_owned(),
+            epoch: 7,
+            nodes: vec![MembershipNode {
+                node_id: "anchor-a".to_owned(),
+                node_pubkey_hex: "11".repeat(32),
+                owner: "ops".to_owned(),
+                status: MembershipNodeStatus::Active,
+                roles: vec!["tag:members".to_owned()],
+                capabilities: vec![RoleCapability::Anchor, RoleCapability::AnchorBundlePull],
+                joined_at_unix: 100,
+                updated_at_unix: 100,
+            }],
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: {
+                    let signing = SigningKey::from_bytes(&[1u8; 32]);
+                    let bytes = signing.verifying_key().to_bytes();
+                    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+                },
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-cond-pull-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("snapshot dir");
+        let path = dir.join("snapshot.v1");
+        persist_membership_snapshot(&path, &state).expect("persist snapshot");
+        let bytes = std::fs::read(&path).expect("read snapshot");
+        let _ = std::fs::remove_dir_all(&dir);
+        bytes
+    }
+
+    #[test]
+    fn unchanged_response_on_matching_state_root() {
+        let bundle = conditional_pull_snapshot_bytes();
+        let (epoch, root) = rustynet_control::membership::snapshot_bytes_state_identity(&bundle)
+            .expect("snapshot identity");
+        let have = format!("have {epoch} {root}");
+
+        let mut out = Vec::new();
+        write_anchor_bundle_pull_response_with_have(&mut out, "tok", "tok", &bundle, Some(&have))
+            .expect("matching have succeeds");
+        assert_eq!(out, b"UNCHANGED\n", "exact-state match replies UNCHANGED");
+
+        // Stale epoch, stale root, or garbage: full bundle every time.
+        for stale in [
+            format!("have {} {root}", epoch + 1),
+            format!("have {epoch} {}", "ab".repeat(32)),
+            "have not-a-number zzz".to_owned(),
+            "hav typo".to_owned(),
+        ] {
+            let mut out = Vec::new();
+            write_anchor_bundle_pull_response_with_have(
+                &mut out,
+                "tok",
+                "tok",
+                &bundle,
+                Some(&stale),
+            )
+            .expect("stale have still succeeds with a full bundle");
+            assert!(
+                out.starts_with(b"OK "),
+                "non-matching have must send the full bundle, got {:?}",
+                String::from_utf8_lossy(&out[..out.len().min(20)])
+            );
+        }
+    }
+
+    #[test]
+    fn have_line_never_bypasses_token_auth() {
+        let bundle = conditional_pull_snapshot_bytes();
+        let (epoch, root) = rustynet_control::membership::snapshot_bytes_state_identity(&bundle)
+            .expect("snapshot identity");
+        let have = format!("have {epoch} {root}");
+        let mut out = Vec::new();
+        let err = write_anchor_bundle_pull_response_with_have(
+            &mut out,
+            "wrong-token",
+            "tok",
+            &bundle,
+            Some(&have),
+        );
+        assert!(err.is_err(), "bad token must reject regardless of have");
+        assert_eq!(
+            out, b"ERR unauthorized\n",
+            "unauthorized reply leaks no state identity"
+        );
+    }
+
+    #[test]
+    fn missing_have_line_sends_full_bundle() {
+        // The 4-arg wrapper (pre-FIS-0020 call shape) is byte-identical to
+        // today: full bundle, no UNCHANGED arm.
+        let bundle = conditional_pull_snapshot_bytes();
+        let mut out = Vec::new();
+        write_anchor_bundle_pull_response(&mut out, "tok", "tok", &bundle)
+            .expect("full pull succeeds");
+        assert!(out.starts_with(b"OK "));
+        assert!(out.ends_with(bundle.as_slice()));
     }
 
     // ── D11.b tests ──────────────────────────────────────────────────────────
