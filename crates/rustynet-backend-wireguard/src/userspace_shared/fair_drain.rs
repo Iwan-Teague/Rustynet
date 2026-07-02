@@ -14,6 +14,12 @@
 //!
 //! Pure module: no sockets, no engine types beyond `NodeId`.
 
+// Exercised by its unit tests + the engine seams today; the runtime pump
+// wiring (behind an Option defaulted None) is the FIS-0012 commits-3-5
+// stage, gated on the perfprobe/criterion evidence plan. Same interim
+// pattern as `inject_plaintext_packet` in engine.rs.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 
@@ -96,6 +102,9 @@ struct FlowQueue {
 /// pooled slots after processing; oversize buffers are simply dropped.
 #[derive(Debug)]
 struct BufferPool {
+    // Boxed deliberately: slots move as pointers on push/pop instead of
+    // 2 KB memcpys, and PooledBuf hands the box out of the pool.
+    #[allow(clippy::vec_box)]
     free: Vec<Box<[u8; POOL_SLOT_BYTES]>>,
     max_pooled: usize,
 }
@@ -433,7 +442,19 @@ mod tests {
         assert_eq!(scheduler.stash(flow, &payload, None), StashOutcome::Stashed);
         let packet = scheduler.next_to_process().expect("packet");
         assert_eq!(packet.payload(), payload.as_slice());
+        assert_eq!(packet.remote_addr(), None);
         scheduler.recycle(packet);
         assert!(scheduler.is_empty());
+
+        // remote_addr survives the stash round-trip for inbound datagrams.
+        let mut scheduler = FairDrainScheduler::with_defaults();
+        let source: std::net::SocketAddr = "203.0.113.5:51820".parse().expect("addr");
+        assert_eq!(
+            scheduler.stash(peer("peer-b"), &[1u8; 8], Some(source)),
+            StashOutcome::Stashed
+        );
+        let packet = scheduler.next_to_process().expect("packet");
+        assert_eq!(packet.remote_addr(), Some(source));
+        scheduler.recycle(packet);
     }
 }
