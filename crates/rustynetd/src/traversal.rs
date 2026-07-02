@@ -47,6 +47,10 @@ pub struct TraversalEngineConfig {
     pub round_spacing_ms: u64,
     pub relay_switch_after_failures: u8,
     pub stun_servers: Vec<SocketAddr>,
+    /// TOTAL gather deadline across ALL configured STUN servers (FIS-0018):
+    /// the socket path fires every binding request up front and collects
+    /// under one deadline; the (singleton) round-trip path slices this
+    /// budget per server. Not a per-server timeout.
     pub stun_gather_timeout_ms: u64,
     /// How many seconds before expiry to fire a proactive refresh (B3-a).
     pub pre_expiry_refresh_margin_secs: u64,
