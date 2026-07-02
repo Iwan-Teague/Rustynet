@@ -15,6 +15,7 @@ pub mod ice_priority;
 pub mod peer_gossip;
 
 pub mod ipc;
+pub mod keepalive;
 pub mod key_material;
 pub mod key_rotation;
 pub mod linux_authenticode;
