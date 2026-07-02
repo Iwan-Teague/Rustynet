@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
 };
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -779,6 +779,9 @@ impl App {
             KeyCode::Char(_) if plain_char == Some('r') => {
                 self.last_vm_probe = None;
             }
+            KeyCode::Char(_) if plain_char == Some('y') => {
+                self.copy_stage_logs();
+            }
 
             // Ctrl+S is often swallowed by terminal flow control, so plain `s`
             // is the primary start key. Stop is deliberately separate.
@@ -1439,6 +1442,87 @@ impl App {
             tracing::error!(%e, "failed to save monitor config");
         }
     }
+
+    fn copy_stage_logs(&mut self) {
+        let Some(job) = self.active_job.as_ref() else {
+            self.log_lines = vec!["no active or recent run to copy logs from".into()];
+            return;
+        };
+        let report_dir = self.repo_root.join(&job.report_dir);
+
+        let stage = self.active_stage.clone().or_else(|| {
+            self.stage_outcomes
+                .iter()
+                .find(|o| o.status == "fail")
+                .or_else(|| self.stage_outcomes.first())
+                .map(|o| o.stage.clone())
+        });
+
+        let Some(stage) = stage else {
+            self.log_lines = vec!["no stage logs available to copy".into()];
+            return;
+        };
+
+        let log_path = report_dir.join("logs").join(format!("{stage}.log"));
+        let content = match std::fs::read_to_string(&log_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.log_lines = vec![format!("failed to read log for {stage}: {e}")];
+                return;
+            }
+        };
+
+        let line_count = content.lines().count();
+        match copy_to_clipboard(&content) {
+            Ok(()) => {
+                self.log_lines = vec![format!(
+                    "copied {stage} log to clipboard ({line_count} lines)"
+                )];
+            }
+            Err(e) => {
+                self.log_lines = vec![format!("failed to copy to clipboard: {e}")];
+            }
+        }
+    }
+}
+
+/// Pipe text to the system clipboard via the platform's native CLI tool.
+/// macOS: pbcopy, Linux: xclip, Windows: clip
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    let cmd = clipboard_command();
+    let mut child = std::process::Command::new(cmd[0])
+        .args(&cmd[1..])
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("{} exited with {}", cmd[0], status);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clipboard_command() -> Vec<&'static str> {
+    vec!["pbcopy"]
+}
+
+#[cfg(target_os = "linux")]
+fn clipboard_command() -> Vec<&'static str> {
+    vec!["xclip", "-selection", "clipboard"]
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_command() -> Vec<&'static str> {
+    vec!["clip"]
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn clipboard_command() -> Vec<&'static str> {
+    // Will fail at spawn-time on unsupported platforms with a clear error.
+    vec!["__no_clipboard_tool_on_this_platform__"]
 }
 
 fn role_for_vm_from_config(alias: &str, config: &MonitorConfig) -> String {

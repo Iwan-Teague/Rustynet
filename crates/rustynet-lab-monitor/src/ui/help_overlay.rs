@@ -36,6 +36,7 @@ pub fn render(f: &mut Frame, full_area: Rect) {
         ("x", "Stop active OpenCode live-lab loop"),
         ("r / ^R", "Force refresh (VM probe + state reload)"),
         ("c", "Fetch VM commit markers now"),
+        ("y", "Copy current/failed stage logs to clipboard"),
         (
             "a",
             "Auto-fill config for next failed/unproven role x OS cell",
