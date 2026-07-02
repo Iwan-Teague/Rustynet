@@ -15,6 +15,7 @@ use crate::linux_command::{
 };
 
 pub(crate) mod engine;
+pub(crate) mod fair_drain;
 pub(crate) mod handshake;
 mod runtime;
 mod socket;
