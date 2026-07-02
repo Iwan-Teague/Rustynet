@@ -252,6 +252,7 @@ fn phase1_backend_contract_perf_report() {
                 },
                 public_key: [9; 32],
                 allowed_ips: vec!["100.64.10.0/24".to_owned()],
+                persistent_keepalive_secs: None,
             })
             .expect("configure peer should succeed");
     });

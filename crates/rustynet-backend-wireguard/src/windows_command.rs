@@ -295,6 +295,12 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
             rendered.push_str("AllowedIPs = ");
             rendered.push_str(allowed_ips.as_str());
             rendered.push('\n');
+            // FIS-0015: only when configured.
+            if let Some(interval_secs) = peer.persistent_keepalive_secs {
+                rendered.push_str("PersistentKeepalive = ");
+                rendered.push_str(interval_secs.to_string().as_str());
+                rendered.push('\n');
+            }
             rendered.push('\n');
         }
 
@@ -332,19 +338,23 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
     fn apply_peer_runtime(&mut self, peer: &PeerConfig) -> Result<(), BackendError> {
         let allowed_ips = self.merged_allowed_ips(peer)?;
         let endpoint = render_endpoint(peer.endpoint);
-        self.runner.run(
-            self.wg_exe_path.to_string_lossy().as_ref(),
-            &[
-                "set".to_owned(),
-                self.tunnel_name.clone(),
-                "peer".to_owned(),
-                encode_wg_public_key_base64(&peer.public_key),
-                "endpoint".to_owned(),
-                endpoint,
-                "allowed-ips".to_owned(),
-                allowed_ips,
-            ],
-        )
+        let mut args = vec![
+            "set".to_owned(),
+            self.tunnel_name.clone(),
+            "peer".to_owned(),
+            encode_wg_public_key_base64(&peer.public_key),
+            "endpoint".to_owned(),
+            endpoint,
+            "allowed-ips".to_owned(),
+            allowed_ips,
+        ];
+        // FIS-0015: only when configured — None preserves today's behavior.
+        if let Some(interval_secs) = peer.persistent_keepalive_secs {
+            args.push("persistent-keepalive".to_owned());
+            args.push(interval_secs.to_string());
+        }
+        self.runner
+            .run(self.wg_exe_path.to_string_lossy().as_ref(), &args)
     }
 
     fn rewrite_runtime_peers(&mut self) -> Result<(), BackendError> {
@@ -1016,6 +1026,7 @@ mod tests {
             },
             public_key: [7; 32],
             allowed_ips: vec!["100.64.10.0/24".to_owned()],
+            persistent_keepalive_secs: None,
         }
     }
 
@@ -1254,6 +1265,62 @@ mod tests {
                         ]
             }),
             "default route should be installed only after exit mode enables it"
+        );
+    }
+
+    #[test]
+    fn windows_backend_wg_set_includes_persistent_keepalive_when_configured() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+
+        // Default (None): no keepalive in the wg set args or the conf.
+        backend
+            .configure_peer(sample_peer("peer-a"))
+            .expect("peer should configure");
+        assert!(
+            !runner
+                .recorded()
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "persistent-keepalive")),
+            "None must not emit persistent-keepalive"
+        );
+        let written = fs::read_to_string(&config_path).expect("config should be readable");
+        assert!(
+            !written.contains("PersistentKeepalive"),
+            "None must not render PersistentKeepalive"
+        );
+
+        // Some(n): both the runtime wg set path and the conf stanza carry it.
+        let mut peer = sample_peer("peer-b");
+        peer.persistent_keepalive_secs = Some(21);
+        backend.configure_peer(peer).expect("peer should configure");
+        assert!(
+            runner.recorded().iter().any(|(_, args)| {
+                args.windows(2)
+                    .any(|pair| pair[0] == "persistent-keepalive" && pair[1] == "21")
+            }),
+            "Some(21) must emit `persistent-keepalive 21`"
+        );
+        let written = fs::read_to_string(&config_path).expect("config should be readable");
+        assert!(
+            written.contains("PersistentKeepalive = 21"),
+            "conf stanza must render PersistentKeepalive = 21, got:\n{written}"
         );
     }
 

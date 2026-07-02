@@ -653,6 +653,7 @@ mod tests {
             },
             public_key: [7; 32],
             allowed_ips: vec!["100.64.1.0/24".to_owned()],
+            persistent_keepalive_secs: None,
         }
     }
 

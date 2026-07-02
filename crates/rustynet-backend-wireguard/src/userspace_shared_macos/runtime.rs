@@ -1770,6 +1770,7 @@ mod tests {
             },
             public_key: *public_key.as_bytes(),
             allowed_ips: vec!["100.64.1.0/24".to_owned()],
+            persistent_keepalive_secs: None,
         }
     }
 }

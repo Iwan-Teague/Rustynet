@@ -12398,6 +12398,7 @@ fn load_auto_tunnel_bundle(
             },
             public_key,
             allowed_ips,
+            persistent_keepalive_secs: None,
         });
     }
 
@@ -15916,6 +15917,7 @@ mod tests {
             },
             public_key: [9u8; 32],
             allowed_ips: vec!["0.0.0.0/0".to_owned()],
+            persistent_keepalive_secs: None,
         }];
         let routes = vec![Route {
             destination_cidr: "0.0.0.0/0".to_owned(),
@@ -15949,6 +15951,7 @@ mod tests {
             },
             public_key: [10u8; 32],
             allowed_ips: vec!["100.64.10.0/24".to_owned()],
+            persistent_keepalive_secs: None,
         }];
         let routes = vec![Route {
             destination_cidr: "100.64.10.0/24".to_owned(),
@@ -15986,6 +15989,7 @@ mod tests {
             },
             public_key: [12u8; 32],
             allowed_ips: vec!["100.64.0.2/32".to_owned()],
+            persistent_keepalive_secs: None,
         }];
         let routes = vec![Route {
             destination_cidr: "100.64.0.2/32".to_owned(),
@@ -16020,6 +16024,7 @@ mod tests {
                 },
                 public_key: [31u8; 32],
                 allowed_ips: vec!["100.64.0.2/32".to_owned()],
+                persistent_keepalive_secs: None,
             },
             rustynet_backend_api::PeerConfig {
                 node_id: peer_b.clone(),
@@ -16029,6 +16034,7 @@ mod tests {
                 },
                 public_key: [32u8; 32],
                 allowed_ips: vec!["100.64.0.2/32".to_owned()],
+                persistent_keepalive_secs: None,
             },
         ];
         let routes = vec![
@@ -16071,6 +16077,7 @@ mod tests {
             },
             public_key: [11u8; 32],
             allowed_ips: vec!["192.168.50.0/24".to_owned()],
+            persistent_keepalive_secs: None,
         }];
         let routes = vec![Route {
             destination_cidr: "192.168.50.0/24".to_owned(),
@@ -16102,6 +16109,7 @@ mod tests {
             },
             public_key: [13u8; 32],
             allowed_ips: vec!["0.0.0.0/0".to_owned()],
+            persistent_keepalive_secs: None,
         }];
         let routes = vec![Route {
             destination_cidr: "0.0.0.0/0".to_owned(),

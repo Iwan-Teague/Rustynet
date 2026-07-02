@@ -99,6 +99,7 @@ impl DataplaneEnginePair {
                 public_key: receiver_public,
                 endpoint: endpoint(receiver_addr),
                 allowed_ips: vec!["10.0.0.0/8".to_owned()],
+                persistent_keepalive_secs: None,
             })
             .expect("configure receiver as sender's peer");
         receiver
@@ -107,6 +108,7 @@ impl DataplaneEnginePair {
                 public_key: sender_public,
                 endpoint: endpoint(sender_addr),
                 allowed_ips: vec!["10.0.0.0/8".to_owned()],
+                persistent_keepalive_secs: None,
             })
             .expect("configure sender as receiver's peer");
 

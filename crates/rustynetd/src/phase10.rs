@@ -7693,6 +7693,7 @@ mod tests {
             },
             public_key: [9; 32],
             allowed_ips: vec!["100.100.20.2/32".to_owned()],
+            persistent_keepalive_secs: None,
         }
     }
 
@@ -12016,6 +12017,7 @@ mod tests {
                 port: 51820,
             },
             allowed_ips: Vec::new(),
+            persistent_keepalive_secs: None,
         };
         system
             .apply_peer_endpoint_bypass_routes(&[peer])

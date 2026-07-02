@@ -171,6 +171,7 @@ mod tests {
             },
             public_key: [9; 32],
             allowed_ips: vec!["100.100.10.1/32".to_owned()],
+            persistent_keepalive_secs: None,
         }
     }
 
