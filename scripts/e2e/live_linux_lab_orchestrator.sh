@@ -2684,20 +2684,12 @@ rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
-# Co-deploy the sibling relay daemon binary ONLY on the relay node (BUILD_RELAY=1
-# from the per-node env). Build it here during bootstrap — network + pinned
-# nameservers are available, so its tokio/windows-service deps download fine —
-# rather than at the relay deploy stage, where the node's killswitch + managed
-# DNS have locked the network down. Building on the single relay node avoids the
-# multi-node parallel-compile contention.
-if [[ "${BUILD_RELAY:-0}" == "1" ]]; then
-  # The daemon feature pulls windows-service (a cfg(windows) crate cargo still
-  # resolves/downloads on Linux); its registry fetch intermittently exceeds
-  # cargo's default 30s HTTP timeout. Raise the timeout + retry budget so a slow
-  # or flaky download does not fail the relay build.
-  run_local_timed 7200 env CARGO_NET_RETRY=10 CARGO_HTTP_TIMEOUT=180 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-relay --features daemon
-  run_root install -m 0755 target/release/rustynet-relay /usr/local/bin/rustynet-relay
-fi
+# Co-deploy the sibling relay daemon binary on every Linux node. Role stages
+# only enable the relay service on relay hosts, but daemon-state validators
+# audit the relay HelloLimiter on every Linux host and must never pick up a
+# stale /usr/local/bin/rustynet-relay from a prior run.
+run_local_timed 7200 env CARGO_NET_RETRY=10 CARGO_HTTP_TIMEOUT=180 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-relay --features daemon
+run_root install -m 0755 target/release/rustynet-relay /usr/local/bin/rustynet-relay
 backend_env=()
 if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
   backend_env+=(RUSTYNET_BACKEND="${RUSTYNET_BACKEND}")
@@ -3102,19 +3094,6 @@ bootstrap_host_worker_linux() {
   local attempt max_attempts=12 sleep_secs=10
   ssh_wait_for_host "$target" || return 1
   live_lab_push_sudo_password "$target"
-  # Build the sibling relay binary during this node's bootstrap (network up)
-  # only if it is the relay_host used by live_relay (entry, else aux). Mirrors
-  # stage_run_live_relay's relay-node selection. Building only on the relay node
-  # avoids multi-node parallel relay compiles.
-  local relay_build_label="" build_relay=0
-  if has_label entry; then
-    relay_build_label="entry"
-  elif has_label aux; then
-    relay_build_label="aux"
-  fi
-  if [[ -n "$relay_build_label" && "$label" == "$relay_build_label" ]]; then
-    build_relay=1
-  fi
   env_path="$STATE_DIR/bootstrap-${label}.env"
   cat > "$env_path" <<EOF_ENV
 ROLE=${role}
@@ -3122,7 +3101,6 @@ NODE_ID=${node_id}
 NETWORK_ID=${NETWORK_ID}
 SSH_ALLOW_CIDRS=${SSH_ALLOW_CIDRS}
 SOURCE_ARCHIVE=/tmp/rn_source.tar.gz
-BUILD_RELAY=${build_relay}
 EOF_ENV
   if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
     printf 'RUSTYNET_BACKEND=%s\n' "${RUSTYNET_BACKEND}" >> "$env_path"
@@ -5348,10 +5326,11 @@ stage_run_live_relay() {
     local relay_src relay_verifier_local
     relay_src="$(live_lab_remote_src_dir "$relay_target")"
     relay_verifier_local="$STATE_DIR/relay-verifier.pub"
-    # The rustynet-relay binary is built + installed during this node's
-    # bootstrap (BUILD_RELAY=1), when the network is still up — building it here,
-    # after the killswitch + managed DNS have locked the node down, fails to
-    # download its deps. Fail closed if the binary is missing.
+    # The rustynet-relay binary is built + installed on every Linux node during
+    # bootstrap, when the network is still up; role stages only enable its
+    # service on relay hosts. Building it here, after the killswitch + managed
+    # DNS have locked the node down, fails to download its deps. Fail closed if
+    # the binary is missing.
     live_lab_run_root "$relay_target" "root test -x /usr/local/bin/rustynet-relay" || {
       printf 'live_relay: /usr/local/bin/rustynet-relay missing on %s (bootstrap relay build did not run?)\n' "$relay_target" >&2
       return 1
