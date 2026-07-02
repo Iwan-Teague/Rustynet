@@ -201,6 +201,7 @@ fn sample_peer() -> PeerConfig {
         },
         public_key: [9; 32],
         allowed_ips: vec!["100.100.20.2/32".to_owned()],
+        persistent_keepalive_secs: None,
     }
 }
 

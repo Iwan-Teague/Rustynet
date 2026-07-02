@@ -2663,6 +2663,7 @@ mod tests {
             },
             public_key,
             allowed_ips: allowed_ips.into_iter().map(str::to_owned).collect(),
+            persistent_keepalive_secs: None,
         }
     }
 

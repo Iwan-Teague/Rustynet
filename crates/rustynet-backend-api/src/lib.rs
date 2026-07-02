@@ -74,6 +74,12 @@ pub struct PeerConfig {
     pub endpoint: SocketEndpoint,
     pub public_key: [u8; 32],
     pub allowed_ips: Vec<String>,
+    /// FIS-0015: WireGuard-native persistent keepalive, seconds. `None`
+    /// (today's production default) sends nothing — command backends only
+    /// append `persistent-keepalive <n>` when `Some`. To be populated from
+    /// the keepalive estimator's operating interval at (re)configure time
+    /// once the adaptive-keepalive rollout is switched on (FIS-0015.4/5).
+    pub persistent_keepalive_secs: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
