@@ -3542,6 +3542,14 @@ struct DaemonRuntime {
     traversal_coordination_replay_window: CoordinationReplayWindow,
     traversal_hint_error: Option<String>,
     traversal_probe_statuses: BTreeMap<NodeId, TraversalProbeStatus>,
+    /// FIS-0015: per-peer adaptive keepalive intervals. Persists across
+    /// sync passes (unlike `traversal_probe_statuses`, which is rebuilt
+    /// each pass); in-memory only — a daemon restart re-runs cold start
+    /// from the prior.
+    keepalive_estimators: BTreeMap<NodeId, crate::keepalive::KeepaliveEstimator>,
+    /// Gap (secs) at which the last relay keepalive was sent per peer,
+    /// awaiting a survival/loss outcome (censored-gap observation model).
+    relay_keepalive_pending_gap: BTreeMap<NodeId, u16>,
     traversal_stale_rejections: u64,
     traversal_replay_rejections: u64,
     traversal_future_dated_rejections: u64,
@@ -3925,6 +3933,8 @@ impl DaemonRuntime {
             traversal_coordination_replay_window: CoordinationReplayWindow::default(),
             traversal_hint_error: None,
             traversal_probe_statuses: BTreeMap::new(),
+            keepalive_estimators: BTreeMap::new(),
+            relay_keepalive_pending_gap: BTreeMap::new(),
             traversal_stale_rejections: 0,
             traversal_replay_rejections: 0,
             traversal_future_dated_rejections: 0,
@@ -5631,7 +5641,38 @@ impl DaemonRuntime {
             }
             relay_client.cleanup_expired_sessions(now_unix);
             if self.transport_socket_identity_blocker.is_none() {
-                for peer_node_id in relay_client.sessions_needing_keepalive() {
+                // FIS-0015: per-peer adaptive keepalive threshold. Cold start
+                // is the estimator's RelaySession prior (25s — exactly the
+                // static `RelayClientConfig::keepalive_interval` production
+                // value), so behavior is identical until evidence accumulates.
+                for (peer_node_id, elapsed) in relay_client.sessions_with_elapsed() {
+                    let estimator = self
+                        .keepalive_estimators
+                        .entry(peer_node_id.clone())
+                        .or_insert_with(|| {
+                            crate::keepalive::KeepaliveEstimator::new(
+                                crate::keepalive::KeepalivePrior::RelaySession,
+                            )
+                        });
+                    let gap_secs = u16::try_from(elapsed.as_secs()).unwrap_or(u16::MAX);
+                    if gap_secs < estimator.next_gap() {
+                        continue;
+                    }
+                    // Reaching the next cycle without a loss event means the
+                    // previously probed gap survived (censored evidence).
+                    if let Some(survived_gap) =
+                        self.relay_keepalive_pending_gap.remove(&peer_node_id)
+                    {
+                        let before = estimator.operating_secs();
+                        estimator.on_survival(survived_gap);
+                        let after = estimator.operating_secs();
+                        if after != before {
+                            eprintln!(
+                                "rustynetd: relay keepalive interval for peer {} raised {before}s -> {after}s (confirmed-safe gap {survived_gap}s)",
+                                peer_node_id.as_str()
+                            );
+                        }
+                    }
                     if let Err(err) = relay_client.send_keepalive_with_sender(
                         &peer_node_id,
                         |remote_addr, payload| {
@@ -5647,13 +5688,32 @@ impl DaemonRuntime {
                             "rustynetd: relay keepalive failed for peer {}: {err}",
                             peer_node_id.as_str()
                         );
+                        // Attributable loss: the mapping (or session) died
+                        // within this gap. Mis-attribution (relay restart)
+                        // only tightens — the cheap direction.
+                        if let Some(estimator) = self.keepalive_estimators.get_mut(&peer_node_id) {
+                            let before = estimator.operating_secs();
+                            estimator.on_binding_loss(gap_secs);
+                            let after = estimator.operating_secs();
+                            eprintln!(
+                                "rustynetd: relay keepalive interval for peer {} tightened {before}s -> {after}s after loss at {gap_secs}s",
+                                peer_node_id.as_str()
+                            );
+                        }
                         relay_client.close_session(&peer_node_id);
                         relay_keepalive_failed_peers.insert(peer_node_id);
+                    } else {
+                        self.relay_keepalive_pending_gap
+                            .insert(peer_node_id, gap_secs);
                     }
                 }
             }
             relay_client
                 .cleanup_idle_sessions(Duration::from_secs(self.relay_session_idle_timeout_secs));
+            // A pending gap on a peer whose session is gone can never receive
+            // its outcome — drop it so a future session never mis-credits it.
+            self.relay_keepalive_pending_gap
+                .retain(|peer_node_id, _| relay_client.has_session(peer_node_id));
             self.relay_client = Some(relay_client);
         }
         if !matches!(
@@ -21652,6 +21712,119 @@ mod tests {
             status
                 .message
                 .contains("transport_socket_identity_local_addr=0.0.0.0:51820")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn relay_keepalive_uses_per_peer_estimator_interval() {
+        // FIS-0015: the per-peer estimator's next_gap — not the flat 25s
+        // config — decides when a relay keepalive fires. A 20s-old session
+        // is silent at the cold-start prior, but fires once the peer's own
+        // estimator has tightened below 20s on loss evidence.
+        let relay_addr: SocketAddr = "203.0.113.35:40026".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-relay-keepalive-estimator",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let authoritative_local_addr: SocketAddr =
+            "0.0.0.0:51820".parse().expect("local addr should parse");
+        let allocated_port = 61_046;
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
+
+        configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
+        script_runtime_authoritative_relay_ack(
+            &mut runtime,
+            relay_addr,
+            authoritative_local_addr,
+            [0x45; 16],
+            allocated_port,
+        );
+        runtime.relay_client = Some(build_test_relay_client(
+            "daemon-local",
+            Duration::from_secs(600),
+            Duration::from_millis(50),
+            Vec::new(),
+        ));
+
+        runtime.bootstrap();
+        runtime
+            .relay_client
+            .as_mut()
+            .expect("relay client should be configured")
+            .set_session_last_activity_for_test(
+                &exit_node,
+                Instant::now() - Duration::from_secs(20),
+            );
+
+        runtime
+            .sync_traversal_runtime_state(false)
+            .expect("relay runtime sync should succeed");
+        let operations = runtime
+            .controller
+            .backend_mut_for_test()
+            .authoritative_transport_operations_for_test();
+        assert_eq!(
+            operations.len(),
+            1,
+            "20s gap under the 25s cold-start prior: establish only, no keepalive"
+        );
+
+        // Loss evidence tightens THIS peer's estimator to the floor (10s).
+        runtime
+            .keepalive_estimators
+            .get_mut(&exit_node)
+            .expect("estimator created on first pass")
+            .on_binding_loss(20);
+        assert_eq!(
+            runtime
+                .keepalive_estimators
+                .get(&exit_node)
+                .expect("estimator present")
+                .operating_secs(),
+            crate::keepalive::KEEPALIVE_FLOOR_SECS
+        );
+
+        runtime
+            .relay_client
+            .as_mut()
+            .expect("relay client should be configured")
+            .set_session_last_activity_for_test(
+                &exit_node,
+                Instant::now() - Duration::from_secs(20),
+            );
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .script_authoritative_send_result_for_test(Ok(()))
+            .expect("relay authoritative keepalive send should be scriptable");
+
+        runtime
+            .sync_traversal_runtime_state(false)
+            .expect("relay runtime sync should succeed");
+        let operations = runtime
+            .controller
+            .backend_mut_for_test()
+            .authoritative_transport_operations_for_test();
+        assert_eq!(
+            operations.len(),
+            2,
+            "the same 20s gap exceeds the tightened per-peer interval: keepalive fires"
+        );
+        assert_eq!(
+            operations[1].kind,
+            RecordedAuthoritativeTransportOperationKind::Send
+        );
+        assert_eq!(
+            operations[1].remote_addr,
+            SocketAddr::new(relay_addr.ip(), allocated_port)
+        );
+        // The sent gap is pending its survival/loss outcome.
+        assert_eq!(
+            runtime.relay_keepalive_pending_gap.get(&exit_node).copied(),
+            Some(20)
         );
 
         let _ = std::fs::remove_dir_all(test_dir);

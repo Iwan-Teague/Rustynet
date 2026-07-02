@@ -659,6 +659,17 @@ impl RelayClient {
         self.config.keepalive_interval
     }
 
+    /// Returns every session with its elapsed time since last activity, so
+    /// the caller can apply a per-peer adaptive threshold (FIS-0015). The
+    /// static `keepalive_interval` config remains the documented cold-start
+    /// prior/fallback consumed by [`Self::sessions_needing_keepalive`].
+    pub fn sessions_with_elapsed(&self) -> Vec<(NodeId, Duration)> {
+        self.sessions
+            .iter()
+            .map(|(peer_id, session)| (peer_id.clone(), session.last_activity.elapsed()))
+            .collect()
+    }
+
     /// Returns peer IDs that need keepalive packets sent.
     ///
     /// A session needs keepalive when `last_activity` is older than
@@ -1989,6 +2000,29 @@ mod tests {
         let needs_keepalive = client.sessions_needing_keepalive();
         assert_eq!(needs_keepalive.len(), 1);
         assert_eq!(needs_keepalive[0], peer_b);
+
+        // FIS-0015 seam: sessions_with_elapsed reports EVERY session with
+        // its observed gap so the daemon can apply per-peer thresholds.
+        let with_elapsed = client.sessions_with_elapsed();
+        assert_eq!(with_elapsed.len(), 2);
+        let gap_a = with_elapsed
+            .iter()
+            .find(|(peer, _)| *peer == peer_a)
+            .map(|(_, elapsed)| *elapsed)
+            .expect("peer-a present");
+        let gap_b = with_elapsed
+            .iter()
+            .find(|(peer, _)| *peer == peer_b)
+            .map(|(_, elapsed)| *elapsed)
+            .expect("peer-b present");
+        assert!(
+            gap_a < Duration::from_secs(5),
+            "recent session gap: {gap_a:?}"
+        );
+        assert!(
+            gap_b >= Duration::from_secs(30),
+            "stale session gap: {gap_b:?}"
+        );
     }
 
     #[test]
