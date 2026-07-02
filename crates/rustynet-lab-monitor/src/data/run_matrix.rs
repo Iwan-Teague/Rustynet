@@ -196,10 +196,16 @@ pub struct RunSummary {
     pub first_failed_stage: String,
     /// Number of `_stage_` / `cross_os_*` columns with outcome "pass".
     pub passed_stages: usize,
-    /// Count of stage columns with a decisive outcome (pass/fail/skip) — NOT counting not_run.
+    /// Count of stage columns that actually ran with a pass/fail outcome —
+    /// `skip`/`skipped` (deliberately not applicable to this run's
+    /// topology/flags) and `not_run` are excluded from both this and
+    /// `passed_stages`, so a run that skips half the catalog on purpose
+    /// doesn't read as if it only got halfway through.
     pub total_stages: usize,
-    /// Column name of the last stage that ran (any non-not_run value), for PASS run display.
-    pub last_ran_stage: String,
+    /// Column name of the last stage with outcome "pass", for PASS run
+    /// display — not just "the last non-not_run column", since that could
+    /// be a skip and would misleadingly render with the pass-green check.
+    pub last_passed_stage: String,
 }
 
 /// True for columns that represent actual orchestrator stages (not role-presence summaries).
@@ -329,7 +335,7 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
 
             let mut passed = 0usize;
             let mut total = 0usize;
-            let mut last_ran_stage = String::new();
+            let mut last_passed_stage = String::new();
 
             for (idx, col_name) in &stage_cols {
                 let v = row.get(*idx).unwrap_or("").trim();
@@ -337,13 +343,14 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
                     "pass" => {
                         passed += 1;
                         total += 1;
-                        last_ran_stage = col_name.clone();
+                        last_passed_stage = col_name.clone();
                     }
-                    "fail" | "skip" | "skipped" => {
+                    "fail" => {
                         total += 1;
-                        last_ran_stage = col_name.clone();
                     }
-                    // "not_run" / "na" / "" → don't count, don't update last_ran
+                    // "skip"/"skipped" -> deliberately not applicable to this
+                    // run (topology/flags), not counted at all, same as
+                    // "not_run"/"na"/"". Neither updates last_passed_stage.
                     _ => {}
                 }
             }
@@ -355,7 +362,7 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
                 first_failed_stage,
                 passed_stages: passed,
                 total_stages: total,
-                last_ran_stage,
+                last_passed_stage,
             }
         })
         .collect();
@@ -863,13 +870,35 @@ mod tests {
         // not_run is excluded from total; pass=1 fail=1 → total=2
         assert_eq!(runs[0].passed_stages, 1);
         assert_eq!(runs[0].total_stages, 2);
-        assert_eq!(runs[0].last_ran_stage, "linux_stage_exit_handoff");
+        // The last column with outcome "fail" doesn't count as a passed
+        // stage -- last_passed_stage must be the actual last PASS, not
+        // just the last column that ran at all.
+        assert_eq!(runs[0].last_passed_stage, "linux_stage_bootstrap");
         // Older pass run: 3 stage columns all pass
         assert_eq!(runs[1].run_id, "run-old");
         assert_eq!(runs[1].overall_result, "pass");
         assert_eq!(runs[1].passed_stages, 3);
         assert_eq!(runs[1].total_stages, 3);
-        assert_eq!(runs[1].last_ran_stage, "linux_stage_exit_handoff");
+        assert_eq!(runs[1].last_passed_stage, "linux_stage_exit_handoff");
+    }
+
+    #[test]
+    fn recent_runs_excludes_skipped_stages_from_the_count_and_last_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "run_id,overall_result,macos_stage_anchor,macos_stage_exit_handoff,cross_os_dns\n\
+             run-1,pass,pass,skip,skip\n",
+        );
+        let runs = load_recent_runs(dir.path(), 1).unwrap();
+
+        // Only macos_stage_anchor is a real pass/fail outcome; the two
+        // skips are deliberately-not-applicable, not "attempted and
+        // stopped partway" -- must not inflate the denominator or look
+        // like the run only got 1/3 of the way through.
+        assert_eq!(runs[0].passed_stages, 1);
+        assert_eq!(runs[0].total_stages, 1);
+        assert_eq!(runs[0].last_passed_stage, "macos_stage_anchor");
     }
 
     #[test]

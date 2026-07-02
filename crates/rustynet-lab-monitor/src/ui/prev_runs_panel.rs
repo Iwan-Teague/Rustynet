@@ -84,8 +84,8 @@ fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize) {
             Span::styled("⊗ ", Style::default().fg(Color::Red)),
             Span::styled(name, Style::default().fg(Color::Red)),
         ])
-    } else if is_pass && !run.last_ran_stage.is_empty() {
-        let name = truncate(&short_stage_name(&run.last_ran_stage), max_name);
+    } else if is_pass && !run.last_passed_stage.is_empty() {
+        let name = truncate(&short_stage_name(&run.last_passed_stage), max_name);
         Line::from(vec![
             Span::styled("✓ ", Style::default().fg(Color::Green)),
             Span::styled(name, Style::default().fg(Color::Green)),
