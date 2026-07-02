@@ -305,6 +305,15 @@ enum RoleCommand {
     TransitionCheck {
         target: rustynet_control::role_presets::RolePreset,
     },
+    /// `rustynet role recommend [--role anchor|relay|exit]` — FIS-0005
+    /// decision-support placement scoring over the signed membership
+    /// state. Advisory only (live collectors land in a later phase, so
+    /// every candidate is data-starved and flagged as such); never
+    /// mutates anything.
+    Recommend {
+        role: rustynet_advisor::RoleType,
+        paths: MembershipPaths,
+    },
     /// `rustynet role pin-port-mapping-authority [--node <id> | --clear
     /// [--node <id>]] --output <path>` — FIS-0014 operator escape hatch.
     /// Mints a `SetNodeCapabilities` proposal that grants or strips the
@@ -1581,6 +1590,32 @@ fn parse_command(args: &[String]) -> CliCommand {
             match role_cli::parse_preset_arg(raw) {
                 Ok(target) => CliCommand::Role(RoleCommand::TransitionCheck { target }),
                 Err(_) => CliCommand::Help,
+            }
+        }
+        [cmd, subcmd, rest @ ..] if cmd == "role" && subcmd == "recommend" => {
+            match OptionParser::parse(rest) {
+                Ok(parser) => {
+                    let role = match parser.value("--role").as_deref().unwrap_or("anchor") {
+                        "anchor" => Some(rustynet_advisor::RoleType::Anchor),
+                        "relay" => Some(rustynet_advisor::RoleType::Relay),
+                        "exit" => Some(rustynet_advisor::RoleType::Exit),
+                        other => {
+                            eprintln!("invalid --role: {other} (expected anchor|relay|exit)");
+                            None
+                        }
+                    };
+                    match role {
+                        Some(role) => CliCommand::Role(RoleCommand::Recommend {
+                            role,
+                            paths: parser.membership_paths(),
+                        }),
+                        None => CliCommand::Help,
+                    }
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    CliCommand::Help
+                }
             }
         }
         [cmd, subcmd, rest @ ..] if cmd == "role" && subcmd == "pin-port-mapping-authority" => {
@@ -17479,7 +17514,50 @@ fn execute_role(cmd: RoleCommand) -> Result<String, String> {
         RoleCommand::PinPortMappingAuthority(config) => {
             execute_role_pin_port_mapping_authority(*config)
         }
+
+        RoleCommand::Recommend { role, paths } => execute_role_recommend(role, &paths),
     }
+}
+
+/// FIS-0005 phase-1 CLI: rank Active, role-eligible membership nodes with
+/// the advisor's MCDA scorer. No live collectors exist yet, so every
+/// observation is deliberately data-starved (Unknown/None on every live
+/// axis) and the output is flagged ADVISORY — the verb proves the seam and
+/// the eligibility filter without fabricating evidence.
+fn execute_role_recommend(
+    role: rustynet_advisor::RoleType,
+    paths: &MembershipPaths,
+) -> Result<String, String> {
+    let (_, _, state) = load_current_membership_state(paths, unix_now())?;
+    let now_unix = unix_now();
+    let observations: Vec<rustynet_advisor::CandidateObservation> = state
+        .nodes
+        .iter()
+        .filter(|node| node.status == MembershipNodeStatus::Active)
+        .filter(|node| match role {
+            rustynet_advisor::RoleType::Anchor => node
+                .capabilities
+                .iter()
+                .any(|capability| capability.is_anchor_capability()),
+            rustynet_advisor::RoleType::Relay => {
+                node.capabilities.contains(&RoleCapability::RelayHost)
+            }
+            rustynet_advisor::RoleType::Exit => {
+                node.capabilities.contains(&RoleCapability::ExitServer)
+            }
+        })
+        .map(|node| rustynet_advisor::CandidateObservation {
+            node_id: node.node_id.clone(),
+            uptime_ratio_ewma: None,
+            nat_class: rustynet_advisor::NatClassCode::InsufficientData,
+            handshake_success_ewma: None,
+            bandwidth_headroom: rustynet_advisor::BandwidthHeadroom::Unknown,
+            centrality: None,
+            observed_at_unix: now_unix,
+        })
+        .collect();
+    let recommendation = rustynet_advisor::recommend_role_placement(role, &observations);
+    Ok(rustynet_advisor::render_recommendation(&recommendation))
 }
 
 /// Pure planning output for `role pin-port-mapping-authority` (FIS-0014).
@@ -18395,6 +18473,7 @@ fn help_text() -> String {
         "  exit-node-list",
         "  role [show|set <admin|client|blind_exit>]",
         "  role pin-port-mapping-authority [--node <id> | --clear [--node <id>]] --output <path> [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
+        "  role recommend [--role anchor|relay|exit] [--snapshot <path>] [--log <path>]",
         "  llm allow <node:id|group:name> [--models a,b] [--quota <tokens>] [--rate <req/min>]",
         "  llm deny <node:id|group:name>",
         "  llm access list",

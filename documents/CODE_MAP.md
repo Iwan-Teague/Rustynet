@@ -64,6 +64,14 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 | `PolicyEngine` | `src/eval.rs` | Evaluates policy against membership + traffic context |
 | `Route` | `src/types.rs` | Route advertisement (exit node advertises subnets) |
 
+### Advisor (`rustynet-advisor`)
+
+| Type | Location | Purpose |
+|---|---|---|
+| `compute_role_score()` | `src/lib.rs` | Weighted-sum MCDA over one candidate's observations (FIS-0005) |
+| `recommend_role_placement()` | `src/lib.rs` | Ranked, deterministic role-placement recommendation; empty input recommends nobody |
+| `CandidateObservation` | `src/lib.rs` | Per-node placement signals (permille ratios; `None` = no evidence, never fabricated) |
+
 ### Backend Abstraction (`rustynet-backend-api`)
 
 | Type | Location | Purpose |

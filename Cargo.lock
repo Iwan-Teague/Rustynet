@@ -1310,6 +1310,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustynet-advisor"
+version = "0.1.0"
+
+[[package]]
 name = "rustynet-alloc-meter"
 version = "0.1.0"
 
@@ -1357,6 +1361,7 @@ dependencies = [
  "ed25519-dalek",
  "nix 0.29.0",
  "rand",
+ "rustynet-advisor",
  "rustynet-control",
  "rustynet-crypto",
  "rustynet-dns-zone",
