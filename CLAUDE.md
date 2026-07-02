@@ -335,6 +335,9 @@ Platform + UX + tooling layer:
 - `rustynet-windows-native` — Windows-specific integration (WFP, DPAPI, named
   pipes). The OS-boundary exception to Rust-first purity.
 - `rustynet-operator` — operator wizards / config (`rustynet operator menu`).
+- `rustynet-advisor` — FIS-0005 role-placement decision support: pure MCDA
+  scorer over per-candidate observations (`rustynet role recommend`). Domain
+  layer; collectors live in the CLI.
 - `rustynet-cli` — the main `rustynet` binary (`default-run = "rustynet-cli"`):
   `ops`, `vm-lab`, live-lab orchestrator, role/anchor/llm subcommands. Its
   `src/bin/` also holds the large family of `live_*`, `*_gates`, `phase*`, and

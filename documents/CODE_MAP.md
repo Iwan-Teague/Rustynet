@@ -64,6 +64,14 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 | `PolicyEngine` | `src/eval.rs` | Evaluates policy against membership + traffic context |
 | `Route` | `src/types.rs` | Route advertisement (exit node advertises subnets) |
 
+### Advisor (`rustynet-advisor`)
+
+| Type | Location | Purpose |
+|---|---|---|
+| `compute_role_score()` | `src/lib.rs` | Weighted-sum MCDA over one candidate's observations (FIS-0005) |
+| `recommend_role_placement()` | `src/lib.rs` | Ranked, deterministic role-placement recommendation; empty input recommends nobody |
+| `CandidateObservation` | `src/lib.rs` | Per-node placement signals (permille ratios; `None` = no evidence, never fabricated) |
+
 ### Backend Abstraction (`rustynet-backend-api`)
 
 | Type | Location | Purpose |
@@ -85,6 +93,7 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 | `CandidateSet` | `src/dataplane_candidates.rs` | Gathered v4/v6 host + srflx candidates |
 | `Killswitch` | `src/killswitch.rs` | Pre-start + post-start killswitch (nftables/WFP/pf) |
 | `MacosPfLoadSpec` | `src/macos_pf_load_spec.rs` | Structured spec for the `macos-pf-load` privileged builtin — daemon sends params, root helper re-renders the `pf` rule text + owns the `pfctl -f` (closes the `pfctl -f` boundary) |
+| `ReconnectPolicy` + `next_reconnect_delay_jittered_ms` | `src/resilience.rs` | Shared backoff primitive (deterministic ceiling + AWS Full Jitter, FIS-0016). Adoption rule: any NEW reconnect loop with inter-attempt delays MUST use the jittered fn; existing spec-timed ladders / condition-polls / local-race retries stay independent per the FIS-0016 classification |
 
 ### Orchestrator (`rustynet-cli/src/vm_lab/orchestrator/`)
 

@@ -21,6 +21,12 @@ pub enum RoleCapability {
     // would silently change signed payloads.
     ServesNas,
     ServesLlm,
+    /// Selection PREFERENCE for the Pin-then-Seniority port-mapping
+    /// authority comparator (`gossip_runtime::select_port_mapping_authority_node_id`).
+    /// Only takes effect on a node that independently passes the
+    /// `AnchorPortMappingAuthoritative` eligibility filter; validated
+    /// in `validate_membership_node_capabilities`.
+    AnchorPortMappingPinned,
 }
 
 impl RoleCapability {
@@ -39,6 +45,7 @@ impl RoleCapability {
             RoleCapability::AnchorPortMappingAuthoritative => "anchor.port_mapping_authoritative",
             RoleCapability::ServesNas => "serves_nas",
             RoleCapability::ServesLlm => "serves_llm",
+            RoleCapability::AnchorPortMappingPinned => "anchor.port_mapping_pinned",
         }
     }
 
@@ -67,6 +74,9 @@ impl RoleCapability {
             | "port-mapping-authoritative" => Ok(RoleCapability::AnchorPortMappingAuthoritative),
             "serves_nas" | "serves-nas" => Ok(RoleCapability::ServesNas),
             "serves_llm" | "serves-llm" => Ok(RoleCapability::ServesLlm),
+            "anchor.port_mapping_pinned" | "port_mapping_pinned" | "port-mapping-pinned" => {
+                Ok(RoleCapability::AnchorPortMappingPinned)
+            }
             "" => Err(RoleCapabilityParseError::Empty),
             other => Err(RoleCapabilityParseError::Unknown(other.to_owned())),
         }
@@ -80,6 +90,7 @@ impl RoleCapability {
                 | RoleCapability::AnchorEnrollmentEndpoint
                 | RoleCapability::AnchorRelayColocation
                 | RoleCapability::AnchorPortMappingAuthoritative
+                | RoleCapability::AnchorPortMappingPinned
         )
     }
 
@@ -168,7 +179,7 @@ pub fn role_capability_csv(capabilities: &[RoleCapability]) -> String {
 mod tests {
     use super::*;
 
-    const ALL_CAPABILITIES: [RoleCapability; 13] = [
+    const ALL_CAPABILITIES: [RoleCapability; 14] = [
         RoleCapability::Anchor,
         RoleCapability::Client,
         RoleCapability::ExitServer,
@@ -182,6 +193,7 @@ mod tests {
         RoleCapability::AnchorPortMappingAuthoritative,
         RoleCapability::ServesNas,
         RoleCapability::ServesLlm,
+        RoleCapability::AnchorPortMappingPinned,
     ];
 
     #[test]
@@ -250,12 +262,16 @@ mod tests {
         // pre-existing one so historical canonical payloads are
         // unchanged.
         for capability in ALL_CAPABILITIES {
-            if capability == RoleCapability::ServesNas || capability == RoleCapability::ServesLlm {
+            if capability == RoleCapability::ServesNas
+                || capability == RoleCapability::ServesLlm
+                || capability == RoleCapability::AnchorPortMappingPinned
+            {
                 continue;
             }
             assert!(capability < RoleCapability::ServesNas);
         }
         assert!(RoleCapability::ServesNas < RoleCapability::ServesLlm);
+        assert!(RoleCapability::ServesLlm < RoleCapability::AnchorPortMappingPinned);
         assert_eq!(
             role_capability_csv(&[
                 RoleCapability::ServesLlm,
@@ -264,6 +280,29 @@ mod tests {
             ]),
             "anchor,serves_nas,serves_llm"
         );
+    }
+
+    #[test]
+    fn role_capability_pinned_round_trips_canonical_and_aliases() {
+        assert_eq!(
+            RoleCapability::AnchorPortMappingPinned.as_str(),
+            "anchor.port_mapping_pinned"
+        );
+        for alias in [
+            "anchor.port_mapping_pinned",
+            "port_mapping_pinned",
+            "port-mapping-pinned",
+        ] {
+            assert_eq!(
+                RoleCapability::parse(alias),
+                Ok(RoleCapability::AnchorPortMappingPinned)
+            );
+        }
+        assert!(RoleCapability::AnchorPortMappingPinned.is_anchor_capability());
+        // The pin is a selection preference, not a grant: the legacy
+        // "anchor" role token must never auto-grant it.
+        assert!(!ANCHOR_CAPABILITIES.contains(&RoleCapability::AnchorPortMappingPinned));
+        assert!(!anchor_role_capabilities().contains(&RoleCapability::AnchorPortMappingPinned));
     }
 
     #[test]

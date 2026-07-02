@@ -74,6 +74,12 @@ pub struct PeerConfig {
     pub endpoint: SocketEndpoint,
     pub public_key: [u8; 32],
     pub allowed_ips: Vec<String>,
+    /// FIS-0015: WireGuard-native persistent keepalive, seconds. `None`
+    /// (today's production default) sends nothing — command backends only
+    /// append `persistent-keepalive <n>` when `Some`. To be populated from
+    /// the keepalive estimator's operating interval at (re)configure time
+    /// once the adaptive-keepalive rollout is switched on (FIS-0015.4/5).
+    pub persistent_keepalive_secs: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +113,34 @@ pub struct TunnelStats {
     pub bytes_tx: u64,
     pub bytes_rx: u64,
     pub using_relay_path: bool,
+}
+
+/// FIS-0004: coarse per-peer path health for reprobe acceleration.
+/// Advisory, never authoritative — the WireGuard handshake stays the
+/// reachability gate. Only this 3-state primitive crosses the backend
+/// boundary; the richer loss/RTT estimator state stays inside the
+/// backend crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathHealth {
+    Unknown,
+    Healthy,
+    Degrading,
+}
+
+/// FIS-0013: raw per-peer path-quality sample for the daemon-side
+/// composite tracker. Only available from backends holding an in-process
+/// boringtun `Tunn` (userspace-shared); command backends have no signal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeerPathSample {
+    /// EWMA loss estimate over recent rekey sessions (0.0..=1.0).
+    pub loss: f32,
+    /// Latest handshake round-trip time sample, milliseconds.
+    pub rtt: Option<u32>,
+    /// RTT variation estimate, milliseconds (estimated backend-side from
+    /// the sample history; the protocol exposes no native RTTVAR).
+    pub rttvar: Option<u32>,
+    /// Unix seconds of the peer's latest completed handshake.
+    pub latest_handshake: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +217,22 @@ pub trait TunnelBackend: Send + Sync {
 
     fn peer_latest_handshake_unix(&mut self, node_id: &NodeId)
     -> Result<Option<u64>, BackendError>;
+
+    /// FIS-0004: coarse per-peer path health. Backends without per-peer
+    /// quality data (command-based) return `Ok(None)` — no data is no
+    /// signal, never a fabricated `Healthy`.
+    fn peer_path_health(&mut self, _node_id: &NodeId) -> Result<Option<PathHealth>, BackendError> {
+        Ok(None)
+    }
+
+    /// FIS-0013: raw per-peer path-quality sample. `Ok(None)` is the
+    /// command-backend default (no in-process tunnel, no signal).
+    fn peer_path_sample(
+        &mut self,
+        _node_id: &NodeId,
+    ) -> Result<Option<PeerPathSample>, BackendError> {
+        Ok(None)
+    }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError>;
 

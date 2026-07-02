@@ -1007,6 +1007,35 @@ pub fn write_anchor_bundle_pull_response<W: Write>(
     expected_token: &str,
     bundle: &[u8],
 ) -> Result<(), DaemonError> {
+    write_anchor_bundle_pull_response_with_have(
+        writer_by_ref(&mut writer),
+        presented_token,
+        expected_token,
+        bundle,
+        None,
+    )
+}
+
+fn writer_by_ref<W: Write>(writer: &mut W) -> &mut W {
+    writer
+}
+
+/// FIS-0020: conditional bundle-pull. `client_have` is the client's optional
+/// `have <epoch> <state_root_hex>` line (raw, without the keyword prefix
+/// already stripped — pass the full trimmed line). When it names EXACTLY the
+/// state this server is about to send, the reply is `UNCHANGED\n` (a
+/// hash-sized round trip instead of the full signed bundle). Any parse
+/// failure or mismatch falls through to the full bundle — the digest can
+/// only ever save bytes, never gate or substitute the accept pipeline.
+/// Token auth runs FIRST regardless: an unauthorized client learns nothing
+/// about the state identity from this path.
+pub fn write_anchor_bundle_pull_response_with_have<W: Write>(
+    mut writer: W,
+    presented_token: &str,
+    expected_token: &str,
+    bundle: &[u8],
+    client_have: Option<&str>,
+) -> Result<(), DaemonError> {
     if !constant_time_ascii_eq(presented_token.trim(), expected_token.trim()) {
         writer
             .write_all(b"ERR unauthorized\n")
@@ -1015,11 +1044,39 @@ pub fn write_anchor_bundle_pull_response<W: Write>(
             "anchor bundle-pull token rejected".to_owned(),
         ));
     }
+    if let Some(have_line) = client_have
+        && let Some(claim) = parse_anchor_bundle_pull_have_line(have_line)
+        && let Some(identity) = rustynet_control::membership::snapshot_bytes_state_identity(bundle)
+        && claim == identity
+    {
+        writer
+            .write_all(b"UNCHANGED\n")
+            .map_err(|err| DaemonError::Io(format!("anchor bundle-pull response failed: {err}")))?;
+        return Ok(());
+    }
     writer
         .write_all(format!("OK {}\n", bundle.len()).as_bytes())
         .and_then(|_| writer.write_all(bundle))
         .map_err(|err| DaemonError::Io(format!("anchor bundle-pull response failed: {err}")))?;
     Ok(())
+}
+
+/// Parse `have <epoch> <state_root_hex>` (lowercase hex, 64 chars). `None`
+/// on any deviation — malformed input degrades to the full bundle.
+fn parse_anchor_bundle_pull_have_line(line: &str) -> Option<(u64, String)> {
+    let rest = line.trim().strip_prefix("have ")?;
+    let mut parts = rest.split_ascii_whitespace();
+    let epoch = parts.next()?.parse::<u64>().ok()?;
+    let root = parts.next()?;
+    if parts.next().is_some()
+        || root.len() != 64
+        || !root
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some((epoch, root.to_owned()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1082,6 +1139,38 @@ fn read_anchor_bundle_pull_request_token(stream: &mut TcpStream) -> Result<Strin
     })
 }
 
+/// FIS-0020: best-effort read of the optional second request line. Any
+/// error (timeout against an old client, EOF, oversize, non-utf8) yields
+/// `None` — the server then sends the full bundle. The stream's read
+/// timeout is restored afterwards.
+fn read_optional_anchor_bundle_pull_have_line(stream: &mut TcpStream) -> Option<String> {
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .is_err()
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    let line = loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break None,
+            Ok(_) if byte[0] == b'\n' => {
+                break String::from_utf8(bytes).ok();
+            }
+            Ok(_) => {
+                bytes.push(byte[0]);
+                if bytes.len() > MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES {
+                    break None;
+                }
+            }
+            Err(_) => break None,
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    line
+}
+
 fn handle_anchor_bundle_pull_stream(
     mut stream: TcpStream,
     token_path: &Path,
@@ -1122,9 +1211,20 @@ fn handle_anchor_bundle_pull_stream(
     let expected_token = load_anchor_bundle_pull_token(token_path).map_err(|source| {
         AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone())
     })?;
-    write_anchor_bundle_pull_response(stream, &presented_token, &expected_token, &bundle).map_err(
-        |source| AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone()),
-    )?;
+    // FIS-0020: optionally read the client's `have <epoch> <root>` line
+    // under a SHORT timeout — a pre-FIS-0020 client sends only the token
+    // and waits, so the cost of the optional read against an old client is
+    // bounded at 150ms (mixed-version only). Timeout/EOF/garbage all
+    // degrade to the full bundle.
+    let client_have = read_optional_anchor_bundle_pull_have_line(&mut stream);
+    write_anchor_bundle_pull_response_with_have(
+        stream,
+        &presented_token,
+        &expected_token,
+        &bundle,
+        client_have.as_deref(),
+    )
+    .map_err(|source| AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone()))?;
     Ok(AnchorBundlePullOutcome { token_thumbprint })
 }
 
@@ -1542,6 +1642,14 @@ pub struct DaemonConfig {
     pub traversal_bundle_path: PathBuf,
     pub traversal_verifier_key_path: PathBuf,
     pub traversal_watermark_path: PathBuf,
+    /// FIS-0009: enable the cross-session prior re-rank of candidate
+    /// pairs. Default OFF — recording always runs (observability first);
+    /// only the re-rank consumption is gated.
+    pub traversal_prior_rerank: bool,
+    /// FIS-0010: enable the direct-relay flap-damping circuit breaker.
+    /// Default OFF — intensity tracking always runs (observability first);
+    /// only the stay-on-relay consult is gated.
+    pub traversal_flap_breaker: bool,
     pub relay_fleet_bundle_path: Option<PathBuf>,
     pub relay_fleet_watermark_path: Option<PathBuf>,
     pub traversal_max_age_secs: NonZeroU64,
@@ -1637,6 +1745,8 @@ impl Default for DaemonConfig {
             traversal_bundle_path: PathBuf::from(DEFAULT_TRAVERSAL_BUNDLE_PATH),
             traversal_verifier_key_path: PathBuf::from(DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH),
             traversal_watermark_path: PathBuf::from(DEFAULT_TRAVERSAL_WATERMARK_PATH),
+            traversal_prior_rerank: false,
+            traversal_flap_breaker: false,
             relay_fleet_bundle_path: Some(relay_fleet_default_path_from_env(
                 RELAY_FLEET_BUNDLE_PATH_ENV,
                 DEFAULT_RELAY_FLEET_BUNDLE_PATH,
@@ -3498,6 +3608,23 @@ struct DaemonRuntime {
     traversal_bundle_path: PathBuf,
     traversal_verifier_key_path: PathBuf,
     traversal_watermark_path: PathBuf,
+    /// FIS-0009: persisted cross-session traversal priors (fail-open store).
+    peer_prior_store: crate::peer_traversal_prior::PeerPriorStore,
+    traversal_prior_rerank: bool,
+    /// FIS-0010: per-peer flap breakers. Persists across sync passes
+    /// (unlike `traversal_probe_statuses`, rebuilt each pass); in-memory
+    /// only — a restart starts every breaker closed.
+    flap_breakers: BTreeMap<NodeId, crate::traversal::FlapBreaker>,
+    traversal_flap_breaker: bool,
+    /// FIS-0013: per-peer path-quality trackers (sustained-degradation
+    /// detector over backend samples). Persists across sync passes.
+    quality_tracker: crate::traversal::PathQualityTracker,
+    /// Peers whose sustained degradation warrants a quality re-race on the
+    /// next sync pass (consumed one-shot).
+    pending_quality_reprobe: BTreeSet<NodeId>,
+    /// The demoted incumbent endpoint per pending quality re-race
+    /// (consumed one-shot when the evaluation is built).
+    quality_demoted_endpoints: BTreeMap<NodeId, SocketEndpoint>,
     traversal_max_age_secs: u64,
     traversal_probe_config: TraversalEngineConfig,
     traversal_probe_handshake_freshness_secs: u64,
@@ -3542,6 +3669,14 @@ struct DaemonRuntime {
     traversal_coordination_replay_window: CoordinationReplayWindow,
     traversal_hint_error: Option<String>,
     traversal_probe_statuses: BTreeMap<NodeId, TraversalProbeStatus>,
+    /// FIS-0015: per-peer adaptive keepalive intervals. Persists across
+    /// sync passes (unlike `traversal_probe_statuses`, which is rebuilt
+    /// each pass); in-memory only — a daemon restart re-runs cold start
+    /// from the prior.
+    keepalive_estimators: BTreeMap<NodeId, crate::keepalive::KeepaliveEstimator>,
+    /// Gap (secs) at which the last relay keepalive was sent per peer,
+    /// awaiting a survival/loss outcome (censored-gap observation model).
+    relay_keepalive_pending_gap: BTreeMap<NodeId, u16>,
     traversal_stale_rejections: u64,
     traversal_replay_rejections: u64,
     traversal_future_dated_rejections: u64,
@@ -3860,6 +3995,17 @@ impl DaemonRuntime {
             traversal_bundle_path: config.traversal_bundle_path.clone(),
             traversal_verifier_key_path: config.traversal_verifier_key_path.clone(),
             traversal_watermark_path: config.traversal_watermark_path.clone(),
+            peer_prior_store: crate::peer_traversal_prior::PeerPriorStore::load_or_empty(
+                config
+                    .traversal_watermark_path
+                    .with_file_name("peer_traversal_priors.v1"),
+            ),
+            traversal_prior_rerank: config.traversal_prior_rerank,
+            flap_breakers: BTreeMap::new(),
+            traversal_flap_breaker: config.traversal_flap_breaker,
+            quality_tracker: crate::traversal::PathQualityTracker::default(),
+            pending_quality_reprobe: BTreeSet::new(),
+            quality_demoted_endpoints: BTreeMap::new(),
             traversal_max_age_secs: config.traversal_max_age_secs.get(),
             traversal_probe_config: TraversalEngineConfig {
                 max_candidates: config.traversal_probe_max_candidates.get(),
@@ -3925,6 +4071,8 @@ impl DaemonRuntime {
             traversal_coordination_replay_window: CoordinationReplayWindow::default(),
             traversal_hint_error: None,
             traversal_probe_statuses: BTreeMap::new(),
+            keepalive_estimators: BTreeMap::new(),
+            relay_keepalive_pending_gap: BTreeMap::new(),
             traversal_stale_rejections: 0,
             traversal_replay_rejections: 0,
             traversal_future_dated_rejections: 0,
@@ -5612,6 +5760,7 @@ impl DaemonRuntime {
 
     fn sync_traversal_runtime_state(&mut self, force_reprobe: bool) -> Result<(), String> {
         let now_unix = unix_now();
+        self.poll_path_quality(now_unix);
         let mut relay_keepalive_failed_peers = BTreeSet::new();
         if let Some(mut relay_client) = self.relay_client.take() {
             let freshness_secs = self.traversal_probe_handshake_freshness_secs;
@@ -5631,7 +5780,38 @@ impl DaemonRuntime {
             }
             relay_client.cleanup_expired_sessions(now_unix);
             if self.transport_socket_identity_blocker.is_none() {
-                for peer_node_id in relay_client.sessions_needing_keepalive() {
+                // FIS-0015: per-peer adaptive keepalive threshold. Cold start
+                // is the estimator's RelaySession prior (25s — exactly the
+                // static `RelayClientConfig::keepalive_interval` production
+                // value), so behavior is identical until evidence accumulates.
+                for (peer_node_id, elapsed) in relay_client.sessions_with_elapsed() {
+                    let estimator = self
+                        .keepalive_estimators
+                        .entry(peer_node_id.clone())
+                        .or_insert_with(|| {
+                            crate::keepalive::KeepaliveEstimator::new(
+                                crate::keepalive::KeepalivePrior::RelaySession,
+                            )
+                        });
+                    let gap_secs = u16::try_from(elapsed.as_secs()).unwrap_or(u16::MAX);
+                    if gap_secs < estimator.next_gap() {
+                        continue;
+                    }
+                    // Reaching the next cycle without a loss event means the
+                    // previously probed gap survived (censored evidence).
+                    if let Some(survived_gap) =
+                        self.relay_keepalive_pending_gap.remove(&peer_node_id)
+                    {
+                        let before = estimator.operating_secs();
+                        estimator.on_survival(survived_gap);
+                        let after = estimator.operating_secs();
+                        if after != before {
+                            eprintln!(
+                                "rustynetd: relay keepalive interval for peer {} raised {before}s -> {after}s (confirmed-safe gap {survived_gap}s)",
+                                peer_node_id.as_str()
+                            );
+                        }
+                    }
                     if let Err(err) = relay_client.send_keepalive_with_sender(
                         &peer_node_id,
                         |remote_addr, payload| {
@@ -5647,13 +5827,32 @@ impl DaemonRuntime {
                             "rustynetd: relay keepalive failed for peer {}: {err}",
                             peer_node_id.as_str()
                         );
+                        // Attributable loss: the mapping (or session) died
+                        // within this gap. Mis-attribution (relay restart)
+                        // only tightens — the cheap direction.
+                        if let Some(estimator) = self.keepalive_estimators.get_mut(&peer_node_id) {
+                            let before = estimator.operating_secs();
+                            estimator.on_binding_loss(gap_secs);
+                            let after = estimator.operating_secs();
+                            eprintln!(
+                                "rustynetd: relay keepalive interval for peer {} tightened {before}s -> {after}s after loss at {gap_secs}s",
+                                peer_node_id.as_str()
+                            );
+                        }
                         relay_client.close_session(&peer_node_id);
                         relay_keepalive_failed_peers.insert(peer_node_id);
+                    } else {
+                        self.relay_keepalive_pending_gap
+                            .insert(peer_node_id, gap_secs);
                     }
                 }
             }
             relay_client
                 .cleanup_idle_sessions(Duration::from_secs(self.relay_session_idle_timeout_secs));
+            // A pending gap on a peer whose session is gone can never receive
+            // its outcome — drop it so a future session never mis-credits it.
+            self.relay_keepalive_pending_gap
+                .retain(|peer_node_id, _| relay_client.has_session(peer_node_id));
             self.relay_client = Some(relay_client);
         }
         if !matches!(
@@ -5765,13 +5964,27 @@ impl DaemonRuntime {
 
             let relay_refresh_due =
                 self.relay_session_refresh_due(&remote_node_id, bundle, now_unix)?;
-            let probe_due = self.traversal_probe_due(
-                current,
-                &direct_candidates,
-                existing_status,
-                now_unix,
-                force_reprobe,
-            );
+            // FIS-0013: a pending quality re-race forces the probe through
+            // (the trigger already checked the FIS-0010 breaker was closed).
+            let quality_reprobe = self.pending_quality_reprobe.remove(&remote_node_id);
+            let probe_due = quality_reprobe
+                || (self.traversal_probe_due(
+                    current,
+                    &direct_candidates,
+                    existing_status,
+                    now_unix,
+                    force_reprobe,
+                )
+                    // FIS-0010: while a peer's breaker is open, withhold the
+                    // direct re-race (stay on relay) — unless the operator
+                    // forced a reprobe, which stays an escape hatch. Cooldown
+                    // expiry (half-open) allows exactly the next race through.
+                    && (force_reprobe
+                        || !self.traversal_flap_breaker
+                        || !self
+                            .flap_breakers
+                            .get(&remote_node_id)
+                            .is_some_and(|breaker| breaker.is_open(now_unix))));
             let relay_keepalive_recovery_due =
                 relay_keepalive_failed_peers.contains(&remote_node_id);
 
@@ -5856,6 +6069,26 @@ impl DaemonRuntime {
                 }
             };
 
+            // FIS-0009: hand the race this peer's cross-session prior only
+            // when the re-rank flag is on; None ranks exactly as today.
+            let prior_ranking = if self.traversal_prior_rerank {
+                self.peer_prior_store
+                    .prior_for(remote_node_id.as_str())
+                    .map(|prior| crate::traversal::PriorRanking {
+                        last_success_class: prior.last_success_class,
+                        per_class_probability: [
+                            crate::peer_traversal_prior::CandidateClass::HostV4,
+                            crate::peer_traversal_prior::CandidateClass::HostV6,
+                            crate::peer_traversal_prior::CandidateClass::SrflxV4,
+                            crate::peer_traversal_prior::CandidateClass::SrflxV6,
+                        ]
+                        .into_iter()
+                        .map(|class| (class, prior.success_probability(class)))
+                        .collect(),
+                    })
+            } else {
+                None
+            };
             let report = self
                 .controller
                 .evaluate_traversal_probes(
@@ -5867,6 +6100,10 @@ impl DaemonRuntime {
                         now_unix,
                         engine_config: self.traversal_probe_config.clone(),
                         handshake_freshness_secs: self.traversal_probe_handshake_freshness_secs,
+                        prior_ranking,
+                        quality_demoted_endpoint: self
+                            .quality_demoted_endpoints
+                            .remove(&remote_node_id),
                         coordination_schedule,
                         coordination_error,
                         // D5.5 promotion: deterministic ICE role
@@ -5892,6 +6129,54 @@ impl DaemonRuntime {
             {
                 relay_client.touch_session(&remote_node_id);
             }
+            // FIS-0009: record the race outcome in the cross-session prior
+            // store. Only real races (attempts > 0) count — cached
+            // short-circuit reports would double-count evidence. A Direct
+            // decision needs a fresh handshake to count as a class win
+            // (the FailClosed pseudo-Direct arm has none).
+            if report.attempts > 0 {
+                let handshake_fresh =
+                    self.traversal_handshake_is_fresh(report.latest_handshake_unix, now_unix);
+                // FIS-0010: feed the flap breaker (always on — consult is
+                // what the flag gates). Failure = the race did not end on a
+                // fresh direct handshake.
+                let race_failed =
+                    !(report.decision == TraversalProbeDecision::Direct && handshake_fresh);
+                let breaker = self
+                    .flap_breakers
+                    .entry(remote_node_id.clone())
+                    .or_default();
+                let state_before = breaker.state_label(now_unix);
+                breaker.record_outcome(race_failed, now_unix);
+                let state_after = breaker.state_label(now_unix);
+                if state_before != state_after {
+                    eprintln!(
+                        "rustynetd: flap breaker for peer {} {} -> {} (intensity {:.2})",
+                        remote_node_id.as_str(),
+                        state_before,
+                        state_after,
+                        breaker.intensity()
+                    );
+                }
+                let (winning_class, tried_classes) = race_outcome_classes(
+                    &direct_candidates,
+                    report.decision,
+                    report.selected_endpoint,
+                    handshake_fresh,
+                );
+                if !tried_classes.is_empty() {
+                    self.peer_prior_store.record_outcome(
+                        remote_node_id.as_str(),
+                        winning_class,
+                        &tried_classes,
+                        now_unix,
+                    );
+                    if let Err(err) = self.peer_prior_store.persist() {
+                        // Fail-open: the prior is an optimization cache.
+                        eprintln!("rustynetd: peer prior store persist failed: {err}");
+                    }
+                }
+            }
             statuses.insert(
                 remote_node_id.clone(),
                 TraversalProbeStatus {
@@ -5910,6 +6195,57 @@ impl DaemonRuntime {
         }
         self.traversal_probe_statuses = statuses;
         Ok(())
+    }
+
+    /// FIS-0013: ingest one backend path-quality sample per Direct peer at
+    /// the reconcile cadence. Sustained degradation (with the FIS-0010
+    /// breaker closed and the per-peer dwell elapsed) schedules a quality
+    /// re-race with the incumbent endpoint demoted.
+    fn poll_path_quality(&mut self, now_unix: u64) {
+        let direct_peers: Vec<(NodeId, SocketEndpoint)> = self
+            .traversal_probe_statuses
+            .iter()
+            .filter(|(_, status)| status.decision == TraversalProbeDecision::Direct)
+            .map(|(node_id, status)| (node_id.clone(), status.selected_endpoint))
+            .collect();
+        let live_peers: BTreeSet<NodeId> = self.traversal_probe_statuses.keys().cloned().collect();
+        self.quality_tracker.retain_peers(&live_peers);
+        self.pending_quality_reprobe
+            .retain(|node_id| live_peers.contains(node_id));
+        self.quality_demoted_endpoints
+            .retain(|node_id, _| live_peers.contains(node_id));
+        for (node_id, incumbent_endpoint) in direct_peers {
+            let Ok(Some(sample)) = self.controller.managed_peer_path_sample(&node_id) else {
+                // Command backends (and errors) yield no signal — the
+                // tracker simply never advances. Fail-open to today's
+                // behavior.
+                continue;
+            };
+            if self
+                .quality_tracker
+                .ingest_sample(&node_id, sample, now_unix)
+                != Some(true)
+            {
+                continue;
+            }
+            // The breaker owns direct-relay damping; the quality trigger is
+            // suppressed unless fully closed (never bypasses it).
+            let breaker_closed = self
+                .flap_breakers
+                .get(&node_id)
+                .is_none_or(|breaker| breaker.is_closed(now_unix));
+            if !breaker_closed {
+                continue;
+            }
+            eprintln!(
+                "rustynetd: path quality degraded for peer {} — scheduling re-race with incumbent {} demoted",
+                node_id.as_str(),
+                incumbent_endpoint.addr
+            );
+            self.pending_quality_reprobe.insert(node_id.clone());
+            self.quality_demoted_endpoints
+                .insert(node_id, incumbent_endpoint);
+        }
     }
 
     fn traversal_probe_due(
@@ -9201,7 +9537,8 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
 /// Decide whether this node should call `PortMappingSupervisor::bring_up`.
 ///
 /// Returns `None` (proceed) when:
-/// - Self is the elected lex-min authority node.
+/// - Self is the elected Pin-then-Seniority authority node (see
+///   `gossip_runtime::select_port_mapping_authority_node_id`).
 ///
 /// Returns `Some(reason)` (skip) when membership is unavailable, no authority
 /// is advertised, or another node is the elected authority.
@@ -9216,7 +9553,7 @@ fn port_mapping_bring_up_skip_reason(
         .port_mapping_authority_node_id;
     match authority_id.as_deref() {
         None => Some("deferred: no anchor port-mapping authority".to_owned()),
-        // Self is the elected lex-min authority: proceed.
+        // Self is the elected Pin-then-Seniority authority: proceed.
         Some(node_id) if node_id == self_node_id => None,
         // Another node is the elected authority: defer.
         Some(node_id) => Some(format!("deferred to authority node={node_id}")),
@@ -9278,7 +9615,10 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     {
         use std::sync::mpsc;
 
-        // Retry the DNS bind with backoff.  When the SCM stops the previous daemon instance and
+        // Retry the DNS bind with backoff (deliberately independent of
+        // resilience::next_reconnect_delay_jittered_ms: local bind-vs-SCM-restart
+        // race, no herd possible — see the FIS-0016 classification).
+        // When the SCM stops the previous daemon instance and
         // immediately starts the new one there is a brief race: the SCM marks the service Stopped
         // before the old process fully terminates, so the old socket may still be bound
         // (WSAEADDRINUSE / os error 10048).  Retrying for ~10 s covers this window.
@@ -12334,6 +12674,7 @@ fn load_auto_tunnel_bundle(
             },
             public_key,
             allowed_ips,
+            persistent_keepalive_secs: None,
         });
     }
 
@@ -14815,9 +15156,113 @@ fn parse_host_cidr_addr(cidr: &str) -> Option<IpAddr> {
     (prefix == host_prefix).then_some(addr)
 }
 
+/// FIS-0009: classify a race outcome for the prior store. `tried` is the
+/// deduped class set of the remote direct candidates; the winner is the
+/// class of the candidate matching the selected endpoint, only when the
+/// decision is Direct AND a fresh handshake backed it.
+fn race_outcome_classes(
+    direct_candidates: &[ProbeTraversalCandidate],
+    decision: TraversalProbeDecision,
+    selected_endpoint: SocketEndpoint,
+    handshake_fresh: bool,
+) -> (
+    Option<crate::peer_traversal_prior::CandidateClass>,
+    Vec<crate::peer_traversal_prior::CandidateClass>,
+) {
+    let mut tried: Vec<crate::peer_traversal_prior::CandidateClass> = Vec::new();
+    for candidate in direct_candidates {
+        if let Some(class) = crate::peer_traversal_prior::CandidateClass::for_candidate(
+            candidate.source,
+            candidate.endpoint.addr,
+        ) && !tried.contains(&class)
+        {
+            tried.push(class);
+        }
+    }
+    let winning = (decision == TraversalProbeDecision::Direct && handshake_fresh)
+        .then(|| {
+            direct_candidates
+                .iter()
+                .find(|candidate| candidate.endpoint == selected_endpoint)
+                .and_then(|candidate| {
+                    crate::peer_traversal_prior::CandidateClass::for_candidate(
+                        candidate.source,
+                        candidate.endpoint.addr,
+                    )
+                })
+        })
+        .flatten();
+    (winning, tried)
+}
+
 #[cfg(all(test, not(windows)))]
 mod tests {
     use std::collections::BTreeMap;
+
+    #[test]
+    fn race_outcome_classes_maps_decisions_to_prior_evidence() {
+        use crate::peer_traversal_prior::CandidateClass;
+        use crate::traversal::CandidateSource;
+        let host_v4 = super::ProbeTraversalCandidate {
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.1".parse().expect("v4"),
+                port: 51820,
+            },
+            source: CandidateSource::Host,
+            priority: 900,
+            observed_at_unix: 1,
+        };
+        let srflx_v4 = super::ProbeTraversalCandidate {
+            endpoint: SocketEndpoint {
+                addr: "198.51.100.2".parse().expect("v4"),
+                port: 51821,
+            },
+            source: CandidateSource::ServerReflexive,
+            priority: 850,
+            observed_at_unix: 1,
+        };
+        let candidates = vec![host_v4, srflx_v4];
+
+        // Direct + fresh handshake: the matching candidate's class wins.
+        let (winning, tried) = super::race_outcome_classes(
+            &candidates,
+            TraversalProbeDecision::Direct,
+            srflx_v4.endpoint,
+            true,
+        );
+        assert_eq!(winning, Some(CandidateClass::SrflxV4));
+        assert_eq!(tried, vec![CandidateClass::HostV4, CandidateClass::SrflxV4]);
+
+        // Direct WITHOUT a fresh handshake (the FailClosed pseudo-Direct
+        // arm): never counts as a win.
+        let (winning, _) = super::race_outcome_classes(
+            &candidates,
+            TraversalProbeDecision::Direct,
+            host_v4.endpoint,
+            false,
+        );
+        assert_eq!(winning, None);
+
+        // Relay fallback: no winner; every tried class records a failure.
+        let (winning, tried) = super::race_outcome_classes(
+            &candidates,
+            TraversalProbeDecision::Relay,
+            srflx_v4.endpoint,
+            true,
+        );
+        assert_eq!(winning, None);
+        assert_eq!(tried.len(), 2);
+
+        // Empty candidate set: nothing to record (deny-by-empty).
+        let (winning, tried) = super::race_outcome_classes(
+            &[],
+            TraversalProbeDecision::Direct,
+            host_v4.endpoint,
+            true,
+        );
+        assert_eq!(winning, None);
+        assert!(tried.is_empty());
+    }
     use std::fs::OpenOptions;
     #[cfg(feature = "test-harness")]
     use std::io::ErrorKind;
@@ -14885,7 +15330,8 @@ mod tests {
         snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
         validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
         validate_daemon_config, validate_file_security, validate_node_role_membership_alignment,
-        write_anchor_bundle_pull_response, zeroize_optional_bytes,
+        write_anchor_bundle_pull_response, write_anchor_bundle_pull_response_with_have,
+        zeroize_optional_bytes,
     };
     use crate::phase10::{
         DataplaneState, PathMode, RuntimeSystem, TraversalProbeDecision, TraversalProbeReason,
@@ -14960,6 +15406,122 @@ mod tests {
         assert_eq!(thumbprint.len(), 16);
         assert_ne!(thumbprint, token);
         assert!(thumbprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    // ── FIS-0020: conditional bundle-pull (have/UNCHANGED) ──────────────────
+
+    fn conditional_pull_snapshot_bytes() -> Vec<u8> {
+        let state = MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-pull".to_owned(),
+            epoch: 7,
+            nodes: vec![MembershipNode {
+                node_id: "anchor-a".to_owned(),
+                node_pubkey_hex: "11".repeat(32),
+                owner: "ops".to_owned(),
+                status: MembershipNodeStatus::Active,
+                roles: vec!["tag:members".to_owned()],
+                capabilities: vec![RoleCapability::Anchor, RoleCapability::AnchorBundlePull],
+                joined_at_unix: 100,
+                updated_at_unix: 100,
+            }],
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: {
+                    let signing = SigningKey::from_bytes(&[1u8; 32]);
+                    let bytes = signing.verifying_key().to_bytes();
+                    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+                },
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-cond-pull-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("snapshot dir");
+        let path = dir.join("snapshot.v1");
+        persist_membership_snapshot(&path, &state).expect("persist snapshot");
+        let bytes = std::fs::read(&path).expect("read snapshot");
+        let _ = std::fs::remove_dir_all(&dir);
+        bytes
+    }
+
+    #[test]
+    fn unchanged_response_on_matching_state_root() {
+        let bundle = conditional_pull_snapshot_bytes();
+        let (epoch, root) = rustynet_control::membership::snapshot_bytes_state_identity(&bundle)
+            .expect("snapshot identity");
+        let have = format!("have {epoch} {root}");
+
+        let mut out = Vec::new();
+        write_anchor_bundle_pull_response_with_have(&mut out, "tok", "tok", &bundle, Some(&have))
+            .expect("matching have succeeds");
+        assert_eq!(out, b"UNCHANGED\n", "exact-state match replies UNCHANGED");
+
+        // Stale epoch, stale root, or garbage: full bundle every time.
+        for stale in [
+            format!("have {} {root}", epoch + 1),
+            format!("have {epoch} {}", "ab".repeat(32)),
+            "have not-a-number zzz".to_owned(),
+            "hav typo".to_owned(),
+        ] {
+            let mut out = Vec::new();
+            write_anchor_bundle_pull_response_with_have(
+                &mut out,
+                "tok",
+                "tok",
+                &bundle,
+                Some(&stale),
+            )
+            .expect("stale have still succeeds with a full bundle");
+            assert!(
+                out.starts_with(b"OK "),
+                "non-matching have must send the full bundle, got {:?}",
+                String::from_utf8_lossy(&out[..out.len().min(20)])
+            );
+        }
+    }
+
+    #[test]
+    fn have_line_never_bypasses_token_auth() {
+        let bundle = conditional_pull_snapshot_bytes();
+        let (epoch, root) = rustynet_control::membership::snapshot_bytes_state_identity(&bundle)
+            .expect("snapshot identity");
+        let have = format!("have {epoch} {root}");
+        let mut out = Vec::new();
+        let err = write_anchor_bundle_pull_response_with_have(
+            &mut out,
+            "wrong-token",
+            "tok",
+            &bundle,
+            Some(&have),
+        );
+        assert!(err.is_err(), "bad token must reject regardless of have");
+        assert_eq!(
+            out, b"ERR unauthorized\n",
+            "unauthorized reply leaks no state identity"
+        );
+    }
+
+    #[test]
+    fn missing_have_line_sends_full_bundle() {
+        // The 4-arg wrapper (pre-FIS-0020 call shape) is byte-identical to
+        // today: full bundle, no UNCHANGED arm.
+        let bundle = conditional_pull_snapshot_bytes();
+        let mut out = Vec::new();
+        write_anchor_bundle_pull_response(&mut out, "tok", "tok", &bundle)
+            .expect("full pull succeeds");
+        assert!(out.starts_with(b"OK "));
+        assert!(out.ends_with(bundle.as_slice()));
     }
 
     // ── D11.b tests ──────────────────────────────────────────────────────────
@@ -15118,6 +15680,24 @@ mod tests {
         }
     }
 
+    fn make_membership_state_with_nodes(nodes: Vec<MembershipNode>) -> MembershipState {
+        MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-test".to_owned(),
+            epoch: 1,
+            nodes,
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: "bb".repeat(32),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 1,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        }
+    }
+
     #[test]
     fn port_mapping_skipped_when_non_authority() {
         // Another node holds AnchorPortMappingAuthoritative — self must not
@@ -15171,6 +15751,108 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("authority unavailable")),
             "skip reason must fail closed when membership is unavailable: {reason_no_state:?}"
+        );
+    }
+
+    #[test]
+    fn port_mapping_authority_follows_pin() {
+        // FIS-0014: a pinned-but-junior node must win port-mapping authority
+        // over a senior unpinned node.
+        let senior_unpinned = MembershipNode {
+            node_id: "node-senior".to_owned(),
+            node_pubkey_hex: "aa".repeat(32),
+            owner: "owner@test.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec![],
+            capabilities: vec![RoleCapability::AnchorPortMappingAuthoritative],
+            joined_at_unix: 10,
+            updated_at_unix: 10,
+        };
+        let junior_pinned = MembershipNode {
+            node_id: "node-pinned".to_owned(),
+            node_pubkey_hex: "cc".repeat(32),
+            owner: "owner@test.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec![],
+            capabilities: vec![
+                RoleCapability::AnchorPortMappingAuthoritative,
+                RoleCapability::AnchorPortMappingPinned,
+            ],
+            joined_at_unix: 500,
+            updated_at_unix: 500,
+        };
+        let state = make_membership_state_with_nodes(vec![senior_unpinned, junior_pinned]);
+
+        let reason_pinned = port_mapping_bring_up_skip_reason("node-pinned", Some(&state));
+        assert!(
+            reason_pinned.is_none(),
+            "pinned node must proceed: {reason_pinned:?}"
+        );
+        let reason_senior = port_mapping_bring_up_skip_reason("node-senior", Some(&state));
+        assert!(
+            reason_senior
+                .as_deref()
+                .is_some_and(|value| value.contains("node-pinned")),
+            "senior unpinned node must defer to the pin: {reason_senior:?}"
+        );
+    }
+
+    #[test]
+    fn port_mapping_pin_fallback_all_nodes_agree() {
+        // FIS-0014 determinism walkthrough as an executable assertion: a
+        // 3-anchor fleet where the pinned node has been revoked must have
+        // every node's independent evaluation agree on exactly one
+        // authority (the seniority winner among the remaining eligible set).
+        let pinned_revoked = MembershipNode {
+            node_id: "node-pinned".to_owned(),
+            node_pubkey_hex: "aa".repeat(32),
+            owner: "owner@test.local".to_owned(),
+            status: MembershipNodeStatus::Revoked,
+            roles: vec![],
+            capabilities: vec![
+                RoleCapability::AnchorPortMappingAuthoritative,
+                RoleCapability::AnchorPortMappingPinned,
+            ],
+            joined_at_unix: 500,
+            updated_at_unix: 500,
+        };
+        let senior = MembershipNode {
+            node_id: "node-senior".to_owned(),
+            node_pubkey_hex: "bb".repeat(32),
+            owner: "owner@test.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec![],
+            capabilities: vec![RoleCapability::AnchorPortMappingAuthoritative],
+            joined_at_unix: 10,
+            updated_at_unix: 10,
+        };
+        let junior = MembershipNode {
+            node_id: "node-junior".to_owned(),
+            node_pubkey_hex: "cc".repeat(32),
+            owner: "owner@test.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec![],
+            capabilities: vec![RoleCapability::AnchorPortMappingAuthoritative],
+            joined_at_unix: 100,
+            updated_at_unix: 100,
+        };
+        let state = make_membership_state_with_nodes(vec![
+            pinned_revoked.clone(),
+            senior.clone(),
+            junior.clone(),
+        ]);
+
+        let none_count = [pinned_revoked, senior, junior]
+            .iter()
+            .filter(|node| port_mapping_bring_up_skip_reason(&node.node_id, Some(&state)).is_none())
+            .count();
+        assert_eq!(
+            none_count, 1,
+            "exactly one node in the fleet must independently conclude it is the authority"
+        );
+        assert!(
+            port_mapping_bring_up_skip_reason("node-senior", Some(&state)).is_none(),
+            "the revoked pin must fall back to the seniority winner, not any other node"
         );
     }
 
@@ -15732,6 +16414,7 @@ mod tests {
             },
             public_key: [9u8; 32],
             allowed_ips: vec!["0.0.0.0/0".to_owned()],
+            persistent_keepalive_secs: None,
         }];
         let routes = vec![Route {
             destination_cidr: "0.0.0.0/0".to_owned(),
@@ -15765,6 +16448,7 @@ mod tests {
             },
             public_key: [10u8; 32],
             allowed_ips: vec!["100.64.10.0/24".to_owned()],
+            persistent_keepalive_secs: None,
         }];
         let routes = vec![Route {
             destination_cidr: "100.64.10.0/24".to_owned(),
@@ -15802,6 +16486,7 @@ mod tests {
             },
             public_key: [12u8; 32],
             allowed_ips: vec!["100.64.0.2/32".to_owned()],
+            persistent_keepalive_secs: None,
         }];
         let routes = vec![Route {
             destination_cidr: "100.64.0.2/32".to_owned(),
@@ -15836,6 +16521,7 @@ mod tests {
                 },
                 public_key: [31u8; 32],
                 allowed_ips: vec!["100.64.0.2/32".to_owned()],
+                persistent_keepalive_secs: None,
             },
             rustynet_backend_api::PeerConfig {
                 node_id: peer_b.clone(),
@@ -15845,6 +16531,7 @@ mod tests {
                 },
                 public_key: [32u8; 32],
                 allowed_ips: vec!["100.64.0.2/32".to_owned()],
+                persistent_keepalive_secs: None,
             },
         ];
         let routes = vec![
@@ -15887,6 +16574,7 @@ mod tests {
             },
             public_key: [11u8; 32],
             allowed_ips: vec!["192.168.50.0/24".to_owned()],
+            persistent_keepalive_secs: None,
         }];
         let routes = vec![Route {
             destination_cidr: "192.168.50.0/24".to_owned(),
@@ -15918,6 +16606,7 @@ mod tests {
             },
             public_key: [13u8; 32],
             allowed_ips: vec!["0.0.0.0/0".to_owned()],
+            persistent_keepalive_secs: None,
         }];
         let routes = vec![Route {
             destination_cidr: "0.0.0.0/0".to_owned(),
@@ -21528,6 +22217,119 @@ mod tests {
             status
                 .message
                 .contains("transport_socket_identity_local_addr=0.0.0.0:51820")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn relay_keepalive_uses_per_peer_estimator_interval() {
+        // FIS-0015: the per-peer estimator's next_gap — not the flat 25s
+        // config — decides when a relay keepalive fires. A 20s-old session
+        // is silent at the cold-start prior, but fires once the peer's own
+        // estimator has tightened below 20s on loss evidence.
+        let relay_addr: SocketAddr = "203.0.113.35:40026".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-relay-keepalive-estimator",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let authoritative_local_addr: SocketAddr =
+            "0.0.0.0:51820".parse().expect("local addr should parse");
+        let allocated_port = 61_046;
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
+
+        configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
+        script_runtime_authoritative_relay_ack(
+            &mut runtime,
+            relay_addr,
+            authoritative_local_addr,
+            [0x45; 16],
+            allocated_port,
+        );
+        runtime.relay_client = Some(build_test_relay_client(
+            "daemon-local",
+            Duration::from_secs(600),
+            Duration::from_millis(50),
+            Vec::new(),
+        ));
+
+        runtime.bootstrap();
+        runtime
+            .relay_client
+            .as_mut()
+            .expect("relay client should be configured")
+            .set_session_last_activity_for_test(
+                &exit_node,
+                Instant::now() - Duration::from_secs(20),
+            );
+
+        runtime
+            .sync_traversal_runtime_state(false)
+            .expect("relay runtime sync should succeed");
+        let operations = runtime
+            .controller
+            .backend_mut_for_test()
+            .authoritative_transport_operations_for_test();
+        assert_eq!(
+            operations.len(),
+            1,
+            "20s gap under the 25s cold-start prior: establish only, no keepalive"
+        );
+
+        // Loss evidence tightens THIS peer's estimator to the floor (10s).
+        runtime
+            .keepalive_estimators
+            .get_mut(&exit_node)
+            .expect("estimator created on first pass")
+            .on_binding_loss(20);
+        assert_eq!(
+            runtime
+                .keepalive_estimators
+                .get(&exit_node)
+                .expect("estimator present")
+                .operating_secs(),
+            crate::keepalive::KEEPALIVE_FLOOR_SECS
+        );
+
+        runtime
+            .relay_client
+            .as_mut()
+            .expect("relay client should be configured")
+            .set_session_last_activity_for_test(
+                &exit_node,
+                Instant::now() - Duration::from_secs(20),
+            );
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .script_authoritative_send_result_for_test(Ok(()))
+            .expect("relay authoritative keepalive send should be scriptable");
+
+        runtime
+            .sync_traversal_runtime_state(false)
+            .expect("relay runtime sync should succeed");
+        let operations = runtime
+            .controller
+            .backend_mut_for_test()
+            .authoritative_transport_operations_for_test();
+        assert_eq!(
+            operations.len(),
+            2,
+            "the same 20s gap exceeds the tightened per-peer interval: keepalive fires"
+        );
+        assert_eq!(
+            operations[1].kind,
+            RecordedAuthoritativeTransportOperationKind::Send
+        );
+        assert_eq!(
+            operations[1].remote_addr,
+            SocketAddr::new(relay_addr.ip(), allocated_port)
+        );
+        // The sent gap is pending its survival/loss outcome.
+        assert_eq!(
+            runtime.relay_keepalive_pending_gap.get(&exit_node).copied(),
+            Some(20)
         );
 
         let _ = std::fs::remove_dir_all(test_dir);

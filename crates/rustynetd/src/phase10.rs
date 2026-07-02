@@ -287,6 +287,15 @@ pub struct TraversalProbeEvaluation<'a> {
     pub now_unix: u64,
     pub engine_config: TraversalEngineConfig,
     pub handshake_freshness_secs: u64,
+    /// FIS-0009: peer's cross-session traversal prior (None = rank as
+    /// today; populated only when the daemon's prior-rerank flag is on).
+    pub prior_ranking: Option<crate::traversal::PriorRanking>,
+    /// FIS-0013: the quality-demoted incumbent endpoint. When set, the
+    /// fresh-handshake short-circuit is skipped (the re-race must actually
+    /// fire) and pairs targeting this endpoint sort LAST
+    /// (demote-don't-exclude: if every alternate fails, the incumbent
+    /// still races and may win).
+    pub quality_demoted_endpoint: Option<SocketEndpoint>,
     pub coordination_schedule: Option<CoordinationSchedule>,
     pub coordination_error: Option<String>,
     /// D5.5 promotion — SHA-256 digests of the local + remote
@@ -5612,6 +5621,19 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         Ok(self.backend.peer_latest_handshake_unix(node_id)?)
     }
 
+    /// FIS-0013: per-peer raw path-quality sample from the backend
+    /// (userspace-shared only; command backends return None).
+    pub fn managed_peer_path_sample(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<rustynet_backend_api::PeerPathSample>, Phase10Error> {
+        self.ensure_started()?;
+        if !self.managed_peers.contains_key(node_id) {
+            return Err(Phase10Error::PeerNotManaged);
+        }
+        Ok(self.backend.peer_path_sample(node_id)?)
+    }
+
     pub fn evaluate_traversal_probes(
         &mut self,
         node_id: &NodeId,
@@ -5636,10 +5658,15 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             .current_peer_endpoint(node_id)?
             .ok_or(Phase10Error::PeerNotManaged)?;
         let current_handshake = self.backend.peer_latest_handshake_unix(node_id)?;
-        if evaluation
-            .direct_candidates
-            .iter()
-            .any(|candidate| candidate.endpoint == current_endpoint)
+        // FIS-0013: when the incumbent endpoint is quality-demoted, a fresh
+        // handshake must NOT short-circuit the race — the whole point of the
+        // quality trigger is to re-race a nominally-up-but-rotten path.
+        let incumbent_demoted = evaluation.quality_demoted_endpoint == Some(current_endpoint);
+        if !incumbent_demoted
+            && evaluation
+                .direct_candidates
+                .iter()
+                .any(|candidate| candidate.endpoint == current_endpoint)
             && handshake_is_fresh(
                 current_handshake,
                 evaluation.now_unix,
@@ -5731,6 +5758,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                     evaluation.relay_endpoint,
                     evaluation.now_unix,
                     evaluation.handshake_freshness_secs,
+                    evaluation.prior_ranking.as_ref(),
+                    evaluation.quality_demoted_endpoint,
                 )
                 .map_err(|err| Phase10Error::TraversalProbeFailed(err.to_string()))?
         };
@@ -7693,6 +7722,7 @@ mod tests {
             },
             public_key: [9; 32],
             allowed_ips: vec!["100.100.20.2/32".to_owned()],
+            persistent_keepalive_secs: None,
         }
     }
 
@@ -10595,6 +10625,8 @@ mod tests {
                     now_unix: 200,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
+                    quality_demoted_endpoint: None,
                     coordination_schedule: None,
                     coordination_error: None,
                     local_node_id_digest: [1u8; 32],
@@ -10665,6 +10697,8 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
+                    quality_demoted_endpoint: None,
                     coordination_schedule: Some(sample_coordination_schedule(210)),
                     coordination_error: None,
                     local_node_id_digest: [1u8; 32],
@@ -10740,6 +10774,8 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
+                    quality_demoted_endpoint: None,
                     coordination_schedule: Some(sample_coordination_schedule(210)),
                     coordination_error: None,
                     local_node_id_digest: [1u8; 32],
@@ -10814,6 +10850,8 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
+                    quality_demoted_endpoint: None,
                     coordination_schedule: Some(sample_coordination_schedule(210)),
                     coordination_error: None,
                     local_node_id_digest: [1u8; 32],
@@ -10892,6 +10930,8 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
+                    quality_demoted_endpoint: None,
                     coordination_schedule: None,
                     coordination_error: Some(
                         "validated traversal coordination for peer node-b is unavailable"
@@ -10964,6 +11004,8 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
+                    quality_demoted_endpoint: None,
                     coordination_schedule: None,
                     coordination_error: Some(
                         "validated traversal coordination for peer node-b is unavailable"
@@ -12016,6 +12058,7 @@ mod tests {
                 port: 51820,
             },
             allowed_ips: Vec::new(),
+            persistent_keepalive_secs: None,
         };
         system
             .apply_peer_endpoint_bypass_routes(&[peer])

@@ -37,6 +37,7 @@ fn peer(name: &str) -> PeerConfig {
         },
         public_key: [7; 32],
         allowed_ips: vec!["100.64.1.0/24".to_owned()],
+        persistent_keepalive_secs: None,
     }
 }
 
@@ -49,6 +50,7 @@ fn peer_with_key(name: &str, key_byte: u8) -> PeerConfig {
         },
         public_key: [key_byte; 32],
         allowed_ips: vec!["100.64.2.0/24".to_owned()],
+        persistent_keepalive_secs: None,
     }
 }
 
@@ -364,6 +366,7 @@ fn contract_configure_same_peer_multiple_ips(b: &mut dyn TunnelBackend) {
             "192.168.100.0/24".to_owned(),
             "10.10.0.0/16".to_owned(),
         ],
+        persistent_keepalive_secs: None,
     };
     b.configure_peer(base)
         .expect("configure with multiple allowed IPs");

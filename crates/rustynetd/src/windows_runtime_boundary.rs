@@ -273,6 +273,10 @@ fn wait_for_pipe_then<T>(
 ///   behind the transient client-side pipe error from the same broken
 ///   exchange;
 /// * only transient pipe-plumbing errors trigger a retry with a fresh server.
+///
+/// The linear retry ramp here is deliberately independent of
+/// `resilience::next_reconnect_delay_jittered_ms`: single-process named-pipe
+/// race closure, no herd possible — see the FIS-0016 classification.
 fn run_self_check_exchange<T>(
     pipe_path: &Path,
     timeout: Duration,
