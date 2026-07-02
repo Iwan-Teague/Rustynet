@@ -268,19 +268,7 @@ impl CandidateGatherer {
                     addr: bound_addr.ip(),
                     port: bound_addr.port(),
                 });
-        let deadline = Instant::now() + self.timeout;
-        let mut srflx_results = Vec::new();
-        for server in &self.stun_servers {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            if remaining.is_zero() {
-                break;
-            }
-            srflx_results.push(self.query_stun_server(*server, remaining));
-        }
+        let srflx_results = self.query_stun_servers_batched();
 
         collect_gathered_candidates(
             local_bound_endpoint,
@@ -291,59 +279,156 @@ impl CandidateGatherer {
         )
     }
 
-    fn query_stun_server(
-        &self,
-        server: SocketAddr,
-        timeout: Duration,
-    ) -> Result<SocketEndpoint, TraversalError> {
-        let mut transaction_id = [0u8; 12];
-        rand::rngs::OsRng
-            .try_fill_bytes(transaction_id.as_mut_slice())
-            .map_err(|err| TraversalError::Stun(format!("os randomness unavailable: {err}")))?;
-        let request = build_stun_binding_request(transaction_id);
-        self.local_socket
-            .set_read_timeout(Some(timeout))
-            .map_err(|err| {
-                TraversalError::Stun(format!("failed to set stun read timeout: {err}"))
-            })?;
-        self.local_socket
-            .set_write_timeout(Some(timeout))
-            .map_err(|err| {
-                TraversalError::Stun(format!("failed to set stun write timeout: {err}"))
-            })?;
-        self.local_socket
-            .send_to(request.as_slice(), server)
-            .map_err(|err| TraversalError::Stun(format!("failed to send stun request: {err}")))?;
+    /// FIS-0011: fire-all-then-collect srflx gathering with an
+    /// RFC 5389 §7.2.1-shaped retransmission ladder.
+    ///
+    /// All binding requests go out up front (own transaction id each; a
+    /// retransmission reuses its original id per the RFC), then one receive
+    /// loop demuxes responses by source address + transaction-id echo until
+    /// the shared gather deadline. An unanswered request retransmits on its
+    /// RTO ladder (250ms initial, doubling, at most
+    /// [`STUN_MAX_REQUEST_ATTEMPTS`] sends — sized down from the RFC's 7
+    /// because this is a short-budget candidate discovery, not a control
+    /// transaction). This simultaneously fixes the old serial path's
+    /// starvation bug (server 1's full-budget `recv_from` blanked servers
+    /// 2..N) and its single-shot fragility (one lost datagram cost the whole
+    /// gather cycle). Results are per-server, in server order.
+    fn query_stun_servers_batched(&self) -> Vec<Result<SocketEndpoint, TraversalError>> {
+        let timed_out = || TraversalError::Stun("stun response timed out".to_owned());
+        let mut results: Vec<Result<SocketEndpoint, TraversalError>> =
+            self.stun_servers.iter().map(|_| Err(timed_out())).collect();
+        if self.stun_servers.is_empty() {
+            return results;
+        }
+        if let Err(err) = self.local_socket.set_write_timeout(Some(self.timeout)) {
+            let message = format!("failed to set stun write timeout: {err}");
+            for slot in &mut results {
+                *slot = Err(TraversalError::Stun(message.clone()));
+            }
+            return results;
+        }
+
+        let deadline = Instant::now() + self.timeout;
+        let mut outstanding: Vec<OutstandingStunQuery> = Vec::new();
+        for (server_index, server) in self.stun_servers.iter().enumerate() {
+            let mut transaction_id = [0u8; 12];
+            if let Err(err) = rand::rngs::OsRng.try_fill_bytes(transaction_id.as_mut_slice()) {
+                results[server_index] = Err(TraversalError::Stun(format!(
+                    "os randomness unavailable: {err}"
+                )));
+                continue;
+            }
+            let request = build_stun_binding_request(transaction_id);
+            if let Err(err) = self.local_socket.send_to(request.as_slice(), *server) {
+                results[server_index] = Err(TraversalError::Stun(format!(
+                    "failed to send stun request: {err}"
+                )));
+                continue;
+            }
+            outstanding.push(OutstandingStunQuery {
+                server_index,
+                server: *server,
+                transaction_id,
+                next_retransmit_at: Instant::now() + STUN_INITIAL_RTO,
+                rto: STUN_INITIAL_RTO,
+                attempts: 1,
+            });
+        }
 
         let mut buffer = [0u8; 1500];
-        let receive_started = Instant::now();
-        // loop { // removed to silence clippy: loop never loops
-        match self.local_socket.recv_from(&mut buffer) {
-            Ok((received, _source)) => {
-                parse_stun_xor_mapped_address(buffer[..received].as_ref(), transaction_id).map(
-                    |addr| SocketEndpoint {
-                        addr: addr.ip(),
-                        port: addr.port(),
-                    },
-                )
+        while !outstanding.is_empty() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
             }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                Err(TraversalError::Stun("stun response timed out".to_owned()))
+            // Wake at the earliest pending retransmit (or the deadline when
+            // every ladder is exhausted); floor 1ms so a due-now retransmit
+            // cannot busy-spin the receive.
+            let wake_at = outstanding
+                .iter()
+                .filter(|query| query.attempts < STUN_MAX_REQUEST_ATTEMPTS)
+                .map(|query| query.next_retransmit_at)
+                .min()
+                .map_or(deadline, |at| at.min(deadline));
+            let wait = wake_at
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(1));
+            if self.local_socket.set_read_timeout(Some(wait)).is_err() {
+                break;
             }
-            Err(err) => {
-                if receive_started.elapsed() >= timeout {
-                    return Err(TraversalError::Stun("stun response timed out".to_owned()));
+            match self.local_socket.recv_from(&mut buffer) {
+                Ok((received, source)) => {
+                    let Some(position) =
+                        outstanding.iter().position(|query| query.server == source)
+                    else {
+                        // Response from an unqueried source: reject.
+                        continue;
+                    };
+                    match parse_stun_xor_mapped_address(
+                        buffer[..received].as_ref(),
+                        outstanding[position].transaction_id,
+                    ) {
+                        Ok(addr) => {
+                            let query = outstanding.swap_remove(position);
+                            results[query.server_index] = Ok(SocketEndpoint {
+                                addr: addr.ip(),
+                                port: addr.port(),
+                            });
+                        }
+                        // Malformed or wrong transaction id from a real
+                        // target: drop the datagram, keep the query pending.
+                        Err(_) => continue,
+                    }
                 }
-                Err(TraversalError::Stun(format!(
-                    "failed to receive stun response: {err}"
-                )))
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // Receive window elapsed: fall through to the
+                    // retransmit sweep below.
+                }
+                Err(_) => break,
+            }
+            let now = Instant::now();
+            for query in &mut outstanding {
+                if query.attempts < STUN_MAX_REQUEST_ATTEMPTS && now >= query.next_retransmit_at {
+                    let request = build_stun_binding_request(query.transaction_id);
+                    if self
+                        .local_socket
+                        .send_to(request.as_slice(), query.server)
+                        .is_ok()
+                    {
+                        query.attempts += 1;
+                        query.rto = query.rto.saturating_mul(2);
+                        query.next_retransmit_at = now + query.rto;
+                    } else {
+                        // Send failure mid-gather: stop retransmitting this
+                        // query; an earlier send may still be answered.
+                        query.attempts = STUN_MAX_REQUEST_ATTEMPTS;
+                    }
+                }
             }
         }
-        // }
+        results
     }
+}
+
+/// Initial retransmission timeout for the FIS-0011 STUN ladder
+/// (RFC 5389 §7.2.1 default is 500ms; halved because the whole gather
+/// budget defaults to 2s and this is candidate discovery).
+const STUN_INITIAL_RTO: Duration = Duration::from_millis(250);
+/// Total sends per server per gather (initial + retransmits) — the RFC's
+/// `Rc`, sized down from 7 for the short gather budget.
+const STUN_MAX_REQUEST_ATTEMPTS: u8 = 3;
+
+/// One in-flight binding request awaiting its response or next retransmit.
+struct OutstandingStunQuery {
+    server_index: usize,
+    server: SocketAddr,
+    transaction_id: [u8; 12],
+    next_retransmit_at: Instant,
+    rto: Duration,
+    attempts: u8,
 }
 
 fn collect_gathered_candidates(
@@ -2249,6 +2334,158 @@ mod tests {
             ))],
         );
         assert!(results.iter().all(|c| c.source == CandidateSource::Host));
+    }
+
+    /// XOR-MAPPED-ADDRESS binding response for the traversal parser.
+    fn build_stun_test_response(transaction_id: [u8; 12], mapped: std::net::SocketAddr) -> Vec<u8> {
+        let std::net::SocketAddr::V4(mapped_v4) = mapped else {
+            panic!("test helper is v4-only");
+        };
+        let mut message = Vec::new();
+        message.extend_from_slice(&0x0101u16.to_be_bytes());
+        message.extend_from_slice(&0u16.to_be_bytes());
+        message.extend_from_slice(&0x2112_A442u32.to_be_bytes());
+        message.extend_from_slice(&transaction_id);
+        message.extend_from_slice(&0x0020u16.to_be_bytes());
+        message.extend_from_slice(&8u16.to_be_bytes());
+        message.push(0x00);
+        message.push(0x01);
+        let cookie_bytes = 0x2112_A442u32.to_be_bytes();
+        let port_mask = u16::from_be_bytes([cookie_bytes[0], cookie_bytes[1]]);
+        message.extend_from_slice(&(mapped_v4.port() ^ port_mask).to_be_bytes());
+        for (index, byte) in mapped_v4.ip().octets().iter().enumerate() {
+            message.push(byte ^ cookie_bytes[index]);
+        }
+        let declared_len = (message.len() - 20) as u16;
+        message[2..4].copy_from_slice(&declared_len.to_be_bytes());
+        message
+    }
+
+    /// STUN test server: drops the first `drop_first` requests, then (when
+    /// `respond`) answers the next one and exits. When `respond` is false it
+    /// only counts until `serve_for` elapses. Returns the request count.
+    fn spawn_stun_ladder_server(
+        drop_first: usize,
+        respond: bool,
+        serve_for: Duration,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<usize>) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind stun test server");
+        let addr = socket.local_addr().expect("stun test server addr");
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + serve_for;
+            let mut received = 0usize;
+            let mut buffer = [0u8; 1500];
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return received;
+                }
+                socket
+                    .set_read_timeout(Some(remaining))
+                    .expect("server read timeout");
+                let Ok((len, source)) = socket.recv_from(&mut buffer) else {
+                    return received;
+                };
+                if len < 20 {
+                    continue;
+                }
+                received += 1;
+                if received <= drop_first || !respond {
+                    continue;
+                }
+                let mut transaction_id = [0u8; 12];
+                transaction_id.copy_from_slice(&buffer[8..20]);
+                let response = build_stun_test_response(transaction_id, source);
+                let _ = socket.send_to(&response, source);
+                return received;
+            }
+        });
+        (addr, handle)
+    }
+
+    fn ladder_test_gatherer(
+        servers: Vec<std::net::SocketAddr>,
+        timeout: Duration,
+    ) -> super::CandidateGatherer {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind gather socket");
+        super::CandidateGatherer::new(socket, servers, timeout, Vec::new(), Vec::new())
+            .expect("gatherer config valid")
+    }
+
+    #[test]
+    fn stun_gather_recovers_lost_response_via_retransmit() {
+        // FIS-0011: the old single-shot path lost the whole gather cycle to
+        // one dropped datagram; the RTO ladder recovers within one RTO.
+        let (server, handle) = spawn_stun_ladder_server(1, true, Duration::from_secs(4));
+        let gatherer = ladder_test_gatherer(vec![server], Duration::from_secs(2));
+
+        let candidates = gatherer.gather();
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source == CandidateSource::ServerReflexive),
+            "retransmit must recover the dropped first response"
+        );
+        let requests_seen = handle.join().expect("server joins");
+        assert_eq!(requests_seen, 2, "one drop + one answered retransmit");
+    }
+
+    #[test]
+    fn stun_gather_slow_server_no_longer_starves_others() {
+        // Old behavior: server 1's full-budget recv_from consumed the whole
+        // deadline and server 2 was never queried. Fire-all means the live
+        // server answers regardless of the blackhole (RFC 5737 TEST-NET-1).
+        let blackhole: std::net::SocketAddr = "192.0.2.1:3478".parse().expect("blackhole addr");
+        let (live, handle) = spawn_stun_ladder_server(0, true, Duration::from_secs(4));
+        let timeout = Duration::from_millis(800);
+        let gatherer = ladder_test_gatherer(vec![blackhole, live], timeout);
+
+        let started = Instant::now();
+        let candidates = gatherer.gather();
+        let elapsed = started.elapsed();
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source == CandidateSource::ServerReflexive),
+            "live server behind a blackhole must still yield its srflx candidate"
+        );
+        assert!(
+            elapsed < timeout * 2,
+            "gather must stay within ~one shared deadline, took {elapsed:?}"
+        );
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn stun_gather_dark_server_gives_up_after_rc_attempts_within_deadline() {
+        let serve_for = Duration::from_millis(1900);
+        let (dark, handle) = spawn_stun_ladder_server(usize::MAX, false, serve_for);
+        let timeout = Duration::from_millis(1500);
+        let gatherer = ladder_test_gatherer(vec![dark], timeout);
+
+        let started = Instant::now();
+        let candidates = gatherer.gather();
+        let elapsed = started.elapsed();
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.source == CandidateSource::ServerReflexive),
+            "dark server must yield no srflx candidate"
+        );
+        assert!(
+            elapsed < timeout + Duration::from_millis(500),
+            "ladder must not blow the shared deadline, took {elapsed:?}"
+        );
+        // RTO ladder: sends at ~0ms, ~250ms, ~750ms — then no more within
+        // the 1.5s budget (next would be at 1750ms).
+        let requests_seen = handle.join().expect("server joins");
+        assert_eq!(
+            requests_seen,
+            usize::from(super::STUN_MAX_REQUEST_ATTEMPTS),
+            "ladder must stop at Rc sends"
+        );
     }
 
     #[test]
