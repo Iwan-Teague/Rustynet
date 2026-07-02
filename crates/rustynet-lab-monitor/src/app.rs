@@ -89,7 +89,13 @@ pub struct App {
 
     pub focused_panel: Panel,
     pub page: Page,
-    pub stage_cursor: usize,
+    /// Which of the 3 stage-grid groups (0=PRE, 1=BOOTSTRAP, 2=LIVE LAB) is
+    /// focused. Left/Right selects the group; Up/Down moves the cursor
+    /// within it -- each group keeps its own cursor (`stage_grid_row`)
+    /// rather than one flat index spanning all 3, so moving down the PRE
+    /// column doesn't spill over into BOOTSTRAP once it runs out.
+    pub stage_grid_col: usize,
+    pub stage_grid_row: [usize; 3],
     pub show_help: bool,
     pub show_stage_detail: bool,
     pub stage_detail_scroll: usize,
@@ -170,7 +176,8 @@ impl App {
             stage_matrix_visible_rows: Cell::new(0),
             focused_panel: Panel::VmStatus,
             page: Page::Overview,
-            stage_cursor: 0,
+            stage_grid_col: 0,
+            stage_grid_row: [0, 0, 0],
             show_help: false,
             show_stage_detail: false,
             stage_detail_scroll: 0,
@@ -269,10 +276,18 @@ impl App {
             });
     }
 
+    /// The stage name under the stage-grid cursor, per `stage_grid_col` /
+    /// `stage_grid_row`.
+    pub fn selected_stage_name(&self) -> Option<String> {
+        let groups = self.planned_stage_groups();
+        let group = groups.get(self.stage_grid_col)?;
+        let row = self.stage_grid_row[self.stage_grid_col];
+        group.stages.get(row).cloned()
+    }
+
     pub fn selected_stage_outcome(&self) -> Option<&crate::data::stage_reader::StageOutcome> {
-        let stages = self.planned_stages();
-        let stage = stages.get(self.stage_cursor)?;
-        self.stage_outcomes.iter().find(|o| &o.stage == stage)
+        let stage = self.selected_stage_name()?;
+        self.stage_outcomes.iter().find(|o| o.stage == stage)
     }
 
     fn selected_stage_has_outcome(&self) -> bool {
@@ -324,6 +339,10 @@ impl App {
         0
     }
 
+    /// Flattened view of `planned_stage_groups()`. Not used by the app
+    /// itself anymore (the stage grid now navigates per-column), kept as
+    /// a convenience for tests that don't care about grouping.
+    #[allow(dead_code)]
     pub fn planned_stages(&self) -> Vec<String> {
         self.planned_stage_groups()
             .into_iter()
@@ -437,6 +456,18 @@ impl App {
         stage == "linux_live_suite" && !self.config.skip_linux_live_suite
     }
 
+    /// The full stage catalog, every group unconditional -- whether a
+    /// given stage actually runs for the *next* launch depends on the
+    /// current config (mac/windows VM selection, --skip-* flags, which
+    /// platform is elected exit/relay/anchor/admin/blind_exit), which
+    /// `stage_enabled` reports for styling (grayed out vs white), but the
+    /// stage itself is always listed. Previously mac/windows-only stages
+    /// were omitted from the returned groups entirely whenever
+    /// `wants_macos()`/`wants_windows()` was false, so e.g. running a
+    /// Linux-only lab made every macOS/Windows stage vanish from the grid
+    /// instead of just showing as not-currently-planned -- and disagreed
+    /// with the Full Stage Matrix / Previous Runs panels, which show the
+    /// whole history-wide catalog regardless of the *next* run's config.
     pub fn planned_stage_groups(&self) -> Vec<StageGroup> {
         let pre = [
             "preflight",
@@ -462,52 +493,40 @@ impl App {
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-        let mut live_lab = Vec::new();
 
-        if self.config.wants_macos() {
-            bootstrap.extend(
-                [
-                    "bootstrap_macos_host",
-                    "collect_macos_pubkey",
-                    "amend_membership_for_macos",
-                    "distribute_macos_bundles",
-                    "validate_macos_mesh_join",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            );
-        }
-        if self.config.wants_macos() {
-            live_lab.extend(
-                macos_live_lab_catalog()
-                    .iter()
-                    .map(|stage| (*stage).to_owned()),
-            );
-        }
+        bootstrap.extend(
+            [
+                "bootstrap_macos_host",
+                "collect_macos_pubkey",
+                "amend_membership_for_macos",
+                "distribute_macos_bundles",
+                "validate_macos_mesh_join",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        bootstrap.extend(
+            [
+                "bootstrap_windows_host",
+                "collect_windows_pubkey",
+                "amend_membership_for_windows",
+                "distribute_windows_bundles",
+                "validate_windows_mesh_join",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
 
-        if self.config.wants_windows() {
-            bootstrap.extend(
-                [
-                    "bootstrap_windows_host",
-                    "collect_windows_pubkey",
-                    "amend_membership_for_windows",
-                    "distribute_windows_bundles",
-                    "validate_windows_mesh_join",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            );
-        }
-        if self.config.wants_windows() {
-            live_lab.extend(
-                windows_live_lab_catalog()
-                    .iter()
-                    .map(|stage| (*stage).to_owned()),
-            );
-        }
-        if !self.config.skip_linux_live_suite {
-            live_lab.push("linux_live_suite".to_owned());
-        }
+        let mut live_lab: Vec<String> = macos_live_lab_catalog()
+            .iter()
+            .map(|stage| (*stage).to_owned())
+            .collect();
+        live_lab.extend(
+            windows_live_lab_catalog()
+                .iter()
+                .map(|stage| (*stage).to_owned()),
+        );
+        live_lab.push("linux_live_suite".to_owned());
 
         vec![
             StageGroup {
@@ -812,8 +831,9 @@ impl App {
             }
 
             KeyCode::Up => match self.focused_panel {
-                Panel::StageGrid if self.stage_cursor > 0 => {
-                    self.stage_cursor -= 1;
+                Panel::StageGrid => {
+                    let col = self.stage_grid_col;
+                    self.stage_grid_row[col] = self.stage_grid_row[col].saturating_sub(1);
                 }
                 Panel::Log => {
                     if self.log_scroll == 0 {
@@ -846,8 +866,13 @@ impl App {
             },
             KeyCode::Down => match self.focused_panel {
                 Panel::StageGrid => {
-                    let max = self.planned_stages().len().saturating_sub(1);
-                    self.stage_cursor = (self.stage_cursor + 1).min(max);
+                    let col = self.stage_grid_col;
+                    let max = self
+                        .planned_stage_groups()
+                        .get(col)
+                        .map(|group| group.stages.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    self.stage_grid_row[col] = (self.stage_grid_row[col] + 1).min(max);
                 }
                 Panel::Log => {
                     self.log_scroll = self.log_scroll.saturating_sub(1);
@@ -899,6 +924,14 @@ impl App {
             KeyCode::Right if self.focused_panel == Panel::StageMatrix => {
                 self.stage_matrix_os_col = (self.stage_matrix_os_col + 1).min(2);
                 self.clamp_stage_matrix_scroll(self.stage_matrix_os_col);
+            }
+            KeyCode::Left if self.focused_panel == Panel::StageGrid => {
+                self.stage_grid_col = self.stage_grid_col.saturating_sub(1);
+                self.clamp_stage_grid_row(self.stage_grid_col);
+            }
+            KeyCode::Right if self.focused_panel == Panel::StageGrid => {
+                self.stage_grid_col = (self.stage_grid_col + 1).min(2);
+                self.clamp_stage_grid_row(self.stage_grid_col);
             }
             KeyCode::Left if self.focused_panel == Panel::Agents => {
                 if self.agents_active {
@@ -1027,7 +1060,7 @@ impl App {
         if self.active_job.is_some() {
             return;
         }
-        let Some(stage) = self.planned_stages().get(self.stage_cursor).cloned() else {
+        let Some(stage) = self.selected_stage_name() else {
             return;
         };
         if let Some(idx) = self
@@ -1271,6 +1304,19 @@ impl App {
         let visible = self.stage_matrix_visible_rows.get().max(1);
         let max_scroll = len.saturating_sub(visible);
         self.stage_matrix_scroll[col] = self.stage_matrix_scroll[col].min(max_scroll);
+    }
+
+    /// Keep `stage_grid_row[col]` within the given group's actual stage
+    /// count -- needed on a Left/Right column switch, since each group can
+    /// have a different length and a stale row index from a longer group
+    /// would otherwise point past the end of a shorter one.
+    fn clamp_stage_grid_row(&mut self, col: usize) {
+        let max = self
+            .planned_stage_groups()
+            .get(col)
+            .map(|group| group.stages.len().saturating_sub(1))
+            .unwrap_or(0);
+        self.stage_grid_row[col] = self.stage_grid_row[col].min(max);
     }
 
     fn cycle_selected_vm_role(&mut self, direction: isize) {
@@ -2075,6 +2121,63 @@ mod tests {
     }
 
     #[test]
+    fn stage_grid_row_does_not_spill_into_the_next_column_at_the_bottom() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.focused_panel = Panel::StageGrid;
+        app.stage_grid_col = 0; // PRE group: 5 stages
+
+        for _ in 0..10 {
+            app.handle_key(KeyCode::Down, KeyModifiers::empty());
+        }
+
+        // Must stop at the last row of PRE (index 4), never spill the
+        // column focus or cursor into BOOTSTRAP just because Down was
+        // pressed more times than PRE has stages.
+        assert_eq!(app.stage_grid_col, 0);
+        assert_eq!(app.stage_grid_row[0], 4);
+    }
+
+    #[test]
+    fn stage_grid_left_right_switches_column_with_independent_cursors() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.focused_panel = Panel::StageGrid;
+        app.stage_grid_col = 0;
+
+        app.handle_key(KeyCode::Down, KeyModifiers::empty());
+        app.handle_key(KeyCode::Down, KeyModifiers::empty());
+        assert_eq!(app.stage_grid_row[0], 2);
+
+        app.handle_key(KeyCode::Right, KeyModifiers::empty());
+        assert_eq!(app.stage_grid_col, 1);
+        // BOOTSTRAP's own cursor starts fresh at 0, unaffected by PRE's.
+        assert_eq!(app.stage_grid_row[1], 0);
+
+        app.handle_key(KeyCode::Down, KeyModifiers::empty());
+        assert_eq!(app.stage_grid_row[1], 1);
+
+        app.handle_key(KeyCode::Left, KeyModifiers::empty());
+        // Switching back to PRE keeps its own cursor exactly where it was.
+        assert_eq!(app.stage_grid_col, 0);
+        assert_eq!(app.stage_grid_row[0], 2);
+    }
+
+    #[test]
+    fn stage_grid_row_clamps_when_switching_to_a_shorter_column() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.focused_panel = Panel::StageGrid;
+        app.stage_grid_col = 1;
+        // PRE (column 0) has only 5 stages (indices 0-4); simulate a stale
+        // row left over from e.g. a taller terminal that could once fit
+        // that far, or a config change that shrank the group.
+        app.stage_grid_row[0] = 20;
+
+        app.handle_key(KeyCode::Left, KeyModifiers::empty());
+
+        assert_eq!(app.stage_grid_col, 0);
+        assert_eq!(app.stage_grid_row[0], 4);
+    }
+
+    #[test]
     fn c_key_forces_vm_commit_probe() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.last_vm_probe = Some(std::time::Instant::now());
@@ -2258,25 +2361,34 @@ mod tests {
             app.planned_stages()
                 .contains(&"validate_windows_exit_nat_lifecycle".to_owned())
         );
+        // linux_live_suite is always listed (the grid shows the full
+        // catalog now), it just reads as disabled/grayed for this config.
         assert!(
-            !app.planned_stages()
+            app.planned_stages()
                 .contains(&"linux_live_suite".to_owned())
         );
+        assert!(!app.stage_enabled("linux_live_suite"));
     }
 
     #[test]
-    fn default_macos_target_hides_linux_suite_and_keeps_only_macos_bootstrap() {
+    fn default_macos_target_disables_linux_suite_but_still_lists_every_stage() {
         let app = App::new(PathBuf::from("/tmp")).expect("app");
 
         assert!(app.config.skip_linux_live_suite);
+        // The full catalog is always listed regardless of what the
+        // current config actually plans to run -- stage_enabled (styling)
+        // is how the grid distinguishes "will run" from "grayed out",
+        // not list membership.
         assert!(
-            !app.planned_stages()
+            app.planned_stages()
                 .contains(&"linux_live_suite".to_owned())
         );
+        assert!(!app.stage_enabled("linux_live_suite"));
         assert!(
             app.planned_stages()
                 .contains(&"bootstrap_macos_host".to_owned())
         );
+        assert!(app.stage_enabled("bootstrap_macos_host"));
         assert!(
             app.planned_stages()
                 .contains(&"validate_macos_blind_exit".to_owned())
@@ -2289,10 +2401,12 @@ mod tests {
             app.planned_stages()
                 .contains(&"validate_macos_exit_killswitch_precedence".to_owned())
         );
+        // Windows stages are listed too now, just not enabled by default.
         assert!(
-            !app.planned_stages()
+            app.planned_stages()
                 .contains(&"bootstrap_windows_host".to_owned())
         );
+        assert!(!app.stage_enabled("bootstrap_windows_host"));
     }
 
     #[test]
@@ -2321,9 +2435,10 @@ mod tests {
                 .contains(&"validate_windows_relay_service_lifecycle".to_owned())
         );
         assert!(
-            !app.planned_stages()
+            app.planned_stages()
                 .contains(&"linux_live_suite".to_owned())
         );
+        assert!(!app.stage_enabled("linux_live_suite"));
     }
 
     #[test]
