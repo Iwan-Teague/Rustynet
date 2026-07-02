@@ -359,7 +359,15 @@ impl App {
             && self.stage_selected_for_current_target(stage)
     }
 
-    fn stage_selected_for_current_target(&self, stage: &str) -> bool {
+    /// Whether `stage` is even *possible* for the current target config
+    /// (right platform/role elected) -- independent of whether the user has
+    /// manually toggled it off via `toggle_selected_stage`. Grid rendering
+    /// needs this split from `stage_enabled`: a stage the user disabled but
+    /// that is still possible must render as "possible, not currently
+    /// planned" (white, empty box), never as "impossible" (grayed out) --
+    /// greying out is reserved for genuinely impossible stages, e.g. a
+    /// Windows-only check on a Linux-only run.
+    pub fn stage_selected_for_current_target(&self, stage: &str) -> bool {
         if matches!(
             stage,
             "preflight"
@@ -1475,7 +1483,12 @@ impl App {
                     let alias = self.default_alias_for_os(os);
                     self.configure_target(role.label(), os.label(), alias);
                     self.save_config_best_effort();
-                    self.focused_panel = Panel::VmStatus;
+                    // Deliberately does NOT touch focused_panel -- this runs
+                    // both from the 'a' keypress and from the automatic
+                    // advance-when-proven tick in refresh_state, so forcing
+                    // focus to VmStatus would yank the cursor away from
+                    // whatever panel (e.g. StageGrid) the user is actively
+                    // working in, on every 2s refresh tick.
                     return;
                 }
             }
@@ -2476,6 +2489,39 @@ mod tests {
         assert_eq!(app.config.macos_vm, "macos-utm-1");
         assert!(app.config.macos_promote_exit);
         assert_eq!(app.config.rebuild_nodes, "macos-utm-1");
+    }
+
+    #[test]
+    fn auto_select_next_target_does_not_steal_focus_from_the_current_panel() {
+        // Regression: auto_select_next_target used to force
+        // focused_panel = Panel::VmStatus unconditionally. It runs both on
+        // the 'a' keypress and silently from the periodic advance-when-proven
+        // refresh tick, so it must never yank focus away from whatever panel
+        // (e.g. StageGrid) the user is actively working in.
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("documents").join("operations");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("live_lab_run_matrix.csv"),
+            "overall_result,macos_stage_exit\npass,fail\n",
+        )
+        .unwrap();
+
+        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        app.vm_statuses.push(crate::data::vm_prober::VmStatus {
+            alias: "macos-utm-1".into(),
+            ip: "192.168.0.210".into(),
+            platform: "macos".into(),
+            ssh_ok: true,
+            git_commit: Some("abc1234".into()),
+        });
+        app.page = Page::Run;
+        app.focused_panel = Panel::StageGrid;
+
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::empty());
+
+        assert_eq!(app.config.area, "macOS exit");
+        assert_eq!(app.focused_panel, Panel::StageGrid);
     }
 
     #[test]
