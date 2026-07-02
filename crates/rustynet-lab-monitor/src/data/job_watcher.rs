@@ -55,6 +55,17 @@ pub fn find_active_job(repo_root: &Path) -> Result<Option<JobState>> {
 }
 
 pub fn find_running_jobs(repo_root: &Path) -> Result<Vec<JobState>> {
+    find_running_jobs_with_live_processes(repo_root, find_live_orchestrator_report_dirs())
+}
+
+/// The actual implementation, taking the live-process list as a parameter
+/// instead of shelling out to `ps` itself, so tests can exercise the
+/// job-state-JSON/orphan-scan logic in isolation from whatever orchestrator
+/// processes happen to really be running on the machine at test time.
+fn find_running_jobs_with_live_processes(
+    repo_root: &Path,
+    live_processes: Vec<(u32, PathBuf)>,
+) -> Result<Vec<JobState>> {
     let mut jobs: Vec<JobState> = Vec::new();
     for dir in [
         repo_root.join("state/deepseek-mcp-jobs"),
@@ -79,8 +90,10 @@ pub fn find_running_jobs(repo_root: &Path) -> Result<Vec<JobState>> {
         }
     }
 
-    // Track which report dirs are already known from job-state JSONs
-    let tracked_report_dirs: std::collections::HashSet<String> = jobs
+    // Track which report dirs are already known, from job-state JSONs first
+    // and growing as orphan/process-discovered ones are added below, so the
+    // same report dir is never double-counted across the three sources.
+    let mut seen_report_dirs: std::collections::HashSet<String> = jobs
         .iter()
         .filter_map(|j| repo_root.join(&j.report_dir).canonicalize().ok())
         .map(|p| p.display().to_string())
@@ -103,7 +116,7 @@ pub fn find_running_jobs(repo_root: &Path) -> Result<Vec<JobState>> {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
-            if tracked_report_dirs.contains(&dir_str) {
+            if seen_report_dirs.contains(&dir_str) {
                 continue;
             }
             // Active = orchestrate_result.json missing AND report_state.json not run_complete
@@ -122,6 +135,7 @@ pub fn find_running_jobs(repo_root: &Path) -> Result<Vec<JobState>> {
             }
             let started_unix = read_started_unix(&dir_path);
             let area = infer_area_from_dir_name(&dir_path);
+            seen_report_dirs.insert(dir_str);
             jobs.push(JobState {
                 job_id: dir_path
                     .file_name()
@@ -136,6 +150,39 @@ pub fn find_running_jobs(repo_root: &Path) -> Result<Vec<JobState>> {
                 request_args: None,
             });
         }
+    }
+
+    // Discover orchestrator processes directly from the process table, so a
+    // run launched ad-hoc from the CLI with --report-dir pointing anywhere
+    // on disk (e.g. /private/tmp/...) is still found even though it has no
+    // job-state JSON and its report dir isn't under repo_root/state/.
+    for (pid, dir_path) in live_processes {
+        if !dir_path.is_dir() {
+            continue;
+        }
+        let canonical = dir_path.canonicalize().ok();
+        let dir_str = canonical
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        if !seen_report_dirs.insert(dir_str) {
+            continue;
+        }
+        let started_unix = read_started_unix(&dir_path);
+        let area = infer_area_from_dir_name(&dir_path);
+        jobs.push(JobState {
+            job_id: dir_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("orchestrator")
+                .to_owned(),
+            state: "running".to_owned(),
+            pid: Some(pid),
+            started_unix,
+            area,
+            report_dir: dir_path.display().to_string(),
+            request_args: None,
+        });
     }
 
     jobs.retain(JobState::is_running);
@@ -184,6 +231,66 @@ fn has_recent_activity(dir: &Path) -> bool {
         return false;
     };
     logs.flatten().any(|entry| is_recent(&entry.path()))
+}
+
+/// CLI subcommands that run a live-lab orchestration and accept
+/// `--report-dir` -- matched as a substring against each process's argv.
+const ORCHESTRATOR_SUBCOMMANDS: &[&str] = &["vm-lab-orchestrate-live-lab", "vm-lab-setup-live-lab"];
+
+/// Discover orchestrator processes directly from the process table via
+/// `ps`, so an ad-hoc CLI-launched run is found even when it has no
+/// job-state JSON and its `--report-dir` isn't under `repo_root/state/`
+/// (e.g. `/private/tmp/...`, which is how most manual runs are launched).
+/// Best-effort: an empty result on any failure just means this source
+/// contributes nothing, not that the scan fails.
+fn find_live_orchestrator_report_dirs() -> Vec<(u32, PathBuf)> {
+    let output = std::process::Command::new("ps")
+        .args(["-eo", "pid=,args=", "-ww"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            parse_orchestrator_processes(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Pure parser for `ps -eo pid=,args=` output, isolated from the `ps`
+/// invocation so it's unit-testable without a real process table.
+fn parse_orchestrator_processes(ps_output: &str) -> Vec<(u32, PathBuf)> {
+    let mut found = Vec::new();
+    for line in ps_output.lines() {
+        let line = line.trim_start();
+        let Some((pid_str, command)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid_str.trim().parse::<u32>() else {
+            continue;
+        };
+        if !ORCHESTRATOR_SUBCOMMANDS
+            .iter()
+            .any(|sub| command.contains(sub))
+        {
+            continue;
+        }
+        if let Some(report_dir) = extract_arg_value(command, "--report-dir") {
+            found.push((pid, PathBuf::from(report_dir)));
+        }
+    }
+    found
+}
+
+/// Extract the value following `flag` in a whitespace-separated argv
+/// string. Best-effort: the orchestrator's own flags are always simple
+/// unquoted tokens, so no shell-style parsing is needed.
+fn extract_arg_value(command: &str, flag: &str) -> Option<String> {
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == flag {
+            return tokens.next().map(str::to_owned);
+        }
+    }
+    None
 }
 
 /// Best-effort parse of the run's creation timestamp
@@ -259,6 +366,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_orchestrator_processes_extracts_pid_and_report_dir() {
+        let ps_output = " 8226 target/debug/rustynet-cli ops vm-lab-orchestrate-live-lab --inventory documents/operations/active/vm_lab_inventory.json --report-dir /private/tmp/rn_role_windows_anchor_mixed_20260702_01 --ssh-identity-file /Users/iwan/.ssh/rustynet_lab_ed25519\n\
+             50807 /bin/zsh -c echo unrelated\n";
+
+        let found = parse_orchestrator_processes(ps_output);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, 8226);
+        assert_eq!(
+            found[0].1,
+            PathBuf::from("/private/tmp/rn_role_windows_anchor_mixed_20260702_01")
+        );
+    }
+
+    #[test]
+    fn parse_orchestrator_processes_ignores_non_orchestrator_and_malformed_lines() {
+        let ps_output = "not-a-pid some command\n\
+             1234 some-unrelated-process --report-dir /tmp/x\n\
+             5678 rustynet-cli ops vm-lab-orchestrate-live-lab\n"; // no --report-dir at all
+
+        let found = parse_orchestrator_processes(ps_output);
+
+        assert!(
+            found.is_empty(),
+            "malformed pid, non-orchestrator command, and missing --report-dir must all be skipped: {found:?}"
+        );
+    }
+
+    #[test]
+    fn parse_orchestrator_processes_matches_setup_live_lab_too() {
+        let ps_output = " 999 rustynet-cli ops vm-lab-setup-live-lab --report-dir /tmp/setup-run\n";
+
+        let found = parse_orchestrator_processes(ps_output);
+
+        assert_eq!(found, vec![(999, PathBuf::from("/tmp/setup-run"))]);
+    }
+
+    #[test]
     fn deepseek_orchestrator_pid_alias_is_running_pid() {
         let dir = tempfile::tempdir().expect("tempdir");
         let jobs = dir.path().join("state/deepseek-mcp-jobs");
@@ -279,7 +424,8 @@ mod tests {
         )
         .expect("job json");
 
-        let running = find_running_jobs(dir.path()).expect("running jobs");
+        let running =
+            find_running_jobs_with_live_processes(dir.path(), Vec::new()).expect("running jobs");
 
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].pid, Some(std::process::id()));
@@ -306,7 +452,8 @@ mod tests {
             std::time::Duration::from_secs(2 * 60 * 60),
         );
 
-        let running = find_running_jobs(dir.path()).expect("running jobs");
+        let running =
+            find_running_jobs_with_live_processes(dir.path(), Vec::new()).expect("running jobs");
 
         assert!(
             running.is_empty(),
@@ -323,9 +470,66 @@ mod tests {
             std::time::Duration::from_secs(30),
         );
 
-        let running = find_running_jobs(dir.path()).expect("running jobs");
+        let running =
+            find_running_jobs_with_live_processes(dir.path(), Vec::new()).expect("running jobs");
 
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].job_id, "live-lab-in-progress-run");
+    }
+
+    #[test]
+    fn process_discovered_report_dir_outside_repo_root_is_running() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let external = tempfile::tempdir().expect("external report dir, e.g. /private/tmp/...");
+
+        // self::process::id() so the pid is guaranteed alive during the test.
+        let live_processes = vec![(std::process::id(), external.path().to_path_buf())];
+        let running = find_running_jobs_with_live_processes(repo.path(), live_processes)
+            .expect("running jobs");
+
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].pid, Some(std::process::id()));
+        assert_eq!(running[0].report_dir, external.path().display().to_string());
+    }
+
+    #[test]
+    fn process_discovered_report_dir_with_a_dead_pid_is_not_running() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let external = tempfile::tempdir().expect("external report dir");
+
+        // A pid that (barring astronomically unlucky reuse) is not alive.
+        // Not u32::MAX: cast to i32 that's -1, which kill() treats as a
+        // broadcast-permission check rather than "does this pid exist" and
+        // trivially succeeds.
+        let live_processes = vec![(999_999_999, external.path().to_path_buf())];
+        let running = find_running_jobs_with_live_processes(repo.path(), live_processes)
+            .expect("running jobs");
+
+        assert!(running.is_empty(), "{running:?}");
+    }
+
+    #[test]
+    fn process_discovered_report_dir_already_tracked_is_not_duplicated() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let jobs_dir = repo.path().join("state/deepseek-mcp-jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        let tracked_report_dir = repo.path().join("state/tracked-run");
+        std::fs::create_dir_all(&tracked_report_dir).expect("tracked report dir");
+        std::fs::write(
+            jobs_dir.join("labrun-1.json"),
+            format!(
+                r#"{{"job_id":"labrun-1","state":"running","started_unix":1,"area":"x","report_dir":"state/tracked-run","orchestrator_pid":{}}}"#,
+                std::process::id()
+            ),
+        )
+        .expect("job json");
+
+        // The process table also reports the same (canonicalized) report
+        // dir -- must not produce a second entry for it.
+        let live_processes = vec![(std::process::id(), tracked_report_dir.clone())];
+        let running = find_running_jobs_with_live_processes(repo.path(), live_processes)
+            .expect("running jobs");
+
+        assert_eq!(running.len(), 1, "{running:?}");
     }
 }
