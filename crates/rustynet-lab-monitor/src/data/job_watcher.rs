@@ -114,6 +114,12 @@ pub fn find_running_jobs(repo_root: &Path) -> Result<Vec<JobState>> {
             if has_final_result {
                 continue;
             }
+            // No completion marker alone doesn't mean running -- most report
+            // dirs under state/ are crashed/abandoned runs from way in the
+            // past that never got one written. Require recent activity too.
+            if !has_recent_activity(&dir_path) {
+                continue;
+            }
             let started_unix = read_started_unix(&dir_path);
             let area = infer_area_from_dir_name(&dir_path);
             jobs.push(JobState {
@@ -151,6 +157,33 @@ fn read_report_complete_flag(dir: &Path) -> bool {
             .unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// An orphan report dir with no completion marker only counts as "running" if
+/// something in it was touched within this window. Without this, every
+/// crashed/abandoned run under `state/` (which never gets a completion
+/// marker written) would show up as running forever.
+const ORPHAN_LIVENESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Best-effort "is this report dir still being actively written to". Checks
+/// `state/stages.tsv` and the newest file directly under `logs/` (one level,
+/// not a recursive walk) against `ORPHAN_LIVENESS_WINDOW`.
+fn has_recent_activity(dir: &Path) -> bool {
+    let now = std::time::SystemTime::now();
+    let is_recent = |path: &Path| -> bool {
+        path.metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age <= ORPHAN_LIVENESS_WINDOW)
+    };
+    if is_recent(&dir.join("state/stages.tsv")) {
+        return true;
+    }
+    let Ok(logs) = std::fs::read_dir(dir.join("logs")) else {
+        return false;
+    };
+    logs.flatten().any(|entry| is_recent(&entry.path()))
 }
 
 /// Best-effort parse of the run's creation timestamp
@@ -250,5 +283,49 @@ mod tests {
 
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].pid, Some(std::process::id()));
+    }
+
+    fn write_orphan_report_dir(repo_root: &Path, name: &str, stages_tsv_age: std::time::Duration) {
+        let report_dir = repo_root.join("state").join(name);
+        std::fs::create_dir_all(report_dir.join("state")).expect("state dir");
+        let stages_tsv = report_dir.join("state/stages.tsv");
+        std::fs::write(&stages_tsv, "stage\tstatus\n").expect("stages.tsv");
+        let stale_time = std::time::SystemTime::now() - stages_tsv_age;
+        std::fs::File::open(&stages_tsv)
+            .expect("reopen stages.tsv")
+            .set_modified(stale_time)
+            .expect("backdate stages.tsv");
+    }
+
+    #[test]
+    fn stale_orphan_report_dir_without_recent_activity_is_not_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_orphan_report_dir(
+            dir.path(),
+            "live-lab-abandoned-run",
+            std::time::Duration::from_secs(2 * 60 * 60),
+        );
+
+        let running = find_running_jobs(dir.path()).expect("running jobs");
+
+        assert!(
+            running.is_empty(),
+            "a report dir with no completion marker but no recent activity must not be shown as running: {running:?}"
+        );
+    }
+
+    #[test]
+    fn orphan_report_dir_with_recent_activity_is_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_orphan_report_dir(
+            dir.path(),
+            "live-lab-in-progress-run",
+            std::time::Duration::from_secs(30),
+        );
+
+        let running = find_running_jobs(dir.path()).expect("running jobs");
+
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].job_id, "live-lab-in-progress-run");
     }
 }
