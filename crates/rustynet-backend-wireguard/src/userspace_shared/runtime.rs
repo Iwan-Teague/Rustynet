@@ -192,6 +192,19 @@ impl RuntimeControl {
         self.request(|reply| RuntimeRequest::PeerLatestHandshake { node_id, reply })
     }
 
+    pub(crate) fn peer_path_quality(
+        &self,
+        node_id: NodeId,
+    ) -> Result<
+        Option<(
+            rustynet_backend_api::PeerPathSample,
+            rustynet_backend_api::PathHealth,
+        )>,
+        BackendError,
+    > {
+        self.request(|reply| RuntimeRequest::PeerPathQuality { node_id, reply })
+    }
+
     pub(crate) fn remove_peer(&self, node_id: NodeId) -> Result<(), BackendError> {
         self.request(|reply| RuntimeRequest::RemovePeer { node_id, reply })
     }
@@ -364,6 +377,17 @@ enum RuntimeRequest {
         node_id: NodeId,
         reply: ReplySender<Option<u64>>,
     },
+    /// FIS-0004/0013: per-peer path-quality read (raw sample + coarse
+    /// health verdict in one round trip).
+    PeerPathQuality {
+        node_id: NodeId,
+        reply: ReplySender<
+            Option<(
+                rustynet_backend_api::PeerPathSample,
+                rustynet_backend_api::PathHealth,
+            )>,
+        >,
+    },
     RemovePeer {
         node_id: NodeId,
         reply: ReplySender<()>,
@@ -509,6 +533,23 @@ impl RuntimeState {
             return Err(BackendError::invalid_input("peer is not configured"));
         }
         Ok(self.handshake_telemetry.latest_handshake(node_id))
+    }
+
+    fn peer_path_quality(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<
+        Option<(
+            rustynet_backend_api::PeerPathSample,
+            rustynet_backend_api::PathHealth,
+        )>,
+        BackendError,
+    > {
+        if !self.engine.has_peer(node_id) {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        }
+        let latest_handshake = self.handshake_telemetry.latest_handshake(node_id);
+        Ok(self.engine.peer_path_quality(node_id, latest_handshake))
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
@@ -1015,6 +1056,10 @@ fn handle_request(state: &mut RuntimeState, request: RuntimeRequest) -> bool {
         }
         RuntimeRequest::PeerLatestHandshake { node_id, reply } => {
             let _ = reply.send(state.peer_latest_handshake_unix(&node_id));
+            true
+        }
+        RuntimeRequest::PeerPathQuality { node_id, reply } => {
+            let _ = reply.send(state.peer_path_quality(&node_id));
             true
         }
         RuntimeRequest::RemovePeer { node_id, reply } => {

@@ -9,6 +9,7 @@ members = [
   "crates/rustynet-nas",
   "crates/rustynet-llm-gateway",
   "crates/rustynet-policy",
+  "crates/rustynet-advisor",
   "crates/rustynet-crypto",
   "crates/rustynet-windows-native",
   "crates/rustynet-backend-api",

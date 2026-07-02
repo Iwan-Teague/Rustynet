@@ -47,6 +47,10 @@ pub struct TraversalEngineConfig {
     pub round_spacing_ms: u64,
     pub relay_switch_after_failures: u8,
     pub stun_servers: Vec<SocketAddr>,
+    /// TOTAL gather deadline across ALL configured STUN servers (FIS-0018):
+    /// the socket path fires every binding request up front and collects
+    /// under one deadline; the (singleton) round-trip path slices this
+    /// budget per server. Not a per-server timeout.
     pub stun_gather_timeout_ms: u64,
     /// How many seconds before expiry to fire a proactive refresh (B3-a).
     pub pre_expiry_refresh_margin_secs: u64,
@@ -264,19 +268,7 @@ impl CandidateGatherer {
                     addr: bound_addr.ip(),
                     port: bound_addr.port(),
                 });
-        let deadline = Instant::now() + self.timeout;
-        let mut srflx_results = Vec::new();
-        for server in &self.stun_servers {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            if remaining.is_zero() {
-                break;
-            }
-            srflx_results.push(self.query_stun_server(*server, remaining));
-        }
+        let srflx_results = self.query_stun_servers_batched();
 
         collect_gathered_candidates(
             local_bound_endpoint,
@@ -287,59 +279,156 @@ impl CandidateGatherer {
         )
     }
 
-    fn query_stun_server(
-        &self,
-        server: SocketAddr,
-        timeout: Duration,
-    ) -> Result<SocketEndpoint, TraversalError> {
-        let mut transaction_id = [0u8; 12];
-        rand::rngs::OsRng
-            .try_fill_bytes(transaction_id.as_mut_slice())
-            .map_err(|err| TraversalError::Stun(format!("os randomness unavailable: {err}")))?;
-        let request = build_stun_binding_request(transaction_id);
-        self.local_socket
-            .set_read_timeout(Some(timeout))
-            .map_err(|err| {
-                TraversalError::Stun(format!("failed to set stun read timeout: {err}"))
-            })?;
-        self.local_socket
-            .set_write_timeout(Some(timeout))
-            .map_err(|err| {
-                TraversalError::Stun(format!("failed to set stun write timeout: {err}"))
-            })?;
-        self.local_socket
-            .send_to(request.as_slice(), server)
-            .map_err(|err| TraversalError::Stun(format!("failed to send stun request: {err}")))?;
+    /// FIS-0011: fire-all-then-collect srflx gathering with an
+    /// RFC 5389 §7.2.1-shaped retransmission ladder.
+    ///
+    /// All binding requests go out up front (own transaction id each; a
+    /// retransmission reuses its original id per the RFC), then one receive
+    /// loop demuxes responses by source address + transaction-id echo until
+    /// the shared gather deadline. An unanswered request retransmits on its
+    /// RTO ladder (250ms initial, doubling, at most
+    /// [`STUN_MAX_REQUEST_ATTEMPTS`] sends — sized down from the RFC's 7
+    /// because this is a short-budget candidate discovery, not a control
+    /// transaction). This simultaneously fixes the old serial path's
+    /// starvation bug (server 1's full-budget `recv_from` blanked servers
+    /// 2..N) and its single-shot fragility (one lost datagram cost the whole
+    /// gather cycle). Results are per-server, in server order.
+    fn query_stun_servers_batched(&self) -> Vec<Result<SocketEndpoint, TraversalError>> {
+        let timed_out = || TraversalError::Stun("stun response timed out".to_owned());
+        let mut results: Vec<Result<SocketEndpoint, TraversalError>> =
+            self.stun_servers.iter().map(|_| Err(timed_out())).collect();
+        if self.stun_servers.is_empty() {
+            return results;
+        }
+        if let Err(err) = self.local_socket.set_write_timeout(Some(self.timeout)) {
+            let message = format!("failed to set stun write timeout: {err}");
+            for slot in &mut results {
+                *slot = Err(TraversalError::Stun(message.clone()));
+            }
+            return results;
+        }
+
+        let deadline = Instant::now() + self.timeout;
+        let mut outstanding: Vec<OutstandingStunQuery> = Vec::new();
+        for (server_index, server) in self.stun_servers.iter().enumerate() {
+            let mut transaction_id = [0u8; 12];
+            if let Err(err) = rand::rngs::OsRng.try_fill_bytes(transaction_id.as_mut_slice()) {
+                results[server_index] = Err(TraversalError::Stun(format!(
+                    "os randomness unavailable: {err}"
+                )));
+                continue;
+            }
+            let request = build_stun_binding_request(transaction_id);
+            if let Err(err) = self.local_socket.send_to(request.as_slice(), *server) {
+                results[server_index] = Err(TraversalError::Stun(format!(
+                    "failed to send stun request: {err}"
+                )));
+                continue;
+            }
+            outstanding.push(OutstandingStunQuery {
+                server_index,
+                server: *server,
+                transaction_id,
+                next_retransmit_at: Instant::now() + STUN_INITIAL_RTO,
+                rto: STUN_INITIAL_RTO,
+                attempts: 1,
+            });
+        }
 
         let mut buffer = [0u8; 1500];
-        let receive_started = Instant::now();
-        // loop { // removed to silence clippy: loop never loops
-        match self.local_socket.recv_from(&mut buffer) {
-            Ok((received, _source)) => {
-                parse_stun_xor_mapped_address(buffer[..received].as_ref(), transaction_id).map(
-                    |addr| SocketEndpoint {
-                        addr: addr.ip(),
-                        port: addr.port(),
-                    },
-                )
+        while !outstanding.is_empty() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
             }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                Err(TraversalError::Stun("stun response timed out".to_owned()))
+            // Wake at the earliest pending retransmit (or the deadline when
+            // every ladder is exhausted); floor 1ms so a due-now retransmit
+            // cannot busy-spin the receive.
+            let wake_at = outstanding
+                .iter()
+                .filter(|query| query.attempts < STUN_MAX_REQUEST_ATTEMPTS)
+                .map(|query| query.next_retransmit_at)
+                .min()
+                .map_or(deadline, |at| at.min(deadline));
+            let wait = wake_at
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(1));
+            if self.local_socket.set_read_timeout(Some(wait)).is_err() {
+                break;
             }
-            Err(err) => {
-                if receive_started.elapsed() >= timeout {
-                    return Err(TraversalError::Stun("stun response timed out".to_owned()));
+            match self.local_socket.recv_from(&mut buffer) {
+                Ok((received, source)) => {
+                    let Some(position) =
+                        outstanding.iter().position(|query| query.server == source)
+                    else {
+                        // Response from an unqueried source: reject.
+                        continue;
+                    };
+                    match parse_stun_xor_mapped_address(
+                        buffer[..received].as_ref(),
+                        outstanding[position].transaction_id,
+                    ) {
+                        Ok(addr) => {
+                            let query = outstanding.swap_remove(position);
+                            results[query.server_index] = Ok(SocketEndpoint {
+                                addr: addr.ip(),
+                                port: addr.port(),
+                            });
+                        }
+                        // Malformed or wrong transaction id from a real
+                        // target: drop the datagram, keep the query pending.
+                        Err(_) => continue,
+                    }
                 }
-                Err(TraversalError::Stun(format!(
-                    "failed to receive stun response: {err}"
-                )))
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // Receive window elapsed: fall through to the
+                    // retransmit sweep below.
+                }
+                Err(_) => break,
+            }
+            let now = Instant::now();
+            for query in &mut outstanding {
+                if query.attempts < STUN_MAX_REQUEST_ATTEMPTS && now >= query.next_retransmit_at {
+                    let request = build_stun_binding_request(query.transaction_id);
+                    if self
+                        .local_socket
+                        .send_to(request.as_slice(), query.server)
+                        .is_ok()
+                    {
+                        query.attempts += 1;
+                        query.rto = query.rto.saturating_mul(2);
+                        query.next_retransmit_at = now + query.rto;
+                    } else {
+                        // Send failure mid-gather: stop retransmitting this
+                        // query; an earlier send may still be answered.
+                        query.attempts = STUN_MAX_REQUEST_ATTEMPTS;
+                    }
+                }
             }
         }
-        // }
+        results
     }
+}
+
+/// Initial retransmission timeout for the FIS-0011 STUN ladder
+/// (RFC 5389 §7.2.1 default is 500ms; halved because the whole gather
+/// budget defaults to 2s and this is candidate discovery).
+const STUN_INITIAL_RTO: Duration = Duration::from_millis(250);
+/// Total sends per server per gather (initial + retransmits) — the RFC's
+/// `Rc`, sized down from 7 for the short gather budget.
+const STUN_MAX_REQUEST_ATTEMPTS: u8 = 3;
+
+/// One in-flight binding request awaiting its response or next retransmit.
+struct OutstandingStunQuery {
+    server_index: usize,
+    server: SocketAddr,
+    transaction_id: [u8; 12],
+    next_retransmit_at: Instant,
+    rto: Duration,
+    attempts: u8,
 }
 
 fn collect_gathered_candidates(
@@ -998,7 +1087,6 @@ pub struct TraversalSession {
     pub active_endpoint: Option<SocketEndpoint>,
     pub consecutive_direct_failures: u8,
     pub last_transition: TransitionEvent,
-    pub last_keepalive_unix: Option<u64>,
 }
 
 impl TraversalSession {
@@ -1014,7 +1102,6 @@ impl TraversalSession {
                 reason: TransitionReason::SessionBoot,
                 at_unix: now_unix,
             },
-            last_keepalive_unix: None,
         }
     }
 
@@ -1078,24 +1165,395 @@ impl TraversalSession {
         Some(event)
     }
 
+    /// Thin delegate: the NAT-conditioned 15/25 values moved into
+    /// [`crate::keepalive::KeepalivePrior`] as the FIS-0015 estimator's
+    /// cold-start priors (see [`keepalive_prior_for_nat`]). Kept until
+    /// `TraversalSession`'s disposition is settled by FIS-0010.
     pub fn recommended_keepalive_secs(nat_profile: NatProfile) -> u64 {
-        if nat_profile.is_hard_nat() || !nat_profile.preserves_port {
-            15
-        } else {
-            25
+        u64::from(keepalive_prior_for_nat(Some(nat_profile)).prior_interval_secs())
+    }
+}
+
+/// Map an (optionally unknown) NAT profile onto the FIS-0015 keepalive
+/// cold-start prior. Unknown NAT fails toward the hard prior: no raising,
+/// 15s — the strictest secure default.
+pub fn keepalive_prior_for_nat(
+    nat_profile: Option<NatProfile>,
+) -> crate::keepalive::KeepalivePrior {
+    match nat_profile {
+        Some(profile) if !profile.is_hard_nat() && profile.preserves_port => {
+            crate::keepalive::KeepalivePrior::DirectEasyNat
+        }
+        _ => crate::keepalive::KeepalivePrior::DirectHardOrUnknownNat,
+    }
+}
+
+/// FIS-0010: direct↔relay flap-damping circuit breaker (Nygard's Circuit
+/// Breaker driven by an EWMA failure-intensity estimator).
+///
+/// A bare consecutive-failure counter resets on one success, so the exact
+/// pathology that hurts users — a path good enough to occasionally
+/// handshake but too flaky to hold — never trips it. The EWMA of the
+/// failure indicator captures RATE: sustained flapping pushes intensity
+/// over the open threshold, the breaker opens, and the daemon stops
+/// re-racing the known-flaky direct path for an exponentially growing
+/// cooldown (deterministic ladder from `resilience::next_reconnect_delay_ms`
+/// — the FIS-0016 primitive — plus additive quarter-jitter; Full Jitter is
+/// deliberately NOT used here because a uniform-from-zero draw could yield
+/// a ~0s cooldown and defeat the hold-down). Cooldown expiry is the
+/// half-open state: one direct trial is allowed; success closes the
+/// breaker immediately, failure re-opens with a longer cooldown. Below
+/// threshold the daemon's behavior is byte-identical to today. Every
+/// uncertain state biases toward relay — the available, safe choice.
+///
+/// Lives OUTSIDE `TraversalProbeStatus` on purpose: that map is rebuilt
+/// from scratch every sync pass; cross-pass state must survive it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlapBreaker {
+    intensity: f32,
+    open_until: u64,
+    exponent: u8,
+    consecutive_good: u16,
+}
+
+impl Default for FlapBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FlapBreaker {
+    const ALPHA: f32 = 0.3;
+    const THETA_OPEN: f32 = 0.6;
+    const THETA_CLOSE: f32 = 0.3;
+    const BASE_COOLDOWN_SECS: u64 = 10;
+    const MAX_EXPONENT: u8 = 6;
+    const FULL_RECOVERY_INTERVALS: u16 = 10;
+
+    pub fn new() -> Self {
+        Self {
+            intensity: 0.0,
+            open_until: 0,
+            exponent: 0,
+            consecutive_good: 0,
         }
     }
 
-    pub fn should_send_keepalive(&self, now_unix: u64, nat_profile: NatProfile) -> bool {
-        let interval = Self::recommended_keepalive_secs(nat_profile);
-        let Some(last) = self.last_keepalive_unix else {
-            return true;
-        };
-        now_unix.saturating_sub(last) >= interval
+    /// Record one race outcome (failure = the race ended on relay/stale
+    /// instead of a fresh direct handshake).
+    pub fn record_outcome(&mut self, is_failure: bool, now_unix: u64) {
+        let indicator = if is_failure { 1.0 } else { 0.0 };
+        self.intensity = (1.0 - Self::ALPHA) * self.intensity + Self::ALPHA * indicator;
+
+        if is_failure {
+            if self.intensity > Self::THETA_OPEN && self.open_until <= now_unix {
+                let policy = crate::resilience::ReconnectPolicy {
+                    initial_backoff_ms: Self::BASE_COOLDOWN_SECS * 1_000,
+                    multiplier: 2,
+                    max_backoff_ms: Self::BASE_COOLDOWN_SECS * 1_000 * (1 << Self::MAX_EXPONENT),
+                };
+                let cooldown_secs =
+                    crate::resilience::next_reconnect_delay_ms(policy, u32::from(self.exponent))
+                        / 1_000;
+                // Additive quarter-jitter, fail-soft to zero on CSPRNG
+                // failure (decorrelation aid, not a security primitive —
+                // same rationale as schedule_proactive_refresh).
+                let jitter = {
+                    let mut buf = [0u8; 8];
+                    match rand::rngs::OsRng.try_fill_bytes(&mut buf) {
+                        Ok(()) => u64::from_le_bytes(buf) % (cooldown_secs / 4 + 1),
+                        Err(_) => 0,
+                    }
+                };
+                self.open_until = now_unix.saturating_add(cooldown_secs + jitter);
+                self.exponent = (self.exponent + 1).min(Self::MAX_EXPONENT);
+                self.consecutive_good = 0;
+            }
+        } else {
+            // A success arrives only while closed or on the half-open
+            // trial — either way the breaker closes immediately.
+            self.open_until = 0;
+            if self.intensity < Self::THETA_CLOSE {
+                self.consecutive_good =
+                    (self.consecutive_good + 1).min(Self::FULL_RECOVERY_INTERVALS);
+                if self.consecutive_good >= Self::FULL_RECOVERY_INTERVALS {
+                    // Sustained recovery: the backoff ladder resets.
+                    self.exponent = 0;
+                }
+            } else {
+                self.consecutive_good = 0;
+            }
+        }
     }
 
-    pub fn mark_keepalive_sent(&mut self, now_unix: u64) {
-        self.last_keepalive_unix = Some(now_unix);
+    /// While open, the daemon withholds direct re-races (stays on relay).
+    pub fn is_open(&self, now_unix: u64) -> bool {
+        self.open_until > now_unix && self.intensity > Self::THETA_CLOSE
+    }
+
+    /// Fully closed (not open, not half-open). The FIS-0013 quality
+    /// trigger fires only in this state — the breaker owns direct-relay
+    /// damping and the quality re-race must never bypass it.
+    pub fn is_closed(&self, now_unix: u64) -> bool {
+        !self.is_open(now_unix) && self.intensity <= Self::THETA_OPEN
+    }
+
+    pub fn intensity(&self) -> f32 {
+        self.intensity
+    }
+
+    /// Observability label: closed / open / half_open.
+    pub fn state_label(&self, now_unix: u64) -> &'static str {
+        if self.is_open(now_unix) {
+            "open"
+        } else if self.intensity > Self::THETA_OPEN {
+            "half_open"
+        } else {
+            "closed"
+        }
+    }
+}
+
+/// FIS-0013: daemon-side per-peer path-quality state, SEPARATE from
+/// `traversal_probe_statuses` (rebuilt from scratch every sync pass).
+/// Nothing here runs per-packet or per-10ms-tick — samples arrive at the
+/// daemon's ~1s reconcile cadence.
+#[derive(Debug, Clone, Copy)]
+pub struct PathQualityState {
+    srtt_ms: f32,
+    rttvar_ms: f32,
+    /// Slow RTT average (~20-rekey time constant) — the baseline the fast
+    /// SRTT is compared against for relative degradation.
+    srtt_slow_ms: f32,
+    loss_ewma: f32,
+    rtt_samples: u8,
+    degraded_streak: u8,
+    last_quality_rerace_unix: u64,
+    /// FIS-0021 delta 3: boringtun's `last_rtt` is STICKY (the same value
+    /// repeats every poll until the next handshake), so RTT evidence is
+    /// ingested only when the handshake advanced, and the RTT arm is gated
+    /// on the age of the last real ingest — not on poll liveness (which a
+    /// loss-only poll refreshes every second, making a 10s gate vacuous).
+    last_rtt_handshake_unix: Option<u64>,
+    last_rtt_ingest_unix: u64,
+}
+
+impl Default for PathQualityState {
+    fn default() -> Self {
+        Self {
+            srtt_ms: 0.0,
+            rttvar_ms: 0.0,
+            srtt_slow_ms: 0.0,
+            loss_ewma: 0.0,
+            rtt_samples: 0,
+            degraded_streak: 0,
+            last_quality_rerace_unix: 0,
+            last_rtt_handshake_unix: None,
+            last_rtt_ingest_unix: 0,
+        }
+    }
+}
+
+impl PathQualityState {
+    const LOSS_DEGRADE_THRESHOLD: f32 = 0.05;
+    const DEGRADED_STREAK_MIN: u8 = 5;
+    const RTT_SAMPLES_MIN: u8 = 2;
+    const RTT_SLOW_ALPHA: f32 = 0.05;
+    const RTT_FAST_ALPHA: f32 = 0.125;
+    const RTT_VAR_BETA: f32 = 0.25;
+    const RTT_RELATIVE_THRESHOLD: f32 = 2.0;
+    const RTT_ABSOLUTE_THRESHOLD_MS: f32 = 50.0;
+    const LOSS_ALPHA: f32 = 0.3;
+    /// Max staleness of the last REAL RTT ingest for the RTT arm — sized to
+    /// RTT's ~120s handshake cadence ("at most one missed handshake"), not
+    /// to the 1s poll cadence.
+    const RTT_INGEST_MAX_AGE_SECS: u64 = 240;
+    /// Minimum spacing between quality-triggered re-races per peer.
+    pub const QUALITY_RERACE_DWELL_SECS: u64 = 300;
+
+    /// Ingest one ~1s poll sample. Returns `Some(true)` when sustained
+    /// degradation (loss OR RTT arm) warrants a quality re-race and the
+    /// per-peer dwell has elapsed; `None` otherwise.
+    fn ingest_sample(
+        &mut self,
+        sample: rustynet_backend_api::PeerPathSample,
+        now_unix: u64,
+    ) -> Option<bool> {
+        // FIS-0021 delta 3: only a handshake ADVANCE carries a fresh RTT
+        // sample; the sticky repeat of the same value every poll must not
+        // re-enter the estimators.
+        let fresh_rtt = sample
+            .latest_handshake
+            .is_some_and(|handshake| self.last_rtt_handshake_unix != Some(handshake));
+        if let Some(rtt) = sample.rtt
+            && fresh_rtt
+        {
+            self.last_rtt_handshake_unix = sample.latest_handshake;
+            self.last_rtt_ingest_unix = now_unix;
+            let rtt = rtt as f32;
+            if self.rtt_samples == 0 {
+                self.srtt_ms = rtt;
+                self.rttvar_ms = rtt / 2.0;
+                self.srtt_slow_ms = rtt;
+            } else {
+                let abs_diff = (self.srtt_ms - rtt).abs();
+                self.rttvar_ms =
+                    (1.0 - Self::RTT_VAR_BETA) * self.rttvar_ms + Self::RTT_VAR_BETA * abs_diff;
+                self.srtt_ms =
+                    (1.0 - Self::RTT_FAST_ALPHA) * self.srtt_ms + Self::RTT_FAST_ALPHA * rtt;
+                self.srtt_slow_ms = (1.0 - Self::RTT_SLOW_ALPHA) * self.srtt_slow_ms
+                    + Self::RTT_SLOW_ALPHA * self.srtt_ms;
+            }
+            self.rtt_samples = self.rtt_samples.saturating_add(1);
+        }
+        self.loss_ewma = (1.0 - Self::LOSS_ALPHA) * self.loss_ewma + Self::LOSS_ALPHA * sample.loss;
+
+        // Two arms, EITHER can flag a degraded poll: sustained loss, or the
+        // fast RTT running 2x the slow baseline AND +50ms absolute.
+        let loss_degraded = self.loss_ewma >= Self::LOSS_DEGRADE_THRESHOLD;
+        let rtt_fresh_enough = self.rtt_samples > 0
+            && now_unix.saturating_sub(self.last_rtt_ingest_unix) <= Self::RTT_INGEST_MAX_AGE_SECS;
+        let rtt_degraded = self.rtt_samples >= Self::RTT_SAMPLES_MIN
+            && rtt_fresh_enough
+            && self.srtt_ms >= Self::RTT_RELATIVE_THRESHOLD * self.srtt_slow_ms
+            && self.srtt_ms - self.srtt_slow_ms >= Self::RTT_ABSOLUTE_THRESHOLD_MS;
+
+        if loss_degraded || rtt_degraded {
+            self.degraded_streak = self
+                .degraded_streak
+                .saturating_add(1)
+                .min(Self::DEGRADED_STREAK_MIN + 1);
+        } else {
+            self.degraded_streak = self.degraded_streak.saturating_sub(1);
+        }
+
+        if self.degraded_streak >= Self::DEGRADED_STREAK_MIN
+            && now_unix >= self.last_quality_rerace_unix + Self::QUALITY_RERACE_DWELL_SECS
+        {
+            self.last_quality_rerace_unix = now_unix;
+            self.degraded_streak = 0;
+            Some(true)
+        } else {
+            None
+        }
+    }
+}
+
+/// FIS-0013: per-peer quality trackers, daemon-owned, persistent across
+/// sync passes.
+#[derive(Debug, Default)]
+pub struct PathQualityTracker {
+    peers: std::collections::BTreeMap<rustynet_backend_api::NodeId, PathQualityState>,
+}
+
+impl PathQualityTracker {
+    pub fn ingest_sample(
+        &mut self,
+        node_id: &rustynet_backend_api::NodeId,
+        sample: rustynet_backend_api::PeerPathSample,
+        now_unix: u64,
+    ) -> Option<bool> {
+        self.peers
+            .entry(node_id.clone())
+            .or_default()
+            .ingest_sample(sample, now_unix)
+    }
+
+    /// Drop trackers for peers no longer present.
+    pub fn retain_peers(
+        &mut self,
+        keep: &std::collections::BTreeSet<rustynet_backend_api::NodeId>,
+    ) {
+        self.peers.retain(|node_id, _| keep.contains(node_id));
+    }
+}
+
+/// FIS-0009 Phase 3 input: the peer's cross-session traversal prior,
+/// reduced to what the pair race needs. `None` (or the flag being off)
+/// ranks exactly as today.
+#[derive(Debug, Clone, Default)]
+pub struct PriorRanking {
+    pub last_success_class: Option<crate::peer_traversal_prior::CandidateClass>,
+    pub per_class_probability:
+        std::collections::BTreeMap<crate::peer_traversal_prior::CandidateClass, f32>,
+}
+
+impl PriorRanking {
+    fn probability_for_pair(&self, pair: &crate::ice_priority::CandidatePair) -> f32 {
+        match pair_candidate_class(pair) {
+            Some(class) => self
+                .per_class_probability
+                .get(&class)
+                .copied()
+                .unwrap_or(0.5),
+            None => 0.5,
+        }
+    }
+}
+
+/// Class of a candidate pair for prior scoring: keyed on the REMOTE
+/// candidate (the destination we are trying to reach — the
+/// Happy-Eyeballs axis). Relay-kind candidates score neutral.
+fn pair_candidate_class(
+    pair: &crate::ice_priority::CandidatePair,
+) -> Option<crate::peer_traversal_prior::CandidateClass> {
+    use crate::ice_priority::CandidateKind;
+    use crate::peer_traversal_prior::CandidateClass;
+    match (pair.remote.kind, pair.remote.addr.ip()) {
+        (CandidateKind::Host, IpAddr::V4(_)) => Some(CandidateClass::HostV4),
+        (CandidateKind::Host, IpAddr::V6(_)) => Some(CandidateClass::HostV6),
+        (CandidateKind::ServerReflexive, IpAddr::V4(_)) => Some(CandidateClass::SrflxV4),
+        (CandidateKind::ServerReflexive, IpAddr::V6(_)) => Some(CandidateClass::SrflxV6),
+        (CandidateKind::Relay, _) => None,
+    }
+}
+
+/// FIS-0009: stable secondary re-rank of the RFC-8445-priority-sorted pair
+/// list by the peer's prior, then the Happy-Eyeballs front-float.
+///
+/// A pair may move at most ±2 positions from its ICE rank (a good class,
+/// posterior → 1.0, gains 2 slots; a bad one loses 2) — a deliberate,
+/// slot-bounded rendering of the design's "only breaks ties / promotes a
+/// historically-winning class a few slots, never overrides a large
+/// ICE-priority gap". The RFC 8445 ordering itself and the deterministic
+/// role assignment are untouched — this re-ranks an already-valid list.
+/// Finally, if the peer's `last_success_class` is present in the pair
+/// list, exactly ONE pair of that class floats to the front of round 0.
+fn prior_rerank_pairs(pairs: &mut [crate::ice_priority::CandidatePair], ranking: &PriorRanking) {
+    // 2.5 slot-units so a full-confidence class STRICTLY passes 2 positions
+    // (a 2.0 shift only ties with the neighbor's key, and stable tie-break
+    // resolves back to ICE order) while 3 positions stays unreachable:
+    // passing 3 pairs would need i - 2.5 < i - 3.
+    const MAX_SLOT_SHIFT: f32 = 2.5;
+    let mut keyed: Vec<(f32, usize)> = pairs
+        .iter()
+        .enumerate()
+        .map(|(index, pair)| {
+            let posterior = ranking.probability_for_pair(pair);
+            let shift = MAX_SLOT_SHIFT * (posterior - 0.5) * 2.0;
+            (index as f32 - shift, index)
+        })
+        .collect();
+    // Stable by original index (the tuple's second element breaks ties
+    // deterministically; f32 keys here are always finite).
+    keyed.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    let reordered: Vec<crate::ice_priority::CandidatePair> = keyed
+        .iter()
+        .map(|(_, index)| pairs[*index].clone())
+        .collect();
+    pairs.clone_from_slice(&reordered);
+
+    if let Some(last_class) = ranking.last_success_class
+        && let Some(position) = pairs
+            .iter()
+            .position(|pair| pair_candidate_class(pair) == Some(last_class))
+        && position > 0
+    {
+        pairs[..=position].rotate_right(1);
     }
 }
 
@@ -1411,6 +1869,8 @@ impl TraversalEngine {
         relay_endpoint: Option<SocketEndpoint>,
         now_unix: u64,
         handshake_freshness_secs: u64,
+        prior_ranking: Option<&PriorRanking>,
+        quality_demoted_endpoint: Option<SocketEndpoint>,
     ) -> Result<SimultaneousOpenResult, TraversalError> {
         if handshake_freshness_secs == 0 {
             return Err(TraversalError::InvalidConfig(
@@ -1458,6 +1918,23 @@ impl TraversalEngine {
                 0,
                 TraversalDecisionReason::NoDirectCandidatesRelayArmed,
             );
+        }
+        if let Some(ranking) = prior_ranking {
+            // FIS-0009: re-rank BEFORE the cap so a promoted class survives
+            // max_probe_pairs truncation.
+            prior_rerank_pairs(&mut pairs, ranking);
+        }
+        if let Some(demoted) = quality_demoted_endpoint {
+            // FIS-0013: incumbent demotion applies LAST (after the RFC 8445
+            // sort and the FIS-0009 re-rank — both stable transforms on the
+            // same seam). Demote-don't-exclude: pairs targeting the rotten
+            // incumbent still race, at the back, and may win if every
+            // alternate fails handshake.
+            let (mut kept, incumbent): (Vec<_>, Vec<_>) = pairs.drain(..).partition(|pair| {
+                !(pair.remote.addr.ip() == demoted.addr && pair.remote.addr.port() == demoted.port)
+            });
+            kept.extend(incumbent);
+            pairs = kept;
         }
         pairs.truncate(self.config.max_probe_pairs);
 
@@ -1996,6 +2473,11 @@ mod tests {
 
         assert_eq!(TraversalSession::recommended_keepalive_secs(hard_nat), 15);
         assert_eq!(TraversalSession::recommended_keepalive_secs(easy_nat), 25);
+        // Unknown NAT (no profile) resolves to the hard prior: 15s, no raise.
+        assert_eq!(
+            super::keepalive_prior_for_nat(None).prior_interval_secs(),
+            15
+        );
     }
 
     #[test]
@@ -2240,6 +2722,492 @@ mod tests {
             ))],
         );
         assert!(results.iter().all(|c| c.source == CandidateSource::Host));
+    }
+
+    /// XOR-MAPPED-ADDRESS binding response for the traversal parser.
+    fn build_stun_test_response(transaction_id: [u8; 12], mapped: std::net::SocketAddr) -> Vec<u8> {
+        let std::net::SocketAddr::V4(mapped_v4) = mapped else {
+            panic!("test helper is v4-only");
+        };
+        let mut message = Vec::new();
+        message.extend_from_slice(&0x0101u16.to_be_bytes());
+        message.extend_from_slice(&0u16.to_be_bytes());
+        message.extend_from_slice(&0x2112_A442u32.to_be_bytes());
+        message.extend_from_slice(&transaction_id);
+        message.extend_from_slice(&0x0020u16.to_be_bytes());
+        message.extend_from_slice(&8u16.to_be_bytes());
+        message.push(0x00);
+        message.push(0x01);
+        let cookie_bytes = 0x2112_A442u32.to_be_bytes();
+        let port_mask = u16::from_be_bytes([cookie_bytes[0], cookie_bytes[1]]);
+        message.extend_from_slice(&(mapped_v4.port() ^ port_mask).to_be_bytes());
+        for (index, byte) in mapped_v4.ip().octets().iter().enumerate() {
+            message.push(byte ^ cookie_bytes[index]);
+        }
+        let declared_len = (message.len() - 20) as u16;
+        message[2..4].copy_from_slice(&declared_len.to_be_bytes());
+        message
+    }
+
+    /// STUN test server: drops the first `drop_first` requests, then (when
+    /// `respond`) answers the next one and exits. When `respond` is false it
+    /// only counts until `serve_for` elapses. Returns the request count.
+    fn spawn_stun_ladder_server(
+        drop_first: usize,
+        respond: bool,
+        serve_for: Duration,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<usize>) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind stun test server");
+        let addr = socket.local_addr().expect("stun test server addr");
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + serve_for;
+            let mut received = 0usize;
+            let mut buffer = [0u8; 1500];
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return received;
+                }
+                socket
+                    .set_read_timeout(Some(remaining))
+                    .expect("server read timeout");
+                let Ok((len, source)) = socket.recv_from(&mut buffer) else {
+                    return received;
+                };
+                if len < 20 {
+                    continue;
+                }
+                received += 1;
+                if received <= drop_first || !respond {
+                    continue;
+                }
+                let mut transaction_id = [0u8; 12];
+                transaction_id.copy_from_slice(&buffer[8..20]);
+                let response = build_stun_test_response(transaction_id, source);
+                let _ = socket.send_to(&response, source);
+                return received;
+            }
+        });
+        (addr, handle)
+    }
+
+    fn ladder_test_gatherer(
+        servers: Vec<std::net::SocketAddr>,
+        timeout: Duration,
+    ) -> super::CandidateGatherer {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind gather socket");
+        super::CandidateGatherer::new(socket, servers, timeout, Vec::new(), Vec::new())
+            .expect("gatherer config valid")
+    }
+
+    #[test]
+    fn stun_gather_recovers_lost_response_via_retransmit() {
+        // FIS-0011: the old single-shot path lost the whole gather cycle to
+        // one dropped datagram; the RTO ladder recovers within one RTO.
+        let (server, handle) = spawn_stun_ladder_server(1, true, Duration::from_secs(4));
+        let gatherer = ladder_test_gatherer(vec![server], Duration::from_secs(2));
+
+        let candidates = gatherer.gather();
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source == CandidateSource::ServerReflexive),
+            "retransmit must recover the dropped first response"
+        );
+        let requests_seen = handle.join().expect("server joins");
+        assert_eq!(requests_seen, 2, "one drop + one answered retransmit");
+    }
+
+    #[test]
+    fn stun_gather_slow_server_no_longer_starves_others() {
+        // Old behavior: server 1's full-budget recv_from consumed the whole
+        // deadline and server 2 was never queried. Fire-all means the live
+        // server answers regardless of the blackhole (RFC 5737 TEST-NET-1).
+        let blackhole: std::net::SocketAddr = "192.0.2.1:3478".parse().expect("blackhole addr");
+        let (live, handle) = spawn_stun_ladder_server(0, true, Duration::from_secs(4));
+        let timeout = Duration::from_millis(800);
+        let gatherer = ladder_test_gatherer(vec![blackhole, live], timeout);
+
+        let started = Instant::now();
+        let candidates = gatherer.gather();
+        let elapsed = started.elapsed();
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source == CandidateSource::ServerReflexive),
+            "live server behind a blackhole must still yield its srflx candidate"
+        );
+        assert!(
+            elapsed < timeout * 2,
+            "gather must stay within ~one shared deadline, took {elapsed:?}"
+        );
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn stun_gather_dark_server_gives_up_after_rc_attempts_within_deadline() {
+        let serve_for = Duration::from_millis(1900);
+        let (dark, handle) = spawn_stun_ladder_server(usize::MAX, false, serve_for);
+        let timeout = Duration::from_millis(1500);
+        let gatherer = ladder_test_gatherer(vec![dark], timeout);
+
+        let started = Instant::now();
+        let candidates = gatherer.gather();
+        let elapsed = started.elapsed();
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.source == CandidateSource::ServerReflexive),
+            "dark server must yield no srflx candidate"
+        );
+        assert!(
+            elapsed < timeout + Duration::from_millis(500),
+            "ladder must not blow the shared deadline, took {elapsed:?}"
+        );
+        // RTO ladder: sends at ~0ms, ~250ms, ~750ms — then no more within
+        // the 1.5s budget (next would be at 1750ms).
+        let requests_seen = handle.join().expect("server joins");
+        assert_eq!(
+            requests_seen,
+            usize::from(super::STUN_MAX_REQUEST_ATTEMPTS),
+            "ladder must stop at Rc sends"
+        );
+    }
+
+    fn rerank_pair(
+        remote_v4: &str,
+        kind: crate::ice_priority::CandidateKind,
+        priority: u64,
+    ) -> crate::ice_priority::CandidatePair {
+        let remote_addr: std::net::SocketAddr = remote_v4.parse().expect("addr");
+        let local_addr: std::net::SocketAddr = "10.0.0.1:51820".parse().expect("addr");
+        crate::ice_priority::CandidatePair {
+            local: crate::ice_priority::PrioritizedCandidate {
+                addr: local_addr,
+                kind: crate::ice_priority::CandidateKind::Host,
+                priority: 100,
+                foundation: format!("local-{remote_v4}"),
+            },
+            remote: crate::ice_priority::PrioritizedCandidate {
+                addr: remote_addr,
+                kind,
+                priority: 100,
+                foundation: format!("remote-{remote_v4}"),
+            },
+            pair_priority: priority,
+        }
+    }
+
+    #[test]
+    fn flap_breaker_steady_good_never_opens() {
+        let mut breaker = super::FlapBreaker::new();
+        for tick in 0..100u64 {
+            breaker.record_outcome(false, tick);
+            assert!(!breaker.is_open(tick));
+            assert_eq!(breaker.state_label(tick), "closed");
+        }
+        assert!(breaker.intensity() < 0.01);
+    }
+
+    #[test]
+    fn flap_breaker_single_failure_does_not_open() {
+        let mut breaker = super::FlapBreaker::new();
+        breaker.record_outcome(true, 10);
+        // One failure: intensity = 0.3, under the 0.6 open threshold.
+        assert!(!breaker.is_open(11));
+    }
+
+    #[test]
+    fn flap_breaker_sustained_flapping_opens_and_holds_relay() {
+        let mut breaker = super::FlapBreaker::new();
+        // Six rapid failures (a flap burst inside one reconcile window):
+        // intensity 1 - 0.7^3 = 0.657 crosses theta_open on the third.
+        for now in 0..6u64 {
+            breaker.record_outcome(true, now);
+        }
+        // Opened at now=2 with cooldown 10s + <=25% jitter: open_until in
+        // [12, 14].
+        assert!(breaker.is_open(6), "sustained failures must open");
+        assert_eq!(breaker.state_label(6), "open");
+        assert!(breaker.is_open(11), "must still hold at 11s");
+        assert!(!breaker.is_open(17), "first cooldown is bounded by 14s");
+    }
+
+    #[test]
+    fn flap_breaker_half_open_success_closes_failure_reopens_longer() {
+        let mut breaker = super::FlapBreaker::new();
+        for now in 0..6u64 {
+            breaker.record_outcome(true, now);
+        }
+        // Opened at now=2, open_until in [12, 14]. Cooldown expires ->
+        // half-open: one trial allowed.
+        let now = 20u64;
+        assert!(!breaker.is_open(now));
+        assert_eq!(breaker.state_label(now), "half_open");
+
+        // Trial FAILURE re-opens with the NEXT ladder step (20s + jitter,
+        // open_until in [40, 45]) — strictly longer than the first.
+        breaker.record_outcome(true, now);
+        assert!(breaker.is_open(now));
+        assert!(
+            breaker.is_open(now + 15),
+            "second cooldown must exceed the first ladder step"
+        );
+
+        // Wait out the longer cooldown, then a trial SUCCESS closes it.
+        let now = 120u64;
+        assert!(!breaker.is_open(now));
+        breaker.record_outcome(false, now);
+        assert!(!breaker.is_open(now));
+        assert_eq!(breaker.open_until, 0, "success must clear the hold-down");
+    }
+
+    #[test]
+    fn flap_breaker_sustained_recovery_resets_backoff_ladder() {
+        let mut breaker = super::FlapBreaker::new();
+        let mut now = 0u64;
+        for _ in 0..8 {
+            breaker.record_outcome(true, now);
+            now += 200; // wait out each cooldown so the ladder climbs
+        }
+        let climbed_exponent = breaker.exponent;
+        assert!(climbed_exponent >= 2, "ladder should have climbed");
+
+        // Long run of successes: intensity decays below theta_close and
+        // after 10 consecutive good intervals the ladder fully resets.
+        for _ in 0..20 {
+            breaker.record_outcome(false, now);
+            now += 30;
+        }
+        assert_eq!(breaker.exponent, 0, "sustained recovery resets backoff");
+        assert_eq!(breaker.state_label(now), "closed");
+    }
+
+    #[test]
+    fn path_quality_loss_arm_triggers_after_sustained_streak_and_dwell() {
+        use rustynet_backend_api::PeerPathSample;
+        let mut state = super::PathQualityState::default();
+        let clean = PeerPathSample {
+            loss: 0.0,
+            rtt: Some(40),
+            rttvar: None,
+            latest_handshake: Some(1),
+        };
+        let lossy = PeerPathSample {
+            loss: 0.2,
+            rtt: Some(40),
+            rttvar: None,
+            latest_handshake: Some(1),
+        };
+        // Clean polls never trigger.
+        for tick in 1_000_000..1_000_010u64 {
+            assert_eq!(state.ingest_sample(clean, tick), None);
+        }
+        // Sustained loss: EWMA crosses 5% quickly; the trigger still needs
+        // 5 consecutive degraded polls.
+        let mut fired_at = None;
+        for tick in 1_000_010..1_000_030u64 {
+            if state.ingest_sample(lossy, tick) == Some(true) {
+                fired_at = Some(tick);
+                break;
+            }
+        }
+        let fired_at = fired_at.expect("sustained loss must trigger");
+        assert!(
+            (1_000_014..=1_000_020).contains(&fired_at),
+            "trigger after ~5 degraded polls, got {fired_at}"
+        );
+        // Dwell: an immediate re-trigger is suppressed for 300s.
+        for tick in fired_at + 1..fired_at + 50 {
+            assert_eq!(state.ingest_sample(lossy, tick), None, "dwell holds");
+        }
+        // After the dwell elapses, sustained degradation may fire again.
+        let mut refired = false;
+        for tick in fired_at + 301..fired_at + 340 {
+            if state.ingest_sample(lossy, tick) == Some(true) {
+                refired = true;
+                break;
+            }
+        }
+        assert!(refired, "post-dwell sustained degradation re-triggers");
+    }
+
+    #[test]
+    fn path_quality_rtt_arm_needs_relative_and_absolute_degradation() {
+        use rustynet_backend_api::PeerPathSample;
+        // Each poll carries a fresh handshake so the RTT ingest advances
+        // (the sticky-repeat dedupe is pinned separately below).
+        let sample = |rtt: u32, handshake: u64| PeerPathSample {
+            loss: 0.0,
+            rtt: Some(rtt),
+            rttvar: None,
+            latest_handshake: Some(handshake),
+        };
+        // Baseline 20ms, spike to 60ms: 3x relative but only +40ms absolute
+        // — must NOT trigger (both arms required).
+        let mut state = super::PathQualityState::default();
+        for tick in 1_000_000..1_000_020u64 {
+            assert_eq!(state.ingest_sample(sample(20, tick), tick), None);
+        }
+        for tick in 1_000_020..1_000_060u64 {
+            assert_eq!(
+                state.ingest_sample(sample(60, tick), tick),
+                None,
+                "3x relative without +50ms absolute must not trigger"
+            );
+        }
+        // Baseline 40ms, sustained 400ms: BOTH arms satisfied -> triggers.
+        let mut state = super::PathQualityState::default();
+        for tick in 1_000_000..1_000_020u64 {
+            assert_eq!(state.ingest_sample(sample(40, tick), tick), None);
+        }
+        let mut fired = false;
+        for tick in 1_000_020..1_000_120u64 {
+            if state.ingest_sample(sample(400, tick), tick) == Some(true) {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "10x + 360ms sustained RTT degradation must trigger");
+    }
+
+    #[test]
+    fn path_quality_rtt_arm_gated_on_ingest_age_not_poll_age() {
+        use rustynet_backend_api::PeerPathSample;
+        // FIS-0021 delta 3: the sticky repeat of one handshake's RTT must
+        // ingest exactly once, and once the last REAL ingest goes stale
+        // (>240s), the RTT arm cannot keep a degraded verdict alive no
+        // matter how fresh the loss-only polling is.
+        let mut state = super::PathQualityState::default();
+        // Establish a baseline with fresh handshakes.
+        for tick in 1_000_000..1_000_010u64 {
+            let _ = state.ingest_sample(
+                PeerPathSample {
+                    loss: 0.0,
+                    rtt: Some(40),
+                    rttvar: None,
+                    latest_handshake: Some(tick),
+                },
+                tick,
+            );
+        }
+        // One degraded handshake, then the SAME handshake repeats for 400
+        // polls (sticky last_rtt): only one ingest, and past 240s the RTT
+        // arm goes stale — no trigger may ever fire.
+        let sticky = PeerPathSample {
+            loss: 0.0,
+            rtt: Some(400),
+            rttvar: None,
+            latest_handshake: Some(1_000_010),
+        };
+        for tick in 1_000_010..1_000_410u64 {
+            assert_eq!(
+                state.ingest_sample(sticky, tick),
+                None,
+                "sticky RTT repeats must not accumulate degraded evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn quality_demoted_incumbent_sorts_last_but_stays_in_race() {
+        use crate::ice_priority::CandidateKind;
+        // Reuse the rerank pair fixture; demote the TOP ICE pair.
+        let pairs_input = vec![
+            rerank_pair("203.0.113.1:1", CandidateKind::Host, 500),
+            rerank_pair("203.0.113.2:2", CandidateKind::Host, 400),
+            rerank_pair("203.0.113.3:3", CandidateKind::ServerReflexive, 300),
+        ];
+        // The demotion transform lives inline in execute_ice_pair_race;
+        // reproduce its partition here against the same shape to pin the
+        // semantics: demoted incumbent moves to the END, order of the rest
+        // is preserved, nothing is excluded.
+        let demoted = SocketEndpoint {
+            addr: "203.0.113.1".parse().expect("addr"),
+            port: 1,
+        };
+        let mut pairs = pairs_input;
+        let (mut kept, incumbent): (Vec<_>, Vec<_>) = pairs.drain(..).partition(|pair| {
+            !(pair.remote.addr.ip() == demoted.addr && pair.remote.addr.port() == demoted.port)
+        });
+        kept.extend(incumbent);
+        assert_eq!(kept.len(), 3, "demote, never exclude");
+        assert_eq!(kept[0].remote.addr.port(), 2);
+        assert_eq!(kept[1].remote.addr.port(), 3);
+        assert_eq!(kept[2].remote.addr.port(), 1, "incumbent races last");
+    }
+
+    #[test]
+    fn prior_rerank_is_identity_without_evidence() {
+        use crate::ice_priority::CandidateKind;
+        let mut pairs = vec![
+            rerank_pair("203.0.113.1:1", CandidateKind::Host, 400),
+            rerank_pair("203.0.113.2:2", CandidateKind::ServerReflexive, 300),
+            rerank_pair("203.0.113.3:3", CandidateKind::Host, 200),
+        ];
+        let baseline = pairs.clone();
+        // Empty ranking: every class scores the neutral 0.5 → no movement.
+        super::prior_rerank_pairs(&mut pairs, &super::PriorRanking::default());
+        assert_eq!(pairs, baseline, "no evidence must not reorder");
+    }
+
+    #[test]
+    fn prior_rerank_promotes_winning_class_bounded_slots() {
+        use crate::ice_priority::CandidateKind;
+        use crate::peer_traversal_prior::CandidateClass;
+        let mut pairs = vec![
+            rerank_pair("203.0.113.1:1", CandidateKind::Host, 500),
+            rerank_pair("203.0.113.2:2", CandidateKind::Host, 400),
+            rerank_pair("203.0.113.3:3", CandidateKind::Host, 300),
+            rerank_pair("203.0.113.4:4", CandidateKind::ServerReflexive, 200),
+        ];
+        let ranking = super::PriorRanking {
+            last_success_class: None,
+            per_class_probability: [
+                (CandidateClass::SrflxV4, 1.0),
+                (CandidateClass::HostV4, 0.5),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        super::prior_rerank_pairs(&mut pairs, &ranking);
+        // SrflxV4 posterior 1.0 → gains exactly 2 slots (index 3 → 1),
+        // never jumps the whole list: the top ICE pair stays first.
+        assert_eq!(pairs[0].remote.addr.port(), 1, "top ICE pair holds rank");
+        assert_eq!(
+            pairs[1].remote.kind,
+            CandidateKind::ServerReflexive,
+            "winning class promoted a bounded number of slots"
+        );
+    }
+
+    #[test]
+    fn prior_front_float_moves_last_success_class_first() {
+        use crate::ice_priority::CandidateKind;
+        use crate::peer_traversal_prior::CandidateClass;
+        let mut pairs = vec![
+            rerank_pair("203.0.113.1:1", CandidateKind::Host, 500),
+            rerank_pair("203.0.113.2:2", CandidateKind::Host, 400),
+            rerank_pair("203.0.113.3:3", CandidateKind::ServerReflexive, 300),
+            rerank_pair("203.0.113.4:4", CandidateKind::ServerReflexive, 200),
+        ];
+        let ranking = super::PriorRanking {
+            last_success_class: Some(CandidateClass::SrflxV4),
+            per_class_probability: std::collections::BTreeMap::new(),
+        };
+        super::prior_rerank_pairs(&mut pairs, &ranking);
+        // Exactly ONE pair of the last-success class floats to the front;
+        // relative order of everything else is preserved.
+        assert_eq!(
+            pairs[0].remote.addr.port(),
+            3,
+            "first srflx pair floats to front"
+        );
+        assert_eq!(pairs[1].remote.addr.port(), 1);
+        assert_eq!(pairs[2].remote.addr.port(), 2);
+        assert_eq!(pairs[3].remote.addr.port(), 4, "only one pair floats");
     }
 
     #[test]

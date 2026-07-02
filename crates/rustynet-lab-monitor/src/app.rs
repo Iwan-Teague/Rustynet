@@ -7,7 +7,7 @@ use ratatui::{
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::MonitorConfig;
 use crate::data::job_watcher::JobState;
@@ -23,6 +23,19 @@ pub enum Panel {
     Log,
     Jobs,
     StageMatrix,
+    Agents,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentsCol {
+    Patch,
+    Review,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentsRow {
+    Model,
+    Iterations,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +87,17 @@ pub struct App {
     pub orchestrator_pgid: Option<u32>,
     pub stop_after_current: bool,
 
+    pub available_models: Vec<String>,
+    pub available_variants: Vec<String>,
+    pub patch_model_idx: usize,
+    pub patch_variant_idx: usize,
+    pub review_model_idx: usize,
+    pub agents_sel_col: Option<AgentsCol>,
+    pub agents_sel_row: Option<AgentsRow>,
+    pub agents_active: bool,
+    pub patch_iterations: u8,
+    pub review_iterations: u8,
+
     active_stage_start: Option<std::time::Instant>,
     last_vm_probe: Option<std::time::Instant>,
 }
@@ -96,6 +120,21 @@ impl App {
         let vm_role_overrides = default_vm_role_overrides(&config);
         let recent_runs =
             crate::data::run_matrix::load_recent_runs(&repo_root, 3).unwrap_or_default();
+
+        let available_models = load_available_models(&repo_root);
+        let patch_model_idx = config
+            .patch_model_idx
+            .min(available_models.len().saturating_sub(1));
+        let review_model_idx = config
+            .review_model_idx
+            .min(available_models.len().saturating_sub(1));
+        let available_variants = vec!["max".to_owned(), "on".to_owned()];
+        let patch_variant_idx = config
+            .patch_variant_idx
+            .min(available_variants.len().saturating_sub(1));
+
+        let patch_iterations = config.patch_iterations.max(1);
+        let review_iterations = config.review_iterations.max(1);
 
         Ok(Self {
             repo_root,
@@ -125,6 +164,16 @@ impl App {
             should_quit: false,
             orchestrator_pgid: None,
             stop_after_current: false,
+            available_models,
+            available_variants,
+            patch_model_idx,
+            patch_variant_idx,
+            review_model_idx,
+            agents_sel_col: None,
+            agents_sel_row: None,
+            agents_active: false,
+            patch_iterations,
+            review_iterations,
             active_stage_start: None,
             last_vm_probe: None,
         })
@@ -684,6 +733,13 @@ impl App {
                 self.page = Page::Matrix;
                 self.focused_panel = Panel::StageMatrix;
             }
+            KeyCode::Char('7') => {
+                self.page = Page::Overview;
+                self.focused_panel = Panel::Agents;
+                self.agents_sel_col = Some(AgentsCol::Patch);
+                self.agents_sel_row = Some(AgentsRow::Model);
+                self.agents_active = false;
+            }
 
             // Single letter shortcuts. Accept plain, Shift, or Ctrl variants.
             KeyCode::Char(_) if plain_char == Some('l') => {
@@ -755,6 +811,19 @@ impl App {
                 Panel::StageMatrix => {
                     self.stage_matrix_scroll = self.stage_matrix_scroll.saturating_sub(1);
                 }
+                Panel::Agents if self.agents_sel_col.is_some() => {
+                    self.agents_active = false;
+                    self.agents_sel_row = match self.agents_sel_row {
+                        Some(AgentsRow::Model) => Some(AgentsRow::Iterations),
+                        Some(AgentsRow::Iterations) => Some(AgentsRow::Model),
+                        None => Some(AgentsRow::Model),
+                    };
+                }
+                Panel::Agents => {
+                    self.agents_sel_col = Some(AgentsCol::Patch);
+                    self.agents_sel_row = Some(AgentsRow::Model);
+                    self.agents_active = false;
+                }
                 _ => {}
             },
             KeyCode::Down => match self.focused_panel {
@@ -774,6 +843,19 @@ impl App {
                 Panel::StageMatrix => {
                     self.stage_matrix_scroll += 1;
                 }
+                Panel::Agents if self.agents_sel_col.is_some() => {
+                    self.agents_active = false;
+                    self.agents_sel_row = match self.agents_sel_row {
+                        Some(AgentsRow::Model) => Some(AgentsRow::Iterations),
+                        Some(AgentsRow::Iterations) => Some(AgentsRow::Model),
+                        None => Some(AgentsRow::Iterations),
+                    };
+                }
+                Panel::Agents => {
+                    self.agents_sel_col = Some(AgentsCol::Patch);
+                    self.agents_sel_row = Some(AgentsRow::Iterations);
+                    self.agents_active = false;
+                }
                 _ => {}
             },
             KeyCode::End if self.focused_panel == Panel::Log => {
@@ -789,6 +871,96 @@ impl App {
             }
             KeyCode::Right if self.focused_panel == Panel::VmStatus => {
                 self.cycle_selected_vm_role(1);
+            }
+            KeyCode::Left if self.focused_panel == Panel::Agents => {
+                if self.agents_active {
+                    // Cycle active field left
+                    match (self.agents_sel_col, self.agents_sel_row) {
+                        (Some(col), Some(AgentsRow::Model)) => {
+                            let n = self.available_models.len();
+                            if n > 0 {
+                                match col {
+                                    AgentsCol::Patch => {
+                                        self.patch_model_idx = (self.patch_model_idx + n - 1) % n;
+                                        self.save_config();
+                                    }
+                                    AgentsCol::Review => {
+                                        self.review_model_idx = (self.review_model_idx + n - 1) % n;
+                                        self.save_config();
+                                    }
+                                }
+                            }
+                        }
+                        (Some(col), Some(AgentsRow::Iterations)) => match col {
+                            AgentsCol::Patch => {
+                                self.patch_iterations = self.patch_iterations.max(2) - 1;
+                                self.save_config();
+                            }
+                            AgentsCol::Review => {
+                                self.review_iterations = self.review_iterations.max(2) - 1;
+                                self.save_config();
+                            }
+                        },
+                        _ => {}
+                    }
+                } else {
+                    // Switch to Patch column, preserve row
+                    let row = self.agents_sel_row.unwrap_or(AgentsRow::Model);
+                    self.agents_sel_col = Some(AgentsCol::Patch);
+                    self.agents_sel_row = Some(row);
+                }
+            }
+            KeyCode::Right if self.focused_panel == Panel::Agents => {
+                if self.agents_active {
+                    // Cycle active field right
+                    match (self.agents_sel_col, self.agents_sel_row) {
+                        (Some(col), Some(AgentsRow::Model)) => {
+                            let n = self.available_models.len();
+                            if n > 0 {
+                                match col {
+                                    AgentsCol::Patch => {
+                                        self.patch_model_idx = (self.patch_model_idx + 1) % n;
+                                        self.save_config();
+                                    }
+                                    AgentsCol::Review => {
+                                        self.review_model_idx = (self.review_model_idx + 1) % n;
+                                        self.save_config();
+                                    }
+                                }
+                            }
+                        }
+                        (Some(col), Some(AgentsRow::Iterations)) => match col {
+                            AgentsCol::Patch => {
+                                self.patch_iterations = (self.patch_iterations % 4) + 1;
+                                self.save_config();
+                            }
+                            AgentsCol::Review => {
+                                self.review_iterations = (self.review_iterations % 4) + 1;
+                                self.save_config();
+                            }
+                        },
+                        _ => {}
+                    }
+                } else {
+                    // Switch to Review column, preserve row
+                    let row = self.agents_sel_row.unwrap_or(AgentsRow::Model);
+                    self.agents_sel_col = Some(AgentsCol::Review);
+                    self.agents_sel_row = Some(row);
+                }
+            }
+            KeyCode::Enter
+                if self.focused_panel == Panel::Agents && self.agents_sel_row.is_some() =>
+            {
+                self.agents_active = true;
+            }
+            KeyCode::Esc if self.focused_panel == Panel::Agents => {
+                if self.agents_active {
+                    self.agents_active = false;
+                } else {
+                    self.agents_sel_col = None;
+                    self.agents_sel_row = None;
+                    self.agents_active = false;
+                }
             }
             KeyCode::Char(' ') if self.page == Page::Run => {
                 self.focused_panel = Panel::StageGrid;
@@ -871,7 +1043,30 @@ impl App {
         config.apply_fast_stage_defaults();
         self.config = config.clone();
         self.save_config_best_effort();
-        match crate::control::launcher::spawn_orchestrator(&repo_root, &config) {
+        let patch_model = self
+            .available_models
+            .get(self.patch_model_idx)
+            .cloned()
+            .unwrap_or_default();
+        let patch_variant = self
+            .available_variants
+            .get(self.patch_variant_idx)
+            .cloned()
+            .unwrap_or_default();
+        let review_model = self
+            .available_models
+            .get(self.review_model_idx)
+            .cloned()
+            .unwrap_or_default();
+        match crate::control::launcher::spawn_orchestrator(
+            &repo_root,
+            &config,
+            &patch_model,
+            &patch_variant,
+            &review_model,
+            self.patch_iterations,
+            self.review_iterations,
+        ) {
             Ok(spawned) => {
                 let child_id = spawned.child.id();
                 let job_id = spawned.job_id.clone();
@@ -1225,6 +1420,18 @@ impl App {
                 Os::Windows => Some(self.config.windows_vm.clone()),
             })
             .filter(|alias| !alias.is_empty())
+    }
+
+    fn save_config(&self) {
+        let mut config = self.config.clone();
+        config.patch_model_idx = self.patch_model_idx;
+        config.patch_variant_idx = self.patch_variant_idx;
+        config.review_model_idx = self.review_model_idx;
+        config.patch_iterations = self.patch_iterations;
+        config.review_iterations = self.review_iterations;
+        if let Err(e) = config.save(&self.repo_root) {
+            tracing::error!(%e, "failed to save monitor config");
+        }
     }
 
     fn save_config_best_effort(&self) {
@@ -1611,6 +1818,28 @@ pub fn render_ui(f: &mut Frame, app: &App) {
     if app.show_stage_detail {
         crate::ui::stage_detail_overlay::render(f, area, app);
     }
+}
+
+fn load_available_models(repo_root: &Path) -> Vec<String> {
+    let config_path = repo_root.join(".opencode/opencode.json");
+    let mut models: Vec<String> = Vec::new();
+    if let Ok(raw) = std::fs::read_to_string(&config_path)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(provider_models) = json
+            .get("provider")
+            .and_then(|p| p.get("deepseek"))
+            .and_then(|d| d.get("models"))
+            .and_then(|m| m.as_object())
+    {
+        for key in provider_models.keys() {
+            models.push(format!("deepseek/{key}"));
+        }
+    }
+    if !models.iter().any(|m| m.contains("flash-free")) {
+        models.push("opencode/deepseek-v4-flash-free".to_owned());
+    }
+    models.sort();
+    models
 }
 
 #[cfg(test)]

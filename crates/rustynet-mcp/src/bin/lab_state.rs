@@ -3574,7 +3574,7 @@ impl LabStateServer {
                 ));
             }
         }
-        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.0));
         if rows.is_empty() {
             out.push_str("No jobs yet.\n");
         } else {
@@ -3881,7 +3881,7 @@ impl LabStateServer {
                 }
             }
         }
-        jobs.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.0)); // newest first
         let mut pruned = 0;
         let mut skipped_running = 0;
         for (_, job_id, rec) in jobs.into_iter().skip(keep) {
@@ -5079,8 +5079,8 @@ impl LabStateServer {
             .cloned()
             .collect();
 
-        if !to_ship.is_empty() {
-            if let Err(e) = self.ship_crates(
+        if !to_ship.is_empty()
+            && let Err(e) = self.ship_crates(
                 &target,
                 &user,
                 is_windows,
@@ -5088,9 +5088,9 @@ impl LabStateServer {
                 &guest_hash,
                 &guest_root,
                 &to_ship,
-            ) {
-                return set_err(base, format!("ship failed: {e}"));
-            }
+            )
+        {
+            return set_err(base, format!("ship failed: {e}"));
         }
         base["seeded"] = json!(to_ship.len());
 

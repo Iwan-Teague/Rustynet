@@ -425,6 +425,11 @@ impl NatPmpClient {
     /// probe or feed us a forged mapping — those packets are silently
     /// dropped by the kernel before they reach this code. Matches the
     /// PCP client's discipline.
+    ///
+    /// Deliberately independent of `resilience::next_reconnect_delay_jittered_ms`:
+    /// this is a receive-timeout retransmission ladder on RFC 6886 §3.1 timing
+    /// (no inter-attempt delay exists to jitter) — see the FIS-0016
+    /// classification.
     fn round_trip(&self, request: &[u8]) -> Result<Vec<u8>, PortMapperError> {
         // Bind to v4 0.0.0.0:0 because NAT-PMP is IPv4-only.
         let socket = UdpSocket::bind("0.0.0.0:0")?;
@@ -857,6 +862,10 @@ impl PcpClient {
 
     /// UDP round-trip with the practical retry/backoff documented at
     /// `PCP_DEFAULT_INITIAL_TIMEOUT`.
+    ///
+    /// Deliberately independent of `resilience::next_reconnect_delay_jittered_ms`:
+    /// receive-timeout ladder on documented RFC 6887 §8.1.1-deviating timing,
+    /// not delay-before-retry backoff — see the FIS-0016 classification.
     fn round_trip(&self, request: &[u8]) -> Result<Vec<u8>, PortMapperError> {
         let socket = match self.gateway.ip() {
             IpAddr::V4(_) => UdpSocket::bind("0.0.0.0:0")?,

@@ -52,7 +52,7 @@ use rand::{TryRngCore, rngs::OsRng};
 use rustynet_control::membership::{
     MAX_MEMBERSHIP_SNAPSHOT_BYTES, MembershipApprover, MembershipApproverRole,
     MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipOperation,
-    MembershipReplayCache, MembershipUpdateRecord, SignedMembershipUpdate,
+    MembershipReplayCache, MembershipState, MembershipUpdateRecord, SignedMembershipUpdate,
     append_membership_log_entry, apply_signed_update, decode_signed_update, decode_update_record,
     encode_signed_update, encode_update_record, load_membership_log, load_membership_snapshot,
     persist_membership_snapshot, replay_membership_snapshot_and_log, sign_update_record,
@@ -305,6 +305,45 @@ enum RoleCommand {
     TransitionCheck {
         target: rustynet_control::role_presets::RolePreset,
     },
+    /// `rustynet role recommend [--role anchor|relay|exit]` — FIS-0005
+    /// decision-support placement scoring over the signed membership
+    /// state. Advisory only (live collectors land in a later phase, so
+    /// every candidate is data-starved and flagged as such); never
+    /// mutates anything.
+    Recommend {
+        role: rustynet_advisor::RoleType,
+        paths: MembershipPaths,
+    },
+    /// `rustynet role pin-port-mapping-authority [--node <id> | --clear
+    /// [--node <id>]] --output <path>` — FIS-0014 operator escape hatch.
+    /// Mints a `SetNodeCapabilities` proposal that grants or strips the
+    /// `anchor.port_mapping_pinned` marker; the record still flows through
+    /// the normal sign-update/apply-update quorum path. Admin-only.
+    PinPortMappingAuthority(Box<RolePinAuthorityConfig>),
+}
+
+/// Parsed shape of `role pin-port-mapping-authority`. Mirrors
+/// `AnchorAdvertiseConfig`: membership paths + proposal metadata; the
+/// eligibility/warning logic lives in the pure planner
+/// `plan_pin_port_mapping_authority`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RolePinAuthorityConfig {
+    paths: MembershipPaths,
+    output_path: PathBuf,
+    action: PinAuthorityAction,
+    update_id: String,
+    reason_code: String,
+    policy_context: Option<String>,
+    expires_in_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PinAuthorityAction {
+    /// Grant the pin to this node.
+    Pin { node_id: String },
+    /// Strip the pin. `node_id: None` resolves to the single currently
+    /// pinned node and refuses when zero or multiple nodes hold the pin.
+    Clear { node_id: Option<String> },
 }
 
 /// D12.b — advanced capability mutation surface. The wizard never
@@ -881,6 +920,10 @@ enum OpsCommand {
     },
     VmLabDiagnoseLiveLabFailure {
         config: vm_lab::VmLabDiagnoseLiveLabFailureConfig,
+    },
+    /// FIS-0006: SPRT/CUSUM flake-vs-regression report over the run matrix.
+    LiveLabFlakeReport {
+        matrix_path: PathBuf,
     },
     VmLabDiffLiveLabRuns {
         config: vm_lab::VmLabDiffLiveLabRunsConfig,
@@ -1547,6 +1590,43 @@ fn parse_command(args: &[String]) -> CliCommand {
             match role_cli::parse_preset_arg(raw) {
                 Ok(target) => CliCommand::Role(RoleCommand::TransitionCheck { target }),
                 Err(_) => CliCommand::Help,
+            }
+        }
+        [cmd, subcmd, rest @ ..] if cmd == "role" && subcmd == "recommend" => {
+            match OptionParser::parse(rest) {
+                Ok(parser) => {
+                    let role = match parser.value("--role").as_deref().unwrap_or("anchor") {
+                        "anchor" => Some(rustynet_advisor::RoleType::Anchor),
+                        "relay" => Some(rustynet_advisor::RoleType::Relay),
+                        "exit" => Some(rustynet_advisor::RoleType::Exit),
+                        other => {
+                            eprintln!("invalid --role: {other} (expected anchor|relay|exit)");
+                            None
+                        }
+                    };
+                    match role {
+                        Some(role) => CliCommand::Role(RoleCommand::Recommend {
+                            role,
+                            paths: parser.membership_paths(),
+                        }),
+                        None => CliCommand::Help,
+                    }
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    CliCommand::Help
+                }
+            }
+        }
+        [cmd, subcmd, rest @ ..] if cmd == "role" && subcmd == "pin-port-mapping-authority" => {
+            match parse_role_pin_authority_command(rest) {
+                Ok(config) => {
+                    CliCommand::Role(RoleCommand::PinPortMappingAuthority(Box::new(config)))
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    CliCommand::Help
+                }
             }
         }
         [cmd] if cmd == "role" => CliCommand::Role(RoleCommand::Status),
@@ -3518,6 +3598,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 require_five_node: parser.has_flag("--require-five-node"),
             },
         }),
+        "live-lab-flake-report" => Ok(OpsCommand::LiveLabFlakeReport {
+            matrix_path: parser.value("--matrix").map_or_else(
+                || PathBuf::from("documents/operations/live_lab_run_matrix.csv"),
+                PathBuf::from,
+            ),
+        }),
         "vm-lab-diagnose-live-lab-failure" => Ok(OpsCommand::VmLabDiagnoseLiveLabFailure {
             config: vm_lab::VmLabDiagnoseLiveLabFailureConfig {
                 inventory_path: parser
@@ -5022,6 +5108,37 @@ fn parse_anchor_advertise_capabilities(raw: Option<String>) -> Result<Vec<RoleCa
     Ok(rustynet_control::roles::canonicalize_role_capabilities(out))
 }
 
+fn parse_role_pin_authority_command(args: &[String]) -> Result<RolePinAuthorityConfig, String> {
+    let parser = OptionParser::parse(args)?;
+    let paths = parser.membership_paths();
+    let node_id = parser.value("--node");
+    let action = if parser.has_flag("--clear") {
+        PinAuthorityAction::Clear { node_id }
+    } else {
+        match node_id {
+            Some(node_id) => PinAuthorityAction::Pin { node_id },
+            None => {
+                return Err(
+                    "role pin-port-mapping-authority requires --node <id> or --clear".to_owned(),
+                );
+            }
+        }
+    };
+    Ok(RolePinAuthorityConfig {
+        paths,
+        output_path: parser.required_path("--output")?,
+        action,
+        update_id: parser
+            .value("--update-id")
+            .unwrap_or_else(generate_update_id),
+        reason_code: parser
+            .value("--reason")
+            .unwrap_or_else(|| "port_mapping_authority_pin".to_owned()),
+        policy_context: parser.value("--policy-context"),
+        expires_in_secs: parser.parse_u64_or_default("--expires-in", 300)?,
+    })
+}
+
 fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String> {
     if args.is_empty() {
         return Err("assignment subcommand is required".to_owned());
@@ -6344,8 +6461,28 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             stream
                 .set_write_timeout(Some(Duration::from_secs(5)))
                 .map_err(|err| format!("set anchor bundle-pull write timeout failed: {err}"))?;
+            // FIS-0020: conditional pull. When a previous bundle exists at
+            // the output path AND the forced-full counter permits, send
+            // `have <epoch> <root>` so an unchanged server replies with a
+            // hash-sized UNCHANGED instead of the full bundle. The counter
+            // is pure client-local monotonic state that no server response
+            // can reset or influence: every Nth pull is unconditionally
+            // full, bounding silent staleness from a lying UNCHANGED to
+            // <= N cycles.
+            let pull_count = increment_anchor_bundle_pull_counter(&output_path);
+            let have_identity = if anchor_bundle_pull_must_force_full(pull_count) {
+                None
+            } else {
+                std::fs::read(&output_path).ok().and_then(|bytes| {
+                    rustynet_control::membership::snapshot_bytes_state_identity(&bytes)
+                })
+            };
+            let mut request = format!("{token}\n");
+            if let Some((epoch, root)) = &have_identity {
+                request.push_str(&format!("have {epoch} {root}\n"));
+            }
             stream
-                .write_all(format!("{token}\n").as_bytes())
+                .write_all(request.as_bytes())
                 .map_err(|err| format!("write anchor bundle-pull token failed: {err}"))?;
             let mut response = Vec::new();
             stream
@@ -6357,6 +6494,19 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             };
             let header = std::str::from_utf8(&response[..header_end])
                 .map_err(|_| "anchor bundle-pull response header is not utf8".to_owned())?;
+            if header == "UNCHANGED" {
+                if have_identity.is_none() {
+                    return Err(
+                        "anchor bundle-pull returned UNCHANGED to a full pull (protocol violation)"
+                            .to_owned(),
+                    );
+                }
+                return Ok(format!(
+                    "anchor bundle unchanged: {} matches the server (epoch {})",
+                    output_path.display(),
+                    have_identity.map(|(epoch, _)| epoch).unwrap_or_default()
+                ));
+            }
             let Some(size_raw) = header.strip_prefix("OK ") else {
                 return Err(format!("anchor bundle-pull failed: {header}"));
             };
@@ -6385,6 +6535,28 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             Ok(render_anchor_init_plan(&plan))
         }
     }
+}
+
+/// FIS-0020: every Nth pull is unconditionally full — the counter is
+/// client-local and monotonic, so no server response can extend the
+/// staleness bound past N cycles.
+const ANCHOR_BUNDLE_PULL_FORCE_FULL_EVERY: u64 = 10;
+
+fn anchor_bundle_pull_must_force_full(pull_count: u64) -> bool {
+    pull_count.is_multiple_of(ANCHOR_BUNDLE_PULL_FORCE_FULL_EVERY)
+}
+
+/// Increment and persist the client-local pull counter beside the output
+/// bundle. Any I/O failure degrades to 0 — which forces a full pull, the
+/// safe direction.
+fn increment_anchor_bundle_pull_counter(output_path: &Path) -> u64 {
+    let counter_path = output_path.with_extension("pulls");
+    let next = std::fs::read_to_string(&counter_path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(0, |count| count.wrapping_add(1));
+    let _ = std::fs::write(&counter_path, next.to_string());
+    next
 }
 
 fn execute_membership(command: MembershipCommand) -> Result<String, String> {
@@ -7211,6 +7383,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::VmLabDiagnoseLiveLabFailure { config } => {
             vm_lab::execute_ops_vm_lab_diagnose_live_lab_failure(config)
+        }
+        OpsCommand::LiveLabFlakeReport { matrix_path } => {
+            vm_lab::run_history::render_flake_report(&matrix_path)
         }
         OpsCommand::VmLabDiffLiveLabRuns { config } => {
             vm_lab::execute_ops_vm_lab_diff_live_lab_runs(config)
@@ -17335,7 +17510,248 @@ fn execute_role(cmd: RoleCommand) -> Result<String, String> {
             );
             execute_role_plan(plan)
         }
+
+        RoleCommand::PinPortMappingAuthority(config) => {
+            execute_role_pin_port_mapping_authority(*config)
+        }
+
+        RoleCommand::Recommend { role, paths } => execute_role_recommend(role, &paths),
     }
+}
+
+/// FIS-0005 phase-1 CLI: rank Active, role-eligible membership nodes with
+/// the advisor's MCDA scorer. No live collectors exist yet, so every
+/// observation is deliberately data-starved (Unknown/None on every live
+/// axis) and the output is flagged ADVISORY — the verb proves the seam and
+/// the eligibility filter without fabricating evidence.
+fn execute_role_recommend(
+    role: rustynet_advisor::RoleType,
+    paths: &MembershipPaths,
+) -> Result<String, String> {
+    let (_, _, state) = load_current_membership_state(paths, unix_now())?;
+    let now_unix = unix_now();
+    let observations: Vec<rustynet_advisor::CandidateObservation> = state
+        .nodes
+        .iter()
+        .filter(|node| node.status == MembershipNodeStatus::Active)
+        .filter(|node| match role {
+            rustynet_advisor::RoleType::Anchor => node
+                .capabilities
+                .iter()
+                .any(|capability| capability.is_anchor_capability()),
+            rustynet_advisor::RoleType::Relay => {
+                node.capabilities.contains(&RoleCapability::RelayHost)
+            }
+            rustynet_advisor::RoleType::Exit => {
+                node.capabilities.contains(&RoleCapability::ExitServer)
+            }
+        })
+        .map(|node| rustynet_advisor::CandidateObservation {
+            node_id: node.node_id.clone(),
+            uptime_ratio_ewma: None,
+            nat_class: rustynet_advisor::NatClassCode::InsufficientData,
+            handshake_success_ewma: None,
+            bandwidth_headroom: rustynet_advisor::BandwidthHeadroom::Unknown,
+            centrality: None,
+            observed_at_unix: now_unix,
+        })
+        .collect();
+    let recommendation = rustynet_advisor::recommend_role_placement(role, &observations);
+    Ok(rustynet_advisor::render_recommendation(&recommendation))
+}
+
+/// Pure planning output for `role pin-port-mapping-authority` (FIS-0014).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PinAuthorityPlan {
+    node_id: String,
+    capabilities: Vec<RoleCapability>,
+    warnings: Vec<String>,
+    action_label: &'static str,
+}
+
+/// Granting a pin puts a capability token on the wire that pre-FIS-0014
+/// daemons cannot parse; their bundle decode fails closed and they freeze
+/// at their last epoch. Sequencing constraint, not a safety hazard.
+const PIN_MIXED_VERSION_WARNING: &str = "anchor.port_mapping_pinned is a new capability token: daemons that predate it fail closed \
+     decoding the membership bundle and freeze at their last epoch. Apply this only after the \
+     entire fleet is upgraded.";
+
+/// Pure planner: refuses ineligible pin targets (missing, non-Active, or
+/// lacking `anchor.port_mapping_authoritative`), refuses redundant ops
+/// (already pinned / nothing to clear), and warns — without refusing — on
+/// degenerate multi-pin and on the mixed-version decode hazard. Inputs are
+/// exclusively fields of the signed membership state, so two admins running
+/// this against the same snapshot compute identical plans.
+fn plan_pin_port_mapping_authority(
+    state: &MembershipState,
+    action: &PinAuthorityAction,
+) -> Result<PinAuthorityPlan, String> {
+    let pinned_node_ids: Vec<String> = state
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.capabilities
+                .contains(&RoleCapability::AnchorPortMappingPinned)
+        })
+        .map(|node| node.node_id.clone())
+        .collect();
+    match action {
+        PinAuthorityAction::Pin { node_id } => {
+            let node = state
+                .nodes
+                .iter()
+                .find(|node| node.node_id == *node_id)
+                .ok_or_else(|| format!("membership node {node_id} not found"))?;
+            if node.status != MembershipNodeStatus::Active {
+                return Err(format!(
+                    "refusing to pin {node_id}: node status is {:?} (must be Active)",
+                    node.status
+                ));
+            }
+            if !node
+                .capabilities
+                .contains(&RoleCapability::AnchorPortMappingAuthoritative)
+            {
+                return Err(format!(
+                    "refusing to pin {node_id}: node lacks anchor.port_mapping_authoritative \
+                     (grant port-mapping eligibility first, e.g. via `rustynet anchor advertise`)"
+                ));
+            }
+            if node
+                .capabilities
+                .contains(&RoleCapability::AnchorPortMappingPinned)
+            {
+                return Err(format!(
+                    "node {node_id} already holds anchor.port_mapping_pinned"
+                ));
+            }
+            let mut warnings = vec![PIN_MIXED_VERSION_WARNING.to_owned()];
+            if !pinned_node_ids.is_empty() {
+                warnings.push(format!(
+                    "multi-pin: {} already pinned; authority still resolves deterministically \
+                     (pinned first, then seniority, then node id) but a single pin is the \
+                     intended state — clear the others",
+                    pinned_node_ids.join(", ")
+                ));
+            }
+            let mut capabilities = node.capabilities.clone();
+            capabilities.push(RoleCapability::AnchorPortMappingPinned);
+            Ok(PinAuthorityPlan {
+                node_id: node_id.clone(),
+                capabilities: rustynet_control::roles::canonicalize_role_capabilities(capabilities),
+                warnings,
+                action_label: "pin",
+            })
+        }
+        PinAuthorityAction::Clear { node_id } => {
+            let target_node_id = match node_id {
+                Some(node_id) => {
+                    if !pinned_node_ids.iter().any(|pinned| pinned == node_id) {
+                        return Err(format!(
+                            "node {node_id} does not hold anchor.port_mapping_pinned"
+                        ));
+                    }
+                    node_id.clone()
+                }
+                None => match pinned_node_ids.as_slice() {
+                    [] => {
+                        return Err(
+                            "no node holds anchor.port_mapping_pinned; nothing to clear".to_owned()
+                        );
+                    }
+                    [single] => single.clone(),
+                    multiple => {
+                        return Err(format!(
+                            "multiple nodes hold anchor.port_mapping_pinned ({}); pass \
+                             --node <id> to pick one",
+                            multiple.join(", ")
+                        ));
+                    }
+                },
+            };
+            // Clearing is allowed on any status — stripping a stale pin from a
+            // revoked node is a legitimate cleanup op.
+            let node = state
+                .nodes
+                .iter()
+                .find(|node| node.node_id == target_node_id)
+                .ok_or_else(|| format!("membership node {target_node_id} not found"))?;
+            let mut capabilities = node.capabilities.clone();
+            capabilities
+                .retain(|capability| *capability != RoleCapability::AnchorPortMappingPinned);
+            Ok(PinAuthorityPlan {
+                node_id: target_node_id,
+                capabilities: rustynet_control::roles::canonicalize_role_capabilities(capabilities),
+                warnings: vec![
+                    "pin cleared: authority falls back to the seniority auto rule (oldest \
+                     joined_at_unix, then node id)"
+                        .to_owned(),
+                ],
+                action_label: "clear",
+            })
+        }
+    }
+}
+
+/// FIS-0014 commit 3: mint the `SetNodeCapabilities` proposal that grants or
+/// strips `anchor.port_mapping_pinned`. Planning is pure
+/// ([`plan_pin_port_mapping_authority`]); this function loads the membership
+/// state, mints the record (same RSA-0009-safe pattern as
+/// `AnchorCommand::Advertise`), and writes the proposal file. The record
+/// still requires the normal sign-update/apply-update quorum path.
+fn execute_role_pin_port_mapping_authority(
+    config: RolePinAuthorityConfig,
+) -> Result<String, String> {
+    let (_, _, state) = load_current_membership_state(&config.paths, unix_now())?;
+    let plan = plan_pin_port_mapping_authority(&state, &config.action)?;
+    let prev_root = state.state_root_hex().map_err(|err| err.to_string())?;
+    let operation = MembershipOperation::SetNodeCapabilities {
+        node_id: plan.node_id.clone(),
+        capabilities: plan.capabilities.clone(),
+    };
+    // RSA-0009: the timestamp fed to preview_next_state MUST equal the
+    // record's created_at_unix so the new_state_root reproduces at apply.
+    let created_at_unix = unix_now();
+    let candidate =
+        rustynet_control::membership::preview_next_state(&state, &operation, created_at_unix)
+            .map_err(|err| err.to_string())?;
+    let new_root = candidate.state_root_hex().map_err(|err| err.to_string())?;
+    let expires_at_unix = created_at_unix.saturating_add(config.expires_in_secs);
+    if expires_at_unix <= created_at_unix {
+        return Err("invalid expiry window: --expires-in must be > 0".to_owned());
+    }
+    let record = MembershipUpdateRecord {
+        network_id: state.network_id,
+        update_id: config.update_id,
+        operation,
+        target: plan.node_id.clone(),
+        prev_state_root: prev_root,
+        new_state_root: new_root,
+        epoch_prev: state.epoch,
+        epoch_new: state.epoch.saturating_add(1),
+        created_at_unix,
+        expires_at_unix,
+        reason_code: config.reason_code,
+        policy_context: config.policy_context,
+    };
+    let payload = encode_update_record(&record).map_err(|err| err.to_string())?;
+    write_text_file(&config.output_path, &payload)?;
+    let mut out = String::new();
+    for warning in &plan.warnings {
+        out.push_str(&format!("warning: {warning}\n"));
+    }
+    out.push_str(&format!(
+        "port-mapping-authority {} proposal written: {} target={} epoch_new={}\n",
+        plan.action_label,
+        config.output_path.display(),
+        record.target,
+        record.epoch_new
+    ));
+    out.push_str(
+        "next: co-sign with `rustynet membership sign-update` and apply with \
+         `rustynet membership apply-update`",
+    );
+    Ok(out)
 }
 
 /// Execute the side-effects produced by
@@ -18056,6 +18472,8 @@ fn help_text() -> String {
         "  tunnel-info",
         "  exit-node-list",
         "  role [show|set <admin|client|blind_exit>]",
+        "  role pin-port-mapping-authority [--node <id> | --clear [--node <id>]] --output <path> [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
+        "  role recommend [--role anchor|relay|exit] [--snapshot <path>] [--log <path>]",
         "  llm allow <node:id|group:name> [--models a,b] [--quota <tokens>] [--rate <req/min>]",
         "  llm deny <node:id|group:name>",
         "  llm access list",
@@ -18189,6 +18607,7 @@ fn help_text() -> String {
         "  ops vm-lab-pull-windows-state-from-linux-exit [--inventory <path>] --linux-exit-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --dest-dir <path> --report-dir <path> [--dry-run]",
         "  ops vm-lab-validate-live-lab-profile --profile <path> [--expected-backend <mode>] [--expected-source-mode <mode>] [--require-five-node]",
         "  ops vm-lab-diagnose-live-lab-failure [--inventory <path>] --profile <path> --report-dir <path> [--stage <name>] [--output-dir <path>] [--collect-artifacts] [--timeout-secs <secs>]",
+        "  ops live-lab-flake-report [--matrix <path>]",
         "  ops vm-lab-diff-live-lab-runs --old-report-dir <path> --new-report-dir <path>",
         "  ops vm-lab-diff-orchestrator-parity --left <parity_input.json> --right <parity_input.json> --output <parity_diff.json>",
         "  ops vm-lab-iterate-live-lab [--inventory <path>] [--profile-output <path>] --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--script <path>] [--dry-run] [--skip-gates] [--skip-soak] [--skip-cross-network] [--require-clean-tree] [--require-local-head] --validation-step <fmt|check:<package>|check-bin:<package>:<bin>|test:<package>[:filter]|test-bin:<package>:<bin>[:filter]>... [--collect-failure-diagnostics] [--failed-log-tail-lines <n>] [--timeout-secs <secs>]",
@@ -19807,6 +20226,357 @@ mod phase18_socket_allowlist_tests {
                 "attacker-controlled path must NEVER be allowlisted: {path}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod anchor_bundle_pull_counter_tests {
+    use super::{anchor_bundle_pull_must_force_full, increment_anchor_bundle_pull_counter};
+
+    #[test]
+    fn forced_full_pull_counter_immune_to_unchanged() {
+        // Every 10th pull (and the very first) is unconditionally full; the
+        // counter is pure client-local state — nothing a server sends can
+        // reset it, so silent staleness from a lying UNCHANGED is bounded
+        // to <= 10 cycles.
+        assert!(anchor_bundle_pull_must_force_full(0), "first pull is full");
+        for count in 1..10u64 {
+            assert!(!anchor_bundle_pull_must_force_full(count));
+        }
+        assert!(anchor_bundle_pull_must_force_full(10));
+        assert!(anchor_bundle_pull_must_force_full(20));
+
+        // The persisted counter increments monotonically and survives
+        // re-reads; a missing file starts at 0 (forced full — the safe
+        // direction).
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-pull-counter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let output = dir.join("membership.snapshot");
+        assert_eq!(increment_anchor_bundle_pull_counter(&output), 0);
+        assert_eq!(increment_anchor_bundle_pull_counter(&output), 1);
+        assert_eq!(increment_anchor_bundle_pull_counter(&output), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod pin_authority_tests {
+    use super::{
+        CliCommand, PinAuthorityAction, RoleCommand, parse_command, plan_pin_port_mapping_authority,
+    };
+    use rustynet_control::membership::{MembershipNode, MembershipNodeStatus, MembershipState};
+    use rustynet_control::roles::RoleCapability;
+    use std::path::PathBuf;
+
+    fn fixture_node(
+        node_id: &str,
+        status: MembershipNodeStatus,
+        capabilities: Vec<RoleCapability>,
+    ) -> MembershipNode {
+        MembershipNode {
+            node_id: node_id.to_owned(),
+            node_pubkey_hex: "00".repeat(32),
+            owner: "ops".to_owned(),
+            status,
+            roles: vec!["tag:members".to_owned()],
+            capabilities,
+            joined_at_unix: 100,
+            updated_at_unix: 100,
+        }
+    }
+
+    fn fixture_state(nodes: Vec<MembershipNode>) -> MembershipState {
+        MembershipState {
+            schema_version: 1,
+            network_id: "net-test".to_owned(),
+            epoch: 7,
+            nodes,
+            approver_set: Vec::new(),
+            quorum_threshold: 1,
+            metadata_hash: None,
+        }
+    }
+
+    fn eligible_caps() -> Vec<RoleCapability> {
+        vec![
+            RoleCapability::Client,
+            RoleCapability::Anchor,
+            RoleCapability::AnchorPortMappingAuthoritative,
+        ]
+    }
+
+    fn pinned_caps() -> Vec<RoleCapability> {
+        let mut caps = eligible_caps();
+        caps.push(RoleCapability::AnchorPortMappingPinned);
+        caps
+    }
+
+    #[test]
+    fn role_pin_authority_parse_pin_clear_and_missing_target() {
+        let pin = parse_command(&[
+            "role".to_owned(),
+            "pin-port-mapping-authority".to_owned(),
+            "--node".to_owned(),
+            "anchor-b".to_owned(),
+            "--output".to_owned(),
+            "/tmp/pin.record".to_owned(),
+        ]);
+        match pin {
+            CliCommand::Role(RoleCommand::PinPortMappingAuthority(config)) => {
+                assert_eq!(
+                    config.action,
+                    PinAuthorityAction::Pin {
+                        node_id: "anchor-b".to_owned()
+                    }
+                );
+                assert_eq!(config.output_path, PathBuf::from("/tmp/pin.record"));
+                assert_eq!(config.reason_code, "port_mapping_authority_pin");
+            }
+            other => panic!("expected pin command, got {other:?}"),
+        }
+
+        let clear = parse_command(&[
+            "role".to_owned(),
+            "pin-port-mapping-authority".to_owned(),
+            "--clear".to_owned(),
+            "--output".to_owned(),
+            "/tmp/clear.record".to_owned(),
+        ]);
+        match clear {
+            CliCommand::Role(RoleCommand::PinPortMappingAuthority(config)) => {
+                assert_eq!(config.action, PinAuthorityAction::Clear { node_id: None });
+            }
+            other => panic!("expected clear command, got {other:?}"),
+        }
+
+        let clear_specific = parse_command(&[
+            "role".to_owned(),
+            "pin-port-mapping-authority".to_owned(),
+            "--clear".to_owned(),
+            "--node".to_owned(),
+            "anchor-a".to_owned(),
+            "--output".to_owned(),
+            "/tmp/clear.record".to_owned(),
+        ]);
+        match clear_specific {
+            CliCommand::Role(RoleCommand::PinPortMappingAuthority(config)) => {
+                assert_eq!(
+                    config.action,
+                    PinAuthorityAction::Clear {
+                        node_id: Some("anchor-a".to_owned())
+                    }
+                );
+            }
+            other => panic!("expected clear command, got {other:?}"),
+        }
+
+        // Neither --node nor --clear → refuse (falls back to Help).
+        let missing = parse_command(&[
+            "role".to_owned(),
+            "pin-port-mapping-authority".to_owned(),
+            "--output".to_owned(),
+            "/tmp/pin.record".to_owned(),
+        ]);
+        assert!(matches!(missing, CliCommand::Help));
+
+        // Missing --output → refuse.
+        let no_output = parse_command(&[
+            "role".to_owned(),
+            "pin-port-mapping-authority".to_owned(),
+            "--node".to_owned(),
+            "anchor-b".to_owned(),
+        ]);
+        assert!(matches!(no_output, CliCommand::Help));
+    }
+
+    #[test]
+    fn pin_authority_plan_grants_pin_and_warns_mixed_version() {
+        let state = fixture_state(vec![fixture_node(
+            "anchor-a",
+            MembershipNodeStatus::Active,
+            eligible_caps(),
+        )]);
+        let plan = plan_pin_port_mapping_authority(
+            &state,
+            &PinAuthorityAction::Pin {
+                node_id: "anchor-a".to_owned(),
+            },
+        )
+        .expect("pin plan");
+        assert_eq!(plan.node_id, "anchor-a");
+        assert_eq!(plan.action_label, "pin");
+        assert!(
+            plan.capabilities
+                .contains(&RoleCapability::AnchorPortMappingPinned)
+        );
+        // Pre-existing capabilities survive the canonicalized merge.
+        assert!(
+            plan.capabilities
+                .contains(&RoleCapability::AnchorPortMappingAuthoritative)
+        );
+        assert!(plan.capabilities.contains(&RoleCapability::Client));
+        // Mixed-version decode hazard is always surfaced on pin.
+        assert!(plan.warnings.iter().any(|w| w.contains("fail closed")));
+        assert!(!plan.warnings.iter().any(|w| w.contains("multi-pin")));
+    }
+
+    #[test]
+    fn pin_authority_plan_refuses_ineligible_targets() {
+        // Unknown node.
+        let empty = fixture_state(Vec::new());
+        let err = plan_pin_port_mapping_authority(
+            &empty,
+            &PinAuthorityAction::Pin {
+                node_id: "ghost".to_owned(),
+            },
+        )
+        .expect_err("unknown node must refuse");
+        assert!(err.contains("not found"), "{err}");
+
+        // Non-Active target.
+        let revoked = fixture_state(vec![fixture_node(
+            "anchor-a",
+            MembershipNodeStatus::Revoked,
+            eligible_caps(),
+        )]);
+        let err = plan_pin_port_mapping_authority(
+            &revoked,
+            &PinAuthorityAction::Pin {
+                node_id: "anchor-a".to_owned(),
+            },
+        )
+        .expect_err("revoked node must refuse");
+        assert!(err.contains("must be Active"), "{err}");
+
+        // Missing eligibility capability.
+        let ineligible = fixture_state(vec![fixture_node(
+            "anchor-a",
+            MembershipNodeStatus::Active,
+            vec![RoleCapability::Client],
+        )]);
+        let err = plan_pin_port_mapping_authority(
+            &ineligible,
+            &PinAuthorityAction::Pin {
+                node_id: "anchor-a".to_owned(),
+            },
+        )
+        .expect_err("ineligible node must refuse");
+        assert!(err.contains("anchor.port_mapping_authoritative"), "{err}");
+
+        // Already pinned.
+        let already = fixture_state(vec![fixture_node(
+            "anchor-a",
+            MembershipNodeStatus::Active,
+            pinned_caps(),
+        )]);
+        let err = plan_pin_port_mapping_authority(
+            &already,
+            &PinAuthorityAction::Pin {
+                node_id: "anchor-a".to_owned(),
+            },
+        )
+        .expect_err("already-pinned node must refuse");
+        assert!(err.contains("already holds"), "{err}");
+    }
+
+    #[test]
+    fn pin_authority_plan_warns_on_multi_pin() {
+        let state = fixture_state(vec![
+            fixture_node("anchor-a", MembershipNodeStatus::Active, pinned_caps()),
+            fixture_node("anchor-b", MembershipNodeStatus::Active, eligible_caps()),
+        ]);
+        let plan = plan_pin_port_mapping_authority(
+            &state,
+            &PinAuthorityAction::Pin {
+                node_id: "anchor-b".to_owned(),
+            },
+        )
+        .expect("multi-pin tolerated with warning");
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("multi-pin") && w.contains("anchor-a")),
+            "warnings: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn pin_authority_plan_clear_resolves_single_and_ambiguous() {
+        // Zero pins → refuse.
+        let none = fixture_state(vec![fixture_node(
+            "anchor-a",
+            MembershipNodeStatus::Active,
+            eligible_caps(),
+        )]);
+        let err =
+            plan_pin_port_mapping_authority(&none, &PinAuthorityAction::Clear { node_id: None })
+                .expect_err("no pin must refuse");
+        assert!(err.contains("nothing to clear"), "{err}");
+
+        // Single pin resolves implicitly.
+        let single = fixture_state(vec![fixture_node(
+            "anchor-a",
+            MembershipNodeStatus::Active,
+            pinned_caps(),
+        )]);
+        let plan =
+            plan_pin_port_mapping_authority(&single, &PinAuthorityAction::Clear { node_id: None })
+                .expect("single pin clears implicitly");
+        assert_eq!(plan.node_id, "anchor-a");
+        assert_eq!(plan.action_label, "clear");
+        assert!(
+            !plan
+                .capabilities
+                .contains(&RoleCapability::AnchorPortMappingPinned)
+        );
+        assert!(
+            plan.capabilities
+                .contains(&RoleCapability::AnchorPortMappingAuthoritative)
+        );
+
+        // Multiple pins → ambiguous without --node.
+        let multi = fixture_state(vec![
+            fixture_node("anchor-a", MembershipNodeStatus::Active, pinned_caps()),
+            fixture_node("anchor-b", MembershipNodeStatus::Active, pinned_caps()),
+        ]);
+        let err =
+            plan_pin_port_mapping_authority(&multi, &PinAuthorityAction::Clear { node_id: None })
+                .expect_err("ambiguous clear must refuse");
+        assert!(err.contains("multiple nodes"), "{err}");
+
+        // Explicit --node disambiguates.
+        let plan = plan_pin_port_mapping_authority(
+            &multi,
+            &PinAuthorityAction::Clear {
+                node_id: Some("anchor-b".to_owned()),
+            },
+        )
+        .expect("explicit clear resolves");
+        assert_eq!(plan.node_id, "anchor-b");
+
+        // Explicit --node on an unpinned node → refuse.
+        let err = plan_pin_port_mapping_authority(
+            &none,
+            &PinAuthorityAction::Clear {
+                node_id: Some("anchor-a".to_owned()),
+            },
+        )
+        .expect_err("clearing an unpinned node must refuse");
+        assert!(err.contains("does not hold"), "{err}");
+
+        // Clearing a stale pin from a revoked node is allowed (cleanup op).
+        let revoked = fixture_state(vec![fixture_node(
+            "anchor-a",
+            MembershipNodeStatus::Revoked,
+            pinned_caps(),
+        )]);
+        let plan =
+            plan_pin_port_mapping_authority(&revoked, &PinAuthorityAction::Clear { node_id: None })
+                .expect("clearing a revoked node's pin is allowed");
+        assert_eq!(plan.node_id, "anchor-a");
     }
 }
 

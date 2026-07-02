@@ -143,7 +143,15 @@ pub fn build_orchestrator_args(
 }
 
 /// Spawn the orchestrator subprocess with its own process group and durable monitor job state.
-pub fn spawn_orchestrator(repo_root: &Path, config: &MonitorConfig) -> Result<SpawnedOrchestrator> {
+pub fn spawn_orchestrator(
+    repo_root: &Path,
+    config: &MonitorConfig,
+    patch_model: &str,
+    patch_variant: &str,
+    review_model: &str,
+    patch_iterations: u8,
+    review_iterations: u8,
+) -> Result<SpawnedOrchestrator> {
     let job_id = format!(
         "monitor-{}",
         std::time::SystemTime::now()
@@ -183,6 +191,11 @@ pub fn spawn_orchestrator(repo_root: &Path, config: &MonitorConfig) -> Result<Sp
     let child = tokio::process::Command::new(&binary)
         .args(&args)
         .env("OPENCODE_LOOP_MAX_CYCLES", "0")
+        .env("OPENCODE_MAIN_MODEL", patch_model)
+        .env("OPENCODE_MAIN_VARIANT", patch_variant)
+        .env("OPENCODE_REVIEW_MODEL", review_model)
+        .env("OPENCODE_MAIN_ITERATIONS", patch_iterations.to_string())
+        .env("OPENCODE_REVIEW_ITERATIONS", review_iterations.to_string())
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log))
         .stdin(Stdio::null())

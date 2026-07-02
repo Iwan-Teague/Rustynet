@@ -362,19 +362,23 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
 
         let allowed_ips = peer.allowed_ips.join(",");
         let endpoint = format!("{}:{}", peer.endpoint.addr, peer.endpoint.port);
-        self.runner.run(
-            "wg",
-            &[
-                "set".to_owned(),
-                self.interface_name.clone(),
-                "peer".to_owned(),
-                encode_wg_public_key_base64(&peer.public_key),
-                "endpoint".to_owned(),
-                endpoint,
-                "allowed-ips".to_owned(),
-                allowed_ips,
-            ],
-        )?;
+        let mut args = vec![
+            "set".to_owned(),
+            self.interface_name.clone(),
+            "peer".to_owned(),
+            encode_wg_public_key_base64(&peer.public_key),
+            "endpoint".to_owned(),
+            endpoint,
+            "allowed-ips".to_owned(),
+            allowed_ips,
+        ];
+        // FIS-0015: only when configured — None preserves today's behavior
+        // (no WG-native keepalive).
+        if let Some(interval_secs) = peer.persistent_keepalive_secs {
+            args.push("persistent-keepalive".to_owned());
+            args.push(interval_secs.to_string());
+        }
+        self.runner.run("wg", &args)?;
 
         self.peers.insert(peer.node_id.clone(), peer);
         Ok(())
@@ -719,6 +723,7 @@ mod tests {
             },
             public_key: [7; 32],
             allowed_ips: vec!["100.64.1.0/24".to_owned()],
+            persistent_keepalive_secs: None,
         }
     }
 
@@ -768,6 +773,45 @@ mod tests {
 
         let stats = backend.stats();
         assert!(stats.is_err());
+    }
+
+    #[test]
+    fn linux_backend_wg_set_includes_persistent_keepalive_when_configured() {
+        let runner = RecordingRunner::default();
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
+            .expect("backend should be constructed");
+        backend
+            .start(runtime_context())
+            .expect("start should execute runner calls");
+
+        // Default (None): no persistent-keepalive arg — today's behavior.
+        backend
+            .configure_peer(sample_peer("peer-a"))
+            .expect("peer configure should work");
+        assert!(
+            !backend
+                .runner
+                .calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "persistent-keepalive")),
+            "None must not emit persistent-keepalive"
+        );
+
+        // Some(n): the wg set call carries `persistent-keepalive n`.
+        let mut peer = sample_peer("peer-b");
+        peer.persistent_keepalive_secs = Some(21);
+        backend
+            .configure_peer(peer)
+            .expect("peer configure should work");
+        assert!(
+            backend.runner.calls.iter().any(|(program, args)| {
+                program == "wg"
+                    && args
+                        .windows(2)
+                        .any(|pair| pair[0] == "persistent-keepalive" && pair[1] == "21")
+            }),
+            "Some(21) must emit `persistent-keepalive 21`"
+        );
     }
 
     #[test]

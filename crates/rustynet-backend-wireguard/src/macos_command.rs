@@ -467,19 +467,22 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
     fn apply_peer_config_to_wg(&mut self, peer: &PeerConfig) -> Result<(), BackendError> {
         let allowed_ips = peer.allowed_ips.join(",");
         let endpoint = render_peer_endpoint(peer.endpoint);
-        self.runner.run(
-            "wg",
-            &[
-                "set".to_owned(),
-                self.interface_name.clone(),
-                "peer".to_owned(),
-                encode_wg_public_key_base64(&peer.public_key),
-                "endpoint".to_owned(),
-                endpoint,
-                "allowed-ips".to_owned(),
-                allowed_ips,
-            ],
-        )
+        let mut args = vec![
+            "set".to_owned(),
+            self.interface_name.clone(),
+            "peer".to_owned(),
+            encode_wg_public_key_base64(&peer.public_key),
+            "endpoint".to_owned(),
+            endpoint,
+            "allowed-ips".to_owned(),
+            allowed_ips,
+        ];
+        // FIS-0015: only when configured — None preserves today's behavior.
+        if let Some(interval_secs) = peer.persistent_keepalive_secs {
+            args.push("persistent-keepalive".to_owned());
+            args.push(interval_secs.to_string());
+        }
+        self.runner.run("wg", &args)
     }
 
     fn remove_peer_from_wg(&mut self, peer: &PeerConfig) -> Result<(), BackendError> {
@@ -1366,6 +1369,7 @@ mod tests {
             },
             public_key: [7; 32],
             allowed_ips: vec!["100.64.1.0/24".to_owned()],
+            persistent_keepalive_secs: None,
         }
     }
 
@@ -1553,6 +1557,50 @@ mod tests {
             }])
             .expect("route apply should work");
         backend.shutdown().expect("shutdown should work");
+    }
+
+    #[test]
+    fn macos_backend_wg_set_includes_persistent_keepalive_when_configured() {
+        let mut backend = MacosWireguardBackend::new_for_test(
+            ScriptedRunner::default(),
+            "utun9",
+            "/tmp/wg.key",
+            "en0",
+            51820,
+        )
+        .expect("backend should be constructed");
+        backend
+            .start(runtime_context())
+            .expect("start should execute runner calls");
+
+        // Default (None): no persistent-keepalive arg — today's behavior.
+        backend
+            .configure_peer(sample_peer("peer-a"))
+            .expect("peer configure should work");
+        assert!(
+            !backend
+                .runner
+                .calls
+                .iter()
+                .any(|call| call.iter().any(|arg| arg == "persistent-keepalive")),
+            "None must not emit persistent-keepalive"
+        );
+
+        // Some(n): the wg set call carries `persistent-keepalive n`.
+        let mut peer = sample_peer("peer-b");
+        peer.persistent_keepalive_secs = Some(21);
+        backend
+            .configure_peer(peer)
+            .expect("peer configure should work");
+        assert!(
+            backend.runner.calls.iter().any(|call| {
+                call.first().is_some_and(|program| program == "wg")
+                    && call
+                        .windows(2)
+                        .any(|pair| pair[0] == "persistent-keepalive" && pair[1] == "21")
+            }),
+            "Some(21) must emit `persistent-keepalive 21`"
+        );
     }
 
     #[test]
