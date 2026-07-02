@@ -62,6 +62,7 @@ ENTRY_TARGET=""
 AUX_TARGET=""
 EXTRA_TARGET=""
 FIFTH_CLIENT_TARGET=""
+LINUX_BLIND_EXIT_LABEL=""
 EXIT_PLATFORM="linux"
 CLIENT_PLATFORM="linux"
 ENTRY_PLATFORM="linux"
@@ -579,6 +580,7 @@ load_profile_file() {
         [[ -z "$FIFTH_CLIENT_TARGET" ]] && FIFTH_CLIENT_TARGET="$value"
         ;;
 	      FIFTH_CLIENT_UTM_NAME) [[ -z "$FIFTH_CLIENT_UTM_NAME" ]] && FIFTH_CLIENT_UTM_NAME="$value" ;;
+      LINUX_BLIND_EXIT_LABEL) [[ -z "$LINUX_BLIND_EXIT_LABEL" ]] && LINUX_BLIND_EXIT_LABEL="$value" ;;
 	      RELAY_TARGET)
 	        RELAY_TARGET_DECLARED=1
 	        [[ -z "$RELAY_TARGET" ]] && RELAY_TARGET="$value"
@@ -865,6 +867,37 @@ node_platform_for_label() {
     fifth_client) printf '%s\n' "$FIFTH_CLIENT_PLATFORM" ;;
     *) printf 'unknown node label for platform lookup: %s\n' "$label" >&2; return 1 ;;
   esac
+}
+
+validate_linux_blind_exit_label() {
+  local label="${LINUX_BLIND_EXIT_LABEL:-}"
+  [[ -n "$label" ]] || return 0
+  case "$label" in
+    aux|fifth_client)
+      ;;
+    *)
+      printf 'LINUX_BLIND_EXIT_LABEL must be aux or fifth_client, got %q\n' "$label" >&2
+      return 1
+      ;;
+  esac
+  if ! has_label "$label"; then
+    printf 'LINUX_BLIND_EXIT_LABEL=%s is not present in nodes.tsv\n' "$label" >&2
+    return 1
+  fi
+  if [[ "$(node_platform_for_label "$label")" != "linux" ]]; then
+    printf 'LINUX_BLIND_EXIT_LABEL=%s must resolve to a Linux node\n' "$label" >&2
+    return 1
+  fi
+}
+
+effective_runtime_role_for_label() {
+  local label="$1"
+  local fallback_role="$2"
+  if [[ -n "${LINUX_BLIND_EXIT_LABEL:-}" && "$label" == "$LINUX_BLIND_EXIT_LABEL" ]]; then
+    printf 'blind_exit'
+  else
+    printf '%s' "$fallback_role"
+  fi
 }
 
 has_label() {
@@ -2181,6 +2214,7 @@ validate_topology_inputs() {
     fi
     printf '%s\t%s\n' "$host" "$label" >> "$seen_hosts_file"
   done < "$NODES_TSV"
+  validate_linux_blind_exit_label
 }
 
 register_cleanup_targets() {
@@ -3355,6 +3389,78 @@ EXIT_NODE_ID=$(quote_env "$exit_node_id")
 EOF_ENV
 }
 
+linux_blind_exit_assignment_env_path() {
+  local label="$1"
+  printf '%s/issue_assignments_%s_blind_exit.env' "$STATE_DIR" "$label"
+}
+
+write_blind_exit_assignment_env() {
+  local label="$1"
+  local env_path="$2"
+  case "$label" in
+    aux|fifth_client)
+      ;;
+    *)
+      printf 'blind_exit assignment label must be aux or fifth_client, got %q\n' "$label" >&2
+      return 1
+      ;;
+  esac
+  if ! has_label "$label"; then
+    printf 'blind_exit assignment label not present: %s\n' "$label" >&2
+    return 1
+  fi
+
+  local node_id be_nodes be_assignments be_exit_node_id
+  node_id="$(node_id_for_label "$label")"
+  be_exit_node_id="$EXIT_NODE_ID"
+  be_nodes="$(printf '%s' "$NODES_SPEC" | sed "s~\(${node_id}|[^|]*|[^|]*|\)client,relay_host||||client,relay_host~\1client,relay_host,exit_server,blind_exit||||client,relay_host,exit_server,blind_exit~")"
+  if [[ "$be_nodes" == "$NODES_SPEC" ]]; then
+    printf 'failed to grant blind_exit assignment capabilities for %s (%s)\n' "$label" "$node_id" >&2
+    return 1
+  fi
+  be_assignments="$(printf '%s' "$ASSIGNMENTS_SPEC" | sed "s~${node_id}|${be_exit_node_id}~${node_id}|-~")"
+  if [[ "$be_assignments" == "$ASSIGNMENTS_SPEC" ]]; then
+    printf 'failed to remove selected exit assignment for blind_exit %s (%s)\n' "$label" "$node_id" >&2
+    return 1
+  fi
+
+  : > "$env_path"
+  append_env_assignment "$env_path" "NODES_SPEC" "$be_nodes"
+  append_env_assignment "$env_path" "ALLOW_SPEC" "$ALLOW_SPEC"
+  append_env_assignment "$env_path" "ASSIGNMENTS_SPEC" "$be_assignments"
+  append_env_assignment "$env_path" "BUNDLE_TTL_SECS" "3600"
+}
+
+install_linux_blind_exit_assignment() {
+  local label="${LINUX_BLIND_EXIT_LABEL:-}"
+  [[ -n "$label" ]] || return 0
+  validate_linux_blind_exit_label || return 1
+  local target node_id platform env_path verifier_local bundle_local refresh_env
+  target="$(node_target_for_label "$label")"
+  node_id="$(node_id_for_label "$label")"
+  platform="$(node_platform_for_label "$label")" || return 1
+  env_path="$(linux_blind_exit_assignment_env_path "$label")"
+  if [[ ! -f "$env_path" ]]; then
+    write_blind_exit_assignment_env "$label" "$env_path" || return 1
+  fi
+  live_lab_issue_assignment_bundles_from_env \
+    "$EXIT_TARGET" \
+    "$env_path" \
+    "/tmp/rn_issue_assignments_${label}_blind_exit.env" || return 1
+  verifier_local="$STATE_DIR/assignment-${label}-blind_exit.pub"
+  bundle_local="$STATE_DIR/assignment-${node_id}-blind_exit.bundle"
+  refresh_env="$STATE_DIR/assignment-refresh-${node_id}-blind_exit.env"
+  live_lab_fetch_root_file_to_local "$EXIT_TARGET" "/run/rustynet/assignment-issue/rn-assignment.pub" "$verifier_local" || return 1
+  live_lab_fetch_root_file_to_local "$EXIT_TARGET" "/run/rustynet/assignment-issue/rn-assignment-${node_id}.assignment" "$bundle_local" || return 1
+  live_lab_install_assignment_bundle "$target" "$verifier_local" "$bundle_local" "$node_id" "$platform" || return 1
+  local NODES_SPEC ALLOW_SPEC ASSIGNMENTS_SPEC BUNDLE_TTL_SECS
+  # shellcheck disable=SC1090
+  source "$env_path"
+  live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$NODES_SPEC" "$ALLOW_SPEC"
+  live_lab_install_assignment_refresh_env "$target" "$refresh_env" "$node_id" "$platform" || return 1
+  printf '[assignment-distribute] linux blind_exit %s %s installed no-selected-exit bundle\n' "$label" "$node_id"
+}
+
 quote_env() {
   local value="$1"
   value="${value//\\/\\\\}"
@@ -3565,23 +3671,21 @@ stage_issue_and_distribute_assignments() {
   # assignment (client-3|exit-1 -> client-3|-). The role-switch test issues a
   # fresh bundle from this env for the blind_exit phase and the baseline env on
   # restore to client.
-  local aux_node_id be_nodes be_assignments be_env be_exit_node_id
+  local aux_node_id be_env
   aux_node_id="$(node_id_for_label aux)"
-  be_exit_node_id="$EXIT_NODE_ID"
   if [[ -n "$aux_node_id" ]]; then
-    be_nodes="$(printf '%s' "$NODES_SPEC" | sed "s~\(${aux_node_id}|[^|]*|[^|]*|\)client,relay_host||||client,relay_host~\1client,relay_host,exit_server,blind_exit||||client,relay_host,exit_server,blind_exit~")"
-    be_assignments="$(printf '%s' "$ASSIGNMENTS_SPEC" | sed "s~${aux_node_id}|${be_exit_node_id}~${aux_node_id}|-~")"
-    be_env="$STATE_DIR/issue_assignments_aux_blind_exit.env"
-    : > "$be_env"
-    append_env_assignment "$be_env" "NODES_SPEC" "$be_nodes"
-    append_env_assignment "$be_env" "ALLOW_SPEC" "$ALLOW_SPEC"
-    append_env_assignment "$be_env" "ASSIGNMENTS_SPEC" "$be_assignments"
-    append_env_assignment "$be_env" "BUNDLE_TTL_SECS" "3600"
+    be_env="$(linux_blind_exit_assignment_env_path aux)"
+    write_blind_exit_assignment_env aux "$be_env" || return 1
+  fi
+  if [[ -n "${LINUX_BLIND_EXIT_LABEL:-}" && "$LINUX_BLIND_EXIT_LABEL" != "aux" ]]; then
+    be_env="$(linux_blind_exit_assignment_env_path "$LINUX_BLIND_EXIT_LABEL")"
+    write_blind_exit_assignment_env "$LINUX_BLIND_EXIT_LABEL" "$be_env" || return 1
   fi
 
   verifier_local="$STATE_DIR/assignment.pub"
   live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/assignment-issue/rn-assignment.pub" "$verifier_local" || return 1
   run_parallel_node_stage issue_and_distribute_assignments distribute_assignment_worker
+  install_linux_blind_exit_assignment
 }
 
 distribute_assignment_worker() {
@@ -3750,12 +3854,13 @@ enforce_runtime_worker() {
   local target="$2"
   local node_id="$3"
   local role="$4"
-  local platform
+  local platform enforce_role
   platform="$(node_platform_for_label "${label}")" || return 1
-  printf '[runtime-enforce] %s %s (%s %s) platform=%s\n' "$label" "$target" "$node_id" "$role" "$platform"
+  enforce_role="$(effective_runtime_role_for_label "$label" "$role")"
+  printf '[runtime-enforce] %s %s (%s %s) platform=%s\n' "$label" "$target" "$node_id" "$enforce_role" "$platform"
   case "$platform" in
     linux)
-      live_lab_enforce_host "$target" "$role" "$node_id" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$target")"
+      live_lab_enforce_host "$target" "$enforce_role" "$node_id" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$target")"
       ;;
     macos)
       # Re-mint + re-distribute fresh signed bundles on the exit BEFORE the
@@ -3769,7 +3874,7 @@ enforce_runtime_worker() {
       # macos_admin_repush) can no longer reach it via `state refresh`. Re-mint
       # here so the startup reconcile sees a bundle inside the freshness window.
       macos_admin_repush_signed_bundles "$label" "$target" "$node_id" || return 1
-      enforce_runtime_worker_macos "$target" "$role" "$node_id"
+      enforce_runtime_worker_macos "$target" "$enforce_role" "$node_id"
       ;;
     windows)
       # Windows enforce relies on the orchestrator-side
@@ -3777,7 +3882,7 @@ enforce_runtime_worker() {
       # bootstrap stage already ran the canonical install; on enforce we
       # only need to flip the SCM service to "auto-tunnel enforce on" via
       # `rustynet ops install-windows-service` if needed.
-      live_lab_enforce_host "$target" "$role" "$node_id" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$target")"
+      live_lab_enforce_host "$target" "$enforce_role" "$node_id" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$target")"
       ;;
     *)
       printf 'enforce_runtime_worker: unsupported platform %q for label %q\n' \
@@ -4066,10 +4171,11 @@ live_lab_collect_baseline_runtime_cluster_snapshot() {
     printf 'baseline_cluster_collected_at_utc=%s\n' "$(date -u +%FT%TZ)"
     while IFS=$'\t' read -r label target node_id role; do
       [[ -n "$target" ]] || continue
-      local cluster_platform
+      local cluster_platform effective_role
       cluster_platform="$(node_platform_for_label "${label}")" || cluster_platform="linux"
+      effective_role="$(effective_runtime_role_for_label "$label" "$role")"
       set +e
-      snapshot="$(live_lab_collect_runtime_validation_snapshot "$target" "$node_id" "$role" "$cluster_platform" 2>&1)"
+      snapshot="$(live_lab_collect_runtime_validation_snapshot "$target" "$node_id" "$effective_role" "$cluster_platform" 2>&1)"
       capture_rc=$?
       set -e
       ready=0
@@ -4077,7 +4183,7 @@ live_lab_collect_baseline_runtime_cluster_snapshot() {
         "$snapshot" \
         "$node_id" \
         "$target" \
-        "$role" \
+        "$effective_role" \
         "$expected_membership_nodes" \
         "$exit_node_id" \
         "$cluster_platform" >/dev/null 2>&1; then
@@ -4089,7 +4195,7 @@ live_lab_collect_baseline_runtime_cluster_snapshot() {
       printf 'label=%s\n' "$label"
       printf 'target=%s\n' "$target"
       printf 'node_id=%s\n' "$node_id"
-      printf 'role=%s\n' "$role"
+      printf 'role=%s\n' "$effective_role"
       printf 'capture_rc=%s\n' "$capture_rc"
       printf 'runtime_ready=%s\n' "$ready"
       printf '%s\n' "$snapshot"
@@ -4709,6 +4815,7 @@ validate_runtime_worker() {
   exit_node_id="$(node_id_for_label exit)"
   zone_name="${RUSTYNET_DNS_ZONE_NAME:-rustynet}"
   platform="$(node_platform_for_label "${_label}")" || return 1
+  role="$(effective_runtime_role_for_label "$_label" "$role")"
   expected_next_hop=""
   if [[ "$role" == "client" ]]; then
     case "$platform" in
@@ -4774,6 +4881,7 @@ refresh_runtime_state_for_validation_worker() {
   local role="$4"
   local exit_node_id platform env_path daemon_socket
 
+  role="$(effective_runtime_role_for_label "$label" "$role")"
   if [[ "$role" == "client" ]]; then
     exit_node_id="$(node_id_for_label exit)"
     [[ -n "$exit_node_id" ]] || {
@@ -8268,6 +8376,7 @@ main() {
   prompt_missing_inputs
   normalize_targets
   export EXIT_TARGET CLIENT_TARGET ENTRY_TARGET AUX_TARGET EXTRA_TARGET FIFTH_CLIENT_TARGET
+  export LINUX_BLIND_EXIT_LABEL
   export EXIT_PLATFORM CLIENT_PLATFORM ENTRY_PLATFORM AUX_PLATFORM EXTRA_PLATFORM FIFTH_CLIENT_PLATFORM
   export EXIT_UTM_NAME CLIENT_UTM_NAME ENTRY_UTM_NAME AUX_UTM_NAME EXTRA_UTM_NAME FIFTH_CLIENT_UTM_NAME
   auto_adjust_default_ssh_allow_cidrs_for_targets
