@@ -71,6 +71,10 @@ impl Os {
 pub enum ParityState {
     Proven,
     Failed,
+    /// The latest decisive result may say pass or fail, but recent history
+    /// (see [`classify_recent_history`]) shows an elevated failure rate
+    /// without being consistently broken -- don't fully trust either color.
+    Flaky,
     Unproven,
 }
 
@@ -428,9 +432,13 @@ pub fn load_sparklines(
 }
 
 /// One row in the full stage matrix: a stage's display name plus its
-/// current pass/fail/untested state (same [`ParityState`] semantics used
-/// elsewhere — latest decisive `pass`/`fail` in run history wins; `skip`
-/// and `not_run` both read as `Unproven`, matching [`latest_decisive_value`]).
+/// current state, classified from recent history (see
+/// [`classify_recent_history`]) rather than just the latest value — a
+/// stage with an elevated-but-not-total recent failure rate reads as
+/// `Flaky` rather than whatever its single most recent result happened to
+/// be. `skip`/`not_run` rows aren't part of the series at all (see
+/// [`decisive_history`]); with zero decisive samples ever, reads
+/// `Unproven`.
 #[derive(Debug, Clone)]
 pub struct StageMatrixEntry {
     pub name: String,
@@ -513,11 +521,7 @@ pub fn load_full_stage_matrix(repo_root: &Path) -> Result<FullStageMatrix> {
         let Some(idx) = headers.iter().position(|h| h == column) else {
             return ParityState::Unproven;
         };
-        match latest_decisive_value(&rows, idx) {
-            Some("pass") => ParityState::Proven,
-            Some("fail") => ParityState::Failed,
-            _ => ParityState::Unproven,
-        }
+        classify_recent_history(&decisive_history(&rows, idx))
     };
 
     let mut matrix = FullStageMatrix::default();
@@ -606,6 +610,116 @@ fn latest_decisive_value(rows: &[csv::StringRecord], idx: usize) -> Option<&str>
         })
 }
 
+/// Every decisive (pass/fail) value for a column, in the CSV's append
+/// order (oldest first). `true` = fail. Rows where the column is
+/// not_run/skip/absent are simply not part of the series -- a stage that
+/// only ran on 12 of 400 runs (because most runs were a different
+/// topology) gets a 12-long series, not a 400-long one padded with noise.
+fn decisive_history(rows: &[csv::StringRecord], idx: usize) -> Vec<bool> {
+    rows.iter()
+        .filter_map(|row| match row.get(idx)?.trim() {
+            "pass" => Some(false),
+            "fail" => Some(true),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Page's CUSUM (Biometrika 1954): two one-sided cumulative sums with
+/// slack `k` = half the shift to detect and decision interval `h`. Ported
+/// from `rustynet-cli`'s `vm_lab::run_history` (FIS-0006) rather than
+/// shared as a dependency -- this crate is deliberately excluded from the
+/// main workspace to stay lightweight, and rustynet-cli is far too large
+/// to pull in just for this ~20-line struct.
+struct CusumDetector {
+    sum_pos: f64,
+    sum_neg: f64,
+    k: f64,
+    h: f64,
+    baseline_p0: f64,
+}
+
+impl CusumDetector {
+    fn new(baseline_p0: f64, shift_to_detect_p1: f64, decision_interval_h: f64) -> Self {
+        Self {
+            sum_pos: 0.0,
+            sum_neg: 0.0,
+            k: (shift_to_detect_p1 - baseline_p0).abs() / 2.0,
+            h: decision_interval_h,
+            baseline_p0,
+        }
+    }
+
+    /// Returns `true` the first time the cumulative sum latches a shift
+    /// above baseline (an elevated failure rate).
+    fn update_shifted_up(&mut self, is_failure: bool) -> bool {
+        let x = if is_failure { 1.0 } else { 0.0 } - self.baseline_p0;
+        self.sum_pos = (self.sum_pos + x - self.k).max(0.0);
+        self.sum_neg = (self.sum_neg - x - self.k).max(0.0);
+        self.sum_pos > self.h
+    }
+}
+
+/// How many trailing decisive results to classify against. Recent behavior
+/// matters more than a check's entire history -- a stage that regressed
+/// weeks ago and has been failing consistently ever since should read as
+/// FAILED, not flaky, even though its full history is "mixed" (old passes
+/// alongside new fails). Bounding to a trailing window keeps the verdict
+/// current instead of dragged down by archaeology.
+const FLAKE_WINDOW: usize = 10;
+
+/// Below this many decisive samples in the window, a flakiness verdict
+/// isn't meaningful -- fall back to the plain latest-value read.
+const FLAKE_MIN_SAMPLES: usize = 4;
+
+/// Assumed "healthy" baseline failure rate for anything in this window --
+/// occasional single-digit-percent noise (an SSH hiccup, a slow VM) is
+/// normal and shouldn't read as flaky. `FLAKE_SHIFT_P1` is the elevated
+/// rate CUSUM is tuned to detect a shift toward.
+const FLAKE_BASELINE_P0: f64 = 0.05;
+const FLAKE_SHIFT_P1: f64 = 0.4;
+/// Decision interval `h`: lower = more sensitive (latches sooner) at the
+/// cost of more false positives. FIS-0006 uses 3.0, but that's tuned for
+/// series that can run to hundreds of samples; against a bounded
+/// [`FLAKE_WINDOW`] of 10, 3.0 doesn't reliably latch even a clean 50/50
+/// alternating pattern before the window runs out. 2.0 still comfortably
+/// ignores a single stray failure among many passes (peak ~0.775, see
+/// tests) while latching a sustained or alternating elevated rate within
+/// the window.
+const FLAKE_DECISION_INTERVAL_H: f64 = 2.0;
+
+/// Classify a column's recent decisive history into a display state.
+/// Below [`FLAKE_MIN_SAMPLES`], just reads the latest value (today's
+/// pass/fail/not-run behavior, unchanged). Above it, runs CUSUM over the
+/// trailing [`FLAKE_WINDOW`]: no shift detected -> Proven (occasional
+/// noise is normal); shift detected but at least one recent pass ->
+/// Flaky (elevated failure rate, not consistently broken); shift detected
+/// with zero recent passes -> Failed (a real, stuck regression).
+fn classify_recent_history(history: &[bool]) -> ParityState {
+    if history.len() < FLAKE_MIN_SAMPLES {
+        return match history.last() {
+            Some(true) => ParityState::Failed,
+            Some(false) => ParityState::Proven,
+            None => ParityState::Unproven,
+        };
+    }
+    let window = &history[history.len().saturating_sub(FLAKE_WINDOW)..];
+    let mut cusum =
+        CusumDetector::new(FLAKE_BASELINE_P0, FLAKE_SHIFT_P1, FLAKE_DECISION_INTERVAL_H);
+    let mut shifted_up = false;
+    for &is_failure in window {
+        shifted_up |= cusum.update_shifted_up(is_failure);
+    }
+    if !shifted_up {
+        return ParityState::Proven;
+    }
+    if window.iter().any(|&is_failure| !is_failure) {
+        ParityState::Flaky
+    } else {
+        ParityState::Failed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +728,85 @@ mod tests {
         let docs = dir.join("documents").join("operations");
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("live_lab_run_matrix.csv"), content).unwrap();
+    }
+
+    #[test]
+    fn classify_recent_history_below_min_samples_falls_back_to_latest_value() {
+        assert_eq!(classify_recent_history(&[]), ParityState::Unproven);
+        assert_eq!(classify_recent_history(&[false]), ParityState::Proven);
+        assert_eq!(classify_recent_history(&[true]), ParityState::Failed);
+        // 3 samples: still below FLAKE_MIN_SAMPLES (4), even though mixed.
+        assert_eq!(
+            classify_recent_history(&[false, true, false]),
+            ParityState::Proven
+        );
+    }
+
+    #[test]
+    fn classify_recent_history_all_pass_is_proven() {
+        assert_eq!(
+            classify_recent_history(&[false, false, false, false, false, false]),
+            ParityState::Proven
+        );
+    }
+
+    #[test]
+    fn classify_recent_history_one_stray_failure_in_a_healthy_run_is_still_proven() {
+        // A single blip among many passes is normal background noise, not
+        // flakiness -- must not latch a shift.
+        let mut history = vec![false; 12];
+        history[5] = true;
+        assert_eq!(classify_recent_history(&history), ParityState::Proven);
+    }
+
+    #[test]
+    fn classify_recent_history_all_fail_is_failed_not_flaky() {
+        assert_eq!(
+            classify_recent_history(&[true, true, true, true, true, true]),
+            ParityState::Failed
+        );
+    }
+
+    #[test]
+    fn classify_recent_history_mostly_fail_with_one_recent_pass_is_flaky() {
+        // The exact shape found in production for windows_stage_anchor:
+        // sustained failures with a single recent pass mixed in.
+        let mut history = vec![true; 9];
+        history.push(false);
+        assert_eq!(classify_recent_history(&history), ParityState::Flaky);
+    }
+
+    #[test]
+    fn classify_recent_history_alternating_is_flaky() {
+        let history = vec![true, false, true, false, true, false, true, false];
+        assert_eq!(classify_recent_history(&history), ParityState::Flaky);
+    }
+
+    #[test]
+    fn classify_recent_history_old_failures_outside_the_window_do_not_count() {
+        // 20 old fails, then 10 clean recent passes: the window is
+        // entirely inside the passing tail, so this must read Proven, not
+        // dragged down by ancient (now-irrelevant) history.
+        let mut history = vec![true; 20];
+        history.extend(vec![false; 10]);
+        assert_eq!(classify_recent_history(&history), ParityState::Proven);
+    }
+
+    #[test]
+    fn full_stage_matrix_flags_a_flaky_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = "overall_result,linux_stage_bootstrap";
+        let mut lines = vec![header.to_owned()];
+        for outcome in [
+            "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "pass",
+        ] {
+            lines.push(format!("pass,{outcome}"));
+        }
+        write_matrix_csv(dir.path(), &format!("{}\n", lines.join("\n")));
+
+        let matrix = load_full_stage_matrix(dir.path()).unwrap();
+
+        assert_eq!(matrix.linux[0].state, ParityState::Flaky);
     }
 
     #[test]

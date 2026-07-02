@@ -134,6 +134,7 @@ fn glyph(state: ParityState) -> &'static str {
     match state {
         ParityState::Proven => "■",
         ParityState::Failed => "■",
+        ParityState::Flaky => "▲",
         ParityState::Unproven => "□",
     }
 }
@@ -142,6 +143,7 @@ fn color_style(state: ParityState) -> Style {
     Style::default().fg(match state {
         ParityState::Proven => Color::Green,
         ParityState::Failed => Color::Red,
+        ParityState::Flaky => Color::Yellow,
         ParityState::Unproven => Color::DarkGray,
     })
 }
