@@ -893,11 +893,11 @@ impl App {
                         }
                         (Some(col), Some(AgentsRow::Iterations)) => match col {
                             AgentsCol::Patch => {
-                                self.patch_iterations = self.patch_iterations.max(2) - 1;
+                                self.patch_iterations = ((self.patch_iterations + 2) % 4) + 1;
                                 self.save_config();
                             }
                             AgentsCol::Review => {
-                                self.review_iterations = self.review_iterations.max(2) - 1;
+                                self.review_iterations = ((self.review_iterations + 2) % 4) + 1;
                                 self.save_config();
                             }
                         },
@@ -951,7 +951,7 @@ impl App {
             KeyCode::Enter
                 if self.focused_panel == Panel::Agents && self.agents_sel_row.is_some() =>
             {
-                self.agents_active = true;
+                self.agents_active = !self.agents_active;
             }
             KeyCode::Esc if self.focused_panel == Panel::Agents => {
                 if self.agents_active {

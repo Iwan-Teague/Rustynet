@@ -242,23 +242,23 @@ fn render_table(
 
     let patch_rowselected = |col_row: Option<(AgentsCol, AgentsRow)>| -> bool {
         focused
+            && app.agents_sel_col == Some(AgentsCol::Patch)
             && col_row
                 == Some((
                     AgentsCol::Patch,
                     app.agents_sel_row.unwrap_or(AgentsRow::Model),
                 ))
             && app.agents_sel_row.is_some()
-            && !app.agents_active
     };
     let review_rowselected = |col_row: Option<(AgentsCol, AgentsRow)>| -> bool {
         focused
+            && app.agents_sel_col == Some(AgentsCol::Review)
             && col_row
                 == Some((
                     AgentsCol::Review,
                     app.agents_sel_row.unwrap_or(AgentsRow::Model),
                 ))
             && app.agents_sel_row.is_some()
-            && !app.agents_active
     };
 
     let rows = vec![
