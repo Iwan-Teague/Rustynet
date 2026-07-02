@@ -135,7 +135,7 @@ fn render_planned_with_statuses(
             } else {
                 "disabled"
             };
-            let (symbol, status_style) = cell_for_status(status);
+            let (symbol, status_style) = cell_for_status(status, selected);
             let mut style = if active {
                 Style::default()
                     .fg(Color::White)
@@ -163,7 +163,12 @@ fn render_planned_with_statuses(
     }
 }
 
-fn cell_for_status(status: &str) -> (&'static str, Style) {
+/// `selected` only affects "pending" (possible, not yet run): the stage
+/// under the cursor gets a filled white box, every other possible stage
+/// gets an outline-only white box -- so only the one thing the cursor
+/// could act on right now reads as "about to run"; the rest just read as
+/// "possible" without visually competing with it.
+fn cell_for_status(status: &str, selected: bool) -> (&'static str, Style) {
     match status {
         "pass" => ("[██]", Style::default().fg(Color::Green)),
         "fail" => ("[✗✗]", Style::default().fg(Color::Red)),
@@ -186,10 +191,8 @@ fn cell_for_status(status: &str) -> (&'static str, Style) {
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
         ),
-        // "pending" = enabled, part of the current plan, hasn't run yet --
-        // filled white box so it visually reads as "will run" rather than
-        // blending into the empty "disabled" box.
-        "pending" => ("[██]", Style::default().fg(Color::White)),
+        "pending" if selected => ("[██]", Style::default().fg(Color::White)),
+        "pending" => ("[  ]", Style::default().fg(Color::White)),
         _ => ("[░░]", Style::default().fg(Color::DarkGray)),
     }
 }
