@@ -58,12 +58,21 @@ fn render_planned_with_statuses(
     app: &App,
     status_by_stage: &HashMap<&str, &str>,
 ) {
-    let chunks = Layout::horizontal([
+    let mut chunks: Vec<Rect> = Layout::horizontal([
         Constraint::Percentage(25),
         Constraint::Percentage(36),
         Constraint::Percentage(39),
     ])
-    .split(area);
+    .split(area)
+    .to_vec();
+    // Nudge BOOTSTRAP 1 char right without touching PRE or LIVE LAB: shrink
+    // its width by 1 as its start moves right by 1, so its right edge (and
+    // therefore LIVE LAB's unchanged start) lands exactly where it did
+    // before.
+    if let Some(bootstrap) = chunks.get_mut(1) {
+        bootstrap.x = bootstrap.x.saturating_add(1);
+        bootstrap.width = bootstrap.width.saturating_sub(1);
+    }
 
     let focused = app.focused_panel == Panel::StageGrid;
     for (idx, group) in app.planned_stage_groups().into_iter().enumerate().take(3) {
@@ -111,7 +120,6 @@ fn render_planned_with_statuses(
             completed,
             enabled,
             skipped,
-            group.stages.len(),
             header_style,
         )));
         let visible_stage_rows = (chunks[idx].height as usize).saturating_sub(2).max(1);
@@ -257,18 +265,16 @@ fn stage_group_header_style(
 }
 
 /// Builds a group's header line: bar + "x/y" against `enabled` (the subset
-/// of stages actually selected to run next), NOT `total` (the group's full
-/// catalog size) -- "2/40" reads as "barely anything passed" when it really
-/// means "both of the 2 selected stages passed"; "2/2" plus a dim total off
-/// to the side says that correctly. The bar's fill is clamped to `enabled`
-/// so a stale completed-count from a prior, wider stage selection can't
-/// overfill the bar past its own width.
+/// of stages actually selected to run next), NOT the group's full catalog
+/// size -- "2/40" reads as "barely anything passed" when it really means
+/// "both of the 2 selected stages passed". The bar's fill is clamped to
+/// `enabled` so a stale completed-count from a prior, wider stage selection
+/// can't overfill the bar past its own width.
 fn stage_group_header_spans(
     group_name: &str,
     completed: usize,
     enabled: usize,
     skipped: usize,
-    total: usize,
     header_style: Style,
 ) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(
@@ -281,10 +287,6 @@ fn stage_group_header_spans(
     if skipped > 0 {
         spans.push(Span::styled(format!("  {skipped} skipped"), header_style));
     }
-    spans.push(Span::styled(
-        format!("  ({total} total)"),
-        Style::default().fg(Color::DarkGray),
-    ));
     spans
 }
 
@@ -345,10 +347,9 @@ mod tests {
         // Regression: "2/40" (completed against the group's full 40-stage
         // catalog) reads as "almost nothing passed" when only 2 stages were
         // ever selected to run and both did -- the count and the bar must
-        // both be measured against `enabled` (2), with the 40 relegated to
-        // a dim "(40 total)" suffix, not the main fraction.
+        // both be measured against `enabled` (2).
         let style = Style::default().fg(Color::White);
-        let spans = stage_group_header_spans("LIVE LAB", 2, 2, 0, 40, style);
+        let spans = stage_group_header_spans("LIVE LAB", 2, 2, 0, style);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text.contains("2/2"),
@@ -358,24 +359,9 @@ mod tests {
             !text.contains("2/40"),
             "must not show completed/total: {text:?}"
         );
-        assert!(text.contains("(40 total)"));
         // The bar itself must be full (both of the 2 enabled stages done),
         // not read as 2-out-of-40 nearly-empty.
         assert!(text.contains("[████████]"));
-    }
-
-    #[test]
-    fn header_total_suffix_is_dimmed_separately_from_the_main_count() {
-        let style = Style::default().fg(Color::White);
-        let spans = stage_group_header_spans("PRE", 1, 3, 0, 5, style);
-        let total_span = spans
-            .iter()
-            .find(|s| s.content.contains("total"))
-            .expect("a total span");
-        assert_eq!(total_span.style.fg, Some(Color::DarkGray));
-        let main_span = &spans[0];
-        assert_eq!(main_span.style.fg, Some(Color::White));
-        assert_ne!(main_span.style.fg, total_span.style.fg);
     }
 
     #[test]
@@ -384,7 +370,7 @@ mod tests {
         // the prior, wider selection) larger than the current `enabled`
         // count -- the bar must not overfill past its own width.
         let style = Style::default().fg(Color::White);
-        let spans = stage_group_header_spans("PRE", 5, 2, 0, 10, style);
+        let spans = stage_group_header_spans("PRE", 5, 2, 0, style);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("5/2"), "raw counts stay honest: {text:?}");
         assert!(

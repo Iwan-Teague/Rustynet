@@ -1953,3 +1953,7 @@ timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
 2026-07-02T22:20:16Z,191bd70,dirty,prime_remote_access,rn_role_linux_blind_exit_daemon_main_20260702_04,45,pass
 2026-07-02T22:21:02Z,191bd70,dirty,macos_preflight_check,rn_role_linux_blind_exit_daemon_main_20260702_04,0,pass
 2026-07-02T22:21:03Z,191bd70,dirty,cleanup_hosts,rn_role_linux_blind_exit_daemon_main_20260702_04,34,pass
+2026-07-02T22:41:46Z,,clean,preflight,rn_role_linux_blind_exit_daemon_main_20260702_06,0,pass
+2026-07-02T22:41:46Z,7ec074c,dirty,prepare_source_archive,rn_role_linux_blind_exit_daemon_main_20260702_06,1,pass
+2026-07-02T22:41:48Z,7ec074c,dirty,verify_ssh_reachability,rn_role_linux_blind_exit_daemon_main_20260702_06,12,pass
+2026-07-02T22:42:01Z,7ec074c,dirty,prime_remote_access,rn_role_linux_blind_exit_daemon_main_20260702_06,288,fail
