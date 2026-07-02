@@ -998,7 +998,6 @@ pub struct TraversalSession {
     pub active_endpoint: Option<SocketEndpoint>,
     pub consecutive_direct_failures: u8,
     pub last_transition: TransitionEvent,
-    pub last_keepalive_unix: Option<u64>,
 }
 
 impl TraversalSession {
@@ -1014,7 +1013,6 @@ impl TraversalSession {
                 reason: TransitionReason::SessionBoot,
                 at_unix: now_unix,
             },
-            last_keepalive_unix: None,
         }
     }
 
@@ -1078,24 +1076,26 @@ impl TraversalSession {
         Some(event)
     }
 
+    /// Thin delegate: the NAT-conditioned 15/25 values moved into
+    /// [`crate::keepalive::KeepalivePrior`] as the FIS-0015 estimator's
+    /// cold-start priors (see [`keepalive_prior_for_nat`]). Kept until
+    /// `TraversalSession`'s disposition is settled by FIS-0010.
     pub fn recommended_keepalive_secs(nat_profile: NatProfile) -> u64 {
-        if nat_profile.is_hard_nat() || !nat_profile.preserves_port {
-            15
-        } else {
-            25
+        u64::from(keepalive_prior_for_nat(Some(nat_profile)).prior_interval_secs())
+    }
+}
+
+/// Map an (optionally unknown) NAT profile onto the FIS-0015 keepalive
+/// cold-start prior. Unknown NAT fails toward the hard prior: no raising,
+/// 15s — the strictest secure default.
+pub fn keepalive_prior_for_nat(
+    nat_profile: Option<NatProfile>,
+) -> crate::keepalive::KeepalivePrior {
+    match nat_profile {
+        Some(profile) if !profile.is_hard_nat() && profile.preserves_port => {
+            crate::keepalive::KeepalivePrior::DirectEasyNat
         }
-    }
-
-    pub fn should_send_keepalive(&self, now_unix: u64, nat_profile: NatProfile) -> bool {
-        let interval = Self::recommended_keepalive_secs(nat_profile);
-        let Some(last) = self.last_keepalive_unix else {
-            return true;
-        };
-        now_unix.saturating_sub(last) >= interval
-    }
-
-    pub fn mark_keepalive_sent(&mut self, now_unix: u64) {
-        self.last_keepalive_unix = Some(now_unix);
+        _ => crate::keepalive::KeepalivePrior::DirectHardOrUnknownNat,
     }
 }
 
@@ -1996,6 +1996,11 @@ mod tests {
 
         assert_eq!(TraversalSession::recommended_keepalive_secs(hard_nat), 15);
         assert_eq!(TraversalSession::recommended_keepalive_secs(easy_nat), 25);
+        // Unknown NAT (no profile) resolves to the hard prior: 15s, no raise.
+        assert_eq!(
+            super::keepalive_prior_for_nat(None).prior_interval_secs(),
+            15
+        );
     }
 
     #[test]
