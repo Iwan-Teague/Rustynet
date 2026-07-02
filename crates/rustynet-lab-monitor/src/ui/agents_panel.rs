@@ -11,7 +11,8 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::app::App;
+use crate::app::AgentsRow;
+use crate::app::{AgentsCol, App, Panel};
 
 /// Durable running-cost ledger, reconciled from the raw per-run artifacts on
 /// every load and persisted to disk. Unlike re-summing the raw files each
@@ -103,20 +104,89 @@ struct AgentsView {
 }
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.focused_panel == Panel::Agents;
+    let border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let block = Block::default()
-        .title("AGENTS")
+        .title("AGENTS [7]")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(border_fg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let view = AgentsView::load(&app.repo_root);
-    render_table(f, inner, &view);
+
+    // Override model/variant with the user's current selection from App state
+    // (what will be used on next launch, not what the last run used).
+    let selected_patch_model = app
+        .available_models
+        .get(app.patch_model_idx)
+        .cloned()
+        .unwrap_or_default();
+    let selected_patch_variant = app
+        .available_variants
+        .get(app.patch_variant_idx)
+        .cloned()
+        .unwrap_or_default();
+    let selected_review_model = app
+        .available_models
+        .get(app.review_model_idx)
+        .cloned()
+        .unwrap_or_default();
+
+    let patch_row_active =
+        focused && app.agents_sel_col == Some(AgentsCol::Patch) && app.agents_active;
+    let review_row_active =
+        focused && app.agents_sel_col == Some(AgentsCol::Review) && app.agents_active;
+
+    let patch_model_ui = if patch_row_active && app.agents_sel_row == Some(AgentsRow::Model) {
+        format_model_cycle(&selected_patch_model, &selected_patch_variant, true)
+    } else {
+        format_model(&selected_patch_model, &selected_patch_variant)
+    };
+    let review_model_ui = if review_row_active && app.agents_sel_row == Some(AgentsRow::Model) {
+        format_model_cycle(&selected_review_model, "", true)
+    } else {
+        format_model(&selected_review_model, "")
+    };
+
+    render_table(
+        f,
+        inner,
+        &view,
+        &patch_model_ui,
+        &review_model_ui,
+        focused,
+        app,
+    );
 }
 
 /// Renders one column per agent (Patch, Review) with metrics as rows, so the
 /// two agents can be compared at a glance instead of scanning a stacked list.
-fn render_table(f: &mut Frame, area: Rect, v: &AgentsView) {
+fn render_table(
+    f: &mut Frame,
+    area: Rect,
+    v: &AgentsView,
+    patch_model_ui: &str,
+    review_model_ui: &str,
+    focused: bool,
+    app: &App,
+) {
+    let no_select = focused && app.agents_sel_col.is_none();
+    let patch_row_active =
+        focused && app.agents_sel_col == Some(AgentsCol::Patch) && app.agents_active;
+    let review_row_active =
+        focused && app.agents_sel_col == Some(AgentsCol::Review) && app.agents_active;
+
+    let patch_iter_ui = if patch_row_active && app.agents_sel_row == Some(AgentsRow::Iterations) {
+        format!("◀ {} ▶", app.patch_iterations)
+    } else {
+        app.patch_iterations.to_string()
+    };
+    let review_iter_ui = if review_row_active && app.agents_sel_row == Some(AgentsRow::Iterations) {
+        format!("◀ {} ▶", app.review_iterations)
+    } else {
+        app.review_iterations.to_string()
+    };
     let bold_green = Style::default()
         .fg(Color::Green)
         .add_modifier(Modifier::BOLD);
@@ -131,8 +201,13 @@ fn render_table(f: &mut Frame, area: Rect, v: &AgentsView) {
     let gray = Style::default().fg(Color::Gray);
     let label_style = Style::default().fg(Color::Blue);
 
-    let patch_model = format_model(&v.patch_model, &v.patch_variant);
-    let review_model = format_model(&v.review_model, "");
+    let patch_header_style = bold_green;
+    let review_header_style = bold_cyan;
+    let patch_style = bold_green;
+    let review_style = bold_cyan;
+
+    let patch_model = patch_model_ui.to_owned();
+    let review_model = review_model_ui.to_owned();
 
     let patch_session = if v.session.is_empty() || v.session == "-" {
         "—".to_owned()
@@ -159,12 +234,62 @@ fn render_table(f: &mut Frame, area: Rect, v: &AgentsView) {
 
     let header = Row::new(vec![
         Cell::new("METRIC").style(label_style.add_modifier(Modifier::BOLD)),
-        Cell::new("PATCH").style(bold_green),
-        Cell::new("REVIEW").style(bold_cyan),
+        Cell::new(if no_select { "PATCH  ←" } else { "PATCH" }).style(patch_header_style),
+        Cell::new(if no_select { "REVIEW  →" } else { "REVIEW" }).style(review_header_style),
     ]);
 
+    let row_sel = Style::default().fg(Color::Yellow);
+
+    let patch_rowselected = |col_row: Option<(AgentsCol, AgentsRow)>| -> bool {
+        focused
+            && col_row
+                == Some((
+                    AgentsCol::Patch,
+                    app.agents_sel_row.unwrap_or(AgentsRow::Model),
+                ))
+            && app.agents_sel_row.is_some()
+            && !app.agents_active
+    };
+    let review_rowselected = |col_row: Option<(AgentsCol, AgentsRow)>| -> bool {
+        focused
+            && col_row
+                == Some((
+                    AgentsCol::Review,
+                    app.agents_sel_row.unwrap_or(AgentsRow::Model),
+                ))
+            && app.agents_sel_row.is_some()
+            && !app.agents_active
+    };
+
     let rows = vec![
-        table_row("Model", patch_model, bold_green, review_model, bold_cyan),
+        table_row_with_sel(
+            "Model",
+            row_sel,
+            SelCell {
+                value: patch_model,
+                style: patch_style,
+                selected: patch_rowselected(Some((AgentsCol::Patch, AgentsRow::Model))),
+            },
+            SelCell {
+                value: review_model,
+                style: review_style,
+                selected: review_rowselected(Some((AgentsCol::Review, AgentsRow::Model))),
+            },
+        ),
+        table_row_with_sel(
+            "Iter",
+            row_sel,
+            SelCell {
+                value: patch_iter_ui,
+                style: patch_style,
+                selected: patch_rowselected(Some((AgentsCol::Patch, AgentsRow::Iterations))),
+            },
+            SelCell {
+                value: review_iter_ui,
+                style: review_style,
+                selected: review_rowselected(Some((AgentsCol::Review, AgentsRow::Iterations))),
+            },
+        ),
         table_row("Session", patch_session, gray, "—".to_owned(), dim),
         table_row("Runs", patch_runs, dim, review_runs, gray),
         Row::new(vec!["", "", ""]),
@@ -222,6 +347,18 @@ fn render_table(f: &mut Frame, area: Rect, v: &AgentsView) {
         Layout::vertical([Constraint::Min(0)]).split(area)
     };
 
+    let hint = if no_select {
+        "← → select column  |  ↑↓ select row  |  Enter activate  |  Esc"
+    } else if app.agents_active {
+        "← → cycle value  |  ↑↓ other row  |  Esc deactivate"
+    } else if app.agents_sel_row.is_some() {
+        "Enter activate  |  ↑↓ other row  |  ← → other col  |  Esc"
+    } else if focused {
+        "↑↓ select row  |  ← → other col  |  Esc"
+    } else {
+        ""
+    };
+
     let widths = [
         Constraint::Length(13),
         Constraint::Fill(1),
@@ -231,11 +368,15 @@ fn render_table(f: &mut Frame, area: Rect, v: &AgentsView) {
     f.render_widget(table, chunks[0]);
 
     if has_caption_room {
+        let caption = if !hint.is_empty() {
+            hint.to_owned()
+        } else if !v.session.is_empty() && v.session != "-" {
+            format!(" Session: {}", v.session)
+        } else {
+            String::new()
+        };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                " Cost (total) = all-time, persisted — calls/tokens/cache above are latest run only",
-                dim,
-            ))),
+            Paragraph::new(Line::from(Span::styled(caption, dim))),
             chunks[1],
         );
     }
@@ -255,6 +396,29 @@ fn table_row(
     ])
 }
 
+struct SelCell {
+    value: String,
+    style: Style,
+    selected: bool,
+}
+
+fn table_row_with_sel(
+    label: &'static str,
+    row_sel: Style,
+    patch: SelCell,
+    review: SelCell,
+) -> Row<'static> {
+    Row::new(vec![
+        Cell::new(label).style(Style::default().fg(Color::Blue)),
+        Cell::new(patch.value).style(if patch.selected { row_sel } else { patch.style }),
+        Cell::new(review.value).style(if review.selected {
+            row_sel
+        } else {
+            review.style
+        }),
+    ])
+}
+
 fn format_model(model: &str, variant: &str) -> String {
     if model.is_empty() {
         return "unknown".to_owned();
@@ -267,6 +431,16 @@ fn format_model(model: &str, variant: &str) -> String {
     } else {
         format!("{short} ({variant})")
     }
+}
+
+fn format_model_cycle(model: &str, variant: &str, _show_arrows: bool) -> String {
+    let short = model.rsplit('/').next().unwrap_or(model);
+    let base = if variant.is_empty() || variant == "-" {
+        short.to_owned()
+    } else {
+        format!("{short} ({variant})")
+    };
+    format!("◀ {base} ▶")
 }
 
 fn plural(n: usize) -> &'static str {

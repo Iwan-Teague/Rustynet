@@ -25,7 +25,9 @@
       "Read(//tmp/**)",
       "Bash(grep -n 'Join-Path\\\\|\\\\$.*Candidates\\\\|\\\\$.*Source\\\\|\\\\$daemonDest\\\\|\\\\$cliDest\\\\|InstallRoot.*bin\\\\|InstallRoot.*rustynetd' /Users/iwan/Desktop/Rustynet/.claude/worktrees/dazzling-wilson-16b7df/scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1)",
       "Bash(grep -n 'Join-Path.*'\\\\''bin'\\\\''\\\\|bin\\\\\\\\rustynetd\\\\|bin..rustynetd\\\\|\\\\$Install' /Users/iwan/Desktop/Rustynet/.claude/worktrees/dazzling-wilson-16b7df/scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1 /Users/iwan/Desktop/Rustynet/.claude/worktrees/dazzling-wilson-16b7df/scripts/bootstrap/windows/Verify-RustyNetWindowsBootstrap.ps1 /Users/iwan/Desktop/Rustynet/.claude/worktrees/dazzling-wilson-16b7df/scripts/bootstrap/windows/Smoke-RustyNetWindowsServiceHost.ps1)",
-      "Bash(PATH=\"/Users/iwan/.rustup/toolchains/1.88.0-aarch64-apple-darwin/bin:/usr/bin:/bin\" ./target/release/rustynet-cli ops vm-lab-bootstrap-phase --phase sync-source --vm windows-utm-1 --inventory documents/operations/active/vm_lab_inventory.json --ssh-identity-file /Users/iwan/.ssh/rustynet_lab_ed25519)"
+      "Bash(PATH=\"/Users/iwan/.rustup/toolchains/1.88.0-aarch64-apple-darwin/bin:/usr/bin:/bin\" ./target/release/rustynet-cli ops vm-lab-bootstrap-phase --phase sync-source --vm windows-utm-1 --inventory documents/operations/active/vm_lab_inventory.json --ssh-identity-file /Users/iwan/.ssh/rustynet_lab_ed25519)",
+      "Bash(rg -n \"FlapBreaker\" crates/rustynetd/src/*.rs)",
+      "Bash(rg -n \"PathQualityTracker|PeerPathSample\" crates/rustynetd/src/*.rs)"
     ]
   }
 }
