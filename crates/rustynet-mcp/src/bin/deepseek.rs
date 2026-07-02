@@ -49,6 +49,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Parsed run-matrix CSV: (header, rows).
+type RunMatrixRows = (Vec<String>, Vec<Vec<String>>);
+
 const FLASH_MODEL: &str = "deepseek-v4-flash";
 const PRO_MODEL: &str = "deepseek-v4-pro";
 const API_URL: &str = "https://api.deepseek.com/chat/completions";
@@ -1164,7 +1167,7 @@ impl DeepSeekServer {
         self.target_from_key("full", "no failing focused cell found; run full matrix")
     }
 
-    fn read_run_matrix_rows(&self) -> Result<Option<(Vec<String>, Vec<Vec<String>>)>, String> {
+    fn read_run_matrix_rows(&self) -> Result<Option<RunMatrixRows>, String> {
         let path = self
             .repo_root
             .join("documents/operations/live_lab_run_matrix.csv");
@@ -2759,7 +2762,7 @@ impl DeepSeekServer {
                 records.push((mtime, path));
             }
         }
-        records.sort_by(|a, b| b.0.cmp(&a.0));
+        records.sort_by_key(|record| std::cmp::Reverse(record.0));
         let total = records.len();
         // report_dir is surfaced so the model can pass it to lab_run_detail /
         // lab_stage_log / lab_report_grep / lab_report_artifacts (and the job_id
