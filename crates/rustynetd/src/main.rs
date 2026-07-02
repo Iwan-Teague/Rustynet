@@ -20,7 +20,7 @@ use rustynetd::daemon::{
     DEFAULT_TRUSTED_HELPER_SOCKET_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
     DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_LISTEN_PORT,
     DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, DaemonBackendMode,
-    DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
+    DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon, validate_anchor_bundle_pull_addr,
 };
 use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
@@ -129,6 +129,81 @@ fn classify_top_level_error(message: &str) -> rustynetd::exit_codes::ExitCode {
     }
 }
 
+fn run_anchor_bundle_pull_bind_check_command(args: &[String]) -> Result<(), String> {
+    let mut addr: Option<SocketAddr> = None;
+    let mut allow_lan = false;
+    let mut expect = "accept".to_owned();
+
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--addr") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("--addr requires a value")?
+                    .parse::<SocketAddr>()
+                    .map_err(|err| format!("invalid --addr: {err}"))?;
+                addr = Some(value);
+                index += 2;
+            }
+            Some("--allow-lan") => {
+                let value = args.get(index + 1).ok_or("--allow-lan requires a value")?;
+                allow_lan = match value.as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => return Err("invalid --allow-lan value: expected true or false".to_owned()),
+                };
+                index += 2;
+            }
+            Some("--expect") => {
+                expect = args
+                    .get(index + 1)
+                    .ok_or("--expect requires a value")?
+                    .clone();
+                if expect != "accept" && expect != "reject" {
+                    return Err("invalid --expect value: expected accept or reject".to_owned());
+                }
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown anchor-bundle-pull-bind-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+
+    let addr = addr.ok_or("--addr is required")?;
+    let validation = validate_anchor_bundle_pull_addr(addr, allow_lan);
+    let (actual, reason) = match validation {
+        Ok(()) => ("accept", String::new()),
+        Err(err) => ("reject", err.to_string()),
+    };
+    let status = if actual == expect { "pass" } else { "fail" };
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "stage": "anchor_bundle_pull_bind_check",
+        "status": status,
+        "addr": addr.to_string(),
+        "allow_lan": allow_lan,
+        "expected": expect,
+        "actual": actual,
+        "reason": reason,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).expect("bind-check report must serialize")
+    );
+    if status == "pass" {
+        Ok(())
+    } else {
+        Err(format!(
+            "anchor bundle-pull bind check failed: expected {expect}, got {actual}"
+        ))
+    }
+}
+
 fn run() -> Result<(), String> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
 
@@ -153,6 +228,9 @@ fn run() -> Result<(), String> {
                     log::error!("rustynetd startup: daemon exited fatally: {err}");
                     err.to_string()
                 })
+            }
+            [cmd, rest @ ..] if cmd == "anchor-bundle-pull-bind-check" => {
+                run_anchor_bundle_pull_bind_check_command(rest)
             }
             [cmd, rest @ ..] if cmd == "privileged-helper" => run_privileged_helper_command(rest),
             [cmd, rest @ ..] if cmd == "privileged-helper-allowlist-audit" => {
@@ -243,6 +321,9 @@ fn run() -> Result<(), String> {
             }
             [cmd, rest @ ..] if cmd == "linux-dns-failclosed-check" => {
                 run_linux_dns_failclosed_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "linux-blind-exit-dataplane-check" => {
+                run_linux_blind_exit_dataplane_check_command(rest)
             }
             [cmd, rest @ ..] if cmd == "linux-exit-dns-failclosed-capture" => {
                 run_linux_exit_dns_failclosed_capture_command(rest)
@@ -992,6 +1073,70 @@ fn run_linux_dns_failclosed_check_command(args: &[String]) -> Result<(), String>
     if fail_on_drift && !report.overall_ok {
         return Err(
             "linux-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed posture".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn run_linux_blind_exit_dataplane_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut options =
+        rustynetd::linux_blind_exit_dataplane::LinuxBlindExitDataplaneOptions::default();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some("--tunnel-iface") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--tunnel-iface requires a value".to_owned())?;
+                options.tunnel_iface = value.to_owned();
+                index += 2;
+            }
+            Some("--egress-iface") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--egress-iface requires a value".to_owned())?;
+                options.egress_iface = Some(value.to_owned());
+                index += 2;
+            }
+            Some("--mesh-cidr") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--mesh-cidr requires a value".to_owned())?;
+                options.mesh_cidr = value.to_owned();
+                index += 2;
+            }
+            Some("--nft-path") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--nft-path requires a value".to_owned())?;
+                options.nft_path = value.to_owned();
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown linux-blind-exit-dataplane-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report =
+        rustynetd::linux_blind_exit_dataplane::collect_linux_blind_exit_dataplane_report(options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|err| {
+            format!("serialize linux blind-exit dataplane report failed: {err}")
+        })?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "linux-blind-exit-dataplane-check reported drift in the live nft blind_exit posture"
+                .to_owned(),
         );
     }
     Ok(())
@@ -3877,6 +4022,7 @@ fn help_text() -> String {
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>] [--keychain-service <name>] [--keychain-allow-any-app]",
+        "  rustynetd anchor-bundle-pull-bind-check --addr <addr:port> [--allow-lan <true|false>] [--expect <accept|reject>]",
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--owner-signing-key-passphrase-file <path>] [--node-id <id>] [--network-id <id>] [--force]",
         "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--capabilities <csv>] [--snapshot <path>] [--log <path>]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
@@ -3892,6 +4038,7 @@ fn help_text() -> String {
         "  rustynetd linux-authenticode-check [--no-fail-on-drift]",
         "  rustynetd linux-service-hardening-check [--no-fail-on-drift]",
         "  rustynetd linux-dns-failclosed-check [--no-fail-on-drift]",
+        "  rustynetd linux-blind-exit-dataplane-check [--tunnel-iface <name>] [--egress-iface <name>] [--mesh-cidr <cidr>] [--nft-path <path>] [--no-fail-on-drift]",
         "  rustynetd linux-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>] [--killswitch-table <name>]",
         "  rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]",
         "  rustynetd linux-ipv6-leak-capture --egress-iface <name> [--probe-target <ipv6>] [--killswitch-table <name>]",
@@ -3995,8 +4142,9 @@ mod tests {
     use super::{
         classify_top_level_error, help_text, parse_daemon_config,
         run_blind_exit_reversal_audit_command, run_enrollment_replay_audit_command,
-        run_gossip_revoked_readmit_audit_command, run_linux_exit_dns_failclosed_capture_command,
-        run_linux_ipv6_leak_capture_command, run_macos_exit_dns_failclosed_capture_command,
+        run_gossip_revoked_readmit_audit_command, run_linux_blind_exit_dataplane_check_command,
+        run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
+        run_macos_exit_dns_failclosed_capture_command,
         run_macos_exit_killswitch_precedence_check_command, run_macos_ipv6_leak_capture_command,
         run_membership_revoke_audit_command, run_membership_signature_audit_command,
         run_policy_default_deny_audit_command, run_privileged_helper_allowlist_audit_command,
@@ -4560,6 +4708,24 @@ mod tests {
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown blind-exit-reversal-audit argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_linux_blind_exit_dataplane_check_subcommand() {
+        assert!(
+            help_text().contains("linux-blind-exit-dataplane-check"),
+            "help text must advertise linux-blind-exit-dataplane-check subcommand"
+        );
+    }
+
+    #[test]
+    fn run_linux_blind_exit_dataplane_check_command_rejects_unknown_flags() {
+        let err = run_linux_blind_exit_dataplane_check_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown linux-blind-exit-dataplane-check argument"),
             "unexpected error: {err}"
         );
     }
