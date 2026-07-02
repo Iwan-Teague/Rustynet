@@ -1291,6 +1291,13 @@ impl FlapBreaker {
         self.open_until > now_unix && self.intensity > Self::THETA_CLOSE
     }
 
+    /// Fully closed (not open, not half-open). The FIS-0013 quality
+    /// trigger fires only in this state — the breaker owns direct-relay
+    /// damping and the quality re-race must never bypass it.
+    pub fn is_closed(&self, now_unix: u64) -> bool {
+        !self.is_open(now_unix) && self.intensity <= Self::THETA_OPEN
+    }
+
     pub fn intensity(&self) -> f32 {
         self.intensity
     }
@@ -1304,6 +1311,134 @@ impl FlapBreaker {
         } else {
             "closed"
         }
+    }
+}
+
+/// FIS-0013: daemon-side per-peer path-quality state, SEPARATE from
+/// `traversal_probe_statuses` (rebuilt from scratch every sync pass).
+/// Nothing here runs per-packet or per-10ms-tick — samples arrive at the
+/// daemon's ~1s reconcile cadence.
+#[derive(Debug, Clone, Copy)]
+pub struct PathQualityState {
+    srtt_ms: f32,
+    rttvar_ms: f32,
+    /// Slow RTT average (~20-rekey time constant) — the baseline the fast
+    /// SRTT is compared against for relative degradation.
+    srtt_slow_ms: f32,
+    loss_ewma: f32,
+    rtt_samples: u8,
+    degraded_streak: u8,
+    last_quality_rerace_unix: u64,
+}
+
+impl Default for PathQualityState {
+    fn default() -> Self {
+        Self {
+            srtt_ms: 0.0,
+            rttvar_ms: 0.0,
+            srtt_slow_ms: 0.0,
+            loss_ewma: 0.0,
+            rtt_samples: 0,
+            degraded_streak: 0,
+            last_quality_rerace_unix: 0,
+        }
+    }
+}
+
+impl PathQualityState {
+    const LOSS_DEGRADE_THRESHOLD: f32 = 0.05;
+    const DEGRADED_STREAK_MIN: u8 = 5;
+    const RTT_SAMPLES_MIN: u8 = 2;
+    const RTT_SLOW_ALPHA: f32 = 0.05;
+    const RTT_FAST_ALPHA: f32 = 0.125;
+    const RTT_VAR_BETA: f32 = 0.25;
+    const RTT_RELATIVE_THRESHOLD: f32 = 2.0;
+    const RTT_ABSOLUTE_THRESHOLD_MS: f32 = 50.0;
+    const LOSS_ALPHA: f32 = 0.3;
+    /// Minimum spacing between quality-triggered re-races per peer.
+    pub const QUALITY_RERACE_DWELL_SECS: u64 = 300;
+
+    /// Ingest one ~1s poll sample. Returns `Some(true)` when sustained
+    /// degradation (loss OR RTT arm) warrants a quality re-race and the
+    /// per-peer dwell has elapsed; `None` otherwise.
+    fn ingest_sample(
+        &mut self,
+        sample: rustynet_backend_api::PeerPathSample,
+        now_unix: u64,
+    ) -> Option<bool> {
+        if let Some(rtt) = sample.rtt {
+            let rtt = rtt as f32;
+            if self.rtt_samples == 0 {
+                self.srtt_ms = rtt;
+                self.rttvar_ms = rtt / 2.0;
+                self.srtt_slow_ms = rtt;
+            } else {
+                let abs_diff = (self.srtt_ms - rtt).abs();
+                self.rttvar_ms =
+                    (1.0 - Self::RTT_VAR_BETA) * self.rttvar_ms + Self::RTT_VAR_BETA * abs_diff;
+                self.srtt_ms =
+                    (1.0 - Self::RTT_FAST_ALPHA) * self.srtt_ms + Self::RTT_FAST_ALPHA * rtt;
+                self.srtt_slow_ms = (1.0 - Self::RTT_SLOW_ALPHA) * self.srtt_slow_ms
+                    + Self::RTT_SLOW_ALPHA * self.srtt_ms;
+            }
+            self.rtt_samples = self.rtt_samples.saturating_add(1);
+        }
+        self.loss_ewma = (1.0 - Self::LOSS_ALPHA) * self.loss_ewma + Self::LOSS_ALPHA * sample.loss;
+
+        // Two arms, EITHER can flag a degraded poll: sustained loss, or the
+        // fast RTT running 2x the slow baseline AND +50ms absolute.
+        let loss_degraded = self.loss_ewma >= Self::LOSS_DEGRADE_THRESHOLD;
+        let rtt_degraded = self.rtt_samples >= Self::RTT_SAMPLES_MIN
+            && self.srtt_ms >= Self::RTT_RELATIVE_THRESHOLD * self.srtt_slow_ms
+            && self.srtt_ms - self.srtt_slow_ms >= Self::RTT_ABSOLUTE_THRESHOLD_MS;
+
+        if loss_degraded || rtt_degraded {
+            self.degraded_streak = self
+                .degraded_streak
+                .saturating_add(1)
+                .min(Self::DEGRADED_STREAK_MIN + 1);
+        } else {
+            self.degraded_streak = self.degraded_streak.saturating_sub(1);
+        }
+
+        if self.degraded_streak >= Self::DEGRADED_STREAK_MIN
+            && now_unix >= self.last_quality_rerace_unix + Self::QUALITY_RERACE_DWELL_SECS
+        {
+            self.last_quality_rerace_unix = now_unix;
+            self.degraded_streak = 0;
+            Some(true)
+        } else {
+            None
+        }
+    }
+}
+
+/// FIS-0013: per-peer quality trackers, daemon-owned, persistent across
+/// sync passes.
+#[derive(Debug, Default)]
+pub struct PathQualityTracker {
+    peers: std::collections::BTreeMap<rustynet_backend_api::NodeId, PathQualityState>,
+}
+
+impl PathQualityTracker {
+    pub fn ingest_sample(
+        &mut self,
+        node_id: &rustynet_backend_api::NodeId,
+        sample: rustynet_backend_api::PeerPathSample,
+        now_unix: u64,
+    ) -> Option<bool> {
+        self.peers
+            .entry(node_id.clone())
+            .or_default()
+            .ingest_sample(sample, now_unix)
+    }
+
+    /// Drop trackers for peers no longer present.
+    pub fn retain_peers(
+        &mut self,
+        keep: &std::collections::BTreeSet<rustynet_backend_api::NodeId>,
+    ) {
+        self.peers.retain(|node_id, _| keep.contains(node_id));
     }
 }
 
@@ -1709,6 +1844,7 @@ impl TraversalEngine {
         now_unix: u64,
         handshake_freshness_secs: u64,
         prior_ranking: Option<&PriorRanking>,
+        quality_demoted_endpoint: Option<SocketEndpoint>,
     ) -> Result<SimultaneousOpenResult, TraversalError> {
         if handshake_freshness_secs == 0 {
             return Err(TraversalError::InvalidConfig(
@@ -1761,6 +1897,18 @@ impl TraversalEngine {
             // FIS-0009: re-rank BEFORE the cap so a promoted class survives
             // max_probe_pairs truncation.
             prior_rerank_pairs(&mut pairs, ranking);
+        }
+        if let Some(demoted) = quality_demoted_endpoint {
+            // FIS-0013: incumbent demotion applies LAST (after the RFC 8445
+            // sort and the FIS-0009 re-rank — both stable transforms on the
+            // same seam). Demote-don't-exclude: pairs targeting the rotten
+            // incumbent still race, at the back, and may win if every
+            // alternate fails handshake.
+            let (mut kept, incumbent): (Vec<_>, Vec<_>) = pairs.drain(..).partition(|pair| {
+                !(pair.remote.addr.ip() == demoted.addr && pair.remote.addr.port() == demoted.port)
+            });
+            kept.extend(incumbent);
+            pairs = kept;
         }
         pairs.truncate(self.config.max_probe_pairs);
 
@@ -2809,6 +2957,120 @@ mod tests {
         }
         assert_eq!(breaker.exponent, 0, "sustained recovery resets backoff");
         assert_eq!(breaker.state_label(now), "closed");
+    }
+
+    #[test]
+    fn path_quality_loss_arm_triggers_after_sustained_streak_and_dwell() {
+        use rustynet_backend_api::PeerPathSample;
+        let mut state = super::PathQualityState::default();
+        let clean = PeerPathSample {
+            loss: 0.0,
+            rtt: Some(40),
+            rttvar: None,
+            latest_handshake: Some(1),
+        };
+        let lossy = PeerPathSample {
+            loss: 0.2,
+            rtt: Some(40),
+            rttvar: None,
+            latest_handshake: Some(1),
+        };
+        // Clean polls never trigger.
+        for tick in 1_000_000..1_000_010u64 {
+            assert_eq!(state.ingest_sample(clean, tick), None);
+        }
+        // Sustained loss: EWMA crosses 5% quickly; the trigger still needs
+        // 5 consecutive degraded polls.
+        let mut fired_at = None;
+        for tick in 1_000_010..1_000_030u64 {
+            if state.ingest_sample(lossy, tick) == Some(true) {
+                fired_at = Some(tick);
+                break;
+            }
+        }
+        let fired_at = fired_at.expect("sustained loss must trigger");
+        assert!(
+            (1_000_014..=1_000_020).contains(&fired_at),
+            "trigger after ~5 degraded polls, got {fired_at}"
+        );
+        // Dwell: an immediate re-trigger is suppressed for 300s.
+        for tick in fired_at + 1..fired_at + 50 {
+            assert_eq!(state.ingest_sample(lossy, tick), None, "dwell holds");
+        }
+        // After the dwell elapses, sustained degradation may fire again.
+        let mut refired = false;
+        for tick in fired_at + 301..fired_at + 340 {
+            if state.ingest_sample(lossy, tick) == Some(true) {
+                refired = true;
+                break;
+            }
+        }
+        assert!(refired, "post-dwell sustained degradation re-triggers");
+    }
+
+    #[test]
+    fn path_quality_rtt_arm_needs_relative_and_absolute_degradation() {
+        use rustynet_backend_api::PeerPathSample;
+        let sample = |rtt: u32| PeerPathSample {
+            loss: 0.0,
+            rtt: Some(rtt),
+            rttvar: None,
+            latest_handshake: Some(1),
+        };
+        // Baseline 20ms, spike to 60ms: 3x relative but only +40ms absolute
+        // — must NOT trigger (both arms required).
+        let mut state = super::PathQualityState::default();
+        for tick in 1_000_000..1_000_020u64 {
+            assert_eq!(state.ingest_sample(sample(20), tick), None);
+        }
+        for tick in 1_000_020..1_000_060u64 {
+            assert_eq!(
+                state.ingest_sample(sample(60), tick),
+                None,
+                "3x relative without +50ms absolute must not trigger"
+            );
+        }
+        // Baseline 40ms, sustained 400ms: BOTH arms satisfied -> triggers.
+        let mut state = super::PathQualityState::default();
+        for tick in 1_000_000..1_000_020u64 {
+            assert_eq!(state.ingest_sample(sample(40), tick), None);
+        }
+        let mut fired = false;
+        for tick in 1_000_020..1_000_120u64 {
+            if state.ingest_sample(sample(400), tick) == Some(true) {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "10x + 360ms sustained RTT degradation must trigger");
+    }
+
+    #[test]
+    fn quality_demoted_incumbent_sorts_last_but_stays_in_race() {
+        use crate::ice_priority::CandidateKind;
+        // Reuse the rerank pair fixture; demote the TOP ICE pair.
+        let pairs_input = vec![
+            rerank_pair("203.0.113.1:1", CandidateKind::Host, 500),
+            rerank_pair("203.0.113.2:2", CandidateKind::Host, 400),
+            rerank_pair("203.0.113.3:3", CandidateKind::ServerReflexive, 300),
+        ];
+        // The demotion transform lives inline in execute_ice_pair_race;
+        // reproduce its partition here against the same shape to pin the
+        // semantics: demoted incumbent moves to the END, order of the rest
+        // is preserved, nothing is excluded.
+        let demoted = SocketEndpoint {
+            addr: "203.0.113.1".parse().expect("addr"),
+            port: 1,
+        };
+        let mut pairs = pairs_input;
+        let (mut kept, incumbent): (Vec<_>, Vec<_>) = pairs.drain(..).partition(|pair| {
+            !(pair.remote.addr.ip() == demoted.addr && pair.remote.addr.port() == demoted.port)
+        });
+        kept.extend(incumbent);
+        assert_eq!(kept.len(), 3, "demote, never exclude");
+        assert_eq!(kept[0].remote.addr.port(), 2);
+        assert_eq!(kept[1].remote.addr.port(), 3);
+        assert_eq!(kept[2].remote.addr.port(), 1, "incumbent races last");
     }
 
     #[test]
