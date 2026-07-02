@@ -207,6 +207,7 @@ fn ice_race_picks_highest_priority_winning_endpoint() {
             None,
             now_unix,
             60,
+            None,
         )
         .expect("race runs");
     match result.decision {
@@ -266,6 +267,7 @@ fn ice_race_falls_back_to_relay_when_no_direct_handshake_lands() {
             Some(relay_endpoint),
             now_unix,
             60,
+            None,
         )
         .expect("race runs");
     match result.decision {
@@ -314,6 +316,7 @@ fn ice_race_fails_closed_when_no_direct_candidates() {
             None,
             now_unix,
             60,
+            None,
         )
         .expect("race runs");
     match result.decision {
@@ -370,6 +373,7 @@ fn ice_race_respects_role_assignment_from_node_ids() {
                 None,
                 now_unix,
                 60,
+                None,
             )
             .expect("race runs");
         match result.decision {
@@ -420,6 +424,7 @@ fn ice_race_falls_back_to_top_priority_when_runtime_lacks_endpoint_attribution()
             None,
             now_unix,
             60,
+            None,
         )
         .expect("race runs");
     match result.decision {
@@ -530,6 +535,7 @@ fn ice_race_marginal_nat_succeeds_where_serial_attempts_would_fail() {
             None,
             now_unix,
             60,
+            None,
         )
         .expect("race runs");
     match result.decision {

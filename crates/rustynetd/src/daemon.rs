@@ -1542,6 +1542,10 @@ pub struct DaemonConfig {
     pub traversal_bundle_path: PathBuf,
     pub traversal_verifier_key_path: PathBuf,
     pub traversal_watermark_path: PathBuf,
+    /// FIS-0009: enable the cross-session prior re-rank of candidate
+    /// pairs. Default OFF — recording always runs (observability first);
+    /// only the re-rank consumption is gated.
+    pub traversal_prior_rerank: bool,
     pub relay_fleet_bundle_path: Option<PathBuf>,
     pub relay_fleet_watermark_path: Option<PathBuf>,
     pub traversal_max_age_secs: NonZeroU64,
@@ -1637,6 +1641,7 @@ impl Default for DaemonConfig {
             traversal_bundle_path: PathBuf::from(DEFAULT_TRAVERSAL_BUNDLE_PATH),
             traversal_verifier_key_path: PathBuf::from(DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH),
             traversal_watermark_path: PathBuf::from(DEFAULT_TRAVERSAL_WATERMARK_PATH),
+            traversal_prior_rerank: false,
             relay_fleet_bundle_path: Some(relay_fleet_default_path_from_env(
                 RELAY_FLEET_BUNDLE_PATH_ENV,
                 DEFAULT_RELAY_FLEET_BUNDLE_PATH,
@@ -3498,6 +3503,9 @@ struct DaemonRuntime {
     traversal_bundle_path: PathBuf,
     traversal_verifier_key_path: PathBuf,
     traversal_watermark_path: PathBuf,
+    /// FIS-0009: persisted cross-session traversal priors (fail-open store).
+    peer_prior_store: crate::peer_traversal_prior::PeerPriorStore,
+    traversal_prior_rerank: bool,
     traversal_max_age_secs: u64,
     traversal_probe_config: TraversalEngineConfig,
     traversal_probe_handshake_freshness_secs: u64,
@@ -3868,6 +3876,12 @@ impl DaemonRuntime {
             traversal_bundle_path: config.traversal_bundle_path.clone(),
             traversal_verifier_key_path: config.traversal_verifier_key_path.clone(),
             traversal_watermark_path: config.traversal_watermark_path.clone(),
+            peer_prior_store: crate::peer_traversal_prior::PeerPriorStore::load_or_empty(
+                config
+                    .traversal_watermark_path
+                    .with_file_name("peer_traversal_priors.v1"),
+            ),
+            traversal_prior_rerank: config.traversal_prior_rerank,
             traversal_max_age_secs: config.traversal_max_age_secs.get(),
             traversal_probe_config: TraversalEngineConfig {
                 max_candidates: config.traversal_probe_max_candidates.get(),
@@ -5916,6 +5930,26 @@ impl DaemonRuntime {
                 }
             };
 
+            // FIS-0009: hand the race this peer's cross-session prior only
+            // when the re-rank flag is on; None ranks exactly as today.
+            let prior_ranking = if self.traversal_prior_rerank {
+                self.peer_prior_store
+                    .prior_for(remote_node_id.as_str())
+                    .map(|prior| crate::traversal::PriorRanking {
+                        last_success_class: prior.last_success_class,
+                        per_class_probability: [
+                            crate::peer_traversal_prior::CandidateClass::HostV4,
+                            crate::peer_traversal_prior::CandidateClass::HostV6,
+                            crate::peer_traversal_prior::CandidateClass::SrflxV4,
+                            crate::peer_traversal_prior::CandidateClass::SrflxV6,
+                        ]
+                        .into_iter()
+                        .map(|class| (class, prior.success_probability(class)))
+                        .collect(),
+                    })
+            } else {
+                None
+            };
             let report = self
                 .controller
                 .evaluate_traversal_probes(
@@ -5927,6 +5961,7 @@ impl DaemonRuntime {
                         now_unix,
                         engine_config: self.traversal_probe_config.clone(),
                         handshake_freshness_secs: self.traversal_probe_handshake_freshness_secs,
+                        prior_ranking,
                         coordination_schedule,
                         coordination_error,
                         // D5.5 promotion: deterministic ICE role
@@ -5951,6 +5986,33 @@ impl DaemonRuntime {
                 && let Some(relay_client) = self.relay_client.as_mut()
             {
                 relay_client.touch_session(&remote_node_id);
+            }
+            // FIS-0009: record the race outcome in the cross-session prior
+            // store. Only real races (attempts > 0) count — cached
+            // short-circuit reports would double-count evidence. A Direct
+            // decision needs a fresh handshake to count as a class win
+            // (the FailClosed pseudo-Direct arm has none).
+            if report.attempts > 0 {
+                let handshake_fresh =
+                    self.traversal_handshake_is_fresh(report.latest_handshake_unix, now_unix);
+                let (winning_class, tried_classes) = race_outcome_classes(
+                    &direct_candidates,
+                    report.decision,
+                    report.selected_endpoint,
+                    handshake_fresh,
+                );
+                if !tried_classes.is_empty() {
+                    self.peer_prior_store.record_outcome(
+                        remote_node_id.as_str(),
+                        winning_class,
+                        &tried_classes,
+                        now_unix,
+                    );
+                    if let Err(err) = self.peer_prior_store.persist() {
+                        // Fail-open: the prior is an optimization cache.
+                        eprintln!("rustynetd: peer prior store persist failed: {err}");
+                    }
+                }
             }
             statuses.insert(
                 remote_node_id.clone(),
@@ -14880,9 +14942,113 @@ fn parse_host_cidr_addr(cidr: &str) -> Option<IpAddr> {
     (prefix == host_prefix).then_some(addr)
 }
 
+/// FIS-0009: classify a race outcome for the prior store. `tried` is the
+/// deduped class set of the remote direct candidates; the winner is the
+/// class of the candidate matching the selected endpoint, only when the
+/// decision is Direct AND a fresh handshake backed it.
+fn race_outcome_classes(
+    direct_candidates: &[ProbeTraversalCandidate],
+    decision: TraversalProbeDecision,
+    selected_endpoint: SocketEndpoint,
+    handshake_fresh: bool,
+) -> (
+    Option<crate::peer_traversal_prior::CandidateClass>,
+    Vec<crate::peer_traversal_prior::CandidateClass>,
+) {
+    let mut tried: Vec<crate::peer_traversal_prior::CandidateClass> = Vec::new();
+    for candidate in direct_candidates {
+        if let Some(class) = crate::peer_traversal_prior::CandidateClass::for_candidate(
+            candidate.source,
+            candidate.endpoint.addr,
+        ) && !tried.contains(&class)
+        {
+            tried.push(class);
+        }
+    }
+    let winning = (decision == TraversalProbeDecision::Direct && handshake_fresh)
+        .then(|| {
+            direct_candidates
+                .iter()
+                .find(|candidate| candidate.endpoint == selected_endpoint)
+                .and_then(|candidate| {
+                    crate::peer_traversal_prior::CandidateClass::for_candidate(
+                        candidate.source,
+                        candidate.endpoint.addr,
+                    )
+                })
+        })
+        .flatten();
+    (winning, tried)
+}
+
 #[cfg(all(test, not(windows)))]
 mod tests {
     use std::collections::BTreeMap;
+
+    #[test]
+    fn race_outcome_classes_maps_decisions_to_prior_evidence() {
+        use crate::peer_traversal_prior::CandidateClass;
+        use crate::traversal::CandidateSource;
+        let host_v4 = super::ProbeTraversalCandidate {
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.1".parse().expect("v4"),
+                port: 51820,
+            },
+            source: CandidateSource::Host,
+            priority: 900,
+            observed_at_unix: 1,
+        };
+        let srflx_v4 = super::ProbeTraversalCandidate {
+            endpoint: SocketEndpoint {
+                addr: "198.51.100.2".parse().expect("v4"),
+                port: 51821,
+            },
+            source: CandidateSource::ServerReflexive,
+            priority: 850,
+            observed_at_unix: 1,
+        };
+        let candidates = vec![host_v4, srflx_v4];
+
+        // Direct + fresh handshake: the matching candidate's class wins.
+        let (winning, tried) = super::race_outcome_classes(
+            &candidates,
+            TraversalProbeDecision::Direct,
+            srflx_v4.endpoint,
+            true,
+        );
+        assert_eq!(winning, Some(CandidateClass::SrflxV4));
+        assert_eq!(tried, vec![CandidateClass::HostV4, CandidateClass::SrflxV4]);
+
+        // Direct WITHOUT a fresh handshake (the FailClosed pseudo-Direct
+        // arm): never counts as a win.
+        let (winning, _) = super::race_outcome_classes(
+            &candidates,
+            TraversalProbeDecision::Direct,
+            host_v4.endpoint,
+            false,
+        );
+        assert_eq!(winning, None);
+
+        // Relay fallback: no winner; every tried class records a failure.
+        let (winning, tried) = super::race_outcome_classes(
+            &candidates,
+            TraversalProbeDecision::Relay,
+            srflx_v4.endpoint,
+            true,
+        );
+        assert_eq!(winning, None);
+        assert_eq!(tried.len(), 2);
+
+        // Empty candidate set: nothing to record (deny-by-empty).
+        let (winning, tried) = super::race_outcome_classes(
+            &[],
+            TraversalProbeDecision::Direct,
+            host_v4.endpoint,
+            true,
+        );
+        assert_eq!(winning, None);
+        assert!(tried.is_empty());
+    }
     use std::fs::OpenOptions;
     #[cfg(feature = "test-harness")]
     use std::io::ErrorKind;
