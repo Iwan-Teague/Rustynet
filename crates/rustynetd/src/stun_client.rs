@@ -2,7 +2,7 @@
 
 use rand::RngCore;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
 const STUN_BINDING_REQUEST: u16 = 0x0001;
@@ -53,6 +53,14 @@ pub struct StunTransportRoundTrip {
     pub local_addr: SocketAddr,
 }
 
+/// One in-flight batched query: which configured server it belongs to,
+/// the resolved target it was sent to, and the tx-id its response must echo.
+struct PendingStunQuery {
+    server_index: usize,
+    target: SocketAddr,
+    tx_id: [u8; 12],
+}
+
 #[derive(Debug, Clone)]
 pub struct StunClient {
     servers: Vec<String>,
@@ -87,19 +95,99 @@ impl StunClient {
     /// information for each STUN server that responded. Deduplicated by
     /// mapped endpoint.
     pub fn gather_mapped_endpoints(&self, socket: Option<&UdpSocket>) -> Vec<StunResult> {
+        // FIS-0018: batched-send + single-receiver demux. Total gather
+        // wall-clock is bounded by ONE `self.timeout` regardless of server
+        // count (previously each server consumed a full serial timeout).
+        match socket {
+            Some(socket) => self.gather_mapped_endpoints_batched(socket),
+            None => {
+                // Test-only mode (production always passes Some): one
+                // ephemeral socket for the whole batch.
+                let Ok(owned_socket) = UdpSocket::bind("0.0.0.0:0") else {
+                    return Vec::new();
+                };
+                self.gather_mapped_endpoints_batched(&owned_socket)
+            }
+        }
+    }
+
+    /// Fire every binding request up front from the one socket (each with
+    /// its own tx-id), then run a single receive loop until the gather
+    /// deadline, demuxing each datagram by source address (must equal a
+    /// queried target — a strictness increase over the old per-server serial
+    /// path, which accepted any source that echoed the tx-id) plus the
+    /// existing tx-id echo check. Results assemble in server order (not
+    /// arrival order) with the same dedup predicate, so an all-responsive
+    /// fixture produces byte-identical output to the old serial version.
+    fn gather_mapped_endpoints_batched<S: StunQuerySocket>(&self, socket: &S) -> Vec<StunResult> {
+        let Ok(local_addr) = socket.local_addr() else {
+            return Vec::new();
+        };
+        let mut pending: Vec<PendingStunQuery> = Vec::new();
+        for (server_index, server) in self.servers.iter().enumerate() {
+            let Ok(server_addrs) = server.to_socket_addrs() else {
+                continue;
+            };
+            let Some(target) = server_addrs.into_iter().next() else {
+                continue;
+            };
+            let tx_id = self.generate_tx_id();
+            let request = self.build_binding_request(&tx_id);
+            if socket.send_to(&request, target).is_err() {
+                continue;
+            }
+            pending.push(PendingStunQuery {
+                server_index,
+                target,
+                tx_id,
+            });
+        }
+        if pending.is_empty() {
+            return Vec::new();
+        }
+
+        let deadline = Instant::now() + self.timeout;
+        let mut slots: Vec<Option<StunResult>> = vec![None; self.servers.len()];
+        let mut buf = [0u8; 1024];
+        while !pending.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if socket.set_read_timeout(Some(remaining)).is_err() {
+                break;
+            }
+            // Timeout (deadline reached) and hard socket errors both end the
+            // gather; whatever responded so far is the result.
+            let Ok((len, source)) = socket.recv_from(&mut buf) else {
+                break;
+            };
+            let Some(position) = pending.iter().position(|query| query.target == source) else {
+                // Response from an unqueried source: reject, keep collecting.
+                continue;
+            };
+            let Ok(mapped_endpoint) =
+                self.parse_binding_response(&buf[..len], &pending[position].tx_id)
+            else {
+                // Malformed or wrong tx-id from a real target: drop the
+                // datagram, keep the query pending until the deadline.
+                continue;
+            };
+            let query = pending.swap_remove(position);
+            slots[query.server_index] = Some(StunResult {
+                mapped_endpoint,
+                server: query.target,
+                local_addr,
+            });
+        }
+
         let mut results = Vec::new();
-        for server in &self.servers {
-            match self.query_stun_server_full(server, socket) {
-                Ok(result) => {
-                    // Deduplicate by mapped endpoint
-                    if !results
-                        .iter()
-                        .any(|r: &StunResult| r.mapped_endpoint == result.mapped_endpoint)
-                    {
-                        results.push(result);
-                    }
-                }
-                Err(_) => continue,
+        for result in slots.into_iter().flatten() {
+            if !results
+                .iter()
+                .any(|existing: &StunResult| existing.mapped_endpoint == result.mapped_endpoint)
+            {
+                results.push(result);
             }
         }
         results
@@ -121,7 +209,13 @@ impl StunClient {
             };
             let tx_id = self.generate_tx_id();
             let request = self.build_binding_request(&tx_id);
-            let Ok(response) = round_trip(target, &request, self.timeout) else {
+            // FIS-0018: the authoritative round-trip transport is a hard
+            // singleton (queries must stay sequential), so the fix is budget
+            // accounting: each server gets total/N so an unresponsive server
+            // can no longer eat the others' budget — total gather wall-clock
+            // stays <= one `self.timeout`. N=1 receives the full timeout,
+            // byte-identical to the old behavior.
+            let Ok(response) = round_trip(target, &request, self.per_server_slice()) else {
                 continue;
             };
             if response.remote_addr != target {
@@ -145,23 +239,9 @@ impl StunClient {
         results
     }
 
-    /// Query a STUN server and return full result with metadata.
-    fn query_stun_server_full(
-        &self,
-        server: &str,
-        provided_socket: Option<&UdpSocket>,
-    ) -> Result<StunResult, String> {
-        let server_addrs = server.to_socket_addrs().map_err(|e| e.to_string())?;
-        let target = server_addrs.into_iter().next().ok_or("no server address")?;
-
-        if let Some(socket) = provided_socket {
-            return self.query_stun_server_with_socket(target, socket);
-        }
-
-        let owned_socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-        self.query_stun_server_with_socket(target, &owned_socket)
-    }
-
+    /// Single-query serial path. Production migrated to the batched
+    /// gather (FIS-0018); kept for the d2 port-identity contract tests.
+    #[cfg(test)]
     fn query_stun_server_with_socket<S: StunQuerySocket>(
         &self,
         target: SocketAddr,
@@ -190,6 +270,14 @@ impl StunClient {
             server: target,
             local_addr,
         })
+    }
+
+    /// Per-server slice of the total gather budget for the (serial,
+    /// singleton-transport) round-trip path: `timeout / server_count`,
+    /// full timeout for a single server.
+    fn per_server_slice(&self) -> Duration {
+        let count = u32::try_from(self.servers.len().max(1)).unwrap_or(u32::MAX);
+        self.timeout / count
     }
 
     fn generate_tx_id(&self) -> [u8; 12] {
@@ -1062,5 +1150,230 @@ mod tests {
         assert_eq!(result.server, server_addr);
 
         server_handle.join().expect("echo server thread joins");
+    }
+
+    /// Scripted in-memory socket for deterministic batched-gather tests:
+    /// records sends, then serves a fixed sequence of (payload, source)
+    /// datagrams. Responses are pre-scripted closures over the recorded
+    /// tx-ids so arrival order is fully controlled.
+    struct ScriptedBatchSocket {
+        local: SocketAddr,
+        sent: std::cell::RefCell<Vec<(Vec<u8>, SocketAddr)>>,
+        // Each entry: (target the response claims to come from, build fn
+        // input index into `sent` for the tx-id, or None for a bogus tx-id).
+        responses: std::cell::RefCell<std::collections::VecDeque<(SocketAddr, Option<usize>)>>,
+        mapped: SocketAddr,
+    }
+
+    impl ScriptedBatchSocket {
+        fn new(mapped: SocketAddr) -> Self {
+            Self {
+                local: "127.0.0.1:40000".parse().expect("local addr"),
+                sent: std::cell::RefCell::new(Vec::new()),
+                responses: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                mapped,
+            }
+        }
+
+        fn queue_response(&self, from: SocketAddr, echo_tx_of_send: Option<usize>) {
+            self.responses
+                .borrow_mut()
+                .push_back((from, echo_tx_of_send));
+        }
+    }
+
+    impl StunQuerySocket for ScriptedBatchSocket {
+        fn set_read_timeout(&self, _duration: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.local)
+        }
+
+        fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.sent.borrow_mut().push((buf.to_vec(), target));
+            Ok(buf.len())
+        }
+
+        fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let Some((from, echo_index)) = self.responses.borrow_mut().pop_front() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "no more scripted responses",
+                ));
+            };
+            let tx_id: [u8; 12] = match echo_index {
+                Some(index) => self.sent.borrow()[index].0[8..20]
+                    .try_into()
+                    .expect("tx id slice"),
+                None => [0xEE; 12],
+            };
+            let response = build_xor_mapped_binding_response(&tx_id, self.mapped);
+            buf[..response.len()].copy_from_slice(&response);
+            Ok((response.len(), from))
+        }
+    }
+
+    #[test]
+    fn multi_server_gather_completes_within_one_gather_deadline() {
+        // Two responsive echoes + one blackhole (RFC 5737 TEST-NET-1, never
+        // routable from CI): both live results must arrive and total elapsed
+        // must stay bounded by ~one gather deadline, not a per-server sum.
+        let (server_a, handle_a) = spawn_local_stun_echo("127.0.0.1:0".parse().expect("bind addr"));
+        let (server_b, handle_b) = spawn_local_stun_echo("127.0.0.1:0".parse().expect("bind addr"));
+        let blackhole = "192.0.2.1:3478";
+
+        let timeout = Duration::from_millis(700);
+        let client = StunClient::new(
+            vec![
+                server_a.to_string(),
+                blackhole.to_owned(),
+                server_b.to_string(),
+            ],
+            timeout,
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("client bind");
+
+        let started = Instant::now();
+        let results = client.gather_mapped_endpoints(Some(&socket));
+        let elapsed = started.elapsed();
+
+        // Old serial behavior would need >= 2x timeout to even reach
+        // server_b behind the blackhole; batched must stay within ~1x
+        // (plus scheduling slack).
+        assert!(
+            elapsed < timeout * 2,
+            "batched gather took {elapsed:?}, serial-shaped latency"
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "loopback echoes map to one deduped endpoint"
+        );
+        assert_eq!(
+            results[0].server, server_a,
+            "server-order assembly: first responsive server wins the dedup slot"
+        );
+        handle_a.join().expect("echo a joins");
+        handle_b.join().expect("echo b joins");
+    }
+
+    #[test]
+    fn multi_server_gather_dedups_identical_mapped_endpoints() {
+        // Both echoes observe the same client socket, so both report the
+        // identical mapped endpoint — dedup must collapse them to one.
+        let (server_a, handle_a) = spawn_local_stun_echo("127.0.0.1:0".parse().expect("bind addr"));
+        let (server_b, handle_b) = spawn_local_stun_echo("127.0.0.1:0".parse().expect("bind addr"));
+        let client = StunClient::new(
+            vec![server_a.to_string(), server_b.to_string()],
+            Duration::from_millis(700),
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("client bind");
+        let bound_local = socket.local_addr().expect("local addr");
+
+        let results = client.gather_mapped_endpoints(Some(&socket));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].mapped_endpoint, bound_local);
+        handle_a.join().expect("echo a joins");
+        handle_b.join().expect("echo b joins");
+    }
+
+    #[test]
+    fn multi_server_gather_output_is_server_order_not_arrival_order() {
+        let server_a: SocketAddr = "127.0.0.1:5001".parse().expect("addr");
+        let server_b: SocketAddr = "127.0.0.1:5002".parse().expect("addr");
+        let client = StunClient::new(
+            vec![server_a.to_string(), server_b.to_string()],
+            Duration::from_millis(200),
+        );
+        // Distinct mapped endpoints per response are impossible with one
+        // shared `mapped` — use identical mapped, but assert ORDER via the
+        // `server` field: responses arrive B-first, output must be A-first.
+        // With identical mapped endpoints dedup keeps exactly one — the one
+        // in SERVER order (A), even though B arrived first.
+        let socket = ScriptedBatchSocket::new("198.51.100.7:4242".parse().expect("mapped"));
+        socket.queue_response(server_b, Some(1)); // B answers first
+        socket.queue_response(server_a, Some(0)); // A answers second
+
+        let results = client.gather_mapped_endpoints_batched(&socket);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].server, server_a,
+            "output must assemble in server order, not arrival order"
+        );
+    }
+
+    #[test]
+    fn single_server_gather_behavior_unchanged() {
+        let (server_addr, handle) =
+            spawn_local_stun_echo("127.0.0.1:0".parse().expect("bind addr"));
+        let client = StunClient::new(vec![server_addr.to_string()], Duration::from_secs(5));
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("client bind");
+        let bound_local = socket.local_addr().expect("local addr");
+
+        let results = client.gather_mapped_endpoints(Some(&socket));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].mapped_endpoint, bound_local);
+        assert_eq!(results[0].server, server_addr);
+        assert_eq!(results[0].local_addr, bound_local);
+        handle.join().expect("echo joins");
+    }
+
+    #[test]
+    fn batched_gather_ignores_response_from_unqueried_source() {
+        let server_a: SocketAddr = "127.0.0.1:5003".parse().expect("addr");
+        let intruder: SocketAddr = "127.0.0.1:5999".parse().expect("addr");
+        let client = StunClient::new(vec![server_a.to_string()], Duration::from_millis(200));
+        let socket = ScriptedBatchSocket::new("198.51.100.7:4242".parse().expect("mapped"));
+        // A perfectly well-formed response (correct tx-id!) from a source we
+        // never queried must be rejected; the real server then answers.
+        socket.queue_response(intruder, Some(0));
+        socket.queue_response(server_a, Some(0));
+
+        let results = client.gather_mapped_endpoints_batched(&socket);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].server, server_a);
+
+        // And if ONLY the intruder answers, the gather yields nothing.
+        let socket = ScriptedBatchSocket::new("198.51.100.7:4242".parse().expect("mapped"));
+        socket.queue_response(intruder, Some(0));
+        let results = client.gather_mapped_endpoints_batched(&socket);
+        assert!(
+            results.is_empty(),
+            "unqueried source must never produce a candidate"
+        );
+    }
+
+    #[test]
+    fn round_trip_gather_slices_budget_across_servers() {
+        let client = StunClient::new(
+            vec![
+                "127.0.0.1:5001".to_owned(),
+                "127.0.0.1:5002".to_owned(),
+                "127.0.0.1:5003".to_owned(),
+            ],
+            Duration::from_millis(900),
+        );
+        let mut observed = Vec::new();
+        let _ = client.gather_mapped_endpoints_with_round_trip(|_target, _req, timeout| {
+            observed.push(timeout);
+            Err("unresponsive".to_owned())
+        });
+        assert_eq!(observed, vec![Duration::from_millis(300); 3]);
+    }
+
+    #[test]
+    fn round_trip_gather_single_server_receives_full_timeout() {
+        let client = StunClient::new(
+            vec!["127.0.0.1:5001".to_owned()],
+            Duration::from_millis(900),
+        );
+        let mut observed = Vec::new();
+        let _ = client.gather_mapped_endpoints_with_round_trip(|_target, _req, timeout| {
+            observed.push(timeout);
+            Err("unresponsive".to_owned())
+        });
+        assert_eq!(observed, vec![Duration::from_millis(900)]);
     }
 }
