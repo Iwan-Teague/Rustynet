@@ -235,6 +235,16 @@ impl GossipNode {
         );
     }
 
+    /// FIS-0003 phase 1: remove a peer's routing/verification state (the
+    /// re-push destination and verifying key). The seen-sequence ledger is
+    /// DELIBERATELY retained — it is the anti-replay watermark, and pruning
+    /// it on revocation would let a later Restore replay the peer's old
+    /// bundles. (Deviation from the FIS-0003 sketch's "prune seen
+    /// sequences", chosen per the strictest-secure-default rule.)
+    pub fn unregister_peer(&mut self, peer_node_id: &[u8; 32]) -> bool {
+        self.peers.remove(peer_node_id).is_some()
+    }
+
     /// Replace the anchor-seed set from verified membership state.
     /// Unknown peer ids are harmless; the rebroadcast scheduler
     /// intersects this set with `self.peers`.
@@ -485,6 +495,13 @@ impl GossipNode {
         let mut ordinary = Vec::new();
         for peer_id in self.peers.keys().copied() {
             if Some(peer_id) == origin || Some(peer_id) == sender {
+                continue;
+            }
+            // FIS-0003 phase 1: a revoked peer gets zero outbound gossip —
+            // the inbound arm (GM-1/RSA-0034) already rejects its bundles;
+            // this closes the re-push direction so revocation fully
+            // excludes it from the epidemic.
+            if self.revoked_peer_ids.contains(&peer_id) {
                 continue;
             }
             if self.anchor_gossip_seed_peer_ids.contains(&peer_id) {
@@ -1206,6 +1223,50 @@ mod tests {
 
         let excluding_sender = node.ordered_peer_ids_for_rebroadcast(None, Some(id3));
         assert_eq!(excluding_sender, vec![id7, id9]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebroadcast_excludes_revoked_peers_and_unregister_keeps_replay_ledger() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(4, dir.path());
+        let local = GossipTransport::bind(loopback_bind()).expect("transport");
+        let mut ids = Vec::new();
+        for byte in [5u8, 6] {
+            let key = SigningKey::from_bytes(&[byte; 32]);
+            let peer_id = key.verifying_key().to_bytes();
+            ids.push(peer_id);
+            node.register_peer(
+                peer_id,
+                key.verifying_key(),
+                local.local_addr().expect("addr"),
+            );
+        }
+        let (peer_a, peer_b) = (ids[0], ids[1]);
+
+        // FIS-0003 phase 1: revocation removes a peer from the OUTBOUND
+        // re-push schedule (the inbound arm is GM-1/RSA-0034).
+        node.set_revoked_peer_ids([peer_a]);
+        let ordered = node.ordered_peer_ids_for_rebroadcast(None, None);
+        assert!(!ordered.contains(&peer_a), "revoked peer gets zero gossip");
+        assert!(ordered.contains(&peer_b));
+
+        // unregister_peer removes routing state but the anti-replay
+        // ledger survives: a later Restore must not enable replay of the
+        // peer's old sequences.
+        node.seen_gossip_sequences.record(peer_a, 41);
+        assert!(node.unregister_peer(&peer_a));
+        assert!(!node.unregister_peer(&peer_a), "second remove is a no-op");
+        assert!(
+            node.ordered_peer_ids_for_rebroadcast(None, None)
+                .iter()
+                .all(|peer_id| *peer_id != peer_a)
+        );
+        assert_eq!(
+            node.seen_gossip_sequences.highest_accepted(&peer_a),
+            Some(41),
+            "replay watermark must survive unregistration"
+        );
     }
 
     #[test]
