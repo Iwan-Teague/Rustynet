@@ -1329,6 +1329,13 @@ pub struct PathQualityState {
     rtt_samples: u8,
     degraded_streak: u8,
     last_quality_rerace_unix: u64,
+    /// FIS-0021 delta 3: boringtun's `last_rtt` is STICKY (the same value
+    /// repeats every poll until the next handshake), so RTT evidence is
+    /// ingested only when the handshake advanced, and the RTT arm is gated
+    /// on the age of the last real ingest — not on poll liveness (which a
+    /// loss-only poll refreshes every second, making a 10s gate vacuous).
+    last_rtt_handshake_unix: Option<u64>,
+    last_rtt_ingest_unix: u64,
 }
 
 impl Default for PathQualityState {
@@ -1341,6 +1348,8 @@ impl Default for PathQualityState {
             rtt_samples: 0,
             degraded_streak: 0,
             last_quality_rerace_unix: 0,
+            last_rtt_handshake_unix: None,
+            last_rtt_ingest_unix: 0,
         }
     }
 }
@@ -1355,6 +1364,10 @@ impl PathQualityState {
     const RTT_RELATIVE_THRESHOLD: f32 = 2.0;
     const RTT_ABSOLUTE_THRESHOLD_MS: f32 = 50.0;
     const LOSS_ALPHA: f32 = 0.3;
+    /// Max staleness of the last REAL RTT ingest for the RTT arm — sized to
+    /// RTT's ~120s handshake cadence ("at most one missed handshake"), not
+    /// to the 1s poll cadence.
+    const RTT_INGEST_MAX_AGE_SECS: u64 = 240;
     /// Minimum spacing between quality-triggered re-races per peer.
     pub const QUALITY_RERACE_DWELL_SECS: u64 = 300;
 
@@ -1366,7 +1379,17 @@ impl PathQualityState {
         sample: rustynet_backend_api::PeerPathSample,
         now_unix: u64,
     ) -> Option<bool> {
-        if let Some(rtt) = sample.rtt {
+        // FIS-0021 delta 3: only a handshake ADVANCE carries a fresh RTT
+        // sample; the sticky repeat of the same value every poll must not
+        // re-enter the estimators.
+        let fresh_rtt = sample
+            .latest_handshake
+            .is_some_and(|handshake| self.last_rtt_handshake_unix != Some(handshake));
+        if let Some(rtt) = sample.rtt
+            && fresh_rtt
+        {
+            self.last_rtt_handshake_unix = sample.latest_handshake;
+            self.last_rtt_ingest_unix = now_unix;
             let rtt = rtt as f32;
             if self.rtt_samples == 0 {
                 self.srtt_ms = rtt;
@@ -1388,7 +1411,10 @@ impl PathQualityState {
         // Two arms, EITHER can flag a degraded poll: sustained loss, or the
         // fast RTT running 2x the slow baseline AND +50ms absolute.
         let loss_degraded = self.loss_ewma >= Self::LOSS_DEGRADE_THRESHOLD;
+        let rtt_fresh_enough = self.rtt_samples > 0
+            && now_unix.saturating_sub(self.last_rtt_ingest_unix) <= Self::RTT_INGEST_MAX_AGE_SECS;
         let rtt_degraded = self.rtt_samples >= Self::RTT_SAMPLES_MIN
+            && rtt_fresh_enough
             && self.srtt_ms >= Self::RTT_RELATIVE_THRESHOLD * self.srtt_slow_ms
             && self.srtt_ms - self.srtt_slow_ms >= Self::RTT_ABSOLUTE_THRESHOLD_MS;
 
@@ -3011,21 +3037,23 @@ mod tests {
     #[test]
     fn path_quality_rtt_arm_needs_relative_and_absolute_degradation() {
         use rustynet_backend_api::PeerPathSample;
-        let sample = |rtt: u32| PeerPathSample {
+        // Each poll carries a fresh handshake so the RTT ingest advances
+        // (the sticky-repeat dedupe is pinned separately below).
+        let sample = |rtt: u32, handshake: u64| PeerPathSample {
             loss: 0.0,
             rtt: Some(rtt),
             rttvar: None,
-            latest_handshake: Some(1),
+            latest_handshake: Some(handshake),
         };
         // Baseline 20ms, spike to 60ms: 3x relative but only +40ms absolute
         // — must NOT trigger (both arms required).
         let mut state = super::PathQualityState::default();
         for tick in 1_000_000..1_000_020u64 {
-            assert_eq!(state.ingest_sample(sample(20), tick), None);
+            assert_eq!(state.ingest_sample(sample(20, tick), tick), None);
         }
         for tick in 1_000_020..1_000_060u64 {
             assert_eq!(
-                state.ingest_sample(sample(60), tick),
+                state.ingest_sample(sample(60, tick), tick),
                 None,
                 "3x relative without +50ms absolute must not trigger"
             );
@@ -3033,16 +3061,54 @@ mod tests {
         // Baseline 40ms, sustained 400ms: BOTH arms satisfied -> triggers.
         let mut state = super::PathQualityState::default();
         for tick in 1_000_000..1_000_020u64 {
-            assert_eq!(state.ingest_sample(sample(40), tick), None);
+            assert_eq!(state.ingest_sample(sample(40, tick), tick), None);
         }
         let mut fired = false;
         for tick in 1_000_020..1_000_120u64 {
-            if state.ingest_sample(sample(400), tick) == Some(true) {
+            if state.ingest_sample(sample(400, tick), tick) == Some(true) {
                 fired = true;
                 break;
             }
         }
         assert!(fired, "10x + 360ms sustained RTT degradation must trigger");
+    }
+
+    #[test]
+    fn path_quality_rtt_arm_gated_on_ingest_age_not_poll_age() {
+        use rustynet_backend_api::PeerPathSample;
+        // FIS-0021 delta 3: the sticky repeat of one handshake's RTT must
+        // ingest exactly once, and once the last REAL ingest goes stale
+        // (>240s), the RTT arm cannot keep a degraded verdict alive no
+        // matter how fresh the loss-only polling is.
+        let mut state = super::PathQualityState::default();
+        // Establish a baseline with fresh handshakes.
+        for tick in 1_000_000..1_000_010u64 {
+            let _ = state.ingest_sample(
+                PeerPathSample {
+                    loss: 0.0,
+                    rtt: Some(40),
+                    rttvar: None,
+                    latest_handshake: Some(tick),
+                },
+                tick,
+            );
+        }
+        // One degraded handshake, then the SAME handshake repeats for 400
+        // polls (sticky last_rtt): only one ingest, and past 240s the RTT
+        // arm goes stale — no trigger may ever fire.
+        let sticky = PeerPathSample {
+            loss: 0.0,
+            rtt: Some(400),
+            rttvar: None,
+            latest_handshake: Some(1_000_010),
+        };
+        for tick in 1_000_010..1_000_410u64 {
+            assert_eq!(
+                state.ingest_sample(sticky, tick),
+                None,
+                "sticky RTT repeats must not accumulate degraded evidence"
+            );
+        }
     }
 
     #[test]
