@@ -68,6 +68,17 @@ const WINDOWS_RELAY_SERVICE_UNINSTALL_HELPER_FILE: &str =
 const WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT: &str = r"C:\ProgramData\RustyNet\vm-lab\windows_exit";
 const WINDOWS_EXIT_KILLSWITCH_PROBE_MARKER: &str =
     r"C:\ProgramData\RustyNet\vm-lab\windows_exit\enable_killswitch_precedence_probe";
+const LOCAL_SOURCE_ARCHIVE_EXCLUDED_TOP_LEVEL_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "artifacts",
+    "state",
+    "target",
+    "target-livelab",
+];
+const LOCAL_SOURCE_GENERATED_TOP_LEVEL_DIRS: &[&str] =
+    &[".git", "artifacts", "state", "target", "target-livelab"];
 const WINDOWS_VERIFY_HELPER_FILE: &str = "Verify-RustyNetWindowsBootstrap.ps1";
 const WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE: &str = "Collect-RustyNetWindowsDiagnostics.ps1";
 const WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE: &str = "Smoke-RustyNetWindowsServiceHost.ps1";
@@ -7078,6 +7089,10 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         config.extra_vm.as_deref(),
         config.fifth_client_vm.as_deref(),
     )?;
+    let linux_blind_exit_alias = topology_resolution
+        .blind_exit_alias()
+        .filter(|alias| selected_aliases.iter().any(|selected| selected == *alias))
+        .map(str::to_owned);
     // Build discovery alias list: Linux nodes + optional Windows/macOS nodes.
     // selected_aliases (Linux only) continues to be used for profile/setup.
     let mut discovery_aliases = selected_aliases.clone();
@@ -7172,7 +7187,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             .filter(|a| a.as_str() == windows_alias)
             .cloned()
             .collect();
-        if !windows_unready.is_empty() {
+        if !windows_unready.is_empty() && !config.trust_inventory_ready {
             let unready_str = windows_unready.join(", ");
             materialize_orchestration_staging_dir(
                 pre_setup_orchestration_dir.as_path(),
@@ -7189,7 +7204,32 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                 )],
             );
         }
-        let windows_outcomes = run_windows_orchestration_stages(
+        if !windows_unready.is_empty() {
+            warnings.push(format!(
+                "--trust-inventory-ready set for Windows-only run; proceeding to Windows \
+                 bootstrap despite discovery marking unready: {}",
+                windows_unready.join(", ")
+            ));
+        }
+        let promote_windows_to_active_exit = config
+            .windows_vm
+            .as_deref()
+            .zip(config.exit_vm.as_deref())
+            .is_some_and(|(win, exit)| win == exit);
+        let windows_options = WindowsOrchestrationOptions {
+            no_fail_on_authenticode: config.no_fail_on_authenticode,
+            promote_to_active_exit: promote_windows_to_active_exit,
+            validate_admin_issue: config
+                .admin_platform
+                .as_deref()
+                .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
+            anchor_platform: config
+                .anchor_platform
+                .as_deref()
+                .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
+            ..WindowsOrchestrationOptions::default()
+        };
+        let windows_outcomes = run_windows_orchestration_stages_with_options(
             windows_alias,
             inventory_path.as_path(),
             config.ssh_identity_file.as_path(),
@@ -7199,6 +7239,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             config.utmctl_path.as_deref(),
             config.dry_run,
             report_dir.as_path(),
+            windows_options,
         );
         for outcome in &windows_outcomes {
             emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
@@ -7681,6 +7722,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         if config.validate_linux_daemon_state && !selected_aliases.is_empty() {
             let linux_outcomes = run_linux_daemon_validators_for_aliases(
                 selected_aliases.as_slice(),
+                linux_blind_exit_alias.as_deref(),
                 inventory_path.as_path(),
                 config.ssh_identity_file.as_path(),
                 config.known_hosts_path.as_deref(),
@@ -7759,6 +7801,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             if config.validate_linux_daemon_state && !selected_aliases.is_empty() {
                 let linux_outcomes = run_linux_daemon_validators_for_aliases(
                     selected_aliases.as_slice(),
+                    linux_blind_exit_alias.as_deref(),
                     inventory_path.as_path(),
                     config.ssh_identity_file.as_path(),
                     config.known_hosts_path.as_deref(),
@@ -10898,8 +10941,9 @@ fn exercise_macos_admin_issue_live(
 
     // node_id is a validated mesh id; the work dir + passphrase + secret are all
     // root-owned (sudo mktemp + sudo tee) so the daemon's passphrase custody
-    // check (owner-uid + 0600) passes. `set -eu` + the `test -s` asserts make a
-    // failed sign a non-zero exit -> stage Fail.
+    // check (owner-uid + 0600) passes. The verifier path also receives a
+    // daemon-format prior watermark, so the live check exercises the same
+    // anti-rollback guard without weakening the CLI's file-shape checks.
     let issue_script = format!(
         "set -eu; \
          WORK=$(sudo mktemp -d /tmp/rn-macos-admin.XXXXXX); \
@@ -10912,9 +10956,29 @@ fn exercise_macos_admin_issue_live(
          sudo /usr/local/bin/rustynet assignment issue --target-node-id {node_id} --nodes \"$NODES\" --allow \"$ALLOW\" --signing-secret \"$WORK/secret\" --signing-secret-passphrase-file \"$WORK/pass\" --output \"$WORK/bundle\" --verifier-key-output \"$WORK/vpub\" --ttl-secs 300 >/dev/null; \
          sudo test -s \"$WORK/bundle\"; \
          sudo test -s \"$WORK/vpub\"; \
+         ZERO_DIGEST=0000000000000000000000000000000000000000000000000000000000000000; \
+         printf 'version=2\\ngenerated_at_unix=0\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-valid\" >/dev/null; \
+         printf 'version=2\\ngenerated_at_unix=0\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-tampered\" >/dev/null; \
+         sudo chmod 600 \"$WORK/watermark-valid\" \"$WORK/watermark-tampered\"; \
+         sudo /usr/local/bin/rustynet assignment verify --bundle \"$WORK/bundle\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-valid\" --expected-node-id {node_id} --max-age-secs 600 >/dev/null; \
+         GEN=$(sudo awk -F= '$1==\"generated_at_unix\"{{print $2}}' \"$WORK/bundle\"); \
+         FUTURE=$((GEN + 1)); \
+         printf 'version=2\\ngenerated_at_unix=%s\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$FUTURE\" \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-future\" >/dev/null; \
+         sudo chmod 600 \"$WORK/watermark-future\"; \
+         if sudo /usr/local/bin/rustynet assignment verify --bundle \"$WORK/bundle\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-future\" --expected-node-id {node_id} --max-age-secs 600 >/dev/null 2>&1; then \
+           echo 'rollback watermark was accepted' >&2; exit 1; \
+         fi; \
+         sudo cp \"$WORK/bundle\" \"$WORK/tampered\"; \
+         sudo perl -0pi -e 's/^node_id={node_id}$/node_id={node_id}-tampered/m' \"$WORK/tampered\"; \
+         if sudo cmp -s \"$WORK/bundle\" \"$WORK/tampered\"; then \
+           echo 'tamper did not modify assignment bundle' >&2; exit 1; \
+         fi; \
+         if sudo /usr/local/bin/rustynet assignment verify --bundle \"$WORK/tampered\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-tampered\" --expected-node-id {node_id} --max-age-secs 600 >/dev/null 2>&1; then \
+           echo 'tampered assignment bundle was accepted' >&2; exit 1; \
+         fi; \
          BYTES=$(sudo stat -f%z \"$WORK/bundle\" 2>/dev/null || echo unknown); \
          sudo rm -rf \"$WORK\"; \
-         echo \"minted signing authority + issued a signed assignment bundle ($BYTES bytes)\"",
+         echo \"minted signing authority + issued a signed assignment bundle ($BYTES bytes); valid verify passed; rollback watermark rejected; tampered verify rejected\"",
     );
     let out = capture_remote_shell_command_for_target(
         &target,
@@ -10926,7 +10990,7 @@ fn exercise_macos_admin_issue_live(
     )
     .map_err(|e| format!("macOS admin issue on {macos_alias} failed: {e}"))?;
     Ok(format!(
-        "macOS admin live-proven on {macos_alias}: node_id={node_id} {}",
+        "macOS admin live-proven on {macos_alias}: node_id={node_id}; signed assignment issue + valid verify + forged/tampered rejection; {}",
         out.trim()
     ))
 }
@@ -11374,6 +11438,114 @@ const WINDOWS_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str =
 const WINDOWS_ANCHOR_MEMBERSHIP_SNAPSHOT_PATH: &str =
     r"C:\ProgramData\RustyNet\membership\membership.snapshot";
 
+fn validate_windows_anchor_deploy_preflight_report(
+    report_body: &str,
+    windows_alias: &str,
+) -> Result<String, String> {
+    let parsed: serde_json::Value = serde_json::from_str(report_body)
+        .map_err(|err| format!("parse Windows anchor deploy preflight report failed: {err}"))?;
+    if parsed
+        .get("schema_version")
+        .and_then(|value| value.as_u64())
+        != Some(1)
+    {
+        return Err(
+            "Windows anchor deploy preflight report has unsupported schema_version".to_owned(),
+        );
+    }
+    if parsed.get("stage").and_then(|value| value.as_str())
+        != Some("windows_anchor_deploy_preflight")
+    {
+        return Err("Windows anchor deploy preflight report has unexpected stage tag".to_owned());
+    }
+    if parsed.get("status").and_then(|value| value.as_str()) != Some("pass") {
+        return Err(format!(
+            "Windows anchor deploy preflight status was not pass for {windows_alias}: {}",
+            parsed
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or("<missing reason>")
+        ));
+    }
+    let required = [
+        "windows_anchor_preflight_whoami",
+        "windows_anchor_preflight_service_present",
+        "windows_anchor_preflight_daemon_present",
+        "windows_anchor_preflight_config_root_present",
+        "windows_anchor_preflight_listener_state_captured",
+    ];
+    let subchecks = parsed
+        .get("subchecks")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "Windows anchor deploy preflight missing subchecks array".to_owned())?;
+    for name in required {
+        let passed = subchecks.iter().any(|entry| {
+            entry.get("name").and_then(|value| value.as_str()) == Some(name)
+                && entry.get("status").and_then(|value| value.as_str()) == Some("pass")
+                && entry
+                    .get("detail")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|detail| !detail.trim().is_empty())
+        });
+        if !passed {
+            return Err(format!(
+                "Windows anchor deploy preflight control {name} did not pass on {windows_alias}"
+            ));
+        }
+    }
+    let whoami = parsed
+        .get("whoami")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<unknown>");
+    let listener = parsed
+        .get("listener_state")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<unknown>");
+    Ok(format!(
+        "Windows anchor deploy preflight passed on {windows_alias}: whoami={whoami} listener_51822={listener}"
+    ))
+}
+
+fn run_windows_anchor_deploy_preflight(
+    windows_alias: &str,
+    target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let preflight_script = format!(
+        "$ErrorActionPreference='Stop'; \
+         $subchecks=New-Object 'System.Collections.Generic.List[object]'; \
+         $who=(whoami); \
+         if([string]::IsNullOrWhiteSpace($who)){{throw 'whoami returned empty'}}; \
+         $subchecks.Add(@{{name='windows_anchor_preflight_whoami';status='pass';detail=$who}}); \
+         $svc=Get-Service -Name RustyNet -ErrorAction Stop; \
+         $subchecks.Add(@{{name='windows_anchor_preflight_service_present';status='pass';detail=$svc.Status.ToString()}}); \
+         if(-not(Test-Path -LiteralPath '{daemon}')){{throw 'rustynetd.exe missing'}}; \
+         $subchecks.Add(@{{name='windows_anchor_preflight_daemon_present';status='pass';detail='{daemon}'}}); \
+         if(-not(Test-Path -LiteralPath 'C:\\ProgramData\\RustyNet\\config')){{throw 'RustyNet config root missing'}}; \
+         $subchecks.Add(@{{name='windows_anchor_preflight_config_root_present';status='pass';detail='C:\\ProgramData\\RustyNet\\config'}}); \
+         $listeners=@(Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | Select-Object -First 8 -Property LocalAddress,LocalPort,State | ForEach-Object {{ ('{{0}}:{{1}}/{{2}}' -f $_.LocalAddress,$_.LocalPort,$_.State) }}); \
+         $listenerState=if($listeners.Count -eq 0){{'none'}}else{{$listeners -join ','}}; \
+         $subchecks.Add(@{{name='windows_anchor_preflight_listener_state_captured';status='pass';detail=$listenerState}}); \
+         $report=[ordered]@{{schema_version=1;stage='windows_anchor_deploy_preflight';status='pass';whoami=$who;service_status=$svc.Status.ToString();listener_state=$listenerState;subchecks=$subchecks}}; \
+         Write-Output ($report|ConvertTo-Json -Depth 8)",
+        daemon = WINDOWS_RUSTYNETD_EXE_PATH,
+        port = WINDOWS_ANCHOR_BUNDLE_PULL_PORT,
+    );
+    let raw = capture_remote_shell_command_for_target_with_phase(
+        target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        preflight_script.as_str(),
+        Duration::from_secs(90),
+        RemoteTransportPhase::AccessEstablishment,
+    )
+    .map_err(|err| format!("Windows anchor deploy preflight on {windows_alias} failed: {err}"))?;
+    let trimmed = extract_trailing_json_object(raw.as_str()).unwrap_or(raw);
+    validate_windows_anchor_deploy_preflight_report(trimmed.as_str(), windows_alias)
+}
+
 /// Make the Windows host actually SERVE the anchor bundle-pull listener before
 /// the live validation runs — the Windows analogue of
 /// `deploy_macos_anchor_profile` (mod.rs:10657).
@@ -11456,7 +11628,17 @@ fn deploy_windows_anchor_service(
         known_hosts_path,
         timeout: Duration::from_secs(180),
     };
+    let preflight_summary = run_windows_anchor_deploy_preflight(
+        windows_alias,
+        &target,
+        ssh_identity_file,
+        known_hosts_path,
+    )?;
     let local_path = windows_helper_script_local_path(WINDOWS_ANCHOR_INSTALL_HELPER_FILE);
+    let remote_helper_name = format!(
+        "Install-RustyNetWindowsAnchorService.{}.ps1",
+        unique_suffix()
+    );
     let args = vec!["-NodeId".to_owned(), node_id.clone()];
     // Retry on a bare SSH channel-open rejection ("exec request failed on
     // channel 0") only -- the installer script is idempotent (filters+
@@ -11473,7 +11655,7 @@ fn deploy_windows_anchor_service(
         match capture_windows_helper_script_output_from_path(
             &context,
             local_path.as_path(),
-            WINDOWS_ANCHOR_INSTALL_HELPER_FILE,
+            remote_helper_name.as_str(),
             &args,
         ) {
             Ok(output) => {
@@ -11496,16 +11678,16 @@ fn deploy_windows_anchor_service(
     Ok(format!(
         "Windows anchor service reconfigured on {windows_alias}: self-contained genesis snapshot \
          (node holds anchor.bundle_pull) + loopback {addr} bundle-pull listener (allow-lan=false, \
-         verify-before-serve asserted), token ACL locked; {out}",
+         verify-before-serve asserted), token ACL locked; {preflight_summary}; helper={remote_helper_name}; {out}",
         addr = WINDOWS_ANCHOR_BUNDLE_PULL_ADDR,
         out = out.trim()
     ))
 }
 
 /// Drive the LIVE Windows anchor bundle-pull proof — the Windows analogue of
-/// `exercise_macos_anchor_bundle_pull_live` (mod.rs:10758). SSHes to the guest
-/// via inline base64 `-EncodedCommand` PowerShell (the Windows admin-issue
-/// pattern, mod.rs:13176), presents the seeded authority token over the loopback
+/// `exercise_macos_anchor_bundle_pull_live` (mod.rs:10758). Runs the
+/// PowerShell body over the normal post-bootstrap SSH transport, presents the
+/// seeded authority token over the loopback
 /// `127.0.0.1:51822` listener, and asserts every fail-closed control LIVE:
 ///
 ///   1. loopback byte-for-byte: the served body SHA256 equals the on-disk
@@ -11556,8 +11738,9 @@ fn exercise_windows_anchor_bundle_pull_live(
     // The PS body fail-closes ($ErrorActionPreference=Stop) and asserts every
     // control before emitting status=pass. A wrong-token probe uses a fixed
     // 32-byte ASCII literal (never the real token). The LAN-refusal probe never
-    // mutates host state — `validate_daemon_config` rejects the non-loopback
-    // addr before any bind (daemon.rs:964).
+    // mutates host state: it calls the daemon's typed bind validator (no
+    // listener start, no backend construction) and requires a reject verdict
+    // whose reason cites the loopback-only rule.
     let exercise_script = format!(
         "$ErrorActionPreference='Stop'; \
          $rn='{daemon}'; \
@@ -11626,11 +11809,13 @@ fn exercise_windows_anchor_bundle_pull_live(
          $subchecks.Add(@{{name='validate_windows_anchor_bundle_pull_token_gate';status='pass';detail=\"wrong_header=$wh short_header=$sh\"}}); \
          $lanExit=0; $lanOut=''; \
          try{{ \
-           $lanOut=(& $rn daemon --node-id $node --node-role admin --backend windows-unsupported --membership-snapshot $snap --anchor-bundle-pull-addr '0.0.0.0:51822' --anchor-bundle-pull-token-path $token_path --anchor-bundle-pull-allow-lan false 2>&1 | Out-String); \
+           $lanOut=(& $rn anchor-bundle-pull-bind-check --addr '0.0.0.0:51822' --allow-lan false --expect reject 2>&1 | Out-String); \
            $lanExit=$LASTEXITCODE; \
          }}catch{{ $lanOut=$_.Exception.Message; $lanExit=1 }}; \
-         if($lanExit -eq 0){{throw 'LAN bind unexpectedly accepted without --anchor-bundle-pull-allow-lan'}}; \
+         if($lanExit -ne 0){{throw \"LAN bind validator command failed: $lanOut\"}}; \
          if($lanOut -notmatch 'loopback'){{throw \"LAN refusal did not cite the loopback-only rule: $lanOut\"}}; \
+         $lanReport=($lanOut | ConvertFrom-Json); \
+         if($lanReport.status -ne 'pass' -or $lanReport.actual -ne 'reject' -or $lanReport.expected -ne 'reject'){{throw \"LAN bind validator did not reject as expected: $lanOut\"}}; \
          $subchecks.Add(@{{name='validate_windows_anchor_bundle_pull_lan_refused';status='pass';detail=\"lan_bind_refused exit=$lanExit\"}}); \
          $resp2=Pull $req; $sp2=SplitResp $resp2; \
          if(Contains $sp2.header $tokenBytes){{throw 'served header leaked the raw token'}}; \
@@ -11646,13 +11831,12 @@ fn exercise_windows_anchor_bundle_pull_live(
         node = node_id,
         addr = WINDOWS_ANCHOR_BUNDLE_PULL_ADDR,
     );
-    let invocation = build_ssh_powershell_encoded_invocation(exercise_script.as_str())?;
     let report_body = capture_remote_shell_command_for_target(
         &target,
         None,
         Some(ssh_identity_file),
         known_hosts_path,
-        invocation.as_str(),
+        exercise_script.as_str(),
         Duration::from_secs(180),
     )
     .map_err(|e| {
@@ -11958,33 +12142,7 @@ fn locate_windows_bundle_paths_from_report_dir(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_windows_orchestration_stages(
-    windows_alias: &str,
-    inventory_path: &Path,
-    ssh_identity_file: &Path,
-    known_hosts_path: Option<&Path>,
-    ssh_port: u16,
-    _utm_documents_root: Option<&Path>,
-    _utmctl_path: Option<&Path>,
-    dry_run: bool,
-    report_dir: &Path,
-) -> Vec<VmLabStageOutcome> {
-    run_windows_orchestration_stages_with_options(
-        windows_alias,
-        inventory_path,
-        ssh_identity_file,
-        known_hosts_path,
-        ssh_port,
-        _utm_documents_root,
-        _utmctl_path,
-        dry_run,
-        report_dir,
-        WindowsOrchestrationOptions::default(),
-    )
-}
-
-/// Per-run knobs for `run_windows_orchestration_stages`. Defaults match the
+/// Per-run knobs for `run_windows_orchestration_stages_with_options`. Defaults match the
 /// historical full-bootstrap behavior for the `vm-lab-orchestrate-live-lab`
 /// path. The standalone `vm-lab-validate-windows-security` subcommand exposes
 /// these flags so iteration loops can skip already-completed phases.
@@ -16264,6 +16422,97 @@ fn evaluate_blind_exit_reversal_report(
     ))
 }
 
+/// Pure evaluator for `rustynetd linux-blind-exit-dataplane-check`.
+/// The report must come from a live `nft list ruleset` capture, not a generated
+/// plan, and every fail-closed control must pass individually.
+fn evaluate_linux_blind_exit_dataplane_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::linux_blind_exit_dataplane::LinuxBlindExitDataplaneReport =
+        serde_json::from_str(raw_json).map_err(|err| {
+            format!("parse linux-blind-exit-dataplane-check JSON output failed: {err}")
+        })?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "linux-blind-exit-dataplane-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.stage != "linux_blind_exit_dataplane" {
+        return Err(format!(
+            "linux-blind-exit-dataplane-check returned unexpected stage tag {:?}",
+            report.stage
+        ));
+    }
+    if report.snapshot.ruleset_source != "nft list ruleset" {
+        return Err(format!(
+            "linux-blind-exit-dataplane-check ruleset source was not live nft: {:?}",
+            report.snapshot.ruleset_source
+        ));
+    }
+    if !report.snapshot.host_observable {
+        return Err(format!(
+            "linux blind_exit dataplane was not observed live on {linux_alias}: {}",
+            report.drift_reasons.join("; ")
+        ));
+    }
+    if report.snapshot.ruleset_byte_len == 0 || report.snapshot.ruleset_sha256.trim().is_empty() {
+        return Err(
+            "linux-blind-exit-dataplane-check did not capture a non-empty live nft ruleset"
+                .to_owned(),
+        );
+    }
+    let required = [
+        "live_nft_ruleset_captured",
+        "mesh_scoped_forward_allow",
+        "no_nat_translation",
+        "no_unrestricted_forward",
+        "no_own_egress_allow",
+    ];
+    if report.subchecks.len() < required.len() {
+        return Err(format!(
+            "linux-blind-exit-dataplane-check returned only {} subcheck(s); expected at least {}",
+            report.subchecks.len(),
+            required.len()
+        ));
+    }
+    for name in required {
+        let passed = report.subchecks.iter().any(|entry| {
+            entry.name == name && entry.status == "pass" && !entry.detail.trim().is_empty()
+        });
+        if !passed {
+            return Err(format!(
+                "linux blind_exit dataplane control {name} did not pass on {linux_alias}"
+            ));
+        }
+    }
+    if !report.overall_ok {
+        let summary = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but listed no drift reasons".to_owned()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!(
+            "linux blind_exit dataplane drift on {linux_alias}: {summary}"
+        ));
+    }
+    if !report.drift_reasons.is_empty() {
+        return Err(format!(
+            "linux blind_exit dataplane drift reasons present on {linux_alias} despite overall_ok=true: {}",
+            report.drift_reasons.join("; ")
+        ));
+    }
+    Ok(format!(
+        "Linux blind_exit dataplane verified on {linux_alias}: live nft ruleset captured ({} bytes, sha256={}) with mesh-scoped forward allow, no NAT, no unrestricted forward, no own-egress allow (tunnel={} egress={} mesh={})",
+        report.snapshot.ruleset_byte_len,
+        report.snapshot.ruleset_sha256,
+        report.snapshot.tunnel_iface,
+        report.snapshot.egress_iface,
+        report.snapshot.mesh_cidr
+    ))
+}
+
 /// Pure evaluator for the JSON output of `rustynetd gossip-revoked-readmit-audit`.
 /// Proves GM-1/RSA-0034: `GossipNode` must refuse to (re-)admit a peer
 /// currently Revoked/Quarantined in signed membership even when its bundle
@@ -18363,6 +18612,57 @@ fn run_validate_linux_blind_exit_reversal_denied_stage(
         .map_err(|reason| (reason, raw))
 }
 
+fn run_validate_linux_blind_exit_dataplane_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let targets = resolve_remote_targets(inventory_path, &[linux_alias.to_owned()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {linux_alias}"))
+        .map_err(|err| (err, String::new()))?;
+    if target.platform_profile.platform != VmGuestPlatform::Linux {
+        return Err((
+            format!(
+                "alias {linux_alias} resolved to non-Linux platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+    let invocation = build_linux_daemon_check_invocation(
+        LINUX_RUSTYNETD_PATH,
+        "linux-blind-exit-dataplane-check",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    let remote_script = format!(
+        "set -eu; if ! sudo -n true >/dev/null 2>&1; then echo 'sudo -n required for live nft blind_exit dataplane capture' >&2; exit 1; fi; sudo -n {invocation}"
+    );
+    let raw = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        remote_script.as_str(),
+        timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS),
+    )
+    .map_err(|err| {
+        (
+            format!("remote dispatch of linux-blind-exit-dataplane-check failed: {err}"),
+            String::new(),
+        )
+    })?;
+    let raw = raw.trim().to_owned();
+    evaluate_linux_blind_exit_dataplane_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
 fn run_validate_linux_gossip_revoked_readmit_stage(
     linux_alias: &str,
     inventory_path: &Path,
@@ -18590,6 +18890,7 @@ pub struct MeshStatusOverrides {
 struct LinuxOrchestrationOptions {
     dry_run: bool,
     mesh_status_overrides: MeshStatusOverrides,
+    validate_blind_exit_dataplane: bool,
 }
 
 /// Linux-side validator orchestrator. Mirrors the Windows
@@ -18627,6 +18928,7 @@ fn run_linux_orchestration_stages_with_options(
     let revoked_peer_denied_log_path = logs_dir.join("validate_linux_revoked_peer_denied_e2e.log");
     let blind_exit_reversal_denied_log_path =
         logs_dir.join("validate_linux_blind_exit_reversal_denied.log");
+    let blind_exit_dataplane_log_path = logs_dir.join("validate_linux_blind_exit_dataplane.log");
     let gossip_revoked_readmit_log_path =
         logs_dir.join("validate_linux_gossip_revoked_readmit.log");
     let enrollment_replay_log_path = logs_dir.join("validate_linux_enrollment_replay.log");
@@ -18804,6 +19106,43 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_blind_exit_reversal_denied",
             blind_exit_reversal_denied_log_path.as_path(),
             run_validate_linux_blind_exit_reversal_denied_stage,
+        )
+    };
+
+    let blind_exit_dataplane_outcome = if options.dry_run {
+        stage_outcome(
+            "validate_linux_blind_exit_dataplane",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate live Linux blind_exit nft dataplane on {linux_alias}"),
+            vec![],
+        )
+    } else if !options.validate_blind_exit_dataplane {
+        stage_outcome(
+            "validate_linux_blind_exit_dataplane",
+            VmLabStageStatus::Skipped,
+            format!("skipped: {linux_alias} is not the elected Linux blind_exit node"),
+            vec![],
+        )
+    } else if !runtime_acls_passed {
+        make_skipped(
+            "validate_linux_blind_exit_dataplane",
+            "validate_linux_runtime_acls",
+        )
+    } else if !key_custody_passed {
+        make_skipped(
+            "validate_linux_blind_exit_dataplane",
+            "validate_linux_key_custody",
+        )
+    } else if !hardening_passed {
+        make_skipped(
+            "validate_linux_blind_exit_dataplane",
+            "validate_linux_service_hardening",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_blind_exit_dataplane",
+            blind_exit_dataplane_log_path.as_path(),
+            run_validate_linux_blind_exit_dataplane_stage,
         )
     };
 
@@ -19393,6 +19732,7 @@ fn run_linux_orchestration_stages_with_options(
         membership_revoke_applies_outcome,
         revoked_peer_denied_outcome,
         blind_exit_reversal_denied_outcome,
+        blind_exit_dataplane_outcome,
         gossip_revoked_readmit_outcome,
         enrollment_replay_outcome,
         hello_limiter_flood_outcome,
@@ -19420,6 +19760,7 @@ fn run_linux_orchestration_stages_with_options(
 /// on the others.
 fn run_linux_daemon_validators_for_aliases(
     linux_aliases: &[String],
+    blind_exit_alias: Option<&str>,
     inventory_path: &Path,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
@@ -19441,6 +19782,7 @@ fn run_linux_daemon_validators_for_aliases(
             LinuxOrchestrationOptions {
                 dry_run,
                 mesh_status_overrides: MeshStatusOverrides::default(),
+                validate_blind_exit_dataplane: blind_exit_alias == Some(alias.as_str()),
             },
         );
         for mut outcome in chainer_outcomes {
@@ -19495,6 +19837,7 @@ pub fn run_validate_linux_security(
                 expected_peer_ids: config.mesh_status_expected_peer_ids.clone(),
                 max_age_seconds: config.mesh_status_max_age_seconds,
             },
+            validate_blind_exit_dataplane: false,
         },
     );
     let summary_path = config.report_dir.join("linux_security_validation.json");
@@ -25800,6 +26143,8 @@ fn build_local_source_extract_script(
     let parent = parent
         .to_str()
         .ok_or_else(|| format!("destination directory parent is not valid UTF-8: {dest_dir}"))?;
+    let cleanup_targets = posix_local_source_generated_cleanup_targets(dest_dir);
+    let backup_glob = posix_local_source_backup_glob(dest_dir)?;
     Ok(format!(
         "set -eu; mkdir -p {parent}; \
 if [ -e {dest_dir} ] && [ ! -d {dest_dir} ]; then \
@@ -25807,17 +26152,70 @@ printf 'destination path exists but is not a directory: %s\\n' {dest_dir} >&2; \
 rm -f -- {remote_archive}; \
 exit 1; \
 fi; \
+backup_path=; \
+if [ -d {dest_dir} ]; then \
+rm -rf -- {cleanup_targets}; \
+fi; \
+if [ -d {parent} ]; then \
+find {parent} -maxdepth 1 -type d -name {backup_glob} -exec rm -rf -- {{}} +; \
+fi; \
 if [ -d {dest_dir} ]; then \
 backup_path={dest_dir}.prep.$(date -u +%Y%m%dT%H%M%S).$$; \
 mv -- {dest_dir} \"$backup_path\"; \
 fi; \
 mkdir -p {dest_dir}; \
 tar -xf {remote_archive} -C {dest_dir}; \
+if [ -n \"${{backup_path:-}}\" ]; then rm -rf -- \"$backup_path\"; fi; \
 rm -f -- {remote_archive}",
         parent = shell_quote(parent),
         dest_dir = shell_quote(dest_dir),
         remote_archive = shell_quote(remote_archive_path),
+        cleanup_targets = cleanup_targets,
+        backup_glob = shell_quote(backup_glob.as_str()),
     ))
+}
+
+fn build_local_source_presync_cleanup_script(dest_dir: &str) -> Result<String, String> {
+    ensure_no_control_chars("destination directory", dest_dir)?;
+    let parent = Path::new(dest_dir)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| format!("destination directory must have a parent: {dest_dir}"))?;
+    let parent = parent
+        .to_str()
+        .ok_or_else(|| format!("destination directory parent is not valid UTF-8: {dest_dir}"))?;
+    let cleanup_targets = posix_local_source_generated_cleanup_targets(dest_dir);
+    let backup_glob = posix_local_source_backup_glob(dest_dir)?;
+    Ok(format!(
+        "set -eu; \
+if [ -d {dest_dir} ]; then rm -rf -- {cleanup_targets}; fi; \
+if [ -d {parent} ]; then find {parent} -maxdepth 1 -type d -name {backup_glob} -exec rm -rf -- {{}} +; fi; \
+if [ -n \"${{HOME:-}}\" ]; then rm -f -- \"$HOME\"/.rn-vm-lab-source-*.tar 2>/dev/null || true; fi",
+        dest_dir = shell_quote(dest_dir),
+        parent = shell_quote(parent),
+        cleanup_targets = cleanup_targets,
+        backup_glob = shell_quote(backup_glob.as_str()),
+    ))
+}
+
+fn posix_local_source_generated_cleanup_targets(dest_dir: &str) -> String {
+    let base = dest_dir.trim_end_matches('/');
+    LOCAL_SOURCE_GENERATED_TOP_LEVEL_DIRS
+        .iter()
+        .map(|name| shell_quote(format!("{base}/{name}").as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn posix_local_source_backup_glob(dest_dir: &str) -> Result<String, String> {
+    Path::new(dest_dir)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("{name}.prep.*"))
+        .ok_or_else(|| {
+            format!("destination directory must have a final path component: {dest_dir}")
+        })
 }
 
 fn build_windows_local_source_extract_script(
@@ -25843,6 +26241,7 @@ fn build_windows_local_source_extract_script(
          if (Test-Path -LiteralPath $staging) {{ Remove-Item -LiteralPath $staging -Recurse -Force }}; \
          try {{ \
            if (-not (Test-Path -LiteralPath $dest)) {{ New-Item -ItemType Directory -Force -Path $dest | Out-Null }}; \
+           {generated_cleanup} \
            Expand-Archive -LiteralPath $archive -DestinationPath $staging -Force; \
            $stagedEntries = @(Get-ChildItem -LiteralPath $staging -Force -ErrorAction SilentlyContinue); \
            if ($stagedEntries.Count -eq 0) {{ throw ('Windows local source archive extracted no files: {{0}}' -f $archive) }}; \
@@ -25866,10 +26265,52 @@ fn build_windows_local_source_extract_script(
          }} finally {{ \
            if (Test-Path -LiteralPath $archive) {{ Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue }}; \
            if (Test-Path -LiteralPath $staging) {{ Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }} \
-         }};",
+        }};",
         dest = powershell_quote(dest_dir)?,
         archive = powershell_quote(remote_archive_path)?,
+        generated_cleanup = windows_local_source_generated_cleanup_snippet(),
     ))
+}
+
+fn build_windows_local_source_presync_cleanup_script(
+    dest_dir: &str,
+    archive_root: &str,
+) -> Result<String, String> {
+    ensure_no_control_chars("destination directory", dest_dir)?;
+    ensure_no_control_chars("Windows local source archive root", archive_root)?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $dest = {dest}; \
+         $archiveRoot = {archive_root}; \
+         $parent = Split-Path -Parent $dest; \
+         if ($parent -and -not (Test-Path -LiteralPath $parent)) {{ New-Item -ItemType Directory -Force -Path $parent | Out-Null }}; \
+         if (-not (Test-Path -LiteralPath $dest)) {{ New-Item -ItemType Directory -Force -Path $dest | Out-Null }}; \
+         if (-not (Test-Path -LiteralPath $archiveRoot)) {{ New-Item -ItemType Directory -Force -Path $archiveRoot | Out-Null }}; \
+         {generated_cleanup} \
+         if (Test-Path -LiteralPath $archiveRoot) {{ \
+           foreach ($archiveJunk in @(Get-ChildItem -LiteralPath $archiveRoot -Force -ErrorAction SilentlyContinue | Where-Object {{ $_.Name.StartsWith('rn-vm-lab-source-', [System.StringComparison]::Ordinal) }})) {{ \
+             Remove-Item -LiteralPath $archiveJunk.FullName -Recurse -Force -ErrorAction SilentlyContinue \
+           }} \
+         }}",
+        dest = powershell_quote(dest_dir)?,
+        archive_root = powershell_quote(archive_root)?,
+        generated_cleanup = windows_local_source_generated_cleanup_snippet(),
+    ))
+}
+
+fn windows_local_source_generated_cleanup_snippet() -> &'static str {
+    "foreach ($generatedChild in @('target', 'target-livelab', 'artifacts', '.git', 'state')) { \
+       $generatedPath = Join-Path $dest $generatedChild; \
+       if (Test-Path -LiteralPath $generatedPath) { Remove-Item -LiteralPath $generatedPath -Recurse -Force -ErrorAction SilentlyContinue } \
+     }; \
+     if ($parent -and (Test-Path -LiteralPath $parent)) { \
+       $prepPrefix = (Split-Path -Leaf $dest) + '.prep.'; \
+       foreach ($staleDir in @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name.StartsWith($prepPrefix, [System.StringComparison]::Ordinal) -or $_.Name.StartsWith('rn-vm-lab-source-', [System.StringComparison]::Ordinal) })) { \
+         Remove-Item -LiteralPath $staleDir.FullName -Recurse -Force -ErrorAction SilentlyContinue \
+       } \
+     };"
 }
 
 fn build_windows_local_source_extract_result_script(
@@ -25902,6 +26343,7 @@ fn build_windows_local_source_extract_result_script(
            if (-not (Test-Path -LiteralPath $archive)) {{ throw ('Windows local source archive is missing: {{0}}' -f $archive) }}; \
            if (Test-Path -LiteralPath $staging) {{ Remove-Item -LiteralPath $staging -Recurse -Force }}; \
            if (-not (Test-Path -LiteralPath $dest)) {{ New-Item -ItemType Directory -Force -Path $dest | Out-Null }}; \
+           {generated_cleanup} \
            Expand-Archive -LiteralPath $archive -DestinationPath $staging -Force; \
            $stagedEntries = @(Get-ChildItem -LiteralPath $staging -Force -ErrorAction SilentlyContinue); \
            if ($stagedEntries.Count -eq 0) {{ throw ('Windows local source archive extracted no files: {{0}}' -f $archive) }}; \
@@ -25931,6 +26373,7 @@ fn build_windows_local_source_extract_result_script(
         dest = powershell_quote(dest_dir)?,
         archive = powershell_quote(remote_archive_path)?,
         result_path = powershell_quote(remote_result_path)?,
+        generated_cleanup = windows_local_source_generated_cleanup_snippet(),
     ))
 }
 
@@ -26098,6 +26541,9 @@ fn write_git_worktree_archive(
             continue;
         }
         let relative_path = Path::new(relative);
+        if should_skip_local_source_path(relative_path) {
+            continue;
+        }
         let absolute_path = source_dir.join(relative_path);
         if !absolute_path.exists() {
             continue;
@@ -26171,7 +26617,7 @@ fn write_git_worktree_zip_archive(
             continue;
         }
         let relative_path = Path::new(relative);
-        if path_contains_macos_metadata_artifact(relative_path) {
+        if should_skip_local_source_path(relative_path) {
             continue;
         }
         let absolute_path = source_dir.join(relative_path);
@@ -26210,6 +26656,12 @@ fn prepare_local_source_bundle_extras(
     if !manifest_path.is_file() {
         return Ok(None);
     }
+    let manifest_path = fs::canonicalize(manifest_path.as_path()).map_err(|err| {
+        format!(
+            "canonicalize local source manifest failed ({}): {err}",
+            manifest_path.display()
+        )
+    })?;
 
     let temp_root =
         std::env::temp_dir().join(format!("rustynet-vm-lab-bundle-{}", unique_suffix()));
@@ -26360,16 +26812,13 @@ fn append_raw_local_source_tree(
             )
         })?;
         let path = entry.path();
-        if is_macos_metadata_artifact_name(entry.file_name().to_string_lossy().as_ref()) {
-            continue;
-        }
         let relative = path.strip_prefix(source_root).map_err(|err| {
             format!(
                 "strip local source prefix failed ({}): {err}",
                 path.display()
             )
         })?;
-        if should_skip_raw_local_source_path(relative) {
+        if should_skip_local_source_path(relative) {
             continue;
         }
         let file_type = entry.file_type().map_err(|err| {
@@ -26416,16 +26865,13 @@ fn append_raw_local_source_tree_to_zip(
             )
         })?;
         let path = entry.path();
-        if is_macos_metadata_artifact_name(entry.file_name().to_string_lossy().as_ref()) {
-            continue;
-        }
         let relative = path.strip_prefix(source_root).map_err(|err| {
             format!(
                 "strip local ZIP source prefix failed ({}): {err}",
                 path.display()
             )
         })?;
-        if should_skip_raw_local_source_path(relative) {
+        if should_skip_local_source_path(relative) {
             continue;
         }
         let file_type = entry.file_type().map_err(|err| {
@@ -26587,12 +27033,18 @@ fn append_file_to_zip(
     Ok(())
 }
 
-fn should_skip_raw_local_source_path(relative: &Path) -> bool {
-    if relative.file_name().and_then(|name| name.to_str()) == Some(".DS_Store") {
+fn should_skip_local_source_path(relative: &Path) -> bool {
+    if path_contains_macos_metadata_artifact(relative) {
         return true;
     }
-    let first = relative.iter().next().and_then(|part| part.to_str());
-    matches!(first, Some(".git" | "target" | "artifacts"))
+    let first = relative.components().next();
+    matches!(
+        first,
+        Some(std::path::Component::Normal(name))
+            if name
+                .to_str()
+                .is_some_and(|value| LOCAL_SOURCE_ARCHIVE_EXCLUDED_TOP_LEVEL_DIRS.contains(&value))
+    )
 }
 
 fn sync_local_source_archive_to_target(
@@ -26614,6 +27066,20 @@ fn sync_local_source_archive_to_target(
         // wedging the result-file pull retry loop.
         let archive_root = windows_orchestration_root(target);
         let archive_root = archive_root.trim_end_matches(['\\', '/']);
+        let cleanup_script =
+            build_windows_local_source_presync_cleanup_script(dest_dir, archive_root)?;
+        let cleanup_status = run_remote_shell_command_for_target(
+            target,
+            ssh_user_override,
+            ssh_identity_file,
+            known_hosts_path,
+            cleanup_script.as_str(),
+            timeout,
+        )?;
+        ensure_success_status(
+            cleanup_status,
+            "cleanup stale Windows local source artifacts before archive copy",
+        )?;
         let remote_archive = format!(r"{archive_root}\rn-vm-lab-source-{}.zip", unique_suffix());
         ensure_success_status(
             scp_to_remote_for_target(
@@ -26674,6 +27140,19 @@ fn sync_local_source_archive_to_target(
         )?;
         return ensure_success_status(status, "extract local ZIP source archive on Windows remote");
     }
+    let cleanup_script = build_local_source_presync_cleanup_script(dest_dir)?;
+    let cleanup_status = run_remote_shell_command_for_target(
+        target,
+        ssh_user_override,
+        ssh_identity_file,
+        known_hosts_path,
+        cleanup_script.as_str(),
+        timeout,
+    )?;
+    ensure_success_status(
+        cleanup_status,
+        "cleanup stale local source artifacts before archive copy",
+    )?;
     // These guest images accept SFTP writes into the SSH user's home directory
     // reliably, while absolute /tmp uploads are rejected on some hosts.
     let remote_archive = if remote_target_local_utm(target).is_some() {
@@ -30840,12 +31319,14 @@ mod tests {
         VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
         VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
         VmServiceManager, WindowsSshReadinessProbe, append_unique_stage_outcomes_collect_new,
-        build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
+        build_assignment_refresh_env, build_local_source_extract_script,
+        build_local_source_presync_cleanup_script, build_remote_argv_script,
         build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
         build_vm_lab_topology, build_windows_local_source_extract_result_script,
-        build_windows_local_source_extract_script, collect_live_lab_stage_local_bundle,
+        build_windows_local_source_extract_script,
+        build_windows_local_source_presync_cleanup_script, collect_live_lab_stage_local_bundle,
         create_orchestration_staging_dir, decide_restart_unready, default_inventory_path,
         default_live_lab_iteration_profile_path, default_live_lab_iteration_report_dir,
         default_live_lab_orchestrator_path, default_platform_profile, default_utmctl_path,
@@ -30869,16 +31350,16 @@ mod tests {
         resolve_live_lab_vm_aliases, resolve_remote_targets, resolve_repo_sync_source,
         resolve_start_targets, resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
         select_inventory_entries, select_live_ssh_host_from_utm_output,
-        selected_local_utm_readiness_from_report, ssh_auth_probe_command,
-        summarize_live_lab_report, transition_local_utm_vm_with_process_probe,
-        validate_live_lab_run_artifacts, windows_bootstrap_helper_script_local_path,
-        windows_diagnostics_helper_script_local_path, windows_helper_script_remote_path,
-        windows_relay_service_install_helper_script_local_path,
+        selected_local_utm_readiness_from_report, should_skip_local_source_path,
+        ssh_auth_probe_command, summarize_live_lab_report,
+        transition_local_utm_vm_with_process_probe, validate_live_lab_run_artifacts,
+        windows_bootstrap_helper_script_local_path, windows_diagnostics_helper_script_local_path,
+        windows_helper_script_remote_path, windows_relay_service_install_helper_script_local_path,
         windows_relay_service_uninstall_helper_script_local_path,
         windows_service_host_smoke_helper_script_local_path,
         windows_service_install_helper_script_local_path,
         windows_service_uninstall_helper_script_local_path,
-        windows_verify_helper_script_local_path, workspace_root_path,
+        windows_verify_helper_script_local_path, workspace_root_path, write_raw_directory_archive,
         write_raw_directory_zip_archive,
     };
     use serde_json::json;
@@ -33459,6 +33940,32 @@ mod tests {
     }
 
     #[test]
+    fn local_source_cleanup_scripts_prune_generated_dirs_and_stale_backups() {
+        let extract = build_local_source_extract_script(
+            "/home/debian/Rustynet",
+            "/home/debian/.rn-vm-lab-source-123.tar",
+        )
+        .expect("extract script should build");
+        let presync = build_local_source_presync_cleanup_script("/home/debian/Rustynet")
+            .expect("presync script should build");
+        for script in [extract.as_str(), presync.as_str()] {
+            assert!(script.contains("rm -rf -- '/home/debian/Rustynet/.git'"));
+            assert!(script.contains("'/home/debian/Rustynet/target'"));
+            assert!(script.contains("'/home/debian/Rustynet/target-livelab'"));
+            assert!(script.contains("'/home/debian/Rustynet/artifacts'"));
+            assert!(script.contains("'/home/debian/Rustynet/state'"));
+            assert!(script.contains(
+                "find '/home/debian' -maxdepth 1 -type d -name 'Rustynet.prep.*' -exec rm -rf -- {} +;"
+            ));
+        }
+        assert!(
+            extract
+                .contains("if [ -n \"${backup_path:-}\" ]; then rm -rf -- \"$backup_path\"; fi;")
+        );
+        assert!(presync.contains("\"$HOME\"/.rn-vm-lab-source-*.tar"));
+    }
+
+    #[test]
     fn windows_local_source_extract_script_uses_expand_archive() {
         let script = build_windows_local_source_extract_script(
             r"C:\Rustynet.offline",
@@ -33480,6 +33987,37 @@ mod tests {
         assert!(script.contains("if ($existing.Name -like 'utm_*.ps1') { continue };"));
         assert!(script.contains("foreach ($entry in $stagedEntries) {"));
         assert!(!script.contains("tar -xf"));
+    }
+
+    #[test]
+    fn windows_local_source_cleanup_scripts_prune_generated_dirs_and_stale_archives() {
+        let extract = build_windows_local_source_extract_script(
+            r"C:\Rustynet",
+            r"C:\ProgramData\Rustynet\vm-lab\rn-vm-lab-source-123.zip",
+        )
+        .expect("Windows extract script should build");
+        let result_script = build_windows_local_source_extract_result_script(
+            r"C:\Rustynet",
+            r"C:\ProgramData\Rustynet\vm-lab\rn-vm-lab-source-123.zip",
+            r"C:\ProgramData\Rustynet\vm-lab\extract-result.json",
+        )
+        .expect("Windows extract result script should build");
+        let presync = build_windows_local_source_presync_cleanup_script(
+            r"C:\Rustynet",
+            r"C:\ProgramData\Rustynet\vm-lab",
+        )
+        .expect("Windows presync cleanup script should build");
+        for script in [extract.as_str(), result_script.as_str(), presync.as_str()] {
+            assert!(script.contains(
+                "foreach ($generatedChild in @('target', 'target-livelab', 'artifacts', '.git', 'state'))"
+            ));
+            assert!(script.contains("Join-Path $dest $generatedChild"));
+            assert!(script.contains("Remove-Item -LiteralPath $generatedPath -Recurse -Force"));
+            assert!(script.contains("StartsWith($prepPrefix"));
+            assert!(script.contains("StartsWith('rn-vm-lab-source-'"));
+        }
+        assert!(presync.contains("New-Item -ItemType Directory -Force -Path $archiveRoot"));
+        assert!(presync.contains("Remove-Item -LiteralPath $archiveJunk.FullName"));
     }
 
     #[test]
@@ -33528,6 +34066,37 @@ mod tests {
     }
 
     #[test]
+    fn local_source_archive_skip_rule_excludes_generated_top_level_dirs() {
+        for path in [
+            ".git/config",
+            ".hg/store",
+            ".svn/entries",
+            "artifacts/live/report.json",
+            "state/report_state.json",
+            "target/debug/rustynet-cli",
+            "target-livelab/debug/rustynet-cli",
+            "src/._sidecar",
+            ".DS_Store",
+        ] {
+            assert!(
+                should_skip_local_source_path(Path::new(path)),
+                "path should be skipped: {path}"
+            );
+        }
+        for path in [
+            "src/lib.rs",
+            "vendor/crate/src/lib.rs",
+            ".gitignore",
+            "Cargo.lock",
+        ] {
+            assert!(
+                !should_skip_local_source_path(Path::new(path)),
+                "path should be included: {path}"
+            );
+        }
+    }
+
+    #[test]
     fn raw_zip_archive_excludes_macos_metadata_artifacts() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -33569,6 +34138,96 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_file(&archive_path);
+    }
+
+    #[test]
+    fn raw_local_source_archives_exclude_generated_dirs() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("rustynet-vm-lab-generated-skip-{unique}.dir"));
+        fs::create_dir_all(root.join("src")).expect("src should exist");
+        fs::write(root.join("src").join("lib.rs"), b"pub fn ok() {}").expect("write source file");
+        for generated in [
+            ".git",
+            ".hg",
+            ".svn",
+            "artifacts",
+            "state",
+            "target",
+            "target-livelab",
+        ] {
+            let generated_dir = root.join(generated);
+            fs::create_dir_all(generated_dir.as_path()).expect("generated dir should exist");
+            fs::write(generated_dir.join("junk.bin"), b"junk").expect("write junk file");
+        }
+
+        let tar_path =
+            std::env::temp_dir().join(format!("rustynet-vm-lab-generated-skip-{unique}.tar"));
+        write_raw_directory_archive(root.as_path(), tar_path.as_path(), None)
+            .expect("raw tar archive should build");
+        let tar_file = fs::File::open(tar_path.as_path()).expect("open tar");
+        let mut tar_archive = tar::Archive::new(tar_file);
+        let tar_names: Vec<String> = tar_archive
+            .entries()
+            .expect("tar entries should read")
+            .map(|entry| {
+                entry
+                    .expect("tar entry should read")
+                    .path()
+                    .expect("tar entry path should read")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(tar_names.iter().any(|name| name == "src/lib.rs"));
+        assert!(
+            !tar_names.iter().any(|name| {
+                name.starts_with(".git/")
+                    || name.starts_with(".hg/")
+                    || name.starts_with(".svn/")
+                    || name.starts_with("artifacts/")
+                    || name.starts_with("state/")
+                    || name.starts_with("target/")
+                    || name.starts_with("target-livelab/")
+            }),
+            "generated dirs leaked into tar: {tar_names:?}"
+        );
+
+        let zip_path =
+            std::env::temp_dir().join(format!("rustynet-vm-lab-generated-skip-{unique}.zip"));
+        write_raw_directory_zip_archive(root.as_path(), zip_path.as_path(), None)
+            .expect("raw zip archive should build");
+        let zip_file = fs::File::open(zip_path.as_path()).expect("open zip");
+        let mut zip_archive = zip::ZipArchive::new(zip_file).expect("read zip");
+        let zip_names: Vec<String> = (0..zip_archive.len())
+            .map(|i| {
+                zip_archive
+                    .by_index(i)
+                    .expect("zip entry should read")
+                    .name()
+                    .to_owned()
+            })
+            .collect();
+        assert!(zip_names.iter().any(|name| name == "src/lib.rs"));
+        assert!(
+            !zip_names.iter().any(|name| {
+                name.starts_with(".git/")
+                    || name.starts_with(".hg/")
+                    || name.starts_with(".svn/")
+                    || name.starts_with("artifacts/")
+                    || name.starts_with("state/")
+                    || name.starts_with("target/")
+                    || name.starts_with("target-livelab/")
+            }),
+            "generated dirs leaked into zip: {zip_names:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&tar_path);
+        let _ = fs::remove_file(&zip_path);
     }
 
     #[test]
@@ -38382,6 +39041,96 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn evaluate_linux_blind_exit_dataplane_report_accepts_reviewed_pass() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "stage": "linux_blind_exit_dataplane",
+            "overall_ok": true,
+            "snapshot": {
+                "ruleset_source": "nft list ruleset",
+                "host_observable": true,
+                "tunnel_iface": "rustynet0",
+                "egress_iface": "enp0s1",
+                "mesh_cidr": "100.64.0.0/10",
+                "ruleset_byte_len": 128,
+                "ruleset_sha256": "abc123"
+            },
+            "subchecks": [
+                { "name": "live_nft_ruleset_captured", "status": "pass", "detail": "bytes=128" },
+                { "name": "mesh_scoped_forward_allow", "status": "pass", "detail": "mesh scoped" },
+                { "name": "no_nat_translation", "status": "pass", "detail": "no nat" },
+                { "name": "no_unrestricted_forward", "status": "pass", "detail": "no unrestricted" },
+                { "name": "no_own_egress_allow", "status": "pass", "detail": "no own egress" }
+            ],
+            "drift_reasons": []
+        })
+        .to_string();
+        let summary = super::evaluate_linux_blind_exit_dataplane_report("debian-exit-1", &raw)
+            .expect("reviewed blind_exit dataplane report must validate");
+        assert!(
+            summary.contains("debian-exit-1") && summary.contains("sha256=abc123"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_blind_exit_dataplane_report_rejects_skipped_nat_control() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "stage": "linux_blind_exit_dataplane",
+            "overall_ok": true,
+            "snapshot": {
+                "ruleset_source": "nft list ruleset",
+                "host_observable": true,
+                "tunnel_iface": "rustynet0",
+                "egress_iface": "enp0s1",
+                "mesh_cidr": "100.64.0.0/10",
+                "ruleset_byte_len": 128,
+                "ruleset_sha256": "abc123"
+            },
+            "subchecks": [
+                { "name": "live_nft_ruleset_captured", "status": "pass", "detail": "bytes=128" },
+                { "name": "mesh_scoped_forward_allow", "status": "pass", "detail": "mesh scoped" },
+                { "name": "no_nat_translation", "status": "skipped", "detail": "not checked" },
+                { "name": "no_unrestricted_forward", "status": "pass", "detail": "no unrestricted" },
+                { "name": "no_own_egress_allow", "status": "pass", "detail": "no own egress" }
+            ],
+            "drift_reasons": []
+        })
+        .to_string();
+        let err = super::evaluate_linux_blind_exit_dataplane_report("debian-exit-1", &raw)
+            .expect_err("skipped NAT control must fail closed");
+        assert!(
+            err.contains("no_nat_translation"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_blind_exit_dataplane_report_rejects_unobservable_ruleset() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "stage": "linux_blind_exit_dataplane",
+            "overall_ok": false,
+            "snapshot": {
+                "ruleset_source": "nft list ruleset",
+                "host_observable": false,
+                "tunnel_iface": "rustynet0",
+                "egress_iface": "enp0s1",
+                "mesh_cidr": "100.64.0.0/10",
+                "ruleset_byte_len": 0,
+                "ruleset_sha256": ""
+            },
+            "subchecks": [],
+            "drift_reasons": ["nft unavailable"]
+        })
+        .to_string();
+        let err = super::evaluate_linux_blind_exit_dataplane_report("debian-exit-1", &raw)
+            .expect_err("unobservable ruleset must fail closed");
+        assert!(err.contains("not observed live"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn hello_limiter_flood_audit_producer_to_validator_round_trip_passes() {
         let report = rustynet_relay::hello_limiter_audit::run_hello_limiter_flood_audit();
         assert!(report.overall_ok, "reviewed funnel must pass: {report:?}");
@@ -38628,6 +39377,51 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     // ── Windows anchor bundle-pull LIVE report consumption contract ─────
+
+    fn reviewed_windows_anchor_deploy_preflight_report() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "stage": "windows_anchor_deploy_preflight",
+            "status": "pass",
+            "whoami": "nt authority\\system",
+            "service_status": "Running",
+            "listener_state": "none",
+            "subchecks": [
+                { "name": "windows_anchor_preflight_whoami", "status": "pass", "detail": "nt authority\\system" },
+                { "name": "windows_anchor_preflight_service_present", "status": "pass", "detail": "Running" },
+                { "name": "windows_anchor_preflight_daemon_present", "status": "pass", "detail": "C:\\Program Files\\RustyNet\\rustynetd.exe" },
+                { "name": "windows_anchor_preflight_config_root_present", "status": "pass", "detail": "C:\\ProgramData\\RustyNet\\config" },
+                { "name": "windows_anchor_preflight_listener_state_captured", "status": "pass", "detail": "none" }
+            ]
+        })
+    }
+
+    #[test]
+    fn validate_windows_anchor_deploy_preflight_report_accepts_reviewed_pass() {
+        let body = reviewed_windows_anchor_deploy_preflight_report().to_string();
+        let summary =
+            super::validate_windows_anchor_deploy_preflight_report(&body, "windows-utm-1")
+                .expect("reviewed Windows anchor deploy preflight report should validate");
+        assert!(
+            summary.contains("windows-utm-1") && summary.contains("listener_51822"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn validate_windows_anchor_deploy_preflight_report_rejects_missing_daemon_check() {
+        let mut payload = reviewed_windows_anchor_deploy_preflight_report();
+        payload["subchecks"][2]["status"] = serde_json::Value::from("skipped");
+        let err = super::validate_windows_anchor_deploy_preflight_report(
+            &payload.to_string(),
+            "windows-utm-1",
+        )
+        .expect_err("skipped daemon presence check must fail closed");
+        assert!(
+            err.contains("windows_anchor_preflight_daemon_present"),
+            "unexpected error: {err}"
+        );
+    }
 
     fn reviewed_windows_anchor_bundle_pull_report() -> serde_json::Value {
         serde_json::json!({
@@ -41479,6 +42273,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         let aliases = vec!["debian-utm-1".to_owned(), "debian-utm-2".to_owned()];
         let outcomes = super::run_linux_daemon_validators_for_aliases(
             aliases.as_slice(),
+            None,
             inventory.as_path(),
             identity.as_path(),
             None,
@@ -41495,6 +42290,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_membership_revoke_applies",
             "validate_linux_revoked_peer_denied_e2e",
             "validate_linux_blind_exit_reversal_denied",
+            "validate_linux_blind_exit_dataplane",
             "validate_linux_gossip_revoked_readmit",
             "validate_linux_enrollment_replay",
             "validate_linux_hello_limiter_flood",
@@ -41549,6 +42345,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         std::fs::write(identity.as_path(), b"fake-key").expect("write key");
         let outcomes = super::run_linux_daemon_validators_for_aliases(
             &[],
+            None,
             inventory.as_path(),
             identity.as_path(),
             None,
@@ -41643,6 +42440,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_membership_revoke_applies",
                 "validate_linux_revoked_peer_denied_e2e",
                 "validate_linux_blind_exit_reversal_denied",
+                "validate_linux_blind_exit_dataplane",
                 "validate_linux_gossip_revoked_readmit",
                 "validate_linux_enrollment_replay",
                 "validate_linux_hello_limiter_flood",
