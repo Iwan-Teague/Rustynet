@@ -1851,7 +1851,7 @@ fn neutralize_csv_formula(value: String) -> String {
     }
 }
 
-fn parse_csv_record(line: &str) -> Result<Vec<String>, String> {
+pub(crate) fn parse_csv_record(line: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut field = String::new();
     let mut chars = line.chars().peekable();

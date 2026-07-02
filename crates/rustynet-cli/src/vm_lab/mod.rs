@@ -4,6 +4,7 @@ mod bootstrap;
 pub mod capability;
 pub mod orchestrator;
 pub mod overnight;
+pub mod run_history;
 pub mod topology;
 
 pub use overnight::{VmLabOvernightConfig, execute_ops_vm_lab_overnight};

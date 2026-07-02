@@ -912,6 +912,10 @@ enum OpsCommand {
     VmLabDiagnoseLiveLabFailure {
         config: vm_lab::VmLabDiagnoseLiveLabFailureConfig,
     },
+    /// FIS-0006: SPRT/CUSUM flake-vs-regression report over the run matrix.
+    LiveLabFlakeReport {
+        matrix_path: PathBuf,
+    },
     VmLabDiffLiveLabRuns {
         config: vm_lab::VmLabDiffLiveLabRunsConfig,
     },
@@ -3558,6 +3562,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 expected_source_mode: parser.value("--expected-source-mode"),
                 require_five_node: parser.has_flag("--require-five-node"),
             },
+        }),
+        "live-lab-flake-report" => Ok(OpsCommand::LiveLabFlakeReport {
+            matrix_path: parser.value("--matrix").map_or_else(
+                || PathBuf::from("documents/operations/live_lab_run_matrix.csv"),
+                PathBuf::from,
+            ),
         }),
         "vm-lab-diagnose-live-lab-failure" => Ok(OpsCommand::VmLabDiagnoseLiveLabFailure {
             config: vm_lab::VmLabDiagnoseLiveLabFailureConfig {
@@ -7338,6 +7348,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::VmLabDiagnoseLiveLabFailure { config } => {
             vm_lab::execute_ops_vm_lab_diagnose_live_lab_failure(config)
+        }
+        OpsCommand::LiveLabFlakeReport { matrix_path } => {
+            vm_lab::run_history::render_flake_report(&matrix_path)
         }
         OpsCommand::VmLabDiffLiveLabRuns { config } => {
             vm_lab::execute_ops_vm_lab_diff_live_lab_runs(config)
@@ -18515,6 +18528,7 @@ fn help_text() -> String {
         "  ops vm-lab-pull-windows-state-from-linux-exit [--inventory <path>] --linux-exit-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --dest-dir <path> --report-dir <path> [--dry-run]",
         "  ops vm-lab-validate-live-lab-profile --profile <path> [--expected-backend <mode>] [--expected-source-mode <mode>] [--require-five-node]",
         "  ops vm-lab-diagnose-live-lab-failure [--inventory <path>] --profile <path> --report-dir <path> [--stage <name>] [--output-dir <path>] [--collect-artifacts] [--timeout-secs <secs>]",
+        "  ops live-lab-flake-report [--matrix <path>]",
         "  ops vm-lab-diff-live-lab-runs --old-report-dir <path> --new-report-dir <path>",
         "  ops vm-lab-diff-orchestrator-parity --left <parity_input.json> --right <parity_input.json> --output <parity_diff.json>",
         "  ops vm-lab-iterate-live-lab [--inventory <path>] [--profile-output <path>] --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--script <path>] [--dry-run] [--skip-gates] [--skip-soak] [--skip-cross-network] [--require-clean-tree] [--require-local-head] --validation-step <fmt|check:<package>|check-bin:<package>:<bin>|test:<package>[:filter]|test-bin:<package>:<bin>[:filter]>... [--collect-failure-diagnostics] [--failed-log-tail-lines <n>] [--timeout-secs <secs>]",
