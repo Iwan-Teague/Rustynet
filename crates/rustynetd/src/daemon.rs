@@ -3516,6 +3516,15 @@ struct DaemonRuntime {
     /// only — a restart starts every breaker closed.
     flap_breakers: BTreeMap<NodeId, crate::traversal::FlapBreaker>,
     traversal_flap_breaker: bool,
+    /// FIS-0013: per-peer path-quality trackers (sustained-degradation
+    /// detector over backend samples). Persists across sync passes.
+    quality_tracker: crate::traversal::PathQualityTracker,
+    /// Peers whose sustained degradation warrants a quality re-race on the
+    /// next sync pass (consumed one-shot).
+    pending_quality_reprobe: BTreeSet<NodeId>,
+    /// The demoted incumbent endpoint per pending quality re-race
+    /// (consumed one-shot when the evaluation is built).
+    quality_demoted_endpoints: BTreeMap<NodeId, SocketEndpoint>,
     traversal_max_age_secs: u64,
     traversal_probe_config: TraversalEngineConfig,
     traversal_probe_handshake_freshness_secs: u64,
@@ -3894,6 +3903,9 @@ impl DaemonRuntime {
             traversal_prior_rerank: config.traversal_prior_rerank,
             flap_breakers: BTreeMap::new(),
             traversal_flap_breaker: config.traversal_flap_breaker,
+            quality_tracker: crate::traversal::PathQualityTracker::default(),
+            pending_quality_reprobe: BTreeSet::new(),
+            quality_demoted_endpoints: BTreeMap::new(),
             traversal_max_age_secs: config.traversal_max_age_secs.get(),
             traversal_probe_config: TraversalEngineConfig {
                 max_candidates: config.traversal_probe_max_candidates.get(),
@@ -5648,6 +5660,7 @@ impl DaemonRuntime {
 
     fn sync_traversal_runtime_state(&mut self, force_reprobe: bool) -> Result<(), String> {
         let now_unix = unix_now();
+        self.poll_path_quality(now_unix);
         let mut relay_keepalive_failed_peers = BTreeSet::new();
         if let Some(mut relay_client) = self.relay_client.take() {
             let freshness_secs = self.traversal_probe_handshake_freshness_secs;
@@ -5851,23 +5864,27 @@ impl DaemonRuntime {
 
             let relay_refresh_due =
                 self.relay_session_refresh_due(&remote_node_id, bundle, now_unix)?;
-            let probe_due = self.traversal_probe_due(
-                current,
-                &direct_candidates,
-                existing_status,
-                now_unix,
-                force_reprobe,
-            )
-                // FIS-0010: while a peer's breaker is open, withhold the
-                // direct re-race (stay on relay) — unless the operator
-                // forced a reprobe, which stays an escape hatch. Cooldown
-                // expiry (half-open) allows exactly the next race through.
-                && (force_reprobe
-                    || !self.traversal_flap_breaker
-                    || !self
-                        .flap_breakers
-                        .get(&remote_node_id)
-                        .is_some_and(|breaker| breaker.is_open(now_unix)));
+            // FIS-0013: a pending quality re-race forces the probe through
+            // (the trigger already checked the FIS-0010 breaker was closed).
+            let quality_reprobe = self.pending_quality_reprobe.remove(&remote_node_id);
+            let probe_due = quality_reprobe
+                || (self.traversal_probe_due(
+                    current,
+                    &direct_candidates,
+                    existing_status,
+                    now_unix,
+                    force_reprobe,
+                )
+                    // FIS-0010: while a peer's breaker is open, withhold the
+                    // direct re-race (stay on relay) — unless the operator
+                    // forced a reprobe, which stays an escape hatch. Cooldown
+                    // expiry (half-open) allows exactly the next race through.
+                    && (force_reprobe
+                        || !self.traversal_flap_breaker
+                        || !self
+                            .flap_breakers
+                            .get(&remote_node_id)
+                            .is_some_and(|breaker| breaker.is_open(now_unix))));
             let relay_keepalive_recovery_due =
                 relay_keepalive_failed_peers.contains(&remote_node_id);
 
@@ -5984,6 +6001,9 @@ impl DaemonRuntime {
                         engine_config: self.traversal_probe_config.clone(),
                         handshake_freshness_secs: self.traversal_probe_handshake_freshness_secs,
                         prior_ranking,
+                        quality_demoted_endpoint: self
+                            .quality_demoted_endpoints
+                            .remove(&remote_node_id),
                         coordination_schedule,
                         coordination_error,
                         // D5.5 promotion: deterministic ICE role
@@ -6075,6 +6095,57 @@ impl DaemonRuntime {
         }
         self.traversal_probe_statuses = statuses;
         Ok(())
+    }
+
+    /// FIS-0013: ingest one backend path-quality sample per Direct peer at
+    /// the reconcile cadence. Sustained degradation (with the FIS-0010
+    /// breaker closed and the per-peer dwell elapsed) schedules a quality
+    /// re-race with the incumbent endpoint demoted.
+    fn poll_path_quality(&mut self, now_unix: u64) {
+        let direct_peers: Vec<(NodeId, SocketEndpoint)> = self
+            .traversal_probe_statuses
+            .iter()
+            .filter(|(_, status)| status.decision == TraversalProbeDecision::Direct)
+            .map(|(node_id, status)| (node_id.clone(), status.selected_endpoint))
+            .collect();
+        let live_peers: BTreeSet<NodeId> = self.traversal_probe_statuses.keys().cloned().collect();
+        self.quality_tracker.retain_peers(&live_peers);
+        self.pending_quality_reprobe
+            .retain(|node_id| live_peers.contains(node_id));
+        self.quality_demoted_endpoints
+            .retain(|node_id, _| live_peers.contains(node_id));
+        for (node_id, incumbent_endpoint) in direct_peers {
+            let Ok(Some(sample)) = self.controller.managed_peer_path_sample(&node_id) else {
+                // Command backends (and errors) yield no signal — the
+                // tracker simply never advances. Fail-open to today's
+                // behavior.
+                continue;
+            };
+            if self
+                .quality_tracker
+                .ingest_sample(&node_id, sample, now_unix)
+                != Some(true)
+            {
+                continue;
+            }
+            // The breaker owns direct-relay damping; the quality trigger is
+            // suppressed unless fully closed (never bypasses it).
+            let breaker_closed = self
+                .flap_breakers
+                .get(&node_id)
+                .is_none_or(|breaker| breaker.is_closed(now_unix));
+            if !breaker_closed {
+                continue;
+            }
+            eprintln!(
+                "rustynetd: path quality degraded for peer {} — scheduling re-race with incumbent {} demoted",
+                node_id.as_str(),
+                incumbent_endpoint.addr
+            );
+            self.pending_quality_reprobe.insert(node_id.clone());
+            self.quality_demoted_endpoints
+                .insert(node_id, incumbent_endpoint);
+        }
     }
 
     fn traversal_probe_due(
