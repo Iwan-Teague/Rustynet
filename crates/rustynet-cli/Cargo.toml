@@ -16,6 +16,7 @@ required-features = ["chaos-forger"]
 
 [dependencies]
 base64 = "0.22"
+rustynet-advisor = { path = "../rustynet-advisor" }
 rustynet-control = { path = "../rustynet-control" }
 rustynet-sysinfo = { path = "../rustynet-sysinfo" }
 rustynet-crypto = { path = "../rustynet-crypto" }
