@@ -10,14 +10,11 @@ use crate::app::{App, Panel};
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focused_panel == Panel::Jobs;
+    let border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let block = Block::default()
-        .title("JOBS [5/J]")
+        .title(Span::styled("JOBS [5/J]", Style::default().fg(border_fg)))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        }));
+        .border_style(Style::default().fg(border_fg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 

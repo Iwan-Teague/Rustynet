@@ -10,9 +10,12 @@ use crate::app::App;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
-        .title("LOOP PIPELINE")
+        .title(Span::styled(
+            "LOOP PIPELINE",
+            Style::default().fg(Color::Cyan),
+        ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     f.render_widget(block, area);
 

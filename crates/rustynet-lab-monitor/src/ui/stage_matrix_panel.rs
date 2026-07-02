@@ -25,16 +25,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         + count_passed(&matrix.windows)
         + count_passed(&matrix.cross_os);
 
+    let outer_border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let outer = Block::default()
-        .title(format!(
-            "FULL STAGE MATRIX [6/M] — {passed}/{total} checks passed"
+        .title(Span::styled(
+            format!("FULL STAGE MATRIX [6/M] — {passed}/{total} checks passed"),
+            Style::default().fg(outer_border_fg),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        }));
+        .border_style(Style::default().fg(outer_border_fg));
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
@@ -96,14 +94,14 @@ fn render_os_column(
     selected: bool,
 ) -> usize {
     let passed = count_passed(stages);
+    let border_fg = if selected { Color::Yellow } else { Color::Cyan };
     let block = Block::default()
-        .title(format!("{label} {passed}/{}", stages.len()))
+        .title(Span::styled(
+            format!("{label} {passed}/{}", stages.len()),
+            Style::default().fg(border_fg),
+        ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if selected {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        }));
+        .border_style(Style::default().fg(border_fg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
