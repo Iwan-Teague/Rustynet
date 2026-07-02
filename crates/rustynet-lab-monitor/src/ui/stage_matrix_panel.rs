@@ -17,13 +17,16 @@ use crate::data::run_matrix::{ParityState, StageMatrixEntry};
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focused_panel == Panel::StageMatrix;
     let matrix = &app.full_stage_matrix;
-    let total = matrix.linux.len() + matrix.macos.len() + matrix.windows.len();
-    let passed =
-        count_passed(&matrix.linux) + count_passed(&matrix.macos) + count_passed(&matrix.windows);
+    let total =
+        matrix.linux.len() + matrix.macos.len() + matrix.windows.len() + matrix.cross_os.len();
+    let passed = count_passed(&matrix.linux)
+        + count_passed(&matrix.macos)
+        + count_passed(&matrix.windows)
+        + count_passed(&matrix.cross_os);
 
     let outer = Block::default()
         .title(format!(
-            "FULL STAGE MATRIX [6/M] — {passed}/{total} per-OS checks passed"
+            "FULL STAGE MATRIX [6/M] — {passed}/{total} checks passed"
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused {
