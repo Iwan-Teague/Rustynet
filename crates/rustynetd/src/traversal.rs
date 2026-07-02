@@ -1188,6 +1188,95 @@ pub fn keepalive_prior_for_nat(
     }
 }
 
+/// FIS-0009 Phase 3 input: the peer's cross-session traversal prior,
+/// reduced to what the pair race needs. `None` (or the flag being off)
+/// ranks exactly as today.
+#[derive(Debug, Clone, Default)]
+pub struct PriorRanking {
+    pub last_success_class: Option<crate::peer_traversal_prior::CandidateClass>,
+    pub per_class_probability:
+        std::collections::BTreeMap<crate::peer_traversal_prior::CandidateClass, f32>,
+}
+
+impl PriorRanking {
+    fn probability_for_pair(&self, pair: &crate::ice_priority::CandidatePair) -> f32 {
+        match pair_candidate_class(pair) {
+            Some(class) => self
+                .per_class_probability
+                .get(&class)
+                .copied()
+                .unwrap_or(0.5),
+            None => 0.5,
+        }
+    }
+}
+
+/// Class of a candidate pair for prior scoring: keyed on the REMOTE
+/// candidate (the destination we are trying to reach — the
+/// Happy-Eyeballs axis). Relay-kind candidates score neutral.
+fn pair_candidate_class(
+    pair: &crate::ice_priority::CandidatePair,
+) -> Option<crate::peer_traversal_prior::CandidateClass> {
+    use crate::ice_priority::CandidateKind;
+    use crate::peer_traversal_prior::CandidateClass;
+    match (pair.remote.kind, pair.remote.addr.ip()) {
+        (CandidateKind::Host, IpAddr::V4(_)) => Some(CandidateClass::HostV4),
+        (CandidateKind::Host, IpAddr::V6(_)) => Some(CandidateClass::HostV6),
+        (CandidateKind::ServerReflexive, IpAddr::V4(_)) => Some(CandidateClass::SrflxV4),
+        (CandidateKind::ServerReflexive, IpAddr::V6(_)) => Some(CandidateClass::SrflxV6),
+        (CandidateKind::Relay, _) => None,
+    }
+}
+
+/// FIS-0009: stable secondary re-rank of the RFC-8445-priority-sorted pair
+/// list by the peer's prior, then the Happy-Eyeballs front-float.
+///
+/// A pair may move at most ±2 positions from its ICE rank (a good class,
+/// posterior → 1.0, gains 2 slots; a bad one loses 2) — a deliberate,
+/// slot-bounded rendering of the design's "only breaks ties / promotes a
+/// historically-winning class a few slots, never overrides a large
+/// ICE-priority gap". The RFC 8445 ordering itself and the deterministic
+/// role assignment are untouched — this re-ranks an already-valid list.
+/// Finally, if the peer's `last_success_class` is present in the pair
+/// list, exactly ONE pair of that class floats to the front of round 0.
+fn prior_rerank_pairs(pairs: &mut [crate::ice_priority::CandidatePair], ranking: &PriorRanking) {
+    // 2.5 slot-units so a full-confidence class STRICTLY passes 2 positions
+    // (a 2.0 shift only ties with the neighbor's key, and stable tie-break
+    // resolves back to ICE order) while 3 positions stays unreachable:
+    // passing 3 pairs would need i - 2.5 < i - 3.
+    const MAX_SLOT_SHIFT: f32 = 2.5;
+    let mut keyed: Vec<(f32, usize)> = pairs
+        .iter()
+        .enumerate()
+        .map(|(index, pair)| {
+            let posterior = ranking.probability_for_pair(pair);
+            let shift = MAX_SLOT_SHIFT * (posterior - 0.5) * 2.0;
+            (index as f32 - shift, index)
+        })
+        .collect();
+    // Stable by original index (the tuple's second element breaks ties
+    // deterministically; f32 keys here are always finite).
+    keyed.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    let reordered: Vec<crate::ice_priority::CandidatePair> = keyed
+        .iter()
+        .map(|(_, index)| pairs[*index].clone())
+        .collect();
+    pairs.clone_from_slice(&reordered);
+
+    if let Some(last_class) = ranking.last_success_class
+        && let Some(position) = pairs
+            .iter()
+            .position(|pair| pair_candidate_class(pair) == Some(last_class))
+        && position > 0
+    {
+        pairs[..=position].rotate_right(1);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraversalEngine {
     pub config: TraversalEngineConfig,
@@ -1500,6 +1589,7 @@ impl TraversalEngine {
         relay_endpoint: Option<SocketEndpoint>,
         now_unix: u64,
         handshake_freshness_secs: u64,
+        prior_ranking: Option<&PriorRanking>,
     ) -> Result<SimultaneousOpenResult, TraversalError> {
         if handshake_freshness_secs == 0 {
             return Err(TraversalError::InvalidConfig(
@@ -1547,6 +1637,11 @@ impl TraversalEngine {
                 0,
                 TraversalDecisionReason::NoDirectCandidatesRelayArmed,
             );
+        }
+        if let Some(ranking) = prior_ranking {
+            // FIS-0009: re-rank BEFORE the cap so a promoted class survives
+            // max_probe_pairs truncation.
+            prior_rerank_pairs(&mut pairs, ranking);
         }
         pairs.truncate(self.config.max_probe_pairs);
 
@@ -2486,6 +2581,101 @@ mod tests {
             usize::from(super::STUN_MAX_REQUEST_ATTEMPTS),
             "ladder must stop at Rc sends"
         );
+    }
+
+    fn rerank_pair(
+        remote_v4: &str,
+        kind: crate::ice_priority::CandidateKind,
+        priority: u64,
+    ) -> crate::ice_priority::CandidatePair {
+        let remote_addr: std::net::SocketAddr = remote_v4.parse().expect("addr");
+        let local_addr: std::net::SocketAddr = "10.0.0.1:51820".parse().expect("addr");
+        crate::ice_priority::CandidatePair {
+            local: crate::ice_priority::PrioritizedCandidate {
+                addr: local_addr,
+                kind: crate::ice_priority::CandidateKind::Host,
+                priority: 100,
+                foundation: format!("local-{remote_v4}"),
+            },
+            remote: crate::ice_priority::PrioritizedCandidate {
+                addr: remote_addr,
+                kind,
+                priority: 100,
+                foundation: format!("remote-{remote_v4}"),
+            },
+            pair_priority: priority,
+        }
+    }
+
+    #[test]
+    fn prior_rerank_is_identity_without_evidence() {
+        use crate::ice_priority::CandidateKind;
+        let mut pairs = vec![
+            rerank_pair("203.0.113.1:1", CandidateKind::Host, 400),
+            rerank_pair("203.0.113.2:2", CandidateKind::ServerReflexive, 300),
+            rerank_pair("203.0.113.3:3", CandidateKind::Host, 200),
+        ];
+        let baseline = pairs.clone();
+        // Empty ranking: every class scores the neutral 0.5 → no movement.
+        super::prior_rerank_pairs(&mut pairs, &super::PriorRanking::default());
+        assert_eq!(pairs, baseline, "no evidence must not reorder");
+    }
+
+    #[test]
+    fn prior_rerank_promotes_winning_class_bounded_slots() {
+        use crate::ice_priority::CandidateKind;
+        use crate::peer_traversal_prior::CandidateClass;
+        let mut pairs = vec![
+            rerank_pair("203.0.113.1:1", CandidateKind::Host, 500),
+            rerank_pair("203.0.113.2:2", CandidateKind::Host, 400),
+            rerank_pair("203.0.113.3:3", CandidateKind::Host, 300),
+            rerank_pair("203.0.113.4:4", CandidateKind::ServerReflexive, 200),
+        ];
+        let ranking = super::PriorRanking {
+            last_success_class: None,
+            per_class_probability: [
+                (CandidateClass::SrflxV4, 1.0),
+                (CandidateClass::HostV4, 0.5),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        super::prior_rerank_pairs(&mut pairs, &ranking);
+        // SrflxV4 posterior 1.0 → gains exactly 2 slots (index 3 → 1),
+        // never jumps the whole list: the top ICE pair stays first.
+        assert_eq!(pairs[0].remote.addr.port(), 1, "top ICE pair holds rank");
+        assert_eq!(
+            pairs[1].remote.kind,
+            CandidateKind::ServerReflexive,
+            "winning class promoted a bounded number of slots"
+        );
+    }
+
+    #[test]
+    fn prior_front_float_moves_last_success_class_first() {
+        use crate::ice_priority::CandidateKind;
+        use crate::peer_traversal_prior::CandidateClass;
+        let mut pairs = vec![
+            rerank_pair("203.0.113.1:1", CandidateKind::Host, 500),
+            rerank_pair("203.0.113.2:2", CandidateKind::Host, 400),
+            rerank_pair("203.0.113.3:3", CandidateKind::ServerReflexive, 300),
+            rerank_pair("203.0.113.4:4", CandidateKind::ServerReflexive, 200),
+        ];
+        let ranking = super::PriorRanking {
+            last_success_class: Some(CandidateClass::SrflxV4),
+            per_class_probability: std::collections::BTreeMap::new(),
+        };
+        super::prior_rerank_pairs(&mut pairs, &ranking);
+        // Exactly ONE pair of the last-success class floats to the front;
+        // relative order of everything else is preserved.
+        assert_eq!(
+            pairs[0].remote.addr.port(),
+            3,
+            "first srflx pair floats to front"
+        );
+        assert_eq!(pairs[1].remote.addr.port(), 1);
+        assert_eq!(pairs[2].remote.addr.port(), 2);
+        assert_eq!(pairs[3].remote.addr.port(), 4, "only one pair floats");
     }
 
     #[test]

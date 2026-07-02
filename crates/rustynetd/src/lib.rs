@@ -13,6 +13,7 @@ pub mod gossip_runtime;
 pub mod gossip_transport;
 pub mod ice_priority;
 pub mod peer_gossip;
+pub mod peer_traversal_prior;
 
 pub mod ipc;
 pub mod keepalive;

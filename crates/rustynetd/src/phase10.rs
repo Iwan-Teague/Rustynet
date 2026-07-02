@@ -287,6 +287,9 @@ pub struct TraversalProbeEvaluation<'a> {
     pub now_unix: u64,
     pub engine_config: TraversalEngineConfig,
     pub handshake_freshness_secs: u64,
+    /// FIS-0009: peer's cross-session traversal prior (None = rank as
+    /// today; populated only when the daemon's prior-rerank flag is on).
+    pub prior_ranking: Option<crate::traversal::PriorRanking>,
     pub coordination_schedule: Option<CoordinationSchedule>,
     pub coordination_error: Option<String>,
     /// D5.5 promotion — SHA-256 digests of the local + remote
@@ -5731,6 +5734,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                     evaluation.relay_endpoint,
                     evaluation.now_unix,
                     evaluation.handshake_freshness_secs,
+                    evaluation.prior_ranking.as_ref(),
                 )
                 .map_err(|err| Phase10Error::TraversalProbeFailed(err.to_string()))?
         };
@@ -10596,6 +10600,7 @@ mod tests {
                     now_unix: 200,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
                     coordination_schedule: None,
                     coordination_error: None,
                     local_node_id_digest: [1u8; 32],
@@ -10666,6 +10671,7 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
                     coordination_schedule: Some(sample_coordination_schedule(210)),
                     coordination_error: None,
                     local_node_id_digest: [1u8; 32],
@@ -10741,6 +10747,7 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
                     coordination_schedule: Some(sample_coordination_schedule(210)),
                     coordination_error: None,
                     local_node_id_digest: [1u8; 32],
@@ -10815,6 +10822,7 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
                     coordination_schedule: Some(sample_coordination_schedule(210)),
                     coordination_error: None,
                     local_node_id_digest: [1u8; 32],
@@ -10893,6 +10901,7 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
                     coordination_schedule: None,
                     coordination_error: Some(
                         "validated traversal coordination for peer node-b is unavailable"
@@ -10965,6 +10974,7 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    prior_ranking: None,
                     coordination_schedule: None,
                     coordination_error: Some(
                         "validated traversal coordination for peer node-b is unavailable"
