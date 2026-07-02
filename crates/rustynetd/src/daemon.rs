@@ -9577,6 +9577,9 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         config.node_id,
         config.backend_mode
     );
+    if let Some(addr) = config.anchor_bundle_pull_addr {
+        validate_anchor_bundle_pull_addr(addr, config.anchor_bundle_pull_allow_lan)?;
+    }
     resolve_configured_egress_interface(&mut config)?;
     normalize_windows_dns_resolver_bind_addr(&mut config);
     normalize_windows_key_custody_paths(&mut config);
@@ -18757,6 +18760,27 @@ mod tests {
         };
         let err = run_daemon(config).expect_err("in-memory backend must be rejected");
         assert!(err.to_string().contains("in-memory backend is disabled"));
+    }
+
+    #[test]
+    fn run_daemon_rejects_non_loopback_anchor_before_egress_detection() {
+        let config = DaemonConfig {
+            anchor_bundle_pull_addr: Some("0.0.0.0:51822".parse().expect("addr")),
+            anchor_bundle_pull_token_path: Some(std::path::PathBuf::from("/tmp/rustynet-token")),
+            anchor_bundle_pull_allow_lan: false,
+            egress_interface: String::new(),
+            ..DaemonConfig::default()
+        };
+        let err = run_daemon(config).expect_err("non-loopback anchor bind must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("loopback"),
+            "anchor bind gate should surface first: {msg}"
+        );
+        assert!(
+            !msg.contains("egress interface"),
+            "egress auto-detect must not mask anchor bind rejection: {msg}"
+        );
     }
 
     #[test]

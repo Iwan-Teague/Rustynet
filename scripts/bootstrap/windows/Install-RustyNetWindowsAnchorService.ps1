@@ -114,13 +114,13 @@ function Test-ReviewedDaemonExe {
 # array (loopback addr + allow-lan=false + present token-path) BEFORE the
 # service is (re)started. Fail closed on any drift.
 function Assert-ReviewedBundlePullArgs {
-    param([string[]] $Args)
+    param([string[]] $DaemonArgs)
     $addr = $null; $allowLan = $null; $tokenPath = $null
-    for ($i = 0; $i -lt $Args.Count; $i++) {
-        switch ($Args[$i]) {
-            '--anchor-bundle-pull-addr'       { $addr      = $Args[$i + 1] }
-            '--anchor-bundle-pull-allow-lan'  { $allowLan  = $Args[$i + 1] }
-            '--anchor-bundle-pull-token-path' { $tokenPath = $Args[$i + 1] }
+    for ($i = 0; $i -lt $DaemonArgs.Count; $i++) {
+        switch ($DaemonArgs[$i]) {
+            '--anchor-bundle-pull-addr'       { $addr      = $DaemonArgs[$i + 1] }
+            '--anchor-bundle-pull-allow-lan'  { $allowLan  = $DaemonArgs[$i + 1] }
+            '--anchor-bundle-pull-token-path' { $tokenPath = $DaemonArgs[$i + 1] }
         }
     }
     if ($addr -ne $ReviewedBundlePullAddr) {
@@ -134,6 +134,35 @@ function Assert-ReviewedBundlePullArgs {
     }
     if ($tokenPath -ne $ReviewedTokenPath) {
         throw "anchor verify-before-serve failed: token-path=$tokenPath (expected $ReviewedTokenPath)"
+    }
+}
+
+function Expand-ReviewedDaemonArgs {
+    param([object[]] $ParsedArgs)
+    foreach ($item in $ParsedArgs) {
+        $value = [string]$item
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            throw 'daemon args JSON contains an empty argument'
+        }
+        if ($value -match '\s') {
+            if ($value -notmatch '^--(backend|auto-tunnel-enforce|auto-tunnel-max-age-secs|trust-max-age-secs|traversal-max-age-secs|node-role|node-id)\s') {
+                throw "daemon arg contains embedded whitespace outside the reviewed legacy baseline shape: $value"
+            }
+            foreach ($metachar in @('"', "'", ';', '&', '|', '<', '>', '`')) {
+                if ($value.Contains($metachar)) {
+                    throw "daemon arg contains unsupported metacharacter in legacy baseline shape: $value"
+                }
+            }
+            foreach ($token in ($value -split '\s+')) {
+                if ([string]::IsNullOrWhiteSpace($token)) { continue }
+                if ($token.Length -gt 256 -or $token -notmatch '^[A-Za-z0-9_.:/\\-]+$') {
+                    throw "daemon arg token rejected while normalizing legacy baseline shape: $token"
+                }
+                Write-Output $token
+            }
+        } else {
+            Write-Output $value
+        }
     }
 }
 
@@ -201,7 +230,7 @@ if (-not $argsLine) {
     throw "$DaemonArgsEnvName not present in env-file; refuse to synthesize daemon args"
 }
 $jsonValue = $argsLine.Substring($DaemonArgsEnvName.Length + 1)
-$daemonArgs = @($jsonValue | ConvertFrom-Json)
+$daemonArgs = @(Expand-ReviewedDaemonArgs -ParsedArgs @($jsonValue | ConvertFrom-Json))
 # Strip any pre-existing bundle-pull triplet so re-runs are idempotent.
 $filtered = New-Object 'System.Collections.Generic.List[string]'
 for ($i = 0; $i -lt $daemonArgs.Count; $i++) {
@@ -218,7 +247,7 @@ $filtered.Add('--anchor-bundle-pull-allow-lan');  $filtered.Add($ReviewedAllowLa
 $newArgs = $filtered.ToArray()
 
 # ── Step 4: VERIFY-BEFORE-SERVE — assert reviewed posture before any restart. ──
-Assert-ReviewedBundlePullArgs -Args $newArgs
+Assert-ReviewedBundlePullArgs -DaemonArgs $newArgs
 
 # Re-serialize as a compact JSON array (daemon parses serde_json string array).
 $newJson = ConvertTo-Json -InputObject $newArgs -Compress
