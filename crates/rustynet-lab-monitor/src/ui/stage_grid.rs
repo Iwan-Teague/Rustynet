@@ -12,7 +12,7 @@ use crate::app::{App, Panel};
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focused_panel == Panel::StageGrid;
     let block = Block::default()
-        .title("STAGE GRID [3] ↑↓ select  Space toggle  Enter detail")
+        .title("STAGE GRID [3] ←→ column  ↑↓ select  Space toggle  Enter detail")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused {
             Color::Yellow
@@ -43,19 +43,16 @@ fn render_planned_with_statuses(
     ])
     .split(area);
 
-    let mut selectable_row = 0usize;
+    let focused = app.focused_panel == Panel::StageGrid;
     for (idx, group) in app.planned_stage_groups().into_iter().enumerate().take(3) {
         let mut lines = Vec::new();
         if group.stages.is_empty() {
             f.render_widget(Paragraph::new(lines), chunks[idx]);
             continue;
         }
-        let group_start = selectable_row;
         let group_len = group.stages.len();
-        let selected_in_group = app
-            .stage_cursor
-            .checked_sub(group_start)
-            .filter(|local| *local < group_len);
+        let col_focused = focused && idx == app.stage_grid_col;
+        let cursor_row = app.stage_grid_row[idx].min(group_len.saturating_sub(1));
         let enabled = group
             .stages
             .iter()
@@ -80,7 +77,11 @@ fn render_planned_with_statuses(
             .iter()
             .filter(|stage| status_by_stage.get(stage.as_str()) == Some(&"skipped"))
             .count();
-        let header_style = if status_by_stage.is_empty() {
+        let header_style = if col_focused {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if status_by_stage.is_empty() {
             Style::default().fg(Color::Cyan)
         } else if failed > 0 {
             Style::default().fg(Color::Red)
@@ -109,9 +110,11 @@ fn render_planned_with_statuses(
         };
         lines.push(Line::from(vec![Span::styled(header, header_style)]));
         let visible_stage_rows = (chunks[idx].height as usize).saturating_sub(2).max(1);
-        let scroll_start = selected_in_group
-            .map(|local| local.saturating_sub(visible_stage_rows / 2))
-            .unwrap_or(0)
+        // Center on this group's own cursor row regardless of which column
+        // is focused -- each group remembers its own scroll position, not
+        // just whichever one happens to be selected right now.
+        let scroll_start = cursor_row
+            .saturating_sub(visible_stage_rows / 2)
             .min(group_len.saturating_sub(visible_stage_rows));
         for (local_idx, stage) in group
             .stages
@@ -120,8 +123,7 @@ fn render_planned_with_statuses(
             .skip(scroll_start)
             .take(visible_stage_rows)
         {
-            let global_idx = group_start + local_idx;
-            let selected = global_idx == app.stage_cursor;
+            let selected = col_focused && local_idx == cursor_row;
             let enabled = app.stage_enabled(&stage);
             let active = app.active_stage.as_deref() == Some(stage.as_str());
             let status = if active {
@@ -147,7 +149,7 @@ fn render_planned_with_statuses(
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM)
             };
-            if selected && app.focused_panel == Panel::StageGrid {
+            if selected {
                 style = style.bg(Color::DarkGray);
             }
             let cursor = " ";
@@ -157,7 +159,6 @@ fn render_planned_with_statuses(
                 Span::styled(stage, style),
             ]));
         }
-        selectable_row = group_start + group_len;
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), chunks[idx]);
     }
 }
@@ -172,12 +173,23 @@ fn cell_for_status(status: &str) -> (&'static str, Style) {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        "skipped" | "disabled" => (
+        // "disabled" = not part of the current plan (grayed out, empty box).
+        "disabled" => (
             "[  ]",
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
         ),
+        "skipped" => (
+            "[  ]",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+        // "pending" = enabled, part of the current plan, hasn't run yet --
+        // filled white box so it visually reads as "will run" rather than
+        // blending into the empty "disabled" box.
+        "pending" => ("[██]", Style::default().fg(Color::White)),
         _ => ("[░░]", Style::default().fg(Color::DarkGray)),
     }
 }
