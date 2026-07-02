@@ -178,6 +178,24 @@ Start there when you need:
 Release-signoff guardrail:
 - [operations/ReleaseReadinessGuardrails.md](./operations/ReleaseReadinessGuardrails.md)
 
+## Formal Verification Artifacts
+
+Machine-checkable models of trust-sensitive protocols (FIS-0019). The `.tla`
+is canonical; the `.cfg` makes TLC one-command-runnable; the Python explorer
+is an exhaustive BFS surrogate mirroring the spec transition-for-transition.
+These artifacts share constants with the CI-enforced conformance test at
+`crates/rustynet-control/tests/membership_model_conformance.rs` and must move
+together.
+
+- [formal/MembershipTrustState.tla](./formal/MembershipTrustState.tla) —
+  bounded model of `apply_signed_update` (epoch chaining, replay cache,
+  root determinism; `BuggyReducer` re-finds RSA-0009)
+- [formal/MembershipTrustState.cfg](./formal/MembershipTrustState.cfg) — TLC
+  configuration (run: `java -cp tla2tools.jar tlc2.TLC -config
+  MembershipTrustState.cfg MembershipTrustState.tla`)
+- [formal/membership_trust_state_explorer.py](./formal/membership_trust_state_explorer.py)
+  — exhaustive surrogate explorer (`python3 … correct` / `… buggy`)
+
 ## Historical Archives
 
 These folders are for evidence and retrospective reference, not live implementation truth.
