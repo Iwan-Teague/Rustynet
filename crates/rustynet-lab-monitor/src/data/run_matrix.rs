@@ -297,11 +297,19 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
     let first_failed_idx = col_idx("first_failed_stage");
     let run_id_idx = col_idx("run_id");
 
-    // Ordered list of (column_index, header_name) for lab stage columns only.
+    // Ordered list of (column_index, header_name) for every real check column
+    // -- is_full_stage_matrix_column, the same "what counts as a check"
+    // definition the header bar (load_stage_progress) and Full Stage Matrix
+    // use, so a run's x/y here means the same thing as the header's X/Y.
+    // Previously this only counted is_lab_stage_column (the 74 generic
+    // `_stage_`/`cross_os_` columns), silently excluding the ~40 one-off
+    // security-audit columns that the header bar and Full Stage Matrix DO
+    // count -- so a run's total here could read e.g. 74 while the header
+    // read 116 for the exact same CSV.
     let stage_cols: Vec<(usize, String)> = headers
         .iter()
         .enumerate()
-        .filter(|(_, h)| is_lab_stage_column(h))
+        .filter(|(_, h)| is_full_stage_matrix_column(h))
         .map(|(i, h)| (i, h.to_owned()))
         .collect();
 
