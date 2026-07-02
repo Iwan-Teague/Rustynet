@@ -4,6 +4,7 @@ use ratatui::{
     Frame, Terminal,
     layout::{Constraint, Layout, Rect},
 };
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::IpAddr;
@@ -74,7 +75,17 @@ pub struct App {
     pub stage_progress: StageProgress,
     pub stage_timings: HashMap<String, u64>,
     pub full_stage_matrix: FullStageMatrix,
-    pub stage_matrix_scroll: usize,
+    pub stage_matrix_scroll: [usize; 3],
+    pub stage_matrix_os_col: usize,
+    /// Rows actually visible inside an OS column last time it was drawn
+    /// (written by `stage_matrix_panel::render`, which only takes `&App` --
+    /// `Cell` gives it write access without threading `&mut App` through
+    /// the whole render tree), so the up/down handlers can clamp
+    /// `stage_matrix_scroll` to the real max immediately instead of only
+    /// at render time -- otherwise scrolling past the bottom lets the
+    /// value run away unbounded, and un-scrolling has to walk all the way
+    /// back before the view visibly moves again.
+    pub stage_matrix_visible_rows: Cell<usize>,
 
     pub focused_panel: Panel,
     pub page: Page,
@@ -154,7 +165,9 @@ impl App {
             stage_progress,
             stage_timings,
             full_stage_matrix,
-            stage_matrix_scroll: 0,
+            stage_matrix_scroll: [0, 0, 0],
+            stage_matrix_os_col: 0,
+            stage_matrix_visible_rows: Cell::new(0),
             focused_panel: Panel::VmStatus,
             page: Page::Overview,
             stage_cursor: 0,
@@ -812,7 +825,9 @@ impl App {
                     self.selected_vm -= 1;
                 }
                 Panel::StageMatrix => {
-                    self.stage_matrix_scroll = self.stage_matrix_scroll.saturating_sub(1);
+                    let col = self.stage_matrix_os_col;
+                    self.stage_matrix_scroll[col] = self.stage_matrix_scroll[col].saturating_sub(1);
+                    self.clamp_stage_matrix_scroll(col);
                 }
                 Panel::Agents if self.agents_sel_col.is_some() => {
                     self.agents_active = false;
@@ -844,7 +859,9 @@ impl App {
                     self.selected_vm += 1;
                 }
                 Panel::StageMatrix => {
-                    self.stage_matrix_scroll += 1;
+                    let col = self.stage_matrix_os_col;
+                    self.stage_matrix_scroll[col] += 1;
+                    self.clamp_stage_matrix_scroll(col);
                 }
                 Panel::Agents if self.agents_sel_col.is_some() => {
                     self.agents_active = false;
@@ -874,6 +891,14 @@ impl App {
             }
             KeyCode::Right if self.focused_panel == Panel::VmStatus => {
                 self.cycle_selected_vm_role(1);
+            }
+            KeyCode::Left if self.focused_panel == Panel::StageMatrix => {
+                self.stage_matrix_os_col = self.stage_matrix_os_col.saturating_sub(1);
+                self.clamp_stage_matrix_scroll(self.stage_matrix_os_col);
+            }
+            KeyCode::Right if self.focused_panel == Panel::StageMatrix => {
+                self.stage_matrix_os_col = (self.stage_matrix_os_col + 1).min(2);
+                self.clamp_stage_matrix_scroll(self.stage_matrix_os_col);
             }
             KeyCode::Left if self.focused_panel == Panel::Agents => {
                 if self.agents_active {
@@ -1223,6 +1248,29 @@ impl App {
             config.apply_request_args(args);
         }
         config
+    }
+
+    /// Number of stages in the given stage-matrix OS column (0=Linux,
+    /// 1=macOS, 2=Windows).
+    fn stage_matrix_column_len(&self, col: usize) -> usize {
+        match col {
+            0 => self.full_stage_matrix.linux.len(),
+            1 => self.full_stage_matrix.macos.len(),
+            _ => self.full_stage_matrix.windows.len(),
+        }
+    }
+
+    /// Keep `stage_matrix_scroll[col]` within `[0, max_scroll]` using the
+    /// real last-rendered viewport height, so it can never run away past
+    /// the point where the last stage is already the bottom visible row --
+    /// otherwise scrolling down past the end silently keeps incrementing,
+    /// and un-scrolling has to walk all the way back before the view
+    /// visibly moves.
+    fn clamp_stage_matrix_scroll(&mut self, col: usize) {
+        let len = self.stage_matrix_column_len(col);
+        let visible = self.stage_matrix_visible_rows.get().max(1);
+        let max_scroll = len.saturating_sub(visible);
+        self.stage_matrix_scroll[col] = self.stage_matrix_scroll[col].min(max_scroll);
     }
 
     fn cycle_selected_vm_role(&mut self, direction: isize) {
@@ -1978,6 +2026,52 @@ mod tests {
         assert!(app.config.macos_promote_exit);
         assert_eq!(app.config.rebuild_nodes, "macos-utm-1");
         assert_eq!(app.role_for_vm("macos-utm-1"), "exit");
+    }
+
+    fn dummy_stage_entries(n: usize) -> Vec<crate::data::run_matrix::StageMatrixEntry> {
+        (0..n)
+            .map(|i| crate::data::run_matrix::StageMatrixEntry {
+                name: format!("stage-{i}"),
+                state: ParityState::Proven,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stage_matrix_scroll_clamps_immediately_at_the_bottom_not_just_on_render() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.focused_panel = Panel::StageMatrix;
+        app.stage_matrix_os_col = 0;
+        app.full_stage_matrix.linux = dummy_stage_entries(20);
+        app.stage_matrix_visible_rows.set(5);
+
+        // Scroll down far past the bottom -- must stop at max_scroll (15),
+        // not run away to some much larger raw increment count.
+        for _ in 0..30 {
+            app.handle_key(KeyCode::Down, KeyModifiers::empty());
+        }
+        assert_eq!(app.stage_matrix_scroll[0], 15);
+
+        // One Up press from the clamped bottom must move the view by
+        // exactly one row immediately, not require many presses to first
+        // undo an inflated scroll value.
+        app.handle_key(KeyCode::Up, KeyModifiers::empty());
+        assert_eq!(app.stage_matrix_scroll[0], 14);
+    }
+
+    #[test]
+    fn stage_matrix_scroll_clamps_on_column_switch_after_a_resize() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.focused_panel = Panel::StageMatrix;
+        app.stage_matrix_os_col = 0;
+        app.full_stage_matrix.macos = dummy_stage_entries(5);
+        app.stage_matrix_scroll[1] = 100; // stale from a taller terminal
+        app.stage_matrix_visible_rows.set(3);
+
+        app.handle_key(KeyCode::Right, KeyModifiers::empty());
+
+        assert_eq!(app.stage_matrix_os_col, 1);
+        assert_eq!(app.stage_matrix_scroll[1], 2);
     }
 
     #[test]
