@@ -392,4 +392,37 @@ mod tests {
             "bar clamps to full, not overfilled"
         );
     }
+
+    #[test]
+    fn header_turns_green_when_every_enabled_stage_is_complete() {
+        let style = stage_group_header_style(false, 2, 2, 0, true);
+        assert_eq!(style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn header_stays_red_when_a_fully_complete_column_has_a_failure() {
+        // All enabled stages finished (completed == enabled) but one of
+        // them failed -- must stay red, never green.
+        let style = stage_group_header_style(false, 2, 2, 1, true);
+        assert_eq!(style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn header_is_not_green_when_nothing_is_enabled() {
+        // enabled == 0 (everything toggled off) must not read as "done".
+        let style = stage_group_header_style(false, 0, 0, 0, true);
+        assert_ne!(style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn header_is_not_green_before_any_stage_has_run() {
+        let style = stage_group_header_style(false, 5, 0, 0, false);
+        assert_eq!(style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn focused_column_stays_yellow_even_when_fully_complete() {
+        let style = stage_group_header_style(true, 2, 2, 0, true);
+        assert_eq!(style.fg, Some(Color::Yellow));
+    }
 }
