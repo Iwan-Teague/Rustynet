@@ -215,14 +215,57 @@ fn is_lab_stage_column(header: &str) -> bool {
 /// check" definition shared by [`load_stage_progress`] (the header bar
 /// counter) and [`load_full_stage_matrix`] (the FULL STAGE MATRIX tab), so
 /// the two always agree. Deliberately excludes role-presence columns
-/// (`linux_client`, `macos_admin`, ...) — those record "was this role
-/// elected for this run", not a pass/fail outcome, even though they use the
-/// same `pass`/`not_run` vocabulary.
+/// (`linux_client`, `macos_admin`, ...) and per-role alias/node_id/target
+/// metadata columns — those record "was this role elected" / "which node
+/// served it", not a pass/fail outcome, even though they use the same
+/// `{os}_` prefix as real checks. Purely header-driven (no hardcoded column
+/// list), so a newly added `{os}_stage_*` or `{os}_<check-name>` column is
+/// picked up automatically without a code change.
 fn is_full_stage_matrix_column(header: &str) -> bool {
-    is_lab_stage_column(header)
-        || LINUX_ONEOFF_COLUMNS.iter().any(|(col, _)| *col == header)
-        || MACOS_ONEOFF_COLUMNS.iter().any(|(col, _)| *col == header)
-        || WINDOWS_ONEOFF_COLUMNS.iter().any(|(col, _)| *col == header)
+    is_lab_stage_column(header) || is_oneoff_check_column(header)
+}
+
+/// Split an `{os}_...` column into its OS prefix and the rest, trying each
+/// known OS prefix in turn. `None` if the header doesn't start with one of
+/// the three OS prefixes at all (e.g. `run_id`, `regression_notes`).
+fn os_prefix_and_rest(header: &str) -> Option<(Os, &str)> {
+    Os::all().into_iter().find_map(|os| {
+        header
+            .strip_prefix(os.csv_prefix())
+            .and_then(|rest| rest.strip_prefix('_'))
+            .map(|rest| (os, rest))
+    })
+}
+
+/// True for the `{os}_present` / `{os}_{role}` role-presence flags and the
+/// per-role `{os}_{role}_alias` / `_node_id` / `_target` metadata columns —
+/// everything under an OS prefix that ISN'T a pass/fail check, enumerated
+/// from the existing [`Role`] catalog rather than a separate hardcoded list.
+fn is_role_presence_or_metadata_suffix(rest: &str) -> bool {
+    if rest == "present" {
+        return true;
+    }
+    Role::all().iter().any(|role| {
+        rest == role.label()
+            || ["alias", "node_id", "target"]
+                .iter()
+                .any(|meta| rest == format!("{}_{meta}", role.label()))
+    })
+}
+
+/// True for a genuine one-off check column outside the `_stage_` naming
+/// convention (e.g. `linux_membership_revoke_applies`,
+/// `windows_named_pipe_acl`) — any `{os}_`-prefixed column that isn't a
+/// `_stage_` column and isn't role-presence/metadata. Discovered purely
+/// from the header, so newly added checks need no code change.
+fn is_oneoff_check_column(header: &str) -> bool {
+    if header.contains("_stage_") {
+        return false;
+    }
+    match os_prefix_and_rest(header) {
+        Some((_, rest)) => !is_role_presence_or_metadata_suffix(rest),
+        None => false,
+    }
 }
 
 pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
@@ -405,79 +448,47 @@ pub struct FullStageMatrix {
     pub cross_os: Vec<StageMatrixEntry>,
 }
 
-/// Canonical order for the 21 stage suffixes shared by all three OS
-/// columns, so row N means the same stage in every column — required for
-/// the "Windows is ahead, macOS still has gaps" at-a-glance comparison.
-const GENERIC_STAGE_ORDER: &[&str] = &[
-    "bootstrap",
-    "membership",
-    "assignments",
-    "baseline_runtime",
-    "anchor",
-    "relay_service_lifecycle",
-    "exit_handoff",
-    "lan_toggle",
-    "two_hop",
-    "role_switch_matrix",
-    "managed_dns",
-    "mixed_topology",
-    "reboot_recovery",
-    "extended_soak",
-    "chaos",
-    "secrets_not_in_logs",
-    "key_custody",
-    "enrollment_restart",
-    "network_flap",
-    "traversal",
-    "cleanup",
-];
+/// Discover every distinct `_stage_` suffix across all three OS-prefixed
+/// columns, in first-appearance order in the header — so row N means the
+/// same stage in every OS column (required for the "Windows is ahead,
+/// macOS still has gaps" at-a-glance comparison) without needing a
+/// hardcoded canonical list: a newly appended `{os}_stage_<name>` column is
+/// discovered automatically and takes the next row.
+fn discover_stage_suffixes(headers: &csv::StringRecord) -> Vec<String> {
+    let mut order = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for header in headers.iter() {
+        for os in Os::all() {
+            if let Some(suffix) = header.strip_prefix(&format!("{}_stage_", os.csv_prefix()))
+                && seen.insert(suffix.to_owned())
+            {
+                order.push(suffix.to_owned());
+            }
+        }
+    }
+    order
+}
 
-/// One-off platform-specific security checks that aren't `_stage_`-prefixed
-/// in the CSV but clearly belong to one OS. `(csv_column, display_name)`.
-const LINUX_ONEOFF_COLUMNS: &[(&str, &str)] = &[
-    (
-        "linux_membership_revoke_applies",
-        "membership_revoke_applies",
-    ),
-    ("linux_revoked_peer_denied_e2e", "revoked_peer_denied_e2e"),
-    (
-        "linux_membership_signature_forgery",
-        "membership_signature_forgery",
-    ),
-    (
-        "linux_privileged_helper_allowlist",
-        "privileged_helper_allowlist",
-    ),
-    ("linux_policy_default_deny", "policy_default_deny"),
-    ("linux_runtime_acls", "runtime_acls"),
-    ("linux_service_hardening", "service_hardening"),
-    ("linux_authenticode", "authenticode"),
-    ("linux_key_custody", "key_custody"),
-    ("linux_membership_genesis", "membership_genesis"),
-    ("linux_mesh_status", "mesh_status"),
-    (
-        "linux_blind_exit_reversal_denied",
-        "blind_exit_reversal_denied",
-    ),
-    ("linux_gossip_revoked_readmit", "gossip_revoked_readmit"),
-    ("linux_enrollment_replay", "enrollment_replay"),
-    ("linux_hello_limiter_flood", "hello_limiter_flood"),
-];
-const MACOS_ONEOFF_COLUMNS: &[(&str, &str)] = &[
-    ("macos_keychain_key_custody", "keychain_key_custody"),
-    ("macos_pf_killswitch", "pf_killswitch"),
-];
-const WINDOWS_ONEOFF_COLUMNS: &[(&str, &str)] = &[
-    ("windows_named_pipe_acl", "named_pipe_acl"),
-    ("windows_dpapi_key_custody", "dpapi_key_custody"),
-];
+/// Discover every one-off check column (see [`is_oneoff_check_column`])
+/// belonging to one OS, in header order, as `(csv_column, display_name)`.
+fn discover_oneoff_columns(headers: &csv::StringRecord, os: Os) -> Vec<(String, String)> {
+    let prefix = format!("{}_", os.csv_prefix());
+    headers
+        .iter()
+        .filter(|header| header.starts_with(&prefix) && is_oneoff_check_column(header))
+        .map(|header| (header.to_owned(), header[prefix.len()..].to_owned()))
+        .collect()
+}
 
-/// Load the full per-OS stage matrix (every `{os}_stage_*` column in
-/// canonical order, plus each OS's one-off security columns, plus
-/// `cross_os_*` as a shared bucket). This is deliberately independent of
-/// [`role_stage_columns`] — that function maps a coarse role to a
-/// representative stage for the 8x3 parity view; this loads every
-/// individual stage check for the full matrix view.
+/// Load the full per-OS stage matrix (every `{os}_stage_*` column plus each
+/// OS's one-off security columns, plus `cross_os_*` as a shared bucket) —
+/// entirely discovered from the live CSV header via
+/// [`discover_stage_suffixes`] / [`discover_oneoff_columns`], so adding a
+/// new stage or check column to the CSV schema shows up here with no code
+/// change. Deliberately independent of [`role_stage_columns`] — that
+/// function maps a coarse role to a representative stage for the 8x3
+/// parity view; this loads every individual stage check for the full
+/// matrix view.
 pub fn load_full_stage_matrix(repo_root: &Path) -> Result<FullStageMatrix> {
     let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
     if !path.exists() {
@@ -510,36 +521,36 @@ pub fn load_full_stage_matrix(repo_root: &Path) -> Result<FullStageMatrix> {
     };
 
     let mut matrix = FullStageMatrix::default();
-    for suffix in GENERIC_STAGE_ORDER {
+    for suffix in discover_stage_suffixes(&headers) {
         matrix.linux.push(StageMatrixEntry {
-            name: (*suffix).to_owned(),
+            name: suffix.clone(),
             state: state_for(&format!("linux_stage_{suffix}")),
         });
         matrix.macos.push(StageMatrixEntry {
-            name: (*suffix).to_owned(),
+            name: suffix.clone(),
             state: state_for(&format!("macos_stage_{suffix}")),
         });
         matrix.windows.push(StageMatrixEntry {
-            name: (*suffix).to_owned(),
+            name: suffix.clone(),
             state: state_for(&format!("windows_stage_{suffix}")),
         });
     }
-    for (column, name) in LINUX_ONEOFF_COLUMNS {
+    for (column, name) in discover_oneoff_columns(&headers, Os::Linux) {
         matrix.linux.push(StageMatrixEntry {
-            name: (*name).to_owned(),
-            state: state_for(column),
+            name,
+            state: state_for(&column),
         });
     }
-    for (column, name) in MACOS_ONEOFF_COLUMNS {
+    for (column, name) in discover_oneoff_columns(&headers, Os::Macos) {
         matrix.macos.push(StageMatrixEntry {
-            name: (*name).to_owned(),
-            state: state_for(column),
+            name,
+            state: state_for(&column),
         });
     }
-    for (column, name) in WINDOWS_ONEOFF_COLUMNS {
+    for (column, name) in discover_oneoff_columns(&headers, Os::Windows) {
         matrix.windows.push(StageMatrixEntry {
-            name: (*name).to_owned(),
-            state: state_for(column),
+            name,
+            state: state_for(&column),
         });
     }
     for header in headers.iter() {
@@ -780,45 +791,23 @@ mod tests {
 
     #[test]
     fn stage_progress_agrees_with_full_stage_matrix_total_on_a_complete_csv() {
-        // Build a CSV containing every real stage column (all 3 OS x the 21
-        // canonical suffixes, plus the one-offs, plus a couple of
-        // cross_os_* columns) -- i.e. the shape of the real, mature
-        // production CSV -- alongside a couple of role-presence columns that
-        // must NOT be counted. On a CSV this complete, load_stage_progress's
-        // total (columns that actually exist) and load_full_stage_matrix's
-        // total (the fixed canonical list) must agree, since every column
-        // the matrix expects is present. This is the exact invariant behind
-        // "why does the top bar show 96 but the matrix shows 78".
+        // Build a CSV containing a handful of stage columns (all 3 OS x 2
+        // suffixes), a couple of one-offs per OS, a couple of cross_os_*
+        // columns, and a role-presence column that must NOT be counted.
+        // load_stage_progress's total and load_full_stage_matrix's total
+        // are driven by the exact same header-discovery logic, so they must
+        // always agree on any CSV, not just a specific hand-maintained one.
         let mut headers = vec!["overall_result".to_owned(), "linux_present".to_owned()];
-        for suffix in GENERIC_STAGE_ORDER {
+        for suffix in ["bootstrap", "membership"] {
             headers.push(format!("linux_stage_{suffix}"));
             headers.push(format!("macos_stage_{suffix}"));
             headers.push(format!("windows_stage_{suffix}"));
         }
-        for (col, _) in LINUX_ONEOFF_COLUMNS {
-            headers.push((*col).to_owned());
-        }
-        for (col, _) in MACOS_ONEOFF_COLUMNS {
-            headers.push((*col).to_owned());
-        }
-        for (col, _) in WINDOWS_ONEOFF_COLUMNS {
-            headers.push((*col).to_owned());
-        }
-        for suffix in [
-            "bootstrap",
-            "membership_convergence",
-            "peer_visibility",
-            "direct_path",
-            "relay_path",
-            "exit_path",
-            "dns",
-            "lan_toggle",
-            "role_switch",
-            "anchor_bundle_pull",
-            "anchor_enrollment",
-        ] {
-            headers.push(format!("cross_os_{suffix}"));
-        }
+        headers.push("linux_membership_revoke_applies".to_owned());
+        headers.push("macos_pf_killswitch".to_owned());
+        headers.push("windows_named_pipe_acl".to_owned());
+        headers.push("cross_os_bootstrap".to_owned());
+        headers.push("cross_os_dns".to_owned());
 
         let values: Vec<&str> = headers.iter().map(|_| "pass").collect();
         let csv = format!("{}\n{}\n", headers.join(","), values.join(","));
@@ -832,25 +821,103 @@ mod tests {
             matrix.linux.len() + matrix.macos.len() + matrix.windows.len() + matrix.cross_os.len();
 
         assert_eq!(progress.total, matrix_total);
-        assert_eq!(matrix_total, 93);
+        // 2 suffixes x 3 OS + 3 one-offs + 2 cross_os = 11; linux_present excluded.
+        assert_eq!(matrix_total, 11);
     }
 
     #[test]
-    fn full_stage_matrix_has_21_generic_stages_per_os_in_canonical_order() {
+    fn full_stage_matrix_discovers_stage_suffixes_in_header_order() {
         let dir = tempfile::tempdir().unwrap();
         write_matrix_csv(
             dir.path(),
-            "overall_result,linux_stage_bootstrap\npass,pass\n",
+            "overall_result,linux_stage_bootstrap,linux_stage_membership,macos_stage_bootstrap\n\
+             pass,pass,pass,pass\n",
         );
         let matrix = load_full_stage_matrix(dir.path()).unwrap();
-        // 21 generic stages in canonical order, plus Linux's own one-off
-        // security columns (LINUX_ONEOFF_COLUMNS) appended after them —
-        // present unconditionally (as Unproven here, since this CSV doesn't
-        // set them), same as macOS/Windows's one-offs.
-        assert_eq!(matrix.linux.len(), 21 + 15);
+        // Only the suffixes actually present anywhere in the header are
+        // discovered ("bootstrap", "membership" — in that order), and each
+        // discovered suffix gets a row in every OS column even if that
+        // specific OS doesn't have the column yet (macOS has no
+        // macos_stage_membership here, so it reads Unproven, not missing).
+        assert_eq!(matrix.linux.len(), 2);
+        assert_eq!(matrix.macos.len(), 2);
+        assert_eq!(matrix.windows.len(), 2);
         assert_eq!(matrix.linux[0].name, "bootstrap");
         assert_eq!(matrix.linux[1].name, "membership");
-        assert_eq!(matrix.linux[20].name, "cleanup");
+        assert_eq!(matrix.macos[0].state, ParityState::Proven);
+        assert_eq!(matrix.macos[1].state, ParityState::Unproven);
+    }
+
+    #[test]
+    fn full_stage_matrix_picks_up_a_newly_added_stage_column_automatically() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,linux_stage_brand_new_check\npass,pass\n",
+        );
+        let matrix = load_full_stage_matrix(dir.path()).unwrap();
+        let progress = load_stage_progress(dir.path()).unwrap();
+        assert!(
+            matrix
+                .linux
+                .iter()
+                .any(|e| e.name == "brand_new_check" && e.state == ParityState::Proven),
+            "a never-before-seen _stage_ suffix must appear with no code change: {:?}",
+            matrix.linux
+        );
+        assert_eq!(progress.total, 1);
+        assert_eq!(progress.passed, 1);
+    }
+
+    #[test]
+    fn full_stage_matrix_picks_up_a_newly_added_oneoff_column_automatically() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,macos_brand_new_security_check\npass,fail\n",
+        );
+        let matrix = load_full_stage_matrix(dir.path()).unwrap();
+        let progress = load_stage_progress(dir.path()).unwrap();
+        assert!(
+            matrix
+                .macos
+                .iter()
+                .any(|e| e.name == "brand_new_security_check" && e.state == ParityState::Failed),
+            "a never-before-seen one-off check column must appear with no code change: {:?}",
+            matrix.macos
+        );
+        assert_eq!(progress.total, 1);
+        assert_eq!(progress.passed, 0);
+    }
+
+    #[test]
+    fn full_stage_matrix_still_excludes_role_presence_and_metadata_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,linux_present,linux_client,linux_client_alias,linux_client_node_id,linux_client_target\n\
+             pass,pass,pass,debian-1,client-1,debian@192.168.0.1\n",
+        );
+        let matrix = load_full_stage_matrix(dir.path()).unwrap();
+        let progress = load_stage_progress(dir.path()).unwrap();
+        assert!(matrix.linux.is_empty(), "{:?}", matrix.linux);
+        assert_eq!(progress.total, 0);
+    }
+
+    #[test]
+    fn full_stage_matrix_distinguishes_role_presence_from_a_same_prefixed_check() {
+        // "linux_blind_exit" is the blind_exit role-presence flag; a check
+        // column that happens to start with the same role name (like the
+        // real linux_blind_exit_reversal_denied) must still be counted.
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,linux_blind_exit,linux_blind_exit_reversal_denied\npass,pass,fail\n",
+        );
+        let matrix = load_full_stage_matrix(dir.path()).unwrap();
+        assert_eq!(matrix.linux.len(), 1);
+        assert_eq!(matrix.linux[0].name, "blind_exit_reversal_denied");
+        assert_eq!(matrix.linux[0].state, ParityState::Failed);
     }
 
     #[test]
@@ -898,9 +965,11 @@ mod tests {
              pass,pass,fail,pass,fail,pass,fail,pass\n",
         );
         let matrix = load_full_stage_matrix(dir.path()).unwrap();
-        assert_eq!(matrix.windows.len(), 21 + 2);
-        assert_eq!(matrix.macos.len(), 21 + 2);
-        assert_eq!(matrix.linux.len(), 21 + 15);
+        // No _stage_ columns in this CSV, so each OS bucket holds exactly
+        // its one-off checks -- nothing hardcoded/expected beyond the header.
+        assert_eq!(matrix.windows.len(), 2);
+        assert_eq!(matrix.macos.len(), 2);
+        assert_eq!(matrix.linux.len(), 2);
         assert!(
             matrix
                 .windows
