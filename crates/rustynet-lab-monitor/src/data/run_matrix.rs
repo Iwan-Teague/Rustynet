@@ -176,7 +176,13 @@ pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
             continue;
         }
         total += 1;
-        if latest_decisive_value(&rows, idx) == Some("pass") {
+        // classify_recent_history, not just "did the latest run pass" --
+        // matching load_full_stage_matrix's classifier so the header bar
+        // and the Full Stage Matrix panel always agree on a passed count.
+        // A column whose latest run passed but whose recent history is
+        // unstable (Flaky) must not inflate the header count while the
+        // matrix panel correctly declines to count it.
+        if classify_recent_history(&decisive_history(&rows, idx)) == ParityState::Proven {
             passed += 1;
         }
     }
@@ -615,16 +621,6 @@ fn stage_progress_column(header: &str, rows: &[csv::StringRecord], idx: usize) -
             )
         })
     })
-}
-
-fn latest_decisive_value(rows: &[csv::StringRecord], idx: usize) -> Option<&str> {
-    rows.iter()
-        .rev()
-        .find_map(|row| match row.get(idx)?.trim() {
-            "pass" => Some("pass"),
-            "fail" => Some("fail"),
-            _ => None,
-        })
 }
 
 /// Every decisive (pass/fail) value for a column, in the CSV's append
@@ -1100,6 +1096,37 @@ mod tests {
         assert_eq!(progress.total, matrix_total);
         // 2 suffixes x 3 OS + 3 one-offs + 2 cross_os = 11; linux_present excluded.
         assert_eq!(matrix_total, 11);
+    }
+
+    #[test]
+    fn stage_progress_passed_count_agrees_with_full_stage_matrix_on_a_flaky_column() {
+        // Regression for the header bar (CHECKS) reporting a higher passed
+        // count than the Full Stage Matrix panel (39 vs 33 in the field):
+        // load_stage_progress used to count a column as passed whenever its
+        // single latest row said "pass", while load_full_stage_matrix ran
+        // the CUSUM classifier over its recent history and correctly
+        // demoted an unstable column to Flaky. A column with this alternating
+        // pass/fail history ends on "pass" but is Flaky, so BOTH functions
+        // must agree it does not count toward "passed".
+        let dir = tempfile::tempdir().unwrap();
+        let header = "overall_result,linux_stage_bootstrap";
+        let mut lines = vec![header.to_owned()];
+        for outcome in [
+            "fail", "pass", "fail", "pass", "fail", "pass", "fail", "pass",
+        ] {
+            lines.push(format!("pass,{outcome}"));
+        }
+        write_matrix_csv(dir.path(), &format!("{}\n", lines.join("\n")));
+
+        let progress = load_stage_progress(dir.path()).unwrap();
+        let matrix = load_full_stage_matrix(dir.path()).unwrap();
+
+        assert_eq!(matrix.linux[0].state, ParityState::Flaky);
+        assert_eq!(progress.total, 1);
+        assert_eq!(
+            progress.passed, 0,
+            "a Flaky column's latest-pass must not inflate the header bar's passed count"
+        );
     }
 
     #[test]

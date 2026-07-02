@@ -10087,7 +10087,257 @@ fn run_macos_orchestration_stages(
     };
     outcomes.push(macos_blind_exit_outcome);
 
+    // Tier-2: macOS audit stages (pure-Rust protocol checks)
+    let macos_membership_revoke_log_path =
+        logs_dir.join("validate_macos_membership_revoke_applies.log");
+    let macos_membership_revoke_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_membership_revoke_applies",
+        &macos_membership_revoke_log_path,
+        run_validate_macos_membership_revoke_applies_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_membership_revoke_outcome);
+
+    let macos_membership_sig_log_path =
+        logs_dir.join("validate_macos_membership_signature_forgery.log");
+    let macos_membership_sig_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_membership_signature_forgery",
+        &macos_membership_sig_log_path,
+        run_validate_macos_membership_signature_forgery_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_membership_sig_outcome);
+
+    let macos_gossip_log_path = logs_dir.join("validate_macos_gossip_revoked_readmit.log");
+    let macos_gossip_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_gossip_revoked_readmit",
+        &macos_gossip_log_path,
+        run_validate_macos_gossip_revoked_readmit_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_gossip_outcome);
+
+    let macos_enrollment_log_path = logs_dir.join("validate_macos_enrollment_replay.log");
+    let macos_enrollment_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_enrollment_replay",
+        &macos_enrollment_log_path,
+        run_validate_macos_enrollment_replay_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_enrollment_outcome);
+
+    let macos_hello_log_path = logs_dir.join("validate_macos_hello_limiter_flood.log");
+    let macos_hello_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_hello_limiter_flood",
+        &macos_hello_log_path,
+        run_validate_macos_hello_limiter_flood_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_hello_outcome);
+
+    // Tier-1/3/4: macOS DaemonProbeOp + pure-Rust audit stages
+    let macos_runtime_acls_log_path = logs_dir.join("validate_macos_runtime_acls.log");
+    let macos_runtime_acls_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_runtime_acls",
+        &macos_runtime_acls_log_path,
+        run_validate_macos_runtime_acls_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_runtime_acls_outcome);
+
+    let macos_service_hardening_log_path = logs_dir.join("validate_macos_service_hardening.log");
+    let macos_service_hardening_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_service_hardening",
+        &macos_service_hardening_log_path,
+        run_validate_macos_service_hardening_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_service_hardening_outcome);
+
+    let macos_mesh_status_log_path = logs_dir.join("validate_macos_mesh_status.log");
+    let macos_mesh_status_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_mesh_status",
+        &macos_mesh_status_log_path,
+        run_validate_macos_mesh_status_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_mesh_status_outcome);
+
+    let macos_authenticode_log_path = logs_dir.join("validate_macos_authenticode.log");
+    let macos_authenticode_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_authenticode",
+        &macos_authenticode_log_path,
+        run_validate_macos_authenticode_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_authenticode_outcome);
+
+    let macos_privileged_helper_log_path =
+        logs_dir.join("validate_macos_privileged_helper_allowlist.log");
+    let macos_privileged_helper_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_privileged_helper_allowlist",
+        &macos_privileged_helper_log_path,
+        run_validate_macos_privileged_helper_allowlist_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_privileged_helper_outcome);
+
+    let macos_policy_dd_log_path = logs_dir.join("validate_macos_policy_default_deny.log");
+    let macos_policy_dd_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_policy_default_deny",
+        &macos_policy_dd_log_path,
+        run_validate_macos_policy_default_deny_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_policy_dd_outcome);
+
+    let macos_revoked_peer_log_path = logs_dir.join("validate_macos_revoked_peer_denied_e2e.log");
+    let macos_revoked_peer_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_revoked_peer_denied_e2e",
+        &macos_revoked_peer_log_path,
+        run_validate_macos_revoked_peer_denied_e2e_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_revoked_peer_outcome);
+
+    let macos_blind_exit_rev_log_path =
+        logs_dir.join("validate_macos_blind_exit_reversal_denied.log");
+    let macos_blind_exit_rev_outcome = run_macos_audit_stage(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_macos_blind_exit_reversal_denied",
+        &macos_blind_exit_rev_log_path,
+        run_validate_macos_blind_exit_reversal_denied_stage,
+        mesh_join_passed,
+        dry_run,
+    );
+    outcomes.push(macos_blind_exit_rev_outcome);
+
     outcomes
+}
+
+/// Helper for macOS audit-stage dispatch with shared boilerplate.
+/// Mirrors the Linux `dispatch_stage` closure pattern in the live suite.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn run_macos_audit_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    stage_name: &'static str,
+    log_path: &Path,
+    dispatch: fn(&str, &Path, &Path, Option<&Path>) -> Result<(String, String), (String, String)>,
+    upstream_passed: bool,
+    is_dry_run: bool,
+) -> VmLabStageOutcome {
+    if is_dry_run {
+        return stage_outcome(
+            stage_name,
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would dispatch {stage_name} on {macos_alias}"),
+            vec![],
+        );
+    }
+    if !upstream_passed {
+        return stage_outcome(
+            stage_name,
+            VmLabStageStatus::Skipped,
+            format!("skipped: upstream stage did not pass for {macos_alias}"),
+            vec![],
+        );
+    }
+    match dispatch(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+    ) {
+        Ok((summary, raw)) => {
+            let _ = std::fs::write(log_path, raw.as_str());
+            stage_outcome(
+                stage_name,
+                VmLabStageStatus::Pass,
+                summary,
+                vec![log_path.to_path_buf()],
+            )
+        }
+        Err((reason, raw)) => {
+            let log_body = if raw.is_empty() {
+                reason.clone()
+            } else {
+                format!("{reason}\n--- raw report ---\n{raw}")
+            };
+            let _ = std::fs::write(log_path, log_body.as_str());
+            stage_outcome(
+                stage_name,
+                VmLabStageStatus::Fail,
+                format!("{stage_name} failed for {macos_alias}: {reason}"),
+                vec![log_path.to_path_buf()],
+            )
+        }
+    }
 }
 
 const MACOS_EXIT_EVIDENCE_REMOTE_ROOT: &str = "/tmp/rustynet-macos-exit-evidence";
@@ -11354,11 +11604,15 @@ fn exercise_linux_membership_genesis_validation(
 
 fn build_linux_membership_genesis_check_script() -> String {
     r#"set -eu
+if ! sudo -n true >/dev/null 2>&1; then
+  echo 'sudo -n required for Linux membership genesis validator' >&2
+  exit 1
+fi
 for path in /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark; do
-  test -f "$path"
-  stat -c '%a %U:%G %n' "$path"
+  sudo -n test -f "$path"
+  sudo -n stat -c '%a %U:%G %n' "$path"
 done
-/usr/local/bin/rustynet membership status \
+sudo -n /usr/local/bin/rustynet membership status \
   --snapshot /var/lib/rustynet/membership.snapshot \
   --log /var/lib/rustynet/membership.log
 "#
@@ -14037,6 +14291,144 @@ fn run_windows_orchestration_stages_with_options(
         }
     };
 
+    // Tier-2: Windows audit stages (pure-Rust protocol checks)
+    let windows_mesh_join_pass = mesh_join_outcome.status == VmLabStageStatus::Pass;
+    let windows_membership_revoke_log_path =
+        logs_dir.join("validate_windows_membership_revoke_applies.log");
+    let windows_membership_revoke_outcome = run_windows_audit_stage(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_windows_membership_revoke_applies",
+        &windows_membership_revoke_log_path,
+        run_validate_windows_membership_revoke_applies_stage,
+        windows_mesh_join_pass,
+        dry_run,
+    );
+
+    let windows_membership_sig_log_path =
+        logs_dir.join("validate_windows_membership_signature_forgery.log");
+    let windows_membership_sig_outcome = run_windows_audit_stage(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_windows_membership_signature_forgery",
+        &windows_membership_sig_log_path,
+        run_validate_windows_membership_signature_forgery_stage,
+        windows_mesh_join_pass,
+        dry_run,
+    );
+
+    let windows_gossip_log_path = logs_dir.join("validate_windows_gossip_revoked_readmit.log");
+    let windows_gossip_outcome = run_windows_audit_stage(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_windows_gossip_revoked_readmit",
+        &windows_gossip_log_path,
+        run_validate_windows_gossip_revoked_readmit_stage,
+        windows_mesh_join_pass,
+        dry_run,
+    );
+
+    let windows_enrollment_log_path = logs_dir.join("validate_windows_enrollment_replay.log");
+    let windows_enrollment_outcome = run_windows_audit_stage(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_windows_enrollment_replay",
+        &windows_enrollment_log_path,
+        run_validate_windows_enrollment_replay_stage,
+        windows_mesh_join_pass,
+        dry_run,
+    );
+
+    let windows_hello_log_path = logs_dir.join("validate_windows_hello_limiter_flood.log");
+    let windows_hello_outcome = run_windows_audit_stage(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_windows_hello_limiter_flood",
+        &windows_hello_log_path,
+        run_validate_windows_hello_limiter_flood_stage,
+        windows_mesh_join_pass,
+        dry_run,
+    );
+
+    // Tier-1/3/4: Windows DaemonProbeOp + pure-Rust audit stages
+    let windows_mesh_status_log_path = logs_dir.join("validate_windows_mesh_status.log");
+    let windows_mesh_status_outcome = run_windows_audit_stage(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_windows_mesh_status",
+        &windows_mesh_status_log_path,
+        run_validate_windows_mesh_status_stage,
+        windows_mesh_join_pass,
+        dry_run,
+    );
+
+    let windows_privileged_helper_log_path =
+        logs_dir.join("validate_windows_privileged_helper_allowlist.log");
+    let windows_privileged_helper_outcome = run_windows_audit_stage(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_windows_privileged_helper_allowlist",
+        &windows_privileged_helper_log_path,
+        run_validate_windows_privileged_helper_allowlist_stage,
+        windows_mesh_join_pass,
+        dry_run,
+    );
+
+    let windows_policy_dd_log_path = logs_dir.join("validate_windows_policy_default_deny.log");
+    let windows_policy_dd_outcome = run_windows_audit_stage(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_windows_policy_default_deny",
+        &windows_policy_dd_log_path,
+        run_validate_windows_policy_default_deny_stage,
+        windows_mesh_join_pass,
+        dry_run,
+    );
+
+    let windows_revoked_peer_log_path =
+        logs_dir.join("validate_windows_revoked_peer_denied_e2e.log");
+    let windows_revoked_peer_outcome = run_windows_audit_stage(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_windows_revoked_peer_denied_e2e",
+        &windows_revoked_peer_log_path,
+        run_validate_windows_revoked_peer_denied_e2e_stage,
+        windows_mesh_join_pass,
+        dry_run,
+    );
+
+    let windows_blind_exit_rev_log_path =
+        logs_dir.join("validate_windows_blind_exit_reversal_denied.log");
+    let windows_blind_exit_rev_outcome = run_windows_audit_stage(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "validate_windows_blind_exit_reversal_denied",
+        &windows_blind_exit_rev_log_path,
+        run_validate_windows_blind_exit_reversal_denied_stage,
+        windows_mesh_join_pass,
+        dry_run,
+    );
+
     vec![
         bootstrap_outcome,
         validate_outcome,
@@ -14065,7 +14457,78 @@ fn run_windows_orchestration_stages_with_options(
         distribute_traversal_outcome,
         distribute_dns_zone_outcome,
         mesh_join_outcome,
+        windows_membership_revoke_outcome,
+        windows_membership_sig_outcome,
+        windows_gossip_outcome,
+        windows_enrollment_outcome,
+        windows_hello_outcome,
+        windows_mesh_status_outcome,
+        windows_privileged_helper_outcome,
+        windows_policy_dd_outcome,
+        windows_revoked_peer_outcome,
+        windows_blind_exit_rev_outcome,
     ]
+}
+
+/// Helper for Windows audit-stage dispatch with shared boilerplate.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn run_windows_audit_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    stage_name: &'static str,
+    log_path: &Path,
+    dispatch: fn(&str, &Path, &Path, Option<&Path>) -> Result<(String, String), (String, String)>,
+    upstream_passed: bool,
+    is_dry_run: bool,
+) -> VmLabStageOutcome {
+    if is_dry_run {
+        return stage_outcome(
+            stage_name,
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would dispatch {stage_name} on {windows_alias}"),
+            vec![],
+        );
+    }
+    if !upstream_passed {
+        return stage_outcome(
+            stage_name,
+            VmLabStageStatus::Skipped,
+            format!("skipped: upstream stage did not pass for {windows_alias}"),
+            vec![],
+        );
+    }
+    match dispatch(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+    ) {
+        Ok((summary, raw)) => {
+            let _ = std::fs::write(log_path, raw.as_str());
+            stage_outcome(
+                stage_name,
+                VmLabStageStatus::Pass,
+                summary,
+                vec![log_path.to_path_buf()],
+            )
+        }
+        Err((reason, raw)) => {
+            let log_body = if raw.is_empty() {
+                reason.clone()
+            } else {
+                format!("{reason}\n--- raw report ---\n{raw}")
+            };
+            let _ = std::fs::write(log_path, log_body.as_str());
+            stage_outcome(
+                stage_name,
+                VmLabStageStatus::Fail,
+                format!("{stage_name} failed for {windows_alias}: {reason}"),
+                vec![log_path.to_path_buf()],
+            )
+        }
+    }
 }
 
 /// Prove the Windows node can act as ADMIN by minting its own DPAPI-backed
@@ -18332,6 +18795,82 @@ fn run_linux_relay_check_remote(
     Ok(raw_output.trim().to_owned())
 }
 
+/// Generic SSH dispatcher for a macOS daemon-check subcommand. Mirrors
+/// [`run_linux_daemon_check_remote`] but targets a macOS peer and uses
+/// the canonical macOS install path.
+fn run_macos_daemon_check_remote(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    subcommand: &str,
+    extra_args: &[String],
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[macos_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {macos_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let invocation =
+        build_linux_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand, extra_args)?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("remote dispatch of {subcommand} failed: {err}"))?;
+    Ok(raw_output.trim().to_owned())
+}
+
+/// Generic SSH dispatcher for a Windows daemon-check subcommand. Mirrors
+/// [`run_linux_daemon_check_remote`] but uses the Windows invocation
+/// builders (PowerShell encoded command) and validates platform.
+fn run_windows_daemon_check_remote(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    subcommand: &str,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {windows_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err(format!(
+            "alias {windows_alias} resolved to non-Windows platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script = build_windows_security_check_invocation(subcommand, &[])
+        .map_err(|err| format!("build windows invocation for {subcommand} failed: {err}"))?;
+    let invocation = build_ssh_powershell_encoded_invocation(script.as_str()).map_err(|err| {
+        format!("build powershell encoded invocation for {subcommand} failed: {err}")
+    })?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("remote dispatch of {subcommand} failed: {err}"))?;
+    Ok(raw_output.trim().to_owned())
+}
+
 /// Pure evaluator for the JSON output of `rustynetd linux-runtime-acls-check`.
 fn evaluate_linux_runtime_acls_report(linux_alias: &str, raw_json: &str) -> Result<String, String> {
     let report: rustynetd::linux_runtime_acls::LinuxRuntimeAclReport =
@@ -18375,6 +18914,160 @@ fn evaluate_linux_runtime_acls_report(linux_alias: &str, raw_json: &str) -> Resu
     let inspected = report.roots.len();
     Ok(format!(
         "Linux runtime ACLs verified on {linux_alias}: {inspected} reviewed roots passed"
+    ))
+}
+
+fn evaluate_macos_runtime_acls_report(macos_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: rustynetd::macos_runtime_acls::MacosRuntimeAclReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse macos-runtime-acls-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "macos-runtime-acls-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.roots.is_empty() {
+        return Err(
+            "macos-runtime-acls-check returned an empty roots list; expected the canonical \
+             macOS runtime root set"
+                .to_owned(),
+        );
+    }
+    if !report.overall_ok {
+        let drifted = report
+            .roots
+            .iter()
+            .filter_map(|entry| match &entry.status {
+                rustynetd::macos_runtime_acls::MacosRuntimeAclRootStatus::Ok => None,
+                rustynetd::macos_runtime_acls::MacosRuntimeAclRootStatus::Missing { reason } => {
+                    Some(format!("{} missing: {reason}", entry.label))
+                }
+                rustynetd::macos_runtime_acls::MacosRuntimeAclRootStatus::Drifted { reason } => {
+                    Some(format!("{} drifted: {reason}", entry.label))
+                }
+            })
+            .collect::<Vec<_>>();
+        let drifted_summary = if drifted.is_empty() {
+            "report set overall_ok=false but every per-root entry is Ok; output is inconsistent"
+                .to_owned()
+        } else {
+            drifted.join("; ")
+        };
+        return Err(format!(
+            "macOS runtime ACL drift detected: {drifted_summary}"
+        ));
+    }
+    if report.roots.iter().any(|entry| {
+        !matches!(
+            entry.status,
+            rustynetd::macos_runtime_acls::MacosRuntimeAclRootStatus::Ok
+        )
+    }) {
+        return Err(
+            "report set overall_ok=true but at least one per-root entry is not Ok; output is \
+             inconsistent"
+                .to_owned(),
+        );
+    }
+    let inspected_count = report.roots.len();
+    Ok(format!(
+        "macOS runtime ACLs verified on {macos_alias}: {inspected_count} reviewed roots passed"
+    ))
+}
+
+fn evaluate_macos_service_hardening_report(
+    macos_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::macos_service_hardening::MacosServiceHardeningReport =
+        serde_json::from_str(raw_json).map_err(|err| {
+            format!("parse macos-service-hardening-check JSON output failed: {err}")
+        })?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "macos-service-hardening-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if !report.probed {
+        return Err(format!(
+            "macos-service-hardening-check was unable to probe the service plist: {}",
+            report.probe_reason.as_deref().unwrap_or("unknown reason")
+        ));
+    }
+    if !report.overall_ok {
+        let reasons = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
+                .to_owned()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!("macOS service hardening drift detected: {reasons}"));
+    }
+    Ok(format!(
+        "macOS service hardening verified on {macos_alias}: {} observed directives matched",
+        report.observed.len()
+    ))
+}
+
+fn evaluate_macos_mesh_status_report(macos_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: rustynetd::macos_mesh_status::MacosMeshStatusReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse macos-mesh-status-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "macos-mesh-status-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if !report.overall_ok {
+        let reasons = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
+                .to_owned()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!("macOS mesh status drift detected: {reasons}"));
+    }
+    if !report.drift_reasons.is_empty() {
+        return Err(format!(
+            "report set overall_ok=true but drift_reasons is non-empty: {}",
+            report.drift_reasons.join("; ")
+        ));
+    }
+    let summary_detail = match &report.snapshot {
+        rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::Ok {
+            peer_ids,
+            age_seconds,
+            ..
+        } => format!("peers={} age_seconds={}", peer_ids.len(), age_seconds),
+        _ => "inconsistent snapshot load".to_owned(),
+    };
+    Ok(format!(
+        "macOS mesh status verified on {macos_alias} ({summary_detail})"
+    ))
+}
+
+fn evaluate_macos_authenticode_report(macos_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: rustynetd::macos_authenticode::MacosAuthenticodeReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse macos-authenticode-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "macos-authenticode-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if !report.overall_ok {
+        return Err(format!(
+            "macos-authenticode-check reported failure: {}",
+            report.reason
+        ));
+    }
+    Ok(format!(
+        "macOS binary attestation verified on {macos_alias} (applicable={}, {})",
+        report.applicable, report.reason
     ))
 }
 
@@ -18711,6 +19404,470 @@ fn run_validate_linux_blind_exit_dataplane_stage(
     })?;
     let raw = raw.trim().to_owned();
     evaluate_linux_blind_exit_dataplane_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+// ---- macOS audit stages (Tier-2 parity: membership_revoke, signature_forgery,
+//       gossip_revoked_readmit, enrollment_replay, hello_limiter_flood) ----
+// These mirror the Linux audit stages above but dispatch over SSH to macOS
+// peers using the same daemon subcommands (already compiled cross-platform).
+// The evaluators are reused directly — they parse JSON, which is platform-agnostic.
+
+fn run_validate_macos_membership_revoke_applies_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "membership-revoke-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_membership_revoke_audit_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_macos_membership_signature_forgery_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "membership-signature-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_membership_signature_audit_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_macos_gossip_revoked_readmit_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "gossip-revoked-readmit-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_gossip_revoked_readmit_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_macos_enrollment_replay_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "enrollment-replay-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_enrollment_replay_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_macos_hello_limiter_flood_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "hello-limiter-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_hello_limiter_flood_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+// ---- macOS Tier-1 audit stages (DaemonProbeOp parity) ----
+
+fn run_validate_macos_runtime_acls_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "macos-runtime-acls-check",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_macos_runtime_acls_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_macos_service_hardening_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "macos-service-hardening-check",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_macos_service_hardening_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_macos_mesh_status_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "macos-mesh-status-check",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_macos_mesh_status_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_macos_authenticode_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "macos-authenticode-check",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_macos_authenticode_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+// ---- macOS Tier-3/4 audit stages (pure-Rust protocol parity) ----
+
+fn run_validate_macos_privileged_helper_allowlist_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "privileged-helper-allowlist-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_privileged_helper_allowlist_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_macos_policy_default_deny_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "policy-default-deny-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_policy_default_deny_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_macos_revoked_peer_denied_e2e_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "revoked-peer-denied-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_revoked_peer_denied_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_macos_blind_exit_reversal_denied_stage(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "blind-exit-reversal-audit",
+        &[],
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_blind_exit_reversal_report(macos_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+// ---- Windows audit stages (Tier-2 parity) ----
+
+fn run_validate_windows_membership_revoke_applies_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_windows_daemon_check_remote(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "membership-revoke-audit",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_membership_revoke_audit_report(windows_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_windows_membership_signature_forgery_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_windows_daemon_check_remote(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "membership-signature-audit",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_membership_signature_audit_report(windows_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_windows_gossip_revoked_readmit_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_windows_daemon_check_remote(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "gossip-revoked-readmit-audit",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_gossip_revoked_readmit_report(windows_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_windows_enrollment_replay_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_windows_daemon_check_remote(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "enrollment-replay-audit",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_enrollment_replay_report(windows_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_windows_hello_limiter_flood_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_windows_daemon_check_remote(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "hello-limiter-audit",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_hello_limiter_flood_report(windows_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+// ---- Windows Tier-1/3/4 audit stages (mac/win parity) ----
+
+fn run_validate_windows_mesh_status_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_windows_daemon_check_remote(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "windows-mesh-status-check",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_windows_mesh_join_report(windows_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_windows_privileged_helper_allowlist_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_windows_daemon_check_remote(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "privileged-helper-allowlist-audit",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_privileged_helper_allowlist_report(windows_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_windows_policy_default_deny_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_windows_daemon_check_remote(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "policy-default-deny-audit",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_policy_default_deny_report(windows_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_windows_revoked_peer_denied_e2e_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_windows_daemon_check_remote(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "revoked-peer-denied-audit",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_revoked_peer_denied_report(windows_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_windows_blind_exit_reversal_denied_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_windows_daemon_check_remote(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "blind-exit-reversal-audit",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_blind_exit_reversal_report(windows_alias, raw.as_str())
         .map(|summary| (summary, raw.clone()))
         .map_err(|reason| (reason, raw))
 }
@@ -39290,6 +40447,23 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         assert!(err.contains("membership.snapshot"));
     }
 
+    #[test]
+    fn linux_membership_genesis_check_script_reads_root_state_via_sudo() {
+        let script = super::build_linux_membership_genesis_check_script();
+        assert!(
+            script.contains("sudo -n required for Linux membership genesis validator"),
+            "script must fail closed when passwordless sudo is unavailable: {script}"
+        );
+        assert!(
+            script.contains("sudo -n stat -c '%a %U:%G %n' \"$path\""),
+            "script must inspect canonical root-owned metadata through sudo: {script}"
+        );
+        assert!(
+            script.contains("sudo -n /usr/local/bin/rustynet membership status"),
+            "script must read the root-owned signed snapshot through sudo: {script}"
+        );
+    }
+
     fn reviewed_macos_exit_killswitch_precedence_artifact() -> serde_json::Value {
         serde_json::json!({
             "schema_version": 1,
@@ -41898,7 +43072,9 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "script must fail closed before privileged dispatch: {script:?}"
         );
         assert!(
-            script.ends_with("sudo -n '/usr/local/bin/rustynetd' 'linux-key-custody-check' --no-fail-on-drift"),
+            script.ends_with(
+                "sudo -n '/usr/local/bin/rustynetd' 'linux-key-custody-check' --no-fail-on-drift"
+            ),
             "script must preserve quoted daemon argv under sudo: {script:?}"
         );
     }

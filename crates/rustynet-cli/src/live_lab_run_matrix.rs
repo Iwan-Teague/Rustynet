@@ -155,6 +155,29 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_gossip_revoked_readmit",
     "linux_enrollment_replay",
     "linux_hello_limiter_flood",
+    "windows_membership_revoke_applies",
+    "windows_membership_signature_forgery",
+    "windows_gossip_revoked_readmit",
+    "windows_enrollment_replay",
+    "windows_hello_limiter_flood",
+    "macos_membership_revoke_applies",
+    "macos_membership_signature_forgery",
+    "macos_gossip_revoked_readmit",
+    "macos_enrollment_replay",
+    "macos_hello_limiter_flood",
+    "macos_runtime_acls",
+    "macos_service_hardening",
+    "macos_mesh_status",
+    "macos_authenticode",
+    "macos_privileged_helper_allowlist",
+    "macos_policy_default_deny",
+    "macos_revoked_peer_denied_e2e",
+    "macos_blind_exit_reversal_denied",
+    "windows_mesh_status",
+    "windows_privileged_helper_allowlist",
+    "windows_policy_default_deny",
+    "windows_revoked_peer_denied_e2e",
+    "windows_blind_exit_reversal_denied",
     "regression_reference_commit",
     "regression_notes",
     "linux_client_alias",
@@ -994,6 +1017,22 @@ fn populate_target_identity_values(
     }
 }
 
+/// Some validators run once per node in a multi-node role (e.g. two Linux
+/// peers under `run_linux_daemon_validators_for_aliases`) and the caller
+/// disambiguates by prefixing the stage id with `"{alias}::"`, e.g.
+/// `"debian-headless-1::validate_linux_hello_limiter_flood"`. The fixed-name
+/// classifiers below (`direct_platform_stage`, `logical_stage_name`,
+/// `set_special_stage_values`, `populate_cross_os_values`) all match on the
+/// bare `"validate_..."` name, so an alias-qualified name silently fell
+/// through their catch-all `_ => {}` arm -- the check's own CSV column stayed
+/// at its default ("not_run") even when the validator genuinely failed,
+/// while `first_failed_stage` (populated separately, alias-preserving) still
+/// correctly named the failure. Strip the alias prefix before classifying so
+/// the column reflects reality too.
+fn strip_node_alias_prefix(stage: &str) -> &str {
+    stage.rsplit("::").next().unwrap_or(stage)
+}
+
 fn populate_stage_values(
     values: &mut BTreeMap<String, String>,
     schema: &BTreeSet<String>,
@@ -1003,21 +1042,22 @@ fn populate_stage_values(
 ) {
     for stage in stages {
         let status = normalize_status(stage.status.as_str());
-        if let Some((platform, logical_stage)) = direct_platform_stage(stage.stage.as_str()) {
+        let unaliased = strip_node_alias_prefix(stage.stage.as_str());
+        if let Some((platform, logical_stage)) = direct_platform_stage(unaliased) {
             set_status(
                 values,
                 schema,
                 format!("{platform}_stage_{logical_stage}").as_str(),
                 status,
             );
-            set_special_stage_values(values, schema, platform, stage.stage.as_str(), status);
-            populate_cross_os_values(values, schema, stage.stage.as_str(), status, targets);
+            set_special_stage_values(values, schema, platform, unaliased, status);
+            populate_cross_os_values(values, schema, unaliased, status, targets);
             continue;
         }
-        if let Some(logical_stage) = logical_stage_name(stage.stage.as_str()) {
+        if let Some(logical_stage) = logical_stage_name(unaliased) {
             let worker_results = read_parallel_stage_results(report_dir, stage.stage.as_str());
             if worker_results.is_empty() {
-                for platform in platforms_for_stage(stage.stage.as_str(), targets) {
+                for platform in platforms_for_stage(unaliased, targets) {
                     set_status(
                         values,
                         schema,
@@ -1040,7 +1080,21 @@ fn populate_stage_values(
                 }
             }
         }
-        populate_cross_os_values(values, schema, stage.stage.as_str(), status, targets);
+        populate_cross_os_values(values, schema, unaliased, status, targets);
+    }
+
+    // Second pass: call set_special_stage_values unconditionally so mac/win
+    // parity-tier validation stages (e.g. validate_macos_runtime_acls) populate
+    // their one-off columns even when the stage name doesn't match
+    // direct_platform_stage or logical_stage_name.
+    let fallback_platform = targets
+        .first()
+        .map(|t| t.platform.as_str())
+        .unwrap_or("linux");
+    for stage in stages {
+        let status = normalize_status(stage.status.as_str());
+        let unaliased = strip_node_alias_prefix(stage.stage.as_str());
+        set_special_stage_values(values, schema, fallback_platform, unaliased, status);
     }
 }
 
@@ -1341,6 +1395,7 @@ fn populate_cross_os_values(
     status: &str,
     targets: &[TargetEvidence],
 ) {
+    let stage = strip_node_alias_prefix(stage);
     let platform_count = unique_platforms(targets).len();
     if platform_count < 2 && !stage.contains("windows") && !stage.contains("macos") {
         return;
@@ -1397,6 +1452,7 @@ fn set_special_stage_values(
     stage: &str,
     status: &str,
 ) {
+    let stage = strip_node_alias_prefix(stage);
     match stage {
         "validate_windows_named_pipe_acls" => {
             set_status(values, schema, "windows_named_pipe_acl", status)
@@ -1446,6 +1502,73 @@ fn set_special_stage_values(
         }
         "validate_linux_hello_limiter_flood" => {
             set_status(values, schema, "linux_hello_limiter_flood", status)
+        }
+        "validate_windows_membership_revoke_applies" => {
+            set_status(values, schema, "windows_membership_revoke_applies", status)
+        }
+        "validate_windows_membership_signature_forgery" => set_status(
+            values,
+            schema,
+            "windows_membership_signature_forgery",
+            status,
+        ),
+        "validate_windows_gossip_revoked_readmit" => {
+            set_status(values, schema, "windows_gossip_revoked_readmit", status)
+        }
+        "validate_windows_enrollment_replay" => {
+            set_status(values, schema, "windows_enrollment_replay", status)
+        }
+        "validate_windows_hello_limiter_flood" => {
+            set_status(values, schema, "windows_hello_limiter_flood", status)
+        }
+        "validate_macos_membership_revoke_applies" => {
+            set_status(values, schema, "macos_membership_revoke_applies", status)
+        }
+        "validate_macos_membership_signature_forgery" => {
+            set_status(values, schema, "macos_membership_signature_forgery", status)
+        }
+        "validate_macos_gossip_revoked_readmit" => {
+            set_status(values, schema, "macos_gossip_revoked_readmit", status)
+        }
+        "validate_macos_enrollment_replay" => {
+            set_status(values, schema, "macos_enrollment_replay", status)
+        }
+        "validate_macos_hello_limiter_flood" => {
+            set_status(values, schema, "macos_hello_limiter_flood", status)
+        }
+        "validate_macos_runtime_acls" => set_status(values, schema, "macos_runtime_acls", status),
+        "validate_macos_service_hardening" => {
+            set_status(values, schema, "macos_service_hardening", status)
+        }
+        "validate_macos_mesh_status" => set_status(values, schema, "macos_mesh_status", status),
+        "validate_macos_authenticode" => set_status(values, schema, "macos_authenticode", status),
+        "validate_macos_privileged_helper_allowlist" => {
+            set_status(values, schema, "macos_privileged_helper_allowlist", status)
+        }
+        "validate_macos_policy_default_deny" => {
+            set_status(values, schema, "macos_policy_default_deny", status)
+        }
+        "validate_macos_revoked_peer_denied_e2e" => {
+            set_status(values, schema, "macos_revoked_peer_denied_e2e", status)
+        }
+        "validate_macos_blind_exit_reversal_denied" => {
+            set_status(values, schema, "macos_blind_exit_reversal_denied", status)
+        }
+        "validate_windows_mesh_status" => set_status(values, schema, "windows_mesh_status", status),
+        "validate_windows_privileged_helper_allowlist" => set_status(
+            values,
+            schema,
+            "windows_privileged_helper_allowlist",
+            status,
+        ),
+        "validate_windows_policy_default_deny" => {
+            set_status(values, schema, "windows_policy_default_deny", status)
+        }
+        "validate_windows_revoked_peer_denied_e2e" => {
+            set_status(values, schema, "windows_revoked_peer_denied_e2e", status)
+        }
+        "validate_windows_blind_exit_reversal_denied" => {
+            set_status(values, schema, "windows_blind_exit_reversal_denied", status)
         }
         _ if stage.starts_with("validate_") => {
             let _ = platform;
@@ -1881,8 +2004,8 @@ pub(crate) fn parse_csv_record(line: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::{
         DEFAULT_MATRIX_COLUMNS, LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome,
-        build_live_lab_run_matrix_values, csv_escape, parse_csv_record, render_csv_row,
-        set_special_stage_values,
+        TargetEvidence, build_live_lab_run_matrix_values, csv_escape, parse_csv_record,
+        populate_cross_os_values, render_csv_row, set_special_stage_values,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1995,6 +2118,215 @@ mod tests {
                 "stage {stage} did not populate column {column}"
             );
         }
+    }
+
+    #[test]
+    fn node_alias_prefixed_stage_name_still_populates_its_csv_column() {
+        // Regression: run_linux_daemon_validators_for_aliases prefixes stage
+        // names with "{alias}::" to disambiguate a multi-node role (see
+        // vm_lab/mod.rs). Before this fix, that prefixed name matched no arm
+        // in set_special_stage_values (not even its own `_ if starts_with`
+        // catch-all), so a real failure never reached the CSV column and it
+        // stayed "not_run" while first_failed_stage (a separate,
+        // alias-preserving path) correctly named the failure -- producing an
+        // inconsistent row: a named failure with no failing column anywhere.
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let mut values = BTreeMap::new();
+        set_special_stage_values(
+            &mut values,
+            &schema,
+            "linux",
+            "debian-headless-1::validate_linux_hello_limiter_flood",
+            "fail",
+        );
+        assert_eq!(
+            values.get("linux_hello_limiter_flood").map(String::as_str),
+            Some("fail")
+        );
+    }
+
+    #[test]
+    fn node_alias_prefixed_cross_os_stage_name_still_populates_its_csv_column() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let mut values = BTreeMap::new();
+        let targets = vec![
+            TargetEvidence {
+                label: "exit".to_owned(),
+                target: "exit".to_owned(),
+                alias: "exit-1".to_owned(),
+                platform: "linux".to_owned(),
+                node_id: "n1".to_owned(),
+                bootstrap_role: "exit".to_owned(),
+            },
+            TargetEvidence {
+                label: "client".to_owned(),
+                target: "client".to_owned(),
+                alias: "client-1".to_owned(),
+                platform: "macos".to_owned(),
+                node_id: "n2".to_owned(),
+                bootstrap_role: "client".to_owned(),
+            },
+        ];
+        populate_cross_os_values(
+            &mut values,
+            &schema,
+            "debian-headless-1::validate_linux_anchor_bundle_pull",
+            "fail",
+            &targets,
+        );
+        assert_eq!(
+            values
+                .get("cross_os_anchor_bundle_pull")
+                .map(String::as_str),
+            Some("fail")
+        );
+    }
+
+    #[test]
+    fn macos_win_parity_tier_stages_map_to_dedicated_csv_columns() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let mut values = BTreeMap::new();
+        // macOS Tier-1 (DaemonProbeOp parity)
+        for (stage, column) in [
+            ("validate_macos_runtime_acls", "macos_runtime_acls"),
+            (
+                "validate_macos_service_hardening",
+                "macos_service_hardening",
+            ),
+            ("validate_macos_mesh_status", "macos_mesh_status"),
+            ("validate_macos_authenticode", "macos_authenticode"),
+        ] {
+            set_special_stage_values(&mut values, &schema, "macos", stage, "pass");
+            assert_eq!(
+                values.get(column).map(String::as_str),
+                Some("pass"),
+                "stage {stage} did not populate column {column}"
+            );
+        }
+        // macOS Tier-2 (Tier2 pure-Rust protocol)
+        for (stage, column) in [
+            (
+                "validate_macos_membership_revoke_applies",
+                "macos_membership_revoke_applies",
+            ),
+            (
+                "validate_macos_membership_signature_forgery",
+                "macos_membership_signature_forgery",
+            ),
+            (
+                "validate_macos_gossip_revoked_readmit",
+                "macos_gossip_revoked_readmit",
+            ),
+            (
+                "validate_macos_enrollment_replay",
+                "macos_enrollment_replay",
+            ),
+            (
+                "validate_macos_hello_limiter_flood",
+                "macos_hello_limiter_flood",
+            ),
+        ] {
+            set_special_stage_values(&mut values, &schema, "macos", stage, "pass");
+            assert_eq!(
+                values.get(column).map(String::as_str),
+                Some("pass"),
+                "stage {stage} did not populate column {column}"
+            );
+        }
+        // macOS Tier-3/4 (protocol parity)
+        for (stage, column) in [
+            (
+                "validate_macos_privileged_helper_allowlist",
+                "macos_privileged_helper_allowlist",
+            ),
+            (
+                "validate_macos_policy_default_deny",
+                "macos_policy_default_deny",
+            ),
+            (
+                "validate_macos_revoked_peer_denied_e2e",
+                "macos_revoked_peer_denied_e2e",
+            ),
+            (
+                "validate_macos_blind_exit_reversal_denied",
+                "macos_blind_exit_reversal_denied",
+            ),
+        ] {
+            set_special_stage_values(&mut values, &schema, "macos", stage, "pass");
+            assert_eq!(
+                values.get(column).map(String::as_str),
+                Some("pass"),
+                "stage {stage} did not populate column {column}"
+            );
+        }
+        // Windows Tier-1/3/4 (DaemonProbeOp + protocol parity)
+        for (stage, column) in [
+            ("validate_windows_mesh_status", "windows_mesh_status"),
+            (
+                "validate_windows_privileged_helper_allowlist",
+                "windows_privileged_helper_allowlist",
+            ),
+            (
+                "validate_windows_policy_default_deny",
+                "windows_policy_default_deny",
+            ),
+            (
+                "validate_windows_revoked_peer_denied_e2e",
+                "windows_revoked_peer_denied_e2e",
+            ),
+            (
+                "validate_windows_blind_exit_reversal_denied",
+                "windows_blind_exit_reversal_denied",
+            ),
+            // Tier-2 Windows columns also verify mapped names
+            (
+                "validate_windows_membership_revoke_applies",
+                "windows_membership_revoke_applies",
+            ),
+            (
+                "validate_windows_hello_limiter_flood",
+                "windows_hello_limiter_flood",
+            ),
+        ] {
+            set_special_stage_values(&mut values, &schema, "windows", stage, "pass");
+            assert_eq!(
+                values.get(column).map(String::as_str),
+                Some("pass"),
+                "stage {stage} did not populate column {column}"
+            );
+        }
+        // Verify fail status round-trips
+        let mut fail_values = BTreeMap::new();
+        set_special_stage_values(
+            &mut fail_values,
+            &schema,
+            "macos",
+            "validate_macos_runtime_acls",
+            "fail",
+        );
+        assert_eq!(
+            fail_values.get("macos_runtime_acls").map(String::as_str),
+            Some("fail")
+        );
+        // Verify unknown stage does not create spurious columns
+        let mut noop_values = BTreeMap::new();
+        set_special_stage_values(
+            &mut noop_values,
+            &schema,
+            "linux",
+            "bogus_unknown_stage",
+            "pass",
+        );
+        assert_eq!(noop_values.len(), 0);
     }
 
     #[test]

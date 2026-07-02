@@ -6,8 +6,30 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::app::{App, Panel};
+
+/// Braille-dot spinner frames for the box of whichever stage is currently
+/// running -- purely a wall-clock animation (no App state needed): the event
+/// loop already redraws roughly every 100ms (see run_event_loop's poll
+/// timeout), so advancing the frame from elapsed time alone is enough to
+/// read as spinning.
+const SPINNER_FRAMES: [&str; 8] = [
+    "[⠋⠋]", "[⠙⠙]", "[⠹⠹]", "[⠸⠸]", "[⠼⠼]", "[⠴⠴]", "[⠦⠦]", "[⠧⠧]",
+];
+
+fn spinner_frame_for_elapsed_ms(elapsed_ms: u128) -> &'static str {
+    let idx = (elapsed_ms / 120) as usize % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[idx]
+}
+
+fn spinner_glyph() -> &'static str {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    spinner_frame_for_elapsed_ms(epoch.elapsed().as_millis())
+}
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focused_panel == Panel::StageGrid;
@@ -124,25 +146,34 @@ fn render_planned_with_statuses(
             .take(visible_stage_rows)
         {
             let selected = col_focused && local_idx == cursor_row;
-            let enabled = app.stage_enabled(&stage);
+            // `possible` = right platform/role for this stage to ever run
+            // (independent of the user's own toggle); `will_run` = possible
+            // AND not manually toggled off. Only `!possible` is grayed out --
+            // a stage the user toggled off but that is still possible stays
+            // white, just with an empty box, so it reads as "possible, not
+            // currently planned" rather than "can't happen".
+            let possible = app.stage_selected_for_current_target(&stage);
+            let will_run = app.stage_enabled(&stage);
             let active = app.active_stage.as_deref() == Some(stage.as_str());
             let status = if active {
                 "active"
             } else if let Some(status) = status_by_stage.get(stage.as_str()) {
                 status
-            } else if enabled {
-                "pending"
-            } else {
+            } else if !possible {
                 "disabled"
+            } else if will_run {
+                "will_run"
+            } else {
+                "excluded"
             };
-            let (symbol, status_style) = cell_for_status(status, selected);
+            let (symbol, status_style) = cell_for_status(status);
             let mut style = if active {
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
             } else if matches!(status, "pass" | "fail" | "skipped" | "disabled") {
                 status_style
-            } else if enabled {
+            } else if possible {
                 Style::default().fg(Color::White)
             } else {
                 Style::default()
@@ -163,22 +194,23 @@ fn render_planned_with_statuses(
     }
 }
 
-/// `selected` only affects "pending" (possible, not yet run): the stage
-/// under the cursor gets a filled white box, every other possible stage
-/// gets an outline-only white box -- so only the one thing the cursor
-/// could act on right now reads as "about to run"; the rest just read as
-/// "possible" without visually competing with it.
-fn cell_for_status(status: &str, selected: bool) -> (&'static str, Style) {
+/// The box fill means one thing only: "will this run on the next live lab" --
+/// it does NOT track cursor position. `will_run` (possible + not manually
+/// toggled off) is the only filled-box state; `excluded` (possible, but the
+/// user toggled it off) stays white so it still reads as "could run", just
+/// not right now; `disabled` (impossible for this config -- wrong
+/// platform/role) is the only grayed-out state.
+fn cell_for_status(status: &str) -> (&'static str, Style) {
     match status {
         "pass" => ("[██]", Style::default().fg(Color::Green)),
         "fail" => ("[✗✗]", Style::default().fg(Color::Red)),
         "running" | "active" => (
-            "[▓▓]",
+            spinner_glyph(),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        // "disabled" = not part of the current plan (grayed out, empty box).
+        // "disabled" = genuinely impossible for this config (grayed out).
         "disabled" => (
             "[  ]",
             Style::default()
@@ -191,8 +223,8 @@ fn cell_for_status(status: &str, selected: bool) -> (&'static str, Style) {
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
         ),
-        "pending" if selected => ("[██]", Style::default().fg(Color::White)),
-        "pending" => ("[  ]", Style::default().fg(Color::White)),
+        "will_run" => ("[██]", Style::default().fg(Color::White)),
+        "excluded" => ("[  ]", Style::default().fg(Color::White)),
         _ => ("[░░]", Style::default().fg(Color::DarkGray)),
     }
 }
@@ -211,4 +243,57 @@ fn progress_bar_string(done: usize, total: usize, width: usize) -> String {
         "█".repeat(filled),
         "░".repeat(width.saturating_sub(filled))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spinner_starts_on_the_first_frame() {
+        assert_eq!(spinner_frame_for_elapsed_ms(0), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_frame_for_elapsed_ms(119), SPINNER_FRAMES[0]);
+    }
+
+    #[test]
+    fn spinner_advances_a_frame_every_120ms() {
+        assert_eq!(spinner_frame_for_elapsed_ms(120), SPINNER_FRAMES[1]);
+        assert_eq!(spinner_frame_for_elapsed_ms(240), SPINNER_FRAMES[2]);
+    }
+
+    #[test]
+    fn spinner_wraps_around_after_the_last_frame() {
+        let cycle_ms = 120 * SPINNER_FRAMES.len() as u128;
+        assert_eq!(spinner_frame_for_elapsed_ms(cycle_ms), SPINNER_FRAMES[0]);
+        assert_eq!(
+            spinner_frame_for_elapsed_ms(cycle_ms + 120),
+            SPINNER_FRAMES[1]
+        );
+    }
+
+    #[test]
+    fn cell_for_status_uses_a_spinner_glyph_for_a_running_stage() {
+        let (symbol, _) = cell_for_status("running");
+        assert!(SPINNER_FRAMES.contains(&symbol));
+        let (symbol, _) = cell_for_status("active");
+        assert!(SPINNER_FRAMES.contains(&symbol));
+    }
+
+    #[test]
+    fn will_run_is_filled_white_excluded_is_empty_white() {
+        let (symbol, style) = cell_for_status("will_run");
+        assert_eq!(symbol, "[██]");
+        assert_eq!(style.fg, Some(Color::White));
+
+        let (symbol, style) = cell_for_status("excluded");
+        assert_eq!(symbol, "[  ]");
+        assert_eq!(style.fg, Some(Color::White));
+    }
+
+    #[test]
+    fn disabled_is_the_only_grayed_out_empty_box() {
+        let (symbol, style) = cell_for_status("disabled");
+        assert_eq!(symbol, "[  ]");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+    }
 }
