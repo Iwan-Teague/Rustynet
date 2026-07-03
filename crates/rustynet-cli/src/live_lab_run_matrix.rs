@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
+#[cfg(not(unix))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -234,6 +235,7 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "windows_anchor_alias",
     "windows_anchor_node_id",
     "windows_anchor_target",
+    "row_role",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +243,29 @@ pub struct LiveLabRunMatrixStageOutcome {
     pub stage: String,
     pub status: String,
     pub artifacts: Vec<String>,
+}
+
+/// Which writer owns this row (Finding 2 of the 2026-07-03 live-lab
+/// findings). One physical run has two writers: the bash EXIT trap fires
+/// first (before the mac/win sidecar stages have run) and the outermost
+/// supervisor writes the complete record afterwards. The run key
+/// (report_dir, run_started_utc) plus this role give the RUN ownership of
+/// its row: a Final write replaces any earlier rows for the same key, an
+/// Interim write only lands when no row for the key exists yet (crash
+/// visibility without clobbering).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveLabRunMatrixRowRole {
+    Interim,
+    Final,
+}
+
+impl LiveLabRunMatrixRowRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            LiveLabRunMatrixRowRole::Interim => "interim",
+            LiveLabRunMatrixRowRole::Final => "final",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +276,7 @@ pub struct LiveLabRunMatrixAppendConfig<'a> {
     pub inventory_path: Option<&'a Path>,
     pub extra_stage_outcomes: &'a [LiveLabRunMatrixStageOutcome],
     pub notes: Option<String>,
+    pub row_role: LiveLabRunMatrixRowRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,6 +392,11 @@ pub fn execute_ops_append_orchestrator_run_to_matrix(
         inventory_path: config.inventory_path.as_deref(),
         extra_stage_outcomes: &[],
         notes,
+        // The bash EXIT trap fires before the wrapper's sidecar stages and
+        // overall verdict exist; its row is systematically optimistic
+        // (46 of 49 historical disagreements). Interim: kept only until —
+        // and unless — the supervisor's Final row lands for the same run.
+        row_role: LiveLabRunMatrixRowRole::Interim,
     })
 }
 
@@ -375,8 +406,14 @@ pub fn append_live_lab_run_matrix_row(
     let matrix_path = default_live_lab_run_matrix_path();
     let schema = ensure_matrix_schema(matrix_path.as_path())?;
     let values = build_live_lab_run_matrix_values(&schema, &config)?;
-    append_csv_row(matrix_path.as_path(), &schema, &values)?;
-    let report_row_path = write_report_local_row(config.report_dir, &schema, &values)?;
+    let written = upsert_csv_row(matrix_path.as_path(), &schema, &values, config.row_role)?;
+    let report_row_path = if written {
+        write_report_local_row(config.report_dir, &schema, &values)?
+    } else {
+        // An Interim write that found the run key already owned (by a
+        // Final row) must not clobber the report-local copy either.
+        report_local_row_path(config.report_dir)
+    };
     let run_id = values.get("run_id").cloned().unwrap_or_default();
     Ok(LiveLabRunMatrixAppendResult {
         matrix_path,
@@ -583,6 +620,12 @@ fn build_live_lab_run_matrix_values(
         &schema_set,
         "run_command",
         config.command_name.to_owned(),
+    );
+    set_if_present(
+        &mut values,
+        &schema_set,
+        "row_role",
+        config.row_role.as_str().to_owned(),
     );
     set_if_present(
         &mut values,
@@ -1567,41 +1610,108 @@ fn acquire_matrix_append_lock(lock_path: &Path) -> Result<MatrixAppendLock, Stri
     }
 }
 
-fn append_csv_row(
+/// Insert or replace this run's row under the append lock (Finding 2:
+/// upsert-by-run-key). The natural key is (report_dir, run_started_utc);
+/// a Final row replaces every earlier row for the key, an Interim row
+/// lands only when the key is not yet owned. A degenerate key (either
+/// component empty) falls back to plain append — never guess ownership.
+/// Returns whether the row was written.
+fn upsert_csv_row(
     path: &Path,
     schema: &[String],
     values: &BTreeMap<String, String>,
-) -> Result<(), String> {
-    // Serialize the read→normalize→append against concurrent live-lab runs
-    // appending to the same shared matrix. Held (RAII) until this fn returns.
+    row_role: LiveLabRunMatrixRowRole,
+) -> Result<bool, String> {
+    // Serialize the read→match→rewrite against concurrent live-lab runs
+    // touching the same shared matrix. Held (RAII) until this fn returns.
     let _lock = acquire_matrix_append_lock(matrix_lock_path_for(path).as_path())?;
-    let mut body = fs::read_to_string(path).map_err(|err| {
+    let body = fs::read_to_string(path).map_err(|err| {
         format!(
             "read live-lab run matrix failed ({}): {err}",
             path.display()
         )
     })?;
-    if !body.ends_with('\n') {
-        body.push('\n');
-        fs::write(path, body).map_err(|err| {
-            format!(
-                "normalize live-lab run matrix newline failed ({}): {err}",
-                path.display()
-            )
-        })?;
+    let mut lines = body.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| format!("live-lab run matrix is empty: {}", path.display()))?;
+    let header_columns = parse_csv_record(header)?;
+    let column_index = |name: &str| header_columns.iter().position(|column| column == name);
+    let report_dir_index = column_index("report_dir");
+    let started_index = column_index("run_started_utc");
+    let key_report_dir = values.get("report_dir").map(String::as_str).unwrap_or("");
+    let key_started = values
+        .get("run_started_utc")
+        .map(String::as_str)
+        .unwrap_or("");
+    let degenerate_key = key_report_dir.is_empty() || key_started.is_empty();
+
+    let mut retained: Vec<&str> = Vec::new();
+    let mut key_owned = false;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let matches_key = !degenerate_key
+            && match parse_csv_record(line) {
+                Ok(fields) => {
+                    let field = |index: Option<usize>| {
+                        index
+                            .and_then(|index| fields.get(index))
+                            .map(String::as_str)
+                            .unwrap_or("")
+                    };
+                    field(report_dir_index) == key_report_dir && field(started_index) == key_started
+                }
+                // A malformed row is never treated as a match — and never
+                // destroyed.
+                Err(_) => false,
+            };
+        if matches_key {
+            key_owned = true;
+            if row_role == LiveLabRunMatrixRowRole::Final {
+                // Replaced by the new Final row below.
+                continue;
+            }
+        }
+        retained.push(line);
     }
-    let mut file = OpenOptions::new().append(true).open(path).map_err(|err| {
+    if row_role == LiveLabRunMatrixRowRole::Interim && key_owned {
+        // A row (interim from a retry, or the supervisor's final) already
+        // owns this run key; the trap's optimistic record must not land.
+        return Ok(false);
+    }
+
+    let mut out = String::with_capacity(body.len() + 1024);
+    out.push_str(header);
+    out.push('\n');
+    for line in retained {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(render_csv_row(schema, values).as_str());
+    out.push('\n');
+    let tmp_path = {
+        let mut os = path.as_os_str().to_os_string();
+        os.push(".tmp");
+        PathBuf::from(os)
+    };
+    fs::write(tmp_path.as_path(), out).map_err(|err| {
         format!(
-            "open live-lab run matrix failed ({}): {err}",
+            "write live-lab run matrix tmp failed ({}): {err}",
+            tmp_path.display()
+        )
+    })?;
+    fs::rename(tmp_path.as_path(), path).map_err(|err| {
+        format!(
+            "replace live-lab run matrix failed ({}): {err}",
             path.display()
         )
     })?;
-    writeln!(file, "{}", render_csv_row(schema, values)).map_err(|err| {
-        format!(
-            "append live-lab run matrix failed ({}): {err}",
-            path.display()
-        )
-    })
+    Ok(true)
+}
+fn report_local_row_path(report_dir: &Path) -> PathBuf {
+    report_dir.join("state/live_lab_run_matrix_row.csv")
 }
 
 fn write_report_local_row(
@@ -1609,7 +1719,7 @@ fn write_report_local_row(
     schema: &[String],
     values: &BTreeMap<String, String>,
 ) -> Result<PathBuf, String> {
-    let path = report_dir.join("state/live_lab_run_matrix_row.csv");
+    let path = report_local_row_path(report_dir);
     let parent = path
         .parent()
         .ok_or_else(|| format!("matrix row path has no parent: {}", path.display()))?;
@@ -2157,8 +2267,13 @@ mod tests {
                 thread::spawn(move || {
                     let mut values = BTreeMap::new();
                     values.insert("run_id".to_string(), format!("row-{i:02}"));
-                    super::append_csv_row(csv.as_path(), schema.as_slice(), &values)
-                        .expect("append under lock");
+                    super::upsert_csv_row(
+                        csv.as_path(),
+                        schema.as_slice(),
+                        &values,
+                        super::LiveLabRunMatrixRowRole::Final,
+                    )
+                    .expect("append under lock");
                 })
             })
             .collect();
@@ -2237,6 +2352,7 @@ mod tests {
                 inventory_path: None,
                 extra_stage_outcomes: extra.as_slice(),
                 notes: None,
+                row_role: super::LiveLabRunMatrixRowRole::Final,
             },
         )
         .expect("values");
@@ -2319,6 +2435,7 @@ mod tests {
                 inventory_path: None,
                 extra_stage_outcomes: stages.as_slice(),
                 notes: None,
+                row_role: super::LiveLabRunMatrixRowRole::Final,
             },
         )
         .expect("values");
@@ -2757,5 +2874,191 @@ mod registry_equivalence_tests {
                 "platforms_for_stage diverged for {bare}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod upsert_tests {
+    //! Finding 2: the run — not the code path — owns its matrix row.
+    //! (report_dir, run_started_utc) is the natural key; interim rows are
+    //! crash-visibility records that a final row replaces.
+
+    use super::{LiveLabRunMatrixRowRole, parse_csv_record, upsert_csv_row};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn schema() -> Vec<String> {
+        [
+            "run_id",
+            "run_started_utc",
+            "report_dir",
+            "overall_result",
+            "row_role",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    fn row_values(
+        run_id: &str,
+        started: &str,
+        report_dir: &str,
+        result: &str,
+        role: LiveLabRunMatrixRowRole,
+    ) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        values.insert("run_id".to_owned(), run_id.to_owned());
+        values.insert("run_started_utc".to_owned(), started.to_owned());
+        values.insert("report_dir".to_owned(), report_dir.to_owned());
+        values.insert("overall_result".to_owned(), result.to_owned());
+        values.insert("row_role".to_owned(), role.as_str().to_owned());
+        values
+    }
+
+    fn temp_matrix(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "upsert_matrix_{name}_{}_{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::write(&path, format!("{}\n", schema().join(","))).expect("seed matrix header");
+        path
+    }
+
+    fn data_rows(path: &PathBuf) -> Vec<Vec<String>> {
+        let body = fs::read_to_string(path).expect("read matrix");
+        body.lines()
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| parse_csv_record(line).expect("parse row"))
+            .collect()
+    }
+
+    #[test]
+    fn final_row_replaces_interim_row_for_same_run_key() {
+        let path = temp_matrix("final_replaces");
+        let schema = schema();
+        let interim = row_values(
+            "run-a",
+            "2026-07-03T10:00:00Z",
+            "/tmp/report-a",
+            "pass", // the trap's systematically optimistic verdict
+            LiveLabRunMatrixRowRole::Interim,
+        );
+        assert!(
+            upsert_csv_row(&path, &schema, &interim, LiveLabRunMatrixRowRole::Interim)
+                .expect("interim write")
+        );
+        let complete = row_values(
+            "run-a",
+            "2026-07-03T10:00:00Z",
+            "/tmp/report-a",
+            "fail", // the supervisor saw the sidecar failures
+            LiveLabRunMatrixRowRole::Final,
+        );
+        assert!(
+            upsert_csv_row(&path, &schema, &complete, LiveLabRunMatrixRowRole::Final)
+                .expect("final write")
+        );
+        let rows = data_rows(&path);
+        assert_eq!(rows.len(), 1, "one row per run: {rows:?}");
+        assert_eq!(rows[0][3], "fail");
+        assert_eq!(rows[0][4], "final");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn interim_never_lands_on_an_owned_run_key() {
+        let path = temp_matrix("interim_skips");
+        let schema = schema();
+        let complete = row_values(
+            "run-a",
+            "2026-07-03T10:00:00Z",
+            "/tmp/report-a",
+            "fail",
+            LiveLabRunMatrixRowRole::Final,
+        );
+        assert!(
+            upsert_csv_row(&path, &schema, &complete, LiveLabRunMatrixRowRole::Final)
+                .expect("final write")
+        );
+        let stale_trap = row_values(
+            "run-a",
+            "2026-07-03T10:00:00Z",
+            "/tmp/report-a",
+            "pass",
+            LiveLabRunMatrixRowRole::Interim,
+        );
+        assert!(
+            !upsert_csv_row(
+                &path,
+                &schema,
+                &stale_trap,
+                LiveLabRunMatrixRowRole::Interim
+            )
+            .expect("interim attempt"),
+            "interim write must be skipped when the key is owned"
+        );
+        let rows = data_rows(&path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][3], "fail");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn distinct_run_keys_do_not_interfere() {
+        let path = temp_matrix("distinct_keys");
+        let schema = schema();
+        for (run, started, dir) in [
+            ("run-a", "2026-07-03T10:00:00Z", "/tmp/report-a"),
+            ("run-b", "2026-07-03T11:00:00Z", "/tmp/report-b"),
+            // same dir, different start = a later reuse of the report dir
+            ("run-c", "2026-07-03T12:00:00Z", "/tmp/report-a"),
+        ] {
+            let values = row_values(run, started, dir, "pass", LiveLabRunMatrixRowRole::Final);
+            assert!(
+                upsert_csv_row(&path, &schema, &values, LiveLabRunMatrixRowRole::Final)
+                    .expect("write")
+            );
+        }
+        assert_eq!(data_rows(&path).len(), 3);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn degenerate_key_falls_back_to_plain_append() {
+        let path = temp_matrix("degenerate");
+        let schema = schema();
+        // No run_started_utc (e.g. a run that recorded no stages): ownership
+        // cannot be established, so both writes append — never guess.
+        let first = row_values(
+            "run-a",
+            "",
+            "/tmp/report-a",
+            "unknown",
+            LiveLabRunMatrixRowRole::Interim,
+        );
+        let second = row_values(
+            "run-a",
+            "",
+            "/tmp/report-a",
+            "unknown",
+            LiveLabRunMatrixRowRole::Final,
+        );
+        assert!(
+            upsert_csv_row(&path, &schema, &first, LiveLabRunMatrixRowRole::Interim)
+                .expect("first write")
+        );
+        assert!(
+            upsert_csv_row(&path, &schema, &second, LiveLabRunMatrixRowRole::Final)
+                .expect("second write")
+        );
+        assert_eq!(data_rows(&path).len(), 2);
+        let _ = fs::remove_file(&path);
     }
 }

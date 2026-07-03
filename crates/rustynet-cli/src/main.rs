@@ -7702,6 +7702,8 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
                 inventory_path: None,
                 extra_stage_outcomes: &[outcome],
                 notes: None,
+                // Focused single-stage evidence rows have one writer: final.
+                row_role: live_lab_run_matrix::LiveLabRunMatrixRowRole::Final,
             };
             live_lab_run_matrix::append_live_lab_run_matrix_row(config)
                 .map(|r| format!("appended row run_id={}", r.run_id))
