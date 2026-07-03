@@ -3,7 +3,15 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Load `documents/operations/live_lab_stage_timings.csv` and compute
-/// P50 (median) duration_secs per stage name (pass rows only).
+/// P90 duration_secs per stage name over ALL terminal outcomes.
+///
+/// Finding 6: the old pass-only P50 starved exactly the stages an
+/// operator iterates on (a stage failing at 20 minutes forever kept its
+/// 300s cold-start estimate), and half of healthy runs exceed a P50 by
+/// definition — the wrong statistic for an "overdue" signal. Failed and
+/// timed-out attempts are real evidence of how long the stage occupies
+/// the pipeline; skipped rows (near-zero durations) are excluded so they
+/// cannot drag the estimate down.
 pub fn load_stage_timings(repo_root: &Path) -> Result<HashMap<String, u64>> {
     let path = repo_root.join("documents/operations/live_lab_stage_timings.csv");
     if !path.exists() {
@@ -21,7 +29,10 @@ pub fn load_stage_timings(repo_root: &Path) -> Result<HashMap<String, u64>> {
             Ok(r) => r,
             Err(_) => continue,
         };
-        if record.outcome != "pass" {
+        if matches!(
+            record.outcome.as_str(),
+            "skip" | "skipped" | "not_run" | "na"
+        ) {
             continue;
         }
         let secs = record.duration_secs.unwrap_or(0);
@@ -30,20 +41,18 @@ pub fn load_stage_timings(repo_root: &Path) -> Result<HashMap<String, u64>> {
         }
     }
 
-    let mut p50: HashMap<String, u64> = HashMap::new();
+    let mut p90: HashMap<String, u64> = HashMap::new();
     for (stage, mut durs) in durations {
         durs.sort_unstable();
-        let median = if durs.is_empty() {
-            60
-        } else if durs.len() % 2 == 0 {
-            (durs[durs.len() / 2 - 1] + durs[durs.len() / 2]) / 2
-        } else {
-            durs[durs.len() / 2]
-        };
-        p50.insert(stage, median);
+        if durs.is_empty() {
+            continue;
+        }
+        // P90 = smallest value covering >= 90% of observations.
+        let index = (durs.len() * 9).div_ceil(10).saturating_sub(1);
+        p90.insert(stage, durs[index.min(durs.len() - 1)]);
     }
 
-    Ok(p50)
+    Ok(p90)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -72,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn p50_empty() {
+    fn p90_empty() {
         let dir = tempfile::tempdir().unwrap();
         write_timing_csv(
             dir.path(),
@@ -83,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn p50_single_stage() {
+    fn p90_single_stage() {
         let dir = tempfile::tempdir().unwrap();
         let content = "\
 timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
@@ -94,22 +103,33 @@ timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
         write_timing_csv(dir.path(), content);
 
         let map = load_stage_timings(dir.path()).unwrap();
-        assert_eq!(map.get("bootstrap"), Some(&160));
+        // sorted [120, 160, 180]; ceil(3*0.9)=3rd value.
+        assert_eq!(map.get("bootstrap"), Some(&180));
     }
 
     #[test]
-    fn p50_median_calc() {
+    fn p90_uses_all_terminal_outcomes_and_excludes_skips() {
         let dir = tempfile::tempdir().unwrap();
+        // A stage that keeps FAILING at ~1200s must not sit at a
+        // cold-start estimate forever (the old pass-only filter), and a
+        // skipped row's ~0s must not drag the estimate down.
         let content = "\
 timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
 2024-01-01T00:00:00Z,abc,no,anchor,,100,pass
 2024-01-01T00:00:00Z,abc,no,anchor,,200,pass
 2024-01-01T00:00:00Z,abc,no,anchor,,300,pass
-2024-01-01T00:00:00Z,abc,no,anchor,,400,pass
+2024-01-01T00:00:00Z,abc,no,anchor,,400,fail
+2024-01-01T00:00:00Z,abc,no,anchor,,1,skipped
+2024-01-01T00:00:00Z,abc,no,flaky,,1200,fail
+2024-01-01T00:00:00Z,abc,no,flaky,,1180,fail
 ";
         write_timing_csv(dir.path(), content);
 
         let map = load_stage_timings(dir.path()).unwrap();
-        assert_eq!(map.get("anchor"), Some(&250));
+        // anchor: sorted [100,200,300,400], ceil(4*0.9)=4th value = 400 —
+        // the fail row counts, the skipped row does not.
+        assert_eq!(map.get("anchor"), Some(&400));
+        // flaky (never passed): now has a real estimate instead of none.
+        assert_eq!(map.get("flaky"), Some(&1200));
     }
 }

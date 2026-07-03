@@ -191,6 +191,11 @@ pub struct App {
     /// edits; replaced when a run with a different report dir starts.
     run_manifest: Option<crate::data::stage_manifest::RunStageManifest>,
     run_manifest_dir: Option<PathBuf>,
+    /// The previous run ended without a recorded ending: its job JSON
+    /// still claims `running` but the PID is dead. Rendered as CRASHED in
+    /// the header while idle (finding 3's monitor half) — previously
+    /// indistinguishable from a clean IDLE.
+    pub last_run_crashed: bool,
 }
 
 /// Which stage's log is most useful to show once a run goes idle: the
@@ -289,6 +294,7 @@ impl App {
             last_vm_probe: None,
             run_manifest: None,
             run_manifest_dir: None,
+            last_run_crashed: false,
         };
         app.prune_unknown_disabled_stages();
         Ok(app)
@@ -343,12 +349,35 @@ impl App {
             .sum()
     }
 
+    /// Stage time budget: max(floor, P90-of-terminal-history x 1.2 slack).
+    /// The floor is the run manifest's cold-start budget when present
+    /// (shared with the orchestrator side), else the hand-tuned defaults.
+    /// P90 over ALL terminal outcomes replaces the old pass-only P50: the
+    /// stages with no passing history are exactly the new cells an
+    /// operator iterates on, and half of HEALTHY runs exceed a P50 by
+    /// definition — the wrong statistic for an "overdue" signal
+    /// (finding 6).
     fn estimate_stage_secs(&self, stage: &str) -> u64 {
-        self.stage_timings
+        let floor = self
+            .run_manifest
+            .as_ref()
+            .and_then(|manifest| {
+                manifest
+                    .stages
+                    .iter()
+                    .find(|entry| entry.name == stage)
+                    .map(|entry| entry.budget_secs)
+            })
+            .filter(|secs| *secs > 0)
+            .unwrap_or_else(|| default_stage_secs(stage));
+        let history = self
+            .stage_timings
             .get(stage)
             .copied()
             .filter(|secs| *secs > 0)
-            .unwrap_or_else(|| default_stage_secs(stage))
+            .map(|p90| p90.saturating_mul(6) / 5)
+            .unwrap_or(0);
+        floor.max(history)
     }
 
     fn ensure_active_stage_visible(&mut self) {
@@ -829,6 +858,7 @@ impl App {
                         self.configure_target(&role, &platform, None);
                     }
                 }
+                self.last_run_crashed = false;
                 let report_dir = self.repo_root.join(&job.report_dir);
                 // Adopt the run's own stage manifest as it appears. A new
                 // report dir resets the held manifest; while the dir is
@@ -868,6 +898,14 @@ impl App {
             }
             Ok(None) => {
                 if let Some(prev_job) = self.active_job.take() {
+                    // The job left the active scan. If its JSON still says
+                    // `running`, the PID died without the worker recording
+                    // an ending — crashed/abandoned, not done.
+                    self.last_run_crashed = crate::data::job_watcher::job_state_by_id(
+                        &self.repo_root,
+                        &prev_job.job_id,
+                    )
+                    .is_some_and(|job| job.state == "running");
                     // Do one final read to replace any synthetic "running" entries
                     // with the definitive pass/fail outcomes before going idle.
                     let report_dir = self.repo_root.join(&prev_job.report_dir);

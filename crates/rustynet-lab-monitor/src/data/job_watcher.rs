@@ -44,6 +44,36 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
+/// Finding 3 (monitor half): re-read a specific job's state JSON by id,
+/// regardless of PID liveness. `find_active_job` silently filters out a
+/// job whose JSON still claims `running` but whose PID is dead — exactly
+/// the crashed/abandoned case the operator most needs to see. Callers
+/// compare: invisible to the active scan + JSON still `running` = the run
+/// ended abnormally without a recorded ending.
+pub fn job_state_by_id(repo_root: &Path, job_id: &str) -> Option<JobState> {
+    for dir in [
+        repo_root.join("state/deepseek-mcp-jobs"),
+        repo_root.join("state/lab-monitor-jobs"),
+    ] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(raw) = std::fs::read_to_string(&path)
+                && let Ok(job) = serde_json::from_str::<JobState>(&raw)
+                && job.job_id == job_id
+            {
+                return Some(job);
+            }
+        }
+    }
+    None
+}
+
 /// Scan job state dirs for *.json files, return the most-recently-started
 /// running job, or None.
 pub fn find_active_job(repo_root: &Path) -> Result<Option<JobState>> {
