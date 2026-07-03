@@ -22,6 +22,35 @@ import argparse, json, os, re, select, subprocess, sys, time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 JOB_RE = re.compile(r"\b(?:triage|labrun|docsync|recover)-\d+(?:-\d+)*\b")  # deepseek async job ids (incl. -millis-pid-seq)
+LIVE_LAB_LAUNCH_TOOLS = {
+    "deepseek_lab_run",
+    "deepseek_autonomous_live_lab_loop",
+}
+
+
+def sandbox_network_disabled() -> bool:
+    return os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1"
+
+
+def allow_sandboxed_live_lab() -> bool:
+    return os.environ.get("RUSTYNET_ALLOW_SANDBOXED_LIVE_LAB") == "1"
+
+
+def refuse_sandboxed_live_lab(tool: str) -> bool:
+    if tool not in LIVE_LAB_LAUNCH_TOOLS:
+        return False
+    if not sandbox_network_disabled() or allow_sandboxed_live_lab():
+        return False
+    print(
+        f"{tool} refused: CODEX_SANDBOX_NETWORK_DISABLED=1. "
+        "Live labs need host LAN/SSH/UTM access and will fail at "
+        "verify_ssh_reachability from this sandbox. Re-run this command "
+        "with Codex escalation / outside the sandbox. Set "
+        "RUSTYNET_ALLOW_SANDBOXED_LIVE_LAB=1 only for an intentional "
+        "negative test.",
+        file=sys.stderr,
+    )
+    return True
 
 
 def main() -> int:
@@ -43,6 +72,8 @@ def main() -> int:
         tool_args = json.loads(a.args)
     except json.JSONDecodeError as e:
         print(f"--args is not valid JSON: {e}", file=sys.stderr)
+        return 2
+    if refuse_sandboxed_live_lab(a.tool):
         return 2
 
     p = subprocess.Popen([binpath], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
