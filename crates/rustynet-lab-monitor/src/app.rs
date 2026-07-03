@@ -525,9 +525,11 @@ impl App {
         if matches!(
             stage,
             "bootstrap_windows_host"
-                | "collect_windows_pubkey"
                 | "amend_membership_for_windows"
-                | "distribute_windows_bundles"
+                | "stage_windows_bundles_for_distribution"
+                | "distribute_windows_membership"
+                | "issue_windows_assignment"
+                | "distribute_windows_assignment"
                 | "validate_windows_mesh_join"
         ) {
             return self.config.wants_windows();
@@ -574,7 +576,8 @@ impl App {
         }
         if matches!(
             stage,
-            "validate_windows_exit_nat_lifecycle"
+            "promote_windows_exit_active"
+                | "validate_windows_exit_nat_lifecycle"
                 | "validate_windows_exit_dns_failclosed"
                 | "validate_windows_exit_killswitch_precedence"
         ) {
@@ -588,6 +591,40 @@ impl App {
         }
         if stage == "validate_windows_admin_issue" {
             return self.config.admin_platform == "windows";
+        }
+        // Per-OS audit families run whenever that guest participates.
+        if matches!(
+            stage,
+            "validate_macos_membership_revoke_applies"
+                | "validate_macos_membership_signature_forgery"
+                | "validate_macos_gossip_revoked_readmit"
+                | "validate_macos_enrollment_replay"
+                | "validate_macos_hello_limiter_flood"
+                | "validate_macos_runtime_acls"
+                | "validate_macos_service_hardening"
+                | "validate_macos_mesh_status"
+                | "validate_macos_authenticode"
+                | "validate_macos_privileged_helper_allowlist"
+                | "validate_macos_policy_default_deny"
+                | "validate_macos_revoked_peer_denied_e2e"
+                | "validate_macos_blind_exit_reversal_denied"
+        ) {
+            return self.config.wants_macos();
+        }
+        if matches!(
+            stage,
+            "validate_windows_membership_revoke_applies"
+                | "validate_windows_membership_signature_forgery"
+                | "validate_windows_gossip_revoked_readmit"
+                | "validate_windows_enrollment_replay"
+                | "validate_windows_hello_limiter_flood"
+                | "validate_windows_mesh_status"
+                | "validate_windows_privileged_helper_allowlist"
+                | "validate_windows_policy_default_deny"
+                | "validate_windows_revoked_peer_denied_e2e"
+                | "validate_windows_blind_exit_reversal_denied"
+        ) {
+            return self.config.wants_windows();
         }
         if stage == "linux_live_suite" {
             return !self.config.skip_linux_live_suite;
@@ -646,10 +683,18 @@ impl App {
         );
         bootstrap.extend(
             [
+                // The real Windows sidecar pipeline, in dispatch order.
+                // `collect_windows_pubkey` and `distribute_windows_bundles`
+                // were phantoms: they never existed in executing code
+                // (2026-07-03 findings, finding 1) — the real stages are
+                // the bundle staging + membership/assignment distribution
+                // quartet below.
                 "bootstrap_windows_host",
-                "collect_windows_pubkey",
                 "amend_membership_for_windows",
-                "distribute_windows_bundles",
+                "stage_windows_bundles_for_distribution",
+                "distribute_windows_membership",
+                "issue_windows_assignment",
+                "distribute_windows_assignment",
                 "validate_windows_mesh_join",
             ]
             .into_iter()
@@ -1930,6 +1975,23 @@ fn macos_live_lab_catalog() -> &'static [&'static str] {
         "validate_macos_admin_issue",
         "validate_macos_blind_exit",
         "validate_macos_key_custody",
+        // macOS one-off security/protocol audit stages (same shape as the
+        // linux catalog below). These really run and really fail runs —
+        // several appear as first_failed_stage values in the run matrix;
+        // before 2026-07-03 they had no cell anywhere in this UI.
+        "validate_macos_membership_revoke_applies",
+        "validate_macos_membership_signature_forgery",
+        "validate_macos_gossip_revoked_readmit",
+        "validate_macos_enrollment_replay",
+        "validate_macos_hello_limiter_flood",
+        "validate_macos_runtime_acls",
+        "validate_macos_service_hardening",
+        "validate_macos_mesh_status",
+        "validate_macos_authenticode",
+        "validate_macos_privileged_helper_allowlist",
+        "validate_macos_policy_default_deny",
+        "validate_macos_revoked_peer_denied_e2e",
+        "validate_macos_blind_exit_reversal_denied",
     ]
 }
 
@@ -1947,6 +2009,18 @@ fn windows_live_lab_catalog() -> &'static [&'static str] {
         "validate_windows_relay_service_lifecycle",
         "validate_windows_anchor_bundle_pull",
         "validate_windows_admin_issue",
+        // Windows audit family — see the macOS catalog note above.
+        "promote_windows_exit_active",
+        "validate_windows_membership_revoke_applies",
+        "validate_windows_membership_signature_forgery",
+        "validate_windows_gossip_revoked_readmit",
+        "validate_windows_enrollment_replay",
+        "validate_windows_hello_limiter_flood",
+        "validate_windows_mesh_status",
+        "validate_windows_privileged_helper_allowlist",
+        "validate_windows_policy_default_deny",
+        "validate_windows_revoked_peer_denied_e2e",
+        "validate_windows_blind_exit_reversal_denied",
     ]
 }
 
@@ -2003,6 +2077,15 @@ fn group_name_for_stage(stage: &str) -> &'static str {
         )
     {
         "PRE"
+    } else if stage.ends_with("_mesh_join") {
+        // validate_{windows,macos}_mesh_join close the per-OS bootstrap
+        // stream (matches planned_stage_groups).
+        "BOOTSTRAP"
+    } else if stage.starts_with("validate_") && stage != "validate_baseline_runtime" {
+        // Audit/validator stages are LIVE LAB even when their names
+        // contain bootstrap-flavored words (validate_*_membership_* would
+        // otherwise be swallowed by the contains("membership") arm below).
+        "LIVE LAB"
     } else if stage.contains("bootstrap")
         || stage.contains("membership")
         || stage.contains("distribute")
@@ -2011,8 +2094,8 @@ fn group_name_for_stage(stage: &str) -> &'static str {
         || stage.contains("dns_zone")
         || stage.contains("baseline")
         || stage.contains("pubkey")
+        || stage.contains("bundles")
         || stage == "enforce_baseline_runtime"
-        || stage == "validate_baseline_runtime"
     {
         "BOOTSTRAP"
     } else {
@@ -2308,10 +2391,10 @@ mod tests {
         assert_eq!(sections[0], (5, 5), "PRE fully passed before BOOTSTRAP");
         assert_eq!(
             sections[1],
-            (14, 19),
+            (14, 21),
             "14 BOOTSTRAP steps (9 base + 5 macos) precede bootstrap_windows_host"
         );
-        assert_eq!(sections[2], (0, 40), "LIVE LAB never reached");
+        assert_eq!(sections[2], (0, 64), "LIVE LAB never reached");
     }
 
     #[test]
@@ -2324,10 +2407,10 @@ mod tests {
         assert_eq!(sections[0], (5, 5));
         assert_eq!(
             sections[1],
-            (9, 19),
+            (9, 21),
             "the 9 base BOOTSTRAP steps precede bootstrap_macos_host"
         );
-        assert_eq!(sections[2], (0, 40));
+        assert_eq!(sections[2], (0, 64));
     }
 
     #[test]
@@ -2349,8 +2432,8 @@ mod tests {
             (2, 5),
             "only preflight + prepare_source_archive precede it"
         );
-        assert_eq!(sections[1], (0, 19), "BOOTSTRAP never reached");
-        assert_eq!(sections[2], (0, 40), "LIVE LAB never reached");
+        assert_eq!(sections[1], (0, 21), "BOOTSTRAP never reached");
+        assert_eq!(sections[2], (0, 64), "LIVE LAB never reached");
     }
 
     #[test]
@@ -2416,9 +2499,10 @@ mod tests {
             Some(1),
             "bootstrap_windows_host must be attributed to BOOTSTRAP"
         );
-        assert_eq!(run.section_stages, [(5, 5), (14, 19), (0, 40)]);
+        assert_eq!(run.section_stages, [(5, 5), (14, 21), (0, 64)]);
         assert_eq!(run.subset_passed_stages, 19);
-        assert_eq!(run.subset_total_stages, 64);
+        // 5 PRE + 21 BOOTSTRAP + 64 LIVE LAB after the catalog heal.
+        assert_eq!(run.subset_total_stages, 90);
         assert_eq!(
             run.total_stages, original_total_stages,
             "total_stages is the CSV-column project catalog size and must \
@@ -3412,7 +3496,9 @@ mod tests {
         // is now a real, always-listed LIVE LAB stage (previously missing
         // from macos_live_lab_catalog entirely), and it's enabled here via
         // macos_promote_exit -> wants_macos().
-        assert_eq!(labels[2], ("LAB", "21m".to_owned()));
+        // 21m of role-cell stages + the 13 macOS audit stages (180s
+        // defaults each) that really run on a macOS-guest lab: 1h0m.
+        assert_eq!(labels[2], ("LAB", "1h0m".to_owned()));
     }
 
     #[test]
