@@ -40,6 +40,12 @@ impl Role {
             Role::Llm,
         ]
     }
+
+    /// Inverse of `label` -- `None` for anything that isn't a known role
+    /// label (e.g. VM Status's "-" placeholder for "no role assigned").
+    pub fn from_label(label: &str) -> Option<Role> {
+        Role::all().into_iter().find(|role| role.label() == label)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -64,6 +70,15 @@ impl Os {
 
     pub fn all() -> [Os; 3] {
         [Os::Linux, Os::Macos, Os::Windows]
+    }
+
+    /// Inverse of `label` -- `None` for anything that isn't one of the 3
+    /// known platform strings (e.g. VM Status's `VmStatus::platform`, which
+    /// is always one of "linux"/"macos"/"windows" per
+    /// `vm_prober::infer_platform`, but defensively `None` rather than
+    /// panicking if that ever changes).
+    pub fn from_label(label: &str) -> Option<Os> {
+        Os::all().into_iter().find(|os| os.label() == label)
     }
 }
 
@@ -372,6 +387,66 @@ fn is_oneoff_check_column(header: &str) -> bool {
     }
 }
 
+/// Collapses rows that describe the SAME physical orchestrator invocation
+/// written twice, keeping only the later (more complete) one.
+///
+/// The orchestrator has two CSV-writing code paths that both fire for a
+/// single run: a narrower `live-linux-lab-orchestrator` writer appends a
+/// Linux-only summary first, then the comprehensive
+/// `vm-lab-orchestrate-live-lab` writer appends the full cross-OS result
+/// right after -- same `report_dir`, same `run_started_utc`/
+/// `run_finished_utc` (an actual re-invocation would have different
+/// start/finish times even against the same report_dir; several report_dir
+/// values are legitimately reused across many distinct retries over time,
+/// each with its own timestamps, so report_dir alone is NOT a safe key).
+/// When the two disagree, the narrow writer's row always reads "pass"
+/// (it never saw the Windows/cross-OS stages that later failed), which
+/// otherwise shows up in the Previous Runs panel as a phantom extra "run"
+/// sitting right next to the real, complete result for the exact same
+/// invocation. Verified against the full run-matrix history: of 243
+/// (report_dir, started, finished) groups, 119 have exactly 2 rows, always
+/// in (live-linux-lab-orchestrator, vm-lab-orchestrate-live-lab) order,
+/// and the later row always has >= as many decisive pass/fail columns as
+/// the earlier one -- so "keep the last-seen row per key" is safe. Rows
+/// missing any of the three key fields (older CSV schema) are left
+/// untouched, each counted as its own unique row.
+fn dedupe_same_invocation_rows(
+    rows: Vec<csv::StringRecord>,
+    headers: &csv::StringRecord,
+) -> Vec<csv::StringRecord> {
+    let report_dir_idx = headers.iter().position(|h| h == "report_dir");
+    let started_idx = headers.iter().position(|h| h == "run_started_utc");
+    let finished_idx = headers.iter().position(|h| h == "run_finished_utc");
+
+    let mut deduped: Vec<csv::StringRecord> = Vec::with_capacity(rows.len());
+    let mut key_to_idx: HashMap<(String, String, String), usize> = HashMap::new();
+
+    for row in rows {
+        let key = (|| {
+            let rd = row.get(report_dir_idx?)?.trim();
+            let started = row.get(started_idx?)?.trim();
+            let finished = row.get(finished_idx?)?.trim();
+            if rd.is_empty() || started.is_empty() || finished.is_empty() {
+                return None;
+            }
+            Some((rd.to_owned(), started.to_owned(), finished.to_owned()))
+        })();
+
+        let existing_idx = key.as_ref().and_then(|k| key_to_idx.get(k).copied());
+        match existing_idx {
+            Some(idx) => deduped[idx] = row,
+            None => {
+                if let Some(k) = key {
+                    key_to_idx.insert(k, deduped.len());
+                }
+                deduped.push(row);
+            }
+        }
+    }
+
+    deduped
+}
+
 pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
     let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
     if !path.exists() {
@@ -417,6 +492,8 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
             Err(_) => continue,
         }
     }
+
+    let rows = dedupe_same_invocation_rows(rows, &headers);
 
     let start = rows.len().saturating_sub(n);
     let summaries: Vec<RunSummary> = rows[start..]
@@ -1079,6 +1156,39 @@ mod tests {
         assert_eq!(runs[0].passed_stages, 6);
         assert_eq!(runs[0].total_stages, 6);
         assert_eq!(runs[0].last_passed_stage, "macos_stage_anchor");
+    }
+
+    #[test]
+    fn recent_runs_collapses_the_same_invocation_written_by_two_orchestrator_paths() {
+        // Real-world regression: the orchestrator has two CSV-writing code
+        // paths that both fire for a single physical run -- a narrower
+        // `live-linux-lab-orchestrator` writer appends a Linux-only "pass"
+        // summary first, then the comprehensive `vm-lab-orchestrate-live-lab`
+        // writer appends the true, full cross-OS result right after. Same
+        // report_dir, same run_started_utc/run_finished_utc -- a real
+        // re-invocation would have different start/finish times even
+        // against a reused report_dir. Without deduping, Previous Runs
+        // showed the phantom "pass" row as if it were a distinct earlier
+        // run, sitting right next to the real failing result for the exact
+        // same invocation.
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "run_id,report_dir,run_started_utc,run_finished_utc,git_commit,overall_result,first_failed_stage,windows_stage_bootstrap,windows_hello_limiter_flood\n\
+             run-old,other-dir,2026-01-01T00:00:00Z,2026-01-01T01:00:00Z,ccc3333,pass,,pass,pass\n\
+             run-narrow,shared-dir,2026-07-03T10:16:28Z,2026-07-03T10:43:15Z,aaa1111,pass,,,\n\
+             run-full,shared-dir,2026-07-03T10:16:28Z,2026-07-03T10:43:15Z,aaa1111,fail,windows_hello_limiter_flood,pass,fail\n",
+        );
+
+        let runs = load_recent_runs(dir.path(), 3).unwrap();
+
+        // 2 distinct invocations, not 3 rows -- run-narrow and run-full
+        // collapse into one, keeping run-full's real outcome.
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].run_id, "run-full");
+        assert_eq!(runs[0].overall_result, "fail");
+        assert_eq!(runs[0].first_failed_stage, "windows_hello_limiter_flood");
+        assert_eq!(runs[1].run_id, "run-old");
     }
 
     #[test]

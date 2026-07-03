@@ -146,7 +146,14 @@ fn render_planned_with_statuses(
             // currently planned" rather than "can't happen".
             let possible = app.stage_selected_for_current_target(&stage);
             let will_run = app.stage_enabled(&stage);
-            let active = app.active_stage.as_deref() == Some(stage.as_str());
+            // Gated on a lab genuinely running right now, not just on
+            // `active_stage` being populated -- that field is refreshed
+            // from log/pipeline-position inference and can go stale (e.g. a
+            // run stopped before `active_job` ever observed a state
+            // transition to react to), which otherwise leaves a stage
+            // spinning forever after the lab has actually gone idle.
+            let active = app.lab_is_actively_running()
+                && app.active_stage.as_deref() == Some(stage.as_str());
             let status = if active {
                 "active"
             } else if let Some(status) = status_by_stage.get(stage.as_str()) {
@@ -299,6 +306,36 @@ fn stage_group_header_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::path::PathBuf;
+
+    #[test]
+    fn no_spinner_renders_when_active_stage_is_stale_and_no_lab_is_running() {
+        // Regression: a lab started then immediately stopped left
+        // `active_stage` (or a synthetic "running" stage_outcomes entry)
+        // pointing at "preflight" with no job actually running -- the grid
+        // must never show a spinner in that state, matching the header's
+        // own IDLE display.
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.active_stage = Some("preflight".to_owned());
+        assert!(
+            app.active_job.is_none(),
+            "no job started in this test -- confirms the idle precondition"
+        );
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, f.area(), &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let text: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        for frame in SPINNER_FRAMES {
+            assert!(
+                !text.contains(frame),
+                "spinner glyph {frame:?} must not render while idle"
+            );
+        }
+    }
 
     #[test]
     fn spinner_starts_on_the_first_frame() {
@@ -339,6 +376,27 @@ mod tests {
         let (symbol, style) = cell_for_status("excluded");
         assert_eq!(symbol, "[  ]");
         assert_eq!(style.fg, Some(Color::White));
+    }
+
+    #[test]
+    fn pass_fail_skipped_map_to_green_red_and_dim_grey() {
+        // The 3 real recorded-outcome statuses the orchestrator ever
+        // actually writes (confirmed against real state/stages.tsv and
+        // orchestrate_result.json history -- no run ever records anything
+        // else): pass -> green, fail -> red, skipped -> greyed-out (a
+        // stage the orchestrator itself decided didn't apply to this run's
+        // topology, same visual language as "disabled").
+        let (symbol, style) = cell_for_status("pass");
+        assert_eq!(symbol, "[██]");
+        assert_eq!(style.fg, Some(Color::Green));
+
+        let (symbol, style) = cell_for_status("fail");
+        assert_eq!(symbol, "[✗✗]");
+        assert_eq!(style.fg, Some(Color::Red));
+
+        let (symbol, style) = cell_for_status("skipped");
+        assert_eq!(symbol, "[  ]");
+        assert_eq!(style.fg, Some(Color::DarkGray));
     }
 
     #[test]

@@ -341,6 +341,27 @@ impl App {
             });
     }
 
+    /// Clears everything that must not survive into idle once a job
+    /// disappears: `active_stage`/`active_stage_start`/`orchestrator_pgid`,
+    /// and any synthetic "running"-status placeholder(s)
+    /// `ensure_active_stage_visible` pushed into `stage_outcomes` for
+    /// whatever stage was active. Real recorded outcomes (from
+    /// orchestrate_result.json / stages.tsv) are always pass/fail/skipped --
+    /// "running" is exclusively that placeholder's marker -- so stripping it
+    /// unconditionally here (not just when a fresh, non-empty result read
+    /// happened to replace the whole list) is always safe. Without this, a
+    /// run stopped before any real result ever existed left the placeholder
+    /// in place forever, still rendering a spinner in Stage Grid / Stage
+    /// Detail long after the lab had gone idle. Deliberately leaves
+    /// `stage_outcomes` and `log_lines` otherwise untouched -- the last
+    /// run's real outcomes stay on display until the next run starts.
+    fn clear_stale_active_run_state(&mut self) {
+        self.stage_outcomes.retain(|o| o.status != "running");
+        self.active_stage = None;
+        self.active_stage_start = None;
+        self.orchestrator_pgid = None;
+    }
+
     /// The stage name under the stage-grid cursor, per `stage_grid_col` /
     /// `stage_grid_row`.
     pub fn selected_stage_name(&self) -> Option<String> {
@@ -703,9 +724,7 @@ impl App {
                     {
                         self.stage_outcomes = result.outcomes;
                     }
-                    self.active_stage = None;
-                    self.active_stage_start = None;
-                    self.orchestrator_pgid = None;
+                    self.clear_stale_active_run_state();
                     // Keep stage_outcomes and log_lines — display last run until next one starts.
                 }
             }
@@ -1398,6 +1417,20 @@ impl App {
 
     pub fn roles_locked_by_active_lab(&self) -> bool {
         self.active_job.is_some() || self.orchestrator_pgid.is_some()
+    }
+
+    /// True only while a lab is genuinely running right now -- the same
+    /// condition the header uses to show "RUNNING" (see header.rs's
+    /// job.state match). Stage Grid gates its spinner on this, not merely
+    /// on `active_stage` being populated: `active_stage` is refreshed from
+    /// log/pipeline-position inference and can otherwise go stale (e.g. a
+    /// run stopped so early that `active_job` never observed a job-state
+    /// transition to react to), leaving a spinner animating on a stage
+    /// forever after the header has already gone IDLE/DONE/CRASHED.
+    pub fn lab_is_actively_running(&self) -> bool {
+        self.active_job
+            .as_ref()
+            .is_some_and(|job| job.state == "running")
     }
 
     fn config_for_role_display(&self) -> MonitorConfig {
@@ -3009,6 +3042,77 @@ mod tests {
         app.active_stage = Some("validate_macos_exit_nat_lifecycle".to_owned());
         let steps = app.pipeline_steps();
         assert!(steps[3].1);
+    }
+
+    fn running_job() -> JobState {
+        JobState {
+            job_id: "monitor-1".to_owned(),
+            state: "running".to_owned(),
+            pid: Some(1),
+            started_unix: Some(1),
+            area: "test".to_owned(),
+            report_dir: "state/monitor-loop-monitor-1".to_owned(),
+            request_args: None,
+        }
+    }
+
+    #[test]
+    fn lab_is_actively_running_requires_a_job_in_the_running_state() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        assert!(
+            !app.lab_is_actively_running(),
+            "no job at all -> not running"
+        );
+
+        app.active_job = Some(running_job());
+        assert!(app.lab_is_actively_running());
+
+        let mut done_job = running_job();
+        done_job.state = "done".to_owned();
+        app.active_job = Some(done_job);
+        assert!(
+            !app.lab_is_actively_running(),
+            "a job record that finished must not count as actively running"
+        );
+    }
+
+    #[test]
+    fn clear_stale_active_run_state_strips_only_the_synthetic_running_placeholder() {
+        // Regression: a lab started then immediately stopped (before any
+        // real orchestrate_result.json/stages.tsv existed) left a
+        // synthetic "running" placeholder (pushed by
+        // ensure_active_stage_visible) sitting in stage_outcomes forever,
+        // since the idle-transition's conditional refresh only replaces
+        // stage_outcomes when a fresh read finds something -- it never
+        // fires when there's genuinely nothing to read yet. That
+        // placeholder kept Stage Grid / Stage Detail spinning on
+        // "preflight" long after the monitor had gone IDLE.
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.stage_outcomes = vec![
+            crate::data::stage_reader::StageOutcome {
+                stage: "preflight".to_owned(),
+                status: "running".to_owned(),
+                summary: "active stage".to_owned(),
+                artifacts: Vec::new(),
+            },
+            crate::data::stage_reader::StageOutcome {
+                stage: "prepare_source_archive".to_owned(),
+                status: "pass".to_owned(),
+                summary: String::new(),
+                artifacts: Vec::new(),
+            },
+        ];
+        app.active_stage = Some("preflight".to_owned());
+        app.active_stage_start = Some(std::time::Instant::now());
+        app.orchestrator_pgid = Some(1234);
+
+        app.clear_stale_active_run_state();
+
+        assert_eq!(app.stage_outcomes.len(), 1);
+        assert_eq!(app.stage_outcomes[0].stage, "prepare_source_archive");
+        assert!(app.active_stage.is_none());
+        assert!(app.active_stage_start.is_none());
+        assert!(app.orchestrator_pgid.is_none());
     }
 
     #[test]
