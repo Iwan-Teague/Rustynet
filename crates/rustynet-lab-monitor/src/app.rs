@@ -235,7 +235,7 @@ impl App {
         let patch_iterations = config.patch_iterations.max(1);
         let review_iterations = config.review_iterations.max(1);
 
-        Ok(Self {
+        let mut app = Self {
             repo_root,
             config,
             active_job: None,
@@ -278,7 +278,9 @@ impl App {
             review_iterations,
             active_stage_start: None,
             last_vm_probe: None,
-        })
+        };
+        app.prune_unknown_disabled_stages();
+        Ok(app)
     }
 
     pub fn stage_timer_labels(&self) -> Vec<(&'static str, String)> {
@@ -451,6 +453,26 @@ impl App {
             .into_iter()
             .flat_map(|group| group.stages)
             .collect()
+    }
+
+    /// `disabled_stages` (config.rs) is persisted as a bare `Vec<String>`
+    /// with no validation against what this monitor actually knows how to
+    /// run -- a stage renamed/removed in a later version, or a hand-typo'd
+    /// entry from manual TOML editing, would otherwise sit in the list
+    /// forever with zero effect and zero visibility. Called after every
+    /// config load (fresh startup and the idle-poll hot-reload in
+    /// `refresh_state`).
+    fn prune_unknown_disabled_stages(&mut self) {
+        let known: HashSet<String> = self.planned_stages().into_iter().collect();
+        let before = self.config.disabled_stages.len();
+        self.config
+            .disabled_stages
+            .retain(|stage| known.contains(stage));
+        let pruned = before - self.config.disabled_stages.len();
+        if pruned > 0 {
+            tracing::warn!(pruned, "removed unknown stage name(s) from disabled_stages");
+            self.save_config_best_effort();
+        }
     }
 
     pub fn stage_enabled(&self, stage: &str) -> bool {
@@ -672,6 +694,7 @@ impl App {
         {
             config.apply_fast_stage_defaults();
             self.config = config;
+            self.prune_unknown_disabled_stages();
         }
         self.stop_after_current =
             crate::control::stopper::stop_after_current_requested(&self.repo_root);
@@ -1553,6 +1576,7 @@ impl App {
         self.config.anchor_platform.clear();
         self.config.admin_platform.clear();
         self.config.blind_exit_platform.clear();
+        self.config.client_platform.clear();
         self.config.macos_promote_exit = false;
 
         match platform {
@@ -1562,6 +1586,8 @@ impl App {
                 }
                 if role == "exit" {
                     self.config.macos_promote_exit = true;
+                } else if role == "client" {
+                    self.config.client_platform = "macos".to_owned();
                 } else {
                     set_role_platform(&mut self.config, role, platform);
                 }
@@ -1572,7 +1598,11 @@ impl App {
                 if let Some(alias) = alias.clone() {
                     self.config.windows_vm = alias;
                 }
-                set_role_platform(&mut self.config, role, platform);
+                if role == "client" {
+                    self.config.client_platform = "windows".to_owned();
+                } else {
+                    set_role_platform(&mut self.config, role, platform);
+                }
                 self.config.area = format!("Windows {role}");
                 self.config.skip_linux_live_suite = true;
             }
@@ -1581,6 +1611,7 @@ impl App {
                     if let Some(alias) = alias.clone() {
                         self.config.client_vm = alias;
                     }
+                    self.config.client_platform = "linux".to_owned();
                     self.config.area = "Linux client".into();
                 } else {
                     if let Some(alias) = alias.clone() {
@@ -1663,6 +1694,15 @@ impl App {
         }
     }
 
+    /// Reads only structured selector fields -- no free-text `area`
+    /// parsing. Previously fell back to substring-matching `area` (e.g.
+    /// `contains("blind")`/`contains("relay")`/`contains("exit")`) to
+    /// derive BOTH the role and the OS whenever none of the 5
+    /// role-platform selectors were set; that fallback existed solely to
+    /// cover the "client" role, which had no selector field of its own
+    /// (see `client_platform`). With one now, every role has a structured
+    /// signal and a free-text label like "windows-adjacent linux relay
+    /// check" can no longer silently change what gets targeted.
     fn current_target_cell(&self) -> Option<(Role, Os)> {
         if self.config.macos_promote_exit || self.config.exit_platform == "macos" {
             return Some((Role::Exit, Os::Macos));
@@ -1673,6 +1713,7 @@ impl App {
             (Role::Anchor, self.config.anchor_platform.as_str()),
             (Role::Admin, self.config.admin_platform.as_str()),
             (Role::BlindExit, self.config.blind_exit_platform.as_str()),
+            (Role::Client, self.config.client_platform.as_str()),
         ] {
             let os = match platform {
                 "linux" => Os::Linux,
@@ -1682,30 +1723,7 @@ impl App {
             };
             return Some((role, os));
         }
-        let area = self.config.area.to_ascii_lowercase();
-        let os = if area.contains("windows") {
-            Os::Windows
-        } else if area.contains("macos") {
-            Os::Macos
-        } else if area.contains("linux") {
-            Os::Linux
-        } else {
-            return None;
-        };
-        let role = if area.contains("blind") {
-            Role::BlindExit
-        } else if area.contains("relay") {
-            Role::Relay
-        } else if area.contains("anchor") {
-            Role::Anchor
-        } else if area.contains("admin") {
-            Role::Admin
-        } else if area.contains("exit") {
-            Role::Exit
-        } else {
-            Role::Client
-        };
-        Some((role, os))
+        None
     }
 
     fn default_alias_for_os(&self, os: Os) -> Option<String> {
@@ -2622,9 +2640,10 @@ mod tests {
     fn stage_grid_down_moves_freely_onto_disabled_stages() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.focused_panel = Panel::StageGrid;
-        // Default area is "macOS exit", which makes wants_macos() true --
-        // override it so only Windows is wanted here.
+        // Default target is macOS exit (macos_promote_exit: true) -- clear
+        // it so only Windows is wanted here.
         app.config.area = "Windows exit".to_owned();
+        app.config.macos_promote_exit = false;
         app.config.exit_platform = "windows".to_owned(); // wants_windows() true, wants_macos() false
         app.stage_grid_col = 1; // BOOTSTRAP: 9 base + 5 macos (disabled) + 5 windows (enabled)
         app.stage_grid_row[1] = 8; // last base stage, "validate_baseline_runtime"
@@ -2644,6 +2663,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.focused_panel = Panel::StageGrid;
         app.config.area = "Windows exit".to_owned();
+        app.config.macos_promote_exit = false;
         app.config.exit_platform = "windows".to_owned();
         app.stage_grid_col = 1;
         app.stage_grid_row[1] = 14; // first enabled Windows bootstrap stage
@@ -2661,6 +2681,7 @@ mod tests {
         app.page = Page::Run; // Space only toggles on the Run page
         app.focused_panel = Panel::StageGrid;
         app.config.area = "Windows exit".to_owned();
+        app.config.macos_promote_exit = false;
         app.config.exit_platform = "windows".to_owned();
         app.stage_grid_col = 1;
         app.stage_grid_row[1] = 9; // bootstrap_macos_host: not possible here
@@ -2689,6 +2710,107 @@ mod tests {
 
         app.handle_key(KeyCode::Char(' '), KeyModifiers::empty());
         assert!(!app.config.disabled_stages.contains(&"preflight".to_owned()));
+    }
+
+    #[test]
+    fn app_new_prunes_unknown_stage_names_from_disabled_stages_and_persists_the_prune() {
+        // disabled_stages is hand-editable TOML with no schema enforcement
+        // -- a renamed/removed stage, or a typo, must not linger forever
+        // silently. Uses an isolated tempdir (not the shared "/tmp" literal
+        // other tests in this file use) since this test writes and re-reads
+        // a real config file on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let state = repo.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("monitor-config.toml"),
+            r#"
+                area = "macOS exit"
+                exit_vm = "debian-headless-1"
+                client_vm = "debian-headless-2"
+                entry_vm = "debian-headless-3"
+                macos_vm = "macos-utm-1"
+                windows_vm = "windows-utm-1"
+                relay_platform = ""
+                anchor_platform = ""
+                exit_platform = ""
+                admin_platform = ""
+                blind_exit_platform = ""
+                macos_promote_exit = true
+                rebuild_nodes = ""
+                disabled_stages = ["preflight", "validate_macos_mesh_join", "this_stage_was_renamed_away"]
+            "#,
+        )
+        .unwrap();
+
+        let app = App::new(repo.to_path_buf()).expect("app");
+
+        assert!(app.config.disabled_stages.contains(&"preflight".to_owned()));
+        assert!(
+            app.config
+                .disabled_stages
+                .contains(&"validate_macos_mesh_join".to_owned())
+        );
+        assert!(
+            !app.config
+                .disabled_stages
+                .contains(&"this_stage_was_renamed_away".to_owned()),
+            "unknown stage name must be pruned: {:?}",
+            app.config.disabled_stages
+        );
+
+        // The prune must be written back, not just held in memory -- else
+        // the stale entry reappears on every reload.
+        let persisted = std::fs::read_to_string(state.join("monitor-config.toml")).unwrap();
+        assert!(!persisted.contains("this_stage_was_renamed_away"));
+    }
+
+    #[tokio::test]
+    async fn refresh_state_prunes_unknown_disabled_stages_on_hot_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let state = repo.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+
+        let mut app = App::new(repo.to_path_buf()).expect("app");
+        // Fresh config still defaults to the macOS-exit target, so
+        // apply_fast_stage_defaults() already seeded a real, valid entry.
+        assert_eq!(
+            app.config.disabled_stages,
+            vec!["linux_live_suite".to_owned()]
+        );
+
+        std::fs::write(
+            state.join("monitor-config.toml"),
+            r#"
+                area = "macOS exit"
+                exit_vm = "debian-headless-1"
+                client_vm = "debian-headless-2"
+                entry_vm = "debian-headless-3"
+                macos_vm = "macos-utm-1"
+                windows_vm = "windows-utm-1"
+                relay_platform = ""
+                anchor_platform = ""
+                exit_platform = ""
+                admin_platform = ""
+                blind_exit_platform = ""
+                macos_promote_exit = true
+                rebuild_nodes = ""
+                disabled_stages = ["stale_entry_from_an_old_version"]
+            "#,
+        )
+        .unwrap();
+
+        app.refresh_state().await;
+
+        assert!(
+            !app.config
+                .disabled_stages
+                .contains(&"stale_entry_from_an_old_version".to_owned()),
+            "hot-reloaded config must also be pruned, not just the App::new path: {:?}",
+            app.config.disabled_stages
+        );
     }
 
     #[test]
@@ -3304,9 +3426,11 @@ mod tests {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.stage_timings.clear();
         app.config.area = "Linux exit".to_owned();
+        app.config.macos_promote_exit = false;
         let linux_only_boot = app.stage_timer_labels()[1].1.clone();
 
         app.config.area = "macOS exit".to_owned();
+        app.config.macos_promote_exit = true;
         let with_macos_boot = app.stage_timer_labels()[1].1.clone();
 
         assert_ne!(
@@ -3356,6 +3480,7 @@ mod tests {
     fn timers_use_selected_target_stages_not_whole_platform_catalog() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.config.area = "macOS blind_exit".to_owned();
+        app.config.macos_promote_exit = false; // isolate blind_exit from the default macOS-exit target
         app.config.blind_exit_platform = "macos".to_owned();
         app.config.skip_linux_live_suite = true;
 

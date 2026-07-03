@@ -17,6 +17,15 @@ pub struct MonitorConfig {
     pub exit_platform: String,
     pub admin_platform: String,
     pub blind_exit_platform: String,
+    /// Which platform the "client" role currently targets -- client has no
+    /// dedicated CLI selector flag the way exit/relay/anchor/admin/
+    /// blind_exit do, so before this field existed, `wants_macos`/
+    /// `wants_windows`/`current_target_cell` had no structured signal for a
+    /// plain "macOS client" or "Windows client" target and fell back to
+    /// substring-matching the free-text `area` label -- the only reason
+    /// that fallback existed at all (see the two functions below).
+    #[serde(default)]
+    pub client_platform: String,
     #[serde(default)]
     pub macos_promote_exit: bool,
     #[serde(default)]
@@ -43,6 +52,12 @@ pub struct MonitorConfig {
 impl Default for MonitorConfig {
     fn default() -> Self {
         Self {
+            // "macOS exit" is the deliberate default target -- previously
+            // expressed only in this display label and picked up by
+            // wants_macos()'s now-removed area substring match; structurally
+            // equivalent to what configure_target("exit", "macos", ..) itself
+            // would set, so the practical default behavior (macOS exit
+            // stages enabled, Linux suite skipped) is unchanged.
             area: "macOS exit".into(),
             exit_vm: "debian-headless-1".into(),
             client_vm: "debian-headless-2".into(),
@@ -54,7 +69,8 @@ impl Default for MonitorConfig {
             exit_platform: String::new(),
             admin_platform: String::new(),
             blind_exit_platform: String::new(),
-            macos_promote_exit: false,
+            client_platform: String::new(),
+            macos_promote_exit: true,
             skip_linux_live_suite: false,
             rebuild_nodes: String::new(),
             triage_on_failure: false,
@@ -110,25 +126,28 @@ impl MonitorConfig {
         }
     }
 
+    /// `area` is a display label only, with zero semantics -- gating reads
+    /// exclusively from structured fields, each of which the operator can
+    /// see and correct directly, unlike a free-text string that silently
+    /// changes behavior on substring match (e.g. "windows-adjacent linux
+    /// relay check" would previously have made this true).
     pub fn wants_macos(&self) -> bool {
-        let area = self.area.to_ascii_lowercase();
-        area.contains("macos")
-            || self.macos_promote_exit
+        self.macos_promote_exit
             || self.exit_platform == "macos"
             || self.relay_platform == "macos"
             || self.anchor_platform == "macos"
             || self.admin_platform == "macos"
             || self.blind_exit_platform == "macos"
+            || self.client_platform == "macos"
     }
 
     pub fn wants_windows(&self) -> bool {
-        let area = self.area.to_ascii_lowercase();
-        area.contains("windows")
-            || self.exit_platform == "windows"
+        self.exit_platform == "windows"
             || self.relay_platform == "windows"
             || self.anchor_platform == "windows"
             || self.admin_platform == "windows"
             || self.blind_exit_platform == "windows"
+            || self.client_platform == "windows"
     }
 
     pub fn platform_specific_target(&self) -> bool {
@@ -152,6 +171,7 @@ impl MonitorConfig {
                 "exit_platform" => assign_string(&mut self.exit_platform, value),
                 "admin_platform" => assign_string(&mut self.admin_platform, value),
                 "blind_exit_platform" => assign_string(&mut self.blind_exit_platform, value),
+                "client_platform" => assign_string(&mut self.client_platform, value),
                 "rebuild_nodes" => assign_string(&mut self.rebuild_nodes, value),
                 "macos_promote_exit" => assign_bool(&mut self.macos_promote_exit, value),
                 "skip_linux_live_suite" => assign_bool(&mut self.skip_linux_live_suite, value),
