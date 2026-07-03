@@ -2046,6 +2046,62 @@ mod tests {
         );
     }
 
+    /// Finding 1D (drift gate, monitor half): every stage-name literal in
+    /// the lab monitor's fallback catalogs must resolve in the registry.
+    /// The monitor is workspace-excluded (no build-time sharing), so this
+    /// reads its source as text — exactly the hand-copied surface whose
+    /// phantoms (collect_windows_pubkey, distribute_windows_bundles) went
+    /// unnoticed for weeks. The fallback only governs pre-manifest report
+    /// dirs, but while it exists it must not drift.
+    #[test]
+    fn every_monitor_fallback_catalog_stage_is_registered() {
+        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rustynet-lab-monitor/src/app.rs");
+        let source = std::fs::read_to_string(&source_path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", source_path.display()));
+        // The fallback-catalog regions: the planned_stage_groups arrays and
+        // the three *_live_lab_catalog functions.
+        let mut regions = String::new();
+        for (start, end) in [
+            ("pub fn planned_stage_groups", "pub async fn refresh_state"),
+            ("fn macos_live_lab_catalog", "fn format_duration"),
+        ] {
+            let from = source
+                .find(start)
+                .unwrap_or_else(|| panic!("marker {start:?} missing from monitor source"));
+            let to = source[from..]
+                .find(end)
+                .map(|offset| from + offset)
+                .unwrap_or_else(|| panic!("marker {end:?} missing from monitor source"));
+            regions.push_str(&source[from..to]);
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for piece in regions.split('"').skip(1).step_by(2) {
+            // Stage-name shape: snake_case with at least one underscore.
+            if piece.len() > 3
+                && piece.contains('_')
+                && piece
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
+                names.insert(piece.to_owned());
+            }
+        }
+        assert!(
+            names.len() >= 60,
+            "extraction regressed — only {} monitor catalog literals found",
+            names.len()
+        );
+        let missing: Vec<String> = names
+            .into_iter()
+            .filter(|name| find_stage(name).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "monitor fallback catalog names the registry does not know: {missing:?}"
+        );
+    }
+
     /// Finding 1D (drift gate, Rust state-machine half): every StageId
     /// the Rust orchestrator can record must resolve in the registry.
     #[test]
