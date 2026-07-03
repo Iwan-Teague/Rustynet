@@ -2766,9 +2766,10 @@ mod registry_equivalence_tests {
                 Some(("windows", "relay_service_lifecycle"))
             }
             "validate_windows_anchor_bundle_pull" => Some(("windows", "anchor")),
-            "promote_windows_exit_active" | "validate_windows_exit_nat_lifecycle" => {
-                Some(("windows", "exit_handoff"))
-            }
+            "capture_windows_exit_evidence_artifacts"
+            | "promote_windows_exit_active"
+            | "pull_windows_exit_evidence_artifacts"
+            | "validate_windows_exit_nat_lifecycle" => Some(("windows", "exit_handoff")),
             "validate_windows_dns_failclosed" | "validate_windows_exit_dns_failclosed" => {
                 Some(("windows", "managed_dns"))
             }
@@ -2804,12 +2805,15 @@ mod registry_equivalence_tests {
             | "validate_windows_named_pipe_acls"
             | "validate_windows_service_hardening"
             | "validate_windows_key_custody" => Some(("windows", "client")),
-            "promote_windows_exit_active"
+            "capture_windows_exit_evidence_artifacts"
+            | "promote_windows_exit_active"
+            | "pull_windows_exit_evidence_artifacts"
             | "validate_windows_exit_nat_lifecycle"
             | "validate_windows_exit_dns_failclosed"
             | "validate_windows_exit_killswitch_precedence" => Some(("windows", "exit")),
             "validate_windows_relay_service_lifecycle" => Some(("windows", "relay")),
             "validate_windows_anchor_bundle_pull" => Some(("windows", "anchor")),
+            "validate_windows_admin_issue" => Some(("windows", "admin")),
             "validate_macos_mesh_join" => Some(("macos", "client")),
             "activate_macos_exit_role"
             | "capture_macos_exit_evidence_artifacts"
