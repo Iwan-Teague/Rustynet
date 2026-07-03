@@ -29,15 +29,15 @@ budgets, header math) builds on that contract.
 | 1A | Stage registry (collapse 4 CSV match tables) | **DONE** 75f2b7a |
 | 1B | Run-scoped stage manifest at run start | **DONE** 5127804 (+ run_mode in 8c006a4) |
 | 1C | Recorder validates stage names | **PARTIAL** — unregistered names surface in the matrix row's notes (8c006a4); per-stage recorder validation moves with Finding 4 |
-| 1D | Drift gate | **PARTIAL** 86449e6 — bash + StageId halves always-on (found and fixed 9 unregistered cross-network stages); monitor-catalog equality half deferred until the concurrent monitor rework settles |
+| 1D | Drift gate | **DONE** 86449e6 + monitor half (reads the monitor's fallback-catalog source as text; passes after the e510246 phantom heal) |
 | 2 | Run-matrix upsert + interim/final row roles | **DONE** 6cb6940 |
-| 3 | Terminal-state taxonomy + conclusion barrier | **DONE (cli side)** 8c006a4. Monitor side (dead-PID job reconciliation, `blocked_pending_review`, "skip" finality) open |
+| 3 | Terminal-state taxonomy + conclusion barrier | **DONE** 8c006a4 (cli) + 1404135/e648ec4 (monitor: dead-PID runs render CRASHED while idle; is_final accepts skip/aborted/timed_out/not_applicable). `blocked_pending_review` job state deferred to Finding 4's recorder |
 | 4 | Shared recorder (`ops record-stage-start/finish`) | OPEN |
 | 5 | Coverage-as-code (`proves` × run-matrix evidence gate) | **v1 DONE** bf3640e — `ops live-lab-coverage-report` joins registry claims against latest non-interim matrix evidence (all six audit-control families live-proven on all 3 OSes as of 2026-07-03); gate enforcement with reviewed exceptions still open |
-| 6 | Timer budgets (P90-of-all-terminal, manifest-carried) | OPEN — manifest carries cold-start budgets; P90 derivation + monitor consumption open |
-| 7 | Header math (ran/planned/NA from manifest snapshot) | OPEN (monitor) |
-| 8 | `area` string demoted to display-only | **IN PROGRESS externally** — a concurrent session is landing `client_platform` + area-substring removal in the monitor; do not double-land |
-| 9 | `disabled_stages` validation | OPEN (monitor; trivial once the monitor consumes the manifest) |
+| 6 | Timer budgets (P90-of-all-terminal, manifest-carried) | **DONE** 1404135 — P90 over all terminal outcomes x1.2 slack, floored by the manifest budget (falls back to hand-tuned defaults) |
+| 7 | Header math (ran/planned/NA from manifest snapshot) | **DONE** e648ec4 — grid + enablement derive from the run's manifest (pinned across idle config reloads); completed/failed/skipped count over the enabled subset |
+| 8 | `area` string demoted to display-only | **DONE** d91dac3 — client_platform structured selector; wants_macos/wants_windows/current_target_cell read structured fields only |
+| 9 | `disabled_stages` validation | **DONE** d91dac3 — unknown names pruned with a warning on every config load, prune persisted |
 | 10 | Evidence contract | OPEN — registry has the field surface; enforcement belongs to Finding 4's recorder |
 | — | Seeded monitor fixes (idle-log catch-up, ACTIVITY column removal) | **DONE** bad117f |
 | — | macOS anchor/daemon plist passphrase-path drift (found en route) | **DONE** 7f2dab7 |
@@ -60,10 +60,10 @@ budgets, header math) builds on that contract.
   from what bash knows (exit/relay platform, chaos, soak, gates, run mode);
   wrapper-launched runs get full fidelity. Cross-network flags are omitted
   from the bash emit (auto mode).
-- **Monitor consumption:** the monitor still renders from its fallback
-  catalogs until Findings 6/7/9 land; it already reads
-  `<report_dir>/orchestration/`, so `stage_manifest.json` is adjacent to
-  files it consumes today.
+- **Monitor consumption (landed e648ec4/e510246):** with a manifest the grid
+  renders the run's own plan (fallback catalog only governs pre-manifest
+  report dirs — healed of phantoms and carrying the real Windows pipeline +
+  per-OS audit families, pinned to the registry by the drift gate).
 
 ## Verification
 
