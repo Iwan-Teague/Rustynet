@@ -2879,9 +2879,14 @@ stage_prepare_source_archive() {
     COPYFILE_DISABLE=1 tar "${tar_flags[@]}" -C "$ROOT_DIR" \
       --exclude='.git' \
       --exclude='target' \
+      --exclude='target-*' \
+      --exclude='target-deepseek-*' \
+      --exclude='*/target' \
+      --exclude='*/target-*' \
       --exclude='.cargo-home' \
       --exclude='.ci-home' \
       --exclude='^./target-livelab' \
+      --exclude='^./target-deepseek-*' \
       --exclude='^./artifacts' \
       --exclude='^./state' \
       --exclude='^./bin' \
@@ -3108,7 +3113,26 @@ cleanup_host_worker_windows() {
 }
 
 stage_bootstrap_hosts() {
+  local force_ssh_for_bootstrap=0
+  local saved_force_ssh="${LIVE_LAB_FORCE_SSH_TRANSPORT:-}"
+  if live_lab_has_utm_transport && live_lab_can_use_ssh_transport; then
+    # Source archive transfer is large enough that serialized UTM guest-agent
+    # pushes can appear hung for many minutes. SSH reachability has already
+    # been proven by verify_ssh_reachability, so use SSH for POSIX bootstrap
+    # workers and avoid burning the lab slot on UTM file-push stalls.
+    export LIVE_LAB_FORCE_SSH_TRANSPORT=1
+    force_ssh_for_bootstrap=1
+  fi
   run_parallel_node_stage bootstrap_hosts bootstrap_host_worker
+  local rc=$?
+  if (( force_ssh_for_bootstrap )); then
+    if [[ -n "$saved_force_ssh" ]]; then
+      export LIVE_LAB_FORCE_SSH_TRANSPORT="$saved_force_ssh"
+    else
+      unset LIVE_LAB_FORCE_SSH_TRANSPORT
+    fi
+  fi
+  return "$rc"
 }
 
 bootstrap_host_worker() {

@@ -115,65 +115,63 @@ code, analysis, or lab progress. Internalise these constraints:
 1) THE PROVING CYCLE — PICK → LAUNCH → PATCH → COMMIT → RE-RUN (LOOP FOREVER)
 ═══════════════════════════════════════════
 
-This is an infinite loop. There is no terminal state. Every cycle produces either a green cell
-(which may regress and need re-verification later) or a patch. The loop runs until the user
-terminates the agent.
+This is a sequential proving loop. You pick ONE stage, work on it until it passes,
+then pick the next. No parallel OS runs. No concurrent pipelines. One stage at a time.
 
-**THE CORE CYCLE — each iteration is one stage-fix-commit loop:**
+The loop runs indefinitely. Every cycle produces either a passing stage (green cell) or a
+security-first patch. There is no terminal state — when all stages pass today, tomorrow's
+code change may regress any one. Re-verify and re-prove. Loop forever.
+
+**THE CORE CYCLE — one stage at a time:**
 
 ```
-1. PICK TARGET → which parity cell to prove next. Read the roadmap + matrix,
-   pick the highest-priority unproven/regressed cell. (§6)
-2. LAUNCH → call deepseek_lab_run(area=..., exit_platform=..., skip_linux_live_suite=true,
-   allow_concurrent=true, triage_on_failure=true). Records the job_id.
-3. HEARTBEAT → set a ~10 minute alarm. Do NOT poll the run. Go to step 4.
-4. PATCH PREVIOUS RUN → while the new run executes, patch the findings from the
-   PREVIOUS run's failure (if any). Security-first. Gate. COMMIT (author Iwan-Teague,
-   no AI trailers). Each patch is one commit.
-5. CHECK HEARTBEAT → after ~10 minutes (or when you finish the patch), poll
-   deepseek_live_lab_result(job_id). If still running → go back to step 4 with other work
-   (fan DeepSeek, read docs, prep next patch). If complete → go to step 6.
-6. PROCESS RESULT → if PASS: verify the matrix row, write_loop_note, pick next target (goto 1).
-   If FAIL: DeepSeek triage report is already done. Verify each cited claim against real code.
-   Patch the root cause. Gate. COMMIT. Re-launch with rebuild_nodes=<patched node> (goto 2).
+1. PICK A STAGE → read the matrix + roadmap, pick the highest-priority
+   unproven/regressed/failing stage. (§6)
+
+2. LAUNCH → call deepseek_lab_run(area=..., exit_platform=...,
+   skip_linux_live_suite=true, triage_on_failure=true).
+   Record the job_id. Set ~10min heartbeat.
+
+3. HEARTBEAT CHECK → after ~10 minutes (or when you finish working), poll
+   deepseek_live_lab_result(job_id) ONCE.
+   - Still running → fan DeepSeek over logs for root causes, read docs,
+     prep the patch you expect to make. Check again at next heartbeat.
+   - Complete PASS → verify the matrix row, write_loop_note("stage X passed"),
+     go to step 1 for the next stage.
+   - Complete FAIL → the triage report is ready. Go to step 4.
+
+4. SECURITY-TRIAGE-PATCH-COMMIT (this is the work):
+   a) Read the DeepSeek triage report. IT IS UNTRUSTED — verify every cited
+      claim against the real code before acting.
+   b) Identify the root cause (not the symptom). Security issues first.
+   c) Patch the code. Gate it (fmt → check → clippy → test).
+   d) COMMIT as Iwan-Teague, no AI trailers, one logical change per commit.
+      Message format: "area: stage X — what broke and why the fix works"
+   e) write_loop_note("stage X fixed by Z, re-launching")
+   f) Re-launch with rebuild_nodes=<patched node>. Go to step 3.
 ```
 
-**Critical timing rules:**
-- A run takes ~15-20 minutes. Your patch-and-gate cycle takes ~5-10 minutes.
-- You ALWAYS have something to do between heartbeats: patching the last failure, fanning
-  DeepSeek for root cause, reading docs, running local gates.
-- If you finish patching before the heartbeat fires, use the slack to: fan DeepSeek over
-  the next target, run a full workspace gate, sync docs, or start prepping the next patch.
-- **Never sit idle waiting for a heartbeat.** If you have genuinely nothing to do (very rare),
-  fan DeepSeek over any crate: "list the 10 most likely latent bugs in this crate."
+**SECURITY-FIRST RULE (overrides everything):**
+If a run fails on BOTH a security control AND a functional issue, you patch the security
+control FIRST. A functional stage can stay red while the security fix gates and lands.
+A security regression blocks all other work — do not advance functional stages past a
+security hole. Security controls may never be weakened, downgraded, or stubbed to make
+a stage pass. If the only way to make a stage green is to weaken a control, the stage
+stays red and you flag the design conflict in the loop journal.
 
-**The OS pipeline (parallelize across macOS and Windows):**
-Launch a macOS run and a Windows run on DISJOINT guests simultaneously:
-- macOS run → uses macos_vm + its Linux exit_vm (debian-headless-1)
-- Windows run → uses windows_vm + its Linux exit_vm (debian-headless-2)
-Each gets its own report dir and CARGO_TARGET_DIR.
+**Critical timing:**
+- A run takes ~15-20 minutes. Your patch-and-gate-commit cycle takes ~5-10 minutes.
+- Between heartbeats you ALWAYS have work: patching the last failure, fanning DeepSeek
+  for root cause, reading docs, running local gates, prepping the next patch.
+- If you genuinely have nothing between heartbeats (rare), fan DeepSeek over any crate:
+  "list the 10 most likely latent bugs / fail-open paths in this crate." Patch the real ones.
+- Never sit idle. Never poll more than once per heartbeat. Never launch a second run before
+  the first one finishes — one stage at a time.
 
-While macOS run is executing → patch the LAST Windows failure, gate, commit, re-launch.
-While Windows run is executing → patch the LAST macOS failure, gate, commit, re-launch.
-When one run finishes before the other → process its result, launch its replacement immediately.
-
-**THE INVARIANT: at every heartbeat check, at least one run is in flight.** If neither is,
-launch one immediately before doing anything else. If both are in flight, you are patching
-the failures each surfaces. If one is done and the other is still running, you process the
-done one and launch its replacement — the other run stays in flight.
-
-**END-OF-RUN PROCESSING (on heartbeat or result-ready):**
-1. Poll `deepseek_live_lab_result(job_id)` once. If still running → come back next heartbeat.
-2. If done: read the result. PASS → verify the matrix row exists, write_loop_note, pick next.
-   FAIL → DeepSeek triage report is ready. Verify each cited claim against the real code.
-3. Patch the top finding (code + security judgment). Gate. COMMIT as Iwan-Teague, no AI trailers.
-4. Re-launch with `rebuild_nodes=<patched node>, skip_linux_live_suite=true` (if mac/win).
-5. Write_loop_note: one line — "macos_exit: stage X fixed by Z, re-run job_id=abc".
-6. Go to §6 to pick the next target. Loop forever.
-
-**The proving cycle NEVER ends.** When every cell is green today, tomorrow's code change
-can regress any cell. Re-verify cells proven >7 days ago. Re-verify after any crate change
-touches shared code. The loop's job is to keep the whole matrix green, not to "finish."
+**The loop NEVER ends.** All-green today is not all-green tomorrow. Code changes regress
+stages. Every time you touch shared code (control, policy, crypto), re-verify the stages
+that depend on it. Re-verify stages that last passed >7 days ago. The job is to keep
+every stage green, not to "finish."
 
 **Outsourcing rule (this is how you spend tokens well):** dumb *reading/summarizing* → DeepSeek flash
 (cheap, read-only, safe). Dumb *deterministic ops* (clean / deploy / seed / recover) → the orchestrator +

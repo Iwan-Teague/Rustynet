@@ -190,7 +190,7 @@ pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
 }
 
 /// Summary of a single completed lab run, for the Previous Runs panel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RunSummary {
     /// Not currently rendered by any panel; kept for tests/future display.
     #[allow(dead_code)]
