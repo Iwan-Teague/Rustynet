@@ -67,9 +67,18 @@ fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize, grou
     };
 
     // Progress bar: width = column width minus brackets and count text.
-    let count_str = format!(" {}/{}", run.passed_stages, run.total_stages);
+    // "{subset passed}/{subset total} │ {full catalog total}" -- the main
+    // fraction is scoped to what this run's own topology actually touched
+    // (see RunSummary::subset_total_stages), not the full historical
+    // catalog, since most of that catalog was never going to run for a
+    // narrowly-targeted run; the number after the divider is just the plain
+    // full-catalog total, for reference, with no "total" label.
+    let count_str = format!(
+        " {}/{} │ {}",
+        run.subset_passed_stages, run.subset_total_stages, run.total_stages
+    );
     let bar_w = (area.width as usize)
-        .saturating_sub(2 + count_str.len()) // brackets + count
+        .saturating_sub(2 + count_str.chars().count()) // brackets + count
         .clamp(4, 20);
 
     // Truncate stage names to one line — area.width minus symbol prefix.
@@ -116,7 +125,7 @@ fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize, grou
         Line::from(
             [
                 vec![Span::raw("[")],
-                bar_spans_by_section(run.section_stages, bar_w, group_sizes),
+                bar_spans_by_section(run.section_stages, run.failing_section, bar_w, group_sizes),
                 vec![
                     Span::raw("]"),
                     Span::styled(count_str, Style::default().fg(Color::Gray)),
@@ -132,23 +141,31 @@ fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize, grou
 /// Builds the `[███░░░│███░░]`-style bar as individual character spans: 3
 /// sections proportional in WIDTH to the stage-grid group sizes
 /// (PRE/BOOTSTRAP/LIVE LAB), each filled independently by its OWN
-/// `(passed, total)` ratio from `section_stages` (green = passed, gray =
-/// failed or never reached within that section) -- not the run's single
-/// overall ratio, so a run that got all the way through PRE and BOOTSTRAP
-/// but died early in LIVE LAB shows exactly that shape. Same layout as the
-/// Stage Grid's own per-column bars, just laid out side by side in one line
-/// instead of 3 separate panes.
+/// `(passed, total)` ratio from `section_stages` (gray = never reached
+/// within that section) -- not the run's single overall ratio, so a run
+/// that got all the way through PRE and BOOTSTRAP but died early in LIVE LAB
+/// shows exactly that shape. Same layout as the Stage Grid's own per-column
+/// bars, just laid out side by side in one line instead of 3 separate
+/// panes.
+///
+/// Fill color is white, EXCEPT the one section named by `failing_section`
+/// (see `RunSummary::failing_section`), which fills red instead -- marking
+/// exactly where this run's own named failure happened, not just "some
+/// section wasn't 100%" (a narrowly-scoped but PASSING run can easily have
+/// sections well under 100% simply because most of the catalog was never
+/// targeted, which isn't a failure at all).
 ///
 /// The `│` divider is its OWN character INSERTED between sections, not
 /// overlaid on top of one -- an earlier version overlaid it on each
 /// section's first cell, which silently swallowed that cell's fill: a
-/// section computing 2-of-6 filled would render only 1 visible green cell
-/// (the other one hidden under the divider), making a 33%-passed section
-/// look visually identical to an unrelated 17%-passed section a few cells
-/// later. Reserving space for the dividers up front keeps every section's
-/// full width available for its own fill.
+/// section computing 2-of-6 filled would render only 1 visible cell (the
+/// other one hidden under the divider), making a 33%-passed section look
+/// visually identical to an unrelated 17%-passed section a few cells later.
+/// Reserving space for the dividers up front keeps every section's full
+/// width available for its own fill.
 fn bar_spans_by_section(
     section_stages: [(usize, usize); 3],
+    failing_section: Option<usize>,
     bar_w: usize,
     group_sizes: &[usize],
 ) -> Vec<Span<'static>> {
@@ -191,9 +208,14 @@ fn bar_spans_by_section(
             passed as f64 / total as f64
         };
         let filled = ((ratio * width as f64).round() as usize).min(width);
+        let fill_color = if failing_section == Some(idx) {
+            Color::Red
+        } else {
+            Color::White
+        };
         for i in 0..width {
             if i < filled {
-                spans.push(Span::styled("█", Style::default().fg(Color::Green)));
+                spans.push(Span::styled("█", Style::default().fg(fill_color)));
             } else {
                 spans.push(grey());
             }
@@ -285,7 +307,7 @@ mod tests {
         // 5 + 19 + 40 = 64 total; dividers are reserved cells (2 of them),
         // so the 3 sections split the remaining 62 cells proportionally:
         // 4 / 19 / 39, with dividers at positions 4 and 24 (4, then 4+1+19).
-        let spans = bar_spans_by_section(ZERO_SECTIONS, 64, &[5, 19, 40]);
+        let spans = bar_spans_by_section(ZERO_SECTIONS, None, 64, &[5, 19, 40]);
         let g = glyphs(&spans);
         assert_eq!(g[4], "│");
         assert_eq!(g[24], "│");
@@ -296,20 +318,20 @@ mod tests {
     fn ticks_stay_in_bounds_for_a_narrower_bar() {
         // Same 5/19/40 proportions, but an 8-wide bar -- must produce
         // exactly 8 spans (no panic, no out-of-bounds position).
-        let spans = bar_spans_by_section(ZERO_SECTIONS, 8, &[5, 19, 40]);
+        let spans = bar_spans_by_section(ZERO_SECTIONS, None, 8, &[5, 19, 40]);
         assert_eq!(spans.len(), 8);
     }
 
     #[test]
     fn no_ticks_when_group_sizes_are_all_zero() {
-        let spans = bar_spans_by_section(ZERO_SECTIONS, 10, &[0, 0, 0]);
+        let spans = bar_spans_by_section(ZERO_SECTIONS, None, 10, &[0, 0, 0]);
         let g = glyphs(&spans);
         assert!(!g.contains(&"│"));
     }
 
     #[test]
     fn zero_total_sections_render_as_all_grey() {
-        let spans = bar_spans_by_section(ZERO_SECTIONS, 10, &[2, 3, 5]);
+        let spans = bar_spans_by_section(ZERO_SECTIONS, None, 10, &[2, 3, 5]);
         let g = glyphs(&spans);
         assert!(g.iter().all(|c| *c == "░" || *c == "│"));
         assert!(!g.contains(&"█"));
@@ -318,7 +340,7 @@ mod tests {
     #[test]
     fn zero_width_bar_returns_no_spans() {
         let sections = [(5, 5), (1, 2), (0, 3)];
-        assert!(bar_spans_by_section(sections, 0, &[2, 3, 5]).is_empty());
+        assert!(bar_spans_by_section(sections, None, 0, &[2, 3, 5]).is_empty());
     }
 
     #[test]
@@ -332,12 +354,12 @@ mod tests {
         // (1 cell) | divider | section2 (4 cells) | divider | section3
         // (5 cells) = 1+1+4+1+5 = 12.
         let sections = [
-            (2, 2), // section 1 (PRE-analogous): fully green
-            (2, 4), // section 2 (BOOTSTRAP-analogous): half green
-            (6, 6), // section 3 (LIVE LAB-analogous): fully green
+            (2, 2), // section 1 (PRE-analogous): fully passed
+            (2, 4), // section 2 (BOOTSTRAP-analogous): half passed
+            (6, 6), // section 3 (LIVE LAB-analogous): fully passed
         ];
 
-        let spans = bar_spans_by_section(sections, 12, &[2, 4, 6]);
+        let spans = bar_spans_by_section(sections, None, 12, &[2, 4, 6]);
         let g = glyphs(&spans);
 
         assert_eq!(g[0], "█", "section 1's only cell, fully passed");
@@ -356,7 +378,7 @@ mod tests {
     fn bootstrap_section_fills_from_its_own_ratio_not_the_overall_run_ratio() {
         // Direct regression for the reported bug: a run where BOOTSTRAP
         // genuinely passed most of its checks must show BOOTSTRAP mostly
-        // green, even if the overall run's CSV-wide ratio is low because
+        // filled, even if the overall run's CSV-wide ratio is low because
         // LIVE LAB barely started. group_sizes [5, 19, 40] over a 64-wide
         // bar reserves 2 divider cells (62 fill cells: 4/19/39), putting
         // BOOTSTRAP's 19 cells at positions [5, 24).
@@ -365,12 +387,12 @@ mod tests {
             (17, 19), // BOOTSTRAP: nearly all passed
             (2, 40),  // LIVE LAB: barely started
         ];
-        let spans = bar_spans_by_section(sections, 64, &[5, 19, 40]);
+        let spans = bar_spans_by_section(sections, None, 64, &[5, 19, 40]);
         let g = glyphs(&spans);
-        let bootstrap_green = g[5..24].iter().filter(|c| **c == "█").count();
+        let bootstrap_filled = g[5..24].iter().filter(|c| **c == "█").count();
         assert!(
-            bootstrap_green >= 15,
-            "BOOTSTRAP (17/19 passed) must render mostly green, got {bootstrap_green}/19 filled cells: {g:?}"
+            bootstrap_filled >= 15,
+            "BOOTSTRAP (17/19 passed) must render mostly filled, got {bootstrap_filled}/19 filled cells: {g:?}"
         );
     }
 
@@ -378,20 +400,58 @@ mod tests {
     fn the_divider_no_longer_swallows_a_sections_own_fill_cell() {
         // Regression for the reported bug: with the divider overlaid on a
         // section's own first cell, a section computing 2-of-N filled
-        // rendered only 1 visible green cell (the other one hidden under
-        // the divider) -- making a 33%-passed BOOTSTRAP section look
-        // visually identical to an unrelated 17%-passed LIVE LAB section a
-        // few cells later. The divider must now be a separate cell, so both
-        // of a 2-filled section's green cells are visible.
+        // rendered only 1 visible cell (the other one hidden under the
+        // divider) -- making a 33%-passed BOOTSTRAP section look visually
+        // identical to an unrelated 17%-passed LIVE LAB section a few cells
+        // later. The divider must now be a separate cell, so both of a
+        // 2-filled section's cells are visible.
         let sections = [(5, 5), (4, 12), (17, 102)];
-        let spans = bar_spans_by_section(sections, 20, &[5, 19, 40]);
+        let spans = bar_spans_by_section(sections, None, 20, &[5, 19, 40]);
         let g = glyphs(&spans);
-        let bootstrap_green = g.iter().filter(|c| **c == "█").count();
+        let filled = g.iter().filter(|c| **c == "█").count();
         // Both BOOTSTRAP (4/12 -> 2 of its cells) and LIVE LAB (17/102 -> 2
-        // of its cells) should each show 2 visible green cells, not 1.
+        // of its cells) should each show 2 visible filled cells, not 1.
         assert!(
-            bootstrap_green >= 4,
-            "expected at least 2 green cells per non-PRE section (plus PRE's own), got {bootstrap_green}: {g:?}"
+            filled >= 4,
+            "expected at least 2 filled cells per non-PRE section (plus PRE's own), got {filled}: {g:?}"
+        );
+    }
+
+    #[test]
+    fn fill_is_white_unless_failing_then_red() {
+        let sections = [(5, 5), (12, 12), (10, 40)];
+
+        let passing = bar_spans_by_section(sections, None, 64, &[5, 19, 40]);
+        assert!(
+            passing
+                .iter()
+                .all(|s| s.style.fg != Some(Color::Green) && s.style.fg != Some(Color::Red)),
+            "a passing run's fill must be white, never green or red"
+        );
+        assert!(
+            passing
+                .iter()
+                .any(|s| s.content.as_ref() == "█" && s.style.fg == Some(Color::White)),
+            "expected at least one white-filled cell"
+        );
+
+        // failing_section = Some(1) -> BOOTSTRAP (index 1) fills red; PRE
+        // (index 0) and LIVE LAB (index 2) stay white.
+        let failing = bar_spans_by_section(sections, Some(1), 64, &[5, 19, 40]);
+        assert!(
+            failing[0].style.fg == Some(Color::White),
+            "PRE (not the failing section) must stay white"
+        );
+        let bootstrap_red = failing[5..24]
+            .iter()
+            .any(|s| s.content.as_ref() == "█" && s.style.fg == Some(Color::Red));
+        assert!(bootstrap_red, "BOOTSTRAP (the failing section) must be red");
+        let live_lab_red = failing[25..]
+            .iter()
+            .any(|s| s.content.as_ref() == "█" && s.style.fg == Some(Color::Red));
+        assert!(
+            !live_lab_red,
+            "LIVE LAB (not the failing section) must not be red"
         );
     }
 }
