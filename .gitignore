@@ -22,6 +22,7 @@
 # Isolated cargo target dir for MCP-launched live-lab jobs (build isolation so
 # lab runs never contend with the gate-runner on the workspace target lock).
 /target-livelab/
+/target-deepseek-*/
 
 # Editor-local config (absolute machine paths; wire up via scripts/mcp/install.sh).
 /.zed/
