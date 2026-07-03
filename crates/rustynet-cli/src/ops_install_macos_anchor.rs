@@ -372,7 +372,7 @@ mod tests {
         <string>--wg-encrypted-private-key</string>
         <string>/usr/local/var/rustynet/keys/wireguard.key.enc</string>
         <string>--wg-key-passphrase</string>
-        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <string>/usr/local/var/rustynet/bootstrap/wireguard.passphrase</string>
         <string>--wg-public-key</string>
         <string>/usr/local/var/rustynet/keys/wireguard.pub</string>
         <string>--backend</string>
@@ -403,7 +403,7 @@ mod tests {
         <key>RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE</key>
         <string>net.rustynet.wg-key-passphrase</string>
         <key>RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH</key>
-        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <string>/usr/local/var/rustynet/bootstrap/wireguard.passphrase</string>
         <key>RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR</key>
         <string>127.0.0.1:51822</string>
         <key>RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH</key>
