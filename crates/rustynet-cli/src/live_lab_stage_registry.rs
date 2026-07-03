@@ -786,6 +786,7 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "validate_macos_blind_exit",
         stream: PlatformStream::Macos,
+        role: Some(("macos", "blind_exit")),
         enable: EnableRule::BlindExitPlatform("macos"),
         budget_secs: 180,
         ..DEFAULT_SPEC
@@ -1640,6 +1641,7 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "restart_unready_vms",
         group: StageGroup::Pre,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1652,6 +1654,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "rediscover_local_utm",
         group: StageGroup::Pre,
         budget_secs: 60,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
