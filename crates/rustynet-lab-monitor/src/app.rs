@@ -52,6 +52,71 @@ pub struct StageGroup {
     pub stages: Vec<String>,
 }
 
+/// For a FAILED run, locates `first_failed_stage` (alias-prefix stripped)
+/// directly in the canonical PRE/BOOTSTRAP/LIVE LAB pipeline order (`groups`,
+/// i.e. `App::planned_stage_groups`) and derives (passed, total) per group
+/// from ITS POSITION: the pipeline is serial, so every step strictly before
+/// the failure is known to have passed, the failing step and everything
+/// after it did not. Returns `None` if the bare stage name isn't found in
+/// any group at all (e.g. an unrecognized name), in which case the caller
+/// should keep whatever CSV-column-based approximation it already had.
+fn position_based_failure_breakdown(
+    groups: &[StageGroup],
+    first_failed_stage: &str,
+) -> Option<([(usize, usize); 3], usize)> {
+    let bare = first_failed_stage.rsplit("::").next().unwrap_or("");
+    if bare.is_empty() {
+        return None;
+    }
+    let failing_group_idx = groups
+        .iter()
+        .position(|g| g.stages.iter().any(|s| s == bare))?;
+    let failing_local_idx = groups[failing_group_idx]
+        .stages
+        .iter()
+        .position(|s| s == bare)?;
+
+    let mut section_stages = [(0usize, 0usize); 3];
+    for (i, group) in groups.iter().enumerate().take(3) {
+        let total = group.stages.len();
+        let passed = match i.cmp(&failing_group_idx) {
+            std::cmp::Ordering::Less => total,
+            std::cmp::Ordering::Equal => failing_local_idx,
+            std::cmp::Ordering::Greater => 0,
+        };
+        section_stages[i] = (passed, total);
+    }
+    Some((section_stages, failing_group_idx))
+}
+
+/// Applies `position_based_failure_breakdown` to a single `RunSummary` in
+/// place, for a FAILED run whose `first_failed_stage` resolves to a known
+/// pipeline position: overrides `section_stages`/`failing_section` and the
+/// LEFT-hand `subset_passed_stages`/`subset_total_stages` fraction (now
+/// measured against the canonical pipeline). Deliberately does NOT touch
+/// `total_stages` -- that stays the CSV-column-based full project catalog
+/// size (see `RunSummary::total_stages`), the constant "how big is the
+/// whole possible test surface" reference shown after the divider,
+/// regardless of how far any single run's pipeline got. A no-op for a
+/// passing run or an unrecognized stage name.
+fn apply_position_based_failure_override(groups: &[StageGroup], run: &mut RunSummary) {
+    if !run.overall_result.eq_ignore_ascii_case("fail") {
+        return;
+    }
+    let Some((section_stages, failing_section)) =
+        position_based_failure_breakdown(groups, &run.first_failed_stage)
+    else {
+        return;
+    };
+    run.section_stages = section_stages;
+    run.failing_section = Some(failing_section);
+    let (passed, total) = section_stages
+        .iter()
+        .fold((0, 0), |(p, t), &(sp, st)| (p + sp, t + st));
+    run.subset_passed_stages = passed;
+    run.subset_total_stages = total;
+}
+
 pub struct App {
     pub repo_root: PathBuf,
     pub config: MonitorConfig,
@@ -709,6 +774,20 @@ impl App {
         }
         if let Ok(runs) = crate::data::run_matrix::load_recent_runs(&self.repo_root, 3) {
             self.recent_runs = runs;
+            // load_recent_runs computes section_stages/failing_section from
+            // CSV CHECK COLUMNS, a coarser, differently-shaped vocabulary
+            // than the pipeline STEP names Stage Grid uses (e.g. BOOTSTRAP
+            // is 12 CSV columns -- 4 suffixes x 3 OS -- vs 19 named pipeline
+            // steps) -- and `first_failed_stage` is always a pipeline step
+            // name (e.g. "bootstrap_windows_host"), which never matches a
+            // CSV column pattern, so the failing section silently defaulted
+            // to LIVE LAB every time regardless of where the failure
+            // actually was. Prefer the pipeline-position breakdown instead,
+            // wherever it resolves.
+            let groups = self.planned_stage_groups();
+            for run in &mut self.recent_runs {
+                apply_position_based_failure_override(&groups, run);
+            }
         }
         if self.active_job.is_none() {
             self.advance_if_current_target_proven();
@@ -2151,6 +2230,154 @@ fn load_available_models(repo_root: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn position_based_failure_breakdown_places_a_bootstrap_windows_failure_correctly() {
+        // Real-world regression: first_failed_stage = "bootstrap_windows_host"
+        // is a pipeline STEP name, not a CSV column pattern -- it must be
+        // attributed to BOOTSTRAP (where Stage Grid lists it, at local index
+        // 14 of 19: 9 base + 5 macos before it), not silently default to
+        // LIVE LAB.
+        let app = App::new(PathBuf::from("/tmp")).expect("app");
+        let groups = app.planned_stage_groups();
+        let (sections, failing) =
+            position_based_failure_breakdown(&groups, "bootstrap_windows_host")
+                .expect("bootstrap_windows_host must resolve to a known position");
+        assert_eq!(failing, 1, "must be attributed to BOOTSTRAP, not LIVE LAB");
+        assert_eq!(sections[0], (5, 5), "PRE fully passed before BOOTSTRAP");
+        assert_eq!(
+            sections[1],
+            (14, 19),
+            "14 BOOTSTRAP steps (9 base + 5 macos) precede bootstrap_windows_host"
+        );
+        assert_eq!(sections[2], (0, 40), "LIVE LAB never reached");
+    }
+
+    #[test]
+    fn position_based_failure_breakdown_places_a_bootstrap_macos_failure_correctly() {
+        let app = App::new(PathBuf::from("/tmp")).expect("app");
+        let groups = app.planned_stage_groups();
+        let (sections, failing) = position_based_failure_breakdown(&groups, "bootstrap_macos_host")
+            .expect("bootstrap_macos_host must resolve to a known position");
+        assert_eq!(failing, 1);
+        assert_eq!(sections[0], (5, 5));
+        assert_eq!(
+            sections[1],
+            (9, 19),
+            "the 9 base BOOTSTRAP steps precede bootstrap_macos_host"
+        );
+        assert_eq!(sections[2], (0, 40));
+    }
+
+    #[test]
+    fn position_based_failure_breakdown_places_a_pre_phase_failure_correctly() {
+        // Real-world regression: PRE was previously ALWAYS shown as (5, 5)
+        // regardless of where the failure actually happened -- even when
+        // the failure was itself inside PRE (verify_ssh_reachability, local
+        // index 2 of 5), which produced a nonsensical "5 passed" count for
+        // a run that broke on PRE's 3rd step. It must now show only the
+        // steps strictly before the failure as passed.
+        let app = App::new(PathBuf::from("/tmp")).expect("app");
+        let groups = app.planned_stage_groups();
+        let (sections, failing) =
+            position_based_failure_breakdown(&groups, "verify_ssh_reachability")
+                .expect("verify_ssh_reachability must resolve to a known position");
+        assert_eq!(failing, 0, "must be attributed to PRE");
+        assert_eq!(
+            sections[0],
+            (2, 5),
+            "only preflight + prepare_source_archive precede it"
+        );
+        assert_eq!(sections[1], (0, 19), "BOOTSTRAP never reached");
+        assert_eq!(sections[2], (0, 40), "LIVE LAB never reached");
+    }
+
+    #[test]
+    fn position_based_failure_breakdown_strips_a_node_alias_prefix() {
+        let app = App::new(PathBuf::from("/tmp")).expect("app");
+        let groups = app.planned_stage_groups();
+        let (_, failing) = position_based_failure_breakdown(
+            &groups,
+            "debian-headless-1::validate_linux_hello_limiter_flood",
+        )
+        .expect("alias-prefixed name must still resolve");
+        assert_eq!(
+            failing, 2,
+            "validate_linux_hello_limiter_flood is a LIVE LAB stage"
+        );
+    }
+
+    #[test]
+    fn position_based_failure_breakdown_returns_none_for_an_unrecognized_name() {
+        let app = App::new(PathBuf::from("/tmp")).expect("app");
+        let groups = app.planned_stage_groups();
+        assert!(position_based_failure_breakdown(&groups, "totally_unknown_stage").is_none());
+        assert!(position_based_failure_breakdown(&groups, "").is_none());
+    }
+
+    fn sample_run_summary() -> crate::data::run_matrix::RunSummary {
+        crate::data::run_matrix::RunSummary {
+            run_id: "test-run".to_owned(),
+            git_commit: "abc1234".to_owned(),
+            overall_result: "fail".to_owned(),
+            first_failed_stage: "bootstrap_windows_host".to_owned(),
+            passed_stages: 5,
+            total_stages: 97,
+            last_passed_stage: "validate_baseline_runtime".to_owned(),
+            section_stages: [(0, 5), (0, 12), (0, 40)],
+            subset_passed_stages: 5,
+            subset_total_stages: 57,
+            failing_section: Some(2),
+        }
+    }
+
+    #[test]
+    fn apply_position_based_failure_override_is_a_noop_for_a_passing_run() {
+        let app = App::new(PathBuf::from("/tmp")).expect("app");
+        let groups = app.planned_stage_groups();
+        let mut run = sample_run_summary();
+        run.overall_result = "pass".to_owned();
+        let before = run.clone();
+        apply_position_based_failure_override(&groups, &mut run);
+        assert_eq!(run, before, "a passing run must be left untouched");
+    }
+
+    #[test]
+    fn apply_position_based_failure_override_corrects_a_failing_run_with_a_resolvable_stage() {
+        let app = App::new(PathBuf::from("/tmp")).expect("app");
+        let groups = app.planned_stage_groups();
+        let mut run = sample_run_summary();
+        let original_total_stages = run.total_stages;
+        apply_position_based_failure_override(&groups, &mut run);
+
+        assert_eq!(
+            run.failing_section,
+            Some(1),
+            "bootstrap_windows_host must be attributed to BOOTSTRAP"
+        );
+        assert_eq!(run.section_stages, [(5, 5), (14, 19), (0, 40)]);
+        assert_eq!(run.subset_passed_stages, 19);
+        assert_eq!(run.subset_total_stages, 64);
+        assert_eq!(
+            run.total_stages, original_total_stages,
+            "total_stages is the CSV-column project catalog size and must \
+             stay untouched by the pipeline-position override"
+        );
+    }
+
+    #[test]
+    fn apply_position_based_failure_override_leaves_an_unrecognized_stage_name_untouched() {
+        let app = App::new(PathBuf::from("/tmp")).expect("app");
+        let groups = app.planned_stage_groups();
+        let mut run = sample_run_summary();
+        run.first_failed_stage = "totally_unknown_stage".to_owned();
+        let before = run.clone();
+        apply_position_based_failure_override(&groups, &mut run);
+        assert_eq!(
+            before, run,
+            "an unresolvable stage name must leave the CSV-column-based approximation intact"
+        );
+    }
 
     #[test]
     fn available_models_never_offers_the_confirmed_broken_free_proxy() {

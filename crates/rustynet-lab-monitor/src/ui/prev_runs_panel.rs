@@ -208,14 +208,20 @@ fn bar_spans_by_section(
             passed as f64 / total as f64
         };
         let filled = ((ratio * width as f64).round() as usize).min(width);
-        let fill_color = if failing_section == Some(idx) {
-            Color::Red
-        } else {
-            Color::White
-        };
+        // The failing section always gets exactly one red marker cell at
+        // the point of failure, even if `filled` is 0 (the very first step
+        // in this section is what failed) or would otherwise fill the
+        // entire width (leave room for the marker by capping `filled` a
+        // cell short) -- "some section wasn't 100% white" isn't the signal
+        // here, "this exact cell is where it broke" is. White fill runs up
+        // to (not including) the marker; everything after is unreached grey.
+        let marker = (failing_section == Some(idx)).then(|| filled.min(width.saturating_sub(1)));
+        let white_up_to = marker.unwrap_or(filled);
         for i in 0..width {
-            if i < filled {
-                spans.push(Span::styled("█", Style::default().fg(fill_color)));
+            if Some(i) == marker {
+                spans.push(Span::styled("█", Style::default().fg(Color::Red)));
+            } else if i < white_up_to {
+                spans.push(Span::styled("█", Style::default().fg(Color::White)));
             } else {
                 spans.push(grey());
             }
@@ -435,8 +441,8 @@ mod tests {
             "expected at least one white-filled cell"
         );
 
-        // failing_section = Some(1) -> BOOTSTRAP (index 1) fills red; PRE
-        // (index 0) and LIVE LAB (index 2) stay white.
+        // failing_section = Some(1) -> BOOTSTRAP (index 1) gets exactly one
+        // red marker cell; PRE (index 0) and LIVE LAB (index 2) stay white.
         let failing = bar_spans_by_section(sections, Some(1), 64, &[5, 19, 40]);
         assert!(
             failing[0].style.fg == Some(Color::White),
@@ -445,13 +451,50 @@ mod tests {
         let bootstrap_red = failing[5..24]
             .iter()
             .any(|s| s.content.as_ref() == "█" && s.style.fg == Some(Color::Red));
-        assert!(bootstrap_red, "BOOTSTRAP (the failing section) must be red");
+        assert!(
+            bootstrap_red,
+            "BOOTSTRAP (the failing section) must have a red marker"
+        );
         let live_lab_red = failing[25..]
             .iter()
             .any(|s| s.content.as_ref() == "█" && s.style.fg == Some(Color::Red));
         assert!(
             !live_lab_red,
             "LIVE LAB (not the failing section) must not be red"
+        );
+    }
+
+    #[test]
+    fn failing_section_always_shows_a_marker_even_at_zero_or_full_progress() {
+        // The marker must be visible in two edge cases the plain fill-ratio
+        // math alone would otherwise hide: (a) the failure is the very
+        // FIRST step in its section (filled = 0 -- nothing to distinguish
+        // "broke immediately" from "not reached" without a marker), and (b)
+        // the section's ratio rounds up to 100% width even though not
+        // literally every step passed (no room left for a marker unless
+        // filled is capped a cell short).
+        let group_sizes = [5, 19, 40];
+
+        // (a) PRE fails on its very first step: 0 of 5 passed.
+        let zero_progress = [(0, 5), (0, 19), (0, 40)];
+        let spans = bar_spans_by_section(zero_progress, Some(0), 64, &group_sizes);
+        assert_eq!(
+            spans[0].style.fg,
+            Some(Color::Red),
+            "the failing section's first cell must be the marker when nothing passed yet"
+        );
+
+        // (b) BOOTSTRAP "fully" passed by ratio (19/19) but is still the
+        // failing section (e.g. a later, ungranular check failed) -- must
+        // still show a marker, sacrificing one white cell for it.
+        let full_ratio = [(5, 5), (19, 19), (0, 40)];
+        let spans = bar_spans_by_section(full_ratio, Some(1), 64, &group_sizes);
+        let bootstrap_has_marker = spans[5..24]
+            .iter()
+            .any(|s| s.content.as_ref() == "█" && s.style.fg == Some(Color::Red));
+        assert!(
+            bootstrap_has_marker,
+            "a 100%-ratio failing section must still show a marker, not just solid white"
         );
     }
 }
