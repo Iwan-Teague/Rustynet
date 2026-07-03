@@ -10064,6 +10064,7 @@ fn run_macos_orchestration_stages(
             inventory_path,
             ssh_identity_file,
             known_hosts_path,
+            report_dir,
         ) {
             Ok(summary) => {
                 let _ = std::fs::write(&macos_admin_log_path, summary.as_str());
@@ -11235,6 +11236,7 @@ fn exercise_macos_admin_issue_live(
     inventory_path: &Path,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
+    report_dir: &Path,
 ) -> Result<String, String> {
     let inventory = load_inventory(inventory_path)?;
     let macos_entry = inventory
@@ -11256,6 +11258,52 @@ fn exercise_macos_admin_issue_live(
     validate_mesh_node_id(node_id.as_str())?;
     let target = remote_target_from_inventory_entry(&macos_entry, None);
 
+    let peer_alias = default_inventory_alias_for_lab_roles(inventory_path, &["client"])?
+        .ok_or_else(|| "macOS admin peer proof needs a Linux client in inventory".to_owned())?;
+    let peer_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == peer_alias)
+        .ok_or_else(|| format!("Linux peer alias {peer_alias:?} not found in inventory"))?
+        .clone();
+    if peer_entry.platform_profile().platform != VmGuestPlatform::Linux {
+        return Err(format!(
+            "macOS admin peer proof needs Linux peer; {peer_alias} is {}",
+            peer_entry.platform_profile().platform.as_str()
+        ));
+    }
+    let peer_node_id = peer_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {peer_alias:?} has no node_id"))?
+        .to_owned();
+    validate_mesh_node_id(peer_node_id.as_str())?;
+    let peer_target = remote_target_from_inventory_entry(&peer_entry, None);
+    let peer_pubkey_hex = collect_public_key_hex_for_target(
+        &peer_target,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        Duration::from_secs(60),
+    )?;
+    let peer_host = resolved_inventory_ssh_target(&peer_entry)
+        .rsplit('@')
+        .next()
+        .unwrap_or(peer_entry.ssh_target.as_str())
+        .to_owned();
+    let peer_endpoint = format!("{peer_host}:51820");
+    validate_mesh_endpoint_address(peer_endpoint.as_str())?;
+
+    let artifact_dir = report_dir.join("macos_admin_peer_ingest");
+    std::fs::create_dir_all(&artifact_dir).map_err(|err| {
+        format!(
+            "create macOS admin peer artifact dir {} failed: {err}",
+            artifact_dir.display()
+        )
+    })?;
+    let suffix = unique_suffix();
+    let remote_work = format!("/tmp/rn-macos-admin-peer-{suffix}");
+    let local_bundle = artifact_dir.join("macos-issued-linux-peer.assignment");
+    let local_verifier = artifact_dir.join("macos-issued-linux-peer.assignment.pub");
+
     // node_id is a validated mesh id; the work dir + passphrase + secret are all
     // root-owned (sudo mktemp + sudo tee) so the daemon's passphrase custody
     // check (owner-uid + 0600) passes. The verifier path also receives a
@@ -11263,39 +11311,43 @@ fn exercise_macos_admin_issue_live(
     // anti-rollback guard without weakening the CLI's file-shape checks.
     let issue_script = format!(
         "set -eu; \
-         WORK=$(sudo mktemp -d /tmp/rn-macos-admin.XXXXXX); \
+         WORK={remote_work}; \
+         sudo rm -rf \"$WORK\"; \
+         sudo mkdir -p \"$WORK\"; \
+         sudo chown root:wheel \"$WORK\"; \
+         sudo chmod 700 \"$WORK\"; \
          head -c 32 /dev/urandom | xxd -p -c 64 | sudo tee \"$WORK/pass\" >/dev/null; \
          sudo chmod 600 \"$WORK/pass\"; \
          sudo /usr/local/bin/rustynet assignment init-signing-secret --output \"$WORK/secret\" --signing-secret-passphrase-file \"$WORK/pass\" --force >/dev/null; \
-         PUBHEX=$(sudo cat /usr/local/var/rustynet/keys/wireguard.pub | base64 -d | xxd -p -c 64); \
-         NODES=\"{node_id}|127.0.0.1:51820|$PUBHEX|{node_id}|{node_id}|macos||client\"; \
-         ALLOW=\"{node_id}|{node_id}\"; \
-         sudo /usr/local/bin/rustynet assignment issue --target-node-id {node_id} --nodes \"$NODES\" --allow \"$ALLOW\" --signing-secret \"$WORK/secret\" --signing-secret-passphrase-file \"$WORK/pass\" --output \"$WORK/bundle\" --verifier-key-output \"$WORK/vpub\" --ttl-secs 300 >/dev/null; \
+         NODES=\"{peer_node_id}|{peer_endpoint}|{peer_pubkey_hex}|{peer_node_id}|{peer_node_id}|linux||client\"; \
+         ALLOW=\"{peer_node_id}|{peer_node_id}\"; \
+         sudo /usr/local/bin/rustynet assignment issue --target-node-id {peer_node_id} --nodes \"$NODES\" --allow \"$ALLOW\" --signing-secret \"$WORK/secret\" --signing-secret-passphrase-file \"$WORK/pass\" --output \"$WORK/bundle\" --verifier-key-output \"$WORK/vpub\" --ttl-secs 300 >/dev/null; \
          sudo test -s \"$WORK/bundle\"; \
          sudo test -s \"$WORK/vpub\"; \
          ZERO_DIGEST=0000000000000000000000000000000000000000000000000000000000000000; \
          printf 'version=2\\ngenerated_at_unix=0\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-valid\" >/dev/null; \
          printf 'version=2\\ngenerated_at_unix=0\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-tampered\" >/dev/null; \
          sudo chmod 600 \"$WORK/watermark-valid\" \"$WORK/watermark-tampered\"; \
-         sudo /usr/local/bin/rustynet assignment verify --bundle \"$WORK/bundle\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-valid\" --expected-node-id {node_id} --max-age-secs 600 >/dev/null; \
+         sudo /usr/local/bin/rustynet assignment verify --bundle \"$WORK/bundle\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-valid\" --expected-node-id {peer_node_id} --max-age-secs 600 >/dev/null; \
          GEN=$(sudo awk -F= '$1==\"generated_at_unix\"{{print $2}}' \"$WORK/bundle\"); \
          FUTURE=$((GEN + 1)); \
          printf 'version=2\\ngenerated_at_unix=%s\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$FUTURE\" \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-future\" >/dev/null; \
          sudo chmod 600 \"$WORK/watermark-future\"; \
-         if sudo /usr/local/bin/rustynet assignment verify --bundle \"$WORK/bundle\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-future\" --expected-node-id {node_id} --max-age-secs 600 >/dev/null 2>&1; then \
+         if sudo /usr/local/bin/rustynet assignment verify --bundle \"$WORK/bundle\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-future\" --expected-node-id {peer_node_id} --max-age-secs 600 >/dev/null 2>&1; then \
            echo 'rollback watermark was accepted' >&2; exit 1; \
          fi; \
          sudo cp \"$WORK/bundle\" \"$WORK/tampered\"; \
-         sudo perl -0pi -e 's/^node_id={node_id}$/node_id={node_id}-tampered/m' \"$WORK/tampered\"; \
+         sudo perl -0pi -e 's/^node_id={peer_node_id}$/node_id={peer_node_id}-tampered/m' \"$WORK/tampered\"; \
          if sudo cmp -s \"$WORK/bundle\" \"$WORK/tampered\"; then \
            echo 'tamper did not modify assignment bundle' >&2; exit 1; \
          fi; \
-         if sudo /usr/local/bin/rustynet assignment verify --bundle \"$WORK/tampered\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-tampered\" --expected-node-id {node_id} --max-age-secs 600 >/dev/null 2>&1; then \
+         if sudo /usr/local/bin/rustynet assignment verify --bundle \"$WORK/tampered\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-tampered\" --expected-node-id {peer_node_id} --max-age-secs 600 >/dev/null 2>&1; then \
            echo 'tampered assignment bundle was accepted' >&2; exit 1; \
          fi; \
          BYTES=$(sudo stat -f%z \"$WORK/bundle\" 2>/dev/null || echo unknown); \
-         sudo rm -rf \"$WORK\"; \
-         echo \"minted signing authority + issued a signed assignment bundle ($BYTES bytes); valid verify passed; rollback watermark rejected; tampered verify rejected\"",
+         sudo rm -f \"$WORK/pass\" \"$WORK/secret\"; \
+         echo \"minted signing authority + issued a signed assignment bundle for {peer_node_id} ($BYTES bytes); macOS valid verify passed; rollback watermark rejected; tampered verify rejected\"",
+        remote_work = shell_quote(remote_work.as_str()),
     );
     let out = capture_remote_shell_command_for_target(
         &target,
@@ -11306,9 +11358,107 @@ fn exercise_macos_admin_issue_live(
         Duration::from_secs(120),
     )
     .map_err(|e| format!("macOS admin issue on {macos_alias} failed: {e}"))?;
+
+    capture_remote_file_to_local(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        &format!("{remote_work}/bundle"),
+        local_bundle.as_path(),
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("capture macOS-issued assignment bundle failed: {e}"))?;
+    capture_remote_file_to_local(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        &format!("{remote_work}/vpub"),
+        local_verifier.as_path(),
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("capture macOS-issued assignment verifier failed: {e}"))?;
+    let _ = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        format!("sudo rm -rf {}", shell_quote(remote_work.as_str())).as_str(),
+        Duration::from_secs(30),
+    );
+
+    let peer_remote_bundle = format!("/tmp/rn-macos-admin-peer-{suffix}.assignment");
+    let peer_remote_verifier = format!("/tmp/rn-macos-admin-peer-{suffix}.assignment.pub");
+    ensure_success_status(
+        scp_to_remote_for_target(
+            &peer_target,
+            None,
+            Some(ssh_identity_file),
+            known_hosts_path,
+            local_bundle.as_path(),
+            peer_remote_bundle.as_str(),
+            Duration::from_secs(30),
+        )
+        .map_err(|e| format!("copy macOS-issued assignment bundle to {peer_alias} failed: {e}"))?,
+        "copy macOS-issued assignment bundle to Linux peer",
+    )?;
+    ensure_success_status(
+        scp_to_remote_for_target(
+            &peer_target,
+            None,
+            Some(ssh_identity_file),
+            known_hosts_path,
+            local_verifier.as_path(),
+            peer_remote_verifier.as_str(),
+            Duration::from_secs(30),
+        )
+        .map_err(|e| {
+            format!("copy macOS-issued assignment verifier to {peer_alias} failed: {e}")
+        })?,
+        "copy macOS-issued assignment verifier to Linux peer",
+    )?;
+
+    let peer_script = format!(
+        "set -eu; \
+         RN=/usr/local/bin/rustynet; test -x \"$RN\" || RN=$(command -v rustynet); \
+         WORK=$(sudo mktemp -d /tmp/rn-macos-admin-peer-verify.XXXXXX); \
+         sudo install -m 0600 -o root -g root {bundle} \"$WORK/bundle\"; \
+         sudo install -m 0644 -o root -g root {verifier} \"$WORK/vpub\"; \
+         ZERO_DIGEST=0000000000000000000000000000000000000000000000000000000000000000; \
+         printf 'version=2\\ngenerated_at_unix=0\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-valid\" >/dev/null; \
+         printf 'version=2\\ngenerated_at_unix=0\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-wrong-node\" >/dev/null; \
+         printf 'version=2\\ngenerated_at_unix=0\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-tampered\" >/dev/null; \
+         sudo chmod 600 \"$WORK\"/watermark-*; \
+         sudo \"$RN\" assignment verify --bundle \"$WORK/bundle\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-valid\" --expected-node-id {peer_node_id} --max-age-secs 600 >/dev/null; \
+         if sudo \"$RN\" assignment verify --bundle \"$WORK/bundle\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-wrong-node\" --expected-node-id {peer_node_id}-forged --max-age-secs 600 >/dev/null 2>&1; then \
+           echo 'wrong expected node id was accepted on Linux peer' >&2; exit 1; \
+         fi; \
+         sudo cp \"$WORK/bundle\" \"$WORK/tampered\"; \
+         sudo perl -0pi -e 's/^node_id={peer_node_id}$/node_id={peer_node_id}-tampered/m' \"$WORK/tampered\"; \
+         if sudo \"$RN\" assignment verify --bundle \"$WORK/tampered\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-tampered\" --expected-node-id {peer_node_id} --max-age-secs 600 >/dev/null 2>&1; then \
+           echo 'tampered assignment bundle was accepted on Linux peer' >&2; exit 1; \
+         fi; \
+         sudo rm -rf \"$WORK\" {bundle} {verifier}; \
+         echo 'Linux peer verify-before-apply accepted valid macOS-issued bundle and rejected wrong-node + tampered variants'",
+        bundle = shell_quote(peer_remote_bundle.as_str()),
+        verifier = shell_quote(peer_remote_verifier.as_str()),
+    );
+    let peer_out = capture_remote_shell_command_for_target(
+        &peer_target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        peer_script.as_str(),
+        Duration::from_secs(120),
+    )
+    .map_err(|e| format!("Linux peer verify-before-apply for macOS admin bundle failed: {e}"))?;
+
     Ok(format!(
-        "macOS admin live-proven on {macos_alias}: node_id={node_id}; signed assignment issue + valid verify + forged/tampered rejection; {}",
-        out.trim()
+        "macOS admin live-proven on {macos_alias}: node_id={node_id}; signed peer assignment issue + macOS local verify + Linux peer verify-before-apply + forged/tampered rejection; peer={peer_alias}/{peer_node_id}; artifacts={}; {}; {}",
+        artifact_dir.display(),
+        out.trim(),
+        peer_out.trim()
     ))
 }
 
