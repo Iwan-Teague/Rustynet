@@ -26,7 +26,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 app.config.area.as_str()
             };
-            ("-", area, "IDLE")
+            // A dead-PID job whose JSON still claims `running` ended
+            // abnormally — say so instead of a clean IDLE.
+            let status = if app.last_run_crashed {
+                "CRASHED"
+            } else {
+                "IDLE"
+            };
+            ("-", area, status)
         }
     };
     let title = Style::default().fg(Color::Blue);
