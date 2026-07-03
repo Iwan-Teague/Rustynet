@@ -203,9 +203,10 @@ only"; validator says `🚫 blocked`) — exclude it, correct the matrix.
 ## 5. Ordered implementation roadmap
 
 Rank = value ÷ (tractability · safety). After **anchor (done for bundle-pull)**
-and **macOS exit** (2026-07-03 run `labrun-1783084800049-93461-0` proved
-activation/NAT/DNS stages but failed the audit tail; patched root causes are
-pending one green `--macos-promote-exit` rerun):
+and **macOS exit** (LIVE-PROVEN 2026-07-03 by
+`labrun-1783087254263-11121-0` from `039f215`: activation, NAT lifecycle,
+DNS fail-closed, service hardening, and mesh-status all passed; `partial` only
+from selector/optional skips):
 
 | # | Cell | Why this rank |
 |---|---|---|
