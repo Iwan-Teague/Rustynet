@@ -233,19 +233,18 @@ the fixes landed this pass (all Linux-gate-verified; live runs still pending):
   forwarding, which is unproven on **every** OS (not Windows-specific). The
   Windows relay SCM lifecycle is contract-validated; forwarding is the
   cross-cutting HP-3 item, not a Windows runtime hole.
-- **macOS exit — live-pending after 2026-07-03 lab fix.** Run
-  `labrun-1783084800049-93461-0` on commit `709ca9f` proved the macOS exit
-  activation/capture path reached the real exit stages (`activate_macos_exit_role`
-  PASS, `validate_macos_exit_nat_lifecycle` PASS, `validate_macos_exit_dns_failclosed`
-  PASS), then failed at two audit checks: stale service-hardening expected path
-  (`keys/wireguard.passphrase` vs the Phase-E `bootstrap/wireguard.passphrase`
-  plist) and `macos_mesh_status` reading the daemon-owned `0600` runtime state
-  without sudo after the destructive NAT lifecycle capture restart. The follow-up
-  patch aligns the hardening oracle/runbook to the bootstrap credential path,
-  dispatches macOS mesh-status through a non-interactive sudo wrapper, and makes
-  the capture wrapper poll `macos-mesh-status-check --max-age-seconds 120` before
-  continuing. **Remaining:** rerun `--macos-promote-exit` live from the patched
-  commit and flip the cell only if the audit tail passes.
+- **macOS exit — LIVE-PROVEN for regular-exit activation/NAT/DNS/audit tail
+  (2026-07-03).** Run `labrun-1783087254263-11121-0` from commit `039f215`
+  reran the `--macos-promote-exit` path after the audit-tail fix and produced no
+  failed stages. The elected macOS exit scope passed `activate_macos_exit_role`,
+  `capture_macos_exit_evidence_artifacts`, `validate_macos_exit_nat_lifecycle`,
+  `validate_macos_exit_dns_failclosed`, `validate_macos_service_hardening`, and
+  `validate_macos_mesh_status` (fresh daemon-owned state snapshot, `age_seconds=5`).
+  The run is recorded as `partial` only because out-of-scope/optional stages
+  skipped: full Linux suite by selector, optional IPv6/killswitch artifacts, and
+  non-elected macOS anchor/admin/blind_exit roles. This supersedes the earlier
+  failed run `labrun-1783084800049-93461-0` on commit `709ca9f`, which exposed
+  the stale service-hardening passphrase path and unprivileged mesh-status read.
 - **macOS/admin/relay context.** Windows admin, macOS admin, and macOS relay (lifecycle) are now **LIVE-PROVEN** (macOS relay
   flipped ✅ 2026-06-27 via the `--relay-platform macos` orchestrate stage, run
   `livelab-1782571161`, `cd6a834`). The only consistent CODE gap is
