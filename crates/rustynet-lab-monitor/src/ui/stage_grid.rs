@@ -16,7 +16,7 @@ use crate::app::{App, Panel};
 /// loop already redraws roughly every 100ms (see run_event_loop's poll
 /// timeout), so advancing the frame from elapsed time alone is enough to
 /// read as spinning.
-const SPINNER_FRAMES: [&str; 8] = [
+pub(crate) const SPINNER_FRAMES: [&str; 8] = [
     "[⠋⠋]", "[⠙⠙]", "[⠹⠹]", "[⠸⠸]", "[⠼⠼]", "[⠴⠴]", "[⠦⠦]", "[⠧⠧]",
 ];
 
@@ -25,7 +25,7 @@ fn spinner_frame_for_elapsed_ms(elapsed_ms: u128) -> &'static str {
     SPINNER_FRAMES[idx]
 }
 
-fn spinner_glyph() -> &'static str {
+pub(crate) fn spinner_glyph() -> &'static str {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = *EPOCH.get_or_init(Instant::now);
     spinner_frame_for_elapsed_ms(epoch.elapsed().as_millis())
@@ -120,6 +120,7 @@ fn render_planned_with_statuses(
             completed,
             enabled,
             skipped,
+            group.stages.len(),
             header_style,
         )));
         let visible_stage_rows = (chunks[idx].height as usize).saturating_sub(2).max(1);
@@ -275,6 +276,7 @@ fn stage_group_header_spans(
     completed: usize,
     enabled: usize,
     skipped: usize,
+    total: usize,
     header_style: Style,
 ) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(
@@ -287,6 +289,10 @@ fn stage_group_header_spans(
     if skipped > 0 {
         spans.push(Span::styled(format!("  {skipped} skipped"), header_style));
     }
+    spans.push(Span::styled(
+        format!(" t{total}"),
+        Style::default().fg(Color::DarkGray),
+    ));
     spans
 }
 
@@ -349,7 +355,7 @@ mod tests {
         // ever selected to run and both did -- the count and the bar must
         // both be measured against `enabled` (2).
         let style = Style::default().fg(Color::White);
-        let spans = stage_group_header_spans("LIVE LAB", 2, 2, 0, style);
+        let spans = stage_group_header_spans("LIVE LAB", 2, 2, 0, 40, style);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text.contains("2/2"),
@@ -362,6 +368,12 @@ mod tests {
         // The bar itself must be full (both of the 2 enabled stages done),
         // not read as 2-out-of-40 nearly-empty.
         assert!(text.contains("[████████]"));
+        // The group's full catalog size is still shown, as a compact "t40"
+        // suffix, distinct from the enabled-based main fraction.
+        assert!(
+            text.contains("t40"),
+            "expected a t40 total suffix: {text:?}"
+        );
     }
 
     #[test]
@@ -370,13 +382,27 @@ mod tests {
         // the prior, wider selection) larger than the current `enabled`
         // count -- the bar must not overfill past its own width.
         let style = Style::default().fg(Color::White);
-        let spans = stage_group_header_spans("PRE", 5, 2, 0, style);
+        let spans = stage_group_header_spans("PRE", 5, 2, 0, 10, style);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("5/2"), "raw counts stay honest: {text:?}");
         assert!(
             text.contains("[████████]"),
             "bar clamps to full, not overfilled"
         );
+    }
+
+    #[test]
+    fn header_total_suffix_is_dimmed_separately_from_the_main_count() {
+        let style = Style::default().fg(Color::White);
+        let spans = stage_group_header_spans("PRE", 1, 3, 0, 5, style);
+        let total_span = spans
+            .iter()
+            .find(|s| s.content.contains('t') && s.content.chars().any(|c| c.is_ascii_digit()))
+            .expect("a total span");
+        assert_eq!(total_span.content.as_ref(), " t5");
+        assert_eq!(total_span.style.fg, Some(Color::DarkGray));
+        let main_span = &spans[0];
+        assert_eq!(main_span.style.fg, Some(Color::White));
     }
 
     #[test]

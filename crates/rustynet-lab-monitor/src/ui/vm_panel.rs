@@ -16,10 +16,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "←→ role"
     };
-    let title = format!(
-        "VM STATUS [1/V] ({})  ↑↓ select  {role_hint}  c fetch commits",
-        count
-    );
+    let title = format!("VM STATUS [1/V] ({count})  ↑↓ select  {role_hint}  c fetch commits");
 
     let border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let block = Block::default()
@@ -76,7 +73,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                     format!("{:<9}", vm.platform),
                     Style::default().fg(Color::Gray),
                 ),
-                Span::styled(format!("{:<16}", role), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{role:<16}"), Style::default().fg(Color::Yellow)),
                 Span::styled(format!("{:<16}", vm.ip), Style::default().fg(Color::Gray)),
                 Span::styled(commit.to_string(), Style::default().fg(Color::Cyan)),
             ])
@@ -105,7 +102,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     lines.extend(visible);
     if extra > 0 {
         lines.push(Line::from(Span::styled(
-            format!("  … and {} more", extra),
+            format!("  … and {extra} more"),
             Style::default().fg(Color::DarkGray),
         )));
     }

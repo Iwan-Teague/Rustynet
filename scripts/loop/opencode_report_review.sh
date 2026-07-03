@@ -16,7 +16,10 @@ REPORT_DIR=""
 AREA=""
 DRY_RUN=0
 
-OPENCODE_REVIEW_MODEL="${OPENCODE_REVIEW_MODEL:-opencode/deepseek-v4-flash-free}"
+# opencode/deepseek-v4-flash-free (OpenCode's hosted free-tier proxy) is
+# confirmed to hang indefinitely with zero output when invoked headlessly --
+# never default to it. deepseek-direct/* is the confirmed-working provider.
+OPENCODE_REVIEW_MODEL="${OPENCODE_REVIEW_MODEL:-deepseek-direct/deepseek-v4-flash}"
 OPENCODE_REVIEW_AGENT="${OPENCODE_REVIEW_AGENT:-rustynet-report-review}"
 OPENCODE_ATTACH="${OPENCODE_ATTACH:-}"
 OPENCODE_TMUX_SESSION="${OPENCODE_TMUX_SESSION:-rustynet-loop}"
@@ -49,7 +52,7 @@ Usage:
   scripts/loop/opencode_report_review.sh --job-id labrun-... [--report-dir state/deepseek-lab-...] [--area "macOS exit"] [--dry-run] [--wait] [--no-tmux]
 
 Env:
-  OPENCODE_REVIEW_MODEL      review model (default: opencode/deepseek-v4-flash-free)
+  OPENCODE_REVIEW_MODEL      review model (default: deepseek-direct/deepseek-v4-flash)
   OPENCODE_REVIEW_AGENT      OpenCode agent name (default: rustynet-report-review)
   OPENCODE_ATTACH            optional OpenCode server URL for `opencode run --attach`
   OPENCODE_TMUX_SESSION      tmux session to open/reuse (default: rustynet-loop)

@@ -36,7 +36,7 @@ pub async fn probe_vm(
 }
 
 async fn tcp_probe(host: &str, port: u16) -> bool {
-    let addr_str = format!("{}:{}", host, port);
+    let addr_str = format!("{host}:{port}");
     // Use spawn_blocking so the blocking connect_timeout doesn't stall the runtime
     tokio::task::spawn_blocking(move || {
         // Resolve first
@@ -51,7 +51,7 @@ async fn tcp_probe(host: &str, port: u16) -> bool {
 }
 
 fn infer_platform(alias: &str, ssh_user: &str) -> String {
-    let key = format!("{} {}", alias, ssh_user).to_ascii_lowercase();
+    let key = format!("{alias} {ssh_user}").to_ascii_lowercase();
     if key.contains("windows") {
         "windows".into()
     } else if key.contains("macos") || key.contains("mac ") {
@@ -62,11 +62,10 @@ fn infer_platform(alias: &str, ssh_user: &str) -> String {
 }
 
 async fn git_rev_parse(host: &str, user: &str, src_dir: &str, platform: &str) -> Option<String> {
-    let target = format!("{}@{}", user, host);
+    let target = format!("{user}@{host}");
     let cmd = if platform == "windows" {
         format!(
-            "if exist {0}\\RUSTYNET_SOURCE_COMMIT (type {0}\\RUSTYNET_SOURCE_COMMIT) else (cd /d {0} && git rev-parse --short HEAD 2>NUL)",
-            src_dir
+            "if exist {src_dir}\\RUSTYNET_SOURCE_COMMIT (type {src_dir}\\RUSTYNET_SOURCE_COMMIT) else (cd /d {src_dir} && git rev-parse --short HEAD 2>NUL)"
         )
     } else {
         format!(
@@ -82,6 +81,20 @@ async fn git_rev_parse(host: &str, user: &str, src_dir: &str, platform: &str) ->
     command.args([
         "-o",
         "ConnectTimeout=3",
+        // ConnectTimeout only bounds the TCP+handshake phase -- a VM that
+        // accepts the connection but then wedges (stuck disk I/O, hung
+        // shell) can leave the remote command running forever with no
+        // timeout of its own. ServerAlive* makes ssh itself notice a dead
+        // session within ~6s; the outer tokio::time::timeout below is the
+        // hard backstop for the case where the connection stays technically
+        // alive but the remote command never returns. Without either, this
+        // single VM probe can block the whole event loop's refresh_state()
+        // indefinitely, freezing every panel (not just VM status) until it
+        // resolves.
+        "-o",
+        "ServerAliveInterval=2",
+        "-o",
+        "ServerAliveCountMax=2",
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -92,10 +105,14 @@ async fn git_rev_parse(host: &str, user: &str, src_dir: &str, platform: &str) ->
     {
         command.args(["-o", "IdentitiesOnly=yes", "-i", identity]);
     }
-    let output = command.arg(&target).arg(&cmd).output().await;
+    let output = tokio::time::timeout(
+        Duration::from_secs(8),
+        command.arg(&target).arg(&cmd).output(),
+    )
+    .await;
 
     match output {
-        Ok(out) if out.status.success() => {
+        Ok(Ok(out)) if out.status.success() => {
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if s.is_empty() { None } else { Some(s) }
         }

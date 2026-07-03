@@ -59,7 +59,7 @@ pub fn render(f: &mut Frame, full_area: Rect) {
         .iter()
         .map(|(key, desc)| {
             Line::from(vec![
-                Span::styled(format!("{:16}", key), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{key:16}"), Style::default().fg(Color::Yellow)),
                 Span::styled(*desc, Style::default().fg(Color::White)),
             ])
         })

@@ -6,7 +6,7 @@
   },
   "agent": {
     "rustynet-report-review": {
-      "model": "opencode/deepseek-v4-flash-free",
+      "model": "deepseek-direct/deepseek-v4-flash",
       "mode": "primary",
       "description": "Read-only Rustynet live-lab failure report reviewer.",
       "steps": 18,

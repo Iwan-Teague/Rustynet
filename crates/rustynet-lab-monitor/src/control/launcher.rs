@@ -161,7 +161,7 @@ pub fn spawn_orchestrator(
     );
     let report_dir = repo_root
         .join("state")
-        .join(format!("monitor-loop-{}", job_id));
+        .join(format!("monitor-loop-{job_id}"));
     std::fs::create_dir_all(&report_dir)
         .with_context(|| format!("creating {}", report_dir.display()))?;
     let job_dir = repo_root.join("state/lab-monitor-jobs");

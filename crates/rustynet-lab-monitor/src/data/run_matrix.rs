@@ -200,7 +200,15 @@ pub struct RunSummary {
     pub overall_result: String,
     /// Name of the first stage that failed (from the `first_failed_stage` CSV column).
     pub first_failed_stage: String,
-    /// Number of `_stage_` / `cross_os_*` columns with outcome "pass".
+    /// Number of `_stage_` / `cross_os_*` columns with outcome "pass", PLUS
+    /// PRE's always-complete 5 (see `section_stages`) -- kept in step with
+    /// what the Previous Runs bar actually renders (all 3 sections,
+    /// including PRE), so the displayed "x/y" text next to the bar can't
+    /// look inconsistent with the bar's own fill (previously PRE rendered
+    /// as a solid green section while being entirely excluded from this
+    /// count, reading as more evidence than the number backed up). Not used
+    /// by the CHECKS header or Full Stage Matrix, which intentionally stay
+    /// scoped to CSV check columns only -- this field is Previous-Runs-only.
     pub passed_stages: usize,
     /// Count of stage columns that were possible for this run: `pass`,
     /// `fail`, and `not_run` all count (not_run means "never reached" --
@@ -210,18 +218,49 @@ pub struct RunSummary {
     /// doesn't apply to this run's topology/flags) is excluded, so a run
     /// that deliberately skips half the catalog doesn't shrink the
     /// denominator, but a run that fails early and never reaches the rest
-    /// still reports against the full possible count.
+    /// still reports against the full possible count. PLUS PRE's
+    /// always-complete 5 -- see `passed_stages`.
     pub total_stages: usize,
     /// Column name of the last stage with outcome "pass", for PASS run
     /// display — not just "the last non-not_run column", since that could
     /// be a skip and would misleadingly render with the pass-green check.
     pub last_passed_stage: String,
+    /// (passed, total) for the Previous Runs panel's 3-section bar, one pair
+    /// per Stage Grid group (PRE/BOOTSTRAP/LIVE LAB). PRE has no CSV
+    /// representation at all (its steps -- preflight, SSH reachability,
+    /// etc. -- never get a pass/fail column) and a run that failed during
+    /// PRE itself never gets far enough to produce a CSV row at all, so any
+    /// row that exists here by definition got past PRE -- always (5, 5),
+    /// unconditionally. BOOTSTRAP is the `{os}_stage_{bootstrap,
+    /// membership,assignments,baseline_runtime}` columns across all 3 OSes
+    /// (12 columns) -- a genuine semantic match to Stage Grid's BOOTSTRAP
+    /// phase, unlike a positional slice of the header (which mixed early and
+    /// late stages together, since the CSV is ordered OS-then-checktype, not
+    /// by pipeline phase, and produced a misleadingly near-empty BOOTSTRAP
+    /// section even when most of that phase actually passed). LIVE LAB is
+    /// every other real check column.
+    pub section_stages: [(usize, usize); 3],
 }
 
 /// True for columns that represent actual orchestrator stages (not role-presence summaries).
 /// Only `*_stage_*` and `cross_os_*` columns count as lab stages.
 fn is_lab_stage_column(header: &str) -> bool {
     header.contains("_stage_") || header.starts_with("cross_os_")
+}
+
+/// The 4 `_stage_` suffixes that correspond to Stage Grid's BOOTSTRAP phase
+/// (bootstrap_hosts/membership_setup+distribute_membership_state/
+/// issue_and_distribute_*/enforce+validate_baseline_runtime) -- see
+/// `RunSummary::section_stages`.
+const BOOTSTRAP_PHASE_STAGE_SUFFIXES: [&str; 4] =
+    ["bootstrap", "membership", "assignments", "baseline_runtime"];
+
+fn is_bootstrap_phase_stage_column(header: &str) -> bool {
+    Os::all().into_iter().any(|os| {
+        BOOTSTRAP_PHASE_STAGE_SUFFIXES
+            .iter()
+            .any(|suffix| header == format!("{}_stage_{suffix}", os.csv_prefix()))
+    })
 }
 
 /// The full, authoritative "does this column represent a real pass/fail
@@ -354,38 +393,57 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
             let mut passed = 0usize;
             let mut total = 0usize;
             let mut last_passed_stage = String::new();
+            let (mut boot_passed, mut boot_total) = (0usize, 0usize);
+            let (mut lab_passed, mut lab_total) = (0usize, 0usize);
 
             for (idx, col_name) in &stage_cols {
                 let v = row.get(*idx).unwrap_or("").trim();
-                match v {
-                    "pass" => {
-                        passed += 1;
-                        total += 1;
-                        last_passed_stage = col_name.clone();
-                    }
-                    // "fail" counts against the total (it was possible, it
-                    // just didn't pass). "not_run"/"na"/"" also count --
-                    // never reached (e.g. the pipeline stopped early after
-                    // an earlier failure) still means this stage WAS part
-                    // of the possible plan, just didn't get attempted.
-                    "fail" | "not_run" | "na" | "" => {
-                        total += 1;
-                    }
-                    // Only "skip"/"skipped" -- the orchestrator itself
-                    // deciding this doesn't apply to this run's
-                    // topology/flags -- is excluded entirely.
-                    _ => {}
+                let is_pass = v == "pass";
+                let is_decisive = matches!(v, "pass" | "fail" | "not_run" | "na" | "");
+                // Only "skip"/"skipped" -- the orchestrator itself deciding
+                // this doesn't apply to this run's topology/flags -- is
+                // excluded entirely; everything else counts toward total.
+                if !is_decisive {
+                    continue;
+                }
+                total += 1;
+                if is_pass {
+                    passed += 1;
+                    last_passed_stage = col_name.clone();
+                }
+                let (section_passed, section_total) = if is_bootstrap_phase_stage_column(col_name) {
+                    (&mut boot_passed, &mut boot_total)
+                } else {
+                    (&mut lab_passed, &mut lab_total)
+                };
+                *section_total += 1;
+                if is_pass {
+                    *section_passed += 1;
                 }
             }
+
+            // PRE has no CSV representation of its own (preflight, SSH
+            // reachability, etc. never get a pass/fail column) and a run
+            // that failed during PRE itself never gets far enough to
+            // produce a CSV row at all -- so any row that exists here by
+            // definition got past PRE. Always show it complete rather than
+            // conditionally inferring it, and fold its 5/5 into the
+            // displayed passed/total so the count text agrees with what the
+            // bar actually shows (previously "4/116" excluded PRE entirely
+            // while the bar still rendered it as a solid green section,
+            // reading as more evidence than the number backed up).
+            const PRE_STAGE_COUNT: usize = 5;
+            let pre = (PRE_STAGE_COUNT, PRE_STAGE_COUNT);
 
             RunSummary {
                 run_id,
                 git_commit,
                 overall_result,
                 first_failed_stage,
-                passed_stages: passed,
-                total_stages: total,
+                passed_stages: passed + PRE_STAGE_COUNT,
+                total_stages: total + PRE_STAGE_COUNT,
                 last_passed_stage,
+                section_stages: [pre, (boot_passed, boot_total), (lab_passed, lab_total)],
             }
         })
         .collect();
@@ -601,7 +659,15 @@ fn role_stage_columns(role: Role, os: Os) -> Vec<String> {
             .collect(),
         Role::Admin => vec![format!("{prefix}_stage_role_switch_matrix")],
         Role::Exit => vec![format!("{prefix}_stage_exit_handoff")],
-        Role::BlindExit => vec![format!("{prefix}_blind_exit")],
+        // NOT `{prefix}_blind_exit` -- that's the role-PRESENCE flag
+        // (`{os}_{role}`, see `is_role_presence_or_metadata_suffix`), which
+        // records "was a node assigned this role", not a pass/fail outcome.
+        // It only ever holds not_run/na/empty, so the parity cell for
+        // BlindExit was permanently stuck at Unproven no matter how many
+        // times blind_exit actually passed. `_reversal_denied` is a real
+        // check column (proves a revoked/blind_exit peer is correctly
+        // denied) and exists for all 3 OSes.
+        Role::BlindExit => vec![format!("{prefix}_blind_exit_reversal_denied")],
         Role::Relay => vec![format!("{prefix}_stage_relay_service_lifecycle")],
         Role::Anchor => vec![format!("{prefix}_stage_anchor")],
         Role::Nas => vec![format!("{prefix}_stage_nas")],
@@ -882,18 +948,19 @@ mod tests {
         assert_eq!(runs[0].first_failed_stage, "linux_stage_exit_handoff");
         // not_run still counts toward total (it was possible, just never
         // reached after the earlier failure) -- pass=1 fail=1 not_run=1 →
-        // total=3.
-        assert_eq!(runs[0].passed_stages, 1);
-        assert_eq!(runs[0].total_stages, 3);
+        // total=3, plus PRE's always-complete 5/5 folded in (a row exists
+        // at all only if the run got past PRE) -> 6/8.
+        assert_eq!(runs[0].passed_stages, 6);
+        assert_eq!(runs[0].total_stages, 8);
         // The last column with outcome "fail" doesn't count as a passed
         // stage -- last_passed_stage must be the actual last PASS, not
         // just the last column that ran at all.
         assert_eq!(runs[0].last_passed_stage, "linux_stage_bootstrap");
-        // Older pass run: 3 stage columns all pass
+        // Older pass run: 3 stage columns all pass, plus PRE's 5/5 -> 8/8.
         assert_eq!(runs[1].run_id, "run-old");
         assert_eq!(runs[1].overall_result, "pass");
-        assert_eq!(runs[1].passed_stages, 3);
-        assert_eq!(runs[1].total_stages, 3);
+        assert_eq!(runs[1].passed_stages, 8);
+        assert_eq!(runs[1].total_stages, 8);
         assert_eq!(runs[1].last_passed_stage, "linux_stage_exit_handoff");
     }
 
@@ -910,9 +977,10 @@ mod tests {
         // Only macos_stage_anchor is a real pass/fail outcome; the two
         // skips are deliberately-not-applicable, not "attempted and
         // stopped partway" -- must not inflate the denominator or look
-        // like the run only got 1/3 of the way through.
-        assert_eq!(runs[0].passed_stages, 1);
-        assert_eq!(runs[0].total_stages, 1);
+        // like the run only got 1/3 of the way through. Plus PRE's
+        // always-complete 5/5 folded in -> 6/6.
+        assert_eq!(runs[0].passed_stages, 6);
+        assert_eq!(runs[0].total_stages, 6);
         assert_eq!(runs[0].last_passed_stage, "macos_stage_anchor");
     }
 
@@ -933,8 +1001,66 @@ mod tests {
         );
         let runs = load_recent_runs(dir.path(), 1).unwrap();
 
-        assert_eq!(runs[0].passed_stages, 3);
-        assert_eq!(runs[0].total_stages, 6);
+        // 3 passed, 6 total from the CSV columns, plus PRE's always-complete
+        // 5/5 folded in -> 8/11.
+        assert_eq!(runs[0].passed_stages, 8);
+        assert_eq!(runs[0].total_stages, 11);
+    }
+
+    #[test]
+    fn section_stages_classifies_columns_by_name_not_header_position() {
+        // Regression: section_stages must route each column into BOOTSTRAP
+        // or LIVE LAB by what it actually IS (its `_stage_{suffix}` name),
+        // not by where it happens to sit in the CSV header -- the CSV is
+        // ordered OS-then-checktype, not by pipeline phase, so a positional
+        // slice previously mixed early and late stages together and could
+        // show BOOTSTRAP as nearly empty even when most of it had passed.
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "run_id,overall_result,\
+             linux_stage_bootstrap,linux_stage_membership,linux_stage_assignments,\
+             macos_stage_anchor,macos_stage_exit_handoff,\
+             windows_stage_bootstrap,windows_stage_membership,windows_stage_assignments\n\
+             run-1,fail,pass,pass,pass,fail,skip,not_run,not_run,skip\n",
+        );
+        let runs = load_recent_runs(dir.path(), 1).unwrap();
+
+        // 3 passed, 6 total from the CSV columns, plus PRE's always-complete
+        // 5/5 folded in -> 8/11.
+        assert_eq!(runs[0].passed_stages, 8);
+        assert_eq!(runs[0].total_stages, 11);
+        let [pre, bootstrap, live_lab] = runs[0].section_stages;
+        assert_eq!(pre, (5, 5));
+        // bootstrap/membership (linux, pass) + bootstrap/membership
+        // (windows, not_run) are all `_stage_{bootstrap,membership,
+        // assignments,baseline_runtime}` -- BOOTSTRAP-phase columns --
+        // regardless of OS or header position: linux_stage_bootstrap (pass),
+        // linux_stage_membership (pass), linux_stage_assignments (pass),
+        // windows_stage_bootstrap (not_run), windows_stage_membership
+        // (not_run) = 3 passed of 5 (windows_stage_assignments is skip,
+        // excluded).
+        assert_eq!(bootstrap, (3, 5));
+        // macos_stage_anchor (fail) is the only non-bootstrap-suffix column
+        // here -> LIVE LAB, 0 passed of 1.
+        assert_eq!(live_lab, (0, 1));
+    }
+
+    #[test]
+    fn pre_section_is_always_complete_even_with_no_other_decisive_data() {
+        // A run that failed during PRE itself never gets far enough to
+        // produce a CSV row at all -- so any row that exists here, no
+        // matter how sparse, implies PRE was already past. No more "0/5"
+        // fallback: PRE is unconditionally (5, 5).
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "run_id,overall_result,linux_stage_bootstrap\nrun-1,,skip\n",
+        );
+        let runs = load_recent_runs(dir.path(), 1).unwrap();
+        assert_eq!(runs[0].section_stages[0], (5, 5));
+        assert_eq!(runs[0].passed_stages, 5);
+        assert_eq!(runs[0].total_stages, 5);
     }
 
     #[test]
@@ -958,6 +1084,26 @@ mod tests {
         let matrix = load_parity_matrix(dir.path()).unwrap();
         assert_eq!(
             matrix.get(&(Role::Anchor, Os::Macos)),
+            Some(&ParityState::Proven)
+        );
+    }
+
+    #[test]
+    fn blind_exit_parity_reads_from_the_real_check_column_not_the_role_presence_flag() {
+        // Regression: role_stage_columns(Role::BlindExit, ..) used to point
+        // at "{os}_blind_exit" -- a role-presence flag ("was a node
+        // assigned blind_exit"), which only ever holds not_run/na/empty and
+        // can never carry a pass/fail outcome. That column and the real
+        // check column can disagree, so a real pass here must be reflected.
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,linux_blind_exit,linux_blind_exit_reversal_denied\n\
+             pass,not_run,pass\n",
+        );
+        let matrix = load_parity_matrix(dir.path()).unwrap();
+        assert_eq!(
+            matrix.get(&(Role::BlindExit, Os::Linux)),
             Some(&ParityState::Proven)
         );
     }

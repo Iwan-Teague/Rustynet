@@ -23,7 +23,7 @@ pub fn render(f: &mut Frame, area: Rect, _app: &App) {
         .iter()
         .map(|(key, desc)| {
             Span::styled(
-                format!(" {}:{} ", key, desc),
+                format!(" {key}:{desc} "),
                 Style::default().fg(Color::DarkGray),
             )
         })

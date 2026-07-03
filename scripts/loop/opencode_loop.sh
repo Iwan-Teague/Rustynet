@@ -31,7 +31,12 @@ OPENCODE_MAIN_VARIANT="${OPENCODE_MAIN_VARIANT:-max}"
 OPENCODE_MAIN_AGENT="${OPENCODE_MAIN_AGENT:-rustynet-loop-main}"
 OPENCODE_SESSION_ID="${OPENCODE_SESSION_ID:-}"
 OPENCODE_ATTACH="${OPENCODE_ATTACH:-}"
-OPENCODE_REVIEW_MODEL="${OPENCODE_REVIEW_MODEL:-opencode/deepseek-v4-flash-free}"
+# opencode/deepseek-v4-flash-free (OpenCode's hosted free-tier proxy) is
+# confirmed to hang indefinitely with zero output when invoked headlessly --
+# never default to it. deepseek-direct/* is the confirmed-working provider
+# (fixed global opencode.jsonc config, own API key, no repo-local setup
+# needed).
+OPENCODE_REVIEW_MODEL="${OPENCODE_REVIEW_MODEL:-deepseek-direct/deepseek-v4-flash}"
 OPENCODE_REVIEW_ON_FAIL="${OPENCODE_REVIEW_ON_FAIL:-1}"
 OPENCODE_LOOP_REPORT_INLINE_LIMIT="${OPENCODE_LOOP_REPORT_INLINE_LIMIT:-25000}"
 OPENCODE_LOOP_REVIEW_INLINE_LIMIT="${OPENCODE_LOOP_REVIEW_INLINE_LIMIT:-25000}"
@@ -75,7 +80,7 @@ Env:
   OPENCODE_MAIN_VARIANT            default max
   OPENCODE_MAIN_AGENT              default rustynet-loop-main
   OPENCODE_ATTACH                  optional opencode server URL
-  OPENCODE_REVIEW_MODEL            default opencode/deepseek-v4-flash-free
+  OPENCODE_REVIEW_MODEL            default deepseek-direct/deepseek-v4-flash
   OPENCODE_LOOP_MAX_CYCLES         0 = unlimited
   OPENCODE_LOOP_MAX_RUN_WAIT       default 5400s
   OPENCODE_LOOP_MAX_AGENT_WAIT     default 7200s
