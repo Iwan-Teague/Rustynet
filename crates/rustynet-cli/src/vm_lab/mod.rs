@@ -11991,17 +11991,15 @@ fn run_windows_anchor_deploy_preflight(
          $subchecks.Add(@{{name='windows_anchor_preflight_whoami';status='pass';detail=$who}}); \
          $svc=Get-Service -Name RustyNet -ErrorAction Stop; \
          $subchecks.Add(@{{name='windows_anchor_preflight_service_present';status='pass';detail=$svc.Status.ToString()}}); \
-         if(-not(Test-Path -LiteralPath '{daemon}')){{throw 'rustynetd.exe missing'}}; \
-         $subchecks.Add(@{{name='windows_anchor_preflight_daemon_present';status='pass';detail='{daemon}'}}); \
+         if(-not(Test-Path -LiteralPath '{WINDOWS_RUSTYNETD_EXE_PATH}')){{throw 'rustynetd.exe missing'}}; \
+         $subchecks.Add(@{{name='windows_anchor_preflight_daemon_present';status='pass';detail='{WINDOWS_RUSTYNETD_EXE_PATH}'}}); \
          if(-not(Test-Path -LiteralPath 'C:\\ProgramData\\RustyNet\\config')){{throw 'RustyNet config root missing'}}; \
          $subchecks.Add(@{{name='windows_anchor_preflight_config_root_present';status='pass';detail='C:\\ProgramData\\RustyNet\\config'}}); \
-         $listeners=@(Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | Select-Object -First 8 -Property LocalAddress,LocalPort,State | ForEach-Object {{ ('{{0}}:{{1}}/{{2}}' -f $_.LocalAddress,$_.LocalPort,$_.State) }}); \
+         $listeners=@(Get-NetTCPConnection -LocalPort {WINDOWS_ANCHOR_BUNDLE_PULL_PORT} -ErrorAction SilentlyContinue | Select-Object -First 8 -Property LocalAddress,LocalPort,State | ForEach-Object {{ ('{{0}}:{{1}}/{{2}}' -f $_.LocalAddress,$_.LocalPort,$_.State) }}); \
          $listenerState=if($listeners.Count -eq 0){{'none'}}else{{$listeners -join ','}}; \
          $subchecks.Add(@{{name='windows_anchor_preflight_listener_state_captured';status='pass';detail=$listenerState}}); \
          $report=[ordered]@{{schema_version=1;stage='windows_anchor_deploy_preflight';status='pass';whoami=$who;service_status=$svc.Status.ToString();listener_state=$listenerState;subchecks=$subchecks}}; \
-         Write-Output ($report|ConvertTo-Json -Depth 8)",
-        daemon = WINDOWS_RUSTYNETD_EXE_PATH,
-        port = WINDOWS_ANCHOR_BUNDLE_PULL_PORT,
+         Write-Output ($report|ConvertTo-Json -Depth 8)"
     );
     let raw = capture_remote_shell_command_for_target_with_phase(
         target,
@@ -12214,11 +12212,11 @@ fn exercise_windows_anchor_bundle_pull_live(
     // whose reason cites the loopback-only rule.
     let exercise_script = format!(
         "$ErrorActionPreference='Stop'; \
-         $rn='{daemon}'; \
-         $addr_host='127.0.0.1'; $addr_port={port}; \
-         $token_path='{token_path}'; \
-         $snap='{snapshot}'; \
-         $node='{node}'; \
+         $rn='{WINDOWS_RUSTYNETD_EXE_PATH}'; \
+         $addr_host='127.0.0.1'; $addr_port={WINDOWS_ANCHOR_BUNDLE_PULL_PORT}; \
+         $token_path='{WINDOWS_ANCHOR_BUNDLE_PULL_TOKEN_PATH}'; \
+         $snap='{WINDOWS_ANCHOR_MEMBERSHIP_SNAPSHOT_PATH}'; \
+         $node='{node_id}'; \
          function Pull([byte[]]$req){{ \
            $cli=New-Object System.Net.Sockets.TcpClient; \
            $cli.Connect($addr_host,$addr_port); \
@@ -12293,14 +12291,8 @@ fn exercise_windows_anchor_bundle_pull_live(
          if(Contains $sp2.body $tokenBytes){{throw 'served body leaked the raw token'}}; \
          $thumb=(Sha256Hex $tokenBytes).Substring(0,16); \
          $subchecks.Add(@{{name='validate_windows_anchor_bundle_pull_secrets_hygiene';status='pass';detail=\"raw_token_in_served_bytes=false token_thumbprint=$thumb\"}}); \
-         $report=[ordered]@{{schema_version=1;stage='live_windows_anchor_bundle_pull';status='pass';platform='windows';node_id=$node;bundle_pull_addr='{addr}';snapshot_path=$snap;subchecks=$subchecks}}; \
-         Write-Output ($report|ConvertTo-Json -Depth 8)",
-        daemon = WINDOWS_RUSTYNETD_EXE_PATH,
-        port = WINDOWS_ANCHOR_BUNDLE_PULL_PORT,
-        token_path = WINDOWS_ANCHOR_BUNDLE_PULL_TOKEN_PATH,
-        snapshot = WINDOWS_ANCHOR_MEMBERSHIP_SNAPSHOT_PATH,
-        node = node_id,
-        addr = WINDOWS_ANCHOR_BUNDLE_PULL_ADDR,
+         $report=[ordered]@{{schema_version=1;stage='live_windows_anchor_bundle_pull';status='pass';platform='windows';node_id=$node;bundle_pull_addr='{WINDOWS_ANCHOR_BUNDLE_PULL_ADDR}';snapshot_path=$snap;subchecks=$subchecks}}; \
+         Write-Output ($report|ConvertTo-Json -Depth 8)"
     );
     let report_body = capture_remote_shell_command_for_target(
         &target,
@@ -14827,6 +14819,9 @@ fn exercise_windows_admin_issue_live(
 /// Path of the installed `rustynetd.exe` on Windows guests, mirroring
 /// `crate::windows_paths::DEFAULT_WINDOWS_INSTALL_ROOT` from the daemon.
 const WINDOWS_RUSTYNETD_EXE_PATH: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
+/// Path of the installed `rustynet-relay.exe` on Windows guests. The
+/// hello-limiter flood audit belongs to the relay binary, not rustynetd.
+const WINDOWS_RUSTYNET_RELAY_EXE_PATH: &str = r"C:\Program Files\RustyNet\rustynet-relay.exe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WindowsExitEvidenceArtifactSpec {
@@ -14885,22 +14880,49 @@ fn build_windows_security_check_invocation(
     subcommand: &str,
     extra_args: &[String],
 ) -> Result<String, String> {
-    ensure_no_control_chars("Windows security-check subcommand", subcommand)?;
+    build_windows_exe_check_invocation(
+        WINDOWS_RUSTYNETD_EXE_PATH,
+        "Windows security-check",
+        subcommand,
+        extra_args,
+    )
+}
+
+fn build_windows_relay_check_invocation(
+    subcommand: &str,
+    extra_args: &[String],
+) -> Result<String, String> {
+    build_windows_exe_check_invocation(
+        WINDOWS_RUSTYNET_RELAY_EXE_PATH,
+        "Windows relay-check",
+        subcommand,
+        extra_args,
+    )
+}
+
+fn build_windows_exe_check_invocation(
+    exe_path: &str,
+    label: &str,
+    subcommand: &str,
+    extra_args: &[String],
+) -> Result<String, String> {
+    ensure_no_control_chars("Windows check executable path", exe_path)?;
+    ensure_no_control_chars(format!("{label} subcommand").as_str(), subcommand)?;
     if subcommand.is_empty()
         || !subcommand
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
     {
         return Err(format!(
-            "Windows security-check subcommand must be ASCII-alphanumeric+hyphen: {subcommand:?}"
+            "{label} subcommand must be ASCII-alphanumeric+hyphen: {subcommand:?}"
         ));
     }
     let mut script = format!(
         "& {exe} {subcommand} --no-fail-on-drift",
-        exe = powershell_quote(WINDOWS_RUSTYNETD_EXE_PATH)?,
+        exe = powershell_quote(exe_path)?,
     );
     for arg in extra_args {
-        ensure_no_control_chars("Windows security-check arg", arg.as_str())?;
+        ensure_no_control_chars(format!("{label} arg").as_str(), arg.as_str())?;
         script.push(' ');
         if arg.starts_with("--")
             && arg
@@ -19048,6 +19070,43 @@ fn run_macos_daemon_check_remote(
     Ok(raw_output.trim().to_owned())
 }
 
+/// Generic SSH dispatcher for a macOS `rustynet-relay <subcommand>` audit.
+/// macOS bootstrap installs `rustynet-relay` at the same reviewed
+/// `/usr/local/bin/rustynet-relay` path as the launchd plist.
+fn run_macos_relay_check_remote(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    subcommand: &str,
+    extra_args: &[String],
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[macos_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {macos_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let invocation =
+        build_linux_daemon_check_invocation(LINUX_RUSTYNET_RELAY_PATH, subcommand, extra_args)?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("remote dispatch of {subcommand} failed: {err}"))?;
+    Ok(raw_output.trim().to_owned())
+}
+
 /// Generic SSH dispatcher for a Windows daemon-check subcommand. Mirrors
 /// [`run_linux_daemon_check_remote`] but uses the Windows invocation
 /// builders (PowerShell encoded command) and validates platform.
@@ -19072,6 +19131,45 @@ fn run_windows_daemon_check_remote(
     let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
     let script = build_windows_security_check_invocation(subcommand, &[])
         .map_err(|err| format!("build windows invocation for {subcommand} failed: {err}"))?;
+    let invocation = build_ssh_powershell_encoded_invocation(script.as_str()).map_err(|err| {
+        format!("build powershell encoded invocation for {subcommand} failed: {err}")
+    })?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("remote dispatch of {subcommand} failed: {err}"))?;
+    Ok(raw_output.trim().to_owned())
+}
+
+/// Generic SSH dispatcher for a Windows `rustynet-relay.exe <subcommand>`
+/// audit. Kept separate from daemon checks so relay-only audits do not get
+/// sent to rustynetd and misreported as bad daemon args.
+fn run_windows_relay_check_remote(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    subcommand: &str,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {windows_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err(format!(
+            "alias {windows_alias} resolved to non-Windows platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script = build_windows_relay_check_invocation(subcommand, &[])
+        .map_err(|err| format!("build windows relay invocation for {subcommand} failed: {err}"))?;
     let invocation = build_ssh_powershell_encoded_invocation(script.as_str()).map_err(|err| {
         format!("build powershell encoded invocation for {subcommand} failed: {err}")
     })?;
@@ -19716,7 +19814,7 @@ fn run_validate_macos_hello_limiter_flood_stage(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<(String, String), (String, String)> {
-    let raw = run_macos_daemon_check_remote(
+    let raw = run_macos_relay_check_remote(
         macos_alias,
         inventory_path,
         ssh_identity_file,
@@ -19978,7 +20076,7 @@ fn run_validate_windows_hello_limiter_flood_stage(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<(String, String), (String, String)> {
-    let raw = run_windows_daemon_check_remote(
+    let raw = run_windows_relay_check_remote(
         windows_alias,
         inventory_path,
         ssh_identity_file,
@@ -44043,6 +44141,24 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         assert!(
             script.ends_with("windows-runtime-acls-check --no-fail-on-drift"),
             "script must end with subcommand + fail-closed flag: {script:?}"
+        );
+    }
+
+    #[test]
+    fn build_windows_relay_check_invocation_uses_relay_binary_for_hello_limiter_audit() {
+        let script = super::build_windows_relay_check_invocation("hello-limiter-audit", &[])
+            .expect("well-formed relay invocation must build");
+        assert!(
+            script.starts_with("& 'C:\\Program Files\\RustyNet\\rustynet-relay.exe' "),
+            "relay audit must start with quoted relay exe path: {script:?}"
+        );
+        assert!(
+            !script.contains("rustynetd.exe"),
+            "relay-only audit must not dispatch to rustynetd: {script:?}"
+        );
+        assert!(
+            script.ends_with("hello-limiter-audit --no-fail-on-drift"),
+            "script must end with relay audit subcommand + fail-closed flag: {script:?}"
         );
     }
 
