@@ -390,6 +390,49 @@ impl GossipNode {
         transport: &GossipTransport,
         now_unix: u64,
     ) -> Result<GossipIngestSummary, GossipNodeError> {
+        let (summary, sender_id) =
+            self.validate_and_apply_inbound_bundle(sender, bundle, now_unix)?;
+        // Epidemic re-push: forward to every known peer except the
+        // immediate sender (anti-loop hint) and the originator
+        // itself (it already has the bundle by definition).
+        for peer_id in
+            self.ordered_peer_ids_for_rebroadcast(Some(summary.source_node_id), sender_id)
+        {
+            let Some(peer) = self.peers.get(&peer_id) else {
+                continue;
+            };
+            if let Err(err) = transport.push_bundle(peer.push_addr, &summary.bundle) {
+                log::warn!(
+                    "gossip_repush_failed source={} via={} target={:?} reason={}",
+                    short_id(&summary.source_node_id),
+                    short_id(&self.local_node_id),
+                    peer.push_addr,
+                    transport_error_kind(&err)
+                );
+            }
+        }
+        Ok(summary.into_public())
+    }
+
+    /// Drive the full inbound verification + state-mutation path without
+    /// epidemic re-push. This is only for local self-audits that must run on
+    /// platforms where the UDP gossip transport is not implemented yet.
+    pub(crate) fn ingest_inbound_bundle_without_rebroadcast_for_local_audit(
+        &mut self,
+        sender: Option<SocketAddr>,
+        bundle: GossipBundle,
+        now_unix: u64,
+    ) -> Result<GossipIngestSummary, GossipNodeError> {
+        let (summary, _) = self.validate_and_apply_inbound_bundle(sender, bundle, now_unix)?;
+        Ok(summary.into_public())
+    }
+
+    fn validate_and_apply_inbound_bundle(
+        &mut self,
+        sender: Option<SocketAddr>,
+        bundle: GossipBundle,
+        now_unix: u64,
+    ) -> Result<(InternalGossipIngestSummary, Option<[u8; 32]>), GossipNodeError> {
         // Drop a bundle that claims our own node id — we should
         // never accept our own gossip as if it came from another
         // peer. Fail closed.
@@ -451,30 +494,16 @@ impl GossipNode {
             bundle.sequence,
             endpoints.len()
         );
-        // Epidemic re-push: forward to every known peer except the
-        // immediate sender (anti-loop hint) and the originator
-        // itself (it already has the bundle by definition).
         let sender_id: Option<[u8; 32]> = sender.and_then(|s| self.peer_id_for_addr(s));
-        for peer_id in self.ordered_peer_ids_for_rebroadcast(Some(bundle.source_node_id), sender_id)
-        {
-            let Some(peer) = self.peers.get(&peer_id) else {
-                continue;
-            };
-            if let Err(err) = transport.push_bundle(peer.push_addr, &bundle) {
-                log::warn!(
-                    "gossip_repush_failed source={} via={} target={:?} reason={}",
-                    short_id(&bundle.source_node_id),
-                    short_id(&self.local_node_id),
-                    peer.push_addr,
-                    transport_error_kind(&err)
-                );
-            }
-        }
-        Ok(GossipIngestSummary {
-            source_node_id: bundle.source_node_id,
-            sequence: bundle.sequence,
-            applied_endpoints: endpoints,
-        })
+        Ok((
+            InternalGossipIngestSummary {
+                source_node_id: bundle.source_node_id,
+                sequence: bundle.sequence,
+                applied_endpoints: endpoints,
+                bundle,
+            },
+            sender_id,
+        ))
     }
 
     fn peer_id_for_addr(&self, addr: SocketAddr) -> Option<[u8; 32]> {
@@ -610,6 +639,23 @@ pub struct GossipIngestSummary {
     pub source_node_id: [u8; 32],
     pub sequence: u64,
     pub applied_endpoints: Vec<SocketAddr>,
+}
+
+struct InternalGossipIngestSummary {
+    source_node_id: [u8; 32],
+    sequence: u64,
+    applied_endpoints: Vec<SocketAddr>,
+    bundle: GossipBundle,
+}
+
+impl InternalGossipIngestSummary {
+    fn into_public(self) -> GossipIngestSummary {
+        GossipIngestSummary {
+            source_node_id: self.source_node_id,
+            sequence: self.sequence,
+            applied_endpoints: self.applied_endpoints,
+        }
+    }
 }
 
 /// Map a `GossipError` to a short, fixed-vocabulary string. Used as
