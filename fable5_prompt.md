@@ -226,10 +226,13 @@ Esc       Close overlay / deactivate
 
 Note: VM Status no longer has a per-VM commit column or a probe for it (an
 unreliable per-VM `git rev-parse` over SSH) — removed this session along with
-its keybinding. VM Status instead shows a live per-VM activity column
-(current stage touching that platform, when a lab is genuinely running) and
-a parity-state glyph (colored dot, same Proven/Flaky/Failed/Unproven scheme
-as the Parity Matrix).
+its keybinding. VM Status instead shows a parity-state glyph (colored dot,
+same Proven/Flaky/Failed/Unproven scheme as the Parity Matrix) reflecting
+that VM's currently-assigned role. A live per-VM activity column was tried
+and then removed the same session — the majority of a run's early wall-clock
+time (PRE + the 9 generic BOOTSTRAP-base stages, which touch every node at
+once and can't be attributed to one VM) always rendered it blank, which read
+as broken rather than merely uninformative for that phase.
 
 ---
 
@@ -922,7 +925,7 @@ The operator ran a deep investigation into the monitor + live lab this session a
 ### Already fixed in the current working tree (uncommitted) — do not re-flag these specific symptoms
 - Stage Grid spinner used to keep animating on a stage forever after the lab had actually gone idle (it was gated only on a possibly-stale `active_stage` field, never on whether a job was genuinely still running). Fixed via a `lab_is_actively_running()` gate plus unconditionally stripping the synthetic "running" placeholder that `ensure_active_stage_visible` pushes into `stage_outcomes`.
 - Previous Runs panel showed a phantom duplicate entry: two CSV rows for the exact same physical orchestrator invocation (identical `report_dir` + `run_started_utc` + `run_finished_utc`, different `run_id`), because two separate orchestrator code paths (`live-linux-lab-orchestrator` and `vm-lab-orchestrate-live-lab`) each append their own summary row for a single run — the narrower Linux-only writer always shows a false "pass" that the fuller writer's real "fail" immediately contradicts. Fixed on the **monitor's display side only** (dedup in `load_recent_runs`, keyed on that triple, keeping the later/fuller row) — the underlying **double-write itself is NOT fixed** (see finding #3 below).
-- VM Status panel: header row was one column off from the data rows below it, used the wrong color, mixed casing conventions app-wide, and had a dead "commit" column (an unreliable per-VM `git rev-parse` over SSH, removed entirely along with its keybinding). Replaced with a live per-VM activity column and a parity-state glyph.
+- VM Status panel: header row was one column off from the data rows below it, used the wrong color, mixed casing conventions app-wide, and had a dead "commit" column (an unreliable per-VM `git rev-parse` over SSH, removed entirely along with its keybinding). Replaced with a parity-state glyph column; a live per-VM activity column was also tried and then removed in the same session — it stayed blank through the entire PRE + generic-BOOTSTRAP phase of a run (14 stages that touch every node at once, can't be attributed to one VM, and often dominate a run's early wall-clock time), which read as broken rather than merely uninformative for that phase. Don't re-attempt this without a plan for that specific failure mode.
 - Window-focus keybindings were numbered inconsistently (the Agents panel was bound to `7`, stranded after the unrelated Matrix page's `6` instead of grouping with its own Overview-page siblings) and had five redundant letter aliases (`l`/`p`/`v`/`j`/`m`). Renumbered 1-7 grouped by page, letter aliases removed entirely — window focus is numbers-only now.
 
 Treat the fixes themselves as ground truth; don't spend your budget re-deriving them. The full diagnostic trail (exact repro, exact evidence) is not included here — if you want it, it's this session's transcript, which you won't have access to; take the summary above as settled.

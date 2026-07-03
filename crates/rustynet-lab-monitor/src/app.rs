@@ -3447,24 +3447,4 @@ mod tests {
             ]
         );
     }
-
-    #[test]
-    #[ignore]
-    fn probe_real_repo_idle_log_catchup() {
-        let repo_root = PathBuf::from("/Users/iwan/Desktop/Rustynet");
-        let report_dir =
-            repo_root.join("state/deepseek-lab-labrun-1783089250895-6139-0");
-        let result =
-            crate::data::stage_reader::read_orchestrate_result(&report_dir).expect("read result");
-        let stage = final_stage_for_idle_log(&result.outcomes);
-        eprintln!("picked stage: {stage:?}");
-        if let Some(stage) = &stage {
-            let lines =
-                crate::data::log_tailer::summarize_stage_lines(&repo_root, &report_dir, stage)
-                    .expect("summarize");
-            for line in lines.iter().take(5) {
-                eprintln!("  {line}");
-            }
-        }
-    }
 }
