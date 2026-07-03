@@ -97,6 +97,68 @@ pub enum StageSeverity {
     Soft,
 }
 
+/// The closed stage-status taxonomy (Finding 3 of the 2026-07-03 live-lab
+/// findings). Recorded outcomes historically spoke an open vocabulary
+/// (`pass`/`fail`/`skip`/`skipped`/`not_run`/`na`/`unknown` with no defined
+/// semantics); every recording layer is expected to converge on these
+/// canonical strings, with [`parse_stage_status`] absorbing the historical
+/// dialects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // consumed by the shared recorder (next increment); the monitor speaks this taxonomy via the manifest
+pub enum StageStatus {
+    Pending,
+    Running,
+    Pass,
+    Fail,
+    Skipped,
+    NotApplicable,
+    TimedOut,
+    Aborted,
+}
+
+impl StageStatus {
+    #[allow(dead_code)] // consumed by the shared recorder (next increment)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StageStatus::Pending => "pending",
+            StageStatus::Running => "running",
+            StageStatus::Pass => "pass",
+            StageStatus::Fail => "fail",
+            StageStatus::Skipped => "skipped",
+            StageStatus::NotApplicable => "not_applicable",
+            StageStatus::TimedOut => "timed_out",
+            StageStatus::Aborted => "aborted",
+        }
+    }
+
+    /// A final outcome: the stage will not change state again this run.
+    #[allow(dead_code)] // consumed by the shared recorder (next increment)
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, StageStatus::Pending | StageStatus::Running)
+    }
+}
+
+/// Absorb every historical status dialect into the closed taxonomy.
+/// Unknown strings return `None` — callers decide whether that is a loud
+/// defect (recorder validation) or display-as-unknown (historical rows).
+#[allow(dead_code)] // consumed by the shared recorder (next increment)
+pub fn parse_stage_status(raw: &str) -> Option<StageStatus> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "pending" => Some(StageStatus::Pending),
+        "running" => Some(StageStatus::Running),
+        "pass" | "passed" | "success" | "succeeded" | "ok" => Some(StageStatus::Pass),
+        "fail" | "failed" | "error" => Some(StageStatus::Fail),
+        "skip" | "skipped" => Some(StageStatus::Skipped),
+        "na" | "n/a" | "not_applicable" | "not-applicable" | "not_run" | "not-run" | "not run" => {
+            Some(StageStatus::NotApplicable)
+        }
+        "timed_out" | "timedout" | "timeout" => Some(StageStatus::TimedOut),
+        "aborted" | "abort" => Some(StageStatus::Aborted),
+        _ => None,
+    }
+}
+
 /// When is this stage part of the resolved plan for a given run? Mirrors
 /// the gating the wrapper and monitor already apply (platform selectors,
 /// role-platform election, suite flags).
@@ -122,6 +184,10 @@ pub enum EnableRule {
     BlindExitPlatform(&'static str),
     /// Part of the Linux live-validation suite (`!skip_linux_live_suite`).
     LinuxLiveSuite,
+    /// The extended soak stage (`!skip_soak` / bash RUN_SOAK).
+    SoakSuite,
+    /// The local full gate suite stage (`!skip_gates` / bash RUN_LOCAL_GATES).
+    LocalGateSuite,
     /// Opt-in chaos suite.
     ChaosSuite,
     /// Opt-in cross-network suite.
@@ -144,6 +210,8 @@ pub struct TargetSelectors {
     pub skip_linux_live_suite: bool,
     pub chaos_suite: bool,
     pub cross_network_suite: bool,
+    pub soak_suite: bool,
+    pub local_gate_suite: bool,
 }
 
 impl TargetSelectors {
@@ -162,6 +230,8 @@ impl TargetSelectors {
             EnableRule::LinuxLiveSuite => !self.skip_linux_live_suite,
             EnableRule::ChaosSuite => self.chaos_suite,
             EnableRule::CrossNetworkSuite => self.cross_network_suite,
+            EnableRule::SoakSuite => self.soak_suite,
+            EnableRule::LocalGateSuite => self.local_gate_suite,
         }
     }
 
@@ -182,6 +252,8 @@ impl TargetSelectors {
             EnableRule::LinuxLiveSuite => "linux live suite skipped for this run",
             EnableRule::ChaosSuite => "chaos suite not selected",
             EnableRule::CrossNetworkSuite => "cross-network suite not selected",
+            EnableRule::SoakSuite => "soak stage not selected",
+            EnableRule::LocalGateSuite => "local gate suite not selected",
         }
     }
 }
@@ -226,6 +298,12 @@ pub struct StageSpec {
     /// True for display-only aggregates (the monitor's `linux_live_suite`
     /// row) that never appear in recorded outcomes.
     pub synthetic: bool,
+    /// True when the stage's enablement rule can resolve `true` and the
+    /// orchestrators may STILL legitimately not dispatch it (runtime
+    /// gating the selectors cannot see: audit sub-passes, cross-network
+    /// auto mode). The conclusion barrier never synthesizes `aborted` for
+    /// these — a missing outcome is not evidence of abnormal termination.
+    pub conditional_dispatch: bool,
 }
 
 const DEFAULT_SPEC: StageSpec = StageSpec {
@@ -245,6 +323,7 @@ const DEFAULT_SPEC: StageSpec = StageSpec {
     severity: StageSeverity::Hard,
     proves: &[],
     synthetic: false,
+    conditional_dispatch: false,
 };
 
 /// Control-ID sets shared by the per-OS variants of each audit stage.
@@ -715,6 +794,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("macos_keychain_key_custody"),
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     // ── macOS audit family ──────────────────────────────────────────────
@@ -725,6 +805,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
         proves: PROVES_MEMBERSHIP_REVOKE,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -733,6 +814,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("macos_membership_signature_forgery"),
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -742,6 +824,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
         proves: PROVES_GOSSIP_REVOKED_READMIT,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -751,6 +834,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
         proves: PROVES_ENROLLMENT_REPLAY,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -760,6 +844,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
         proves: PROVES_HELLO_LIMITER_FLOOD,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -768,6 +853,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("macos_runtime_acls"),
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -776,6 +862,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("macos_service_hardening"),
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -784,6 +871,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("macos_mesh_status"),
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -792,6 +880,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("macos_authenticode"),
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -800,6 +889,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("macos_privileged_helper_allowlist"),
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -808,6 +898,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("macos_policy_default_deny"),
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -817,6 +908,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
         proves: PROVES_REVOKED_PEER_DENIED,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -826,6 +918,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsMacos,
         budget_secs: 180,
         proves: PROVES_BLIND_EXIT_REVERSAL,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     // ── Windows live cells ──────────────────────────────────────────────
@@ -844,6 +937,7 @@ pub const STAGES: &[StageSpec] = &[
         role: Some(("windows", "client")),
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -853,6 +947,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("windows_named_pipe_acl"),
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -861,6 +956,7 @@ pub const STAGES: &[StageSpec] = &[
         role: Some(("windows", "client")),
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -870,6 +966,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("windows_dpapi_key_custody"),
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -961,6 +1058,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
         proves: PROVES_MEMBERSHIP_REVOKE,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -969,6 +1067,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("windows_membership_signature_forgery"),
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -978,6 +1077,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
         proves: PROVES_GOSSIP_REVOKED_READMIT,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -987,6 +1087,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
         proves: PROVES_ENROLLMENT_REPLAY,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -996,6 +1097,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
         proves: PROVES_HELLO_LIMITER_FLOOD,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1004,6 +1106,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("windows_mesh_status"),
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1012,6 +1115,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("windows_privileged_helper_allowlist"),
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1020,6 +1124,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("windows_policy_default_deny"),
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1029,6 +1134,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
         proves: PROVES_REVOKED_PEER_DENIED,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1038,6 +1144,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::WantsWindows,
         budget_secs: 180,
         proves: PROVES_BLIND_EXIT_REVERSAL,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     // ── Linux live cells ────────────────────────────────────────────────
@@ -1048,6 +1155,7 @@ pub const STAGES: &[StageSpec] = &[
         role: Some(("linux", "relay")),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1058,6 +1166,7 @@ pub const STAGES: &[StageSpec] = &[
         cross_os: Some("cross_os_anchor_bundle_pull"),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1067,6 +1176,7 @@ pub const STAGES: &[StageSpec] = &[
         role: Some(("linux", "exit")),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1076,6 +1186,7 @@ pub const STAGES: &[StageSpec] = &[
         role: Some(("linux", "exit")),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1085,6 +1196,7 @@ pub const STAGES: &[StageSpec] = &[
         role: Some(("linux", "exit")),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1093,6 +1205,7 @@ pub const STAGES: &[StageSpec] = &[
         direct_platform: Some(("linux", "managed_dns")),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1101,6 +1214,7 @@ pub const STAGES: &[StageSpec] = &[
         direct_platform: Some(("linux", "managed_dns")),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1108,6 +1222,7 @@ pub const STAGES: &[StageSpec] = &[
         stream: PlatformStream::Linux,
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     // ── Linux audit family ──────────────────────────────────────────────
@@ -1118,6 +1233,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
         proves: PROVES_MEMBERSHIP_REVOKE,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1127,6 +1243,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
         proves: PROVES_REVOKED_PEER_DENIED,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1135,6 +1252,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("linux_membership_signature_forgery"),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1143,6 +1261,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("linux_privileged_helper_allowlist"),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1151,6 +1270,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("linux_policy_default_deny"),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1159,6 +1279,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("linux_runtime_acls"),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1167,6 +1288,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("linux_service_hardening"),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1175,6 +1297,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("linux_authenticode"),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1183,6 +1306,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("linux_key_custody"),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1191,6 +1315,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("linux_membership_genesis"),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1199,6 +1324,7 @@ pub const STAGES: &[StageSpec] = &[
         special: Some("linux_mesh_status"),
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1208,6 +1334,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
         proves: PROVES_BLIND_EXIT_REVERSAL,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1217,6 +1344,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
         proves: PROVES_GOSSIP_REVOKED_READMIT,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1226,6 +1354,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
         proves: PROVES_ENROLLMENT_REPLAY,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1235,6 +1364,7 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
         proves: PROVES_HELLO_LIMITER_FLOOD,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     // ── bash live suite (shared LIVE stages) ────────────────────────────
@@ -1335,7 +1465,7 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "extended_soak",
         logical: Some("extended_soak"),
-        enable: EnableRule::LinuxLiveSuite,
+        enable: EnableRule::SoakSuite,
         ..DEFAULT_SPEC
     },
     // ── chaos suite ─────────────────────────────────────────────────────
@@ -1407,11 +1537,22 @@ pub const STAGES: &[StageSpec] = &[
         name: "cross_network_nat_classification",
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
+        // Cross-network auto mode decides at runtime whether the substrate
+        // is available; the selectors cannot see that.
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cross_network_nat_matrix",
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
         name: "local_full_gate_suite",
         group: StageGroup::Job,
+        enable: EnableRule::LocalGateSuite,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1748,6 +1889,40 @@ mod tests {
         assert!(!empty.resolves(EnableRule::MacosExit));
         assert!(!empty.resolves(EnableRule::ChaosSuite));
         assert!(empty.resolves(EnableRule::LinuxLiveSuite));
+    }
+
+    #[test]
+    fn stage_status_taxonomy_round_trips_and_absorbs_dialects() {
+        // Canonical strings round-trip.
+        for status in [
+            StageStatus::Pending,
+            StageStatus::Running,
+            StageStatus::Pass,
+            StageStatus::Fail,
+            StageStatus::Skipped,
+            StageStatus::NotApplicable,
+            StageStatus::TimedOut,
+            StageStatus::Aborted,
+        ] {
+            assert_eq!(parse_stage_status(status.as_str()), Some(status));
+        }
+        // Historical dialects normalize.
+        assert_eq!(parse_stage_status("skip"), Some(StageStatus::Skipped));
+        assert_eq!(parse_stage_status("SKIPPED"), Some(StageStatus::Skipped));
+        assert_eq!(parse_stage_status("passed"), Some(StageStatus::Pass));
+        assert_eq!(
+            parse_stage_status("not_run"),
+            Some(StageStatus::NotApplicable)
+        );
+        assert_eq!(parse_stage_status("n/a"), Some(StageStatus::NotApplicable));
+        assert_eq!(parse_stage_status("timeout"), Some(StageStatus::TimedOut));
+        // Unknown strings are a caller decision, not a silent bucket.
+        assert_eq!(parse_stage_status("exploded"), None);
+        // Terminality: only pending/running are non-terminal.
+        assert!(!StageStatus::Pending.is_terminal());
+        assert!(!StageStatus::Running.is_terminal());
+        assert!(StageStatus::Aborted.is_terminal());
+        assert!(StageStatus::Skipped.is_terminal());
     }
 
     #[test]

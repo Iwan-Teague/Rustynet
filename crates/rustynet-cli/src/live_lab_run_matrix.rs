@@ -544,6 +544,8 @@ fn build_live_lab_run_matrix_values(
             }),
     );
     dedupe_stage_evidence(&mut stage_evidence);
+    apply_conclusion_barrier(&mut stage_evidence, config.report_dir);
+    let unregistered_note = unregistered_stage_note(&stage_evidence);
 
     let mut values = BTreeMap::new();
     set_if_present(
@@ -659,8 +661,14 @@ fn build_live_lab_run_matrix_values(
         "evidence_bundle_path",
         path_display(config.report_dir),
     );
-    if let Some(ref notes) = config.notes {
-        set_if_present(&mut values, &schema_set, "notes", notes.clone());
+    let notes = match (config.notes.as_deref(), unregistered_note.as_deref()) {
+        (Some(notes), Some(warning)) => Some(format!("{notes}; {warning}")),
+        (Some(notes), None) => Some(notes.to_owned()),
+        (None, Some(warning)) => Some(warning.to_owned()),
+        (None, None) => None,
+    };
+    if let Some(notes) = notes {
+        set_if_present(&mut values, &schema_set, "notes", notes);
     }
 
     populate_target_identity_values(&mut values, &schema_set, &target_evidence);
@@ -679,6 +687,57 @@ fn build_live_lab_run_matrix_values(
         &stage_evidence,
     );
     Ok(values)
+}
+
+/// Finding 3's conclusion barrier: every stage the run's manifest planned
+/// (enabled, non-synthetic) that recorded NO outcome gets an explicit
+/// `aborted` row instead of silently vanishing. Only `full` runs conclude
+/// this way — a setup-only / validate-only / dry run legitimately records
+/// nothing for the stages it never intended to reach. Pre-manifest report
+/// dirs (or unreadable manifests) change nothing.
+fn apply_conclusion_barrier(stages: &mut Vec<StageEvidence>, report_dir: &Path) {
+    let manifest = match crate::live_lab_stage_manifest::read_stage_manifest(report_dir) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) | Err(_) => return,
+    };
+    if manifest.run_mode != "full" {
+        return;
+    }
+    let recorded: BTreeSet<String> = stages
+        .iter()
+        .map(|stage| strip_node_alias_prefix(stage.stage.as_str()).to_owned())
+        .collect();
+    for planned in manifest
+        .stages
+        .iter()
+        .filter(|stage| stage.enabled && !stage.synthetic && !stage.barrier_exempt)
+    {
+        if !recorded.contains(planned.name.as_str()) {
+            stages.push(StageEvidence {
+                stage: planned.name.clone(),
+                status: "aborted".to_owned(),
+                artifacts: Vec::new(),
+            });
+        }
+    }
+}
+
+/// Recorder validation (Finding 1C): a recorded stage name the registry
+/// does not know is exactly the silent-drift class the registry exists to
+/// kill — surface it in the row's notes so it reads as a defect, not
+/// nothing. Non-fatal: evidence is still recorded.
+fn unregistered_stage_note(stages: &[StageEvidence]) -> Option<String> {
+    let mut unknown: Vec<&str> = stages
+        .iter()
+        .map(|stage| stage.stage.as_str())
+        .filter(|name| crate::live_lab_stage_registry::find_stage(name).is_none())
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    unknown.sort_unstable();
+    unknown.dedup();
+    Some(format!("unregistered_stages: {}", unknown.join(",")))
 }
 
 fn set_if_present(
@@ -1371,7 +1430,9 @@ fn merge_status(existing: &str, next: &str) -> String {
 
 fn status_rank(status: &str) -> u8 {
     match normalize_status(status) {
-        "fail" => 6,
+        "fail" => 8,
+        "timed_out" => 7,
+        "aborted" => 6,
         "blocked" => 5,
         "pass" => 4,
         "skip" => 3,
@@ -1388,6 +1449,11 @@ fn normalize_status(status: &str) -> &str {
         "failed" | "fail" | "error" => "fail",
         "skipped" | "skip" => "skip",
         "blocked" => "blocked",
+        // Finding 3: the conclusion barrier's terminal states — a planned
+        // stage that evaporated (aborted) or exceeded its watchdog
+        // (timed_out) is distinguishable from fail and from never-planned.
+        "aborted" | "abort" => "aborted",
+        "timed_out" | "timedout" | "timeout" => "timed_out",
         "not_run" | "not-run" | "not run" => "not_run",
         "n/a" | "na" => "na",
         _ => "unknown",
@@ -1411,14 +1477,25 @@ fn dedupe_stage_evidence(stages: &mut Vec<StageEvidence>) {
 }
 
 fn overall_result(report_state: &Option<Value>, stages: &[StageEvidence]) -> String {
+    // Finding 3: a run whose planned stages evaporated must not read as a
+    // clean pass, even when the (Linux-side) report state says the suite it
+    // ran passed — the conclusion barrier's synthesized outcomes demote it.
+    let has_aborted = stages
+        .iter()
+        .any(|stage| stage.status == "aborted" || stage.status == "timed_out");
     if let Some(true) = json_bool_path(report_state, &["run_complete"]) {
         if json_bool_path(report_state, &["run_passed"]) == Some(true) {
+            if has_aborted {
+                return "aborted".to_owned();
+            }
             return "pass".to_owned();
         }
         return "fail".to_owned();
     }
     if stages.iter().any(|stage| stage.status == "fail") {
         "fail".to_owned()
+    } else if has_aborted {
+        "aborted".to_owned()
     } else if stages.iter().any(|stage| stage.status == "pass") {
         "pass".to_owned()
     } else {
@@ -3060,5 +3137,188 @@ mod upsert_tests {
         );
         assert_eq!(data_rows(&path).len(), 2);
         let _ = fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod conclusion_barrier_tests {
+    //! Finding 3: planned stages must not evaporate without a recorded
+    //! ending. The barrier synthesizes `aborted` for manifest-enabled,
+    //! non-exempt stages with no outcome — and overall_result demotes a
+    //! "passing" run whose plan has holes.
+
+    use super::{StageEvidence, apply_conclusion_barrier, overall_result};
+    use crate::live_lab_stage_manifest::{build_stage_manifest, write_stage_manifest};
+    use crate::live_lab_stage_registry::TargetSelectors;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_report_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "barrier_{name}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("temp report dir");
+        dir
+    }
+
+    fn evidence(stage: &str, status: &str) -> StageEvidence {
+        StageEvidence {
+            stage: stage.to_owned(),
+            status: status.to_owned(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// Every barrier-eligible enabled stage recorded → nothing synthesized.
+    /// (Linux-only selectors keep the eligible set small enough to
+    /// enumerate exactly: the shared pipeline + the non-audit live suite.)
+    fn fully_recorded_evidence() -> Vec<StageEvidence> {
+        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default());
+        manifest
+            .stages
+            .iter()
+            .filter(|stage| stage.enabled && !stage.synthetic && !stage.barrier_exempt)
+            .map(|stage| evidence(stage.name.as_str(), "pass"))
+            .collect()
+    }
+
+    #[test]
+    fn barrier_synthesizes_aborted_for_planned_unrecorded_stages() {
+        let dir = temp_report_dir("synthesizes");
+        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default());
+        write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
+
+        // The run recorded everything except live_managed_dns.
+        let mut stages: Vec<StageEvidence> = fully_recorded_evidence()
+            .into_iter()
+            .filter(|stage| stage.stage != "live_managed_dns")
+            .collect();
+        apply_conclusion_barrier(&mut stages, dir.as_path());
+        let synthesized: Vec<&StageEvidence> = stages
+            .iter()
+            .filter(|stage| stage.status == "aborted")
+            .collect();
+        assert_eq!(synthesized.len(), 1, "{synthesized:?}");
+        assert_eq!(synthesized[0].stage, "live_managed_dns");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn barrier_is_silent_when_every_planned_stage_recorded() {
+        let dir = temp_report_dir("complete");
+        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default());
+        write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
+        let mut stages = fully_recorded_evidence();
+        let before = stages.len();
+        apply_conclusion_barrier(&mut stages, dir.as_path());
+        assert_eq!(stages.len(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn barrier_respects_run_mode_exemptions_and_node_composites() {
+        let dir = temp_report_dir("modes");
+        // setup_only: recording nothing for the live suite is legitimate.
+        let manifest = build_stage_manifest("test", "setup_only", &TargetSelectors::default());
+        write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
+        let mut stages = vec![evidence("preflight", "pass")];
+        apply_conclusion_barrier(&mut stages, dir.as_path());
+        assert_eq!(stages.len(), 1, "setup_only must not synthesize");
+        let _ = fs::remove_dir_all(&dir);
+
+        // Missing manifest (pre-manifest report dirs): no-op.
+        let dir = temp_report_dir("no_manifest");
+        let mut stages = vec![evidence("preflight", "pass")];
+        apply_conclusion_barrier(&mut stages, dir.as_path());
+        assert_eq!(stages.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+
+        // Node-scoped composites count as recordings of the bare stage.
+        let dir = temp_report_dir("composites");
+        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default());
+        write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
+        let mut stages = fully_recorded_evidence();
+        // Replace the flat record with a node-scoped one.
+        stages.retain(|stage| stage.stage != "live_anchor");
+        stages.push(evidence("debian-headless-1::live_anchor", "pass"));
+        apply_conclusion_barrier(&mut stages, dir.as_path());
+        assert!(
+            !stages
+                .iter()
+                .any(|stage| stage.stage == "live_anchor" && stage.status == "aborted"),
+            "a node-scoped record must satisfy the barrier for the bare stage"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn barrier_never_marks_exempt_or_disabled_stages() {
+        let dir = temp_report_dir("exempt");
+        // Chaos + audit families stay quiet even though a full manifest
+        // exists: chaos is disabled by default selectors, audits are
+        // barrier-exempt (conditional dispatch).
+        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default());
+        write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
+        let mut stages = fully_recorded_evidence();
+        apply_conclusion_barrier(&mut stages, dir.as_path());
+        assert!(
+            !stages.iter().any(|stage| {
+                stage.status == "aborted"
+                    && (stage.stage.starts_with("chaos_")
+                        || stage.stage.starts_with("validate_linux_")
+                        || stage.stage == "extended_soak"
+                        || stage.stage == "local_full_gate_suite")
+            }),
+            "exempt/disabled stages must not be marked aborted"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overall_result_demotes_runs_with_aborted_stages() {
+        use serde_json::json;
+        // Linux suite said pass, but a planned stage evaporated.
+        let state = Some(json!({"run_complete": true, "run_passed": true}));
+        let stages = vec![
+            evidence("preflight", "pass"),
+            evidence("live_relay", "aborted"),
+        ];
+        assert_eq!(overall_result(&state, &stages), "aborted");
+        // A real fail still dominates.
+        let stages = vec![
+            evidence("preflight", "fail"),
+            evidence("live_relay", "aborted"),
+        ];
+        assert_eq!(overall_result(&None, &stages), "fail");
+        // No report state: aborted beats pass.
+        let stages = vec![
+            evidence("preflight", "pass"),
+            evidence("live_relay", "aborted"),
+        ];
+        assert_eq!(overall_result(&None, &stages), "aborted");
+        // Clean pass unchanged.
+        let state = Some(json!({"run_complete": true, "run_passed": true}));
+        assert_eq!(
+            overall_result(&state, &[evidence("preflight", "pass")]),
+            "pass"
+        );
+    }
+
+    #[test]
+    fn status_vocabulary_recognizes_terminal_states() {
+        use super::{normalize_status, status_rank};
+        assert_eq!(normalize_status("aborted"), "aborted");
+        assert_eq!(normalize_status("timed_out"), "timed_out");
+        assert_eq!(normalize_status("timeout"), "timed_out");
+        // Worst-wins ordering: fail > timed_out > aborted > blocked > pass.
+        assert!(status_rank("fail") > status_rank("timed_out"));
+        assert!(status_rank("timed_out") > status_rank("aborted"));
+        assert!(status_rank("aborted") > status_rank("blocked"));
+        assert!(status_rank("blocked") > status_rank("pass"));
     }
 }

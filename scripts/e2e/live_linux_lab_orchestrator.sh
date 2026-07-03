@@ -8139,7 +8139,15 @@ emit_stage_manifest_best_effort() {
   if [[ -f "${REPORT_DIR}/orchestration/stage_manifest.json" ]]; then
     return 0
   fi
-  local _args=(--report-dir "$REPORT_DIR" --run-command live-linux-lab-orchestrator)
+  local _run_mode="full"
+  if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+    _run_mode="dry_run"
+  elif [[ "${SETUP_ONLY:-0}" -eq 1 ]]; then
+    _run_mode="setup_only"
+  elif [[ "${VALIDATE_ONLY:-0}" -eq 1 ]]; then
+    _run_mode="validate_only"
+  fi
+  local _args=(--report-dir "$REPORT_DIR" --run-command live-linux-lab-orchestrator --run-mode "$_run_mode")
   if [[ "${EXIT_PLATFORM:-}" == "macos" || "${RELAY_PLATFORM:-}" == "macos" ]]; then
     _args+=(--macos)
   fi
@@ -8149,6 +8157,8 @@ emit_stage_manifest_best_effort() {
   [[ -n "${EXIT_PLATFORM:-}" ]] && _args+=(--exit-platform "$EXIT_PLATFORM")
   [[ -n "${RELAY_PLATFORM:-}" ]] && _args+=(--relay-platform "$RELAY_PLATFORM")
   [[ "${ENABLE_CHAOS_SUITE:-0}" -eq 1 ]] && _args+=(--chaos-suite)
+  [[ "${RUN_SOAK:-0}" -eq 1 ]] && _args+=(--soak-suite)
+  [[ "${RUN_LOCAL_GATES:-0}" -eq 1 ]] && _args+=(--local-gate-suite)
   cargo run --quiet -p rustynet-cli -- ops emit-stage-manifest "${_args[@]}" >/dev/null 2>&1 || true
 }
 

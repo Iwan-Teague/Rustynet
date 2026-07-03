@@ -6687,9 +6687,12 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
     crate::live_lab_stage_manifest::ensure_stage_manifest(
         report_dir.as_path(),
         "vm-lab-run-live-lab",
+        if config.dry_run { "dry_run" } else { "full" },
         &crate::live_lab_stage_registry::TargetSelectors {
             chaos_suite: config.enable_chaos_suite,
             cross_network_suite: !config.skip_cross_network,
+            soak_suite: !config.skip_soak,
+            local_gate_suite: !config.skip_gates,
             ..Default::default()
         },
     )?;
@@ -6858,6 +6861,8 @@ fn orchestrate_manifest_selectors(
         skip_linux_live_suite: config.skip_linux_live_suite,
         chaos_suite: config.enable_chaos_suite,
         cross_network_suite: !config.skip_cross_network,
+        soak_suite: !config.skip_soak,
+        local_gate_suite: !config.skip_gates,
     }
 }
 
@@ -7097,7 +7102,10 @@ fn execute_rust_native_orchestration(
             status: match outcome {
                 StageOutcome::Passed => "pass",
                 StageOutcome::Failed(_) => "fail",
-                StageOutcome::Skipped => "skip",
+                // Canonical taxonomy (finding 3): the bash recorder and the
+                // monitor's finality test both speak "skipped"; the matrix
+                // normalizer accepts either.
+                StageOutcome::Skipped => "skipped",
             }
             .to_owned(),
             artifacts: vec![parity_path.display().to_string()],
@@ -7200,6 +7208,13 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     crate::live_lab_stage_manifest::ensure_stage_manifest(
         report_dir.as_path(),
         "vm-lab-orchestrate-live-lab",
+        if config.dry_run {
+            "dry_run"
+        } else if config.stop_after_ready {
+            "setup_only"
+        } else {
+            "full"
+        },
         &orchestrate_manifest_selectors(&config),
     )?;
     let selected_aliases = resolve_live_lab_vm_aliases(
@@ -24545,7 +24560,9 @@ fn live_lab_matrix_stage_outcomes_from_vm_lab(
             status: match outcome.status {
                 VmLabStageStatus::Pass => "pass",
                 VmLabStageStatus::Fail => "fail",
-                VmLabStageStatus::Skipped => "skip",
+                // Canonical taxonomy (finding 3) — see the StageOutcome
+                // converter above.
+                VmLabStageStatus::Skipped => "skipped",
             }
             .to_owned(),
             artifacts: outcome.artifacts.clone(),

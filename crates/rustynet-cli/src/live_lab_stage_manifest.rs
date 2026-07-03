@@ -33,6 +33,12 @@ pub struct StageManifest {
     /// The command that resolved this plan (`vm-lab-orchestrate-live-lab`,
     /// `live-linux-lab-orchestrator`, ...).
     pub run_command: String,
+    /// `full` | `setup_only` | `validate_only` | `dry_run`. The conclusion
+    /// barrier only synthesizes `aborted` outcomes for planned-but-
+    /// unrecorded stages on `full` runs — a setup-only run legitimately
+    /// records nothing for the live suite.
+    #[serde(default = "default_run_mode")]
+    pub run_mode: String,
     pub selectors: ManifestSelectors,
     pub stages: Vec<ManifestStage>,
 }
@@ -95,10 +101,24 @@ pub struct ManifestStage {
     /// Display-only aggregate; never appears in recorded outcomes.
     #[serde(default)]
     pub synthetic: bool,
+    /// Exempt from the conclusion barrier: job-level bookkeeping stages
+    /// and stages whose dispatch is runtime-gated beyond the selectors
+    /// (audit sub-passes, cross-network auto mode) — a missing outcome is
+    /// not evidence of abnormal termination for these.
+    #[serde(default)]
+    pub barrier_exempt: bool,
+}
+
+fn default_run_mode() -> String {
+    "full".to_owned()
 }
 
 /// Resolve the full registry against this run's selectors.
-pub fn build_stage_manifest(run_command: &str, selectors: &TargetSelectors) -> StageManifest {
+pub fn build_stage_manifest(
+    run_command: &str,
+    run_mode: &str,
+    selectors: &TargetSelectors,
+) -> StageManifest {
     let stages = STAGES
         .iter()
         .map(|spec| {
@@ -115,6 +135,8 @@ pub fn build_stage_manifest(run_command: &str, selectors: &TargetSelectors) -> S
                     live_lab_stage_registry::StageSeverity::Soft => "soft".to_owned(),
                 },
                 synthetic: spec.synthetic,
+                barrier_exempt: spec.conditional_dispatch
+                    || spec.group == live_lab_stage_registry::StageGroup::Job,
             }
         })
         .collect();
@@ -122,6 +144,7 @@ pub fn build_stage_manifest(run_command: &str, selectors: &TargetSelectors) -> S
         schema_version: STAGE_MANIFEST_SCHEMA_VERSION,
         generated_at_unix: unix_now(),
         run_command: run_command.to_owned(),
+        run_mode: run_mode.to_owned(),
         selectors: ManifestSelectors::from(selectors),
         stages,
     }
@@ -162,7 +185,6 @@ pub fn write_stage_manifest(
 }
 
 /// Read a previously emitted manifest, if one exists.
-#[allow(dead_code)] // consumed by the recorder validation + drift gate (next increments)
 pub fn read_stage_manifest(report_dir: &Path) -> Result<Option<StageManifest>, String> {
     let path = report_dir.join(STAGE_MANIFEST_RELATIVE_PATH);
     if !path.exists() {
@@ -181,13 +203,14 @@ pub fn read_stage_manifest(report_dir: &Path) -> Result<Option<StageManifest>, S
 pub fn ensure_stage_manifest(
     report_dir: &Path,
     run_command: &str,
+    run_mode: &str,
     selectors: &TargetSelectors,
 ) -> Result<(PathBuf, bool), String> {
     let path = report_dir.join(STAGE_MANIFEST_RELATIVE_PATH);
     if path.exists() {
         return Ok((path, false));
     }
-    let manifest = build_stage_manifest(run_command, selectors);
+    let manifest = build_stage_manifest(run_command, run_mode, selectors);
     let path = write_stage_manifest(report_dir, &manifest)?;
     Ok((path, true))
 }
@@ -199,6 +222,7 @@ pub fn ensure_stage_manifest(
 pub struct EmitStageManifestConfig {
     pub report_dir: PathBuf,
     pub run_command: String,
+    pub run_mode: String,
     pub selectors: TargetSelectors,
 }
 
@@ -206,6 +230,7 @@ pub fn execute_ops_emit_stage_manifest(config: EmitStageManifestConfig) -> Resul
     let (path, written) = ensure_stage_manifest(
         config.report_dir.as_path(),
         config.run_command.as_str(),
+        config.run_mode.as_str(),
         &config.selectors,
     )?;
     Ok(if written {
@@ -239,12 +264,14 @@ mod tests {
             skip_linux_live_suite: false,
             chaos_suite: true,
             cross_network_suite: true,
+            soak_suite: true,
+            local_gate_suite: true,
         }
     }
 
     #[test]
     fn manifest_covers_every_registry_stage_exactly_once() {
-        let manifest = build_stage_manifest("test-run", &TargetSelectors::default());
+        let manifest = build_stage_manifest("test-run", "full", &TargetSelectors::default());
         let mut names: Vec<&str> = manifest.stages.iter().map(|s| s.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();
@@ -259,7 +286,7 @@ mod tests {
     fn manifest_resolves_enablement_and_skip_reasons() {
         // Default selectors: linux-only run — mac/win cells not applicable,
         // linux suite enabled, chaos not selected.
-        let manifest = build_stage_manifest("test-run", &TargetSelectors::default());
+        let manifest = build_stage_manifest("test-run", "full", &TargetSelectors::default());
         let by_name = |name: &str| {
             manifest
                 .stages
@@ -287,7 +314,7 @@ mod tests {
         // off), relay to Windows (macOS relay cell off), anchor to macOS
         // (windows anchor cell off), admin to Windows (macOS admin cell
         // off).
-        let full = build_stage_manifest("test-run", &full_selectors());
+        let full = build_stage_manifest("test-run", "full", &full_selectors());
         let mut disabled: Vec<&str> = full
             .stages
             .iter()
@@ -317,7 +344,8 @@ mod tests {
             unix_now()
         ));
         fs::create_dir_all(&dir).expect("create temp report dir");
-        let manifest = build_stage_manifest("vm-lab-orchestrate-live-lab", &full_selectors());
+        let manifest =
+            build_stage_manifest("vm-lab-orchestrate-live-lab", "full", &full_selectors());
         let path = write_stage_manifest(dir.as_path(), &manifest).expect("write");
         assert!(path.ends_with(STAGE_MANIFEST_RELATIVE_PATH));
         let loaded = read_stage_manifest(dir.as_path())
@@ -326,9 +354,13 @@ mod tests {
         assert_eq!(loaded, manifest);
 
         // ensure_stage_manifest is idempotent: second call does not rewrite.
-        let (path_again, written) =
-            ensure_stage_manifest(dir.as_path(), "other-command", &TargetSelectors::default())
-                .expect("ensure");
+        let (path_again, written) = ensure_stage_manifest(
+            dir.as_path(),
+            "other-command",
+            "full",
+            &TargetSelectors::default(),
+        )
+        .expect("ensure");
         assert_eq!(path_again, path);
         assert!(!written);
         let still = read_stage_manifest(dir.as_path())
@@ -343,7 +375,7 @@ mod tests {
 
     #[test]
     fn synthetic_aggregates_are_marked_in_manifest() {
-        let manifest = build_stage_manifest("test-run", &TargetSelectors::default());
+        let manifest = build_stage_manifest("test-run", "full", &TargetSelectors::default());
         let synthetic: Vec<&str> = manifest
             .stages
             .iter()
