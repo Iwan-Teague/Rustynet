@@ -40,7 +40,21 @@ pub fn read_orchestrate_result(report_dir: &Path) -> Result<OrchestrateResult> {
 
 /// Infer the active stage from the orchestrate.log file.
 /// Returns the stage name if a `STAGE:` marker line is found.
-pub fn infer_active_stage(report_dir: &Path) -> Result<Option<String>> {
+///
+/// `ordered_enabled_stages` and `outcomes` back a THIRD fallback (see
+/// `infer_active_stage_from_pipeline_position`) for stages whose dispatcher
+/// writes its `.log` file only once, wholesale, after the remote command
+/// returns (e.g. `bootstrap_macos_host`, `bootstrap_windows_host`, and other
+/// one-shot SSH-dispatch stages) -- those never emit a `[stage:xxx] START`
+/// line while genuinely running, so the two log-based methods above can
+/// never detect them as active no matter how long they take. Pass an empty
+/// slice for either to skip this fallback (e.g. from a caller without a
+/// config-driven stage list).
+pub fn infer_active_stage(
+    report_dir: &Path,
+    ordered_enabled_stages: &[String],
+    outcomes: &[StageOutcome],
+) -> Result<Option<String>> {
     let log_path = report_dir.join("orchestration").join("orchestrate.log");
     if log_path.exists() {
         let raw = std::fs::read_to_string(&log_path)
@@ -62,7 +76,36 @@ pub fn infer_active_stage(report_dir: &Path) -> Result<Option<String>> {
         return Ok(Some(stage));
     }
 
-    Ok(None)
+    Ok(infer_active_stage_from_pipeline_position(
+        ordered_enabled_stages,
+        outcomes,
+    ))
+}
+
+/// The first stage (in pipeline order) that hasn't reached a final status
+/// yet. Doesn't depend on any log file existing or following a particular
+/// format at all -- just the fixed, always-known pipeline order and
+/// whatever outcomes have actually been recorded so far -- so it still
+/// finds the right answer for a stage whose log only appears after it
+/// finishes. This is a positional approximation: it assumes
+/// `ordered_enabled_stages` reflects real execution order (true for the
+/// pipeline as currently defined), so it can occasionally point at the
+/// wrong one of two genuinely-parallel stages -- but it's never worse than
+/// the "nothing detected" status quo for stages the log-based methods are
+/// structurally blind to.
+fn infer_active_stage_from_pipeline_position(
+    ordered_enabled_stages: &[String],
+    outcomes: &[StageOutcome],
+) -> Option<String> {
+    let finished: std::collections::HashSet<&str> = outcomes
+        .iter()
+        .filter(|o| matches!(o.status.as_str(), "pass" | "fail" | "skip" | "skipped"))
+        .map(|o| o.stage.as_str())
+        .collect();
+    ordered_enabled_stages
+        .iter()
+        .find(|stage| !finished.contains(stage.as_str()))
+        .cloned()
 }
 
 fn orchestrate_result_path(report_dir: &Path) -> PathBuf {
@@ -170,7 +213,64 @@ mod tests {
         )
         .expect("log");
 
-        let stage = infer_active_stage(dir.path()).expect("stage");
+        let stage = infer_active_stage(dir.path(), &[], &[]).expect("stage");
+
+        assert_eq!(stage.as_deref(), Some("bootstrap_hosts"));
+    }
+
+    #[test]
+    fn active_stage_falls_back_to_pipeline_position_when_no_log_signal_exists() {
+        // bootstrap_macos_host (and other one-shot SSH-dispatch stages)
+        // write their .log file only once, after the remote command
+        // returns -- there's no "logs" dir at all yet while genuinely
+        // running, so infer_active_stage_from_logs finds nothing. The
+        // pipeline-position fallback must still say it's active.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ordered = vec!["preflight".to_owned(), "bootstrap_macos_host".to_owned()];
+        let outcomes = vec![StageOutcome {
+            stage: "preflight".to_owned(),
+            status: "pass".to_owned(),
+            summary: String::new(),
+            artifacts: Vec::new(),
+        }];
+
+        let stage = infer_active_stage(dir.path(), &ordered, &outcomes).expect("stage");
+
+        assert_eq!(stage.as_deref(), Some("bootstrap_macos_host"));
+    }
+
+    #[test]
+    fn active_stage_pipeline_fallback_is_none_when_everything_enabled_is_finished() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ordered = vec!["preflight".to_owned()];
+        let outcomes = vec![StageOutcome {
+            stage: "preflight".to_owned(),
+            status: "pass".to_owned(),
+            summary: String::new(),
+            artifacts: Vec::new(),
+        }];
+
+        let stage = infer_active_stage(dir.path(), &ordered, &outcomes).expect("stage");
+
+        assert_eq!(stage, None);
+    }
+
+    #[test]
+    fn log_based_detection_still_wins_over_the_pipeline_position_fallback() {
+        // When a real "[stage:xxx] START" marker exists, it's more precise
+        // (immediate, not just positional) than the fallback -- it must
+        // still take priority even if the fallback would point elsewhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        std::fs::write(
+            logs.join("bootstrap_hosts.log"),
+            "[stage:bootstrap_hosts] START fresh install\n",
+        )
+        .expect("log");
+        let ordered = vec!["some_other_stage".to_owned()];
+
+        let stage = infer_active_stage(dir.path(), &ordered, &[]).expect("stage");
 
         assert_eq!(stage.as_deref(), Some("bootstrap_hosts"));
     }

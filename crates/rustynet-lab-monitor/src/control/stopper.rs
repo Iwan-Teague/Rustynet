@@ -10,7 +10,7 @@ pub fn stop_orchestrator(pgid: u32) -> Result<()> {
         use nix::sys::signal::{Signal, killpg};
         use nix::unistd::Pid;
         killpg(Pid::from_raw(pgid as i32), Signal::SIGTERM)
-            .with_context(|| format!("sending SIGTERM to process group {}", pgid))?;
+            .with_context(|| format!("sending SIGTERM to process group {pgid}"))?;
         tracing::info!(pgid, "SIGTERM sent to orchestrator process group");
     }
     #[cfg(not(unix))]

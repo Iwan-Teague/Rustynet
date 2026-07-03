@@ -576,17 +576,49 @@ impl App {
         // Poll for active job (sync, fast)
         match crate::data::job_watcher::find_active_job(&self.repo_root) {
             Ok(Some(job)) => {
+                let is_new_job = self.active_job.as_ref().map(|j| j.report_dir.as_str())
+                    != Some(job.report_dir.as_str());
                 if let Some(args) = &job.request_args {
                     let mut config = self.config.clone();
                     config.apply_request_args(args);
                     self.config = config;
+                } else if is_new_job {
+                    // Jobs launched outside this monitor (raw CLI, another
+                    // user's session) never carry request_args (see
+                    // JobState::request_args) -- without this, the stage
+                    // grid keeps showing whatever target THIS monitor last
+                    // had configured locally, completely unrelated to the
+                    // job whose live progress it's actually displaying
+                    // (e.g. showing only macOS stages enabled while the
+                    // active job is a Linux blind_exit run). Recover the
+                    // real role/platform from the report dir's own naming
+                    // convention and reconfigure to match -- only when the
+                    // job actually changed, so an already-adopted target
+                    // isn't reset every 2s poll of the same ongoing job.
+                    if let Some((role, platform)) =
+                        crate::data::job_watcher::infer_role_and_platform_from_report_dir(
+                            Path::new(&job.report_dir),
+                        )
+                    {
+                        self.configure_target(&role, &platform, None);
+                    }
                 }
                 let report_dir = self.repo_root.join(&job.report_dir);
                 if let Ok(result) = crate::data::stage_reader::read_orchestrate_result(&report_dir)
                 {
                     self.stage_outcomes = result.outcomes;
                 }
-                if let Ok(active) = crate::data::stage_reader::infer_active_stage(&report_dir) {
+                let ordered_enabled_stages: Vec<String> = self
+                    .planned_stage_groups()
+                    .into_iter()
+                    .flat_map(|group| group.stages)
+                    .filter(|stage| self.stage_enabled(stage))
+                    .collect();
+                if let Ok(active) = crate::data::stage_reader::infer_active_stage(
+                    &report_dir,
+                    &ordered_enabled_stages,
+                    &self.stage_outcomes,
+                ) {
                     if self.active_stage.as_deref() != active.as_deref() {
                         self.active_stage_start = Some(std::time::Instant::now());
                     }
@@ -2073,6 +2105,25 @@ pub fn render_ui(f: &mut Frame, app: &App) {
     }
 }
 
+/// deepseek-direct/* is a fixed provider defined in the user's global
+/// `~/.config/opencode/opencode.jsonc` with its own hardcoded API key --
+/// always safe to offer, unlike the project-local `deepseek/*` provider
+/// below (needs a `.opencode/opencode.json` models block AND a resolvable
+/// `DEEPSEEK_API_KEY`, neither of which exist in this repo/environment) and
+/// unlike `opencode/deepseek-v4-flash-free` (OpenCode's hosted free-tier
+/// proxy) which is confirmed to hang indefinitely with zero output when
+/// invoked headlessly -- it must never be offered as a selectable model,
+/// since `available_models` is indexed positionally (see
+/// `patch_model_idx`/`review_model_idx`) and a persisted index landing on
+/// it would silently break the whole "s" (start) loop, patch and review
+/// agents alike.
+const KNOWN_WORKING_DEEPSEEK_DIRECT_MODELS: [&str; 4] = [
+    "deepseek-chat",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "deepseek-reasoner",
+];
+
 fn load_available_models(repo_root: &Path) -> Vec<String> {
     let config_path = repo_root.join(".opencode/opencode.json");
     let mut models: Vec<String> = Vec::new();
@@ -2088,10 +2139,11 @@ fn load_available_models(repo_root: &Path) -> Vec<String> {
             models.push(format!("deepseek/{key}"));
         }
     }
-    if !models.iter().any(|m| m.contains("flash-free")) {
-        models.push("opencode/deepseek-v4-flash-free".to_owned());
+    for key in KNOWN_WORKING_DEEPSEEK_DIRECT_MODELS {
+        models.push(format!("deepseek-direct/{key}"));
     }
     models.sort();
+    models.dedup();
     models
 }
 
@@ -2099,6 +2151,51 @@ fn load_available_models(repo_root: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn available_models_never_offers_the_confirmed_broken_free_proxy() {
+        // Regression: opencode/deepseek-v4-flash-free (OpenCode's hosted
+        // free-tier proxy) hangs indefinitely with zero output when invoked
+        // headlessly. Since available_models is indexed positionally by
+        // patch_model_idx/review_model_idx (persisted in monitor-config.toml),
+        // even briefly offering it risks a saved index silently landing on
+        // it and breaking the whole "s" (start) loop -- as it did on a real
+        // repo checkout where the project has no .opencode/opencode.json
+        // deepseek models block, so this was the ONLY model ever returned,
+        // and both persisted indices resolved to it after clamping.
+        let dir = tempfile::tempdir().unwrap();
+        let models = load_available_models(dir.path());
+        assert!(
+            !models.iter().any(|m| m.contains("flash-free")),
+            "must never offer the hanging free-tier proxy: {models:?}"
+        );
+    }
+
+    #[test]
+    fn available_models_always_includes_working_deepseek_direct_options() {
+        // deepseek-direct/* needs no project-local config or env var --
+        // it's a fixed, always-usable provider from the user's global
+        // opencode config -- so it must be available even in a completely
+        // empty repo (no .opencode/opencode.json at all).
+        let dir = tempfile::tempdir().unwrap();
+        let models = load_available_models(dir.path());
+        assert!(!models.is_empty());
+        assert!(
+            models.iter().all(|m| m.starts_with("deepseek-direct/")),
+            "with no project-local deepseek config, every option must be a \
+             known-working deepseek-direct model: {models:?}"
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m == "deepseek-direct/deepseek-v4-flash")
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m == "deepseek-direct/deepseek-v4-pro")
+        );
+    }
 
     #[test]
     fn inventory_filter_rejects_hostname_without_utm_controller() {
@@ -2522,6 +2619,32 @@ mod tests {
 
         assert_eq!(app.config.area, "macOS exit");
         assert_eq!(app.focused_panel, Panel::StageGrid);
+    }
+
+    #[test]
+    fn configuring_a_linux_blind_exit_target_clears_stale_macos_selection() {
+        // Regression: an externally-launched job (raw CLI, another user's
+        // session) has no request_args, so refresh_state's fallback parses
+        // the job's report-dir name (job_watcher::
+        // infer_role_and_platform_from_report_dir) and calls this same
+        // configure_target -- reproduce that here directly. Before the fix,
+        // a monitor left showing a stale local "macOS admin" target kept
+        // every macOS-only stage enabled and every Linux stage disabled
+        // even while the actually-running job was a Linux blind_exit run.
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.config.area = "macOS admin".to_owned();
+        app.config.admin_platform = "macos".to_owned();
+        app.config.macos_promote_exit = false;
+
+        app.configure_target("blind_exit", "linux", None);
+
+        assert_eq!(app.config.blind_exit_platform, "linux");
+        assert!(app.config.admin_platform.is_empty());
+        assert!(!app.config.area.to_ascii_lowercase().contains("macos"));
+        assert!(!app.config.wants_macos());
+        // The macOS-only validator must now read as impossible for this
+        // target (grayed out), not just "not selected".
+        assert!(!app.stage_selected_for_current_target("validate_macos_admin_issue"));
     }
 
     #[test]

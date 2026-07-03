@@ -58,6 +58,14 @@ pub fn find_running_jobs(repo_root: &Path) -> Result<Vec<JobState>> {
     find_running_jobs_with_live_processes(repo_root, find_live_orchestrator_report_dirs())
 }
 
+/// `infer_role_and_platform_from_dir_name`, applied to a job's `report_dir`
+/// path directly -- the convenience form callers with a `JobState` actually
+/// have on hand.
+pub fn infer_role_and_platform_from_report_dir(report_dir: &Path) -> Option<(String, String)> {
+    let name = report_dir.file_name()?.to_str()?;
+    infer_role_and_platform_from_dir_name(name)
+}
+
 /// The actual implementation, taking the live-process list as a parameter
 /// instead of shelling out to `ps` itself, so tests can exercise the
 /// job-state-JSON/orphan-scan logic in isolation from whatever orchestrator
@@ -316,6 +324,9 @@ fn infer_area_from_dir_name(dir: &Path) -> String {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("live-lab");
+    if let Some((role, platform)) = infer_role_and_platform_from_dir_name(name) {
+        return format!("{platform} {role}");
+    }
     // Extract meaningful segments: "live-lab-macos-exit-direct-r3" → "macos exit"
     let parts: Vec<&str> = name.split('-').collect();
     if parts.len() >= 3 && parts[0] == "live" && parts[1] == "lab" {
@@ -329,6 +340,53 @@ fn infer_area_from_dir_name(dir: &Path) -> String {
     } else {
         name.to_owned()
     }
+}
+
+/// Parses the live-lab orchestrator's `rn_role_{os}_{role_words...}_...`
+/// report-dir naming convention (e.g.
+/// "rn_role_linux_blind_exit_daemon_main_20260703_08" ->
+/// `("blind_exit", "linux")`, "rn_role_macos_admin_20260702_01" ->
+/// `("admin", "macos")`) -- used to recover which role/platform a live-lab
+/// job launched OUTSIDE this monitor (raw CLI, another user's session) is
+/// actually targeting, since such jobs have no `request_args` at all (see
+/// `JobState::request_args` and the 3 discovery paths in
+/// `find_running_jobs_with_live_processes`, all of which set it to `None`
+/// for anything other than a job-state JSON this monitor itself wrote).
+/// Returns `None` if the name doesn't match the convention or the role
+/// tokens don't resolve to one of the known role labels.
+pub fn infer_role_and_platform_from_dir_name(name: &str) -> Option<(String, String)> {
+    const KNOWN_ROLES: [&str; 6] = ["client", "admin", "exit", "blind_exit", "relay", "anchor"];
+
+    let rest = name.strip_prefix("rn_role_")?;
+    let tokens: Vec<&str> = rest.split('_').collect();
+    let os_idx = tokens
+        .iter()
+        .position(|t| matches!(*t, "linux" | "macos" | "windows"))?;
+    let platform = tokens[os_idx].to_owned();
+
+    // Grow the candidate role string one token at a time and check it
+    // against the known role labels after each token, rather than guessing
+    // where the role name ends via a fixed stop-word list -- trailing
+    // descriptors after the real role vary ("daemon", "main", "mixed",
+    // "direct", ...) and a stop-word list would need to enumerate all of
+    // them. Once a valid role has matched, the next non-matching token
+    // means we've walked past it into a trailing descriptor -- stop there
+    // (so "blind_exit_daemon" doesn't keep growing into "blind_exit_daemon"
+    // and lose the match).
+    let mut candidate = String::new();
+    let mut matched: Option<String> = None;
+    for token in &tokens[os_idx + 1..] {
+        if !candidate.is_empty() {
+            candidate.push('_');
+        }
+        candidate.push_str(token);
+        if KNOWN_ROLES.contains(&candidate.as_str()) {
+            matched = Some(candidate.clone());
+        } else if matched.is_some() {
+            break;
+        }
+    }
+    matched.map(|role| (role, platform))
 }
 
 /// Poll every 2s and send events on the watch channel when the active job changes.
@@ -401,6 +459,52 @@ mod tests {
         let found = parse_orchestrator_processes(ps_output);
 
         assert_eq!(found, vec![(999, PathBuf::from("/tmp/setup-run"))]);
+    }
+
+    #[test]
+    fn infers_role_and_platform_from_real_report_dir_names() {
+        // Regression: jobs discovered via the orphan/live-process paths
+        // (i.e. launched outside this monitor -- raw CLI, another user's
+        // session) always have request_args = None, so this parser is the
+        // ONLY way the stage grid ever learns what such a job is actually
+        // targeting. Names taken from real report dirs seen in the lab.
+        assert_eq!(
+            infer_role_and_platform_from_dir_name(
+                "rn_role_linux_blind_exit_daemon_main_20260703_08"
+            ),
+            Some(("blind_exit".to_owned(), "linux".to_owned()))
+        );
+        assert_eq!(
+            infer_role_and_platform_from_dir_name("rn_role_linux_blind_exit_main_20260702_01"),
+            Some(("blind_exit".to_owned(), "linux".to_owned()))
+        );
+        assert_eq!(
+            infer_role_and_platform_from_dir_name("rn_role_macos_admin_20260702_01"),
+            Some(("admin".to_owned(), "macos".to_owned()))
+        );
+        // "mixed" is a trailing descriptor, not part of the role -- the
+        // growing-candidate match must stop at "anchor", not swallow it
+        // into an unrecognized "anchor_mixed".
+        assert_eq!(
+            infer_role_and_platform_from_dir_name("rn_role_windows_anchor_mixed_20260702_01"),
+            Some(("anchor".to_owned(), "windows".to_owned()))
+        );
+    }
+
+    #[test]
+    fn infer_role_and_platform_returns_none_for_unrecognized_names() {
+        assert_eq!(
+            infer_role_and_platform_from_dir_name("live-lab-macos-exit-r3"),
+            None
+        );
+        assert_eq!(
+            infer_role_and_platform_from_dir_name("rn_role_linux_"),
+            None
+        );
+        assert_eq!(
+            infer_role_and_platform_from_dir_name("rn_role_linux_totally_unknown_role_20260702_01"),
+            None
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Span::styled("RUSTYNET", title),
         Span::styled(" │ ", sep),
         Span::styled("STATUS:", title),
-        Span::styled(format!("{:<8}", status), value),
+        Span::styled(format!("{status:<8}"), value),
         Span::styled(" │ ", sep),
         Span::styled(format!("{}:", timers[0].0), title),
         Span::styled(format!("{:<6}", fixed(timers[0].1.as_str(), 6)), value),
@@ -47,7 +47,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!("{:<6}", fixed(timers[2].1.as_str(), 6)), value),
         Span::styled(" │ ", sep),
         Span::styled("VMS:", title),
-        Span::styled(format!("{:<3}", vms), value),
+        Span::styled(format!("{vms:<3}"), value),
         Span::styled(" │ ", sep),
         // "CHECKS", not "STAGES" — distinct from the LOOP PIPELINE panel's
         // "stages" (prepare VMs -> build -> ...); this counts real per-OS +

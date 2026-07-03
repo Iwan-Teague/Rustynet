@@ -95,8 +95,23 @@ fn status_symbol(status: &str) -> &'static str {
     match status {
         "pass" => "[██]",
         "fail" => "[✗✗]",
-        "running" | "active" => "[▓▓]",
+        // Same animation as the Stage Grid's own active-stage cell -- this
+        // overlay can show the currently-running stage too (Enter on it
+        // from the grid), and previously fell back to a static glyph here,
+        // the one place that stage's box would stop looking "in progress".
+        "running" | "active" => super::stage_grid::spinner_glyph(),
         "skipped" => "[  ]",
         _ => "[░░]",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn running_and_active_use_the_stage_grid_spinner_not_a_static_glyph() {
+        assert!(super::super::stage_grid::SPINNER_FRAMES.contains(&status_symbol("running")));
+        assert!(super::super::stage_grid::SPINNER_FRAMES.contains(&status_symbol("active")));
     }
 }
