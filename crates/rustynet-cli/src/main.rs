@@ -2,6 +2,7 @@
 
 mod anchor_init;
 mod env_file;
+mod live_lab_coverage;
 mod live_lab_results;
 mod live_lab_run_matrix;
 mod live_lab_stage_manifest;
@@ -1201,6 +1202,9 @@ enum OpsCommand {
     },
     EmitStageManifest {
         config: live_lab_stage_manifest::EmitStageManifestConfig,
+    },
+    LiveLabCoverageReport {
+        config: live_lab_coverage::LiveLabCoverageReportConfig,
     },
     AppendOrchestratorRunToMatrix {
         config: live_lab_run_matrix::AppendOrchestratorRunToMatrixConfig,
@@ -4689,6 +4693,11 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 run_b: parser.required_path("--run-b")?,
             },
         }),
+        "live-lab-coverage-report" => Ok(OpsCommand::LiveLabCoverageReport {
+            config: live_lab_coverage::LiveLabCoverageReportConfig {
+                matrix_path: parser.optional_path("--matrix"),
+            },
+        }),
         "emit-stage-manifest" => Ok(OpsCommand::EmitStageManifest {
             config: live_lab_stage_manifest::EmitStageManifestConfig {
                 report_dir: parser.required_path("--report-dir")?,
@@ -7727,6 +7736,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::EmitStageManifest { config } => {
             live_lab_stage_manifest::execute_ops_emit_stage_manifest(config)
+        }
+        OpsCommand::LiveLabCoverageReport { config } => {
+            live_lab_coverage::execute_ops_live_lab_coverage_report(config)
         }
         OpsCommand::AppendOrchestratorRunToMatrix { config } => {
             live_lab_run_matrix::execute_ops_append_orchestrator_run_to_matrix(config)
