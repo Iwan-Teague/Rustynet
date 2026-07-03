@@ -11429,7 +11429,7 @@ fn exercise_macos_admin_issue_live(
          printf 'version=2\\ngenerated_at_unix=0\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-valid\" >/dev/null; \
          printf 'version=2\\ngenerated_at_unix=0\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-wrong-node\" >/dev/null; \
          printf 'version=2\\ngenerated_at_unix=0\\nnonce=0\\npayload_digest_sha256=%s\\n' \"$ZERO_DIGEST\" | sudo tee \"$WORK/watermark-tampered\" >/dev/null; \
-         sudo chmod 600 \"$WORK\"/watermark-*; \
+         sudo chmod 600 \"$WORK/watermark-valid\" \"$WORK/watermark-wrong-node\" \"$WORK/watermark-tampered\"; \
          sudo \"$RN\" assignment verify --bundle \"$WORK/bundle\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-valid\" --expected-node-id {peer_node_id} --max-age-secs 600 >/dev/null; \
          if sudo \"$RN\" assignment verify --bundle \"$WORK/bundle\" --verifier-key \"$WORK/vpub\" --watermark \"$WORK/watermark-wrong-node\" --expected-node-id {peer_node_id}-forged --max-age-secs 600 >/dev/null 2>&1; then \
            echo 'wrong expected node id was accepted on Linux peer' >&2; exit 1; \
