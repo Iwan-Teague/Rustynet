@@ -34206,6 +34206,52 @@ mod tests {
     }
 
     #[test]
+    fn windows_bootstrap_build_release_builds_relay_binary_for_live_audits() {
+        let body = std::fs::read_to_string(windows_bootstrap_helper_script_local_path())
+            .expect("read Windows bootstrap helper");
+        assert!(
+            body.contains(
+                "$relayBuildArgs = @('build', '--locked', '--release', '-p', 'rustynet-relay', '--features', 'daemon')"
+            ),
+            "Windows build-release must build rustynet-relay.exe for relay-owned audits"
+        );
+        assert!(
+            body.contains("$relayBuildArgsOffline = $relayBuildArgs + '--offline'"),
+            "Windows build-release must keep offline relay fallback for no-egress lab guests"
+        );
+        assert!(
+            body.contains("cargo build failed for Windows relay build-release"),
+            "Windows build-release must fail closed if relay binary cannot be built"
+        );
+    }
+
+    #[test]
+    fn windows_service_install_helper_installs_relay_binary_for_live_audits() {
+        let body = std::fs::read_to_string(windows_service_install_helper_script_local_path())
+            .expect("read Windows service install helper");
+        assert!(
+            body.contains("target\\release\\rustynet-relay.exe"),
+            "install-release must locate rustynet-relay.exe in release output"
+        );
+        assert!(
+            body.contains("rustynet-relay.exe not found under release output"),
+            "install-release must fail closed when build-release skipped relay"
+        );
+        assert!(
+            body.contains("$relayDest = Join-Path $InstallRoot 'rustynet-relay.exe'"),
+            "install-release must target the reviewed Program Files relay path"
+        );
+        assert!(
+            body.contains("Copy-Item -LiteralPath $relaySource -Destination $relayDest -Force"),
+            "install-release must copy relay binary beside rustynetd.exe"
+        );
+        assert!(
+            body.contains("$binariesToSign = @($daemonDest, (Join-Path $InstallRoot 'rustynet.exe'), $relayDest)"),
+            "install-release must Authenticode-sign the installed relay binary"
+        );
+    }
+
+    #[test]
     fn windows_verify_helper_selection_uses_canonical_script_path() {
         assert!(
             windows_verify_helper_script_local_path().ends_with(Path::new(

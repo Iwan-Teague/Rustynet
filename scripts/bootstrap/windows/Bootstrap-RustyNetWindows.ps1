@@ -1562,13 +1562,16 @@ function Build-RustyNet {
     }
 
     $cargoCommand = $cargoPath
-    # Build rustynetd (the Windows service host) and the minimal Windows
+    # Build rustynetd (the Windows service host), the minimal Windows
     # trust CLI used by Install-RustyNetWindowsService.ps1 to rotate
-    # per-host trust evidence under SYSTEM at install-release time.  The
-    # full ops CLI remains Unix-oriented; this Windows bin intentionally
-    # exposes only `rustynet trust keygen/export-verifier-key/issue`.
+    # per-host trust evidence under SYSTEM at install-release time, and
+    # rustynet-relay.exe for relay-owned live audits such as
+    # hello-limiter-audit. The full ops CLI remains Unix-oriented; this
+    # Windows CLI bin intentionally exposes only
+    # `rustynet trust keygen/export-verifier-key/issue`.
     $daemonBuildArgs = @('build', '--locked', '--release', '-p', 'rustynetd')
     $trustCliBuildArgs = @('build', '--locked', '--release', '-p', 'rustynet-cli', '--bin', 'rustynet-windows-trust-cli')
+    $relayBuildArgs = @('build', '--locked', '--release', '-p', 'rustynet-relay', '--features', 'daemon')
     # Offline fallback: live-lab guests have no internet egress, so the online
     # build can't reach the registry (it fails trying to fetch e.g. criterion,
     # a bench-only dep that --offline + the scoped -p build never pulls). Retry
@@ -1576,6 +1579,7 @@ function Build-RustyNet {
     # (rn_bootstrap.sh) and macOS bootstrap --offline fallback.
     $daemonBuildArgsOffline = $daemonBuildArgs + '--offline'
     $trustCliBuildArgsOffline = $trustCliBuildArgs + '--offline'
+    $relayBuildArgsOffline = $relayBuildArgs + '--offline'
     Push-Location $RustyNetRoot
     try {
         if ($null -eq $buildReportLayout) {
@@ -1591,6 +1595,13 @@ function Build-RustyNet {
                 & $cargoCommand $trustCliBuildArgsOffline
                 if ($LASTEXITCODE -ne 0) {
                     throw 'cargo build failed for Windows trust CLI build-release'
+                }
+            }
+            & $cargoCommand $relayBuildArgs
+            if ($LASTEXITCODE -ne 0) {
+                & $cargoCommand $relayBuildArgsOffline
+                if ($LASTEXITCODE -ne 0) {
+                    throw 'cargo build failed for Windows relay build-release'
                 }
             }
             return
@@ -1617,6 +1628,20 @@ function Build-RustyNet {
                 $exitCode = Invoke-CargoBuildForReport `
                     -CargoCommand $cargoCommand `
                     -CargoArgs $trustCliBuildArgsOffline `
+                    -Layout $buildReportLayout `
+                    -Append
+            }
+        }
+        if ($exitCode -eq 0) {
+            $exitCode = Invoke-CargoBuildForReport `
+                -CargoCommand $cargoCommand `
+                -CargoArgs $relayBuildArgs `
+                -Layout $buildReportLayout `
+                -Append
+            if ($exitCode -ne 0) {
+                $exitCode = Invoke-CargoBuildForReport `
+                    -CargoCommand $cargoCommand `
+                    -CargoArgs $relayBuildArgsOffline `
                     -Layout $buildReportLayout `
                     -Append
             }

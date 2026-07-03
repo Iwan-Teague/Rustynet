@@ -612,6 +612,14 @@ impl Drop for LedgerLockGuard {
     }
 }
 
+#[cfg(any(not(unix), test))]
+fn is_non_unix_ledger_lock_contention_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+    )
+}
+
 /// Acquire [`LedgerLockGuard`]. Blocks (bounded retry, 3s) on genuine live
 /// contention; fails closed on timeout or I/O error rather than proceeding
 /// without the lock.
@@ -673,8 +681,14 @@ pub fn acquire_ledger_lock(ledger_path: &Path) -> Result<LedgerLockGuard, Enroll
                     _handle: handle,
                 });
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(err) if is_non_unix_ledger_lock_contention_kind(err.kind()) => {
                 if Instant::now() >= deadline {
+                    if err.kind() == std::io::ErrorKind::PermissionDenied {
+                        return Err(EnrollmentSpoolError::Io(format!(
+                            "create enrollment ledger lock {} after bounded contention wait: {err}",
+                            lock_path.display()
+                        )));
+                    }
                     return Err(EnrollmentSpoolError::Io(
                         "enrollment ledger lock contended (timeout)".to_owned(),
                     ));
@@ -1300,6 +1314,22 @@ mod tests {
             "exactly one redemption of a single-use token may succeed under a race"
         );
         assert_eq!(load_ledger(&path).expect("final load").consumed_count(), 1);
+    }
+
+    #[test]
+    fn non_unix_ledger_lock_treats_permission_denied_as_contention() {
+        // Windows may report CREATE_NEW against a live open lock file as
+        // PermissionDenied instead of AlreadyExists. That is still contention:
+        // retry bounded, then fail closed if it never clears.
+        assert!(is_non_unix_ledger_lock_contention_kind(
+            std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(is_non_unix_ledger_lock_contention_kind(
+            std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(!is_non_unix_ledger_lock_contention_kind(
+            std::io::ErrorKind::NotFound
+        ));
     }
 
     #[test]

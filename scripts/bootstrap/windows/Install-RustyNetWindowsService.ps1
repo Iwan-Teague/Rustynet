@@ -704,6 +704,9 @@ $cliCandidates = @(
     (Join-Path $RustyNetRoot 'target\release\rustynet-cli.exe'),
     (Join-Path $RustyNetRoot 'target\release\rustynet-windows-trust-cli.exe')
 )
+$relayCandidates = @(
+    Join-Path $RustyNetRoot 'target\release\rustynet-relay.exe'
+)
 
 $daemonSource = $daemonCandidates[0]
 if (-not $daemonSource) {
@@ -716,6 +719,13 @@ $cliSource = $null
 foreach ($candidate in $cliCandidates) {
     if (Test-Path -LiteralPath $candidate) {
         $cliSource = $candidate
+        break
+    }
+}
+$relaySource = $null
+foreach ($candidate in $relayCandidates) {
+    if (Test-Path -LiteralPath $candidate) {
+        $relaySource = $candidate
         break
     }
 }
@@ -732,8 +742,15 @@ if (-not $cliSource) {
         ". Bootstrap-RustyNetWindows.ps1's build-release must build rustynetd and " +
         "rustynet-windows-trust-cli.")
 }
+if (-not $relaySource) {
+    throw ("rustynet-relay.exe not found under release output. Looked at: " +
+        ($relayCandidates -join ', ') +
+        ". Bootstrap-RustyNetWindows.ps1's build-release must build rustynet-relay " +
+        "with the daemon feature so relay-owned audits can run on Windows.")
+}
 
 $daemonDest = Join-Path $InstallRoot 'rustynetd.exe'
+$relayDest = Join-Path $InstallRoot 'rustynet-relay.exe'
 
 function Get-RustyNetServiceProcessId {
     param([Parameter(Mandatory = $true)][string]$Name)
@@ -848,6 +865,9 @@ if ($cliSource) {
     Copy-Item -LiteralPath $cliSource -Destination (Join-Path $InstallRoot 'rustynet.exe') -Force
 }
 
+Set-InstallProgressStep 'copy-relay-binary'
+Copy-Item -LiteralPath $relaySource -Destination $relayDest -Force
+
 # Sign the installed binaries with a per-host self-signed code-signing
 # certificate, and trust that certificate in LocalMachine\Root. This
 # is what `validate_windows_authenticode` (and the daemon's
@@ -937,12 +957,13 @@ finally {
     $rootStore.Close()
 }
 
-# Sign rustynetd.exe (the binary the validator targets) and rustynet
-# .exe (consistency; it's what the trust-issue step below executes).
+# Sign rustynetd.exe (the binary the validator targets), rustynet.exe
+# (consistency; it's what the trust-issue step below executes), and
+# rustynet-relay.exe (the binary relay-owned live audits execute).
 # Skip /tr timestamping: lab guests may lack internet, and an
 # expired-cert risk is bounded by the 2-year cert lifetime above. If
 # timestamping becomes important add /tr <server> /td SHA256 here.
-$binariesToSign = @($daemonDest, (Join-Path $InstallRoot 'rustynet.exe'))
+$binariesToSign = @($daemonDest, (Join-Path $InstallRoot 'rustynet.exe'), $relayDest)
 foreach ($binPath in $binariesToSign) {
     if (-not (Test-Path -LiteralPath $binPath)) {
         continue
