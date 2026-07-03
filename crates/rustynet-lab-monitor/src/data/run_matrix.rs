@@ -102,8 +102,17 @@ pub enum CellOutcome {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StageProgress {
+    /// Checks whose LATEST decisive outcome is pass — completion, the
+    /// number an operator expects to move the moment a check goes green.
     pub passed: usize,
     pub total: usize,
+    /// Of `passed`, how many the flake classifier does NOT yet consider
+    /// stably Proven (green now, unstable recent history). Displayed as a
+    /// separate warning — never subtracted from `passed`: gating the
+    /// numerator on stability made the header sit at a stale-looking
+    /// count right after a debugging loop turned checks green (observed
+    /// live 2026-07-03: 9 freshly-passing checks invisible for hours).
+    pub flaky: usize,
 }
 
 pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), ParityState>> {
@@ -194,19 +203,25 @@ pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
 
     let mut total = 0usize;
     let mut passed = 0usize;
+    let mut flaky = 0usize;
     for (idx, header) in headers.iter().enumerate() {
         if !stage_progress_column(header, &rows, idx) {
             continue;
         }
         total += 1;
-        // classify_recent_history, not just "did the latest run pass" --
-        // matching load_full_stage_matrix's classifier so the header bar
-        // and the Full Stage Matrix panel always agree on a passed count.
-        // A column whose latest run passed but whose recent history is
-        // unstable (Flaky) must not inflate the header count while the
-        // matrix panel correctly declines to count it.
-        if classify_recent_history(&decisive_history(&rows, idx)) == ParityState::Proven {
+        // `passed` = latest decisive outcome is pass (completion). The
+        // Full Stage Matrix panel's stability classifier still runs, but
+        // as a SEPARATE `flaky` count: a check that just went green after
+        // a red debugging loop counts as passed immediately and carries a
+        // flaky warning until its window stabilizes — the two panels tell
+        // one story ("green now, N of them unstable") instead of the
+        // header silently deflating progress.
+        let history = decisive_history(&rows, idx);
+        if history.last() == Some(&false) {
             passed += 1;
+            if classify_recent_history(&history) != ParityState::Proven {
+                flaky += 1;
+            }
         }
     }
     // PRE has no CSV column at all, so the loop above can never see it --
@@ -216,6 +231,7 @@ pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
     Ok(StageProgress {
         passed: passed + PRE_STAGE_COUNT,
         total: total + PRE_STAGE_COUNT,
+        flaky,
     })
 }
 
@@ -1457,15 +1473,16 @@ mod tests {
     }
 
     #[test]
-    fn stage_progress_passed_count_agrees_with_full_stage_matrix_on_a_flaky_column() {
-        // Regression for the header bar (CHECKS) reporting a higher passed
-        // count than the Full Stage Matrix panel (39 vs 33 in the field):
-        // load_stage_progress used to count a column as passed whenever its
-        // single latest row said "pass", while load_full_stage_matrix ran
-        // the CUSUM classifier over its recent history and correctly
-        // demoted an unstable column to Flaky. A column with this alternating
-        // pass/fail history ends on "pass" but is Flaky, so BOTH functions
-        // must agree it does not count toward "passed".
+    fn stage_progress_counts_a_flaky_latest_pass_and_flags_it() {
+        // The header CHECKS numerator is COMPLETION (latest decisive
+        // outcome), with stability carried as a separate `flaky` sidecar.
+        // History: gating `passed` on the CUSUM classifier made the header
+        // sit at a stale-looking count for hours after a debugging loop
+        // turned checks green (field case 2026-07-03: 9 freshly-passing
+        // checks — same-day windows anchor + macos exit wins — invisible
+        // at "76/121"). A flaky column that currently passes counts as
+        // passed AND as flaky; the Full Stage Matrix panel still colors it
+        // Flaky — one story: "green now, unstable".
         let dir = tempfile::tempdir().unwrap();
         let header = "overall_result,linux_stage_bootstrap";
         let mut lines = vec![header.to_owned()];
@@ -1482,10 +1499,24 @@ mod tests {
         assert_eq!(matrix.linux[0].state, ParityState::Flaky);
         assert_eq!(progress.total, 1 + PRE_STAGE_COUNT);
         assert_eq!(
-            progress.passed, PRE_STAGE_COUNT,
-            "a Flaky column's latest-pass must not inflate the header bar's passed count \
-             beyond PRE's always-complete 5"
+            progress.passed,
+            1 + PRE_STAGE_COUNT,
+            "a currently-passing check counts as passed the moment it goes green"
         );
+        assert_eq!(
+            progress.flaky, 1,
+            "...while carrying the instability warning"
+        );
+
+        // A column whose latest outcome is FAIL counts in neither.
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,linux_stage_bootstrap\npass,pass\npass,fail\n",
+        );
+        let progress = load_stage_progress(dir.path()).unwrap();
+        assert_eq!(progress.passed, PRE_STAGE_COUNT);
+        assert_eq!(progress.flaky, 0);
     }
 
     #[test]
