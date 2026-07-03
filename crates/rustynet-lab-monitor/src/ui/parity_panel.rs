@@ -17,7 +17,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let block = Block::default()
         .title(Span::styled(
-            "PARITY MATRIX [2/P]",
+            "PARITY MATRIX [2]",
             Style::default().fg(border_fg),
         ))
         .borders(Borders::ALL)

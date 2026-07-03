@@ -25,7 +25,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "  ↑=scroll"
     };
-    let title = format!("LOG [4/L] — {active_stage}{scroll_hint}");
+    let title = format!("LOG [5] — {active_stage}{scroll_hint}");
 
     let border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let block = Block::default()

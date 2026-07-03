@@ -28,7 +28,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let outer_border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let outer = Block::default()
         .title(Span::styled(
-            format!("FULL STAGE MATRIX [6/M] — {passed}/{total} checks passed"),
+            format!("FULL STAGE MATRIX [7] — {passed}/{total} checks passed"),
             Style::default().fg(outer_border_fg),
         ))
         .borders(Borders::ALL)

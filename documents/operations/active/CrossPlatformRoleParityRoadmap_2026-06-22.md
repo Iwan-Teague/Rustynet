@@ -24,10 +24,10 @@ program and to **concurrent Windows+macOS** runs.
   forwarding on the HP-3 transport item) and one is **out of scope by design**
   (Windows blind_exit). The rest is mostly *authoring live-lab stages that
   fail loud*, not new runtime code.
-- **Ordered program (after the in-flight macOS anchor):** macOS admin → Windows
+- **Ordered program (after the now-live-proven anchor bundle-pull cells):** macOS admin → Windows
   admin → macOS blind_exit → ✅ **macOS blind_exit DONE 2026-06-29** → cross-OS
   role transitions (design doc at `CrossOsRoleSwitchPlan_2026-06-24.md`) →
-  Windows/macOS anchor live. (macOS relay *live lifecycle* is **DONE** — see §1
+  remaining anchor sub-surfaces beyond bundle-pull. (macOS relay *live lifecycle* is **DONE** — see §1
   matrix flip. Relay forwarding and Windows exit/blind_exit remain explicitly
   parked with reasons.)
 - **Pipeline:** run a **Windows lab and a macOS lab simultaneously** on disjoint
@@ -60,7 +60,7 @@ untested/not implemented · 🔒 blocked):
 |---|---|---|---|
 | client | ✅ | ✅ | ✅ (active client traffic pending cross-OS run) |
 | admin (mint/issue signed bundles) | ✅ | ❌ *(see §4 — "self-mint disabled" framing is **stale**, not a posture)* | ❌ (trust keygen works; live issuing untested) |
-| anchor (gossip/bundle-pull/enrollment) | ✅ | 🟡→ landing now (live bundle-pull stage) | 🟠 dry-run plan contract only |
+| anchor (gossip/bundle-pull/enrollment) | ✅ | ✅ **bundle-pull LIVE-PROVEN 2026-06-22** (`validate_macos_anchor_bundle_pull` PASS; gossip/enrollment remain tracked separately) | ✅ **bundle-pull LIVE-PROVEN 2026-07-03** (`validate_windows_anchor_bundle_pull` PASS, run `labrun-1783079551578-32671-0`, commit `786f900`; loopback byte-for-byte + token gate + LAN refused + secrets hygiene; gossip/enrollment remain tracked separately) |
 | exit (NAT egress + killswitch) | ✅ | 🟡 implemented — needs a green live run | 🟡 implemented but **🔒 lab guest lacks WinNAT/`MSFT_NetNat`** |
 | blind_exit (irreversible exit) | ✅ | ✅ **LIVE-PROVEN 2026-06-29** (run `labrun-1782770042330-16244-0`, `--blind-exit-platform macos`): `validate_macos_blind_exit` PASS — irreversible transition applied, pf anchor hardened (9 rules, no route-to/reply-to/dup-to), immutability gate enforced | 🚫 **blocked by design** (`main.rs:11768` hard-errors; macOS/Linux only) |
 | relay (live session forwarding) | ✅ *(lifecycle only — no live forwarding proof anywhere; see §4)* | ✅ **lifecycle LIVE-PROVEN 2026-06-27** (run `livelab-1782571161`, `validate_macos_relay_service_lifecycle` PASS). **Live session forwarding remains HP-3-gated** (same cross-OS gate as Linux ✅). | 🟠 SCM lifecycle contract only |
@@ -90,7 +90,7 @@ dry-run had masked). "Live stage" = author a fail-loud stage per §7.
 | 4 | **Role transitions (macOS→Windows)** | ❌ | **design doc** (`CrossOsRoleSwitchPlan_2026-06-24.md`, authored 2026-06-24), then a stage that drives a real flip and re-applies signed state via `refresh_signed_state_with_reason` | ~2–4 d | needs admin (#1/#2) |
 | 5 | macOS **exit** | 🟡 | just a green run with `--exit-platform macos` (no code) | ~hours | none |
 | 6 | macOS **relay** *live lifecycle* | ✅ **DONE** (2026-06-27) | ✅ live lifecycle proven: `validate_macos_relay_service_lifecycle` PASS (run `livelab-1782571161`). **Forwarding proof remains HP-3-gated, same as Linux.** | — | — |
-| 7 | Windows **anchor** live + macOS **anchor** live | 🟠/🟡 | convert in-process contract validators to live bundle-serving stages | ~1–2 d | sequence after anchor cell settles |
+| 7 | Windows **anchor** live + macOS **anchor** live | ✅ DONE for bundle-pull | macOS bundle-pull live-proven 2026-06-22; Windows bundle-pull live-proven 2026-07-03 via `labrun-1783079551578-32671-0` on `786f900`; remaining gossip/enrollment anchor sub-surfaces stay separate | — | — |
 | 🔒 | Windows **relay** forwarding | 🟠 | nothing to author until a Linux live two-peer forwarding stage exists | — | **HP-3** (`MasterWorkPlan` HP-3 — "most substantial remaining code item"; weeks) |
 | 🔒 | Windows **exit** | 🟡 | code done (`promote_windows_exit_active`); needs a WinNAT-capable guest | — | lab env (`MSFT_NetNat` absent) |
 | 🚫 | Windows **blind_exit** | — | out of scope by design (`main.rs:11768`) | — | n/a |
@@ -133,11 +133,13 @@ SSHed as `iwan@` instead of `mac@`.)
 
 **Anti-pattern to never repeat:** `validate_macos_anchor_bundle_pull`
 (`vm_lab/mod.rs:8915-8961` → `9340-9377`) records **Pass** from a `--dry-run` plan-text
-check without serving a bundle; the Windows contract validators
-(`validate_windows_anchor_bundle_pull_plan_contract` `:9516`,
-`validate_windows_relay_service_lifecycle_contract` `:9565`) run entirely in-process
-against repo files ("without guest mutation") — they never touch the guest. These are
-the exact defects §7 forbids.
+check without serving a bundle; the old Windows anchor contract validator
+(`validate_windows_anchor_bundle_pull_plan_contract` `:9516`) had the same defect
+until it was replaced by the 2026-07-03 live guest-touching
+`validate_windows_anchor_bundle_pull` run. The Windows relay contract validator
+(`validate_windows_relay_service_lifecycle_contract` `:9565`) still runs entirely
+in-process against repo files ("without guest mutation") and remains the exact
+defect §7 forbids for relay.
 
 ---
 
@@ -210,7 +212,7 @@ Rank = value ÷ (tractability · safety). After **anchor (in flight)** and **mac
 | 3 | **macOS blind_exit** | runtime exists; only the live stage missing; safe on disposable guest; run last |
 | 4 | **Role transitions (macOS→Windows)** | reuses `refresh_signed_state_with_reason`; depends on admin; needs design doc |
 | 5 | **macOS relay live lifecycle** | ✅ **DONE** (live-proven 2026-06-27); forwarding stays HP-3-gated |
-| 6 | **Windows + macOS anchor live** | convert contract validators to live bundle-serving; sequence after anchor settles |
+| 6 | **Windows + macOS anchor bundle-pull live** | ✅ **DONE** (macOS 2026-06-22; Windows 2026-07-03 `labrun-1783079551578-32671-0`); remaining anchor gossip/enrollment/port-map proof is separate |
 | 🔒 | Windows relay forwarding | blocked on HP-3 (no live forwarding proof anywhere) |
 | 🔒 | Windows exit | blocked on WinNAT guest (code done) |
 | 🚫 | Windows blind_exit | out of scope by design |
@@ -301,8 +303,10 @@ The macOS anchor cell taught the rule the hard way: its dry-run *fallback* recor
    `8586`), or a strict prerequisite stage didn't pass (`!mesh_join_passed`, `8596`).
 2. **No dry-run-as-pass, ever.** A `--dry-run`/plan-contract check may be an
    *informational artifact* but never substitutes for a live Pass. The anti-examples to
-   delete/replace: `validate_macos_anchor_bundle_pull` (`8915-8961`), and the Windows
-   contract validators (`9516`, `9565`) that never touch the guest.
+   delete/replace: the old `validate_macos_anchor_bundle_pull` dry-run fallback
+   (`8915-8961`) and the Windows relay contract validator (`9565`) that never
+   touches the guest. The prior Windows anchor contract validator was superseded
+   by the 2026-07-03 live `validate_windows_anchor_bundle_pull` run.
 3. **Chain on the live result.** Downstream validators run only if the live capture
    passed (`macos_exit_capture_passed`, `8633`) — never skip-to-pass.
 4. **Assert the role's security controls LIVE** on the guest: killswitch precedence, DNS

@@ -36,7 +36,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let block = Block::default()
         .title(Span::styled(
-            "STAGE GRID [3] ←→ column  ↑↓ select  Space toggle  Enter detail",
+            "STAGE GRID [4] ←→ column  ↑↓ select  Space toggle  Enter detail",
             Style::default().fg(border_fg),
         ))
         .borders(Borders::ALL)

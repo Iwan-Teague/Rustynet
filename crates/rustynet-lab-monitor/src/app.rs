@@ -890,6 +890,11 @@ impl App {
             KeyCode::Tab => {
                 self.toggle_page();
             }
+            // Window-focus hotkeys are numbers only, grouped by owning page
+            // (1-3 Overview, 4-6 Run, 7 Matrix) so the order matches how the
+            // panels actually sit on screen within each page -- previously
+            // Agents was bound to '7', stranded after the unrelated Matrix
+            // page's '6' instead of sitting with its own Overview siblings.
             KeyCode::Char('1') => {
                 self.page = Page::Overview;
                 self.focused_panel = Panel::VmStatus;
@@ -899,47 +904,25 @@ impl App {
                 self.focused_panel = Panel::Parity;
             }
             KeyCode::Char('3') => {
-                self.page = Page::Run;
-                self.focused_panel = Panel::StageGrid;
-            }
-            KeyCode::Char('4') => {
-                self.page = Page::Run;
-                self.focused_panel = Panel::Log;
-            }
-            KeyCode::Char('5') => {
-                self.page = Page::Run;
-                self.focused_panel = Panel::Jobs;
-            }
-            KeyCode::Char('6') => {
-                self.page = Page::Matrix;
-                self.focused_panel = Panel::StageMatrix;
-            }
-            KeyCode::Char('7') => {
                 self.page = Page::Overview;
                 self.focused_panel = Panel::Agents;
                 self.agents_sel_col = Some(AgentsCol::Patch);
                 self.agents_sel_row = Some(AgentsRow::Model);
                 self.agents_active = false;
             }
-
-            // Single letter shortcuts. Accept plain, Shift, or Ctrl variants.
-            KeyCode::Char(_) if plain_char == Some('l') => {
+            KeyCode::Char('4') => {
+                self.page = Page::Run;
+                self.focused_panel = Panel::StageGrid;
+            }
+            KeyCode::Char('5') => {
                 self.page = Page::Run;
                 self.focused_panel = Panel::Log;
             }
-            KeyCode::Char(_) if plain_char == Some('p') => {
-                self.page = Page::Overview;
-                self.focused_panel = Panel::Parity;
-            }
-            KeyCode::Char(_) if plain_char == Some('v') => {
-                self.page = Page::Overview;
-                self.focused_panel = Panel::VmStatus;
-            }
-            KeyCode::Char(_) if plain_char == Some('j') => {
+            KeyCode::Char('6') => {
                 self.page = Page::Run;
                 self.focused_panel = Panel::Jobs;
             }
-            KeyCode::Char(_) if plain_char == Some('m') => {
+            KeyCode::Char('7') => {
                 self.page = Page::Matrix;
                 self.focused_panel = Panel::StageMatrix;
             }
@@ -3006,6 +2989,8 @@ mod tests {
 
     #[test]
     fn numeric_focus_hotkeys_switch_to_owning_page() {
+        // 1-3 Overview, 4-6 Run, 7 Matrix -- grouped by page, matching each
+        // page's own on-screen top-to-bottom/left-to-right panel order.
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
 
         app.page = Page::Run;
@@ -3018,8 +3003,46 @@ mod tests {
         assert_eq!(app.focused_panel, Panel::Parity);
 
         app.handle_key(KeyCode::Char('3'), KeyModifiers::NONE);
+        assert_eq!(app.page, Page::Overview);
+        assert_eq!(app.focused_panel, Panel::Agents);
+
+        app.handle_key(KeyCode::Char('4'), KeyModifiers::NONE);
         assert_eq!(app.page, Page::Run);
         assert_eq!(app.focused_panel, Panel::StageGrid);
+
+        app.handle_key(KeyCode::Char('5'), KeyModifiers::NONE);
+        assert_eq!(app.page, Page::Run);
+        assert_eq!(app.focused_panel, Panel::Log);
+
+        app.handle_key(KeyCode::Char('6'), KeyModifiers::NONE);
+        assert_eq!(app.page, Page::Run);
+        assert_eq!(app.focused_panel, Panel::Jobs);
+
+        app.handle_key(KeyCode::Char('7'), KeyModifiers::NONE);
+        assert_eq!(app.page, Page::Matrix);
+        assert_eq!(app.focused_panel, Panel::StageMatrix);
+    }
+
+    #[test]
+    fn letter_shortcuts_no_longer_focus_a_window() {
+        // Window focus is numbers-only now -- the old l/p/v/j/m aliases
+        // must be inert (not silently still switching pages/panels).
+        for letter in ['l', 'p', 'v', 'j', 'm'] {
+            let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+            app.page = Page::Run;
+            app.focused_panel = Panel::Log;
+            app.handle_key(KeyCode::Char(letter), KeyModifiers::NONE);
+            assert_eq!(
+                app.page,
+                Page::Run,
+                "'{letter}' must not change the page anymore"
+            );
+            assert_eq!(
+                app.focused_panel,
+                Panel::Log,
+                "'{letter}' must not change the focused panel anymore"
+            );
+        }
     }
 
     #[test]
