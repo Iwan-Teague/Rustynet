@@ -288,9 +288,9 @@ pub fn evaluate_macos_launchd_environment(environment: &BTreeMap<String, String>
         ),
     }
     match environment.get("RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH") {
-        Some(path) if path == "/usr/local/var/rustynet/keys/wireguard.passphrase" => {}
+        Some(path) if path == "/usr/local/var/rustynet/bootstrap/wireguard.passphrase" => {}
         Some(path) => reasons.push(format!(
-            "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH drifted: expected \"/usr/local/var/rustynet/keys/wireguard.passphrase\", observed {path:?}"
+            "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH drifted: expected \"/usr/local/var/rustynet/bootstrap/wireguard.passphrase\", observed {path:?}"
         )),
         None => reasons.push(
             "EnvironmentVariables missing RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH".to_owned(),
@@ -404,7 +404,7 @@ fn reviewed_program_arguments_fixture() -> Vec<String> {
         "--wg-encrypted-private-key",
         "/usr/local/var/rustynet/keys/wireguard.key.enc",
         "--wg-key-passphrase",
-        "/usr/local/var/rustynet/keys/wireguard.passphrase",
+        "/usr/local/var/rustynet/bootstrap/wireguard.passphrase",
         "--wg-public-key",
         "/usr/local/var/rustynet/keys/wireguard.pub",
         "--backend",
@@ -427,7 +427,7 @@ fn reviewed_environment_fixture() -> BTreeMap<String, String> {
         ),
         (
             "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH",
-            "/usr/local/var/rustynet/keys/wireguard.passphrase",
+            "/usr/local/var/rustynet/bootstrap/wireguard.passphrase",
         ),
     ]
     .iter()
@@ -613,7 +613,7 @@ mod tests {
         <string>--wg-encrypted-private-key</string>
         <string>/usr/local/var/rustynet/keys/wireguard.key.enc</string>
         <string>--wg-key-passphrase</string>
-        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <string>/usr/local/var/rustynet/bootstrap/wireguard.passphrase</string>
         <string>--wg-public-key</string>
         <string>/usr/local/var/rustynet/keys/wireguard.pub</string>
         <string>--backend</string>
@@ -638,7 +638,7 @@ mod tests {
         <key>RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE</key>
         <string>net.rustynet.wg-key-passphrase</string>
         <key>RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH</key>
-        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <string>/usr/local/var/rustynet/bootstrap/wireguard.passphrase</string>
     </dict>
 </dict>
 </plist>"#;
@@ -684,7 +684,7 @@ mod tests {
             environment
                 .get("RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH")
                 .map(String::as_str),
-            Some("/usr/local/var/rustynet/keys/wireguard.passphrase")
+            Some("/usr/local/var/rustynet/bootstrap/wireguard.passphrase")
         );
     }
 
@@ -1035,7 +1035,7 @@ mod tests {
         <string>--wg-encrypted-private-key</string>
         <string>/usr/local/var/rustynet/keys/wireguard.key.enc</string>
         <string>--wg-key-passphrase</string>
-        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <string>/usr/local/var/rustynet/bootstrap/wireguard.passphrase</string>
         <string>--wg-public-key</string>
         <string>/usr/local/var/rustynet/keys/wireguard.pub</string>
         <string>--backend</string>
@@ -1066,7 +1066,7 @@ mod tests {
         <key>RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE</key>
         <string>net.rustynet.wg-key-passphrase</string>
         <key>RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH</key>
-        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <string>/usr/local/var/rustynet/bootstrap/wireguard.passphrase</string>
         <key>RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR</key>
         <string>127.0.0.1:51822</string>
         <key>RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH</key>

@@ -233,8 +233,20 @@ the fixes landed this pass (all Linux-gate-verified; live runs still pending):
   forwarding, which is unproven on **every** OS (not Windows-specific). The
   Windows relay SCM lifecycle is contract-validated; forwarding is the
   cross-cutting HP-3 item, not a Windows runtime hole.
-- **macOS exit — code-complete-live-pending (§9 accurate).** Windows admin,
-  macOS admin, and macOS relay (lifecycle) are now **LIVE-PROVEN** (macOS relay
+- **macOS exit — live-pending after 2026-07-03 lab fix.** Run
+  `labrun-1783084800049-93461-0` on commit `709ca9f` proved the macOS exit
+  activation/capture path reached the real exit stages (`activate_macos_exit_role`
+  PASS, `validate_macos_exit_nat_lifecycle` PASS, `validate_macos_exit_dns_failclosed`
+  PASS), then failed at two audit checks: stale service-hardening expected path
+  (`keys/wireguard.passphrase` vs the Phase-E `bootstrap/wireguard.passphrase`
+  plist) and `macos_mesh_status` reading the daemon-owned `0600` runtime state
+  without sudo after the destructive NAT lifecycle capture restart. The follow-up
+  patch aligns the hardening oracle/runbook to the bootstrap credential path,
+  dispatches macOS mesh-status through a non-interactive sudo wrapper, and makes
+  the capture wrapper poll `macos-mesh-status-check --max-age-seconds 120` before
+  continuing. **Remaining:** rerun `--macos-promote-exit` live from the patched
+  commit and flip the cell only if the audit tail passes.
+- **macOS/admin/relay context.** Windows admin, macOS admin, and macOS relay (lifecycle) are now **LIVE-PROVEN** (macOS relay
   flipped ✅ 2026-06-27 via the `--relay-platform macos` orchestrate stage, run
   `livelab-1782571161`, `cd6a834`). The only consistent CODE gap is
   that none of the mac/win FAIL-LOUD stages have a Linux-buildable **contract

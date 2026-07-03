@@ -10710,6 +10710,24 @@ fi
 (sudo bash {dns_script} --output "$ROOT/dns_leak_proof" --lan-iface {lan_iface} --mesh-hostname {mesh_hostname}) || echo "[capture] DNS capture failed (non-fatal)" >&2
 (sudo bash {killswitch_script} --output "$ROOT/macos_exit_killswitch_precedence.json") || echo "[capture] killswitch capture failed (non-fatal)" >&2
 (sudo bash {nat_script} --mesh-cidr {mesh_cidr} --output "$ROOT/macos_exit_nat_lifecycle.json") || echo "[capture] NAT lifecycle capture failed (non-fatal)" >&2
+RND=/usr/local/bin/rustynetd
+post_mesh_out="$ROOT/post_capture_macos_mesh_status.json"
+post_mesh_err="$ROOT/post_capture_macos_mesh_status.err"
+post_mesh_ok=0
+for _i in $(seq 1 30); do
+  if sudo "$RND" macos-mesh-status-check --max-age-seconds 120 > "$post_mesh_out" 2>"$post_mesh_err"; then
+    post_mesh_ok=1
+    break
+  fi
+  sleep 2
+done
+if [ "$post_mesh_ok" != 1 ]; then
+  echo 'post-capture daemon readiness failed: macOS runtime state did not return after destructive NAT lifecycle capture' >&2
+  cat "$post_mesh_err" >&2 2>/dev/null || true
+  sudo launchctl print system/com.rustynet.daemon >&2 2>/dev/null || true
+  sudo tail -n 80 /usr/local/var/log/rustynet/rustynetd.log >&2 2>/dev/null || true
+  exit 1
+fi
 # Make artifacts readable by the SSH user for SCP copy-back.
 sudo chown -R $(whoami) "$ROOT"
 find "$ROOT" -type f -print | sort
@@ -18921,6 +18939,20 @@ fn build_sudo_linux_daemon_check_invocation(
     ))
 }
 
+/// macOS daemon-check wrapper for probes that inspect `0600` runtime state.
+/// The state snapshot is intentionally daemon-owned, so the live lab must use
+/// the same non-interactive sudo guard Linux uses for root-state validators.
+fn build_sudo_macos_daemon_check_invocation(
+    daemon_path: &str,
+    subcommand: &str,
+    extra_args: &[String],
+) -> Result<String, String> {
+    let invocation = build_linux_daemon_check_invocation(daemon_path, subcommand, extra_args)?;
+    Ok(format!(
+        "set -eu; if ! sudo -n true >/dev/null 2>&1; then echo 'sudo -n required for macOS root-state validator' >&2; exit 1; fi; sudo -n {invocation}"
+    ))
+}
+
 /// Generic SSH dispatcher for a Linux daemon-check subcommand. Resolves
 /// the alias, asserts the platform is Linux, builds the POSIX
 /// invocation, and returns the trimmed raw stdout. Stage runners parse
@@ -19056,8 +19088,11 @@ fn run_macos_daemon_check_remote(
         ));
     }
     let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
-    let invocation =
-        build_linux_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand, extra_args)?;
+    let invocation = if subcommand == "macos-mesh-status-check" {
+        build_sudo_macos_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand, extra_args)?
+    } else {
+        build_linux_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand, extra_args)?
+    };
     let raw_output = capture_remote_shell_command_for_target(
         &target,
         None,
@@ -43503,6 +43538,39 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "sudo -n '/usr/local/bin/rustynetd' 'linux-key-custody-check' --no-fail-on-drift"
             ),
             "script must preserve quoted daemon argv under sudo: {script:?}"
+        );
+    }
+
+    #[test]
+    fn build_sudo_macos_daemon_check_invocation_wraps_mesh_status() {
+        let script = super::build_sudo_macos_daemon_check_invocation(
+            super::LINUX_RUSTYNETD_PATH,
+            "macos-mesh-status-check",
+            &[],
+        )
+        .expect("well-formed privileged macOS invocation must build");
+        assert!(
+            script.contains("sudo -n required for macOS root-state validator"),
+            "script must fail closed before privileged dispatch: {script:?}"
+        );
+        assert!(
+            script.ends_with(
+                "sudo -n '/usr/local/bin/rustynetd' 'macos-mesh-status-check' --no-fail-on-drift"
+            ),
+            "script must preserve quoted macOS daemon argv under sudo: {script:?}"
+        );
+    }
+
+    #[test]
+    fn macos_exit_capture_script_rechecks_daemon_state_after_nat_lifecycle() {
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains("post_capture_macos_mesh_status.json"),
+            "capture wrapper must emit post-capture mesh-status evidence"
+        );
+        assert!(
+            source.contains("macos-mesh-status-check --max-age-seconds 120"),
+            "capture wrapper must wait for fresh runtime state after destructive NAT lifecycle capture"
         );
     }
 
