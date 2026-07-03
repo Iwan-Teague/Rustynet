@@ -123,6 +123,44 @@ mod tests {
         );
     }
 
+    /// Cross-binary contract: a manifest emitted by the REAL rustynet-cli
+    /// emitter (ops emit-stage-manifest, captured 2026-07-03 with a macOS
+    /// promote-exit / skip-linux-suite selector set) must parse. The
+    /// monitor is workspace-excluded, so this committed fixture is the
+    /// only CI-visible seam between the two binaries — regenerate it when
+    /// the emitter schema version bumps.
+    #[test]
+    fn real_emitter_output_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestration = dir.path().join("orchestration");
+        std::fs::create_dir_all(&orchestration).unwrap();
+        std::fs::write(
+            orchestration.join("stage_manifest.json"),
+            include_str!("../../fixtures/stage_manifest_emitted_2026-07-03.json"),
+        )
+        .unwrap();
+
+        let manifest = read_stage_manifest(dir.path()).expect("real emitter output parses");
+        assert_eq!(manifest.run_command, "vm-lab-orchestrate-live-lab");
+        assert_eq!(manifest.run_mode, "full");
+        assert!(manifest.stages.len() >= 150, "{}", manifest.stages.len());
+        let by_name = |name: &str| {
+            manifest
+                .stages
+                .iter()
+                .find(|stage| stage.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        assert!(by_name("activate_macos_exit_role").enabled);
+        assert!(!by_name("validate_linux_hello_limiter_flood").enabled);
+        assert!(
+            by_name("validate_linux_hello_limiter_flood")
+                .skip_reason
+                .is_some()
+        );
+        assert!(by_name("linux_live_suite").synthetic);
+    }
+
     #[test]
     fn missing_or_empty_manifest_yields_none() {
         let dir = tempfile::tempdir().unwrap();
