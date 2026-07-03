@@ -89,24 +89,42 @@ fn render_planned_with_statuses(
             .iter()
             .filter(|stage| app.stage_enabled(stage))
             .count();
+        // completed/failed/skipped count over the same subset the
+        // denominator (`enabled`) describes. Historically completed
+        // counted ANY recorded outcome in the group while enabled counted
+        // the current config's plan — two orthogonal filters over one
+        // list, producing displays like "13/9" (finding 7).
         let completed = group
             .stages
             .iter()
             .filter(|stage| {
-                status_by_stage
-                    .get(stage.as_str())
-                    .is_some_and(|status| is_final(status))
+                app.stage_enabled(stage)
+                    && status_by_stage
+                        .get(stage.as_str())
+                        .is_some_and(|status| is_final(status))
             })
             .count();
         let failed = group
             .stages
             .iter()
-            .filter(|stage| status_by_stage.get(stage.as_str()) == Some(&"fail"))
+            .filter(|stage| {
+                app.stage_enabled(stage)
+                    && matches!(
+                        status_by_stage.get(stage.as_str()),
+                        Some(&"fail") | Some(&"aborted") | Some(&"timed_out")
+                    )
+            })
             .count();
         let skipped = group
             .stages
             .iter()
-            .filter(|stage| status_by_stage.get(stage.as_str()) == Some(&"skipped"))
+            .filter(|stage| {
+                app.stage_enabled(stage)
+                    && matches!(
+                        status_by_stage.get(stage.as_str()),
+                        Some(&"skipped") | Some(&"skip")
+                    )
+            })
             .count();
         let header_style = stage_group_header_style(
             col_focused,
@@ -229,7 +247,14 @@ fn cell_for_status(status: &str) -> (&'static str, Style) {
 }
 
 fn is_final(status: &str) -> bool {
-    matches!(status, "pass" | "fail" | "skipped")
+    // Both skip dialects (bash writes "skipped", the Rust wrapper
+    // historically wrote "skip") plus the finding-3 terminal states — a
+    // stage the conclusion barrier marked aborted/timed_out is finished,
+    // not forever-pending.
+    matches!(
+        status,
+        "pass" | "fail" | "skipped" | "skip" | "aborted" | "timed_out" | "not_applicable"
+    )
 }
 
 fn progress_bar_string(done: usize, total: usize, width: usize) -> String {

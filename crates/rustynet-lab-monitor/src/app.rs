@@ -182,6 +182,15 @@ pub struct App {
 
     active_stage_start: Option<std::time::Instant>,
     last_vm_probe: Option<std::time::Instant>,
+    /// The active (or most recently seen) run's own resolved plan, read
+    /// from `<report_dir>/orchestration/stage_manifest.json`. When present
+    /// the stage grid renders THIS instead of the hardcoded fallback
+    /// catalog — the run's plan, pinned to the config that launched it
+    /// (finding 1/7 of the 2026-07-03 live-lab findings). Kept after the
+    /// run goes idle so a held run's display cannot drift under config
+    /// edits; replaced when a run with a different report dir starts.
+    run_manifest: Option<crate::data::stage_manifest::RunStageManifest>,
+    run_manifest_dir: Option<PathBuf>,
 }
 
 /// Which stage's log is most useful to show once a run goes idle: the
@@ -278,6 +287,8 @@ impl App {
             review_iterations,
             active_stage_start: None,
             last_vm_probe: None,
+            run_manifest: None,
+            run_manifest_dir: None,
         };
         app.prune_unknown_disabled_stages();
         Ok(app)
@@ -493,6 +504,14 @@ impl App {
     /// greying out is reserved for genuinely impossible stages, e.g. a
     /// Windows-only check on a Linux-only run.
     pub fn stage_selected_for_current_target(&self, stage: &str) -> bool {
+        // The run's own manifest is authoritative when present: it was
+        // resolved from the selectors that actually launched the run, so
+        // it cannot disagree with what the orchestrator is doing.
+        if let Some(manifest) = &self.run_manifest
+            && let Some(entry) = manifest.stages.iter().find(|entry| entry.name == stage)
+        {
+            return entry.enabled;
+        }
         if matches!(
             stage,
             "preflight"
@@ -645,6 +664,9 @@ impl App {
     /// with the Full Stage Matrix / Previous Runs panels, which show the
     /// whole history-wide catalog regardless of the *next* run's config.
     pub fn planned_stage_groups(&self) -> Vec<StageGroup> {
+        if let Some(groups) = self.manifest_stage_groups() {
+            return groups;
+        }
         let pre = [
             "preflight",
             "prepare_source_archive",
@@ -733,6 +755,39 @@ impl App {
         ]
     }
 
+    /// The stage grid derived from the active/held run's own manifest:
+    /// pre → PRE, bootstrap → BOOTSTRAP, everything else (live, chaos,
+    /// job) → LIVE LAB, in the manifest's own pipeline order. `None` when
+    /// no manifest has been seen (pre-manifest report dirs, fresh monitor)
+    /// — callers fall back to the hardcoded catalog.
+    fn manifest_stage_groups(&self) -> Option<Vec<StageGroup>> {
+        let manifest = self.run_manifest.as_ref()?;
+        let mut pre = Vec::new();
+        let mut bootstrap = Vec::new();
+        let mut live = Vec::new();
+        for stage in &manifest.stages {
+            match stage.group.as_str() {
+                "pre" => pre.push(stage.name.clone()),
+                "bootstrap" => bootstrap.push(stage.name.clone()),
+                _ => live.push(stage.name.clone()),
+            }
+        }
+        Some(vec![
+            StageGroup {
+                name: "PRE",
+                stages: pre,
+            },
+            StageGroup {
+                name: "BOOTSTRAP",
+                stages: bootstrap,
+            },
+            StageGroup {
+                name: "LIVE LAB",
+                stages: live,
+            },
+        ])
+    }
+
     pub async fn refresh_state(&mut self) {
         if self.active_job.is_none()
             && let Ok(mut config) = MonitorConfig::load(&self.repo_root)
@@ -775,6 +830,19 @@ impl App {
                     }
                 }
                 let report_dir = self.repo_root.join(&job.report_dir);
+                // Adopt the run's own stage manifest as it appears. A new
+                // report dir resets the held manifest; while the dir is
+                // unchanged and no manifest has been seen yet, keep
+                // retrying each poll — the orchestrator emits it at run
+                // start, which can land moments after the job JSON.
+                if self.run_manifest_dir.as_deref() != Some(report_dir.as_path()) {
+                    self.run_manifest = None;
+                    self.run_manifest_dir = Some(report_dir.clone());
+                }
+                if self.run_manifest.is_none() {
+                    self.run_manifest =
+                        crate::data::stage_manifest::read_stage_manifest(&report_dir);
+                }
                 if let Ok(result) = crate::data::stage_reader::read_orchestrate_result(&report_dir)
                 {
                     self.stage_outcomes = result.outcomes;
@@ -2848,6 +2916,90 @@ mod tests {
         // the stale entry reappears on every reload.
         let persisted = std::fs::read_to_string(state.join("monitor-config.toml")).unwrap();
         assert!(!persisted.contains("this_stage_was_renamed_away"));
+    }
+
+    fn manifest_from_json(json: &str) -> crate::data::stage_manifest::RunStageManifest {
+        serde_json::from_str(json).expect("manifest fixture parses")
+    }
+
+    #[test]
+    fn stage_grid_derives_from_the_runs_manifest_when_present() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        // A stage name this binary's fallback catalog has never heard of —
+        // exactly the "invisible failure-causing stage" class. With a
+        // manifest it MUST get a cell.
+        app.run_manifest = Some(manifest_from_json(
+            r#"{"run_mode": "full", "stages": [
+                {"name": "preflight", "group": "pre", "enabled": true},
+                {"name": "membership_setup", "group": "bootstrap", "enabled": true},
+                {"name": "validate_linux_hello_limiter_flood", "group": "live", "enabled": true},
+                {"name": "some_brand_new_stage", "group": "live", "enabled": true},
+                {"name": "chaos_daemon_fault", "group": "chaos", "enabled": false,
+                 "skip_reason": "chaos suite not selected"}
+            ]}"#,
+        ));
+
+        let groups = app.planned_stage_groups();
+        assert_eq!(groups[0].stages, vec!["preflight".to_owned()]);
+        assert_eq!(groups[1].stages, vec!["membership_setup".to_owned()]);
+        assert_eq!(
+            groups[2].stages,
+            vec![
+                "validate_linux_hello_limiter_flood".to_owned(),
+                "some_brand_new_stage".to_owned(),
+                "chaos_daemon_fault".to_owned(),
+            ],
+            "live + chaos both render in the LIVE LAB pane, manifest order"
+        );
+
+        // Enablement comes from the manifest's resolved plan, not from
+        // this monitor's local config heuristics.
+        assert!(app.stage_selected_for_current_target("some_brand_new_stage"));
+        assert!(!app.stage_selected_for_current_target("chaos_daemon_fault"));
+        // User-level disables still layer on top.
+        app.config
+            .disabled_stages
+            .push("some_brand_new_stage".to_owned());
+        assert!(!app.stage_enabled("some_brand_new_stage"));
+    }
+
+    #[test]
+    fn held_run_display_is_pinned_to_its_manifest_not_live_config() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.run_manifest = Some(manifest_from_json(
+            r#"{"run_mode": "full", "stages": [
+                {"name": "validate_macos_blind_exit", "group": "live", "enabled": true}
+            ]}"#,
+        ));
+        assert!(app.stage_selected_for_current_target("validate_macos_blind_exit"));
+
+        // An external config edit while the run is held must not change
+        // what the held run's grid says was planned (finding 7's
+        // config-reload divergence).
+        app.config.blind_exit_platform.clear();
+        app.config.macos_promote_exit = false;
+        app.config.exit_platform = "windows".to_owned();
+        assert!(
+            app.stage_selected_for_current_target("validate_macos_blind_exit"),
+            "held-run enablement must read the manifest, not live config"
+        );
+    }
+
+    #[test]
+    fn fallback_catalog_still_governs_pre_manifest_report_dirs() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.run_manifest = None;
+        // Default target is macOS exit: the macOS exit cells are planned,
+        // the Windows exit cells are not — the pre-manifest logic intact.
+        assert!(app.stage_selected_for_current_target("activate_macos_exit_role"));
+        assert!(!app.stage_selected_for_current_target("promote_windows_exit_active"));
+        let groups = app.planned_stage_groups();
+        assert_eq!(groups.len(), 3);
+        assert!(
+            groups[1]
+                .stages
+                .contains(&"stage_windows_bundles_for_distribution".to_owned())
+        );
     }
 
     #[tokio::test]
