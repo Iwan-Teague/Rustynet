@@ -1,0 +1,1771 @@
+#![forbid(unsafe_code)]
+
+//! Single source of truth for the live-lab stage vocabulary.
+//!
+//! Before this module existed the stage name was hand-copied across at least
+//! six components (bash orchestrator dispatch, the Rust state-machine
+//! `StageId` enum, mac/win sidecar literals, the monitor's hardcoded
+//! catalogs, four match tables in the CSV writer, and the docs), none of
+//! which agreed — the 2026-07-03 live-lab findings pass recorded phantom
+//! monitor entries, failure-causing stages invisible to the UI, and three
+//! naming dialects inside one CSV column. Every component is expected to
+//! consume THIS table (directly in `rustynet-cli`, or via the run-scoped
+//! stage manifest emitted into each report dir) instead of keeping a copy.
+//!
+//! The four historical match tables in `live_lab_run_matrix.rs`
+//! (`direct_platform_stage`, `logical_stage_name`, `populate_cross_os_values`
+//! arms, `set_special_stage_values` arms) are now thin lookups into this
+//! registry; their original bodies survive as test oracles that pin exact
+//! behavioral equivalence.
+//!
+//! Boundary note: this is tooling-layer code (§8/§10.3 untouched) — nothing
+//! here is consumed by domain, policy, or daemon crates.
+
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+/// Display/pipeline group. Mirrors the monitor's PRE / BOOTSTRAP / LIVE LAB
+/// grouping plus the chaos suite and job-level pseudo-stages that the
+/// wrapper records (`vm_lab_setup_live_lab` etc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageGroup {
+    Pre,
+    Bootstrap,
+    Live,
+    Chaos,
+    Job,
+}
+
+impl StageGroup {
+    #[allow(dead_code)] // consumed by the stage-manifest emitter (next increment)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StageGroup::Pre => "pre",
+            StageGroup::Bootstrap => "bootstrap",
+            StageGroup::Live => "live",
+            StageGroup::Chaos => "chaos",
+            StageGroup::Job => "job",
+        }
+    }
+}
+
+/// Which platform stream a stage belongs to: the shared/common pipeline or
+/// one of the per-OS sidecar streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformStream {
+    Common,
+    Linux,
+    Macos,
+    Windows,
+}
+
+impl PlatformStream {
+    #[allow(dead_code)] // consumed by the stage-manifest emitter (next increment)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlatformStream::Common => "common",
+            PlatformStream::Linux => "linux",
+            PlatformStream::Macos => "macos",
+            PlatformStream::Windows => "windows",
+        }
+    }
+}
+
+/// How the CSV writer resolves which `{platform}_stage_*` columns a SHARED
+/// stage populates (OS-specific stages carry `direct_platform` instead).
+/// Encodes the arms of the historical `platforms_for_stage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformRule {
+    /// All platforms present in the run's target set.
+    AllPlatforms,
+    /// The platform of the target labelled `exit`.
+    ExitTarget,
+    /// The platform of the elected relay target.
+    RelayTarget,
+    /// Only the linux platforms of the target set (historical default).
+    LinuxOnly,
+}
+
+/// Stage severity, mirroring the bash orchestrator's `record_stage`
+/// severity column: `hard` failures gate the run, `soft` failures do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageSeverity {
+    Hard,
+    Soft,
+}
+
+/// When is this stage part of the resolved plan for a given run? Mirrors
+/// the gating the wrapper and monitor already apply (platform selectors,
+/// role-platform election, suite flags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnableRule {
+    /// Always part of the plan.
+    Always,
+    /// Requires a macOS guest in the run (`wants_macos`).
+    WantsMacos,
+    /// Requires a Windows guest in the run (`wants_windows`).
+    WantsWindows,
+    /// macOS elected as exit (`macos_promote_exit` or `exit_platform=macos`).
+    MacosExit,
+    /// Windows elected as exit.
+    WindowsExit,
+    /// Relay elected on the given platform.
+    RelayPlatform(&'static str),
+    /// Anchor elected on the given platform.
+    AnchorPlatform(&'static str),
+    /// Admin elected on the given platform.
+    AdminPlatform(&'static str),
+    /// blind_exit elected on the given platform.
+    BlindExitPlatform(&'static str),
+    /// Part of the Linux live-validation suite (`!skip_linux_live_suite`).
+    LinuxLiveSuite,
+    /// Opt-in chaos suite.
+    ChaosSuite,
+    /// Opt-in cross-network suite.
+    CrossNetworkSuite,
+}
+
+/// The run selectors that resolve [`EnableRule`]s into an actual plan.
+/// Mirrors the monitor's `MonitorConfig` gating fields and the wrapper's
+/// role-platform selectors.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetSelectors {
+    pub wants_macos: bool,
+    pub wants_windows: bool,
+    pub macos_promote_exit: bool,
+    pub exit_platform: String,
+    pub relay_platform: String,
+    pub anchor_platform: String,
+    pub admin_platform: String,
+    pub blind_exit_platform: String,
+    pub skip_linux_live_suite: bool,
+    pub chaos_suite: bool,
+    pub cross_network_suite: bool,
+}
+
+impl TargetSelectors {
+    #[allow(dead_code)] // consumed by the stage-manifest emitter (next increment)
+    pub fn resolves(&self, rule: EnableRule) -> bool {
+        match rule {
+            EnableRule::Always => true,
+            EnableRule::WantsMacos => self.wants_macos,
+            EnableRule::WantsWindows => self.wants_windows,
+            EnableRule::MacosExit => self.macos_promote_exit || self.exit_platform == "macos",
+            EnableRule::WindowsExit => self.exit_platform == "windows",
+            EnableRule::RelayPlatform(platform) => self.relay_platform == platform,
+            EnableRule::AnchorPlatform(platform) => self.anchor_platform == platform,
+            EnableRule::AdminPlatform(platform) => self.admin_platform == platform,
+            EnableRule::BlindExitPlatform(platform) => self.blind_exit_platform == platform,
+            EnableRule::LinuxLiveSuite => !self.skip_linux_live_suite,
+            EnableRule::ChaosSuite => self.chaos_suite,
+            EnableRule::CrossNetworkSuite => self.cross_network_suite,
+        }
+    }
+
+    /// Human-readable reason a rule did NOT resolve, for the manifest's
+    /// `not_applicable(reason)` state.
+    #[allow(dead_code)] // consumed by the stage-manifest emitter (next increment)
+    pub fn skip_reason(&self, rule: EnableRule) -> &'static str {
+        match rule {
+            EnableRule::Always => "always enabled",
+            EnableRule::WantsMacos => "no macOS guest in this run",
+            EnableRule::WantsWindows => "no Windows guest in this run",
+            EnableRule::MacosExit => "macOS not elected as exit",
+            EnableRule::WindowsExit => "Windows not elected as exit",
+            EnableRule::RelayPlatform(_) => "relay not elected on this platform",
+            EnableRule::AnchorPlatform(_) => "anchor not elected on this platform",
+            EnableRule::AdminPlatform(_) => "admin not elected on this platform",
+            EnableRule::BlindExitPlatform(_) => "blind_exit not elected on this platform",
+            EnableRule::LinuxLiveSuite => "linux live suite skipped for this run",
+            EnableRule::ChaosSuite => "chaos suite not selected",
+            EnableRule::CrossNetworkSuite => "cross-network suite not selected",
+        }
+    }
+}
+
+/// One stage, fully described as data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageSpec {
+    /// Canonical recorded name.
+    pub name: &'static str,
+    /// Historical / phantom names that must resolve to this stage (the
+    /// monitor's `distribute_windows_bundles`, etc). Node-scoped composites
+    /// (`node::stage`) are handled by [`strip_node_alias`], not aliases.
+    pub aliases: &'static [&'static str],
+    pub group: StageGroup,
+    pub stream: PlatformStream,
+    /// OS-specific stages: `(platform, logical)` → `{platform}_stage_{logical}`
+    /// CSV column. Mirrors the historical `direct_platform_stage` table.
+    pub direct_platform: Option<(&'static str, &'static str)>,
+    /// Shared stages: logical column suffix; platform resolved per
+    /// [`PlatformRule`]. Mirrors the historical `logical_stage_name` table.
+    pub logical: Option<&'static str>,
+    /// `(platform, role)` → `{platform}_{role}` role-result column. Mirrors
+    /// the historical `direct_platform_role` table.
+    pub role: Option<(&'static str, &'static str)>,
+    /// Cross-OS aggregate column. Mirrors `populate_cross_os_values` arms.
+    pub cross_os: Option<&'static str>,
+    /// One-off check column. Mirrors `set_special_stage_values` arms.
+    pub special: Option<&'static str>,
+    /// Member of the Rust state-machine's native stage vocabulary
+    /// (`StageId::as_str`). Mirrors `is_rust_native_stage_name`.
+    pub rust_native: bool,
+    pub platform_rule: PlatformRule,
+    pub enable: EnableRule,
+    /// Cold-start time budget in seconds (fallback when no timing history
+    /// exists). Values mirror the monitor's `default_stage_secs` table.
+    pub budget_secs: u64,
+    pub severity: StageSeverity,
+    /// SecurityMinimumBar / audit-ledger control IDs this stage proves live
+    /// (coverage-as-code; sourced from the stage evaluators' own
+    /// "Proves ..." doc comments).
+    pub proves: &'static [&'static str],
+    /// True for display-only aggregates (the monitor's `linux_live_suite`
+    /// row) that never appear in recorded outcomes.
+    pub synthetic: bool,
+}
+
+const DEFAULT_SPEC: StageSpec = StageSpec {
+    name: "",
+    aliases: &[],
+    group: StageGroup::Live,
+    stream: PlatformStream::Common,
+    direct_platform: None,
+    logical: None,
+    role: None,
+    cross_os: None,
+    special: None,
+    rust_native: false,
+    platform_rule: PlatformRule::LinuxOnly,
+    enable: EnableRule::Always,
+    budget_secs: 300,
+    severity: StageSeverity::Hard,
+    proves: &[],
+    synthetic: false,
+};
+
+/// Control-ID sets shared by the per-OS variants of each audit stage.
+const PROVES_MEMBERSHIP_REVOKE: &[&str] = &["RSA-0009"];
+const PROVES_REVOKED_PEER_DENIED: &[&str] = &["DD-03", "RSA-0007"];
+const PROVES_BLIND_EXIT_REVERSAL: &[&str] = &["RT-2", "SecMinBar-6.D.2"];
+const PROVES_GOSSIP_REVOKED_READMIT: &[&str] = &["GM-1", "RSA-0034"];
+const PROVES_ENROLLMENT_REPLAY: &[&str] = &["ENR-1", "TOCTOU-1", "RSA-0023"];
+const PROVES_HELLO_LIMITER_FLOOD: &[&str] = &["DOS-1", "RSA-0037"];
+
+pub const STAGES: &[StageSpec] = &[
+    // ── PRE (shared pipeline head) ──────────────────────────────────────
+    StageSpec {
+        name: "preflight",
+        group: StageGroup::Pre,
+        logical: Some("bootstrap"),
+        cross_os: Some("cross_os_bootstrap"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "prepare_source_archive",
+        group: StageGroup::Pre,
+        logical: Some("bootstrap"),
+        cross_os: Some("cross_os_bootstrap"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 30,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "verify_ssh_reachability",
+        group: StageGroup::Pre,
+        logical: Some("bootstrap"),
+        cross_os: Some("cross_os_bootstrap"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "prime_remote_access",
+        group: StageGroup::Pre,
+        logical: Some("bootstrap"),
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "macos_preflight_check",
+        group: StageGroup::Pre,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cleanup_hosts",
+        group: StageGroup::Pre,
+        logical: Some("bootstrap"),
+        cross_os: Some("cross_os_bootstrap"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    // ── BOOTSTRAP (shared) ──────────────────────────────────────────────
+    StageSpec {
+        name: "bootstrap_hosts",
+        group: StageGroup::Bootstrap,
+        logical: Some("bootstrap"),
+        cross_os: Some("cross_os_bootstrap"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 900,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "collect_pubkeys",
+        group: StageGroup::Bootstrap,
+        logical: Some("bootstrap"),
+        cross_os: Some("cross_os_bootstrap"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "membership_setup",
+        group: StageGroup::Bootstrap,
+        logical: Some("membership"),
+        budget_secs: 120,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_membership_state",
+        group: StageGroup::Bootstrap,
+        logical: Some("membership"),
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "issue_and_distribute_assignments",
+        group: StageGroup::Bootstrap,
+        logical: Some("assignments"),
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        // NOTE: deliberately NOT mapped to `logical: traversal` yet — the
+        // historical table only knows the Rust dialect `distribute_traversal`
+        // and this bash name fell through. Healing that drift is a separate,
+        // explicitly-tested change (see the healed-drift test), not part of
+        // the behavior-preserving registry extraction.
+        name: "issue_and_distribute_traversal",
+        group: StageGroup::Bootstrap,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        // Same deliberate gap as issue_and_distribute_traversal.
+        name: "issue_and_distribute_dns_zone",
+        group: StageGroup::Bootstrap,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "enforce_baseline_runtime",
+        group: StageGroup::Bootstrap,
+        logical: Some("baseline_runtime"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_baseline_runtime",
+        group: StageGroup::Bootstrap,
+        logical: Some("baseline_runtime"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    // ── Rust state-machine dialect (StageId::as_str vocabulary) ────────
+    StageSpec {
+        name: "membership_init",
+        group: StageGroup::Bootstrap,
+        logical: Some("membership"),
+        cross_os: Some("cross_os_membership_convergence"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 120,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_membership",
+        group: StageGroup::Bootstrap,
+        logical: Some("membership"),
+        cross_os: Some("cross_os_membership_convergence"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "anchor_validation",
+        group: StageGroup::Live,
+        logical: Some("anchor"),
+        cross_os: Some("cross_os_anchor_bundle_pull"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_assignments",
+        group: StageGroup::Bootstrap,
+        logical: Some("assignments"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_traversal",
+        group: StageGroup::Bootstrap,
+        logical: Some("traversal"),
+        cross_os: Some("cross_os_direct_path"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_dns_zone",
+        group: StageGroup::Bootstrap,
+        logical: Some("managed_dns"),
+        cross_os: Some("cross_os_dns"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "deploy_relay_service",
+        group: StageGroup::Live,
+        logical: Some("relay_service_lifecycle"),
+        cross_os: Some("cross_os_relay_path"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "relay_validation",
+        group: StageGroup::Live,
+        logical: Some("relay_service_lifecycle"),
+        cross_os: Some("cross_os_relay_path"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "traffic_test_matrix",
+        group: StageGroup::Live,
+        logical: Some("two_hop"),
+        cross_os: Some("cross_os_peer_visibility"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "role_switch_matrix",
+        group: StageGroup::Live,
+        logical: Some("role_switch_matrix"),
+        cross_os: Some("cross_os_role_switch"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "exit_handoff",
+        group: StageGroup::Live,
+        logical: Some("exit_handoff"),
+        cross_os: Some("cross_os_exit_path"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "active_exit",
+        group: StageGroup::Live,
+        logical: Some("exit_handoff"),
+        cross_os: Some("cross_os_exit_path"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cleanup",
+        group: StageGroup::Live,
+        logical: Some("cleanup"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    // ── macOS sidecar: bootstrap stream ────────────────────────────────
+    StageSpec {
+        name: "bootstrap_macos_host",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "bootstrap")),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 600,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "collect_macos_pubkey",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "mixed_topology")),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "amend_membership_for_macos",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "membership")),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 120,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_macos_bundles",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "membership")),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_mesh_join",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "mixed_topology")),
+        role: Some(("macos", "client")),
+        cross_os: Some("cross_os_peer_visibility"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    // ── Windows sidecar: bootstrap stream ───────────────────────────────
+    StageSpec {
+        name: "bootstrap_windows_host",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "bootstrap")),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 600,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "amend_membership_for_windows",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "membership")),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 120,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "stage_windows_bundles_for_distribution",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        enable: EnableRule::WantsWindows,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        // `distribute_windows_bundles` is the monitor's historical phantom
+        // for this stage (it never existed in executing code) — kept as an
+        // alias so historical UI references resolve somewhere real.
+        name: "distribute_windows_membership",
+        aliases: &["distribute_windows_bundles"],
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "membership")),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "issue_windows_assignment",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "assignments")),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 120,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_windows_assignment",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "assignments")),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    // ── macOS live cells ────────────────────────────────────────────────
+    StageSpec {
+        name: "activate_macos_exit_role",
+        stream: PlatformStream::Macos,
+        enable: EnableRule::MacosExit,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "capture_macos_exit_evidence_artifacts",
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "exit_handoff")),
+        enable: EnableRule::MacosExit,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_exit_nat_lifecycle",
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "exit_handoff")),
+        role: Some(("macos", "blind_exit")),
+        enable: EnableRule::MacosExit,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_ipv6_leak",
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "exit_handoff")),
+        role: Some(("macos", "blind_exit")),
+        enable: EnableRule::MacosExit,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_exit_dns_failclosed",
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "managed_dns")),
+        role: Some(("macos", "blind_exit")),
+        cross_os: Some("cross_os_dns"),
+        enable: EnableRule::MacosExit,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_exit_killswitch_precedence",
+        stream: PlatformStream::Macos,
+        role: Some(("macos", "blind_exit")),
+        special: Some("macos_pf_killswitch"),
+        enable: EnableRule::MacosExit,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_relay_service_lifecycle",
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "relay_service_lifecycle")),
+        role: Some(("macos", "relay")),
+        cross_os: Some("cross_os_relay_path"),
+        enable: EnableRule::RelayPlatform("macos"),
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "deploy_macos_anchor_profile",
+        stream: PlatformStream::Macos,
+        enable: EnableRule::AnchorPlatform("macos"),
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_anchor_bundle_pull",
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "anchor")),
+        role: Some(("macos", "anchor")),
+        cross_os: Some("cross_os_anchor_bundle_pull"),
+        enable: EnableRule::AnchorPlatform("macos"),
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_admin_issue",
+        stream: PlatformStream::Macos,
+        enable: EnableRule::AdminPlatform("macos"),
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_blind_exit",
+        stream: PlatformStream::Macos,
+        enable: EnableRule::BlindExitPlatform("macos"),
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_key_custody",
+        stream: PlatformStream::Macos,
+        special: Some("macos_keychain_key_custody"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    // ── macOS audit family ──────────────────────────────────────────────
+    StageSpec {
+        name: "validate_macos_membership_revoke_applies",
+        stream: PlatformStream::Macos,
+        special: Some("macos_membership_revoke_applies"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        proves: PROVES_MEMBERSHIP_REVOKE,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_membership_signature_forgery",
+        stream: PlatformStream::Macos,
+        special: Some("macos_membership_signature_forgery"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_gossip_revoked_readmit",
+        stream: PlatformStream::Macos,
+        special: Some("macos_gossip_revoked_readmit"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        proves: PROVES_GOSSIP_REVOKED_READMIT,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_enrollment_replay",
+        stream: PlatformStream::Macos,
+        special: Some("macos_enrollment_replay"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        proves: PROVES_ENROLLMENT_REPLAY,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_hello_limiter_flood",
+        stream: PlatformStream::Macos,
+        special: Some("macos_hello_limiter_flood"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        proves: PROVES_HELLO_LIMITER_FLOOD,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_runtime_acls",
+        stream: PlatformStream::Macos,
+        special: Some("macos_runtime_acls"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_service_hardening",
+        stream: PlatformStream::Macos,
+        special: Some("macos_service_hardening"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_mesh_status",
+        stream: PlatformStream::Macos,
+        special: Some("macos_mesh_status"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_authenticode",
+        stream: PlatformStream::Macos,
+        special: Some("macos_authenticode"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_privileged_helper_allowlist",
+        stream: PlatformStream::Macos,
+        special: Some("macos_privileged_helper_allowlist"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_policy_default_deny",
+        stream: PlatformStream::Macos,
+        special: Some("macos_policy_default_deny"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_revoked_peer_denied_e2e",
+        stream: PlatformStream::Macos,
+        special: Some("macos_revoked_peer_denied_e2e"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        proves: PROVES_REVOKED_PEER_DENIED,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_blind_exit_reversal_denied",
+        stream: PlatformStream::Macos,
+        special: Some("macos_blind_exit_reversal_denied"),
+        enable: EnableRule::WantsMacos,
+        budget_secs: 180,
+        proves: PROVES_BLIND_EXIT_REVERSAL,
+        ..DEFAULT_SPEC
+    },
+    // ── Windows live cells ──────────────────────────────────────────────
+    StageSpec {
+        name: "validate_windows_client_install",
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "baseline_runtime")),
+        role: Some(("windows", "client")),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_runtime_acls",
+        stream: PlatformStream::Windows,
+        role: Some(("windows", "client")),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_named_pipe_acls",
+        stream: PlatformStream::Windows,
+        role: Some(("windows", "client")),
+        special: Some("windows_named_pipe_acl"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_service_hardening",
+        stream: PlatformStream::Windows,
+        role: Some(("windows", "client")),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_key_custody",
+        stream: PlatformStream::Windows,
+        role: Some(("windows", "client")),
+        special: Some("windows_dpapi_key_custody"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_dns_failclosed",
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "managed_dns")),
+        cross_os: Some("cross_os_dns"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_exit_nat_lifecycle",
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "exit_handoff")),
+        role: Some(("windows", "exit")),
+        enable: EnableRule::WindowsExit,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_exit_dns_failclosed",
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "managed_dns")),
+        role: Some(("windows", "exit")),
+        enable: EnableRule::WindowsExit,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_exit_killswitch_precedence",
+        stream: PlatformStream::Windows,
+        role: Some(("windows", "exit")),
+        enable: EnableRule::WindowsExit,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_relay_service_lifecycle",
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "relay_service_lifecycle")),
+        role: Some(("windows", "relay")),
+        cross_os: Some("cross_os_relay_path"),
+        enable: EnableRule::RelayPlatform("windows"),
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_anchor_bundle_pull",
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "anchor")),
+        role: Some(("windows", "anchor")),
+        cross_os: Some("cross_os_anchor_bundle_pull"),
+        enable: EnableRule::AnchorPlatform("windows"),
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_admin_issue",
+        stream: PlatformStream::Windows,
+        enable: EnableRule::AdminPlatform("windows"),
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "promote_windows_exit_active",
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "exit_handoff")),
+        role: Some(("windows", "exit")),
+        cross_os: Some("cross_os_exit_path"),
+        enable: EnableRule::WindowsExit,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_mesh_join",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "mixed_topology")),
+        cross_os: Some("cross_os_peer_visibility"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    // ── Windows audit family ────────────────────────────────────────────
+    StageSpec {
+        name: "validate_windows_membership_revoke_applies",
+        stream: PlatformStream::Windows,
+        special: Some("windows_membership_revoke_applies"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        proves: PROVES_MEMBERSHIP_REVOKE,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_membership_signature_forgery",
+        stream: PlatformStream::Windows,
+        special: Some("windows_membership_signature_forgery"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_gossip_revoked_readmit",
+        stream: PlatformStream::Windows,
+        special: Some("windows_gossip_revoked_readmit"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        proves: PROVES_GOSSIP_REVOKED_READMIT,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_enrollment_replay",
+        stream: PlatformStream::Windows,
+        special: Some("windows_enrollment_replay"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        proves: PROVES_ENROLLMENT_REPLAY,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_hello_limiter_flood",
+        stream: PlatformStream::Windows,
+        special: Some("windows_hello_limiter_flood"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        proves: PROVES_HELLO_LIMITER_FLOOD,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_mesh_status",
+        stream: PlatformStream::Windows,
+        special: Some("windows_mesh_status"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_privileged_helper_allowlist",
+        stream: PlatformStream::Windows,
+        special: Some("windows_privileged_helper_allowlist"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_policy_default_deny",
+        stream: PlatformStream::Windows,
+        special: Some("windows_policy_default_deny"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_revoked_peer_denied_e2e",
+        stream: PlatformStream::Windows,
+        special: Some("windows_revoked_peer_denied_e2e"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        proves: PROVES_REVOKED_PEER_DENIED,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_windows_blind_exit_reversal_denied",
+        stream: PlatformStream::Windows,
+        special: Some("windows_blind_exit_reversal_denied"),
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        proves: PROVES_BLIND_EXIT_REVERSAL,
+        ..DEFAULT_SPEC
+    },
+    // ── Linux live cells ────────────────────────────────────────────────
+    StageSpec {
+        name: "validate_linux_relay_service_lifecycle",
+        stream: PlatformStream::Linux,
+        direct_platform: Some(("linux", "relay_service_lifecycle")),
+        role: Some(("linux", "relay")),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_anchor_bundle_pull",
+        stream: PlatformStream::Linux,
+        direct_platform: Some(("linux", "anchor")),
+        role: Some(("linux", "anchor")),
+        cross_os: Some("cross_os_anchor_bundle_pull"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_exit_nat_lifecycle",
+        stream: PlatformStream::Linux,
+        direct_platform: Some(("linux", "exit_handoff")),
+        role: Some(("linux", "exit")),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_ipv6_leak",
+        stream: PlatformStream::Linux,
+        direct_platform: Some(("linux", "exit_handoff")),
+        role: Some(("linux", "exit")),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_exit_demotion_residue",
+        stream: PlatformStream::Linux,
+        direct_platform: Some(("linux", "exit_handoff")),
+        role: Some(("linux", "exit")),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_dns_failclosed",
+        stream: PlatformStream::Linux,
+        direct_platform: Some(("linux", "managed_dns")),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_exit_dns_failclosed",
+        stream: PlatformStream::Linux,
+        direct_platform: Some(("linux", "managed_dns")),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_blind_exit_dataplane",
+        stream: PlatformStream::Linux,
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    // ── Linux audit family ──────────────────────────────────────────────
+    StageSpec {
+        name: "validate_linux_membership_revoke_applies",
+        stream: PlatformStream::Linux,
+        special: Some("linux_membership_revoke_applies"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        proves: PROVES_MEMBERSHIP_REVOKE,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_revoked_peer_denied_e2e",
+        stream: PlatformStream::Linux,
+        special: Some("linux_revoked_peer_denied_e2e"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        proves: PROVES_REVOKED_PEER_DENIED,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_membership_signature_forgery",
+        stream: PlatformStream::Linux,
+        special: Some("linux_membership_signature_forgery"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_privileged_helper_allowlist",
+        stream: PlatformStream::Linux,
+        special: Some("linux_privileged_helper_allowlist"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_policy_default_deny",
+        stream: PlatformStream::Linux,
+        special: Some("linux_policy_default_deny"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_runtime_acls",
+        stream: PlatformStream::Linux,
+        special: Some("linux_runtime_acls"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_service_hardening",
+        stream: PlatformStream::Linux,
+        special: Some("linux_service_hardening"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_authenticode",
+        stream: PlatformStream::Linux,
+        special: Some("linux_authenticode"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_key_custody",
+        stream: PlatformStream::Linux,
+        special: Some("linux_key_custody"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_membership_genesis",
+        stream: PlatformStream::Linux,
+        special: Some("linux_membership_genesis"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_mesh_status",
+        stream: PlatformStream::Linux,
+        special: Some("linux_mesh_status"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_blind_exit_reversal_denied",
+        stream: PlatformStream::Linux,
+        special: Some("linux_blind_exit_reversal_denied"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        proves: PROVES_BLIND_EXIT_REVERSAL,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_gossip_revoked_readmit",
+        stream: PlatformStream::Linux,
+        special: Some("linux_gossip_revoked_readmit"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        proves: PROVES_GOSSIP_REVOKED_READMIT,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_enrollment_replay",
+        stream: PlatformStream::Linux,
+        special: Some("linux_enrollment_replay"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        proves: PROVES_ENROLLMENT_REPLAY,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_hello_limiter_flood",
+        stream: PlatformStream::Linux,
+        special: Some("linux_hello_limiter_flood"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        proves: PROVES_HELLO_LIMITER_FLOOD,
+        ..DEFAULT_SPEC
+    },
+    // ── bash live suite (shared LIVE stages) ────────────────────────────
+    StageSpec {
+        name: "upgrade_admin_node_membership",
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 120,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_anchor",
+        logical: Some("anchor"),
+        platform_rule: PlatformRule::ExitTarget,
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_relay",
+        logical: Some("relay_service_lifecycle"),
+        cross_os: Some("cross_os_relay_path"),
+        platform_rule: PlatformRule::RelayTarget,
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_exit_handoff",
+        logical: Some("exit_handoff"),
+        cross_os: Some("cross_os_exit_path"),
+        platform_rule: PlatformRule::ExitTarget,
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_two_hop",
+        logical: Some("two_hop"),
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_lan_toggle",
+        logical: Some("lan_toggle"),
+        cross_os: Some("cross_os_lan_toggle"),
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_role_switch_matrix",
+        logical: Some("role_switch_matrix"),
+        cross_os: Some("cross_os_role_switch"),
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_managed_dns",
+        logical: Some("managed_dns"),
+        cross_os: Some("cross_os_dns"),
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_mixed_topology",
+        logical: Some("mixed_topology"),
+        cross_os: Some("cross_os_peer_visibility"),
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_reboot_recovery",
+        logical: Some("reboot_recovery"),
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_secrets_not_in_logs",
+        logical: Some("secrets_not_in_logs"),
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_key_custody",
+        logical: Some("key_custody"),
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_enrollment_restart",
+        logical: Some("enrollment_restart"),
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "live_network_flap",
+        logical: Some("network_flap"),
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "extended_soak",
+        logical: Some("extended_soak"),
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    // ── chaos suite ─────────────────────────────────────────────────────
+    StageSpec {
+        name: "chaos_clock_attack",
+        group: StageGroup::Chaos,
+        logical: Some("chaos"),
+        enable: EnableRule::ChaosSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "chaos_crash_recovery",
+        group: StageGroup::Chaos,
+        logical: Some("chaos"),
+        enable: EnableRule::ChaosSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "chaos_daemon_fault",
+        group: StageGroup::Chaos,
+        logical: Some("chaos"),
+        enable: EnableRule::ChaosSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "chaos_daemon_sigstop_sigcont",
+        group: StageGroup::Chaos,
+        logical: Some("chaos"),
+        enable: EnableRule::ChaosSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "chaos_membership_adversarial",
+        group: StageGroup::Chaos,
+        logical: Some("chaos"),
+        enable: EnableRule::ChaosSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "chaos_network_impairment",
+        group: StageGroup::Chaos,
+        logical: Some("chaos"),
+        enable: EnableRule::ChaosSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "chaos_privileged_boundary",
+        group: StageGroup::Chaos,
+        logical: Some("chaos"),
+        enable: EnableRule::ChaosSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "chaos_resource_exhaustion",
+        group: StageGroup::Chaos,
+        logical: Some("chaos"),
+        enable: EnableRule::ChaosSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "chaos_signed_state_adversarial",
+        group: StageGroup::Chaos,
+        logical: Some("chaos"),
+        enable: EnableRule::ChaosSuite,
+        ..DEFAULT_SPEC
+    },
+    // ── cross-network + job-level ───────────────────────────────────────
+    StageSpec {
+        name: "cross_network_nat_classification",
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "local_full_gate_suite",
+        group: StageGroup::Job,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "fresh_install_os_matrix_report",
+        group: StageGroup::Job,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "vm_lab_setup_live_lab",
+        group: StageGroup::Job,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "vm_lab_run_live_lab",
+        group: StageGroup::Job,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "restart_unready_vms",
+        group: StageGroup::Pre,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "discover_local_utm",
+        group: StageGroup::Pre,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "rediscover_local_utm",
+        group: StageGroup::Pre,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        // Display-only aggregate the monitor uses for the whole Linux
+        // live-validation suite; never appears in recorded outcomes.
+        name: "linux_live_suite",
+        stream: PlatformStream::Linux,
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 3_600,
+        synthetic: true,
+        ..DEFAULT_SPEC
+    },
+];
+
+/// `node::stage` composites (per-node parallel audit workers) record under a
+/// node-scoped name; classification always applies to the bare stage.
+pub fn strip_node_alias(stage: &str) -> &str {
+    stage.rsplit("::").next().unwrap_or(stage)
+}
+
+fn registry_index() -> &'static BTreeMap<&'static str, &'static StageSpec> {
+    static INDEX: OnceLock<BTreeMap<&'static str, &'static StageSpec>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut index = BTreeMap::new();
+        for spec in STAGES {
+            index.insert(spec.name, spec);
+            for alias in spec.aliases {
+                index.insert(*alias, spec);
+            }
+        }
+        index
+    })
+}
+
+/// Look up a stage by canonical name or alias; node-scoped composites are
+/// resolved to their bare stage first.
+pub fn find_stage(stage: &str) -> Option<&'static StageSpec> {
+    registry_index().get(strip_node_alias(stage)).copied()
+}
+
+/// All canonical stage names (no aliases, no synthetics excluded — callers
+/// filter on [`StageSpec::synthetic`] when they need recordable names only).
+#[allow(dead_code)] // consumed by the stage-manifest emitter (next increment)
+pub fn all_stage_names() -> impl Iterator<Item = &'static str> {
+    STAGES.iter().map(|spec| spec.name)
+}
+
+/// Registry-backed replacement for the historical `direct_platform_stage`
+/// match table: `(platform, logical)` for OS-specific stages.
+pub fn direct_platform_stage(stage: &str) -> Option<(&'static str, &'static str)> {
+    find_stage(stage)?.direct_platform
+}
+
+/// Registry-backed replacement for the historical `direct_platform_role`
+/// match table: `(platform, role)` role-result column attribution.
+pub fn direct_platform_role(stage: &str) -> Option<(&'static str, &'static str)> {
+    find_stage(stage)?.role
+}
+
+/// Registry-backed replacement for the historical `logical_stage_name`
+/// match table, preserving its prefix fallbacks (`chaos_*` → chaos,
+/// `*reboot*` → reboot_recovery) for names the registry does not know.
+pub fn logical_stage_name(stage: &str) -> Option<&'static str> {
+    let stage = strip_node_alias(stage);
+    // A registered stage without a logical mapping is a deliberate gap
+    // (e.g. the issue_and_distribute_* dialect drift) — the historical
+    // prefix fallbacks below still apply to it exactly as they did when it
+    // was unregistered.
+    if let Some(spec) = find_stage(stage)
+        && spec.logical.is_some()
+    {
+        return spec.logical;
+    }
+    if stage.starts_with("chaos_") {
+        return Some("chaos");
+    }
+    if stage.contains("reboot") {
+        return Some("reboot_recovery");
+    }
+    None
+}
+
+/// Registry-backed replacement for the `populate_cross_os_values` match
+/// arms: the cross-OS aggregate column a stage feeds, if any.
+pub fn cross_os_column(stage: &str) -> Option<&'static str> {
+    find_stage(stage)?.cross_os
+}
+
+/// Registry-backed replacement for the `set_special_stage_values` match
+/// arms: the one-off check column a stage feeds, if any.
+pub fn special_column(stage: &str) -> Option<&'static str> {
+    find_stage(stage)?.special
+}
+
+/// Registry-backed replacement for `is_rust_native_stage_name`.
+#[allow(dead_code)] // kept for the drift gate; production platform choice goes through platform_rule
+pub fn is_rust_native_stage_name(stage: &str) -> bool {
+    find_stage(stage).is_some_and(|spec| spec.rust_native)
+}
+
+/// Registry-backed platform-resolution rule for shared stages, preserving
+/// the historical `platforms_for_stage` fallbacks: unknown `cross_network_*`
+/// names resolve on all platforms; every other unknown name is linux-only.
+pub fn platform_rule(stage: &str) -> PlatformRule {
+    let stage = strip_node_alias(stage);
+    if let Some(spec) = find_stage(stage) {
+        return spec.platform_rule;
+    }
+    if stage.starts_with("cross_network_") {
+        PlatformRule::AllPlatforms
+    } else {
+        PlatformRule::LinuxOnly
+    }
+}
+
+/// Cold-start budget for a stage: the registry value when known, else the
+/// historical heuristic fallbacks (mirrors the monitor's
+/// `default_stage_secs`).
+#[allow(dead_code)] // consumed by the stage-manifest emitter (next increment)
+pub fn default_budget_secs(stage: &str) -> u64 {
+    let stage = strip_node_alias(stage);
+    if let Some(spec) = find_stage(stage) {
+        return spec.budget_secs;
+    }
+    if stage.starts_with("validate_macos_")
+        || stage.starts_with("validate_windows_")
+        || stage.starts_with("activate_macos_")
+        || stage.starts_with("capture_macos_")
+        || stage.starts_with("deploy_macos_")
+    {
+        180
+    } else if stage.contains("collect") || stage.contains("distribute") {
+        60
+    } else if stage.contains("membership") || stage.contains("assignment") {
+        120
+    } else {
+        // Includes the historical `contains("baseline")` arm, whose value
+        // equals the default.
+        300
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn registry_names_and_aliases_are_unique() {
+        let mut seen = BTreeSet::new();
+        for spec in STAGES {
+            assert!(
+                seen.insert(spec.name),
+                "duplicate stage name: {}",
+                spec.name
+            );
+            for alias in spec.aliases {
+                assert!(seen.insert(*alias), "duplicate alias: {alias}");
+            }
+        }
+    }
+
+    #[test]
+    fn registry_resolves_aliases_and_node_composites() {
+        // Monitor phantom → the real stage.
+        let spec = find_stage("distribute_windows_bundles").expect("alias resolves");
+        assert_eq!(spec.name, "distribute_windows_membership");
+        // Node-scoped composite → bare stage.
+        let spec =
+            find_stage("debian-headless-1::validate_linux_hello_limiter_flood").expect("resolves");
+        assert_eq!(spec.name, "validate_linux_hello_limiter_flood");
+        assert_eq!(spec.proves, PROVES_HELLO_LIMITER_FLOOD);
+        // Unknown names stay unknown.
+        assert!(find_stage("no_such_stage_ever").is_none());
+    }
+
+    #[test]
+    fn every_recorded_vocabulary_name_is_registered() {
+        // The full set of stage names observed in real recorded data
+        // (live_lab_stage_timings.csv stage column + run-matrix
+        // first_failed_stage values as of 2026-07-03). Every one must
+        // resolve in the registry — this is the anti-drift floor: a stage
+        // that records outcomes but is absent here is exactly the
+        // "invisible failure" class the registry exists to kill.
+        const RECORDED: &[&str] = &[
+            // timings CSV vocabulary
+            "bootstrap_hosts",
+            "chaos_clock_attack",
+            "chaos_crash_recovery",
+            "chaos_daemon_fault",
+            "chaos_daemon_sigstop_sigcont",
+            "chaos_membership_adversarial",
+            "chaos_network_impairment",
+            "chaos_privileged_boundary",
+            "chaos_resource_exhaustion",
+            "chaos_signed_state_adversarial",
+            "cleanup_hosts",
+            "collect_pubkeys",
+            "cross_network_nat_classification",
+            "distribute_membership_state",
+            "enforce_baseline_runtime",
+            "extended_soak",
+            "fresh_install_os_matrix_report",
+            "issue_and_distribute_assignments",
+            "issue_and_distribute_dns_zone",
+            "issue_and_distribute_traversal",
+            "live_anchor",
+            "live_enrollment_restart",
+            "live_exit_handoff",
+            "live_key_custody",
+            "live_lan_toggle",
+            "live_managed_dns",
+            "live_network_flap",
+            "live_reboot_recovery",
+            "live_relay",
+            "live_role_switch_matrix",
+            "live_secrets_not_in_logs",
+            "live_two_hop",
+            "local_full_gate_suite",
+            "macos_preflight_check",
+            "membership_setup",
+            "preflight",
+            "prepare_source_archive",
+            "prime_remote_access",
+            "upgrade_admin_node_membership",
+            "validate_baseline_runtime",
+            "verify_ssh_reachability",
+            // first_failed_stage extras
+            "activate_macos_exit_role",
+            "amend_membership_for_macos",
+            "amend_membership_for_windows",
+            "bootstrap_macos_host",
+            "bootstrap_windows_host",
+            "capture_macos_exit_evidence_artifacts",
+            "debian-headless-1::validate_linux_hello_limiter_flood",
+            "debian-headless-1::validate_linux_membership_genesis",
+            "debian-headless-4::validate_linux_blind_exit_dataplane",
+            "deploy_macos_anchor_profile",
+            "live_managed_dns",
+            "membership_init",
+            "relay_validation",
+            "restart_unready_vms",
+            "role_switch_matrix",
+            "traffic_test_matrix",
+            "validate_macos_admin_issue",
+            "validate_macos_blind_exit",
+            "validate_macos_exit_dns_failclosed",
+            "validate_macos_hello_limiter_flood",
+            "validate_macos_mesh_status",
+            "validate_macos_relay_service_lifecycle",
+            "validate_windows_admin_issue",
+            "validate_windows_anchor_bundle_pull",
+            "validate_windows_dns_failclosed",
+            "validate_windows_enrollment_replay",
+            "validate_windows_gossip_revoked_readmit",
+            "validate_windows_hello_limiter_flood",
+            "validate_windows_mesh_join",
+            "validate_windows_named_pipe_acls",
+            "vm_lab_run_live_lab",
+            "vm_lab_setup_live_lab",
+        ];
+        let missing: Vec<&str> = RECORDED
+            .iter()
+            .filter(|name| find_stage(name).is_none())
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "recorded stage names missing from the registry: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn selectors_resolve_enable_rules() {
+        let selectors = TargetSelectors {
+            wants_macos: true,
+            exit_platform: "macos".to_owned(),
+            relay_platform: "linux".to_owned(),
+            skip_linux_live_suite: true,
+            ..TargetSelectors::default()
+        };
+        assert!(selectors.resolves(EnableRule::Always));
+        assert!(selectors.resolves(EnableRule::WantsMacos));
+        assert!(!selectors.resolves(EnableRule::WantsWindows));
+        assert!(selectors.resolves(EnableRule::MacosExit));
+        assert!(!selectors.resolves(EnableRule::WindowsExit));
+        assert!(selectors.resolves(EnableRule::RelayPlatform("linux")));
+        assert!(!selectors.resolves(EnableRule::RelayPlatform("macos")));
+        assert!(!selectors.resolves(EnableRule::LinuxLiveSuite));
+        assert!(!selectors.resolves(EnableRule::ChaosSuite));
+
+        // macos_promote_exit alone elects the macOS exit stages.
+        let promoted = TargetSelectors {
+            macos_promote_exit: true,
+            ..TargetSelectors::default()
+        };
+        assert!(promoted.resolves(EnableRule::MacosExit));
+
+        // Empty selectors: default-deny for everything conditional.
+        let empty = TargetSelectors::default();
+        assert!(!empty.resolves(EnableRule::WantsMacos));
+        assert!(!empty.resolves(EnableRule::MacosExit));
+        assert!(!empty.resolves(EnableRule::ChaosSuite));
+        assert!(empty.resolves(EnableRule::LinuxLiveSuite));
+    }
+
+    #[test]
+    fn synthetic_stages_are_marked() {
+        assert!(
+            find_stage("linux_live_suite")
+                .expect("registered")
+                .synthetic
+        );
+        assert!(!find_stage("preflight").expect("registered").synthetic);
+    }
+
+    #[test]
+    fn budget_fallback_matches_monitor_heuristics_for_unknown_names() {
+        assert_eq!(default_budget_secs("validate_macos_future_check"), 180);
+        assert_eq!(default_budget_secs("distribute_future_bundle"), 60);
+        assert_eq!(default_budget_secs("future_membership_thing"), 120);
+        assert_eq!(default_budget_secs("future_baseline_thing"), 300);
+        assert_eq!(default_budget_secs("totally_unknown"), 300);
+    }
+}
