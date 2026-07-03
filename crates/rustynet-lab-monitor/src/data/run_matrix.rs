@@ -147,6 +147,14 @@ pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), Parity
     Ok(matrix)
 }
 
+/// PRE (preflight, prepare_source_archive, verify_ssh_reachability,
+/// prime_remote_access, cleanup_hosts) never gets its own CSV column, so it's
+/// invisible to every column-driven metric in this module. Shared by
+/// [`load_stage_progress`] (the header CHECKS count) and [`load_recent_runs`]
+/// (the Previous Runs panel), both of which fold this in unconditionally so
+/// the two views agree on what the full check catalog size is.
+const PRE_STAGE_COUNT: usize = 5;
+
 pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
     let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
     if !path.exists() {
@@ -186,7 +194,14 @@ pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
             passed += 1;
         }
     }
-    Ok(StageProgress { passed, total })
+    // PRE has no CSV column at all, so the loop above can never see it --
+    // fold in its always-complete 5 unconditionally (see PRE_STAGE_COUNT),
+    // the same convention load_recent_runs uses for total_stages, so CHECKS
+    // and the Previous Runs total agree on what the full catalog size is.
+    Ok(StageProgress {
+        passed: passed + PRE_STAGE_COUNT,
+        total: total + PRE_STAGE_COUNT,
+    })
 }
 
 /// Summary of a single completed lab run, for the Previous Runs panel.
@@ -494,7 +509,6 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
             // while the bar still rendered it as a solid green section,
             // reading as more evidence than the number backed up). PRE is
             // universal to every run, so it's also folded into the subset.
-            const PRE_STAGE_COUNT: usize = 5;
             let pre = (PRE_STAGE_COUNT, PRE_STAGE_COUNT);
 
             // Which section (if any) contains the run's own named failure --
@@ -1266,12 +1280,13 @@ mod tests {
 
         // Only macos_stage_anchor, cross_os_dns, windows_stage_exit_handoff are
         // real stage columns; linux_present/linux_client are role-presence
-        // flags and must not count (see next test).
-        assert_eq!(progress.total, 3);
+        // flags and must not count (see next test). PRE_STAGE_COUNT (5) is
+        // folded into both sides unconditionally (see load_stage_progress).
+        assert_eq!(progress.total, 3 + PRE_STAGE_COUNT);
         // macos_stage_anchor latest=pass, cross_os_dns latest=fail,
         // windows_stage_exit_handoff latest row is not_run so falls back to
         // the earlier decisive "pass".
-        assert_eq!(progress.passed, 2);
+        assert_eq!(progress.passed, 2 + PRE_STAGE_COUNT);
     }
 
     #[test]
@@ -1286,9 +1301,10 @@ mod tests {
         let progress = load_stage_progress(dir.path()).unwrap();
 
         // Every column here is a role-presence/summary flag; none are real
-        // stage checks, so the header bar's counter must read 0/0, not 8/8.
-        assert_eq!(progress.total, 0);
-        assert_eq!(progress.passed, 0);
+        // stage checks, so the header bar's counter must read only PRE's
+        // always-complete 5, not 8/8 (or 13/13 if PRE were miscounted too).
+        assert_eq!(progress.total, PRE_STAGE_COUNT);
+        assert_eq!(progress.passed, PRE_STAGE_COUNT);
     }
 
     #[test]
@@ -1322,7 +1338,10 @@ mod tests {
         let matrix_total =
             matrix.linux.len() + matrix.macos.len() + matrix.windows.len() + matrix.cross_os.len();
 
-        assert_eq!(progress.total, matrix_total);
+        // load_full_stage_matrix has no notion of PRE at all (it's purely
+        // column-driven), so progress.total must be exactly matrix_total
+        // plus PRE's always-complete 5, not equal to it.
+        assert_eq!(progress.total, matrix_total + PRE_STAGE_COUNT);
         // 2 suffixes x 3 OS + 3 one-offs + 2 cross_os = 11; linux_present excluded.
         assert_eq!(matrix_total, 11);
     }
@@ -1351,10 +1370,11 @@ mod tests {
         let matrix = load_full_stage_matrix(dir.path()).unwrap();
 
         assert_eq!(matrix.linux[0].state, ParityState::Flaky);
-        assert_eq!(progress.total, 1);
+        assert_eq!(progress.total, 1 + PRE_STAGE_COUNT);
         assert_eq!(
-            progress.passed, 0,
-            "a Flaky column's latest-pass must not inflate the header bar's passed count"
+            progress.passed, PRE_STAGE_COUNT,
+            "a Flaky column's latest-pass must not inflate the header bar's passed count \
+             beyond PRE's always-complete 5"
         );
     }
 
@@ -1398,8 +1418,8 @@ mod tests {
             "a never-before-seen _stage_ suffix must appear with no code change: {:?}",
             matrix.linux
         );
-        assert_eq!(progress.total, 1);
-        assert_eq!(progress.passed, 1);
+        assert_eq!(progress.total, 1 + PRE_STAGE_COUNT);
+        assert_eq!(progress.passed, 1 + PRE_STAGE_COUNT);
     }
 
     #[test]
@@ -1419,8 +1439,8 @@ mod tests {
             "a never-before-seen one-off check column must appear with no code change: {:?}",
             matrix.macos
         );
-        assert_eq!(progress.total, 1);
-        assert_eq!(progress.passed, 0);
+        assert_eq!(progress.total, 1 + PRE_STAGE_COUNT);
+        assert_eq!(progress.passed, PRE_STAGE_COUNT);
     }
 
     #[test]
@@ -1434,7 +1454,7 @@ mod tests {
         let matrix = load_full_stage_matrix(dir.path()).unwrap();
         let progress = load_stage_progress(dir.path()).unwrap();
         assert!(matrix.linux.is_empty(), "{:?}", matrix.linux);
-        assert_eq!(progress.total, 0);
+        assert_eq!(progress.total, PRE_STAGE_COUNT);
     }
 
     #[test]

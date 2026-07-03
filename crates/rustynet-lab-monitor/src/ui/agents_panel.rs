@@ -263,7 +263,7 @@ fn render_table(
 
     let rows = vec![
         table_row_with_sel(
-            "Model",
+            "MODEL",
             row_sel,
             SelCell {
                 value: patch_model,
@@ -277,7 +277,7 @@ fn render_table(
             },
         ),
         table_row_with_sel(
-            "Iter",
+            "ITER",
             row_sel,
             SelCell {
                 value: patch_iter_ui,
@@ -290,18 +290,18 @@ fn render_table(
                 selected: review_rowselected(Some((AgentsCol::Review, AgentsRow::Iterations))),
             },
         ),
-        table_row("Session", patch_session, gray, "—".to_owned(), dim),
-        table_row("Runs", patch_runs, dim, review_runs, gray),
+        table_row("SESSION", patch_session, gray, "—".to_owned(), dim),
+        table_row("RUNS", patch_runs, dim, review_runs, gray),
         Row::new(vec!["", "", ""]),
         table_row(
-            "API calls",
+            "API CALLS",
             v.api_calls.to_string(),
             white,
             v.review_api_calls.to_string(),
             gray,
         ),
         table_row(
-            "Tool calls",
+            "TOOL CALLS",
             v.tool_calls.to_string(),
             white,
             v.review_tool_calls.to_string(),
@@ -309,7 +309,7 @@ fn render_table(
         ),
         Row::new(vec!["", "", ""]),
         table_row(
-            "Cost (total)",
+            "COST (TOTAL)",
             format!("${:.4}", v.patch_total_cost_usd),
             bold_white,
             format!("${:.4}", v.review_total_cost_usd),
@@ -317,14 +317,14 @@ fn render_table(
         ),
         Row::new(vec!["", "", ""]),
         table_row(
-            "Tokens fresh",
+            "TOKENS FRESH",
             fmt_tokens(v.input_tokens + v.output_tokens),
             gray,
             fmt_tokens(v.review_input_tokens + v.review_output_tokens),
             dim,
         ),
         table_row(
-            "Cache read",
+            "CACHE READ",
             format!(
                 "{} ({:.0}%)",
                 fmt_tokens(v.cache_read_tokens),
@@ -371,7 +371,7 @@ fn render_table(
         let caption = if !hint.is_empty() {
             hint.to_owned()
         } else if !v.session.is_empty() && v.session != "-" {
-            format!(" Session: {}", v.session)
+            format!(" SESSION: {}", v.session)
         } else {
             String::new()
         };

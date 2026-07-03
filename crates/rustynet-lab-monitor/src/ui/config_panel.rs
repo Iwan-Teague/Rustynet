@@ -68,7 +68,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     for (label, value) in fields.iter() {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {}: ", label), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("  {}: ", label.to_ascii_uppercase()),
+                Style::default().fg(Color::Gray),
+            ),
             Span::styled(*value, Style::default().fg(Color::White)),
         ]));
     }

@@ -23,17 +23,17 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         let value = Style::default().fg(Color::White);
         let muted = Style::default().fg(Color::Gray);
         let mut lines = vec![
-            Line::from(Span::styled("Job:", label)),
+            Line::from(Span::styled("JOB:", label)),
             Line::from(Span::styled(job.job_id.clone(), value)),
-            Line::from(Span::styled("State:", label)),
+            Line::from(Span::styled("STATE:", label)),
             Line::from(Span::styled(job.state.clone(), value)),
-            Line::from(Span::styled("Area:", label)),
+            Line::from(Span::styled("AREA:", label)),
             Line::from(Span::styled(job.area.clone(), value)),
-            Line::from(Span::styled("Report:", label)),
+            Line::from(Span::styled("REPORT:", label)),
             Line::from(Span::styled(job.report_dir.clone(), muted)),
         ];
         if app.stop_after_current {
-            lines.push(Line::from(Span::styled("Drain:", label)));
+            lines.push(Line::from(Span::styled("DRAIN:", label)));
             lines.push(Line::from(Span::styled(
                 "stop after current run",
                 Style::default().fg(Color::Yellow),
