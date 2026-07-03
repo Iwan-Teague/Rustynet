@@ -23,8 +23,7 @@
 //! state mutation.
 //!
 //! This audit drives the REAL shipped `GossipNode`, in-process, with
-//! synthetic Ed25519 keys and a loopback transport (touches no production
-//! key, socket, or state):
+//! synthetic Ed25519 keys and no production key, socket, or state:
 //!   - a bundle from a peer marked Revoked in membership MUST be rejected
 //!     with `GossipError::RevokedSource`, and its endpoints must never be
 //!     admitted;
@@ -41,7 +40,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::dataplane_candidates::CandidateSet;
 use crate::gossip_runtime::{GossipNode, GossipNodeError};
-use crate::gossip_transport::GossipTransport;
 use crate::peer_gossip::{GossipError, mint_bundle_with_timestamp};
 
 const GOSSIP_REVOKED_READMIT_AUDIT_SCHEMA_VERSION: u32 = 1;
@@ -107,28 +105,37 @@ fn run_case(
     if revoke_sender {
         receiver.set_revoked_peer_ids([sender_id]);
     }
-    let bundle =
-        match mint_bundle_with_timestamp(&sender_key, 1, AUDIT_NOW_UNIX, CandidateSet::default()) {
-            Ok(bundle) => bundle,
-            Err(err) => {
-                return build_failed_result(id, revoke_sender, format!("mint failed: {err}"));
-            }
-        };
-    let transport = match GossipTransport::bind(loopback_bind()) {
-        Ok(transport) => transport,
+    let mut candidates = CandidateSet::default();
+    candidates
+        .v4_host
+        .push(IpAddr::V4(Ipv4Addr::new(10, 0, 0, sender_key_byte)));
+    let bundle = match mint_bundle_with_timestamp(&sender_key, 1, AUDIT_NOW_UNIX, candidates) {
+        Ok(bundle) => bundle,
         Err(err) => {
-            return build_failed_result(id, revoke_sender, format!("transport bind failed: {err}"));
+            return build_failed_result(id, revoke_sender, format!("mint failed: {err}"));
         }
     };
     let expectation = if revoke_sender { "reject" } else { "accept" };
-    match receiver.ingest_inbound_bundle(None, bundle, &transport, AUDIT_NOW_UNIX) {
-        Ok(_) => GossipRevokedReadmitCaseResult {
-            id: id.to_owned(),
-            expectation: expectation.to_owned(),
-            outcome: "accepted".to_owned(),
-            reason: "ACCEPTED: bundle admitted, endpoints applied".to_owned(),
-            passed: !revoke_sender,
-        },
+    match receiver.ingest_inbound_bundle_without_rebroadcast_for_local_audit(
+        None,
+        bundle,
+        AUDIT_NOW_UNIX,
+    ) {
+        Ok(summary) => {
+            let endpoints_applied = !summary.applied_endpoints.is_empty()
+                && receiver.applied_endpoints.contains_key(&sender_id);
+            GossipRevokedReadmitCaseResult {
+                id: id.to_owned(),
+                expectation: expectation.to_owned(),
+                outcome: if endpoints_applied {
+                    "accepted".to_owned()
+                } else {
+                    "accepted_without_endpoints".to_owned()
+                },
+                reason: "ACCEPTED: bundle admitted, endpoints applied".to_owned(),
+                passed: !revoke_sender && endpoints_applied,
+            }
+        }
         Err(GossipNodeError::Bundle(err)) => {
             let is_revoked_rejection = matches!(err, GossipError::RevokedSource);
             GossipRevokedReadmitCaseResult {
