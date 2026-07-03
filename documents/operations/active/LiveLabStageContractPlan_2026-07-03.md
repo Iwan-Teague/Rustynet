@@ -33,7 +33,7 @@ budgets, header math) builds on that contract.
 | 2 | Run-matrix upsert + interim/final row roles | **DONE** 6cb6940 |
 | 3 | Terminal-state taxonomy + conclusion barrier | **DONE (cli side)** 8c006a4. Monitor side (dead-PID job reconciliation, `blocked_pending_review`, "skip" finality) open |
 | 4 | Shared recorder (`ops record-stage-start/finish`) | OPEN |
-| 5 | Coverage-as-code (`proves` × run-matrix evidence gate) | OPEN — registry already carries `proves` control-IDs for the audit families |
+| 5 | Coverage-as-code (`proves` × run-matrix evidence gate) | **v1 DONE** bf3640e — `ops live-lab-coverage-report` joins registry claims against latest non-interim matrix evidence (all six audit-control families live-proven on all 3 OSes as of 2026-07-03); gate enforcement with reviewed exceptions still open |
 | 6 | Timer budgets (P90-of-all-terminal, manifest-carried) | OPEN — manifest carries cold-start budgets; P90 derivation + monitor consumption open |
 | 7 | Header math (ran/planned/NA from manifest snapshot) | OPEN (monitor) |
 | 8 | `area` string demoted to display-only | **IN PROGRESS externally** — a concurrent session is landing `client_platform` + area-substring removal in the monitor; do not double-land |
