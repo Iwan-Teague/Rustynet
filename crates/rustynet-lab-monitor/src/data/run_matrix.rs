@@ -201,14 +201,12 @@ pub struct RunSummary {
     /// Name of the first stage that failed (from the `first_failed_stage` CSV column).
     pub first_failed_stage: String,
     /// Number of `_stage_` / `cross_os_*` columns with outcome "pass", PLUS
-    /// PRE's always-complete 5 (see `section_stages`) -- kept in step with
-    /// what the Previous Runs bar actually renders (all 3 sections,
-    /// including PRE), so the displayed "x/y" text next to the bar can't
-    /// look inconsistent with the bar's own fill (previously PRE rendered
-    /// as a solid green section while being entirely excluded from this
-    /// count, reading as more evidence than the number backed up). Not used
-    /// by the CHECKS header or Full Stage Matrix, which intentionally stay
-    /// scoped to CSV check columns only -- this field is Previous-Runs-only.
+    /// PRE's always-complete 5 (see `section_stages`). Not currently
+    /// rendered directly -- the Previous Runs bar shows only the bare
+    /// `total_stages` after the divider, with no matching numerator (see
+    /// `subset_passed_stages` for the main fraction against this run's
+    /// actual scope) -- kept for tests/future display, same as `run_id`.
+    #[allow(dead_code)]
     pub passed_stages: usize,
     /// Count of stage columns that were possible for this run: `pass`,
     /// `fail`, and `not_run` all count (not_run means "never reached" --
@@ -240,6 +238,22 @@ pub struct RunSummary {
     /// section even when most of that phase actually passed). LIVE LAB is
     /// every other real check column.
     pub section_stages: [(usize, usize); 3],
+    /// Same as `passed_stages`, but restricted to the OSes/cross-OS group
+    /// that were actually part of this run's topology -- an OS with NO
+    /// decisive (pass/fail) value anywhere in the row was never targeted at
+    /// all (e.g. macOS columns on a Linux-only run) and is excluded
+    /// entirely, rather than counting its wall of `not_run` against the
+    /// denominator as if those checks were ever going to run. PRE's
+    /// always-complete 5 is folded in here too (universal to every run).
+    pub subset_passed_stages: usize,
+    /// Same as `total_stages`, but restricted the same way as
+    /// `subset_passed_stages`.
+    pub subset_total_stages: usize,
+    /// Which of the 3 `section_stages` groups (0=PRE, 1=BOOTSTRAP,
+    /// 2=LIVE LAB) contains this run's own named failure, if any --
+    /// `None` for a passing run or when `first_failed_stage` is empty.
+    /// PRE can never be the failing section (see `section_stages`).
+    pub failing_section: Option<usize>,
 }
 
 /// True for columns that represent actual orchestrator stages (not role-presence summaries).
@@ -261,6 +275,29 @@ fn is_bootstrap_phase_stage_column(header: &str) -> bool {
             .iter()
             .any(|suffix| header == format!("{}_stage_{suffix}", os.csv_prefix()))
     })
+}
+
+/// Which of the 4 CSV column families a `is_full_stage_matrix_column` header
+/// belongs to -- used to decide whether an OS (or cross-OS) was even part of
+/// a given run's topology at all (see `RunSummary::subset_total_stages`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ScopeGroup {
+    Linux,
+    Macos,
+    Windows,
+    CrossOs,
+}
+
+fn scope_group_of(header: &str) -> ScopeGroup {
+    if header.starts_with("cross_os_") {
+        ScopeGroup::CrossOs
+    } else if header.starts_with("linux_") {
+        ScopeGroup::Linux
+    } else if header.starts_with("macos_") {
+        ScopeGroup::Macos
+    } else {
+        ScopeGroup::Windows
+    }
 }
 
 /// The full, authoritative "does this column represent a real pass/fail
@@ -390,8 +427,26 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
 
             let run_id = run_id_idx.and_then(|i| row.get(i)).unwrap_or("").to_owned();
 
+            // Which scope groups (linux / macos / windows / cross_os) have
+            // ANY decisive (pass/fail) value anywhere in this row -- a group
+            // with nothing decisive at all was never part of this run's
+            // topology to begin with (e.g. macOS columns on a Linux-only
+            // run), as opposed to a group that DID run but has some not_run
+            // columns because the pipeline stopped early after a failure.
+            // Used below to build "the subset that was actually in scope for
+            // this run", not the full historical catalog.
+            let mut scopes_in_play: std::collections::HashSet<ScopeGroup> =
+                std::collections::HashSet::new();
+            for (idx, col_name) in &stage_cols {
+                if matches!(row.get(*idx).unwrap_or("").trim(), "pass" | "fail") {
+                    scopes_in_play.insert(scope_group_of(col_name));
+                }
+            }
+
             let mut passed = 0usize;
             let mut total = 0usize;
+            let mut subset_passed = 0usize;
+            let mut subset_total = 0usize;
             let mut last_passed_stage = String::new();
             let (mut boot_passed, mut boot_total) = (0usize, 0usize);
             let (mut lab_passed, mut lab_total) = (0usize, 0usize);
@@ -410,6 +465,12 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
                 if is_pass {
                     passed += 1;
                     last_passed_stage = col_name.clone();
+                }
+                if scopes_in_play.contains(&scope_group_of(col_name)) {
+                    subset_total += 1;
+                    if is_pass {
+                        subset_passed += 1;
+                    }
                 }
                 let (section_passed, section_total) = if is_bootstrap_phase_stage_column(col_name) {
                     (&mut boot_passed, &mut boot_total)
@@ -431,9 +492,28 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
             // displayed passed/total so the count text agrees with what the
             // bar actually shows (previously "4/116" excluded PRE entirely
             // while the bar still rendered it as a solid green section,
-            // reading as more evidence than the number backed up).
+            // reading as more evidence than the number backed up). PRE is
+            // universal to every run, so it's also folded into the subset.
             const PRE_STAGE_COUNT: usize = 5;
             let pre = (PRE_STAGE_COUNT, PRE_STAGE_COUNT);
+
+            // Which section (if any) contains the run's own named failure --
+            // None for a passing run, or when there's no specific stage name
+            // to attribute the failure to. Node-alias-prefixed names (e.g.
+            // "debian-headless-1::validate_linux_hello_limiter_flood") are
+            // stripped to their bare stage name first.
+            let failing_section = if overall_result.eq_ignore_ascii_case("fail") {
+                let bare = first_failed_stage.rsplit("::").next().unwrap_or("");
+                if bare.is_empty() {
+                    None
+                } else if is_bootstrap_phase_stage_column(bare) {
+                    Some(1)
+                } else {
+                    Some(2)
+                }
+            } else {
+                None
+            };
 
             RunSummary {
                 run_id,
@@ -442,8 +522,11 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
                 first_failed_stage,
                 passed_stages: passed + PRE_STAGE_COUNT,
                 total_stages: total + PRE_STAGE_COUNT,
+                subset_passed_stages: subset_passed + PRE_STAGE_COUNT,
+                subset_total_stages: subset_total + PRE_STAGE_COUNT,
                 last_passed_stage,
                 section_stages: [pre, (boot_passed, boot_total), (lab_passed, lab_total)],
+                failing_section,
             }
         })
         .collect();

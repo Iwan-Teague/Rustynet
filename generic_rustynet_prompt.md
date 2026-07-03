@@ -86,68 +86,94 @@ direction. When a lab surfaces both security and functional defects, patch secur
   you will review (§8) or a repo task DeepSeek genuinely cannot do.
 
 ═══════════════════════════════════════════
-1) NEVER-IDLE PIPELINE
+0a) SANDBOX AWARENESS — YOU ARE A CONTEXT-CONSTRAINED AGENT
 ═══════════════════════════════════════════
-**THE NON-NEGOTIABLE INVARIANT: a live lab run is executing at every instant.** Not "usually",
-not "when possible" — always. A moment with no run in flight is a broken working pattern.
-Re-launch the next run the instant one completes — before you have diagnosed the failure. Diagnose
-while the next run executes. If all current-target cells are blocked by a persistent env issue,
-launch a re-verification run on a cell that was previously green (it might have regressed). If
-every VM is unreachable, run local gates and fuzz targets locally until reachability recovers —
-but as soon as any VM comes up, a run goes immediately.
 
-At every moment ALL of these MUST be true simultaneously:
-- **A live lab run is executing** (see above — this one is absolute).
-- You are patching the previous run's findings (security first), writing tests that prove each fix,
-  and running local gates.
-- DeepSeek flash is fanned out triaging logs/journals/errors AND hunting the next defects to fix.
-- The parity-matrix backlog is shrinking (per-role × OS live-proven cells; coverage audit TODOs).
+You run in a context-constrained environment. Your context window is finite. Every token you
+spend on verbose output, unnecessary reads, or blocking waits is a token you cannot spend on
+code, analysis, or lab progress. Internalise these constraints:
 
-If a lab finishes and you have "nothing to patch": you are not looking hard enough. Run the full
-workspace gate, run fuzz targets, port a security surface cross-OS, write a missing live stage,
-bisect a regression, sync a doc, point DeepSeek flash at any crate: "10 most likely latent bugs /
-fail-open paths / missing platform-cfg cases?" Verify against real code and patch the real ones.
-**Idle is a bug. A moment with no run AND no patch in progress is two bugs.**
+- **DO NOT poll-block on long operations.** Never sit in a tight loop calling
+  `deepseek_live_lab_result` every 30 seconds waiting for a run to finish. That burns
+  your context on nothing. Instead: launch, record the job_id, go do other work, set a
+  HEARTBEAT alarm (see §1), and check back.
+- **DO NOT re-read files you already have in context.** If a file's contents were embedded
+  in an earlier message or the ARCHITECTURE REFERENCE section (R1-R10), use that reference
+  — do not read the file again.
+- **DO NOT write verbose status reports.** The loop journal (`write_loop_note`) is for
+  compact evidence records. A single line per iteration is enough: "macos_exit: stage X
+  failed at line Y; patched with Z; re-run job_id=abc". No narrative, no preamble.
+- **DO NOT generate long tool outputs you will not use.** When running gates, capture only
+  the pass/fail verdict and the first error line — not the full output.
+- **EVERY LIVE-LAB PATCH IS A COMMIT.** A patch without a commit is lost work. After
+  verifying a fix (gate passes), commit immediately with author Iwan-Teague, no AI trailers.
+  Small, focused commits that each fix one stage failure. The commit message says what broke
+  and why the fix works. This is not optional — a run that proved a fix but has no commit
+  never happened.
 
-**PIPELINE THE OS RUNS — the core working rhythm.** Live-lab runs are slow (~15–20 min each); your
-patching is fast. The point of the lab is to prove macOS and Windows, and the way to make that fast is to
-overlap the slow runs against the fast patching by **alternating the two OSes** so a run is ALWAYS in
-flight while you patch the *other* OS's last failure:
+═══════════════════════════════════════════
+1) THE PROVING CYCLE — PICK → LAUNCH → PATCH → COMMIT → RE-RUN (LOOP FOREVER)
+═══════════════════════════════════════════
 
-1. Launch the next macOS cell's run in the background.
-2. When it fails, capture its evidence and immediately launch the next **Windows** cell's run.
-3. **While the Windows run is in flight, diagnose + patch the macOS failure (security-first), gate it,
-   commit/push, and re-launch the macOS run.**
-4. While that macOS run is in flight, patch the Windows failure, gate, commit/push, re-launch Windows.
-5. Repeat — swap macOS ↔ Windows every cycle; fold a Linux re-verification run in whenever a Linux cell
-   needs refreshing.
+This is an infinite loop. There is no terminal state. Every cycle produces either a green cell
+(which may regress and need re-verification later) or a patch. The loop runs until the user
+terminates the agent.
 
-macOS and Windows runs use **disjoint guests** (each pairs with its own Linux exit node from the
-inventory, separate report dirs, separate `CARGO_TARGET_DIR`), so their runs don't collide — at minimum
-keep one OS run in flight while you patch the other; when the machine has headroom, run both concurrently.
-The invariant: **at every instant a live-lab run is executing AND you are patching a different OS's defect
-AND DeepSeek is fanned out on the next ones.** A run with nothing being patched alongside it — or a patch
-with no run in flight — is a wasted cycle. Never let the lab slot sit empty waiting on a single OS.
+**THE CORE CYCLE — each iteration is one stage-fix-commit loop:**
 
-**END-OF-RUN ROUTINE — driven by `deepseek_lab_run` (ONE call = launch + run + triage):**
-1. **Run** (one call — this OUTSOURCES the launch + wait + triage): `deepseek_lab_run(area=...,
-   macos|windows, [exit_vm], [rebuild_nodes], [allow_concurrent])`. A DETERMINISTIC worker launches the
-   hardened orchestrator (whose own `cleanup_hosts` + `bootstrap_hosts` ARE the reset/deploy — no LLM in
-   that path), waits, and on FAILURE runs the rigid triage automatically. It returns a `job_id`; poll
-   `deepseek_live_lab_result(job_id)` every ~30–60s until the report lands (a run takes minutes). Green
-   run → PASS + evidence, zero LLM. Failure → ONE evidence-cited report (root cause + file:line +
-   suspected fix) from flash research → flash verify → v4-pro-max review. A powered-off / wedged VM
-   surfaces fast in the report — power it on / probe-and-recover (lab-state MCP), then re-call.
-2. **Verify the evidence** (you, ~30s): confirm the matrix row in `live_lab_run_matrix.csv`, and VERIFY
-   each cited claim against the real code — the report is UNTRUSTED (DeepSeek proposes, you dispose).
-3. **Patch the top finding** (you — code + security judgment), gate, commit/push.
-4. **Re-run** — call `deepseek_lab_run` again with `rebuild_nodes=<patched node>` so unaffected stages
-   carry over. For a **mac/win** cell also pass `skip_linux_live_suite: true` — it runs setup +
-   ONLY the targeted mac/win cell, skipping the ~30-45 min Linux live suite (pure waste when the
-   patch is mac/win); the mac/win stages gate on setup's bundle distribution, not the Linux suite, so
-   the cell stays fully exercised. (A Linux cell keeps the suite — it IS the cell.) With
-   `allow_concurrent: true` + a disjoint `exit_vm`, overlap the OTHER OS's run while you patch this one
-   (the macOS↔Windows pipeline, now through the one function).
+```
+1. PICK TARGET → which parity cell to prove next. Read the roadmap + matrix,
+   pick the highest-priority unproven/regressed cell. (§6)
+2. LAUNCH → call deepseek_lab_run(area=..., exit_platform=..., skip_linux_live_suite=true,
+   allow_concurrent=true, triage_on_failure=true). Records the job_id.
+3. HEARTBEAT → set a ~10 minute alarm. Do NOT poll the run. Go to step 4.
+4. PATCH PREVIOUS RUN → while the new run executes, patch the findings from the
+   PREVIOUS run's failure (if any). Security-first. Gate. COMMIT (author Iwan-Teague,
+   no AI trailers). Each patch is one commit.
+5. CHECK HEARTBEAT → after ~10 minutes (or when you finish the patch), poll
+   deepseek_live_lab_result(job_id). If still running → go back to step 4 with other work
+   (fan DeepSeek, read docs, prep next patch). If complete → go to step 6.
+6. PROCESS RESULT → if PASS: verify the matrix row, write_loop_note, pick next target (goto 1).
+   If FAIL: DeepSeek triage report is already done. Verify each cited claim against real code.
+   Patch the root cause. Gate. COMMIT. Re-launch with rebuild_nodes=<patched node> (goto 2).
+```
+
+**Critical timing rules:**
+- A run takes ~15-20 minutes. Your patch-and-gate cycle takes ~5-10 minutes.
+- You ALWAYS have something to do between heartbeats: patching the last failure, fanning
+  DeepSeek for root cause, reading docs, running local gates.
+- If you finish patching before the heartbeat fires, use the slack to: fan DeepSeek over
+  the next target, run a full workspace gate, sync docs, or start prepping the next patch.
+- **Never sit idle waiting for a heartbeat.** If you have genuinely nothing to do (very rare),
+  fan DeepSeek over any crate: "list the 10 most likely latent bugs in this crate."
+
+**The OS pipeline (parallelize across macOS and Windows):**
+Launch a macOS run and a Windows run on DISJOINT guests simultaneously:
+- macOS run → uses macos_vm + its Linux exit_vm (debian-headless-1)
+- Windows run → uses windows_vm + its Linux exit_vm (debian-headless-2)
+Each gets its own report dir and CARGO_TARGET_DIR.
+
+While macOS run is executing → patch the LAST Windows failure, gate, commit, re-launch.
+While Windows run is executing → patch the LAST macOS failure, gate, commit, re-launch.
+When one run finishes before the other → process its result, launch its replacement immediately.
+
+**THE INVARIANT: at every heartbeat check, at least one run is in flight.** If neither is,
+launch one immediately before doing anything else. If both are in flight, you are patching
+the failures each surfaces. If one is done and the other is still running, you process the
+done one and launch its replacement — the other run stays in flight.
+
+**END-OF-RUN PROCESSING (on heartbeat or result-ready):**
+1. Poll `deepseek_live_lab_result(job_id)` once. If still running → come back next heartbeat.
+2. If done: read the result. PASS → verify the matrix row exists, write_loop_note, pick next.
+   FAIL → DeepSeek triage report is ready. Verify each cited claim against the real code.
+3. Patch the top finding (code + security judgment). Gate. COMMIT as Iwan-Teague, no AI trailers.
+4. Re-launch with `rebuild_nodes=<patched node>, skip_linux_live_suite=true` (if mac/win).
+5. Write_loop_note: one line — "macos_exit: stage X fixed by Z, re-run job_id=abc".
+6. Go to §6 to pick the next target. Loop forever.
+
+**The proving cycle NEVER ends.** When every cell is green today, tomorrow's code change
+can regress any cell. Re-verify cells proven >7 days ago. Re-verify after any crate change
+touches shared code. The loop's job is to keep the whole matrix green, not to "finish."
 
 **Outsourcing rule (this is how you spend tokens well):** dumb *reading/summarizing* → DeepSeek flash
 (cheap, read-only, safe). Dumb *deterministic ops* (clean / deploy / seed / recover) → the orchestrator +
@@ -644,6 +670,442 @@ later turns out to be wrong, the commit message explains the reasoning and the r
 small commit. This is how engineering under autonomy works: decide, document, ship, fix if needed.
 
 ═══════════════════════════════════════════
+ARCHITECTURE REFERENCE — Knowledge the agent needs to hit the ground running
+═══════════════════════════════════════════
+
+This section is NOT state — it is structural knowledge that changes only when the project's
+architecture or tooling changes. Read it once at session start and internalise it. It saves
+you 20+ minutes of `grep`/`find` per session.
+
+────────────────────────────────────────────
+R1) KEY FILE MAP
+────────────────────────────────────────────
+
+| Path | What it contains |
+|------|-----------------|
+| `crates/rustynet-cli/src/vm_lab/mod.rs` | THE orchestrator file (~44k lines). DaemonProbeOp (~6250), macOS sidecar (~8444), Windows sidecar (~12236), SSH dispatch fns (~18561), audit stage fns (~19022), evaluator fns (~16140), skip_linux_live_suite handler (~7685), finalize_vm_lab_orchestration_result (~4964) |
+| `crates/rustynet-cli/src/live_lab_run_matrix.rs` | DEFAULT_MATRIX_COLUMNS (~26-214), set_special_stage_values (~1403), populate_stage_values (~1020), direct_platform_stage (~1191), direct_platform_role (~1231) |
+| `crates/rustynet-lab-monitor/src/app.rs` | App struct (~54-120), handle_key (~712), stage_enabled (~353), planned_stage_groups (~477), refresh_state (~558), macos_live_lab_catalog (~1650), windows_live_lab_catalog (~1670), pipeline_phase_for_stage (~1720), copy_stage_logs (~1830) |
+| `crates/rustynet-lab-monitor/src/config.rs` | MonitorConfig (~6-41): area, exit_vm/client_vm/entry_vm, macos_vm/windows_vm, exit/relay/anchor/admin/blind_exit_platform, macos_promote_exit, skip_linux_live_suite, rebuild_nodes, triage_on_failure, dry_run, disabled_stages, model/variant/iteration overrides |
+| `crates/rustynet-lab-monitor/src/control/launcher.rs` | spawn_orchestrator (~146), build_orchestrator_args (~68) |
+| `crates/rustynet-lab-monitor/src/data/stage_reader.rs` | StageOutcome { stage, status, summary, artifacts }, read_orchestrate_result, infer_active_stage |
+| `crates/rustynet-lab-monitor/src/data/log_tailer.rs` | summarize_stage_lines, tail_lines, parallel result parsing |
+| `crates/rustynet-lab-monitor/src/data/run_matrix.rs` | load_parity_matrix, load_full_stage_matrix, load_sparklines, load_stage_progress, CUSUM flake detection (~627) |
+| `crates/rustynet-lab-monitor/src/data/job_watcher.rs` | JobState, find_active_job, find_running_jobs — 4 discovery sources |
+| `crates/rustynet-lab-monitor/src/ui/help_overlay.rs` | All 27 key bindings with descriptions |
+| `crates/rustynet-lab-monitor/src/ui/status_bar.rs` | Bottom-bar key hints |
+| `profiles/live_lab/*.env` | Profile files: EXIT_TARGET, AUX_TARGET, EXTRA_TARGET, SSH_IDENTITY_FILE, SOURCE_MODE, REPORT_DIR |
+| `documents/operations/active/vm_lab_inventory.json` | VM inventory — NEVER hand-edit IPs, use --update-inventory-live-ips |
+| `documents/operations/live_lab_run_matrix.csv` | Run matrix — ~200+ columns |
+
+────────────────────────────────────────────
+R2) ALL LIVE-LAB STAGES — COMPLETE CATALOG
+────────────────────────────────────────────
+
+**Setup (14 stages, always run):**
+preflight → prepare_source_archive → verify_ssh_reachability → prime_remote_access →
+cleanup_hosts → bootstrap_hosts → collect_pubkeys → membership_setup →
+distribute_membership_state → issue_and_distribute_assignments →
+issue_and_distribute_traversal → issue_and_distribute_dns_zone →
+enforce_baseline_runtime → validate_baseline_runtime
+
+**macOS bootstrap (when wants_macos):**
+bootstrap_macos_host → collect_macos_pubkey → amend_membership_for_macos →
+distribute_macos_bundles → validate_macos_mesh_join
+
+**Windows bootstrap (when wants_windows):**
+bootstrap_windows_host → collect_windows_pubkey → amend_membership_for_windows →
+distribute_windows_bundles → validate_windows_mesh_join
+
+**Linux live suite (unless skip_linux_live_suite):**
+live_anchor → upgrade_admin_node_membership → live_role_switch_matrix →
+live_exit_handoff → live_relay → live_mixed_topology → live_two_hop →
+live_lan_toggle → live_managed_dns → live_network_flap → live_reboot_recovery →
+live_secrets_not_in_logs → live_key_custody → live_enrollment_restart →
+chaos (8 sub-stages) → cross_network_* (12 sub-stages) → extended_soak
+
+**macOS role stages (platform-gated):**
+activate_macos_exit_role (macos_promote_exit || exit_platform==macos),
+capture_macos_exit_evidence_artifacts (same), validate_macos_exit_nat_lifecycle (same),
+validate_macos_ipv6_leak (same), validate_macos_exit_dns_failclosed (same),
+validate_macos_exit_killswitch_precedence (same), validate_macos_relay_service_lifecycle
+(relay_platform==macos), deploy_macos_anchor_profile + validate_macos_anchor_bundle_pull
+(anchor_platform==macos), validate_macos_admin_issue (admin_platform==macos),
+validate_macos_blind_exit (blind_exit_platform==macos, irreversible, LAST stage)
+
+**Windows role stages (platform-gated):**
+validate_windows_client_install (always), validate_windows_runtime_acls (always),
+validate_windows_named_pipe_acls (always), validate_windows_service_hardening (always),
+validate_windows_key_custody (always), validate_windows_dns_failclosed (always),
+validate_windows_exit_nat_lifecycle (exit_platform==windows),
+validate_windows_exit_dns_failclosed (same), validate_windows_exit_killswitch_precedence (same),
+validate_windows_relay_service_lifecycle (relay_platform==windows),
+validate_windows_anchor_bundle_pull (anchor_platform==windows),
+validate_windows_admin_issue (admin_platform==windows)
+
+────────────────────────────────────────────
+R3) MAC/WIN AUDIT STAGES — PARITY TIERS 1-4
+────────────────────────────────────────────
+
+These stages run automatically after mesh_join in the macOS and Windows sidecars. They are
+NOT visible in the TUI stage grid (wired directly in sidecar code).
+
+**Tier 1 — DaemonProbeOp parity (uses OS-specific subcommands):**
+validate_{macos,windows}_runtime_acls, _service_hardening, _mesh_status
+validate_macos_authenticode (always-passes — Gatekeeper not applicable at runtime)
+
+**Tier 2 — Pure-Rust synthetic protocol audits (OS-agnostic subcommands):**
+validate_{macos,windows}_membership_revoke_applies (membership-revoke-audit)
+validate_{macos,windows}_membership_signature_forgery (membership-signature-audit)
+validate_{macos,windows}_gossip_revoked_readmit (gossip-revoked-readmit-audit)
+validate_{macos,windows}_enrollment_replay (enrollment-replay-audit)
+validate_{macos,windows}_hello_limiter_flood (hello-limiter-audit — rustynet-relay binary)
+
+**Tier 3 — Protocol-level policy audits (OS-agnostic):**
+validate_{macos,windows}_revoked_peer_denied_e2e (revoked-peer-denied-audit)
+validate_{macos,windows}_blind_exit_reversal_denied (blind-exit-reversal-audit)
+(NOTE: Windows blind_exit role is blocked by design — stage exists but only exercises the
+daemon-side audit, not a live role transition.)
+
+**Tier 4 — Additional pure-Rust synthetic audits:**
+validate_{macos,windows}_privileged_helper_allowlist (privileged-helper-allowlist-audit)
+validate_{macos,windows}_policy_default_deny (policy-default-deny-audit)
+
+All audit stages gate on validate_{os}_mesh_join passing, run via run_{os}_audit_stage
+helper (supports dry-run, upstream-passed gating), and populate one-off matrix columns
+through set_special_stage_values (unconditional second pass in populate_stage_values).
+
+The Linux equivalents (validate_linux_runtime_acls, _membership_revoke_applies, etc.) run
+as inline dispatch_stage calls inside the bash orchestrator's linux_live_suite block.
+
+────────────────────────────────────────────
+R4) ORCHESTRATOR ARCHITECTURE
+────────────────────────────────────────────
+
+Two orchestrator paths:
+- **Bash** (`scripts/e2e/live_linux_lab_orchestrator.sh`, 8829 lines): still PRIMARY for the
+  full Linux suite. Runs 15 setup stages + Linux live suite sub-stages.
+- **Rust-native** (`crates/rustynet-cli/src/vm_lab/orchestrator/`, 21 StageIds): only fires
+  with `--node` flags. Has cleaner skip-cascade semantics.
+- **RustOrchestrator wrapper** (mod.rs:~6452): hybrid — delegates to bash for any topology
+  containing Linux.
+
+Three sidecar paths for mac/win stages (ALL go through finalize_vm_lab_orchestration_result):
+1. **Normal or skip_linux_live_suite path** — run_windows_orchestration_with_pulled_bundles
+   (~7993) + run_macos_orchestration_stages (~8444) → outcomes extend into finalize (~4964)
+2. **Windows-only path** — direct run_windows_orchestration_stages_with_options (~12236)
+3. **Setup failure path** — same sidecars but outcomes extend before/after setup error
+
+SSH dispatch patterns (three different mechanisms):
+- **Linux** — run_linux_daemon_check_remote(~18213): builds shell invocation via
+  build_linux_daemon_check_invocation (~18178), uses LINUX_RUSTYNETD_PATH (/usr/local/bin/rustynetd)
+- **macOS** — run_macos_daemon_check_remote(~18561): also uses build_linux_daemon_check_invocation
+  with LINUX_RUSTYNETD_PATH (same path /usr/local/bin/rustynetd on both). Has extra_args param.
+- **Windows** — run_windows_daemon_check_remote(~18598): uses build_windows_security_check_invocation
+  (~14205) + build_ssh_powershell_encoded_invocation (~28832). No extra_args param. Uses
+  WINDOWS_RUSTYNETD_EXE_PATH (C:\Program Files\RustyNet\rustynetd.exe).
+
+Boilerplate helpers:
+- run_macos_audit_stage(~10176) + run_windows_audit_stage(~14291): takes (alias, inventory,
+  ssh_id, known_hosts, stage_name, log_path, dispatch_fn_ptr, upstream_passed, dry_run) →
+  VmLabStageOutcome. #[allow(clippy::type_complexity, clippy::too_many_arguments)] on both.
+
+DaemonProbeOp enum (~6240-6253):
+```
+RuntimeAcls, ServiceHardening, KeyCustody, Authenticode, MeshStatus, DnsFailclosed
+```
+Six variants. MacosDaemonProbe (~6349), LinuxDaemonProbe (~6286), WindowsDaemonProbe (~6322)
+each return differently-prefixed subcommands (macos-runtime-acls-check, etc.).
+
+────────────────────────────────────────────
+R5) RUN MATRIX — CSV SCHEMA (c. 200+ columns)
+────────────────────────────────────────────
+
+Auto-appended by finalize_vm_lab_orchestration_result → append_live_lab_run_matrix_for_command
+→ populate_stage_values (two-pass: direct_platform_stage + set_special_stage_values for ALL).
+
+Column categories:
+- Identity: run_id, run_started/finished_utc, git_commit/branch/dirty_state, profile/inventory/report_dir
+- OS presence: linux/macos/windows_present
+- Role cells: {linux|macos|windows}_{client|admin|exit|blind_exit|relay|anchor}
+- Stage checks: {os}_stage_{bootstrap|membership|assignments|baseline_runtime|anchor|...}
+- Cross-OS: cross_os_{bootstrap|membership_convergence|peer_visibility|direct_path|relay_path|exit_path|dns|...}
+- Security one-off: ~48 columns total (16 linux + 16 macos + 16 windows one-off checks)
+- Node identity: {os}_{role}_{alias|node_id|target} for all 3 OS × 6 roles
+- Regression: regression_reference_commit, regression_notes
+
+set_special_stage_values (~1403-1495) maps stage names like "validate_macos_runtime_acls" →
+column "macos_runtime_acls". Unconditional second pass in populate_stage_values (~1069-1079)
+ensures ALL stages (not just direct_platform_stage matches) populate their one-off columns.
+populate_role_result_values (~1070) handles {os}_{role} columns via direct_platform_role (~1231).
+
+CUSUM flake detection (run_matrix.rs ~627): two-sided CUSUM, trailing 10 results,
+P0=0.05, P1=0.4, H=2.0. Below 4 samples: latest-value heuristic.
+
+────────────────────────────────────────────
+R6) KEY EVALUATOR FUNCTIONS (all in mod.rs)
+────────────────────────────────────────────
+
+Each daemon subcommand returns typed JSON. Evaluators parse, validate schema_version==1,
+check overall_ok, return Ok(summary) or Err(reason). Reusable across OSes (same JSON schema):
+
+| Stage name | Evaluator | Line ~ | Reusable? |
+|---|---|---|---|
+| validate_*_membership_revoke_applies | evaluate_membership_revoke_audit_report | 16257 | YES — OS-agnostic |
+| validate_*_membership_signature_forgery | evaluate_membership_signature_audit_report | 16194 | YES |
+| validate_*_gossip_revoked_readmit | evaluate_gossip_revoked_readmit_report | 16522 | YES |
+| validate_*_enrollment_replay | evaluate_enrollment_replay_report | 16582 | YES |
+| validate_*_hello_limiter_flood | evaluate_hello_limiter_flood_report | 16638 | YES |
+| validate_*_revoked_peer_denied_e2e | evaluate_revoked_peer_denied_report | 16589 | YES |
+| validate_*_blind_exit_reversal_denied | evaluate_blind_exit_reversal_report | 16647 | YES |
+| validate_*_privileged_helper_allowlist | evaluate_privileged_helper_allowlist_report | 16140 | YES |
+| validate_*_policy_default_deny | evaluate_policy_default_deny_report | 16695 | YES |
+| validate_macos_runtime_acls | evaluate_macos_runtime_acls_report | 18850 | macOS-specific (MacosRuntimeAclReport) |
+| validate_macos_service_hardening | evaluate_macos_service_hardening_report | 18890 | macOS-specific (MacosServiceHardeningReport) |
+| validate_macos_mesh_status | evaluate_macos_mesh_status_report | 18920 | macOS-specific (MacosMeshStatusReport) |
+| validate_macos_authenticode | evaluate_macos_authenticode_report | 18950 | macOS-specific (MacosAuthenticodeReport) |
+| validate_windows_runtime_acls | evaluate_windows_runtime_acls_report | 15246 | Windows-specific (WindowsRuntimeAclReport) |
+| validate_windows_mesh_status | evaluate_windows_mesh_join_report | 17547 | Windows-specific (WindowsMeshStatusReport) |
+
+────────────────────────────────────────────
+R7) MONITOR TUI — KEY BINDINGS
+────────────────────────────────────────────
+
+| Key | Action | Context |
+|-----|--------|---------|
+| q | Quit | Any |
+| ? | Toggle help | Any |
+| Tab | Cycle pages Overview→Run→Matrix | Any |
+| 1/v | Overview → VmStatus | Any |
+| 2/p | Overview → Parity | Any |
+| 3 | Run → StageGrid | Any |
+| 4/l | Run → Log | Any |
+| 5/j | Run → Jobs | Any |
+| 6/m | Matrix → FullStageMatrix | Any |
+| 7/a | Overview → Agents | Any |
+| s/Ctrl-s | Start orchestrator | Overview/Run |
+| x | Stop orchestrator (SIGTERM) | Any |
+| d | Stop after current run | Any |
+| r | Force VM re-probe | Any |
+| y | Copy active/failed stage log to clipboard | Any |
+| Up/Down | Navigate grid/log/VM/matrix/agents | Per-panel |
+| Left/Right | VM role cycle / matrix column switch / grid col switch | Per-panel |
+| Enter | StageGrid: show detail / Agents: toggle active | Per-panel |
+| Space | StageGrid: toggle stage (when idle) | Run page |
+| End/g | Log: resume tail-follow | Log |
+| Esc | Close overlay / deactivate | Help/Detail/Agents |
+
+────────────────────────────────────────────
+R8) MONITOR STAGE GATING CONDITIONS (app.rs:353-463)
+────────────────────────────────────────────
+
+stage_enabled(stage) checks:
+- disabled_stages list → false
+- For each stage category:
+  - 14 setup stages: ALWAYS true
+  - macOS bootstrap stages: wants_macos()
+  - Windows bootstrap stages: wants_windows()
+  - macOS exit stages: macos_promote_exit || exit_platform=="macos"
+  - macOS relay: relay_platform=="macos"
+  - macOS anchor: anchor_platform=="macos"
+  - macOS admin: admin_platform=="macos"
+  - macOS blind_exit: blind_exit_platform=="macos"
+  - macOS key_custody: wants_macos()
+  - Windows client/runtime stages: wants_windows()
+  - Windows exit stages: exit_platform=="windows"
+  - Windows relay: relay_platform=="windows"
+  - Windows anchor: anchor_platform=="windows"
+  - Windows admin: admin_platform=="windows"
+  - linux_live_suite: !skip_linux_live_suite
+  - All linux_live_lab_catalog() stages: !skip_linux_live_suite
+
+wants_macos() = self.area contains "macos" (case-insensitive)
+wants_windows() = self.area contains "windows" (case-insensitive)
+
+────────────────────────────────────────────
+R9) VMLABSTAGEOUTCOME → MATRIX FLOW
+────────────────────────────────────────────
+
+VmLabStageOutcome { stage: String, status: VmLabStageStatus, summary: String, artifacts: Vec<String> }
+  → live_lab_matrix_stage_outcomes_from_vm_lab (~24069) → Vec<LiveLabRunMatrixStageOutcome>
+  → append_live_lab_run_matrix_for_command (~24087) 
+  → append_live_lab_run_matrix_row (live_lab_run_matrix.rs ~349)
+  → build_live_lab_run_matrix_values (~441)
+  → populate_stage_values (~1020) + populate_role_result_values (~1070)
+  → set_special_stage_values (one-off columns) + direct_platform_stage ({os}_stage_{logical}) +
+     direct_platform_role ({os}_{role}) + logical_stage_name (bash stage → {os}_stage_{logical}) +
+     populate_cross_os_values + read_parallel_stage_results
+
+Every stage outcome with a matching set_special_stage_values entry writes. The second pass
+(~1070-1079) ensures stages that match NEITHER direct_platform_stage NOR logical_stage_name
+still populate their one-off columns through set_special_stage_values.
+
+Bash stages go through logical_stage_name + platforms_for_stage. macOS/Windows sidecar
+stages go through direct_platform_stage + set_special_stage_values. Linux audit stages
+(validate_linux_*) go through set_special_stage_values only.
+
+────────────────────────────────────────────
+R10) CROSS-ORCHESTRATOR NAMING DIVERGENCES
+────────────────────────────────────────────
+
+Stages with different names between bash and Rust:
+membership_setup (bash) vs MembershipInit (Rust)
+issue_and_distribute_assignments vs DistributeAssignments
+issue_and_distribute_traversal vs DistributeTraversal
+issue_and_distribute_dns_zone vs DistributeDnsZone
+
+Stages only in bash: prime_remote_access, macos_preflight_check, macos/win sidecar stages,
+all validate_linux_* audit stages, all chaos + cross-network + soak sub-stages.
+
+Stages only in Rust: AnchorValidation, DeployRelayService, RelayValidation,
+TrafficTestMatrix, RoleSwitchMatrix, ExitHandoff, ActiveExit, Cleanup.
+
+────────────────────────────────────────────
+R11) WORKSPACE CRATE MAP — ARCHITECTURAL LAYERS
+────────────────────────────────────────────
+
+```
+Domain (transport-agnostic, NO backend/WireGuard types):
+  rustynet-control     — Membership bundles, roles/capabilities, role transitions, gossip, replay watermarks
+  rustynet-policy      — ACL eval (default-deny always)
+  rustynet-dns-zone    — Magic DNS signed-zone schema
+  rustynet-crypto      — Signing, key types, custody primitives
+  rustynet-local-security  — Local privileged-boundary checks
+  rustynet-sysinfo     — OS detection, interface enumeration
+
+Daemon + Services:
+  rustynetd            — Main daemon: WireGuard mgmt, dataplane, STUN, gossip, ICE, enrollment, killswitch
+  rustynet-relay       — Frame forwarding for relay role
+  rustynet-nas         — Tunnel-only storage (service role)
+  rustynet-llm-gateway — LLM inference gateway (service role)
+
+Backend abstraction:
+  rustynet-backend-api       — Backend trait + abstract types
+  rustynet-backend-wireguard — Kernel WG adapter (wraps boringtun)
+  rustynet-backend-userspace — Boringtun userspace adapter
+  rustynet-backend-stub      — Deterministic test stub
+
+CLI + Tooling:
+  rustynet-cli              — Main CLI binary: ops/vm-lab/orchestrator/live* gates
+  rustynet-lab-monitor      — TUI monitor (excluded from workspace)
+  rustynet-operator         — Operator wizards
+  rustynet-advisor          — FIS-0005 role-placement MCDA scorer
+  rustynet-mcp              — MCP servers (repo-context, gate-runner, lab-state, deepseek)
+  rustynet-xtask            — Dev runner (gates, fmt-check-clippy-test)
+  rustynet-windows-native   — Windows WFP/DPAPI/named-pipe integration
+
+Third-party (vendored):
+  third_party/boringtun     — Userspace WireGuard implementation
+  third_party/rustynet-tun  — TUN device abstraction
+  third_party/rustynet-alloc-meter — Allocation accounting
+```
+
+Dependency chains (who breaks when you patch the shared crate):
+- rustynet-control ← rustynetd, rustynet-cli, rustynet-operator, rustynet-mcp
+- rustynet-backend-api ← rustynet-backend-{wireguard,userspace,stub} ← rustynetd
+- rustynet-policy ← rustynetd (policy eval is daemon-side)
+- rustynet-crypto ← rustynet-control, rustynetd, rustynet-cli
+
+CRITICAL BOUNDARY: Domain crates (control, policy, dns-zone, crypto) MUST NOT import
+backend or WireGuard types. The backend trait lives in rustynet-backend-api; all
+WireGuard-specific code lives behind it. Violation = blocked by CI gate
+`scripts/ci/check_backend_boundary_leakage.sh`.
+
+────────────────────────────────────────────
+R12) KEY DOMAIN TYPES — FILE:LINE LOCATIONS
+────────────────────────────────────────────
+
+| Type | File | Line | Notes |
+|------|------|------|-------|
+| NodeRole (Client/Admin/Exit/BlindExit/Relay/Anchor/Nas/Llm) | rustynet-control/src/roles.rs | ~30 | 8 roles, used everywhere |
+| Capability enum | rustynet-control/src/roles.rs | ~80 | Sub-capabilities per role |
+| RoleTransition | rustynet-control/src/role_presets.rs | ~50 | Transition plan: identity/local-only/signed/blocked/irreversible |
+| MembershipState | rustynet-control/src/membership.rs | ~100 | Signed membership bundle, peer list, epoch, watermark |
+| SignedUpdate (enum) | rustynet-control/src/membership.rs | ~200 | Revoke/Restore/RotateKey/SetCapabilities variants |
+| DefaultDenyPolicy | rustynet-policy/src/eval.rs | ~50 | Default-deny ACL evaluator |
+| Backend trait | rustynet-backend-api/src/lib.rs | ~30 | Tunnel backend abstraction (WireGuard behind it) |
+| DaemonProbeOp | vm_lab/mod.rs | ~6240 | 6 variants: RuntimeAcls/ServiceHardening/KeyCustody/Authenticode/MeshStatus/DnsFailclosed |
+| VmLabStageOutcome | vm_lab/mod.rs | ~4760 | stage + status + summary + artifacts |
+| VmLabStageStatus | vm_lab/mod.rs | ~4750 | Pass/Fail/Skipped/SkippedMissingPeer |
+| StageEvidence | live_lab_run_matrix.rs | ~295 | stage + status + artifacts — the CSV input |
+| MonitorConfig | lab-monitor/src/config.rs | ~6 | area, VM aliases, platform selectors, disabled_stages |
+| StageOutcome | lab-monitor/src/stage_reader.rs | ~17 | stage + status + summary + artifacts |
+| JobState | lab-monitor/src/job_watcher.rs | ~20 | job_id + state + pid + report_dir |
+| VmStatus | lab-monitor/src/vm_prober.rs | ~15 | alias + ip + platform + ssh_ok + git_commit |
+| OrchestrationStage trait | orchestrator/stage/mod.rs | ~99 | id/name/dependencies/execute for Rust pipeline |
+| StageId (21 stages) | orchestrator/stage/mod.rs | ~31-53 | Preflight through Cleanup enum |
+
+Role transition rules (get_role_transition via MCP or rustynet-control/src/role_presets.rs):
+- client→admin: signed, adds serves_admin
+- admin→exit: signed, adds serves_exit (also deploys relay service if serves_relay)
+- exit→blind_exit: signed, IRREVERSIBLE (requires factory reset)
+- blind_exit→anything: BLOCKED by design
+- client→relay: signed, adds serves_relay (deploys rustynet-relay service)
+- anything→anchor: signed, needs existing anchor in mesh
+- adding serves_relay: deploy relay service BEFORE emitting bundle
+- removing serves_relay: undeploy relay service BEFORE revocation bundle
+- exit NAT teardown: MUST happen BEFORE removing exit capability (residue = release-blocker)
+- All transitions: append-only audit log entries
+
+────────────────────────────────────────────
+R13) SECURITY CONTROLS CATALOG (from SecurityMinimumBar.md)
+────────────────────────────────────────────
+
+Controls an agent MUST preserve in every patch. These are non-negotiable:
+
+| § | Control | Enforcement point | Who verifies |
+|---|---------|-----------------|--------------|
+| 4.A | Signed state validation before mutation | rustynet-control/src/membership.rs — verify() before apply() | unit test + live lab |
+| 4.B | Anti-replay watermark | rustynet-control/src/watermark.rs — reject stale epochs | unit test |
+| 4.C | Key custody: OS secure storage or encrypted-at-rest | rustynet-crypto/src/key_custody.rs — macOS Keychain/DPAPI or encrypted file + 0o600 | key_custody stage |
+| 4.D | No secrets in logs | rustynetd/src/secret_log_audit.rs — grep daemon journal for key material | secrets_not_in_logs stage |
+| 4.E | Default-deny ACL | rustynet-policy/src/eval.rs — empty/missing → deny | policy_default_deny audit |
+| 4.F | Fail-closed on trust state unavailable | rustynetd/src/phase10.rs — error on missing state, not default | runtime validation |
+| 4.G | One hardened execution path, no runtime fallback | All security paths — no try-or-downgrade | code review |
+| 4.H | Privileged helper argv allowlist | rustynetd/src/privileged_helper.rs — validate_request() | helper_allowlist audit |
+| 4.I | Blind_exit irreversibility | rustynet-control/src/role_presets.rs — preview_next_state() rejects blind_exit→anything | blind_exit_reversal audit |
+| 4.J | Enrollment token replay prevention | rustynetd/src/enrollment_token.rs — token consumption idempotent | enrollment_replay audit |
+| 4.K | Gossip revoked-peer re-admission denial | rustynetd/src/peer_gossip.rs — reject bundles from revoked sources | gossip_revoked_readmit audit |
+| 4.L | Revoked peer dataplane denial | rustynetd/src/revoked_peer_denied_audit.rs — NoopBackend eval | revoked_peer_denied audit |
+| 4.M | Membership signature forgery rejection | rustynetd/src/membership_signature_audit.rs — forged sigs rejected | signature_forgery audit |
+| 4.N | Membership revoke delayed-apply | rustynetd/src/membership_revoke_audit.rs — 4 delayed-apply + 2 negative cases | membership_revoke audit |
+| 4.O | Hello-limiter flood cap | rustynet-relay/src/hello_limiter_audit.rs — DOS-1 | hello_limiter_flood audit |
+| 4.P | Runtime ACL integrity | rustynetd/src/{linux,macos,windows}_runtime_acls.rs — reviewed roots match | runtime_acls stage |
+| 4.Q | Service hardening | rustynetd/src/{linux,macos,windows}_service_hardening.rs — service config secure | service_hardening stage |
+| 4.R | Mesh state integrity | rustynetd/src/{linux,macos,windows}_mesh_status.rs — session snapshot valid | mesh_status stage |
+
+The enforcement point column IS the file you patch when that control is broken. The verifier
+column IS the stage/evaluator that proves it in the lab. Both must exist before claiming
+a control is "done." Every control has at least one unit test + one live-lab stage (except
+planned roles NAS/LLM which lack live-lab stages).
+
+────────────────────────────────────────────
+R14) COMMON LAB FAILURE PATTERNS — DIAGNOSIS
+────────────────────────────────────────────
+
+| Failure signature | Most likely root cause | File to patch | How to verify |
+|---|---|---|---|
+| `validate_{os}_mesh_join` fails — daemon reports 0 peers | Membership bundle not distributed, or daemon crashed after distribute | vm_lab/mod.rs distribute stages, or daemon enrollment | Check daemon journal on the node: `journalctl -u rustynetd` or equivalent |
+| `bootstrap_hosts` fails — compile error | Cargo.lock changed, registry index stale, missing crate in offline cache | Add crate to cargo cache on VM, or fix dependency | Re-run bootstrap |
+| `validate_{os}_runtime_acls` fails — root drifted | OS update changed file permissions/owner/path | Update expectation in daemon's *_runtime_acls.rs const | Run the check manually |
+| SSH timeout during setup | nft killswitch from previous run blocking port 22 | `utmctl exec` to flush nft, or `probe_and_recover_local_utm.sh` | `nc -z <ip> 22` |
+| All nodes unreachable simultaneously | Host lost its lab-subnet IP (bridge100 went down) | `sudo ipconfig set bridge100 DHCP` on host | `ifconfig bridge100` |
+| `cross_os_*` stage fails | macOS/Windows node never rejoined after Linux membership changed | Redeploy mac/win bundles via sidecar | Check peer list on mac/win node |
+| Stage times out (no PASS/FAIL within timer) | Daemon deadlocked, panic, or hung on IO | Check daemon journal; common: stuck on file lock or WG uapi socket | `journalctl -u rustynetd \| tail -50` |
+| `live_key_custody` fails | File permissions drifted, or OS secure storage unavailable | Update key_custody.rs for the OS, or check Keychain/DPAPI state | Run key-custody-check manually |
+| `cargo audit` fails in gate | New advisory published | Update `deny.toml` or patch the dependency | `cargo audit` |
+| `cargo deny` fails | License or ban policy violation | Update `deny.toml` or switch dependency | `cargo deny check` |
+| Fmt/clippy/check gates fail in CI but pass locally | Toolchain version mismatch (Homebrew cargo vs rust-toolchain.toml) | Pin toolchain via `rustup override set` or defer to CI | `rustup show` |
+| `validate_{os}_enrollment_replay` fails | Enrollment token replay protection regression | rustynetd/src/enrollment_token.rs — check consumption idempotency | Run enrollment-replay-audit |
+| `validate_{os}_gossip_revoked_readmit` fails | Gossip not filtering revoked sources | rustynetd/src/peer_gossip.rs — check source validation | Run gossip-revoked-readmit-audit |
+| `validate_{os}_hello_limiter_flood` fails | Relay hello-limiter cap regressed | rustynet-relay/src/hello_limiter.rs — check MAX_HELLO_LIMITER_ENTRIES | Run hello-limiter-audit |
+| `validate_windows_blind_exit_reversal_denied` runs but blind_exit not supported on Windows | Expected — Windows blind_exit is blocked by design in main.rs:~11833 | No patch needed; the stage exercises only the daemon-side audit | Verify the audit passes (not a live role transition) |
+
+When a stage fails: capture the daemon journal from the relevant node, feed to DeepSeek
+flash for root cause, verify against real code, patch, gate, commit, re-run. Never patch
+blind — always read the journal first.
+
+═══════════════════════════════════════════
 START NOW
 ═══════════════════════════════════════════
 Run `/loop` (self-paced, on `main`). Act immediately:
@@ -653,15 +1115,37 @@ Run `/loop` (self-paced, on `main`). Act immediately:
 2. **Fast-forward** the main repo to `origin/main` (§4).
 3. **Before orientation even finishes**, fan DeepSeek flash over the most recent failed stage log —
    candidate root causes arrive before you need them.
-4. **The instant orientation completes**, launch the next lab run (highest-priority uncovered parity
-   cell from the matrix + roadmap) AND simultaneously start patching the top finding. Both start
-   within seconds of orientation completing. **From this point a run is always executing.**
+4. **The instant orientation completes**, enter the proving cycle (§1):
+   - Launch the first lab run (highest-priority uncovered parity cell).
+   - Record the job_id.
+   - Set your 10-minute heartbeat.
+   - Do NOT wait for it. Start patching the previous run's findings or the DeepSeek
+     triage results that arrived in step 3.
+   - From this point the cycle runs forever. Never exit.
 
-**Your internal alarm for the overnight run — check this every loop iteration:**
-- Is a lab run currently executing? If NO → launch one immediately, then ask why it wasn't running.
-- Am I patching or gating something? If NO → pick the next item from §6 and start.
-- Have I surfaced a question or decision to the user? If YES → that was a mistake; undo it, make
-  the decision using §9, and continue.
+**HEARTBEAT RHYTHM — how you stay alive without burning context:**
+- Every ~10 minutes, check each in-flight run once via `deepseek_live_lab_result(job_id)`.
+- Between heartbeats: patch, gate, commit, fan DeepSeek, read docs.
+- If a heartbeat finds a run COMPLETE: process the result, launch the replacement,
+  commit the patch, write_loop_note, pick the next cell.
+- If a heartbeat finds a run STILL RUNNING: fine. Continue patching the other OS's findings.
+  Do NOT poll again until the next heartbeat fires.
+- If a heartbeat finds NO runs in flight: this is an emergency. Launch one immediately before
+  doing anything else, then ask yourself why the run slot was empty.
+- **Never poll more frequently than once per heartbeat.** Polling burns context on nothing.
+  The lab does not need you watching it — it needs you patching while it runs.
+
+**THE COMMIT RULE — non-negotiable:**
+Every patch that fixes a lab failure is one commit. Author Iwan-Teague. No AI trailers.
+Small, focused, one logical change per commit. Gate before commit. Commit before re-launch.
+A fix that is not committed did not happen. The commit message says what broke and why the
+fix is correct. No "fix stuff" or "wip" commits.
+
+**Your internal alarm — check this every heartbeat:**
+- Is at least one run in flight? If NO → launch one immediately.
+- Am I in the middle of patching? If NO → pick the next finding from the last failure.
+- Do I have a fix that gates clean? If YES → commit it NOW, then re-launch.
+- Have I surfaced a question or decision to the user? If YES → undo that, use §9, move on.
 
 **Decision fatigue is not a reason to ask.** Any time you feel "I need to ask the user about X":
 - If X is a security/design choice → §9 protocol, cap at 10 min, decide and move on.
@@ -671,7 +1155,8 @@ Run `/loop` (self-paced, on `main`). Act immediately:
 - If X is literally anything else → make the most conservative secure choice, document it in a
   commit message or loop journal note, and move on.
 
-Patch security-first. Gate correctly. Commit as Iwan-Teague, no AI trailers. No questions. No
-waiting. No idle. The user will read the loop journal and git log when they wake up — make sure
-there is a lot to read.
+Patch security-first. Gate correctly. Commit as Iwan-Teague, no AI trailers. Every patch is a
+commit. Every run is a heartbeat check, not a blocking wait. No questions. No waiting.
+No idle. The user will read the loop journal and git log — make sure every entry says what
+broke, what fixed it, and which run proved it.
 ```
