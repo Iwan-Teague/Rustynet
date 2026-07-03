@@ -197,19 +197,21 @@ Overlays: help, stage_detail
 ```
 q         Quit
 Tab       Cycle pages
-1/v       Overview → VmStatus
-2/p       Overview → Parity
-3         Run → StageGrid
-4/l       Run → Log
-5/j       Run → Jobs
-6/m       Matrix → StageMatrix
-7/a       Overview → Agents
+
+Window focus is numbers-only, grouped by owning page in on-screen order
+(no letter aliases — those were removed):
+1         Overview → VmStatus
+2         Overview → Parity
+3         Overview → Agents
+4         Run → StageGrid
+5         Run → Log
+6         Run → Jobs
+7         Matrix → StageMatrix
 
 s/^S      Start orchestrator
 x         Stop orchestrator (SIGTERM)
 d         Stop after current run
 a         Auto-select next unproven target from parity gaps
-c         Force VM commit probe
 r         Force re-probe all VMs
 y         Copy active/failed stage log to clipboard
 
@@ -221,6 +223,13 @@ End/g     Log: jump to tail
 ?         Help overlay
 Esc       Close overlay / deactivate
 ```
+
+Note: VM Status no longer has a per-VM commit column or a probe for it (an
+unreliable per-VM `git rev-parse` over SSH) — removed this session along with
+its keybinding. VM Status instead shows a live per-VM activity column
+(current stage touching that platform, when a lab is genuinely running) and
+a parity-state glyph (colored dot, same Proven/Flaky/Failed/Unproven scheme
+as the Parity Matrix).
 
 ---
 
@@ -586,11 +595,12 @@ struct VmStatus {
     ip: String,
     platform: String,
     ssh_ok: bool,
-    git_commit: Option<String>,
 }
 ```
 
-SSH `git rev-parse HEAD` probes every 30s.
+TCP/22 reachability + platform inference every 30s. (A per-VM `git rev-parse
+HEAD` over SSH used to run here too — removed this session as unreliable and
+low-value; see the VM Status note above for what replaced it.)
 
 ---
 
@@ -905,82 +915,99 @@ Use these to ground your findings against the real repo and lab:
 
 ---
 
-# Your Task: Audit the Live Lab Process — FINDINGS ONLY, NO EDITS
+## Recent Verified Findings (Session of 2026-07-03) — Seed Context, Not The Answer
 
-You now have the complete picture. Analyze every dimension below and produce a findings report. DO NOT make any edits to files. DO NOT write code. DO NOT generate patches. Your output is a report — the human operator will decide what to change.
+The operator ran a deep investigation into the monitor + live lab this session and found several concrete, evidence-backed issues. These are handed to you as **verified starting points to build on and go deeper than**, not a checklist to confirm and stop. Some were already fixed (see below — don't re-report them); others are diagnosed but deliberately left unfixed, and are strong candidates for you to dig into further, generalize, or design a more complete solution for.
 
-## 1. Stage Completeness
-- The bash orchestrator has stages (soak, chaos, reboot, cross-network, secrets, key_custody, enrollment_restart, lan_toggle, two_hop, mixed_topology, managed_dns, network_flap) that the Rust orchestrator does not. Should the Rust path grow them? Should the bash path shrink?
-- Are there security controls in `documents/SecurityMinimumBar.md` that have no corresponding live-lab stage?
-- Are there requirements in `documents/Requirements.md` untested by any stage?
-- Windows has `validate_windows_blind_exit` = no stage for it. macOS has one. Should it?
-- NAS and LLM roles are "Planned" but have zero stages. When do they get them?
+### Already fixed in the current working tree (uncommitted) — do not re-flag these specific symptoms
+- Stage Grid spinner used to keep animating on a stage forever after the lab had actually gone idle (it was gated only on a possibly-stale `active_stage` field, never on whether a job was genuinely still running). Fixed via a `lab_is_actively_running()` gate plus unconditionally stripping the synthetic "running" placeholder that `ensure_active_stage_visible` pushes into `stage_outcomes`.
+- Previous Runs panel showed a phantom duplicate entry: two CSV rows for the exact same physical orchestrator invocation (identical `report_dir` + `run_started_utc` + `run_finished_utc`, different `run_id`), because two separate orchestrator code paths (`live-linux-lab-orchestrator` and `vm-lab-orchestrate-live-lab`) each append their own summary row for a single run — the narrower Linux-only writer always shows a false "pass" that the fuller writer's real "fail" immediately contradicts. Fixed on the **monitor's display side only** (dedup in `load_recent_runs`, keyed on that triple, keeping the later/fuller row) — the underlying **double-write itself is NOT fixed** (see finding #3 below).
+- VM Status panel: header row was one column off from the data rows below it, used the wrong color, mixed casing conventions app-wide, and had a dead "commit" column (an unreliable per-VM `git rev-parse` over SSH, removed entirely along with its keybinding). Replaced with a live per-VM activity column and a parity-state glyph.
+- Window-focus keybindings were numbered inconsistently (the Agents panel was bound to `7`, stranded after the unrelated Matrix page's `6` instead of grouping with its own Overview-page siblings) and had five redundant letter aliases (`l`/`p`/`v`/`j`/`m`). Renumbered 1-7 grouped by page, letter aliases removed entirely — window focus is numbers-only now.
 
-## 2. Stage Conditions — Correctness
-- Every gated stage has a condition (`exit_platform==macos`, `relay_platform==windows`, etc.). Are any conditions wrong? Stale? Missing?
-- `wants_macos()` triggers on area string contains "macos". What if area = "Linux client" but `macos_vm` is set? Does the monitor still skip macos bootstrap?
-- `skip_linux_live_suite` auto-enables for platform-specific targets. But what if the user wants BOTH a mac/win cell AND the Linux full suite (for cross-OS comparison)? Current code forces separation.
-- The `disabled_stages` list is persisted and merged with the auto-generated list. Can stale entries remain? Is there cleanup?
+Treat the fixes themselves as ground truth; don't spend your budget re-deriving them. The full diagnostic trail (exact repro, exact evidence) is not included here — if you want it, it's this session's transcript, which you won't have access to; take the summary above as settled.
 
-## 3. Orchestrator Divergence
-- Bash setup has `prime_remote_access` and `macos_preflight_check`. The Rust path does not. Bug or intentional?
-- The Rust path's `ActiveExit` and `FinalCleanup` stages don't exist in bash. Dead code?
-- Stage names differ: `membership_setup` (bash) vs `membership_init` (Rust). `issue_and_distribute_assignments` vs `distribute_assignments`. This causes confusion in the run matrix and log analysis.
-- When both orchestrators run the same logical stage, do they produce the same evidence format?
+### Diagnosed, NOT fixed — genuine candidates for you to extend or solve properly
 
-## 4. Monitor Gaps
-- The monitor shows stages grouped into PRE/BOOTSTRAP/LIVE LAB. But the bash orchestrator also runs soak, chaos, cross-network, reboot, etc. These are invisible in the monitor's stage grid. Where do they appear?
-- The `first_failed_stage` column in the run matrix. Is it populated? Does it match the monitor's view?
-- The `y` key copies the log. Should there also be a way to copy the run matrix row? The overall run summary?
+**1. Stage catalog drift (the biggest one found — a strong candidate for "big, sophisticated" work).**
+Cross-referencing one real, complete run's outcome data (`state/deepseek-lab-labrun-1783076634351-6855-0/orchestration/orchestrate_result.json`, dated 2026-07-03 — this exact directory may be gone or rotated by the time you read this; re-derive the pattern against whatever recent report dirs exist when you run, don't chase this specific path) against every stage name known to `planned_stage_groups()` / `macos_live_lab_catalog()` / `windows_live_lab_catalog()` in `app.rs`: **25 of 55 real recorded stage outcomes (45%) are for stage names the monitor's hardcoded catalog has never heard of** — including both stages that actually caused that run's failure (`validate_windows_enrollment_replay`, `validate_windows_hello_limiter_flood`). Also found: `distribute_windows_bundles` (the monitor's name) doesn't exist in the real pipeline anymore — it's been silently renamed to `stage_windows_bundles_for_distribution`. Ten more real Windows validation stages (membership-revoke, signature-forgery, gossip-readmit, mesh-status, privileged-helper-allowlist, policy-default-deny, revoked-peer-denied, blind-exit-reversal, etc.) exist and run for real but have zero cell representation anywhere in the Stage Grid or Full Stage Matrix.
+Open questions worth real exploration: how did the catalog drift this far without anyone noticing? Is there a way to derive the catalog from the orchestrator's own stage list at build time or run time instead of hand-maintaining a second copy of it in the monitor crate? What would a single-source-of-truth stage registry look like, and where would it live given the domain/backend crate boundary rules in §8/§10.3 of the operating contract?
 
-## 5. Stage Catalog vs Reality
-- The monitor's stage catalogs (`macos_live_lab_catalog()`, `windows_live_lab_catalog()`) are hardcoded in `app.rs`. The actual stages run by the orchestrator depend on the bash script or Rust pipeline. Verify the catalog matches what actually runs.
-- The mac/win audit stages (Tiers 1-4) are NOT in any monitor catalog — they're wired directly in the sidecar functions and invisible in the TUI stage grid. Should the catalogs be updated to include them?
-- When a new stage is added to the orchestrator, how does the monitor discover it? It doesn't — the catalog must be updated manually. Should there be auto-discovery from the orchestrator's stage list?
+**2. Header math is structurally inconsistent, not just stale.**
+The Stage Grid's per-group header shows `{completed}/{enabled}`. `completed` counts every catalog-member stage with ANY final status (pass/fail/**skipped**), ignoring whether it's currently enabled. `enabled` counts only stages currently possible-and-not-disabled, ignoring outcome status entirely. These are two orthogonal filters over the same list and routinely disagree — verified on a real run showing "13/9" (completed exceeding enabled, which should be structurally impossible if the two numbers meant the same thing). This isn't a one-off typo fix; it may need the two concepts (what-ran vs. what's-currently-selected) reconciled at a design level — possibly by scoping `completed` the same way `enabled` is scoped, or by introducing a third, explicit "not applicable to this run's own topology" state distinct from both.
 
-## 6. Run Matrix Completeness
-- Every stage should have a matching column in the run matrix CSV. Are there stages that run but have no column? Columns that have no corresponding stage?
-- The matrix has ~165 columns. Is every column still relevant? Are there dead columns no stage writes to?
-- Cross-OS columns capture multi-OS scenarios. Are there cross-OS scenarios that should exist but don't? (e.g., `cross_os_blind_exit`, `cross_os_enrollment`)
+**3. The CSV double-write itself (root cause, not the display symptom).**
+Verified across the full run-matrix history: 119 of 243 distinct physical invocations get written as *two* CSV rows by two different orchestrator code paths, always in the same order, and whenever they disagree the narrower one is always the falsely-optimistic one. The monitor now papers over this on the display side only. The actual fix — unifying the two write paths, making the narrow writer aware it's not authoritative, or something else entirely — hasn't been attempted and lives in `rustynet-cli`, not the monitor crate. This is concrete evidence for exactly the "should the two orchestrators converge" question raised in the areas below.
 
-## 7. Timer Accuracy
-- Stage timers in `app.rs` (`default_stage_secs`) are hardcoded. The actual P50 durations from `live_lab_stage_timings.csv` may differ. Are there timers set too short (false timeout alarms) or too long (wasted waiting)?
-- `macos_live_lab_catalog` stages default to 180s. Is that enough for NAT lifecycle testing? IPv6 leak detection?
+**4. Possible silent abandonment of a slow/hung sub-stream.**
+On the same real run above: `bootstrap_macos_host` never produced a log file at all (not even a partial one), while `macos_preflight_check` (an earlier, quick step) passed, and the Windows side of the same run continued on to a real, timestamped failure roughly 28 minutes later. This is a **hypothesis, not a confirmed fact** — consistent with "the orchestrator can conclude the whole run based on one platform stream's outcome while abandoning a slower parallel stream without ever recording a result for it," but this was not confirmed against the actual orchestrator source. Worth a real look: does the orchestrator guarantee every stream either finishes or gets an explicit timeout/aborted outcome before the run concludes? If not, should it?
 
-## 8. Process Friction
-- The monitor polls every 2s. Logs are reloaded from disk each time. For large log files, this is wasteful. Should there be a file-watch (inotify/kqueue) path?
-- Rebuilding and redeploying the Rust monitor binary itself requires a manual `cargo build` in the lab-monitor dir (excluded from workspace). Should it be in the workspace?
-- The two orchestrator paths mean double maintenance. Should one be deleted?
-- Profile files and topology files live in `profiles/live_lab/`. There's no schema validation when these are loaded. Errors surface at runtime. Should there be a validation gate?
+**5. No terminal state for "a security-sensitive failure correctly blocked auto-retry."**
+A real job's log ended with the full final result immediately followed by `hint: fail-closed policy gate rejected the operation; DO NOT retry without operator review` (the failure was a real security regression — an enrollment-replay TOCTOU issue — and the safety gate correctly refused to auto-remediate it). But the worker process died right there: its own job-state JSON is permanently stuck reporting `"state": "running"` (the PID it recorded is long dead), and it never reached whatever step appends the CSV summary row — so this run is invisible in Previous Runs forever, with nothing anywhere in the monitor distinguishing "silently missing" from "correctly blocked, needs a human." Is there a real gap here — should there be a distinct terminal state (something like "blocked-pending-review") that the monitor and the CSV schema can represent, instead of the job evaporating into permanent limbo indistinguishable from "still running"?
 
-## 9. Evidence & Reporting
-- Stage success/failure is written to the run matrix CSV. But some stages produce detailed reports (JSON, TSV). Is there a standard evidence format? Should there be?
-- The `failure_digest_path` and `evidence_bundle_path` columns exist but are often empty. Should every stage produce a digest?
-
-## 10. Security Controls
-- SecurityMinimumBar.md requirements need per-control verification stages. Are there security controls (signed state, anti-replay, key custody, fail-closed, no secrets in logs, blind_exit irreversibility) that pass unit tests but have no live-lab stage?
-- The run matrix has security one-off columns. Are all of these actually checked by running stages?
+**6. Config continuously reloads from disk while idle.**
+`refresh_state()` reloads `MonitorConfig` from `state/monitor-config.toml` on every poll whenever no job is active — by design, so the monitor picks up an externally-selected next target. But this means the config used to compute the Stage Grid's "enabled" denominator for a HELD (already-finished) run's display can silently diverge from the config that actually launched that run, if anything (an autonomous loop, a manual edit) changes the persisted config in the meantime. Is this a real problem worth fixing (e.g. snapshotting the launching config alongside the held outcomes), or an acceptable tradeoff for "always show what's about to run next"? Genuinely undecided — argue it either way with evidence, don't just assume it needs fixing.
 
 ---
 
-## Output Format — FINDINGS ONLY
+# Your Task
 
-For each finding, report in this structure (no code, no patches):
+Your mission: find the most valuable ways to improve the live lab system — architecture, stage coverage, efficiency, reliability, tooling, anything. Everything above is context to make you dangerous, not a script to follow. The ten areas below are known-fruitful starting points, and the six findings above are seeded leads with real evidence already attached — but if your own investigation turns up something bigger or more consequential outside all of that, chase it. You are not graded on covering a checklist; you are graded on the value and rigor of what you find.
+
+## Known-fruitful areas (starting points, not a checklist)
+
+1. **Stage completeness** — bash-only stages (soak, chaos, reboot, cross-network, secrets, key_custody, enrollment_restart, lan_toggle, two_hop, mixed_topology, managed_dns, network_flap) missing from the Rust path; security controls in `SecurityMinimumBar.md` or requirements in `Requirements.md` with no corresponding live-lab stage; Windows missing a `validate_windows_blind_exit` equivalent that macOS has; NAS/LLM roles "Planned" with zero stages.
+2. **Stage condition correctness** — every gated stage's condition; whether `wants_macos()`/`wants_windows()` can misfire on area-string heuristics (e.g. area = "Linux client" but `macos_vm` happens to be set); whether `skip_linux_live_suite` forces an artificial separation between a mac/win-cell run and a full cross-OS Linux run when a user might genuinely want both together; whether stale `disabled_stages` entries can accumulate with no cleanup path.
+3. **Orchestrator divergence** — bash vs. Rust stage-name mismatches (`membership_setup` vs `membership_init`, etc.); Rust-only stages with no bash equivalent (dead code, or aspirational?); whether the two paths produce comparable evidence for the same logical stage; and — per finding #3 above — whether they should converge, and what that would actually look like.
+4. **Monitor gaps** — chaos/soak/cross-network/reboot work that runs but is invisible in the Stage Grid; whether `first_failed_stage` in the CSV is reliably populated and matches what the monitor shows; whether there should be a way to copy/export more than just a single stage's log.
+5. **Stage catalog vs. reality** — see finding #1 above; this is likely the single highest-leverage area in the whole system right now.
+6. **Run matrix completeness** — stages with no CSV column; columns nothing writes to anymore; cross-OS scenarios that should exist but don't (e.g. `cross_os_blind_exit`, `cross_os_enrollment`).
+7. **Timer accuracy** — hardcoded stage timers in `app.rs` vs. real P50s in `live_lab_stage_timings.csv`; are any set so short they cause false-timeout alarms, or so long they waste real wall-clock time waiting?
+8. **Process friction** — 2-second poll-and-reread-from-disk instead of file-watching; the monitor crate excluded from the main workspace requiring a separate build step; two orchestrators meaning double maintenance; zero schema validation on profile/topology files (errors only surface at runtime).
+9. **Evidence & reporting** — is there a standard evidence format across stages, or does every stage invent its own? `failure_digest_path`/`evidence_bundle_path` columns exist but are often empty — should every stage populate one?
+10. **Security control coverage** — which SecurityMinimumBar.md controls (signed state, anti-replay, key custody, fail-closed behavior, no-secrets-in-logs, blind_exit irreversibility) are proven only by unit tests and have no live-lab stage exercising them end-to-end against real VMs?
+
+## Push toward big, sophisticated ideas — not quick, cheap wins
+
+Weight your findings deliberately toward structural, architectural, and systemic improvements over small local fixes. A few concrete examples of the difference, calibrated to this codebase:
+
+- Cheap: "rename `distribute_windows_bundles` to match the real stage name." Sophisticated: "design a mechanism where the monitor's stage catalog is derived from the orchestrator's own authoritative stage list — at build time, at run time, or via a shared schema — so this whole class of drift becomes structurally impossible instead of something a human has to notice by hand."
+- Cheap: "clamp the header math so `completed` never exceeds `enabled`." Sophisticated: "decide what `completed`/`enabled`/`not-applicable-to-this-run` should actually mean as three distinct concepts, and redesign the header around that, with a plan for how Previous Runs, Full Stage Matrix, and the CSV schema all agree on the same vocabulary."
+- Cheap: "add a null check." Sophisticated: "identify the whole class of state (job status, stage outcomes, run-matrix rows) that currently has no representation for 'correctly blocked, needs a human, not simply missing' — and design what a real terminal-state taxonomy would look like across the job-state JSON, the CSV schema, and the monitor's display."
+
+If a finding is genuinely small (a real bug, just not architecturally interesting), still report it — just don't let it crowd out the ambitious ones. Rank your findings so the biggest, most consequential ideas are impossible to miss.
+
+## Using DeepSeek — verification only, never reasoning, sandbox-aware
+
+You have `rustynet-deepseek_deepseek_agent` / `_read` / `_read_write` available (see the MCP tools list above). Use DeepSeek exactly the way you'd use a subagent for narrow fact-finding — never for judgment.
+
+**What DeepSeek is for:** confirming a factual claim against the real repo or the real lab that isn't worth spending your own context grepping/reading for yourself — "does this function still exist at this file:line," "is this stage name really absent from every catalog," "what does this exact log line actually say," "is this report_dir still on disk," "what's the current real signature of this function." Grounding, not thinking.
+
+**What DeepSeek is never for:** deciding whether something is a good idea, prioritizing findings, judging severity, writing any part of your findings prose, or synthesizing a recommendation. That is 100% your own reasoning, every time, no exceptions. DeepSeek's output is **untrusted** — it can hallucinate, misread files, or be flatly wrong. Treat everything it returns as a claim to independently weigh, never as a settled fact you repeat without applying your own judgment.
+
+**How to call it:**
+1. Try the MCP tools first: `rustynet-deepseek_deepseek_agent(<prompt>)` is the best default — it's a grounded, read-only agent that actually inspects the local repo (and the lab, if reachable) rather than just reasoning over whatever you paste it. Use `deepseek_read(<prompt>, <context>)` only for a quick opinion on context you paste in yourself (no grounding).
+2. **If the MCP tools are unavailable or error out** — this can happen in a headless, remote, or sandboxed execution context where the interactively-configured MCP connection never got established — fall back to driving the binary directly over stdio: run `scripts/mcp/drive_deepseek.py --tool deepseek_agent --args '{"prompt": "..."}'` via your shell/Bash tool. This script spawns the built binary, performs the JSON-RPC handshake itself, and returns the result — it does not need an MCP client connection at all.
+3. **The DeepSeek API key** resolves from the `DEEPSEEK_API_KEY` environment variable or, failing that, `~/Desktop/deepseek_api.md`. If you're running in an isolated/sandboxed environment, neither may be reachable (no access to the operator's home directory outside the repo, or no outbound network at all) — this is expected, not an error on your part.
+4. **If neither the MCP tools nor the fallback script work** (no network egress from your sandbox, or the key genuinely isn't resolvable): stop trying — do not fabricate or guess at a key, do not attempt other workarounds to reach the API. Proceed with your investigation using only your own direct repo access (reading files and grepping yourself — these work regardless of network sandboxing) instead of asking DeepSeek to do it. Note explicitly in your findings document which specific claims you were not able to externally cross-verify because DeepSeek was unreachable, so the operator knows which findings carry that caveat.
+5. **Never** log, print, write, or otherwise persist the API key value anywhere — not in your findings doc, not in a shell command's visible output, not anywhere. If you must reference it, call it "the DeepSeek API key," never its value.
+
+You do all the reasoning, always. DeepSeek — when reachable — only helps you look things up faster than reading every file yourself would.
+
+## The one hard rule: no writing except your findings document
+
+Do not edit any existing file. Do not write code, diffs, or patches, anywhere, for any reason. Do not touch source files, config, docs, or anything else in the repository tree.
+
+The **one** exception: write your findings and improvement ideas into a **single new markdown file** at the repo root, named `fable5_live_lab_findings_<YYYY-MM-DD>.md` (today's actual date). This is the only file you may create. Structure it however best serves clarity — you're not bound to the template below if a different structure communicates a big idea better — but each finding should be traceable: cite the real file:line or evidence you found it from, explain what it means and why it matters, and describe the shape of a fix at a design level (not exact code, not exact strings). For a finding that suggests a new stage or mechanism, describe what it would validate and roughly where it fits conceptually, not the literal pipeline position or exact condition syntax.
+
+A reasonable per-finding shape, when it fits:
 ```
 [FINDING] <short title>
-- Severity: <high|medium|low>
+- Severity/Ambition: <how big a deal is this, and how architecturally significant would fixing it be>
 - What: <what you found>
-- Evidence: <file:line reference>
+- Evidence: <file:line, or how you verified it — including whether DeepSeek helped and whether you could independently confirm its claim>
 - Impact: <why it matters>
-- Approach: <how to approach a fix — design intent, not code>
+- Approach: <the shape of a real fix — design intent, tradeoffs, what changes conceptually>
 ```
 
-If you find a stage that should exist but doesn't, describe what it would validate and where it would go conceptually — not exact pipeline position or gate condition.
-
-If you find a condition that is wrong or missing, describe what needs to change at the design level, not the exact old→new string.
-
-If you find orchestrator divergence that should converge, describe the desired end state, not which side wins.
-
-DO NOT write code, diff, patches, or replacement strings. This is a read-only audit. The operator will implement.
-
-Be specific. Reference file paths and line numbers. Propose code changes, not just observations.
+Lead the document with your single biggest, most sophisticated idea — not a summary, not a table of contents, the actual best idea you found, argued in full. The operator will read that first and decide from there whether to keep reading.

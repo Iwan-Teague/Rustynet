@@ -127,9 +127,10 @@ sudo -u rustynetd sh -c '
 
 For production: generate a passphrase-protected encrypted copy. The install script
 (`Install-RustyNetMacosService.sh`) automatically detects whether
-`wireguard.passphrase` exists and includes `--wg-encrypted-private-key` in the
-plist only when it does. Without a passphrase file the daemon uses the plaintext
-`wireguard.key` directly (lab-safe; use encrypted key for production).
+`/usr/local/var/rustynet/bootstrap/wireguard.passphrase` exists and includes
+`--wg-encrypted-private-key` in the plist only when it does. Without a
+passphrase file the daemon uses the plaintext `wireguard.key` directly
+(lab-safe; use encrypted key for production).
 
 ```bash
 # Generate passphrase and encrypt key (production).
@@ -138,7 +139,7 @@ sudo -u rustynetd /usr/local/bin/rustynetd key init \
   --runtime-private-key /usr/local/var/rustynet/keys/wireguard.key \
   --encrypted-private-key /usr/local/var/rustynet/keys/wireguard.key.enc \
   --public-key /usr/local/var/rustynet/keys/wireguard.pub \
-  --passphrase-file /usr/local/var/rustynet/keys/wireguard.passphrase
+  --passphrase-file /usr/local/var/rustynet/bootstrap/wireguard.passphrase
 ```
 
 ---
@@ -181,7 +182,7 @@ Key points discovered during live install:
         <string>--wg-encrypted-private-key</string>
         <string>/usr/local/var/rustynet/keys/wireguard.key.enc</string>
         <string>--wg-key-passphrase</string>
-        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <string>/usr/local/var/rustynet/bootstrap/wireguard.passphrase</string>
         <string>--wg-public-key</string>
         <string>/usr/local/var/rustynet/keys/wireguard.pub</string>
         <string>--backend</string>
@@ -230,7 +231,7 @@ Key points discovered during live install:
         <key>RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE</key>
         <string>net.rustynet.wg-key-passphrase</string>
         <key>RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH</key>
-        <string>/usr/local/var/rustynet/keys/wireguard.passphrase</string>
+        <string>/usr/local/var/rustynet/bootstrap/wireguard.passphrase</string>
     </dict>
 </dict>
 </plist>

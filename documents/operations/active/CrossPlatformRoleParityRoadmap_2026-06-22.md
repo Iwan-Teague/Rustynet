@@ -202,8 +202,10 @@ only"; validator says `🚫 blocked`) — exclude it, correct the matrix.
 
 ## 5. Ordered implementation roadmap
 
-Rank = value ÷ (tractability · safety). After **anchor (in flight)** and **macOS exit
-(just a green `--exit-platform macos` run)**:
+Rank = value ÷ (tractability · safety). After **anchor (done for bundle-pull)**
+and **macOS exit** (2026-07-03 run `labrun-1783084800049-93461-0` proved
+activation/NAT/DNS stages but failed the audit tail; patched root causes are
+pending one green `--macos-promote-exit` rerun):
 
 | # | Cell | Why this rank |
 |---|---|---|
