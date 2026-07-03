@@ -68,7 +68,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "←→ role"
     };
-    let title = format!("VM STATUS [1/V] ({count})  ↑↓ select  {role_hint}");
+    let title = format!("VM STATUS [1] ({count})  ↑↓ select  {role_hint}");
 
     let border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let block = Block::default()

@@ -52,7 +52,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         // "CHECKS", not "STAGES" — distinct from the LOOP PIPELINE panel's
         // "stages" (prepare VMs -> build -> ...); this counts real per-OS +
         // cross-OS live-lab checks, same definition as the FULL STAGE
-        // MATRIX tab [6/M] (role-presence flags like linux_client are not
+        // MATRIX tab [7] (role-presence flags like linux_client are not
         // checks and are excluded from both).
         Span::styled("CHECKS:", title),
         Span::styled(
