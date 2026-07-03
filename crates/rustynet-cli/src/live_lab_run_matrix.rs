@@ -533,6 +533,12 @@ fn build_live_lab_run_matrix_values(
     }
     let mut stage_evidence =
         read_stage_evidence(config.report_dir.join(STAGES_RELATIVE_PATH).as_path())?;
+    stage_evidence.extend(read_orchestrator_outcome_evidence(
+        config
+            .report_dir
+            .join("orchestration/orchestrate_result.json")
+            .as_path(),
+    )?);
     stage_evidence.extend(
         config
             .extra_stage_outcomes
@@ -917,6 +923,54 @@ fn read_stage_evidence(path: &Path) -> Result<Vec<StageEvidence>, String> {
             stage: row[0].clone(),
             status: normalize_status(row[2].as_str()).to_owned(),
             artifacts: vec![row[4].clone()],
+        })
+        .collect())
+}
+
+fn read_orchestrator_outcome_evidence(path: &Path) -> Result<Vec<StageEvidence>, String> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let body = fs::read_to_string(path).map_err(|err| {
+        format!(
+            "read orchestrate_result.json failed ({}): {err}",
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(body.as_str()).map_err(|err| {
+        format!(
+            "parse orchestrate_result.json failed ({}): {err}",
+            path.display()
+        )
+    })?;
+    let Some(outcomes) = value.get("outcomes").and_then(|value| value.as_array()) else {
+        return Ok(Vec::new());
+    };
+    Ok(outcomes
+        .iter()
+        .filter_map(|outcome| {
+            let stage = outcome.get("stage")?.as_str()?.to_owned();
+            let status = outcome
+                .get("status")
+                .and_then(|value| value.as_str())
+                .map(normalize_status)
+                .unwrap_or("unknown")
+                .to_owned();
+            let artifacts = outcome
+                .get("artifacts")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(StageEvidence {
+                stage,
+                status,
+                artifacts,
+            })
         })
         .collect())
 }
@@ -1914,10 +1968,12 @@ pub(crate) fn parse_csv_record(line: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::{
         DEFAULT_MATRIX_COLUMNS, LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome,
-        TargetEvidence, build_live_lab_run_matrix_values, csv_escape, parse_csv_record,
-        populate_cross_os_values, render_csv_row, set_special_stage_values,
+        StageEvidence, TargetEvidence, build_live_lab_run_matrix_values, csv_escape,
+        parse_csv_record, populate_cross_os_values, populate_role_result_values, render_csv_row,
+        set_special_stage_values,
     };
     use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
 
     #[test]
     fn tier0_revocation_stages_map_to_dedicated_csv_columns() {
@@ -2240,6 +2296,90 @@ mod tests {
     }
 
     #[test]
+    fn macos_exit_stages_mark_exit_role_not_blind_exit() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let mut values = BTreeMap::new();
+        let stages = [
+            "activate_macos_exit_role",
+            "capture_macos_exit_evidence_artifacts",
+            "validate_macos_exit_nat_lifecycle",
+            "validate_macos_exit_dns_failclosed",
+        ]
+        .into_iter()
+        .map(|stage| StageEvidence {
+            stage: stage.to_owned(),
+            status: "pass".to_owned(),
+            artifacts: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+        populate_role_result_values(&mut values, &schema, Path::new("."), &[], &stages);
+
+        assert_eq!(values.get("macos_exit").map(String::as_str), Some("pass"));
+        assert_eq!(values.get("macos_blind_exit").map(String::as_str), None);
+    }
+
+    #[test]
+    fn orchestrator_outcomes_feed_matrix_after_worker_reload() {
+        let root = temp_dir("orchestrator-outcomes");
+        fs::create_dir_all(root.join("state")).expect("state dir");
+        fs::create_dir_all(root.join("orchestration")).expect("orchestration dir");
+        fs::write(
+            root.join("state/stages.tsv"),
+            "preflight\thard\tpass\t0\tlogs/preflight.log\tverify\t2026-07-03T18:24:21Z\t2026-07-03T18:24:21Z\n",
+        )
+        .expect("stages");
+        fs::write(
+            root.join("orchestration/orchestrate_result.json"),
+            r#"{
+  "overall_status": "partial",
+  "outcomes": [
+    {"stage": "activate_macos_exit_role", "status": "pass", "artifacts": []},
+    {"stage": "validate_macos_exit_nat_lifecycle", "status": "pass", "artifacts": []},
+    {"stage": "validate_macos_exit_dns_failclosed", "status": "pass", "artifacts": []}
+  ]
+}"#,
+        )
+        .expect("orchestrate result");
+        let schema = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|column| (*column).to_owned())
+            .collect::<Vec<_>>();
+
+        let values = build_live_lab_run_matrix_values(
+            &schema,
+            &LiveLabRunMatrixAppendConfig {
+                command_name: "vm-lab-orchestrate-live-lab",
+                report_dir: &root,
+                profile_path: None,
+                inventory_path: None,
+                extra_stage_outcomes: &[],
+                notes: None,
+                row_role: super::LiveLabRunMatrixRowRole::Final,
+            },
+        )
+        .expect("values");
+
+        assert_eq!(
+            values.get("overall_result").map(String::as_str),
+            Some("pass")
+        );
+        assert_eq!(values.get("macos_exit").map(String::as_str), Some("pass"));
+        assert_eq!(
+            values.get("macos_stage_exit_handoff").map(String::as_str),
+            Some("pass")
+        );
+        assert_ne!(
+            values.get("macos_blind_exit").map(String::as_str),
+            Some("pass")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rsa0055_csv_escape_neutralizes_formula_injection() {
         // Cells beginning with =,+,-,@,TAB,CR must be prefixed with ' so a
         // spreadsheet renders them as text, not a formula.
@@ -2267,7 +2407,7 @@ mod tests {
         assert_eq!(csv_escape("=a,b".to_owned()), "\"'=a,b\"");
     }
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -2649,10 +2789,12 @@ mod registry_equivalence_tests {
             "validate_windows_relay_service_lifecycle" => Some(("windows", "relay")),
             "validate_windows_anchor_bundle_pull" => Some(("windows", "anchor")),
             "validate_macos_mesh_join" => Some(("macos", "client")),
-            "validate_macos_exit_nat_lifecycle"
+            "activate_macos_exit_role"
+            | "capture_macos_exit_evidence_artifacts"
+            | "validate_macos_exit_nat_lifecycle"
             | "validate_macos_exit_dns_failclosed"
             | "validate_macos_exit_killswitch_precedence"
-            | "validate_macos_ipv6_leak" => Some(("macos", "blind_exit")),
+            | "validate_macos_ipv6_leak" => Some(("macos", "exit")),
             "validate_macos_relay_service_lifecycle" => Some(("macos", "relay")),
             "validate_macos_anchor_bundle_pull" => Some(("macos", "anchor")),
             "validate_linux_exit_nat_lifecycle"
