@@ -4,6 +4,7 @@ mod anchor_init;
 mod env_file;
 mod live_lab_results;
 mod live_lab_run_matrix;
+mod live_lab_stage_registry;
 mod llm_cli;
 mod ops_cross_network_preflight;
 mod ops_cross_network_reports;

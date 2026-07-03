@@ -1219,163 +1219,42 @@ fn set_target_role_statuses(
     }
 }
 
+// The stage-classification tables that used to live here as four
+// hand-maintained match blocks are now data in `live_lab_stage_registry`
+// (the single stage vocabulary owner). The original match bodies survive
+// verbatim as oracles in this file's test module, with an equivalence test
+// pinning the registry against them for the full recorded vocabulary.
+
 fn direct_platform_stage(stage: &str) -> Option<(&'static str, &'static str)> {
-    match stage {
-        "bootstrap_windows_host" => Some(("windows", "bootstrap")),
-        "validate_windows_client_install" => Some(("windows", "baseline_runtime")),
-        "amend_membership_for_windows" | "distribute_windows_membership" => {
-            Some(("windows", "membership"))
-        }
-        "issue_windows_assignment" | "distribute_windows_assignment" => {
-            Some(("windows", "assignments"))
-        }
-        "validate_windows_mesh_join" => Some(("windows", "mixed_topology")),
-        "validate_windows_relay_service_lifecycle" => Some(("windows", "relay_service_lifecycle")),
-        "validate_windows_anchor_bundle_pull" => Some(("windows", "anchor")),
-        "promote_windows_exit_active" | "validate_windows_exit_nat_lifecycle" => {
-            Some(("windows", "exit_handoff"))
-        }
-        "validate_windows_dns_failclosed" | "validate_windows_exit_dns_failclosed" => {
-            Some(("windows", "managed_dns"))
-        }
-        "bootstrap_macos_host" => Some(("macos", "bootstrap")),
-        "collect_macos_pubkey" | "validate_macos_mesh_join" => Some(("macos", "mixed_topology")),
-        "amend_membership_for_macos" | "distribute_macos_bundles" => Some(("macos", "membership")),
-        "validate_macos_relay_service_lifecycle" => Some(("macos", "relay_service_lifecycle")),
-        "validate_macos_anchor_bundle_pull" => Some(("macos", "anchor")),
-        "capture_macos_exit_evidence_artifacts"
-        | "validate_macos_exit_nat_lifecycle"
-        | "validate_macos_ipv6_leak" => Some(("macos", "exit_handoff")),
-        "validate_macos_exit_dns_failclosed" => Some(("macos", "managed_dns")),
-        "validate_linux_relay_service_lifecycle" => Some(("linux", "relay_service_lifecycle")),
-        "validate_linux_anchor_bundle_pull" => Some(("linux", "anchor")),
-        "validate_linux_exit_nat_lifecycle"
-        | "validate_linux_ipv6_leak"
-        | "validate_linux_exit_demotion_residue" => Some(("linux", "exit_handoff")),
-        "validate_linux_dns_failclosed" | "validate_linux_exit_dns_failclosed" => {
-            Some(("linux", "managed_dns"))
-        }
-        _ => None,
-    }
+    crate::live_lab_stage_registry::direct_platform_stage(stage)
 }
 
 fn direct_platform_role(stage: &str) -> Option<(&'static str, &'static str)> {
-    match stage {
-        "validate_windows_client_install"
-        | "validate_windows_runtime_acls"
-        | "validate_windows_named_pipe_acls"
-        | "validate_windows_service_hardening"
-        | "validate_windows_key_custody" => Some(("windows", "client")),
-        "promote_windows_exit_active"
-        | "validate_windows_exit_nat_lifecycle"
-        | "validate_windows_exit_dns_failclosed"
-        | "validate_windows_exit_killswitch_precedence" => Some(("windows", "exit")),
-        "validate_windows_relay_service_lifecycle" => Some(("windows", "relay")),
-        "validate_windows_anchor_bundle_pull" => Some(("windows", "anchor")),
-        "validate_macos_mesh_join" => Some(("macos", "client")),
-        "validate_macos_exit_nat_lifecycle"
-        | "validate_macos_exit_dns_failclosed"
-        | "validate_macos_exit_killswitch_precedence"
-        | "validate_macos_ipv6_leak" => Some(("macos", "blind_exit")),
-        "validate_macos_relay_service_lifecycle" => Some(("macos", "relay")),
-        "validate_macos_anchor_bundle_pull" => Some(("macos", "anchor")),
-        "validate_linux_exit_nat_lifecycle"
-        | "validate_linux_ipv6_leak"
-        | "validate_linux_exit_demotion_residue" => Some(("linux", "exit")),
-        "validate_linux_relay_service_lifecycle" => Some(("linux", "relay")),
-        "validate_linux_anchor_bundle_pull" => Some(("linux", "anchor")),
-        _ => None,
-    }
+    crate::live_lab_stage_registry::direct_platform_role(stage)
 }
 
 fn logical_stage_name(stage: &str) -> Option<&'static str> {
-    match stage {
-        "preflight"
-        | "prepare_source_archive"
-        | "verify_ssh_reachability"
-        | "prime_remote_access"
-        | "cleanup_hosts"
-        | "bootstrap_hosts"
-        | "collect_pubkeys" => Some("bootstrap"),
-        "membership_init"
-        | "distribute_membership"
-        | "membership_setup"
-        | "distribute_membership_state" => Some("membership"),
-        "distribute_assignments" | "issue_and_distribute_assignments" => Some("assignments"),
-        "distribute_traversal" => Some("traversal"),
-        "distribute_dns_zone" => Some("managed_dns"),
-        "enforce_baseline_runtime" | "validate_baseline_runtime" => Some("baseline_runtime"),
-        "anchor_validation" | "live_anchor" => Some("anchor"),
-        "deploy_relay_service" | "relay_validation" | "live_relay" => {
-            Some("relay_service_lifecycle")
-        }
-        "exit_handoff" | "active_exit" | "live_exit_handoff" => Some("exit_handoff"),
-        "traffic_test_matrix" => Some("two_hop"),
-        "role_switch_matrix" => Some("role_switch_matrix"),
-        "live_lan_toggle" => Some("lan_toggle"),
-        "live_two_hop" => Some("two_hop"),
-        "live_role_switch_matrix" => Some("role_switch_matrix"),
-        "live_managed_dns" => Some("managed_dns"),
-        "live_mixed_topology" => Some("mixed_topology"),
-        "live_reboot_recovery" => Some("reboot_recovery"),
-        "live_secrets_not_in_logs" => Some("secrets_not_in_logs"),
-        "live_key_custody" => Some("key_custody"),
-        "live_enrollment_restart" => Some("enrollment_restart"),
-        "live_network_flap" => Some("network_flap"),
-        "extended_soak" => Some("extended_soak"),
-        "cleanup" => Some("cleanup"),
-        stage if stage.starts_with("chaos_") => Some("chaos"),
-        stage if stage.contains("reboot") => Some("reboot_recovery"),
-        _ => None,
-    }
+    crate::live_lab_stage_registry::logical_stage_name(stage)
 }
 
 fn platforms_for_stage(stage: &str, targets: &[TargetEvidence]) -> Vec<String> {
-    match stage {
-        stage if is_rust_native_stage_name(stage) => unique_platforms(targets),
-        "live_anchor" | "live_exit_handoff" => targets
+    use crate::live_lab_stage_registry::PlatformRule;
+    match crate::live_lab_stage_registry::platform_rule(stage) {
+        PlatformRule::AllPlatforms => unique_platforms(targets),
+        PlatformRule::ExitTarget => targets
             .iter()
             .find(|target| target.label == "exit")
             .map(|target| vec![target.platform.clone()])
             .unwrap_or_default(),
-        "live_relay" => relay_label(targets)
+        PlatformRule::RelayTarget => relay_label(targets)
             .and_then(|label| targets.iter().find(|target| target.label == label))
             .map(|target| vec![target.platform.clone()])
             .unwrap_or_default(),
-        "live_mixed_topology" => unique_platforms(targets),
-        stage if stage.starts_with("cross_network_") => unique_platforms(targets),
-        _ => unique_platforms(targets)
+        PlatformRule::LinuxOnly => unique_platforms(targets)
             .into_iter()
             .filter(|platform| platform == "linux")
             .collect(),
     }
-}
-
-fn is_rust_native_stage_name(stage: &str) -> bool {
-    matches!(
-        stage,
-        "preflight"
-            | "prepare_source_archive"
-            | "verify_ssh_reachability"
-            | "cleanup_hosts"
-            | "bootstrap_hosts"
-            | "collect_pubkeys"
-            | "membership_init"
-            | "distribute_membership"
-            | "anchor_validation"
-            | "distribute_assignments"
-            | "distribute_traversal"
-            | "distribute_dns_zone"
-            | "enforce_baseline_runtime"
-            | "validate_baseline_runtime"
-            | "deploy_relay_service"
-            | "relay_validation"
-            | "traffic_test_matrix"
-            | "role_switch_matrix"
-            | "exit_handoff"
-            | "active_exit"
-            | "cleanup"
-    )
 }
 
 fn unique_platforms(targets: &[TargetEvidence]) -> Vec<String> {
@@ -1400,48 +1279,8 @@ fn populate_cross_os_values(
     if platform_count < 2 && !stage.contains("windows") && !stage.contains("macos") {
         return;
     }
-    match stage {
-        "preflight"
-        | "prepare_source_archive"
-        | "verify_ssh_reachability"
-        | "cleanup_hosts"
-        | "bootstrap_hosts"
-        | "collect_pubkeys" => set_status(values, schema, "cross_os_bootstrap", status),
-        "membership_init" | "distribute_membership" => {
-            set_status(values, schema, "cross_os_membership_convergence", status)
-        }
-        "distribute_traversal" => set_status(values, schema, "cross_os_direct_path", status),
-        "live_mixed_topology" | "validate_windows_mesh_join" | "validate_macos_mesh_join" => {
-            set_status(values, schema, "cross_os_peer_visibility", status);
-        }
-        "live_exit_handoff" | "exit_handoff" | "active_exit" | "promote_windows_exit_active" => {
-            set_status(values, schema, "cross_os_exit_path", status);
-        }
-        "live_relay"
-        | "deploy_relay_service"
-        | "relay_validation"
-        | "validate_windows_relay_service_lifecycle"
-        | "validate_macos_relay_service_lifecycle" => {
-            set_status(values, schema, "cross_os_relay_path", status);
-        }
-        "live_lan_toggle" => set_status(values, schema, "cross_os_lan_toggle", status),
-        "live_role_switch_matrix" | "role_switch_matrix" => {
-            set_status(values, schema, "cross_os_role_switch", status)
-        }
-        "live_managed_dns"
-        | "distribute_dns_zone"
-        | "validate_windows_dns_failclosed"
-        | "validate_macos_exit_dns_failclosed" => {
-            set_status(values, schema, "cross_os_dns", status)
-        }
-        "traffic_test_matrix" => set_status(values, schema, "cross_os_peer_visibility", status),
-        "anchor_validation" => set_status(values, schema, "cross_os_anchor_bundle_pull", status),
-        "validate_windows_anchor_bundle_pull"
-        | "validate_macos_anchor_bundle_pull"
-        | "validate_linux_anchor_bundle_pull" => {
-            set_status(values, schema, "cross_os_anchor_bundle_pull", status);
-        }
-        _ => {}
+    if let Some(column) = crate::live_lab_stage_registry::cross_os_column(stage) {
+        set_status(values, schema, column, status);
     }
 }
 
@@ -1452,128 +1291,12 @@ fn set_special_stage_values(
     stage: &str,
     status: &str,
 ) {
+    // `platform` is retained for signature stability with historical
+    // callers; the one-off column is fully determined by the stage name.
+    let _ = platform;
     let stage = strip_node_alias_prefix(stage);
-    match stage {
-        "validate_windows_named_pipe_acls" => {
-            set_status(values, schema, "windows_named_pipe_acl", status)
-        }
-        "validate_windows_key_custody" => {
-            set_status(values, schema, "windows_dpapi_key_custody", status)
-        }
-        "validate_macos_key_custody" => {
-            set_status(values, schema, "macos_keychain_key_custody", status)
-        }
-        "validate_macos_exit_killswitch_precedence" => {
-            set_status(values, schema, "macos_pf_killswitch", status)
-        }
-        "validate_linux_membership_revoke_applies" => {
-            set_status(values, schema, "linux_membership_revoke_applies", status)
-        }
-        "validate_linux_revoked_peer_denied_e2e" => {
-            set_status(values, schema, "linux_revoked_peer_denied_e2e", status)
-        }
-        "validate_linux_membership_signature_forgery" => {
-            set_status(values, schema, "linux_membership_signature_forgery", status)
-        }
-        "validate_linux_privileged_helper_allowlist" => {
-            set_status(values, schema, "linux_privileged_helper_allowlist", status)
-        }
-        "validate_linux_policy_default_deny" => {
-            set_status(values, schema, "linux_policy_default_deny", status)
-        }
-        "validate_linux_runtime_acls" => set_status(values, schema, "linux_runtime_acls", status),
-        "validate_linux_service_hardening" => {
-            set_status(values, schema, "linux_service_hardening", status)
-        }
-        "validate_linux_authenticode" => set_status(values, schema, "linux_authenticode", status),
-        "validate_linux_key_custody" => set_status(values, schema, "linux_key_custody", status),
-        "validate_linux_membership_genesis" => {
-            set_status(values, schema, "linux_membership_genesis", status)
-        }
-        "validate_linux_mesh_status" => set_status(values, schema, "linux_mesh_status", status),
-        "validate_linux_blind_exit_reversal_denied" => {
-            set_status(values, schema, "linux_blind_exit_reversal_denied", status)
-        }
-        "validate_linux_gossip_revoked_readmit" => {
-            set_status(values, schema, "linux_gossip_revoked_readmit", status)
-        }
-        "validate_linux_enrollment_replay" => {
-            set_status(values, schema, "linux_enrollment_replay", status)
-        }
-        "validate_linux_hello_limiter_flood" => {
-            set_status(values, schema, "linux_hello_limiter_flood", status)
-        }
-        "validate_windows_membership_revoke_applies" => {
-            set_status(values, schema, "windows_membership_revoke_applies", status)
-        }
-        "validate_windows_membership_signature_forgery" => set_status(
-            values,
-            schema,
-            "windows_membership_signature_forgery",
-            status,
-        ),
-        "validate_windows_gossip_revoked_readmit" => {
-            set_status(values, schema, "windows_gossip_revoked_readmit", status)
-        }
-        "validate_windows_enrollment_replay" => {
-            set_status(values, schema, "windows_enrollment_replay", status)
-        }
-        "validate_windows_hello_limiter_flood" => {
-            set_status(values, schema, "windows_hello_limiter_flood", status)
-        }
-        "validate_macos_membership_revoke_applies" => {
-            set_status(values, schema, "macos_membership_revoke_applies", status)
-        }
-        "validate_macos_membership_signature_forgery" => {
-            set_status(values, schema, "macos_membership_signature_forgery", status)
-        }
-        "validate_macos_gossip_revoked_readmit" => {
-            set_status(values, schema, "macos_gossip_revoked_readmit", status)
-        }
-        "validate_macos_enrollment_replay" => {
-            set_status(values, schema, "macos_enrollment_replay", status)
-        }
-        "validate_macos_hello_limiter_flood" => {
-            set_status(values, schema, "macos_hello_limiter_flood", status)
-        }
-        "validate_macos_runtime_acls" => set_status(values, schema, "macos_runtime_acls", status),
-        "validate_macos_service_hardening" => {
-            set_status(values, schema, "macos_service_hardening", status)
-        }
-        "validate_macos_mesh_status" => set_status(values, schema, "macos_mesh_status", status),
-        "validate_macos_authenticode" => set_status(values, schema, "macos_authenticode", status),
-        "validate_macos_privileged_helper_allowlist" => {
-            set_status(values, schema, "macos_privileged_helper_allowlist", status)
-        }
-        "validate_macos_policy_default_deny" => {
-            set_status(values, schema, "macos_policy_default_deny", status)
-        }
-        "validate_macos_revoked_peer_denied_e2e" => {
-            set_status(values, schema, "macos_revoked_peer_denied_e2e", status)
-        }
-        "validate_macos_blind_exit_reversal_denied" => {
-            set_status(values, schema, "macos_blind_exit_reversal_denied", status)
-        }
-        "validate_windows_mesh_status" => set_status(values, schema, "windows_mesh_status", status),
-        "validate_windows_privileged_helper_allowlist" => set_status(
-            values,
-            schema,
-            "windows_privileged_helper_allowlist",
-            status,
-        ),
-        "validate_windows_policy_default_deny" => {
-            set_status(values, schema, "windows_policy_default_deny", status)
-        }
-        "validate_windows_revoked_peer_denied_e2e" => {
-            set_status(values, schema, "windows_revoked_peer_denied_e2e", status)
-        }
-        "validate_windows_blind_exit_reversal_denied" => {
-            set_status(values, schema, "windows_blind_exit_reversal_denied", status)
-        }
-        _ if stage.starts_with("validate_") => {
-            let _ = platform;
-        }
-        _ => {}
+    if let Some(column) = crate::live_lab_stage_registry::special_column(stage) {
+        set_status(values, schema, column, status);
     }
 }
 
@@ -2654,5 +2377,385 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod registry_equivalence_tests {
+    //! Pins the registry-backed classification against verbatim copies of
+    //! the four historical match tables this file used to own. If a registry
+    //! edit changes the classification of any name in the recorded
+    //! vocabulary, these tests fail — turning silent drift into a diff.
+    //!
+    //! Known, deliberate deltas (NOT covered by the oracles):
+    //!   * alias names (`distribute_windows_bundles`) — the phantom now
+    //!     resolves to `distribute_windows_membership` where the old tables
+    //!     returned None; that healing is the point of the alias table.
+
+    use super::{TargetEvidence, platforms_for_stage};
+    use crate::live_lab_stage_registry;
+
+    fn oracle_direct_platform_stage(stage: &str) -> Option<(&'static str, &'static str)> {
+        match stage {
+            "bootstrap_windows_host" => Some(("windows", "bootstrap")),
+            "validate_windows_client_install" => Some(("windows", "baseline_runtime")),
+            "amend_membership_for_windows" | "distribute_windows_membership" => {
+                Some(("windows", "membership"))
+            }
+            "issue_windows_assignment" | "distribute_windows_assignment" => {
+                Some(("windows", "assignments"))
+            }
+            "validate_windows_mesh_join" => Some(("windows", "mixed_topology")),
+            "validate_windows_relay_service_lifecycle" => {
+                Some(("windows", "relay_service_lifecycle"))
+            }
+            "validate_windows_anchor_bundle_pull" => Some(("windows", "anchor")),
+            "promote_windows_exit_active" | "validate_windows_exit_nat_lifecycle" => {
+                Some(("windows", "exit_handoff"))
+            }
+            "validate_windows_dns_failclosed" | "validate_windows_exit_dns_failclosed" => {
+                Some(("windows", "managed_dns"))
+            }
+            "bootstrap_macos_host" => Some(("macos", "bootstrap")),
+            "collect_macos_pubkey" | "validate_macos_mesh_join" => {
+                Some(("macos", "mixed_topology"))
+            }
+            "amend_membership_for_macos" | "distribute_macos_bundles" => {
+                Some(("macos", "membership"))
+            }
+            "validate_macos_relay_service_lifecycle" => Some(("macos", "relay_service_lifecycle")),
+            "validate_macos_anchor_bundle_pull" => Some(("macos", "anchor")),
+            "capture_macos_exit_evidence_artifacts"
+            | "validate_macos_exit_nat_lifecycle"
+            | "validate_macos_ipv6_leak" => Some(("macos", "exit_handoff")),
+            "validate_macos_exit_dns_failclosed" => Some(("macos", "managed_dns")),
+            "validate_linux_relay_service_lifecycle" => Some(("linux", "relay_service_lifecycle")),
+            "validate_linux_anchor_bundle_pull" => Some(("linux", "anchor")),
+            "validate_linux_exit_nat_lifecycle"
+            | "validate_linux_ipv6_leak"
+            | "validate_linux_exit_demotion_residue" => Some(("linux", "exit_handoff")),
+            "validate_linux_dns_failclosed" | "validate_linux_exit_dns_failclosed" => {
+                Some(("linux", "managed_dns"))
+            }
+            _ => None,
+        }
+    }
+
+    fn oracle_direct_platform_role(stage: &str) -> Option<(&'static str, &'static str)> {
+        match stage {
+            "validate_windows_client_install"
+            | "validate_windows_runtime_acls"
+            | "validate_windows_named_pipe_acls"
+            | "validate_windows_service_hardening"
+            | "validate_windows_key_custody" => Some(("windows", "client")),
+            "promote_windows_exit_active"
+            | "validate_windows_exit_nat_lifecycle"
+            | "validate_windows_exit_dns_failclosed"
+            | "validate_windows_exit_killswitch_precedence" => Some(("windows", "exit")),
+            "validate_windows_relay_service_lifecycle" => Some(("windows", "relay")),
+            "validate_windows_anchor_bundle_pull" => Some(("windows", "anchor")),
+            "validate_macos_mesh_join" => Some(("macos", "client")),
+            "validate_macos_exit_nat_lifecycle"
+            | "validate_macos_exit_dns_failclosed"
+            | "validate_macos_exit_killswitch_precedence"
+            | "validate_macos_ipv6_leak" => Some(("macos", "blind_exit")),
+            "validate_macos_relay_service_lifecycle" => Some(("macos", "relay")),
+            "validate_macos_anchor_bundle_pull" => Some(("macos", "anchor")),
+            "validate_linux_exit_nat_lifecycle"
+            | "validate_linux_ipv6_leak"
+            | "validate_linux_exit_demotion_residue" => Some(("linux", "exit")),
+            "validate_linux_relay_service_lifecycle" => Some(("linux", "relay")),
+            "validate_linux_anchor_bundle_pull" => Some(("linux", "anchor")),
+            _ => None,
+        }
+    }
+
+    fn oracle_logical_stage_name(stage: &str) -> Option<&'static str> {
+        match stage {
+            "preflight"
+            | "prepare_source_archive"
+            | "verify_ssh_reachability"
+            | "prime_remote_access"
+            | "cleanup_hosts"
+            | "bootstrap_hosts"
+            | "collect_pubkeys" => Some("bootstrap"),
+            "membership_init"
+            | "distribute_membership"
+            | "membership_setup"
+            | "distribute_membership_state" => Some("membership"),
+            "distribute_assignments" | "issue_and_distribute_assignments" => Some("assignments"),
+            "distribute_traversal" => Some("traversal"),
+            "distribute_dns_zone" => Some("managed_dns"),
+            "enforce_baseline_runtime" | "validate_baseline_runtime" => Some("baseline_runtime"),
+            "anchor_validation" | "live_anchor" => Some("anchor"),
+            "deploy_relay_service" | "relay_validation" | "live_relay" => {
+                Some("relay_service_lifecycle")
+            }
+            "exit_handoff" | "active_exit" | "live_exit_handoff" => Some("exit_handoff"),
+            "traffic_test_matrix" => Some("two_hop"),
+            "role_switch_matrix" => Some("role_switch_matrix"),
+            "live_lan_toggle" => Some("lan_toggle"),
+            "live_two_hop" => Some("two_hop"),
+            "live_role_switch_matrix" => Some("role_switch_matrix"),
+            "live_managed_dns" => Some("managed_dns"),
+            "live_mixed_topology" => Some("mixed_topology"),
+            "live_reboot_recovery" => Some("reboot_recovery"),
+            "live_secrets_not_in_logs" => Some("secrets_not_in_logs"),
+            "live_key_custody" => Some("key_custody"),
+            "live_enrollment_restart" => Some("enrollment_restart"),
+            "live_network_flap" => Some("network_flap"),
+            "extended_soak" => Some("extended_soak"),
+            "cleanup" => Some("cleanup"),
+            stage if stage.starts_with("chaos_") => Some("chaos"),
+            stage if stage.contains("reboot") => Some("reboot_recovery"),
+            _ => None,
+        }
+    }
+
+    fn oracle_is_rust_native(stage: &str) -> bool {
+        matches!(
+            stage,
+            "preflight"
+                | "prepare_source_archive"
+                | "verify_ssh_reachability"
+                | "cleanup_hosts"
+                | "bootstrap_hosts"
+                | "collect_pubkeys"
+                | "membership_init"
+                | "distribute_membership"
+                | "anchor_validation"
+                | "distribute_assignments"
+                | "distribute_traversal"
+                | "distribute_dns_zone"
+                | "enforce_baseline_runtime"
+                | "validate_baseline_runtime"
+                | "deploy_relay_service"
+                | "relay_validation"
+                | "traffic_test_matrix"
+                | "role_switch_matrix"
+                | "exit_handoff"
+                | "active_exit"
+                | "cleanup"
+        )
+    }
+
+    fn oracle_cross_os_column(stage: &str) -> Option<&'static str> {
+        match stage {
+            "preflight"
+            | "prepare_source_archive"
+            | "verify_ssh_reachability"
+            | "cleanup_hosts"
+            | "bootstrap_hosts"
+            | "collect_pubkeys" => Some("cross_os_bootstrap"),
+            "membership_init" | "distribute_membership" => Some("cross_os_membership_convergence"),
+            "distribute_traversal" => Some("cross_os_direct_path"),
+            "live_mixed_topology" | "validate_windows_mesh_join" | "validate_macos_mesh_join" => {
+                Some("cross_os_peer_visibility")
+            }
+            "live_exit_handoff"
+            | "exit_handoff"
+            | "active_exit"
+            | "promote_windows_exit_active" => Some("cross_os_exit_path"),
+            "live_relay"
+            | "deploy_relay_service"
+            | "relay_validation"
+            | "validate_windows_relay_service_lifecycle"
+            | "validate_macos_relay_service_lifecycle" => Some("cross_os_relay_path"),
+            "live_lan_toggle" => Some("cross_os_lan_toggle"),
+            "live_role_switch_matrix" | "role_switch_matrix" => Some("cross_os_role_switch"),
+            "live_managed_dns"
+            | "distribute_dns_zone"
+            | "validate_windows_dns_failclosed"
+            | "validate_macos_exit_dns_failclosed" => Some("cross_os_dns"),
+            "traffic_test_matrix" => Some("cross_os_peer_visibility"),
+            "anchor_validation" => Some("cross_os_anchor_bundle_pull"),
+            "validate_windows_anchor_bundle_pull"
+            | "validate_macos_anchor_bundle_pull"
+            | "validate_linux_anchor_bundle_pull" => Some("cross_os_anchor_bundle_pull"),
+            _ => None,
+        }
+    }
+
+    fn oracle_special_column(stage: &str) -> Option<&'static str> {
+        match stage {
+            "validate_windows_named_pipe_acls" => Some("windows_named_pipe_acl"),
+            "validate_windows_key_custody" => Some("windows_dpapi_key_custody"),
+            "validate_macos_key_custody" => Some("macos_keychain_key_custody"),
+            "validate_macos_exit_killswitch_precedence" => Some("macos_pf_killswitch"),
+            "validate_linux_membership_revoke_applies" => Some("linux_membership_revoke_applies"),
+            "validate_linux_revoked_peer_denied_e2e" => Some("linux_revoked_peer_denied_e2e"),
+            "validate_linux_membership_signature_forgery" => {
+                Some("linux_membership_signature_forgery")
+            }
+            "validate_linux_privileged_helper_allowlist" => {
+                Some("linux_privileged_helper_allowlist")
+            }
+            "validate_linux_policy_default_deny" => Some("linux_policy_default_deny"),
+            "validate_linux_runtime_acls" => Some("linux_runtime_acls"),
+            "validate_linux_service_hardening" => Some("linux_service_hardening"),
+            "validate_linux_authenticode" => Some("linux_authenticode"),
+            "validate_linux_key_custody" => Some("linux_key_custody"),
+            "validate_linux_membership_genesis" => Some("linux_membership_genesis"),
+            "validate_linux_mesh_status" => Some("linux_mesh_status"),
+            "validate_linux_blind_exit_reversal_denied" => Some("linux_blind_exit_reversal_denied"),
+            "validate_linux_gossip_revoked_readmit" => Some("linux_gossip_revoked_readmit"),
+            "validate_linux_enrollment_replay" => Some("linux_enrollment_replay"),
+            "validate_linux_hello_limiter_flood" => Some("linux_hello_limiter_flood"),
+            "validate_windows_membership_revoke_applies" => {
+                Some("windows_membership_revoke_applies")
+            }
+            "validate_windows_membership_signature_forgery" => {
+                Some("windows_membership_signature_forgery")
+            }
+            "validate_windows_gossip_revoked_readmit" => Some("windows_gossip_revoked_readmit"),
+            "validate_windows_enrollment_replay" => Some("windows_enrollment_replay"),
+            "validate_windows_hello_limiter_flood" => Some("windows_hello_limiter_flood"),
+            "validate_macos_membership_revoke_applies" => Some("macos_membership_revoke_applies"),
+            "validate_macos_membership_signature_forgery" => {
+                Some("macos_membership_signature_forgery")
+            }
+            "validate_macos_gossip_revoked_readmit" => Some("macos_gossip_revoked_readmit"),
+            "validate_macos_enrollment_replay" => Some("macos_enrollment_replay"),
+            "validate_macos_hello_limiter_flood" => Some("macos_hello_limiter_flood"),
+            "validate_macos_runtime_acls" => Some("macos_runtime_acls"),
+            "validate_macos_service_hardening" => Some("macos_service_hardening"),
+            "validate_macos_mesh_status" => Some("macos_mesh_status"),
+            "validate_macos_authenticode" => Some("macos_authenticode"),
+            "validate_macos_privileged_helper_allowlist" => {
+                Some("macos_privileged_helper_allowlist")
+            }
+            "validate_macos_policy_default_deny" => Some("macos_policy_default_deny"),
+            "validate_macos_revoked_peer_denied_e2e" => Some("macos_revoked_peer_denied_e2e"),
+            "validate_macos_blind_exit_reversal_denied" => Some("macos_blind_exit_reversal_denied"),
+            "validate_windows_mesh_status" => Some("windows_mesh_status"),
+            "validate_windows_privileged_helper_allowlist" => {
+                Some("windows_privileged_helper_allowlist")
+            }
+            "validate_windows_policy_default_deny" => Some("windows_policy_default_deny"),
+            "validate_windows_revoked_peer_denied_e2e" => Some("windows_revoked_peer_denied_e2e"),
+            "validate_windows_blind_exit_reversal_denied" => {
+                Some("windows_blind_exit_reversal_denied")
+            }
+            _ => None,
+        }
+    }
+
+    /// Every canonical registry name plus the historical prefix/fallback
+    /// cases and a set of unknowns. Aliases are deliberately excluded (see
+    /// module doc).
+    fn probe_names() -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = live_lab_stage_registry::all_stage_names().collect();
+        names.extend([
+            "chaos_totally_new_scenario",
+            "post_upgrade_reboot_check",
+            "cross_network_vxlan_ssh_e2e",
+            "no_such_stage_ever",
+            "debian-headless-1::validate_linux_hello_limiter_flood",
+            "debian-headless-4::validate_linux_blind_exit_dataplane",
+        ]);
+        names
+    }
+
+    #[test]
+    fn registry_matches_historical_direct_platform_stage() {
+        for name in probe_names() {
+            let bare = name.rsplit("::").next().unwrap_or(name);
+            assert_eq!(
+                super::direct_platform_stage(bare),
+                oracle_direct_platform_stage(bare),
+                "direct_platform_stage diverged for {bare}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_matches_historical_direct_platform_role() {
+        for name in probe_names() {
+            let bare = name.rsplit("::").next().unwrap_or(name);
+            assert_eq!(
+                super::direct_platform_role(bare),
+                oracle_direct_platform_role(bare),
+                "direct_platform_role diverged for {bare}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_matches_historical_logical_stage_name() {
+        for name in probe_names() {
+            let bare = name.rsplit("::").next().unwrap_or(name);
+            assert_eq!(
+                super::logical_stage_name(bare),
+                oracle_logical_stage_name(bare),
+                "logical_stage_name diverged for {bare}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_matches_historical_rust_native_and_cross_os_and_special() {
+        for name in probe_names() {
+            let bare = name.rsplit("::").next().unwrap_or(name);
+            assert_eq!(
+                live_lab_stage_registry::is_rust_native_stage_name(bare),
+                oracle_is_rust_native(bare),
+                "is_rust_native diverged for {bare}"
+            );
+            assert_eq!(
+                live_lab_stage_registry::cross_os_column(bare),
+                oracle_cross_os_column(bare),
+                "cross_os_column diverged for {bare}"
+            );
+            assert_eq!(
+                live_lab_stage_registry::special_column(bare),
+                oracle_special_column(bare),
+                "special_column diverged for {bare}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_matches_historical_platform_resolution() {
+        fn target(label: &str, platform: &str) -> TargetEvidence {
+            TargetEvidence {
+                label: label.to_owned(),
+                target: format!("{label}@10.0.0.1"),
+                alias: label.to_owned(),
+                platform: platform.to_owned(),
+                node_id: format!("node-{label}"),
+                bootstrap_role: label.to_owned(),
+            }
+        }
+        // `relay_label` elects "entry" (or "aux") as the relay target, so
+        // the fixture uses the real label vocabulary.
+        let mixed = vec![
+            target("admin", "linux"),
+            target("exit", "macos"),
+            target("entry", "windows"),
+            target("client", "linux"),
+        ];
+        for name in probe_names() {
+            let bare = name.rsplit("::").next().unwrap_or(name);
+            let expected: Vec<String> = if oracle_is_rust_native(bare) {
+                vec!["linux".into(), "macos".into(), "windows".into()]
+            } else {
+                match bare {
+                    "live_anchor" | "live_exit_handoff" => vec!["macos".into()],
+                    "live_relay" => vec!["windows".into()],
+                    "live_mixed_topology" => {
+                        vec!["linux".into(), "macos".into(), "windows".into()]
+                    }
+                    _ if bare.starts_with("cross_network_") => {
+                        vec!["linux".into(), "macos".into(), "windows".into()]
+                    }
+                    _ => vec!["linux".into()],
+                }
+            };
+            assert_eq!(
+                platforms_for_stage(bare, &mixed),
+                expected,
+                "platforms_for_stage diverged for {bare}"
+            );
+        }
     }
 }
