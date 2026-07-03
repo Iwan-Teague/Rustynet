@@ -8128,6 +8128,30 @@ kill_background_workers() {
   fi
 }
 
+# Finding 1B (live-lab findings 2026-07-03): emit the run-scoped stage
+# manifest so downstream consumers (monitor, recorder, CSV appender) read
+# the resolved plan from the report dir instead of hand-copied catalogs.
+# The Rust wrapper emits it with full selector fidelity before launching
+# this script, so this is a no-op under the wrapper; standalone runs emit
+# with the selectors bash knows (exit/relay platform, chaos). Best-effort:
+# a manifest failure must never block a lab run.
+emit_stage_manifest_best_effort() {
+  if [[ -f "${REPORT_DIR}/orchestration/stage_manifest.json" ]]; then
+    return 0
+  fi
+  local _args=(--report-dir "$REPORT_DIR" --run-command live-linux-lab-orchestrator)
+  if [[ "${EXIT_PLATFORM:-}" == "macos" || "${RELAY_PLATFORM:-}" == "macos" ]]; then
+    _args+=(--macos)
+  fi
+  if [[ "${EXIT_PLATFORM:-}" == "windows" || "${RELAY_PLATFORM:-}" == "windows" ]]; then
+    _args+=(--windows)
+  fi
+  [[ -n "${EXIT_PLATFORM:-}" ]] && _args+=(--exit-platform "$EXIT_PLATFORM")
+  [[ -n "${RELAY_PLATFORM:-}" ]] && _args+=(--relay-platform "$RELAY_PLATFORM")
+  [[ "${ENABLE_CHAOS_SUITE:-0}" -eq 1 ]] && _args+=(--chaos-suite)
+  cargo run --quiet -p rustynet-cli -- ops emit-stage-manifest "${_args[@]}" >/dev/null 2>&1 || true
+}
+
 orchestrator_cleanup() {
   kill_background_workers
   cleanup_local_password_files
@@ -8418,6 +8442,7 @@ main() {
   build_nodes_file
   refresh_failure_digest
   validate_topology_inputs
+  emit_stage_manifest_best_effort
   validate_source_mode
   validate_positive_integer "traversal TTL seconds" "$TRAVERSAL_TTL_SECS"
   validate_positive_integer "cross-network max time skew seconds" "$CROSS_NETWORK_MAX_TIME_SKEW_SECS"

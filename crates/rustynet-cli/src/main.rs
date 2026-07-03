@@ -4,6 +4,7 @@ mod anchor_init;
 mod env_file;
 mod live_lab_results;
 mod live_lab_run_matrix;
+mod live_lab_stage_manifest;
 mod live_lab_stage_registry;
 mod llm_cli;
 mod ops_cross_network_preflight;
@@ -1197,6 +1198,9 @@ enum OpsCommand {
     },
     DiffRunSummaries {
         config: ops_live_lab_orchestrator::DiffRunSummariesConfig,
+    },
+    EmitStageManifest {
+        config: live_lab_stage_manifest::EmitStageManifestConfig,
     },
     AppendOrchestratorRunToMatrix {
         config: live_lab_run_matrix::AppendOrchestratorRunToMatrixConfig,
@@ -4685,6 +4689,27 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 run_b: parser.required_path("--run-b")?,
             },
         }),
+        "emit-stage-manifest" => Ok(OpsCommand::EmitStageManifest {
+            config: live_lab_stage_manifest::EmitStageManifestConfig {
+                report_dir: parser.required_path("--report-dir")?,
+                run_command: parser
+                    .value("--run-command")
+                    .unwrap_or_else(|| "live-linux-lab-orchestrator".to_owned()),
+                selectors: live_lab_stage_registry::TargetSelectors {
+                    wants_macos: parser.has_flag("--macos"),
+                    wants_windows: parser.has_flag("--windows"),
+                    macos_promote_exit: parser.has_flag("--macos-promote-exit"),
+                    exit_platform: parser.value("--exit-platform").unwrap_or_default(),
+                    relay_platform: parser.value("--relay-platform").unwrap_or_default(),
+                    anchor_platform: parser.value("--anchor-platform").unwrap_or_default(),
+                    admin_platform: parser.value("--admin-platform").unwrap_or_default(),
+                    blind_exit_platform: parser.value("--blind-exit-platform").unwrap_or_default(),
+                    skip_linux_live_suite: parser.has_flag("--skip-linux-live-suite"),
+                    chaos_suite: parser.has_flag("--chaos-suite"),
+                    cross_network_suite: parser.has_flag("--cross-network-suite"),
+                },
+            },
+        }),
         "append-orchestrator-run-to-matrix" => Ok(OpsCommand::AppendOrchestratorRunToMatrix {
             config: live_lab_run_matrix::AppendOrchestratorRunToMatrixConfig {
                 report_dir: parser.required_path("--report-dir")?,
@@ -7692,6 +7717,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
                 print!("{s}");
                 String::new()
             })
+        }
+        OpsCommand::EmitStageManifest { config } => {
+            live_lab_stage_manifest::execute_ops_emit_stage_manifest(config)
         }
         OpsCommand::AppendOrchestratorRunToMatrix { config } => {
             live_lab_run_matrix::execute_ops_append_orchestrator_run_to_matrix(config)
