@@ -24,7 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::env_file::{format_env_assignment, parse_env_value};
 use crate::live_lab_results::{LiveLabWorkerResult, read_parallel_stage_results};
 use crate::live_lab_run_matrix::{
-    LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome, append_live_lab_run_matrix_row,
+    LiveLabRunMatrixAppendConfig, LiveLabRunMatrixRowRole, LiveLabRunMatrixStageOutcome,
+    append_live_lab_run_matrix_row,
 };
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -7109,6 +7110,9 @@ fn execute_rust_native_orchestration(
         inventory_path: Some(inventory_path.as_path()),
         extra_stage_outcomes: matrix_outcomes.as_slice(),
         notes: None,
+        // Outermost supervisor: complete record incl. sidecar outcomes —
+        // replaces the bash trap's interim row for the same run key.
+        row_role: LiveLabRunMatrixRowRole::Final,
     }) {
         Ok(result) => {
             let _ = writeln!(
@@ -24564,6 +24568,8 @@ fn append_live_lab_run_matrix_for_command(
         inventory_path,
         extra_stage_outcomes: matrix_outcomes.as_slice(),
         notes: None,
+        // Focused wrappers are single-writer runs: their one row is final.
+        row_role: LiveLabRunMatrixRowRole::Final,
     })
     .map(|result| result.report_row_path)
 }
