@@ -18,18 +18,17 @@ program and to **concurrent Windows+macOS** runs.
 
 ## 0. TL;DR
 
-- **What's left (mac/win):** of 7 roles × 2 OS, the genuine remaining work is **~7
-  implementable cells + 1 design doc + 1 small infra fix**. Two cells are
-  hard-blocked (Windows exit on the lab guest's missing WinNAT stack; relay live
-  forwarding on the HP-3 transport item) and one is **out of scope by design**
-  (Windows blind_exit). The rest is mostly *authoring live-lab stages that
-  fail loud*, not new runtime code.
-- **Ordered program (after the now-live-proven anchor bundle-pull cells):** macOS admin → Windows
-  admin → macOS blind_exit → ✅ **macOS blind_exit DONE 2026-06-29** → cross-OS
+- **What's left (mac/win):** of 7 roles × 2 OS, the genuine remaining work is now
+  concentrated in cross-OS role transitions, anchor sub-surfaces beyond
+  bundle-pull, Windows relay forwarding, and Windows exit lab enablement. Windows
+  exit remains blocked on the lab guest's missing WinNAT stack, relay live
+  forwarding remains HP-3-gated, and Windows blind_exit is out of scope by
+  design.
+- **Ordered program (after the now-live-proven anchor bundle-pull, admin,
+  macOS exit, macOS relay-lifecycle, and macOS blind_exit cells):** cross-OS
   role transitions (design doc at `CrossOsRoleSwitchPlan_2026-06-24.md`) →
-  remaining anchor sub-surfaces beyond bundle-pull. (macOS relay *live lifecycle* is **DONE** — see §1
-  matrix flip. Relay forwarding and Windows exit/blind_exit remain explicitly
-  parked with reasons.)
+  remaining anchor sub-surfaces beyond bundle-pull. Relay forwarding and Windows
+  exit/blind_exit remain explicitly parked with reasons.
 - **Pipeline:** run a **Windows lab and a macOS lab simultaneously** on disjoint
   Debian backbones, iterate each role with **standalone SSH wrappers** against an
   already-warm guest (seconds, no 9-min bootstrap), and **write the next cell's code
@@ -59,16 +58,16 @@ untested/not implemented · 🔒 blocked):
 | Role | Linux | macOS | Windows |
 |---|---|---|---|
 | client | ✅ | ✅ | ✅ (active client traffic pending cross-OS run) |
-| admin (mint/issue signed bundles) | ✅ | ❌ *(see §4 — "self-mint disabled" framing is **stale**, not a posture)* | ❌ (trust keygen works; live issuing untested) |
+| admin (mint/issue signed bundles) | ✅ | ✅ **LIVE-PROVEN** (refresh run `labrun-1783089250895-6139-0`, commit `831d41d`, `validate_macos_admin_issue` PASS: signed assignment issue, local verify, rollback/tamper reject, Linux peer verify-before-apply accept/reject) | ✅ **LIVE-PROVEN 2026-06-27** (`validate_windows_admin_issue` PASS, run `livelab-1782526081`) |
 | anchor (gossip/bundle-pull/enrollment) | ✅ | ✅ **bundle-pull LIVE-PROVEN 2026-06-22** (`validate_macos_anchor_bundle_pull` PASS; gossip/enrollment remain tracked separately) | ✅ **bundle-pull LIVE-PROVEN 2026-07-03** (`validate_windows_anchor_bundle_pull` PASS, run `labrun-1783079551578-32671-0`, commit `786f900`; loopback byte-for-byte + token gate + LAN refused + secrets hygiene; gossip/enrollment remain tracked separately) |
-| exit (NAT egress + killswitch) | ✅ | 🟡 implemented — needs a green live run | 🟡 implemented but **🔒 lab guest lacks WinNAT/`MSFT_NetNat`** |
+| exit (NAT egress + killswitch) | ✅ | ✅ **LIVE-PROVEN 2026-07-03** (`labrun-1783087254263-11121-0`, commit `039f215`: activation, NAT lifecycle, DNS fail-closed, service hardening, mesh-status) | 🟡 implemented but **🔒 lab guest lacks WinNAT/`MSFT_NetNat`** |
 | blind_exit (irreversible exit) | ✅ | ✅ **LIVE-PROVEN 2026-06-29** (run `labrun-1782770042330-16244-0`, `--blind-exit-platform macos`): `validate_macos_blind_exit` PASS — irreversible transition applied, pf anchor hardened (9 rules, no route-to/reply-to/dup-to), immutability gate enforced | 🚫 **blocked by design** (`main.rs:11768` hard-errors; macOS/Linux only) |
 | relay (live session forwarding) | ✅ *(lifecycle only — no live forwarding proof anywhere; see §4)* | ✅ **lifecycle LIVE-PROVEN 2026-06-27** (run `livelab-1782571161`, `validate_macos_relay_service_lifecycle` PASS). **Live session forwarding remains HP-3-gated** (same cross-OS gate as Linux ✅). | 🟠 SCM lifecycle contract only |
-| live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | ❌ | ❌ (banked design file is **missing**) |
+| live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | ❌ stage unbuilt | ❌ stage unbuilt (design doc exists: `CrossOsRoleSwitchPlan_2026-06-24.md`) |
 
-**Three corrections this roadmap makes to the matrix (apply when landing each cell):**
-1. macOS **admin** is in-scope and unblocked — the "self-mint deliberately disabled"
-   note has **no backing** in code or `SecurityMinimumBar` (§4). Re-label as 🟡-ready.
+**Three corrections this roadmap has made to the matrix:**
+1. macOS **admin** is live-proven; the "self-mint deliberately disabled" note had
+   no backing in code or `SecurityMinimumBar` (§4).
 2. **Windows blind_exit** is not a gap to close — it is an intentional platform
    exclusion (`main.rs:11768`). Re-label ❌ → 🚫 (out of scope, like mobile clients).
 3. macOS **blind_exit** is now ✅ Live-Proven (2026-06-29, run `labrun-1782770042330-16244-0`); cell 3 closed.
@@ -83,21 +82,22 @@ dry-run had masked). "Live stage" = author a fail-loud stage per §7.
 
 | # | Cell | Status | What's needed | Effort | Gating |
 |---|---|---|---|---|---|
-| — | macOS anchor | 🟡 landing | confirm live (not dry-run-fallback) PASS, fold in fail-loud fix, push | in flight | — |
-| 1 | **macOS admin** | ❌→ready | live stage only (issuing path is platform-neutral; keychain custody exists) | ~0.5–1 d | none |
-| 2 | **Windows admin** | ❌→ready | live stage only (DPAPI custody exists) | ~0.5–1 d | none |
+| — | macOS anchor | ✅ DONE for bundle-pull | live-proven 2026-06-22; remaining gossip/enrollment/port-map sub-surfaces stay separate | — | — |
+| 1 | **macOS admin** | ✅ DONE | refresh proof: `labrun-1783089250895-6139-0`, `831d41d`, `validate_macos_admin_issue` PASS | — | — |
+| 2 | **Windows admin** | ✅ DONE | live-proven 2026-06-27: `validate_windows_admin_issue` PASS, run `livelab-1782526081` | — | — |
 | 3 | **macOS blind_exit** | ✅ DONE (2026-06-29) | live-proven: `labrun-1782770042330-16244-0`, `ed3ed7e` | — | — |
-| 4 | **Role transitions (macOS→Windows)** | ❌ | **design doc** (`CrossOsRoleSwitchPlan_2026-06-24.md`, authored 2026-06-24), then a stage that drives a real flip and re-applies signed state via `refresh_signed_state_with_reason` | ~2–4 d | needs admin (#1/#2) |
-| 5 | macOS **exit** | 🟡 | just a green run with `--exit-platform macos` (no code) | ~hours | none |
+| 4 | **Role transitions (macOS→Windows)** | ❌ | stage that drives a real flip and re-applies signed state via `refresh_signed_state_with_reason`; design exists in `CrossOsRoleSwitchPlan_2026-06-24.md` | ~2–4 d | admin cells done |
+| 5 | macOS **exit** | ✅ DONE | live-proven 2026-07-03 by `labrun-1783087254263-11121-0` on `039f215` | — | — |
 | 6 | macOS **relay** *live lifecycle* | ✅ **DONE** (2026-06-27) | ✅ live lifecycle proven: `validate_macos_relay_service_lifecycle` PASS (run `livelab-1782571161`). **Forwarding proof remains HP-3-gated, same as Linux.** | — | — |
 | 7 | Windows **anchor** live + macOS **anchor** live | ✅ DONE for bundle-pull | macOS bundle-pull live-proven 2026-06-22; Windows bundle-pull live-proven 2026-07-03 via `labrun-1783079551578-32671-0` on `786f900`; remaining gossip/enrollment anchor sub-surfaces stay separate | — | — |
 | 🔒 | Windows **relay** forwarding | 🟠 | nothing to author until a Linux live two-peer forwarding stage exists | — | **HP-3** (`MasterWorkPlan` HP-3 — "most substantial remaining code item"; weeks) |
 | 🔒 | Windows **exit** | 🟡 | code done (`promote_windows_exit_active`); needs a WinNAT-capable guest | — | lab env (`MSFT_NetNat` absent) |
 | 🚫 | Windows **blind_exit** | — | out of scope by design (`main.rs:11768`) | — | n/a |
 
-**Bottom line:** ~5–8 focused days of implementable parity work (cells 1–5 + 7; cell 6
-macOS relay lifecycle is **DONE**), gated behind HP-3 only for *relay live forwarding*
-and behind a lab-env fix for *Windows exit*. Plus ~1 day of small enabling infra (§8.3, §11).
+**Bottom line:** remaining implementable parity work is now role-transition stage
+implementation plus explicit anchor gossip/enrollment/port-map live proof. Relay
+forwarding stays HP-3-gated, and Windows exit stays blocked by the lab guest's
+missing WinNAT/HNS stack.
 
 ---
 
@@ -210,10 +210,11 @@ from selector/optional skips):
 
 | # | Cell | Why this rank |
 |---|---|---|
-| 1 | **macOS admin** | closes a ❌ with a pure live-stage add, no new dataplane; framing-stale unblock |
-| 2 | **Windows admin** | same platform-neutral issuing code; DPAPI custody exists |
-| 3 | **macOS blind_exit** | runtime exists; only the live stage missing; safe on disposable guest; run last |
-| 4 | **Role transitions (macOS→Windows)** | reuses `refresh_signed_state_with_reason`; depends on admin; needs design doc |
+| 1 | **Role transitions (macOS→Windows)** | reuses `refresh_signed_state_with_reason`; admin prerequisites are now live-proven; design exists, stage remains |
+| 2 | **Remaining anchor sub-surfaces** | bundle-pull is live-proven on macOS/Windows; gossip/enrollment/port-map still need explicit live proof |
+| ✅ | **macOS admin** | DONE: `labrun-1783089250895-6139-0`, commit `831d41d`, `validate_macos_admin_issue` PASS |
+| ✅ | **Windows admin** | DONE: `livelab-1782526081`, `validate_windows_admin_issue` PASS |
+| ✅ | **macOS blind_exit** | DONE: live-proven 2026-06-29 |
 | 5 | **macOS relay live lifecycle** | ✅ **DONE** (live-proven 2026-06-27); forwarding stays HP-3-gated |
 | 6 | **Windows + macOS anchor bundle-pull live** | ✅ **DONE** (macOS 2026-06-22; Windows 2026-07-03 `labrun-1783079551578-32671-0`); remaining anchor gossip/enrollment/port-map proof is separate |
 | 🔒 | Windows relay forwarding | blocked on HP-3 (no live forwarding proof anywhere) |
@@ -222,9 +223,9 @@ from selector/optional skips):
 
 ---
 
-## 6. First three implementable cells — file-by-file
+## 6. First three implemented cells — file-by-file
 
-### Cell 1 — macOS admin (mint/issue signed bundle, live)
+### Cell 1 — macOS admin (mint/issue signed bundle, live) — DONE
 - **Runtime:** none new. Reuse the platform-neutral issuing verbs
   (`e2e-issue-assignment-bundles-from-env` / `assignment issue`,
   `main.rs:4500-4519,5552`) + keychain custody (`macos_key_custody.rs`). Confirm
@@ -256,7 +257,7 @@ from selector/optional skips):
     --source-mode working-tree
   ```
 
-### Cell 2 — Windows admin (mint/issue signed bundle, live)
+### Cell 2 — Windows admin (mint/issue signed bundle, live) — DONE
 - **Runtime:** none new — same issuing verbs; DPAPI custody exists
   (`windows_key_custody.rs`).
 - **Live stage** in `run_windows_orchestration_stages_with_options` (`vm_lab/mod.rs:9851`):
@@ -272,7 +273,7 @@ from selector/optional skips):
 - **Lab command:** as Cell 1 but `--windows-vm windows-utm-1 --admin-platform windows`
   (drop `--macos-vm`).
 
-### Cell 3 — macOS blind_exit (irreversible exit, live, run last)
+### Cell 3 — macOS blind_exit (irreversible exit, live, run last) — DONE
 - **Runtime:** already present (`macos_blind_exit.rs`,
   `build/evaluate_macos_blind_exit_pf_rules`, wired `phase10.rs:2457,2653,2967`); gate
   enforced (`role_cli.rs:199,220-224,355`).

@@ -41,7 +41,7 @@ pub fn summarize_stage_lines(
 
     let log_path = report_dir.join("logs").join(format!("{stage}.log"));
     let raw = tail_lines(&log_path, 250)?;
-    let summarized = summarize_raw_lines(stage, &raw);
+    let summarized = summarize_raw_lines(&raw);
     if summarized.is_empty() {
         Ok(raw.into_iter().take(80).collect())
     } else {
@@ -147,7 +147,7 @@ fn summarize_worker_log(stage: &str, label: &str, raw: &str) -> String {
     format!("{} running on {}", human_stage(stage), label)
 }
 
-fn summarize_raw_lines(stage: &str, raw: &[String]) -> Vec<String> {
+fn summarize_raw_lines(raw: &[String]) -> Vec<String> {
     let mut summaries = Vec::new();
     let compile_count = raw
         .iter()
@@ -182,10 +182,18 @@ fn summarize_raw_lines(stage: &str, raw: &[String]) -> Vec<String> {
         }
     }
 
-    if summaries.is_empty() && !raw.is_empty() {
-        summaries.push(format!("{} is running", human_stage(stage)));
-    }
-
+    // Deliberately no "stage is running" fallback here: a stage's log file
+    // is only ever written once its remote command returns (there is no
+    // partial/live write path), so non-empty content always means the
+    // stage is DONE -- even when its own output format (a raw JSON result
+    // blob from the tier 1-4 audit stages, or a single plain-text
+    // completion sentence like "macOS host bootstrapped") doesn't contain
+    // any of the keywords matched above. Claiming "is running" here was
+    // always wrong for this case, and could sit on screen long after a run
+    // had actually finished (nothing re-summarizes it once idle). Leaving
+    // `summaries` empty here falls through to `summarize_stage_lines`'s own
+    // raw-content fallback, which shows the real completion message instead
+    // of a misleading placeholder.
     summaries.sort();
     summaries.dedup();
     summaries
@@ -306,5 +314,63 @@ mod tests {
                 .any(|line| line == "compiled successfully on debian-headless-1 (exit-1, admin)")
         );
         assert!(!lines.iter().any(|line| line.contains("Compiling")));
+    }
+
+    #[test]
+    fn a_completed_stage_with_no_recognized_keyword_shows_its_real_content_not_is_running() {
+        // Regression, verified against a real report dir: the tier 1-4
+        // audit stages (membership-revoke, hello-limiter-flood,
+        // blind-exit-reversal-denied, etc.) write a raw JSON result blob
+        // with no PASS/FAIL/etc. text marker at all -- a log file is only
+        // ever written once its stage's remote command returns (there is
+        // no partial/live write path), so this content is always a
+        // completed result, never an in-progress one. It used to always
+        // render as "<stage> is running" regardless, which could sit on
+        // screen long after the run had actually finished.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let report = repo.join("state/report");
+        let logs = report.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("validate_macos_blind_exit_reversal_denied.log"),
+            "{\n  \"schema_version\": 1,\n  \"overall_ok\": true,\n  \"total_cases\": 8\n}\n",
+        )
+        .unwrap();
+
+        let lines =
+            summarize_stage_lines(repo, &report, "validate_macos_blind_exit_reversal_denied")
+                .unwrap();
+
+        assert!(
+            !lines.iter().any(|line| line.contains("is running")),
+            "a completed stage's log must never be summarized as still running: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("overall_ok")),
+            "the real JSON result must be shown instead: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_text_completion_sentence_with_no_keyword_also_shows_its_real_content() {
+        // Same bug, different real log format: bootstrap_macos_host.log's
+        // completion message is a single plain sentence with no PASS/FAIL
+        // keyword either ("macOS host bootstrapped; node_id=...").
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let report = repo.join("state/report");
+        let logs = report.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("bootstrap_macos_host.log"),
+            "macOS host macos-utm-1 bootstrapped; node_id=macos-client-1\n",
+        )
+        .unwrap();
+
+        let lines = summarize_stage_lines(repo, &report, "bootstrap_macos_host").unwrap();
+
+        assert!(!lines.iter().any(|line| line.contains("is running")));
+        assert!(lines.iter().any(|line| line.contains("bootstrapped")));
     }
 }
