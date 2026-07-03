@@ -53,6 +53,32 @@ pub enum StageId {
 }
 
 impl StageId {
+    /// Every variant, in pipeline order — the drift gate asserts each is
+    /// registered in `live_lab_stage_registry` (finding 1D).
+    pub const ALL: [StageId; 21] = [
+        StageId::Preflight,
+        StageId::PrepareSourceArchive,
+        StageId::VerifySshReachability,
+        StageId::CleanupHosts,
+        StageId::BootstrapHosts,
+        StageId::CollectPubkeys,
+        StageId::MembershipInit,
+        StageId::DistributeMembership,
+        StageId::AnchorValidation,
+        StageId::DistributeAssignments,
+        StageId::DistributeTraversal,
+        StageId::DistributeDnsZone,
+        StageId::EnforceBaselineRuntime,
+        StageId::ValidateBaselineRuntime,
+        StageId::DeployRelayService,
+        StageId::RelayValidation,
+        StageId::TrafficTestMatrix,
+        StageId::RoleSwitchMatrix,
+        StageId::ExitHandoff,
+        StageId::ActiveExit,
+        StageId::Cleanup,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             StageId::Preflight => "preflight",
