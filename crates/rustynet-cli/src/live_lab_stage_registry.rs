@@ -1550,6 +1550,71 @@ pub const STAGES: &[StageSpec] = &[
         ..DEFAULT_SPEC
     },
     StageSpec {
+        name: "cross_network_controller_switch",
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cross_network_direct_remote_exit",
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cross_network_failback_roaming",
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cross_network_node_network_switch",
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cross_network_relay_remote_exit",
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cross_network_remote_exit_dns",
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cross_network_remote_exit_soak",
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cross_network_traversal_adversarial",
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cross_network_preflight",
+        group: StageGroup::Pre,
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        conditional_dispatch: true,
+        budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
         name: "local_full_gate_suite",
         group: StageGroup::Job,
         enable: EnableRule::LocalGateSuite,
@@ -1933,6 +1998,65 @@ mod tests {
                 .synthetic
         );
         assert!(!find_stage("preflight").expect("registered").synthetic);
+    }
+
+    /// Finding 1D (drift gate, orchestrator half): every stage-name
+    /// literal the bash orchestrator records must resolve in the registry.
+    /// A new bash stage that lands without a registry entry fails this
+    /// test instead of becoming invisible to every consumer.
+    #[test]
+    fn every_bash_orchestrator_stage_literal_is_registered() {
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/e2e/live_linux_lab_orchestrator.sh");
+        let source = std::fs::read_to_string(&script_path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", script_path.display()));
+        let mut names = std::collections::BTreeSet::new();
+        for line in source.lines() {
+            let line = line.trim_start();
+            for prefix in [
+                "run_stage hard ",
+                "run_stage soft ",
+                "run_setup_stage hard ",
+                "run_setup_stage soft ",
+                "record_stage_skip \"",
+            ] {
+                if let Some(rest) = line.find(prefix).map(|idx| &line[idx + prefix.len()..]) {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                        .collect();
+                    if !name.is_empty() {
+                        names.insert(name);
+                    }
+                }
+            }
+        }
+        assert!(
+            names.len() >= 30,
+            "extraction regressed — only {} stage literals found",
+            names.len()
+        );
+        let missing: Vec<String> = names
+            .into_iter()
+            .filter(|name| find_stage(name).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "bash orchestrator records stages the registry does not know: {missing:?}"
+        );
+    }
+
+    /// Finding 1D (drift gate, Rust state-machine half): every StageId
+    /// the Rust orchestrator can record must resolve in the registry.
+    #[test]
+    fn every_rust_state_machine_stage_id_is_registered() {
+        for stage in crate::vm_lab::orchestrator::stage::StageId::ALL {
+            assert!(
+                find_stage(stage.as_str()).is_some(),
+                "StageId::{stage:?} ({}) missing from the registry",
+                stage.as_str()
+            );
+        }
     }
 
     #[test]
