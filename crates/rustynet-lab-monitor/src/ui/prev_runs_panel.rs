@@ -50,9 +50,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize, group_sizes: &[usize]) {
     let label = match idx {
-        0 => "Run 1  latest",
-        1 => "Run 2",
-        _ => "Run 3  oldest",
+        0 => "RUN 1  LATEST",
+        1 => "RUN 2",
+        _ => "RUN 3  OLDEST",
     };
 
     let is_pass = run.overall_result.eq_ignore_ascii_case("pass");

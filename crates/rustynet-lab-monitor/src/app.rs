@@ -932,12 +932,6 @@ impl App {
                 }
                 self.auto_select_next_target();
             }
-            KeyCode::Char(_) if plain_char == Some('c') => {
-                self.page = Page::Overview;
-                self.focused_panel = Panel::VmStatus;
-                self.last_vm_probe = None;
-                self.log_lines = vec!["fetching VM commits from inventory SSH targets".into()];
-            }
             KeyCode::Char(_) if plain_char == Some('r') => {
                 self.last_vm_probe = None;
             }
@@ -2077,14 +2071,9 @@ async fn probe_vms_sync(repo_root: &std::path::Path) -> Vec<crate::data::vm_prob
             .and_then(|u| u.as_str())
             .unwrap_or("")
             .to_string();
-        let src_dir = entry
-            .get("rustynet_src_dir")
-            .and_then(|d| d.as_str())
-            .unwrap_or("")
-            .to_string();
         if !ip.is_empty() {
             tasks.push(tokio::spawn(async move {
-                crate::data::vm_prober::probe_vm(&alias, &ip, &utm_name, &ssh_user, &src_dir).await
+                crate::data::vm_prober::probe_vm(&alias, &ip, &utm_name, &ssh_user).await
             }));
         }
     }
@@ -2462,7 +2451,6 @@ mod tests {
             ip: "192.168.0.210".into(),
             platform: "macos".into(),
             ssh_ok: true,
-            git_commit: Some("abc1234".into()),
         };
 
         app.assign_vm_role(&vm, "exit");
@@ -2666,24 +2654,6 @@ mod tests {
     }
 
     #[test]
-    fn c_key_forces_vm_commit_probe() {
-        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
-        app.last_vm_probe = Some(std::time::Instant::now());
-        app.page = Page::Run;
-        app.focused_panel = Panel::Log;
-
-        app.handle_key(KeyCode::Char('c'), KeyModifiers::empty());
-
-        assert!(app.last_vm_probe.is_none());
-        assert_eq!(app.page, Page::Overview);
-        assert_eq!(app.focused_panel, Panel::VmStatus);
-        assert_eq!(
-            app.log_lines,
-            vec!["fetching VM commits from inventory SSH targets".to_owned()]
-        );
-    }
-
-    #[test]
     fn assigning_linux_non_exit_role_is_not_displayed_as_exit() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         let vm = crate::data::vm_prober::VmStatus {
@@ -2691,7 +2661,6 @@ mod tests {
             ip: "192.168.0.201".into(),
             platform: "linux".into(),
             ssh_ok: true,
-            git_commit: Some("abc1234".into()),
         };
 
         app.assign_vm_role(&vm, "relay");
@@ -2709,7 +2678,6 @@ mod tests {
             ip: "192.168.0.201".into(),
             platform: "linux".into(),
             ssh_ok: true,
-            git_commit: Some("abc1234".into()),
         };
 
         app.assign_vm_role(&vm, "relay");
@@ -2726,7 +2694,6 @@ mod tests {
             ip: "192.168.0.200".into(),
             platform: "linux".into(),
             ssh_ok: true,
-            git_commit: Some("abc1234".into()),
         };
 
         app.assign_vm_role(&vm, "relay");
@@ -2764,7 +2731,6 @@ mod tests {
             ip: "192.168.0.200".into(),
             platform: "linux".into(),
             ssh_ok: true,
-            git_commit: Some("abc1234".into()),
         });
         let overrides_before = app.vm_role_overrides.clone();
         app.active_job = Some(JobState {
@@ -2804,7 +2770,6 @@ mod tests {
             ip: "192.168.0.210".into(),
             platform: "macos".into(),
             ssh_ok: true,
-            git_commit: Some("abc1234".into()),
         });
 
         app.auto_select_next_target();
@@ -2837,7 +2802,6 @@ mod tests {
             ip: "192.168.0.210".into(),
             platform: "macos".into(),
             ssh_ok: true,
-            git_commit: Some("abc1234".into()),
         });
         app.page = Page::Run;
         app.focused_panel = Panel::StageGrid;
@@ -2891,7 +2855,6 @@ mod tests {
             ip: "192.168.0.220".into(),
             platform: "windows".into(),
             ssh_ok: true,
-            git_commit: Some("abc1234".into()),
         });
 
         app.auto_select_next_target();
