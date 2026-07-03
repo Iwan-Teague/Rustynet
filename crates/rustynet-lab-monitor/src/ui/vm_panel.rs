@@ -10,32 +10,6 @@ use crate::app::{App, Panel};
 use crate::data::run_matrix::{Os, ParityState, Role};
 use crate::data::vm_prober::VmStatus;
 
-/// The active stage's name, IF it's inferable as touching this VM's
-/// platform specifically -- e.g. "bootstrap_windows_host" for a windows VM,
-/// "validate_macos_anchor_bundle_pull" for a macos VM. Stage names encode
-/// their target OS by substring (`_{os}_`, a leading `{os}_`, or a trailing
-/// `_{os}`; verified against the real per-stage log directory naming
-/// convention -- there is no per-node log file, only per-stage ones, so
-/// this substring match on the OS-scoped stage name is the closest
-/// attribution available without parsing individual log bodies). Stages
-/// with no OS keyword at all (PRE, and the 9 generic BOOTSTRAP stages) are
-/// cross-platform and touch every node at once, so deliberately not
-/// attributed to any single VM here -- showing the same generic stage name
-/// against every row wouldn't differentiate anything. `None` whenever no
-/// lab is genuinely running right now (see `App::lab_is_actively_running`).
-fn live_activity_for_vm<'a>(app: &'a App, vm: &VmStatus) -> Option<&'a str> {
-    if !app.lab_is_actively_running() {
-        return None;
-    }
-    let stage = app.active_stage.as_deref()?;
-    let platform = vm.platform.as_str();
-    let touches_platform = stage == platform
-        || stage.starts_with(&format!("{platform}_"))
-        || stage.ends_with(&format!("_{platform}"))
-        || stage.contains(&format!("_{platform}_"));
-    touches_platform.then_some(stage)
-}
-
 /// A single-character colored dot reflecting this VM's CURRENT role's
 /// Proven/Flaky/Failed/Unproven parity state for its platform, reusing
 /// Parity Matrix's own color scheme (see parity_panel.rs's `progress_bar`):
@@ -115,7 +89,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             let marker = if selected { "▸" } else { " " };
             let role = app.role_for_vm(&vm.alias);
             let glyph = parity_glyph_for_vm(app, vm).unwrap_or_else(|| Span::raw(" "));
-            let activity = live_activity_for_vm(app, vm).unwrap_or("");
 
             Line::from(vec![
                 Span::raw(marker),
@@ -129,8 +102,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!("{role:<16}"), Style::default().fg(Color::Yellow)),
                 Span::styled(format!("{:<16}", vm.ip), Style::default().fg(Color::Gray)),
                 glyph,
-                Span::raw(" "),
-                Span::styled(activity.to_owned(), Style::default().fg(Color::Cyan)),
             ])
         })
         .collect();
@@ -147,8 +118,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!("{:<16}", "ROLE"), Style::default().fg(Color::Blue)),
         Span::styled(format!("{:<16}", "IP"), Style::default().fg(Color::Blue)),
         Span::styled("P", Style::default().fg(Color::Blue)),
-        Span::raw(" "),
-        Span::styled("ACTIVITY", Style::default().fg(Color::Blue)),
     ])];
     lines.extend(visible);
     if extra > 0 {
@@ -246,61 +215,6 @@ mod tests {
         }
     }
 
-    fn running_job() -> crate::data::job_watcher::JobState {
-        crate::data::job_watcher::JobState {
-            job_id: "monitor-1".to_owned(),
-            state: "running".to_owned(),
-            pid: Some(1),
-            started_unix: Some(1),
-            area: "test".to_owned(),
-            report_dir: "state/monitor-loop-monitor-1".to_owned(),
-            request_args: None,
-        }
-    }
-
-    #[test]
-    fn live_activity_matches_an_os_specific_stage_to_that_platforms_vm_only() {
-        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
-        app.active_job = Some(running_job());
-        app.active_stage = Some("bootstrap_windows_host".to_owned());
-
-        assert_eq!(
-            live_activity_for_vm(&app, &windows_vm()),
-            Some("bootstrap_windows_host")
-        );
-        assert_eq!(
-            live_activity_for_vm(&app, &linux_vm()),
-            None,
-            "a windows-specific stage must not show against a linux VM"
-        );
-    }
-
-    #[test]
-    fn live_activity_is_none_for_a_cross_platform_stage() {
-        // PRE and the 9 generic BOOTSTRAP stages have no OS keyword at all
-        // and touch every node at once -- attributing them to one VM would
-        // misleadingly imply the others are idle.
-        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
-        app.active_job = Some(running_job());
-        app.active_stage = Some("bootstrap_hosts".to_owned());
-
-        assert_eq!(live_activity_for_vm(&app, &windows_vm()), None);
-        assert_eq!(live_activity_for_vm(&app, &linux_vm()), None);
-    }
-
-    #[test]
-    fn live_activity_is_none_once_the_lab_is_idle() {
-        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
-        app.active_stage = Some("bootstrap_windows_host".to_owned());
-        // No active_job set -- lab_is_actively_running() is false.
-
-        assert_eq!(
-            live_activity_for_vm(&app, &windows_vm()),
-            None,
-            "a stale active_stage must not render as live activity once idle"
-        );
-    }
-
     #[test]
     fn parity_glyph_reflects_the_vms_role_state_with_parity_matrix_colors() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
@@ -333,10 +247,8 @@ mod tests {
     }
 
     #[test]
-    fn render_shows_activity_and_glyph_columns_aligned_with_the_header() {
+    fn render_shows_the_glyph_column_aligned_with_the_header() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
-        app.active_job = Some(running_job());
-        app.active_stage = Some("bootstrap_windows_host".to_owned());
         app.parity_matrix
             .insert((Role::Exit, Os::Windows), ParityState::Proven);
         app.config.windows_vm = "windows-utm-1".to_owned();
@@ -351,26 +263,20 @@ mod tests {
         let header_row = 1;
         let windows_row = 2;
         let linux_row = 3;
-        // "P ACTIVITY", not bare "P" -- "IP"'s own trailing P would
-        // otherwise be the first (wrong) match for a 1-char needle.
-        let glyph_header_col = col_of(&buf, header_row, "P ACTIVITY");
+        // " P", not bare "P" -- "IP"'s own trailing P would otherwise be
+        // the first (wrong) match for a 1-char needle; "P" is now the very
+        // last header token, preceded only by the IP column's padding
+        // spaces, which " P" disambiguates against ("IP"'s P is preceded
+        // by "I", never a space).
+        let glyph_header_col = col_of(&buf, header_row, " P").map(|x| x + 1);
         assert_eq!(
             glyph_header_col,
             col_of(&buf, windows_row, "●"),
             "the P header must line up with the parity glyph column"
         );
-        assert_eq!(
-            col_of(&buf, header_row, "ACTIVITY"),
-            col_of(&buf, windows_row, "bootstrap_windows_host"),
-            "the ACTIVITY header must line up with the activity column"
-        );
         assert!(
             col_of(&buf, linux_row, "●").is_none(),
             "linux VM has no role assigned, so no parity glyph should render"
-        );
-        assert!(
-            col_of(&buf, linux_row, "bootstrap_windows_host").is_none(),
-            "a windows-specific stage must not render against the linux row"
         );
     }
 }
