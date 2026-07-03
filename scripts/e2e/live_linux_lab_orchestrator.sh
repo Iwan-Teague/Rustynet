@@ -2818,6 +2818,13 @@ prime_remote_access_worker() {
 }
 
 stage_preflight() {
+  if [[ "${CODEX_SANDBOX_NETWORK_DISABLED:-}" == "1" && "${RUSTYNET_ALLOW_SANDBOXED_LIVE_LAB:-}" != "1" ]]; then
+    printf '%s\n' \
+      "live lab refused: CODEX_SANDBOX_NETWORK_DISABLED=1; host LAN/SSH/UTM access is sandbox-blocked" \
+      "rerun this live lab with Codex escalation / outside the sandbox" \
+      "set RUSTYNET_ALLOW_SANDBOXED_LIVE_LAB=1 only for an intentional negative test" >&2
+    return 1
+  fi
   require_cmd bash
   require_cmd git
   require_cmd tar

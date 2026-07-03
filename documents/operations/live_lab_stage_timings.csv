@@ -2038,3 +2038,9 @@ timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
 2026-07-03T08:41:03Z,da3c99f,dirty,prime_remote_access,deepseek-lab-labrun-1783067926285-95298-0,47,pass
 2026-07-03T08:41:51Z,da3c99f,dirty,macos_preflight_check,deepseek-lab-labrun-1783067926285-95298-0,0,pass
 2026-07-03T08:41:52Z,da3c99f,dirty,cleanup_hosts,deepseek-lab-labrun-1783067926285-95298-0,32,pass
+2026-07-03T09:08:13Z,,clean,preflight,deepseek-lab-labrun-1783069658515-56203-0,0,pass
+2026-07-03T09:08:40Z,,clean,preflight,deepseek-lab-labrun-1783069687220-58572-0,0,pass
+2026-07-03T09:08:15Z,a620154,dirty,prepare_source_archive,deepseek-lab-labrun-1783069658515-56203-0,64,pass
+2026-07-03T09:09:20Z,a620154,dirty,verify_ssh_reachability,deepseek-lab-labrun-1783069658515-56203-0,13,fail
+2026-07-03T09:08:41Z,a620154,dirty,prepare_source_archive,deepseek-lab-labrun-1783069687220-58572-0,62,pass
+2026-07-03T09:09:44Z,a620154,dirty,verify_ssh_reachability,deepseek-lab-labrun-1783069687220-58572-0,12,fail
