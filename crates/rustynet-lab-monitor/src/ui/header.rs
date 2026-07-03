@@ -66,6 +66,17 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             format!("{}/{}", app.stage_progress.passed, app.stage_progress.total),
             value,
         ),
+        // Green-but-unstable checks (latest pass, flake classifier not yet
+        // Proven) — a warning sidecar, deliberately not subtracted from
+        // the fraction.
+        Span::styled(
+            if app.stage_progress.flaky > 0 {
+                format!(" ~{} flaky", app.stage_progress.flaky)
+            } else {
+                String::new()
+            },
+            Style::default().fg(Color::Yellow),
+        ),
     ]);
     let job_area_line = Line::from(vec![
         Span::styled("JOB:", title),
