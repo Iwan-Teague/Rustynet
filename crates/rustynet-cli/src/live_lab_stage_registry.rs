@@ -698,6 +698,7 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "activate_macos_exit_role",
         stream: PlatformStream::Macos,
+        role: Some(("macos", "exit")),
         enable: EnableRule::MacosExit,
         budget_secs: 180,
         ..DEFAULT_SPEC
@@ -706,6 +707,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "capture_macos_exit_evidence_artifacts",
         stream: PlatformStream::Macos,
         direct_platform: Some(("macos", "exit_handoff")),
+        role: Some(("macos", "exit")),
         enable: EnableRule::MacosExit,
         budget_secs: 180,
         ..DEFAULT_SPEC
@@ -714,7 +716,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "validate_macos_exit_nat_lifecycle",
         stream: PlatformStream::Macos,
         direct_platform: Some(("macos", "exit_handoff")),
-        role: Some(("macos", "blind_exit")),
+        role: Some(("macos", "exit")),
         enable: EnableRule::MacosExit,
         budget_secs: 180,
         ..DEFAULT_SPEC
@@ -723,7 +725,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "validate_macos_ipv6_leak",
         stream: PlatformStream::Macos,
         direct_platform: Some(("macos", "exit_handoff")),
-        role: Some(("macos", "blind_exit")),
+        role: Some(("macos", "exit")),
         enable: EnableRule::MacosExit,
         budget_secs: 180,
         ..DEFAULT_SPEC
@@ -732,7 +734,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "validate_macos_exit_dns_failclosed",
         stream: PlatformStream::Macos,
         direct_platform: Some(("macos", "managed_dns")),
-        role: Some(("macos", "blind_exit")),
+        role: Some(("macos", "exit")),
         cross_os: Some("cross_os_dns"),
         enable: EnableRule::MacosExit,
         budget_secs: 180,
@@ -741,7 +743,7 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "validate_macos_exit_killswitch_precedence",
         stream: PlatformStream::Macos,
-        role: Some(("macos", "blind_exit")),
+        role: Some(("macos", "exit")),
         special: Some("macos_pf_killswitch"),
         enable: EnableRule::MacosExit,
         budget_secs: 180,

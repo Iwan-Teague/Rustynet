@@ -136,7 +136,8 @@ pub fn build_stage_manifest(
                 },
                 synthetic: spec.synthetic,
                 barrier_exempt: spec.conditional_dispatch
-                    || spec.group == live_lab_stage_registry::StageGroup::Job,
+                    || spec.group == live_lab_stage_registry::StageGroup::Job
+                    || (run_command == "vm-lab-orchestrate-live-lab" && spec.rust_native),
             }
         })
         .collect();
@@ -383,5 +384,29 @@ mod tests {
             .map(|stage| stage.name.as_str())
             .collect();
         assert_eq!(synthetic, vec!["linux_live_suite"]);
+    }
+
+    #[test]
+    fn wrapper_manifest_exempts_rust_native_dialect_from_barrier() {
+        let manifest = build_stage_manifest(
+            "vm-lab-orchestrate-live-lab",
+            "full",
+            &TargetSelectors::default(),
+        );
+        let membership_init = manifest
+            .stages
+            .iter()
+            .find(|stage| stage.name == "membership_init")
+            .expect("membership_init stage");
+        assert!(membership_init.enabled);
+        assert!(membership_init.barrier_exempt);
+
+        let bash_live = manifest
+            .stages
+            .iter()
+            .find(|stage| stage.name == "live_managed_dns")
+            .expect("live_managed_dns stage");
+        assert!(bash_live.enabled);
+        assert!(!bash_live.barrier_exempt);
     }
 }
