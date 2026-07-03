@@ -6679,6 +6679,19 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
         let report_state = initial_report_state(report_dir.as_path(), &manifest)?;
         write_report_state(report_dir.as_path(), &report_state)?;
     }
+    // Finding 1B: idempotent — setup-reuse runs keep the manifest their
+    // setup emitted; fresh runs get one resolved from this command's flags
+    // (no mac/win role selectors exist on this surface, so those streams
+    // resolve not_applicable).
+    crate::live_lab_stage_manifest::ensure_stage_manifest(
+        report_dir.as_path(),
+        "vm-lab-run-live-lab",
+        &crate::live_lab_stage_registry::TargetSelectors {
+            chaos_suite: config.enable_chaos_suite,
+            cross_network_suite: !config.skip_cross_network,
+            ..Default::default()
+        },
+    )?;
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_LIVE_LAB_TIMEOUT_SECS);
     let inputs = LiveLabRunInputs {
         profile_path: config.profile_path.clone(),
@@ -6807,6 +6820,43 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
         Ok(rendered)
     } else {
         Err(rendered)
+    }
+}
+
+/// Resolve this orchestrate invocation's flags into the registry's
+/// [`TargetSelectors`], mirroring the monitor's `wants_macos`/`wants_windows`
+/// gating: a platform stream is wanted when its guest VM is selected or any
+/// role is elected onto that platform.
+fn orchestrate_manifest_selectors(
+    config: &VmLabOrchestrateLiveLabConfig,
+) -> crate::live_lab_stage_registry::TargetSelectors {
+    let platform_elected = |platform: &str| {
+        [
+            config.exit_platform.as_deref(),
+            config.relay_platform.as_deref(),
+            config.anchor_platform.as_deref(),
+            config.admin_platform.as_deref(),
+            config.blind_exit_platform.as_deref(),
+        ]
+        .into_iter()
+        .any(|selector| selector == Some(platform))
+    };
+    crate::live_lab_stage_registry::TargetSelectors {
+        wants_macos: config.macos_vm.is_some()
+            || config.macos_promote_exit
+            || platform_elected("macos"),
+        wants_windows: config.windows_vm.is_some()
+            || config.windows_only
+            || platform_elected("windows"),
+        macos_promote_exit: config.macos_promote_exit,
+        exit_platform: config.exit_platform.clone().unwrap_or_default(),
+        relay_platform: config.relay_platform.clone().unwrap_or_default(),
+        anchor_platform: config.anchor_platform.clone().unwrap_or_default(),
+        admin_platform: config.admin_platform.clone().unwrap_or_default(),
+        blind_exit_platform: config.blind_exit_platform.clone().unwrap_or_default(),
+        skip_linux_live_suite: config.skip_linux_live_suite,
+        chaos_suite: config.enable_chaos_suite,
+        cross_network_suite: !config.skip_cross_network,
     }
 }
 
@@ -7138,6 +7188,16 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     let (config, topology_resolution) =
         topology::apply_topology_overrides_to_orchestrate_config(config, &inventory_entries)?;
     log_topology_resolution_overrides(&topology_resolution);
+    // Finding 1B: emit the run-scoped stage manifest (the resolved plan)
+    // before any stage executes, so every downstream consumer — monitor,
+    // recorder, CSV appender — reads the plan from the report dir instead
+    // of a hand-copied catalog. Selectors reflect the POST-topology-override
+    // config; the bash orchestrator's own emit is a no-op once this exists.
+    crate::live_lab_stage_manifest::ensure_stage_manifest(
+        report_dir.as_path(),
+        "vm-lab-orchestrate-live-lab",
+        &orchestrate_manifest_selectors(&config),
+    )?;
     let selected_aliases = resolve_live_lab_vm_aliases(
         inventory_path.as_path(),
         config.exit_vm.as_deref(),
