@@ -408,5 +408,15 @@ mod tests {
             .expect("live_managed_dns stage");
         assert!(bash_live.enabled);
         assert!(!bash_live.barrier_exempt);
+
+        for conditional_preflight in ["restart_unready_vms", "rediscover_local_utm"] {
+            let stage = manifest
+                .stages
+                .iter()
+                .find(|stage| stage.name == conditional_preflight)
+                .unwrap_or_else(|| panic!("{conditional_preflight} stage"));
+            assert!(stage.enabled);
+            assert!(stage.barrier_exempt);
+        }
     }
 }

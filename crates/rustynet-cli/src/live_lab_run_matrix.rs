@@ -2323,6 +2323,28 @@ mod tests {
     }
 
     #[test]
+    fn macos_blind_exit_stage_marks_blind_exit_role() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let mut values = BTreeMap::new();
+        let stages = [StageEvidence {
+            stage: "validate_macos_blind_exit".to_owned(),
+            status: "pass".to_owned(),
+            artifacts: Vec::new(),
+        }];
+
+        populate_role_result_values(&mut values, &schema, Path::new("."), &[], &stages);
+
+        assert_eq!(
+            values.get("macos_blind_exit").map(String::as_str),
+            Some("pass")
+        );
+        assert_eq!(values.get("macos_exit").map(String::as_str), None);
+    }
+
+    #[test]
     fn orchestrator_outcomes_feed_matrix_after_worker_reload() {
         let root = temp_dir("orchestrator-outcomes");
         fs::create_dir_all(root.join("state")).expect("state dir");
@@ -2795,6 +2817,7 @@ mod registry_equivalence_tests {
             | "validate_macos_exit_dns_failclosed"
             | "validate_macos_exit_killswitch_precedence"
             | "validate_macos_ipv6_leak" => Some(("macos", "exit")),
+            "validate_macos_blind_exit" => Some(("macos", "blind_exit")),
             "validate_macos_relay_service_lifecycle" => Some(("macos", "relay")),
             "validate_macos_anchor_bundle_pull" => Some(("macos", "anchor")),
             "validate_linux_exit_nat_lifecycle"
