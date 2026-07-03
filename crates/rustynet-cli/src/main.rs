@@ -4695,6 +4695,9 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 run_command: parser
                     .value("--run-command")
                     .unwrap_or_else(|| "live-linux-lab-orchestrator".to_owned()),
+                run_mode: parser
+                    .value("--run-mode")
+                    .unwrap_or_else(|| "full".to_owned()),
                 selectors: live_lab_stage_registry::TargetSelectors {
                     wants_macos: parser.has_flag("--macos"),
                     wants_windows: parser.has_flag("--windows"),
@@ -4707,6 +4710,8 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     skip_linux_live_suite: parser.has_flag("--skip-linux-live-suite"),
                     chaos_suite: parser.has_flag("--chaos-suite"),
                     cross_network_suite: parser.has_flag("--cross-network-suite"),
+                    soak_suite: parser.has_flag("--soak-suite"),
+                    local_gate_suite: parser.has_flag("--local-gate-suite"),
                 },
             },
         }),
