@@ -973,6 +973,14 @@ pub const STAGES: &[StageSpec] = &[
         ..DEFAULT_SPEC
     },
     StageSpec {
+        name: "validate_windows_authenticode",
+        stream: PlatformStream::Windows,
+        enable: EnableRule::WantsWindows,
+        budget_secs: 180,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
         name: "validate_windows_dns_failclosed",
         stream: PlatformStream::Windows,
         direct_platform: Some(("windows", "managed_dns")),
@@ -1030,6 +1038,7 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "validate_windows_admin_issue",
         stream: PlatformStream::Windows,
+        role: Some(("windows", "admin")),
         enable: EnableRule::AdminPlatform("windows"),
         budget_secs: 180,
         ..DEFAULT_SPEC
@@ -1041,6 +1050,64 @@ pub const STAGES: &[StageSpec] = &[
         role: Some(("windows", "exit")),
         cross_os: Some("cross_os_exit_path"),
         enable: EnableRule::WindowsExit,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "capture_windows_exit_evidence_artifacts",
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "exit_handoff")),
+        role: Some(("windows", "exit")),
+        enable: EnableRule::WindowsExit,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "pull_windows_exit_evidence_artifacts",
+        stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "exit_handoff")),
+        role: Some(("windows", "exit")),
+        enable: EnableRule::WindowsExit,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_windows_assignment_verifier_key",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        enable: EnableRule::WantsWindows,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_windows_traversal_verifier_key",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        enable: EnableRule::WantsWindows,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_windows_dns_zone_verifier_key",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        enable: EnableRule::WantsWindows,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_windows_traversal",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        enable: EnableRule::WantsWindows,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "distribute_windows_dns_zone",
+        group: StageGroup::Bootstrap,
+        stream: PlatformStream::Windows,
+        enable: EnableRule::WantsWindows,
+        conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -1889,12 +1956,19 @@ mod tests {
             "bootstrap_macos_host",
             "bootstrap_windows_host",
             "capture_macos_exit_evidence_artifacts",
+            "capture_windows_exit_evidence_artifacts",
             "debian-headless-1::validate_linux_hello_limiter_flood",
             "debian-headless-1::validate_linux_membership_genesis",
             "debian-headless-4::validate_linux_blind_exit_dataplane",
             "deploy_macos_anchor_profile",
+            "distribute_windows_assignment_verifier_key",
+            "distribute_windows_dns_zone",
+            "distribute_windows_dns_zone_verifier_key",
+            "distribute_windows_traversal",
+            "distribute_windows_traversal_verifier_key",
             "live_managed_dns",
             "membership_init",
+            "pull_windows_exit_evidence_artifacts",
             "relay_validation",
             "restart_unready_vms",
             "role_switch_matrix",
@@ -1907,6 +1981,7 @@ mod tests {
             "validate_macos_relay_service_lifecycle",
             "validate_windows_admin_issue",
             "validate_windows_anchor_bundle_pull",
+            "validate_windows_authenticode",
             "validate_windows_dns_failclosed",
             "validate_windows_enrollment_replay",
             "validate_windows_gossip_revoked_readmit",
