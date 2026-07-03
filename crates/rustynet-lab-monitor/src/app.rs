@@ -184,6 +184,23 @@ pub struct App {
     last_vm_probe: Option<std::time::Instant>,
 }
 
+/// Which stage's log is most useful to show once a run goes idle: the
+/// first "fail" entry if the run failed (immediately shows what broke),
+/// else the last entry (whatever ran most recently) -- mirrors
+/// `copy_stage_logs`'s fail-first heuristic, but prefers the LAST entry
+/// over the FIRST as the non-failing fallback, since "the most recently
+/// completed stage" is a more informative final snapshot than an
+/// arbitrary early one. `None` only when there's nothing recorded at all.
+fn final_stage_for_idle_log(
+    stage_outcomes: &[crate::data::stage_reader::StageOutcome],
+) -> Option<String> {
+    stage_outcomes
+        .iter()
+        .find(|o| o.status == "fail")
+        .or_else(|| stage_outcomes.last())
+        .map(|o| o.stage.clone())
+}
+
 impl App {
     pub fn new(repo_root: PathBuf) -> Result<Self> {
         let mut config = MonitorConfig::load(&repo_root).unwrap_or_default();
@@ -723,6 +740,27 @@ impl App {
                         && !result.outcomes.is_empty()
                     {
                         self.stage_outcomes = result.outcomes;
+                    }
+                    // The "reload log for active stage" block below only runs
+                    // while active_job is Some -- without a final catch-up
+                    // here, log_lines freezes at whatever the last live poll
+                    // saw, which can be well behind the truth if the real run
+                    // raced ahead (or fully finished) between that poll and
+                    // this one going idle. Verified in the field: a run whose
+                    // last live poll caught "bootstrap_macos_host, no log yet"
+                    // kept showing that exact placeholder for 5+ minutes after
+                    // the run had actually gone on to complete 25 more stages
+                    // and finish, because nothing ever told log_lines to look
+                    // again.
+                    if let Some(stage) = final_stage_for_idle_log(&self.stage_outcomes)
+                        && let Ok(lines) = crate::data::log_tailer::summarize_stage_lines(
+                            &self.repo_root,
+                            &report_dir,
+                            &stage,
+                        )
+                        && !lines.is_empty()
+                    {
+                        self.log_lines = lines;
                     }
                     self.clear_stale_active_run_state();
                     // Keep stage_outcomes and log_lines — display last run until next one starts.
@@ -3138,6 +3176,56 @@ mod tests {
         assert!(app.orchestrator_pgid.is_none());
     }
 
+    fn outcome(stage: &str, status: &str) -> crate::data::stage_reader::StageOutcome {
+        crate::data::stage_reader::StageOutcome {
+            stage: stage.to_owned(),
+            status: status.to_owned(),
+            summary: String::new(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn final_stage_for_idle_log_prefers_the_failing_stage() {
+        // Regression: a real run's last live poll caught "bootstrap_macos_host,
+        // no log file yet" as the active stage, then the real run went on to
+        // finish 25 more stages and conclude -- but log_lines was never told
+        // to look again once the job went idle, so it kept showing that exact
+        // stale placeholder for 5+ minutes after the run had actually failed
+        // much further along. The failing stage is what a human needs to see
+        // first, regardless of where in the outcome list it sits.
+        let outcomes = vec![
+            outcome("bootstrap_macos_host", "pass"),
+            outcome("collect_macos_pubkey", "pass"),
+            outcome("validate_macos_enrollment_replay", "fail"),
+            outcome("validate_macos_hello_limiter_flood", "pass"),
+        ];
+        assert_eq!(
+            final_stage_for_idle_log(&outcomes).as_deref(),
+            Some("validate_macos_enrollment_replay")
+        );
+    }
+
+    #[test]
+    fn final_stage_for_idle_log_falls_back_to_the_last_stage_when_nothing_failed() {
+        let outcomes = vec![
+            outcome("bootstrap_macos_host", "pass"),
+            outcome("collect_macos_pubkey", "pass"),
+            outcome("validate_macos_blind_exit_reversal_denied", "pass"),
+        ];
+        assert_eq!(
+            final_stage_for_idle_log(&outcomes).as_deref(),
+            Some("validate_macos_blind_exit_reversal_denied"),
+            "the most recently completed stage is the most useful final snapshot, \
+             not an arbitrary early one"
+        );
+    }
+
+    #[test]
+    fn final_stage_for_idle_log_is_none_when_nothing_ran() {
+        assert_eq!(final_stage_for_idle_log(&[]), None);
+    }
+
     #[test]
     fn cleanup_hosts_is_shown_in_pre_group() {
         let app = App::new(PathBuf::from("/tmp")).expect("app");
@@ -3358,5 +3446,25 @@ mod tests {
                 ("LAB", "0s".to_owned())
             ]
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_real_repo_idle_log_catchup() {
+        let repo_root = PathBuf::from("/Users/iwan/Desktop/Rustynet");
+        let report_dir =
+            repo_root.join("state/deepseek-lab-labrun-1783089250895-6139-0");
+        let result =
+            crate::data::stage_reader::read_orchestrate_result(&report_dir).expect("read result");
+        let stage = final_stage_for_idle_log(&result.outcomes);
+        eprintln!("picked stage: {stage:?}");
+        if let Some(stage) = &stage {
+            let lines =
+                crate::data::log_tailer::summarize_stage_lines(&repo_root, &report_dir, stage)
+                    .expect("summarize");
+            for line in lines.iter().take(5) {
+                eprintln!("  {line}");
+            }
+        }
     }
 }
