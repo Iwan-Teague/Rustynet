@@ -5027,11 +5027,197 @@ fn orchestrated_command_status(
     }
 }
 
+/// Complete `orchestrate_result.json` so EVERY stage the run's manifest
+/// planned (enabled, non-synthetic) that is barrier-exempt but recorded no
+/// outcome ends with an explicit terminal row instead of silently vanishing
+/// from the run's own outcome record. These are the job-level bookkeeping
+/// pseudo-stages (`vm_lab_setup_live_lab`, ...) and conditional infra
+/// (`restart_unready_vms`, `rediscover_local_utm`) that legitimately no-op or
+/// are handled by an outer layer — the conclusion barrier deliberately never
+/// synthesizes `aborted` for them (a missing outcome is not abnormal), so
+/// without this they stayed forever-unresolved cells in every consumer of the
+/// result (the monitor's LIVE column never cleared on a clean run).
+///
+/// Recorded as `Skipped` with a reason: honest for this invocation (the stage
+/// did not run here), verdict-neutral (this runs AFTER the overall status is
+/// computed and AFTER the run-matrix CSV is written, so it changes neither),
+/// and already understood by every downstream reader. NON-exempt planned
+/// stages that vanish remain the conclusion barrier's concern (`aborted` in
+/// the matrix) — abnormal termination, a different signal. Only `full` runs
+/// reconcile: a setup-only/validate-only run legitimately records nothing for
+/// the live suite.
+fn reconcile_barrier_exempt_outcomes(report_dir: &Path, outcomes: &mut Vec<VmLabStageOutcome>) {
+    let manifest = match crate::live_lab_stage_manifest::read_stage_manifest(report_dir) {
+        Ok(Some(manifest)) => manifest,
+        _ => return,
+    };
+    if manifest.run_mode != "full" {
+        return;
+    }
+    let recorded: std::collections::HashSet<String> = outcomes
+        .iter()
+        .map(|outcome| outcome.stage.clone())
+        .collect();
+    let synthesized: Vec<VmLabStageOutcome> = manifest
+        .stages
+        .iter()
+        .filter(|stage| {
+            stage.enabled
+                && !stage.synthetic
+                && stage.barrier_exempt
+                && !recorded.contains(&stage.name)
+        })
+        .map(|stage| VmLabStageOutcome {
+            stage: stage.name.clone(),
+            status: VmLabStageStatus::Skipped,
+            summary: "not dispatched this run (conditional/job-level; recorded for completeness)"
+                .to_owned(),
+            artifacts: Vec::new(),
+        })
+        .collect();
+    outcomes.extend(synthesized);
+}
+
+#[cfg(test)]
+mod reconcile_barrier_exempt_tests {
+    use super::{VmLabStageOutcome, VmLabStageStatus, reconcile_barrier_exempt_outcomes};
+    use crate::live_lab_stage_manifest::{
+        ManifestSelectors, ManifestStage, STAGE_MANIFEST_SCHEMA_VERSION, StageManifest,
+        write_stage_manifest,
+    };
+
+    fn stage(name: &str, enabled: bool, synthetic: bool, barrier_exempt: bool) -> ManifestStage {
+        ManifestStage {
+            name: name.to_owned(),
+            group: "live".to_owned(),
+            stream: "common".to_owned(),
+            enabled,
+            skip_reason: (!enabled).then(|| "off".to_owned()),
+            budget_secs: 60,
+            severity: "hard".to_owned(),
+            synthetic,
+            barrier_exempt,
+        }
+    }
+
+    fn recorded(name: &str) -> VmLabStageOutcome {
+        VmLabStageOutcome {
+            stage: name.to_owned(),
+            status: VmLabStageStatus::Pass,
+            summary: String::new(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn write_manifest(dir: &std::path::Path, run_mode: &str, stages: Vec<ManifestStage>) {
+        let manifest = StageManifest {
+            schema_version: STAGE_MANIFEST_SCHEMA_VERSION,
+            generated_at_unix: 0,
+            run_command: "vm-lab-orchestrate-live-lab".to_owned(),
+            run_mode: run_mode.to_owned(),
+            selectors: ManifestSelectors::default(),
+            stages,
+        };
+        write_stage_manifest(dir, &manifest).expect("write manifest");
+    }
+
+    fn temp_report_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "reconcile_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn appends_skipped_only_for_enabled_nonsynthetic_barrier_exempt_missing_stages() {
+        let dir = temp_report_dir("basic");
+        write_manifest(
+            dir.as_path(),
+            "full",
+            vec![
+                stage("recorded_stage", true, false, false),
+                // enabled + barrier_exempt + missing -> appended Skipped.
+                stage("job_marker", true, false, true),
+                stage("conditional_infra", true, false, true),
+                // NOT barrier_exempt + missing -> left to the conclusion barrier.
+                stage("real_pipeline_stage", true, false, false),
+                // synthetic aggregate -> never appended.
+                stage("aggregate", true, true, true),
+                // not planned -> never appended.
+                stage("dead_dialect", false, false, true),
+            ],
+        );
+        let mut outcomes = vec![recorded("recorded_stage")];
+
+        reconcile_barrier_exempt_outcomes(dir.as_path(), &mut outcomes);
+
+        let by_name = |n: &str| outcomes.iter().find(|o| o.stage == n);
+        assert_eq!(
+            by_name("job_marker").map(|o| &o.status),
+            Some(&VmLabStageStatus::Skipped)
+        );
+        assert_eq!(
+            by_name("conditional_infra").map(|o| &o.status),
+            Some(&VmLabStageStatus::Skipped)
+        );
+        assert!(
+            by_name("real_pipeline_stage").is_none(),
+            "non-exempt stays the barrier's job"
+        );
+        assert!(
+            by_name("aggregate").is_none(),
+            "synthetic aggregate never recorded"
+        );
+        assert!(
+            by_name("dead_dialect").is_none(),
+            "not-planned never recorded"
+        );
+        // The already-recorded stage is untouched.
+        assert_eq!(
+            by_name("recorded_stage").map(|o| &o.status),
+            Some(&VmLabStageStatus::Pass)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconciles_nothing_for_a_non_full_run() {
+        let dir = temp_report_dir("setup_only");
+        write_manifest(
+            dir.as_path(),
+            "setup_only",
+            vec![stage("job_marker", true, false, true)],
+        );
+        let mut outcomes: Vec<VmLabStageOutcome> = Vec::new();
+        reconcile_barrier_exempt_outcomes(dir.as_path(), &mut outcomes);
+        assert!(
+            outcomes.is_empty(),
+            "a setup-only run legitimately records nothing for the live suite"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconciles_nothing_without_a_manifest() {
+        let dir = temp_report_dir("no_manifest");
+        let mut outcomes: Vec<VmLabStageOutcome> = Vec::new();
+        reconcile_barrier_exempt_outcomes(dir.as_path(), &mut outcomes);
+        assert!(outcomes.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 fn finalize_vm_lab_orchestration_result(
     command: &str,
     report_dir: &Path,
     orchestration_dir: &Path,
-    outcomes: Vec<VmLabStageOutcome>,
+    mut outcomes: Vec<VmLabStageOutcome>,
     mut warnings: Vec<String>,
     next_actions: Vec<String>,
 ) -> Result<String, String> {
@@ -5041,6 +5227,9 @@ fn finalize_vm_lab_orchestration_result(
         warnings.push(format!("live-lab run matrix update failed: {err}"));
     }
     let overall_status = orchestrated_command_status(outcomes.as_slice(), warnings.as_slice());
+    // Verdict + CSV are locked in above; now complete the run's own outcome
+    // record so no planned barrier-exempt stage is left without a terminal row.
+    reconcile_barrier_exempt_outcomes(report_dir, &mut outcomes);
     let rendered = serialize_vm_lab_command_result(&VmLabCommandResult {
         command: command.to_owned(),
         overall_status: overall_status.clone(),

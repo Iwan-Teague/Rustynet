@@ -125,13 +125,30 @@ pub fn build_stage_manifest(
     let stages = STAGES
         .iter()
         .map(|spec| {
-            let enabled = selectors.resolves(spec.enable);
+            // The Rust state-machine dialect runs only on the `--node` path,
+            // which emits no manifest today, so every manifest is a bash-path
+            // plan where this dialect never dispatches: mark it enabled=false
+            // with an explicit dialect skip_reason rather than advertising it
+            // as pending-and-expected (which left ~13 forever-unresolved cells
+            // downstream). Its bash-dialect siblings do the real work and
+            // record under their own names. See `state_machine_only`'s doc for
+            // the W5.7 default-flip caveat (this inverts once the Rust path
+            // emits a manifest).
+            let enabled = selectors.resolves(spec.enable) && !spec.state_machine_only;
+            let skip_reason = (!enabled).then(|| {
+                if spec.state_machine_only {
+                    "inactive orchestrator dialect (Rust state machine not the active path)"
+                        .to_owned()
+                } else {
+                    selectors.skip_reason(spec.enable).to_owned()
+                }
+            });
             ManifestStage {
                 name: spec.name.to_owned(),
                 group: spec.group.as_str().to_owned(),
                 stream: spec.stream.as_str().to_owned(),
                 enabled,
-                skip_reason: (!enabled).then(|| selectors.skip_reason(spec.enable).to_owned()),
+                skip_reason,
                 budget_secs: spec.budget_secs,
                 severity: match spec.severity {
                     live_lab_stage_registry::StageSeverity::Hard => "hard".to_owned(),
@@ -140,7 +157,7 @@ pub fn build_stage_manifest(
                 synthetic: spec.synthetic,
                 barrier_exempt: spec.conditional_dispatch
                     || spec.group == live_lab_stage_registry::StageGroup::Job
-                    || (run_command == "vm-lab-orchestrate-live-lab" && spec.rust_native),
+                    || spec.state_machine_only,
             }
         })
         .collect();
@@ -320,11 +337,20 @@ mod tests {
         // relay cell off), anchor to macOS (windows anchor cell off), admin
         // to Windows (macOS admin cell off), role-transition to macOS
         // (windows role-transition cell off).
+        // Disabled by SELECTOR (role election) -- exclude the dead Rust
+        // dialect, which is unconditionally not-planned and asserted
+        // separately in `manifest_marks_the_dead_rust_dialect_not_planned`.
         let full = build_stage_manifest("test-run", "full", &full_selectors());
         let mut disabled: Vec<&str> = full
             .stages
             .iter()
             .filter(|stage| !stage.enabled)
+            .filter(|stage| {
+                stage.skip_reason.as_deref()
+                    != Some(
+                        "inactive orchestrator dialect (Rust state machine not the active path)",
+                    )
+            })
             .map(|stage| stage.name.as_str())
             .collect();
         disabled.sort_unstable();
@@ -395,19 +421,54 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_manifest_exempts_rust_native_dialect_from_barrier() {
+    fn manifest_marks_the_dead_rust_dialect_not_planned() {
+        // The Rust state-machine dialect never dispatches in the production
+        // (bash/wrapper) path, so it must be enabled=false with an explicit
+        // dialect skip_reason -- not advertised as pending-and-expected. Its
+        // bash siblings (live_managed_dns, etc.) stay enabled + barrier-eligible.
         let manifest = build_stage_manifest(
             "vm-lab-orchestrate-live-lab",
             "full",
             &TargetSelectors::default(),
         );
-        let membership_init = manifest
+        for dialect_stage in [
+            "membership_init",
+            "distribute_membership",
+            "distribute_assignments",
+            "distribute_traversal",
+            "distribute_dns_zone",
+            "anchor_validation",
+            "deploy_relay_service",
+            "relay_validation",
+            "traffic_test_matrix",
+            "role_switch_matrix",
+            "exit_handoff",
+            "active_exit",
+            "cleanup",
+        ] {
+            let stage = manifest
+                .stages
+                .iter()
+                .find(|stage| stage.name == dialect_stage)
+                .unwrap_or_else(|| panic!("{dialect_stage} stage"));
+            assert!(!stage.enabled, "{dialect_stage} must be not-planned");
+            assert_eq!(
+                stage.skip_reason.as_deref(),
+                Some("inactive orchestrator dialect (Rust state machine not the active path)"),
+                "{dialect_stage} skip_reason"
+            );
+            assert!(stage.barrier_exempt, "{dialect_stage} barrier_exempt");
+        }
+
+        // A SHARED rust_native name (records under the same name in the bash
+        // path) must stay planned and barrier-eligible.
+        let shared = manifest
             .stages
             .iter()
-            .find(|stage| stage.name == "membership_init")
-            .expect("membership_init stage");
-        assert!(membership_init.enabled);
-        assert!(membership_init.barrier_exempt);
+            .find(|stage| stage.name == "collect_pubkeys")
+            .expect("collect_pubkeys stage");
+        assert!(shared.enabled, "shared rust_native name stays planned");
+        assert!(!shared.barrier_exempt);
 
         let bash_live = manifest
             .stages
