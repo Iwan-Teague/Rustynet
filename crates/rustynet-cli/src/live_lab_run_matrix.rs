@@ -1978,6 +1978,63 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn every_registry_stage_column_reference_exists_in_the_csv_schema() {
+        // EXTENSIBILITY GATE: a StageSpec that references a CSV column absent
+        // from DEFAULT_MATRIX_COLUMNS has its value SILENTLY DROPPED by
+        // set_status (which returns early on an unknown key, line ~1467). This
+        // makes that a loud test failure, so adding a new stage with a new
+        // `special`/`cross_os`/`{platform}_stage_{logical}`/`{platform}_{role}`
+        // column cannot silently vanish from the run matrix. A shared `logical`
+        // column can be elected onto any platform its `platform_rule` allows,
+        // so every such platform's column must exist.
+        use crate::live_lab_stage_registry::{PlatformRule, STAGES};
+        let schema: BTreeSet<&'static str> = DEFAULT_MATRIX_COLUMNS.iter().copied().collect();
+        let platforms_for_rule = |rule: PlatformRule| -> &'static [&'static str] {
+            match rule {
+                PlatformRule::LinuxOnly => &["linux"],
+                // AllPlatforms / ExitTarget / RelayTarget can each land on any OS.
+                _ => &["linux", "macos", "windows"],
+            }
+        };
+        let mut missing: Vec<(&'static str, String)> = Vec::new();
+        for spec in STAGES {
+            // Synthetic aggregates never record an outcome, so they never
+            // populate a column.
+            if spec.synthetic {
+                continue;
+            }
+            let mut required: Vec<String> = Vec::new();
+            if let Some(col) = spec.special {
+                required.push(col.to_owned());
+            }
+            if let Some(col) = spec.cross_os {
+                required.push(col.to_owned());
+            }
+            if let Some((platform, logical)) = spec.direct_platform {
+                required.push(format!("{platform}_stage_{logical}"));
+            }
+            if let Some((platform, role)) = spec.role {
+                required.push(format!("{platform}_{role}"));
+            }
+            if let Some(logical) = spec.logical {
+                for platform in platforms_for_rule(spec.platform_rule) {
+                    required.push(format!("{platform}_stage_{logical}"));
+                }
+            }
+            for col in required {
+                if !schema.contains(col.as_str()) {
+                    missing.push((spec.name, col));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "StageSpec column refs absent from DEFAULT_MATRIX_COLUMNS \
+             (set_status would SILENTLY DROP them): {missing:?}"
+        );
+    }
+
+    #[test]
     fn tier0_revocation_stages_map_to_dedicated_csv_columns() {
         let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
             .iter()
@@ -3412,7 +3469,7 @@ mod conclusion_barrier_tests {
     /// (Linux-only selectors keep the eligible set small enough to
     /// enumerate exactly: the shared pipeline + the non-audit live suite.)
     fn fully_recorded_evidence() -> Vec<StageEvidence> {
-        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default());
+        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default(), None);
         manifest
             .stages
             .iter()
@@ -3424,7 +3481,7 @@ mod conclusion_barrier_tests {
     #[test]
     fn barrier_synthesizes_aborted_for_planned_unrecorded_stages() {
         let dir = temp_report_dir("synthesizes");
-        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default());
+        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default(), None);
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
 
         // The run recorded everything except live_managed_dns.
@@ -3445,7 +3502,7 @@ mod conclusion_barrier_tests {
     #[test]
     fn barrier_is_silent_when_every_planned_stage_recorded() {
         let dir = temp_report_dir("complete");
-        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default());
+        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default(), None);
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
         let mut stages = fully_recorded_evidence();
         let before = stages.len();
@@ -3458,7 +3515,8 @@ mod conclusion_barrier_tests {
     fn barrier_respects_run_mode_exemptions_and_node_composites() {
         let dir = temp_report_dir("modes");
         // setup_only: recording nothing for the live suite is legitimate.
-        let manifest = build_stage_manifest("test", "setup_only", &TargetSelectors::default());
+        let manifest =
+            build_stage_manifest("test", "setup_only", &TargetSelectors::default(), None);
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
         let mut stages = vec![evidence("preflight", "pass")];
         apply_conclusion_barrier(&mut stages, dir.as_path());
@@ -3474,7 +3532,7 @@ mod conclusion_barrier_tests {
 
         // Node-scoped composites count as recordings of the bare stage.
         let dir = temp_report_dir("composites");
-        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default());
+        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default(), None);
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
         let mut stages = fully_recorded_evidence();
         // Replace the flat record with a node-scoped one.
@@ -3496,7 +3554,7 @@ mod conclusion_barrier_tests {
         // Chaos + audit families stay quiet even though a full manifest
         // exists: chaos is disabled by default selectors, audits are
         // barrier-exempt (conditional dispatch).
-        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default());
+        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default(), None);
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
         let mut stages = fully_recorded_evidence();
         apply_conclusion_barrier(&mut stages, dir.as_path());
