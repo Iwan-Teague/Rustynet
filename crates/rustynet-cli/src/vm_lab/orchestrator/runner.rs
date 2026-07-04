@@ -81,7 +81,12 @@ impl StateMachineRunner {
                         .is_some_and(super::error::StageOutcome::is_blocking)
             });
 
-            if dep_blocked {
+            // `always_run` teardown stages (e.g. final cleanup) are exempt from
+            // the dependency skip-cascade: they must run even when an earlier
+            // stage failed, so this run's killswitch / exit-NAT residue is
+            // always removed from the guests (leaving it is a release-blocker).
+            // They still respect the explicit-skip set handled above.
+            if dep_blocked && !stage.always_run() {
                 blocked.insert(id.clone());
                 observer.stage_finished(&id, &StageOutcome::Skipped);
                 results.push((id.clone(), StageOutcome::Skipped));
@@ -90,7 +95,20 @@ impl StateMachineRunner {
             }
 
             observer.stage_started(&id);
-            let outcome = stage.execute(ctx);
+            // Guard `execute` so a panicking stage becomes a `Failed` outcome
+            // instead of unwinding out of the runner — otherwise a panic would
+            // abort past finalize AND skip the always-run cleanup, the worst
+            // residue case. The mutable `ctx` borrow ends when `catch_unwind`
+            // returns; `assignments`/`adapters` (all cleanup needs) are set
+            // before the run and untouched by stage execution.
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stage.execute(ctx)))
+                    .unwrap_or_else(|_| {
+                        StageOutcome::Failed(format!(
+                            "stage '{}' panicked during execute",
+                            id.as_str()
+                        ))
+                    });
 
             if outcome.is_blocking() {
                 blocked.insert(id.clone());
@@ -169,6 +187,8 @@ mod tests {
         name: &'static str,
         deps: Vec<StageId>,
         outcome: StageOutcome,
+        always_run: bool,
+        panics: bool,
     }
 
     impl OrchestrationStage for MockStage {
@@ -188,7 +208,15 @@ mod tests {
             StageFanout::Once
         }
         fn execute(&self, _ctx: &mut OrchestrationContext) -> StageOutcome {
+            assert!(
+                !self.panics,
+                "mock stage '{}' panicking on purpose",
+                self.name
+            );
             self.outcome.clone()
+        }
+        fn always_run(&self) -> bool {
+            self.always_run
         }
     }
 
@@ -198,6 +226,8 @@ mod tests {
             name: "pass",
             deps,
             outcome: StageOutcome::Passed,
+            always_run: false,
+            panics: false,
         })
     }
 
@@ -207,6 +237,34 @@ mod tests {
             name: "fail",
             deps,
             outcome: StageOutcome::Failed("test failure".to_owned()),
+            always_run: false,
+            panics: false,
+        })
+    }
+
+    /// A teardown stage (`always_run = true`) that passes when it executes —
+    /// used to prove cleanup runs despite a failed/panicking dependency.
+    fn always_run_stage(id: StageId, deps: Vec<StageId>) -> Box<dyn OrchestrationStage> {
+        Box::new(MockStage {
+            id,
+            name: "always_run",
+            deps,
+            outcome: StageOutcome::Passed,
+            always_run: true,
+            panics: false,
+        })
+    }
+
+    /// A stage that panics inside `execute` — used to prove the runner's
+    /// panic guard converts it to `Failed` instead of aborting the run.
+    fn panic_stage(id: StageId, deps: Vec<StageId>) -> Box<dyn OrchestrationStage> {
+        Box::new(MockStage {
+            id,
+            name: "panic",
+            deps,
+            outcome: StageOutcome::Passed,
+            always_run: false,
+            panics: true,
         })
     }
 
@@ -251,6 +309,53 @@ mod tests {
             outcome_of(&StageId::VerifySshReachability),
             Some(&StageOutcome::Skipped),
             "stage depending on failed stage must be skipped"
+        );
+    }
+
+    #[test]
+    fn always_run_stage_runs_even_when_dependency_failed() {
+        // A(pass) → B(fail) → cleanup(always_run, depends on B).
+        // cleanup must STILL run (Passed), not be cascade-skipped — otherwise a
+        // mid-pipeline failure leaves killswitch/NAT residue on the guests.
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            pass_stage(StageId::Preflight, vec![]),
+            fail_stage(StageId::ExitHandoff, vec![StageId::Preflight]),
+            always_run_stage(StageId::Cleanup, vec![StageId::ExitHandoff]),
+        ];
+        let results = StateMachineRunner::new(stages).run(&mut make_ctx());
+        let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
+        assert!(matches!(
+            outcome_of(&StageId::ExitHandoff),
+            Some(StageOutcome::Failed(_))
+        ));
+        assert_eq!(
+            outcome_of(&StageId::Cleanup),
+            Some(&StageOutcome::Passed),
+            "always_run cleanup MUST run despite a failed dependency"
+        );
+    }
+
+    #[test]
+    fn panicking_stage_becomes_failed_and_always_run_cleanup_still_executes() {
+        // A stage that panics must be caught as Failed (not abort the runner),
+        // and the always_run cleanup must still run afterwards.
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            panic_stage(StageId::ExitHandoff, vec![]),
+            always_run_stage(StageId::Cleanup, vec![StageId::ExitHandoff]),
+        ];
+        let results = StateMachineRunner::new(stages).run(&mut make_ctx());
+        let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
+        assert!(
+            matches!(
+                outcome_of(&StageId::ExitHandoff),
+                Some(StageOutcome::Failed(_))
+            ),
+            "a panicking stage must be converted to Failed, not abort the run"
+        );
+        assert_eq!(
+            outcome_of(&StageId::Cleanup),
+            Some(&StageOutcome::Passed),
+            "always_run cleanup MUST run after a panicking stage"
         );
     }
 
