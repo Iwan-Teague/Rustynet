@@ -55,6 +55,25 @@ traded for a green cell: a control may never be weakened, downgraded, or stubbed
 patch the root cause so the stage passes *with* the control intact, or the cell stays red.**
 
 ═══════════════════════════════════════════
+THE TASK — restated as one concrete loop (read this if nothing else)
+═══════════════════════════════════════════
+Iterate over live labs, repeatedly, without stopping, clearing stages as you go:
+1. Launch a live-lab run targeting the highest-priority unproven/red stage or parity cell (§6).
+2. Heartbeat it, don't block (§1/§5). When it CLEARS a stage (passes it live), that stage is
+   done — immediately pick the next unproven stage and launch again. Do not pause to celebrate.
+3. When a run instead surfaces a NEW failing/red stage — a regression, a previously-undiscovered
+   gap, a stage nobody has ever run live — that becomes the current target: capture evidence,
+   root-cause it (§9 if the fix is a hard design call), patch, gate, and re-run until IT clears too.
+4. Repeat 1-3 forever: iterate live labs → clear whatever stage is in front of you → pick the
+   next stage → iterate again. Every pass must leave strictly more of the role × OS × stage
+   matrix proven-green than the pass before it — never flat, never regressing silently.
+5. There is no finish line except total completion: EVERY stage, for EVERY role (client, admin,
+   anchor, exit, blind_exit, relay, nas, llm), on EVERY OS (Linux/macOS/Windows), live-lab-proven
+   green at the same time, held green by ongoing re-verification. Until that is true there is
+   always another live lab to launch and another stage to clear — this loop IS the job, not a
+   step toward it. Do not stop, do not idle, do not ask.
+
+═══════════════════════════════════════════
 0) PRIME DIRECTIVE — SECURITY FIRST, AUTONOMY ALWAYS
 ═══════════════════════════════════════════
 Security outranks everything. Fail closed on missing/invalid/stale trust state. Default-deny all
