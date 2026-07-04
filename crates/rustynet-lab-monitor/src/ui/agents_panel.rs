@@ -58,7 +58,7 @@ struct ReviewLedger {
 }
 
 #[derive(Debug, Clone, Default)]
-struct AgentsView {
+pub(crate) struct AgentsView {
     patch_model: String,
     patch_variant: String,
     session: String,
@@ -113,7 +113,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let view = AgentsView::load(&app.repo_root);
+    let view = &app.agents_view;
 
     // Override model/variant with the user's current selection from App state
     // (what will be used on next launch, not what the last run used).
@@ -152,7 +152,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     render_table(
         f,
         inner,
-        &view,
+        view,
         &patch_model_ui,
         &review_model_ui,
         focused,
@@ -469,7 +469,7 @@ fn fmt_tokens(t: u64) -> String {
 // ── Data loading ─────────────────────────────────────────────────────────────
 
 impl AgentsView {
-    fn load(repo_root: &Path) -> Self {
+    pub(crate) fn load(repo_root: &Path) -> Self {
         let mut view = AgentsView::default();
 
         // Model + variant + session from status file or opencode config.
