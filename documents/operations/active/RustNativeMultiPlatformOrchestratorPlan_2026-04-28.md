@@ -87,6 +87,44 @@ Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4
 > flip only after genuine parity proof). W5.7 (bash removal) remains gated on the
 > cross-OS live-evidence campaign.
 >
+> **Loop-readiness increment (2026-07-04) — functional-parity gate + cleanup
+> release-blocker fix landed.** Two of the three prerequisites for running the
+> live-lab loop on the Rust engine are now addressed in code:
+> - **Functional/outcome parity mode (`a88ce75`).** `canonical_stage_id` +
+>   `diff_live_lab_reports_functional` + `FunctionalParityDiff`, exposed as
+>   `vm-lab-diff-orchestrator-parity --mode strict|functional` (default
+>   `strict`, byte-compatible). Functional mode normalizes the bash/Rust
+>   stage-ID dialects (the 5 known aliases → canonical) and compares the shared
+>   logical work + overall status + node count; **fail-closed on zero overlap**;
+>   validator counts reported-but-informational. This is the satisfiable
+>   redefinition the parity-gate finding called for. 6 unit tests.
+> - **Cleanup residue release-blocker FIXED (`9c1c908`).** The first live
+>   `--node` run reproduced it: `FinalCleanupStage` lists `ExitHandoff` as a
+>   dependency only for ordering, but the runner's skip-cascade also gated on
+>   it, so a `traffic_test_matrix` failure skip-cascaded cleanup and left this
+>   run's killswitch + exit-NAT residue on the guests. Fix: new
+>   `OrchestrationStage::always_run()` (cleanup overrides `true`) exempts
+>   teardown stages from the skip-cascade (still ordered last, still honored by
+>   `--skip-stage`), plus a `catch_unwind` panic guard around `execute` so a
+>   panicking stage becomes `Failed` rather than aborting past cleanup. 578
+>   orchestrator tests green.
+>
+> **Remaining loop-readiness work (planned, grounded):** (prereq 1) port the
+> bash-only validators into the Rust `PlanBuilder` — RANK-0 is a report-mapping
+> win (the 6 daemon-probe results `ValidateBaselineRuntimeStage` already
+> computes → the `linux_runtime_acls/service_hardening/key_custody/mesh_status`
+> columns), RANK-1 is a new `SecurityAuditValidationStage` wrapping the 8
+> adversarial audit checks (logic exists in `evaluate_*_report` /
+> `run_validate_linux_*_stage`; needs an adapter-seam stage + `StageId`/registry/
+> `PlanBuilder` count bump); (prereq 2) an opt-in `rust_engine` param on
+> `deepseek_lab_run` that synthesizes `--node` from selectors + inventory
+> (`build_orchestrator_args`, needs an MCP rebuild). Tracked gap-hunt follow-ups
+> (non-blocking): `--node` path emits no `run_summary.json` so the run-matrix
+> `run_note` is dropped; `traffic_test_matrix` assumes all-pairs mesh
+> reachability (may be the correct mesh contract — do NOT weaken without a
+> topology-model decision); dead `applies_to_roles`/`fanout` trait methods;
+> best-effort parity/manifest writes.
+>
 > **The role-platform matrix in §3.4 is not yet validated end-to-end for
 > any non-Linux Exit deployment.** Windows-as-Exit and macOS-as-Exit
 > are now fail-closed in code (`NodeRole::is_supported_for_platform`
