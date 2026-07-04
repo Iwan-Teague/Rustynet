@@ -42722,6 +42722,56 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn relay_forward_test_topology_is_deterministic_with_more_than_two_spare_peers() {
+        // A richer topology than the standard 5-node lab: two extra plain
+        // "client"-role peers beyond aux/extra. Selection must stay
+        // deterministic (same pair every time) rather than depending on
+        // inventory iteration order.
+        let mut inventory = hp3_test_standard_topology();
+        inventory.push(hp3_test_inventory_entry(
+            "debian-headless-6",
+            "client",
+            false,
+            false,
+            Some("100.64.0.6"),
+        ));
+        inventory.push(hp3_test_inventory_entry(
+            "debian-headless-7",
+            "client",
+            false,
+            false,
+            Some("100.64.0.7"),
+        ));
+        let first = super::select_relay_forward_test_topology(&inventory)
+            .expect("richer topology should resolve");
+        let second = super::select_relay_forward_test_topology(&inventory)
+            .expect("richer topology should resolve");
+        assert_eq!(
+            first, second,
+            "selection must be deterministic across calls"
+        );
+        // aux/extra still win over the plain "client"-role extras.
+        assert_eq!(first.sender_alias, "debian-headless-4");
+        assert_eq!(first.receiver_alias, "debian-headless-5");
+    }
+
+    #[test]
+    fn relay_forward_test_topology_handles_relay_node_that_is_also_exit_capable() {
+        // Edge case: a node marked both relay_capable and exit_capable. The
+        // relay filter must select it by relay_capable regardless, and the
+        // peer filter must still exclude it (via the alias != relay_alias
+        // check, not just the exit_capable filter) so it can never also be
+        // picked as a spare peer.
+        let mut inventory = hp3_test_standard_topology();
+        inventory[2].exit_capable = Some(true);
+        let topology = super::select_relay_forward_test_topology(&inventory)
+            .expect("topology with a dual-role relay node should still resolve");
+        assert_eq!(topology.relay_alias, "debian-headless-3");
+        assert_ne!(topology.sender_alias, "debian-headless-3");
+        assert_ne!(topology.receiver_alias, "debian-headless-3");
+    }
+
+    #[test]
     fn relay_forward_test_topology_fails_closed_without_relay_capable_node() {
         let mut inventory = hp3_test_standard_topology();
         inventory[2].relay_capable = Some(false);
