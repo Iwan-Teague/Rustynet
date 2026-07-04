@@ -682,16 +682,26 @@ impl App {
             "active_stage: {}",
             self.active_stage.as_deref().unwrap_or("-")
         );
+        // Show the run's ENABLED plan (the manifest's in-scope stages), not the
+        // full ~166-stage catalog — so the grid + counts reflect what this run
+        // actually planned/ran (e.g. the 21-stage Rust plan) rather than being
+        // diluted by the disabled catalog. Groups with nothing enabled are hidden.
         let _ = writeln!(out, "\nSTAGE GRID:");
         for group in self.planned_stage_groups() {
-            let total = group.stages.len();
-            let passed = group
+            let enabled: Vec<&String> = group
                 .stages
+                .iter()
+                .filter(|s| self.stage_enabled(s))
+                .collect();
+            if enabled.is_empty() {
+                continue;
+            }
+            let passed = enabled
                 .iter()
                 .filter(|s| status_by_stage.get(s.as_str()) == Some(&"pass"))
                 .count();
-            let _ = writeln!(out, "  [{}] ({passed}/{total})", group.name);
-            for stage in &group.stages {
+            let _ = writeln!(out, "  [{}] ({passed}/{})", group.name, enabled.len());
+            for stage in enabled {
                 let status = status_by_stage.get(stage.as_str()).copied().unwrap_or("-");
                 let _ = writeln!(out, "    {stage:<34} {status}");
             }
@@ -1280,6 +1290,34 @@ impl App {
                 match run_plan_summary(&repo_root, run) {
                     Some(counts) => apply_plan_counts(run, counts),
                     None => apply_position_based_failure_override(&groups, run),
+                }
+            }
+        }
+        // Idle (no active job): render the NEWEST run's OWN manifest + outcomes so
+        // the stage grid + counts reflect a finished / jobless run (e.g. a
+        // direct-CLI --node run with no MCP job record, or any completed run)
+        // instead of the generic catalog fallback. The active-job arm above only
+        // loads the run manifest for a *running* job; without this, run_manifest
+        // stays None for a completed run and planned_stage_groups() falls back to
+        // the hardcoded ~90-stage catalog with every stage status blank — which is
+        // exactly what a headless --snapshot on a finished run would show.
+        if self.active_job.is_none() {
+            let newest_report = self
+                .recent_runs
+                .first()
+                .map(|r| r.report_dir.trim().to_owned())
+                .filter(|s| !s.is_empty());
+            if let Some(report_str) = newest_report {
+                let report_dir = resolve_report_dir(&self.repo_root, &report_str);
+                if self.run_manifest_dir.as_deref() != Some(report_dir.as_path()) {
+                    self.run_manifest =
+                        crate::data::stage_manifest::read_stage_manifest(&report_dir);
+                    self.run_manifest_dir = Some(report_dir.clone());
+                    if let Ok(result) =
+                        crate::data::stage_reader::read_orchestrate_result(&report_dir)
+                    {
+                        self.stage_outcomes = result.outcomes;
+                    }
                 }
             }
         }
