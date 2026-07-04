@@ -2728,6 +2728,7 @@ mod tests {
             .map(|i| crate::data::run_matrix::StageMatrixEntry {
                 name: format!("stage-{i}"),
                 state: ParityState::Proven,
+                latest_pass: true,
             })
             .collect()
     }
