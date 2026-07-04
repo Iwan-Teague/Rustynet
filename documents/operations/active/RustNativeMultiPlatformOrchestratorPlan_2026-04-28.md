@@ -23,6 +23,18 @@ Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4
 > | W5.6 CLI surface (--legacy-bash-orchestrator, deprecation translation) | ✓ | ✓ (13 tests) | n/a (CLI wiring); default-flip ⛔ blocked-by: W5.5 parity proof | `b530e85` |
 > | W5.7 Live-evidence campaign + bash removal | ✗ | ✗ | ⛔ blocked-by: all live-evidence scenarios | — |
 >
+> **Observability parity (2026-07-04, `831a32a`):** the `--node` path now
+> emits the SAME live-lab recording artifacts as the wrapper — a run-scoped
+> `stage_manifest.json` reflecting the Rust `StageId` plan (dialect enabled +
+> barrier-eligible), realtime `state/stages.tsv` `running`/terminal rows via a
+> new shared recorder (`live_lab_stage_recorder.rs`) threaded through
+> `StateMachineRunner::run_with_observer`, and `orchestrate_result.json` +
+> barrier-exempt reconcile + a single run-matrix row via `finalize`. A `--node`
+> run therefore renders in the live-lab monitor with no monitor change. This is
+> Fable5 Finding 4 recorder-first (see `LiveLabStageContractPlan_2026-07-03.md`)
+> and makes the eventual W5.7 default-flip a no-op for every downstream
+> consumer. It does NOT flip the default or assert parity.
+>
 > **The role-platform matrix in §3.4 is not yet validated end-to-end for
 > any non-Linux Exit deployment.** Windows-as-Exit and macOS-as-Exit
 > are now fail-closed in code (`NodeRole::is_supported_for_platform`
