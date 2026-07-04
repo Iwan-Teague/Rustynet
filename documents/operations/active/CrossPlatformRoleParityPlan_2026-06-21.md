@@ -59,7 +59,7 @@ validator only (no live runtime) · ❌ untested / not implemented · 🔒 block
 | exit (NAT egress + route advertise + killswitch) | ✅ (nftables) | ✅ **LIVE-PROVEN 2026-07-03** (run `labrun-1783087254263-11121-0`, commit `039f215`, `--macos-promote-exit`): `activate_macos_exit_role`, `capture_macos_exit_evidence_artifacts`, `validate_macos_exit_nat_lifecycle`, `validate_macos_exit_dns_failclosed`, `validate_macos_service_hardening`, and `validate_macos_mesh_status` all passed; `partial` was selector/optional skips only. | 🟡 implemented (`promote_windows_exit_active`, `validate_windows_exit_nat_lifecycle`) but 🔒 the lab Windows guest lacks the WinNAT/HNS stack (`MSFT_NetNat` absent) — see `WindowsExitNodeRunbook_2026-06-04.md` |
 | blind_exit (irreversible exit) | ✅ | ✅ **live-proven 2026-06-29** (orchestrate stage, run `labrun-1782770042330-16244-0`, commit `ed3ed7e`, `--blind-exit-platform macos`): `validate_macos_blind_exit` PASS — irreversible transition applied on macos-utm-1, pf anchor `com.rustynet/blind_exit` loaded (9 rules, no route-to/reply-to/dup-to), immutability gate enforced. Runtime: `macos_blind_exit.rs` pf builder/evaluator + daemon invariants + the mesh-egress-source CIDR bound from the pfctl-boundary review. Stage drives `role set blind_exit --accept-irreversible`, asserts pf anchor hardened, verifies immutability gate blocks leaving. Fixed in `5386c09` (blind_exit via plist rewrite + daemon restart instead of blocked `role set`) and `ed3ed7e` (allow pf anchor load with stale client membership). | 🚫 **out of scope by design** — `main.rs:11833` hard-errors "blind_exit role is supported on Linux/macOS only"; like mobile clients, not a parity gap (corrected 2026-06-24, was ❌) |
 | relay (live session forwarding) | ✅ | ✅ **lifecycle LIVE-PROVEN 2026-06-27** (orchestrate stage, run `livelab-1782571161`, commit `cd6a834`, `--relay-platform macos`): `validate_macos_relay_service_lifecycle` PASS — install/bootstrap → active (`/healthz` ok, `127.0.0.1:4501` bound) → stop/release (released after stop). The loopback `/healthz` wedge that blocked this was fixed by `574eaac` (the macOS PF killswitch now emits `pass quick on lo0 all` — previously it wedged loopback TCP, SYN_RCVD on `127.0.0.1:4501` → empty `/healthz`; verified in the live render path `render_macos_killswitch_pf_rules` phase10.rs, scoped to lo0 before the terminal `block drop out quick all`, at parity with the Linux killswitch's `oifname "lo" accept`). Earlier focused-proof on .210 2026-06-22 (`356f8a3`): `install-macos-relay` → relay `state=running`, `127.0.0.1:4501` bound, `/healthz={"status":"ok",...}` → `--uninstall` → released. Live cell `exercise_macos_relay_lifecycle_live` fixed (upload the static reviewed `com.rustynet.relay.plist` + run from a temp cwd since the bootstrap build dir is ephemeral; derive `--verifier-key` from the distributed trust verifier `trust-evidence.pub` written root-owned via `tee`, since `assignment.pub` is not distributed to macOS). **Live session forwarding remains HP-3-gated** (no live forwarding proven on ANY OS yet — the same cross-OS gate as the Linux ✅; macOS relay is now at lifecycle parity with Linux). | 🟠 SCM lifecycle **contract** only (`validate_windows_relay_service_lifecycle_contract`, "without guest mutation") — no live forwarding |
-| live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | ✅ **LIVE-PROVEN 2026-07-04** (`livelab-1783135864-2fda3979d599`, commit `2fda397`): `validate_macos_role_transition` (`--role-switch-platform macos`) drove a real `LocalOnly` client->admin flip on `macos-utm-1` via `rustynet role set` + launchd bootout/bootstrap, asserted the new role via `role status`, ran `state refresh`, and asserted mesh peers did not regress across the flip (0 before/after, expected for a `--skip-linux-live-suite` run). `SignedMembership`-kind transitions (capability changes) are a separate follow-up. | 🔒 **stage built, BLOCKED 2026-07-04 on a real capability gap** (`validate_windows_role_transition`, commit `8816bf7`; first live run `livelab-1783142381-8816bf73333b` FAILED, isolated, no collateral damage): the only installed Windows CLI (`rustynet-windows-trust-cli.rs`) is a pure offline crypto tool with no daemon IPC client, so there is no Windows verb for `role status`/`role set`/`state refresh` yet; `update_node_role_env_file` also does not parse the Windows `RUSTYNETD_DAEMON_ARGS_JSON` array format. See `CrossOsRoleSwitchPlan_2026-06-24.md` status header for the full root-cause + required follow-up (a named-pipe IPC client + the env-file parser fix) |
+| live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | ✅ **LIVE-PROVEN 2026-07-04** (`livelab-1783135864-2fda3979d599`, commit `2fda397`): `validate_macos_role_transition` (`--role-switch-platform macos`) drove a real `LocalOnly` client->admin flip on `macos-utm-1` via `rustynet role set` + launchd bootout/bootstrap, asserted the new role via `role status`, ran `state refresh`, and asserted mesh peers did not regress across the flip (0 before/after, expected for a `--skip-linux-live-suite` run). `SignedMembership`-kind transitions (capability changes) are a separate follow-up. | ✅ **LIVE-PROVEN 2026-07-04** (`livelab-1783174602-844175f5ad2a`, commit `5516711`): `validate_windows_role_transition` drove a real `LocalOnly` client->admin flip on `windows-utm-1` via `rustynet role set` + `Stop-Service`/`Start-Service`, verified via `role status`, ran `state refresh`, and asserted mesh peers did not regress (0 before/after). The capability gap that blocked the first live run (`livelab-1783142381-8816bf73333b` FAIL — the installed Windows CLI had no daemon IPC client, and `update_node_role_env_file` didn't parse the `RUSTYNETD_DAEMON_ARGS_JSON` array format) was closed by `c51f00a`. See `CrossOsRoleSwitchPlan_2026-06-24.md` status header for the full history. |
 
 ## 4. The gap is LIVE PROVING + a few real impls — not (mostly) missing framework
 
@@ -135,9 +135,11 @@ fail-closed, signed-state verify-before-apply, anti-replay, default-deny ACL/rou
   `SignedMembership` transition kind.
 - **Cross-OS live role transitions:** macOS `LocalOnly` (admin<->client)
   LIVE-PROVEN 2026-07-04 (`validate_macos_role_transition`); Windows
-  (`windows_service` reload) and the `SignedMembership` kind remain design-only
-  — design at `CrossOsRoleSwitchPlan_2026-06-24.md` (note: Windows
-  `StateRefresh` IPC already exists; reuse the single verified apply path
+  `LocalOnly` (`windows_service` reload) also LIVE-PROVEN 2026-07-04
+  (`validate_windows_role_transition`, `livelab-1783174602-844175f5ad2a`).
+  Only the `SignedMembership` kind remains design-only for both OS — design at
+  `CrossOsRoleSwitchPlan_2026-06-24.md` (note: Windows `StateRefresh` IPC
+  already exists; reuse the single verified apply path
   `refresh_signed_state_with_reason`, never add a second/weaker one).
 - **Lab connectivity prerequisites:** `HomelabConnectivityParityDeltaPlan_2026-05-21.md`
   (macOS/Windows tunnel connectivity gap vs Linux).
@@ -271,18 +273,16 @@ the fixes landed this pass (all Linux-gate-verified; live runs still pending):
   `StateRefresh`/`refresh_signed_state_with_reason`. Design now in
   `CrossOsRoleSwitchPlan_2026-06-24.md`; the stage itself is the remaining work
   (Linux-buildable, but only meaningful when run live against mac/win guests).
-  **UPDATE 2026-07-04: the macOS `LocalOnly` slice of this is now built AND
-  live-proven** (`validate_macos_role_transition`, run
-  `livelab-1783135864-2fda3979d599`) — see §3 above. This note's diagnosis
-  stays accurate for the Windows half and the `SignedMembership` kind.
+  **UPDATE 2026-07-04: both the macOS and Windows `LocalOnly` slices of this
+  are now built AND live-proven** (`validate_macos_role_transition`, run
+  `livelab-1783135864-2fda3979d599`; `validate_windows_role_transition`, run
+  `livelab-1783174602-844175f5ad2a`, commit `5516711`, after the Windows CLI
+  IPC-client gap was closed by `c51f00a`) — see §3 above. Only the
+  `SignedMembership` kind remains unbuilt for both OS.
 
-**Net remaining parity CODE work (no live lab):** (a) a Windows CLI IPC
-client (named-pipe) for `role status`/`role set`/`state refresh` + fixing
-`update_node_role_env_file` to parse the `RUSTYNETD_DAEMON_ARGS_JSON` array
-format, discovered blocking `validate_windows_role_transition`'s first live
-run 2026-07-04 (macOS `LocalOnly` landed the same day); (b) the
-`SignedMembership` transition kind for both OS; (c) the mac/win
-stage-gating contract tests (Linux-authorable, small); (d) explicit live
+**Net remaining parity CODE work (no live lab):** (a) the
+`SignedMembership` transition kind for both OS; (b) the mac/win
+stage-gating contract tests (Linux-authorable, small); (c) explicit live
 stages for the remaining anchor sub-surfaces beyond bundle-pull and
 port_mapping_authoritative (macOS `port_mapping_authoritative` landed
 2026-07-04): gossip_seed and enrollment_endpoint on both OS, and
