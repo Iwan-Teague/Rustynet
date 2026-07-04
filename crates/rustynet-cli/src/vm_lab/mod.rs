@@ -8372,7 +8372,7 @@ fn macos_membership_capabilities(is_active_exit: bool, is_elected_anchor: bool) 
     if is_active_exit {
         "client,anchor,exit_server"
     } else if is_elected_anchor {
-        "client,anchor.bundle_pull"
+        "client,anchor.bundle_pull,anchor.port_mapping_authoritative"
     } else {
         "client"
     }
@@ -10131,6 +10131,75 @@ fn run_macos_orchestration_stages(
     };
     outcomes.push(macos_anchor_bundle_pull_outcome);
 
+    // ── Stage: validate_macos_anchor_port_mapping_authority ────────────────
+    //
+    // Prove the elected anchor actually WINS the anchor.port_mapping_authoritative
+    // Pin-then-Seniority election (gossip_runtime::anchor_runtime_view_from_membership) —
+    // previously computed but never externally observable. Runs only when
+    // elected (--anchor-platform macos), after mesh_join + anchor_deploy pass
+    // (same prerequisites as bundle-pull, since the capability is granted
+    // alongside anchor.bundle_pull). FAIL-LOUD.
+    let macos_anchor_port_mapping_log_path =
+        logs_dir.join("validate_macos_anchor_port_mapping_authority.log");
+    let macos_anchor_port_mapping_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_anchor_port_mapping_authority",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would assert {macos_alias} wins the port-mapping-authority election"),
+            vec![],
+        )
+    } else if !is_macos_elected_anchor {
+        stage_outcome(
+            "validate_macos_anchor_port_mapping_authority",
+            VmLabStageStatus::Skipped,
+            format!("skipped: {macos_alias} is not the elected anchor (anchor_platform != macos)"),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "validate_macos_anchor_port_mapping_authority",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else if !anchor_deploy_passed {
+        stage_outcome(
+            "validate_macos_anchor_port_mapping_authority",
+            VmLabStageStatus::Skipped,
+            format!("skipped: deploy_macos_anchor_profile did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        match exercise_macos_anchor_port_mapping_authority_live(
+            macos_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&macos_anchor_port_mapping_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_macos_anchor_port_mapping_authority",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![macos_anchor_port_mapping_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&macos_anchor_port_mapping_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_macos_anchor_port_mapping_authority",
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "macOS anchor port-mapping authority check failed for {macos_alias}: {reason}"
+                    ),
+                    vec![macos_anchor_port_mapping_log_path.clone()],
+                )
+            }
+        }
+    };
+    outcomes.push(macos_anchor_port_mapping_outcome);
+
     // ── Stage: validate_macos_admin_issue ────────────────────────────────
     //
     // Prove the macOS node can act as ADMIN: mint its own assignment signing
@@ -11820,6 +11889,85 @@ fn macos_mesh_peer_count(
         _ => 0,
     };
     Ok((peer_count, mesh_summary))
+}
+
+/// Parse a `rustynetd anchor-port-mapping-status-check` JSON report and
+/// decide Pass/Fail. The dispatch path always appends `--no-fail-on-drift`
+/// (`build_linux_daemon_check_invocation`), so the daemon subcommand's own
+/// exit code is never authoritative here — this evaluator makes the actual
+/// call, exactly like `evaluate_macos_mesh_status_report`.
+fn evaluate_anchor_port_mapping_status_report(
+    macos_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::anchor_port_mapping_status::AnchorPortMappingStatusReport =
+        serde_json::from_str(raw_json).map_err(|err| {
+            format!("parse anchor-port-mapping-status-check JSON output failed: {err}")
+        })?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "anchor-port-mapping-status-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if !report.is_self_authority {
+        return Err(format!(
+            "macOS anchor {macos_alias} (node_id={}) does not hold the anchor.port_mapping_authoritative \
+             election; resolved authority={:?}",
+            report.self_node_id, report.authority_node_id
+        ));
+    }
+    Ok(format!(
+        "macOS anchor port-mapping authority verified on {macos_alias}: node_id={} is the elected \
+         Pin-then-Seniority authority",
+        report.self_node_id
+    ))
+}
+
+/// Prove the macOS anchor actually WINS the `anchor.port_mapping_authoritative`
+/// Pin-then-Seniority election (`gossip_runtime::anchor_runtime_view_from_membership`),
+/// closing part of the "remaining anchor sub-surfaces beyond bundle-pull" gap
+/// (`CrossPlatformRoleParityRoadmap_2026-06-22.md` rank #2). The election result
+/// was previously only visible internally to `daemon.rs::port_mapping_bring_up_
+/// skip_reason` — no external query existed — so this reads the persisted
+/// membership snapshot fresh via the new `anchor-port-mapping-status-check`
+/// daemon subcommand. Requires `anchor.port_mapping_authoritative` in the
+/// elected anchor's membership grant (`macos_membership_capabilities`).
+fn exercise_macos_anchor_port_mapping_authority_live(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let macos_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == macos_alias)
+        .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
+        .clone();
+    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            macos_entry.platform_profile().platform.as_str()
+        ));
+    }
+    let node_id = macos_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {macos_alias:?} has no node_id"))?
+        .to_owned();
+    validate_mesh_node_id(node_id.as_str())?;
+
+    let extra_args = vec!["--self-node-id".to_owned(), node_id.clone()];
+    let raw_json = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "anchor-port-mapping-status-check",
+        &extra_args,
+    )?;
+    evaluate_anchor_port_mapping_status_report(macos_alias, raw_json.as_str())
 }
 
 /// Deploy the reviewed macOS anchor launchd profile on the elected anchor
@@ -19645,7 +19793,9 @@ fn run_macos_daemon_check_remote(
         ));
     }
     let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
-    let invocation = if subcommand == "macos-mesh-status-check" {
+    let invocation = if subcommand == "macos-mesh-status-check"
+        || subcommand == "anchor-port-mapping-status-check"
+    {
         build_sudo_macos_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand, extra_args)?
     } else {
         build_linux_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand, extra_args)?
@@ -33506,7 +33656,7 @@ mod tests {
         // Anchor election and the client default are unchanged.
         assert_eq!(
             super::macos_membership_capabilities(false, true),
-            "client,anchor.bundle_pull"
+            "client,anchor.bundle_pull,anchor.port_mapping_authoritative"
         );
         assert_eq!(super::macos_membership_capabilities(false, false), "client");
         // Exit election takes precedence over anchor election.
