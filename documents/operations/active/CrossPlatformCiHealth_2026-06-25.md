@@ -8,7 +8,11 @@ determinism, and the advisory-db CRLF parse fix). The only remaining red is the
 documented-environmental class: macOS = the single `vm_lab` Gatekeeper/`trustd`
 subprocess flake (§4.1, user-deferred; verified on `e3f99ce`: 1751 passed, 1
 failed — the budget-test fix landed, only the flake remains); Debian + Linux-E2E
-= `cargo: not found` bootstrap (§4.2, deferred infra). Author: Iwan-Teague.
+= `cargo: not found` bootstrap (§4.2, deferred infra). **Update 2026-07-04:** the
+`e3f99ce` budget-test fix (67→7 queued datagrams) turned out to be incomplete —
+it recurred as a `left: 0, right: 4` race on 5 consecutive `main` CI runs; see
+§4.6 for the actual root cause (virtualized-runner loopback delivery timing, not
+a buffer drop) and the real fix. Author: Iwan-Teague.
 
 Purpose: the `cross-platform-ci.yml` workflow (jobs: **Windows build+security**,
 **macOS build+security**, **Debian 13 build+security**, **Linux real WireGuard
@@ -297,6 +301,25 @@ integration/bin tests pass, `no_secret_material_equality_in_workspace` ok.
    advisory-db parses identically to Linux/macOS. (Push-and-see: cannot be
    reproduced on the macOS lab host.)
 
+6. **macOS budget-test race, recurred after the 2026-06-25 fix — FIXED
+   2026-07-04.** `macos_runtime_authoritative_socket_poll_is_budgeted_per_tick`
+   reduced the queued-datagram count from 67 to 7 to dodge kernel receive-buffer
+   drops under CI load (the original flake). That fix landed, but the test
+   still failed on 5 consecutive `main` CI runs (`28679465730` through
+   `28686678747`) with `left: 0, right: 4` — i.e. the very first non-blocking
+   poll observed **zero** queued datagrams, not a partial drop. Root cause:
+   GitHub's macOS runners are themselves virtualized, so a loopback
+   `UdpSocket::send_to` returning is not guaranteed to mean the datagram is
+   already in the receiving socket's kernel buffer under scheduler contention —
+   the test polled immediately with no margin. Fix: added a bounded
+   `thread::sleep(Duration::from_millis(200))` between the send loop and the
+   first budgeted poll
+   (`crates/rustynet-backend-wireguard/src/userspace_shared_macos/runtime.rs`).
+   Production `poll_authoritative_socket_with_budget` is unchanged — only the
+   test's timing assumption was wrong. Verified: 5/5 local re-runs green,
+   `cargo fmt`/`clippy -D warnings`/`cargo check` clean on the rustup `1.88.0`
+   (CI) toolchain for `rustynet-backend-wireguard`.
+
 ---
 
 ## 5. CI state snapshot
@@ -304,7 +327,7 @@ integration/bin tests pass, `no_secret_material_equality_in_workspace` ok.
 | Job | State | Blocker |
 |---|---|---|
 | Windows build+security | ✅ **GREEN @ `e3f99ce`** — build+test + Security gates both pass | none |
-| macOS build+security | clippy GREEN @ 2026-06-27 (§4.4); test-run TBD | Workspace-validation clippy red was **code-caused** (3 crates), NOT the `vm_lab` flake — fixed 2026-06-27 (§4.4). Remaining macOS concerns are in the *test-run* step (after clippy): the `vm_lab` Gatekeeper flake (§4.1) + a `userspace_shared_macos` socket-poll-budget timing test seen on `7734156` — both surface only once clippy is green, which it now is. |
+| macOS build+security | clippy GREEN @ 2026-06-27 (§4.4); test-run flake fixed 2026-07-04 (§4.6) | Workspace-validation clippy red was **code-caused** (3 crates), NOT the `vm_lab` flake — fixed 2026-06-27 (§4.4). The `userspace_shared_macos` socket-poll-budget timing test (recurred on `28686678747`/`28683745418`/others, `left: 0, right: 4`) is fixed §4.6. Remaining macOS red is only the documented-environmental `vm_lab` Gatekeeper/subprocess-spawn flake (§4.1, user-deferred). |
 | Debian 13 build+security | red | `cargo: not found` bootstrap (§4.2, deferred) |
 | Linux real WireGuard E2E | red | `cargo: not found` bootstrap (§4.2, deferred) |
 

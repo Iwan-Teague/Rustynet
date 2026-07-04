@@ -1676,6 +1676,14 @@ mod tests {
                 .expect("datagram should send");
         }
 
+        // CI macOS runners are themselves virtualized, so loopback UDP delivery
+        // into the receiving socket's kernel buffer is not guaranteed to be
+        // synchronous with `send_to` returning under scheduler contention;
+        // without this margin the first non-blocking poll can observe zero
+        // queued datagrams instead of racing the budget cap (seen as
+        // `left: 0, right: 4` on `28686678747`/`28683745418`).
+        thread::sleep(Duration::from_millis(200));
+
         state
             .poll_authoritative_socket_budget_for_test(TEST_BUDGET)
             .expect("first socket poll should succeed");
