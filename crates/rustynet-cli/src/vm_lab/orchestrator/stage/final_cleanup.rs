@@ -23,6 +23,16 @@ impl OrchestrationStage for FinalCleanupStage {
         StageFanout::PerNode
     }
 
+    /// Cleanup is a teardown `finally` block: it lists `ExitHandoff` as a
+    /// dependency only for ORDERING (run last), but it must still run when an
+    /// earlier stage failed — otherwise a mid-pipeline failure would
+    /// skip-cascade cleanup and leave this run's killswitch + exit NAT residue
+    /// on the guests (a release-blocker). `always_run` exempts it from the
+    /// skip-cascade while preserving its last-in-order placement.
+    fn always_run(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
         let results: Vec<(String, Result<(), String>)> = aliases
