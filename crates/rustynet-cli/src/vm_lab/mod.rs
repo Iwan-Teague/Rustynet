@@ -7188,6 +7188,16 @@ struct RustNativeStageRecorder<'a> {
     started_at: std::cell::RefCell<std::collections::HashMap<String, String>>,
 }
 
+impl RustNativeStageRecorder<'_> {
+    /// Per-stage log file: `<report_dir>/logs/<stage>.log`. The Rust stages run
+    /// in-process, so (unlike the bash stage wrappers) their output is not
+    /// captured to a file by default — this gives get_stage_log / diagnose /
+    /// the monitor tail / validate_live_lab_run_artifacts a real path to read.
+    fn stage_log_path(&self, name: &str) -> PathBuf {
+        self.report_dir.join("logs").join(format!("{name}.log"))
+    }
+}
+
 impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
     fn stage_started(&self, id: &orchestrator::stage::StageId) {
         let name = id.as_str();
@@ -7195,12 +7205,13 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
         self.started_at
             .borrow_mut()
             .insert(name.to_owned(), now.clone());
+        let log_path = self.stage_log_path(name);
         let _ = crate::live_lab_stage_recorder::record_stage_start(
             self.report_dir,
             name,
             registry_severity_str(name),
             "",
-            "",
+            &log_path.to_string_lossy(),
             &now,
         );
     }
@@ -7224,13 +7235,27 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
             .cloned()
             .unwrap_or_default();
         let now = collected_at_utc_now();
+        // Write the per-stage log so downstream readers (get_stage_log, diagnose,
+        // the monitor tail, validate_live_lab_run_artifacts) have a real file.
+        // A Rust stage runs in-process; its outcome detail IS the log content
+        // (the Failed error carries the per-node failure reason). Best-effort.
+        let log_path = self.stage_log_path(name);
+        if let Some(parent) = log_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let log_body = if summary.is_empty() {
+            format!("[stage:{name}] {status} (rust --node engine)\n")
+        } else {
+            format!("[stage:{name}] {status} (rust --node engine)\n{summary}\n")
+        };
+        let _ = fs::write(&log_path, log_body);
         let _ = crate::live_lab_stage_recorder::record_stage_finish(
             self.report_dir,
             name,
             registry_severity_str(name),
             status,
             rc,
-            "",
+            &log_path.to_string_lossy(),
             &summary,
             &started,
             &now,
@@ -7678,7 +7703,7 @@ fn execute_rust_native_orchestration(
             artifacts: vec![parity_path.display().to_string()],
         })
         .collect();
-    finalize_vm_lab_orchestration_result_with_inventory(
+    let finalized = finalize_vm_lab_orchestration_result_with_inventory(
         "vm-lab-orchestrate-live-lab",
         report_dir.as_path(),
         orchestration_dir.as_path(),
@@ -7686,7 +7711,19 @@ fn execute_rust_native_orchestration(
         vm_lab_outcomes,
         Vec::new(),
         Vec::new(),
-    )
+    );
+    // Enforce the SAME artifact-completeness contract the bash path checks
+    // (run_summary.json/.md + state/{stages,nodes}.tsv present, every recorded
+    // stage log exists, and a failure digest exists when a stage failed) — run
+    // AFTER finalize, which writes the failure digest. Best-effort: a gap is
+    // surfaced to the operator log, not turned into a false pass/fail, so the
+    // finalize verdict still governs. Previously the Rust path never validated
+    // its own artifacts — a future regression could ship a green run missing
+    // evidence.
+    if let Err(err) = validate_live_lab_run_artifacts(report_dir.as_path()) {
+        eprintln!("warning: --node run artifact completeness check: {err}");
+    }
+    finalized
 }
 
 fn build_rust_native_orchestration_stages(
@@ -47259,6 +47296,48 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             Some(note)
         );
 
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn rust_native_recorder_writes_per_stage_log_and_records_its_path() {
+        use super::orchestrator::error::StageOutcome;
+        use super::orchestrator::runner::StageObserver;
+        use super::orchestrator::stage::StageId;
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-recorder-log-{}.dir",
+            super::unique_suffix()
+        ));
+        fs::create_dir_all(&tmp).expect("tmp dir");
+        let rec = super::RustNativeStageRecorder {
+            report_dir: &tmp,
+            started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
+        };
+        rec.stage_started(&StageId::TrafficTestMatrix);
+        rec.stage_finished(
+            &StageId::TrafficTestMatrix,
+            &StageOutcome::Failed("client->client ping failed".to_owned()),
+        );
+        // A per-stage log exists and carries the status + the failure detail —
+        // so get_stage_log / diagnose / the monitor tail have a real file (a Rust
+        // stage runs in-process; previously log_path was empty).
+        let log = fs::read_to_string(tmp.join("logs/traffic_test_matrix.log"))
+            .expect("per-stage log must exist");
+        assert!(
+            log.contains("traffic_test_matrix") && log.contains("fail"),
+            "{log}"
+        );
+        assert!(
+            log.contains("client->client ping failed"),
+            "log must carry the failure detail: {log}"
+        );
+        // stages.tsv records the log path (col 5) so validate_live_lab_run_artifacts
+        // + get_stage_log can resolve it.
+        let tsv = fs::read_to_string(tmp.join("state/stages.tsv")).expect("stages.tsv");
+        assert!(
+            tsv.contains("traffic_test_matrix.log"),
+            "stages.tsv must record the log path: {tsv}"
+        );
         fs::remove_dir_all(&tmp).ok();
     }
 
