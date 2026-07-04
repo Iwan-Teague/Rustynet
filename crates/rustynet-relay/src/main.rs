@@ -40,7 +40,7 @@ mod daemon {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use ed25519_dalek::VerifyingKey;
@@ -240,6 +240,33 @@ mod daemon {
         session_id: SessionId,
     }
 
+    /// Forwarded-frame counters, surfaced read-only via `/healthz` and
+    /// `/metrics`. This is the ONLY observability the relay exposes about
+    /// the traffic it moves: a frame count and a byte count, both sourced
+    /// from the length already known at the real `send_to` in
+    /// `spawn_forward_task` (see `record_forward`) — never from reading or
+    /// copying payload content. Proves forwarding happened without ever
+    /// giving the relay (or an operator inspecting it) a way to see what
+    /// was forwarded.
+    #[derive(Default)]
+    struct ForwardStats {
+        frames_forwarded_total: AtomicU64,
+        bytes_forwarded_total: AtomicU64,
+    }
+
+    /// Records one successfully forwarded frame. `len` is the byte count
+    /// already known from the UDP `recv`/`send` call the caller just made;
+    /// this function never touches the payload itself. Relaxed ordering is
+    /// appropriate: this is a monitoring counter, not a security invariant
+    /// (the forwarding decision itself, in `RelayTransport::forward_packet`,
+    /// is unaffected by when this update becomes visible to other threads).
+    fn record_forward(stats: &ForwardStats, len: usize) {
+        stats.frames_forwarded_total.fetch_add(1, Ordering::Relaxed);
+        stats
+            .bytes_forwarded_total
+            .fetch_add(len as u64, Ordering::Relaxed);
+    }
+
     /// Relay daemon state.
     pub struct RelayDaemon {
         config: RelayConfig,
@@ -250,6 +277,8 @@ mod daemon {
         allocated_sockets: Arc<RwLock<HashMap<u16, (UdpSocket, PortAllocation)>>>,
         /// Next port to try allocating.
         next_port: Arc<RwLock<u16>>,
+        /// Forwarded-frame/byte counters (see `ForwardStats`).
+        forward_stats: Arc<ForwardStats>,
     }
 
     impl RelayDaemon {
@@ -283,6 +312,7 @@ mod daemon {
                 ))),
                 allocated_sockets: Arc::new(RwLock::new(HashMap::new())),
                 next_port: Arc::new(RwLock::new(config.port_range_start)),
+                forward_stats: Arc::new(ForwardStats::default()),
             })
         }
 
@@ -359,6 +389,7 @@ mod daemon {
             if let Some(health_listener) = health_listener {
                 let transport_health = Arc::clone(&self.transport);
                 let allocated_health = Arc::clone(&self.allocated_sockets);
+                let forward_stats_health = Arc::clone(&self.forward_stats);
                 let max_sessions_per_node = self.config.max_sessions_per_node;
                 let max_total_sessions = self.config.max_total_sessions;
                 tokio::spawn(async move {
@@ -366,6 +397,7 @@ mod daemon {
                         health_listener,
                         transport_health,
                         allocated_health,
+                        forward_stats_health,
                         max_sessions_per_node,
                         max_total_sessions,
                     )
@@ -533,6 +565,7 @@ mod daemon {
         async fn spawn_forward_task(&self, port: u16) {
             let allocated_sockets = Arc::clone(&self.allocated_sockets);
             let transport = Arc::clone(&self.transport);
+            let forward_stats = Arc::clone(&self.forward_stats);
 
             tokio::spawn(async move {
                 let mut buf = [0u8; 65536];
@@ -581,8 +614,11 @@ mod daemon {
                                     // Zero-copy forward: send the exact
                                     // received bytes (the transport never
                                     // copies or inspects the payload).
-                                    let _ =
+                                    let sent =
                                         peer_socket.send_to(&buf[..len], target.peer_addr).await;
+                                    if sent.is_ok() {
+                                        record_forward(&forward_stats, len);
+                                    }
                                 }
                             }
                             Ok(None) => {}
@@ -906,6 +942,8 @@ mod daemon {
         allocated_ports: usize,
         max_sessions_per_node: usize,
         max_total_sessions: usize,
+        frames_forwarded_total: u64,
+        bytes_forwarded_total: u64,
     }
 
     async fn bind_health_listener(bind_addr: SocketAddr) -> Result<TcpListener, String> {
@@ -921,6 +959,7 @@ mod daemon {
         listener: TcpListener,
         transport: Arc<RwLock<RelayTransport>>,
         allocated_sockets: Arc<RwLock<HashMap<u16, (UdpSocket, PortAllocation)>>>,
+        forward_stats: Arc<ForwardStats>,
         max_sessions_per_node: usize,
         max_total_sessions: usize,
     ) -> Result<(), String> {
@@ -931,6 +970,7 @@ mod daemon {
                 .map_err(|err| format!("accept health connection: {err}"))?;
             let transport = Arc::clone(&transport);
             let allocated_sockets = Arc::clone(&allocated_sockets);
+            let forward_stats = Arc::clone(&forward_stats);
             tokio::spawn(async move {
                 let mut request = [0u8; 1024];
                 let read = match stream.read(&mut request).await {
@@ -946,6 +986,12 @@ mod daemon {
                     allocated_ports: allocated_sockets.read().await.len(),
                     max_sessions_per_node,
                     max_total_sessions,
+                    frames_forwarded_total: forward_stats
+                        .frames_forwarded_total
+                        .load(Ordering::Relaxed),
+                    bytes_forwarded_total: forward_stats
+                        .bytes_forwarded_total
+                        .load(Ordering::Relaxed),
                 };
                 let (status, content_type, body) = match path {
                     "/healthz" => ("200 OK", "application/json", render_health_json(snapshot)),
@@ -979,21 +1025,25 @@ mod daemon {
 
     fn render_health_json(snapshot: HealthSnapshot) -> String {
         format!(
-            "{{\"status\":\"ok\",\"active_sessions\":{},\"allocated_ports\":{},\"max_sessions_per_node\":{},\"max_total_sessions\":{}}}\n",
+            "{{\"status\":\"ok\",\"active_sessions\":{},\"allocated_ports\":{},\"max_sessions_per_node\":{},\"max_total_sessions\":{},\"frames_forwarded_total\":{},\"bytes_forwarded_total\":{}}}\n",
             snapshot.active_sessions,
             snapshot.allocated_ports,
             snapshot.max_sessions_per_node,
-            snapshot.max_total_sessions
+            snapshot.max_total_sessions,
+            snapshot.frames_forwarded_total,
+            snapshot.bytes_forwarded_total
         )
     }
 
     fn render_metrics(snapshot: HealthSnapshot) -> String {
         format!(
-            "# TYPE rustynet_relay_active_sessions gauge\nrustynet_relay_active_sessions {}\n# TYPE rustynet_relay_allocated_ports gauge\nrustynet_relay_allocated_ports {}\n# TYPE rustynet_relay_max_sessions_per_node gauge\nrustynet_relay_max_sessions_per_node {}\n# TYPE rustynet_relay_max_total_sessions gauge\nrustynet_relay_max_total_sessions {}\n",
+            "# TYPE rustynet_relay_active_sessions gauge\nrustynet_relay_active_sessions {}\n# TYPE rustynet_relay_allocated_ports gauge\nrustynet_relay_allocated_ports {}\n# TYPE rustynet_relay_max_sessions_per_node gauge\nrustynet_relay_max_sessions_per_node {}\n# TYPE rustynet_relay_max_total_sessions gauge\nrustynet_relay_max_total_sessions {}\n# TYPE rustynet_relay_frames_forwarded_total counter\nrustynet_relay_frames_forwarded_total {}\n# TYPE rustynet_relay_bytes_forwarded_total counter\nrustynet_relay_bytes_forwarded_total {}\n",
             snapshot.active_sessions,
             snapshot.allocated_ports,
             snapshot.max_sessions_per_node,
-            snapshot.max_total_sessions
+            snapshot.max_total_sessions,
+            snapshot.frames_forwarded_total,
+            snapshot.bytes_forwarded_total
         )
     }
 
@@ -2396,16 +2446,17 @@ mod daemon {
     #[cfg(test)]
     mod tests {
         use super::{
-            HealthSnapshot, MAX_PRE_AUTH_HELLO_SOURCE_IPS, PreAuthHelloLimiter,
+            ForwardStats, HealthSnapshot, MAX_PRE_AUTH_HELLO_SOURCE_IPS, PreAuthHelloLimiter,
             RELAY_REJECT_GENERIC_REASON, RELAY_REJECT_MSG_TYPE, RelayConfig,
             RelayHostEntrySelection, RelayTransport, WindowsRelayServiceHardeningSnapshot,
             WindowsRelayServiceOptions, bind_health_listener,
             build_windows_relay_service_hardening_report, evaluate_windows_relay_service_hardening,
             http_request_path, load_control_verifier_key, parse_relay_id_arg,
-            parse_windows_image_path_argv, render_health_json, render_metrics,
+            parse_windows_image_path_argv, record_forward, render_health_json, render_metrics,
             run_hello_limiter_audit_command, select_relay_host_entry, serialize_relay_reject,
             serve_health_endpoint,
         };
+        use std::sync::atomic::Ordering;
         // Only the off-Windows fail-closed test calls this collector directly; on
         // Windows the symbol is unused here, so gate the import to match its caller.
         #[cfg(not(windows))]
@@ -3529,12 +3580,16 @@ mod daemon {
                 allocated_ports: 2,
                 max_sessions_per_node: 8,
                 max_total_sessions: 32,
+                frames_forwarded_total: 41,
+                bytes_forwarded_total: 12_345,
             };
 
             let health = render_health_json(snapshot);
             assert!(health.contains("\"status\":\"ok\""));
             assert!(health.contains("\"active_sessions\":2"));
             assert!(health.contains("\"max_total_sessions\":32"));
+            assert!(health.contains("\"frames_forwarded_total\":41"));
+            assert!(health.contains("\"bytes_forwarded_total\":12345"));
             assert!(!health.contains("verifier"));
             assert!(!health.contains("replay"));
             assert!(!health.contains("token"));
@@ -3544,10 +3599,25 @@ mod daemon {
             assert!(metrics.contains("rustynet_relay_active_sessions 2"));
             assert!(metrics.contains("rustynet_relay_allocated_ports 2"));
             assert!(metrics.contains("rustynet_relay_max_total_sessions 32"));
+            assert!(metrics.contains("rustynet_relay_frames_forwarded_total 41"));
+            assert!(metrics.contains("rustynet_relay_bytes_forwarded_total 12345"));
             assert!(!metrics.contains("verifier"));
             assert!(!metrics.contains("replay"));
             assert!(!metrics.contains("token"));
             assert!(!metrics.contains("relay_id"));
+        }
+
+        #[test]
+        fn record_forward_increments_frame_and_byte_counters_by_exact_length() {
+            let stats = ForwardStats::default();
+            assert_eq!(stats.frames_forwarded_total.load(Ordering::Relaxed), 0);
+            assert_eq!(stats.bytes_forwarded_total.load(Ordering::Relaxed), 0);
+
+            record_forward(&stats, 128);
+            record_forward(&stats, 64);
+
+            assert_eq!(stats.frames_forwarded_total.load(Ordering::Relaxed), 2);
+            assert_eq!(stats.bytes_forwarded_total.load(Ordering::Relaxed), 192);
         }
 
         #[test]
@@ -3592,11 +3662,13 @@ mod daemon {
                 90,
             )));
             let allocated_sockets = Arc::new(RwLock::new(HashMap::<u16, (UdpSocket, _)>::new()));
+            let forward_stats = Arc::new(ForwardStats::default());
 
             let health_task = tokio::spawn(serve_health_endpoint(
                 listener,
                 Arc::clone(&transport),
                 Arc::clone(&allocated_sockets),
+                Arc::clone(&forward_stats),
                 8,
                 4096,
             ));
@@ -3605,6 +3677,8 @@ mod daemon {
             assert!(health_response.starts_with("HTTP/1.1 200 OK"));
             assert!(health_response.contains("\"status\":\"ok\""));
             assert!(health_response.contains("\"active_sessions\":0"));
+            assert!(health_response.contains("\"frames_forwarded_total\":0"));
+            assert!(health_response.contains("\"bytes_forwarded_total\":0"));
             assert!(!health_response.contains("token"));
             assert!(!health_response.contains("relay_id"));
             assert!(!health_response.contains("verifier"));
@@ -3615,10 +3689,63 @@ mod daemon {
             assert!(metrics_response.contains("rustynet_relay_active_sessions 0"));
             assert!(metrics_response.contains("rustynet_relay_max_sessions_per_node 8"));
             assert!(metrics_response.contains("rustynet_relay_max_total_sessions 4096"));
+            assert!(metrics_response.contains("rustynet_relay_frames_forwarded_total 0"));
+            assert!(metrics_response.contains("rustynet_relay_bytes_forwarded_total 0"));
             assert!(!metrics_response.contains("token"));
             assert!(!metrics_response.contains("relay_id"));
             assert!(!metrics_response.contains("verifier"));
             assert!(!metrics_response.contains("replay"));
+
+            health_task.abort();
+        }
+
+        #[tokio::test]
+        async fn health_endpoint_reports_nonzero_forwarding_counters_once_frames_move() {
+            let listener = match bind_health_listener("127.0.0.1:0".parse().unwrap()).await {
+                Ok(listener) => listener,
+                Err(err)
+                    if err.contains("Operation not permitted")
+                        || err.contains("Permission denied") =>
+                {
+                    eprintln!("skipping forwarding-counter health endpoint socket test: {err}");
+                    return;
+                }
+                Err(err) => panic!("loopback health listener should bind: {err}"),
+            };
+            let health_addr = listener.local_addr().expect("health addr should exist");
+            let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+            let transport = Arc::new(RwLock::new(RelayTransport::new(
+                [1u8; 16],
+                signing_key.verifying_key(),
+                8,
+                90,
+            )));
+            let allocated_sockets = Arc::new(RwLock::new(HashMap::<u16, (UdpSocket, _)>::new()));
+            let forward_stats = Arc::new(ForwardStats::default());
+
+            let health_task = tokio::spawn(serve_health_endpoint(
+                listener,
+                transport,
+                allocated_sockets,
+                Arc::clone(&forward_stats),
+                8,
+                4096,
+            ));
+
+            // Simulate what `spawn_forward_task` does at its real send_to call
+            // site: record a forward using only the byte length, never the
+            // payload itself — this is the exact enforcement point under test,
+            // exercised here without needing two live UDP sockets end-to-end.
+            record_forward(&forward_stats, 512);
+            record_forward(&forward_stats, 256);
+
+            let metrics_response = request_health_path(health_addr, "/metrics").await;
+            assert!(metrics_response.contains("rustynet_relay_frames_forwarded_total 2"));
+            assert!(metrics_response.contains("rustynet_relay_bytes_forwarded_total 768"));
+
+            let health_response = request_health_path(health_addr, "/healthz").await;
+            assert!(health_response.contains("\"frames_forwarded_total\":2"));
+            assert!(health_response.contains("\"bytes_forwarded_total\":768"));
 
             health_task.abort();
         }
