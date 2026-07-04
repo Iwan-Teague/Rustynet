@@ -2202,3 +2202,12 @@ timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
 2026-07-03T20:52:08Z,d9f6a06,dirty,issue_and_distribute_dns_zone,deepseek-lab-labrun-1783110787664-76066-0,69,pass
 2026-07-03T20:53:18Z,d9f6a06,dirty,enforce_baseline_runtime,deepseek-lab-labrun-1783110787664-76066-0,278,pass
 2026-07-03T20:57:57Z,d9f6a06,dirty,validate_baseline_runtime,deepseek-lab-labrun-1783110787664-76066-0,75,pass
+2026-07-04T01:29:05Z,7a72c30,dirty,bootstrap_hosts,deepseek-lab-labrun-1783128405579-34966-0,727,pass
+2026-07-04T01:41:22Z,7a72c30,dirty,collect_pubkeys,deepseek-lab-labrun-1783128405579-34966-0,23,pass
+2026-07-04T01:41:46Z,7a72c30,dirty,membership_setup,deepseek-lab-labrun-1783128405579-34966-0,27,pass
+2026-07-04T01:42:21Z,7a72c30,dirty,distribute_membership_state,deepseek-lab-labrun-1783128405579-34966-0,37,pass
+2026-07-04T01:42:59Z,7a72c30,dirty,issue_and_distribute_assignments,deepseek-lab-labrun-1783128405579-34966-0,96,pass
+2026-07-04T01:44:39Z,7a72c30,dirty,issue_and_distribute_traversal,deepseek-lab-labrun-1783128405579-34966-0,67,pass
+2026-07-04T01:45:47Z,7a72c30,dirty,issue_and_distribute_dns_zone,deepseek-lab-labrun-1783128405579-34966-0,68,pass
+2026-07-04T01:47:23Z,7a72c30,dirty,enforce_baseline_runtime,deepseek-lab-labrun-1783128405579-34966-0,271,pass
+2026-07-04T01:51:55Z,7a72c30,dirty,validate_baseline_runtime,deepseek-lab-labrun-1783128405579-34966-0,72,pass
