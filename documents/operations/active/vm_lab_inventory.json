@@ -40,7 +40,7 @@
       "exit_capable": false,
       "lab_role": "client",
       "last_known_ip": "192.168.0.201",
-      "last_known_network": "utm-shared-192.168.65.0/24",
+      "last_known_network": "lan-192.168.0.0/24",
       "live_ips": [
         "192.168.0.201",
         "192.168.65.4",
@@ -49,7 +49,7 @@
         "fe80::a419:949:1c4a:4d9f"
       ],
       "mesh_ip": "100.64.0.2",
-      "network_group": "utm-shared-192.168.65.0/24",
+      "network_group": "lan-192.168.0.0/24",
       "node_id": "client-1",
       "os": "Debian/Linux",
       "parent_device": "iwan's MacBook Pro",
@@ -69,7 +69,7 @@
       "exit_capable": false,
       "lab_role": "relay",
       "last_known_ip": "192.168.0.202",
-      "last_known_network": "utm-shared-192.168.65.0/24",
+      "last_known_network": "lan-192.168.0.0/24",
       "live_ips": [
         "192.168.0.202",
         "192.168.65.6",
@@ -79,7 +79,7 @@
         "fe80::bec8:79f7:a83d:ddc"
       ],
       "mesh_ip": "100.64.0.3",
-      "network_group": "utm-shared-192.168.65.0/24",
+      "network_group": "lan-192.168.0.0/24",
       "node_id": "relay-1",
       "os": "Debian/Linux",
       "parent_device": "iwan's MacBook Pro",
@@ -99,7 +99,7 @@
       "exit_capable": false,
       "lab_role": "aux",
       "last_known_ip": "192.168.0.203",
-      "last_known_network": "utm-shared-192.168.65.0/24",
+      "last_known_network": "lan-192.168.0.0/24",
       "live_ips": [
         "192.168.0.203",
         "192.168.65.5",
@@ -109,7 +109,7 @@
         "fe80::cadd:6589:4e14:8590"
       ],
       "mesh_ip": "100.64.0.4",
-      "network_group": "utm-shared-192.168.65.0/24",
+      "network_group": "lan-192.168.0.0/24",
       "node_id": "aux-1",
       "os": "Debian/Linux",
       "parent_device": "iwan's MacBook Pro",
@@ -142,14 +142,14 @@
       "exit_capable": false,
       "lab_role": "extra",
       "last_known_ip": "192.168.0.204",
-      "last_known_network": "utm-shared-192.168.65.0/24",
+      "last_known_network": "lan-192.168.0.0/24",
       "live_ips": [
         "192.168.0.204",
         "192.168.65.7",
         "fe80::7ffa:3176:cf30:8856"
       ],
       "mesh_ip": "100.64.0.5",
-      "network_group": "utm-shared-192.168.65.0/24",
+      "network_group": "lan-192.168.0.0/24",
       "node_id": "extra-1",
       "os": "Debian/Linux",
       "parent_device": "iwan's MacBook Pro",
