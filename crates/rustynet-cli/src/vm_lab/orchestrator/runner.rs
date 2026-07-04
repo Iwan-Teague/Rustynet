@@ -263,10 +263,14 @@ mod tests {
         }
         impl StageObserver for RecordingObserver {
             fn stage_started(&self, id: &StageId) {
-                self.events.borrow_mut().push((id.as_str().to_owned(), "start"));
+                self.events
+                    .borrow_mut()
+                    .push((id.as_str().to_owned(), "start"));
             }
             fn stage_finished(&self, id: &StageId, _outcome: &StageOutcome) {
-                self.events.borrow_mut().push((id.as_str().to_owned(), "finish"));
+                self.events
+                    .borrow_mut()
+                    .push((id.as_str().to_owned(), "finish"));
             }
         }
 
@@ -284,8 +288,12 @@ mod tests {
 
         // An executed stage emits start then finish.
         for executed in ["preflight", "cleanup_hosts"] {
-            let start = events.iter().position(|(n, e)| n == executed && *e == "start");
-            let finish = events.iter().position(|(n, e)| n == executed && *e == "finish");
+            let start = events
+                .iter()
+                .position(|(n, e)| n == executed && *e == "start");
+            let finish = events
+                .iter()
+                .position(|(n, e)| n == executed && *e == "finish");
             assert!(start.is_some(), "{executed} must start");
             assert!(
                 start < finish,
