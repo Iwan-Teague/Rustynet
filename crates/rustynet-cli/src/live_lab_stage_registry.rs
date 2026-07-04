@@ -799,6 +799,7 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "validate_macos_role_transition",
         stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "role_transition")),
         enable: EnableRule::RoleSwitchPlatform("macos"),
         budget_secs: 180,
         ..DEFAULT_SPEC
@@ -1066,6 +1067,7 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "validate_windows_role_transition",
         stream: PlatformStream::Windows,
+        direct_platform: Some(("windows", "role_transition")),
         enable: EnableRule::RoleSwitchPlatform("windows"),
         budget_secs: 180,
         ..DEFAULT_SPEC

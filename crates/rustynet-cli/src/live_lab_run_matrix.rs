@@ -90,6 +90,7 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "macos_stage_lan_toggle",
     "macos_stage_two_hop",
     "macos_stage_role_switch_matrix",
+    "macos_stage_role_transition",
     "macos_stage_managed_dns",
     "macos_stage_traversal",
     "macos_stage_mixed_topology",
@@ -107,6 +108,7 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "windows_stage_lan_toggle",
     "windows_stage_two_hop",
     "windows_stage_role_switch_matrix",
+    "windows_stage_role_transition",
     "windows_stage_managed_dns",
     "windows_stage_traversal",
     "windows_stage_mixed_topology",
@@ -1969,8 +1971,8 @@ mod tests {
     use super::{
         DEFAULT_MATRIX_COLUMNS, LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome,
         StageEvidence, TargetEvidence, build_live_lab_run_matrix_values, csv_escape,
-        parse_csv_record, populate_cross_os_values, populate_role_result_values, render_csv_row,
-        set_special_stage_values,
+        parse_csv_record, populate_cross_os_values, populate_role_result_values,
+        populate_stage_values, render_csv_row, set_special_stage_values,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
@@ -2151,6 +2153,67 @@ mod tests {
                 .get("cross_os_anchor_bundle_pull")
                 .map(String::as_str),
             Some("fail")
+        );
+    }
+
+    #[test]
+    fn role_transition_stages_populate_their_own_dedicated_csv_columns() {
+        // Regression: validate_macos_role_transition / validate_windows_role_transition
+        // were registered stages with no direct_platform mapping, so a real pass/fail
+        // never landed in any tracked run-matrix column -- find_untested_work-style
+        // coverage queries (which read dedicated per-stage columns) had no visibility
+        // into this stage at all, in either direction.
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let targets = vec![TargetEvidence {
+            label: "windows".to_owned(),
+            target: "windows".to_owned(),
+            alias: "windows-utm-1".to_owned(),
+            platform: "windows".to_owned(),
+            node_id: "windows-client-1".to_owned(),
+            bootstrap_role: "client".to_owned(),
+        }];
+        let report_dir = tempfile::tempdir().expect("tempdir");
+        let mut values = BTreeMap::new();
+        populate_stage_values(
+            &mut values,
+            &schema,
+            report_dir.path(),
+            &targets,
+            &[StageEvidence {
+                stage: "validate_windows_role_transition".to_owned(),
+                status: "pass".to_owned(),
+                artifacts: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            values
+                .get("windows_stage_role_transition")
+                .map(String::as_str),
+            Some("pass"),
+            "validate_windows_role_transition must populate windows_stage_role_transition: {values:?}"
+        );
+
+        let mut values = BTreeMap::new();
+        populate_stage_values(
+            &mut values,
+            &schema,
+            report_dir.path(),
+            &targets,
+            &[StageEvidence {
+                stage: "validate_macos_role_transition".to_owned(),
+                status: "fail".to_owned(),
+                artifacts: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            values
+                .get("macos_stage_role_transition")
+                .map(String::as_str),
+            Some("fail"),
+            "validate_macos_role_transition must populate macos_stage_role_transition: {values:?}"
         );
     }
 
@@ -2773,6 +2836,7 @@ mod registry_equivalence_tests {
             "validate_windows_dns_failclosed" | "validate_windows_exit_dns_failclosed" => {
                 Some(("windows", "managed_dns"))
             }
+            "validate_windows_role_transition" => Some(("windows", "role_transition")),
             "bootstrap_macos_host" => Some(("macos", "bootstrap")),
             "collect_macos_pubkey" | "validate_macos_mesh_join" => {
                 Some(("macos", "mixed_topology"))
@@ -2786,6 +2850,7 @@ mod registry_equivalence_tests {
             | "validate_macos_exit_nat_lifecycle"
             | "validate_macos_ipv6_leak" => Some(("macos", "exit_handoff")),
             "validate_macos_exit_dns_failclosed" => Some(("macos", "managed_dns")),
+            "validate_macos_role_transition" => Some(("macos", "role_transition")),
             "validate_linux_relay_service_lifecycle" => Some(("linux", "relay_service_lifecycle")),
             "validate_linux_anchor_bundle_pull" => Some(("linux", "anchor")),
             "validate_linux_exit_nat_lifecycle"

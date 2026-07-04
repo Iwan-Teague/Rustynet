@@ -64,6 +64,19 @@ budgets, header math) builds on that contract.
   renders the run's own plan (fallback catalog only governs pre-manifest
   report dirs — healed of phantoms and carrying the real Windows pipeline +
   per-OS audit families, pinned to the registry by the drift gate).
+- **`role_transition` column gap (healed):** `validate_macos_role_transition`
+  and `validate_windows_role_transition` were registered stages with no
+  `direct_platform` mapping — a real pass/fail never landed in any run-matrix
+  column, so coverage queries over stage history (e.g. `find_untested_work`)
+  had no visibility into either direction for this stage. Fixed by mapping
+  both to `("<os>", "role_transition")` → `<os>_stage_role_transition`,
+  updating the registry-equivalence oracle in lockstep (`registry_matches_
+  historical_direct_platform_stage`), and adding both new columns to
+  `DEFAULT_MATRIX_COLUMNS` (self-migrates the on-disk CSV header via
+  `ensure_matrix_schema` on the next append — no manual file surgery). Found
+  while investigating why the Windows role-transition live-lab proof
+  (`CrossOsRoleSwitchPlan_2026-06-24.md`) wouldn't show up in automated
+  coverage once re-run.
 
 ## Verification
 
