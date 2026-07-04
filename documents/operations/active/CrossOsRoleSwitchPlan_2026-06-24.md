@@ -1,14 +1,21 @@
 # Cross-OS Live Role-Transition Design — 2026-06-24
 
-> **Status: macOS `LocalOnly` (admin<->client) slice IMPLEMENTED 2026-07-04,
-> pending live-lab proof.** `exercise_macos_role_transition_live` (`crates/
-> rustynet-cli/src/vm_lab/mod.rs`) drives the real §5 sequence — `rustynet
-> role set <to>` → `launchctl bootout`/`bootstrap` → assert new role via
-> `role status` → `rustynet state refresh` → assert mesh peers survived the
-> flip — gated behind a new `--role-switch-platform macos` selector
-> (`validate_macos_role_transition` stage, `live_lab_stage_registry.rs`).
-> Windows (`windows_service` reload) and the `SignedMembership` transition
-> kind (capability changes, needs the admin issue/ingest wiring) remain
+> **Status: macOS `LocalOnly` (admin<->client) slice LIVE-PROVEN 2026-07-04**
+> (`livelab-1783135864-2fda3979d599`, commit `2fda397`,
+> `validate_macos_role_transition` PASS — 0 failures across 47 outcomes,
+> `overall_status: partial` only from unelected role selectors legitimately
+> skipping). `exercise_macos_role_transition_live` (`crates/rustynet-cli/src/
+> vm_lab/mod.rs`) drove the real §5 sequence on `macos-utm-1` — `rustynet
+> role set admin` (from `client`) → `launchctl bootout`/`bootstrap` → asserted
+> the new role via `role status` → `rustynet state refresh` → asserted mesh
+> peers did not regress across the flip (0 before, 0 after — expected for a
+> `--skip-linux-live-suite` run with no live traffic stage) — gated behind
+> `--role-switch-platform macos` (`live_lab_stage_registry.rs`). First
+> attempt (`livelab-...-` run 1) failed on an absolute zero-peers-after
+> check; fixed to a before/after regression comparison (commit `2fda397`)
+> since a fast run legitimately has zero live peers throughout. Windows
+> (`windows_service` reload) and the `SignedMembership` transition kind
+> (capability changes, needs the admin issue/ingest wiring) remain
 > design-only — see §3/§4 below, unchanged. This is the banked design the
 > `CrossPlatformRoleParityPlan_2026-06-21.md` §3 *live role transitions
 > (cross-OS)* cell depends on (Roadmap `CrossPlatformRoleParityRoadmap_2026-06-22.md`
