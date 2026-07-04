@@ -63,7 +63,7 @@ untested/not implemented · 🔒 blocked):
 | exit (NAT egress + killswitch) | ✅ | ✅ **LIVE-PROVEN 2026-07-03** (`labrun-1783087254263-11121-0`, commit `039f215`: activation, NAT lifecycle, DNS fail-closed, service hardening, mesh-status) | 🟡 implemented but **🔒 lab guest lacks WinNAT/`MSFT_NetNat`** |
 | blind_exit (irreversible exit) | ✅ | ✅ **LIVE-PROVEN 2026-06-29** (run `labrun-1782770042330-16244-0`, `--blind-exit-platform macos`): `validate_macos_blind_exit` PASS — irreversible transition applied, pf anchor hardened (9 rules, no route-to/reply-to/dup-to), immutability gate enforced | 🚫 **blocked by design** (`main.rs:11768` hard-errors; macOS/Linux only) |
 | relay (live session forwarding) | ✅ *(lifecycle only — no live forwarding proof anywhere; see §4)* | ✅ **lifecycle LIVE-PROVEN 2026-06-27** (run `livelab-1782571161`, `validate_macos_relay_service_lifecycle` PASS). **Live session forwarding remains HP-3-gated** (same cross-OS gate as Linux ✅). | 🟠 SCM lifecycle contract only |
-| live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | ❌ stage unbuilt | ❌ stage unbuilt (design doc exists: `CrossOsRoleSwitchPlan_2026-06-24.md`) |
+| live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | 🟡 stage built (`validate_macos_role_transition`, `LocalOnly` admin<->client), pending live-lab proof | ❌ stage unbuilt (design doc exists: `CrossOsRoleSwitchPlan_2026-06-24.md`) |
 
 **Three corrections this roadmap has made to the matrix:**
 1. macOS **admin** is live-proven; the "self-mint deliberately disabled" note had
@@ -86,7 +86,7 @@ dry-run had masked). "Live stage" = author a fail-loud stage per §7.
 | 1 | **macOS admin** | ✅ DONE | refresh proof: `labrun-1783089250895-6139-0`, `831d41d`, `validate_macos_admin_issue` PASS | — | — |
 | 2 | **Windows admin** | ✅ DONE | live-proven 2026-06-27: `validate_windows_admin_issue` PASS, run `livelab-1782526081` | — | — |
 | 3 | **macOS blind_exit** | ✅ DONE (2026-06-29) | live-proven: `labrun-1782770042330-16244-0`, `ed3ed7e` | — | — |
-| 4 | **Role transitions (macOS→Windows)** | ❌ | stage that drives a real flip and re-applies signed state via `refresh_signed_state_with_reason`; design exists in `CrossOsRoleSwitchPlan_2026-06-24.md` | ~2–4 d | admin cells done |
+| 4 | **Role transitions (macOS→Windows)** | 🟡 macOS `LocalOnly` IMPLEMENTED 2026-07-04, pending live-lab proof | `validate_macos_role_transition` (`--role-switch-platform macos`) drives `rustynet role set` + launchd bootout/bootstrap + `state refresh`, asserts new role + mesh peers; needs a live run to flip 🟡→✅. Windows (`windows_service` reload) + `SignedMembership` kind remain design-only in `CrossOsRoleSwitchPlan_2026-06-24.md` | macOS: live-run only; Windows: ~1–2 d | admin cells done |
 | 5 | macOS **exit** | ✅ DONE | live-proven 2026-07-03 by `labrun-1783087254263-11121-0` on `039f215` | — | — |
 | 6 | macOS **relay** *live lifecycle* | ✅ **DONE** (2026-06-27) | ✅ live lifecycle proven: `validate_macos_relay_service_lifecycle` PASS (run `livelab-1782571161`). **Forwarding proof remains HP-3-gated, same as Linux.** | — | — |
 | 7 | Windows **anchor** live + macOS **anchor** live | ✅ DONE for bundle-pull | macOS bundle-pull live-proven 2026-06-22; Windows bundle-pull live-proven 2026-07-03 via `labrun-1783079551578-32671-0` on `786f900`; remaining gossip/enrollment anchor sub-surfaces stay separate | — | — |
@@ -210,7 +210,7 @@ from selector/optional skips):
 
 | # | Cell | Why this rank |
 |---|---|---|
-| 1 | **Role transitions (macOS→Windows)** | reuses `refresh_signed_state_with_reason`; admin prerequisites are now live-proven; design exists, stage remains |
+| 1 | **Role transitions (macOS→Windows)** | 🟡 macOS `LocalOnly` stage IMPLEMENTED 2026-07-04 (`validate_macos_role_transition`, `--role-switch-platform macos`), reuses `refresh_signed_state_with_reason` via `state refresh`; needs a live run to flip ✅. Windows + `SignedMembership` kind remain design-only |
 | 2 | **Remaining anchor sub-surfaces** | bundle-pull is live-proven on macOS/Windows; gossip/enrollment/port-map still need explicit live proof |
 | ✅ | **macOS admin** | DONE: `labrun-1783089250895-6139-0`, commit `831d41d`, `validate_macos_admin_issue` PASS |
 | ✅ | **Windows admin** | DONE: `livelab-1782526081`, `validate_windows_admin_issue` PASS |

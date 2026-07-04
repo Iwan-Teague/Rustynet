@@ -967,6 +967,15 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// blind_exit live stage, which runs LAST because it wipes node identity.
     /// `Some("macos")` runs that stage; unset/other Skips it.
     pub blind_exit_platform: Option<String>,
+    /// Counterpart of [`Self::exit_platform`] for the live role-transition
+    /// cell (`CrossOsRoleSwitchPlan_2026-06-24.md`). Like admin/blind_exit it
+    /// is NOT threaded into `topology::resolve_topology`; it only elects the
+    /// macOS live role-transition stage, which drives a real
+    /// `TransitionKind::LocalOnly` admin<->client flip via `rustynet role
+    /// set` + the launchd reload and asserts the new role + mesh
+    /// connectivity post-restart. `Some("macos")` runs that stage;
+    /// unset/other Skips it.
+    pub role_switch_platform: Option<String>,
     /// Promote the macOS node to a SECONDARY regular (NATing) exit while a
     /// Linux node remains the PRIMARY exit and the membership/assignment
     /// authority. Unlike `--exit-platform macos` (which would make the macOS
@@ -6841,6 +6850,7 @@ fn orchestrate_manifest_selectors(
             config.anchor_platform.as_deref(),
             config.admin_platform.as_deref(),
             config.blind_exit_platform.as_deref(),
+            config.role_switch_platform.as_deref(),
         ]
         .into_iter()
         .any(|selector| selector == Some(platform))
@@ -6858,6 +6868,7 @@ fn orchestrate_manifest_selectors(
         anchor_platform: config.anchor_platform.clone().unwrap_or_default(),
         admin_platform: config.admin_platform.clone().unwrap_or_default(),
         blind_exit_platform: config.blind_exit_platform.clone().unwrap_or_default(),
+        role_switch_platform: config.role_switch_platform.clone().unwrap_or_default(),
         skip_linux_live_suite: config.skip_linux_live_suite,
         chaos_suite: config.enable_chaos_suite,
         cross_network_suite: !config.skip_cross_network,
@@ -8618,6 +8629,14 @@ fn run_macos_orchestration_stages(
         .as_deref()
         .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
 
+    // The macOS node is elected for the live role-transition proof when
+    // `--role-switch-platform macos` is set. Drives a real LocalOnly
+    // admin<->client flip; runs ONLY when elected, otherwise Skips.
+    let is_macos_active_role_transition = config
+        .role_switch_platform
+        .as_deref()
+        .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
+
     // The macOS node is the elected blind_exit when `--blind-exit-platform
     // macos` is set. The blind_exit live stage drives the IRREVERSIBLE
     // `* -> blind_exit` transition and asserts the `pf` blind_exit anchor +
@@ -10167,6 +10186,71 @@ fn run_macos_orchestration_stages(
     };
     outcomes.push(macos_admin_outcome);
 
+    // ── Stage: validate_macos_role_transition ─────────────────────────────
+    //
+    // Prove the macOS node can transition roles LIVE (the previously
+    // "stage unbuilt" cross-OS role-transitions cell,
+    // `CrossOsRoleSwitchPlan_2026-06-24.md`): drive a real
+    // `TransitionKind::LocalOnly` admin<->client flip via the actual
+    // `rustynet role set <to>` CLI (never a second apply path), perform the
+    // macOS-only launchd reload the CLI does not do itself, assert the
+    // daemon reports the new role post-restart, run `state refresh` (the one
+    // verified apply path), and assert mesh connectivity survived the flip.
+    // Runs only when elected (--role-switch-platform macos); else Skips.
+    // FAIL-LOUD: the live result is the stage status.
+    let macos_role_transition_log_path = logs_dir.join("validate_macos_role_transition.log");
+    let macos_role_transition_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_role_transition",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would drive a live admin<->client role transition on {macos_alias}"),
+            vec![],
+        )
+    } else if !is_macos_active_role_transition {
+        stage_outcome(
+            "validate_macos_role_transition",
+            VmLabStageStatus::Skipped,
+            format!(
+                "skipped: {macos_alias} is not elected for role transition (role_switch_platform != macos)"
+            ),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "validate_macos_role_transition",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        match exercise_macos_role_transition_live(
+            macos_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&macos_role_transition_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_macos_role_transition",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![macos_role_transition_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&macos_role_transition_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_macos_role_transition",
+                    VmLabStageStatus::Fail,
+                    format!("macOS live role transition failed for {macos_alias}: {reason}"),
+                    vec![macos_role_transition_log_path.clone()],
+                )
+            }
+        }
+    };
+    outcomes.push(macos_role_transition_outcome);
+
     // ── Stage: validate_macos_blind_exit (LAST — wipes node identity) ─────
     //
     // Prove the macOS node can become the IRREVERSIBLE blind_exit: drive the
@@ -11556,6 +11640,132 @@ fn exercise_macos_admin_issue_live(
         artifact_dir.display(),
         out.trim(),
         peer_out.trim()
+    ))
+}
+
+/// Prove a macOS node can transition roles LIVE via the `TransitionKind::
+/// LocalOnly` admin<->client pair (config write + daemon reload, no signed
+/// bundle — `role_presets::validate_transition`) — the first live-lab proof
+/// for the previously "stage unbuilt" cross-OS role-transitions cell
+/// (`CrossOsRoleSwitchPlan_2026-06-24.md`). Drives the actual `rustynet role
+/// set <to>` CLI (the one hardened planner path — never a second/weaker
+/// apply branch), then performs the macOS-only reload the CLI does not do
+/// itself (`role set` only rewrites the launchd plist's `--node-role` pair
+/// and tells the operator "daemon restart applies it" —
+/// `update_node_role_macos_plist` in `main.rs`); the live-lab stage is the
+/// operator here, so it drives `launchctl bootout` + `bootstrap` exactly
+/// like the proven `exercise_macos_blind_exit_live` reload sequence. Asserts
+/// the daemon reports the new role post-restart, runs `state refresh` (the
+/// single verified `refresh_signed_state_with_reason` apply path), and
+/// asserts mesh connectivity survived the flip: `overall_ok` alone can
+/// false-green with zero peers, so peer count is checked explicitly rather
+/// than trusting the evaluator's summary alone. FAIL-LOUD: the live result
+/// is the stage status; an unexpected before-role is a Fail, not a silent
+/// Skip. SignedMembership-kind transitions (capability changes) need the
+/// admin cell's issue/ingest wiring and are a separate increment.
+fn exercise_macos_role_transition_live(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let macos_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == macos_alias)
+        .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
+        .clone();
+    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            macos_entry.platform_profile().platform.as_str()
+        ));
+    }
+    let target = remote_target_from_inventory_entry(&macos_entry, None);
+
+    let role_transition_script = "set -eu; \
+         RN=/usr/local/bin/rustynet; \
+         CLIENT_PLIST=/Library/LaunchDaemons/com.rustynet.daemon.plist; \
+         test -f \"$CLIENT_PLIST\"; \
+         BEFORE_STATUS=\"$(sudo $RN role status 2>&1)\"; \
+         BEFORE_ROLE=$(echo \"$BEFORE_STATUS\" | awk '/^current role:/{print $3; exit}'); \
+         case \"$BEFORE_ROLE\" in \
+           admin) TARGET=client ;; \
+           client) TARGET=admin ;; \
+           *) echo \"unexpected before-role for LocalOnly admin<->client proof: $BEFORE_ROLE\" >&2; \
+              echo \"$BEFORE_STATUS\" >&2; exit 1 ;; \
+         esac; \
+         if ! SET_OUT=\"$(sudo $RN role set \"$TARGET\" 2>&1)\"; then \
+           echo \"role set $TARGET failed: $SET_OUT\" >&2; exit 1; fi; \
+         sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
+         for _i in $(seq 1 20); do \
+           sudo launchctl print system/com.rustynet.daemon >/dev/null 2>&1 || break; \
+           sleep 1; \
+         done; \
+         BOOT_OK=0; BOOT_ERR=''; \
+         for _i in $(seq 1 10); do \
+           if BOOT_ERR=\"$(sudo launchctl bootstrap system \"$CLIENT_PLIST\" 2>&1)\"; then BOOT_OK=1; break; fi; \
+           sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
+           sleep 2; \
+         done; \
+         if [ \"$BOOT_OK\" != 1 ]; then echo \"launchctl bootstrap failed after retries: $BOOT_ERR\" >&2; exit 1; fi; \
+         AFTER_OK=0; AFTER_STATUS=''; \
+         for _i in $(seq 1 30); do \
+           AFTER_STATUS=\"$(sudo $RN role status 2>&1)\" || true; \
+           if echo \"$AFTER_STATUS\" | grep -q \"^current role: $TARGET\"; then AFTER_OK=1; break; fi; \
+           sleep 2; \
+         done; \
+         if [ \"$AFTER_OK\" != 1 ]; then \
+           echo \"daemon did not report $TARGET role after restart (before was $BEFORE_ROLE)\" >&2; \
+           echo \"$AFTER_STATUS\" >&2; \
+           echo '--- diag: rustynetd journal (last 2m) ---' >&2; \
+           sudo log show --last 2m --predicate 'process == \"rustynetd\"' 2>/dev/null | tail -40 >&2 || true; \
+           exit 1; \
+         fi; \
+         if ! REFRESH_OUT=\"$(sudo $RN state refresh 2>&1)\"; then \
+           echo \"state refresh after role transition failed: $REFRESH_OUT\" >&2; exit 1; fi; \
+         echo \"role transition proven: $BEFORE_ROLE -> $TARGET; launchctl bootout+bootstrap reload verified; state refresh ok\"";
+
+    let out = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        role_transition_script,
+        Duration::from_secs(120),
+    )
+    .map_err(|e| format!("macOS role transition on {macos_alias} failed: {e}"))?;
+
+    let mesh_raw_json = run_macos_daemon_check_remote(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "macos-mesh-status-check",
+        &[],
+    )
+    .map_err(|e| format!("post-transition mesh status check on {macos_alias} failed: {e}"))?;
+    let mesh_summary = evaluate_macos_mesh_status_report(macos_alias, mesh_raw_json.as_str())?;
+    let mesh_report: rustynetd::macos_mesh_status::MacosMeshStatusReport =
+        serde_json::from_str(mesh_raw_json.as_str())
+            .map_err(|err| format!("parse macos-mesh-status-check JSON output failed: {err}"))?;
+    let peer_count = match &mesh_report.snapshot {
+        rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::Ok { peer_ids, .. } => {
+            peer_ids.len()
+        }
+        _ => 0,
+    };
+    if peer_count == 0 {
+        return Err(format!(
+            "mesh status reported healthy but zero peers on {macos_alias} after the role \
+             transition — a flip that silently dropped mesh connectivity must not read as a \
+             Pass ({mesh_summary})"
+        ));
+    }
+
+    Ok(format!(
+        "macOS live role transition proven on {macos_alias}: {}; post-restart {mesh_summary}",
+        out.trim()
     ))
 }
 
@@ -44781,6 +44991,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             anchor_platform: None,
             admin_platform: None,
             blind_exit_platform: None,
+            role_switch_platform: None,
             macos_promote_exit: false,
             enable_chaos_suite: false,
             stage_timeout_secs: 0,

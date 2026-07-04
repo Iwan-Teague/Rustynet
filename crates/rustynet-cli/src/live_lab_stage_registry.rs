@@ -182,6 +182,9 @@ pub enum EnableRule {
     AdminPlatform(&'static str),
     /// blind_exit elected on the given platform.
     BlindExitPlatform(&'static str),
+    /// Live role-transition (LocalOnly admin<->client flip) elected on the
+    /// given platform.
+    RoleSwitchPlatform(&'static str),
     /// Part of the Linux live-validation suite (`!skip_linux_live_suite`).
     LinuxLiveSuite,
     /// The extended soak stage (`!skip_soak` / bash RUN_SOAK).
@@ -207,6 +210,7 @@ pub struct TargetSelectors {
     pub anchor_platform: String,
     pub admin_platform: String,
     pub blind_exit_platform: String,
+    pub role_switch_platform: String,
     pub skip_linux_live_suite: bool,
     pub chaos_suite: bool,
     pub cross_network_suite: bool,
@@ -227,6 +231,7 @@ impl TargetSelectors {
             EnableRule::AnchorPlatform(platform) => self.anchor_platform == platform,
             EnableRule::AdminPlatform(platform) => self.admin_platform == platform,
             EnableRule::BlindExitPlatform(platform) => self.blind_exit_platform == platform,
+            EnableRule::RoleSwitchPlatform(platform) => self.role_switch_platform == platform,
             EnableRule::LinuxLiveSuite => !self.skip_linux_live_suite,
             EnableRule::ChaosSuite => self.chaos_suite,
             EnableRule::CrossNetworkSuite => self.cross_network_suite,
@@ -249,6 +254,7 @@ impl TargetSelectors {
             EnableRule::AnchorPlatform(_) => "anchor not elected on this platform",
             EnableRule::AdminPlatform(_) => "admin not elected on this platform",
             EnableRule::BlindExitPlatform(_) => "blind_exit not elected on this platform",
+            EnableRule::RoleSwitchPlatform(_) => "role transition not elected on this platform",
             EnableRule::LinuxLiveSuite => "linux live suite skipped for this run",
             EnableRule::ChaosSuite => "chaos suite not selected",
             EnableRule::CrossNetworkSuite => "cross-network suite not selected",
@@ -780,6 +786,13 @@ pub const STAGES: &[StageSpec] = &[
         name: "validate_macos_admin_issue",
         stream: PlatformStream::Macos,
         enable: EnableRule::AdminPlatform("macos"),
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_role_transition",
+        stream: PlatformStream::Macos,
+        enable: EnableRule::RoleSwitchPlatform("macos"),
         budget_secs: 180,
         ..DEFAULT_SPEC
     },
@@ -2034,6 +2047,27 @@ mod tests {
         assert!(!empty.resolves(EnableRule::MacosExit));
         assert!(!empty.resolves(EnableRule::ChaosSuite));
         assert!(empty.resolves(EnableRule::LinuxLiveSuite));
+    }
+
+    #[test]
+    fn role_switch_platform_selector_default_denies_and_elects() {
+        // Default-deny: an unset role_switch_platform never elects the stage
+        // on any platform.
+        let empty = TargetSelectors::default();
+        assert!(!empty.resolves(EnableRule::RoleSwitchPlatform("macos")));
+        assert!(!empty.resolves(EnableRule::RoleSwitchPlatform("windows")));
+
+        let macos_elected = TargetSelectors {
+            role_switch_platform: "macos".to_owned(),
+            ..TargetSelectors::default()
+        };
+        assert!(macos_elected.resolves(EnableRule::RoleSwitchPlatform("macos")));
+        assert!(!macos_elected.resolves(EnableRule::RoleSwitchPlatform("windows")));
+
+        let spec = find_stage("validate_macos_role_transition")
+            .expect("validate_macos_role_transition is registered");
+        assert_eq!(spec.stream, PlatformStream::Macos);
+        assert_eq!(spec.enable, EnableRule::RoleSwitchPlatform("macos"));
     }
 
     #[test]

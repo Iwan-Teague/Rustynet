@@ -1,6 +1,15 @@
 # Cross-OS Live Role-Transition Design — 2026-06-24
 
-> **Status: design (code-pending).** This is the banked design the
+> **Status: macOS `LocalOnly` (admin<->client) slice IMPLEMENTED 2026-07-04,
+> pending live-lab proof.** `exercise_macos_role_transition_live` (`crates/
+> rustynet-cli/src/vm_lab/mod.rs`) drives the real §5 sequence — `rustynet
+> role set <to>` → `launchctl bootout`/`bootstrap` → assert new role via
+> `role status` → `rustynet state refresh` → assert mesh peers survived the
+> flip — gated behind a new `--role-switch-platform macos` selector
+> (`validate_macos_role_transition` stage, `live_lab_stage_registry.rs`).
+> Windows (`windows_service` reload) and the `SignedMembership` transition
+> kind (capability changes, needs the admin issue/ingest wiring) remain
+> design-only — see §3/§4 below, unchanged. This is the banked design the
 > `CrossPlatformRoleParityPlan_2026-06-21.md` §3 *live role transitions
 > (cross-OS)* cell depends on (Roadmap `CrossPlatformRoleParityRoadmap_2026-06-22.md`
 > §4 cell #4). It supersedes the previously-cited `state/cross_os_role_switch_plan.md`,

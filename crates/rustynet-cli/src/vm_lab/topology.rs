@@ -902,6 +902,7 @@ mod tests {
             anchor_platform: None,
             admin_platform: None,
             blind_exit_platform: None,
+            role_switch_platform: None,
             macos_promote_exit: false,
             enable_chaos_suite: false,
             stage_timeout_secs: 0,

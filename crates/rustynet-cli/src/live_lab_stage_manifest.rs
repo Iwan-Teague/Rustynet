@@ -60,6 +60,8 @@ pub struct ManifestSelectors {
     pub admin_platform: String,
     #[serde(default)]
     pub blind_exit_platform: String,
+    #[serde(default)]
+    pub role_switch_platform: String,
     pub skip_linux_live_suite: bool,
     pub chaos_suite: bool,
     pub cross_network_suite: bool,
@@ -76,6 +78,7 @@ impl From<&TargetSelectors> for ManifestSelectors {
             anchor_platform: selectors.anchor_platform.clone(),
             admin_platform: selectors.admin_platform.clone(),
             blind_exit_platform: selectors.blind_exit_platform.clone(),
+            role_switch_platform: selectors.role_switch_platform.clone(),
             skip_linux_live_suite: selectors.skip_linux_live_suite,
             chaos_suite: selectors.chaos_suite,
             cross_network_suite: selectors.cross_network_suite,
@@ -262,6 +265,7 @@ mod tests {
             anchor_platform: "macos".to_owned(),
             admin_platform: "windows".to_owned(),
             blind_exit_platform: "macos".to_owned(),
+            role_switch_platform: "macos".to_owned(),
             skip_linux_live_suite: false,
             chaos_suite: true,
             cross_network_suite: true,
@@ -311,10 +315,10 @@ mod tests {
         );
 
         // With full selectors, exactly the role cells whose platform lost
-        // the election stay off: exit went to macOS (windows exit cells
-        // off), relay to Windows (macOS relay cell off), anchor to macOS
-        // (windows anchor cell off), admin to Windows (macOS admin cell
-        // off).
+        // the election stay off: exit went to macOS (windows exit cells +
+        // its evidence capture/pull stages off), relay to Windows (macOS
+        // relay cell off), anchor to macOS (windows anchor cell off), admin
+        // to Windows (macOS admin cell off).
         let full = build_stage_manifest("test-run", "full", &full_selectors());
         let mut disabled: Vec<&str> = full
             .stages
@@ -326,7 +330,9 @@ mod tests {
         assert_eq!(
             disabled,
             vec![
+                "capture_windows_exit_evidence_artifacts",
                 "promote_windows_exit_active",
+                "pull_windows_exit_evidence_artifacts",
                 "validate_macos_admin_issue",
                 "validate_macos_relay_service_lifecycle",
                 "validate_windows_anchor_bundle_pull",

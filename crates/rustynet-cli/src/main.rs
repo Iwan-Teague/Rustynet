@@ -3473,6 +3473,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 anchor_platform: parser.value("--anchor-platform"),
                 admin_platform: parser.value("--admin-platform"),
                 blind_exit_platform: parser.value("--blind-exit-platform"),
+                role_switch_platform: parser.value("--role-switch-platform"),
                 macos_promote_exit: parser.has_flag("--macos-promote-exit"),
                 stage_timeout_secs: parser.parse_u64_or_default("--stage-timeout-secs", 0)?,
                 skip_linux_live_suite: parser.has_flag("--skip-linux-live-suite"),
@@ -4716,6 +4717,9 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     anchor_platform: parser.value("--anchor-platform").unwrap_or_default(),
                     admin_platform: parser.value("--admin-platform").unwrap_or_default(),
                     blind_exit_platform: parser.value("--blind-exit-platform").unwrap_or_default(),
+                    role_switch_platform: parser
+                        .value("--role-switch-platform")
+                        .unwrap_or_default(),
                     skip_linux_live_suite: parser.has_flag("--skip-linux-live-suite"),
                     chaos_suite: parser.has_flag("--chaos-suite"),
                     cross_network_suite: parser.has_flag("--cross-network-suite"),
