@@ -55,6 +55,16 @@ pub fn infer_active_stage(
     ordered_enabled_stages: &[String],
     outcomes: &[StageOutcome],
 ) -> Result<Option<String>> {
+    // Recorder-first realtime contract (Fable5 Finding 4): the orchestrator's
+    // shared recorder writes a `running` row into stages.tsv when a stage
+    // starts and replaces it with the terminal outcome when it finishes. When
+    // present, that row is the AUTHORITATIVE active stage -- read it directly,
+    // no inference. Everything below is the legacy fallback for pre-recorder
+    // report dirs (no running row) whose active stage must still be guessed
+    // from logs / pipeline position.
+    if let Some(running) = outcomes.iter().find(|outcome| outcome.status == "running") {
+        return Ok(Some(running.stage.clone()));
+    }
     // Log-based candidate (orchestrate.log STAGE: marker, then the newest
     // per-stage `[stage:xxx] START` log). Only accepted if it does not
     // REGRESS behind work the pipeline has provably already finished --
@@ -366,6 +376,46 @@ mod tests {
             summary: String::new(),
             artifacts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_running_outcome_is_the_authoritative_active_stage_over_inference() {
+        // Recorder-first: when the orchestrator's recorder has written a
+        // `running` row (surfaced as a status="running" outcome), that stage
+        // is the active one directly -- no log/pipeline-position guessing, and
+        // it wins even over a stale log marker that would point elsewhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        std::fs::write(
+            logs.join("preflight.log"),
+            "[stage:preflight] START stale marker\n",
+        )
+        .expect("log");
+        let ordered = vec!["preflight".to_owned(), "bootstrap_hosts".to_owned()];
+        let outcomes = vec![
+            outcome("preflight", "pass"),
+            outcome("bootstrap_hosts", "running"),
+        ];
+
+        let stage = infer_active_stage(dir.path(), &ordered, &outcomes).expect("stage");
+
+        assert_eq!(
+            stage.as_deref(),
+            Some("bootstrap_hosts"),
+            "the running row wins over the stale log marker + pipeline inference"
+        );
+    }
+
+    #[test]
+    fn active_stage_falls_back_to_inference_without_a_running_row() {
+        // No running row (legacy pre-recorder run) -> the existing
+        // log/pipeline inference still drives the active stage.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ordered = vec!["preflight".to_owned(), "bootstrap_hosts".to_owned()];
+        let outcomes = vec![outcome("preflight", "pass")];
+        let stage = infer_active_stage(dir.path(), &ordered, &outcomes).expect("stage");
+        assert_eq!(stage.as_deref(), Some("bootstrap_hosts"));
     }
 
     #[test]
