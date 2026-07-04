@@ -269,6 +269,176 @@ pub fn diff_live_lab_reports(left: &LiveLabRunReport, right: &LiveLabRunReport) 
     }
 }
 
+/// Canonicalize a stage ID so the bash and Rust dialects — which name the
+/// same logical work differently by design — compare equal under functional
+/// parity. Identity for any ID without a known alias (including all 8 stage
+/// IDs the two dialects already share verbatim: `preflight`,
+/// `prepare_source_archive`, `verify_ssh_reachability`, `cleanup_hosts`,
+/// `bootstrap_hosts`, `collect_pubkeys`, `enforce_baseline_runtime`,
+/// `validate_baseline_runtime`).
+///
+/// This table is the bridge that makes cross-dialect parity satisfiable at
+/// all. [`diff_live_lab_reports`] (strict) requires byte-identical stage-ID
+/// sets, which the two orchestrators cannot produce because they name their
+/// stages differently; [`diff_live_lab_reports_functional`] maps both reports
+/// through this table and compares the shared logical work.
+pub fn canonical_stage_id(stage_id: &str) -> &str {
+    match stage_id {
+        // bash dialect -> canonical (Rust `StageId`) name.
+        "membership_setup" => "membership_init",
+        "distribute_membership_state" => "distribute_membership",
+        "issue_and_distribute_assignments" => "distribute_assignments",
+        "issue_and_distribute_traversal" => "distribute_traversal",
+        "issue_and_distribute_dns_zone" => "distribute_dns_zone",
+        // Everything else (the 8 shared IDs + any dialect-only stage) is its
+        // own canonical form.
+        other => other,
+    }
+}
+
+/// Functional/outcome parity between two reports whose orchestrators use
+/// DIFFERENT stage-ID vocabularies (bash vs Rust dialect).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FunctionalParityDiff {
+    /// `true` iff functional/outcome parity holds: at least one shared
+    /// (canonicalized) stage exists AND every shared stage has the same
+    /// outcome on both sides AND the overall status matches AND the node
+    /// count matches. Validator pass/total counts are reported below but are
+    /// NOT part of this verdict — the two dialects legitimately run different
+    /// validator *sets*, and whether baseline validation passed is already
+    /// captured by the shared `validate_baseline_runtime` stage outcome.
+    pub overall_functional_parity_pass: bool,
+
+    pub overall_status_match: bool,
+    pub overall_status_left: RunStatus,
+    pub overall_status_right: RunStatus,
+
+    /// One entry per canonical stage ID present on BOTH sides, with the
+    /// outcome each dialect recorded for it.
+    pub shared_stages: Vec<StageParityEntry>,
+    /// Size of the shared (intersection) stage set. `0` forces
+    /// `overall_functional_parity_pass = false` (fail-closed: a zero-overlap
+    /// comparison proves nothing and must not read as a pass).
+    pub shared_stage_count: usize,
+
+    /// Canonical stage IDs present only on one side — reported for visibility
+    /// but NOT a parity failure (the dialects legitimately run
+    /// dialect-specific stages such as bash `prime_remote_access` or Rust
+    /// `traffic_test_matrix`).
+    pub stages_only_in_left: Vec<String>,
+    pub stages_only_in_right: Vec<String>,
+
+    pub node_count_match: bool,
+    pub node_count_left: usize,
+    pub node_count_right: usize,
+
+    // Informational only (see `overall_functional_parity_pass` doc).
+    pub validator_pass_count_match: bool,
+    pub validator_pass_count_left: usize,
+    pub validator_pass_count_right: usize,
+    pub validator_total_count_match: bool,
+    pub validator_total_count_left: usize,
+    pub validator_total_count_right: usize,
+}
+
+/// Functional/outcome parity between two reports whose orchestrators use
+/// DIFFERENT stage-ID vocabularies (bash vs Rust dialect).
+///
+/// Unlike [`diff_live_lab_reports`] (which requires byte-identical stage-ID
+/// sets and is therefore unsatisfiable across dialects), this normalizes both
+/// reports through [`canonical_stage_id`] and compares only the shared logical
+/// work: overall status, per-shared-stage outcome, and node count. Stages that
+/// exist on only one side are surfaced but do not fail parity.
+///
+/// Fail-closed: if the two reports share ZERO canonical stages, parity is
+/// FALSE — a zero-overlap comparison proves nothing and must not read as a
+/// pass.
+pub fn diff_live_lab_reports_functional(
+    left: &LiveLabRunReport,
+    right: &LiveLabRunReport,
+) -> FunctionalParityDiff {
+    let left_by_id: BTreeMap<&str, &StageReport> = left
+        .stages
+        .iter()
+        .map(|s| (canonical_stage_id(s.stage_id.as_str()), s))
+        .collect();
+    let right_by_id: BTreeMap<&str, &StageReport> = right
+        .stages
+        .iter()
+        .map(|s| (canonical_stage_id(s.stage_id.as_str()), s))
+        .collect();
+
+    // Shared canonical stage IDs (intersection), walked in left's stage order
+    // and de-duplicated so a canonical ID is compared once.
+    let mut shared_stages: Vec<StageParityEntry> = Vec::new();
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for s in &left.stages {
+        let cid = canonical_stage_id(s.stage_id.as_str());
+        if !seen.insert(cid) {
+            continue;
+        }
+        if let Some(r) = right_by_id.get(cid) {
+            let matches = r.outcome == s.outcome;
+            shared_stages.push(StageParityEntry {
+                stage_id: cid.to_owned(),
+                left_outcome: Some(s.outcome.clone()),
+                right_outcome: Some(r.outcome.clone()),
+                matches,
+            });
+        }
+    }
+
+    let stages_only_in_left: Vec<String> = left_by_id
+        .keys()
+        .filter(|k| !right_by_id.contains_key(*k))
+        .map(|k| (*k).to_owned())
+        .collect();
+    let stages_only_in_right: Vec<String> = right_by_id
+        .keys()
+        .filter(|k| !left_by_id.contains_key(*k))
+        .map(|k| (*k).to_owned())
+        .collect();
+
+    let overall_status_match = left.overall_status == right.overall_status;
+
+    let node_count_left = left.node_statuses.len();
+    let node_count_right = right.node_statuses.len();
+    let node_count_match = node_count_left == node_count_right;
+
+    let (vp_left, vt_left) = count_validator_results(left);
+    let (vp_right, vt_right) = count_validator_results(right);
+    let validator_pass_count_match = vp_left == vp_right;
+    let validator_total_count_match = vt_left == vt_right;
+
+    let shared_stage_count = shared_stages.len();
+    let shared_stages_all_match = shared_stages.iter().all(|e| e.matches);
+
+    let overall_functional_parity_pass = shared_stage_count > 0
+        && shared_stages_all_match
+        && overall_status_match
+        && node_count_match;
+
+    FunctionalParityDiff {
+        overall_functional_parity_pass,
+        overall_status_match,
+        overall_status_left: left.overall_status.clone(),
+        overall_status_right: right.overall_status.clone(),
+        shared_stages,
+        shared_stage_count,
+        stages_only_in_left,
+        stages_only_in_right,
+        node_count_match,
+        node_count_left,
+        node_count_right,
+        validator_pass_count_match,
+        validator_pass_count_left: vp_left,
+        validator_pass_count_right: vp_right,
+        validator_total_count_match,
+        validator_total_count_left: vt_left,
+        validator_total_count_right: vt_right,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,5 +679,199 @@ mod tests {
         assert!(diff.stages.iter().all(|e| e.matches));
         assert!(!diff.node_count_match);
         assert!(!diff.overall_parity_pass);
+    }
+
+    // ---- functional/outcome parity (cross-dialect) ----
+
+    #[test]
+    fn canonical_stage_id_maps_bash_aliases_and_is_identity_otherwise() {
+        // The 5 known bash-dialect aliases canonicalize to the Rust names.
+        assert_eq!(canonical_stage_id("membership_setup"), "membership_init");
+        assert_eq!(
+            canonical_stage_id("distribute_membership_state"),
+            "distribute_membership"
+        );
+        assert_eq!(
+            canonical_stage_id("issue_and_distribute_assignments"),
+            "distribute_assignments"
+        );
+        assert_eq!(
+            canonical_stage_id("issue_and_distribute_traversal"),
+            "distribute_traversal"
+        );
+        assert_eq!(
+            canonical_stage_id("issue_and_distribute_dns_zone"),
+            "distribute_dns_zone"
+        );
+        // Shared IDs + dialect-only stages are their own canonical form.
+        assert_eq!(canonical_stage_id("bootstrap_hosts"), "bootstrap_hosts");
+        assert_eq!(
+            canonical_stage_id("traffic_test_matrix"),
+            "traffic_test_matrix"
+        );
+        assert_eq!(
+            canonical_stage_id("prime_remote_access"),
+            "prime_remote_access"
+        );
+    }
+
+    #[test]
+    fn functional_parity_passes_across_dialects_with_matching_outcomes() {
+        // bash dialect (left) vs Rust dialect (right): different stage-ID
+        // vocabularies but the same logical work with identical outcomes.
+        // The strict diff would FAIL this (divergent stage-ID sets); the
+        // functional diff must PASS on the shared logical stages.
+        let bash = report(
+            "bash",
+            RunStatus::Passed,
+            vec![
+                stage("bootstrap_hosts", StageOutcomeRecord::Passed),
+                stage("membership_setup", StageOutcomeRecord::Passed),
+                stage("distribute_membership_state", StageOutcomeRecord::Passed),
+                stage(
+                    "issue_and_distribute_assignments",
+                    StageOutcomeRecord::Passed,
+                ),
+                // bash-only setup helper — legitimately not in the Rust plan.
+                stage("prime_remote_access", StageOutcomeRecord::Passed),
+            ],
+            vec![node("n1", vec![("acl", true)])],
+        );
+        let rust = report(
+            "rust",
+            RunStatus::Passed,
+            vec![
+                stage("bootstrap_hosts", StageOutcomeRecord::Passed),
+                stage("membership_init", StageOutcomeRecord::Passed),
+                stage("distribute_membership", StageOutcomeRecord::Passed),
+                stage("distribute_assignments", StageOutcomeRecord::Passed),
+                // Rust-only stage — legitimately not in the bash setup run.
+                stage("traffic_test_matrix", StageOutcomeRecord::Passed),
+            ],
+            vec![node("n1", vec![("acl", true)])],
+        );
+
+        // Strict diff cannot pass across dialects (sanity anchor).
+        assert!(!diff_live_lab_reports(&bash, &rust).overall_parity_pass);
+
+        let f = diff_live_lab_reports_functional(&bash, &rust);
+        assert!(f.overall_functional_parity_pass, "{f:#?}");
+        // 4 shared canonical stages: bootstrap_hosts + the 3 aliased ones.
+        assert_eq!(f.shared_stage_count, 4);
+        assert!(f.shared_stages.iter().all(|e| e.matches));
+        // Dialect-only stages are surfaced but do not fail parity.
+        assert_eq!(
+            f.stages_only_in_left,
+            vec!["prime_remote_access".to_owned()]
+        );
+        assert_eq!(
+            f.stages_only_in_right,
+            vec!["traffic_test_matrix".to_owned()]
+        );
+    }
+
+    #[test]
+    fn functional_parity_fails_closed_on_zero_overlap() {
+        // No shared canonical stage → a vacuous comparison → must NOT pass.
+        let a = report(
+            "a",
+            RunStatus::Passed,
+            vec![stage("prime_remote_access", StageOutcomeRecord::Passed)],
+            vec![node("n1", vec![])],
+        );
+        let b = report(
+            "b",
+            RunStatus::Passed,
+            vec![stage("traffic_test_matrix", StageOutcomeRecord::Passed)],
+            vec![node("n1", vec![])],
+        );
+        let f = diff_live_lab_reports_functional(&a, &b);
+        assert_eq!(f.shared_stage_count, 0);
+        assert!(
+            !f.overall_functional_parity_pass,
+            "zero-overlap must fail closed: {f:#?}"
+        );
+    }
+
+    #[test]
+    fn functional_parity_fails_on_shared_stage_outcome_divergence() {
+        let bash = report(
+            "bash",
+            RunStatus::Failed,
+            vec![
+                stage("bootstrap_hosts", StageOutcomeRecord::Passed),
+                stage("membership_setup", StageOutcomeRecord::Failed),
+            ],
+            vec![node("n1", vec![])],
+        );
+        let rust = report(
+            "rust",
+            RunStatus::Passed,
+            vec![
+                stage("bootstrap_hosts", StageOutcomeRecord::Passed),
+                stage("membership_init", StageOutcomeRecord::Passed),
+            ],
+            vec![node("n1", vec![])],
+        );
+        let f = diff_live_lab_reports_functional(&bash, &rust);
+        // membership canonical stage diverges (Failed vs Passed) AND overall
+        // status diverges → functional parity fails.
+        assert!(!f.overall_functional_parity_pass);
+        assert!(!f.overall_status_match);
+        assert!(f.shared_stages.iter().any(|e| !e.matches));
+    }
+
+    #[test]
+    fn functional_parity_fails_on_node_count_divergence() {
+        let s_bash = vec![stage("bootstrap_hosts", StageOutcomeRecord::Passed)];
+        let s_rust = vec![stage("bootstrap_hosts", StageOutcomeRecord::Passed)];
+        let bash = report("bash", RunStatus::Passed, s_bash, vec![node("n1", vec![])]);
+        let rust = report(
+            "rust",
+            RunStatus::Passed,
+            s_rust,
+            vec![node("n1", vec![]), node("n2", vec![])],
+        );
+        let f = diff_live_lab_reports_functional(&bash, &rust);
+        assert!(f.shared_stages.iter().all(|e| e.matches));
+        assert!(!f.node_count_match);
+        assert!(!f.overall_functional_parity_pass);
+    }
+
+    #[test]
+    fn functional_parity_validator_counts_are_informational_not_gating() {
+        // Different validator counts (bash ran extra security validators) but
+        // matching shared-stage outcomes + overall + node count → functional
+        // parity still PASSES; validator mismatch is reported, not gating.
+        let bash = report(
+            "bash",
+            RunStatus::Passed,
+            vec![stage(
+                "validate_baseline_runtime",
+                StageOutcomeRecord::Passed,
+            )],
+            vec![node(
+                "n1",
+                vec![("acl", true), ("dns", true), ("mesh", true)],
+            )],
+        );
+        let rust = report(
+            "rust",
+            RunStatus::Passed,
+            vec![stage(
+                "validate_baseline_runtime",
+                StageOutcomeRecord::Passed,
+            )],
+            vec![node("n1", vec![("acl", true)])],
+        );
+        let f = diff_live_lab_reports_functional(&bash, &rust);
+        assert!(
+            !f.validator_total_count_match,
+            "counts should differ (3 vs 1)"
+        );
+        assert!(
+            f.overall_functional_parity_pass,
+            "validator-count divergence must NOT gate functional parity: {f:#?}"
+        );
     }
 }

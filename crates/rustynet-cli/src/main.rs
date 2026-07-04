@@ -3646,6 +3646,19 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 left_path: parser.required_path("--left")?,
                 right_path: parser.required_path("--right")?,
                 output_path: parser.required_path("--output")?,
+                // Default `strict` preserves the pre-`--mode` exit-code +
+                // output-byte contract. `functional` selects the satisfiable
+                // cross-dialect (bash↔Rust) gate. Unknown values fail closed.
+                mode: match parser.value("--mode").as_deref() {
+                    None | Some("strict") => vm_lab::ParityMode::Strict,
+                    Some("functional") => vm_lab::ParityMode::Functional,
+                    Some(other) => {
+                        return Err(format!(
+                            "ops vm-lab-diff-orchestrator-parity: invalid --mode '{other}' \
+                             (expected 'strict' or 'functional')"
+                        ));
+                    }
+                },
             },
         }),
         "vm-lab-iterate-live-lab" => {
@@ -18778,7 +18791,7 @@ fn help_text() -> String {
         "  ops vm-lab-diagnose-live-lab-failure [--inventory <path>] --profile <path> --report-dir <path> [--stage <name>] [--output-dir <path>] [--collect-artifacts] [--timeout-secs <secs>]",
         "  ops live-lab-flake-report [--matrix <path>]",
         "  ops vm-lab-diff-live-lab-runs --old-report-dir <path> --new-report-dir <path>",
-        "  ops vm-lab-diff-orchestrator-parity --left <parity_input.json> --right <parity_input.json> --output <parity_diff.json>",
+        "  ops vm-lab-diff-orchestrator-parity --left <parity_input.json> --right <parity_input.json> --output <parity_diff.json> [--mode strict|functional]",
         "  ops vm-lab-iterate-live-lab [--inventory <path>] [--profile-output <path>] --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--script <path>] [--dry-run] [--skip-gates] [--skip-soak] [--skip-cross-network] [--require-clean-tree] [--require-local-head] --validation-step <fmt|check:<package>|check-bin:<package>:<bin>|test:<package>[:filter]|test-bin:<package>:<bin>[:filter]>... [--collect-failure-diagnostics] [--failed-log-tail-lines <n>] [--timeout-secs <secs>]",
         "  ops vm-lab-run-live-lab --profile <path> [--script <path>] [--dry-run] [--skip-setup] [--skip-gates] [--skip-soak] [--skip-cross-network] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>]",
         "  ops vm-lab-check-known-hosts [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--known-hosts-file <path>]",

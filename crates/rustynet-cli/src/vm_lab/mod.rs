@@ -1035,11 +1035,28 @@ pub fn validate_orchestrate_live_lab_config(
 /// the W5.5 evidence harness: takes two `parity_input.json` snapshots
 /// (one bash, one Rust), emits a machine-readable parity diff to
 /// `--output`, and exits non-zero on any drift.
+/// Which parity comparison `vm-lab-diff-orchestrator-parity` runs.
+///
+/// `Strict` (default) requires byte-identical stage-ID sets — correct for
+/// same-dialect regression (e.g. Rust-vs-Rust determinism). `Functional`
+/// normalizes the bash/Rust stage-ID dialects via
+/// `orchestrator::parity::canonical_stage_id` and compares the shared logical
+/// work + overall status + node count. Strict is UNSATISFIABLE across dialects
+/// (bash and Rust name their stages differently by design); Functional is the
+/// satisfiable cross-dialect (bash-vs-Rust) gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParityMode {
+    #[default]
+    Strict,
+    Functional,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabDiffOrchestratorParityConfig {
     pub left_path: PathBuf,
     pub right_path: PathBuf,
     pub output_path: PathBuf,
+    pub mode: ParityMode,
 }
 
 pub fn execute_ops_vm_lab_diff_orchestrator_parity(
@@ -1071,9 +1088,7 @@ pub fn execute_ops_vm_lab_diff_orchestrator_parity(
                 config.right_path.display()
             )
         })?;
-    let diff = orchestrator::parity::diff_live_lab_reports(&left, &right);
-    let body =
-        serde_json::to_vec_pretty(&diff).map_err(|err| format!("serialize parity diff: {err}"))?;
+    // Create the output directory once (shared by both modes).
     if let Some(parent) = config.output_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1084,26 +1099,67 @@ pub fn execute_ops_vm_lab_diff_orchestrator_parity(
             )
         })?;
     }
-    fs::write(&config.output_path, &body).map_err(|err| {
-        format!(
-            "write parity diff to '{}': {err}",
-            config.output_path.display()
-        )
-    })?;
-    let summary = format!(
-        "parity_diff: pass={} stages={} stages_only_left={} stages_only_right={} \
-         node_count_left={} node_count_right={}",
-        diff.overall_parity_pass,
-        diff.stages.len(),
-        diff.stages_only_in_left.len(),
-        diff.stages_only_in_right.len(),
-        diff.node_count_left,
-        diff.node_count_right,
-    );
-    if diff.overall_parity_pass {
-        Ok(summary)
-    } else {
-        Err(summary)
+
+    match config.mode {
+        // Strict: byte-identical stage-ID sets required. Output shape is
+        // unchanged from before `--mode` existed (a bare `ParityDiff`), so
+        // existing evidence consumers keep working. Unsatisfiable across
+        // dialects; correct for same-dialect (Rust-vs-Rust) regression.
+        ParityMode::Strict => {
+            let diff = orchestrator::parity::diff_live_lab_reports(&left, &right);
+            let body = serde_json::to_vec_pretty(&diff)
+                .map_err(|err| format!("serialize parity diff: {err}"))?;
+            fs::write(&config.output_path, &body).map_err(|err| {
+                format!(
+                    "write parity diff to '{}': {err}",
+                    config.output_path.display()
+                )
+            })?;
+            let summary = format!(
+                "parity_diff[strict]: pass={} stages={} stages_only_left={} \
+                 stages_only_right={} node_count_left={} node_count_right={}",
+                diff.overall_parity_pass,
+                diff.stages.len(),
+                diff.stages_only_in_left.len(),
+                diff.stages_only_in_right.len(),
+                diff.node_count_left,
+                diff.node_count_right,
+            );
+            if diff.overall_parity_pass {
+                Ok(summary)
+            } else {
+                Err(summary)
+            }
+        }
+        // Functional: the satisfiable cross-dialect gate. Normalizes the
+        // bash/Rust stage-ID vocabularies and compares the shared logical
+        // work + overall status + node count. Fail-closed on zero overlap.
+        ParityMode::Functional => {
+            let diff = orchestrator::parity::diff_live_lab_reports_functional(&left, &right);
+            let body = serde_json::to_vec_pretty(&diff)
+                .map_err(|err| format!("serialize functional parity diff: {err}"))?;
+            fs::write(&config.output_path, &body).map_err(|err| {
+                format!(
+                    "write parity diff to '{}': {err}",
+                    config.output_path.display()
+                )
+            })?;
+            let summary = format!(
+                "parity_diff[functional]: pass={} shared_stages={} only_left={} \
+                 only_right={} overall_status_match={} node_count_match={}",
+                diff.overall_functional_parity_pass,
+                diff.shared_stage_count,
+                diff.stages_only_in_left.len(),
+                diff.stages_only_in_right.len(),
+                diff.overall_status_match,
+                diff.node_count_match,
+            );
+            if diff.overall_functional_parity_pass {
+                Ok(summary)
+            } else {
+                Err(summary)
+            }
+        }
     }
 }
 
@@ -46868,6 +46924,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             left_path: left,
             right_path: right,
             output_path: output.clone(),
+            mode: super::ParityMode::Strict,
         };
         let summary = super::execute_ops_vm_lab_diff_orchestrator_parity(cfg)
             .expect("identical reports must produce parity pass");
@@ -46922,6 +46979,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             left_path: left,
             right_path: right,
             output_path: output.clone(),
+            mode: super::ParityMode::Strict,
         };
         let err = super::execute_ops_vm_lab_diff_orchestrator_parity(cfg)
             .expect_err("drift must surface as Err");
