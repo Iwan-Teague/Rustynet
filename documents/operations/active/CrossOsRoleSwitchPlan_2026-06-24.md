@@ -15,33 +15,25 @@
 > check; fixed to a before/after regression comparison (commit `2fda397`)
 > since a fast run legitimately has zero live peers throughout.
 >
-> **Windows `LocalOnly` slice: stage BUILT (commit `8816bf7`), BLOCKED live
-> 2026-07-04 on a genuine capability gap** (`livelab-1783142381-8816bf73333b`,
-> `validate_windows_role_transition` FAIL — the only stage failure in the
-> run, no collateral damage). Root cause, confirmed against the live guest:
-> the installed Windows CLI at `C:\Program Files\RustyNet\rustynet.exe` is
-> `rustynet-windows-trust-cli.rs` — a standalone, PURELY OFFLINE crypto tool
-> (`trust keygen`/`export-verifier-key`/`issue` only; no daemon socket or
-> named-pipe client code at all). There is currently no Windows CLI verb for
-> `role status`, `role set`, or `state refresh` — §3's claim that Windows
-> `role set` "reviewed PowerShell helper writes role" and re-reads via
-> "`windows_service` `StateRefresh` IPC" describes a daemon-side capability
-> that has no CLIENT-side entry point on Windows today. A second, independent
-> issue was also found by inspection (not yet hit live because the CLI gap
-> blocks reaching it): `update_node_role_env_file` looks for a `NODE_ROLE=`/
-> `RUSTYNET_NODE_ROLE=` line, but the actual Windows env file
-> (`C:\ProgramData\RustyNet\config\rustynetd.env`) embeds the role inside
-> `RUSTYNETD_DAEMON_ARGS_JSON=[...,"--node-role","client",...]` — a JSON
-> array, not a line-oriented `KEY=value` format — so even a working CLI call
-> would silently fail to update the real value today. **Required follow-up:**
-> (1) add a named-pipe IPC client capability (reusing the daemon's existing
-> control-channel protocol) to a Windows CLI tool for `role status`/
-> `role set`/`state refresh`; (2) fix `update_node_role_env_file` to parse
-> and rewrite the `RUSTYNETD_DAEMON_ARGS_JSON` array on Windows instead of
-> its current line-based assumption. Do not bypass this with a raw
-> env-file-edit-and-restart workaround in the live-lab stage — that would be
-> a second, weaker apply path, which CLAUDE.md §3 and this doc's own §2 hard
-> rule forbid; the CLI-level fix is the one hardened path.
+> **Windows `LocalOnly` slice: LIVE-PROVEN 2026-07-04**
+> (`livelab-1783174602-844175f5ad2a`, commit `5516711`,
+> `validate_windows_role_transition` PASS — "role transition proven: client ->
+> admin; service restart verified; state refresh ok; mesh peers before=0
+> after=0"). The capability gap that blocked the first attempt
+> (`livelab-1783142381-8816bf73333b`, FAIL) was closed by `c51f00a` ("windows:
+> add role/state daemon-control CLI verbs, fix env-file JSON rewrite"), which
+> added the named-pipe IPC client capability to the Windows CLI (`role
+> status`/`role set`/`state refresh`, reusing the daemon's existing
+> control-channel protocol per §2's one-hardened-path rule) and fixed
+> `update_node_role_env_file` to parse/rewrite the
+> `RUSTYNETD_DAEMON_ARGS_JSON` array instead of assuming a line-oriented
+> `NODE_ROLE=` format. `exercise_windows_role_transition_live`
+> (`crates/rustynet-cli/src/vm_lab/mod.rs`, committed `8816bf7`) needed no
+> changes once the CLI gap closed — it already expected the exact
+> `execute_role_status()` output format the new CLI verbs emit. Re-run against
+> a corrected `vm_lab_inventory.json` (a stale `network_group` on
+> `debian-headless-2/3/4/5` had been independently blocking
+> `--require-same-network`; fixed in `7227627`) confirmed the fix live.
 >
 > The `SignedMembership` transition kind (capability changes, needs the
 > admin issue/ingest wiring) remains design-only for both OS — see §3/§4

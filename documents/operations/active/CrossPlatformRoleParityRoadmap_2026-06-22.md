@@ -18,18 +18,19 @@ program and to **concurrent Windows+macOS** runs.
 
 ## 0. TL;DR
 
-- **What's left (mac/win):** of 7 roles × 2 OS, the genuine remaining work is now
-  concentrated in the Windows half of role transitions (macOS `LocalOnly` is
-  live-proven 2026-07-04), anchor sub-surfaces beyond bundle-pull, Windows
-  relay forwarding, and Windows exit lab enablement. Windows exit remains
-  blocked on the lab guest's missing WinNAT stack, relay live forwarding
-  remains HP-3-gated, and Windows blind_exit is out of scope by design.
+- **What's left (mac/win):** of 7 roles × 2 OS, `LocalOnly` role transitions are
+  now live-proven on BOTH macOS and Windows (2026-07-04); the genuine
+  remaining work is anchor sub-surfaces beyond bundle-pull, the
+  `SignedMembership` transition kind (both OS), Windows relay forwarding, and
+  Windows exit lab enablement. Windows exit remains blocked on the lab
+  guest's missing WinNAT stack, relay live forwarding remains HP-3-gated, and
+  Windows blind_exit is out of scope by design.
 - **Ordered program (after the now-live-proven anchor bundle-pull, admin,
-  macOS exit, macOS relay-lifecycle, macOS blind_exit, and macOS `LocalOnly`
-  role-transition cells):** Windows role transitions + the `SignedMembership`
-  kind (design doc at `CrossOsRoleSwitchPlan_2026-06-24.md`) → remaining
-  anchor sub-surfaces beyond bundle-pull. Relay forwarding and Windows
-  exit/blind_exit remain explicitly parked with reasons.
+  macOS exit, macOS relay-lifecycle, macOS blind_exit, and both `LocalOnly`
+  role-transition cells):** the `SignedMembership` kind (design doc at
+  `CrossOsRoleSwitchPlan_2026-06-24.md`) → remaining anchor sub-surfaces
+  beyond bundle-pull. Relay forwarding and Windows exit/blind_exit remain
+  explicitly parked with reasons.
 - **Pipeline:** run a **Windows lab and a macOS lab simultaneously** on disjoint
   Debian backbones, iterate each role with **standalone SSH wrappers** against an
   already-warm guest (seconds, no 9-min bootstrap), and **write the next cell's code
@@ -64,7 +65,7 @@ untested/not implemented · 🔒 blocked):
 | exit (NAT egress + killswitch) | ✅ | ✅ **LIVE-PROVEN 2026-07-03** (`labrun-1783087254263-11121-0`, commit `039f215`: activation, NAT lifecycle, DNS fail-closed, service hardening, mesh-status) | 🟡 implemented but **🔒 lab guest lacks WinNAT/`MSFT_NetNat`** |
 | blind_exit (irreversible exit) | ✅ | ✅ **LIVE-PROVEN 2026-06-29** (run `labrun-1782770042330-16244-0`, `--blind-exit-platform macos`): `validate_macos_blind_exit` PASS — irreversible transition applied, pf anchor hardened (9 rules, no route-to/reply-to/dup-to), immutability gate enforced | 🚫 **blocked by design** (`main.rs:11768` hard-errors; macOS/Linux only) |
 | relay (live session forwarding) | ✅ *(lifecycle only — no live forwarding proof anywhere; see §4)* | ✅ **lifecycle LIVE-PROVEN 2026-06-27** (run `livelab-1782571161`, `validate_macos_relay_service_lifecycle` PASS). **Live session forwarding remains HP-3-gated** (same cross-OS gate as Linux ✅). | 🟠 SCM lifecycle contract only |
-| live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | ✅ **LIVE-PROVEN 2026-07-04** (`validate_macos_role_transition`, `LocalOnly` admin<->client, run `livelab-1783135864-2fda3979d599`) | ❌ stage unbuilt (design doc exists: `CrossOsRoleSwitchPlan_2026-06-24.md`) |
+| live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | ✅ **LIVE-PROVEN 2026-07-04** (`validate_macos_role_transition`, `LocalOnly` admin<->client, run `livelab-1783135864-2fda3979d599`) | ✅ **LIVE-PROVEN 2026-07-04** (`validate_windows_role_transition`, `LocalOnly` admin<->client, run `livelab-1783174602-844175f5ad2a`, commit `5516711`) |
 
 **Three corrections this roadmap has made to the matrix:**
 1. macOS **admin** is live-proven; the "self-mint deliberately disabled" note had
@@ -87,7 +88,7 @@ dry-run had masked). "Live stage" = author a fail-loud stage per §7.
 | 1 | **macOS admin** | ✅ DONE | refresh proof: `labrun-1783089250895-6139-0`, `831d41d`, `validate_macos_admin_issue` PASS | — | — |
 | 2 | **Windows admin** | ✅ DONE | live-proven 2026-06-27: `validate_windows_admin_issue` PASS, run `livelab-1782526081` | — | — |
 | 3 | **macOS blind_exit** | ✅ DONE (2026-06-29) | live-proven: `labrun-1782770042330-16244-0`, `ed3ed7e` | — | — |
-| 4 | **Role transitions (macOS→Windows)** | ✅ macOS `LocalOnly` DONE (2026-07-04); 🔒 Windows BLOCKED (2026-07-04) | macOS: `validate_macos_role_transition` PASS, run `livelab-1783135864-2fda3979d599`, commit `2fda397`. Windows: `validate_windows_role_transition` stage built + committed (`8816bf7`) but its FIRST live run (`livelab-1783142381-8816bf73333b`) FAILED on a genuine capability gap, not a stage bug — the deployed Windows guest CLI (`rustynet.exe`) is `rustynet-windows-trust-cli.rs`, a pure OFFLINE crypto tool (`trust keygen/export-verifier-key/issue` only, no daemon IPC client at all); there is currently NO Windows CLI verb for `role status`/`role set`/`state refresh`. Fixing this needs a Windows IPC client (named-pipe) added to a CLI tool, plus fixing `update_node_role_env_file` to parse/rewrite `RUSTYNETD_DAEMON_ARGS_JSON` (a JSON array embedding `--node-role`) instead of its current line-based `NODE_ROLE=` assumption, which does not match the Windows env-file format either. `SignedMembership` kind remains design-only for both OS | Windows: new estimate, needs an IPC-client build (~2-3 d, was previously mis-estimated at 1-2 d assuming the CLI already worked) | admin cells done |
+| 4 | **Role transitions (macOS + Windows)** | ✅ macOS `LocalOnly` DONE (2026-07-04); ✅ Windows `LocalOnly` DONE (2026-07-04) | macOS: `validate_macos_role_transition` PASS, run `livelab-1783135864-2fda3979d599`, commit `2fda397`. Windows: `validate_windows_role_transition` stage built + committed (`8816bf7`); its first live run (`livelab-1783142381-8816bf73333b`) FAILED on a genuine capability gap (the deployed Windows guest CLI had no daemon IPC client and `update_node_role_env_file` didn't parse the `RUSTYNETD_DAEMON_ARGS_JSON` array format) — both closed by `c51f00a` (named-pipe IPC client + env-file fix). Re-run `livelab-1783174602-844175f5ad2a` (commit `5516711`) PASSED: client->admin flip, service restart verified, state refresh ok, mesh peers before=0 after=0. `SignedMembership` kind remains design-only for both OS | — | admin + role-transition cells done |
 | 5 | macOS **exit** | ✅ DONE | live-proven 2026-07-03 by `labrun-1783087254263-11121-0` on `039f215` | — | — |
 | 6 | macOS **relay** *live lifecycle* | ✅ **DONE** (2026-06-27) | ✅ live lifecycle proven: `validate_macos_relay_service_lifecycle` PASS (run `livelab-1782571161`). **Forwarding proof remains HP-3-gated, same as Linux.** | — | — |
 | 7 | Windows **anchor** live + macOS **anchor** live | ✅ DONE for bundle-pull | macOS bundle-pull live-proven 2026-06-22; Windows bundle-pull live-proven 2026-07-03 via `labrun-1783079551578-32671-0` on `786f900`; remaining gossip/enrollment anchor sub-surfaces stay separate | — | — |
@@ -95,15 +96,14 @@ dry-run had masked). "Live stage" = author a fail-loud stage per §7.
 | 🔒 | Windows **exit** | 🟡 | code done (`promote_windows_exit_active`); needs a WinNAT-capable guest | — | lab env (`MSFT_NetNat` absent) |
 | 🚫 | Windows **blind_exit** | — | out of scope by design (`main.rs:11768`) | — | n/a |
 
-**Bottom line:** the macOS `LocalOnly` role-transition slice is live-proven
-(2026-07-04); the Windows half is BLOCKED on a genuine capability gap (no
-Windows CLI exposes `role status`/`role set`/`state refresh` — the only
-Windows CLI is a pure-offline trust tool with no daemon IPC client),
-discovered by that stage's first live run. Remaining implementable parity
-work is that Windows IPC-client build + the `SignedMembership` transition
-kind, plus explicit anchor gossip/enrollment/port-map live proof. Relay
-forwarding stays HP-3-gated, and
-Windows exit stays blocked by the lab guest's missing WinNAT/HNS stack.
+**Bottom line:** the `LocalOnly` role-transition slice is live-proven on BOTH
+macOS and Windows (2026-07-04). The Windows half was briefly blocked on a
+genuine capability gap (no Windows CLI exposed `role status`/`role set`/
+`state refresh`), discovered by that stage's first live run and closed by
+`c51f00a`. Remaining implementable parity work is the `SignedMembership`
+transition kind (both OS), plus explicit anchor gossip/enrollment/port-map
+live proof. Relay forwarding stays HP-3-gated, and Windows exit stays
+blocked by the lab guest's missing WinNAT/HNS stack.
 
 ---
 
@@ -183,6 +183,11 @@ already correct (`keychain-secrets` macOS / `dpapi-secrets` Windows). Correct th
 don't silently rely on a stale "disabled" note.
 
 ### ROLE TRANSITIONS (both OS) — need a DESIGN doc first
+**UPDATE 2026-07-04: superseded — both macOS and Windows `LocalOnly` role
+transitions are now built AND live-proven; see the ordered-roadmap table
+above and `CrossOsRoleSwitchPlan_2026-06-24.md`'s status header.** The
+original gap analysis below is kept for historical context.
+
 `CrossOsRoleSwitchPlan_2026-06-24.md` now holds this design (the gitignored `state/` path could not persist; matrix cited it as "banked"
 — it isn't). The runtime to reuse exists: `refresh_signed_state_with_reason`
 (`daemon.rs:4487-4526`) is the single verified apply path (re-fetch trust → traversal →
@@ -216,7 +221,7 @@ from selector/optional skips):
 
 | # | Cell | Why this rank |
 |---|---|---|
-| ✅🔒 | **Role transitions (macOS→Windows)** | macOS `LocalOnly` DONE: `validate_macos_role_transition` PASS, run `livelab-1783135864-2fda3979d599`, commit `2fda397` (client->admin flip, launchd reload, `state refresh`, mesh-peer-regression check). Windows `LocalOnly` BLOCKED (2026-07-04): stage built (`8816bf7`) but the guest's only CLI (`rustynet-windows-trust-cli.rs`) is offline-only (no IPC client), so `role status`/`role set`/`state refresh` have no Windows entry point yet — needs a named-pipe IPC client + an `update_node_role_env_file` fix for the `RUSTYNETD_DAEMON_ARGS_JSON` array format. `SignedMembership` kind remains design-only for both OS |
+| ✅ | **Role transitions (macOS + Windows)** | macOS `LocalOnly` DONE: `validate_macos_role_transition` PASS, run `livelab-1783135864-2fda3979d599`, commit `2fda397` (client->admin flip, launchd reload, `state refresh`, mesh-peer-regression check). Windows `LocalOnly` DONE 2026-07-04: stage built (`8816bf7`), briefly blocked on a missing IPC client + an `update_node_role_env_file` format mismatch, both closed by `c51f00a` — re-run `livelab-1783174602-844175f5ad2a` (commit `5516711`) PASSED (client->admin flip, service restart, `state refresh`, mesh-peer-regression check). `SignedMembership` kind remains design-only for both OS |
 | 2 | **Remaining anchor sub-surfaces** | bundle-pull is live-proven on macOS/Windows; macOS `port_mapping_authoritative` live-proven 2026-07-04 (`validate_macos_anchor_port_mapping_authority`, run `livelab-1783159711-65e19f7cdb49`); gossip_seed/enrollment_endpoint (both OS) and port_mapping_authoritative (Windows) still need explicit live proof — enrollment_endpoint has zero runtime enforcement today and needs a design+implementation pass first |
 | ✅ | **macOS admin** | DONE: `labrun-1783089250895-6139-0`, commit `831d41d`, `validate_macos_admin_issue` PASS |
 | ✅ | **Windows admin** | DONE: `livelab-1782526081`, `validate_windows_admin_issue` PASS |
