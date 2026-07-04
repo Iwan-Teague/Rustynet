@@ -12028,9 +12028,10 @@ fn exercise_linux_relay_forwards_frame(
         }
     }
 
-    let mut failures: Vec<String> = Vec::new();
-
     // 1. Ensure the relay is provisioned with a routable bind and running.
+    // No cleanup is needed for this step regardless of outcome: widening the
+    // relay's bind is durable infrastructure setup, not test-scoped state, so
+    // an early return here is safe (nothing has been firewalled yet).
     let provision_output = run_relay_forward_test_script(
         relay_target,
         ssh_identity_file,
@@ -12051,7 +12052,8 @@ fn exercise_linux_relay_forwards_frame(
         ));
     }
 
-    // 2. Snapshot forwarding counters BEFORE any traffic.
+    // 2. Snapshot forwarding counters BEFORE any traffic. Still safe to
+    // early-return: no firewall/daemon-restart state has been applied yet.
     let before_metrics = run_relay_forward_test_script(
         relay_target,
         ssh_identity_file,
@@ -12070,8 +12072,16 @@ fn exercise_linux_relay_forwards_frame(
     )
     .ok_or_else(|| format!("could not parse bytes_forwarded_total (before): {before_metrics}"))?;
 
-    // 3. Force a relay-only path between sender and receiver.
-    let block_result = (|| -> Result<(), String> {
+    // 3-6. Everything from here on mutates sender/receiver state (firewall
+    // block, daemon restart) that MUST be reverted before this function
+    // returns, on every path — pass, assertion failure, or an SSH-transport
+    // error partway through. Wrapping the whole body in a closure and running
+    // cleanup unconditionally on its result (rather than threading a
+    // `failures` accumulator through `?`-early-returns) is what guarantees
+    // that: no exit from the closure, of any kind, can skip the
+    // `cleanup_relay_forward_test` call below it.
+    let result: Result<String, String> = (|| -> Result<String, String> {
+        // 3. Force a relay-only path between sender and receiver.
         let sender_block = run_relay_forward_test_script(
             sender_target,
             ssh_identity_file,
@@ -12098,15 +12108,9 @@ fn exercise_linux_relay_forwards_frame(
                 receiver_target.label
             ));
         }
-        Ok(())
-    })();
-    if let Err(err) = block_result {
-        failures.push(err);
-    }
 
-    // 4. Force fresh traversal negotiation and wait for both peers to
-    //    independently confirm they're relay-routed.
-    if failures.is_empty() {
+        // 4. Force fresh traversal negotiation and wait for both peers to
+        //    independently confirm they're relay-routed.
         for target in [sender_target, receiver_target] {
             let restart_output = run_relay_forward_test_script(
                 target,
@@ -12116,32 +12120,22 @@ fn exercise_linux_relay_forwards_frame(
                 "daemon restart",
             )?;
             if !restart_output.contains("HP3_DAEMON_STATE=active") {
-                failures.push(format!(
+                return Err(format!(
                     "rustynetd did not report active after restart on {}: {restart_output}",
                     target.label
                 ));
             }
         }
-    }
 
-    let mut relay_routed_status: Option<(String, String)> = None;
-    if failures.is_empty() {
-        match wait_for_relay_forward_test_relay_routing(
+        let (sender_status, receiver_status) = wait_for_relay_forward_test_relay_routing(
             sender_target,
             receiver_target,
             ssh_identity_file,
             known_hosts_path,
-        ) {
-            Ok(statuses) => relay_routed_status = Some(statuses),
-            Err(err) => failures.push(err),
-        }
-    }
+        )?;
 
-    // 5. Send real marked traffic while the relay captures its own wire.
-    let marker = generate_relay_forward_test_marker();
-    let mut ping_output = String::new();
-    let mut capture_text = String::new();
-    if failures.is_empty() {
+        // 5. Send real marked traffic while the relay captures its own wire.
+        let marker = generate_relay_forward_test_marker();
         let capture_start = run_relay_forward_test_script(
             relay_target,
             ssh_identity_file,
@@ -12150,72 +12144,65 @@ fn exercise_linux_relay_forwards_frame(
             "capture start",
         )?;
         if !capture_start.contains("HP3_CAPTURE_STARTED=1") {
-            failures.push(format!(
+            return Err(format!(
                 "failed to start relay-side capture on {}: {capture_start}",
                 relay_target.label
             ));
-        } else {
-            match run_relay_forward_test_script(
-                sender_target,
-                ssh_identity_file,
-                known_hosts_path,
-                build_relay_forward_test_ping_script(
-                    topology.receiver_mesh_ip.as_str(),
-                    relay_forward_test_marker_hex(marker.as_str()).as_str(),
-                )
-                .as_str(),
-                "marked ping",
-            ) {
-                Ok(output) => ping_output = output,
-                Err(err) => failures.push(err),
-            }
+        }
 
-            // Bounded wait for the background capture to self-terminate
-            // (it always does, via `timeout`, regardless of ping timing) —
-            // poll rather than guess a fixed sleep.
-            let capture_deadline =
-                Instant::now() + Duration::from_secs(RELAY_FORWARD_TEST_CAPTURE_SECS + 10);
-            loop {
-                let running = run_relay_forward_test_script(
-                    relay_target,
-                    ssh_identity_file,
-                    known_hosts_path,
-                    build_relay_forward_test_capture_running_check_script().as_str(),
-                    "capture status",
-                )?;
-                if running.contains("HP3_CAPTURE_RUNNING=0") || Instant::now() >= capture_deadline {
-                    break;
-                }
-                thread::sleep(Duration::from_secs(2));
-            }
+        let ping_output = run_relay_forward_test_script(
+            sender_target,
+            ssh_identity_file,
+            known_hosts_path,
+            build_relay_forward_test_ping_script(
+                topology.receiver_mesh_ip.as_str(),
+                relay_forward_test_marker_hex(marker.as_str()).as_str(),
+            )
+            .as_str(),
+            "marked ping",
+        )?;
 
-            capture_text = run_relay_forward_test_script(
+        // Bounded wait for the background capture to self-terminate (it
+        // always does, via `timeout`, regardless of ping timing) — poll
+        // rather than guess a fixed sleep.
+        let capture_deadline =
+            Instant::now() + Duration::from_secs(RELAY_FORWARD_TEST_CAPTURE_SECS + 10);
+        loop {
+            let running = run_relay_forward_test_script(
                 relay_target,
                 ssh_identity_file,
                 known_hosts_path,
-                build_relay_forward_test_capture_fetch_script().as_str(),
-                "capture fetch",
+                build_relay_forward_test_capture_running_check_script().as_str(),
+                "capture status",
             )?;
+            if running.contains("HP3_CAPTURE_RUNNING=0") || Instant::now() >= capture_deadline {
+                break;
+            }
+            thread::sleep(Duration::from_secs(2));
         }
-    }
 
-    if failures.is_empty() {
+        let capture_text = run_relay_forward_test_script(
+            relay_target,
+            ssh_identity_file,
+            known_hosts_path,
+            build_relay_forward_test_capture_fetch_script().as_str(),
+            "capture fetch",
+        )?;
+
         if !ping_output.contains("HP3_PING_EXIT=0") {
-            failures.push(format!(
+            return Err(format!(
                 "marked ping from {} to {} ({}) did not succeed: {ping_output}",
                 sender_target.label, receiver_target.label, topology.receiver_mesh_ip
             ));
         }
         if relay_forward_test_capture_contains_marker(capture_text.as_str(), marker.as_str()) {
-            failures.push(
+            return Err(
                 "relay-captured wire traffic contained the plaintext marker — ciphertext-only property violated"
                     .to_owned(),
             );
         }
-    }
 
-    // 6. Snapshot forwarding counters AFTER traffic and assert they moved.
-    if failures.is_empty() {
+        // 6. Snapshot forwarding counters AFTER traffic and assert they moved.
         let after_metrics = run_relay_forward_test_script(
             relay_target,
             ssh_identity_file,
@@ -12237,62 +12224,51 @@ fn exercise_linux_relay_forwards_frame(
         .ok_or_else(|| format!("could not parse bytes_forwarded_total (after): {after_metrics}"))?;
 
         if frames_after <= frames_before {
-            failures.push(format!(
+            return Err(format!(
                 "relay frames_forwarded_total did not increase: before={frames_before} after={frames_after}"
             ));
         }
         if bytes_after <= bytes_before {
-            failures.push(format!(
+            return Err(format!(
                 "relay bytes_forwarded_total did not increase: before={bytes_before} after={bytes_after}"
             ));
         }
 
-        if failures.is_empty() {
-            let (sender_status, receiver_status) = relay_routed_status.unwrap_or_default();
-            let summary = format!(
-                "relay forwarding proof passed (chain invoked against {linux_alias}): relay={} sender={} receiver={}; frames {frames_before}->{frames_after}; bytes {bytes_before}->{bytes_after}; ciphertext-only: marker absent from relay capture; sender status confirmed relay-routed ({sender_status_field:?}); receiver status confirmed relay-routed ({receiver_status_field:?})",
-                relay_target.label,
-                sender_target.label,
-                receiver_target.label,
-                sender_status_field = parse_relay_forward_test_status_field(
-                    sender_status.as_str(),
-                    "path_live_relay_peers"
-                )
-                .or_else(|| parse_relay_forward_test_status_field(
-                    sender_status.as_str(),
-                    "relay_session_established_peers"
-                )),
-                receiver_status_field = parse_relay_forward_test_status_field(
-                    receiver_status.as_str(),
-                    "path_live_relay_peers"
-                )
-                .or_else(|| parse_relay_forward_test_status_field(
-                    receiver_status.as_str(),
-                    "relay_session_established_peers"
-                )),
-            );
+        Ok(format!(
+            "relay forwarding proof passed (chain invoked against {linux_alias}): relay={} sender={} receiver={}; frames {frames_before}->{frames_after}; bytes {bytes_before}->{bytes_after}; ciphertext-only: marker absent from relay capture; sender status confirmed relay-routed ({sender_status_field:?}); receiver status confirmed relay-routed ({receiver_status_field:?})",
+            relay_target.label,
+            sender_target.label,
+            receiver_target.label,
+            sender_status_field = parse_relay_forward_test_status_field(
+                sender_status.as_str(),
+                "path_live_relay_peers"
+            )
+            .or_else(|| parse_relay_forward_test_status_field(
+                sender_status.as_str(),
+                "relay_session_established_peers"
+            )),
+            receiver_status_field = parse_relay_forward_test_status_field(
+                receiver_status.as_str(),
+                "path_live_relay_peers"
+            )
+            .or_else(|| parse_relay_forward_test_status_field(
+                receiver_status.as_str(),
+                "relay_session_established_peers"
+            )),
+        ))
+    })();
 
-            // 7. Cleanup (always attempted below) succeeded implicitly by
-            // reaching here without an early return; still run it before
-            // returning so success and failure share one cleanup path.
-            cleanup_relay_forward_test(
-                sender_target,
-                receiver_target,
-                ssh_identity_file,
-                known_hosts_path,
-            );
-            return Ok(summary);
-        }
-    }
-
-    // Failure path: always attempt cleanup before surfacing the reason(s).
+    // Always attempted, pass or fail, and regardless of which line inside the
+    // closure above produced the result (assertion failure or SSH-transport
+    // error alike) — this is what keeps a failed run from leaving the lab
+    // stuck in the artificially-relay-forced state.
     cleanup_relay_forward_test(
         sender_target,
         receiver_target,
         ssh_identity_file,
         known_hosts_path,
     );
-    Err(failures.join("; "))
+    result
 }
 
 /// Best-effort cleanup: remove the firewall block and restart both daemons
