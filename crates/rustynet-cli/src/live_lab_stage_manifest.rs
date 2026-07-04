@@ -318,7 +318,8 @@ mod tests {
         // the election stay off: exit went to macOS (windows exit cells +
         // its evidence capture/pull stages off), relay to Windows (macOS
         // relay cell off), anchor to macOS (windows anchor cell off), admin
-        // to Windows (macOS admin cell off).
+        // to Windows (macOS admin cell off), role-transition to macOS
+        // (windows role-transition cell off).
         let full = build_stage_manifest("test-run", "full", &full_selectors());
         let mut disabled: Vec<&str> = full
             .stages
@@ -339,6 +340,7 @@ mod tests {
                 "validate_windows_exit_dns_failclosed",
                 "validate_windows_exit_killswitch_precedence",
                 "validate_windows_exit_nat_lifecycle",
+                "validate_windows_role_transition",
             ]
         );
     }

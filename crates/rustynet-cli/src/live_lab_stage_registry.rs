@@ -1057,6 +1057,13 @@ pub const STAGES: &[StageSpec] = &[
         ..DEFAULT_SPEC
     },
     StageSpec {
+        name: "validate_windows_role_transition",
+        stream: PlatformStream::Windows,
+        enable: EnableRule::RoleSwitchPlatform("windows"),
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
         name: "promote_windows_exit_active",
         stream: PlatformStream::Windows,
         direct_platform: Some(("windows", "exit_handoff")),
@@ -2068,6 +2075,21 @@ mod tests {
             .expect("validate_macos_role_transition is registered");
         assert_eq!(spec.stream, PlatformStream::Macos);
         assert_eq!(spec.enable, EnableRule::RoleSwitchPlatform("macos"));
+
+        let windows_elected = TargetSelectors {
+            role_switch_platform: "windows".to_owned(),
+            ..TargetSelectors::default()
+        };
+        assert!(windows_elected.resolves(EnableRule::RoleSwitchPlatform("windows")));
+        assert!(!windows_elected.resolves(EnableRule::RoleSwitchPlatform("macos")));
+
+        let windows_spec = find_stage("validate_windows_role_transition")
+            .expect("validate_windows_role_transition is registered");
+        assert_eq!(windows_spec.stream, PlatformStream::Windows);
+        assert_eq!(
+            windows_spec.enable,
+            EnableRule::RoleSwitchPlatform("windows")
+        );
     }
 
     #[test]
