@@ -7316,6 +7316,8 @@ fn execute_rust_native_orchestration(
     // below are consumed by value). The Rust-path manifest drives enablement
     // by plan membership, so these selectors only fill the audit snapshot.
     let manifest_selectors = orchestrate_manifest_selectors(&config);
+    // Capture dry_run while `config` is intact (fields below are consumed).
+    let dry_run = config.dry_run;
 
     let known_hosts = config
         .known_hosts_path
@@ -7518,6 +7520,23 @@ fn execute_rust_native_orchestration(
         &plan_names,
     ) {
         eprintln!("warning: failed to emit stage manifest: {err}");
+    }
+
+    // --dry-run is a WIRING CHECK: the manifest above already records the
+    // resolved plan (what WOULD run) and the adapters/topology were validated
+    // when they were constructed. A dry run must NOT execute any stage or
+    // bootstrap the guests. Return the plan summary now. (Previously the Rust
+    // `--node` path ignored dry_run and ran a full real bootstrap — a foot-gun
+    // for anyone using dry_run as a fast wiring check.)
+    if dry_run {
+        return Ok(format!(
+            "dry-run (rust --node): {} node(s), {} planned stage(s); manifest at {}/{}. \
+             Topology + adapters validated; no stages executed.",
+            ctx.adapters.len(),
+            plan_names.len(),
+            report_dir.display(),
+            crate::live_lab_stage_manifest::STAGE_MANIFEST_RELATIVE_PATH,
+        ));
     }
 
     let runner = StateMachineRunner::new(stages);
