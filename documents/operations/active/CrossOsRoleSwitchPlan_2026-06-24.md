@@ -13,10 +13,39 @@
 > `--role-switch-platform macos` (`live_lab_stage_registry.rs`). First
 > attempt (`livelab-...-` run 1) failed on an absolute zero-peers-after
 > check; fixed to a before/after regression comparison (commit `2fda397`)
-> since a fast run legitimately has zero live peers throughout. Windows
-> (`windows_service` reload) and the `SignedMembership` transition kind
-> (capability changes, needs the admin issue/ingest wiring) remain
-> design-only — see §3/§4 below, unchanged. This is the banked design the
+> since a fast run legitimately has zero live peers throughout.
+>
+> **Windows `LocalOnly` slice: stage BUILT (commit `8816bf7`), BLOCKED live
+> 2026-07-04 on a genuine capability gap** (`livelab-1783142381-8816bf73333b`,
+> `validate_windows_role_transition` FAIL — the only stage failure in the
+> run, no collateral damage). Root cause, confirmed against the live guest:
+> the installed Windows CLI at `C:\Program Files\RustyNet\rustynet.exe` is
+> `rustynet-windows-trust-cli.rs` — a standalone, PURELY OFFLINE crypto tool
+> (`trust keygen`/`export-verifier-key`/`issue` only; no daemon socket or
+> named-pipe client code at all). There is currently no Windows CLI verb for
+> `role status`, `role set`, or `state refresh` — §3's claim that Windows
+> `role set` "reviewed PowerShell helper writes role" and re-reads via
+> "`windows_service` `StateRefresh` IPC" describes a daemon-side capability
+> that has no CLIENT-side entry point on Windows today. A second, independent
+> issue was also found by inspection (not yet hit live because the CLI gap
+> blocks reaching it): `update_node_role_env_file` looks for a `NODE_ROLE=`/
+> `RUSTYNET_NODE_ROLE=` line, but the actual Windows env file
+> (`C:\ProgramData\RustyNet\config\rustynetd.env`) embeds the role inside
+> `RUSTYNETD_DAEMON_ARGS_JSON=[...,"--node-role","client",...]` — a JSON
+> array, not a line-oriented `KEY=value` format — so even a working CLI call
+> would silently fail to update the real value today. **Required follow-up:**
+> (1) add a named-pipe IPC client capability (reusing the daemon's existing
+> control-channel protocol) to a Windows CLI tool for `role status`/
+> `role set`/`state refresh`; (2) fix `update_node_role_env_file` to parse
+> and rewrite the `RUSTYNETD_DAEMON_ARGS_JSON` array on Windows instead of
+> its current line-based assumption. Do not bypass this with a raw
+> env-file-edit-and-restart workaround in the live-lab stage — that would be
+> a second, weaker apply path, which CLAUDE.md §3 and this doc's own §2 hard
+> rule forbid; the CLI-level fix is the one hardened path.
+>
+> The `SignedMembership` transition kind (capability changes, needs the
+> admin issue/ingest wiring) remains design-only for both OS — see §3/§4
+> below, unchanged. This is the banked design the
 > `CrossPlatformRoleParityPlan_2026-06-21.md` §3 *live role transitions
 > (cross-OS)* cell depends on (Roadmap `CrossPlatformRoleParityRoadmap_2026-06-22.md`
 > §4 cell #4). It supersedes the previously-cited `state/cross_os_role_switch_plan.md`,

@@ -87,7 +87,7 @@ dry-run had masked). "Live stage" = author a fail-loud stage per §7.
 | 1 | **macOS admin** | ✅ DONE | refresh proof: `labrun-1783089250895-6139-0`, `831d41d`, `validate_macos_admin_issue` PASS | — | — |
 | 2 | **Windows admin** | ✅ DONE | live-proven 2026-06-27: `validate_windows_admin_issue` PASS, run `livelab-1782526081` | — | — |
 | 3 | **macOS blind_exit** | ✅ DONE (2026-06-29) | live-proven: `labrun-1782770042330-16244-0`, `ed3ed7e` | — | — |
-| 4 | **Role transitions (macOS→Windows)** | ✅ macOS `LocalOnly` DONE (2026-07-04) | `validate_macos_role_transition` PASS, run `livelab-1783135864-2fda3979d599`, commit `2fda397`: `rustynet role set` + launchd bootout/bootstrap + `state refresh`, new role + mesh-peer-regression asserted live. Windows (`windows_service` reload) + `SignedMembership` kind remain design-only in `CrossOsRoleSwitchPlan_2026-06-24.md` | Windows: ~1–2 d | admin cells done |
+| 4 | **Role transitions (macOS→Windows)** | ✅ macOS `LocalOnly` DONE (2026-07-04); 🔒 Windows BLOCKED (2026-07-04) | macOS: `validate_macos_role_transition` PASS, run `livelab-1783135864-2fda3979d599`, commit `2fda397`. Windows: `validate_windows_role_transition` stage built + committed (`8816bf7`) but its FIRST live run (`livelab-1783142381-8816bf73333b`) FAILED on a genuine capability gap, not a stage bug — the deployed Windows guest CLI (`rustynet.exe`) is `rustynet-windows-trust-cli.rs`, a pure OFFLINE crypto tool (`trust keygen/export-verifier-key/issue` only, no daemon IPC client at all); there is currently NO Windows CLI verb for `role status`/`role set`/`state refresh`. Fixing this needs a Windows IPC client (named-pipe) added to a CLI tool, plus fixing `update_node_role_env_file` to parse/rewrite `RUSTYNETD_DAEMON_ARGS_JSON` (a JSON array embedding `--node-role`) instead of its current line-based `NODE_ROLE=` assumption, which does not match the Windows env-file format either. `SignedMembership` kind remains design-only for both OS | Windows: new estimate, needs an IPC-client build (~2-3 d, was previously mis-estimated at 1-2 d assuming the CLI already worked) | admin cells done |
 | 5 | macOS **exit** | ✅ DONE | live-proven 2026-07-03 by `labrun-1783087254263-11121-0` on `039f215` | — | — |
 | 6 | macOS **relay** *live lifecycle* | ✅ **DONE** (2026-06-27) | ✅ live lifecycle proven: `validate_macos_relay_service_lifecycle` PASS (run `livelab-1782571161`). **Forwarding proof remains HP-3-gated, same as Linux.** | — | — |
 | 7 | Windows **anchor** live + macOS **anchor** live | ✅ DONE for bundle-pull | macOS bundle-pull live-proven 2026-06-22; Windows bundle-pull live-proven 2026-07-03 via `labrun-1783079551578-32671-0` on `786f900`; remaining gossip/enrollment anchor sub-surfaces stay separate | — | — |
@@ -96,9 +96,13 @@ dry-run had masked). "Live stage" = author a fail-loud stage per §7.
 | 🚫 | Windows **blind_exit** | — | out of scope by design (`main.rs:11768`) | — | n/a |
 
 **Bottom line:** the macOS `LocalOnly` role-transition slice is live-proven
-(2026-07-04); remaining implementable parity work is the Windows role-transition
-half + the `SignedMembership` transition kind, plus explicit anchor
-gossip/enrollment/port-map live proof. Relay forwarding stays HP-3-gated, and
+(2026-07-04); the Windows half is BLOCKED on a genuine capability gap (no
+Windows CLI exposes `role status`/`role set`/`state refresh` — the only
+Windows CLI is a pure-offline trust tool with no daemon IPC client),
+discovered by that stage's first live run. Remaining implementable parity
+work is that Windows IPC-client build + the `SignedMembership` transition
+kind, plus explicit anchor gossip/enrollment/port-map live proof. Relay
+forwarding stays HP-3-gated, and
 Windows exit stays blocked by the lab guest's missing WinNAT/HNS stack.
 
 ---
@@ -212,7 +216,7 @@ from selector/optional skips):
 
 | # | Cell | Why this rank |
 |---|---|---|
-| ✅ | **Role transitions (macOS→Windows)** | macOS `LocalOnly` DONE: `validate_macos_role_transition` PASS, run `livelab-1783135864-2fda3979d599`, commit `2fda397` (client->admin flip, launchd reload, `state refresh`, mesh-peer-regression check). Windows + `SignedMembership` kind remain design-only |
+| ✅🔒 | **Role transitions (macOS→Windows)** | macOS `LocalOnly` DONE: `validate_macos_role_transition` PASS, run `livelab-1783135864-2fda3979d599`, commit `2fda397` (client->admin flip, launchd reload, `state refresh`, mesh-peer-regression check). Windows `LocalOnly` BLOCKED (2026-07-04): stage built (`8816bf7`) but the guest's only CLI (`rustynet-windows-trust-cli.rs`) is offline-only (no IPC client), so `role status`/`role set`/`state refresh` have no Windows entry point yet — needs a named-pipe IPC client + an `update_node_role_env_file` fix for the `RUSTYNETD_DAEMON_ARGS_JSON` array format. `SignedMembership` kind remains design-only for both OS |
 | 2 | **Remaining anchor sub-surfaces** | bundle-pull is live-proven on macOS/Windows; gossip/enrollment/port-map still need explicit live proof |
 | ✅ | **macOS admin** | DONE: `labrun-1783089250895-6139-0`, commit `831d41d`, `validate_macos_admin_issue` PASS |
 | ✅ | **Windows admin** | DONE: `livelab-1782526081`, `validate_windows_admin_issue` PASS |
