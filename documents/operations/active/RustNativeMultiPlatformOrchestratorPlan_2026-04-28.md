@@ -178,6 +178,121 @@ ops vm-lab-orchestrate-live-lab \
 
 …to spin up a heterogeneous mesh and validate it end-to-end. Adding a fourth OS = ship one new adapter impl. Adding a new orchestration stage = ship one new `OrchestrationStage` impl.
 
+## 0.5) Full-Replacement Definition of Done (2026-07-04)
+
+**Mandate (operator, 2026-07-04):** this is a *replacement*, not an alternative
+engine. It cannot be called done until the Rust `--node` engine **and its whole
+tooling stack** carry EVERY capability the bash orchestrator + tooling carry
+today — the autonomous live-lab loop, next-available-stage selection, all MCP
+lab-state + DeepSeek functions, agent/overnight configs, the terminal monitor,
+and every evidence artifact — all driving the new engine and proven live. Only
+then does bash get removed (W5.7).
+
+This DoD is grounded in a 5-surface inventory (workflow `weme66cwa`, 2026-07-04)
+of the old orchestrator's complete feature/integration surface mapped to the
+Rust engine.
+
+### Already at parity (the recorder-first convergence pays off — DONE/verified)
+- **MCP `lab-state`:** 18/19 tools already work on a Rust `--node` run — both
+  engines share ONE evidence contract (`stage_manifest.json`, `state/stages.tsv`,
+  `parity_input.json`, the fixed-schema `live_lab_run_matrix.csv`) and ONE
+  stage-vocabulary owner (`live_lab_stage_registry`) mapping both dialects into
+  the same `{os}_stage_*` columns. `start_live_lab_run` **already drives the Rust
+  engine today** — passing `nodes` → `--node` selects `execute_rust_native_orchestration`.
+- **MCP `deepseek` loop:** an engine-agnostic *client* of the orchestrator CLI;
+  the loop / `next_live_lab_target` / reconcile / triage already work against Rust
+  runs via the shared evidence contract.
+- **Monitor stage grid + per-run counts:** manifest-driven and **render Rust
+  `--node` runs correctly today** — the Rust path emits `orchestration/stage_manifest.json`
+  and the monitor reads it from the identical path (verified 2026-07-04; an
+  inventory agent's "no manifest" claim was false). Regression-guard only.
+- **Foundation shipped this session:** functional-parity gate (`a88ce75`),
+  cleanup-residue release-blocker fix proven live (`9c1c908`, run
+  `livelab-1783193071`), recorder-first observability (`831a32a`).
+
+### Gap buckets — the real remaining replacement work
+
+**BUCKET 1 — Orchestrator stage / mode / flag parity (largest).** The Rust
+engine runs ONLY the 21-stage `PlanBuilder`. Missing / bash-routed:
+- **Stage families:** the Linux live **security suite** (~13 hard validators:
+  two_hop, managed_dns, network_flap, reboot_recovery, secrets_not_in_logs,
+  key_custody, enrollment_restart, lan_toggle, mixed_topology, membership-revoke /
+  signature-forgery / privileged-helper-allowlist / policy-default-deny /
+  gossip-revoked-readmit / enrollment-replay / hello-limiter-flood); the
+  **mac/win role-election + validator stages** (~20 macOS, ~25 Windows — these
+  ALREADY EXIST as Rust helper stages but are only reachable from the bash-router
+  arm; wire them into the Rust plan / `--node` role dispatch); the **chaos** suite
+  (9 stages) and **cross-network** suite (~10 families per NAT profile) —
+  implement Rust-native OR explicitly scope out of the parity claim with a
+  documented blocker.
+- **Recovery / readiness gate:** `restart_unready_vms` / `rediscover_local_utm` /
+  probe-and-recover + the `--trust-inventory-ready` opt-out. The Rust path has NO
+  readiness gate — an unreachable node fails hard instead of being recovered.
+- **Modes:** setup-only (`--stop-after-ready` early return after
+  `validate_baseline_runtime`), run-only-against-profile (`vm-lab-run-live-lab`),
+  iterate (`vm-lab-iterate-live-lab`).
+- **Flags:** `--skip-linux-live-suite`, `--enable-chaos-suite`,
+  `--skip-cross-network`, `--collect-artifacts-on-failure`,
+  `--skip-diagnose-on-failure`, the platform selectors
+  (`--exit/relay/anchor/admin/blind_exit-platform`, `--macos-promote-exit`,
+  `--topology-profile`) which currently take effect ONLY in the bash-router arm,
+  and honoring `--repo-ref` in the Rust archive stage.
+
+**BUCKET 2 — Evidence parity.** The Rust finalize path writes
+`orchestrate_result.json` + `parity_input.json` but NOT `run_summary.json` /
+`run_summary.md`, so `validate_live_lab_run_artifacts` and the run-matrix
+`run_note` are dropped for Rust runs. Emit them; carry `run_note` through
+finalize (stop hardcoding `notes: None`).
+
+**BUCKET 3 — Monitor.** Add a headless `--snapshot`/`--once` mode (grid + counts
++ VM roles to stdout/JSON, no TUI) so Rust-run rendering is verifiable in scripts
+and CI. (Grid/counts already render — see above.)
+
+**BUCKET 4 — Loop / next-target dialect-awareness.** `key_for_stage_or_cell`
+(deepseek.rs) only maps a cell when the name contains `macos`/`windows`; a Rust
+`first_failed_stage` recorded as a raw Linux `StageId` (e.g. `traffic_test_matrix`,
+`distribute_traversal`) is a next-target blind spot. Make next-target recognize
+Rust-dialect stage IDs; add the `rust_engine` opt-in on `deepseek_lab_run` (and
+`start_live_lab_run` role-platform selectors) that synthesizes `--node` from
+selectors + inventory.
+
+**BUCKET 5 — MCP lab-state.** `diagnose_live_lab_failure` auto-resolves a
+bash-style profile from the matrix row; make it work on a profile-less Rust
+`--node` report dir (or document the grep_report/get_stage_log path). Expose the
+role-platform / promote-exit / skip-linux-live-suite selectors on
+`start_live_lab_run`.
+
+**BUCKET 6 — Overnight driver.** **Route it to the Rust engine:** the executor
+(`verify_cell`, executor.rs:369) invokes `vm-lab-orchestrate-live-lab` with
+`--{role}-platform` selectors but **no `--node`**, so it currently routes to
+BASH — emit `--node` (synthesized from the cell) so the overnight oracle drives
+the Rust engine. Run the live path (`run_loop` + `LiveExecutor`)
+end-to-end against the real lab at least once (only `--dry-run`/mocks have run);
+give the spawned agent a real `--mcp-config`/`--allowedTools`; enforce
+`agent_timeout_secs`; wire run-matrix auto-seeding, the adversarial second-review
+agent, and `--auto-merge-safe-cells` (or scope them out). blind_exit cells never
+scheduled/merged.
+
+**BUCKET 7 — Parity proof.** `vm-lab-diff-orchestrator-parity --mode functional`
+passes (shared logical work + overall status + node count) between a bash run and
+the equivalent Rust `--node` run on the same topology, captured as run-matrix
+evidence — the redefined W5.6 flip gate.
+
+**BUCKET 8 — Removal (W5.7).** Only after Buckets 1–7 are green and Rust is the
+routing default: remove `scripts/e2e/live_linux_lab_orchestrator.sh` and the
+mac/win helper functions from the bash-router arm.
+
+### Ordered execution (incremental, prove-as-you-go)
+1. Evidence + observability parity (Buckets 2, 3, 4-observability) — cheap, unblocks
+   clean monitor/loop verification. 2. Security-suite stages (Bucket 1) — port the
+   8 audit checks (RANK-1) + surface the 6 already-computed daemon probes (RANK-0),
+   security-first. 3. mac/win role-election stages into the Rust plan (Bucket 1) —
+   they exist; wire them. 4. Recovery/readiness gate + modes + flags (Bucket 1).
+   5. Loop routing + next-target dialect-awareness + MCP selectors (Buckets 4, 5).
+   6. Overnight live path (Bucket 6). 7. Functional-parity proof (Bucket 7).
+   8. Chaos/cross-network decision. 9. Removal (Bucket 8). Each stage/bucket is
+   proven live and recorded in `live_lab_run_matrix.csv` before the next.
+
 ## 1) Motivation
 
 ### 1.1 Problem statement
