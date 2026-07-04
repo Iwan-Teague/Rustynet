@@ -4976,9 +4976,24 @@ fn write_orchestration_artifact(path: &Path, contents: &str) -> Result<(), Strin
             )
         })?;
     }
-    fs::write(path, contents).map_err(|err| {
+    // Atomic write (tmp + rename) so a concurrent reader — e.g. the MCP
+    // reload-recovery reader polling orchestrate_result.json while the detached
+    // orchestrator is mid-write at finalize — never observes a torn/partial file.
+    // Matches the stage recorder's upsert and the MCP job-record writer.
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ));
+    fs::write(&tmp, contents).map_err(|err| {
         format!(
-            "write orchestration artifact failed ({}): {err}",
+            "write orchestration artifact (tmp) failed ({}): {err}",
+            tmp.display()
+        )
+    })?;
+    fs::rename(&tmp, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp);
+        format!(
+            "rename orchestration artifact into place failed ({}): {err}",
             path.display()
         )
     })
@@ -7247,7 +7262,11 @@ fn write_rust_native_run_summary(
         .map_err(|err| format!("create state dir for nodes.tsv: {err}"))?;
 
     // nodes.tsv: label \t target \t node_id \t bootstrap_role — the 4-column
-    // shape `execute_ops_write_live_linux_lab_run_summary` expects.
+    // shape `execute_ops_write_live_linux_lab_run_summary` expects. Sanitize each
+    // field (strip \t/\n/\r → space, mirroring the stage recorder) so a tab or
+    // newline in an operator-supplied inventory alias/target can't shift or split
+    // the fixed 4-column TSV (which would silently drop or mis-attribute the row).
+    let tsv_safe = |v: &str| v.replace(['\t', '\n', '\r'], " ");
     let nodes_tsv = state_dir.join("nodes.tsv");
     let mut body = String::with_capacity(node_targets.len() * 64);
     for (alias, target, role) in node_targets {
@@ -7255,7 +7274,13 @@ fn write_rust_native_run_summary(
             .get(alias)
             .cloned()
             .unwrap_or_else(|| format!("{alias}-bootstrap"));
-        body.push_str(&format!("{alias}\t{target}\t{node_id}\t{role}\n"));
+        body.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            tsv_safe(alias),
+            tsv_safe(target),
+            tsv_safe(&node_id),
+            tsv_safe(role)
+        ));
     }
     fs::write(&nodes_tsv, body).map_err(|err| format!("write nodes.tsv: {err}"))?;
 
@@ -7529,13 +7554,22 @@ fn execute_rust_native_orchestration(
     // `--node` path ignored dry_run and ran a full real bootstrap — a foot-gun
     // for anyone using dry_run as a fast wiring check.)
     if dry_run {
+        let node_count = ctx.adapters.len();
+        let stage_count = plan_names.len();
+        // Remove the report dir this dry run created (only the manifest lives
+        // there) so a subsequent REAL run to the SAME --report-dir is not blocked
+        // by ensure_report_dir_fresh's empty-dir precondition. The dry run's value
+        // is this summary; the guests were never touched. Safe: this run created
+        // the dir (ensure_report_dir_fresh required it fresh/absent).
+        if let Err(err) = fs::remove_dir_all(report_dir.as_path()) {
+            eprintln!(
+                "warning: dry-run cleanup of {} failed: {err}",
+                report_dir.display()
+            );
+        }
         return Ok(format!(
-            "dry-run (rust --node): {} node(s), {} planned stage(s); manifest at {}/{}. \
-             Topology + adapters validated; no stages executed.",
-            ctx.adapters.len(),
-            plan_names.len(),
-            report_dir.display(),
-            crate::live_lab_stage_manifest::STAGE_MANIFEST_RELATIVE_PATH,
+            "dry-run (rust --node): {node_count} node(s), {stage_count} planned stage(s); \
+             topology + adapters validated, no stages executed (report dir not persisted).",
         ));
     }
 
