@@ -714,6 +714,10 @@ pub fn load_sparklines(
 pub struct StageMatrixEntry {
     pub name: String,
     pub state: ParityState,
+    /// Latest decisive outcome is pass — the completion signal the panel
+    /// title counts, matching the header CHECKS definition. `state` stays
+    /// the stability classification that colors the cell.
+    pub latest_pass: bool,
 }
 
 /// The complete "what needs to pass" grid: every real live-lab stage
@@ -788,51 +792,83 @@ pub fn load_full_stage_matrix(repo_root: &Path) -> Result<FullStageMatrix> {
         rows.push(r);
     }
 
-    let state_for = |column: &str| -> ParityState {
+    let state_for = |column: &str| -> (ParityState, bool) {
         let Some(idx) = headers.iter().position(|h| h == column) else {
-            return ParityState::Unproven;
+            return (ParityState::Unproven, false);
         };
-        classify_recent_history(&decisive_history(&rows, idx))
+        let history = decisive_history(&rows, idx);
+        (
+            classify_recent_history(&history),
+            history.last() == Some(&false),
+        )
     };
 
     let mut matrix = FullStageMatrix::default();
     for suffix in discover_stage_suffixes(&headers) {
-        matrix.linux.push(StageMatrixEntry {
-            name: suffix.clone(),
-            state: state_for(&format!("linux_stage_{suffix}")),
+        matrix.linux.push({
+            let (state, latest_pass) = state_for(&format!("linux_stage_{suffix}"));
+            StageMatrixEntry {
+                name: suffix.clone(),
+                state,
+                latest_pass,
+            }
         });
-        matrix.macos.push(StageMatrixEntry {
-            name: suffix.clone(),
-            state: state_for(&format!("macos_stage_{suffix}")),
+        matrix.macos.push({
+            let (state, latest_pass) = state_for(&format!("macos_stage_{suffix}"));
+            StageMatrixEntry {
+                name: suffix.clone(),
+                state,
+                latest_pass,
+            }
         });
-        matrix.windows.push(StageMatrixEntry {
-            name: suffix.clone(),
-            state: state_for(&format!("windows_stage_{suffix}")),
+        matrix.windows.push({
+            let (state, latest_pass) = state_for(&format!("windows_stage_{suffix}"));
+            StageMatrixEntry {
+                name: suffix.clone(),
+                state,
+                latest_pass,
+            }
         });
     }
     for (column, name) in discover_oneoff_columns(&headers, Os::Linux) {
-        matrix.linux.push(StageMatrixEntry {
-            name,
-            state: state_for(&column),
+        matrix.linux.push({
+            let (state, latest_pass) = state_for(&column);
+            StageMatrixEntry {
+                name,
+                state,
+                latest_pass,
+            }
         });
     }
     for (column, name) in discover_oneoff_columns(&headers, Os::Macos) {
-        matrix.macos.push(StageMatrixEntry {
-            name,
-            state: state_for(&column),
+        matrix.macos.push({
+            let (state, latest_pass) = state_for(&column);
+            StageMatrixEntry {
+                name,
+                state,
+                latest_pass,
+            }
         });
     }
     for (column, name) in discover_oneoff_columns(&headers, Os::Windows) {
-        matrix.windows.push(StageMatrixEntry {
-            name,
-            state: state_for(&column),
+        matrix.windows.push({
+            let (state, latest_pass) = state_for(&column);
+            StageMatrixEntry {
+                name,
+                state,
+                latest_pass,
+            }
         });
     }
     for header in headers.iter() {
         if let Some(name) = header.strip_prefix("cross_os_") {
-            matrix.cross_os.push(StageMatrixEntry {
-                name: name.to_owned(),
-                state: state_for(header),
+            matrix.cross_os.push({
+                let (state, latest_pass) = state_for(header);
+                StageMatrixEntry {
+                    name: name.to_owned(),
+                    state,
+                    latest_pass,
+                }
             });
         }
     }
@@ -1497,6 +1533,11 @@ mod tests {
         let matrix = load_full_stage_matrix(dir.path()).unwrap();
 
         assert_eq!(matrix.linux[0].state, ParityState::Flaky);
+        assert!(
+            matrix.linux[0].latest_pass,
+            "the panel entry carries the completion bit so its title \
+             (count_passed = latest_pass) agrees with the header CHECKS"
+        );
         assert_eq!(progress.total, 1 + PRE_STAGE_COUNT);
         assert_eq!(
             progress.passed,

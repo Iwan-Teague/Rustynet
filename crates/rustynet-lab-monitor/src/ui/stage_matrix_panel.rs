@@ -20,15 +20,28 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let matrix = &app.full_stage_matrix;
     let total =
         matrix.linux.len() + matrix.macos.len() + matrix.windows.len() + matrix.cross_os.len();
+    // Same definitions as the header CHECKS counter: passed = latest
+    // decisive outcome is pass (completion), flaky = green now but the
+    // stability classifier hasn't re-proven it yet. Cells keep their
+    // stability colors; the counts must never silently deflate progress.
     let passed = count_passed(&matrix.linux)
         + count_passed(&matrix.macos)
         + count_passed(&matrix.windows)
         + count_passed(&matrix.cross_os);
+    let flaky = count_flaky(&matrix.linux)
+        + count_flaky(&matrix.macos)
+        + count_flaky(&matrix.windows)
+        + count_flaky(&matrix.cross_os);
 
     let outer_border_fg = if focused { Color::Yellow } else { Color::Cyan };
+    let flaky_note = if flaky > 0 {
+        format!(" (~{flaky} flaky)")
+    } else {
+        String::new()
+    };
     let outer = Block::default()
         .title(Span::styled(
-            format!("FULL STAGE MATRIX [7] — {passed}/{total} checks passed"),
+            format!("FULL STAGE MATRIX [7] — {passed}/{total} checks passing{flaky_note}"),
             Style::default().fg(outer_border_fg),
         ))
         .borders(Borders::ALL)
@@ -162,9 +175,17 @@ fn color_style(state: ParityState) -> Style {
     })
 }
 
+/// Completion: latest decisive outcome is pass — the same numerator
+/// definition as the header CHECKS counter, so the two never disagree.
 fn count_passed(stages: &[StageMatrixEntry]) -> usize {
+    stages.iter().filter(|e| e.latest_pass).count()
+}
+
+/// Green now, but the stability classifier has not re-proven the recent
+/// window — surfaced as a sidecar, never subtracted from `count_passed`.
+fn count_flaky(stages: &[StageMatrixEntry]) -> usize {
     stages
         .iter()
-        .filter(|e| e.state == ParityState::Proven)
+        .filter(|e| e.latest_pass && e.state != ParityState::Proven)
         .count()
 }
