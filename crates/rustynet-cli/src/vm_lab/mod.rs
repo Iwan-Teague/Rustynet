@@ -11657,12 +11657,19 @@ fn exercise_macos_admin_issue_live(
 /// like the proven `exercise_macos_blind_exit_live` reload sequence. Asserts
 /// the daemon reports the new role post-restart, runs `state refresh` (the
 /// single verified `refresh_signed_state_with_reason` apply path), and
-/// asserts mesh connectivity survived the flip: `overall_ok` alone can
-/// false-green with zero peers, so peer count is checked explicitly rather
-/// than trusting the evaluator's summary alone. FAIL-LOUD: the live result
-/// is the stage status; an unexpected before-role is a Fail, not a silent
-/// Skip. SignedMembership-kind transitions (capability changes) need the
-/// admin cell's issue/ingest wiring and are a separate increment.
+/// asserts mesh connectivity did not REGRESS across the flip: a fast
+/// (`--skip-linux-live-suite`) run never drives real traffic, so a node can
+/// legitimately have zero live peers throughout (`validate_macos_mesh_join`
+/// reports success with `path_live_peer_count=0` — membership-joined, not
+/// handshake-proven); requiring peers > 0 unconditionally would fail every
+/// fast-iteration run regardless of the transition, so the before/after peer
+/// count is compared instead (fewer peers after than before = Fail). This
+/// was found live: the first proving run failed on an absolute
+/// zero-peers-after check before the before/after comparison replaced it.
+/// FAIL-LOUD: the live result is the stage status; an unexpected before-role
+/// is a Fail, not a silent Skip. SignedMembership-kind transitions
+/// (capability changes) need the admin cell's issue/ingest wiring and are a
+/// separate increment.
 fn exercise_macos_role_transition_live(
     macos_alias: &str,
     inventory_path: &Path,
@@ -11682,6 +11689,14 @@ fn exercise_macos_role_transition_live(
         ));
     }
     let target = remote_target_from_inventory_entry(&macos_entry, None);
+
+    let (before_peer_count, before_mesh_summary) = macos_mesh_peer_count(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+    )
+    .map_err(|e| format!("pre-transition mesh status check on {macos_alias} failed: {e}"))?;
 
     let role_transition_script = "set -eu; \
          RN=/usr/local/bin/rustynet; \
@@ -11736,6 +11751,48 @@ fn exercise_macos_role_transition_live(
     )
     .map_err(|e| format!("macOS role transition on {macos_alias} failed: {e}"))?;
 
+    let (after_peer_count, after_mesh_summary) = macos_mesh_peer_count(
+        macos_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+    )
+    .map_err(|e| format!("post-transition mesh status check on {macos_alias} failed: {e}"))?;
+
+    // A fast (--skip-linux-live-suite) run never drives real cross-node
+    // traffic, so a freshly-bootstrapped macOS node legitimately has ZERO
+    // live WireGuard peers even at baseline (`validate_macos_mesh_join`
+    // reports success with path_live_peer_count=0 — membership-joined, not
+    // handshake-proven). Requiring peers > 0 unconditionally would fail
+    // every fast-iteration run regardless of the transition. What actually
+    // matters is a REGRESSION: the flip must not silently DROP peers that
+    // were connected before it.
+    if after_peer_count < before_peer_count {
+        return Err(format!(
+            "mesh connectivity regressed on {macos_alias} after the role transition: \
+             {before_peer_count} peer(s) before ({before_mesh_summary}), {after_peer_count} \
+             peer(s) after ({after_mesh_summary}) — a flip that silently drops peers must not \
+             read as a Pass"
+        ));
+    }
+
+    Ok(format!(
+        "macOS live role transition proven on {macos_alias}: {}; mesh peers before={before_peer_count} after={after_peer_count} ({after_mesh_summary})",
+        out.trim()
+    ))
+}
+
+/// Live peer count from the macOS node's mesh-status snapshot, alongside the
+/// human-readable evaluator summary. Used to detect a REGRESSION (peers
+/// dropped) around a role transition rather than enforcing an absolute
+/// floor — a fast (`--skip-linux-live-suite`) run legitimately has zero live
+/// peers throughout, since no traffic-generating stage ever ran a handshake.
+fn macos_mesh_peer_count(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(usize, String), String> {
     let mesh_raw_json = run_macos_daemon_check_remote(
         macos_alias,
         inventory_path,
@@ -11743,8 +11800,7 @@ fn exercise_macos_role_transition_live(
         known_hosts_path,
         "macos-mesh-status-check",
         &[],
-    )
-    .map_err(|e| format!("post-transition mesh status check on {macos_alias} failed: {e}"))?;
+    )?;
     let mesh_summary = evaluate_macos_mesh_status_report(macos_alias, mesh_raw_json.as_str())?;
     let mesh_report: rustynetd::macos_mesh_status::MacosMeshStatusReport =
         serde_json::from_str(mesh_raw_json.as_str())
@@ -11755,18 +11811,7 @@ fn exercise_macos_role_transition_live(
         }
         _ => 0,
     };
-    if peer_count == 0 {
-        return Err(format!(
-            "mesh status reported healthy but zero peers on {macos_alias} after the role \
-             transition — a flip that silently dropped mesh connectivity must not read as a \
-             Pass ({mesh_summary})"
-        ));
-    }
-
-    Ok(format!(
-        "macOS live role transition proven on {macos_alias}: {}; post-restart {mesh_summary}",
-        out.trim()
-    ))
+    Ok((peer_count, mesh_summary))
 }
 
 /// Deploy the reviewed macOS anchor launchd profile on the elected anchor
