@@ -5217,13 +5217,43 @@ fn finalize_vm_lab_orchestration_result(
     command: &str,
     report_dir: &Path,
     orchestration_dir: &Path,
+    outcomes: Vec<VmLabStageOutcome>,
+    warnings: Vec<String>,
+    next_actions: Vec<String>,
+) -> Result<String, String> {
+    finalize_vm_lab_orchestration_result_with_inventory(
+        command,
+        report_dir,
+        orchestration_dir,
+        None,
+        outcomes,
+        warnings,
+        next_actions,
+    )
+}
+
+/// Like [`finalize_vm_lab_orchestration_result`] but preserves an
+/// `inventory_path` on the run-matrix append so a run's node evidence isn't
+/// dropped. The Rust `--node` path uses this (it has an inventory); the bash
+/// call sites delegate through `finalize_vm_lab_orchestration_result` with
+/// `None`, byte-identical to before.
+#[allow(clippy::too_many_arguments)]
+fn finalize_vm_lab_orchestration_result_with_inventory(
+    command: &str,
+    report_dir: &Path,
+    orchestration_dir: &Path,
+    inventory_path: Option<&Path>,
     mut outcomes: Vec<VmLabStageOutcome>,
     mut warnings: Vec<String>,
     next_actions: Vec<String>,
 ) -> Result<String, String> {
-    if let Err(err) =
-        append_live_lab_run_matrix_for_command(command, report_dir, None, None, outcomes.as_slice())
-    {
+    if let Err(err) = append_live_lab_run_matrix_for_command(
+        command,
+        report_dir,
+        None,
+        inventory_path,
+        outcomes.as_slice(),
+    ) {
         warnings.push(format!("live-lab run matrix update failed: {err}"));
     }
     let overall_status = orchestrated_command_status(outcomes.as_slice(), warnings.as_slice());
@@ -7066,6 +7096,75 @@ fn orchestrate_manifest_selectors(
     }
 }
 
+/// The registry severity string for a stage (defaults `hard` for an
+/// unregistered name — every Rust `StageId` is registered, drift-gated).
+fn registry_severity_str(stage: &str) -> &'static str {
+    match crate::live_lab_stage_registry::find_stage(stage).map(|spec| spec.severity) {
+        Some(crate::live_lab_stage_registry::StageSeverity::Soft) => "soft",
+        _ => "hard",
+    }
+}
+
+/// [`StageObserver`](orchestrator::runner::StageObserver) that emits the
+/// realtime `stages.tsv` contract for a `--node` run: a `running` row when a
+/// stage starts, replaced by its terminal outcome when it finishes. Recorder
+/// failures are best-effort (never fail a real lab stage). `started_at` is
+/// remembered across the start→finish pair so the terminal row keeps it.
+struct RustNativeStageRecorder<'a> {
+    report_dir: &'a Path,
+    started_at: std::cell::RefCell<std::collections::HashMap<String, String>>,
+}
+
+impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
+    fn stage_started(&self, id: &orchestrator::stage::StageId) {
+        let name = id.as_str();
+        let now = collected_at_utc_now();
+        self.started_at
+            .borrow_mut()
+            .insert(name.to_owned(), now.clone());
+        let _ = crate::live_lab_stage_recorder::record_stage_start(
+            self.report_dir,
+            name,
+            registry_severity_str(name),
+            "",
+            "",
+            &now,
+        );
+    }
+
+    fn stage_finished(
+        &self,
+        id: &orchestrator::stage::StageId,
+        outcome: &orchestrator::error::StageOutcome,
+    ) {
+        use orchestrator::error::StageOutcome;
+        let name = id.as_str();
+        let (status, rc, summary) = match outcome {
+            StageOutcome::Passed => ("pass", "0", String::new()),
+            StageOutcome::Failed(err) => ("fail", "1", err.clone()),
+            StageOutcome::Skipped => ("skipped", "", String::new()),
+        };
+        let started = self
+            .started_at
+            .borrow()
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        let now = collected_at_utc_now();
+        let _ = crate::live_lab_stage_recorder::record_stage_finish(
+            self.report_dir,
+            name,
+            registry_severity_str(name),
+            status,
+            rc,
+            "",
+            &summary,
+            &started,
+            &now,
+        );
+    }
+}
+
 fn execute_rust_native_orchestration(
     config: VmLabOrchestrateLiveLabConfig,
 ) -> Result<String, String> {
@@ -7074,6 +7173,11 @@ fn execute_rust_native_orchestration(
     use orchestrator::context::OrchestrationContext;
     use orchestrator::error::StageOutcome;
     use orchestrator::runner::StateMachineRunner;
+
+    // Snapshot the manifest selectors while `config` is fully intact (fields
+    // below are consumed by value). The Rust-path manifest drives enablement
+    // by plan membership, so these selectors only fill the audit snapshot.
+    let manifest_selectors = orchestrate_manifest_selectors(&config);
 
     let known_hosts = config
         .known_hosts_path
@@ -7232,8 +7336,35 @@ fn execute_rust_native_orchestration(
 
     let stages = build_rust_native_orchestration_stages(rebuild_only, source_mode);
 
+    // Finding 1/4 (recorder-first): emit the run-scoped stage manifest that
+    // reflects THIS run's actual plan — the Rust state-machine dialect enabled
+    // + barrier-eligible, the bash dialect/sidecars not-planned — BEFORE any
+    // stage runs, so every downstream consumer reads the plan from the report
+    // dir. Capture the plan names now, since StateMachineRunner::new moves
+    // `stages`.
+    let plan_names: std::collections::HashSet<String> = stages
+        .iter()
+        .map(|stage| stage.id().as_str().to_owned())
+        .collect();
+    if let Err(err) = crate::live_lab_stage_manifest::ensure_stage_manifest_with_plan(
+        report_dir.as_path(),
+        "vm-lab-orchestrate-live-lab",
+        "full",
+        &manifest_selectors,
+        &plan_names,
+    ) {
+        eprintln!("warning: failed to emit stage manifest: {err}");
+    }
+
     let runner = StateMachineRunner::new(stages);
-    let results = runner.run(&mut ctx);
+    // Realtime: the observer upserts a `running` stages.tsv row at each stage
+    // start and its terminal row at finish, so the monitor reads active-stage
+    // + outcomes directly instead of inferring them.
+    let recorder = RustNativeStageRecorder {
+        report_dir: report_dir.as_path(),
+        started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
+    };
+    let results = runner.run_with_observer(&mut ctx, &recorder);
 
     let passed = results
         .iter()
@@ -7277,65 +7408,49 @@ fn execute_rust_native_orchestration(
         }
     }
 
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "rust orchestrator: {} node(s), {} stage(s)",
+    eprintln!(
+        "rust orchestrator: {} node(s), {} stage(s); passed={passed} failed={failed} \
+         skipped={skipped}; parity_input: {}",
         config.node_assignments.len(),
-        results.len()
+        results.len(),
+        parity_path.display()
     );
-    for (id, outcome) in &results {
-        let label = match outcome {
-            StageOutcome::Passed => "passed",
-            StageOutcome::Failed(_) => "failed",
-            StageOutcome::Skipped => "skipped",
-        };
-        let _ = writeln!(out, "  {}: {label}", id.as_str());
-    }
-    let _ = writeln!(out, "passed={passed} failed={failed} skipped={skipped}");
-    let _ = writeln!(out, "parity_input: {}", parity_path.display());
 
-    let matrix_outcomes = results
+    // Complete the run's own outcome record through the SAME shared recorder
+    // the bash/wrapper path uses (Finding 4): one run-matrix writer (finalize's
+    // upsert — NOT a second bespoke append, which the degenerate no-stages.tsv
+    // run key would have turned into a duplicate row), the
+    // orchestrate_result.json the monitor renders, and the barrier-exempt
+    // completeness reconcile. The realtime stages.tsv rows were emitted live by
+    // the observer above; finalize's verdict (Fail iff any stage Failed) equals
+    // the previous `failed > 0 => Err`.
+    let orchestration_dir = report_dir.join("orchestration");
+    let vm_lab_outcomes: Vec<VmLabStageOutcome> = results
         .iter()
-        .map(|(id, outcome)| LiveLabRunMatrixStageOutcome {
+        .map(|(id, outcome)| VmLabStageOutcome {
             stage: id.as_str().to_owned(),
             status: match outcome {
-                StageOutcome::Passed => "pass",
-                StageOutcome::Failed(_) => "fail",
-                // Canonical taxonomy (finding 3): the bash recorder and the
-                // monitor's finality test both speak "skipped"; the matrix
-                // normalizer accepts either.
-                StageOutcome::Skipped => "skipped",
-            }
-            .to_owned(),
+                StageOutcome::Passed => VmLabStageStatus::Pass,
+                StageOutcome::Failed(_) => VmLabStageStatus::Fail,
+                StageOutcome::Skipped => VmLabStageStatus::Skipped,
+            },
+            summary: match outcome {
+                StageOutcome::Passed => String::new(),
+                StageOutcome::Failed(err) => err.clone(),
+                StageOutcome::Skipped => "skipped".to_owned(),
+            },
             artifacts: vec![parity_path.display().to_string()],
         })
-        .collect::<Vec<_>>();
-    match append_live_lab_run_matrix_row(LiveLabRunMatrixAppendConfig {
-        command_name: "vm-lab-orchestrate-live-lab",
-        report_dir: report_dir.as_path(),
-        profile_path: None,
-        inventory_path: Some(inventory_path.as_path()),
-        extra_stage_outcomes: matrix_outcomes.as_slice(),
-        notes: None,
-        // Outermost supervisor: complete record incl. sidecar outcomes —
-        // replaces the bash trap's interim row for the same run key.
-        row_role: LiveLabRunMatrixRowRole::Final,
-    }) {
-        Ok(result) => {
-            let _ = writeln!(
-                out,
-                "live_lab_run_matrix_row: {}",
-                result.report_row_path.display()
-            );
-        }
-        Err(err) => {
-            let _ = writeln!(out, "live_lab_run_matrix_error: {err}");
-            return Err(out);
-        }
-    }
-
-    if failed > 0 { Err(out) } else { Ok(out) }
+        .collect();
+    finalize_vm_lab_orchestration_result_with_inventory(
+        "vm-lab-orchestrate-live-lab",
+        report_dir.as_path(),
+        orchestration_dir.as_path(),
+        Some(inventory_path.as_path()),
+        vm_lab_outcomes,
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 fn build_rust_native_orchestration_stages(

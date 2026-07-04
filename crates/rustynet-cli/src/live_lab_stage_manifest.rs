@@ -116,33 +116,58 @@ fn default_run_mode() -> String {
     "full".to_owned()
 }
 
-/// Resolve the full registry against this run's selectors.
+/// Resolve the full registry into this run's plan.
+///
+/// `active_plan` selects the orchestrator dialect:
+/// - `None` — the BASH/wrapper path (the default). Enablement is selector-
+///   driven and the Rust state-machine dialect is marked not-planned (it does
+///   not dispatch here). Byte-identical to the pre-`active_plan` behavior.
+/// - `Some(plan)` — the Rust state-machine `--node` path, where `plan` is the
+///   set of canonical stage names the runner will actually dispatch (from
+///   `PlanBuilder`). Enablement is plan membership, and the `state_machine_only`
+///   dialect is INVERTED: the Rust stages become enabled + barrier-eligible
+///   (a vanished Rust stage is then caught by the conclusion barrier, Finding
+///   3), while the bash-dialect + sidecar stages become not-planned. This is
+///   the inversion the `state_machine_only` doc-comment describes.
 pub fn build_stage_manifest(
     run_command: &str,
     run_mode: &str,
     selectors: &TargetSelectors,
+    active_plan: Option<&std::collections::HashSet<String>>,
 ) -> StageManifest {
     let stages = STAGES
         .iter()
         .map(|spec| {
-            // The Rust state-machine dialect runs only on the `--node` path,
-            // which emits no manifest today, so every manifest is a bash-path
-            // plan where this dialect never dispatches: mark it enabled=false
-            // with an explicit dialect skip_reason rather than advertising it
-            // as pending-and-expected (which left ~13 forever-unresolved cells
-            // downstream). Its bash-dialect siblings do the real work and
-            // record under their own names. See `state_machine_only`'s doc for
-            // the W5.7 default-flip caveat (this inverts once the Rust path
-            // emits a manifest).
-            let enabled = selectors.resolves(spec.enable) && !spec.state_machine_only;
-            let skip_reason = (!enabled).then(|| {
-                if spec.state_machine_only {
-                    "inactive orchestrator dialect (Rust state machine not the active path)"
-                        .to_owned()
-                } else {
-                    selectors.skip_reason(spec.enable).to_owned()
+            let (enabled, skip_reason, barrier_exempt) = match active_plan {
+                // BASH PATH — byte-identical to the pre-`active_plan` logic.
+                None => {
+                    let enabled = selectors.resolves(spec.enable) && !spec.state_machine_only;
+                    let skip_reason = (!enabled).then(|| {
+                        if spec.state_machine_only {
+                            "inactive orchestrator dialect (Rust state machine not the active path)"
+                                .to_owned()
+                        } else {
+                            selectors.skip_reason(spec.enable).to_owned()
+                        }
+                    });
+                    let barrier_exempt = spec.conditional_dispatch
+                        || spec.group == live_lab_stage_registry::StageGroup::Job
+                        || spec.state_machine_only;
+                    (enabled, skip_reason, barrier_exempt)
                 }
-            });
+                // RUST STATE-MACHINE PATH — enablement is plan membership; the
+                // dialect inversion. `state_machine_only` no longer forces
+                // enabled=false or barrier_exempt=true, so a planned Rust stage
+                // that records no outcome is caught by the conclusion barrier.
+                Some(plan) => {
+                    let enabled = plan.contains(spec.name);
+                    let skip_reason = (!enabled)
+                        .then(|| "not part of the Rust state-machine plan for this run".to_owned());
+                    let barrier_exempt = spec.conditional_dispatch
+                        || spec.group == live_lab_stage_registry::StageGroup::Job;
+                    (enabled, skip_reason, barrier_exempt)
+                }
+            };
             ManifestStage {
                 name: spec.name.to_owned(),
                 group: spec.group.as_str().to_owned(),
@@ -155,9 +180,7 @@ pub fn build_stage_manifest(
                     live_lab_stage_registry::StageSeverity::Soft => "soft".to_owned(),
                 },
                 synthetic: spec.synthetic,
-                barrier_exempt: spec.conditional_dispatch
-                    || spec.group == live_lab_stage_registry::StageGroup::Job
-                    || spec.state_machine_only,
+                barrier_exempt,
             }
         })
         .collect();
@@ -220,7 +243,9 @@ pub fn read_stage_manifest(report_dir: &Path) -> Result<Option<StageManifest>, S
 
 /// Emit a manifest unless one already exists for this run (the wrapper
 /// emits before launching bash; a standalone bash run emits its own).
-/// Returns the path and whether a new manifest was written.
+/// Returns the path and whether a new manifest was written. Bash/wrapper
+/// path (selector-driven enablement) — see [`ensure_stage_manifest_with_plan`]
+/// for the Rust state-machine `--node` path.
 pub fn ensure_stage_manifest(
     report_dir: &Path,
     run_command: &str,
@@ -231,7 +256,27 @@ pub fn ensure_stage_manifest(
     if path.exists() {
         return Ok((path, false));
     }
-    let manifest = build_stage_manifest(run_command, run_mode, selectors);
+    let manifest = build_stage_manifest(run_command, run_mode, selectors, None);
+    let path = write_stage_manifest(report_dir, &manifest)?;
+    Ok((path, true))
+}
+
+/// Emit a manifest for the Rust state-machine `--node` path, whose plan is
+/// the explicit set of stage names the runner will dispatch. First-writer-
+/// wins like [`ensure_stage_manifest`]; drives enablement by plan membership
+/// (the dialect inversion — see [`build_stage_manifest`]).
+pub fn ensure_stage_manifest_with_plan(
+    report_dir: &Path,
+    run_command: &str,
+    run_mode: &str,
+    selectors: &TargetSelectors,
+    active_plan: &std::collections::HashSet<String>,
+) -> Result<(PathBuf, bool), String> {
+    let path = report_dir.join(STAGE_MANIFEST_RELATIVE_PATH);
+    if path.exists() {
+        return Ok((path, false));
+    }
+    let manifest = build_stage_manifest(run_command, run_mode, selectors, Some(active_plan));
     let path = write_stage_manifest(report_dir, &manifest)?;
     Ok((path, true))
 }
@@ -293,7 +338,7 @@ mod tests {
 
     #[test]
     fn manifest_covers_every_registry_stage_exactly_once() {
-        let manifest = build_stage_manifest("test-run", "full", &TargetSelectors::default());
+        let manifest = build_stage_manifest("test-run", "full", &TargetSelectors::default(), None);
         let mut names: Vec<&str> = manifest.stages.iter().map(|s| s.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();
@@ -308,7 +353,7 @@ mod tests {
     fn manifest_resolves_enablement_and_skip_reasons() {
         // Default selectors: linux-only run — mac/win cells not applicable,
         // linux suite enabled, chaos not selected.
-        let manifest = build_stage_manifest("test-run", "full", &TargetSelectors::default());
+        let manifest = build_stage_manifest("test-run", "full", &TargetSelectors::default(), None);
         let by_name = |name: &str| {
             manifest
                 .stages
@@ -340,7 +385,7 @@ mod tests {
         // Disabled by SELECTOR (role election) -- exclude the dead Rust
         // dialect, which is unconditionally not-planned and asserted
         // separately in `manifest_marks_the_dead_rust_dialect_not_planned`.
-        let full = build_stage_manifest("test-run", "full", &full_selectors());
+        let full = build_stage_manifest("test-run", "full", &full_selectors(), None);
         let mut disabled: Vec<&str> = full
             .stages
             .iter()
@@ -379,8 +424,12 @@ mod tests {
             unix_now()
         ));
         fs::create_dir_all(&dir).expect("create temp report dir");
-        let manifest =
-            build_stage_manifest("vm-lab-orchestrate-live-lab", "full", &full_selectors());
+        let manifest = build_stage_manifest(
+            "vm-lab-orchestrate-live-lab",
+            "full",
+            &full_selectors(),
+            None,
+        );
         let path = write_stage_manifest(dir.as_path(), &manifest).expect("write");
         assert!(path.ends_with(STAGE_MANIFEST_RELATIVE_PATH));
         let loaded = read_stage_manifest(dir.as_path())
@@ -410,7 +459,7 @@ mod tests {
 
     #[test]
     fn synthetic_aggregates_are_marked_in_manifest() {
-        let manifest = build_stage_manifest("test-run", "full", &TargetSelectors::default());
+        let manifest = build_stage_manifest("test-run", "full", &TargetSelectors::default(), None);
         let synthetic: Vec<&str> = manifest
             .stages
             .iter()
@@ -430,6 +479,7 @@ mod tests {
             "vm-lab-orchestrate-live-lab",
             "full",
             &TargetSelectors::default(),
+            None,
         );
         for dialect_stage in [
             "membership_init",
@@ -487,5 +537,124 @@ mod tests {
             assert!(stage.enabled);
             assert!(stage.barrier_exempt);
         }
+    }
+
+    fn rust_plan() -> std::collections::HashSet<String> {
+        // A representative Rust state-machine plan: some state_machine_only
+        // dialect stages + some shared names.
+        [
+            "preflight",
+            "collect_pubkeys",
+            "membership_init",
+            "anchor_validation",
+            "traffic_test_matrix",
+            "active_exit",
+            "cleanup",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[test]
+    fn rust_plan_manifest_enables_planned_dialect_stages_and_makes_them_barrier_eligible() {
+        // The dialect inversion: state_machine_only stages that ARE in the
+        // Rust plan become enabled with no skip_reason and barrier-ELIGIBLE
+        // (barrier_exempt=false), so a vanished Rust stage is caught by the
+        // conclusion barrier (Finding 3) instead of hiding.
+        let plan = rust_plan();
+        let manifest = build_stage_manifest(
+            "vm-lab-orchestrate-live-lab",
+            "full",
+            &TargetSelectors::default(),
+            Some(&plan),
+        );
+        let by_name = |name: &str| {
+            manifest
+                .stages
+                .iter()
+                .find(|stage| stage.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from manifest"))
+        };
+        for planned in [
+            "membership_init",
+            "anchor_validation",
+            "active_exit",
+            "cleanup",
+        ] {
+            let stage = by_name(planned);
+            assert!(stage.enabled, "{planned} is in the plan => enabled");
+            assert_eq!(stage.skip_reason, None, "{planned} has no skip_reason");
+            assert!(
+                !stage.barrier_exempt,
+                "{planned} is barrier-eligible on the Rust path"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_plan_manifest_marks_unplanned_bash_dialect_not_planned() {
+        // Bash-dialect / sidecar stages the Rust runner does NOT dispatch are
+        // enabled=false with the Rust-path skip_reason (the mirror image of
+        // the bash-path dead-dialect marking).
+        let plan = rust_plan();
+        let manifest = build_stage_manifest(
+            "vm-lab-orchestrate-live-lab",
+            "full",
+            &TargetSelectors::default(),
+            Some(&plan),
+        );
+        for unplanned in [
+            "membership_setup",
+            "distribute_membership_state",
+            "validate_linux_hello_limiter_flood",
+            "live_managed_dns",
+        ] {
+            let stage = manifest
+                .stages
+                .iter()
+                .find(|stage| stage.name == unplanned)
+                .unwrap_or_else(|| panic!("{unplanned} missing"));
+            assert!(
+                !stage.enabled,
+                "{unplanned} not in the Rust plan => not-planned"
+            );
+            assert_eq!(
+                stage.skip_reason.as_deref(),
+                Some("not part of the Rust state-machine plan for this run"),
+                "{unplanned} skip_reason"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_plan_manifest_still_covers_every_registry_stage_exactly_once() {
+        let plan = rust_plan();
+        let manifest =
+            build_stage_manifest("test-run", "full", &TargetSelectors::default(), Some(&plan));
+        let mut names: Vec<&str> = manifest.stages.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), manifest.stages.len(), "duplicate stage names");
+        assert_eq!(
+            manifest.stages.len(),
+            crate::live_lab_stage_registry::STAGES.len()
+        );
+    }
+
+    #[test]
+    fn bash_path_manifest_is_unchanged_by_the_active_plan_parameter() {
+        // Passing None must reproduce the exact bash-path manifest.
+        let a = build_stage_manifest("c", "full", &full_selectors(), None);
+        let b = build_stage_manifest("c", "full", &full_selectors(), None);
+        assert_eq!(a.stages, b.stages);
+        // Spot-check the dead dialect still not-planned on the None path.
+        let init = a
+            .stages
+            .iter()
+            .find(|s| s.name == "membership_init")
+            .unwrap();
+        assert!(!init.enabled);
+        assert!(init.barrier_exempt);
     }
 }
