@@ -310,6 +310,30 @@ pub struct StageSpec {
     /// auto mode). The conclusion barrier never synthesizes `aborted` for
     /// these — a missing outcome is not evidence of abnormal termination.
     pub conditional_dispatch: bool,
+    /// True for the Rust state-machine (`StageId`) orchestrator's EXCLUSIVE
+    /// stage vocabulary — names the bash/wrapper path records equivalent work
+    /// under a different (bash-dialect) name and therefore never emits
+    /// (verified: 0 of 129 recorded runs). The Rust orchestrator is the
+    /// in-flight Rust-first replacement for bash
+    /// (`RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md`, waves
+    /// W5.5→W5.7); it runs ONLY when `vm-lab-orchestrate-live-lab` is passed
+    /// `--node <alias>:<role>`, and that path currently emits NO
+    /// `stage_manifest.json` at all (it writes `parity_input.json` for the
+    /// parity-diff harness). Every manifest on disk is therefore a bash-path
+    /// manifest, where this dialect genuinely does not dispatch — so we mark
+    /// these `enabled: false` ("not planned") instead of advertising them as
+    /// pending-and-expected (which otherwise left ~13 forever-unresolved cells
+    /// downstream). NOT set on names SHARED by both dialects (`preflight`,
+    /// `collect_pubkeys`, `enforce_baseline_runtime`, ...), which are
+    /// `rust_native` yet genuinely record.
+    ///
+    /// MIGRATION CAVEAT: the discriminator is `--node` presence, NOT the
+    /// `run_command` (both paths use `vm-lab-orchestrate-live-lab`). When the
+    /// W5.7 default-flip makes the Rust path emit a manifest, teach
+    /// `build_stage_manifest` which orchestrator is active and INVERT this:
+    /// the Rust dialect becomes `enabled`, the bash dialect becomes
+    /// not-planned — otherwise the manifest hides the stages that really run.
+    pub state_machine_only: bool,
 }
 
 const DEFAULT_SPEC: StageSpec = StageSpec {
@@ -330,6 +354,7 @@ const DEFAULT_SPEC: StageSpec = StageSpec {
     proves: &[],
     synthetic: false,
     conditional_dispatch: false,
+    state_machine_only: false,
 };
 
 /// Control-ID sets shared by the per-OS variants of each audit stage.
@@ -476,6 +501,7 @@ pub const STAGES: &[StageSpec] = &[
     // ── Rust state-machine dialect (StageId::as_str vocabulary) ────────
     StageSpec {
         name: "membership_init",
+        state_machine_only: true,
         group: StageGroup::Bootstrap,
         logical: Some("membership"),
         cross_os: Some("cross_os_membership_convergence"),
@@ -486,6 +512,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "distribute_membership",
+        state_machine_only: true,
         group: StageGroup::Bootstrap,
         logical: Some("membership"),
         cross_os: Some("cross_os_membership_convergence"),
@@ -496,6 +523,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "anchor_validation",
+        state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("anchor"),
         cross_os: Some("cross_os_anchor_bundle_pull"),
@@ -505,6 +533,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "distribute_assignments",
+        state_machine_only: true,
         group: StageGroup::Bootstrap,
         logical: Some("assignments"),
         rust_native: true,
@@ -514,6 +543,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "distribute_traversal",
+        state_machine_only: true,
         group: StageGroup::Bootstrap,
         logical: Some("traversal"),
         cross_os: Some("cross_os_direct_path"),
@@ -524,6 +554,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "distribute_dns_zone",
+        state_machine_only: true,
         group: StageGroup::Bootstrap,
         logical: Some("managed_dns"),
         cross_os: Some("cross_os_dns"),
@@ -534,6 +565,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "deploy_relay_service",
+        state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("relay_service_lifecycle"),
         cross_os: Some("cross_os_relay_path"),
@@ -543,6 +575,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "relay_validation",
+        state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("relay_service_lifecycle"),
         cross_os: Some("cross_os_relay_path"),
@@ -552,6 +585,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "traffic_test_matrix",
+        state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("two_hop"),
         cross_os: Some("cross_os_peer_visibility"),
@@ -561,6 +595,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "role_switch_matrix",
+        state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("role_switch_matrix"),
         cross_os: Some("cross_os_role_switch"),
@@ -570,6 +605,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "exit_handoff",
+        state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("exit_handoff"),
         cross_os: Some("cross_os_exit_path"),
@@ -579,6 +615,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "active_exit",
+        state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("exit_handoff"),
         cross_os: Some("cross_os_exit_path"),
@@ -588,6 +625,7 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "cleanup",
+        state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("cleanup"),
         rust_native: true,
