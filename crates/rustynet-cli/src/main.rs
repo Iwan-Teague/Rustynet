@@ -1204,6 +1204,12 @@ enum OpsCommand {
     EmitStageManifest {
         config: live_lab_stage_manifest::EmitStageManifestConfig,
     },
+    RecordStageStart {
+        config: live_lab_stage_recorder::RecordStageStartConfig,
+    },
+    RecordStageFinish {
+        config: live_lab_stage_recorder::RecordStageFinishConfig,
+    },
     LiveLabCoverageReport {
         config: live_lab_coverage::LiveLabCoverageReportConfig,
     },
@@ -4729,6 +4735,39 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             },
         }),
+        "record-stage-start" => Ok(OpsCommand::RecordStageStart {
+            config: live_lab_stage_recorder::RecordStageStartConfig {
+                report_dir: parser.required_path("--report-dir")?,
+                stage: parser
+                    .value("--stage")
+                    .ok_or_else(|| "record-stage-start requires --stage".to_owned())?,
+                severity: parser
+                    .value("--severity")
+                    .unwrap_or_else(|| "hard".to_owned()),
+                log_path: parser.value("--log").unwrap_or_default(),
+                summary: parser.value("--summary").unwrap_or_default(),
+                started_at: parser.value("--started-at").unwrap_or_default(),
+            },
+        }),
+        "record-stage-finish" => Ok(OpsCommand::RecordStageFinish {
+            config: live_lab_stage_recorder::RecordStageFinishConfig {
+                report_dir: parser.required_path("--report-dir")?,
+                stage: parser
+                    .value("--stage")
+                    .ok_or_else(|| "record-stage-finish requires --stage".to_owned())?,
+                severity: parser
+                    .value("--severity")
+                    .unwrap_or_else(|| "hard".to_owned()),
+                status: parser
+                    .value("--status")
+                    .ok_or_else(|| "record-stage-finish requires --status".to_owned())?,
+                rc: parser.value("--rc").unwrap_or_default(),
+                log_path: parser.value("--log").unwrap_or_default(),
+                summary: parser.value("--summary").unwrap_or_default(),
+                started_at: parser.value("--started-at").unwrap_or_default(),
+                finished_at: parser.value("--finished-at").unwrap_or_default(),
+            },
+        }),
         "append-orchestrator-run-to-matrix" => Ok(OpsCommand::AppendOrchestratorRunToMatrix {
             config: live_lab_run_matrix::AppendOrchestratorRunToMatrixConfig {
                 report_dir: parser.required_path("--report-dir")?,
@@ -7741,6 +7780,12 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::EmitStageManifest { config } => {
             live_lab_stage_manifest::execute_ops_emit_stage_manifest(config)
+        }
+        OpsCommand::RecordStageStart { config } => {
+            live_lab_stage_recorder::execute_ops_record_stage_start(config)
+        }
+        OpsCommand::RecordStageFinish { config } => {
+            live_lab_stage_recorder::execute_ops_record_stage_finish(config)
         }
         OpsCommand::LiveLabCoverageReport { config } => {
             live_lab_coverage::execute_ops_live_lab_coverage_report(config)

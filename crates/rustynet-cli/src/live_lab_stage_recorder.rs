@@ -28,7 +28,7 @@
 //! consumed by domain, policy, or daemon crates.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const STAGES_TSV_RELATIVE_PATH: &str = "state/stages.tsv";
 
@@ -227,6 +227,66 @@ pub fn active_stage(report_dir: &Path) -> Option<String> {
         .map(|row| row.stage)
 }
 
+// ── `ops record-stage-start/finish` CLI surface ───────────────────────────
+// The bash-callable interface into the recorder (Finding 4). The bash
+// orchestrator invokes these per stage instead of appending to stages.tsv
+// directly, so exactly one implementation owns the file across both paths.
+
+/// `ops record-stage-start` parsed config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordStageStartConfig {
+    pub report_dir: PathBuf,
+    pub stage: String,
+    pub severity: String,
+    pub log_path: String,
+    pub summary: String,
+    pub started_at: String,
+}
+
+/// `ops record-stage-finish` parsed config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordStageFinishConfig {
+    pub report_dir: PathBuf,
+    pub stage: String,
+    pub severity: String,
+    pub status: String,
+    pub rc: String,
+    pub log_path: String,
+    pub summary: String,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
+pub fn execute_ops_record_stage_start(config: RecordStageStartConfig) -> Result<String, String> {
+    record_stage_start(
+        config.report_dir.as_path(),
+        &config.stage,
+        &config.severity,
+        &config.log_path,
+        &config.summary,
+        &config.started_at,
+    )?;
+    Ok(format!("recorded start: {}", config.stage))
+}
+
+pub fn execute_ops_record_stage_finish(config: RecordStageFinishConfig) -> Result<String, String> {
+    record_stage_finish(
+        config.report_dir.as_path(),
+        &config.stage,
+        &config.severity,
+        &config.status,
+        &config.rc,
+        &config.log_path,
+        &config.summary,
+        &config.started_at,
+        &config.finished_at,
+    )?;
+    Ok(format!(
+        "recorded finish: {} = {}",
+        config.stage, config.status
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +423,43 @@ mod tests {
     fn active_stage_is_none_without_a_file() {
         let dir = temp_report_dir("empty");
         assert_eq!(active_stage(&dir), None);
+    }
+
+    #[test]
+    fn ops_start_then_finish_upsert_a_single_row_via_the_cli_configs() {
+        // The bash-callable surface: a start followed by a finish must leave
+        // exactly one row (running replaced by terminal), never two.
+        let dir = temp_report_dir("ops");
+        execute_ops_record_stage_start(RecordStageStartConfig {
+            report_dir: dir.clone(),
+            stage: "bootstrap_hosts".to_owned(),
+            severity: "hard".to_owned(),
+            log_path: "/l".to_owned(),
+            summary: "install".to_owned(),
+            started_at: "T0".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(active_stage(&dir).as_deref(), Some("bootstrap_hosts"));
+        execute_ops_record_stage_finish(RecordStageFinishConfig {
+            report_dir: dir.clone(),
+            stage: "bootstrap_hosts".to_owned(),
+            severity: "hard".to_owned(),
+            status: "pass".to_owned(),
+            rc: "0".to_owned(),
+            log_path: "/l".to_owned(),
+            summary: "install".to_owned(),
+            started_at: "T0".to_owned(),
+            finished_at: "T1".to_owned(),
+        })
+        .unwrap();
+        let data_rows: Vec<String> = read_raw(&dir)
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(data_rows.len(), 1, "start+finish upsert to one row");
+        assert!(data_rows[0].contains("\tpass\t"));
+        assert_eq!(active_stage(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
