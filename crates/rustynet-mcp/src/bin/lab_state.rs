@@ -3255,6 +3255,37 @@ impl LabStateServer {
             return tool_error("mode=run requires a 'profile'");
         }
 
+        // Fail closed on the nodes + role-platform-selector conflict: passing
+        // `nodes` routes to the Rust --node engine, which takes each node's role
+        // from its `alias:role` and IGNORES the bash-arm --{role}-platform
+        // election flags. Emitting both would silently drop the election — so
+        // reject rather than run a topology the operator did not intend.
+        if mode == "orchestrate" && !string_array(args, "nodes").is_empty() {
+            for sel in [
+                "exit_platform",
+                "relay_platform",
+                "anchor_platform",
+                "admin_platform",
+                "blind_exit_platform",
+            ] {
+                if arg_str(args, sel).is_some() {
+                    return tool_error(&format!(
+                        "'{sel}' (a role-platform election) is ignored when 'nodes' is set: \
+                         nodes routes to the Rust --node engine, which takes each node's role \
+                         from its alias:role. Pass the role directly in nodes (e.g. \
+                         \"macos-utm-1:exit\"), or omit nodes to use the bash auto-topology \
+                         path with platform election."
+                    ));
+                }
+            }
+            if arg_bool(args, "macos_promote_exit") {
+                return tool_error(
+                    "'macos_promote_exit' is ignored when 'nodes' is set (Rust --node engine). \
+                     Pass the macOS node's role directly in nodes (e.g. \"macos-utm-1:exit\").",
+                );
+            }
+        }
+
         let job_id = self.new_job_id();
         let report_dir = arg_str(args, "report_dir")
             .map(String::from)

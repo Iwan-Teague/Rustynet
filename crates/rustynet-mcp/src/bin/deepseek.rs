@@ -1925,6 +1925,32 @@ impl DeepSeekServer {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // Fail closed: rust_engine with no synthesizable --node (no guest / role-
+        // platform selector) emits zero --node flags and the CLI router silently
+        // falls back to the BASH path — the operator would get bash while
+        // believing they opted into the Rust engine. Reject before reserving a job.
+        if rust_engine
+            && synthesize_rust_node_args(
+                macos_vm.as_deref(),
+                windows_vm.as_deref(),
+                exit_vm.as_deref(),
+                client_vm.as_deref(),
+                entry_vm.as_deref(),
+                exit_platform.as_deref(),
+                relay_platform.as_deref(),
+                anchor_platform.as_deref(),
+                admin_platform.as_deref(),
+                blind_exit_platform.as_deref(),
+            )
+            .is_empty()
+        {
+            return tool_error(
+                "rust_engine=true requires at least one guest (exit_vm/client_vm/entry_vm/\
+                 macos_vm/windows_vm) or role-platform selector so --node can be synthesized; \
+                 with none, the run would silently fall back to the bash path.",
+            );
+        }
+
         let allow_concurrent = args
             .get("allow_concurrent")
             .and_then(|v| v.as_bool())
@@ -4180,16 +4206,21 @@ fn synthesize_rust_node_args(
 ) -> Vec<String> {
     let role_for_os = |os: &str| -> &'static str {
         let is = |sel: Option<&str>| sel.is_some_and(|s| s.eq_ignore_ascii_case(os));
+        // NOTE: `admin` and `blind_exit` are DAEMON roles, not lab-role `--node`
+        // tokens (parse_node_role_arg only accepts exit/client/entry/aux/extra/
+        // relay/anchor). Emitting `:admin` / `:blind_exit` fails the CLI parse
+        // and aborts the whole run. Map them to the lab role that resolves to the
+        // right daemon role: Anchor→'admin' daemon role, and macOS Exit→blind_exit
+        // daemon role. (The dedicated admin-issue / blind-exit VALIDATION stages
+        // are not in the Rust plan yet — Bucket 1 — but the node joins correctly.)
         if is(exit_platform) {
             "exit"
         } else if is(relay_platform) {
             "relay"
-        } else if is(anchor_platform) {
+        } else if is(anchor_platform) || is(admin_platform) {
             "anchor"
-        } else if is(admin_platform) {
-            "admin"
         } else if is(blind_exit_platform) {
-            "blind_exit"
+            "exit"
         } else {
             "client"
         }
@@ -5894,6 +5925,91 @@ mod tests {
         assert!(!d.iter().any(|x| x == "--legacy-bash-orchestrator"));
         assert!(!d.iter().any(|x| x == "--skip-linux-live-suite"));
         assert!(!d.iter().any(|x| x == "--node"));
+    }
+
+    #[test]
+    fn synthesize_rust_node_args_maps_every_role_to_a_parseable_token() {
+        let node = |m, w, e, c, en, xp, rp, ap, adp, bxp| {
+            super::synthesize_rust_node_args(m, w, e, c, en, xp, rp, ap, adp, bxp)
+        };
+        // Linux fixed roles.
+        assert_eq!(
+            node(
+                None,
+                None,
+                Some("d1"),
+                Some("d2"),
+                Some("d3"),
+                None,
+                None,
+                None,
+                None,
+                None
+            ),
+            vec!["d1:exit", "d2:client", "d3:entry"]
+        );
+        // Each role-platform selector elects the mac guest into a PARSEABLE role.
+        // exit/relay/anchor map 1:1; admin→anchor and blind_exit→exit because
+        // `admin`/`blind_exit` are daemon roles, not lab-role --node tokens.
+        let mac = |sel: &str| {
+            let p = Some("macos");
+            match sel {
+                "exit" => node(Some("m"), None, None, None, None, p, None, None, None, None),
+                "relay" => node(Some("m"), None, None, None, None, None, p, None, None, None),
+                "anchor" => node(Some("m"), None, None, None, None, None, None, p, None, None),
+                "admin" => node(Some("m"), None, None, None, None, None, None, None, p, None),
+                "blind_exit" => node(Some("m"), None, None, None, None, None, None, None, None, p),
+                _ => node(
+                    Some("m"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            }
+        };
+        assert_eq!(mac("exit"), vec!["m:exit"]);
+        assert_eq!(mac("relay"), vec!["m:relay"]);
+        assert_eq!(mac("anchor"), vec!["m:anchor"]);
+        assert_eq!(
+            mac("admin"),
+            vec!["m:anchor"],
+            "admin→anchor (daemon-role bridge)"
+        );
+        assert_eq!(
+            mac("blind_exit"),
+            vec!["m:exit"],
+            "blind_exit→exit (macOS Exit=blind_exit)"
+        );
+        assert_eq!(
+            mac("default"),
+            vec!["m:client"],
+            "no matching selector → client"
+        );
+        // Every emitted role token must be one the CLI --node parser accepts.
+        for spec in [
+            mac("exit"),
+            mac("relay"),
+            mac("anchor"),
+            mac("admin"),
+            mac("blind_exit"),
+        ]
+        .concat()
+        {
+            let role = spec.split(':').nth(1).unwrap();
+            assert!(
+                matches!(
+                    role,
+                    "exit" | "client" | "entry" | "relay" | "anchor" | "aux" | "extra"
+                ),
+                "unparseable --node role token: {role}"
+            );
+        }
     }
 
     #[test]
