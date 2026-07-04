@@ -28,6 +28,8 @@ use crate::live_lab_run_matrix::{
     append_live_lab_run_matrix_row,
 };
 use base64::prelude::*;
+use rand::Rng;
+use rand::distr::Alphanumeric;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -11628,6 +11630,705 @@ fn validate_linux_relay_uninstall_output(output: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ── HP-3: relay packet-forwarding proof (Linux) ──────────────────────────
+//
+// Closes the gap the FAIL-LOUD honesty note on `exercise_linux_relay_lifecycle_dry_run`
+// spells out: no stage anywhere has ever driven a real peer's session
+// through the relay role and proven a frame was forwarded. This one does —
+// it forces two Linux peers onto a relay-only path (their direct UDP is
+// firewalled off), sends a real ICMP payload between them over the mesh,
+// and asserts on the relay's OWN forwarded-frame/byte counters
+// (`ForwardStats` in `rustynet-relay`) that traffic actually moved, while
+// independently proving the relay never saw the plaintext.
+//
+// Security guardrail (do not weaken): every assertion here reads evidence
+// that does NOT require the relay to decrypt or inspect payload content.
+// The forwarded-frame/byte counters come from `/metrics` (length-only,
+// added in rustynet-relay's `record_forward`). The ciphertext-only check
+// captures packets on the relay's OWN network interface with `tcpdump` —
+// an external observer of the wire, not a new relay capability — and
+// asserts the plaintext marker is ABSENT. Never add a decrypt/inspection
+// path to the relay itself to make this or any assertion "easier".
+
+/// Matches `RUSTYNET_RELAY_PORT_RANGE` in the widened env-file this stage
+/// provisions (`build_relay_forward_test_provision_script`) — the relay's
+/// systemd unit (`scripts/systemd/rustynet-relay.service`) ships the same
+/// default, so this is not introducing a new value, just keeping the
+/// stage's own env-file override consistent with it.
+const RELAY_FORWARD_TEST_DATA_PORT_RANGE: &str = "40000-49999";
+const RELAY_FORWARD_TEST_HEALTH_PORT: u16 = 4501;
+const RELAY_FORWARD_TEST_NFT_TABLE: &str = "hp3_relay_forward_test";
+const RELAY_FORWARD_TEST_TRAVERSAL_TIMEOUT_SECS: u64 = 90;
+const RELAY_FORWARD_TEST_TRAVERSAL_POLL_INTERVAL_SECS: u64 = 5;
+const RELAY_FORWARD_TEST_CAPTURE_SECS: u64 = 15;
+const RELAY_FORWARD_TEST_MARKER_LEN: usize = 8;
+
+/// Which two spare Linux peers (and the relay node) this proof drives.
+/// Carries mesh IPs too, since the traffic itself must cross the mesh
+/// tunnel, not the underlay LAN the SSH control plane uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayForwardTestTopology {
+    relay_alias: String,
+    sender_alias: String,
+    sender_mesh_ip: String,
+    receiver_alias: String,
+    receiver_mesh_ip: String,
+}
+
+/// Selects the relay node plus two non-relay, non-exit Linux peers to force
+/// through it with no direct path between them. Fails closed with a clear
+/// reason (not a silent skip) if the topology lacks what this proof needs —
+/// the standard 5-node lab (exit/client/relay/aux/extra) always has them.
+fn select_relay_forward_test_topology(
+    inventory: &[VmInventoryEntry],
+) -> Result<RelayForwardTestTopology, String> {
+    let is_linux = |e: &&VmInventoryEntry| {
+        e.platform.unwrap_or(VmGuestPlatform::Linux) == VmGuestPlatform::Linux
+    };
+
+    let relay_entry = inventory
+        .iter()
+        .filter(is_linux)
+        .find(|e| e.relay_capable == Some(true))
+        .ok_or_else(|| "no relay_capable Linux node in inventory".to_owned())?;
+
+    let mut peer_candidates: Vec<&VmInventoryEntry> = inventory
+        .iter()
+        .filter(is_linux)
+        .filter(|e| e.alias != relay_entry.alias)
+        .filter(|e| e.exit_capable != Some(true))
+        .filter(|e| e.relay_capable != Some(true))
+        .collect();
+    // Deterministic ordering: prefer the conventional aux/extra lab_role
+    // names so repeated runs pick the same pair (stable evidence), falling
+    // back to alias order for topologies that don't use those names.
+    peer_candidates.sort_by(|a, b| {
+        relay_forward_test_peer_rank(a)
+            .cmp(&relay_forward_test_peer_rank(b))
+            .then_with(|| a.alias.cmp(&b.alias))
+    });
+
+    if peer_candidates.len() < 2 {
+        return Err(format!(
+            "need at least 2 spare Linux peers (non-relay, non-exit) to force a relay-only path between them; found {}",
+            peer_candidates.len()
+        ));
+    }
+    let sender = peer_candidates[0];
+    let receiver = peer_candidates[1];
+    let sender_mesh_ip = sender
+        .mesh_ip
+        .clone()
+        .ok_or_else(|| format!("peer {} has no mesh_ip recorded in inventory", sender.alias))?;
+    let receiver_mesh_ip = receiver.mesh_ip.clone().ok_or_else(|| {
+        format!(
+            "peer {} has no mesh_ip recorded in inventory",
+            receiver.alias
+        )
+    })?;
+
+    Ok(RelayForwardTestTopology {
+        relay_alias: relay_entry.alias.clone(),
+        sender_alias: sender.alias.clone(),
+        sender_mesh_ip,
+        receiver_alias: receiver.alias.clone(),
+        receiver_mesh_ip,
+    })
+}
+
+fn relay_forward_test_peer_rank(entry: &VmInventoryEntry) -> u8 {
+    match entry.lab_role.as_deref() {
+        Some("aux") => 0,
+        Some("extra") => 1,
+        _ => 2,
+    }
+}
+
+/// Generates a fresh per-run ASCII marker used as the ICMP payload pattern.
+/// Random (not fixed) so a stale capture from a previous run can never be
+/// mistaken for live evidence.
+fn generate_relay_forward_test_marker() -> String {
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(RELAY_FORWARD_TEST_MARKER_LEN)
+        .map(char::from)
+        .collect()
+}
+
+/// Converts an ASCII marker to the hex form `ping -p` expects. Every byte of
+/// an alphanumeric marker is printable ASCII, so the same marker is directly
+/// greppable in a `tcpdump -A` (ASCII) capture — no hex/byte decoding needed
+/// on the read side.
+fn relay_forward_test_marker_hex(marker: &str) -> String {
+    marker.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Parses one `key value` line out of the relay's Prometheus-style
+/// `/metrics` text (e.g. `rustynet_relay_frames_forwarded_total 42`).
+fn parse_relay_metrics_counter(metrics_text: &str, key: &str) -> Option<u64> {
+    metrics_text.lines().find_map(|line| {
+        let rest = line.strip_prefix(key)?;
+        rest.trim().parse::<u64>().ok()
+    })
+}
+
+/// Parses one `key=value` field out of a `rustynet status` space-separated
+/// status line. Mirrors `role_cli.rs::find_field`'s shape (kept local since
+/// that helper is private to its module).
+fn parse_relay_forward_test_status_field(status_line: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    status_line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(prefix.as_str()).map(ToString::to_string))
+}
+
+/// True if `capture_text` (a `tcpdump -A` ASCII capture) contains the
+/// plaintext marker anywhere. Used as the ciphertext-only negative
+/// assertion: this MUST be false for the stage to pass.
+fn relay_forward_test_capture_contains_marker(capture_text: &str, marker: &str) -> bool {
+    capture_text.contains(marker)
+}
+
+/// Provisions a routable relay bind (the systemd unit's own default is
+/// loopback-only — correct for an operator who hasn't opted in to serving
+/// off-host peers, but nothing in this lab has ever needed one before) and
+/// (re)installs + restarts the service so the new bind takes effect.
+/// Emits explicit `HP3_...=` marker lines rather than relying on the
+/// remote script's own exit code, so the caller never has to guess how a
+/// partial failure surfaces.
+fn build_relay_forward_test_provision_script(relay_lan_ip: &str) -> String {
+    format!(
+        "cat <<'EOF' | sudo tee /etc/default/rustynet-relay > /dev/null\n\
+         RUSTYNET_RELAY_ID=relay-local\n\
+         RUSTYNET_RELAY_BIND={relay_lan_ip}:4500\n\
+         RUSTYNET_RELAY_VERIFIER_KEY=/etc/rustynet/relay-verifier.pub\n\
+         RUSTYNET_RELAY_REPLAY_STORE=/var/lib/rustynet-relay/relay.replay\n\
+         RUSTYNET_RELAY_PORT_RANGE={RELAY_FORWARD_TEST_DATA_PORT_RANGE}\n\
+         RUSTYNET_RELAY_MAX_SESSIONS_PER_NODE=8\n\
+         RUSTYNET_RELAY_MAX_TOTAL_SESSIONS=4096\n\
+         RUSTYNET_RELAY_HEALTH_BIND=127.0.0.1:{RELAY_FORWARD_TEST_HEALTH_PORT}\n\
+         EOF\n\
+         sudo /usr/local/bin/rustynet ops install-systemd-relay 2>&1\n\
+         sudo systemctl restart rustynet-relay.service 2>&1 || true\n\
+         sleep 2\n\
+         echo \"HP3_RELAY_UNIT_STATE=$(sudo systemctl is-active rustynet-relay.service 2>/dev/null || echo inactive)\"\n\
+         echo \"HP3_RELAY_HEALTHZ=$(curl --silent --max-time 5 http://127.0.0.1:{RELAY_FORWARD_TEST_HEALTH_PORT}/healthz 2>/dev/null || echo unreachable)\""
+    )
+}
+
+fn build_relay_forward_test_metrics_script() -> String {
+    format!(
+        "curl --silent --max-time 5 http://127.0.0.1:{RELAY_FORWARD_TEST_HEALTH_PORT}/metrics 2>/dev/null || echo HP3_METRICS_UNREACHABLE"
+    )
+}
+
+/// Firewalls direct UDP between this node and `peer_ip` in both directions,
+/// in a dedicated nft table so nothing about the node's existing killswitch
+/// rules is touched, reordered, or removed. Emits a marker line reporting
+/// how many `udp drop` rules ended up in the table (2 expected: one per
+/// direction).
+fn build_relay_forward_test_block_script(peer_ip: &str) -> String {
+    format!(
+        "sudo nft add table inet {RELAY_FORWARD_TEST_NFT_TABLE} 2>/dev/null; \
+         sudo nft add chain inet {RELAY_FORWARD_TEST_NFT_TABLE} out '{{ type filter hook output priority 0; policy accept; }}' 2>/dev/null; \
+         sudo nft add chain inet {RELAY_FORWARD_TEST_NFT_TABLE} in '{{ type filter hook input priority 0; policy accept; }}' 2>/dev/null; \
+         sudo nft add rule inet {RELAY_FORWARD_TEST_NFT_TABLE} out ip daddr {peer_ip} udp drop; \
+         sudo nft add rule inet {RELAY_FORWARD_TEST_NFT_TABLE} in ip saddr {peer_ip} udp drop; \
+         echo \"HP3_NFT_RULE_COUNT=$(sudo nft list table inet {RELAY_FORWARD_TEST_NFT_TABLE} 2>/dev/null | grep -c 'udp drop')\""
+    )
+}
+
+/// Reverses `build_relay_forward_test_block_script`. Always attempted at
+/// the end of the stage (pass or fail) so a failed run never leaves the lab
+/// stuck in the artificially-relay-forced state.
+fn build_relay_forward_test_unblock_script() -> String {
+    format!(
+        "sudo nft delete table inet {RELAY_FORWARD_TEST_NFT_TABLE} 2>/dev/null; echo HP3_NFT_CLEANED=1"
+    )
+}
+
+/// Restarts the main daemon so it drops any existing direct-path WireGuard
+/// handshake state and re-runs traversal negotiation from scratch — the
+/// nft block above only matters if the daemon actually re-attempts a fresh
+/// direct connection afterward, not a cached one from before the block.
+fn build_relay_forward_test_daemon_restart_script() -> String {
+    "sudo systemctl restart rustynetd.service 2>&1 || true; \
+     sleep 3; \
+     echo \"HP3_DAEMON_STATE=$(sudo systemctl is-active rustynetd.service 2>/dev/null || echo inactive)\""
+        .to_owned()
+}
+
+fn build_relay_forward_test_status_script() -> String {
+    "/usr/local/bin/rustynet status 2>&1 || echo HP3_STATUS_UNREACHABLE".to_owned()
+}
+
+/// Starts a bounded background capture on the relay's own dataplane port
+/// range. `timeout` self-terminates the capture after
+/// `RELAY_FORWARD_TEST_CAPTURE_SECS` regardless of what else happens, so a
+/// stuck ping or SSH hiccup downstream can never leave `tcpdump` running
+/// indefinitely on the lab node.
+fn build_relay_forward_test_capture_start_script() -> String {
+    format!(
+        "sudo rm -f /tmp/hp3_relay_capture.txt; \
+         sudo bash -c 'nohup timeout {RELAY_FORWARD_TEST_CAPTURE_SECS} tcpdump -i any -A -c 500 udp portrange {RELAY_FORWARD_TEST_DATA_PORT_RANGE} > /tmp/hp3_relay_capture.txt 2>&1 &' ; \
+         echo HP3_CAPTURE_STARTED=1"
+    )
+}
+
+fn build_relay_forward_test_capture_running_check_script() -> String {
+    "if pgrep -x tcpdump >/dev/null 2>&1; then echo HP3_CAPTURE_RUNNING=1; else echo HP3_CAPTURE_RUNNING=0; fi".to_owned()
+}
+
+fn build_relay_forward_test_capture_fetch_script() -> String {
+    "sudo cat /tmp/hp3_relay_capture.txt 2>/dev/null; sudo rm -f /tmp/hp3_relay_capture.txt"
+        .to_owned()
+}
+
+fn build_relay_forward_test_ping_script(receiver_mesh_ip: &str, marker_hex: &str) -> String {
+    format!(
+        "ping -c 5 -p {marker_hex} -s 64 -W 3 {receiver_mesh_ip} 2>&1; echo \"HP3_PING_EXIT=$?\""
+    )
+}
+
+/// Runs a remote script against `target`, returning its captured output.
+/// Every script this stage builds emits explicit `HP3_...=` marker lines
+/// instead of relying on its own process exit code, so this thin wrapper
+/// only needs to surface SSH-transport failures — the caller always parses
+/// markers out of the returned text.
+fn run_relay_forward_test_script(
+    target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    script: &str,
+    label: &str,
+) -> Result<String, String> {
+    capture_remote_shell_command_for_target(
+        target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        script,
+        timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS),
+    )
+    .map_err(|err| format!("{label} on {} failed: {err}", target.label))
+}
+
+/// Polls (bounded, real sleeps between attempts — never a single
+/// fixed-sleep-then-assume) both peers' own `rustynet status` until each
+/// independently reports at least one relay-routed session, or fails
+/// closed with the last-seen status line on timeout. Checking BOTH peers'
+/// own belief (not the relay's) is deliberate: the relay is not a trusted
+/// witness for this assertion, the clients are.
+fn wait_for_relay_forward_test_relay_routing(
+    sender_target: &RemoteTarget,
+    receiver_target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), String> {
+    let script = build_relay_forward_test_status_script();
+    let deadline = Instant::now() + Duration::from_secs(RELAY_FORWARD_TEST_TRAVERSAL_TIMEOUT_SECS);
+    let mut last_sender_status: String;
+    let mut last_receiver_status: String;
+
+    loop {
+        last_sender_status = run_relay_forward_test_script(
+            sender_target,
+            ssh_identity_file,
+            known_hosts_path,
+            script.as_str(),
+            "rustynet status (sender)",
+        )?;
+        last_receiver_status = run_relay_forward_test_script(
+            receiver_target,
+            ssh_identity_file,
+            known_hosts_path,
+            script.as_str(),
+            "rustynet status (receiver)",
+        )?;
+
+        let sender_relay_routed = relay_forward_test_status_reports_relay_peer(&last_sender_status);
+        let receiver_relay_routed =
+            relay_forward_test_status_reports_relay_peer(&last_receiver_status);
+        if sender_relay_routed && receiver_relay_routed {
+            return Ok((last_sender_status, last_receiver_status));
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out after {}s waiting for both peers to report a relay-routed session; last sender status: {last_sender_status:?}; last receiver status: {last_receiver_status:?}",
+                RELAY_FORWARD_TEST_TRAVERSAL_TIMEOUT_SECS
+            ));
+        }
+        thread::sleep(Duration::from_secs(
+            RELAY_FORWARD_TEST_TRAVERSAL_POLL_INTERVAL_SECS,
+        ));
+    }
+}
+
+/// True if a `rustynet status` line reports at least one live-or-configured
+/// relay-routed peer. Accepts either signal name the daemon may report
+/// depending on version — fails closed (false) if the field is missing or
+/// zero, never assumes success from an unparseable line.
+fn relay_forward_test_status_reports_relay_peer(status_line: &str) -> bool {
+    for key in ["path_live_relay_peers", "relay_session_established_peers"] {
+        if let Some(value) = parse_relay_forward_test_status_field(status_line, key)
+            && let Ok(count) = value.parse::<u64>()
+            && count > 0
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Drives the full live two-peer-through-relay proof: provisions a
+/// reachable relay, firewalls direct UDP between two spare peers so their
+/// only path is the relay, forces fresh traversal negotiation, waits for
+/// both peers to independently report relay routing, sends a real marked
+/// ICMP payload between them, and asserts (a) the relay's own
+/// forwarded-frame/byte counters moved and (b) the relay's own captured
+/// wire traffic never contained the plaintext marker. Always attempts
+/// cleanup (remove the firewall block, restart the daemons back to normal)
+/// regardless of pass/fail, so a failed run never leaves the lab stuck.
+fn exercise_linux_relay_forwards_frame(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let topology = select_relay_forward_test_topology(&inventory)?;
+
+    let targets = resolve_remote_targets(
+        inventory_path,
+        &[
+            topology.relay_alias.clone(),
+            topology.sender_alias.clone(),
+            topology.receiver_alias.clone(),
+        ],
+        false,
+        &[],
+    )?;
+    let find_target = |alias: &str| -> Result<&RemoteTarget, String> {
+        targets
+            .iter()
+            .find(|t| t.label == alias)
+            .ok_or_else(|| format!("no resolved target for alias {alias}"))
+    };
+    let relay_target = find_target(topology.relay_alias.as_str())?;
+    let sender_target = find_target(topology.sender_alias.as_str())?;
+    let receiver_target = find_target(topology.receiver_alias.as_str())?;
+    for target in [relay_target, sender_target, receiver_target] {
+        if target.platform_profile.platform != VmGuestPlatform::Linux {
+            return Err(format!(
+                "alias {} resolved to non-Linux platform: {}",
+                target.label,
+                target.platform_profile.platform.as_str()
+            ));
+        }
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // 1. Ensure the relay is provisioned with a routable bind and running.
+    let provision_output = run_relay_forward_test_script(
+        relay_target,
+        ssh_identity_file,
+        known_hosts_path,
+        build_relay_forward_test_provision_script(relay_target.ssh_target.as_str()).as_str(),
+        "relay provisioning",
+    )?;
+    if !provision_output.contains("HP3_RELAY_UNIT_STATE=active") {
+        return Err(format!(
+            "relay service did not report active after provisioning on {}: {provision_output}",
+            relay_target.label
+        ));
+    }
+    if !provision_output.contains("\"status\":\"ok\"") {
+        return Err(format!(
+            "relay /healthz did not report ok after provisioning on {}: {provision_output}",
+            relay_target.label
+        ));
+    }
+
+    // 2. Snapshot forwarding counters BEFORE any traffic.
+    let before_metrics = run_relay_forward_test_script(
+        relay_target,
+        ssh_identity_file,
+        known_hosts_path,
+        build_relay_forward_test_metrics_script().as_str(),
+        "relay metrics (before)",
+    )?;
+    let frames_before = parse_relay_metrics_counter(
+        before_metrics.as_str(),
+        "rustynet_relay_frames_forwarded_total",
+    )
+    .ok_or_else(|| format!("could not parse frames_forwarded_total (before): {before_metrics}"))?;
+    let bytes_before = parse_relay_metrics_counter(
+        before_metrics.as_str(),
+        "rustynet_relay_bytes_forwarded_total",
+    )
+    .ok_or_else(|| format!("could not parse bytes_forwarded_total (before): {before_metrics}"))?;
+
+    // 3. Force a relay-only path between sender and receiver.
+    let block_result = (|| -> Result<(), String> {
+        let sender_block = run_relay_forward_test_script(
+            sender_target,
+            ssh_identity_file,
+            known_hosts_path,
+            build_relay_forward_test_block_script(receiver_target.ssh_target.as_str()).as_str(),
+            "nft block (sender)",
+        )?;
+        if !sender_block.contains("HP3_NFT_RULE_COUNT=2") {
+            return Err(format!(
+                "expected 2 udp-drop rules on sender {}, got: {sender_block}",
+                sender_target.label
+            ));
+        }
+        let receiver_block = run_relay_forward_test_script(
+            receiver_target,
+            ssh_identity_file,
+            known_hosts_path,
+            build_relay_forward_test_block_script(sender_target.ssh_target.as_str()).as_str(),
+            "nft block (receiver)",
+        )?;
+        if !receiver_block.contains("HP3_NFT_RULE_COUNT=2") {
+            return Err(format!(
+                "expected 2 udp-drop rules on receiver {}, got: {receiver_block}",
+                receiver_target.label
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(err) = block_result {
+        failures.push(err);
+    }
+
+    // 4. Force fresh traversal negotiation and wait for both peers to
+    //    independently confirm they're relay-routed.
+    if failures.is_empty() {
+        for target in [sender_target, receiver_target] {
+            let restart_output = run_relay_forward_test_script(
+                target,
+                ssh_identity_file,
+                known_hosts_path,
+                build_relay_forward_test_daemon_restart_script().as_str(),
+                "daemon restart",
+            )?;
+            if !restart_output.contains("HP3_DAEMON_STATE=active") {
+                failures.push(format!(
+                    "rustynetd did not report active after restart on {}: {restart_output}",
+                    target.label
+                ));
+            }
+        }
+    }
+
+    let mut relay_routed_status: Option<(String, String)> = None;
+    if failures.is_empty() {
+        match wait_for_relay_forward_test_relay_routing(
+            sender_target,
+            receiver_target,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(statuses) => relay_routed_status = Some(statuses),
+            Err(err) => failures.push(err),
+        }
+    }
+
+    // 5. Send real marked traffic while the relay captures its own wire.
+    let marker = generate_relay_forward_test_marker();
+    let mut ping_output = String::new();
+    let mut capture_text = String::new();
+    if failures.is_empty() {
+        let capture_start = run_relay_forward_test_script(
+            relay_target,
+            ssh_identity_file,
+            known_hosts_path,
+            build_relay_forward_test_capture_start_script().as_str(),
+            "capture start",
+        )?;
+        if !capture_start.contains("HP3_CAPTURE_STARTED=1") {
+            failures.push(format!(
+                "failed to start relay-side capture on {}: {capture_start}",
+                relay_target.label
+            ));
+        } else {
+            match run_relay_forward_test_script(
+                sender_target,
+                ssh_identity_file,
+                known_hosts_path,
+                build_relay_forward_test_ping_script(
+                    topology.receiver_mesh_ip.as_str(),
+                    relay_forward_test_marker_hex(marker.as_str()).as_str(),
+                )
+                .as_str(),
+                "marked ping",
+            ) {
+                Ok(output) => ping_output = output,
+                Err(err) => failures.push(err),
+            }
+
+            // Bounded wait for the background capture to self-terminate
+            // (it always does, via `timeout`, regardless of ping timing) —
+            // poll rather than guess a fixed sleep.
+            let capture_deadline =
+                Instant::now() + Duration::from_secs(RELAY_FORWARD_TEST_CAPTURE_SECS + 10);
+            loop {
+                let running = run_relay_forward_test_script(
+                    relay_target,
+                    ssh_identity_file,
+                    known_hosts_path,
+                    build_relay_forward_test_capture_running_check_script().as_str(),
+                    "capture status",
+                )?;
+                if running.contains("HP3_CAPTURE_RUNNING=0") || Instant::now() >= capture_deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(2));
+            }
+
+            capture_text = run_relay_forward_test_script(
+                relay_target,
+                ssh_identity_file,
+                known_hosts_path,
+                build_relay_forward_test_capture_fetch_script().as_str(),
+                "capture fetch",
+            )?;
+        }
+    }
+
+    if failures.is_empty() {
+        if !ping_output.contains("HP3_PING_EXIT=0") {
+            failures.push(format!(
+                "marked ping from {} to {} ({}) did not succeed: {ping_output}",
+                sender_target.label, receiver_target.label, topology.receiver_mesh_ip
+            ));
+        }
+        if relay_forward_test_capture_contains_marker(capture_text.as_str(), marker.as_str()) {
+            failures.push(
+                "relay-captured wire traffic contained the plaintext marker — ciphertext-only property violated"
+                    .to_owned(),
+            );
+        }
+    }
+
+    // 6. Snapshot forwarding counters AFTER traffic and assert they moved.
+    if failures.is_empty() {
+        let after_metrics = run_relay_forward_test_script(
+            relay_target,
+            ssh_identity_file,
+            known_hosts_path,
+            build_relay_forward_test_metrics_script().as_str(),
+            "relay metrics (after)",
+        )?;
+        let frames_after = parse_relay_metrics_counter(
+            after_metrics.as_str(),
+            "rustynet_relay_frames_forwarded_total",
+        )
+        .ok_or_else(|| {
+            format!("could not parse frames_forwarded_total (after): {after_metrics}")
+        })?;
+        let bytes_after = parse_relay_metrics_counter(
+            after_metrics.as_str(),
+            "rustynet_relay_bytes_forwarded_total",
+        )
+        .ok_or_else(|| format!("could not parse bytes_forwarded_total (after): {after_metrics}"))?;
+
+        if frames_after <= frames_before {
+            failures.push(format!(
+                "relay frames_forwarded_total did not increase: before={frames_before} after={frames_after}"
+            ));
+        }
+        if bytes_after <= bytes_before {
+            failures.push(format!(
+                "relay bytes_forwarded_total did not increase: before={bytes_before} after={bytes_after}"
+            ));
+        }
+
+        if failures.is_empty() {
+            let (sender_status, receiver_status) = relay_routed_status.unwrap_or_default();
+            let summary = format!(
+                "relay forwarding proof passed (chain invoked against {linux_alias}): relay={} sender={} receiver={}; frames {frames_before}->{frames_after}; bytes {bytes_before}->{bytes_after}; ciphertext-only: marker absent from relay capture; sender status confirmed relay-routed ({sender_status_field:?}); receiver status confirmed relay-routed ({receiver_status_field:?})",
+                relay_target.label,
+                sender_target.label,
+                receiver_target.label,
+                sender_status_field = parse_relay_forward_test_status_field(
+                    sender_status.as_str(),
+                    "path_live_relay_peers"
+                )
+                .or_else(|| parse_relay_forward_test_status_field(
+                    sender_status.as_str(),
+                    "relay_session_established_peers"
+                )),
+                receiver_status_field = parse_relay_forward_test_status_field(
+                    receiver_status.as_str(),
+                    "path_live_relay_peers"
+                )
+                .or_else(|| parse_relay_forward_test_status_field(
+                    receiver_status.as_str(),
+                    "relay_session_established_peers"
+                )),
+            );
+
+            // 7. Cleanup (always attempted below) succeeded implicitly by
+            // reaching here without an early return; still run it before
+            // returning so success and failure share one cleanup path.
+            cleanup_relay_forward_test(
+                sender_target,
+                receiver_target,
+                ssh_identity_file,
+                known_hosts_path,
+            );
+            return Ok(summary);
+        }
+    }
+
+    // Failure path: always attempt cleanup before surfacing the reason(s).
+    cleanup_relay_forward_test(
+        sender_target,
+        receiver_target,
+        ssh_identity_file,
+        known_hosts_path,
+    );
+    Err(failures.join("; "))
+}
+
+/// Best-effort cleanup: remove the firewall block and restart both daemons
+/// so the lab returns to normal direct-path operation for subsequent
+/// stages/runs. Failures here are logged to stderr rather than propagated —
+/// they must never mask the stage's own pass/fail verdict, but silently
+/// swallowing them entirely would hide real residue, so they're still
+/// visible in the orchestrator's captured output.
+fn cleanup_relay_forward_test(
+    sender_target: &RemoteTarget,
+    receiver_target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) {
+    for target in [sender_target, receiver_target] {
+        if let Err(err) = run_relay_forward_test_script(
+            target,
+            ssh_identity_file,
+            known_hosts_path,
+            build_relay_forward_test_unblock_script().as_str(),
+            "nft cleanup",
+        ) {
+            eprintln!("hp3 relay-forward-test cleanup: {err}");
+        }
+        if let Err(err) = run_relay_forward_test_script(
+            target,
+            ssh_identity_file,
+            known_hosts_path,
+            build_relay_forward_test_daemon_restart_script().as_str(),
+            "daemon restart (cleanup)",
+        ) {
+            eprintln!("hp3 relay-forward-test cleanup: {err}");
+        }
+    }
+}
+
 fn exercise_macos_anchor_bundle_pull_plan_dry_run(
     macos_alias: &str,
     inventory_path: &Path,
@@ -22309,6 +23010,46 @@ fn run_linux_orchestration_stages_with_options(
         }
     };
 
+    // HP-3: real relay packet-forwarding proof. Independent of the
+    // lifecycle-only `relay_lifecycle_outcome` above (gated only on the
+    // foundational ACL pin, same as every other stage in this chain) —
+    // resolves its own relay/sender/receiver nodes from the inventory
+    // rather than assuming `linux_alias` is any particular role, since this
+    // chain runs once per Linux node and the relay role may not be it.
+    let relay_forwards_frame_outcome = if options.dry_run {
+        stage_outcome(
+            "validate_linux_relay_forwards_frame",
+            VmLabStageStatus::Skipped,
+            "dry-run: would force a relay-only path between two peers and assert a frame was forwarded".to_owned(),
+            vec![],
+        )
+    } else if !runtime_acls_passed {
+        make_skipped(
+            "validate_linux_relay_forwards_frame",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        match exercise_linux_relay_forwards_frame(
+            linux_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => stage_outcome(
+                "validate_linux_relay_forwards_frame",
+                VmLabStageStatus::Pass,
+                summary,
+                vec![],
+            ),
+            Err(reason) => stage_outcome(
+                "validate_linux_relay_forwards_frame",
+                VmLabStageStatus::Fail,
+                format!("validate_linux_relay_forwards_frame failed: {reason}"),
+                vec![],
+            ),
+        }
+    };
+
     vec![
         runtime_acls_outcome,
         key_custody_outcome,
@@ -22333,6 +23074,7 @@ fn run_linux_orchestration_stages_with_options(
         anchor_bundle_pull_outcome,
         membership_genesis_outcome,
         mesh_status_outcome,
+        relay_forwards_frame_outcome,
     ]
 }
 
@@ -41927,6 +42669,224 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         );
     }
 
+    // ── HP-3: relay packet-forwarding proof — pure-helper coverage ──
+
+    fn hp3_test_inventory_entry(
+        alias: &str,
+        lab_role: &str,
+        relay_capable: bool,
+        exit_capable: bool,
+        mesh_ip: Option<&str>,
+    ) -> super::VmInventoryEntry {
+        super::VmInventoryEntry {
+            alias: alias.to_owned(),
+            ssh_target: format!("192.168.0.{}", 200 + alias.len()),
+            ssh_user: Some("debian".to_owned()),
+            ssh_password: None,
+            include_in_all: None,
+            os: Some("Debian/Linux".to_owned()),
+            last_known_ip: None,
+            parent_device: None,
+            last_known_network: None,
+            network_group: None,
+            node_id: None,
+            lab_role: Some(lab_role.to_owned()),
+            mesh_ip: mesh_ip.map(ToString::to_string),
+            exit_capable: Some(exit_capable),
+            relay_capable: Some(relay_capable),
+            remote_temp_dir: None,
+            utm_staging_dir: None,
+            rustynet_src_dir: None,
+            platform: Some(super::VmGuestPlatform::Linux),
+            remote_shell: None,
+            guest_exec_mode: None,
+            service_manager: None,
+            controller: None,
+        }
+    }
+
+    fn hp3_test_standard_topology() -> Vec<super::VmInventoryEntry> {
+        vec![
+            hp3_test_inventory_entry("debian-headless-1", "exit", false, true, Some("100.64.0.1")),
+            hp3_test_inventory_entry(
+                "debian-headless-2",
+                "client",
+                false,
+                false,
+                Some("100.64.0.2"),
+            ),
+            hp3_test_inventory_entry(
+                "debian-headless-3",
+                "relay",
+                true,
+                false,
+                Some("100.64.0.3"),
+            ),
+            hp3_test_inventory_entry("debian-headless-4", "aux", false, false, Some("100.64.0.4")),
+            hp3_test_inventory_entry(
+                "debian-headless-5",
+                "extra",
+                false,
+                false,
+                Some("100.64.0.5"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn relay_forward_test_topology_picks_relay_and_prefers_aux_extra_peers() {
+        let inventory = hp3_test_standard_topology();
+        let topology = super::select_relay_forward_test_topology(&inventory)
+            .expect("standard 5-node topology should resolve");
+        assert_eq!(topology.relay_alias, "debian-headless-3");
+        assert_eq!(topology.sender_alias, "debian-headless-4");
+        assert_eq!(topology.sender_mesh_ip, "100.64.0.4");
+        assert_eq!(topology.receiver_alias, "debian-headless-5");
+        assert_eq!(topology.receiver_mesh_ip, "100.64.0.5");
+    }
+
+    #[test]
+    fn relay_forward_test_topology_fails_closed_without_relay_capable_node() {
+        let mut inventory = hp3_test_standard_topology();
+        inventory[2].relay_capable = Some(false);
+        let err = super::select_relay_forward_test_topology(&inventory)
+            .expect_err("no relay_capable node must fail closed");
+        assert!(err.contains("relay_capable"));
+    }
+
+    #[test]
+    fn relay_forward_test_topology_fails_closed_with_fewer_than_two_spare_peers() {
+        // Only the relay and the exit node — no spare non-relay/non-exit peer.
+        let inventory = vec![
+            hp3_test_inventory_entry("exit-1", "exit", false, true, Some("100.64.0.1")),
+            hp3_test_inventory_entry("relay-1", "relay", true, false, Some("100.64.0.3")),
+        ];
+        let err = super::select_relay_forward_test_topology(&inventory)
+            .expect_err("fewer than 2 spare peers must fail closed");
+        assert!(err.contains("spare Linux peers"));
+    }
+
+    #[test]
+    fn relay_forward_test_topology_fails_closed_on_missing_mesh_ip() {
+        let mut inventory = hp3_test_standard_topology();
+        inventory[3].mesh_ip = None;
+        let err = super::select_relay_forward_test_topology(&inventory)
+            .expect_err("missing mesh_ip on the chosen sender must fail closed");
+        assert!(err.contains("mesh_ip"));
+    }
+
+    #[test]
+    fn relay_forward_test_peer_rank_orders_aux_before_extra_before_other() {
+        let aux = hp3_test_inventory_entry("a", "aux", false, false, None);
+        let extra = hp3_test_inventory_entry("b", "extra", false, false, None);
+        let other = hp3_test_inventory_entry("c", "client", false, false, None);
+        assert!(
+            super::relay_forward_test_peer_rank(&aux) < super::relay_forward_test_peer_rank(&extra)
+        );
+        assert!(
+            super::relay_forward_test_peer_rank(&extra)
+                < super::relay_forward_test_peer_rank(&other)
+        );
+    }
+
+    #[test]
+    fn relay_forward_test_marker_is_fresh_alphanumeric_and_expected_length() {
+        let a = super::generate_relay_forward_test_marker();
+        let b = super::generate_relay_forward_test_marker();
+        assert_eq!(a.len(), 8);
+        assert_eq!(b.len(), 8);
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(a, b, "two generated markers should not collide");
+    }
+
+    #[test]
+    fn relay_forward_test_marker_hex_round_trips_ascii() {
+        assert_eq!(super::relay_forward_test_marker_hex("AB"), "4142");
+        assert_eq!(super::relay_forward_test_marker_hex(""), "");
+    }
+
+    #[test]
+    fn parse_relay_metrics_counter_reads_prometheus_style_line() {
+        let metrics = "# TYPE rustynet_relay_frames_forwarded_total counter\nrustynet_relay_frames_forwarded_total 42\n# TYPE rustynet_relay_bytes_forwarded_total counter\nrustynet_relay_bytes_forwarded_total 12345\n";
+        assert_eq!(
+            super::parse_relay_metrics_counter(metrics, "rustynet_relay_frames_forwarded_total"),
+            Some(42)
+        );
+        assert_eq!(
+            super::parse_relay_metrics_counter(metrics, "rustynet_relay_bytes_forwarded_total"),
+            Some(12345)
+        );
+        assert_eq!(
+            super::parse_relay_metrics_counter(metrics, "rustynet_relay_missing_total"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_relay_forward_test_status_field_reads_space_separated_key_value() {
+        let status = "path_mode=relay path_live_relay_peers=1 relay_session_configured=true";
+        assert_eq!(
+            super::parse_relay_forward_test_status_field(status, "path_live_relay_peers"),
+            Some("1".to_owned())
+        );
+        assert_eq!(
+            super::parse_relay_forward_test_status_field(status, "missing_field"),
+            None
+        );
+    }
+
+    #[test]
+    fn relay_forward_test_capture_contains_marker_detects_plaintext_presence() {
+        assert!(super::relay_forward_test_capture_contains_marker(
+            "...garbage...ABCDEFGH...garbage...",
+            "ABCDEFGH"
+        ));
+        assert!(!super::relay_forward_test_capture_contains_marker(
+            "...only ciphertext-looking bytes...",
+            "ABCDEFGH"
+        ));
+    }
+
+    #[test]
+    fn relay_forward_test_status_reports_relay_peer_requires_nonzero_count() {
+        assert!(super::relay_forward_test_status_reports_relay_peer(
+            "path_live_relay_peers=1 other=x"
+        ));
+        assert!(super::relay_forward_test_status_reports_relay_peer(
+            "relay_session_established_peers=2"
+        ));
+        assert!(!super::relay_forward_test_status_reports_relay_peer(
+            "path_live_relay_peers=0"
+        ));
+        assert!(!super::relay_forward_test_status_reports_relay_peer(
+            "unrelated=field"
+        ));
+    }
+
+    #[test]
+    fn relay_forward_test_block_script_targets_exactly_the_given_peer_ip() {
+        let script = super::build_relay_forward_test_block_script("192.168.0.204");
+        assert!(script.contains("ip daddr 192.168.0.204 udp drop"));
+        assert!(script.contains("ip saddr 192.168.0.204 udp drop"));
+        assert!(script.contains("hp3_relay_forward_test"));
+    }
+
+    #[test]
+    fn relay_forward_test_provision_script_widens_bind_and_matches_unit_defaults() {
+        let script = super::build_relay_forward_test_provision_script("192.168.0.202");
+        assert!(script.contains("RUSTYNET_RELAY_BIND=192.168.0.202:4500"));
+        assert!(script.contains("RUSTYNET_RELAY_PORT_RANGE=40000-49999"));
+        assert!(script.contains("RUSTYNET_RELAY_HEALTH_BIND=127.0.0.1:4501"));
+        assert!(script.contains("install-systemd-relay"));
+    }
+
+    #[test]
+    fn relay_forward_test_ping_script_embeds_marker_and_target() {
+        let script = super::build_relay_forward_test_ping_script("100.64.0.5", "4142");
+        assert!(script.contains("ping -c 5 -p 4142 -s 64 -W 3 100.64.0.5"));
+        assert!(script.contains("HP3_PING_EXIT"));
+    }
+
     #[test]
     fn linux_membership_genesis_validator_accepts_reviewed_output() {
         let output = "600 rustynetd:rustynetd /var/lib/rustynet/membership.snapshot\n600 rustynetd:rustynetd /var/lib/rustynet/membership.log\n600 rustynetd:rustynetd /var/lib/rustynet/membership.watermark\nmembership status: network_id=test epoch=1 quorum_threshold=1 active_nodes=3 state_root=abc\n";
@@ -45078,6 +46038,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "validate_linux_anchor_bundle_pull",
             "validate_linux_membership_genesis",
             "validate_linux_mesh_status",
+            "validate_linux_relay_forwards_frame",
         ];
         assert_eq!(outcomes.len(), expected_stages.len() * aliases.len());
         for alias in &aliases {
@@ -45228,6 +46189,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "validate_linux_anchor_bundle_pull",
                 "validate_linux_membership_genesis",
                 "validate_linux_mesh_status",
+                "validate_linux_relay_forwards_frame",
             ]
         );
         assert!(
