@@ -4399,6 +4399,18 @@ static STAGE_INFO: &[StageInfo] = &[
             "this stage targets the rustynet-relay binary, not rustynetd — no validate_linux_runtime_acls gating",
         ],
     },
+    StageInfo {
+        name: "validate_linux_relay_forwards_frame",
+        aliases: &["relay_forwards_frame", "hp3", "rpt-01"],
+        checks: "HP-3: forces two spare Linux peers onto a relay-only path (firewalls their direct UDP with a dedicated nft table, restarts both daemons to force fresh traversal negotiation, polls each peer's own `rustynet status` until both independently report a relay-routed session), sends a real marked ICMP payload between them, then asserts the relay's own forwarded-frame/byte counters (rustynet-relay's ForwardStats, exposed via /healthz+/metrics) increased AND a tcpdump capture on the relay's own wire never contained the plaintext marker (RPT-01, ciphertext-only). Always cleans up the firewall block and restarts both daemons back to normal, pass or fail.",
+        owning: "crates/rustynet-relay/src/main.rs::ForwardStats/record_forward (forwarding counter); crates/rustynet-cli/src/vm_lab/mod.rs::exercise_linux_relay_forwards_frame (orchestrator validator)",
+        causes: &[
+            "the relay's forwarded-frame/byte counters did not increase after a real marked ping between the two firewalled peers",
+            "the relay's own captured wire traffic contained the plaintext marker — ciphertext-only property violated",
+            "neither peer's own `rustynet status` ever reported a relay-routed session within the traversal timeout",
+            "gated on validate_linux_runtime_acls passing first",
+        ],
+    },
 ];
 
 // `aliases` are &'static str but `norm` is borrowed from a local, so
@@ -5814,6 +5826,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
                 "validate_linux_hello_limiter_flood",
                 "hello_limiter_audit.rs",
             ),
+            ("validate_linux_relay_forwards_frame", "ForwardStats"),
         ] {
             let txt = explain_stage(stage).content[0].text.clone();
             assert!(
@@ -5836,6 +5849,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             "enr-1",
             "toctou-1",
             "dos-1",
+            "relay_forwards_frame",
+            "hp3",
+            "rpt-01",
         ] {
             assert!(
                 !explain_stage(s).content[0].text.contains("Unknown stage"),

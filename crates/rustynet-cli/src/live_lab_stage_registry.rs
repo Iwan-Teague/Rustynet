@@ -376,6 +376,7 @@ const PROVES_BLIND_EXIT_REVERSAL: &[&str] = &["RT-2", "SecMinBar-6.D.2"];
 const PROVES_GOSSIP_REVOKED_READMIT: &[&str] = &["GM-1", "RSA-0034"];
 const PROVES_ENROLLMENT_REPLAY: &[&str] = &["ENR-1", "TOCTOU-1", "RSA-0023"];
 const PROVES_HELLO_LIMITER_FLOOD: &[&str] = &["DOS-1", "RSA-0037"];
+const PROVES_RELAY_FORWARDING: &[&str] = &["HP-3", "RPT-01"];
 
 pub const STAGES: &[StageSpec] = &[
     // ── PRE (shared pipeline head) ──────────────────────────────────────
@@ -1513,6 +1514,16 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::LinuxLiveSuite,
         budget_secs: 300,
         proves: PROVES_HELLO_LIMITER_FLOOD,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_linux_relay_forwards_frame",
+        stream: PlatformStream::Linux,
+        special: Some("linux_relay_forwards_frame"),
+        enable: EnableRule::LinuxLiveSuite,
+        budget_secs: 300,
+        proves: PROVES_RELAY_FORWARDING,
         conditional_dispatch: true,
         ..DEFAULT_SPEC
     },

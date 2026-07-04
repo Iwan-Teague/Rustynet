@@ -158,6 +158,7 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_gossip_revoked_readmit",
     "linux_enrollment_replay",
     "linux_hello_limiter_flood",
+    "linux_relay_forwards_frame",
     "windows_membership_revoke_applies",
     "windows_membership_signature_forgery",
     "windows_gossip_revoked_readmit",
@@ -3086,6 +3087,7 @@ mod registry_equivalence_tests {
             "validate_linux_gossip_revoked_readmit" => Some("linux_gossip_revoked_readmit"),
             "validate_linux_enrollment_replay" => Some("linux_enrollment_replay"),
             "validate_linux_hello_limiter_flood" => Some("linux_hello_limiter_flood"),
+            "validate_linux_relay_forwards_frame" => Some("linux_relay_forwards_frame"),
             "validate_windows_membership_revoke_applies" => {
                 Some("windows_membership_revoke_applies")
             }
