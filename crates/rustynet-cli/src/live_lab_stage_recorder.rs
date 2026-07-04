@@ -16,13 +16,17 @@
 //! consumer.
 //!
 //! FORMAT — deliberately the EXISTING 8-column v1 layout the bash
-//! orchestrator already writes and the monitor already parses positionally
+//! orchestrator already writes and every consumer already parses positionally
 //! (`stage \t severity \t status \t rc \t log_path \t summary \t started_at
-//! \t finished_at`), so today's monitor renders a recorder-written file with
-//! no change — a `running` status row already surfaces as a live spinner via
-//! the monitor's existing status lookup. A leading `#schema_version=2` marker
-//! line is written for forward detection; the monitor's positional parser
-//! skips it (it has < 3 tab columns), so it is invisible to the v1 reader.
+//! \t finished_at`), with NO header/marker line — so a recorder-written file
+//! is byte-shape-identical to a bash-written one and every reader (the
+//! monitor, the run-summary/failure-digest tools) handles it unchanged. A
+//! `running` status row is the only new thing; it already surfaces as a live
+//! spinner via the monitor's existing status lookup, and it is transient
+//! (replaced by the terminal outcome), so end-of-run readers only ever see
+//! terminal rows. (An earlier `#schema_version=2` marker was dropped: the bash
+//! conclusion tools parse every non-empty line and do not skip comments, so a
+//! marker line would have been ingested as a bogus stage row.)
 //!
 //! Boundary note: tooling-layer code (§8/§10.3 untouched) — nothing here is
 //! consumed by domain, policy, or daemon crates.
@@ -31,13 +35,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const STAGES_TSV_RELATIVE_PATH: &str = "state/stages.tsv";
-
-/// Versioned schema marker written as the first line of a recorder-owned
-/// `stages.tsv`. The monitor's positional parser skips any line with fewer
-/// than 3 tab-separated columns, so this comment is invisible to the v1
-/// reader; a schema-aware reader can key on it to opt into `running`-row
-/// semantics.
-pub const STAGES_TSV_SCHEMA_MARKER: &str = "#schema_version=2";
 
 /// The canonical terminal + live status strings written into the status
 /// column. Mirrors the registry's closed `StageStatus` taxonomy; `running`
@@ -138,9 +135,7 @@ fn upsert_row(report_dir: &Path, row: StageRow) -> Result<(), String> {
         None => rows.push(row),
     }
 
-    let mut body = String::with_capacity(rows.len() * 96 + STAGES_TSV_SCHEMA_MARKER.len() + 1);
-    body.push_str(STAGES_TSV_SCHEMA_MARKER);
-    body.push('\n');
+    let mut body = String::with_capacity(rows.len() * 96);
     for row in &rows {
         body.push_str(&row.to_tsv());
         body.push('\n');
@@ -321,12 +316,10 @@ mod tests {
         )
         .unwrap();
         let raw = read_raw(&dir);
-        // Schema marker first, invisible to the v1 (<3 col) parser.
-        assert!(raw.starts_with(STAGES_TSV_SCHEMA_MARKER));
-        let row = raw
-            .lines()
-            .find(|l| !l.starts_with('#'))
-            .expect("a data row");
+        // Pure v1: no header/marker line -- the first line is a data row every
+        // existing positional reader handles unchanged.
+        assert!(!raw.starts_with('#'), "no marker/comment line: {raw:?}");
+        let row = raw.lines().next().expect("a data row");
         let cols: Vec<&str> = row.split('\t').collect();
         assert_eq!(cols[0], "preflight");
         assert_eq!(cols[1], "hard");

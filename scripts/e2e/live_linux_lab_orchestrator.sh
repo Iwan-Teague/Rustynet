@@ -1192,6 +1192,27 @@ record_node() {
   printf '%s\t%s\t%s\t%s\n' "$label" "$target" "$node_id" "$role" >> "$NODES_TSV"
 }
 
+# Best-effort call into the shared stages.tsv recorder (Fable5 Finding 4,
+# recorder-first): the SAME `ops record-stage-*` surface the Rust `--node`
+# runner uses in-process, so both orchestrators write stages.tsv byte-shape
+# identically and every consumer is path-agnostic. Prefers a built binary
+# (the bootstrap phase installs target/release/rustynet-cli); falls back to
+# `cargo run` before that binary exists. Returns the CLI's status so callers
+# can fall back where a terminal outcome must not be lost.
+rustynet_recorder() {
+  local _bin=""
+  if [[ -x "$ROOT_DIR/target/release/rustynet-cli" ]]; then
+    _bin="$ROOT_DIR/target/release/rustynet-cli"
+  elif [[ -x "$ROOT_DIR/target/debug/rustynet-cli" ]]; then
+    _bin="$ROOT_DIR/target/debug/rustynet-cli"
+  fi
+  if [[ -n "$_bin" ]]; then
+    "$_bin" "$@" >/dev/null 2>&1
+  else
+    ( cd "$ROOT_DIR" && cargo run --quiet -p rustynet-cli -- "$@" ) >/dev/null 2>&1
+  fi
+}
+
 record_stage() {
   local stage_name="$1"
   local severity="$2"
@@ -1201,15 +1222,31 @@ record_stage() {
   local message="$6"
   local started_at="$7"
   local finished_at="$8"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$stage_name" \
-    "$severity" \
-    "$status" \
-    "$rc" \
-    "$log_path" \
-    "$(sanitize_text "$message")" \
-    "$started_at" \
-    "$finished_at" >> "$STAGE_TSV"
+  local sanitized_message
+  sanitized_message="$(sanitize_text "$message")"
+  # Route the terminal outcome through the shared recorder (upserts the row,
+  # replacing any `running` row from record-stage-start). Fall back to a direct
+  # append if the recorder is unavailable, so a terminal outcome is never lost.
+  if ! rustynet_recorder ops record-stage-finish \
+    --report-dir "$REPORT_DIR" \
+    --stage "$stage_name" \
+    --severity "$severity" \
+    --status "$status" \
+    --rc "$rc" \
+    --log "$log_path" \
+    --summary "$sanitized_message" \
+    --started-at "$started_at" \
+    --finished-at "$finished_at"; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$stage_name" \
+      "$severity" \
+      "$status" \
+      "$rc" \
+      "$log_path" \
+      "$sanitized_message" \
+      "$started_at" \
+      "$finished_at" >> "$STAGE_TSV"
+  fi
 }
 
 record_stage_skip() {
@@ -1798,6 +1835,16 @@ run_stage() {
   local status="pass"
   local forensics_dir=""
   printf '[stage:%s] START %s\n' "$stage_name" "$description" | tee "$log_path"
+  # Realtime: upsert a `running` row so a consumer (the monitor) reads the
+  # active stage directly instead of inferring it. Best-effort; the terminal
+  # row from record_stage replaces it.
+  rustynet_recorder ops record-stage-start \
+    --report-dir "$REPORT_DIR" \
+    --stage "$stage_name" \
+    --severity "$severity" \
+    --log "$log_path" \
+    --summary "$description" \
+    --started-at "$started_at" || true
 
   if [[ "${STAGE_TIMEOUT_SECS:-0}" -gt 0 ]]; then
     local _tmp_log="${log_path}.running.$$"
