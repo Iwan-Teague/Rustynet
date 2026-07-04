@@ -239,3 +239,9 @@ timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
 2026-07-04T12:48:54Z,c51f00a,dirty,fmt,workspace,2,pass
 2026-07-04T12:49:03Z,c51f00a,dirty,check,workspace,8,pass
 2026-07-04T12:49:14Z,c51f00a,dirty,clippy,workspace,10,pass
+2026-07-04T15:40:58Z,9c91a9f,clean,fmt,--workspace,2,pass
+2026-07-04T15:40:58Z,9c91a9f,clean,check,--workspace,0,fail
+2026-07-04T16:12:57Z,9c91a9f,dirty,fmt,workspace,2,pass
+2026-07-04T16:13:36Z,9c91a9f,dirty,check,workspace,39,pass
+2026-07-04T16:14:14Z,9c91a9f,dirty,clippy,workspace,38,pass
+2026-07-04T16:17:48Z,9c91a9f,dirty,test,workspace,213,pass
