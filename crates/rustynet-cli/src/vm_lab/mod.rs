@@ -10133,11 +10133,16 @@ fn run_macos_orchestration_stages(
 
     // ── Stage: validate_macos_anchor_port_mapping_authority ────────────────
     //
-    // Prove the elected anchor actually WINS the anchor.port_mapping_authoritative
-    // Pin-then-Seniority election (gossip_runtime::anchor_runtime_view_from_membership) —
-    // previously computed but never externally observable. Runs only when
-    // elected (--anchor-platform macos), after mesh_join + anchor_deploy pass
-    // (same prerequisites as bundle-pull, since the capability is granted
+    // Prove the anchor.port_mapping_authoritative capability granted via
+    // membership amendment actually reaches the daemon's persisted state
+    // (gossip_runtime::anchor_runtime_view_from_membership's election input,
+    // previously computed but never externally observable). Asserts the
+    // node HOLDS the capability, not that it wins the global
+    // Pin-then-Seniority election — the genesis node holds every anchor.*
+    // sub-capability unconditionally and, being most senior, always
+    // outranks a later-joined node unless pinned. Runs only when elected
+    // (--anchor-platform macos), after mesh_join + anchor_deploy pass (same
+    // prerequisites as bundle-pull, since the capability is granted
     // alongside anchor.bundle_pull). FAIL-LOUD.
     let macos_anchor_port_mapping_log_path =
         logs_dir.join("validate_macos_anchor_port_mapping_authority.log");
@@ -10145,7 +10150,7 @@ fn run_macos_orchestration_stages(
         stage_outcome(
             "validate_macos_anchor_port_mapping_authority",
             VmLabStageStatus::Skipped,
-            format!("dry-run: would assert {macos_alias} wins the port-mapping-authority election"),
+            format!("dry-run: would assert {macos_alias} holds anchor.port_mapping_authoritative"),
             vec![],
         )
     } else if !is_macos_elected_anchor {
@@ -11910,29 +11915,42 @@ fn evaluate_anchor_port_mapping_status_report(
             report.schema_version
         ));
     }
-    if !report.is_self_authority {
+    // Assert the capability grant reached the daemon's persisted state, not
+    // that this node WINS the global Pin-then-Seniority election: the
+    // genesis/founding node is unconditionally granted every anchor.*
+    // sub-capability (`run_membership_init`) and, being the most senior
+    // member, always outranks a later-joined node unless pinned — so
+    // "wins the election" is not a claim this stage can make in the
+    // standard live-lab topology. `authority_node_id` is informational.
+    if !report.self_holds_capability {
         return Err(format!(
-            "macOS anchor {macos_alias} (node_id={}) does not hold the anchor.port_mapping_authoritative \
-             election; resolved authority={:?}",
+            "macOS anchor {macos_alias} (node_id={}) does not hold anchor.port_mapping_authoritative \
+             in its membership entry; current election authority={:?}",
             report.self_node_id, report.authority_node_id
         ));
     }
     Ok(format!(
-        "macOS anchor port-mapping authority verified on {macos_alias}: node_id={} is the elected \
-         Pin-then-Seniority authority",
-        report.self_node_id
+        "macOS anchor port-mapping-authoritative capability verified on {macos_alias}: node_id={} \
+         holds the capability (current election authority={:?})",
+        report.self_node_id, report.authority_node_id
     ))
 }
 
-/// Prove the macOS anchor actually WINS the `anchor.port_mapping_authoritative`
-/// Pin-then-Seniority election (`gossip_runtime::anchor_runtime_view_from_membership`),
-/// closing part of the "remaining anchor sub-surfaces beyond bundle-pull" gap
-/// (`CrossPlatformRoleParityRoadmap_2026-06-22.md` rank #2). The election result
-/// was previously only visible internally to `daemon.rs::port_mapping_bring_up_
-/// skip_reason` — no external query existed — so this reads the persisted
-/// membership snapshot fresh via the new `anchor-port-mapping-status-check`
-/// daemon subcommand. Requires `anchor.port_mapping_authoritative` in the
-/// elected anchor's membership grant (`macos_membership_capabilities`).
+/// Prove the macOS anchor's `anchor.port_mapping_authoritative` membership
+/// grant reaches the daemon's persisted state, closing part of the
+/// "remaining anchor sub-surfaces beyond bundle-pull" gap
+/// (`CrossPlatformRoleParityRoadmap_2026-06-22.md` rank #2). Does NOT assert
+/// this node wins the Pin-then-Seniority election
+/// (`gossip_runtime::anchor_runtime_view_from_membership`) — the genesis
+/// node holds every anchor.* sub-capability unconditionally and, being most
+/// senior, always outranks a later-joined node unless pinned, so "wins
+/// globally" is not an achievable claim in the standard live-lab topology.
+/// The election result was previously only visible internally to
+/// `daemon.rs::port_mapping_bring_up_skip_reason` — no external query
+/// existed — so this reads the persisted membership snapshot fresh via the
+/// new `anchor-port-mapping-status-check` daemon subcommand. Requires
+/// `anchor.port_mapping_authoritative` in the elected anchor's membership
+/// grant (`macos_membership_capabilities`).
 fn exercise_macos_anchor_port_mapping_authority_live(
     macos_alias: &str,
     inventory_path: &Path,

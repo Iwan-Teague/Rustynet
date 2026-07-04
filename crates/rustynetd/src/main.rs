@@ -1611,7 +1611,7 @@ fn run_anchor_port_mapping_status_check_command(args: &[String]) -> Result<(), S
     let mut fail_on_drift = true;
     let mut snapshot_path: Option<std::path::PathBuf> = None;
     let mut self_node_id: Option<String> = None;
-    let mut expect_self_authority = false;
+    let mut expect_self_capability = false;
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
@@ -1619,8 +1619,8 @@ fn run_anchor_port_mapping_status_check_command(args: &[String]) -> Result<(), S
                 fail_on_drift = false;
                 index += 1;
             }
-            Some("--expect-self-authority") => {
-                expect_self_authority = true;
+            Some("--expect-self-capability") => {
+                expect_self_capability = true;
                 index += 1;
             }
             Some("--snapshot-path") => {
@@ -1649,7 +1649,7 @@ fn run_anchor_port_mapping_status_check_command(args: &[String]) -> Result<(), S
     let options = AnchorPortMappingStatusOptions {
         snapshot_path,
         self_node_id,
-        expect_self_authority,
+        expect_self_capability,
     };
     let report = collect_anchor_port_mapping_status_report(&options);
     println!(
@@ -4169,7 +4169,7 @@ fn help_text() -> String {
         "  rustynetd windows-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-name <name>] [--tunnel-alias <name>]",
         "  rustynetd windows-killswitch-assert [daemon options] [--no-fail-on-drift]",
         "  rustynetd windows-backend-readiness-check [--no-fail-on-drift]",
-        "  rustynetd anchor-port-mapping-status-check --self-node-id <id> [--snapshot-path <path>] [--expect-self-authority] [--no-fail-on-drift]",
+        "  rustynetd anchor-port-mapping-status-check --self-node-id <id> [--snapshot-path <path>] [--expect-self-capability] [--no-fail-on-drift]",
         "  rustynetd --emit-phase1-baseline <path>",
         "",
         "defaults:",
