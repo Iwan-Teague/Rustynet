@@ -235,7 +235,13 @@ impl TargetSelectors {
             EnableRule::LinuxLiveSuite => !self.skip_linux_live_suite,
             EnableRule::ChaosSuite => self.chaos_suite,
             EnableRule::CrossNetworkSuite => self.cross_network_suite,
-            EnableRule::SoakSuite => self.soak_suite,
+            // extended_soak only ever dispatches as part of the Linux
+            // live-validation suite (`execute_ops_vm_lab_run_live_lab`); when
+            // that suite is skipped the soak sub-stage never runs either, so
+            // it must not stay "enabled" or the terminal-outcome guarantee
+            // synthesizes a spurious `aborted` for a stage that was never
+            // dispatched by design.
+            EnableRule::SoakSuite => self.soak_suite && !self.skip_linux_live_suite,
             EnableRule::LocalGateSuite => self.local_gate_suite,
         }
     }
@@ -258,6 +264,12 @@ impl TargetSelectors {
             EnableRule::LinuxLiveSuite => "linux live suite skipped for this run",
             EnableRule::ChaosSuite => "chaos suite not selected",
             EnableRule::CrossNetworkSuite => "cross-network suite not selected",
+            // extended_soak only dispatches inside the Linux live suite; when
+            // that suite is skipped, say so even though soak_suite itself may
+            // be selected — matches the AND in `resolves()` above.
+            EnableRule::SoakSuite if self.skip_linux_live_suite => {
+                "linux live suite skipped for this run"
+            }
             EnableRule::SoakSuite => "soak stage not selected",
             EnableRule::LocalGateSuite => "local gate suite not selected",
         }
@@ -2137,6 +2149,34 @@ mod tests {
             windows_spec.enable,
             EnableRule::RoleSwitchPlatform("windows")
         );
+    }
+
+    #[test]
+    fn soak_suite_selector_requires_linux_live_suite_too() {
+        // extended_soak only ever dispatches inside the Linux live-validation
+        // suite; skip_linux_live_suite must disable it even when soak_suite
+        // (--skip-soak's inverse) is selected, or the conclusion barrier
+        // synthesizes a spurious `aborted` for a stage that was never
+        // dispatched by design (see run livelab-1783174602-844175f5ad2a).
+        let soak_selected = TargetSelectors {
+            soak_suite: true,
+            ..TargetSelectors::default()
+        };
+        assert!(soak_selected.resolves(EnableRule::SoakSuite));
+
+        let soak_selected_but_linux_suite_skipped = TargetSelectors {
+            soak_suite: true,
+            skip_linux_live_suite: true,
+            ..TargetSelectors::default()
+        };
+        assert!(!soak_selected_but_linux_suite_skipped.resolves(EnableRule::SoakSuite));
+        assert_eq!(
+            soak_selected_but_linux_suite_skipped.skip_reason(EnableRule::SoakSuite),
+            "linux live suite skipped for this run"
+        );
+
+        let spec = find_stage("extended_soak").expect("extended_soak is registered");
+        assert_eq!(spec.enable, EnableRule::SoakSuite);
     }
 
     #[test]
