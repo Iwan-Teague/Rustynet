@@ -171,12 +171,19 @@ pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), Parity
     Ok(matrix)
 }
 
-/// PRE (preflight, prepare_source_archive, verify_ssh_reachability,
-/// prime_remote_access, cleanup_hosts) never gets its own CSV column, so it's
-/// invisible to every column-driven metric in this module. Shared by
-/// [`load_stage_progress`] (the header CHECKS count) and [`load_recent_runs`]
-/// (the Previous Runs panel), both of which fold this in unconditionally so
-/// the two views agree on what the full check catalog size is.
+/// Legacy fallback for the Previous Runs panel ONLY, and only for runs whose
+/// per-run `stage_manifest.json` is no longer on disk (report dir pruned).
+/// PRE steps (preflight, SSH reachability, ...) never get their own CSV
+/// column, so a CSV-only reconstruction can't see them; a run that produced a
+/// CSV row by definition got past PRE, so its PRE section is shown complete.
+/// For live runs the authoritative source is the run's own manifest (see
+/// `App::run_plan_summary`), which counts the REAL, current PRE stage set (now
+/// 9-10 stages, not 5) — this constant is never consulted on that path.
+///
+/// The header CHECKS counter deliberately does NOT fold this in: it counts
+/// real pass/fail CHECK columns only, identically to the FULL STAGE MATRIX
+/// tab, so the two headline numbers always match. PRE steps are pipeline
+/// plumbing, not parity checks.
 const PRE_STAGE_COUNT: usize = 5;
 
 pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
@@ -224,13 +231,15 @@ pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
             }
         }
     }
-    // PRE has no CSV column at all, so the loop above can never see it --
-    // fold in its always-complete 5 unconditionally (see PRE_STAGE_COUNT),
-    // the same convention load_recent_runs uses for total_stages, so CHECKS
-    // and the Previous Runs total agree on what the full catalog size is.
+    // Header CHECKS counts real pass/fail CHECK columns only -- the exact
+    // same definition (and therefore the same total) as the FULL STAGE
+    // MATRIX tab, so the two headline numbers never disagree. PRE steps have
+    // no CSV column and aren't parity checks, so they are deliberately NOT
+    // folded in here (an earlier `+ PRE_STAGE_COUNT` made the header read 5
+    // higher than the matrix and, with PRE now 9-10 stages, stale).
     Ok(StageProgress {
-        passed: passed + PRE_STAGE_COUNT,
-        total: total + PRE_STAGE_COUNT,
+        passed,
+        total,
         flaky,
     })
 }
@@ -243,6 +252,13 @@ pub struct RunSummary {
     pub run_id: String,
     /// Short (7-char) git commit SHA.
     pub git_commit: String,
+    /// The run's report directory (verbatim from the CSV `report_dir`
+    /// column, usually an absolute path). Lets the app read this run's OWN
+    /// `stage_manifest.json` + `orchestrate_result.json` for authoritative,
+    /// per-run-accurate, catalog-size-adaptive counts (see
+    /// `App::run_plan_summary`), instead of the CSV-column approximation.
+    /// Empty when the CSV has no `report_dir` column (older schema).
+    pub report_dir: String,
     pub overall_result: String,
     /// Name of the first stage that failed (from the `first_failed_stage` CSV column).
     pub first_failed_stage: String,
@@ -484,6 +500,7 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
     let overall_idx = col_idx("overall_result");
     let first_failed_idx = col_idx("first_failed_stage");
     let run_id_idx = col_idx("run_id");
+    let report_dir_idx = col_idx("report_dir");
 
     // Ordered list of (column_index, header_name) for every real check column
     // -- is_full_stage_matrix_column, the same "what counts as a check"
@@ -534,6 +551,12 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
                 .to_owned();
 
             let run_id = run_id_idx.and_then(|i| row.get(i)).unwrap_or("").to_owned();
+
+            let report_dir = report_dir_idx
+                .and_then(|i| row.get(i))
+                .unwrap_or("")
+                .trim()
+                .to_owned();
 
             // Which scope groups (linux / macos / windows / cross_os) have
             // ANY decisive (pass/fail) value anywhere in this row -- a group
@@ -625,6 +648,7 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
             RunSummary {
                 run_id,
                 git_commit,
+                report_dir,
                 overall_result,
                 first_failed_stage,
                 passed_stages: passed + PRE_STAGE_COUNT,
@@ -639,6 +663,71 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
         .collect();
 
     Ok(summaries)
+}
+
+/// Alias -> role label from the MOST RECENT run's `{os}_{role}_alias`
+/// columns -- the authoritative record of which node actually served which
+/// role in the latest live lab. VM STATUS uses it to light up nodes with the
+/// role a real run gave them (and their parity glyph), even nodes outside the
+/// monitor's own config slots (e.g. a `debian-headless-5` elected client, a
+/// `debian-headless-3` elected relay, which the config heuristic alone can't
+/// name). When one node served several roles in that run, the most
+/// significant wins (exit > blind_exit > anchor > relay > admin > client).
+/// Reads the newest row that has ANY alias column populated (older schema
+/// rows, and the narrow Linux-only writer's role-less row, are skipped).
+pub fn load_latest_run_roles(repo_root: &Path) -> Result<HashMap<String, String>> {
+    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_path(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let headers = reader
+        .headers()
+        .with_context(|| format!("reading headers from {}", path.display()))?
+        .clone();
+    let mut rows: Vec<csv::StringRecord> = Vec::new();
+    for r in reader.records().flatten() {
+        rows.push(r);
+    }
+
+    // Least-significant role first, so a more significant role overwrites it
+    // for a node that served several roles in the same run.
+    let precedence = [
+        Role::Client,
+        Role::Admin,
+        Role::Nas,
+        Role::Llm,
+        Role::Relay,
+        Role::Anchor,
+        Role::BlindExit,
+        Role::Exit,
+    ];
+    let col_idx = |name: &str| headers.iter().position(|h| h == name);
+
+    for row in rows.iter().rev() {
+        let mut roles: HashMap<String, String> = HashMap::new();
+        for role in precedence {
+            for os in Os::all() {
+                let column = format!("{}_{}_alias", os.csv_prefix(), role.label());
+                if let Some(alias) = col_idx(&column)
+                    .and_then(|idx| row.get(idx))
+                    .map(str::trim)
+                    .filter(|alias| !alias.is_empty())
+                {
+                    roles.insert(alias.to_owned(), role.label().to_owned());
+                }
+            }
+        }
+        if !roles.is_empty() {
+            return Ok(roles);
+        }
+    }
+
+    Ok(HashMap::new())
 }
 
 pub fn load_sparklines(
@@ -1323,6 +1412,63 @@ mod tests {
     }
 
     #[test]
+    fn latest_run_roles_maps_each_node_to_the_role_it_served() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "git_commit,linux_client_alias,linux_exit_alias,linux_relay_alias,linux_anchor_alias\n\
+             old1111,old-client,old-exit,,\n\
+             new2222,debian-headless-5,debian-headless-1,debian-headless-3,debian-headless-1\n",
+        );
+        let roles = load_latest_run_roles(dir.path()).unwrap();
+        // Newest row wins; each node maps to its role.
+        assert_eq!(
+            roles.get("debian-headless-5").map(String::as_str),
+            Some("client")
+        );
+        assert_eq!(
+            roles.get("debian-headless-3").map(String::as_str),
+            Some("relay")
+        );
+        // debian-headless-1 served BOTH exit and anchor -- exit is more
+        // significant, so it wins.
+        assert_eq!(
+            roles.get("debian-headless-1").map(String::as_str),
+            Some("exit")
+        );
+        // Stale older-row aliases must not leak through.
+        assert!(!roles.contains_key("old-client"));
+    }
+
+    #[test]
+    fn latest_run_roles_skips_rows_with_no_alias_data() {
+        let dir = tempfile::tempdir().unwrap();
+        // Newest row is a role-less writer row; the loader must fall back to
+        // the most recent row that actually carries alias columns.
+        write_matrix_csv(
+            dir.path(),
+            "git_commit,linux_client_alias,linux_exit_alias\n\
+             real1111,debian-headless-5,debian-headless-1\n\
+             narrow22,,\n",
+        );
+        let roles = load_latest_run_roles(dir.path()).unwrap();
+        assert_eq!(
+            roles.get("debian-headless-5").map(String::as_str),
+            Some("client")
+        );
+        assert_eq!(
+            roles.get("debian-headless-1").map(String::as_str),
+            Some("exit")
+        );
+    }
+
+    #[test]
+    fn latest_run_roles_empty_when_no_csv() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_latest_run_roles(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
     fn parity_empty_csv_returns_unproven() {
         let dir = tempfile::tempdir().unwrap();
         write_matrix_csv(dir.path(), "overall_result,macos_stage_anchor\n");
@@ -1442,13 +1588,14 @@ mod tests {
 
         // Only macos_stage_anchor, cross_os_dns, windows_stage_exit_handoff are
         // real stage columns; linux_present/linux_client are role-presence
-        // flags and must not count (see next test). PRE_STAGE_COUNT (5) is
-        // folded into both sides unconditionally (see load_stage_progress).
-        assert_eq!(progress.total, 3 + PRE_STAGE_COUNT);
+        // flags and must not count (see next test). PRE steps have no CSV
+        // column and are not parity checks, so they are NOT folded in --
+        // header CHECKS counts real check columns only, matching the matrix.
+        assert_eq!(progress.total, 3);
         // macos_stage_anchor latest=pass, cross_os_dns latest=fail,
         // windows_stage_exit_handoff latest row is not_run so falls back to
         // the earlier decisive "pass".
-        assert_eq!(progress.passed, 2 + PRE_STAGE_COUNT);
+        assert_eq!(progress.passed, 2);
     }
 
     #[test]
@@ -1463,10 +1610,9 @@ mod tests {
         let progress = load_stage_progress(dir.path()).unwrap();
 
         // Every column here is a role-presence/summary flag; none are real
-        // stage checks, so the header bar's counter must read only PRE's
-        // always-complete 5, not 8/8 (or 13/13 if PRE were miscounted too).
-        assert_eq!(progress.total, PRE_STAGE_COUNT);
-        assert_eq!(progress.passed, PRE_STAGE_COUNT);
+        // stage checks, so the header bar's counter must read 0/0, not 8/8.
+        assert_eq!(progress.total, 0);
+        assert_eq!(progress.passed, 0);
     }
 
     #[test]
@@ -1500,10 +1646,10 @@ mod tests {
         let matrix_total =
             matrix.linux.len() + matrix.macos.len() + matrix.windows.len() + matrix.cross_os.len();
 
-        // load_full_stage_matrix has no notion of PRE at all (it's purely
-        // column-driven), so progress.total must be exactly matrix_total
-        // plus PRE's always-complete 5, not equal to it.
-        assert_eq!(progress.total, matrix_total + PRE_STAGE_COUNT);
+        // Header CHECKS and the FULL STAGE MATRIX count the exact same
+        // check columns, so progress.total must equal matrix_total EXACTLY --
+        // no PRE fold on either side, so the two headline numbers agree.
+        assert_eq!(progress.total, matrix_total);
         // 2 suffixes x 3 OS + 3 one-offs + 2 cross_os = 11; linux_present excluded.
         assert_eq!(matrix_total, 11);
     }
@@ -1538,10 +1684,9 @@ mod tests {
             "the panel entry carries the completion bit so its title \
              (count_passed = latest_pass) agrees with the header CHECKS"
         );
-        assert_eq!(progress.total, 1 + PRE_STAGE_COUNT);
+        assert_eq!(progress.total, 1);
         assert_eq!(
-            progress.passed,
-            1 + PRE_STAGE_COUNT,
+            progress.passed, 1,
             "a currently-passing check counts as passed the moment it goes green"
         );
         assert_eq!(
@@ -1556,7 +1701,7 @@ mod tests {
             "overall_result,linux_stage_bootstrap\npass,pass\npass,fail\n",
         );
         let progress = load_stage_progress(dir.path()).unwrap();
-        assert_eq!(progress.passed, PRE_STAGE_COUNT);
+        assert_eq!(progress.passed, 0);
         assert_eq!(progress.flaky, 0);
     }
 
@@ -1600,8 +1745,8 @@ mod tests {
             "a never-before-seen _stage_ suffix must appear with no code change: {:?}",
             matrix.linux
         );
-        assert_eq!(progress.total, 1 + PRE_STAGE_COUNT);
-        assert_eq!(progress.passed, 1 + PRE_STAGE_COUNT);
+        assert_eq!(progress.total, 1);
+        assert_eq!(progress.passed, 1);
     }
 
     #[test]
@@ -1621,8 +1766,8 @@ mod tests {
             "a never-before-seen one-off check column must appear with no code change: {:?}",
             matrix.macos
         );
-        assert_eq!(progress.total, 1 + PRE_STAGE_COUNT);
-        assert_eq!(progress.passed, PRE_STAGE_COUNT);
+        assert_eq!(progress.total, 1);
+        assert_eq!(progress.passed, 0);
     }
 
     #[test]
@@ -1636,7 +1781,7 @@ mod tests {
         let matrix = load_full_stage_matrix(dir.path()).unwrap();
         let progress = load_stage_progress(dir.path()).unwrap();
         assert!(matrix.linux.is_empty(), "{:?}", matrix.linux);
-        assert_eq!(progress.total, PRE_STAGE_COUNT);
+        assert_eq!(progress.total, 0);
     }
 
     #[test]
