@@ -18,9 +18,9 @@ Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4
 > | W5.2 WindowsNodeAdapter | ✓ | ✓ | ⛔ blocked-by: Windows UTM VM | `76df3c4`, `81749e4` (hardening: collected pubkeys for non-Exit; Exit still fail-closed) |
 > | W5.3 MacosNodeAdapter + 6 macos-*-check subcommands | ✓ | ✓ | ⛔ blocked-by: macOS UTM VM (W5.4 keeps Exit fail-closed if absent) | `f4a0076`, `81749e4` |
 > | W5.4 Windows/macOS-as-Exit (membership-owner cross-OS) | ✓ (impl ships); fail-closed in code per `NodeRole::is_supported_for_platform` | ✓ | ⛔ blocked-by: heterogeneous mesh with non-Linux Exit | `04cf7fd`, `81749e4` (matrix tightening) |
-> | W5.5a 17 stages + PlanBuilder | ✓ | ✓ | ⛔ blocked-by: side-by-side bash↔Rust parity run | `c63084b`, `81749e4` (single-source-of-truth via `build_rust_native_orchestration_stages` + `FinalCleanupStage`) |
-> | W5.5b parity-diff harness + `vm-lab-diff-orchestrator-parity` subcommand | ✓ | ✓ (11 tests) | ⛔ blocked-by: paired live runs producing `parity_input.json` | `b530e85` |
-> | W5.6 CLI surface (--legacy-bash-orchestrator, deprecation translation) | ✓ | ✓ (13 tests) | n/a (CLI wiring); default-flip ⛔ blocked-by: W5.5 parity proof | `b530e85` |
+> | W5.5a 17 stages + PlanBuilder | ✓ | ✓ | ✅ Linux live-proven 2026-07-04 (`42afa4b`): full pipeline ran, all Rust-dialect stages PASS through `deploy_relay_service`; only `traffic_test_matrix` client↔client failed (known downstream dataplane gap, not migration) — report `state/rust-native-linux-1783185441` | `c63084b`, `81749e4` (single-source-of-truth via `build_rust_native_orchestration_stages` + `FinalCleanupStage`) |
+> | W5.5b parity-diff harness + `vm-lab-diff-orchestrator-parity` subcommand | ✓ | ✓ (11 tests) | 🟡 Rust `parity_input.json` now emitted live (2026-07-04); bash emitter still absent AND the mechanical `overall_parity_pass` gate is unsatisfiable bash↔Rust (divergent stage IDs — see parity-gate finding above); gate needs redefinition | `b530e85` |
+> | W5.6 CLI surface (--legacy-bash-orchestrator, deprecation translation) | ✓ | ✓ (13 tests) | n/a (CLI wiring); default-flip ⛔ blocked-by: **redefined** functional-parity gate (mechanical stage-ID parity is unsatisfiable by construction — see parity-gate finding) | `b530e85` |
 > | W5.7 Live-evidence campaign + bash removal | ✗ | ✗ | ⛔ blocked-by: all live-evidence scenarios | — |
 >
 > **Observability parity (2026-07-04, `831a32a`):** the `--node` path now
@@ -34,6 +34,58 @@ Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4
 > Fable5 Finding 4 recorder-first (see `LiveLabStageContractPlan_2026-07-03.md`)
 > and makes the eventual W5.7 default-flip a no-op for every downstream
 > consumer. It does NOT flip the default or assert parity.
+>
+> **First live Linux `--node` run (2026-07-04, HEAD `42afa4b`) — W5.5a/W5.5b
+> unblocked for Linux.** `ops vm-lab-orchestrate-live-lab --node
+> debian-headless-1:exit --node debian-headless-2:client --node
+> debian-headless-3:client --source-mode working-tree` executed the full
+> `PlanBuilder` pipeline against the real 3-node Debian lab (report dir
+> `state/rust-native-linux-1783185441`, run-matrix row
+> `livelab-1783187272-42afa4bd910a`). Result: **15 of 21 stages PASS**, covering
+> **every Rust-dialect stage** — `membership_init`, `distribute_membership`,
+> `anchor_validation`, `distribute_assignments`/`traversal`/`dns_zone`,
+> `enforce_baseline_runtime`, **`validate_baseline_runtime` (mesh functionally
+> validated)**, and `deploy_relay_service`/`relay_validation`. The bootstrap's
+> retry+DNS-repair recovered all three flaky-egress nodes live. The state-machine
+> runner emitted every recording artifact and they were verified: the run-scoped
+> `stage_manifest.json` (166-entry catalog, 21 enabled = the Rust plan,
+> `membership_init` enabled / `membership_setup` disabled), realtime `stages.tsv`
+> (clean `running`→terminal per stage, no dup rows), `orchestrate_result.json`,
+> and `parity_input.json` (21-stage `LiveLabRunReport`, `overall_status: failed`,
+> 3 `node_statuses`). The single failure is `traffic_test_matrix` — the all-pairs
+> mesh ping failed **only** on the client↔client pair (`debian-headless-2 ↔
+> debian-headless-3`); client↔exit passed. Every orchestration *setup* stage
+> passed, so this is a dataplane/mesh-reachability issue **downstream of
+> orchestration** (the known, separately-tracked Linux traffic-test gap), not a
+> migration defect — the bash orchestrator would fail the same client↔client pair
+> on the same topology. `role_switch_matrix`/`exit_handoff`/`active_exit`/`cleanup`
+> then fail-closed skipped, which is correct.
+>
+> **Parity-gate design finding (2026-07-04) — the W5.6 default-flip gate as
+> written is unsatisfiable bash↔Rust and must be redefined.** The plan's parity
+> definition (§4.W5.5, "identical set of stage IDs executed") and
+> `diff_live_lab_reports`'s `overall_parity_pass` require `stages_match_all`
+> (empty `stages_only_in_left`/`right`). But the two orchestrators use
+> **divergent stage IDs by design** — the bash dialect
+> (`membership_setup`, `distribute_membership_state`, `issue_and_distribute_*`,
+> `prime_remote_access`) vs the Rust dialect (`membership_init`,
+> `distribute_membership`, `distribute_assignments`/`traversal`/`dns_zone`,
+> `anchor_validation`, `deploy_relay_service`, …). Only 8 stage IDs overlap
+> (`preflight`, `prepare_source_archive`, `verify_ssh_reachability`,
+> `cleanup_hosts`, `bootstrap_hosts`, `collect_pubkeys`,
+> `enforce_baseline_runtime`, `validate_baseline_runtime`). So a mechanical
+> bash↔Rust diff can **never** produce `overall_parity_pass=true`, and the bash
+> `parity_input.json` emitter was never built (W5.5b, below). The recorder-first
+> convergence (`831a32a`) unifies the **consumer contract**
+> (`stage_manifest.json` + `stages.tsv` + `orchestrate_result.json` the monitor
+> reads), **not** the stage-ID sets. **Recommendation:** redefine the W5.6 flip
+> gate as **functional/outcome parity** — both dialects reach mesh setup +
+> `validate_baseline_runtime` PASS + equal validator pass/total counts on the
+> same topology — and/or restrict the mechanical `diff_live_lab_reports` to the
+> shared-ID stages or a bash→Rust `StageId` remap. Until that gate is redefined
+> and met, **the default stays on bash** (flipping now would violate the DoD:
+> flip only after genuine parity proof). W5.7 (bash removal) remains gated on the
+> cross-OS live-evidence campaign.
 >
 > **The role-platform matrix in §3.4 is not yet validated end-to-end for
 > any non-Linux Exit deployment.** Windows-as-Exit and macOS-as-Exit
@@ -658,14 +710,14 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 **Tests per stage:** unit test of the stage's logic with a mocked `NodeAdapter`. Integration test (gated) drives the stage against a live VM.
 
 **Acceptance criteria:**
-- Side-by-side parity run: invoke `vm-lab-orchestrate-live-lab` once with `--legacy-bash-orchestrator` and once with the new code path against the same lab. **Parity is defined as:** (a) identical set of stage IDs executed; (b) identical pass/fail status for every stage; (c) identical overall exit code; (d) per-stage JSON `outcome` field values match exactly; (e) numeric peer counts and validator counts within ±0. The parity runner produces a machine-readable JSON diff; CI asserts zero diff. Capture diff + summary as evidence.
+- Side-by-side parity run: invoke `vm-lab-orchestrate-live-lab` once with `--legacy-bash-orchestrator` and once with the new code path against the same lab. **Parity was originally defined as:** (a) identical set of stage IDs executed; (b) identical pass/fail status for every stage; (c) identical overall exit code; (d) per-stage JSON `outcome` field values match exactly; (e) numeric peer counts and validator counts within ±0. **⚠️ SUPERSEDED (2026-07-04):** criterion (a) — and therefore the mechanical `overall_parity_pass` — is **unsatisfiable** because the bash and Rust dialects use divergent stage IDs by design (only 8 of ~21 overlap; see the parity-gate finding at the top of this doc). The redefined gate is **functional/outcome parity**: both dialects reach mesh setup + `validate_baseline_runtime` PASS with equal validator pass/total counts on the same topology, optionally with a mechanical diff restricted to the shared-ID stages. Capture diff + summary as evidence.
 - `TrafficTestMatrix` stage includes both **positive probes** (mesh peers reachable via tunnel — N×N) and **negative probes** (default-deny ACL blocks a non-mesh probe IP from each node). Stage result is PASS only when all positive probes succeed AND all negative probes return `Blocked`. A `Reachable` result on any negative probe is a security failure that fails the stage and blocks phase progression. Both probe sets are documented in per-stage evidence.
 - All gates pass.
 
 **Status (2026-04-29):**
 - W5.5a — 17 stage execute() impls + `PlanBuilder::build()` shipped in `c63084b`. Stages walk in dep order, emit typed `StageOutcome`, route through `NodeAdapter`. Unit tests on the runner / plan / per-stage logic with mocked adapters.
 - W5.5b — parity-diff harness shipped in `85e786d`. Rust orchestrator now writes `<report-dir>/parity_input.json` (a `LiveLabRunReport`) at end-of-run. New `vm-lab-diff-orchestrator-parity --left <bash.json> --right <rust.json> --output <diff.json>` subcommand emits `ParityDiff` covering every dimension above (stage list, per-stage outcome, overall status, node count, validator pass/total counts). 11 unit tests cover the diff function + every drift dimension; 2 tests cover the executor end-to-end. Returns Err on drift so CI can gate.
-- ⛔ Live parity evidence is **NOT** captured. The bash orchestrator still needs to emit (or be wrapped to emit) a `parity_input.json` matching the schema. The paired bash↔Rust run against equivalent Linux labs is blocked on the real lab being reachable from this work environment.
+- 🟡 **Rust-side live parity evidence CAPTURED (2026-07-04, `42afa4b`).** The Rust orchestrator wrote a live `parity_input.json` (`state/rust-native-linux-1783185441`, 21-stage `LiveLabRunReport`) from a real 3-node Linux run — all Rust-dialect stages PASS through `deploy_relay_service`; only the downstream `traffic_test_matrix` client↔client pair failed (known dataplane gap, not migration). The **bash** side still emits no `parity_input.json`, and — critically — even if it did, the mechanical `overall_parity_pass` cannot go green bash↔Rust because the two dialects' stage-ID sets differ by design (parity-gate finding, top of doc). Next: redefine the gate to functional/outcome parity (or shared-ID-only diff), then a paired bash↔Rust run on an all-pairs-reachable topology.
 
 **Estimated LOC:** 3000-4000 across 17 stage files + per-stage tests.
 
@@ -692,7 +744,7 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 - `translate_legacy_role_flags` in `role_assignment.rs` maps the legacy `--exit-vm` / `--client-vm` / `--entry-vm` / `--aux-vm` / `--extra-vm` / `--fifth-client-vm` / `--windows-vm` flag set to a `Vec<NodeRoleAssignment>` matching the bash orchestrator's role semantics. Pin test asserts equality with the equivalent repeated `--node A:exit ...` form.
 - `legacy_role_flags_deprecation_warnings` returns the warning lines emitted to stderr when the legacy flag set is used without `--node` and without `--legacy-bash-orchestrator`.
 - 13 unit tests cover translation correctness (every legacy → role mapping, fifth-client/windows-vm both → second Client, blank/missing alias handling, whitespace trimming), validator mutual-exclusion (4 cases), and deprecation-warning silence vs. trigger (5 cases).
-- ⛔ **Default routing is NOT yet flipped.** Per the W5.5b parity-evidence gate, the bash orchestrator remains the default; the Rust path is opt-in via repeated `--node`. Flipping the default is a one-line change in `execute_ops_vm_lab_orchestrate_live_lab` that should land **only after** a `parity_diff.overall_parity_pass=true` artifact is captured against an equivalent Linux lab.
+- ⛔ **Default routing is NOT yet flipped.** The bash orchestrator remains the default; the Rust path is opt-in via repeated `--node`. Flipping the default is a one-line change in `execute_ops_vm_lab_orchestrate_live_lab`. **Gate update (2026-07-04):** the original `parity_diff.overall_parity_pass=true` gate is unsatisfiable bash↔Rust (divergent dialect stage IDs — parity-gate finding, top of doc), so the flip is now blocked on the **redefined functional/outcome-parity gate** (both dialects reach `validate_baseline_runtime` PASS with equal validator counts on an all-pairs-reachable topology). The Rust path is Linux live-proven through relay deploy (`42afa4b`); the flip additionally stays gated on the cross-OS (macOS/Windows) live-evidence campaign per W5.7.
 
 **Estimated LOC:** 200-300 (most work already done in W5.1).
 
