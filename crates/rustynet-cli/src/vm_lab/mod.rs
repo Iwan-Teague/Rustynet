@@ -7223,6 +7223,86 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
     }
 }
 
+/// Bucket 2 (evidence parity): write `state/nodes.tsv` + `run_summary.json` +
+/// `run_summary.md` for a Rust `--node` run, reusing the canonical bash-path
+/// writer so both engines produce the SAME evidence shape. Populates `run_note`
+/// (read back by the run-matrix append from run_summary.json) so it is no longer
+/// dropped for --node runs, and satisfies `validate_live_lab_run_artifacts`
+/// (which requires run_summary.json/.md + state/nodes.tsv).
+#[allow(clippy::too_many_arguments)]
+fn write_rust_native_run_summary(
+    report_dir: &Path,
+    node_targets: &[(String, String, String)],
+    node_ids: &std::collections::HashMap<String, String>,
+    network_id: &str,
+    passed: usize,
+    failed: usize,
+    skipped: usize,
+    total_stages: usize,
+    started_unix: u64,
+    started_utc: &str,
+) -> Result<(), String> {
+    let state_dir = report_dir.join("state");
+    fs::create_dir_all(&state_dir)
+        .map_err(|err| format!("create state dir for nodes.tsv: {err}"))?;
+
+    // nodes.tsv: label \t target \t node_id \t bootstrap_role — the 4-column
+    // shape `execute_ops_write_live_linux_lab_run_summary` expects.
+    let nodes_tsv = state_dir.join("nodes.tsv");
+    let mut body = String::with_capacity(node_targets.len() * 64);
+    for (alias, target, role) in node_targets {
+        let node_id = node_ids
+            .get(alias)
+            .cloned()
+            .unwrap_or_else(|| format!("{alias}-bootstrap"));
+        body.push_str(&format!("{alias}\t{target}\t{node_id}\t{role}\n"));
+    }
+    fs::write(&nodes_tsv, body).map_err(|err| format!("write nodes.tsv: {err}"))?;
+
+    let overall_status = if failed > 0 {
+        "fail"
+    } else if skipped > 0 {
+        "partial"
+    } else {
+        "pass"
+    };
+    let run_note = format!(
+        "rust --node orchestration: {} node(s), {total_stages} stage(s); \
+         passed={passed} failed={failed} skipped={skipped}",
+        node_targets.len()
+    );
+
+    let finished_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let finished_utc = collected_at_utc_now();
+    let elapsed_secs = finished_unix.saturating_sub(started_unix);
+    let elapsed_human = format!("{:02}m {:02}s", elapsed_secs / 60, elapsed_secs % 60);
+
+    let config = crate::ops_live_lab_orchestrator::WriteLiveLinuxLabRunSummaryConfig {
+        nodes_tsv,
+        stages_tsv: report_dir.join("state/stages.tsv"),
+        summary_json: report_dir.join("run_summary.json"),
+        summary_md: report_dir.join("run_summary.md"),
+        run_id: format!("rust-{started_unix}"),
+        network_id: network_id.to_owned(),
+        report_dir: report_dir.display().to_string(),
+        overall_status: overall_status.to_owned(),
+        started_at_local: started_utc.to_owned(),
+        started_at_utc: started_utc.to_owned(),
+        started_at_unix: started_unix,
+        finished_at_local: finished_utc.clone(),
+        finished_at_utc: finished_utc,
+        finished_at_unix: finished_unix,
+        elapsed_secs,
+        elapsed_human,
+        run_note,
+    };
+    crate::ops_live_lab_orchestrator::execute_ops_write_live_linux_lab_run_summary(config)
+        .map(|_| ())
+}
+
 fn execute_rust_native_orchestration(
     config: VmLabOrchestrateLiveLabConfig,
 ) -> Result<String, String> {
@@ -7254,6 +7334,13 @@ fn execute_rust_native_orchestration(
             report_dir.display()
         )
     })?;
+
+    // Capture run-start timing for run_summary.json (Bucket 2 evidence parity).
+    let run_started_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let run_started_utc = collected_at_utc_now();
 
     let network_id = format!(
         "rustynet-lab-{}",
@@ -7297,6 +7384,25 @@ fn execute_rust_native_orchestration(
                 })
         })
         .collect::<Result<Vec<_>, String>>()?;
+
+    // Snapshot (alias, target, role) now for the run_summary nodes.tsv (Bucket 2);
+    // node_id is filled from ctx.node_ids after the run populates it. Owned
+    // strings so no borrow of `node_entries`/`inventory` lingers.
+    let node_targets: Vec<(String, String, String)> = node_entries
+        .iter()
+        .map(|(entry, assignment)| {
+            let target = entry
+                .last_known_ip
+                .as_deref()
+                .unwrap_or(entry.ssh_target.as_str())
+                .to_owned();
+            (
+                assignment.alias.clone(),
+                target,
+                assignment.role.as_str().to_owned(),
+            )
+        })
+        .collect();
 
     // Auto-derive /24 ssh_allow_cidrs from node underlay IPs when not set.
     if ctx.ssh_allow_cidrs.is_empty() {
@@ -7436,6 +7542,25 @@ fn execute_rust_native_orchestration(
         .iter()
         .filter(|(_, o)| matches!(o, StageOutcome::Skipped))
         .count();
+
+    // Bucket 2 (evidence parity): write run_summary.json/.md (+ state/nodes.tsv)
+    // so validate_live_lab_run_artifacts passes and the run-matrix run_note is
+    // populated for --node runs, at parity with the bash path. Best-effort: a
+    // failure is logged, not fatal (mirrors the parity_input write below).
+    if let Err(err) = write_rust_native_run_summary(
+        report_dir.as_path(),
+        &node_targets,
+        &ctx.node_ids,
+        ctx.network_id.as_str(),
+        passed,
+        failed,
+        skipped,
+        results.len(),
+        run_started_unix,
+        run_started_utc.as_str(),
+    ) {
+        eprintln!("warning: failed to write run_summary for --node run: {err}");
+    }
 
     // Emit the parity-input JSON snapshot used by the W5.5 cross-orchestrator
     // diff harness. Failure to write it does not fail the run; it is
@@ -46987,6 +47112,79 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         // Diff JSON must still be written even on drift so the operator
         // can inspect it.
         assert!(output.exists(), "diff JSON must be written even on drift");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn write_rust_native_run_summary_emits_summary_nodes_tsv_and_run_note() {
+        let unique = super::unique_suffix();
+        let tmp = std::env::temp_dir().join(format!("rustynet-rust-summary-{unique}.dir"));
+        let state = tmp.join("state");
+        fs::create_dir_all(&state).expect("tmp state dir");
+        // Minimal 8-column stages.tsv (the canonical writer reads it).
+        fs::write(
+            state.join("stages.tsv"),
+            "preflight\thard\tpass\t0\t/dev/null\tok\t2026-01-01T00:00:00Z\t2026-01-01T00:00:01Z\n\
+             traffic_test_matrix\thard\tfail\t1\t/dev/null\tping failed\t2026-01-01T00:00:02Z\t2026-01-01T00:00:03Z\n",
+        )
+        .expect("write stages.tsv");
+
+        let node_targets = vec![
+            (
+                "debian-1".to_owned(),
+                "debian@10.0.0.1".to_owned(),
+                "exit".to_owned(),
+            ),
+            (
+                "debian-2".to_owned(),
+                "debian@10.0.0.2".to_owned(),
+                "client".to_owned(),
+            ),
+        ];
+        let mut node_ids = std::collections::HashMap::new();
+        node_ids.insert("debian-1".to_owned(), "exit-1".to_owned());
+        // debian-2 intentionally absent → node_id falls back to <alias>-bootstrap.
+
+        super::write_rust_native_run_summary(
+            &tmp,
+            &node_targets,
+            &node_ids,
+            "net-test",
+            1,
+            1,
+            0,
+            2,
+            100,
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("run summary must write");
+
+        // nodes.tsv: 4 columns, with the node_id fallback for the missing alias.
+        let nodes = fs::read_to_string(tmp.join("state/nodes.tsv")).expect("nodes.tsv");
+        assert!(
+            nodes.contains("debian-1\tdebian@10.0.0.1\texit-1\texit"),
+            "nodes.tsv: {nodes}"
+        );
+        assert!(
+            nodes.contains("debian-2\tdebian@10.0.0.2\tdebian-2-bootstrap\tclient"),
+            "nodes.tsv fallback: {nodes}"
+        );
+
+        // run_summary.json/.md exist; run_note + overall_status are what the
+        // run-matrix append reads back (Bucket 2: no longer dropped).
+        assert!(
+            tmp.join("run_summary.md").is_file(),
+            "run_summary.md must exist"
+        );
+        let summary: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(tmp.join("run_summary.json")).expect("run_summary.json"),
+        )
+        .expect("valid json");
+        assert_eq!(summary["overall_status"], "fail");
+        let note = summary["run_note"].as_str().unwrap_or_default();
+        assert!(note.contains("rust --node"), "run_note: {note}");
+        assert!(note.contains("failed=1"), "run_note: {note}");
 
         fs::remove_dir_all(&tmp).ok();
     }
