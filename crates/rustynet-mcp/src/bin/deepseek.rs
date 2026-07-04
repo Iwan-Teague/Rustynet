@@ -1899,6 +1899,16 @@ impl DeepSeekServer {
             .get("legacy_bash")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Route this run through the Rust --node engine (synthesizes --node from
+        // the guest + role-platform selectors) instead of the default bash path.
+        // Mutually exclusive with legacy_bash.
+        let rust_engine = args
+            .get("rust_engine")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if rust_engine && legacy_bash {
+            return tool_error("rust_engine and legacy_bash are mutually exclusive");
+        }
         let entry_vm = get_str(args, "entry_vm")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -2010,6 +2020,7 @@ impl DeepSeekServer {
                 entry_vm.as_deref(),
                 macos_promote_exit,
                 legacy_bash,
+                rust_engine,
                 dry_run,
                 windows_only,
                 skip_linux_live_suite,
@@ -4147,6 +4158,62 @@ fn pid_is_alive(_pid: u32) -> bool {
 /// drives. Safe defaults: trust the prepared inventory, skip the slow gates/soak/
 /// cross-network legs, and ship the working tree (so uncommitted patches deploy).
 #[allow(clippy::too_many_arguments)] // a flat, deterministic CLI-arg builder; each arg is distinct.
+/// Synthesize `--node <alias>:<role>` assignments for the Rust engine from the
+/// deepseek_lab_run guest + role-platform selectors. A mac/win guest takes the
+/// role of whichever `*_platform` selector points at its OS
+/// (exit/relay/anchor/admin/blind_exit), defaulting to `client`; the Linux
+/// guests map to their fixed roles. Stable order (exit, client, entry, macos,
+/// windows). This is the topology→`--node` bridge the Rust router
+/// (`execute_ops_vm_lab_orchestrate_live_lab`, routes on any `--node`) needs,
+/// since the Rust path — unlike bash — does not auto-derive roles.
+fn synthesize_rust_node_args(
+    macos_vm: Option<&str>,
+    windows_vm: Option<&str>,
+    exit_vm: Option<&str>,
+    client_vm: Option<&str>,
+    entry_vm: Option<&str>,
+    exit_platform: Option<&str>,
+    relay_platform: Option<&str>,
+    anchor_platform: Option<&str>,
+    admin_platform: Option<&str>,
+    blind_exit_platform: Option<&str>,
+) -> Vec<String> {
+    let role_for_os = |os: &str| -> &'static str {
+        let is = |sel: Option<&str>| sel.is_some_and(|s| s.eq_ignore_ascii_case(os));
+        if is(exit_platform) {
+            "exit"
+        } else if is(relay_platform) {
+            "relay"
+        } else if is(anchor_platform) {
+            "anchor"
+        } else if is(admin_platform) {
+            "admin"
+        } else if is(blind_exit_platform) {
+            "blind_exit"
+        } else {
+            "client"
+        }
+    };
+    let mut out = Vec::new();
+    if let Some(e) = exit_vm {
+        out.push(format!("{e}:exit"));
+    }
+    if let Some(c) = client_vm {
+        out.push(format!("{c}:client"));
+    }
+    if let Some(en) = entry_vm {
+        out.push(format!("{en}:entry"));
+    }
+    if let Some(m) = macos_vm {
+        out.push(format!("{m}:{}", role_for_os("macos")));
+    }
+    if let Some(w) = windows_vm {
+        out.push(format!("{w}:{}", role_for_os("windows")));
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_orchestrator_args(
     inventory: &str,
     ssh_identity: &str,
@@ -4165,6 +4232,7 @@ fn build_orchestrator_args(
     entry_vm: Option<&str>,
     macos_promote_exit: bool,
     legacy_bash: bool,
+    rust_engine: bool,
     dry_run: bool,
     windows_only: bool,
     skip_linux_live_suite: bool,
@@ -4179,56 +4247,80 @@ fn build_orchestrator_args(
     a.push("--skip-soak".to_string());
     a.push("--skip-cross-network".to_string());
     a.extend(["--source-mode".to_string(), "working-tree".to_string()]);
-    if let Some(m) = macos_vm {
-        a.extend(["--macos-vm".to_string(), m.to_string()]);
+    if rust_engine {
+        // Route to the Rust --node engine: synthesize alias:role from the guest
+        // + role-platform selectors and emit --node (the router switch) instead
+        // of the bash-arm --{guest}-vm / --{role}-platform flags.
+        for assignment in synthesize_rust_node_args(
+            macos_vm,
+            windows_vm,
+            exit_vm,
+            client_vm,
+            entry_vm,
+            exit_platform,
+            relay_platform,
+            anchor_platform,
+            admin_platform,
+            blind_exit_platform,
+        ) {
+            a.extend(["--node".to_string(), assignment]);
+        }
+        if let Some(r) = rebuild_nodes {
+            a.extend(["--rebuild-nodes".to_string(), r.to_string()]);
+        }
     }
-    if let Some(w) = windows_vm {
-        a.extend(["--windows-vm".to_string(), w.to_string()]);
-    }
-    if let Some(e) = exit_vm {
-        a.extend(["--exit-vm".to_string(), e.to_string()]);
-    }
-    if let Some(c) = client_vm {
-        a.extend(["--client-vm".to_string(), c.to_string()]);
-    }
-    if let Some(r) = rebuild_nodes {
-        a.extend(["--rebuild-nodes".to_string(), r.to_string()]);
-    }
-    // Role-platform selectors: elect a mac/win node into the role so the focused
-    // role cell runs live instead of skipping (validated upstream to linux|macos|
-    // windows). Bare --macos-promote-exit is the Option-B macOS secondary-exit
-    // selector (is_macos_active_exit = config.macos_promote_exit).
-    if let Some(p) = exit_platform {
-        a.extend(["--exit-platform".to_string(), p.to_string()]);
-    }
-    if let Some(p) = relay_platform {
-        a.extend(["--relay-platform".to_string(), p.to_string()]);
-    }
-    if let Some(p) = anchor_platform {
-        a.extend(["--anchor-platform".to_string(), p.to_string()]);
-    }
-    if let Some(p) = admin_platform {
-        a.extend(["--admin-platform".to_string(), p.to_string()]);
-    }
-    if let Some(p) = blind_exit_platform {
-        a.extend(["--blind-exit-platform".to_string(), p.to_string()]);
-    }
-    if let Some(e) = entry_vm {
-        a.extend(["--entry-vm".to_string(), e.to_string()]);
-    }
-    if macos_promote_exit {
-        a.push("--macos-promote-exit".to_string());
-    }
-    // The proven orchestrator path for the mac/win ROLE stages
-    // (activate_macos_exit_role + capture, the relay/anchor lifecycle). The
-    // default Rust path may not drive every role stage; the legacy bash
-    // orchestrator does (it flipped relay + reached every prior macOS role
-    // stage). Mutually exclusive with --node (deepseek_lab_run never uses --node).
-    if legacy_bash {
-        a.push("--legacy-bash-orchestrator".to_string());
-    }
-    if windows_only {
-        a.push("--windows-only".to_string());
+    if !rust_engine {
+        if let Some(m) = macos_vm {
+            a.extend(["--macos-vm".to_string(), m.to_string()]);
+        }
+        if let Some(w) = windows_vm {
+            a.extend(["--windows-vm".to_string(), w.to_string()]);
+        }
+        if let Some(e) = exit_vm {
+            a.extend(["--exit-vm".to_string(), e.to_string()]);
+        }
+        if let Some(c) = client_vm {
+            a.extend(["--client-vm".to_string(), c.to_string()]);
+        }
+        if let Some(r) = rebuild_nodes {
+            a.extend(["--rebuild-nodes".to_string(), r.to_string()]);
+        }
+        // Role-platform selectors: elect a mac/win node into the role so the focused
+        // role cell runs live instead of skipping (validated upstream to linux|macos|
+        // windows). Bare --macos-promote-exit is the Option-B macOS secondary-exit
+        // selector (is_macos_active_exit = config.macos_promote_exit).
+        if let Some(p) = exit_platform {
+            a.extend(["--exit-platform".to_string(), p.to_string()]);
+        }
+        if let Some(p) = relay_platform {
+            a.extend(["--relay-platform".to_string(), p.to_string()]);
+        }
+        if let Some(p) = anchor_platform {
+            a.extend(["--anchor-platform".to_string(), p.to_string()]);
+        }
+        if let Some(p) = admin_platform {
+            a.extend(["--admin-platform".to_string(), p.to_string()]);
+        }
+        if let Some(p) = blind_exit_platform {
+            a.extend(["--blind-exit-platform".to_string(), p.to_string()]);
+        }
+        if let Some(e) = entry_vm {
+            a.extend(["--entry-vm".to_string(), e.to_string()]);
+        }
+        if macos_promote_exit {
+            a.push("--macos-promote-exit".to_string());
+        }
+        // The proven orchestrator path for the mac/win ROLE stages
+        // (activate_macos_exit_role + capture, the relay/anchor lifecycle). The
+        // default Rust path may not drive every role stage; the legacy bash
+        // orchestrator does (it flipped relay + reached every prior macOS role
+        // stage). Mutually exclusive with --node (deepseek_lab_run never uses --node).
+        if legacy_bash {
+            a.push("--legacy-bash-orchestrator".to_string());
+        }
+        if windows_only {
+            a.push("--windows-only".to_string());
+        }
     }
     // Skip the Linux LIVE-VALIDATION SUITE (anchor/role-switch/exit-handoff/
     // relay/two-hop/managed-dns/chaos — the ~30-45 min time sink) while still
@@ -5056,6 +5148,7 @@ impl McpServer for DeepSeekServer {
                         "macos_promote_exit": json!({"type": "boolean", "description": "Option-B selector: elect macOS as a SECONDARY exit so the macOS exit cell runs live (drives is_macos_active_exit). Use alongside exit_vm/client_vm/entry_vm."}),
                         "entry_vm": json_schema_string("Linux entry-node alias for the Option-B exit topology (used alongside exit_vm/client_vm + macos_promote_exit)."),
                         "legacy_bash": json!({"type": "boolean", "description": "Route the Linux live suite through the legacy bash orchestrator instead of the default Rust one. OPTIONAL: both paths run the mac/win ROLE stages (activate_macos_exit_role + capture, relay/anchor lifecycle) when macos_vm + the role selector are set. The early 'no macOS nodes in topology' preflight line is a benign Linux-preflight artifact, not a skip of the macOS role stages."}),
+                        "rust_engine": json!({"type": "boolean", "description": "Route the run through the Rust-native --node orchestrator engine instead of the default bash path. Synthesizes --node <alias>:<role> from the guest (exit_vm/client_vm/entry_vm/macos_vm/windows_vm) + role-platform selectors, so the mesh is driven by the pure-Rust state machine (execute_rust_native_orchestration). Mutually exclusive with legacy_bash. NOTE (Full-Replacement DoD): the Rust engine currently runs the 21-stage core pipeline; it does NOT yet run the full Linux security suite / chaos / cross-network — use for setup+baseline+traffic+relay+role/exit backbone coverage while the remaining stage families are ported."}),
                         "skip_linux_live_suite": json!({"type": "boolean", "description": "FAST mac/win cell iteration: skip the ~30-45 min Linux live-validation suite (anchor/role-switch/exit-handoff/relay/two-hop/managed-dns/chaos) and jump straight to the mac/win role stages AFTER setup (bootstrap + membership + signed-bundle distribution still run, because the mac/win stages need the mesh). Pair with a role-platform selector (exit_platform/relay_platform/anchor_platform/blind_exit_platform or macos_promote_exit) to drive ONE mac/win cell live without paying for the whole Linux lab. The mac/win stages gate on setup's distribute_* outcomes, not the Linux suite, so they stay fully exercised. Use this whenever you are failing on a mac/win stage and the Linux suite would just be wasted time."}),
                         "windows_only": json!({"type": "boolean", "description": "Skip ALL Linux stages (incl. membership setup) and run ONLY the Windows bootstrap + validation stages; requires windows_vm. NOTE: this also skips membership distribution, so it only works when the Windows guest is already mesh-joined from a prior run — for a fresh Windows cell use skip_linux_live_suite instead (keeps setup)."}),
                         "allow_concurrent": json!({"type": "boolean", "description": "Opt into PARALLEL runs (default false = singleton). When true, up to 3 runs may overlap — you MUST give each disjoint guests (e.g. the macOS↔Windows pipeline: macOS on one Debian backbone, Windows on another). Each concurrent run gets its own CARGO_TARGET_DIR + report dir."}),
@@ -5753,6 +5846,7 @@ mod tests {
             Some("debian-3"), // entry_vm
             true,             // macos_promote_exit
             true,             // legacy_bash
+            false,            // rust_engine
             false,            // dry_run
             false,            // windows_only
             true,             // skip_linux_live_suite
@@ -5788,7 +5882,7 @@ mod tests {
         // selectors (incl. --macos-promote-exit) when omitted.
         let d = build_orchestrator_args(
             "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None, None,
-            false, false, true, false, false,
+            false, false, false, true, false, false,
         );
         assert!(d.iter().any(|x| x == "--dry-run"));
         assert!(!d.iter().any(|x| x == "--macos-vm"));
@@ -5799,6 +5893,83 @@ mod tests {
         assert!(!d.iter().any(|x| x == "--macos-promote-exit"));
         assert!(!d.iter().any(|x| x == "--legacy-bash-orchestrator"));
         assert!(!d.iter().any(|x| x == "--skip-linux-live-suite"));
+        assert!(!d.iter().any(|x| x == "--node"));
+    }
+
+    #[test]
+    fn rust_engine_emits_node_flags_and_no_legacy_guest_flags() {
+        // Standard Linux topology through the Rust engine: exit + 2 clients.
+        let a = build_orchestrator_args(
+            "inv",
+            "s",
+            "k",
+            "r",
+            None,             // macos_vm
+            None,             // windows_vm
+            Some("debian-1"), // exit_vm
+            Some("debian-2"), // client_vm
+            Some("debian-1"), // rebuild_nodes
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,  // entry_vm
+            false, // macos_promote_exit
+            false, // legacy_bash
+            true,  // rust_engine
+            false, // dry_run
+            false, // windows_only
+            false, // skip_linux_live_suite
+        );
+        // Emits --node alias:role for the router switch...
+        assert!(
+            a.windows(2).any(|w| w == ["--node", "debian-1:exit"]),
+            "exit --node: {a:?}"
+        );
+        assert!(
+            a.windows(2).any(|w| w == ["--node", "debian-2:client"]),
+            "client --node: {a:?}"
+        );
+        assert!(a.windows(2).any(|w| w == ["--rebuild-nodes", "debian-1"]));
+        // ...and NONE of the bash-arm guest/legacy flags.
+        assert!(!a.iter().any(|x| x == "--exit-vm"), "no --exit-vm: {a:?}");
+        assert!(!a.iter().any(|x| x == "--client-vm"));
+        assert!(!a.iter().any(|x| x == "--legacy-bash-orchestrator"));
+
+        // A mac guest elected into the exit role via exit_platform=macos.
+        let m = build_orchestrator_args(
+            "inv",
+            "s",
+            "k",
+            "r",
+            Some("macos-utm-1"), // macos_vm
+            None,
+            None,
+            Some("debian-2"), // client_vm
+            None,
+            Some("macos"), // exit_platform → macos_vm plays exit
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            true, // rust_engine
+            false,
+            false,
+            false,
+        );
+        assert!(
+            m.windows(2).any(|w| w == ["--node", "macos-utm-1:exit"]),
+            "macos exit --node: {m:?}"
+        );
+        assert!(
+            !m.iter().any(|x| x == "--exit-platform"),
+            "no --exit-platform: {m:?}"
+        );
+        assert!(!m.iter().any(|x| x == "--macos-vm"));
     }
 
     #[test]
