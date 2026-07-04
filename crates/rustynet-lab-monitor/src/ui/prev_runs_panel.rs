@@ -67,12 +67,14 @@ fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize, grou
     };
 
     // Progress bar: width = column width minus brackets and count text.
-    // "{subset passed}/{subset total} │ {full catalog total}" -- the main
-    // fraction is scoped to what this run's own topology actually touched
-    // (see RunSummary::subset_total_stages), not the full historical
-    // catalog, since most of that catalog was never going to run for a
-    // narrowly-targeted run; the number after the divider is just the plain
-    // full-catalog total, for reference, with no "total" label.
+    // "{passed}/{in-scope} │ {catalog}" -- all three from the run's OWN
+    // manifest (see App::run_plan_summary), so they're always coherent
+    // (passed <= in-scope <= catalog). The main fraction is scoped to what
+    // this run's topology actually intended to run; the number after the
+    // divider is the full planned catalog, for reference. Historically the
+    // left came from the manifest plan and the right from CSV columns -- two
+    // different universes that could read e.g. "28/165 | 100" (in-scope
+    // larger than the "total").
     let count_str = format!(
         " {}/{} │ {}",
         run.subset_passed_stages, run.subset_total_stages, run.total_stages

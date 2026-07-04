@@ -44,11 +44,20 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let status_by_stage = app
+    let mut status_by_stage = app
         .stage_outcomes
         .iter()
         .map(|outcome| (outcome.stage.as_str(), outcome.status.as_str()))
         .collect::<HashMap<_, _>>();
+    // Fold in stages the pipeline has provably passed but which never
+    // recorded an outcome (conditional infra like restart_unready_vms) as
+    // `skipped`, so their column can clear instead of hanging on a
+    // forever-pending cell. A real recorded outcome always wins (or_insert
+    // never overwrites), and these stages by construction have none.
+    let implicit = app.implicitly_completed_stages();
+    for stage in &implicit {
+        status_by_stage.entry(stage.as_str()).or_insert("skipped");
+    }
     render_planned_with_statuses(f, inner, app, &status_by_stage);
 }
 

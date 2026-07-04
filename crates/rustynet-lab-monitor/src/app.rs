@@ -89,16 +89,163 @@ fn position_based_failure_breakdown(
     Some((section_stages, failing_group_idx))
 }
 
+/// Per-run counts derived from the run's OWN `stage_manifest.json` +
+/// `orchestrate_result.json` (see [`run_plan_summary`]) -- the authoritative,
+/// per-run-accurate, catalog-size-adaptive source, used in preference to the
+/// CSV-column approximation whenever the run's report dir is still on disk.
+struct PlanCounts {
+    /// `(passed, in_scope_total)` per PRE / BOOTSTRAP / LIVE LAB group.
+    section_stages: [(usize, usize); 3],
+    subset_passed: usize,
+    subset_total: usize,
+    grand_total: usize,
+    failing_section: Option<usize>,
+}
+
+/// Read a completed run's real per-stage plan + outcomes and fold them into
+/// one coherent count triple. Every tally is in the SAME universe (the run's
+/// manifest stage list), so `passed <= in_scope <= catalog` holds by
+/// construction -- the fix for the "28/165 | 100" contradiction, where the
+/// left fraction came from the manifest plan (165) and the right number from
+/// CSV columns (100), two incommensurable universes. Fully adaptive: the
+/// numbers move automatically as the manifest gains or loses stages, with no
+/// hardcoded PRE count anywhere. Returns `None` (caller falls back to the
+/// CSV-column approximation) when the run has no report dir recorded or its
+/// report dir / manifest is no longer on disk.
+fn run_plan_summary(repo_root: &Path, run: &RunSummary) -> Option<PlanCounts> {
+    if run.report_dir.trim().is_empty() {
+        return None;
+    }
+    let report_dir = resolve_report_dir(repo_root, run.report_dir.trim());
+    let manifest = crate::data::stage_manifest::read_stage_manifest(&report_dir)?;
+    let outcomes = crate::data::stage_reader::read_orchestrate_result(&report_dir)
+        .map(|result| result.outcomes)
+        .unwrap_or_default();
+    let status_of: HashMap<&str, &str> = outcomes
+        .iter()
+        .map(|o| (o.stage.as_str(), o.status.as_str()))
+        .collect();
+
+    let group_index = |group: &str| match group {
+        "pre" => 0,
+        "bootstrap" => 1,
+        _ => 2,
+    };
+    // Synthetic aggregates (e.g. linux_live_suite) stand in for a whole
+    // sub-suite whose members are also listed; counting them would
+    // double-count, so they sit outside every tally.
+    let planned: Vec<&crate::data::stage_manifest::ManifestStage> = manifest
+        .stages
+        .iter()
+        .filter(|stage| !stage.synthetic)
+        .collect();
+    let grand_total = planned.len();
+    // Position, among the enabled stages, of the furthest one that reached a
+    // DECISIVE (pass/fail) outcome -- the "how far did the pipeline provably
+    // get" frontier. Deliberately NOT counting `skip` here: the orchestrator
+    // marks every downstream stage `skip` when it aborts on a failure, which
+    // would otherwise push the frontier to the end of the list and wrongly
+    // reclassify genuinely never-reached stages as passed-over infra.
+    let enabled_names: Vec<&str> = planned
+        .iter()
+        .filter(|stage| stage.enabled)
+        .map(|stage| stage.name.as_str())
+        .collect();
+    let frontier = enabled_names
+        .iter()
+        .rposition(|name| matches!(status_of.get(name).copied(), Some("pass") | Some("fail")));
+
+    let mut section = [(0usize, 0usize); 3];
+    let mut enabled_idx = 0usize;
+    for stage in &planned {
+        if !stage.enabled {
+            continue;
+        }
+        let idx = enabled_idx;
+        enabled_idx += 1;
+        let status = status_of.get(stage.name.as_str()).copied().unwrap_or("");
+        // Out of the in-scope denominator: (a) stages the orchestrator
+        // skipped as not-applicable to this run's topology, and (b)
+        // conditional infra the pipeline provably passed WITHOUT recording an
+        // outcome (no status, sitting before the frontier) -- same rule that
+        // clears those cells in the Stage Grid. A no-outcome stage AFTER the
+        // frontier is genuinely never-reached (e.g. everything past an early
+        // failure) and DOES stay in the denominator, so an early failure
+        // still reads "died at N of many", not a misleadingly near-complete
+        // fraction.
+        if matches!(status, "skip" | "skipped") {
+            continue;
+        }
+        // A no-outcome stage is passed-over plumbing rather than a
+        // never-reached check when EITHER it sits before the decisive
+        // frontier, OR it's a PRE step: PRE is pure setup (never a parity
+        // check), and its conditional infra (restart_unready_vms,
+        // rediscover_local_utm) both records nothing when it no-ops AND is
+        // appended at the very end of the manifest's stage list, so a
+        // frontier check alone would miscount the trailing one as
+        // never-reached.
+        if status.is_empty() && (stage.group == "pre" || matches!(frontier, Some(f) if idx < f)) {
+            continue;
+        }
+        let gi = group_index(&stage.group);
+        section[gi].1 += 1;
+        if status == "pass" {
+            section[gi].0 += 1;
+        }
+    }
+    let subset_passed = section.iter().map(|(p, _)| *p).sum();
+    let subset_total = section.iter().map(|(_, t)| *t).sum();
+    let failing_section = if run.overall_result.eq_ignore_ascii_case("fail") {
+        let bare = run.first_failed_stage.rsplit("::").next().unwrap_or("");
+        manifest
+            .stages
+            .iter()
+            .find(|stage| stage.name == bare)
+            .map(|stage| group_index(&stage.group))
+    } else {
+        None
+    };
+    Some(PlanCounts {
+        section_stages: section,
+        subset_passed,
+        subset_total,
+        grand_total,
+        failing_section,
+    })
+}
+
+fn resolve_report_dir(repo_root: &Path, report_dir: &str) -> PathBuf {
+    let path = Path::new(report_dir);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(report_dir)
+    }
+}
+
+fn apply_plan_counts(run: &mut RunSummary, counts: PlanCounts) {
+    run.section_stages = counts.section_stages;
+    run.subset_passed_stages = counts.subset_passed;
+    run.subset_total_stages = counts.subset_total;
+    // `.max` is belt-and-suspenders: subset_total is already a subset of
+    // grand_total by construction, but this guarantees the displayed
+    // "passed / in-scope | catalog" can never read the catalog smaller than
+    // the in-scope count.
+    run.total_stages = counts.grand_total.max(counts.subset_total);
+    run.failing_section = counts.failing_section;
+}
+
 /// Applies `position_based_failure_breakdown` to a single `RunSummary` in
 /// place, for a FAILED run whose `first_failed_stage` resolves to a known
-/// pipeline position: overrides `section_stages`/`failing_section` and the
-/// LEFT-hand `subset_passed_stages`/`subset_total_stages` fraction (now
-/// measured against the canonical pipeline). Deliberately does NOT touch
-/// `total_stages` -- that stays the CSV-column-based full project catalog
-/// size (see `RunSummary::total_stages`), the constant "how big is the
-/// whole possible test surface" reference shown after the divider,
-/// regardless of how far any single run's pipeline got. A no-op for a
-/// passing run or an unrecognized stage name.
+/// pipeline position. FALLBACK used only when [`run_plan_summary`] can't read
+/// the run's own manifest (report dir pruned). Overrides
+/// `section_stages`/`failing_section` and the LEFT-hand
+/// `subset_passed_stages`/`subset_total_stages` fraction, and sets
+/// `total_stages` to the same pipeline-plan catalog so the card stays
+/// coherent (`passed <= in-scope <= catalog`) -- it must NOT be left at the
+/// CSV-column value, which lives in a different universe and produced the
+/// "28/165 | 100" contradiction. A no-op for a passing run or an
+/// unrecognized stage name.
 fn apply_position_based_failure_override(groups: &[StageGroup], run: &mut RunSummary) {
     if !run.overall_result.eq_ignore_ascii_case("fail") {
         return;
@@ -115,6 +262,7 @@ fn apply_position_based_failure_override(groups: &[StageGroup], run: &mut RunSum
         .fold((0, 0), |(p, t), &(sp, st)| (p + sp, t + st));
     run.subset_passed_stages = passed;
     run.subset_total_stages = total;
+    run.total_stages = total;
 }
 
 pub struct App {
@@ -134,6 +282,11 @@ pub struct App {
     pub vm_statuses: Vec<crate::data::vm_prober::VmStatus>,
     pub selected_vm: usize,
     pub vm_role_overrides: HashMap<String, String>,
+    /// Alias -> role label from the most recent run's authoritative
+    /// `{os}_{role}_alias` record (see `run_matrix::load_latest_run_roles`),
+    /// used to name (and light up the parity glyph for) VMs the config's own
+    /// role slots don't recognize but a real run actually elected.
+    pub latest_run_roles: HashMap<String, String>,
 
     pub parity_matrix: HashMap<(Role, Os), ParityState>,
     pub parity_sparklines: HashMap<(Role, Os), Vec<CellOutcome>>,
@@ -231,6 +384,8 @@ impl App {
             crate::data::run_matrix::load_full_stage_matrix(&repo_root).unwrap_or_default();
 
         let vm_role_overrides = default_vm_role_overrides(&config);
+        let latest_run_roles =
+            crate::data::run_matrix::load_latest_run_roles(&repo_root).unwrap_or_default();
         let recent_runs =
             crate::data::run_matrix::load_recent_runs(&repo_root, 3).unwrap_or_default();
 
@@ -262,6 +417,7 @@ impl App {
             vm_statuses: Vec::new(),
             selected_vm: 0,
             vm_role_overrides,
+            latest_run_roles,
             parity_matrix,
             parity_sparklines,
             stage_progress,
@@ -492,6 +648,44 @@ impl App {
         self.planned_stage_groups()
             .into_iter()
             .flat_map(|group| group.stages)
+            .collect()
+    }
+
+    /// Enabled stages the serial pipeline has provably advanced PAST but
+    /// which never recorded a terminal outcome of their own -- conditional
+    /// infra like `restart_unready_vms` / `rediscover_local_utm` /
+    /// `cross_network_preflight` that no-op (record nothing) when their
+    /// precondition already holds. Any enabled stage that sits before the
+    /// furthest recorded terminal outcome in pipeline order, yet has no
+    /// outcome, is treated as satisfied so its column can CLEAR instead of
+    /// showing a forever-pending cell that stops PRE (or any earlier phase)
+    /// from ever reading complete. Uses the same flattened planned order and
+    /// terminal-status definition as the active-stage inference, so the two
+    /// never disagree about "how far has the pipeline gotten".
+    pub fn implicitly_completed_stages(&self) -> HashSet<String> {
+        let ordered: Vec<String> = self
+            .planned_stage_groups()
+            .into_iter()
+            .flat_map(|group| group.stages)
+            .filter(|stage| self.stage_enabled(stage))
+            .collect();
+        let finished: HashSet<&str> = self
+            .stage_outcomes
+            .iter()
+            .filter(|o| matches!(o.status.as_str(), "pass" | "fail" | "skip" | "skipped"))
+            .map(|o| o.stage.as_str())
+            .collect();
+        let Some(furthest_done) = ordered
+            .iter()
+            .rposition(|stage| finished.contains(stage.as_str()))
+        else {
+            return HashSet::new();
+        };
+        ordered
+            .iter()
+            .take(furthest_done)
+            .filter(|stage| !finished.contains(stage.as_str()))
+            .cloned()
             .collect()
     }
 
@@ -989,6 +1183,9 @@ impl App {
         if let Ok(matrix) = crate::data::run_matrix::load_parity_matrix(&self.repo_root) {
             self.parity_matrix = matrix;
         }
+        if let Ok(roles) = crate::data::run_matrix::load_latest_run_roles(&self.repo_root) {
+            self.latest_run_roles = roles;
+        }
         if let Ok(sparklines) = crate::data::run_matrix::load_sparklines(&self.repo_root, 8) {
             self.parity_sparklines = sparklines;
         }
@@ -1016,8 +1213,16 @@ impl App {
             // actually was. Prefer the pipeline-position breakdown instead,
             // wherever it resolves.
             let groups = self.planned_stage_groups();
+            let repo_root = self.repo_root.clone();
             for run in &mut self.recent_runs {
-                apply_position_based_failure_override(&groups, run);
+                // Prefer the run's OWN manifest+outcomes (per-run-accurate,
+                // catalog-adaptive, always coherent); fall back to the
+                // pipeline-position CSV approximation only when that run's
+                // report dir is gone.
+                match run_plan_summary(&repo_root, run) {
+                    Some(counts) => apply_plan_counts(run, counts),
+                    None => apply_position_based_failure_override(&groups, run),
+                }
             }
         }
         if self.active_job.is_none() {
@@ -1602,12 +1807,27 @@ impl App {
 
     pub fn role_for_vm(&self, alias: &str) -> String {
         let config = self.config_for_role_display();
-        if !self.roles_locked_by_active_lab()
-            && let Some(role) = self.vm_role_overrides.get(alias)
-        {
+        if self.roles_locked_by_active_lab() {
+            // A lab is running: its own config (request_args / report-dir
+            // inference) is the source of truth for who's playing what.
+            return role_for_vm_from_config(alias, &config);
+        }
+        if let Some(role) = self.vm_role_overrides.get(alias) {
             return role.clone();
         }
-        role_for_vm_from_config(alias, &config)
+        let label = role_for_vm_from_config(alias, &config);
+        // When the config's own slots can't name a real role for this node
+        // (placeholder like "—" / "linux-target"), fall back to the role it
+        // actually served in the most recent run -- so a node the last run
+        // elected (e.g. a relay outside the monitor's default slots) still
+        // shows its real role and lights up the parity glyph, updating as new
+        // runs land, instead of sitting blank run after run.
+        if Role::from_label(&label).is_none()
+            && let Some(actual) = self.latest_run_roles.get(alias)
+        {
+            return actual.clone();
+        }
+        label
     }
 
     pub fn roles_locked_by_active_lab(&self) -> bool {
@@ -2569,6 +2789,9 @@ mod tests {
         crate::data::run_matrix::RunSummary {
             run_id: "test-run".to_owned(),
             git_commit: "abc1234".to_owned(),
+            // Empty so run_plan_summary returns None and these tests exercise
+            // the CSV/pipeline-position fallback path they were written for.
+            report_dir: String::new(),
             overall_result: "fail".to_owned(),
             first_failed_stage: "bootstrap_windows_host".to_owned(),
             passed_stages: 5,
@@ -2597,7 +2820,6 @@ mod tests {
         let app = App::new(PathBuf::from("/tmp")).expect("app");
         let groups = app.planned_stage_groups();
         let mut run = sample_run_summary();
-        let original_total_stages = run.total_stages;
         apply_position_based_failure_override(&groups, &mut run);
 
         assert_eq!(
@@ -2609,10 +2831,122 @@ mod tests {
         assert_eq!(run.subset_passed_stages, 19);
         // 5 PRE + 21 BOOTSTRAP + 64 LIVE LAB after the catalog heal.
         assert_eq!(run.subset_total_stages, 90);
+        // total_stages is pinned to the same pipeline-plan catalog as the
+        // in-scope count, so the card stays coherent (passed <= in-scope <=
+        // catalog): 19 <= 90 <= 90, never the old cross-universe "19/90 | 97".
+        assert_eq!(run.total_stages, 90);
+    }
+
+    fn write_run_report(report_dir: &std::path::Path, manifest_json: &str, result_json: &str) {
+        let orchestration = report_dir.join("orchestration");
+        std::fs::create_dir_all(&orchestration).unwrap();
+        std::fs::write(orchestration.join("stage_manifest.json"), manifest_json).unwrap();
+        std::fs::write(orchestration.join("orchestrate_result.json"), result_json).unwrap();
+    }
+
+    const SAMPLE_MANIFEST_JSON: &str = r#"{
+        "schema_version": 1, "run_command": "vm-lab-orchestrate-live-lab", "run_mode": "full",
+        "stages": [
+            {"name": "preflight", "group": "pre", "enabled": true},
+            {"name": "restart_unready_vms", "group": "pre", "enabled": true},
+            {"name": "bootstrap_hosts", "group": "bootstrap", "enabled": true},
+            {"name": "validate_windows_client_install", "group": "bootstrap", "enabled": false},
+            {"name": "check_a", "group": "live", "enabled": true},
+            {"name": "check_b", "group": "live", "enabled": true},
+            {"name": "linux_live_suite", "group": "live", "enabled": true, "synthetic": true}
+        ]
+    }"#;
+
+    #[test]
+    fn run_plan_summary_counts_are_coherent_and_drop_passed_over_infra_on_a_failed_run() {
+        // The direct fix for the "28/165 | 100" contradiction: every number
+        // comes from the run's own manifest, so passed <= in-scope <=
+        // catalog holds. restart_unready_vms (enabled PRE infra, no recorded
+        // outcome, before the failure frontier) is dropped from the
+        // denominator; check_b (the failing stage) stays counted.
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report");
+        write_run_report(
+            &report,
+            SAMPLE_MANIFEST_JSON,
+            r#"{"overall_status":"fail","outcomes":[
+                {"stage":"preflight","status":"pass"},
+                {"stage":"bootstrap_hosts","status":"pass"},
+                {"stage":"check_a","status":"pass"},
+                {"stage":"check_b","status":"fail"}
+            ]}"#,
+        );
+        let mut run = sample_run_summary();
+        run.report_dir = report.display().to_string();
+        run.first_failed_stage = "check_b".to_owned();
+
+        let counts = run_plan_summary(&PathBuf::from("/tmp"), &run).expect("manifest present");
+
+        assert_eq!(counts.section_stages, [(1, 1), (1, 1), (1, 2)]);
+        assert_eq!(counts.subset_passed, 3);
+        assert_eq!(counts.subset_total, 4);
+        // grand_total = 6 non-synthetic stages (linux_live_suite excluded).
+        assert_eq!(counts.grand_total, 6);
         assert_eq!(
-            run.total_stages, original_total_stages,
-            "total_stages is the CSV-column project catalog size and must \
-             stay untouched by the pipeline-position override"
+            counts.failing_section,
+            Some(2),
+            "check_b is a LIVE LAB stage"
+        );
+        assert!(
+            counts.subset_passed <= counts.subset_total
+                && counts.subset_total <= counts.grand_total,
+            "passed <= in-scope <= catalog must hold: {:?}",
+            (
+                counts.subset_passed,
+                counts.subset_total,
+                counts.grand_total
+            )
+        );
+    }
+
+    #[test]
+    fn run_plan_summary_reads_a_clean_pass_run_as_full_not_artificially_partial() {
+        // A clean PASS run whose infra stages no-op'd (no recorded outcome)
+        // must read as complete, not dragged down by those phantom cells.
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report");
+        write_run_report(
+            &report,
+            SAMPLE_MANIFEST_JSON,
+            r#"{"overall_status":"pass","outcomes":[
+                {"stage":"preflight","status":"pass"},
+                {"stage":"bootstrap_hosts","status":"pass"},
+                {"stage":"check_a","status":"pass"},
+                {"stage":"check_b","status":"pass"}
+            ]}"#,
+        );
+        let mut run = sample_run_summary();
+        run.report_dir = report.display().to_string();
+        run.overall_result = "pass".to_owned();
+        run.first_failed_stage = String::new();
+
+        let counts = run_plan_summary(&PathBuf::from("/tmp"), &run).expect("manifest present");
+
+        assert_eq!(counts.subset_passed, 4);
+        assert_eq!(
+            counts.subset_total, 4,
+            "no artificial partial from no-op infra"
+        );
+        assert_eq!(counts.grand_total, 6);
+        assert_eq!(counts.failing_section, None);
+    }
+
+    #[test]
+    fn run_plan_summary_is_none_without_a_report_dir_or_manifest() {
+        let run = sample_run_summary(); // empty report_dir
+        assert!(run_plan_summary(&PathBuf::from("/tmp"), &run).is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut run = sample_run_summary();
+        run.report_dir = dir.path().join("no-such-report").display().to_string();
+        assert!(
+            run_plan_summary(&PathBuf::from("/tmp"), &run).is_none(),
+            "a missing manifest must fall back, not panic"
         );
     }
 
@@ -3175,6 +3509,44 @@ mod tests {
     }
 
     #[test]
+    fn role_for_vm_falls_back_to_the_last_runs_actual_assignment_for_unconfigured_nodes() {
+        // A node the last run elected but that the monitor's own config slots
+        // don't name (e.g. debian-headless-3 as relay) must show that real
+        // role -- and therefore its parity glyph -- instead of a blank "—".
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        // debian-headless-3 is entry_vm by default -> role_for_vm_from_config
+        // returns the "—" placeholder for it.
+        assert_eq!(app.role_for_vm("debian-headless-3"), "—");
+        app.latest_run_roles
+            .insert("debian-headless-3".to_owned(), "relay".to_owned());
+        app.latest_run_roles
+            .insert("debian-headless-5".to_owned(), "client".to_owned());
+
+        assert_eq!(app.role_for_vm("debian-headless-3"), "relay");
+        assert_eq!(app.role_for_vm("debian-headless-5"), "client");
+    }
+
+    #[test]
+    fn last_run_roles_never_override_a_config_named_role_or_a_manual_override() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        // exit_vm is a real config-named role; the last-run map must not
+        // clobber it even if that node also served something else.
+        app.latest_run_roles
+            .insert("debian-headless-1".to_owned(), "anchor".to_owned());
+        assert_eq!(
+            app.role_for_vm("debian-headless-1"),
+            "exit",
+            "config-named role wins over the last-run fallback"
+        );
+        // A manual override wins over both.
+        app.vm_role_overrides
+            .insert("debian-headless-3".to_owned(), "admin".to_owned());
+        app.latest_run_roles
+            .insert("debian-headless-3".to_owned(), "relay".to_owned());
+        assert_eq!(app.role_for_vm("debian-headless-3"), "admin");
+    }
+
+    #[test]
     fn active_lab_blocks_vm_role_cycling() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.vm_statuses.push(crate::data::vm_prober::VmStatus {
@@ -3580,6 +3952,55 @@ mod tests {
             summary: String::new(),
             artifacts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn implicitly_completed_stages_covers_passed_over_infra_but_not_pending_stages() {
+        // A stage with no recorded outcome that sits BEFORE the furthest
+        // completed stage in pipeline order is treated as satisfied so its
+        // column can clear; a stage AFTER the furthest completed one stays
+        // genuinely pending (not swallowed).
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        // preflight passed, then a BOOTSTRAP stage passed -- the PRE steps in
+        // between never recorded (fallback catalog has no infra stages, but
+        // the mechanism is identical). collect_pubkeys sits AFTER the
+        // furthest completed stage, so it must NOT be implicit.
+        app.stage_outcomes = vec![
+            outcome("preflight", "pass"),
+            outcome("bootstrap_hosts", "pass"),
+        ];
+
+        let implicit = app.implicitly_completed_stages();
+
+        for passed_over in [
+            "prepare_source_archive",
+            "verify_ssh_reachability",
+            "prime_remote_access",
+            "cleanup_hosts",
+        ] {
+            assert!(
+                implicit.contains(passed_over),
+                "{passed_over} was passed over and must clear: {implicit:?}"
+            );
+        }
+        assert!(
+            !implicit.contains("preflight"),
+            "a stage with a real outcome is never implicit"
+        );
+        assert!(
+            !implicit.contains("bootstrap_hosts"),
+            "the furthest completed stage is not implicit"
+        );
+        assert!(
+            !implicit.contains("collect_pubkeys"),
+            "a stage after the furthest completed one is still genuinely pending"
+        );
+    }
+
+    #[test]
+    fn implicitly_completed_stages_is_empty_before_any_outcome() {
+        let app = App::new(PathBuf::from("/tmp")).expect("app");
+        assert!(app.implicitly_completed_stages().is_empty());
     }
 
     #[test]

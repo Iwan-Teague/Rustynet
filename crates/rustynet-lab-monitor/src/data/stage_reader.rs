@@ -55,6 +55,15 @@ pub fn infer_active_stage(
     ordered_enabled_stages: &[String],
     outcomes: &[StageOutcome],
 ) -> Result<Option<String>> {
+    // Log-based candidate (orchestrate.log STAGE: marker, then the newest
+    // per-stage `[stage:xxx] START` log). Only accepted if it does not
+    // REGRESS behind work the pipeline has provably already finished --
+    // otherwise a stale marker, or a late-running infra stage that recurs
+    // (rediscover_local_utm re-runs after bootstrap), snaps the active
+    // pointer backward into an earlier phase. When it would regress, or
+    // there's no log signal at all, fall through to the monotonic
+    // pipeline-position fallback below.
+    let mut candidate = None;
     let log_path = report_dir.join("orchestration").join("orchestrate.log");
     if log_path.exists() {
         let raw = std::fs::read_to_string(&log_path)
@@ -66,13 +75,19 @@ pub fn infer_active_stage(
                 let rest = &line[idx + 6..];
                 let stage = rest.trim().trim_matches('"').trim_matches('\'');
                 if !stage.is_empty() {
-                    return Ok(Some(stage.to_string()));
+                    candidate = Some(stage.to_string());
+                    break;
                 }
             }
         }
     }
+    if candidate.is_none() {
+        candidate = infer_active_stage_from_logs(report_dir)?;
+    }
 
-    if let Some(stage) = infer_active_stage_from_logs(report_dir)? {
+    if let Some(stage) = candidate
+        && !would_regress(&stage, ordered_enabled_stages, outcomes)
+    {
         return Ok(Some(stage));
     }
 
@@ -80,6 +95,37 @@ pub fn infer_active_stage(
         ordered_enabled_stages,
         outcomes,
     ))
+}
+
+/// True when `candidate` sits strictly BEFORE the furthest stage that has
+/// already reached a terminal outcome, in the known pipeline order -- i.e.
+/// accepting it would move the active indicator backward past completed
+/// work. A candidate not present in `ordered_enabled_stages` (unknown
+/// position) never counts as a regression, so a legitimately novel stage
+/// name is still honored. An empty order (callers with no config-driven
+/// list) also never regresses.
+fn would_regress(
+    candidate: &str,
+    ordered_enabled_stages: &[String],
+    outcomes: &[StageOutcome],
+) -> bool {
+    let Some(candidate_idx) = ordered_enabled_stages.iter().position(|s| s == candidate) else {
+        return false;
+    };
+    let finished = finished_stage_set(outcomes);
+    let furthest_done = ordered_enabled_stages
+        .iter()
+        .rposition(|s| finished.contains(s.as_str()));
+    matches!(furthest_done, Some(done_idx) if candidate_idx < done_idx)
+}
+
+/// Stages with a recorded terminal (non-pending) status, as a lookup set.
+fn finished_stage_set(outcomes: &[StageOutcome]) -> std::collections::HashSet<&str> {
+    outcomes
+        .iter()
+        .filter(|o| matches!(o.status.as_str(), "pass" | "fail" | "skip" | "skipped"))
+        .map(|o| o.stage.as_str())
+        .collect()
 }
 
 /// The first stage (in pipeline order) that hasn't reached a final status
@@ -97,12 +143,23 @@ fn infer_active_stage_from_pipeline_position(
     ordered_enabled_stages: &[String],
     outcomes: &[StageOutcome],
 ) -> Option<String> {
-    let finished: std::collections::HashSet<&str> = outcomes
+    let finished = finished_stage_set(outcomes);
+    // Monotonic: start the search AFTER the furthest stage that has already
+    // finished, never at the very first unfinished one. Some enabled stages
+    // are conditional infra (restart_unready_vms, rediscover_local_utm,
+    // cross_network_preflight) that record NO terminal outcome when their
+    // precondition already holds -- the naive "first unfinished" anchors to
+    // the earliest such phantom-pending stage forever, dragging the active
+    // pointer back into PRE even after BOOTSTRAP/LIVE stages have completed
+    // (the reported PRE<->BOOTSTRAP bounce / stuck-on-restart_unready_vms).
+    let start = ordered_enabled_stages
         .iter()
-        .filter(|o| matches!(o.status.as_str(), "pass" | "fail" | "skip" | "skipped"))
-        .map(|o| o.stage.as_str())
-        .collect();
+        .rposition(|stage| finished.contains(stage.as_str()))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
     ordered_enabled_stages
+        .get(start..)
+        .unwrap_or(&[])
         .iter()
         .find(|stage| !finished.contains(stage.as_str()))
         .cloned()
@@ -237,6 +294,78 @@ mod tests {
         let stage = infer_active_stage(dir.path(), &ordered, &outcomes).expect("stage");
 
         assert_eq!(stage.as_deref(), Some("bootstrap_macos_host"));
+    }
+
+    #[test]
+    fn pipeline_fallback_never_regresses_to_a_phantom_pending_early_stage() {
+        // Regression for the reported PRE<->BOOTSTRAP bounce: restart_unready_vms
+        // is an enabled PRE stage that records NO outcome when the VMs were
+        // already ready. The naive "first unfinished" returned it forever,
+        // even after BOOTSTRAP stages had passed. The monotonic fallback must
+        // skip it and point at the genuinely-current stage.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ordered = vec![
+            "preflight".to_owned(),
+            "restart_unready_vms".to_owned(), // enabled, never records
+            "bootstrap_hosts".to_owned(),
+            "membership_setup".to_owned(),
+            "validate_baseline_runtime".to_owned(),
+        ];
+        let outcomes = vec![
+            outcome("preflight", "pass"),
+            outcome("bootstrap_hosts", "pass"),
+            outcome("membership_setup", "pass"),
+            // restart_unready_vms + validate_baseline_runtime unrecorded
+        ];
+
+        let stage = infer_active_stage(dir.path(), &ordered, &outcomes).expect("stage");
+
+        assert_eq!(
+            stage.as_deref(),
+            Some("validate_baseline_runtime"),
+            "must advance past the phantom-pending PRE stage, not snap back to it"
+        );
+    }
+
+    #[test]
+    fn log_marker_that_would_regress_behind_completed_work_is_ignored() {
+        // A stale/recurring log marker (e.g. rediscover_local_utm re-running
+        // late in the pipeline) must not drag the active pointer backward
+        // once later stages have finished.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        std::fs::write(
+            logs.join("restart_unready_vms.log"),
+            "[stage:restart_unready_vms] START retrying stuck guests\n",
+        )
+        .expect("log");
+        let ordered = vec![
+            "restart_unready_vms".to_owned(),
+            "bootstrap_hosts".to_owned(),
+            "validate_baseline_runtime".to_owned(),
+        ];
+        let outcomes = vec![
+            outcome("restart_unready_vms", "pass"),
+            outcome("bootstrap_hosts", "pass"),
+        ];
+
+        let stage = infer_active_stage(dir.path(), &ordered, &outcomes).expect("stage");
+
+        assert_eq!(
+            stage.as_deref(),
+            Some("validate_baseline_runtime"),
+            "the backward log marker must be rejected in favor of forward progress"
+        );
+    }
+
+    fn outcome(stage: &str, status: &str) -> StageOutcome {
+        StageOutcome {
+            stage: stage.to_owned(),
+            status: status.to_owned(),
+            summary: String::new(),
+            artifacts: Vec::new(),
+        }
     }
 
     #[test]
