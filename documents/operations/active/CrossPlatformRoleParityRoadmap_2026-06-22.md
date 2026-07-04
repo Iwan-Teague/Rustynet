@@ -217,7 +217,7 @@ from selector/optional skips):
 | # | Cell | Why this rank |
 |---|---|---|
 | ✅🔒 | **Role transitions (macOS→Windows)** | macOS `LocalOnly` DONE: `validate_macos_role_transition` PASS, run `livelab-1783135864-2fda3979d599`, commit `2fda397` (client->admin flip, launchd reload, `state refresh`, mesh-peer-regression check). Windows `LocalOnly` BLOCKED (2026-07-04): stage built (`8816bf7`) but the guest's only CLI (`rustynet-windows-trust-cli.rs`) is offline-only (no IPC client), so `role status`/`role set`/`state refresh` have no Windows entry point yet — needs a named-pipe IPC client + an `update_node_role_env_file` fix for the `RUSTYNETD_DAEMON_ARGS_JSON` array format. `SignedMembership` kind remains design-only for both OS |
-| 2 | **Remaining anchor sub-surfaces** | bundle-pull is live-proven on macOS/Windows; gossip/enrollment/port-map still need explicit live proof |
+| 2 | **Remaining anchor sub-surfaces** | bundle-pull is live-proven on macOS/Windows; macOS `port_mapping_authoritative` live-proven 2026-07-04 (`validate_macos_anchor_port_mapping_authority`, run `livelab-1783159711-65e19f7cdb49`); gossip_seed/enrollment_endpoint (both OS) and port_mapping_authoritative (Windows) still need explicit live proof — enrollment_endpoint has zero runtime enforcement today and needs a design+implementation pass first |
 | ✅ | **macOS admin** | DONE: `labrun-1783089250895-6139-0`, commit `831d41d`, `validate_macos_admin_issue` PASS |
 | ✅ | **Windows admin** | DONE: `livelab-1782526081`, `validate_windows_admin_issue` PASS |
 | ✅ | **macOS blind_exit** | DONE: live-proven 2026-06-29 |
