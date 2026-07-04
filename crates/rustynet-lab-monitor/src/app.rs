@@ -332,6 +332,13 @@ pub struct App {
     pub agents_active: bool,
     pub patch_iterations: u8,
     pub review_iterations: u8,
+    /// Cached agent/cost-ledger stats for the Agents panel. Loaded (and the
+    /// underlying cost ledger reconciled + persisted) only in
+    /// `refresh_state`'s 2s cadence -- rendering happens roughly every 100ms
+    /// (see `run_event_loop`'s poll timeout), and re-doing the ledger's file
+    /// I/O and disk write on every draw would be both wasteful and a needless
+    /// widening of the window for a torn/lost write to the shared ledger file.
+    pub agents_view: crate::ui::agents_panel::AgentsView,
 
     active_stage_start: Option<std::time::Instant>,
     last_vm_probe: Option<std::time::Instant>,
@@ -403,6 +410,7 @@ impl App {
 
         let patch_iterations = config.patch_iterations.max(1);
         let review_iterations = config.review_iterations.max(1);
+        let agents_view = crate::ui::agents_panel::AgentsView::load(&repo_root);
 
         let mut app = Self {
             repo_root,
@@ -446,6 +454,7 @@ impl App {
             agents_active: false,
             patch_iterations,
             review_iterations,
+            agents_view,
             active_stage_start: None,
             last_vm_probe: None,
             run_manifest: None,
@@ -1225,6 +1234,7 @@ impl App {
                 }
             }
         }
+        self.agents_view = crate::ui::agents_panel::AgentsView::load(&self.repo_root);
         if self.active_job.is_none() {
             self.advance_if_current_target_proven();
         }
