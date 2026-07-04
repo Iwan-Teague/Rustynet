@@ -7383,6 +7383,10 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                 .anchor_platform
                 .as_deref()
                 .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
+            validate_role_transition: config
+                .role_switch_platform
+                .as_deref()
+                .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
             ..WindowsOrchestrationOptions::default()
         };
         let windows_outcomes = run_windows_orchestration_stages_with_options(
@@ -8175,6 +8179,10 @@ fn run_windows_orchestration_with_pulled_bundles(
             .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
         anchor_platform: config
             .anchor_platform
+            .as_deref()
+            .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
+        validate_role_transition: config
+            .role_switch_platform
             .as_deref()
             .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
         ..WindowsOrchestrationOptions::default()
@@ -13044,6 +13052,13 @@ pub struct WindowsOrchestrationOptions {
     /// `exercise_windows_anchor_bundle_pull_live` to live-prove the anchor
     /// bundle-pull listener. Default (false) skips.
     pub anchor_platform: bool,
+    /// Elect the Windows host for the live role-transition proof
+    /// (`--role-switch-platform windows`). When true the orchestrator runs
+    /// `validate_windows_role_transition`: a real `TransitionKind::LocalOnly`
+    /// admin<->client flip via `rustynet role set` + a Windows service
+    /// restart, the macOS cell's Windows counterpart
+    /// (`CrossOsRoleSwitchPlan_2026-06-24.md`). Default (false) skips.
+    pub validate_role_transition: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14851,6 +14866,71 @@ fn run_windows_orchestration_stages_with_options(
         }
     };
 
+    // ── Stage: validate_windows_role_transition ──────────────────────────
+    //
+    // Prove the Windows node can transition roles LIVE (the Windows half of
+    // the previously "stage unbuilt" cross-OS role-transitions cell,
+    // `CrossOsRoleSwitchPlan_2026-06-24.md`; macOS half live-proven
+    // 2026-07-04 via `validate_macos_role_transition`): drive a real
+    // `TransitionKind::LocalOnly` admin<->client flip via `rustynet role set`
+    // + a `Restart-Service` reload, assert the new role via `role status`,
+    // run `state refresh`, and assert mesh peers did not regress across the
+    // flip. Runs only when elected (--role-switch-platform windows); else
+    // Skips. FAIL-LOUD: the live result is the stage status.
+    let windows_role_transition_log_path = logs_dir.join("validate_windows_role_transition.log");
+    let windows_role_transition_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_role_transition",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would drive a live admin<->client role transition on {windows_alias}"
+            ),
+            vec![],
+        )
+    } else if !options.validate_role_transition {
+        stage_outcome(
+            "validate_windows_role_transition",
+            VmLabStageStatus::Skipped,
+            format!(
+                "skipped: {windows_alias} is not elected for role transition (role_switch_platform != windows)"
+            ),
+            vec![],
+        )
+    } else if mesh_join_outcome.status != VmLabStageStatus::Pass {
+        stage_outcome(
+            "validate_windows_role_transition",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_mesh_join did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        match exercise_windows_role_transition_live(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&windows_role_transition_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_windows_role_transition",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![windows_role_transition_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&windows_role_transition_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_windows_role_transition",
+                    VmLabStageStatus::Fail,
+                    format!("Windows role transition failed for {windows_alias}: {reason}"),
+                    vec![windows_role_transition_log_path.clone()],
+                )
+            }
+        }
+    };
+
     // Tier-2: Windows audit stages (pure-Rust protocol checks)
     let windows_mesh_join_pass = mesh_join_outcome.status == VmLabStageStatus::Pass;
     let windows_membership_revoke_log_path =
@@ -15007,6 +15087,7 @@ fn run_windows_orchestration_stages_with_options(
         windows_relay_lifecycle_outcome,
         windows_anchor_bundle_pull_outcome,
         windows_admin_issue_outcome,
+        windows_role_transition_outcome,
         amend_membership_outcome,
         issue_windows_assignment_outcome,
         distribute_membership_outcome,
@@ -15166,6 +15247,148 @@ fn exercise_windows_admin_issue_live(
         "Windows admin live-proven on {windows_alias}: node_id={node_id} {}",
         out.trim()
     ))
+}
+
+/// Prove a Windows node can transition roles LIVE via the `TransitionKind::
+/// LocalOnly` admin<->client pair — the Windows half of the previously
+/// "stage unbuilt" cross-OS role-transitions cell
+/// (`CrossOsRoleSwitchPlan_2026-06-24.md`; macOS half live-proven
+/// 2026-07-04 via `exercise_macos_role_transition_live`, whose before/after
+/// mesh-peer-regression design this mirrors). Drives the actual `rustynet
+/// role set <to>` CLI (the one hardened planner path), which on Windows
+/// writes the new role to the same env-file convention Linux uses
+/// (`DEFAULT_DAEMON_ENV_PATH`, `role_cli.rs`) — the Windows service only
+/// re-reads it at startup, so this stage is the operator that restarts it
+/// (`Restart-Service`-equivalent stop/start, mirroring
+/// `daemon_restart_instruction_for_os("windows")`). Asserts the daemon
+/// reports the new role post-restart, runs `state refresh` (the single
+/// verified `refresh_signed_state_with_reason` apply path), and asserts
+/// mesh peers did not regress across the flip rather than requiring an
+/// absolute floor (a `--skip-linux-live-suite` run can legitimately have
+/// zero live peers throughout — see the macOS stage's doc comment for why).
+/// FAIL-LOUD: the live result is the stage status; an unexpected
+/// before-role is a Fail, not a silent Skip. `SignedMembership`-kind
+/// transitions (capability changes) are a separate increment.
+fn exercise_windows_role_transition_live(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let windows_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == windows_alias)
+        .ok_or_else(|| format!("Windows alias {windows_alias:?} not found in inventory"))?
+        .clone();
+    if windows_entry.platform_profile().platform != VmGuestPlatform::Windows {
+        return Err(format!(
+            "alias {windows_alias} resolved to non-Windows platform: {}",
+            windows_entry.platform_profile().platform.as_str()
+        ));
+    }
+    let target = remote_target_from_inventory_entry(&windows_entry, None);
+
+    let (before_peer_count, before_mesh_summary) = windows_mesh_peer_count(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+    )
+    .map_err(|e| format!("pre-transition mesh status check on {windows_alias} failed: {e}"))?;
+
+    let role_transition_script = "$ErrorActionPreference='Stop'; \
+         $rn='C:\\Program Files\\RustyNet\\rustynet.exe'; \
+         $svc='RustyNet'; \
+         $before = & $rn role status; \
+         if($LASTEXITCODE -ne 0){throw 'role status (before) failed'}; \
+         $beforeLine = $before | Where-Object { $_ -match '^current role:' } | Select-Object -First 1; \
+         if(-not $beforeLine){throw 'could not find current role line in before status'}; \
+         $beforeRole = ($beforeLine -split '\\s+')[2]; \
+         if($beforeRole -eq 'admin'){ $target='client' } elseif($beforeRole -eq 'client'){ $target='admin' } else { throw \"unexpected before-role for LocalOnly admin<->client proof: $beforeRole\" }; \
+         & $rn role set $target; \
+         if($LASTEXITCODE -ne 0){throw \"role set $target failed\"}; \
+         Stop-Service -Name $svc -Force -ErrorAction Stop; \
+         Start-Sleep -Seconds 4; \
+         Start-Service -Name $svc -ErrorAction Stop; \
+         Start-Sleep -Seconds 8; \
+         $afterOk = $false; $afterStatus = $null; \
+         for($i=0; $i -lt 15; $i++){ \
+           try { \
+             $afterStatus = & $rn role status; \
+             if($LASTEXITCODE -eq 0){ \
+               $afterLine = $afterStatus | Where-Object { $_ -match \"^current role: $target\" } | Select-Object -First 1; \
+               if($afterLine){ $afterOk = $true; break }; \
+             } \
+           } catch {}; \
+           Start-Sleep -Seconds 2; \
+         }; \
+         if(-not $afterOk){ throw \"daemon did not report $target role after restart (before was $beforeRole): $afterStatus\" }; \
+         & $rn state refresh; \
+         if($LASTEXITCODE -ne 0){throw 'state refresh after role transition failed'}; \
+         Write-Output \"role transition proven: $beforeRole -> $target; service restart verified; state refresh ok\"";
+
+    let out = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        role_transition_script,
+        Duration::from_secs(120),
+    )
+    .map_err(|e| format!("Windows role transition on {windows_alias} failed: {e}"))?;
+
+    let (after_peer_count, after_mesh_summary) = windows_mesh_peer_count(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+    )
+    .map_err(|e| format!("post-transition mesh status check on {windows_alias} failed: {e}"))?;
+
+    if after_peer_count < before_peer_count {
+        return Err(format!(
+            "mesh connectivity regressed on {windows_alias} after the role transition: \
+             {before_peer_count} peer(s) before ({before_mesh_summary}), {after_peer_count} \
+             peer(s) after ({after_mesh_summary}) — a flip that silently drops peers must not \
+             read as a Pass"
+        ));
+    }
+
+    Ok(format!(
+        "Windows live role transition proven on {windows_alias}: {}; mesh peers before={before_peer_count} after={after_peer_count} ({after_mesh_summary})",
+        out.trim()
+    ))
+}
+
+/// Live peer count from the Windows node's mesh-status snapshot, alongside
+/// the human-readable evaluator summary. Mirrors `macos_mesh_peer_count` —
+/// used to detect a REGRESSION (peers dropped) around a role transition
+/// rather than enforcing an absolute floor.
+fn windows_mesh_peer_count(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(usize, String), String> {
+    let mesh_raw_json = run_windows_daemon_check_remote(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "windows-mesh-status-check",
+    )?;
+    let mesh_summary = evaluate_windows_mesh_join_report(windows_alias, mesh_raw_json.as_str())?;
+    let mesh_report: rustynetd::windows_mesh_status::WindowsMeshStatusReport =
+        serde_json::from_str(mesh_raw_json.as_str())
+            .map_err(|err| format!("parse windows-mesh-status-check JSON output failed: {err}"))?;
+    let peer_count = match &mesh_report.snapshot {
+        rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::Ok { peer_ids, .. } => {
+            peer_ids.len()
+        }
+        _ => 0,
+    };
+    Ok((peer_count, mesh_summary))
 }
 
 /// Path of the installed `rustynetd.exe` on Windows guests, mirroring
