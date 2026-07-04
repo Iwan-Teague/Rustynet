@@ -2613,7 +2613,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "diagnose_live_lab_failure".into(),
-                description: "Deep triage of a failed run. `ops vm-lab-diagnose-live-lab-failure`. Only report_dir is required — profile is auto-resolved from the run's matrix row (orchestrate runs generate it internally); pass profile only to override.".into(),
+                description: "Deep SSH-into-nodes triage of a failed run. `ops vm-lab-diagnose-live-lab-failure`. Only report_dir is required — profile is auto-resolved from the run's matrix row (bash setup runs generate one internally); pass profile only to override. NOTE: a Rust --node run records NO profile, so this SSH-triage path is unavailable for it — triage a profile-less run from its report dir instead with read_report_artifact(failure_digest.json) + get_stage_log + grep_report + explain_stage (the tool returns this guidance when no profile is resolvable).".into(),
                 input_schema: json_schema_object(
                     json!({
                         "report_dir": json_schema_string("Report directory of the failed run (from start_live_lab_run / get_job_status)"),
@@ -2650,6 +2650,13 @@ impl McpServer for LabStateServer {
                         "skip_gates": json_schema_boolean("Skip gate stages"),
                         "skip_soak": json_schema_boolean("Skip soak stages"),
                         "skip_cross_network": json_schema_boolean("Skip cross-network stages"),
+                        "exit_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the EXIT role so the focused mac/win exit cell runs live instead of skipping."),
+                        "relay_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the RELAY role."),
+                        "anchor_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the ANCHOR role."),
+                        "admin_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the ADMIN role."),
+                        "blind_exit_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos) into the BLIND_EXIT role (irreversible; Windows unsupported by design)."),
+                        "macos_promote_exit": json_schema_boolean("orchestrate: Option-B macOS secondary-exit selector — promote the macOS node to an active exit."),
+                        "skip_linux_live_suite": json_schema_boolean("orchestrate: skip the ~30-45 min Linux live-validation suite and jump to the mac/win role stages after setup. Pair with a role-platform selector to drive ONE mac/win cell fast."),
                     }),
                     vec![],
                 ),
@@ -3138,8 +3145,20 @@ impl McpServer for LabStateServer {
                     }
                 };
                 if profile_owned.is_empty() {
+                    // A Rust --node run records no profile (bash setup generates
+                    // one; the Rust path does not). The SSH-into-nodes deep triage
+                    // needs a profile, but a profile-less run's report dir already
+                    // carries everything needed to triage — point the operator at
+                    // the tools that work on it directly (Bucket 5).
                     return tool_error(
-                        "No 'profile' given and none recorded in the report dir's matrix row (profile_path); pass profile explicitly.",
+                        "This run has no profile (a Rust --node run does not generate one; bash \
+                         setup runs do). Deep SSH-into-nodes triage requires a profile. For a \
+                         profile-less run, triage from the report dir directly with the tools that \
+                         work on it: read_report_artifact(\"failure_digest.json\") for the \
+                         structured first failure, get_stage_log(<first_failed_stage>) for its full \
+                         log, grep_report(<pattern>) across all logs/artifacts, and \
+                         explain_stage(<stage>) for the owning file + likely causes. Or pass \
+                         `profile` explicitly to force the SSH-triage path.",
                     );
                 }
                 let report_dir = match self.ensure_report_dir(report_dir_arg) {
@@ -3324,6 +3343,29 @@ impl LabStateServer {
                 if !rebuild.is_empty() {
                     cli.push("--rebuild-nodes".into());
                     cli.push(rebuild.join(","));
+                }
+                // Role-platform selectors (Bucket 5): ELECT an OS into a role so
+                // the focused mac/win cell runs live instead of skipping — parity
+                // with the CLI + DeepSeek MCP. Values (linux|macos|windows) are
+                // validated by the CLI parser. macos_promote_exit is the Option-B
+                // macOS secondary-exit selector; skip_linux_live_suite jumps to
+                // the mac/win role stages after setup.
+                for (flag, key) in [
+                    ("--exit-platform", "exit_platform"),
+                    ("--relay-platform", "relay_platform"),
+                    ("--anchor-platform", "anchor_platform"),
+                    ("--admin-platform", "admin_platform"),
+                    ("--blind-exit-platform", "blind_exit_platform"),
+                ] {
+                    if let Some(v) = arg_str(args, key) {
+                        cli.extend([flag.into(), v.into()]);
+                    }
+                }
+                if arg_bool(args, "macos_promote_exit") {
+                    cli.push("--macos-promote-exit".into());
+                }
+                if arg_bool(args, "skip_linux_live_suite") {
+                    cli.push("--skip-linux-live-suite".into());
                 }
             }
             "run" => {
