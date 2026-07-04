@@ -2131,6 +2131,59 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_stages_doc_matches_the_rust_planbuilder() {
+        // Anti-drift gate: this server's ORCHESTRATOR_STAGES discovery table (the
+        // one get_orchestrator_stages returns) must list EXACTLY the Rust
+        // PlanBuilder's stages (StageId::ALL), in order. When a stage is added to
+        // the plan — e.g. Bucket 1 ports the security suite / mac-win stages —
+        // update the ORCHESTRATOR_STAGES table too; this test is the forcing
+        // function so the hand-maintained doc can't silently rot. Source of truth:
+        // crates/rustynet-cli/src/vm_lab/orchestrator/stage/mod.rs (StageId::ALL)
+        // + orchestrator/plan.rs (PlanBuilder::build).
+        const EXPECTED: &[&str] = &[
+            "preflight",
+            "prepare_source_archive",
+            "verify_ssh_reachability",
+            "cleanup_hosts",
+            "bootstrap_hosts",
+            "collect_pubkeys",
+            "membership_init",
+            "distribute_membership",
+            "anchor_validation",
+            "distribute_assignments",
+            "distribute_traversal",
+            "distribute_dns_zone",
+            "enforce_baseline_runtime",
+            "validate_baseline_runtime",
+            "deploy_relay_service",
+            "relay_validation",
+            "traffic_test_matrix",
+            "role_switch_matrix",
+            "exit_handoff",
+            "active_exit",
+            "cleanup",
+        ];
+        // Parse the numbered "| N | `stage` | ... |" rows out of the doc table.
+        let doc_stages: Vec<String> = ORCHESTRATOR_STAGES
+            .lines()
+            .filter_map(|line| {
+                let cells: Vec<&str> = line.split('|').collect();
+                // A stage row has a numeric first cell and a backticked stage
+                // name in the second (skips the header + separator rows).
+                if cells.len() < 3 || cells[1].trim().parse::<u32>().is_err() {
+                    return None;
+                }
+                Some(cells[2].trim().trim_matches('`').to_owned())
+            })
+            .collect();
+        assert_eq!(
+            doc_stages, EXPECTED,
+            "ORCHESTRATOR_STAGES in repo_context.rs drifted from the Rust PlanBuilder \
+             (StageId::ALL). Update the discovery table to match the plan."
+        );
+    }
+
+    #[test]
     fn transition_client_exit_is_signed_with_exit_cap() {
         let p = plan_transition(Preset::Client, Preset::Exit);
         assert_eq!(p.kind, TransitionKind::SignedMembership);
