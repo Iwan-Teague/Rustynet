@@ -26419,6 +26419,19 @@ fn live_lab_matrix_stage_outcomes_from_vm_lab(
         .collect()
 }
 
+/// Read `run_note` from `<report_dir>/run_summary.json` if present (Bucket 2:
+/// so the finalize-path run-matrix row carries the note instead of dropping it —
+/// the Rust `--node` path now writes run_summary.json, and bash focused wrappers
+/// that write one benefit identically). Absent/unparseable/empty → None.
+fn read_run_note_from_summary(report_dir: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(report_dir.join("run_summary.json")).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+    val.get("run_note")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 fn append_live_lab_run_matrix_for_command(
     command_name: &str,
     report_dir: &Path,
@@ -26433,7 +26446,7 @@ fn append_live_lab_run_matrix_for_command(
         profile_path,
         inventory_path,
         extra_stage_outcomes: matrix_outcomes.as_slice(),
-        notes: None,
+        notes: read_run_note_from_summary(report_dir),
         // Focused wrappers are single-writer runs: their one row is final.
         row_role: LiveLabRunMatrixRowRole::Final,
     })
@@ -47185,6 +47198,13 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         let note = summary["run_note"].as_str().unwrap_or_default();
         assert!(note.contains("rust --node"), "run_note: {note}");
         assert!(note.contains("failed=1"), "run_note: {note}");
+
+        // Bucket 2 second half: the finalize run-matrix appender reads this note
+        // back (previously hardcoded notes:None, dropping it for --node runs).
+        assert_eq!(
+            super::read_run_note_from_summary(&tmp).as_deref(),
+            Some(note)
+        );
 
         fs::remove_dir_all(&tmp).ok();
     }
