@@ -783,6 +783,13 @@ pub const STAGES: &[StageSpec] = &[
         ..DEFAULT_SPEC
     },
     StageSpec {
+        name: "validate_macos_anchor_port_mapping_authority",
+        stream: PlatformStream::Macos,
+        enable: EnableRule::AnchorPlatform("macos"),
+        budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
         name: "validate_macos_admin_issue",
         stream: PlatformStream::Macos,
         enable: EnableRule::AdminPlatform("macos"),

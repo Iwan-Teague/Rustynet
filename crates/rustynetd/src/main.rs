@@ -349,6 +349,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "macos-mesh-status-check" => {
                 run_macos_mesh_status_check_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "anchor-port-mapping-status-check" => {
+                run_anchor_port_mapping_status_check_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "macos-dns-failclosed-check" => {
                 run_macos_dns_failclosed_check_command(rest)
             }
@@ -1583,6 +1586,81 @@ fn run_macos_mesh_status_check_command(args: &[String]) -> Result<(), String> {
         return Err(format!(
             "macos-mesh-status-check failed for {}: {}",
             report.state_path,
+            if report.drift_reasons.is_empty() {
+                "no drift_reasons recorded".to_owned()
+            } else {
+                report.drift_reasons.join("; ")
+            }
+        ));
+    }
+    Ok(())
+}
+
+/// Reads the persisted membership snapshot fresh and reports the
+/// Pin-then-Seniority `anchor.port_mapping_authoritative` election result
+/// (`gossip_runtime::anchor_runtime_view_from_membership`), which was
+/// previously only visible internally to `port_mapping_bring_up_skip_reason`.
+/// `--self-node-id` is required — the caller (the live-lab orchestrator)
+/// already knows the target node's id and passes it in, since this is a
+/// one-shot check with no access to the running daemon's own argv.
+fn run_anchor_port_mapping_status_check_command(args: &[String]) -> Result<(), String> {
+    use rustynetd::anchor_port_mapping_status::{
+        AnchorPortMappingStatusOptions, collect_anchor_port_mapping_status_report,
+    };
+
+    let mut fail_on_drift = true;
+    let mut snapshot_path: Option<std::path::PathBuf> = None;
+    let mut self_node_id: Option<String> = None;
+    let mut expect_self_authority = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some("--expect-self-authority") => {
+                expect_self_authority = true;
+                index += 1;
+            }
+            Some("--snapshot-path") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--snapshot-path requires a value".to_owned())?;
+                snapshot_path = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            Some("--self-node-id") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--self-node-id requires a value".to_owned())?;
+                self_node_id = Some(value.clone());
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown anchor-port-mapping-status-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let self_node_id = self_node_id.ok_or_else(|| "--self-node-id is required".to_owned())?;
+    let options = AnchorPortMappingStatusOptions {
+        snapshot_path,
+        self_node_id,
+        expect_self_authority,
+    };
+    let report = collect_anchor_port_mapping_status_report(&options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize anchor-port-mapping-status report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(format!(
+            "anchor-port-mapping-status-check failed for {}: {}",
+            report.membership_snapshot_path,
             if report.drift_reasons.is_empty() {
                 "no drift_reasons recorded".to_owned()
             } else {
@@ -4091,6 +4169,7 @@ fn help_text() -> String {
         "  rustynetd windows-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-name <name>] [--tunnel-alias <name>]",
         "  rustynetd windows-killswitch-assert [daemon options] [--no-fail-on-drift]",
         "  rustynetd windows-backend-readiness-check [--no-fail-on-drift]",
+        "  rustynetd anchor-port-mapping-status-check --self-node-id <id> [--snapshot-path <path>] [--expect-self-authority] [--no-fail-on-drift]",
         "  rustynetd --emit-phase1-baseline <path>",
         "",
         "defaults:",
