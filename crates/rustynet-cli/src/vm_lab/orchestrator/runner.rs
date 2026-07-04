@@ -5,6 +5,23 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageId};
 
+/// Notified as each stage starts and finishes so a caller can emit realtime
+/// per-stage status (the recorder's `running`/terminal `stages.tsv` rows)
+/// WITHOUT the runner depending on the recording layer. `stage_started` fires
+/// immediately before a stage executes; `stage_finished` fires for every
+/// stage including the skip-cascade branches (which never "start").
+pub trait StageObserver {
+    fn stage_started(&self, id: &StageId);
+    fn stage_finished(&self, id: &StageId, outcome: &StageOutcome);
+}
+
+/// The default observer for callers (and tests) that don't record realtime.
+struct NoopObserver;
+impl StageObserver for NoopObserver {
+    fn stage_started(&self, _id: &StageId) {}
+    fn stage_finished(&self, _id: &StageId, _outcome: &StageOutcome) {}
+}
+
 /// Drives stages in dependency order with skip-cascade.
 ///
 /// Skip-cascade rule: if a stage fails or is skipped, every stage that lists
@@ -31,6 +48,17 @@ impl StateMachineRunner {
     /// Execute all stages in dependency order, applying skip-cascade.
     /// Returns a list of (`StageId`, `StageOutcome`) in execution order.
     pub fn run(&self, ctx: &mut OrchestrationContext) -> Vec<(StageId, StageOutcome)> {
+        self.run_with_observer(ctx, &NoopObserver)
+    }
+
+    /// Like [`run`](Self::run) but notifies `observer` of each stage's start
+    /// (before execute) and finish (after outcome, including skips) — the seam
+    /// the `--node` path uses to emit realtime `stages.tsv` rows.
+    pub fn run_with_observer(
+        &self,
+        ctx: &mut OrchestrationContext,
+        observer: &dyn StageObserver,
+    ) -> Vec<(StageId, StageOutcome)> {
         let ordered = topological_order(&self.stages);
         let mut results: Vec<(StageId, StageOutcome)> = Vec::new();
         let mut blocked: HashSet<StageId> = self.explicit_skips.clone();
@@ -40,6 +68,7 @@ impl StateMachineRunner {
             let id = stage.id();
 
             if blocked.contains(&id) {
+                observer.stage_finished(&id, &StageOutcome::Skipped);
                 results.push((id.clone(), StageOutcome::Skipped));
                 ctx.record_outcome(id, StageOutcome::Skipped);
                 continue;
@@ -54,17 +83,20 @@ impl StateMachineRunner {
 
             if dep_blocked {
                 blocked.insert(id.clone());
+                observer.stage_finished(&id, &StageOutcome::Skipped);
                 results.push((id.clone(), StageOutcome::Skipped));
                 ctx.record_outcome(id, StageOutcome::Skipped);
                 continue;
             }
 
+            observer.stage_started(&id);
             let outcome = stage.execute(ctx);
 
             if outcome.is_blocking() {
                 blocked.insert(id.clone());
             }
 
+            observer.stage_finished(&id, &outcome);
             ctx.record_outcome(id.clone(), outcome.clone());
             results.push((id, outcome));
         }
@@ -219,6 +251,60 @@ mod tests {
             outcome_of(&StageId::VerifySshReachability),
             Some(&StageOutcome::Skipped),
             "stage depending on failed stage must be skipped"
+        );
+    }
+
+    #[test]
+    fn observer_sees_start_then_finish_for_executed_stages_and_only_finish_for_skips() {
+        use std::cell::RefCell;
+        #[derive(Default)]
+        struct RecordingObserver {
+            events: RefCell<Vec<(String, &'static str)>>,
+        }
+        impl StageObserver for RecordingObserver {
+            fn stage_started(&self, id: &StageId) {
+                self.events.borrow_mut().push((id.as_str().to_owned(), "start"));
+            }
+            fn stage_finished(&self, id: &StageId, _outcome: &StageOutcome) {
+                self.events.borrow_mut().push((id.as_str().to_owned(), "finish"));
+            }
+        }
+
+        // A (fail) → B (skipped via cascade); C (pass, independent).
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            fail_stage(StageId::Preflight, vec![]),
+            pass_stage(StageId::PrepareSourceArchive, vec![StageId::Preflight]),
+            pass_stage(StageId::CleanupHosts, vec![]),
+        ];
+        let runner = StateMachineRunner::new(stages);
+        let mut ctx = make_ctx();
+        let observer = RecordingObserver::default();
+        runner.run_with_observer(&mut ctx, &observer);
+        let events = observer.events.borrow();
+
+        // An executed stage emits start then finish.
+        for executed in ["preflight", "cleanup_hosts"] {
+            let start = events.iter().position(|(n, e)| n == executed && *e == "start");
+            let finish = events.iter().position(|(n, e)| n == executed && *e == "finish");
+            assert!(start.is_some(), "{executed} must start");
+            assert!(
+                start < finish,
+                "{executed}: start must precede finish (start={start:?} finish={finish:?})"
+            );
+        }
+        // A cascade-skipped stage finishes without ever starting — so no stray
+        // `running` row is left behind.
+        assert!(
+            !events
+                .iter()
+                .any(|(n, e)| n == "prepare_source_archive" && *e == "start"),
+            "a skipped stage must never emit a start (running) event"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(n, e)| n == "prepare_source_archive" && *e == "finish"),
+            "a skipped stage must still emit a finish (terminal) event"
         );
     }
 

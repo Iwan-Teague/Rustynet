@@ -6,6 +6,7 @@ mod live_lab_coverage;
 mod live_lab_results;
 mod live_lab_run_matrix;
 mod live_lab_stage_manifest;
+mod live_lab_stage_recorder;
 mod live_lab_stage_registry;
 mod llm_cli;
 mod ops_cross_network_preflight;
