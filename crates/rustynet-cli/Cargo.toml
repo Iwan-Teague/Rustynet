@@ -9,6 +9,10 @@ default-run = "rustynet-cli"
 [features]
 chaos-forger = []
 
+[lib]
+name = "rustynet_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "live_signed_bundle_forger"
 path = "src/bin/live_signed_bundle_forger.rs"

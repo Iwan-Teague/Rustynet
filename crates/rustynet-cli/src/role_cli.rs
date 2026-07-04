@@ -259,6 +259,17 @@ pub const DEFAULT_DAEMON_ENV_PATH: &str = "/etc/default/rustynetd";
 /// `REVIEWED_LAUNCHDAEMON_PLIST` in `rustynetd::macos_service_hardening`.
 pub const MACOS_DAEMON_PLIST_PATH: &str = "/Library/LaunchDaemons/com.rustynet.daemon.plist";
 
+/// Windows daemon env-file path (`Install-RustyNetWindowsService.ps1`'s
+/// `$StateRoot\config\rustynetd.env`, `$StateRoot` defaulting to
+/// `C:\ProgramData\RustyNet`). Unlike Linux, whose env file is
+/// `KEY=value` lines, the Windows file embeds the daemon's full argv
+/// inside a single `RUSTYNETD_DAEMON_ARGS_JSON=[...]` JSON array
+/// (`rustynetd::windows_service::load_windows_service_runtime_input`),
+/// so `role set` rewrites the array's `--node-role` element in place
+/// (see [`rewrite_windows_daemon_env_node_role`]) rather than a
+/// line-oriented key.
+pub const WINDOWS_DAEMON_ENV_PATH: &str = r"C:\ProgramData\RustyNet\config\rustynetd.env";
+
 /// Per-OS default for the file `role set` rewrites to persist the
 /// daemon's primary role across a restart. Mirrors the
 /// [`platform_default_role_audit_log_path`] pattern so the CLI lands
@@ -268,8 +279,12 @@ pub const MACOS_DAEMON_PLIST_PATH: &str = "/Library/LaunchDaemons/com.rustynet.d
 ///   `rustynetd.service` substitutes `RUSTYNET_NODE_ROLE` from that
 ///   file into `--node-role`, so rewriting the file changes the role
 ///   the daemon reads on the next restart.
-/// - Windows: the same env-file convention (`DEFAULT_DAEMON_ENV_PATH`),
-///   preserved unchanged.
+/// - Windows: [`WINDOWS_DAEMON_ENV_PATH`] — a *different* file whose
+///   role lives inside the `RUSTYNETD_DAEMON_ARGS_JSON` JSON array, not
+///   a `KEY=value` line. Treating it like the Linux env file silently
+///   no-ops the rewrite (the daemon never reads a bare `NODE_ROLE=`
+///   line), so Windows gets its own path and its own pure rewrite
+///   function ([`rewrite_windows_daemon_env_node_role`]).
 /// - macOS: launchd does **not** expand `EnvironmentVariables` into
 ///   `ProgramArguments`, and the daemon resolves its role only from the
 ///   `--node-role` argv pair (`rustynetd` has no env-var role
@@ -290,6 +305,7 @@ pub fn platform_default_daemon_env_path() -> &'static str {
 fn daemon_env_path_for_os(target_os: &str) -> &'static str {
     match target_os {
         "macos" => MACOS_DAEMON_PLIST_PATH,
+        "windows" => WINDOWS_DAEMON_ENV_PATH,
         _ => DEFAULT_DAEMON_ENV_PATH,
     }
 }
@@ -404,6 +420,75 @@ fn replace_string_tag_value(line: &str, new_value: &str) -> Option<String> {
     rewritten.push_str(new_value);
     rewritten.push_str(&line[value_end..]);
     Some(rewritten)
+}
+
+/// Rewrite the Windows daemon env file so the daemon comes up as
+/// `new_role` on its next service restart.
+///
+/// Unlike Linux's `KEY=value` line format, the Windows env file
+/// ([`WINDOWS_DAEMON_ENV_PATH`]) embeds the daemon's full argv inside
+/// one `RUSTYNETD_DAEMON_ARGS_JSON=[...]` JSON array (see
+/// `rustynetd::windows_service::load_windows_service_runtime_input`).
+/// The daemon reads its primary role only from the `--node-role
+/// <value>` pair inside that array, so the rewrite replaces the array
+/// element that follows `--node-role`, re-encodes the array, and
+/// leaves every other line (comments, other env vars) untouched
+/// byte-for-byte.
+///
+/// Pure (no I/O) so the rewrite is unit-testable; the filesystem
+/// wrapper that reads, atomically writes, and fail-closes on a missing
+/// `--node-role` entry lives next to `update_node_role_env_file` in
+/// `main.rs` (and its Windows-CLI counterpart in `src/bin/`).
+///
+/// Returns `(rewritten_env_file, node_role_replaced)`.
+/// `node_role_replaced == false` means the `RUSTYNETD_DAEMON_ARGS_JSON`
+/// line was missing, malformed, or had no `--node-role` entry — the
+/// caller must treat that as a fail-closed error rather than write a
+/// role the daemon will not read.
+pub fn rewrite_windows_daemon_env_node_role(env_file: &str, new_role: &str) -> (String, bool) {
+    const KEY: &str = "RUSTYNETD_DAEMON_ARGS_JSON=";
+    let mut out = String::with_capacity(env_file.len() + new_role.len());
+    let mut replaced = false;
+
+    for line in env_file.split_inclusive('\n') {
+        let (content, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+
+        if let Some(json_array) = content.strip_prefix(KEY)
+            && let Some(rewritten_json) =
+                replace_node_role_in_daemon_args_json(json_array, new_role)
+        {
+            out.push_str(KEY);
+            out.push_str(&rewritten_json);
+            out.push_str(newline);
+            replaced = true;
+            continue;
+        }
+        // Line didn't match KEY, or the JSON was malformed or had no
+        // --node-role entry: fall through unchanged so the caller sees
+        // replaced == false and fails closed instead of silently
+        // leaving the primary role stale.
+
+        out.push_str(content);
+        out.push_str(newline);
+    }
+
+    (out, replaced)
+}
+
+/// Parse `json_array` as a JSON array of strings, replace the element
+/// immediately after `--node-role` with `new_role`, and re-encode.
+/// Returns `None` if the array does not parse or has no `--node-role`
+/// entry (or that entry has no following value), so the caller can
+/// fail closed rather than guess.
+fn replace_node_role_in_daemon_args_json(json_array: &str, new_role: &str) -> Option<String> {
+    let mut args: Vec<String> = serde_json::from_str(json_array).ok()?;
+    let index = args.iter().position(|arg| arg == "--node-role")?;
+    let value = args.get_mut(index + 1)?;
+    *value = new_role.to_owned();
+    serde_json::to_string(&args).ok()
 }
 
 /// Resolve the current preset from a daemon status line.
@@ -1708,16 +1793,108 @@ mod tests {
     // ----- per-OS daemon role-persistence target + restart instruction -----
 
     #[test]
-    fn daemon_env_path_is_the_launchd_plist_on_macos_and_env_file_elsewhere() {
+    fn daemon_env_path_is_the_launchd_plist_on_macos_json_array_on_windows_and_env_file_on_linux() {
         // macOS persists the role in the launchd plist (the daemon reads
-        // --node-role from argv; no env-file fallback). Linux/Windows use the
-        // env file. Regression guard: a macОS env-file write would land at
-        // /etc/default/ which does not exist on the guest.
+        // --node-role from argv; no env-file fallback). Windows persists it
+        // inside the RUSTYNETD_DAEMON_ARGS_JSON array of its own env file —
+        // a DIFFERENT path and format than Linux's KEY=value env file.
+        // Regression guards: a macOS env-file write would land at
+        // /etc/default/ which does not exist on the guest, and a
+        // Linux-style line rewrite on Windows would silently append an
+        // inert NODE_ROLE= line instead of touching the JSON array the
+        // daemon actually reads.
         assert_eq!(daemon_env_path_for_os("macos"), MACOS_DAEMON_PLIST_PATH);
+        assert_eq!(daemon_env_path_for_os("windows"), WINDOWS_DAEMON_ENV_PATH);
         assert_eq!(daemon_env_path_for_os("linux"), DEFAULT_DAEMON_ENV_PATH);
-        assert_eq!(daemon_env_path_for_os("windows"), DEFAULT_DAEMON_ENV_PATH);
+        assert_ne!(WINDOWS_DAEMON_ENV_PATH, DEFAULT_DAEMON_ENV_PATH);
         // The live wrapper resolves a non-empty path for the build target.
         assert!(!platform_default_daemon_env_path().is_empty());
+    }
+
+    // ----- Windows daemon env-file (RUSTYNETD_DAEMON_ARGS_JSON) role rewrite -----
+
+    const SAMPLE_WINDOWS_ENV_FILE: &str = concat!(
+        "# reviewed Windows service config\n",
+        "RUSTYNETD_DAEMON_ARGS_JSON=[\"--backend\",\"windows-wireguard-nt\",\"--node-id\",\"windows-client-1\",\"--node-role\",\"client\"]\n",
+    );
+
+    #[test]
+    fn rewrite_windows_daemon_env_node_role_replaces_value_and_preserves_other_entries() {
+        let (out, replaced) =
+            rewrite_windows_daemon_env_node_role(SAMPLE_WINDOWS_ENV_FILE, "admin");
+        assert!(replaced, "expected --node-role to be replaced: {out}");
+        assert!(
+            out.contains(r#""--node-role","admin""#),
+            "rewritten JSON array must carry --node-role admin: {out}"
+        );
+        assert!(
+            out.contains(r#""--backend","windows-wireguard-nt""#),
+            "unrelated array entries must be preserved: {out}"
+        );
+        assert!(
+            out.contains(r#""--node-id","windows-client-1""#),
+            "node-id entry must be preserved: {out}"
+        );
+        assert!(!out.contains(r#""client""#), "no stale client role: {out}");
+        assert!(
+            out.contains("# reviewed Windows service config\n"),
+            "comment line must be preserved verbatim: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_windows_daemon_env_node_role_is_fail_closed_when_node_role_absent() {
+        let env_file = "RUSTYNETD_DAEMON_ARGS_JSON=[\"--backend\",\"windows-wireguard-nt\"]\n";
+        let (out, replaced) = rewrite_windows_daemon_env_node_role(env_file, "admin");
+        assert!(!replaced, "no --node-role entry means no replacement");
+        assert_eq!(out, env_file, "nothing may be mutated on fail-closed");
+    }
+
+    #[test]
+    fn rewrite_windows_daemon_env_node_role_is_fail_closed_when_node_role_has_no_value() {
+        let env_file =
+            "RUSTYNETD_DAEMON_ARGS_JSON=[\"--backend\",\"windows-wireguard-nt\",\"--node-role\"]\n";
+        let (out, replaced) = rewrite_windows_daemon_env_node_role(env_file, "admin");
+        assert!(
+            !replaced,
+            "trailing --node-role with no value must not replace"
+        );
+        assert_eq!(out, env_file);
+    }
+
+    #[test]
+    fn rewrite_windows_daemon_env_node_role_is_fail_closed_on_malformed_json() {
+        let env_file = "RUSTYNETD_DAEMON_ARGS_JSON=not-json\n";
+        let (out, replaced) = rewrite_windows_daemon_env_node_role(env_file, "admin");
+        assert!(!replaced);
+        assert_eq!(out, env_file);
+    }
+
+    #[test]
+    fn rewrite_windows_daemon_env_node_role_is_fail_closed_when_key_absent() {
+        let env_file = "# no daemon args json here\nSOME_OTHER_KEY=value\n";
+        let (out, replaced) = rewrite_windows_daemon_env_node_role(env_file, "admin");
+        assert!(!replaced);
+        assert_eq!(out, env_file);
+    }
+
+    #[test]
+    fn rewrite_windows_daemon_env_node_role_preserves_line_order_and_trailing_lines() {
+        let env_file = concat!(
+            "RUSTYNET_SOCKET=irrelevant-on-windows\n",
+            "RUSTYNETD_DAEMON_ARGS_JSON=[\"--node-role\",\"client\",\"--node-id\",\"windows-client-1\"]\n",
+            "TRAILING_KEY=kept\n",
+        );
+        let (out, replaced) = rewrite_windows_daemon_env_node_role(env_file, "admin");
+        assert!(replaced);
+        assert_eq!(
+            out,
+            concat!(
+                "RUSTYNET_SOCKET=irrelevant-on-windows\n",
+                "RUSTYNETD_DAEMON_ARGS_JSON=[\"--node-role\",\"admin\",\"--node-id\",\"windows-client-1\"]\n",
+                "TRAILING_KEY=kept\n",
+            )
+        );
     }
 
     #[test]

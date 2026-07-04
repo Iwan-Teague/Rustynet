@@ -1562,13 +1562,16 @@ function Build-RustyNet {
     }
 
     $cargoCommand = $cargoPath
-    # Build rustynetd (the Windows service host), the minimal Windows
-    # trust CLI used by Install-RustyNetWindowsService.ps1 to rotate
-    # per-host trust evidence under SYSTEM at install-release time, and
-    # rustynet-relay.exe for relay-owned live audits such as
-    # hello-limiter-audit. The full ops CLI remains Unix-oriented; this
-    # Windows CLI bin intentionally exposes only
-    # `rustynet trust keygen/export-verifier-key/issue`.
+    # Build rustynetd (the Windows service host), the Windows CLI binary
+    # used by Install-RustyNetWindowsService.ps1 to rotate per-host trust
+    # evidence under SYSTEM at install-release time, and rustynet-relay.exe
+    # for relay-owned live audits such as hello-limiter-audit. The full ops
+    # CLI (`rustynet-cli`'s default `main.rs` binary) remains Unix-oriented
+    # (it unconditionally depends on the `nix` crate), so this
+    # `rustynet-windows-trust-cli` binary is the Windows CLI: offline trust
+    # material (`trust keygen/export-verifier-key/issue`) plus, over the
+    # daemon's named-pipe control channel, `role status`/`role set`/
+    # `state refresh`.
     $daemonBuildArgs = @('build', '--locked', '--release', '-p', 'rustynetd')
     $trustCliBuildArgs = @('build', '--locked', '--release', '-p', 'rustynet-cli', '--bin', 'rustynet-windows-trust-cli')
     $relayBuildArgs = @('build', '--locked', '--release', '-p', 'rustynet-relay', '--features', 'daemon')

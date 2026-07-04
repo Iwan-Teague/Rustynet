@@ -28,7 +28,6 @@ mod ops_phase9;
 mod ops_security_audit;
 mod ops_security_audit_workflows;
 mod ops_write_daemon_env;
-mod role_cli;
 mod security_audit_catalog;
 mod vm_lab;
 
@@ -52,6 +51,7 @@ use crate::env_file::{format_env_assignment, parse_env_value};
 use ed25519_dalek::{Signer, SigningKey};
 use nix::unistd::{Gid, Group, Uid, User, chown};
 use rand::{TryRngCore, rngs::OsRng};
+use rustynet_cli::role_cli;
 use rustynet_control::membership::{
     MAX_MEMBERSHIP_SNAPSHOT_BYTES, MembershipApprover, MembershipApproverRole,
     MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipOperation,
@@ -15509,7 +15509,7 @@ fn send_command_with_socket(
     validate_control_socket_security(socket_path.as_path(), "daemon socket")?;
     let line = call_windows_daemon_control_raw(
         socket_path.as_path(),
-        command.as_wire(),
+        &command.as_wire(),
         Duration::from_secs(5),
     )?;
     Ok(IpcResponse::from_wire(&line))
@@ -17985,6 +17985,16 @@ fn execute_role_action(action: &role_cli::ConcreteAction) -> Result<String, Stri
                     new_primary,
                     env_path.display()
                 ))
+            } else if cfg!(target_os = "windows") {
+                // Windows embeds the daemon's argv (incl. --node-role) inside
+                // the RUSTYNETD_DAEMON_ARGS_JSON array of its own env file, not
+                // KEY=value lines — see role_cli::rewrite_windows_daemon_env_node_role.
+                update_node_role_windows_env_file(env_path, new_primary.as_str())?;
+                Ok(format!(
+                    "set --node-role {} in {} (service restart applies it)",
+                    new_primary,
+                    env_path.display()
+                ))
             } else {
                 update_node_role_env_file(env_path, new_primary.as_str())?;
                 Ok(format!(
@@ -18187,6 +18197,65 @@ fn update_node_role_env_file(env_path: &Path, new_role: &str) -> Result<(), Stri
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("rustynetd")
+    ));
+    std::fs::write(&tmp, updated.as_bytes())
+        .map_err(|err| format!("write {} failed: {err}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(env_path) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        } else {
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    std::fs::rename(&tmp, env_path).map_err(|err| {
+        format!(
+            "rename {} → {} failed: {err}",
+            tmp.display(),
+            env_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Windows counterpart of [`update_node_role_env_file`]. The Windows
+/// service env file embeds the daemon's full argv inside a single
+/// `RUSTYNETD_DAEMON_ARGS_JSON` JSON array rather than `KEY=value`
+/// lines, so a role change must rewrite the `--node-role` array element
+/// in place rather than a line — see
+/// [`role_cli::rewrite_windows_daemon_env_node_role`].
+///
+/// Fail-closed: a missing env file, malformed JSON, or an array with no
+/// `--node-role` entry returns `Err` rather than silently persisting a
+/// role the daemon will never read. The write is atomic (temp + rename).
+fn update_node_role_windows_env_file(env_path: &Path, new_role: &str) -> Result<(), String> {
+    let existing = std::fs::read_to_string(env_path).map_err(|err| {
+        format!(
+            "read {} failed (daemon not installed on this host?): {err}",
+            env_path.display()
+        )
+    })?;
+
+    let (updated, node_role_replaced) =
+        role_cli::rewrite_windows_daemon_env_node_role(&existing, new_role);
+    if !node_role_replaced {
+        return Err(format!(
+            "{}: RUSTYNETD_DAEMON_ARGS_JSON has no `--node-role` entry to update; \
+             refusing to persist a role the daemon will not read",
+            env_path.display()
+        ));
+    }
+
+    let parent = env_path
+        .parent()
+        .ok_or_else(|| format!("env path {} has no parent directory", env_path.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.role-update.tmp",
+        env_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("rustynetd.env")
     ));
     std::fs::write(&tmp, updated.as_bytes())
         .map_err(|err| format!("write {} failed: {err}", tmp.display()))?;
@@ -20654,8 +20723,8 @@ mod tests {
         render_launchd_plist, required_macos_tunnel_keychain_account,
         required_macos_tunnel_keychain_service, rewrite_assignment_refresh_exit_node,
         rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
-        update_node_role_env_file, update_node_role_macos_plist, validate_control_socket_security,
-        write_json_pretty_file,
+        update_node_role_env_file, update_node_role_macos_plist, update_node_role_windows_env_file,
+        validate_control_socket_security, write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
@@ -25161,7 +25230,7 @@ mod tests {
         );
     }
 
-    // ----- Linux/Windows role-set env-file persistence (update_node_role_env_file) -----
+    // ----- Linux role-set env-file persistence (update_node_role_env_file) -----
 
     #[test]
     fn update_node_role_env_file_replaces_existing_role_and_preserves_other_lines() {
@@ -25210,6 +25279,81 @@ mod tests {
             out.contains("RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock\n"),
             "{out}"
         );
+    }
+
+    // ----- Windows role-set env-file persistence (update_node_role_windows_env_file) -----
+
+    #[test]
+    fn update_node_role_windows_env_file_rewrites_json_array_and_preserves_other_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = dir.path().join("rustynetd.env");
+        std::fs::write(
+            &env,
+            concat!(
+                "# reviewed Windows service config\n",
+                "RUSTYNETD_DAEMON_ARGS_JSON=[\"--backend\",\"windows-wireguard-nt\",\"--node-id\",\"windows-client-1\",\"--node-role\",\"client\"]\n",
+            ),
+        )
+        .expect("write env");
+        update_node_role_windows_env_file(&env, "admin").expect("update should succeed");
+        let out = std::fs::read_to_string(&env).expect("read back");
+        assert!(
+            out.contains(r#""--node-role","admin""#),
+            "role updated in JSON array: {out}"
+        );
+        assert!(!out.contains(r#""client""#), "no stale role: {out}");
+        assert!(
+            out.contains(r#""--node-id","windows-client-1""#),
+            "unrelated array entries preserved: {out}"
+        );
+        assert!(
+            out.contains("# reviewed Windows service config\n"),
+            "comment line preserved: {out}"
+        );
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.contains("role-update.tmp"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "atomic rename must leave no temp: {strays:?}"
+        );
+    }
+
+    #[test]
+    fn update_node_role_windows_env_file_fails_closed_without_node_role_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = dir.path().join("rustynetd.env");
+        let body = "RUSTYNETD_DAEMON_ARGS_JSON=[\"--backend\",\"windows-wireguard-nt\"]\n";
+        std::fs::write(&env, body).expect("write env");
+        let err = update_node_role_windows_env_file(&env, "admin").expect_err("must fail closed");
+        assert!(
+            err.contains("--node-role"),
+            "error must name the missing entry: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&env).unwrap(),
+            body,
+            "the env file must be left unchanged on fail-closed"
+        );
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.contains("role-update.tmp"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "fail-closed must not leave a temp: {strays:?}"
+        );
+    }
+
+    #[test]
+    fn update_node_role_windows_env_file_fails_closed_on_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = dir.path().join("rustynetd.env");
+        let err = update_node_role_windows_env_file(&env, "admin").expect_err("must fail closed");
+        assert!(err.contains("read"), "error names the read failure: {err}");
     }
 
     // ---- RSA-0014: durable-audit fail-closed for security-sensitive transitions ----
