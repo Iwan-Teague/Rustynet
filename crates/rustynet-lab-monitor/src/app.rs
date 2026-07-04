@@ -660,6 +660,55 @@ impl App {
             .collect()
     }
 
+    /// Plain-text rendering of the current model — the stage grid (grouped,
+    /// with per-stage status + per-group passed/total), the active stage, and
+    /// VM roles — for the headless `--snapshot` mode. Lets a script or CI
+    /// verify what the TUI would show for the latest/active run without a real
+    /// terminal (Bucket 3, Full-Replacement DoD). Dialect-agnostic: it renders
+    /// whatever `planned_stage_groups()` (manifest-driven) + `stage_outcomes`
+    /// (orchestrate_result/stages.tsv) contain, so it works for a bash or a
+    /// Rust `--node` run identically.
+    pub fn snapshot_text(&self) -> String {
+        use std::fmt::Write as _;
+        let status_by_stage: std::collections::HashMap<&str, &str> = self
+            .stage_outcomes
+            .iter()
+            .map(|o| (o.stage.as_str(), o.status.as_str()))
+            .collect();
+        let mut out = String::new();
+        let _ = writeln!(out, "=== rustynet-lab-monitor snapshot ===");
+        let _ = writeln!(
+            out,
+            "active_stage: {}",
+            self.active_stage.as_deref().unwrap_or("-")
+        );
+        let _ = writeln!(out, "\nSTAGE GRID:");
+        for group in self.planned_stage_groups() {
+            let total = group.stages.len();
+            let passed = group
+                .stages
+                .iter()
+                .filter(|s| status_by_stage.get(s.as_str()) == Some(&"pass"))
+                .count();
+            let _ = writeln!(out, "  [{}] ({passed}/{total})", group.name);
+            for stage in &group.stages {
+                let status = status_by_stage.get(stage.as_str()).copied().unwrap_or("-");
+                let _ = writeln!(out, "    {stage:<34} {status}");
+            }
+        }
+        let _ = writeln!(out, "\nVM STATUS:");
+        for vm in &self.vm_statuses {
+            let _ = writeln!(
+                out,
+                "  {:<20} {:<9} role={}",
+                vm.alias,
+                vm.platform,
+                self.role_for_vm(&vm.alias)
+            );
+        }
+        out
+    }
+
     /// Enabled stages the serial pipeline has provably advanced PAST but
     /// which never recorded a terminal outcome of their own -- conditional
     /// infra like `restart_unready_vms` / `rediscover_local_utm` /

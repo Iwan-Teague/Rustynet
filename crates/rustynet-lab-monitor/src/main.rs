@@ -113,6 +113,23 @@ fn main() -> Result<()> {
 
     init_logging(&repo_root)?;
 
+    // Headless snapshot mode: build the model, refresh once, print what the TUI
+    // would render for the latest/active run, and exit — no terminal required
+    // (Bucket 3, Full-Replacement DoD). Enables scripted / CI verification of
+    // the monitor's data (works identically for a bash or a Rust --node run).
+    if args.iter().any(|a| a == "--snapshot") {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime")?;
+        return rt.block_on(async {
+            let mut app = app::App::new(repo_root.clone())?;
+            app.refresh_state().await;
+            print!("{}", app.snapshot_text());
+            Ok(())
+        });
+    }
+
     // Set panic hook to restore terminal before printing panic
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
