@@ -41,6 +41,23 @@ pub struct StageManifest {
     pub run_mode: String,
     pub selectors: ManifestSelectors,
     pub stages: Vec<ManifestStage>,
+    /// The node→role topology this run was launched with (the Rust `--node`
+    /// path's explicit assignments). Emitted so a consumer — chiefly the
+    /// monitor — can show THIS run's live roles instead of inferring them from
+    /// the previous finalized run's matrix row. Empty on the bash/wrapper path
+    /// (whose topology comes from selectors + inventory, not `--node`).
+    #[serde(default)]
+    pub node_assignments: Vec<ManifestNodeAssignment>,
+}
+
+/// One `<alias>:<role>` assignment from a Rust `--node` run, recorded in the
+/// manifest so consumers render the current run's topology (emit-don't-infer).
+/// Platform is intentionally absent — a consumer already knows each alias's OS
+/// from the inventory; the run only adds the role.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ManifestNodeAssignment {
+    pub alias: String,
+    pub role: String,
 }
 
 /// Snapshot of the selectors the plan was resolved from — recorded so a
@@ -191,6 +208,9 @@ pub fn build_stage_manifest(
         run_mode: run_mode.to_owned(),
         selectors: ManifestSelectors::from(selectors),
         stages,
+        // Populated by the Rust `--node` path via
+        // `ensure_stage_manifest_with_plan`; empty on the bash/wrapper path.
+        node_assignments: Vec::new(),
     }
 }
 
@@ -271,12 +291,14 @@ pub fn ensure_stage_manifest_with_plan(
     run_mode: &str,
     selectors: &TargetSelectors,
     active_plan: &std::collections::HashSet<String>,
+    node_assignments: &[ManifestNodeAssignment],
 ) -> Result<(PathBuf, bool), String> {
     let path = report_dir.join(STAGE_MANIFEST_RELATIVE_PATH);
     if path.exists() {
         return Ok((path, false));
     }
-    let manifest = build_stage_manifest(run_command, run_mode, selectors, Some(active_plan));
+    let mut manifest = build_stage_manifest(run_command, run_mode, selectors, Some(active_plan));
+    manifest.node_assignments = node_assignments.to_vec();
     let path = write_stage_manifest(report_dir, &manifest)?;
     Ok((path, true))
 }
@@ -554,6 +576,49 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    }
+
+    #[test]
+    fn rust_plan_manifest_records_node_assignments_and_round_trips() {
+        // The Rust `--node` path records its node->role topology so the monitor
+        // renders the CURRENT run's roles (emit-don't-infer). build_stage_manifest
+        // itself defaults it empty; ensure_stage_manifest_with_plan injects it.
+        let dir = tempfile::tempdir().unwrap();
+        let plan = rust_plan();
+        let assignments = vec![
+            ManifestNodeAssignment {
+                alias: "debian-headless-1".to_owned(),
+                role: "exit".to_owned(),
+            },
+            ManifestNodeAssignment {
+                alias: "debian-headless-3".to_owned(),
+                role: "client".to_owned(),
+            },
+        ];
+        let (_, written) = ensure_stage_manifest_with_plan(
+            dir.path(),
+            "vm-lab-orchestrate-live-lab",
+            "full",
+            &TargetSelectors::default(),
+            &plan,
+            &assignments,
+        )
+        .expect("emit manifest");
+        assert!(written);
+        let manifest = read_stage_manifest(dir.path())
+            .expect("read manifest")
+            .expect("manifest present");
+        assert_eq!(manifest.node_assignments, assignments);
+
+        // The bash/wrapper path (build_stage_manifest directly, or the
+        // no-plan ensure) records no topology.
+        let bash = build_stage_manifest(
+            "live-linux-lab-orchestrator",
+            "full",
+            &TargetSelectors::default(),
+            None,
+        );
+        assert!(bash.node_assignments.is_empty());
     }
 
     #[test]

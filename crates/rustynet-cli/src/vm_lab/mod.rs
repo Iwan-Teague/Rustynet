@@ -5190,6 +5190,7 @@ mod reconcile_barrier_exempt_tests {
             run_mode: run_mode.to_owned(),
             selectors: ManifestSelectors::default(),
             stages,
+            node_assignments: Vec::new(),
         };
         write_stage_manifest(dir, &manifest).expect("write manifest");
     }
@@ -7562,12 +7563,25 @@ fn execute_rust_native_orchestration(
         .iter()
         .map(|stage| stage.id().as_str().to_owned())
         .collect();
+    // Record THIS run's node→role topology in the manifest so consumers (the
+    // monitor) render live roles from the current run instead of inferring them
+    // from the previous finalized matrix row (emit-don't-infer).
+    let manifest_node_assignments: Vec<crate::live_lab_stage_manifest::ManifestNodeAssignment> =
+        config
+            .node_assignments
+            .iter()
+            .map(|a| crate::live_lab_stage_manifest::ManifestNodeAssignment {
+                alias: a.alias.clone(),
+                role: a.role.as_str().to_owned(),
+            })
+            .collect();
     if let Err(err) = crate::live_lab_stage_manifest::ensure_stage_manifest_with_plan(
         report_dir.as_path(),
         "vm-lab-orchestrate-live-lab",
         "full",
         &manifest_selectors,
         &plan_names,
+        &manifest_node_assignments,
     ) {
         eprintln!("warning: failed to emit stage manifest: {err}");
     }

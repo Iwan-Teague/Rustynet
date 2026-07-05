@@ -34,6 +34,20 @@ pub struct RunStageManifest {
     pub run_mode: String,
     #[serde(default)]
     pub stages: Vec<ManifestStage>,
+    /// The node→role topology this run was launched with (Rust `--node` path).
+    /// Empty on bash/wrapper runs. The monitor prefers these over the previous
+    /// finalized run's roles so VM STATUS reflects the CURRENT run live.
+    #[serde(default)]
+    pub node_assignments: Vec<ManifestNodeAssignment>,
+}
+
+/// One `<alias>:<role>` assignment recorded by the Rust `--node` orchestrator.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ManifestNodeAssignment {
+    #[serde(default)]
+    pub alias: String,
+    #[serde(default)]
+    pub role: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]

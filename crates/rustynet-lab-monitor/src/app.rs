@@ -1902,7 +1902,27 @@ impl App {
         }
     }
 
+    /// The role this alias plays in the current/newest run, taken from the
+    /// run's OWN emitted manifest topology (Rust `--node` path). This is the
+    /// emit-don't-infer source: strictly more authoritative than any inference
+    /// below (config slots, previous-run CSV roles). `None` for bash/wrapper
+    /// runs (which emit no `node_assignments`) and for aliases not in the run.
+    fn role_from_run_manifest(&self, alias: &str) -> Option<String> {
+        let manifest = self.run_manifest.as_ref()?;
+        manifest
+            .node_assignments
+            .iter()
+            .find(|a| a.alias == alias)
+            .map(|a| a.role.clone())
+            .filter(|role| !role.is_empty())
+    }
+
     pub fn role_for_vm(&self, alias: &str) -> String {
+        // Highest priority: the current run's OWN emitted node→role topology.
+        // Beats every inference below because it is what actually dispatched.
+        if let Some(role) = self.role_from_run_manifest(alias) {
+            return role;
+        }
         let config = self.config_for_role_display();
         if self.roles_locked_by_active_lab() {
             // A lab is running: its own config (request_args / report-dir
@@ -3431,6 +3451,48 @@ mod tests {
             .disabled_stages
             .push("some_brand_new_stage".to_owned());
         assert!(!app.stage_enabled("some_brand_new_stage"));
+    }
+
+    #[test]
+    fn vm_role_comes_from_the_runs_own_manifest_topology() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        // Baseline: with no manifest, an alias the monitor's default slots +
+        // the previous run's CSV roles don't name resolves however it resolves.
+        let baseline_absent = app.role_for_vm("debian-headless-5");
+
+        // A Rust `--node` run that elected dh-1 exit, dh-2/3 client. The
+        // emitted topology must win over every inference below role_for_vm.
+        app.run_manifest = Some(manifest_from_json(
+            r#"{"run_mode": "full",
+                "stages": [{"name": "preflight", "group": "pre", "enabled": true}],
+                "node_assignments": [
+                    {"alias": "debian-headless-1", "role": "exit"},
+                    {"alias": "debian-headless-2", "role": "client"},
+                    {"alias": "debian-headless-3", "role": "client"}
+                ]}"#,
+        ));
+        assert_eq!(app.role_for_vm("debian-headless-1"), "exit");
+        assert_eq!(app.role_for_vm("debian-headless-2"), "client");
+        // The bug this fixes: dh-3 is a client in the run but was absent from
+        // the previous run's roles, so it used to show blank. Now it's correct.
+        assert_eq!(app.role_for_vm("debian-headless-3"), "client");
+        // An alias the run does NOT name is unaffected — falls through to the
+        // same inference as with no manifest (no blanking, no override).
+        assert_eq!(app.role_for_vm("debian-headless-5"), baseline_absent);
+    }
+
+    #[test]
+    fn empty_node_assignments_do_not_change_role_inference() {
+        // A bash/wrapper run emits no node_assignments; role_for_vm must be
+        // byte-identical to the pre-manifest behaviour (no regression).
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        let before = app.role_for_vm("debian-headless-1");
+        app.run_manifest = Some(manifest_from_json(
+            r#"{"run_mode": "full",
+                "stages": [{"name": "preflight", "group": "pre", "enabled": true}],
+                "node_assignments": []}"#,
+        ));
+        assert_eq!(app.role_for_vm("debian-headless-1"), before);
     }
 
     #[test]
