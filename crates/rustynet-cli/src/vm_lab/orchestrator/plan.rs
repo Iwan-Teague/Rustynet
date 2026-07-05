@@ -17,6 +17,7 @@ use crate::vm_lab::orchestrator::stage::membership_init::MembershipInitStage;
 use crate::vm_lab::orchestrator::stage::preflight::PreflightStage;
 use crate::vm_lab::orchestrator::stage::relay_validation::RelayValidationStage;
 use crate::vm_lab::orchestrator::stage::role_switch_matrix::RoleSwitchMatrixStage;
+use crate::vm_lab::orchestrator::stage::security_audit_validation::SecurityAuditValidationStage;
 use crate::vm_lab::orchestrator::stage::source_archive::{
     ArchiveSourceMode, PrepareSourceArchiveStage,
 };
@@ -79,6 +80,13 @@ impl PlanBuilder {
             Box::new(DistributeDnsZoneStage),
             Box::new(EnforceBaselineRuntimeStage),
             Box::new(ValidateBaselineRuntimeStage),
+            // Eight Tier-0 adversarial daemon self-audits (membership-revoke,
+            // revoked-peer-denied, signature-forgery, privileged-helper-allowlist,
+            // policy-default-deny, gossip-revoked-readmit, enrollment-replay,
+            // hello-limiter-flood) — folds the formerly bash-only Linux security
+            // suite into the Rust engine. After baseline-runtime validation (the
+            // daemon must be up + baseline-good) and before the traffic matrix.
+            Box::new(SecurityAuditValidationStage),
             // Deploy the rustynet-relay sibling service onto every Relay node
             // (verifier key + `ops install-systemd-relay`) so relay_validation
             // has a live relay to prove. Closes the gap where the standard
@@ -104,9 +112,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_21_stages() {
+    fn build_returns_22_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 21, "plan must contain exactly 21 stages");
+        assert_eq!(stages.len(), 22, "plan must contain exactly 22 stages");
     }
 
     #[test]
@@ -132,6 +140,7 @@ mod tests {
                 StageId::DistributeDnsZone,
                 StageId::EnforceBaselineRuntime,
                 StageId::ValidateBaselineRuntime,
+                StageId::SecurityAuditValidation,
                 StageId::DeployRelayService,
                 StageId::RelayValidation,
                 StageId::TrafficTestMatrix,
