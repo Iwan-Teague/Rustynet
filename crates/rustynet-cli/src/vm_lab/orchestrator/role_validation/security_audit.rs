@@ -88,7 +88,10 @@ pub const LINUX_SECURITY_AUDITS: &[(&str, &str, AuditEvaluator)] = &[
 /// gate. (macOS/Windows have their own dedicated security-validator stages in
 /// the bash-arm path today; folding those into the Rust engine is later work.)
 pub fn security_audit_runtime_implemented(platform: VmGuestPlatform) -> bool {
-    matches!(platform, VmGuestPlatform::Linux)
+    matches!(
+        platform,
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+    )
 }
 
 /// Run the eight Linux daemon self-audits through the shell seam, applying each
@@ -118,11 +121,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_implemented_linux_only() {
+    fn runtime_implemented_linux_macos_and_windows() {
         assert!(security_audit_runtime_implemented(VmGuestPlatform::Linux));
-        assert!(!security_audit_runtime_implemented(VmGuestPlatform::Macos));
+        assert!(security_audit_runtime_implemented(VmGuestPlatform::Macos));
+        assert!(security_audit_runtime_implemented(VmGuestPlatform::Windows));
+        assert!(!security_audit_runtime_implemented(VmGuestPlatform::Ios));
         assert!(!security_audit_runtime_implemented(
-            VmGuestPlatform::Windows
+            VmGuestPlatform::Android
         ));
     }
 
