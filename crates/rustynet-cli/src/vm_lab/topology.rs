@@ -885,6 +885,8 @@ mod tests {
             timeout_secs: 86_400,
             collect_artifacts_on_failure: false,
             skip_diagnose_on_failure: false,
+            setup_only: false,
+            run_only: false,
             stop_after_ready: false,
             dry_run: false,
             trust_inventory_ready: false,

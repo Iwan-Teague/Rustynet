@@ -30,6 +30,7 @@ pub struct StateMachineRunner {
     stages: Vec<Box<dyn OrchestrationStage>>,
     /// Stage IDs explicitly requested to skip via `--skip-stage`.
     explicit_skips: HashSet<StageId>,
+    explicit_skip_outcome: StageOutcome,
 }
 
 impl StateMachineRunner {
@@ -37,11 +38,17 @@ impl StateMachineRunner {
         StateMachineRunner {
             stages,
             explicit_skips: HashSet::new(),
+            explicit_skip_outcome: StageOutcome::Skipped,
         }
     }
 
     pub fn with_explicit_skips(mut self, skips: impl IntoIterator<Item = StageId>) -> Self {
         self.explicit_skips.extend(skips);
+        self
+    }
+
+    pub fn with_explicit_skips_recorded_as_passed(mut self) -> Self {
+        self.explicit_skip_outcome = StageOutcome::Passed;
         self
     }
 
@@ -61,16 +68,20 @@ impl StateMachineRunner {
     ) -> Vec<(StageId, StageOutcome)> {
         let ordered = topological_order(&self.stages);
         let mut results: Vec<(StageId, StageOutcome)> = Vec::new();
-        let mut blocked: HashSet<StageId> = self.explicit_skips.clone();
+        let mut blocked: HashSet<StageId> = HashSet::new();
 
         for idx in ordered {
             let stage = &self.stages[idx];
             let id = stage.id();
 
-            if blocked.contains(&id) {
-                observer.stage_finished(&id, &StageOutcome::Skipped);
-                results.push((id.clone(), StageOutcome::Skipped));
-                ctx.record_outcome(id, StageOutcome::Skipped);
+            if self.explicit_skips.contains(&id) {
+                let outcome = self.explicit_skip_outcome.clone();
+                if outcome.is_blocking() || matches!(outcome, StageOutcome::Skipped) {
+                    blocked.insert(id.clone());
+                }
+                observer.stage_finished(&id, &outcome);
+                results.push((id.clone(), outcome.clone()));
+                ctx.record_outcome(id, outcome);
                 continue;
             }
 
@@ -498,6 +509,35 @@ mod tests {
             outcome_of(&StageId::PrepareSourceArchive),
             Some(&StageOutcome::Skipped),
             "dependent of explicitly-skipped stage must also be skipped"
+        );
+    }
+
+    #[test]
+    fn explicit_skip_recorded_as_passed_does_not_cascade_to_dependents() {
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            pass_stage(StageId::ValidateBaselineRuntime, vec![]),
+            pass_stage(
+                StageId::TrafficTestMatrix,
+                vec![StageId::ValidateBaselineRuntime],
+            ),
+        ];
+        let runner = StateMachineRunner::new(stages)
+            .with_explicit_skips([StageId::ValidateBaselineRuntime])
+            .with_explicit_skips_recorded_as_passed();
+        let mut ctx = make_ctx();
+        let results = runner.run(&mut ctx);
+
+        let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
+
+        assert_eq!(
+            outcome_of(&StageId::ValidateBaselineRuntime),
+            Some(&StageOutcome::Passed),
+            "skipped setup dependency must be injected as Passed"
+        );
+        assert_eq!(
+            outcome_of(&StageId::TrafficTestMatrix),
+            Some(&StageOutcome::Passed),
+            "dependent live stage must run when setup dependency was injected Passed"
         );
     }
 }

@@ -3,11 +3,12 @@ use std::fmt;
 
 use crate::vm_lab::VmGuestPlatform;
 use rustynet_control::roles::RoleCapability;
+use serde::{Deserialize, Serialize};
 
 /// OS-agnostic role definition. The 5 named roles match the bash
 /// orchestrator's existing names so membership / traffic-test / role-switch
 /// logic stays semantically identical.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeRole {
     Exit,
     Anchor,

@@ -873,6 +873,12 @@ pub struct VmLabOrchestrateLiveLabConfig {
     pub timeout_secs: u64,
     pub collect_artifacts_on_failure: bool,
     pub skip_diagnose_on_failure: bool,
+    /// Rust-native `--node` mode: run through validate_baseline_runtime, persist
+    /// orchestration context, then stop with the mesh left up.
+    pub setup_only: bool,
+    /// Rust-native `--node` mode: load persisted orchestration context and run
+    /// only the live validation suite against the already-up mesh.
+    pub run_only: bool,
     pub stop_after_ready: bool,
     pub dry_run: bool,
     /// `--trust-inventory-ready`: skip the pre-run restart-unready gate.
@@ -1021,12 +1027,33 @@ pub struct VmLabOrchestrateLiveLabConfig {
 pub fn validate_orchestrate_live_lab_config(
     config: &VmLabOrchestrateLiveLabConfig,
 ) -> Result<(), String> {
+    if config.setup_only && config.run_only {
+        return Err("--setup-only and --run-only are mutually exclusive".to_owned());
+    }
+    if config.run_only && config.skip_linux_live_suite {
+        return Err("--run-only cannot be combined with --skip-linux-live-suite".to_owned());
+    }
+    if config.stop_after_ready && (config.setup_only || config.run_only) {
+        return Err(
+            "--stop-after-ready cannot be combined with --setup-only or --run-only".to_owned(),
+        );
+    }
     if config.legacy_bash_orchestrator && !config.node_assignments.is_empty() {
         return Err(
             "--legacy-bash-orchestrator is mutually exclusive with --node; \
              pass either the legacy --*-vm flag set or --node assignments, not both"
                 .to_owned(),
         );
+    }
+    if config.legacy_bash_orchestrator && (config.setup_only || config.run_only) {
+        return Err(
+            "--legacy-bash-orchestrator is mutually exclusive with --setup-only/--run-only; \
+             those modes are Rust --node only"
+                .to_owned(),
+        );
+    }
+    if config.setup_only && config.node_assignments.is_empty() {
+        return Err("--setup-only requires at least one --node <alias>:<role>".to_owned());
     }
     Ok(())
 }
@@ -7410,7 +7437,9 @@ fn execute_rust_native_orchestration(
     use orchestrator::connection::NodeConnection;
     use orchestrator::context::OrchestrationContext;
     use orchestrator::error::StageOutcome;
+    use orchestrator::runner::StageObserver;
     use orchestrator::runner::StateMachineRunner;
+    use orchestrator::stage::OrchestrationStage;
 
     // Capture scalar config while `config` is intact (fields below are consumed
     // by value). The Rust-path manifest selectors are built LATER from the
@@ -7418,9 +7447,12 @@ fn execute_rust_native_orchestration(
     // snapshot reflects only what THIS plan runs — never a bash-arm-only suite.
     let dry_run = config.dry_run;
     let skip_live_suite = config.skip_linux_live_suite;
+    let setup_only = config.setup_only;
+    let run_only = config.run_only;
 
     let known_hosts = config
         .known_hosts_path
+        .clone()
         .ok_or_else(|| "--known-hosts-file is required when --node flags are present".to_owned())?;
     ensure_local_regular_file_path(config.ssh_identity_file.as_path(), "SSH identity file")?;
     ensure_local_regular_file_path(known_hosts.as_path(), "SSH known-hosts file")?;
@@ -7429,7 +7461,16 @@ fn execute_rust_native_orchestration(
     let inventory = load_inventory(&inventory_path)?;
 
     let report_dir = resolve_absolute_path(config.report_dir.as_path())?;
-    ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-orchestrate-live-lab")?;
+    if run_only {
+        if !report_dir.is_dir() {
+            return Err(format!(
+                "--run-only requires an existing setup report directory: {}",
+                report_dir.display()
+            ));
+        }
+    } else {
+        ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-orchestrate-live-lab")?;
+    }
     fs::create_dir_all(report_dir.as_path()).map_err(|err| {
         format!(
             "create report directory failed ({}): {err}",
@@ -7444,19 +7485,36 @@ fn execute_rust_native_orchestration(
         .unwrap_or(0);
     let run_started_utc = collected_at_utc_now();
 
-    let network_id = format!(
-        "rustynet-lab-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    );
-
-    let mut ctx = OrchestrationContext::new(
-        config.node_assignments.clone(),
-        report_dir.clone(),
-        network_id,
-    );
+    let context_path = report_dir.join("state/orchestration_context.json");
+    let mut ctx = if run_only {
+        let loaded = OrchestrationContext::load(context_path.as_path(), report_dir.clone())?;
+        if loaded.assignments.is_empty() {
+            return Err(format!(
+                "persisted orchestration context '{}' contains no node assignments",
+                context_path.display()
+            ));
+        }
+        if !config.node_assignments.is_empty() && config.node_assignments != loaded.assignments {
+            return Err(format!(
+                "--run-only --node assignments do not match persisted context at {}; omit --node or pass the same aliases/roles",
+                context_path.display()
+            ));
+        }
+        loaded
+    } else {
+        let network_id = format!(
+            "rustynet-lab-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        );
+        OrchestrationContext::new(
+            config.node_assignments.clone(),
+            report_dir.clone(),
+            network_id,
+        )
+    };
     if let Some(cidrs) = config.orchestrate_ssh_allow_cidrs.as_deref() {
         let trimmed = cidrs.trim();
         if !trimmed.is_empty() {
@@ -7469,8 +7527,8 @@ fn execute_rust_native_orchestration(
     let node_entries: Vec<(
         &crate::vm_lab::VmInventoryEntry,
         &crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment,
-    )> = config
-        .node_assignments
+    )> = ctx
+        .assignments
         .iter()
         .map(|assignment| {
             inventory
@@ -7486,6 +7544,13 @@ fn execute_rust_native_orchestration(
                 })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let selected_aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
+    let readiness_outcomes = run_rust_native_readiness_gate(
+        &config,
+        inventory_path.as_path(),
+        &selected_aliases,
+        report_dir.as_path(),
+    )?;
 
     // Snapshot (alias, target, role) now for the run_summary nodes.tsv (Bucket 2);
     // node_id is filled from ctx.node_ids after the run populates it. Owned
@@ -7589,7 +7654,7 @@ fn execute_rust_native_orchestration(
     let rebuild_only = match config.rebuild_nodes.as_ref() {
         Some(rebuild) => {
             for alias in rebuild {
-                if !config.node_assignments.iter().any(|a| &a.alias == alias) {
+                if !ctx.assignments.iter().any(|a| &a.alias == alias) {
                     return Err(format!(
                         "--rebuild-nodes alias '{alias}' is not one of the --node aliases for this run"
                     ));
@@ -7600,7 +7665,11 @@ fn execute_rust_native_orchestration(
         None => None,
     };
 
-    let stages = build_rust_native_orchestration_stages(rebuild_only, source_mode, skip_live_suite);
+    let stages = filter_rust_native_stages_for_mode(
+        build_rust_native_orchestration_stages(rebuild_only, source_mode, skip_live_suite),
+        setup_only,
+        run_only,
+    );
 
     // Build the manifest audit snapshot from THIS run's resolved topology + only
     // the selectors the Rust plan actually honors. The bash-arm suite selectors
@@ -7645,8 +7714,7 @@ fn execute_rust_native_orchestration(
     // monitor) render live roles from the current run instead of inferring them
     // from the previous finalized matrix row (emit-don't-infer).
     let manifest_node_assignments: Vec<crate::live_lab_stage_manifest::ManifestNodeAssignment> =
-        config
-            .node_assignments
+        ctx.assignments
             .iter()
             .map(|a| crate::live_lab_stage_manifest::ManifestNodeAssignment {
                 alias: a.alias.clone(),
@@ -7656,7 +7724,13 @@ fn execute_rust_native_orchestration(
     if let Err(err) = crate::live_lab_stage_manifest::ensure_stage_manifest_with_plan(
         report_dir.as_path(),
         "vm-lab-orchestrate-live-lab",
-        "full",
+        if setup_only {
+            "setup_only"
+        } else if run_only {
+            "run_only"
+        } else {
+            "full"
+        },
         &manifest_selectors,
         &plan_names,
         &manifest_node_assignments,
@@ -7690,7 +7764,13 @@ fn execute_rust_native_orchestration(
         ));
     }
 
-    let runner = StateMachineRunner::new(stages);
+    let setup_stage_ids = rust_native_setup_stage_ids();
+    let mut runner = StateMachineRunner::new(stages);
+    if run_only {
+        runner = runner
+            .with_explicit_skips(setup_stage_ids.clone())
+            .with_explicit_skips_recorded_as_passed();
+    }
     // Realtime: the observer upserts a `running` stages.tsv row at each stage
     // start and its terminal row at finish, so the monitor reads active-stage
     // + outcomes directly instead of inferring them.
@@ -7698,7 +7778,39 @@ fn execute_rust_native_orchestration(
         report_dir: report_dir.as_path(),
         started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
     };
-    let results = runner.run_with_observer(&mut ctx, &recorder);
+    let mut results = runner.run_with_observer(&mut ctx, &recorder);
+    if setup_only
+        && results
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, StageOutcome::Failed(_)))
+    {
+        // setup-only success intentionally leaves the mesh up for a later
+        // run-only pass. Failure still tears down guest residue: stranded
+        // killswitch or exit-NAT state is release-blocking.
+        let cleanup = orchestrator::stage::final_cleanup::FinalCleanupStage;
+        let cleanup_id = orchestrator::stage::StageId::Cleanup;
+        recorder.stage_started(&cleanup_id);
+        let cleanup_outcome = cleanup.execute(&mut ctx);
+        recorder.stage_finished(&cleanup_id, &cleanup_outcome);
+        ctx.record_outcome(cleanup_id.clone(), cleanup_outcome.clone());
+        results.push((cleanup_id, cleanup_outcome));
+    }
+    if setup_only
+        && !results
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, StageOutcome::Failed(_)))
+        && let Err(err) = ctx.save(context_path.as_path())
+    {
+        let cleanup = orchestrator::stage::final_cleanup::FinalCleanupStage;
+        let cleanup_id = orchestrator::stage::StageId::Cleanup;
+        recorder.stage_started(&cleanup_id);
+        let cleanup_outcome = cleanup.execute(&mut ctx);
+        recorder.stage_finished(&cleanup_id, &cleanup_outcome);
+        ctx.record_outcome(cleanup_id, cleanup_outcome.clone());
+        return Err(format!(
+            "persist setup-only orchestration context failed; cleanup outcome={cleanup_outcome:?}: {err}"
+        ));
+    }
 
     let passed = results
         .iter()
@@ -7764,7 +7876,7 @@ fn execute_rust_native_orchestration(
     eprintln!(
         "rust orchestrator: {} node(s), {} stage(s); passed={passed} failed={failed} \
          skipped={skipped}; parity_input: {}",
-        config.node_assignments.len(),
+        ctx.assignments.len(),
         results.len(),
         parity_path.display()
     );
@@ -7778,23 +7890,26 @@ fn execute_rust_native_orchestration(
     // the observer above; finalize's verdict (Fail iff any stage Failed) equals
     // the previous `failed > 0 => Err`.
     let orchestration_dir = report_dir.join("orchestration");
-    let vm_lab_outcomes: Vec<VmLabStageOutcome> = results
-        .iter()
-        .map(|(id, outcome)| VmLabStageOutcome {
-            stage: id.as_str().to_owned(),
-            status: match outcome {
-                StageOutcome::Passed => VmLabStageStatus::Pass,
-                StageOutcome::Failed(_) => VmLabStageStatus::Fail,
-                StageOutcome::Skipped => VmLabStageStatus::Skipped,
-            },
-            summary: match outcome {
-                StageOutcome::Passed => String::new(),
-                StageOutcome::Failed(err) => err.clone(),
-                StageOutcome::Skipped => "skipped".to_owned(),
-            },
-            artifacts: vec![parity_path.display().to_string()],
-        })
-        .collect();
+    let mut vm_lab_outcomes = readiness_outcomes;
+    vm_lab_outcomes.extend(
+        results
+            .iter()
+            .map(|(id, outcome)| VmLabStageOutcome {
+                stage: id.as_str().to_owned(),
+                status: match outcome {
+                    StageOutcome::Passed => VmLabStageStatus::Pass,
+                    StageOutcome::Failed(_) => VmLabStageStatus::Fail,
+                    StageOutcome::Skipped => VmLabStageStatus::Skipped,
+                },
+                summary: match outcome {
+                    StageOutcome::Passed => String::new(),
+                    StageOutcome::Failed(err) => err.clone(),
+                    StageOutcome::Skipped => "skipped".to_owned(),
+                },
+                artifacts: vec![parity_path.display().to_string()],
+            })
+            .collect::<Vec<_>>(),
+    );
     let finalized = finalize_vm_lab_orchestration_result_with_inventory(
         "vm-lab-orchestrate-live-lab",
         report_dir.as_path(),
@@ -7830,12 +7945,245 @@ fn build_rust_native_orchestration_stages(
         .build()
 }
 
+fn rust_native_setup_stage_ids() -> Vec<orchestrator::stage::StageId> {
+    use orchestrator::stage::StageId;
+    vec![
+        StageId::Preflight,
+        StageId::PrepareSourceArchive,
+        StageId::VerifySshReachability,
+        StageId::CleanupHosts,
+        StageId::BootstrapHosts,
+        StageId::CollectPubkeys,
+        StageId::MembershipInit,
+        StageId::DistributeMembership,
+        StageId::AnchorValidation,
+        StageId::DistributeAssignments,
+        StageId::DistributeTraversal,
+        StageId::DistributeDnsZone,
+        StageId::EnforceBaselineRuntime,
+        StageId::ValidateBaselineRuntime,
+    ]
+}
+
+fn filter_rust_native_stages_for_mode(
+    mut stages: Vec<Box<dyn orchestrator::stage::OrchestrationStage>>,
+    setup_only: bool,
+    run_only: bool,
+) -> Vec<Box<dyn orchestrator::stage::OrchestrationStage>> {
+    if setup_only {
+        let setup = rust_native_setup_stage_ids();
+        stages.retain(|stage| setup.contains(&stage.id()));
+    } else if run_only {
+        let setup = rust_native_setup_stage_ids();
+        let live = orchestrator::plan::PlanBuilder::LIVE_SUITE_STAGES;
+        stages.retain(|stage| setup.contains(&stage.id()) || live.contains(&stage.id()));
+    }
+    stages
+}
+
+fn run_rust_native_readiness_gate(
+    config: &VmLabOrchestrateLiveLabConfig,
+    inventory_path: &Path,
+    selected_aliases: &[String],
+    report_dir: &Path,
+) -> Result<Vec<VmLabStageOutcome>, String> {
+    let orchestration_dir = report_dir.join("orchestration");
+    fs::create_dir_all(orchestration_dir.as_path()).map_err(|err| {
+        format!(
+            "create rust readiness orchestration dir '{}': {err}",
+            orchestration_dir.display()
+        )
+    })?;
+    let discovery_timeout = timeout_or_default(
+        config.discovery_timeout_secs,
+        DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS,
+    )
+    .as_secs();
+    let ready_timeout = timeout_or_default(
+        config.ready_timeout_secs,
+        DEFAULT_RESTART_READY_TIMEOUT_SECS,
+    )
+    .as_secs();
+    let discover_config = VmLabDiscoverLocalUtmConfig {
+        inventory_path: Some(inventory_path.to_path_buf()),
+        utm_documents_root: config.utm_documents_root.clone(),
+        utmctl_path: config.utmctl_path.clone(),
+        ssh_identity_file: Some(config.ssh_identity_file.clone()),
+        known_hosts_path: config.known_hosts_path.clone(),
+        ssh_port: config.ssh_port,
+        timeout_secs: discovery_timeout,
+        update_inventory_live_ips: true,
+        report_dir: None,
+    };
+
+    let mut outcomes = Vec::new();
+    let initial_discovery = execute_ops_vm_lab_discover_local_utm(discover_config.clone())?;
+    let initial_discovery_path = orchestration_dir.join("discover_initial.json");
+    write_orchestration_artifact(initial_discovery_path.as_path(), initial_discovery.as_str())?;
+    let initial_readiness =
+        selected_local_utm_readiness_from_report(initial_discovery.as_str(), selected_aliases)?;
+    let unready_aliases = not_execution_ready_aliases(&initial_readiness);
+    let discovery_outcome = stage_outcome(
+        "discover_local_utm",
+        VmLabStageStatus::Pass,
+        format!(
+            "selected aliases readiness: {}",
+            render_selected_local_utm_readiness(&initial_readiness)
+        ),
+        vec![initial_discovery_path.clone()],
+    );
+    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &discovery_outcome);
+    outcomes.push(discovery_outcome);
+
+    match decide_restart_unready(
+        unready_aliases.is_empty(),
+        config.dry_run,
+        config.trust_inventory_ready,
+    ) {
+        RestartUnreadyDecision::AllReady => Ok(outcomes),
+        RestartUnreadyDecision::DryRunSkip => {
+            let restart_outcome = stage_outcome(
+                "restart_unready_vms",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "dry-run: would restart aliases {}",
+                    unready_aliases.join(", ")
+                ),
+                vec![initial_discovery_path],
+            );
+            emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
+            outcomes.push(restart_outcome);
+            Ok(outcomes)
+        }
+        RestartUnreadyDecision::TrustInventorySkip => {
+            eprintln!(
+                "warning: --trust-inventory-ready set; skipping restart for probed-unready aliases: {}",
+                unready_aliases.join(", ")
+            );
+            let restart_outcome = stage_outcome(
+                "restart_unready_vms",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped by --trust-inventory-ready: bootstrap/live SSH will fail loudly if unreachable: {}",
+                    unready_aliases.join(", ")
+                ),
+                vec![initial_discovery_path],
+            );
+            emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
+            outcomes.push(restart_outcome);
+            Ok(outcomes)
+        }
+        RestartUnreadyDecision::Restart => {
+            let restart_output = execute_ops_vm_lab_restart(VmLabRestartConfig {
+                inventory_path: inventory_path.to_path_buf(),
+                vm_aliases: unready_aliases.clone(),
+                raw_targets: Vec::new(),
+                select_all: false,
+                utmctl_path: config
+                    .utmctl_path
+                    .clone()
+                    .unwrap_or_else(default_utmctl_path),
+                service: None,
+                wait_ready: true,
+                ssh_port: config.ssh_port,
+                ready_timeout_secs: ready_timeout,
+                ssh_user: None,
+                ssh_identity_file: Some(config.ssh_identity_file.clone()),
+                known_hosts_path: config.known_hosts_path.clone(),
+                timeout_secs: config.timeout_secs,
+                json_output: false,
+                report_dir: Some(orchestration_dir.clone()),
+            });
+            let restart_path = orchestration_dir.join("restart_unready_vms.txt");
+            match restart_output {
+                Ok(output) => {
+                    write_orchestration_artifact(restart_path.as_path(), output.as_str())?;
+                    let restart_outcome = stage_outcome(
+                        "restart_unready_vms",
+                        VmLabStageStatus::Pass,
+                        format!("restarted aliases {}", unready_aliases.join(", ")),
+                        vec![restart_path.clone()],
+                    );
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
+                    outcomes.push(restart_outcome);
+                }
+                Err(err) => {
+                    write_orchestration_artifact(restart_path.as_path(), err.as_str())?;
+                    let restart_outcome = stage_outcome(
+                        "restart_unready_vms",
+                        VmLabStageStatus::Fail,
+                        format!("restart failed for aliases {}", unready_aliases.join(", ")),
+                        vec![initial_discovery_path, restart_path.clone()],
+                    );
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
+                    outcomes.push(restart_outcome);
+                    return Err(format!(
+                        "Rust --node readiness gate failed restarting aliases {} (artifact: {})",
+                        unready_aliases.join(", "),
+                        restart_path.display()
+                    ));
+                }
+            }
+
+            let rediscovery = execute_ops_vm_lab_discover_local_utm(discover_config)?;
+            let rediscovery_path = orchestration_dir.join("discover_post_restart.json");
+            write_orchestration_artifact(rediscovery_path.as_path(), rediscovery.as_str())?;
+            let post_restart_readiness =
+                selected_local_utm_readiness_from_report(rediscovery.as_str(), selected_aliases)?;
+            let still_unready = not_execution_ready_aliases(&post_restart_readiness);
+            let rediscovery_status = if still_unready.is_empty() {
+                VmLabStageStatus::Pass
+            } else {
+                VmLabStageStatus::Fail
+            };
+            let rediscovery_outcome = stage_outcome(
+                "rediscover_local_utm",
+                rediscovery_status.clone(),
+                format!(
+                    "selected aliases readiness after restart: {}",
+                    render_selected_local_utm_readiness(&post_restart_readiness)
+                ),
+                vec![rediscovery_path.clone()],
+            );
+            emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &rediscovery_outcome);
+            outcomes.push(rediscovery_outcome);
+            if rediscovery_status == VmLabStageStatus::Fail {
+                return Err(format!(
+                    "Rust --node readiness gate failed after recovery; still unready: {} (artifact: {})",
+                    still_unready.join(", "),
+                    rediscovery_path.display()
+                ));
+            }
+            Ok(outcomes)
+        }
+    }
+}
+
 #[cfg(test)]
 fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::StageId> {
     build_rust_native_orchestration_stages(
         None,
         orchestrator::stage::source_archive::ArchiveSourceMode::Head,
         false,
+    )
+    .iter()
+    .map(|stage| stage.id())
+    .collect()
+}
+
+#[cfg(test)]
+fn rust_native_orchestration_stage_ids_for_mode(
+    setup_only: bool,
+    run_only: bool,
+) -> Vec<orchestrator::stage::StageId> {
+    filter_rust_native_stages_for_mode(
+        build_rust_native_orchestration_stages(
+            None,
+            orchestrator::stage::source_archive::ArchiveSourceMode::Head,
+            false,
+        ),
+        setup_only,
+        run_only,
     )
     .iter()
     .map(|stage| stage.id())
@@ -7849,7 +8197,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     for warning in legacy_role_flags_deprecation_warnings(&config) {
         eprintln!("warning: {warning}");
     }
-    if !config.node_assignments.is_empty() {
+    if !config.node_assignments.is_empty() || config.run_only {
         return execute_rust_native_orchestration(config);
     }
     // legacy_bash_orchestrator (when set) and the absence of --node both
@@ -35495,6 +35843,35 @@ mod tests {
     }
 
     #[test]
+    fn rust_native_setup_only_plan_stops_after_validate_baseline_without_cleanup() {
+        let ids = super::rust_native_orchestration_stage_ids_for_mode(true, false);
+        assert_eq!(ids, super::rust_native_setup_stage_ids());
+        assert_eq!(
+            ids.last(),
+            Some(&super::orchestrator::stage::StageId::ValidateBaselineRuntime)
+        );
+        assert!(!ids.contains(&super::orchestrator::stage::StageId::Cleanup));
+    }
+
+    #[test]
+    fn rust_native_run_only_plan_keeps_setup_dependencies_and_live_suite_without_cleanup() {
+        let ids = super::rust_native_orchestration_stage_ids_for_mode(false, true);
+        for setup_id in super::rust_native_setup_stage_ids() {
+            assert!(
+                ids.contains(&setup_id),
+                "run-only plan must retain {setup_id:?} so it can be injected Passed"
+            );
+        }
+        for live_id in super::orchestrator::plan::PlanBuilder::LIVE_SUITE_STAGES {
+            assert!(
+                ids.contains(&live_id),
+                "run-only plan must execute live stage {live_id:?}"
+            );
+        }
+        assert!(!ids.contains(&super::orchestrator::stage::StageId::Cleanup));
+    }
+
+    #[test]
     fn load_inventory_accepts_local_and_remote_entries() {
         let path = write_temp_inventory(
             r#"{
@@ -47084,6 +47461,8 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             timeout_secs: 86_400,
             collect_artifacts_on_failure: false,
             skip_diagnose_on_failure: false,
+            setup_only: false,
+            run_only: false,
             stop_after_ready: false,
             dry_run: false,
             trust_inventory_ready: false,
@@ -47137,6 +47516,32 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         cfg.node_assignments =
             vec![super::orchestrator::role_assignment::parse_node_role_arg("a:exit").unwrap()];
         super::validate_orchestrate_live_lab_config(&cfg).expect("must accept --node alone");
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_rejects_setup_and_run_only_together() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.setup_only = true;
+        cfg.run_only = true;
+        let err = super::validate_orchestrate_live_lab_config(&cfg).unwrap_err();
+        assert!(err.contains("--setup-only") && err.contains("--run-only"));
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_rejects_run_only_skip_live_suite() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.run_only = true;
+        cfg.skip_linux_live_suite = true;
+        let err = super::validate_orchestrate_live_lab_config(&cfg).unwrap_err();
+        assert!(err.contains("--run-only") && err.contains("--skip-linux-live-suite"));
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_rejects_setup_only_without_node() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.setup_only = true;
+        let err = super::validate_orchestrate_live_lab_config(&cfg).unwrap_err();
+        assert!(err.contains("--setup-only") && err.contains("--node"));
     }
 
     #[test]

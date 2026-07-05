@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::role::NodeRole;
+use serde::{Deserialize, Serialize};
 
 /// Translate the legacy per-role `--<role>-vm <alias>` CLI flags into the
 /// `Vec<NodeRoleAssignment>` shape used by `--node <alias>:<role>`.
@@ -48,7 +49,7 @@ pub fn translate_legacy_role_flags(
 }
 
 /// Binding of a node alias to a role for one lab run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRoleAssignment {
     pub alias: String,
     pub role: NodeRole,

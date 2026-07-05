@@ -226,11 +226,18 @@ engine runs ONLY the 21-stage `PlanBuilder`. Missing / bash-routed:
   implement Rust-native OR explicitly scope out of the parity claim with a
   documented blocker.
 - **Recovery / readiness gate:** `restart_unready_vms` / `rediscover_local_utm` /
-  probe-and-recover + the `--trust-inventory-ready` opt-out. The Rust path has NO
-  readiness gate — an unreachable node fails hard instead of being recovered.
-- **Modes:** setup-only (`--stop-after-ready` early return after
-  `validate_baseline_runtime`), run-only-against-profile (`vm-lab-run-live-lab`),
-  iterate (`vm-lab-iterate-live-lab`).
+  probe-and-recover + the `--trust-inventory-ready` opt-out. **Code landed
+  2026-07-05 for the Rust `--node` path:** it discovers selected aliases,
+  restarts probed-unready VMs, rediscover-validates readiness, and honors
+  `--trust-inventory-ready` as an explicit skip of the restart gate. Live proof
+  is pending lab-free confirmation.
+- **Modes:** setup-only / run-only-against-profile / iterate. **Code landed
+  2026-07-05 for setup/run:** `--setup-only` runs through
+  `validate_baseline_runtime`, persists
+  `state/orchestration_context.json`, and leaves the mesh up on success while
+  still running cleanup on failure; `--run-only` reloads that state, reconstructs
+  adapters from inventory, injects setup dependencies as `Passed`, and runs the
+  live suite against the existing mesh. Iterate remains open.
 - **Flags:** `--skip-linux-live-suite`, `--enable-chaos-suite`,
   `--skip-cross-network`, `--collect-artifacts-on-failure`,
   `--skip-diagnose-on-failure`, the platform selectors
@@ -335,8 +342,9 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
 **Still open per bucket (map `wf_ee06d0be-054`):** B1 — Windows-relay deploy
 adapter, mac/win security-audit + anchor-bundle-pull runtime (all reported-skip →
 live, each gated on a live mac/win run before flipping `is_supported_for_platform`);
-admin/blind_exit as first-class `--node` roles; chaos/cross-network stages; modes
-(setup/run/iterate via `ctx` persistence + `runner` skip-set) + recovery gate.
+admin/blind_exit as first-class `--node` roles; chaos/cross-network stages;
+iterate mode. Setup/run modes + the Rust-path recovery gate are code-landed but
+still need coordinated live proof once the shared lab is free.
 B6 — route `verify_cell` to `--node` + wire `mcp_config`/`allowed_tools`/timeout/
 review-agent/auto-merge/auto-seed. B7 — the **bash-side `parity_input.json`
 emitter is the single hard blocker** to running the proof; then a run-both-and-diff
