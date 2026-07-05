@@ -260,6 +260,7 @@ pub fn execute_ops_vm_lab_overnight(config: VmLabOvernightConfig) -> Result<Stri
     let loop_cfg = LoopConfig {
         scheduler: sched,
         max_duration_secs: config.max_duration_secs,
+        auto_merge_safe_cells: config.auto_merge_safe_cells,
     };
 
     let clock = SystemClock::started_now();
