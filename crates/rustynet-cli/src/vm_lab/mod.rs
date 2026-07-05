@@ -27,6 +27,7 @@ use crate::live_lab_run_matrix::{
     LiveLabRunMatrixAppendConfig, LiveLabRunMatrixRowRole, LiveLabRunMatrixStageOutcome,
     append_live_lab_run_matrix_row,
 };
+use crate::vm_lab::orchestrator::stage::StageId;
 use base64::prelude::*;
 use rand::Rng;
 use rand::distr::Alphanumeric;
@@ -881,6 +882,14 @@ pub struct VmLabOrchestrateLiveLabConfig {
     pub run_only: bool,
     pub stop_after_ready: bool,
     pub dry_run: bool,
+    /// `--resume-from <stage>`: resume a failed Rust `--node` run from a
+    /// specific stage; all earlier stages are skipped-as-passed. Mutually
+    /// exclusive with `--rerun-stage` and `--run-only`.
+    pub resume_from: Option<String>,
+    /// `--rerun-stage <stage>`: re-run a single Rust-native stage; all other
+    /// stages are skipped-as-passed. Mutually exclusive with `--resume-from`
+    /// and `--run-only`.
+    pub rerun_stage: Option<String>,
     /// `--trust-inventory-ready`: skip the pre-run restart-unready gate.
     ///
     /// The readiness gate keys off `probe_tcp_port_status`, a raw `TcpStream`
@@ -1054,6 +1063,29 @@ pub fn validate_orchestrate_live_lab_config(
     }
     if config.setup_only && config.node_assignments.is_empty() {
         return Err("--setup-only requires at least one --node <alias>:<role>".to_owned());
+    }
+    if config.resume_from.is_some() && config.rerun_stage.is_some() {
+        return Err("--resume-from and --rerun-stage are mutually exclusive".to_owned());
+    }
+    if config.resume_from.is_some() {
+        let name = config.resume_from.as_deref().unwrap_or("");
+        if StageId::try_from(name).is_err() {
+            return Err(format!(
+                "--resume-from '{}' is not a recognized Rust-native stage; choose from: {:?}",
+                name,
+                StageId::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+            ));
+        }
+    }
+    if config.rerun_stage.is_some() {
+        let name = config.rerun_stage.as_deref().unwrap_or("");
+        if StageId::try_from(name).is_err() {
+            return Err(format!(
+                "--rerun-stage '{}' is not a recognized Rust-native stage; choose from: {:?}",
+                name,
+                StageId::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+            ));
+        }
     }
     Ok(())
 }
@@ -7450,6 +7482,44 @@ fn execute_rust_native_orchestration(
     let setup_only = config.setup_only;
     let run_only = config.run_only;
 
+    let resume_from_stage = config.resume_from.clone().filter(|s| !s.is_empty());
+    let rerun_stage = config.rerun_stage.clone().filter(|s| !s.is_empty());
+    let iterate_mode = resume_from_stage.is_some() || rerun_stage.is_some();
+
+    if run_only && iterate_mode {
+        return Err("--run-only and --resume-from/--rerun-stage are mutually exclusive".to_owned());
+    }
+    if resume_from_stage.is_some() && rerun_stage.is_some() {
+        return Err("--resume-from and --rerun-stage are mutually exclusive".to_owned());
+    }
+    if let Some(ref stage) = resume_from_stage
+        && !orchestrator::stage::StageId::ALL
+            .iter()
+            .any(|s| s.as_str() == stage.as_str())
+    {
+        return Err(format!(
+            "--resume-from stage '{stage}' is not a Rust-native stage; valid stages: {}",
+            orchestrator::stage::StageId::ALL
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    } else if let Some(ref stage) = rerun_stage
+        && !orchestrator::stage::StageId::ALL
+            .iter()
+            .any(|s| s.as_str() == stage.as_str())
+    {
+        return Err(format!(
+            "--rerun-stage stage '{stage}' is not a Rust-native stage; valid stages: {}",
+            orchestrator::stage::StageId::ALL
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
     let known_hosts = config
         .known_hosts_path
         .clone()
@@ -7465,6 +7535,21 @@ fn execute_rust_native_orchestration(
         if !report_dir.is_dir() {
             return Err(format!(
                 "--run-only requires an existing setup report directory: {}",
+                report_dir.display()
+            ));
+        }
+    } else if iterate_mode {
+        if !report_dir.is_dir() {
+            return Err(format!(
+                "--resume-from / --rerun-stage requires an existing report directory: {}",
+                report_dir.display()
+            ));
+        }
+        let stages_tsv = report_dir.join("state/stages.tsv");
+        if !stages_tsv.is_file() {
+            return Err(format!(
+                "no previous run evidence found at {} (state/stages.tsv missing); \
+                 --resume-from / --rerun-stage requires a completed prior run",
                 report_dir.display()
             ));
         }
@@ -7486,7 +7571,7 @@ fn execute_rust_native_orchestration(
     let run_started_utc = collected_at_utc_now();
 
     let context_path = report_dir.join("state/orchestration_context.json");
-    let mut ctx = if run_only {
+    let mut ctx = if run_only || iterate_mode {
         let loaded = OrchestrationContext::load(context_path.as_path(), report_dir.clone())?;
         if loaded.assignments.is_empty() {
             return Err(format!(
@@ -7765,10 +7850,36 @@ fn execute_rust_native_orchestration(
     }
 
     let setup_stage_ids = rust_native_setup_stage_ids();
+    let plan_stage_ids: Vec<orchestrator::stage::StageId> = stages.iter().map(|s| s.id()).collect();
     let mut runner = StateMachineRunner::new(stages);
     if run_only {
         runner = runner
             .with_explicit_skips(setup_stage_ids.clone())
+            .with_explicit_skips_recorded_as_passed();
+    } else if iterate_mode {
+        let skip_ids: Vec<orchestrator::stage::StageId> = if let Some(ref target) =
+            resume_from_stage
+        {
+            let pos = plan_stage_ids
+                .iter()
+                .position(|s| s.as_str() == target.as_str())
+                .ok_or_else(|| {
+                    format!("--resume-from stage '{target}' is not present in the current plan")
+                })?;
+            plan_stage_ids.iter().take(pos).cloned().collect()
+        } else if let Some(ref target) = rerun_stage {
+            plan_stage_ids
+                .iter()
+                .filter(|s| s.as_str() != target.as_str())
+                .cloned()
+                .collect()
+        } else {
+            return Err(
+                "iterate_mode set but neither resume_from_stage nor rerun_stage present".to_owned(),
+            );
+        };
+        runner = runner
+            .with_explicit_skips(skip_ids)
             .with_explicit_skips_recorded_as_passed();
     }
     // Realtime: the observer upserts a `running` stages.tsv row at each stage
@@ -47466,6 +47577,8 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             run_only: false,
             stop_after_ready: false,
             dry_run: false,
+            resume_from: None,
+            rerun_stage: None,
             trust_inventory_ready: false,
             windows_vm: None,
             macos_vm: None,
@@ -47543,6 +47656,45 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         cfg.setup_only = true;
         let err = super::validate_orchestrate_live_lab_config(&cfg).unwrap_err();
         assert!(err.contains("--setup-only") && err.contains("--node"));
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_rejects_resume_from_and_rerun_stage_together() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.resume_from = Some("preflight".to_owned());
+        cfg.rerun_stage = Some("anchor_validation".to_owned());
+        let err = super::validate_orchestrate_live_lab_config(&cfg).unwrap_err();
+        assert!(err.contains("--resume-from") && err.contains("--rerun-stage"));
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_rejects_unknown_resume_from_stage() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.resume_from = Some("not_a_stage".to_owned());
+        let err = super::validate_orchestrate_live_lab_config(&cfg).unwrap_err();
+        assert!(err.contains("--resume-from") && err.contains("not_a_stage"));
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_rejects_unknown_rerun_stage() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.rerun_stage = Some("bogus".to_owned());
+        let err = super::validate_orchestrate_live_lab_config(&cfg).unwrap_err();
+        assert!(err.contains("--rerun-stage") && err.contains("bogus"));
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_accepts_valid_resume_from() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.resume_from = Some("preflight".to_owned());
+        super::validate_orchestrate_live_lab_config(&cfg).expect("valid resume_from must validate");
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_accepts_valid_rerun_stage() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.rerun_stage = Some("anchor_validation".to_owned());
+        super::validate_orchestrate_live_lab_config(&cfg).expect("valid rerun_stage must validate");
     }
 
     #[test]

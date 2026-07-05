@@ -889,6 +889,8 @@ mod tests {
             run_only: false,
             stop_after_ready: false,
             dry_run: false,
+            resume_from: None,
+            rerun_stage: None,
             trust_inventory_ready: false,
             windows_vm: None,
             macos_vm: None,
