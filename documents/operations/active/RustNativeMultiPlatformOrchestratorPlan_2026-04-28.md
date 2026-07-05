@@ -371,6 +371,16 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   as `pass` from `stages.tsv`/`run_summary.json` (a false-green the converter now
   avoids). Proven on real artifacts. The remaining Bucket-7 item is the live
   bash-vs-Rust functional-parity *run*, not the tooling.
+- **Validation — orchestrator subsystem test audit: VERIFIED** (`ed7e1e1`, 2026-07-05).
+  Comprehensive test-audit of 157 orchestrator tests across 10 subsystems: 16 state
+  machine (runner 8 + plan 8), 1 context, 14 --node parsing + role assignment, 18
+  NodeRole matrix, 22 parity diff, 68 stage implementations, 18 overnight executor.
+  156 pass (1 pre-existing source_archive snapshot). Smoke evidence `rust-rank0-proof`
+  confirms full 22-stage pipeline with correct skip-cascade + always_run cleanup,
+  manifest selectors match stages, parity converter reads orchestrate_result.json.
+  Gaps documented (dry-run readiness-gate probes real VMs — pre-existing; overnight
+  executor routes to BASH — Bucket 6; no failure_digest.json emission — low severity
+  with diagnose fallback).
 
 **Still open per bucket (map `wf_ee06d0be-054`):** B1 — Windows-relay deploy
 adapter, mac/win security-audit + anchor-bundle-pull runtime (all reported-skip →
