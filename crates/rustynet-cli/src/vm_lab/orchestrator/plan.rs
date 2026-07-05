@@ -1,4 +1,33 @@
 #![allow(dead_code)]
+//! # Adding a stage to the Rust `--node` plan
+//!
+//! A new stage is a single source-of-truth item (its `StageId`), but it is
+//! surfaced in seven places that drift gates + full-suite asserts enforce.
+//! Adding a stage without updating all seven fails CI (each at a different
+//! test scope — the extensibility/drift gates catch the registry/doc omissions,
+//! the full `cargo test` suite catches the count + oracle omissions). Touch, in
+//! order:
+//!
+//! 1. `stage/mod.rs` — add the `StageId` variant, extend `StageId::ALL: [_; N]`
+//!    (bump N), add the `as_str` arm, and `pub mod <file>;`.
+//! 2. `stage/<name>.rs` — the `OrchestrationStage` impl (id / dependencies /
+//!    applies_to_roles / fanout / execute; override `always_run` for teardown).
+//! 3. `plan.rs` (this file) — `Box::new(<Stage>)` at the right pipeline
+//!    position, and update `build_returns_N_stages` + the canonical-order list
+//!    in `mod tests`.
+//! 4. `vm_lab/mod.rs` — the `rust_native_cli_stage_ids_match_plan_builder`
+//!    absolute-count assert (`cli_ids.len() == N`).
+//! 5. `live_lab_stage_registry.rs` — the `StageSpec` entry (the extensibility
+//!    gate asserts every `StageId::ALL` member is registered — finding 1D).
+//! 6. `live_lab_run_matrix.rs` — if the stage is rust-native, add it to the
+//!    `oracle_is_rust_native` historical copy (it also drives the
+//!    `registry_matches_historical_platform_resolution` expected-platform
+//!    branch); add `oracle_cross_os_column` / `oracle_special_column` arms only
+//!    if the stage owns such a column.
+//! 7. `rustynet-mcp/.../repo_context.rs` — add the row to the
+//!    `ORCHESTRATOR_STAGES` doc table and the `EXPECTED` list in
+//!    `orchestrator_stages_doc_matches_the_rust_planbuilder` (the drift gate
+//!    asserts the doc == `StageId::ALL`).
 use crate::vm_lab::orchestrator::stage::OrchestrationStage;
 use crate::vm_lab::orchestrator::stage::active_exit::ActiveExitStage;
 use crate::vm_lab::orchestrator::stage::anchor_validation::AnchorValidationStage;
