@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 use crate::vm_lab::LINUX_RUSTYNETD_PATH;
+use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
@@ -7,6 +9,8 @@ use crate::vm_lab::orchestrator::role_validation::security_audit::{
     security_audit_runtime_implemented, validate_linux_security_audits,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+
+const WINDOWS_RUSTYNETD_PATH: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
 
 const REPORTED_SKIPS_FILENAME: &str = "security_audit_validation.reported_skips.json";
 
@@ -75,7 +79,16 @@ impl OrchestrationStage for SecurityAuditValidationStage {
                     continue;
                 }
             };
-            if let Err(e) = validate_linux_security_audits(&*shell, LINUX_RUSTYNETD_PATH, alias) {
+            let daemon_path = match platform {
+                VmGuestPlatform::Linux => LINUX_RUSTYNETD_PATH,
+                VmGuestPlatform::Macos => MACOS_RUSTYNETD_PATH,
+                VmGuestPlatform::Windows => WINDOWS_RUSTYNETD_PATH,
+                _ => {
+                    reported_skips.push((alias.clone(), format!("{platform:?}")));
+                    continue;
+                }
+            };
+            if let Err(e) = validate_linux_security_audits(&*shell, daemon_path, alias) {
                 failures.push(format!("{alias}: {e}"));
             }
         }
@@ -107,10 +120,9 @@ fn reported_skips_json_bytes(reported_skips: &[(String, String)]) -> Vec<u8> {
     let body = serde_json::json!({
         "stage": "security_audit_validation",
         "reported_skipped_security_audit": skipped,
-        "reason": "the eight Tier-0 daemon self-audits run live on Linux through the Rust \
-                   engine; a macOS/Windows node is reported-skipped (named, never a silent \
-                   pass) — those OSes have dedicated security-validator stages in the \
-                   bash-arm path, gated on security_audit_runtime_implemented",
+        "reason": "the eight Tier-0 daemon self-audits run live on Linux/macOS/Windows \
+                   through the Rust engine; a non-desktop-platform node (iOS/Android) is \
+                   reported-skipped (named, never a silent pass)",
     });
     serde_json::to_vec_pretty(&body).unwrap_or_default()
 }
