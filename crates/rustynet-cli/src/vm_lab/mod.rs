@@ -18926,7 +18926,7 @@ fn evaluate_macos_ipv6_leak_artifact(macos_alias: &str, raw_json: &str) -> Resul
 /// match expectation. Fail-closed: a non-empty `violations` list means the
 /// allowlist either ACCEPTED an adversarial request (privilege-escalation
 /// regression) or REJECTED a reviewed one (control-plane breakage).
-fn evaluate_privileged_helper_allowlist_report(
+pub(crate) fn evaluate_privileged_helper_allowlist_report(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -18980,7 +18980,7 @@ fn evaluate_privileged_helper_allowlist_report(
 ///   - empty corpus, or no valid baseline accepted (the reject-all vacuous pass),
 ///   - too few forgery cases (a stripped corpus must not trivially pass),
 ///   - any violation (a forgery accepted, or the valid baseline rejected).
-fn evaluate_membership_signature_audit_report(
+pub(crate) fn evaluate_membership_signature_audit_report(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -19043,7 +19043,7 @@ fn evaluate_membership_signature_audit_report(
 /// updates must apply even when applied strictly later than the record's
 /// signed `created_at_unix` (the realistic propose→sign→transport→apply gap
 /// that made these four ops non-functional before the fix).
-fn evaluate_membership_revoke_audit_report(
+pub(crate) fn evaluate_membership_revoke_audit_report(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -19101,7 +19101,7 @@ fn evaluate_membership_revoke_audit_report(
 /// `ensure_lan_route_allowed` must deny a peer revoked in signed membership
 /// even when it still matches a broad/wildcard ACL allow rule, while an
 /// active (non-revoked) peer in the identical scenario is still allowed.
-fn evaluate_revoked_peer_denied_report(
+pub(crate) fn evaluate_revoked_peer_denied_report(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -19159,7 +19159,7 @@ fn evaluate_revoked_peer_denied_report(
 /// transition attempt (client/admin/exit/relay/anchor/nas/llm) must be
 /// rejected at the signed-membership-state layer, while an ordinary
 /// non-blind_exit node's capability change still succeeds (anti-vacuous).
-fn evaluate_blind_exit_reversal_report(
+pub(crate) fn evaluate_blind_exit_reversal_report(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -19308,7 +19308,7 @@ fn evaluate_linux_blind_exit_dataplane_report(
 /// currently Revoked/Quarantined in signed membership even when its bundle
 /// passes signature/freshness/sequence checks, while an active peer's
 /// otherwise-identical bundle is still accepted.
-fn evaluate_gossip_revoked_readmit_report(
+pub(crate) fn evaluate_gossip_revoked_readmit_report(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -19368,7 +19368,10 @@ fn evaluate_gossip_revoked_readmit_report(
 ///   - unsupported schema, or fewer than 3 cases (thin battery),
 ///   - the sequential-replay or concurrent-race denial case did not deny,
 ///   - the distinct-tokens baseline was wrongly denied (vacuous guard).
-fn evaluate_enrollment_replay_report(linux_alias: &str, raw_json: &str) -> Result<String, String> {
+pub(crate) fn evaluate_enrollment_replay_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
     let report: rustynetd::enrollment_replay_audit::EnrollmentReplayAuditReport =
         serde_json::from_str(raw_json)
             .map_err(|err| format!("parse enrollment-replay-audit JSON output failed: {err}"))?;
@@ -19481,7 +19484,7 @@ fn evaluate_hello_limiter_flood_report(
 /// default-deny truth table (`SecurityMinimumBar.md` §3.6). Fail-closed:
 ///   - empty corpus, or no ALLOW case passed (the vacuous deny-all pass),
 ///   - any case whose decision did not match expectation.
-fn evaluate_policy_default_deny_report(
+pub(crate) fn evaluate_policy_default_deny_report(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {

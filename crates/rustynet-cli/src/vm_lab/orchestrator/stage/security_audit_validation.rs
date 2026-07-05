@@ -75,7 +75,7 @@ impl OrchestrationStage for SecurityAuditValidationStage {
                     continue;
                 }
             };
-            if let Err(e) = validate_linux_security_audits(&*shell, LINUX_RUSTYNETD_PATH) {
+            if let Err(e) = validate_linux_security_audits(&*shell, LINUX_RUSTYNETD_PATH, alias) {
                 failures.push(format!("{alias}: {e}"));
             }
         }
