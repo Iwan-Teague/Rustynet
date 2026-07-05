@@ -124,6 +124,18 @@ impl std::fmt::Display for StageId {
     }
 }
 
+impl TryFrom<&str> for StageId {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        StageId::ALL
+            .iter()
+            .find(|s| s.as_str() == value)
+            .cloned()
+            .ok_or_else(|| format!("unknown Rust-native stage: '{}'", value))
+    }
+}
+
 /// How a stage fans out across nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageFanout {
