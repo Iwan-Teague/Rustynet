@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 pub enum NodeRole {
     Exit,
     Anchor,
+    Admin,
     Relay,
+    BlindExit,
     Client,
     Entry,
     Aux,
@@ -21,33 +23,37 @@ pub enum NodeRole {
 }
 
 impl NodeRole {
-    /// Exactly one node per lab may hold an Exit role.
+    /// Exactly one node per lab may hold an Exit, Admin, or BlindExit role.
     pub fn is_unique_per_lab(&self) -> bool {
-        matches!(self, NodeRole::Exit)
+        matches!(self, NodeRole::Exit | NodeRole::Admin | NodeRole::BlindExit)
     }
 
     /// Returns true for roles that act as the membership-owner (signs bundles).
     pub fn is_membership_owner(&self) -> bool {
-        matches!(self, NodeRole::Exit)
+        matches!(self, NodeRole::Exit | NodeRole::Admin)
     }
 
     /// Role-platform matrix currently enforced by the Rust-native path.
     /// Windows Exit remains fail-closed until W5.4 live evidence is recorded.
-    /// macOS Exit maps to the reviewed `blind_exit` PF posture. Anchor and
-    /// Relay are supported on Linux today (live-evidenced) and remain
+    /// macOS Exit maps to the reviewed `blind_exit` PF posture. Anchor, Admin,
+    /// and Relay are supported on Linux today (live-evidenced) and remain
     /// fail-closed on macOS + Windows until a green standard-orchestrator run
     /// is archived (cross-OS role-testing Phase 8); they are still
     /// lab-assignable everywhere so that evidence can be generated.
+    /// BlindExit is macOS + Linux only (PF-level posture; Windows unsupported
+    /// by design — no WFP blind-exit equivalent exists).
     ///
-    /// | Role   | Linux | Windows | macOS | iOS | Android |
-    /// |--------|-------|---------|-------|-----|---------|
-    /// | Exit   | ✓     | ✗       | ✓     | ✗   | ✗       |
-    /// | Anchor | ✓     | ✗       | ✗     | ✗   | ✗       |
-    /// | Relay  | ✓     | ✗       | ✗     | ✗   | ✗       |
-    /// | Client | ✓     | ✓       | ✓     | ✗   | ✗       |
-    /// | Entry  | ✓     | ✓       | ✓     | ✗   | ✗       |
-    /// | Aux    | ✓     | ✓       | ✓     | ✗   | ✗       |
-    /// | Extra  | ✓     | ✓       | ✓     | ✗   | ✗       |
+    /// | Role      | Linux | Windows | macOS | iOS | Android |
+    /// |-----------|-------|---------|-------|-----|---------|
+    /// | Exit      | ✓     | ✗       | ✓     | ✗   | ✗       |
+    /// | Admin     | ✓     | ✗       | ✗     | ✗   | ✗       |
+    /// | Anchor    | ✓     | ✗       | ✗     | ✗   | ✗       |
+    /// | Relay     | ✓     | ✗       | ✗     | ✗   | ✗       |
+    /// | BlindExit | ✓     | ✗       | ✓     | ✗   | ✗       |
+    /// | Client    | ✓     | ✓       | ✓     | ✗   | ✗       |
+    /// | Entry     | ✓     | ✓       | ✓     | ✗   | ✗       |
+    /// | Aux       | ✓     | ✓       | ✓     | ✗   | ✗       |
+    /// | Extra     | ✓     | ✓       | ✓     | ✗   | ✗       |
     ///
     /// iOS and Android adapters fail closed with security-specific rejection
     /// messages (unreviewed key custody + connection model + daemon coverage).
@@ -59,7 +65,14 @@ impl NodeRole {
             // promoted to supported here only once a green run is archived,
             // mirroring the Windows-Exit posture-promotion gate. Strictest
             // secure default until then: fail closed.
-            NodeRole::Anchor | NodeRole::Relay => matches!(platform, VmGuestPlatform::Linux),
+            NodeRole::Anchor | NodeRole::Admin | NodeRole::Relay => {
+                matches!(platform, VmGuestPlatform::Linux)
+            }
+            // BlindExit: macOS + Linux only. No WFP blind-exit equivalent on
+            // Windows; rejection-by-design, not just fail-closed.
+            NodeRole::BlindExit => {
+                matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
+            }
             _ => match platform {
                 VmGuestPlatform::Ios | VmGuestPlatform::Android => false,
                 VmGuestPlatform::Linux | VmGuestPlatform::Macos => true,
@@ -82,8 +95,10 @@ impl NodeRole {
     pub fn as_str(&self) -> &str {
         match self {
             NodeRole::Exit => "exit",
+            NodeRole::Admin => "admin",
             NodeRole::Anchor => "anchor",
             NodeRole::Relay => "relay",
+            NodeRole::BlindExit => "blind_exit",
             NodeRole::Client => "client",
             NodeRole::Entry => "entry",
             NodeRole::Aux => "aux",
@@ -99,15 +114,19 @@ impl NodeRole {
         match platform {
             VmGuestPlatform::Linux | VmGuestPlatform::Windows => match self {
                 NodeRole::Exit => Ok("admin"),
-                // Anchor runs as the `admin` daemon role: it holds the `anchor`
-                // capability the daemon's admin role requires and serves the
-                // control plane. Relay runs as the `client` daemon role — it is
-                // a client that ALSO hosts a relay (relay_host, via a separate
-                // rustynet-relay service). The daemon's admin role requires the
-                // `anchor` capability (membership.rs role↔capability alignment),
-                // which a relay neither holds nor should; running a relay as
-                // admin fail-closes reconcile ("admin requires anchor").
-                NodeRole::Anchor => Ok("admin"),
+                // Admin and Anchor both run as the `admin` daemon role: they
+                // hold the `anchor` capability the daemon's admin role requires
+                // and serve the control plane. Relay runs as the `client`
+                // daemon role — it is a client that ALSO hosts a relay
+                // (relay_host, via a separate rustynet-relay service). The
+                // daemon's admin role requires the `anchor` capability
+                // (membership.rs role↔capability alignment), which a relay
+                // neither holds nor should; running a relay as admin
+                // fail-closes reconcile ("admin requires anchor").
+                NodeRole::Admin | NodeRole::Anchor => Ok("admin"),
+                // BlindExit runs as the `blind_exit` daemon role on Linux
+                // (PF-backed blind exit posture, same as the macOS path).
+                NodeRole::BlindExit => Ok("blind_exit"),
                 NodeRole::Client
                 | NodeRole::Entry
                 | NodeRole::Aux
@@ -118,11 +137,9 @@ impl NodeRole {
                 )),
             },
             VmGuestPlatform::Macos => match self {
-                NodeRole::Exit => Ok("blind_exit"),
-                // Anchor = admin (holds the `anchor` capability). Relay =
-                // client + relay_host (see the Linux/Windows arm): admin would
-                // fail-close reconcile because admin requires `anchor`.
-                NodeRole::Anchor => Ok("admin"),
+                NodeRole::Exit | NodeRole::BlindExit => Ok("blind_exit"),
+                // Admin / Anchor = admin (holds the `anchor` capability).
+                NodeRole::Admin | NodeRole::Anchor => Ok("admin"),
                 NodeRole::Client
                 | NodeRole::Entry
                 | NodeRole::Aux
@@ -146,24 +163,39 @@ impl NodeRole {
             VmGuestPlatform::Ios | VmGuestPlatform::Android => Err(format!(
                 "{platform:?} has no supported product capability mapping"
             )),
-            VmGuestPlatform::Macos if matches!(self, NodeRole::Exit) => {
+            // macOS Exit / BlindExit → blind_exit daemon role + ExitServer
+            VmGuestPlatform::Macos if matches!(self, NodeRole::Exit | NodeRole::BlindExit) => {
                 Ok(vec![RoleCapability::BlindExit, RoleCapability::ExitServer])
             }
-            VmGuestPlatform::Linux | VmGuestPlatform::Windows if matches!(self, NodeRole::Exit) => {
-                Ok(vec![
-                    RoleCapability::Anchor,
-                    RoleCapability::ExitServer,
-                    RoleCapability::RelayHost,
-                ])
+            // Linux Exit / BlindExit → both get ExitServer. Exit additionally
+            // gets Anchor (admin-owner) + RelayHost.
+            VmGuestPlatform::Linux if matches!(self, NodeRole::Exit | NodeRole::BlindExit) => {
+                if matches!(self, NodeRole::Exit) {
+                    Ok(vec![
+                        RoleCapability::Anchor,
+                        RoleCapability::ExitServer,
+                        RoleCapability::RelayHost,
+                    ])
+                } else {
+                    // BlindExit on Linux: ExitServer only (no Anchor — the
+                    // admin role is separate; BlindExit is exit-only).
+                    Ok(vec![RoleCapability::BlindExit, RoleCapability::ExitServer])
+                }
             }
+            // Windows Exit → admin daemon role + full admin-owner capability
+            VmGuestPlatform::Windows if matches!(self, NodeRole::Exit) => Ok(vec![
+                RoleCapability::Anchor,
+                RoleCapability::ExitServer,
+                RoleCapability::RelayHost,
+            ]),
             _ => match self {
                 NodeRole::Client | NodeRole::Aux | NodeRole::Extra => {
                     Ok(vec![RoleCapability::Client])
                 }
                 NodeRole::Entry => Ok(vec![RoleCapability::Client, RoleCapability::EntryRelay]),
-                // Anchor advertises the canonical anchor capability set: the
-                // Anchor marker + relay_host + the five composable anchor
-                // sub-capabilities, exactly matching
+                // Admin and Anchor advertise the canonical anchor capability
+                // set: the Anchor marker + relay_host + the five composable
+                // anchor sub-capabilities, exactly matching
                 // `rustynet_control::roles::anchor_role_capabilities()`.
                 // relay_host is REQUIRED, not optional: anchors co-locate a
                 // relay, and the daemon's membership-format validation rejects
@@ -172,7 +204,7 @@ impl NodeRole {
                 // daemon + gossip / bundle-pull / enrollment / port-mapping
                 // paths read these from the signed membership snapshot.
                 // Platform-independent: the same set is advertised on every OS.
-                NodeRole::Anchor => Ok(vec![
+                NodeRole::Admin | NodeRole::Anchor => Ok(vec![
                     RoleCapability::Anchor,
                     RoleCapability::RelayHost,
                     RoleCapability::AnchorGossipSeed,
@@ -188,7 +220,7 @@ impl NodeRole {
                 NodeRole::Custom(label) => Err(format!(
                     "custom lab role '{label}' has no explicit product capability mapping"
                 )),
-                NodeRole::Exit => unreachable!("exit role handled above"),
+                NodeRole::Exit | NodeRole::BlindExit => unreachable!("handled above"),
             },
         }
     }
@@ -196,8 +228,10 @@ impl NodeRole {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim() {
             "exit" => Ok(NodeRole::Exit),
+            "admin" => Ok(NodeRole::Admin),
             "anchor" => Ok(NodeRole::Anchor),
             "relay" => Ok(NodeRole::Relay),
+            "blind_exit" => Ok(NodeRole::BlindExit),
             "client" => Ok(NodeRole::Client),
             "entry" => Ok(NodeRole::Entry),
             "aux" => Ok(NodeRole::Aux),
@@ -210,7 +244,7 @@ impl NodeRole {
                     Ok(NodeRole::Custom(label.to_owned()))
                 } else {
                     Err(format!(
-                        "unknown role '{other}'; expected one of: exit, anchor, relay, client, entry, aux, extra, custom-<label>"
+                        "unknown role '{other}'; expected one of: exit, admin, anchor, relay, blind_exit, client, entry, aux, extra, custom-<label>"
                     ))
                 }
             }
@@ -229,18 +263,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_unique_per_lab_only_exit() {
+    fn is_unique_per_lab() {
         assert!(NodeRole::Exit.is_unique_per_lab());
+        assert!(NodeRole::Admin.is_unique_per_lab());
+        assert!(NodeRole::BlindExit.is_unique_per_lab());
         assert!(!NodeRole::Client.is_unique_per_lab());
         assert!(!NodeRole::Entry.is_unique_per_lab());
         assert!(!NodeRole::Aux.is_unique_per_lab());
         assert!(!NodeRole::Extra.is_unique_per_lab());
+        assert!(!NodeRole::Anchor.is_unique_per_lab());
+        assert!(!NodeRole::Relay.is_unique_per_lab());
         assert!(!NodeRole::Custom("foo".to_owned()).is_unique_per_lab());
     }
 
     #[test]
     fn parse_named_roles() {
         assert_eq!(NodeRole::parse("exit").unwrap(), NodeRole::Exit);
+        assert_eq!(NodeRole::parse("admin").unwrap(), NodeRole::Admin);
+        assert_eq!(NodeRole::parse("anchor").unwrap(), NodeRole::Anchor);
+        assert_eq!(NodeRole::parse("relay").unwrap(), NodeRole::Relay);
+        assert_eq!(NodeRole::parse("blind_exit").unwrap(), NodeRole::BlindExit);
         assert_eq!(NodeRole::parse("client").unwrap(), NodeRole::Client);
         assert_eq!(NodeRole::parse("entry").unwrap(), NodeRole::Entry);
         assert_eq!(NodeRole::parse("aux").unwrap(), NodeRole::Aux);
@@ -272,6 +314,10 @@ mod tests {
     fn is_supported_for_platform_linux_all_roles() {
         let roles = [
             NodeRole::Exit,
+            NodeRole::Admin,
+            NodeRole::Anchor,
+            NodeRole::Relay,
+            NodeRole::BlindExit,
             NodeRole::Client,
             NodeRole::Entry,
             NodeRole::Aux,
@@ -286,10 +332,26 @@ mod tests {
     }
 
     #[test]
-    fn is_supported_for_platform_windows_fail_closed_for_exit_only() {
+    fn is_supported_for_platform_windows_fail_closed_for_privileged_roles() {
         assert!(
             !NodeRole::Exit.is_supported_for_platform(&VmGuestPlatform::Windows),
             "Windows Exit must remain fail-closed until W5.4 live evidence exists"
+        );
+        assert!(
+            !NodeRole::Admin.is_supported_for_platform(&VmGuestPlatform::Windows),
+            "Windows Admin fail-closed until evidence"
+        );
+        assert!(
+            !NodeRole::Anchor.is_supported_for_platform(&VmGuestPlatform::Windows),
+            "Windows Anchor fail-closed until evidence"
+        );
+        assert!(
+            !NodeRole::Relay.is_supported_for_platform(&VmGuestPlatform::Windows),
+            "Windows Relay fail-closed until evidence"
+        );
+        assert!(
+            !NodeRole::BlindExit.is_supported_for_platform(&VmGuestPlatform::Windows),
+            "Windows BlindExit unsupported by design (no WFP blind-exit equivalent)"
         );
         for role in &[
             NodeRole::Client,
@@ -332,6 +394,10 @@ mod tests {
     fn is_supported_for_platform_ios_android_all_roles_blocked() {
         let roles = [
             NodeRole::Exit,
+            NodeRole::Admin,
+            NodeRole::Anchor,
+            NodeRole::Relay,
+            NodeRole::BlindExit,
             NodeRole::Client,
             NodeRole::Entry,
             NodeRole::Aux,
@@ -414,6 +480,77 @@ mod tests {
                 .product_capabilities_for_platform(&VmGuestPlatform::Windows)
                 .unwrap(),
             vec![RoleCapability::Client, RoleCapability::EntryRelay]
+        );
+    }
+
+    // ── Admin + BlindExit: first-class --node roles ──────────────────────
+
+    #[test]
+    fn admin_is_membership_owner() {
+        assert!(NodeRole::Admin.is_membership_owner());
+        assert!(!NodeRole::BlindExit.is_membership_owner());
+        assert!(NodeRole::Exit.is_membership_owner());
+        assert!(!NodeRole::Client.is_membership_owner());
+    }
+
+    #[test]
+    fn admin_daemon_and_capabilities_match_exit_on_linux() {
+        assert_eq!(
+            NodeRole::Admin
+                .daemon_node_role_for_platform(&VmGuestPlatform::Linux)
+                .unwrap(),
+            "admin"
+        );
+        assert_eq!(
+            NodeRole::Admin
+                .product_capabilities_for_platform(&VmGuestPlatform::Linux)
+                .unwrap(),
+            vec![
+                RoleCapability::Anchor,
+                RoleCapability::RelayHost,
+                RoleCapability::AnchorGossipSeed,
+                RoleCapability::AnchorBundlePull,
+                RoleCapability::AnchorEnrollmentEndpoint,
+                RoleCapability::AnchorRelayColocation,
+                RoleCapability::AnchorPortMappingAuthoritative,
+            ]
+        );
+    }
+
+    #[test]
+    fn blind_exit_platform_gating_linux_macos_only() {
+        assert!(NodeRole::BlindExit.is_supported_for_platform(&VmGuestPlatform::Linux));
+        assert!(NodeRole::BlindExit.is_supported_for_platform(&VmGuestPlatform::Macos));
+        assert!(!NodeRole::BlindExit.is_supported_for_platform(&VmGuestPlatform::Windows));
+        assert!(!NodeRole::BlindExit.is_supported_for_platform(&VmGuestPlatform::Ios));
+        assert!(!NodeRole::BlindExit.is_supported_for_platform(&VmGuestPlatform::Android));
+    }
+
+    #[test]
+    fn blind_exit_daemon_and_capabilities() {
+        assert_eq!(
+            NodeRole::BlindExit
+                .daemon_node_role_for_platform(&VmGuestPlatform::Linux)
+                .unwrap(),
+            "blind_exit"
+        );
+        assert_eq!(
+            NodeRole::BlindExit
+                .daemon_node_role_for_platform(&VmGuestPlatform::Macos)
+                .unwrap(),
+            "blind_exit"
+        );
+        assert_eq!(
+            NodeRole::BlindExit
+                .product_capabilities_for_platform(&VmGuestPlatform::Linux)
+                .unwrap(),
+            vec![RoleCapability::BlindExit, RoleCapability::ExitServer]
+        );
+        assert_eq!(
+            NodeRole::BlindExit
+                .product_capabilities_for_platform(&VmGuestPlatform::Macos)
+                .unwrap(),
+            vec![RoleCapability::BlindExit, RoleCapability::ExitServer]
         );
     }
 

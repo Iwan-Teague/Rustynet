@@ -545,6 +545,15 @@ pub const STAGES: &[StageSpec] = &[
         ..DEFAULT_SPEC
     },
     StageSpec {
+        name: "admin_issue",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("admin"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
         name: "distribute_assignments",
         state_machine_only: true,
         group: StageGroup::Bootstrap,
@@ -574,6 +583,15 @@ pub const STAGES: &[StageSpec] = &[
         rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "blind_exit",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("blind_exit"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
     StageSpec {

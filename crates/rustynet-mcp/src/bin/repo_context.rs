@@ -2073,19 +2073,21 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 7 | `membership_init` | Exit node signs initial membership snapshot | `stage/membership_init.rs` |
 | 8 | `distribute_membership` | scp membership snapshot to non-exit peers | `stage/distribute_membership.rs` |
 | 9 | `anchor_validation` | Anchor role validation (bundle-pull, gossip, enrollment) | `stage/anchor_validation.rs` |
-| 10 | `distribute_assignments` | Exit signs + distributes assignments | `stage/distribute_assignments.rs` |
-| 11 | `distribute_traversal` | Exit signs + distributes traversal hints | `stage/distribute_traversal.rs` |
-| 12 | `distribute_dns_zone` | Exit signs + distributes DNS zone | `stage/distribute_dns_zone.rs` |
-| 13 | `enforce_baseline_runtime` | Start daemon on each peer | `stage/enforce_runtime.rs` |
-| 14 | `validate_baseline_runtime` | Each peer's daemon ingests state + validates | `stage/validate_runtime.rs` |
-| 15 | `security_audit_validation` | Eight Tier-0 daemon self-audits (membership-revoke, revoked-peer-denied, signature-forgery, privileged-helper-allowlist, policy-default-deny, gossip-revoked-readmit, enrollment-replay, hello-limiter-flood) | `stage/security_audit_validation.rs` |
-| 16 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
-| 17 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
-| 18 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
-| 19 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
-| 20 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
-| 21 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
-| 22 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 10 | `admin_issue` | Admin role validation (bundle signing, assignment issuance) | `stage/admin_issue.rs` |
+| 11 | `distribute_assignments` | Exit signs + distributes assignments | `stage/distribute_assignments.rs` |
+| 12 | `distribute_traversal` | Exit signs + distributes traversal hints | `stage/distribute_traversal.rs` |
+| 13 | `distribute_dns_zone` | Exit signs + distributes DNS zone | `stage/distribute_dns_zone.rs` |
+| 14 | `enforce_baseline_runtime` | Start daemon on each peer | `stage/enforce_runtime.rs` |
+| 15 | `blind_exit` | Blind-exit role validation (PF posture, ExitServer-only) | `stage/blind_exit.rs` |
+| 16 | `validate_baseline_runtime` | Each peer's daemon ingests state + validates | `stage/validate_runtime.rs` |
+| 17 | `security_audit_validation` | Eight Tier-0 daemon self-audits (membership-revoke, revoked-peer-denied, signature-forgery, privileged-helper-allowlist, policy-default-deny, gossip-revoked-readmit, enrollment-replay, hello-limiter-flood) | `stage/security_audit_validation.rs` |
+| 18 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
+| 19 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
+| 20 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
+| 21 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
+| 22 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
+| 23 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
+| 24 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2151,10 +2153,12 @@ mod tests {
             "membership_init",
             "distribute_membership",
             "anchor_validation",
+            "admin_issue",
             "distribute_assignments",
             "distribute_traversal",
             "distribute_dns_zone",
             "enforce_baseline_runtime",
+            "blind_exit",
             "validate_baseline_runtime",
             "security_audit_validation",
             "deploy_relay_service",

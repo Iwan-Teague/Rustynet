@@ -30,7 +30,9 @@
 //!    asserts the doc == `StageId::ALL`).
 use crate::vm_lab::orchestrator::stage::OrchestrationStage;
 use crate::vm_lab::orchestrator::stage::active_exit::ActiveExitStage;
+use crate::vm_lab::orchestrator::stage::admin_issue::AdminIssueStage;
 use crate::vm_lab::orchestrator::stage::anchor_validation::AnchorValidationStage;
+use crate::vm_lab::orchestrator::stage::blind_exit::BlindExitStage;
 use crate::vm_lab::orchestrator::stage::cleanup::CleanupHostsStage;
 use crate::vm_lab::orchestrator::stage::collect_pubkeys::CollectPubkeysStage;
 use crate::vm_lab::orchestrator::stage::deploy_relay::DeployRelayServiceStage;
@@ -133,10 +135,12 @@ impl PlanBuilder {
             // membership snapshot is distributed (so the daemon can derive
             // the anchor view) and before assignments are distributed.
             Box::new(AnchorValidationStage),
+            Box::new(AdminIssueStage),
             Box::new(DistributeAssignmentsStage),
             Box::new(DistributeTraversalStage),
             Box::new(DistributeDnsZoneStage),
             Box::new(EnforceBaselineRuntimeStage),
+            Box::new(BlindExitStage),
             Box::new(ValidateBaselineRuntimeStage),
             // Eight Tier-0 adversarial daemon self-audits (membership-revoke,
             // revoked-peer-denied, membership-signature, privileged-helper-allowlist,
@@ -179,9 +183,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_22_stages() {
+    fn build_returns_24_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 22, "plan must contain exactly 22 stages");
+        assert_eq!(stages.len(), 24, "plan must contain exactly 24 stages");
     }
 
     #[test]
@@ -189,8 +193,8 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 22 - 7 live-suite stages = 15.
-        assert_eq!(ids.len(), 22 - PlanBuilder::LIVE_SUITE_STAGES.len());
+        // 24 - 7 live-suite stages = 17.
+        assert_eq!(ids.len(), 24 - PlanBuilder::LIVE_SUITE_STAGES.len());
         for dropped in PlanBuilder::LIVE_SUITE_STAGES {
             assert!(
                 !ids.contains(&dropped),
@@ -225,10 +229,12 @@ mod tests {
                 StageId::MembershipInit,
                 StageId::DistributeMembership,
                 StageId::AnchorValidation,
+                StageId::AdminIssue,
                 StageId::DistributeAssignments,
                 StageId::DistributeTraversal,
                 StageId::DistributeDnsZone,
                 StageId::EnforceBaselineRuntime,
+                StageId::BlindExit,
                 StageId::ValidateBaselineRuntime,
                 StageId::SecurityAuditValidation,
                 StageId::DeployRelayService,

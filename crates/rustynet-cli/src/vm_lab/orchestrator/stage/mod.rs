@@ -4,7 +4,9 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 
 pub mod active_exit;
+pub mod admin_issue;
 pub mod anchor_validation;
+pub mod blind_exit;
 pub mod cleanup;
 pub mod collect_pubkeys;
 pub mod deploy_relay;
@@ -39,6 +41,8 @@ pub enum StageId {
     MembershipInit,
     DistributeMembership,
     AnchorValidation,
+    AdminIssue,
+    BlindExit,
     DistributeAssignments,
     DistributeTraversal,
     DistributeDnsZone,
@@ -57,7 +61,7 @@ pub enum StageId {
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 22] = [
+    pub const ALL: [StageId; 24] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -67,6 +71,8 @@ impl StageId {
         StageId::MembershipInit,
         StageId::DistributeMembership,
         StageId::AnchorValidation,
+        StageId::AdminIssue,
+        StageId::BlindExit,
         StageId::DistributeAssignments,
         StageId::DistributeTraversal,
         StageId::DistributeDnsZone,
@@ -93,6 +99,8 @@ impl StageId {
             StageId::MembershipInit => "membership_init",
             StageId::DistributeMembership => "distribute_membership",
             StageId::AnchorValidation => "anchor_validation",
+            StageId::AdminIssue => "admin_issue",
+            StageId::BlindExit => "blind_exit",
             StageId::DistributeAssignments => "distribute_assignments",
             StageId::DistributeTraversal => "distribute_traversal",
             StageId::DistributeDnsZone => "distribute_dns_zone",

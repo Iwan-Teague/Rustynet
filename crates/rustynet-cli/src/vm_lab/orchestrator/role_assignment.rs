@@ -89,10 +89,14 @@ mod tests {
     fn parse_all_named_roles() {
         let cases = [
             ("node-a:exit", NodeRole::Exit),
-            ("node-b:client", NodeRole::Client),
-            ("node-c:entry", NodeRole::Entry),
-            ("node-d:aux", NodeRole::Aux),
-            ("node-e:extra", NodeRole::Extra),
+            ("node-b:admin", NodeRole::Admin),
+            ("node-c:anchor", NodeRole::Anchor),
+            ("node-d:relay", NodeRole::Relay),
+            ("node-e:blind_exit", NodeRole::BlindExit),
+            ("node-f:client", NodeRole::Client),
+            ("node-g:entry", NodeRole::Entry),
+            ("node-h:aux", NodeRole::Aux),
+            ("node-i:extra", NodeRole::Extra),
         ];
         for (input, expected_role) in cases {
             let result = parse_node_role_arg(input).unwrap();
