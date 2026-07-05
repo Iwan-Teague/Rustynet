@@ -67,6 +67,10 @@ impl NodeAdapter for WindowsNodeAdapter {
 
     // ── Install lifecycle ─────────────────────────────────────────────────────
 
+    fn deploy_relay_service(&self) -> Result<(), AdapterError> {
+        windows_install::deploy_relay_service(&self.conn)
+    }
+
     fn install_daemon(
         &self,
         source: &SourceArchive,
