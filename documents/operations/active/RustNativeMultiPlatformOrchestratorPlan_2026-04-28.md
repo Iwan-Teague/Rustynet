@@ -380,13 +380,21 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   manifest selectors match stages, parity converter reads orchestrate_result.json.
   Gaps documented (dry-run readiness-gate probes real VMs — pre-existing; overnight
   executor routes to BASH — Bucket 6; no failure_digest.json emission — low severity
-  with diagnose fallback).
+   with diagnose fallback).
+- **Bucket 1.5 — Admin + BlindExit as first-class `--node` roles: LANDED** (`dbb41c8`,
+   2026-07-05). `NodeRole::Admin` + `NodeRole::BlindExit` with full platform gating
+   (Admin Linux-only; BlindExit Linux+macOS, Windows blocked-by-design), daemon mapping
+   (admin/blind_exit), product capabilities, and parsing. Full 7-place stage plumbing:
+   `StageId::AdminIssue` + `StageId::BlindExit` (24 stages), no-op plan stages, oracle
+   + registry + MCP tables (deepseek `is_rust_native_stage`, repo-context stage table).
+   Overnight `march_role_to_node_role` returns `Some` for both. 662 orchestrator tests
+   pass (629 CLI + 33 MCP). Admin/BlindExit removed from B1 still-open list.
 
 **Still open per bucket (map `wf_ee06d0be-054`):** B1 — Windows-relay deploy
 adapter, mac/win security-audit + anchor-bundle-pull runtime (all reported-skip →
 live, each gated on a live mac/win run before flipping `is_supported_for_platform`);
-admin/blind_exit as first-class `--node` roles; chaos/cross-network stages;
-iterate mode. Setup/run modes + the Rust-path recovery gate are code-landed but
+chaos/cross-network stages; iterate mode. Setup/run modes + the Rust-path recovery
+gate are code-landed but
 still need coordinated live proof once the shared lab is free.
 B6 — code landed locally 2026-07-05 for the overnight driver route/gate:
 `verify_cell` synthesizes full `--node <alias>:<role>` assignments from
