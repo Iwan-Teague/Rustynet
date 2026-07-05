@@ -313,9 +313,21 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   on any non-`overall_ok:true`) into the Rust plan as stage 15/22. Proven PASS on
   the 3-node Linux `--node` run **`livelab-1783214166`** (all 8 audits × 3 nodes
   green). Commits `1dde13d`, `a29cc3f`, `05b2a06` (subcommand ground-truth fix),
-  `07781bd` (drift-gate + oracle). *Follow-up (RANK-0):* the bash live-suite has
-  richer anti-vacuity evaluators (empty-corpus / vacuous-baseline / thin-battery)
-  beyond `overall_ok`; fold those in per-audit for full depth parity.
+  `07781bd` (drift-gate + oracle).
+- **Bucket 1 — security-audit anti-vacuity depth: LANDED + LIVE-PROVEN** (`051f44a`).
+  Resolves the depth-parity follow-up: `validate_linux_security_audits` now
+  dispatches each of the 8 audits to the SAME typed evaluator the bash live-suite
+  applies (`crate::vm_lab::evaluate_*`, now `pub(crate)`) instead of accepting the
+  daemon's `overall_ok:true` alone, so a stripped/vacuous audit (empty corpus,
+  reject-all baseline, too-thin battery, or an `overall_ok`/`violations`
+  inconsistency) now fails the Rust engine exactly as it fails bash. Live-proven:
+  `security_audit_validation` = pass on the 3-node `--node` run
+  **`state/rust-rank0-proof-1783249849`** (run-matrix row
+  `livelab-1783251676-d2e4968f29f0`; all 8 audits × 3 nodes green under the stricter
+  evaluators; live-safe because the audit subcommands take no corpus-size args, so
+  the daemon-baked corpus is invocation-independent). The same run re-confirmed the
+  always-run cleanup exemption: `cleanup` = pass despite `traffic_test_matrix`
+  failing on the known client↔client gap and the downstream stages skip-cascading.
 - **Bucket 1 — `--skip-linux-live-suite` now HONORED by `PlanBuilder`** (`19e5e49`):
   drops the 7 post-baseline live stages (security_audit / deploy_relay /
   relay_validation / traffic / role_switch / exit_handoff / active_exit), keeping
@@ -338,6 +350,19 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   prefers them over the previous finalized run's roles (emit-don't-infer).
 - **Extensibility — the 7-place "add a Rust plan stage" checklist** is documented
   at the top of `orchestrator/plan.rs` (`8cbbcdb`).
+- **Bucket 7 — engine-agnostic `parity_input.json` converter: LANDED** (`420b900`,
+  `1f52a13`). Removes what the plan called the single hard blocker (the bash
+  orchestrator never emitted `parity_input.json`):
+  `orchestrator::parity::live_lab_run_report_from_report_dir` reconstructs a
+  `LiveLabRunReport` from ANY completed run's on-disk evidence, exposed via
+  `ops vm-lab-emit-parity-input` + `scripts/e2e/orchestrator_parity_diff.sh`. v2
+  (`1f52a13`) reads the authoritative `orchestration/orchestrate_result.json` (the
+  full-run record both engines write) rather than `state/stages.tsv` — the bash arm
+  records only the SETUP stages there and collapses the live suite into one
+  `orchestrate_result` outcome, so a bash run that failed its live suite was reading
+  as `pass` from `stages.tsv`/`run_summary.json` (a false-green the converter now
+  avoids). Proven on real artifacts. The remaining Bucket-7 item is the live
+  bash-vs-Rust functional-parity *run*, not the tooling.
 
 **Still open per bucket (map `wf_ee06d0be-054`):** B1 — Windows-relay deploy
 adapter, mac/win security-audit + anchor-bundle-pull runtime (all reported-skip →
@@ -345,10 +370,17 @@ live, each gated on a live mac/win run before flipping `is_supported_for_platfor
 admin/blind_exit as first-class `--node` roles; chaos/cross-network stages;
 iterate mode. Setup/run modes + the Rust-path recovery gate are code-landed but
 still need coordinated live proof once the shared lab is free.
-B6 — route `verify_cell` to `--node` + wire `mcp_config`/`allowed_tools`/timeout/
-review-agent/auto-merge/auto-seed. B7 — the **bash-side `parity_input.json`
-emitter is the single hard blocker** to running the proof; then a run-both-and-diff
-wrapper; then the router flip. B8 — gated on 1–7; `run_{windows,linux}_orchestration_stages`
+B6 — route `verify_cell` to `--node` + wire `mcp_config`/`allowed_tools`/
+review-agent/auto-merge/auto-seed (agent-timeout already enforced, `041549d`).
+B7 — the converter + `orchestrator_parity_diff.sh` wrapper are LANDED (`420b900`,
+`1f52a13`); the remaining item is a CLEAN coordinated live bash-vs-Rust run pair on
+a matching topology → `overall_functional_parity_pass`. Two run-time cautions found
+2026-07-05: the bash orchestrate path's live-suite (`vm_lab_run_live_lab`)
+provenance-checks the WORKING-TREE orchestrator source even under
+`--source-mode local-head` (do NOT edit orchestrator source during a bash run), and
+a bash run auto-expands `--exit-vm/--client-vm/--entry-vm` to a 5-node topology
+(match the Rust `--node` side's node count). Then the router flip. B8 — gated on
+1–7; `run_{windows,linux}_orchestration_stages`
 + `run_validate_{windows,linux}_security` are SHARED (not removable), and deleting
 the `.sh` breaks `cargo test` compilation via `macos_install.rs` `include_str!`.
 **Known blockers:** client↔client traffic (`traffic_test_matrix`) fails in an
