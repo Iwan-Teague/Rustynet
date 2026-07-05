@@ -135,42 +135,149 @@ fn run_summary_identity(report_dir: &Path) -> Option<(String, String)> {
     Some((run_id, timestamp))
 }
 
-/// Engine-agnostic reconstruction of a [`LiveLabRunReport`] from a completed
-/// run's on-disk evidence (`<report_dir>/state/stages.tsv` +
-/// `<report_dir>/state/nodes.tsv`), independent of which orchestrator produced
-/// it.
+/// Map an orchestrator `overall_status` / stage-status string to [`RunStatus`].
+fn run_status_from_str(raw: &str) -> Option<RunStatus> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "pass" | "passed" | "success" | "succeeded" | "ok" => Some(RunStatus::Passed),
+        "fail" | "failed" | "error" | "aborted" | "abort" | "timed_out" | "timeout" => {
+            Some(RunStatus::Failed)
+        }
+        "partial" => Some(RunStatus::Partial),
+        _ => None,
+    }
+}
+
+/// `overall_status` derived from a stage list, matching [`build_live_lab_run_report`]:
+/// any `Failed` → `Failed`, else any `Skipped` → `Partial`, else `Passed`.
+fn derive_overall_status(stages: &[StageReport]) -> RunStatus {
+    if stages
+        .iter()
+        .any(|s| s.outcome == StageOutcomeRecord::Failed)
+    {
+        RunStatus::Failed
+    } else if stages
+        .iter()
+        .any(|s| s.outcome == StageOutcomeRecord::Skipped)
+    {
+        RunStatus::Partial
+    } else {
+        RunStatus::Passed
+    }
+}
+
+/// `node_statuses` from `<report_dir>/state/nodes.tsv` (best-effort): one entry
+/// per `alias \t target \t node_id \t role` row. `platform` is `unknown` (the
+/// artifact carries none) and `validator_results` is empty — the functional
+/// diff uses only the node COUNT, so this is sufficient and honest.
+fn node_statuses_from_nodes_tsv(report_dir: &Path) -> HashMap<String, NodeStatus> {
+    let mut node_statuses: HashMap<String, NodeStatus> = HashMap::new();
+    if let Ok(nodes_body) = std::fs::read_to_string(report_dir.join("state/nodes.tsv")) {
+        for raw_line in nodes_body.lines() {
+            let line = raw_line.trim_end_matches('\r');
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            let alias = cols.first().map(|s| s.trim()).unwrap_or("");
+            if alias.is_empty() {
+                continue;
+            }
+            let role = cols.get(3).map(|s| s.trim()).unwrap_or("").to_owned();
+            node_statuses.insert(
+                alias.to_owned(),
+                NodeStatus {
+                    alias: alias.to_owned(),
+                    platform: "unknown".to_owned(),
+                    role,
+                    validator_results: Vec::new(),
+                },
+            );
+        }
+    }
+    node_statuses
+}
+
+/// Primary source: `<report_dir>/orchestration/orchestrate_result.json` — the
+/// authoritative full-run record BOTH engines write. Returns `None` when the
+/// file is absent or unparseable (the caller falls back to `stages.tsv`).
 ///
-/// This removes the Bucket-7 blocker: the Rust `--node` path already emits
-/// `parity_input.json` directly (via [`build_live_lab_run_report`]), but the
-/// bash orchestrator never did. Because BOTH engines now write the shared
-/// recorder artifacts (`stages.tsv` + `nodes.tsv`), this converter turns ANY
-/// report directory — bash or Rust — into a `LiveLabRunReport`, so the
-/// functional-parity gate (the redefined W5.6 flip gate) can finally be run
-/// bash-vs-Rust. Deriving BOTH sides through this one function also guarantees
-/// the two reports are produced identically, so any diff reflects a real
-/// difference in the runs rather than a difference in how the report was built.
-///
-/// Semantics (kept consistent with [`build_live_lab_run_report`]):
-/// - Stage outcomes come from the `stages.tsv` status column, normalized
-///   through the canonical [`parse_stage_status`](crate::live_lab_stage_registry::parse_stage_status)
-///   taxonomy: `pass` → `Passed`, `fail`/`aborted`/`timed_out` → `Failed`,
-///   `skip`/`skipped` → `Skipped`. Non-terminal (`pending`/`running`) and
-///   never-dispatched (`not_run`/`na`) rows are excluded — they are not
-///   executed logical work and would otherwise skew the derived overall
-///   status.
-/// - `overall_status` is derived the SAME way as `build_live_lab_run_report`:
-///   any `Failed` → `Failed`, else any `Skipped` → `Partial`, else `Passed`.
-/// - `node_statuses` is one entry per `nodes.tsv` row (`alias`, `role`);
-///   `platform` is `unknown` (the artifact carries none) and
-///   `validator_results` is empty. The functional diff uses only the node
-///   COUNT, so this is sufficient for the gate and honest about what the
-///   artifact records.
-/// - `run_id` / `timestamp_utc` are best-effort from `run_summary.json`.
-///
-/// Fail-closed: an unreadable `stages.tsv`, or one with zero terminal stage
-/// rows, is an error — a report with no executed work cannot prove parity and
-/// must never silently read as a pass.
-pub fn live_lab_run_report_from_report_dir(report_dir: &Path) -> Result<LiveLabRunReport, String> {
+/// This is the fix for the bash under-reporting: the bash orchestrate path
+/// records ONLY the setup stages in `state/stages.tsv` (and `run_summary.json`),
+/// collapsing the entire live suite into a single `orchestrate_result` outcome
+/// — so a bash run that PASSED setup but FAILED its live suite reads as `pass`
+/// from `stages.tsv`/`run_summary.json` yet `fail` here. `overall_status` is
+/// taken from the record's own field (falling back to a derivation over the
+/// outcomes if absent), so the live-suite verdict is captured for both engines.
+fn report_from_orchestrate_result(report_dir: &Path) -> Option<(RunStatus, Vec<StageReport>)> {
+    use crate::live_lab_stage_registry::{StageStatus, parse_stage_status};
+
+    let path = report_dir.join("orchestration/orchestrate_result.json");
+    let body = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+
+    let mut stages: Vec<StageReport> = Vec::new();
+    if let Some(outcomes) = value.get("outcomes").and_then(|v| v.as_array()) {
+        for outcome in outcomes {
+            let stage_id = outcome
+                .get("stage")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if stage_id.is_empty() {
+                continue;
+            }
+            let summary = outcome
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            // Completeness placeholders the bash arm emits for stages that were
+            // never part of this run's plan — not executed work, drop them so
+            // they neither pollute the stage list nor push overall to Partial.
+            if summary.contains("not dispatched this run") {
+                continue;
+            }
+            let status = outcome
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let rec = match parse_stage_status(status) {
+                Some(StageStatus::Pass) => StageOutcomeRecord::Passed,
+                Some(StageStatus::Fail | StageStatus::Aborted | StageStatus::TimedOut) => {
+                    StageOutcomeRecord::Failed
+                }
+                Some(StageStatus::Skipped) => StageOutcomeRecord::Skipped,
+                Some(StageStatus::Pending | StageStatus::Running | StageStatus::NotApplicable)
+                | None => continue,
+            };
+            let error_detail = if rec == StageOutcomeRecord::Failed && !summary.is_empty() {
+                Some(summary.to_owned())
+            } else {
+                None
+            };
+            stages.push(StageReport {
+                stage_id: stage_id.to_owned(),
+                stage_name: stage_id.to_owned(),
+                outcome: rec,
+                duration_ms: 0,
+                error_detail,
+            });
+        }
+    }
+
+    let overall_status = value
+        .get("overall_status")
+        .and_then(serde_json::Value::as_str)
+        .and_then(run_status_from_str)
+        .unwrap_or_else(|| derive_overall_status(&stages));
+
+    Some((overall_status, stages))
+}
+
+/// Fallback source: `<report_dir>/state/stages.tsv` (the realtime recorder
+/// TSV). Complete for a Rust `--node` run; for a bash run it holds only the
+/// setup stages, which is why `orchestrate_result.json` is preferred. Fails
+/// closed on an unreadable file or one with zero terminal stage rows.
+fn report_from_stages_tsv(report_dir: &Path) -> Result<(RunStatus, Vec<StageReport>), String> {
     use crate::live_lab_stage_registry::{StageStatus, parse_stage_status};
 
     let stages_path = report_dir.join("state/stages.tsv");
@@ -199,7 +306,6 @@ pub fn live_lab_run_report_from_report_dir(report_dir: &Path) -> Result<LiveLabR
                 StageOutcomeRecord::Failed
             }
             Some(StageStatus::Skipped) => StageOutcomeRecord::Skipped,
-            // Non-terminal or never-dispatched — not executed logical work.
             Some(StageStatus::Pending | StageStatus::Running | StageStatus::NotApplicable)
             | None => continue,
         };
@@ -227,49 +333,42 @@ pub fn live_lab_run_report_from_report_dir(report_dir: &Path) -> Result<LiveLabR
         ));
     }
 
-    let any_failed = stages
-        .iter()
-        .any(|s| s.outcome == StageOutcomeRecord::Failed);
-    let any_skipped = stages
-        .iter()
-        .any(|s| s.outcome == StageOutcomeRecord::Skipped);
-    let overall_status = if any_failed {
-        RunStatus::Failed
-    } else if any_skipped {
-        RunStatus::Partial
-    } else {
-        RunStatus::Passed
-    };
+    Ok((derive_overall_status(&stages), stages))
+}
 
-    // nodes.tsv (best-effort): alias/label, target, node_id, role. The
-    // functional diff uses only the node COUNT, so an absent file yields an
-    // empty (0-node) set rather than an error — the stage list is the
-    // authoritative parity signal.
-    let mut node_statuses: HashMap<String, NodeStatus> = HashMap::new();
-    if let Ok(nodes_body) = std::fs::read_to_string(report_dir.join("state/nodes.tsv")) {
-        for raw_line in nodes_body.lines() {
-            let line = raw_line.trim_end_matches('\r');
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let cols: Vec<&str> = line.split('\t').collect();
-            let alias = cols.first().map(|s| s.trim()).unwrap_or("");
-            if alias.is_empty() {
-                continue;
-            }
-            let role = cols.get(3).map(|s| s.trim()).unwrap_or("").to_owned();
-            node_statuses.insert(
-                alias.to_owned(),
-                NodeStatus {
-                    alias: alias.to_owned(),
-                    platform: "unknown".to_owned(),
-                    role,
-                    validator_results: Vec::new(),
-                },
-            );
-        }
-    }
-
+/// Engine-agnostic reconstruction of a [`LiveLabRunReport`] from a completed
+/// run's on-disk evidence, independent of which orchestrator produced it.
+///
+/// This removes the Bucket-7 blocker: the Rust `--node` path already emits
+/// `parity_input.json` directly (via [`build_live_lab_run_report`]), but the
+/// bash orchestrator never did. Reconstructing ANY report directory — bash or
+/// Rust — into a `LiveLabRunReport` through this one function lets the
+/// functional-parity gate (the redefined W5.6 flip gate) run bash-vs-Rust, and
+/// deriving BOTH sides identically guarantees a diff reflects a real difference
+/// in the runs rather than in how the report was built.
+///
+/// Source precedence (see the helpers):
+/// - PRIMARY `<report_dir>/orchestration/orchestrate_result.json` — the
+///   authoritative full-run record both engines write. Required because the
+///   bash arm records only the SETUP stages in `state/stages.tsv` /
+///   `run_summary.json` and collapses the live suite into one
+///   `orchestrate_result` outcome; reading `stages.tsv` alone would misreport a
+///   bash run that failed its live suite as `pass`.
+/// - FALLBACK `<report_dir>/state/stages.tsv` — used only when
+///   `orchestrate_result.json` is absent/unparseable (e.g. a crashed run).
+///
+/// Stage statuses are normalized through the canonical
+/// [`parse_stage_status`](crate::live_lab_stage_registry::parse_stage_status)
+/// taxonomy (`pass` → `Passed`, `fail`/`aborted`/`timed_out` → `Failed`,
+/// `skip` → `Skipped`; non-terminal / never-dispatched rows excluded).
+/// `node_statuses` comes from `state/nodes.tsv`; `run_id`/`timestamp_utc` are
+/// best-effort from `run_summary.json`.
+///
+/// Fail-closed: if neither source yields any stage rows, this is an error — a
+/// report with no executed work cannot prove parity and must never read as a
+/// pass.
+pub fn live_lab_run_report_from_report_dir(report_dir: &Path) -> Result<LiveLabRunReport, String> {
+    let node_statuses = node_statuses_from_nodes_tsv(report_dir);
     let (run_id, timestamp_utc) = run_summary_identity(report_dir).unwrap_or_else(|| {
         let fallback = report_dir
             .file_name()
@@ -278,6 +377,11 @@ pub fn live_lab_run_report_from_report_dir(report_dir: &Path) -> Result<LiveLabR
             .to_owned();
         (fallback, String::new())
     });
+
+    let (overall_status, stages) = match report_from_orchestrate_result(report_dir) {
+        Some(result) => result,
+        None => report_from_stages_tsv(report_dir)?,
+    };
 
     Ok(LiveLabRunReport {
         run_id,
@@ -1155,5 +1259,101 @@ mod tests {
         );
         std::fs::remove_dir_all(&bash_dir).ok();
         std::fs::remove_dir_all(&rust_dir).ok();
+    }
+
+    fn write_report_dir_with_result(
+        name: &str,
+        stages_tsv: Option<&str>,
+        orchestrate_result_json: &str,
+    ) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("rustynet-parity-orch-{name}-{stamp}"));
+        std::fs::create_dir_all(dir.join("state")).expect("state dir");
+        std::fs::create_dir_all(dir.join("orchestration")).expect("orchestration dir");
+        if let Some(tsv) = stages_tsv {
+            std::fs::write(dir.join("state/stages.tsv"), tsv).expect("stages.tsv");
+        }
+        std::fs::write(
+            dir.join("orchestration/orchestrate_result.json"),
+            orchestrate_result_json,
+        )
+        .expect("orchestrate_result.json");
+        dir
+    }
+
+    #[test]
+    fn converter_prefers_orchestrate_result_over_setup_only_stages_tsv() {
+        // The bash-run bug: stages.tsv holds only the SETUP stages (all pass),
+        // but the live suite failed — recorded only in orchestrate_result.json.
+        // The converter must report Failed (from the authoritative record), not
+        // Passed (from the setup-only TSV).
+        let setup_only_tsv = "membership_setup\thard\tpass\t0\t\t\t\t\n\
+             validate_baseline_runtime\thard\tpass\t0\t\t\t\t\n";
+        let result = serde_json::json!({
+            "overall_status": "fail",
+            "outcomes": [
+                {"stage": "validate_baseline_runtime", "status": "pass", "summary": "ok"},
+                {"stage": "vm_lab_run_live_lab", "status": "fail", "summary": "traffic pair unreachable"}
+            ]
+        })
+        .to_string();
+        let dir = write_report_dir_with_result("prefers", Some(setup_only_tsv), &result);
+        let report = live_lab_run_report_from_report_dir(&dir).expect("converts");
+        assert_eq!(
+            report.overall_status,
+            RunStatus::Failed,
+            "must take the live-suite failure from orchestrate_result.json, not the setup-only TSV"
+        );
+        assert!(
+            report
+                .stages
+                .iter()
+                .any(|s| s.stage_id == "vm_lab_run_live_lab"
+                    && s.outcome == StageOutcomeRecord::Failed),
+            "{:#?}",
+            report.stages
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn converter_drops_not_dispatched_placeholders() {
+        // The bash arm records "not dispatched this run" completeness
+        // placeholders; they are not executed work and must not appear as
+        // Skipped stages (which would otherwise push a clean run to Partial).
+        let result = serde_json::json!({
+            "overall_status": "pass",
+            "outcomes": [
+                {"stage": "bootstrap_hosts", "status": "pass", "summary": "ok"},
+                {"stage": "validate_linux_relay_service_lifecycle", "status": "skipped",
+                 "summary": "not dispatched this run (conditional/job-level; recorded for completeness)"}
+            ]
+        })
+        .to_string();
+        let dir = write_report_dir_with_result("placeholders", None, &result);
+        let report = live_lab_run_report_from_report_dir(&dir).expect("converts");
+        assert_eq!(report.overall_status, RunStatus::Passed);
+        assert_eq!(report.stages.len(), 1, "{:#?}", report.stages);
+        assert_eq!(report.stages[0].stage_id, "bootstrap_hosts");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn converter_falls_back_to_stages_tsv_when_no_orchestrate_result() {
+        // A report dir with only the recorder TSV (e.g. a crashed run) still
+        // converts via the fallback path.
+        let dir = write_report_dir(
+            "fallback",
+            "preflight\thard\tpass\t0\t\t\t\t\nbootstrap_hosts\thard\tpass\t0\t\t\t\t\n",
+            None,
+        );
+        let report = live_lab_run_report_from_report_dir(&dir).expect("fallback converts");
+        assert_eq!(report.overall_status, RunStatus::Passed);
+        assert_eq!(report.stages.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
