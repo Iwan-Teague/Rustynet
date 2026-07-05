@@ -403,6 +403,59 @@ all-clients topology — needs a product call (hub-spoke by design vs a real
 peering bug) + daemon-level investigation; Windows Exit needs a WinNAT/HNS-capable
 guest (current lab guest lacks `MSFT_NetNat`).
 
+### Full bash→Rust stage migration tracker (2026-07-05)
+
+**Operator mandate (2026-07-05):** *everything the bash orchestrator offers must be
+runnable in the Rust engine — every stage, on Linux AND macOS AND Windows — but
+improved (the Rust engine has more control + information). Deferral is fine;
+nothing is permanently scoped out. Everything migrates eventually.*
+
+Grounded in the `live_lab_stage_registry` catalog (167 stage names) vs. the 22-stage
+Rust `--node` plan. The migration is **not** "145 stages to add" — the Rust engine
+consolidates by design (one role×adapter stage covers many discrete bash cells). It
+decomposes into three kinds of work:
+
+1. **Already consolidated (done).** The bash setup/bootstrap/membership/distribute/
+   baseline dialects (`membership_setup`, `bootstrap_macos_host`,
+   `distribute_*_bundles`, …) collapse into the 22 role×adapter stages. ~38 core +
+   the mac/win *setup* cells are covered here.
+2. **Adapter promotion (code partly there; live-proof deferred).** mac/win role
+   behaviors (exit / relay / anchor / security-audit) run *inside* the existing 22
+   stages via the per-OS `NodeAdapter`; they are reported-skip on mac/win today and
+   flip to live only after a live mac/win run proves each (§ promotion-follows-
+   evidence). ~70 mac/win cells map here — no new `StageId`s, just adapter runtime +
+   the reported-skip→live flip.
+3. **Genuinely new Rust stages (the real remaining port, ~50).** Behaviors the 22 do
+   not cover:
+   - **chaos ×9** (`chaos_daemon_fault`, `_sigstop_sigcont`, `_clock_attack`,
+     `_signed_state_adversarial`, `_crash_recovery`, `_resource_exhaustion`,
+     `_network_impairment`, `_membership_adversarial`, `_privileged_boundary`) —
+     opt-in (`--enable-chaos-suite`), self-contained.
+   - **cross-network ~14** (`cross_network_nat_classification`/`_matrix`/
+     `_controller_switch`/`_direct_remote_exit`/`_failback_roaming`, +
+     `validate_{linux,macos,windows}_exit_nat_lifecycle`).
+   - **rich Linux validators ~28** not consolidated (`live_two_hop`,
+     `live_managed_dns`, `validate_linux_ipv6_leak`, `_dns_failclosed`,
+     `_network_flap`, `_reboot_recovery`, `_lan_toggle`, `_mixed_topology`,
+     `_exit_demotion_residue`, `_blind_exit_dataplane`, `_secrets_not_in_logs`,
+     `_enrollment_restart`, the daemon validators, …). Most already have the logic
+     as bash-arm Rust functions (`run_validate_linux_*`), so each port is
+     "wrap the existing evaluator in an `OrchestrationStage` + the 7-place
+     checklist" — the `SecurityAuditValidationStage` pattern.
+
+**Suggested port order (deferral OK):** rich Linux validators (reuse existing
+evaluators, cheapest) → chaos ×9 (self-contained, opt-in) → cross-network (needs the
+substrate) → mac/win adapter promotion (needs coordinated live proof). Live proof of
+each new/promoted cell **follows** the code (reported-skip until a live run proves it
++ a run-matrix row exists; strictest-secure default).
+
+**Coordination rule — stage-adding is SERIALIZED.** Adding a `StageId` touches the
+count/drift gates (`build_returns_N`, `rust_native_cli_stage_ids_match_plan_builder`,
+the registry extensibility gate, `oracle_is_rust_native`, repo-context
+`ORCHESTRATOR_STAGES`). Two agents adding stages at once collide on those asserts.
+Assign disjoint *batches* and land them one at a time; always run the FULL
+`cargo test --workspace` before claiming a stage batch landed.
+
 ## 1) Motivation
 
 ### 1.1 Problem statement
