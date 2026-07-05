@@ -7363,12 +7363,12 @@ fn execute_rust_native_orchestration(
     use orchestrator::error::StageOutcome;
     use orchestrator::runner::StateMachineRunner;
 
-    // Snapshot the manifest selectors while `config` is fully intact (fields
-    // below are consumed by value). The Rust-path manifest drives enablement
-    // by plan membership, so these selectors only fill the audit snapshot.
-    let manifest_selectors = orchestrate_manifest_selectors(&config);
-    // Capture dry_run while `config` is intact (fields below are consumed).
+    // Capture scalar config while `config` is intact (fields below are consumed
+    // by value). The Rust-path manifest selectors are built LATER from the
+    // resolved topology (see `rust_native_manifest_selectors`) so the audit
+    // snapshot reflects only what THIS plan runs — never a bash-arm-only suite.
     let dry_run = config.dry_run;
+    let skip_live_suite = config.skip_linux_live_suite;
 
     let known_hosts = config
         .known_hosts_path
@@ -7551,7 +7551,36 @@ fn execute_rust_native_orchestration(
         None => None,
     };
 
-    let stages = build_rust_native_orchestration_stages(rebuild_only, source_mode);
+    let stages = build_rust_native_orchestration_stages(rebuild_only, source_mode, skip_live_suite);
+
+    // Build the manifest audit snapshot from THIS run's resolved topology + only
+    // the selectors the Rust plan actually honors. The bash-arm suite selectors
+    // (chaos, cross-network, macos_promote_exit, the role-platform election
+    // family) are NOT run by PlanBuilder, so stamping them active would be a
+    // false evidence claim (cross_network_suite defaults on!) — they are forced
+    // inactive here. wants_macos/windows come from the real `--node` guest
+    // platforms, not the ignored `*_platform` flags. skip_linux_live_suite IS
+    // honored by PlanBuilder (drops the live suite), so it is stamped truthfully.
+    let manifest_selectors = crate::live_lab_stage_registry::TargetSelectors {
+        wants_macos: node_entries
+            .iter()
+            .any(|(entry, _)| entry.platform == Some(VmGuestPlatform::Macos)),
+        wants_windows: node_entries
+            .iter()
+            .any(|(entry, _)| entry.platform == Some(VmGuestPlatform::Windows)),
+        macos_promote_exit: false,
+        exit_platform: String::new(),
+        relay_platform: String::new(),
+        anchor_platform: String::new(),
+        admin_platform: String::new(),
+        blind_exit_platform: String::new(),
+        role_switch_platform: String::new(),
+        skip_linux_live_suite: skip_live_suite,
+        chaos_suite: false,
+        cross_network_suite: false,
+        soak_suite: false,
+        local_gate_suite: false,
+    };
 
     // Finding 1/4 (recorder-first): emit the run-scoped stage manifest that
     // reflects THIS run's actual plan — the Rust state-machine dialect enabled
@@ -7743,10 +7772,12 @@ fn execute_rust_native_orchestration(
 fn build_rust_native_orchestration_stages(
     rebuild_only: Option<Vec<String>>,
     source_mode: orchestrator::stage::source_archive::ArchiveSourceMode,
+    skip_live_suite: bool,
 ) -> Vec<Box<dyn orchestrator::stage::OrchestrationStage>> {
     orchestrator::plan::PlanBuilder::new()
         .with_rebuild_only(rebuild_only)
         .with_source_mode(source_mode)
+        .with_skip_live_suite(skip_live_suite)
         .build()
 }
 
@@ -7755,6 +7786,7 @@ fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::StageId> {
     build_rust_native_orchestration_stages(
         None,
         orchestrator::stage::source_archive::ArchiveSourceMode::Head,
+        false,
     )
     .iter()
     .map(|stage| stage.id())
