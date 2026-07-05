@@ -1163,6 +1163,55 @@ pub fn execute_ops_vm_lab_diff_orchestrator_parity(
     }
 }
 
+/// Configuration for `vm-lab-emit-parity-input`: reconstruct a
+/// `parity_input.json` (`LiveLabRunReport`) from a completed run's on-disk
+/// evidence (`state/stages.tsv` + `state/nodes.tsv`), regardless of which
+/// orchestrator produced it.
+///
+/// The Rust `--node` path already writes `parity_input.json` directly, but the
+/// bash orchestrator never did — this subcommand is the Bucket-7 bridge that
+/// lets a bash run be fed to `vm-lab-diff-orchestrator-parity --mode
+/// functional` (the redefined W5.6 flip gate). Emitting BOTH sides through this
+/// one converter also makes the comparison apples-to-apples (same construction
+/// logic), so a diff reflects a real run difference, not a report-building one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabEmitParityInputConfig {
+    pub report_dir: PathBuf,
+    pub output_path: PathBuf,
+}
+
+pub fn execute_ops_vm_lab_emit_parity_input(
+    config: VmLabEmitParityInputConfig,
+) -> Result<String, String> {
+    let report = orchestrator::parity::live_lab_run_report_from_report_dir(&config.report_dir)?;
+    if let Some(parent) = config.output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "create parity input output directory '{}': {err}",
+                parent.display()
+            )
+        })?;
+    }
+    let body = serde_json::to_vec_pretty(&report)
+        .map_err(|err| format!("serialize parity input: {err}"))?;
+    fs::write(&config.output_path, &body).map_err(|err| {
+        format!(
+            "write parity input to '{}': {err}",
+            config.output_path.display()
+        )
+    })?;
+    Ok(format!(
+        "parity_input: report_dir='{}' overall={:?} stages={} nodes={} -> {}",
+        config.report_dir.display(),
+        report.overall_status,
+        report.stages.len(),
+        report.node_statuses.len(),
+        config.output_path.display(),
+    ))
+}
+
 /// Build the deprecation-warning lines (newline-free, one per item) that
 /// callers should emit on stderr when the operator invoked
 /// `vm-lab-orchestrate-live-lab` with the legacy `--*-vm` flag set but
@@ -47209,6 +47258,63 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             serde_json::from_str(&written).expect("output must be valid ParityDiff");
         assert!(parsed.overall_parity_pass);
 
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_emit_parity_input_converts_report_dir_and_feeds_diff() {
+        // End-to-end Bucket-7 path: a bash-style report dir → parity_input.json
+        // via the emit subcommand → consumable by the functional diff.
+        let unique = super::unique_suffix();
+        let tmp = std::env::temp_dir().join(format!("rustynet-emit-parity-{unique}.dir"));
+        let state = tmp.join("state");
+        fs::create_dir_all(&state).expect("state dir");
+        fs::write(
+            state.join("stages.tsv"),
+            "membership_setup\thard\tpass\t0\t\t\t\t\n\
+             validate_baseline_runtime\thard\tpass\t0\t\t\t\t\n",
+        )
+        .expect("stages.tsv");
+        fs::write(
+            state.join("nodes.tsv"),
+            "exit\tdebian@exit\texit-1\texit\nclient\tdebian@client\tclient-1\tclient\n",
+        )
+        .expect("nodes.tsv");
+
+        let output = tmp.join("parity_input.json");
+        let cfg = super::VmLabEmitParityInputConfig {
+            report_dir: tmp.clone(),
+            output_path: output.clone(),
+        };
+        let summary =
+            super::execute_ops_vm_lab_emit_parity_input(cfg).expect("emit must convert bash dir");
+        assert!(summary.contains("stages=2"), "summary: {summary}");
+        assert!(summary.contains("nodes=2"), "summary: {summary}");
+
+        let report: super::orchestrator::report::LiveLabRunReport =
+            serde_json::from_str(&fs::read_to_string(&output).expect("parity_input written"))
+                .expect("valid LiveLabRunReport");
+        assert_eq!(
+            report.overall_status,
+            super::orchestrator::report::RunStatus::Passed
+        );
+        assert_eq!(report.node_statuses.len(), 2);
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_emit_parity_input_errors_on_missing_stages() {
+        let unique = super::unique_suffix();
+        let tmp = std::env::temp_dir().join(format!("rustynet-emit-parity-miss-{unique}.dir"));
+        fs::create_dir_all(&tmp).expect("tmp dir");
+        let cfg = super::VmLabEmitParityInputConfig {
+            report_dir: tmp.clone(),
+            output_path: tmp.join("parity_input.json"),
+        };
+        let err = super::execute_ops_vm_lab_emit_parity_input(cfg)
+            .expect_err("missing stages.tsv must fail closed");
+        assert!(err.contains("stages.tsv"), "err: {err}");
         fs::remove_dir_all(&tmp).ok();
     }
 
