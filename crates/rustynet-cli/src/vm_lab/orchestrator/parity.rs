@@ -17,6 +17,7 @@
 //! module is intentionally pure-data so it has full unit coverage.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -114,6 +115,177 @@ pub fn build_live_lab_run_report(
         stages,
         node_statuses,
     }
+}
+
+/// Best-effort `(run_id, timestamp_utc)` from `<report_dir>/run_summary.json`.
+/// Neither field participates in the functional-parity verdict, so absence /
+/// unparseable JSON is not an error — the caller falls back to the directory
+/// name and an empty timestamp.
+fn run_summary_identity(report_dir: &Path) -> Option<(String, String)> {
+    let body = std::fs::read_to_string(report_dir.join("run_summary.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let run_id = value.get("run_id")?.as_str()?.to_owned();
+    let timestamp = value
+        .get("started_at_utc")
+        .or_else(|| value.get("timestamp_utc"))
+        .or_else(|| value.get("finished_at_utc"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    Some((run_id, timestamp))
+}
+
+/// Engine-agnostic reconstruction of a [`LiveLabRunReport`] from a completed
+/// run's on-disk evidence (`<report_dir>/state/stages.tsv` +
+/// `<report_dir>/state/nodes.tsv`), independent of which orchestrator produced
+/// it.
+///
+/// This removes the Bucket-7 blocker: the Rust `--node` path already emits
+/// `parity_input.json` directly (via [`build_live_lab_run_report`]), but the
+/// bash orchestrator never did. Because BOTH engines now write the shared
+/// recorder artifacts (`stages.tsv` + `nodes.tsv`), this converter turns ANY
+/// report directory — bash or Rust — into a `LiveLabRunReport`, so the
+/// functional-parity gate (the redefined W5.6 flip gate) can finally be run
+/// bash-vs-Rust. Deriving BOTH sides through this one function also guarantees
+/// the two reports are produced identically, so any diff reflects a real
+/// difference in the runs rather than a difference in how the report was built.
+///
+/// Semantics (kept consistent with [`build_live_lab_run_report`]):
+/// - Stage outcomes come from the `stages.tsv` status column, normalized
+///   through the canonical [`parse_stage_status`](crate::live_lab_stage_registry::parse_stage_status)
+///   taxonomy: `pass` → `Passed`, `fail`/`aborted`/`timed_out` → `Failed`,
+///   `skip`/`skipped` → `Skipped`. Non-terminal (`pending`/`running`) and
+///   never-dispatched (`not_run`/`na`) rows are excluded — they are not
+///   executed logical work and would otherwise skew the derived overall
+///   status.
+/// - `overall_status` is derived the SAME way as `build_live_lab_run_report`:
+///   any `Failed` → `Failed`, else any `Skipped` → `Partial`, else `Passed`.
+/// - `node_statuses` is one entry per `nodes.tsv` row (`alias`, `role`);
+///   `platform` is `unknown` (the artifact carries none) and
+///   `validator_results` is empty. The functional diff uses only the node
+///   COUNT, so this is sufficient for the gate and honest about what the
+///   artifact records.
+/// - `run_id` / `timestamp_utc` are best-effort from `run_summary.json`.
+///
+/// Fail-closed: an unreadable `stages.tsv`, or one with zero terminal stage
+/// rows, is an error — a report with no executed work cannot prove parity and
+/// must never silently read as a pass.
+pub fn live_lab_run_report_from_report_dir(report_dir: &Path) -> Result<LiveLabRunReport, String> {
+    use crate::live_lab_stage_registry::{StageStatus, parse_stage_status};
+
+    let stages_path = report_dir.join("state/stages.tsv");
+    let stages_body = std::fs::read_to_string(&stages_path)
+        .map_err(|err| format!("read stages.tsv '{}': {err}", stages_path.display()))?;
+
+    let mut stages: Vec<StageReport> = Vec::new();
+    for raw_line in stages_body.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        // 8-column v1 layout: stage, severity, status, rc, log, summary,
+        // started, finished. Fewer than 3 columns cannot carry a status.
+        if cols.len() < 3 {
+            continue;
+        }
+        let stage_id = cols[0].trim();
+        if stage_id.is_empty() {
+            continue;
+        }
+        let outcome = match parse_stage_status(cols[2].trim()) {
+            Some(StageStatus::Pass) => StageOutcomeRecord::Passed,
+            Some(StageStatus::Fail | StageStatus::Aborted | StageStatus::TimedOut) => {
+                StageOutcomeRecord::Failed
+            }
+            Some(StageStatus::Skipped) => StageOutcomeRecord::Skipped,
+            // Non-terminal or never-dispatched — not executed logical work.
+            Some(StageStatus::Pending | StageStatus::Running | StageStatus::NotApplicable)
+            | None => continue,
+        };
+        let error_detail = if outcome == StageOutcomeRecord::Failed {
+            cols.get(5)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        stages.push(StageReport {
+            stage_id: stage_id.to_owned(),
+            stage_name: stage_id.to_owned(),
+            outcome,
+            duration_ms: 0,
+            error_detail,
+        });
+    }
+
+    if stages.is_empty() {
+        return Err(format!(
+            "no terminal stage rows in '{}': cannot build a parity report",
+            stages_path.display()
+        ));
+    }
+
+    let any_failed = stages
+        .iter()
+        .any(|s| s.outcome == StageOutcomeRecord::Failed);
+    let any_skipped = stages
+        .iter()
+        .any(|s| s.outcome == StageOutcomeRecord::Skipped);
+    let overall_status = if any_failed {
+        RunStatus::Failed
+    } else if any_skipped {
+        RunStatus::Partial
+    } else {
+        RunStatus::Passed
+    };
+
+    // nodes.tsv (best-effort): alias/label, target, node_id, role. The
+    // functional diff uses only the node COUNT, so an absent file yields an
+    // empty (0-node) set rather than an error — the stage list is the
+    // authoritative parity signal.
+    let mut node_statuses: HashMap<String, NodeStatus> = HashMap::new();
+    if let Ok(nodes_body) = std::fs::read_to_string(report_dir.join("state/nodes.tsv")) {
+        for raw_line in nodes_body.lines() {
+            let line = raw_line.trim_end_matches('\r');
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            let alias = cols.first().map(|s| s.trim()).unwrap_or("");
+            if alias.is_empty() {
+                continue;
+            }
+            let role = cols.get(3).map(|s| s.trim()).unwrap_or("").to_owned();
+            node_statuses.insert(
+                alias.to_owned(),
+                NodeStatus {
+                    alias: alias.to_owned(),
+                    platform: "unknown".to_owned(),
+                    role,
+                    validator_results: Vec::new(),
+                },
+            );
+        }
+    }
+
+    let (run_id, timestamp_utc) = run_summary_identity(report_dir).unwrap_or_else(|| {
+        let fallback = report_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("converted")
+            .to_owned();
+        (fallback, String::new())
+    });
+
+    Ok(LiveLabRunReport {
+        run_id,
+        timestamp_utc,
+        overall_status,
+        stages,
+        node_statuses,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -873,5 +1045,115 @@ mod tests {
             f.overall_functional_parity_pass,
             "validator-count divergence must NOT gate functional parity: {f:#?}"
         );
+    }
+
+    // ── report_dir → LiveLabRunReport converter (Bucket 7 blocker removal) ──
+
+    fn write_report_dir(
+        name: &str,
+        stages_tsv: &str,
+        nodes_tsv: Option<&str>,
+    ) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("rustynet-parity-conv-{name}-{stamp}"));
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(state.join("stages.tsv"), stages_tsv).expect("stages.tsv");
+        if let Some(nodes) = nodes_tsv {
+            std::fs::write(state.join("nodes.tsv"), nodes).expect("nodes.tsv");
+        }
+        dir
+    }
+
+    #[test]
+    fn converter_reads_stages_and_nodes_and_derives_passed() {
+        // bash dialect stage IDs, all pass; `na`/`running` rows are ignored.
+        let stages = "membership_setup\thard\tpass\t0\t/tmp/m.log\tok\t2026-07-05T00:00:00Z\t2026-07-05T00:01:00Z\n\
+             validate_baseline_runtime\thard\tpass\t0\t/tmp/b.log\tok\t2026-07-05T00:02:00Z\t2026-07-05T00:03:00Z\n\
+             activate_macos_exit_role\tsoft\tna\t\t\t\t\t\n";
+        let nodes = "debian-headless-1\tdebian@192.168.0.200\texit-1\texit\n\
+             debian-headless-2\tdebian@192.168.0.201\tclient-1\tclient\n";
+        let dir = write_report_dir("passed", stages, Some(nodes));
+        let report = live_lab_run_report_from_report_dir(&dir).expect("converts");
+        assert_eq!(report.overall_status, RunStatus::Passed);
+        // The `na` row is excluded; only the two terminal rows survive.
+        assert_eq!(report.stages.len(), 2, "{:#?}", report.stages);
+        assert_eq!(report.node_statuses.len(), 2);
+        assert_eq!(
+            report.node_statuses["debian-headless-1"].role,
+            "exit".to_owned()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn converter_maps_fail_and_skip_and_prefers_failed_overall() {
+        let stages = "bootstrap_hosts\thard\tpass\t0\t/tmp/a.log\tok\t\t\n\
+             traffic_test_matrix\thard\tfail\t1\t/tmp/t.log\tclient pair unreachable\t\t\n\
+             role_switch_matrix\thard\tskip\t\t\t\t\t\n";
+        let dir = write_report_dir("failed", stages, None);
+        let report = live_lab_run_report_from_report_dir(&dir).expect("converts");
+        assert_eq!(report.overall_status, RunStatus::Failed);
+        let traffic = report
+            .stages
+            .iter()
+            .find(|s| s.stage_id == "traffic_test_matrix")
+            .expect("traffic stage present");
+        assert_eq!(traffic.outcome, StageOutcomeRecord::Failed);
+        assert_eq!(
+            traffic.error_detail.as_deref(),
+            Some("client pair unreachable")
+        );
+        // No nodes.tsv → empty node set, but the stage list still stands.
+        assert_eq!(report.node_statuses.len(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn converter_errors_on_empty_stages() {
+        // Only a non-terminal row → zero executed stages → fail-closed error.
+        let stages = "preflight\thard\trunning\t\t\t\t\t\n";
+        let dir = write_report_dir("empty", stages, None);
+        let err = live_lab_run_report_from_report_dir(&dir).expect_err("must fail closed");
+        assert!(err.contains("no terminal stage rows"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn converter_output_feeds_functional_diff_across_dialects() {
+        // A bash report dir and a Rust report dir, both green on the same
+        // 2-node topology, must yield `overall_functional_parity_pass` when
+        // both are reconstructed via the converter — the end-to-end Bucket-7
+        // path (bash-vs-Rust functional gate) with divergent stage IDs.
+        let bash_stages = "membership_setup\thard\tpass\t0\t\t\t\t\n\
+             validate_baseline_runtime\thard\tpass\t0\t\t\t\t\n\
+             prime_remote_access\thard\tpass\t0\t\t\t\t\n";
+        let rust_stages = "membership_init\thard\tpass\t0\t\t\t\t\n\
+             validate_baseline_runtime\thard\tpass\t0\t\t\t\t\n\
+             distribute_traversal\thard\tpass\t0\t\t\t\t\n";
+        let nodes = "n1\tt1\tid1\texit\nn2\tt2\tid2\tclient\n";
+        let bash_dir = write_report_dir("bash", bash_stages, Some(nodes));
+        let rust_dir = write_report_dir("rust", rust_stages, Some(nodes));
+        let bash = live_lab_run_report_from_report_dir(&bash_dir).expect("bash converts");
+        let rust = live_lab_run_report_from_report_dir(&rust_dir).expect("rust converts");
+        let diff = diff_live_lab_reports_functional(&bash, &rust);
+        assert!(
+            diff.overall_functional_parity_pass,
+            "shared canonical stages (membership + baseline) all pass, \
+             overall Passed==Passed, 2==2 nodes: {diff:#?}"
+        );
+        // membership_setup canonicalizes to membership_init → shared.
+        assert!(
+            diff.shared_stages
+                .iter()
+                .any(|s| s.stage_id == "membership_init"),
+            "{diff:#?}"
+        );
+        std::fs::remove_dir_all(&bash_dir).ok();
+        std::fs::remove_dir_all(&rust_dir).ok();
     }
 }
