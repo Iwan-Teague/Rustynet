@@ -293,6 +293,61 @@ mac/win helper functions from the bash-router arm.
    8. Chaos/cross-network decision. 9. Removal (Bucket 8). Each stage/bucket is
    proven live and recorded in `live_lab_run_matrix.csv` before the next.
 
+### Progress — 2026-07-05 session (verified)
+
+Grounded in the exhaustive bucket map (workflow `wf_ee06d0be-054`, 2026-07-05),
+which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8.
+
+- **Bucket 1 — security suite: `SecurityAuditValidationStage` LANDED + LIVE-PROVEN.**
+  Folds the 8 Tier-0 `rustynetd` daemon self-audits (membership-revoke,
+  revoked-peer-denied, membership-signature, privileged-helper-allowlist,
+  policy-default-deny, gossip-revoked-readmit, enrollment-replay,
+  blind-exit-reversal — the exact set `rustynetd/src/main.rs` dispatches; fail-closed
+  on any non-`overall_ok:true`) into the Rust plan as stage 15/22. Proven PASS on
+  the 3-node Linux `--node` run **`livelab-1783214166`** (all 8 audits × 3 nodes
+  green). Commits `1dde13d`, `a29cc3f`, `05b2a06` (subcommand ground-truth fix),
+  `07781bd` (drift-gate + oracle). *Follow-up (RANK-0):* the bash live-suite has
+  richer anti-vacuity evaluators (empty-corpus / vacuous-baseline / thin-battery)
+  beyond `overall_ok`; fold those in per-audit for full depth parity.
+- **Bucket 1 — `--skip-linux-live-suite` now HONORED by `PlanBuilder`** (`19e5e49`):
+  drops the 7 post-baseline live stages (security_audit / deploy_relay /
+  relay_validation / traffic / role_switch / exit_handoff / active_exit), keeping
+  setup → baseline → the always-run cleanup. Previously the Rust plan ignored it
+  and the MCP loop's fast inner loop was a no-op.
+- **Correctness — Rust-path manifest evidence-integrity fixed** (`19e5e49`):
+  `execute_rust_native_orchestration` used to stamp the run manifest with the
+  bash-arm suite selectors (`cross_network_suite = !skip_cross_network` → TRUE by
+  default, plus chaos / macos_promote_exit / `*_platform`) that `PlanBuilder` never
+  runs — a green `--node` run advertised suites that never executed. Now the
+  manifest selectors are built from the resolved `--node` topology + only the
+  flags the plan honors; every un-honored suite is stamped inactive.
+- **Correctness — macOS Exit `active_exit` no longer hard-fails** (`53a837c`): a
+  macOS node elected Exit via `--node` hit the trait fail-closed default and turned
+  the whole run RED. Now reported-skipped (`active_exit.reported_skips.json`, run
+  goes Partial) gated on `active_exit_runtime_implemented` (Linux + Windows). Full
+  macOS enforce-time pf blind_exit NAT assertion is the tracked follow-up.
+- **Monitor — VM roles now render from the run's own emitted topology** (`d8db72d`):
+  the Rust path records `node_assignments` in `stage_manifest.json`; the monitor
+  prefers them over the previous finalized run's roles (emit-don't-infer).
+- **Extensibility — the 7-place "add a Rust plan stage" checklist** is documented
+  at the top of `orchestrator/plan.rs` (`8cbbcdb`).
+
+**Still open per bucket (map `wf_ee06d0be-054`):** B1 — Windows-relay deploy
+adapter, mac/win security-audit + anchor-bundle-pull runtime (all reported-skip →
+live, each gated on a live mac/win run before flipping `is_supported_for_platform`);
+admin/blind_exit as first-class `--node` roles; chaos/cross-network stages; modes
+(setup/run/iterate via `ctx` persistence + `runner` skip-set) + recovery gate.
+B6 — route `verify_cell` to `--node` + wire `mcp_config`/`allowed_tools`/timeout/
+review-agent/auto-merge/auto-seed. B7 — the **bash-side `parity_input.json`
+emitter is the single hard blocker** to running the proof; then a run-both-and-diff
+wrapper; then the router flip. B8 — gated on 1–7; `run_{windows,linux}_orchestration_stages`
++ `run_validate_{windows,linux}_security` are SHARED (not removable), and deleting
+the `.sh` breaks `cargo test` compilation via `macos_install.rs` `include_str!`.
+**Known blockers:** client↔client traffic (`traffic_test_matrix`) fails in an
+all-clients topology — needs a product call (hub-spoke by design vs a real
+peering bug) + daemon-level investigation; Windows Exit needs a WinNAT/HNS-capable
+guest (current lab guest lacks `MSFT_NetNat`).
+
 ## 1) Motivation
 
 ### 1.1 Problem statement
