@@ -8,9 +8,10 @@
 //! git for commit/diff/revert, and the existing orchestrate CLI as the oracle.
 //! It is compiled and type-checked but never invoked by the tests.
 
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::vm_lab::overnight::agent::{AgentSpawnSpec, build_agent_argv, render_unit_prompt};
 use crate::vm_lab::overnight::backlog::{Cell, CellState, FrontierBacklog};
@@ -259,6 +260,11 @@ pub struct LiveExecutorConfig {
     pub agent_cmd: String,
     pub mcp_config_path: String,
     pub allowed_tools: Vec<String>,
+    /// Hard wall-clock cap per spawned agent. On expiry the agent's whole
+    /// process group is killed (so a mid-orchestrate lab child dies too) and the
+    /// cell is treated as a failed attempt — a wedged agent must never hang the
+    /// whole multi-hour run. `0` disables the cap (test/interactive use only).
+    pub agent_timeout_secs: u64,
 }
 
 pub struct LiveExecutor {
@@ -298,6 +304,56 @@ impl LiveExecutor {
     }
 }
 
+/// Result of a timeout-bounded agent spawn.
+enum AgentRunStatus {
+    Exited(std::process::ExitStatus),
+    TimedOut,
+}
+
+/// Spawn `program args` in its OWN process group and wait up to `timeout_secs`.
+/// On expiry, SIGKILL the whole group (the agent plus any orchestrate / lab
+/// grandchild it spawned) so a wedged agent cannot strand a mid-run lab or hang
+/// the multi-hour loop. `timeout_secs == 0` waits forever (test/interactive).
+fn spawn_with_timeout(
+    program: &str,
+    args: &[String],
+    timeout_secs: u64,
+) -> Result<AgentRunStatus, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        // Child leads its own process group so grandchildren inherit it and the
+        // whole tree can be killed via the negative pgid on timeout.
+        .process_group(0)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    if timeout_secs == 0 {
+        let status = child.wait().map_err(|e| e.to_string())?;
+        return Ok(AgentRunStatus::Exited(status));
+    }
+
+    let pgid = child.id() as i64; // == the new group id because process_group(0)
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) => return Ok(AgentRunStatus::Exited(status)),
+            None => {
+                if Instant::now() >= deadline {
+                    // Kill the whole group (negative pgid via the `kill` binary
+                    // — no unsafe/libc). Best-effort, then reap the direct child.
+                    let _ = Command::new("kill")
+                        .arg("-KILL")
+                        .arg(format!("-{pgid}"))
+                        .status();
+                    let _ = child.wait();
+                    return Ok(AgentRunStatus::TimedOut);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
 impl WorkUnitExecutor for LiveExecutor {
     fn run_agent(&self, cell: &Cell, prompt: &str) -> Result<AgentOutcome, String> {
         let head_before = Self::current_head()?;
@@ -313,10 +369,18 @@ impl WorkUnitExecutor for LiveExecutor {
             .split_first()
             .ok_or_else(|| "empty agent argv".to_owned())?;
 
-        let status = Command::new(program)
-            .args(args)
-            .status()
+        let status = spawn_with_timeout(program, args, self.cfg.agent_timeout_secs)
             .map_err(|e| format!("spawn agent for {} failed: {e}", cell.id()))?;
+        let status = match status {
+            AgentRunStatus::Exited(s) => s,
+            AgentRunStatus::TimedOut => {
+                return Err(format!(
+                    "agent for {} timed out after {}s (process group killed)",
+                    cell.id(),
+                    self.cfg.agent_timeout_secs
+                ));
+            }
+        };
         if !status.success() {
             return Err(format!(
                 "agent for {} exited {}",
@@ -425,6 +489,36 @@ mod tests {
     use crate::vm_lab::VmGuestPlatform;
     use crate::vm_lab::overnight::backlog::{MarchRole, PriorVerdicts};
     use std::cell::RefCell;
+
+    #[test]
+    fn spawn_with_timeout_kills_a_wedged_process() {
+        // A sleep far exceeding the 1s cap must be killed and reported TimedOut,
+        // and control must return near the deadline, not after the full sleep.
+        let start = Instant::now();
+        let r = spawn_with_timeout("sleep", &["30".to_owned()], 1).expect("spawn");
+        assert!(matches!(r, AgentRunStatus::TimedOut));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timeout must fire promptly, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn spawn_with_timeout_returns_exit_status_for_a_fast_command() {
+        match spawn_with_timeout("true", &[], 30).expect("spawn") {
+            AgentRunStatus::Exited(s) => assert!(s.success()),
+            AgentRunStatus::TimedOut => panic!("a fast command must not time out"),
+        }
+    }
+
+    #[test]
+    fn zero_timeout_waits_for_completion() {
+        match spawn_with_timeout("true", &[], 0).expect("spawn") {
+            AgentRunStatus::Exited(s) => assert!(s.success()),
+            AgentRunStatus::TimedOut => panic!("zero timeout must wait, not time out"),
+        }
+    }
 
     /// Scripted executor: returns a queued (outcome, verdict) per call and
     /// records reverts. No process is ever spawned.

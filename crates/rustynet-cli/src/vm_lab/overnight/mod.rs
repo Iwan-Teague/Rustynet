@@ -45,6 +45,28 @@ pub const DEFAULT_MAX_ATTEMPTS_PER_CELL: u32 = 3;
 /// Default per-work-unit agent timeout (1 hour).
 pub const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 3_600;
 
+/// Default tool allowlist for a spawned overnight agent — the core edit/inspect
+/// tools plus the three Rustynet MCP servers its cell prompt drives (gate
+/// runner, lab-state, repo-context). A conservative, functional starting set;
+/// the security-crate write guard + branch guard (safety.rs) still bound what a
+/// committed diff may touch regardless of this list.
+fn default_overnight_allowed_tools() -> Vec<String> {
+    [
+        "Bash",
+        "Read",
+        "Edit",
+        "Write",
+        "Grep",
+        "Glob",
+        "mcp__rustynet-gate-runner",
+        "mcp__rustynet-lab-state",
+        "mcp__rustynet-repo-context",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 /// CLI configuration for `ops vm-lab-overnight`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabOvernightConfig {
@@ -207,6 +229,18 @@ pub fn execute_ops_vm_lab_overnight(config: VmLabOvernightConfig) -> Result<Stri
         .join("artifacts/overnight")
         .join(&token);
 
+    // Point the spawned agent at the repo's MCP config (so its prompt's
+    // gate-runner / lab-state / repo-context calls resolve) and give it a
+    // working default tool allowlist + the hard per-agent timeout. Previously
+    // these were empty/dead, so the agent launched with no MCP + no timeout.
+    let mcp_config = {
+        let p = super::workspace_root_path().join("mcp/mcp.json");
+        if p.is_file() {
+            p.to_string_lossy().into_owned()
+        } else {
+            String::new()
+        }
+    };
     let exec_cfg = LiveExecutorConfig {
         cli_binary,
         inventory_path: config.inventory_path.clone(),
@@ -214,8 +248,9 @@ pub fn execute_ops_vm_lab_overnight(config: VmLabOvernightConfig) -> Result<Stri
         known_hosts_path: config.known_hosts_path.clone(),
         report_root: report_root.clone(),
         agent_cmd: config.agent_cmd.clone(),
-        mcp_config_path: String::new(),
-        allowed_tools: Vec::new(),
+        mcp_config_path: mcp_config,
+        allowed_tools: default_overnight_allowed_tools(),
+        agent_timeout_secs: config.agent_timeout_secs,
     };
     let executor = LiveExecutor::new(exec_cfg);
     let ctx = UnitContext {
