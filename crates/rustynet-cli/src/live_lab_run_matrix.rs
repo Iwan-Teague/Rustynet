@@ -3015,6 +3015,7 @@ mod registry_equivalence_tests {
                 | "distribute_dns_zone"
                 | "enforce_baseline_runtime"
                 | "validate_baseline_runtime"
+                | "security_audit_validation"
                 | "deploy_relay_service"
                 | "relay_validation"
                 | "traffic_test_matrix"
