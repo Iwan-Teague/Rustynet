@@ -269,6 +269,14 @@ bash-style profile from the matrix row; make it work on a profile-less Rust
 role-platform / promote-exit / skip-linux-live-suite selectors on
 `start_live_lab_run`.
 
+> **DONE.** `diagnose_live_lab_failure` now diagnoses profile-less Rust `--node`
+> runs directly from report-dir evidence artifacts (orchestrate_result.json +
+> stages.tsv + failure_digest.json), returning a useful failure summary with log
+> pointers. Fail-closed on empty/no-evidence dirs. `start_live_lab_run` already
+> exposed all Rust-honored selectors (exit/relay/anchor/admin/blind_exit_platform,
+> macos_promote_exit, skip_linux_live_suite) as pass-through CLI flags with
+> mutually-exclusive validation against `nodes`. 6 tests added.
+
 **BUCKET 6 — Overnight driver.** **Route it to the Rust engine:** the executor
 (`verify_cell`, executor.rs:369) invokes `vm-lab-orchestrate-live-lab` with
 `--{role}-platform` selectors but **no `--node`**, so it currently routes to
@@ -370,8 +378,15 @@ live, each gated on a live mac/win run before flipping `is_supported_for_platfor
 admin/blind_exit as first-class `--node` roles; chaos/cross-network stages;
 iterate mode. Setup/run modes + the Rust-path recovery gate are code-landed but
 still need coordinated live proof once the shared lab is free.
-B6 — route `verify_cell` to `--node` + wire `mcp_config`/`allowed_tools`/
-review-agent/auto-merge/auto-seed (agent-timeout already enforced, `041549d`).
+B6 — code landed locally 2026-07-05 for the overnight driver route/gate:
+`verify_cell` synthesizes full `--node <alias>:<role>` assignments from
+inventory, keeps `admin`/`blind_exit` out of the Rust path until first-class
+roles exist, runs preflight/recover plus `build-release` cargo-cache warm before
+the oracle, seeds the per-cell run-matrix scaffold, launches the adversarial
+second-review agent with MCP/tool scope, and gates `--auto-merge-safe-cells` on live green + safe review +
+non-denylisted diff + non-main target branch. Agent timeout was already enforced
+(`041549d`). Still pending: coordinated live `run_loop` + `LiveExecutor` proof
+on an isolated branch after the human confirms the shared lab is free.
 B7 — the converter + `orchestrator_parity_diff.sh` wrapper are LANDED (`420b900`,
 `1f52a13`); the remaining item is a CLEAN coordinated live bash-vs-Rust run pair on
 a matching topology → `overall_functional_parity_pass`. Two run-time cautions found

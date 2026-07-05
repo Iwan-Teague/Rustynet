@@ -434,6 +434,223 @@ impl LabStateServer {
         find_digest_recursive(report_dir, 3)
     }
 
+    /// Diagnose a profile-less (Rust --node) run directly from report-dir
+    /// evidence artifacts — no SSH-into-nodes deep triage.
+    fn diagnose_profileless_run(
+        &self,
+        report_dir: &Path,
+        stage_filter: Option<&str>,
+        collect_artifacts: bool,
+    ) -> ToolCallResult {
+        let mut out = format!(
+            "# Profile-less run diagnosis\n\nReport dir: `{}`\n\n",
+            report_dir.display()
+        );
+
+        // ── 1. Orchestrate result ──────────────────────────────────────
+        let orchestrate_path = report_dir.join("orchestration/orchestrate_result.json");
+        let orchestrate: Option<Value> = std::fs::read_to_string(&orchestrate_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+        if let Some(ref orch) = orchestrate {
+            let overall = orch
+                .get("overall_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let outcomes = orch.get("outcomes").and_then(|v| v.as_array());
+            let fail_count = outcomes
+                .map(|a| {
+                    a.iter()
+                        .filter(|o| {
+                            o.get("status")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|s| s.to_lowercase() == "fail")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            let total = outcomes.map(|a| a.len()).unwrap_or(0);
+            out.push_str(&format!(
+                "## Overall: **{overall}** ({fail_count}/{total} stages failed)\n\n"
+            ));
+            if let Some(a) = outcomes
+                && !a.is_empty()
+            {
+                out.push_str("| stage | status | summary |\n|---|---|---|\n");
+                for o in a {
+                    let stage = o.get("stage").and_then(|v| v.as_str()).unwrap_or("?");
+                    let status = o.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                    let summary = o
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .chars()
+                        .take(120)
+                        .collect::<String>();
+                    out.push_str(&format!("| {stage} | {status} | {summary} |\n"));
+                }
+                out.push('\n');
+            }
+        } else {
+            out.push_str("_orchestration/orchestrate_result.json not found._\n\n");
+        }
+
+        // ── 2. Failure digest ──────────────────────────────────────────
+        let digest = self.find_failure_digest(report_dir);
+        let first_failure_info: Option<(
+            String, // stage
+            String, // primary_failure_reason or message
+            String, // log path
+        )> = digest.as_ref().and_then(|d| {
+            let ff = d.get("first_failure").unwrap_or(d);
+            let stage = ff.get("stage").and_then(|v| v.as_str())?;
+            let reason = ff
+                .get("primary_failure_reason")
+                .or_else(|| ff.get("reason"))
+                .or_else(|| ff.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let log_path = ff.get("log_path").and_then(|v| v.as_str()).unwrap_or("");
+            Some((stage.to_string(), reason.to_string(), log_path.to_string()))
+        });
+
+        if let Some((ref stage, ref reason, ref log)) = first_failure_info {
+            out.push_str("## First failure\n\n");
+            out.push_str(&format!("- **Stage:** `{stage}`\n"));
+            out.push_str(&format!("- **Reason:** {reason}\n"));
+            if !log.is_empty() {
+                out.push_str(&format!("- **Log:** `{log}`\n"));
+            }
+            out.push('\n');
+        }
+
+        // ── 3. stages.tsv — first failed row ───────────────────────────
+        let tsv_path = report_dir.join("state/stages.tsv");
+        let tsv_failures: Vec<(String, String, String, String)> =
+            // (stage, status, rc, log_path)
+            if let Ok(body) = std::fs::read_to_string(&tsv_path) {
+                body.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter_map(|line| {
+                        let cols: Vec<&str> = line.split('\t').collect();
+                        if cols.len() < 5 {
+                            return None;
+                        }
+                        let status = cols[2].to_lowercase();
+                        (status == "fail" || status == "error").then(|| {
+                            (
+                                cols[0].to_string(),
+                                cols[2].to_string(),
+                                cols[3].to_string(),
+                                cols[4].to_string(),
+                            )
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        if !tsv_failures.is_empty() {
+            if first_failure_info.is_none() {
+                let first = &tsv_failures[0];
+                out.push_str("## First failed stage (from stages.tsv)\n\n");
+                out.push_str(&format!(
+                    "- **Stage:** `{}` (rc={})\n- **Log:** `{}`\n\n",
+                    first.0, first.2, first.3
+                ));
+            }
+            out.push_str("## All failed stages (stages.tsv)\n\n");
+            out.push_str("| stage | rc | log |\n|---|---|---|\n");
+            for (stage, _status, rc, log) in &tsv_failures {
+                out.push_str(&format!("| {stage} | {rc} | {log} |\n"));
+            }
+            out.push('\n');
+        } else if orchestrate.is_none() && digest.is_none() && !tsv_path.exists() {
+            // No evidence at all — fail closed.
+            return tool_error(&format!(
+                "No diagnosable evidence found in report dir `{}` (no orchestrate_result.json, \
+                 no failure_digest.json, no stages.tsv). The run may not have started or \
+                 completed. Check the run's job log or the report dir contents.",
+                report_dir.display()
+            ));
+        } else if orchestrate.is_some() && first_failure_info.is_none() {
+            out.push_str(
+                "## stages.tsv\n\n_no failed stages recorded (all pass or skipped)._ \n\n",
+            );
+        }
+
+        // ── 4. Stage-filtered log tail ─────────────────────────────────
+        if let Some(stage_name) = stage_filter {
+            let lower = stage_name.to_lowercase();
+            let norm = lower
+                .strip_prefix("linux_stage_")
+                .or_else(|| lower.strip_prefix("macos_stage_"))
+                .or_else(|| lower.strip_prefix("windows_stage_"))
+                .unwrap_or(lower.as_str());
+            out.push_str(&format!("## Stage log tail: `{stage_name}`\n\n"));
+            let mut found = false;
+            // Prefer matching row from stages.tsv for log path.
+            if let Ok(body) = std::fs::read_to_string(&tsv_path) {
+                for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                    let cols: Vec<&str> = line.split('\t').collect();
+                    if cols.len() < 5 {
+                        continue;
+                    }
+                    let name_l = cols[0].to_lowercase();
+                    if !name_l.contains(norm) && !norm.contains(name_l.as_str()) {
+                        continue;
+                    }
+                    let raw = cols[4];
+                    for cand in [
+                        PathBuf::from(raw),
+                        report_dir.join(raw),
+                        report_dir.join(raw.trim_start_matches("./")),
+                    ] {
+                        if cand.is_file() {
+                            match read_file_capped(&cand, 1_000_000) {
+                                Ok(content) => {
+                                    out.push_str(&format!(
+                                        "- **Log:** `{}`\n\n```\n{}\n```\n",
+                                        cand.display(),
+                                        truncate_tail(&content, 40, 16_000),
+                                    ));
+                                    found = true;
+                                }
+                                Err(e) => {
+                                    out.push_str(&format!("_Cannot read log: {e}_\n"));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            if !found {
+                out.push_str("_No matching stage log found in stages.tsv. Use list_report_artifacts + read_report_artifact._\n");
+            }
+        }
+
+        // ── 5. Triage guidance ─────────────────────────────────────────
+        if collect_artifacts {
+            out.push_str(
+                "\n**Note:** `collect_artifacts` requires SSH into nodes (needs a profile). \
+                 For a profile-less run use `list_report_artifacts` and `read_report_artifact` \
+                 to browse the report dir directly.\n\n",
+            );
+        }
+        out.push_str(
+            "\n## Further triage\n\n\
+             - `explain_stage(<first_failed_stage>)` — owning file + likely causes\n\
+             - `get_stage_log(<stage>)` — full stage log from stages.tsv\n\
+             - `grep_report(<pattern>)` — search all report artifacts\n\
+             - `list_report_artifacts` — browse the report dir\n\
+             - `read_report_artifact(<path>)` — read any file in the report dir\n",
+        );
+
+        tool_success(&out)
+    }
+
     /// First inventory alias whose `platform` field matches (case-insensitive).
     /// Linux entries have no `platform` field, so this returns the windows/macos
     /// aliases used by auto-topology.
@@ -2613,7 +2830,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "diagnose_live_lab_failure".into(),
-                description: "Deep SSH-into-nodes triage of a failed run. `ops vm-lab-diagnose-live-lab-failure`. Only report_dir is required — profile is auto-resolved from the run's matrix row (bash setup runs generate one internally); pass profile only to override. NOTE: a Rust --node run records NO profile, so this SSH-triage path is unavailable for it — triage a profile-less run from its report dir instead with read_report_artifact(failure_digest.json) + get_stage_log + grep_report + explain_stage (the tool returns this guidance when no profile is resolvable).".into(),
+                description: "Deep SSH-into-nodes triage of a failed run. `ops vm-lab-diagnose-live-lab-failure`. Only report_dir is required — profile is auto-resolved from the run's matrix row (bash setup runs generate one internally); pass profile only to override. For a profile-less Rust --node run, diagnoses directly from the report-dir evidence artifacts (orchestrate_result.json + stages.tsv + failure_digest.json) and returns a useful failure summary with log pointers — no SSH needed. Fail-closed: errors on a report dir with no diagnosable evidence.".into(),
                 input_schema: json_schema_object(
                     json!({
                         "report_dir": json_schema_string("Report directory of the failed run (from start_live_lab_run / get_job_status)"),
@@ -3144,27 +3361,21 @@ impl McpServer for LabStateServer {
                             .unwrap_or_default()
                     }
                 };
-                if profile_owned.is_empty() {
-                    // A Rust --node run records no profile (bash setup generates
-                    // one; the Rust path does not). The SSH-into-nodes deep triage
-                    // needs a profile, but a profile-less run's report dir already
-                    // carries everything needed to triage — point the operator at
-                    // the tools that work on it directly (Bucket 5).
-                    return tool_error(
-                        "This run has no profile (a Rust --node run does not generate one; bash \
-                         setup runs do). Deep SSH-into-nodes triage requires a profile. For a \
-                         profile-less run, triage from the report dir directly with the tools that \
-                         work on it: read_report_artifact(\"failure_digest.json\") for the \
-                         structured first failure, get_stage_log(<first_failed_stage>) for its full \
-                         log, grep_report(<pattern>) across all logs/artifacts, and \
-                         explain_stage(<stage>) for the owning file + likely causes. Or pass \
-                         `profile` explicitly to force the SSH-triage path.",
-                    );
-                }
                 let report_dir = match self.ensure_report_dir(report_dir_arg) {
                     Ok(dir) => dir,
                     Err(e) => return tool_error(&e),
                 };
+                if profile_owned.is_empty() {
+                    // A Rust --node run records no profile (bash setup generates
+                    // one; the Rust path does not). Diagnose directly from the
+                    // report-dir evidence artifacts (orchestrate_result.json +
+                    // stages.tsv + failure_digest.json) — no SSH-into-nodes.
+                    return self.diagnose_profileless_run(
+                        &PathBuf::from(&report_dir),
+                        arg_str(args, "stage"),
+                        arg_bool(args, "collect_artifacts"),
+                    );
+                }
                 let mut extra: Vec<&str> =
                     vec!["--profile", &profile_owned, "--report-dir", &report_dir];
                 if let Some(stage) = arg_str(args, "stage") {
@@ -6367,6 +6578,233 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             !macos.contains("linux_stage_a"),
             "os=macos excludes linux cells; got: {macos}"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Diagnose profile-less (Rust --node) runs ────────────────────────
+
+    #[test]
+    fn diagnose_profileless_empty_dir_errors_closed() {
+        let tmp = std::env::temp_dir().join(format!("mcp-diag-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let srv = test_server(&tmp);
+        let result = srv.diagnose_profileless_run(&tmp, None, false);
+        assert!(
+            result.is_error.is_some(),
+            "empty dir must error closed; got: {:?}",
+            result.content
+        );
+        let text = result.content[0].text.to_lowercase();
+        assert!(
+            text.contains("no diagnosable evidence"),
+            "error must mention no evidence; got: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn diagnose_profileless_with_stages_tsv_and_orchestrate_result() {
+        let tmp = std::env::temp_dir().join(format!("mcp-diag-tsv-{}", std::process::id()));
+        let orch_dir = tmp.join("orchestration");
+        let state_dir = tmp.join("state");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let orch = json!({
+            "command": "vm-lab-orchestrate-live-lab",
+            "overall_status": "fail",
+            "report_dir": tmp.to_string_lossy(),
+            "outcomes": [
+                {"stage": "bootstrap", "status": "pass", "summary": "ok"},
+                {"stage": "membership", "status": "fail", "summary": "timeout"},
+                {"stage": "anchor", "status": "skipped", "summary": ""}
+            ],
+            "warnings": [],
+            "next_actions": []
+        });
+        std::fs::write(
+            orch_dir.join("orchestrate_result.json"),
+            serde_json::to_string_pretty(&orch).unwrap(),
+        )
+        .unwrap();
+
+        let tsv = "bootstrap\tinfo\tpass\t0\tlogs/bootstrap.log\tok\t2026-01-01T00:00:00Z\t2026-01-01T00:01:00Z\n\
+                   membership\tinfo\tfail\t1\tlogs/membership.log\ttimeout\t2026-01-01T00:01:00Z\t2026-01-01T00:02:00Z\n\
+                   anchor\tinfo\tskipped\t\t\t\t2026-01-01T00:02:00Z\t\n";
+        std::fs::write(state_dir.join("stages.tsv"), tsv).unwrap();
+
+        let srv = test_server(&tmp);
+        let result = srv.diagnose_profileless_run(&tmp, None, false);
+        assert!(
+            result.is_error.is_none(),
+            "should succeed: {:?}",
+            result.content
+        );
+        let text = &result.content[0].text;
+        assert!(
+            text.contains("Overall: **fail**"),
+            "must show overall fail; got: {text}"
+        );
+        assert!(
+            text.contains("1/3") || text.contains("(1"),
+            "must show 1 failure from orchestrate; got: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("membership"),
+            "must mention failed stage membership; got: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn diagnose_profileless_with_failure_digest() {
+        let tmp = std::env::temp_dir().join(format!("mcp-diag-digest-{}", std::process::id()));
+        let state_dir = tmp.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let digest = json!({
+            "first_failure": {
+                "stage": "anchor",
+                "primary_failure_reason": "anchor handshake timeout",
+                "message": "tunnel did not establish",
+                "log_path": "logs/anchor.log"
+            }
+        });
+        std::fs::write(
+            tmp.join("failure_digest.json"),
+            serde_json::to_string_pretty(&digest).unwrap(),
+        )
+        .unwrap();
+
+        let tsv = "anchor\tcritical\tfail\t1\tlogs/anchor.log\thandshake timeout\t2026-01-01T00:00:00Z\t2026-01-01T00:01:00Z\n";
+        std::fs::write(state_dir.join("stages.tsv"), tsv).unwrap();
+
+        let srv = test_server(&tmp);
+        let result = srv.diagnose_profileless_run(&tmp, Some("anchor"), false);
+        assert!(
+            result.is_error.is_none(),
+            "should succeed: {:?}",
+            result.content
+        );
+        let text = &result.content[0].text;
+        assert!(
+            text.contains("anchor handshake timeout"),
+            "must show failure reason; got: {text}"
+        );
+        assert!(
+            text.contains("First failure"),
+            "must have first-failure section; got: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn diagnose_profileless_stage_filter_log() {
+        let tmp = std::env::temp_dir().join(format!("mcp-diag-filter-{}", std::process::id()));
+        let state_dir = tmp.join("state");
+        let logs_dir = tmp.join("logs");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&logs_dir).unwrap();
+
+        let tsv = "bootstrap\tinfo\tpass\t0\tlogs/bootstrap.log\tok\t2026-01-01T00:00:00Z\t2026-01-01T00:01:00Z\n";
+        std::fs::write(state_dir.join("stages.tsv"), tsv).unwrap();
+        std::fs::write(
+            logs_dir.join("bootstrap.log"),
+            "bootstrap completed\nall peers joined\n",
+        )
+        .unwrap();
+
+        let srv = test_server(&tmp);
+        let result = srv.diagnose_profileless_run(&tmp, Some("bootstrap"), false);
+        assert!(
+            result.is_error.is_none(),
+            "should succeed: {:?}",
+            result.content
+        );
+        let text = &result.content[0].text;
+        assert!(
+            text.contains("bootstrap completed"),
+            "must include stage log tail; got: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn diagnose_profileless_collect_artifacts_notes_unsupported() {
+        let tmp = std::env::temp_dir().join(format!("mcp-diag-collect-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let orch = json!({
+            "command": "vm-lab-orchestrate-live-lab",
+            "overall_status": "pass",
+            "report_dir": tmp.to_string_lossy(),
+            "outcomes": [],
+            "warnings": [],
+            "next_actions": []
+        });
+        std::fs::create_dir_all(tmp.join("orchestration")).unwrap();
+        std::fs::write(
+            tmp.join("orchestration/orchestrate_result.json"),
+            serde_json::to_string_pretty(&orch).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.join("state")).unwrap();
+        std::fs::write(tmp.join("state/stages.tsv"), "b\tinfo\tpass\t0\t\tok\t\t\n").unwrap();
+
+        let srv = test_server(&tmp);
+        let result = srv.diagnose_profileless_run(&tmp, None, true);
+        assert!(
+            result.is_error.is_none(),
+            "should succeed: {:?}",
+            result.content
+        );
+        let text = &result.content[0].text;
+        assert!(
+            text.to_lowercase().contains("collect_artifacts"),
+            "must note collect_artifacts not supported without profile; got: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── start_live_lab_run mutually-exclusive validation ────────────────
+
+    #[test]
+    fn start_live_lab_run_rejects_nodes_with_role_platform_selector() {
+        let tmp = std::env::temp_dir().join(format!("mcp-reject-selector-{}", std::process::id()));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(inv_dir.join("vm_lab_inventory.json"), r#"{"entries":[]}"#).unwrap();
+        let srv = test_server(&tmp);
+
+        let args = json!({
+            "mode": "orchestrate",
+            "nodes": ["vm1:exit"],
+            "exit_platform": "linux"
+        });
+        let result = srv.start_live_lab_run(Some(&args));
+        assert!(
+            result.is_error.is_some(),
+            "nodes + exit_platform must error; got: {:?}",
+            result.content
+        );
+        let text = result.content[0].text.to_lowercase();
+        assert!(
+            text.contains("exit_platform") && text.contains("ignored"),
+            "error must mention exit_platform ignored; got: {text}"
+        );
+
+        let args2 = json!({
+            "mode": "orchestrate",
+            "nodes": ["vm1:client"],
+            "macos_promote_exit": true
+        });
+        let result2 = srv.start_live_lab_run(Some(&args2));
+        assert!(
+            result2.is_error.is_some(),
+            "nodes + macos_promote_exit must error; got: {:?}",
+            result2.content
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
