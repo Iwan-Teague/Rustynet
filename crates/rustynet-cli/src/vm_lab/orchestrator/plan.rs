@@ -62,9 +62,30 @@ pub struct PlanBuilder {
     rebuild_only: Option<Vec<String>>,
     /// `--source-mode`: which tree the shipped source archive is built from.
     source_mode: ArchiveSourceMode,
+    /// `--skip-linux-live-suite`: when true, drop the post-baseline live
+    /// validation + role stages ([`Self::LIVE_SUITE_STAGES`]) so the plan runs
+    /// only setup → baseline → cleanup. The fast inner loop (mesh-health check /
+    /// mac-win cell iteration) that the MCP loop tooling already emits.
+    skip_live_suite: bool,
 }
 
 impl PlanBuilder {
+    /// The post-baseline live-validation + role stages, dropped when
+    /// `--skip-linux-live-suite` is set. Setup (through `validate_baseline_runtime`)
+    /// and the always-run `cleanup` are never in this set.
+    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 7] = {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        [
+            StageId::SecurityAuditValidation,
+            StageId::DeployRelayService,
+            StageId::RelayValidation,
+            StageId::TrafficTestMatrix,
+            StageId::RoleSwitchMatrix,
+            StageId::ExitHandoff,
+            StageId::ActiveExit,
+        ]
+    };
+
     pub fn new() -> Self {
         PlanBuilder::default()
     }
@@ -82,12 +103,20 @@ impl PlanBuilder {
         self
     }
 
+    /// `--skip-linux-live-suite`: drop the post-baseline live-validation + role
+    /// stages, keeping only setup → baseline → cleanup.
+    pub fn with_skip_live_suite(mut self, skip_live_suite: bool) -> Self {
+        self.skip_live_suite = skip_live_suite;
+        self
+    }
+
     pub fn build(self) -> Vec<Box<dyn OrchestrationStage>> {
         let PlanBuilder {
             rebuild_only,
             source_mode,
+            skip_live_suite,
         } = self;
-        vec![
+        let mut stages: Vec<Box<dyn OrchestrationStage>> = vec![
             Box::new(PreflightStage),
             Box::new(PrepareSourceArchiveStage::new(source_mode)),
             Box::new(VerifySshReachabilityStage),
@@ -133,7 +162,15 @@ impl PlanBuilder {
             Box::new(ExitHandoffStage),
             Box::new(ActiveExitStage),
             Box::new(FinalCleanupStage),
-        ]
+        ];
+        if skip_live_suite {
+            // Drop the post-baseline live suite; setup + baseline + the
+            // always-run cleanup remain. FinalCleanupStage (Cleanup) is never in
+            // LIVE_SUITE_STAGES, so guest killswitch / exit-NAT residue is still
+            // torn down.
+            stages.retain(|stage| !Self::LIVE_SUITE_STAGES.contains(&stage.id()));
+        }
+        stages
     }
 }
 
@@ -145,6 +182,29 @@ mod tests {
     fn build_returns_22_stages() {
         let stages = PlanBuilder::new().build();
         assert_eq!(stages.len(), 22, "plan must contain exactly 22 stages");
+    }
+
+    #[test]
+    fn skip_live_suite_drops_the_post_baseline_suite_but_keeps_setup_and_cleanup() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new().with_skip_live_suite(true).build();
+        let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
+        // 22 - 7 live-suite stages = 15.
+        assert_eq!(ids.len(), 22 - PlanBuilder::LIVE_SUITE_STAGES.len());
+        for dropped in PlanBuilder::LIVE_SUITE_STAGES {
+            assert!(
+                !ids.contains(&dropped),
+                "live-suite stage {dropped:?} must be dropped"
+            );
+        }
+        // Setup boundary + the always-run cleanup remain.
+        assert!(ids.contains(&StageId::ValidateBaselineRuntime));
+        assert!(ids.contains(&StageId::BootstrapHosts));
+        assert_eq!(
+            ids.last(),
+            Some(&StageId::Cleanup),
+            "cleanup must still run last so guest residue is torn down"
+        );
     }
 
     #[test]
