@@ -64,11 +64,12 @@ use rustynetd::windows_service_hardening::{
 /// before it can generate that evidence. Platforms without a relay-deploy
 /// adapter implementation are reported-skipped (named, never a silent pass).
 ///
-/// Implemented today: Linux (`linux_install::deploy_relay_service`) and macOS
-/// (`macos_install::deploy_relay_service`). Windows is pending its SCM relay
-/// install; iOS / Android do not host a relay service.
+/// Implemented today: Linux (`linux_install::deploy_relay_service`), macOS
+/// (`macos_install::deploy_relay_service`), and Windows
+/// (`windows_install::deploy_relay_service`, SCM-managed).
+/// iOS / Android do not host a relay service.
 pub fn relay_lab_runtime_implemented(platform: VmGuestPlatform) -> bool {
-    matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
+    matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows)
 }
 
 /// Canonical systemd unit for the Linux relay (matches the unit the
@@ -1020,14 +1021,10 @@ mod tests {
     }
 
     #[test]
-    fn relay_lab_runtime_implemented_for_linux_and_macos_only() {
-        // The deploy_relay_service + relay_validation stages gate on this
-        // predicate. Linux + macOS have a relay-deploy adapter and run live;
-        // Windows (no SCM relay install yet) and the mobile platforms are
-        // reported-skipped — named, never a silent pass.
+    fn relay_lab_runtime_implemented_for_linux_macos_and_windows() {
         assert!(relay_lab_runtime_implemented(VmGuestPlatform::Linux));
         assert!(relay_lab_runtime_implemented(VmGuestPlatform::Macos));
-        assert!(!relay_lab_runtime_implemented(VmGuestPlatform::Windows));
+        assert!(relay_lab_runtime_implemented(VmGuestPlatform::Windows));
         assert!(!relay_lab_runtime_implemented(VmGuestPlatform::Ios));
         assert!(!relay_lab_runtime_implemented(VmGuestPlatform::Android));
     }
