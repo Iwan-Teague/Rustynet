@@ -231,8 +231,8 @@ engine runs ONLY the 21-stage `PlanBuilder`. Missing / bash-routed:
   restarts probed-unready VMs, rediscover-validates readiness, and honors
   `--trust-inventory-ready` as an explicit skip of the restart gate. Live proof
   is pending lab-free confirmation.
-- **Modes:** setup-only / run-only-against-profile / iterate. **Code landed
-  2026-07-05 for setup/run:** `--setup-only` runs through
+- **Modes:** setup-only / run-only-against-profile / iterate (resume_from/rerun_stage). **Code landed
+  2026-07-05 for all three:** `--setup-only` runs through
   `validate_baseline_runtime`, persists
   `state/orchestration_context.json`, and leaves the mesh up on success while
   still running cleanup on failure; `--run-only` reloads that state, reconstructs
@@ -371,6 +371,13 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   as `pass` from `stages.tsv`/`run_summary.json` (a false-green the converter now
   avoids). Proven on real artifacts. The remaining Bucket-7 item is the live
   bash-vs-Rust functional-parity *run*, not the tooling.
+- **Bucket 1 — iterate mode (`--resume-from` / `--rerun-stage`): LANDED** (`78ec843`).
+  Both flags accepted by the Rust `--node` path. `resume_from` loads prior context,
+  builds the full 24-stage plan, marks all earlier stages as explicit-skips-recorded-
+  as-passed, runs remaining. `rerun_stage` marks all-but-target as skips. Either
+  requires a prior report dir with valid context + stages.tsv. Mutually exclusive
+  with each other and with `--run-only`. Stage names validated against `StageId::ALL`
+  via `TryFrom<&str>`. 5 validation tests; 645 orchestrator tests pass.
 - **Validation — orchestrator subsystem test audit: VERIFIED** (`ed7e1e1`, 2026-07-05).
   Comprehensive test-audit of 157 orchestrator tests across 10 subsystems: 16 state
   machine (runner 8 + plan 8), 1 context, 14 --node parsing + role assignment, 18
@@ -393,7 +400,7 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
 **Still open per bucket (map `wf_ee06d0be-054`):** B1 — Windows-relay deploy
 adapter, mac/win security-audit + anchor-bundle-pull runtime (all reported-skip →
 live, each gated on a live mac/win run before flipping `is_supported_for_platform`);
-chaos/cross-network stages; iterate mode. Setup/run modes + the Rust-path recovery
+chaos/cross-network stages. Setup/run modes + the Rust-path recovery
 gate are code-landed but
 still need coordinated live proof once the shared lab is free.
 B6 — code landed locally 2026-07-05 for the overnight driver route/gate:
