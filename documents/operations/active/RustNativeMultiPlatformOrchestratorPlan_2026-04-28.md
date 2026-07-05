@@ -385,6 +385,19 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   service (`sc.exe create`) pointed at `C:\Program Files\RustyNet\rustynet-relay.exe`,
   and starts it. `relay_lab_runtime_implemented` now returns `true` for Windows.
   Live evidence needed (VM-based); test-only for now.
+- **Bucket 1 — macOS+Windows security-audit adapter: LANDED** (`6429a87`).
+  Flipped `security_audit_runtime_implemented()` to gate Linux|Macos|Windows.
+  Added platform-specific daemon paths (`/usr/local/bin/rustynetd` for macOS,
+  `C:\Program Files\RustyNet\rustynetd.exe` for Windows). Per-platform selection
+  in the stage dispatcher. 30 security-audit + 645 orchestrator tests pass.
+- **Validation — monitor + drift gate: RE-CONFIRMED GREEN** (2026-07-05).
+  `rustynet-lab-monitor --snapshot` renders Rust report dirs with VM roles +
+  stage grid. Drift gate `orchestrator_stages_doc_matches_the_rust_planbuilder`
+  passes (24 stages = `StageId::ALL`). Full workspace: 0 failures.
+- **Dry-run readiness gate: FIXED** (`9364e48`). `run_rust_native_readiness_gate`
+  now returns immediately when `dry_run=true` — skips the VM-probe call entirely.
+  The `--dry-run` path was previously blocked by a readiness gate that probed
+  real VMs unconditionally.
 - **Validation — orchestrator subsystem test audit: VERIFIED** (`ed7e1e1`, 2026-07-05).
   Comprehensive test-audit of 157 orchestrator tests across 10 subsystems: 16 state
   machine (runner 8 + plan 8), 1 context, 14 --node parsing + role assignment, 18
