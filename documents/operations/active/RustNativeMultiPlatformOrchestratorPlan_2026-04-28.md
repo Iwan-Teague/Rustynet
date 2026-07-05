@@ -404,9 +404,8 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
    Overnight `march_role_to_node_role` returns `Some` for both. 662 orchestrator tests
    pass (629 CLI + 33 MCP). Admin/BlindExit removed from B1 still-open list.
 
-**Still open per bucket (map `wf_ee06d0be-054`):** B1 — mac/win security-audit + anchor-bundle-pull runtime (all reported-skip →
-live, each gated on a live mac/win run before flipping `is_supported_for_platform`);
-chaos/cross-network stages. Setup/run modes + the Rust-path recovery
+**Still open per bucket (map `wf_ee06d0be-054`):** B1 — anchor-bundle-pull macOS/Windows
+(gated on Phase 8 token provisioning); chaos/cross-network stages. Setup/run modes + the Rust-path recovery
 gate are code-landed but
 still need coordinated live proof once the shared lab is free.
 B6 — code landed locally 2026-07-05 for the overnight driver route/gate:
