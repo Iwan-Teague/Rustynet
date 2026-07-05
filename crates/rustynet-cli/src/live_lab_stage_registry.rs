@@ -596,6 +596,21 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-engine security suite: the eight Tier-0 daemon self-audits folded in
+    // as one OrchestrationStage (Bucket 1). state_machine_only — only the Rust
+    // `--node` plan dispatches it; the bash orchestrate path runs the audits via
+    // its own per-check validators. No single logical/cross_os CSV column yet —
+    // the per-check → run-matrix column mapping (the eight linux_* security
+    // columns) is a follow-up; today the stage's outcome lives in
+    // stages.tsv / orchestrate_result / the per-stage log.
+    StageSpec {
+        name: "security_audit_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,
