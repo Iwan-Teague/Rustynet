@@ -378,6 +378,13 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   requires a prior report dir with valid context + stages.tsv. Mutually exclusive
   with each other and with `--run-only`. Stage names validated against `StageId::ALL`
   via `TryFrom<&str>`. 5 validation tests; 645 orchestrator tests pass.
+- **Bucket 1 — Windows relay deploy adapter: LANDED** (`a21dc17`).
+  `deploy_relay_service()` on Windows reads `assignment.pub` via PowerShell
+  Get-Content, decodes to raw 32-byte verifier key, scp to
+  `C:\ProgramData\RustyNet\relay-verifier.pub`, creates the `RustyNetRelay` SCM
+  service (`sc.exe create`) pointed at `C:\Program Files\RustyNet\rustynet-relay.exe`,
+  and starts it. `relay_lab_runtime_implemented` now returns `true` for Windows.
+  Live evidence needed (VM-based); test-only for now.
 - **Validation — orchestrator subsystem test audit: VERIFIED** (`ed7e1e1`, 2026-07-05).
   Comprehensive test-audit of 157 orchestrator tests across 10 subsystems: 16 state
   machine (runner 8 + plan 8), 1 context, 14 --node parsing + role assignment, 18
@@ -397,8 +404,7 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
    Overnight `march_role_to_node_role` returns `Some` for both. 662 orchestrator tests
    pass (629 CLI + 33 MCP). Admin/BlindExit removed from B1 still-open list.
 
-**Still open per bucket (map `wf_ee06d0be-054`):** B1 — Windows-relay deploy
-adapter, mac/win security-audit + anchor-bundle-pull runtime (all reported-skip →
+**Still open per bucket (map `wf_ee06d0be-054`):** B1 — mac/win security-audit + anchor-bundle-pull runtime (all reported-skip →
 live, each gated on a live mac/win run before flipping `is_supported_for_platform`);
 chaos/cross-network stages. Setup/run modes + the Rust-path recovery
 gate are code-landed but
