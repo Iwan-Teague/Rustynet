@@ -4048,7 +4048,51 @@ fn key_for_stage_or_cell(name: &str) -> Option<&'static str> {
             return Some("windows_exit");
         }
     }
+    // Rust-native (--node) stage IDs — mirror StageId::ALL in
+    // crates/rustynet-cli/src/vm_lab/orchestrator/stage/mod.rs and
+    // oracle_is_rust_native in live_lab_run_matrix.rs. A Rust --node
+    // run fails with a Linux-dialect stage; the sensible retry is the
+    // full cross-platform suite.
+    if is_rust_native_stage(&n) {
+        return Some("full");
+    }
     None
+}
+
+/// Closed set of Rust-native stage IDs — mirrors [`StageId::ALL`]
+/// (`crates/rustynet-cli/src/vm_lab/orchestrator/stage/mod.rs`) and
+/// `oracle_is_rust_native` (`live_lab_run_matrix.rs`). A Rust `--node`
+/// run records failure as a Linux-dialect stage that contains neither
+/// `macos` nor `windows` — without this check it falls into a
+/// next-target blind spot.
+fn is_rust_native_stage(n: &str) -> bool {
+    matches!(
+        n,
+        "preflight"
+            | "prepare_source_archive"
+            | "verify_ssh_reachability"
+            | "cleanup_hosts"
+            | "bootstrap_hosts"
+            | "collect_pubkeys"
+            | "membership_init"
+            | "distribute_membership"
+            | "anchor_validation"
+            | "admin_issue"
+            | "distribute_assignments"
+            | "distribute_traversal"
+            | "distribute_dns_zone"
+            | "enforce_baseline_runtime"
+            | "blind_exit"
+            | "validate_baseline_runtime"
+            | "security_audit_validation"
+            | "deploy_relay_service"
+            | "relay_validation"
+            | "traffic_test_matrix"
+            | "role_switch_matrix"
+            | "exit_handoff"
+            | "active_exit"
+            | "cleanup"
+    )
 }
 
 fn extract_labrun_job_id(s: &str) -> Option<String> {
@@ -7009,5 +7053,72 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── key_for_stage_or_cell unit tests ──────────────────────────
+
+    #[test]
+    fn key_rust_native_stages_map_to_full() {
+        for stage in [
+            "traffic_test_matrix",
+            "distribute_traversal",
+            "security_audit_validation",
+            "membership_init",
+            "relay_validation",
+            "role_switch_matrix",
+            "exit_handoff",
+            "anchor_validation",
+        ] {
+            assert_eq!(
+                key_for_stage_or_cell(stage),
+                Some("full"),
+                "Rust-native stage `{stage}` must produce 'full' not a blind spot"
+            );
+        }
+    }
+
+    #[test]
+    fn key_unknown_stage_degrades_safely() {
+        assert_eq!(key_for_stage_or_cell("nonexistent_stage"), None);
+        assert_eq!(key_for_stage_or_cell(""), None);
+        assert_eq!(key_for_stage_or_cell("random_garbage"), None);
+    }
+
+    #[test]
+    fn key_existing_macos_stages_unchanged() {
+        assert_eq!(key_for_stage_or_cell("macos_exit"), Some("macos_exit"));
+        assert_eq!(
+            key_for_stage_or_cell("stage_macos_anchor_capture"),
+            Some("macos_anchor")
+        );
+        assert_eq!(
+            key_for_stage_or_cell("macos_blind_exit"),
+            Some("macos_blind_exit")
+        );
+        assert_eq!(
+            key_for_stage_or_cell("validate_macos_relay_service_lifecycle"),
+            Some("macos_relay")
+        );
+        assert_eq!(
+            key_for_stage_or_cell("macOS_admin_live_issue"),
+            Some("macos_admin")
+        );
+    }
+
+    #[test]
+    fn key_existing_windows_stages_unchanged() {
+        assert_eq!(key_for_stage_or_cell("windows_exit"), Some("windows_exit"));
+        assert_eq!(
+            key_for_stage_or_cell("validate_windows_anchor"),
+            Some("windows_anchor")
+        );
+        assert_eq!(
+            key_for_stage_or_cell("Windows_relay_lifecycle"),
+            Some("windows_relay")
+        );
+        assert_eq!(
+            key_for_stage_or_cell("windows_admin_live_issue"),
+            Some("windows_admin")
+        );
     }
 }
