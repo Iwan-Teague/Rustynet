@@ -11,11 +11,11 @@ use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageI
 const REPORTED_SKIPS_FILENAME: &str = "security_audit_validation.reported_skips.json";
 
 /// Prove every node's daemon passes the eight Tier-0 adversarial self-audits —
-/// membership-revoke, revoked-peer-denied, membership-signature-forgery,
+/// membership-revoke, revoked-peer-denied, membership-signature,
 /// privileged-helper-allowlist, policy-default-deny, gossip-revoked-readmit,
-/// enrollment-replay, hello-limiter-flood — folding the formerly bash-only
-/// Linux security suite into the standard Rust orchestrator so a `--node` run
-/// exercises it.
+/// enrollment-replay, blind-exit-reversal (the exact set `rustynetd` exposes) —
+/// folding the formerly bash-only Linux security suite into the standard Rust
+/// orchestrator so a `--node` run exercises it.
 ///
 /// Runs after `validate_baseline_runtime` (the daemon must be up + baseline-good
 /// before its security posture is meaningful) and before the traffic matrix.

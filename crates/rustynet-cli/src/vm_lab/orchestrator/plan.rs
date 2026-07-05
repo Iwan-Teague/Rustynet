@@ -110,11 +110,12 @@ impl PlanBuilder {
             Box::new(EnforceBaselineRuntimeStage),
             Box::new(ValidateBaselineRuntimeStage),
             // Eight Tier-0 adversarial daemon self-audits (membership-revoke,
-            // revoked-peer-denied, signature-forgery, privileged-helper-allowlist,
+            // revoked-peer-denied, membership-signature, privileged-helper-allowlist,
             // policy-default-deny, gossip-revoked-readmit, enrollment-replay,
-            // hello-limiter-flood) — folds the formerly bash-only Linux security
-            // suite into the Rust engine. After baseline-runtime validation (the
-            // daemon must be up + baseline-good) and before the traffic matrix.
+            // blind-exit-reversal) — the exact set `rustynetd` exposes; folds the
+            // formerly bash-only Linux security suite into the Rust engine. After
+            // baseline-runtime validation (the daemon must be up + baseline-good)
+            // and before the traffic matrix.
             Box::new(SecurityAuditValidationStage),
             // Deploy the rustynet-relay sibling service onto every Relay node
             // (verifier key + `ops install-systemd-relay`) so relay_validation
