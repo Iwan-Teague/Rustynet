@@ -8105,6 +8105,25 @@ fn run_rust_native_readiness_gate(
             orchestration_dir.display()
         )
     })?;
+
+    let mut outcomes = Vec::new();
+
+    // Dry-run: skip VM discovery + probing entirely — this is a wiring
+    // check, not a lab run. Probing unreachable VMs would hang.
+    if config.dry_run {
+        let dry_discovery = stage_outcome(
+            "discover_local_utm",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would discover and probe aliases {}",
+                selected_aliases.join(", ")
+            ),
+            vec![],
+        );
+        emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &dry_discovery);
+        outcomes.push(dry_discovery);
+        return Ok(outcomes);
+    }
     let discovery_timeout = timeout_or_default(
         config.discovery_timeout_secs,
         DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS,
@@ -8127,7 +8146,6 @@ fn run_rust_native_readiness_gate(
         report_dir: None,
     };
 
-    let mut outcomes = Vec::new();
     let initial_discovery = execute_ops_vm_lab_discover_local_utm(discover_config.clone())?;
     let initial_discovery_path = orchestration_dir.join("discover_initial.json");
     write_orchestration_artifact(initial_discovery_path.as_path(), initial_discovery.as_str())?;
