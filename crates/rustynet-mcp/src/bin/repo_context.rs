@@ -2078,13 +2078,14 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 12 | `distribute_dns_zone` | Exit signs + distributes DNS zone | `stage/distribute_dns_zone.rs` |
 | 13 | `enforce_baseline_runtime` | Start daemon on each peer | `stage/enforce_runtime.rs` |
 | 14 | `validate_baseline_runtime` | Each peer's daemon ingests state + validates | `stage/validate_runtime.rs` |
-| 15 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
-| 16 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
-| 17 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
-| 18 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
-| 19 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
-| 20 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
-| 21 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 15 | `security_audit_validation` | Eight Tier-0 daemon self-audits (membership-revoke, revoked-peer-denied, signature-forgery, privileged-helper-allowlist, policy-default-deny, gossip-revoked-readmit, enrollment-replay, hello-limiter-flood) | `stage/security_audit_validation.rs` |
+| 16 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
+| 17 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
+| 18 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
+| 19 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
+| 20 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
+| 21 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
+| 22 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2155,6 +2156,7 @@ mod tests {
             "distribute_dns_zone",
             "enforce_baseline_runtime",
             "validate_baseline_runtime",
+            "security_audit_validation",
             "deploy_relay_service",
             "relay_validation",
             "traffic_test_matrix",
