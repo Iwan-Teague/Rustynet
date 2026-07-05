@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
@@ -29,8 +30,10 @@ use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageI
 /// `100.64.0.0/10`-sourced translated conntrack entry. macOS Exit maps to the
 /// `blind_exit` role, whose pf NAT is applied at enforce-time (not via route
 /// advertise) and whose pf anchor is hard-locked across cleanup; that does not
-/// fit this activate→assert→nat-session shape, so the macOS adapter keeps the
-/// fail-closed default here (scoped follow-up).
+/// fit this activate→assert→nat-session shape, so a macOS Exit is
+/// reported-skipped here (named in `active_exit.reported_skips.json`, run goes
+/// Partial — never a misleading hard-fail on the trait default) pending the
+/// macOS exit-serving adapter, gated on `active_exit_runtime_implemented`.
 pub struct ActiveExitStage;
 
 impl OrchestrationStage for ActiveExitStage {
@@ -71,6 +74,20 @@ impl OrchestrationStage for ActiveExitStage {
                 ));
             }
         };
+
+        // macOS Exit maps to the blind_exit role, whose pf NAT is applied at
+        // enforce-time (not via route-advertise) and whose pf anchor is
+        // hard-locked across cleanup — it does not fit this
+        // activate→assert→nat-session shape, so the macOS adapter has no
+        // exit-serving override and would hit the trait fail-closed default.
+        // Report-skip it (named, never a silent pass) so the run goes Partial
+        // instead of a misleading hard-fail; gated on
+        // active_exit_runtime_implemented pending the macOS exit-serving adapter.
+        let exit_platform = exit_adapter.platform();
+        if !active_exit_runtime_implemented(exit_platform) {
+            write_reported_skip_note(ctx, &exit_alias, exit_platform);
+            return StageOutcome::Skipped;
+        }
 
         // 1. Activate exit-serving: instruct the daemon to advertise 0.0.0.0/0,
         //    which triggers apply IP forwarding + NAT. Fails closed (with the
@@ -120,10 +137,61 @@ impl OrchestrationStage for ActiveExitStage {
     }
 }
 
+/// True where the active-exit-serving dataplane is implemented: Linux (nftables
+/// MASQUERADE driven over the daemon control socket) and Windows (WinNAT, whose
+/// adapter overrides the exit-serving methods). macOS is NOT implemented here —
+/// its blind_exit pf NAT is applied at enforce-time, not via route-advertise —
+/// so a macOS Exit is reported-skipped rather than hard-failing the trait
+/// default. Gated on this, NOT `is_supported_for_platform`, so promotion follows
+/// a live macOS exit-serving run rather than preceding it.
+fn active_exit_runtime_implemented(platform: VmGuestPlatform) -> bool {
+    matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Windows)
+}
+
+const REPORTED_SKIP_FILENAME: &str = "active_exit.reported_skips.json";
+
+/// Serialize the reported-skip note as pretty JSON bytes. Pure (no I/O) so a
+/// unit test asserts the content without a macOS adapter.
+fn reported_skip_json_bytes(alias: &str, platform: VmGuestPlatform) -> Vec<u8> {
+    let body = serde_json::json!({
+        "stage": "active_exit",
+        "reported_skipped_active_exit": [{ "alias": alias, "platform": format!("{platform:?}") }],
+        "reason": "active exit-serving is implemented for Linux (nftables MASQUERADE) and Windows \
+                   (WinNAT); a macOS Exit maps to the blind_exit role whose pf NAT is applied at \
+                   enforce-time (not via route-advertise), so it is reported-skipped here (named, \
+                   never a silent pass) pending the macOS exit-serving adapter — gated on \
+                   active_exit_runtime_implemented, not is_supported_for_platform",
+    });
+    serde_json::to_vec_pretty(&body).unwrap_or_default()
+}
+
+/// Write the reported-skip note to `<report_dir>/active_exit.reported_skips.json`.
+/// Best-effort: a write failure does not change the stage outcome.
+fn write_reported_skip_note(ctx: &OrchestrationContext, alias: &str, platform: VmGuestPlatform) {
+    let path = ctx.report_dir.join(REPORTED_SKIP_FILENAME);
+    let _ = std::fs::write(&path, reported_skip_json_bytes(alias, platform));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn runtime_implemented_linux_and_windows_not_macos() {
+        assert!(active_exit_runtime_implemented(VmGuestPlatform::Linux));
+        assert!(active_exit_runtime_implemented(VmGuestPlatform::Windows));
+        assert!(!active_exit_runtime_implemented(VmGuestPlatform::Macos));
+    }
+
+    #[test]
+    fn reported_skip_note_names_alias_and_platform() {
+        let bytes = reported_skip_json_bytes("macos-utm-1", VmGuestPlatform::Macos);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["stage"], "active_exit");
+        assert_eq!(v["reported_skipped_active_exit"][0]["alias"], "macos-utm-1");
+        assert_eq!(v["reported_skipped_active_exit"][0]["platform"], "Macos");
+    }
 
     #[test]
     fn stage_identity_and_dependencies() {
