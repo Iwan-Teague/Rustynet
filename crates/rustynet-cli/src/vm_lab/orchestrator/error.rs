@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use rustynet_control::roles::RoleCapability;
+use serde::{Deserialize, Serialize};
 
 // ── Domain value types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireguardPublicKey(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
