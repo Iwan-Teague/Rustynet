@@ -23,6 +23,7 @@ pub mod membership_init;
 pub mod preflight;
 pub mod relay_validation;
 pub mod role_switch_matrix;
+pub mod runtime_acls_validation;
 pub mod security_audit_validation;
 pub mod source_archive;
 pub mod traffic_test_matrix;
@@ -51,6 +52,7 @@ pub enum StageId {
     ValidateBaselineRuntime,
     SecurityAuditValidation,
     DnsFailclosedValidation,
+    RuntimeAclsValidation,
     DeployRelayService,
     RelayValidation,
     TrafficTestMatrix,
@@ -63,7 +65,7 @@ pub enum StageId {
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 25] = [
+    pub const ALL: [StageId; 26] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -82,6 +84,7 @@ impl StageId {
         StageId::ValidateBaselineRuntime,
         StageId::SecurityAuditValidation,
         StageId::DnsFailclosedValidation,
+        StageId::RuntimeAclsValidation,
         StageId::DeployRelayService,
         StageId::RelayValidation,
         StageId::TrafficTestMatrix,
@@ -111,6 +114,7 @@ impl StageId {
             StageId::ValidateBaselineRuntime => "validate_baseline_runtime",
             StageId::SecurityAuditValidation => "security_audit_validation",
             StageId::DnsFailclosedValidation => "dns_failclosed_validation",
+            StageId::RuntimeAclsValidation => "runtime_acls_validation",
             StageId::DeployRelayService => "deploy_relay_service",
             StageId::RelayValidation => "relay_validation",
             StageId::TrafficTestMatrix => "traffic_test_matrix",

@@ -21775,7 +21775,10 @@ fn run_windows_relay_check_remote(
 }
 
 /// Pure evaluator for the JSON output of `rustynetd linux-runtime-acls-check`.
-fn evaluate_linux_runtime_acls_report(linux_alias: &str, raw_json: &str) -> Result<String, String> {
+pub(crate) fn evaluate_linux_runtime_acls_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
     let report: rustynetd::linux_runtime_acls::LinuxRuntimeAclReport =
         serde_json::from_str(raw_json)
             .map_err(|err| format!("parse linux-runtime-acls-check JSON output failed: {err}"))?;
@@ -35966,8 +35969,9 @@ mod tests {
         // the CLI builder and the plan builder stay in sync; this guards the
         // absolute size). 24 = the 18 baseline + cross-OS relay_validation +
         // anchor_validation + admin_issue + blind_exit + deploy_relay_service +
-        // security_audit_validation + dns_failclosed_validation.
-        assert_eq!(cli_ids.len(), 25);
+        // security_audit_validation + dns_failclosed_validation +
+        // runtime_acls_validation.
+        assert_eq!(cli_ids.len(), 26);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)

@@ -49,6 +49,7 @@ use crate::vm_lab::orchestrator::stage::membership_init::MembershipInitStage;
 use crate::vm_lab::orchestrator::stage::preflight::PreflightStage;
 use crate::vm_lab::orchestrator::stage::relay_validation::RelayValidationStage;
 use crate::vm_lab::orchestrator::stage::role_switch_matrix::RoleSwitchMatrixStage;
+use crate::vm_lab::orchestrator::stage::runtime_acls_validation::RuntimeAclsValidationStage;
 use crate::vm_lab::orchestrator::stage::security_audit_validation::SecurityAuditValidationStage;
 use crate::vm_lab::orchestrator::stage::source_archive::{
     ArchiveSourceMode, PrepareSourceArchiveStage,
@@ -76,11 +77,12 @@ impl PlanBuilder {
     /// The post-baseline live-validation + role stages, dropped when
     /// `--skip-linux-live-suite` is set. Setup (through `validate_baseline_runtime`)
     /// and the always-run `cleanup` are never in this set.
-    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 8] = {
+    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 9] = {
         use crate::vm_lab::orchestrator::stage::StageId;
         [
             StageId::SecurityAuditValidation,
             StageId::DnsFailclosedValidation,
+            StageId::RuntimeAclsValidation,
             StageId::DeployRelayService,
             StageId::RelayValidation,
             StageId::TrafficTestMatrix,
@@ -157,6 +159,11 @@ impl PlanBuilder {
             // killswitch. Runs after the security-audit suite (daemon must be
             // up + baseline-good) and before relay deploy.
             Box::new(DnsFailclosedValidationStage),
+            // Runtime-ACLs per-node daemon self-check — canonical runtime
+            // root set present, no unexpected additions, per-path status
+            // consistent. Runs after dns_failclosed_validation and before
+            // relay deploy.
+            Box::new(RuntimeAclsValidationStage),
             // Deploy the rustynet-relay sibling service onto every Relay node
             // (verifier key + `ops install-systemd-relay`) so relay_validation
             // has a live relay to prove. Closes the gap where the standard
@@ -190,9 +197,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_25_stages() {
+    fn build_returns_26_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 25, "plan must contain exactly 25 stages");
+        assert_eq!(stages.len(), 26, "plan must contain exactly 26 stages");
     }
 
     #[test]
@@ -200,8 +207,8 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 25 total - 8 live-suite stages = 17.
-        assert_eq!(ids.len(), 25 - PlanBuilder::LIVE_SUITE_STAGES.len());
+        // 26 total - 9 live-suite stages = 17.
+        assert_eq!(ids.len(), 26 - PlanBuilder::LIVE_SUITE_STAGES.len());
         for dropped in PlanBuilder::LIVE_SUITE_STAGES {
             assert!(
                 !ids.contains(&dropped),
@@ -245,6 +252,7 @@ mod tests {
                 StageId::ValidateBaselineRuntime,
                 StageId::SecurityAuditValidation,
                 StageId::DnsFailclosedValidation,
+                StageId::RuntimeAclsValidation,
                 StageId::DeployRelayService,
                 StageId::RelayValidation,
                 StageId::TrafficTestMatrix,
