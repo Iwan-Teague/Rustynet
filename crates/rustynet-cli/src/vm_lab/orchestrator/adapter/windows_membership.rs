@@ -16,6 +16,7 @@ use rustynet_control::roles::role_capability_csv;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
+const WINDOWS_MEMBERSHIP_LOG_PATH: &str = r"C:\ProgramData\RustyNet\membership\membership.log";
 
 /// Read the membership owner public key from a Windows exit node.
 /// Reads `WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH` via `PowerShell` `Get-Content`.
@@ -158,10 +159,20 @@ pub fn distribute_signed_bundle(
         MEDIUM_TIMEOUT,
     )?;
 
+    let log_init_script = if matches!(kind, BundleKind::Membership) {
+        format!(
+            "; if (-not (Test-Path -LiteralPath {log_q})) {{ \
+                 New-Item -ItemType File -Force -Path {log_q} | Out-Null \
+             }}",
+            log_q = ps_quote(WINDOWS_MEMBERSHIP_LOG_PATH)?,
+        )
+    } else {
+        String::new()
+    };
     let install_script = format!(
         "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
-         Move-Item -LiteralPath {src_q} -Destination {dst_q} -Force",
+         Move-Item -LiteralPath {src_q} -Destination {dst_q} -Force{log_init_script}",
         src_q = ps_quote(&remote_staging)?,
         dst_q = ps_quote(&remote_dst)?,
     );
