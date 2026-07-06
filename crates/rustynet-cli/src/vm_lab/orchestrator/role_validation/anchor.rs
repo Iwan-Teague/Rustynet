@@ -153,9 +153,10 @@ pub fn validate_anchor_capability_advertisement(
         .map_err(|err| format!("anchor list run_argv failed: {err}"))?;
     if status.code != 0 {
         return Err(format!(
-            "anchor list exited {} (stderr: {})",
+            "anchor list exited {} (stdout: {}; stderr: {})",
             status.code,
-            stderr_snippet(&status.stderr)
+            output_snippet(&status.stdout),
+            output_snippet(&status.stderr)
         ));
     }
     let anchor_list = String::from_utf8_lossy(&status.stdout).into_owned();
@@ -165,16 +166,21 @@ pub fn validate_anchor_capability_advertisement(
     Ok(gossip_summary)
 }
 
-/// First 200 bytes of a stderr blob, single-lined, for embedding in a
+/// First 200 bytes of a command-output blob, single-lined, for embedding in a
 /// failure string without flooding the report.
-fn stderr_snippet(stderr: &[u8]) -> String {
-    String::from_utf8_lossy(stderr)
+fn output_snippet(output: &[u8]) -> String {
+    let snippet = String::from_utf8_lossy(output)
         .chars()
         .take(200)
         .collect::<String>()
         .replace('\n', " ")
         .trim()
-        .to_owned()
+        .to_owned();
+    if snippet.is_empty() {
+        "<empty>".to_owned()
+    } else {
+        snippet
+    }
 }
 
 // ── Pure parsers (copied verbatim from `live_linux_anchor_test`) ──────
@@ -841,13 +847,14 @@ mod tests {
             VmGuestPlatform::Linux,
             RemoteExitStatus {
                 code: 1,
-                stdout: Vec::new(),
+                stdout: b"usage: rustynet anchor list --snapshot <path>".to_vec(),
                 stderr: b"membership snapshot unreadable".to_vec(),
             },
         );
         let err = validate_anchor_capability_advertisement(&mock, VmGuestPlatform::Linux, "exit-1")
             .expect_err("non-zero anchor list exit must fail closed");
         assert!(err.contains("anchor list exited 1"), "got: {err}");
+        assert!(err.contains("usage: rustynet anchor list"), "got: {err}");
         assert!(err.contains("membership snapshot unreadable"), "got: {err}");
     }
 
