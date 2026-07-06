@@ -12,6 +12,7 @@ use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot, NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
+use rustynet_control::membership::MEMBERSHIP_SCHEMA_VERSION;
 use rustynet_control::roles::role_capability_csv;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -160,11 +161,14 @@ pub fn distribute_signed_bundle(
     )?;
 
     let log_init_script = if matches!(kind, BundleKind::Membership) {
+        let log_header = membership_log_header();
         format!(
-            "; if (-not (Test-Path -LiteralPath {log_q})) {{ \
-                 New-Item -ItemType File -Force -Path {log_q} | Out-Null \
+            "; if ((-not (Test-Path -LiteralPath {log_q})) -or \
+                 ((Get-Item -LiteralPath {log_q}).Length -eq 0)) {{ \
+                 Set-Content -LiteralPath {log_q} -Value {log_header_q} -Encoding ascii \
              }}",
             log_q = ps_quote(WINDOWS_MEMBERSHIP_LOG_PATH)?,
+            log_header_q = ps_quote(&log_header)?,
         )
     } else {
         String::new()
@@ -264,6 +268,10 @@ fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
             format!(r"{state}\trust\rustynetd.dns-zone"),
         ),
     }
+}
+
+fn membership_log_header() -> String {
+    format!("version={MEMBERSHIP_SCHEMA_VERSION}")
 }
 
 /// Build the PowerShell `membership add-peer` script for one peer. Every
@@ -406,6 +414,11 @@ mod tests {
                 "dst path '{dst}' must be under WINDOWS_STATE_ROOT"
             );
         }
+    }
+
+    #[test]
+    fn membership_log_header_matches_control_schema() {
+        assert_eq!(membership_log_header(), "version=1");
     }
 
     #[test]
