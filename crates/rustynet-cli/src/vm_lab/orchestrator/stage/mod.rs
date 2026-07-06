@@ -20,6 +20,7 @@ pub mod enforce_runtime;
 pub mod exit_demotion_residue_validation;
 pub mod exit_dns_failclosed_validation;
 pub mod exit_handoff;
+pub mod exit_nat_lifecycle_validation;
 pub mod final_cleanup;
 pub mod install;
 pub mod ipv6_leak_validation;
@@ -73,13 +74,14 @@ pub enum StageId {
     ActiveExit,
     ExitDemotionResidueValidation,
     ExitDnsFailclosedValidation,
+    ExitNatLifecycleValidation,
     Cleanup,
 }
 
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 33] = [
+    pub const ALL: [StageId; 34] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -112,6 +114,7 @@ impl StageId {
         StageId::ActiveExit,
         StageId::ExitDemotionResidueValidation,
         StageId::ExitDnsFailclosedValidation,
+        StageId::ExitNatLifecycleValidation,
         StageId::Cleanup,
     ];
 
@@ -149,6 +152,7 @@ impl StageId {
             StageId::ActiveExit => "active_exit",
             StageId::ExitDemotionResidueValidation => "exit_demotion_residue_validation",
             StageId::ExitDnsFailclosedValidation => "exit_dns_failclosed_validation",
+            StageId::ExitNatLifecycleValidation => "exit_nat_lifecycle_validation",
             StageId::Cleanup => "cleanup",
         }
     }

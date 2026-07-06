@@ -19116,7 +19116,7 @@ fn evaluate_macos_exit_nat_lifecycle_artifact(
 /// `/proc/sys/net/ipv4/ip_forward` lifecycle. The producer captures a
 /// single phase; the wrapper merges during-run + after-stop snapshots
 /// into this two-phase JSON shape.
-fn evaluate_linux_exit_nat_lifecycle_artifact(
+pub(crate) fn evaluate_linux_exit_nat_lifecycle_artifact(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -35984,8 +35984,9 @@ mod tests {
         // security_audit_validation + dns_failclosed_validation +
         // runtime_acls_validation + service_hardening_validation +
         // key_custody_validation + mesh_status_validation + authenticode_validation +
-        // ipv6_leak_validation + exit_demotion_residue_validation.
-        assert_eq!(cli_ids.len(), 33);
+        // ipv6_leak_validation + exit_demotion_residue_validation +
+        // exit_dns_failclosed_validation + exit_nat_lifecycle_validation.
+        assert_eq!(cli_ids.len(), 34);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)

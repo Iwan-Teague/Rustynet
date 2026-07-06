@@ -761,6 +761,19 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-engine exit NAT lifecycle: two-phase snapshot→stop→snapshot prove
+    // NAT present during exit and gone after stop. state_machine_only — only
+    // the Rust `--node` plan dispatches it; the bash orchestrate path runs the
+    // check via its own artifact evaluator.
+    StageSpec {
+        name: "exit_nat_lifecycle_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("exit_nat_lifecycle_check"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,
