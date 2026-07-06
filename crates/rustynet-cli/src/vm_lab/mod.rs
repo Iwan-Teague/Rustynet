@@ -7948,7 +7948,7 @@ fn execute_rust_native_orchestration(
 
     let stages = filter_rust_native_stages_for_mode(
         build_rust_native_orchestration_stages(
-            rebuild_only,
+            rebuild_only.clone(),
             source_mode,
             skip_live_suite,
             enable_chaos_suite,
@@ -8098,7 +8098,8 @@ fn execute_rust_native_orchestration(
         // setup-only success intentionally leaves the mesh up for a later
         // run-only pass. Failure still tears down guest residue: stranded
         // killswitch or exit-NAT state is release-blocking.
-        let cleanup = orchestrator::stage::final_cleanup::FinalCleanupStage;
+        let cleanup =
+            orchestrator::stage::final_cleanup::FinalCleanupStage::new(rebuild_only.clone());
         let cleanup_id = orchestrator::stage::StageId::Cleanup;
         recorder.stage_started(&cleanup_id);
         let cleanup_outcome = cleanup.execute(&mut ctx);
@@ -8112,7 +8113,8 @@ fn execute_rust_native_orchestration(
             .any(|(_, outcome)| matches!(outcome, StageOutcome::Failed(_)))
         && let Err(err) = ctx.save(context_path.as_path())
     {
-        let cleanup = orchestrator::stage::final_cleanup::FinalCleanupStage;
+        let cleanup =
+            orchestrator::stage::final_cleanup::FinalCleanupStage::new(rebuild_only.clone());
         let cleanup_id = orchestrator::stage::StageId::Cleanup;
         recorder.stage_started(&cleanup_id);
         let cleanup_outcome = cleanup.execute(&mut ctx);
