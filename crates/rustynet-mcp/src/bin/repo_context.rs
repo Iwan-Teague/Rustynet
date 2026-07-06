@@ -2090,13 +2090,14 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 24 | `ipv6_leak_validation` | Per-node IPv6 tunnel-leak adversarial capture (real outbound IPv6 probe, 0 leaked datagrams + containment control present) | `stage/ipv6_leak_validation.rs` |
 | 25 | `exit_demotion_residue_validation` | Two-phase exit→client demotion capture (NAT torn down, forwarding restored, daemon still running) | `stage/exit_demotion_residue_validation.rs` |
 | 26 | `exit_dns_failclosed_validation` | Per-node exit DNS fail-closed leak proof (six-artifact directory: firewall rules, block pcaps, active off-tunnel probe, tunnel positive control) | `stage/exit_dns_failclosed_validation.rs` |
-| 27 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
-| 28 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
-| 29 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
-| 30 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
-| 31 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
-| 32 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
-| 33 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 27 | `exit_nat_lifecycle_validation` | Two-phase exit NAT lifecycle check (snapshot during active exit → stop daemon → snapshot again → prove NAT gone) | `stage/exit_nat_lifecycle_validation.rs` |
+| 28 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
+| 29 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
+| 30 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
+| 31 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
+| 32 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
+| 33 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
+| 34 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2179,6 +2180,7 @@ mod tests {
             "ipv6_leak_validation",
             "exit_demotion_residue_validation",
             "exit_dns_failclosed_validation",
+            "exit_nat_lifecycle_validation",
             "deploy_relay_service",
             "relay_validation",
             "traffic_test_matrix",

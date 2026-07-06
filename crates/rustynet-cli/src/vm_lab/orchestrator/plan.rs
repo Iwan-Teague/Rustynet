@@ -46,6 +46,7 @@ use crate::vm_lab::orchestrator::stage::enforce_runtime::EnforceBaselineRuntimeS
 use crate::vm_lab::orchestrator::stage::exit_demotion_residue_validation::ExitDemotionResidueValidationStage;
 use crate::vm_lab::orchestrator::stage::exit_dns_failclosed_validation::ExitDnsFailclosedValidationStage;
 use crate::vm_lab::orchestrator::stage::exit_handoff::ExitHandoffStage;
+use crate::vm_lab::orchestrator::stage::exit_nat_lifecycle_validation::ExitNatLifecycleValidationStage;
 use crate::vm_lab::orchestrator::stage::final_cleanup::FinalCleanupStage;
 use crate::vm_lab::orchestrator::stage::install::BootstrapHostsStage;
 use crate::vm_lab::orchestrator::stage::ipv6_leak_validation::Ipv6LeakValidationStage;
@@ -84,7 +85,7 @@ impl PlanBuilder {
     /// The post-baseline live-validation + role stages, dropped when
     /// `--skip-linux-live-suite` is set. Setup (through `validate_baseline_runtime`)
     /// and the always-run `cleanup` are never in this set.
-    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 16] = {
+    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 17] = {
         use crate::vm_lab::orchestrator::stage::StageId;
         [
             StageId::SecurityAuditValidation,
@@ -103,6 +104,7 @@ impl PlanBuilder {
             StageId::ActiveExit,
             StageId::ExitDemotionResidueValidation,
             StageId::ExitDnsFailclosedValidation,
+            StageId::ExitNatLifecycleValidation,
         ]
     };
 
@@ -221,6 +223,7 @@ impl PlanBuilder {
             Box::new(ActiveExitStage),
             Box::new(ExitDemotionResidueValidationStage),
             Box::new(ExitDnsFailclosedValidationStage),
+            Box::new(ExitNatLifecycleValidationStage),
             Box::new(FinalCleanupStage),
         ];
         if skip_live_suite {
@@ -239,9 +242,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_33_stages() {
+    fn build_returns_34_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 33, "plan must contain exactly 33 stages");
+        assert_eq!(stages.len(), 34, "plan must contain exactly 34 stages");
     }
 
     #[test]
@@ -249,8 +252,8 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 33 total - 16 live-suite stages = 17.
-        assert_eq!(ids.len(), 33 - PlanBuilder::LIVE_SUITE_STAGES.len());
+        // 34 total - 17 live-suite stages = 17.
+        assert_eq!(ids.len(), 34 - PlanBuilder::LIVE_SUITE_STAGES.len());
         for dropped in PlanBuilder::LIVE_SUITE_STAGES {
             assert!(
                 !ids.contains(&dropped),
@@ -308,6 +311,7 @@ mod tests {
                 StageId::ActiveExit,
                 StageId::ExitDemotionResidueValidation,
                 StageId::ExitDnsFailclosedValidation,
+                StageId::ExitNatLifecycleValidation,
                 StageId::Cleanup,
             ],
             "orchestrator stage order is security-sensitive"
