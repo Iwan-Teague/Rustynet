@@ -668,6 +668,22 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-engine key-custody: the canonical Linux daemon self-check
+    // folded into a first-class OrchestrationStage — validates on-disk
+    // key material (encrypted WG private key, public key, keys dir,
+    // credentials dir, passphrase credentials) against the reviewed
+    // custody contract. state_machine_only — only the Rust `--node` plan
+    // dispatches it; the bash orchestrate path runs the check via its
+    // own per-check validators.
+    StageSpec {
+        name: "key_custody_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("key_custody_check"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,
