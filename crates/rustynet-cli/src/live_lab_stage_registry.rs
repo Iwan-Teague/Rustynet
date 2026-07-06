@@ -1835,6 +1835,16 @@ pub const STAGES: &[StageSpec] = &[
         ..DEFAULT_SPEC
     },
     StageSpec {
+        name: "live_key_custody_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("key_custody"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
         name: "live_mixed_topology",
         logical: Some("mixed_topology"),
         cross_os: Some("cross_os_peer_visibility"),
