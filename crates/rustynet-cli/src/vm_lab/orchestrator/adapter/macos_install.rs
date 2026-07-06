@@ -357,6 +357,62 @@ pub fn start_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     Ok(())
 }
 
+/// Ensure passwordless sudo on this node so that daemon lifecycle commands
+/// (stop/start/restart) and network-stack operations work without blocking
+/// for a password prompt. Uses `sshpass` + the lab SSH password to push a
+/// temporary `/etc/sudoers.d/99-rustynet-lab` grant when `sudo -n true` fails.
+/// Idempotent: if the node already answers `sudo -n true`, this is a no-op.
+pub fn prime_remote_access(conn: &NodeConnection) -> Result<(), AdapterError> {
+    match conn.ssh_parts() {
+        Some((host, port, user, identity_file, Some(password))) => {
+            let user_flag = user.map(|u| format!("{u}@")).unwrap_or_default();
+            let mut cmd = std::process::Command::new("sshpass");
+            cmd.arg("-p")
+                .arg(password)
+                .arg("ssh")
+                .arg("-i")
+                .arg(identity_file)
+                .arg("-o")
+                .arg("StrictHostKeyChecking=yes")
+                .arg("-o")
+                .arg("ConnectTimeout=10")
+                .arg("-p")
+                .arg(port.to_string())
+                .arg(format!("{user_flag}{host}"))
+                .arg("sudo -n true 2>/dev/null && echo 'sudo-ok' || echo 'need-sudo'");
+            let output = cmd.output().map_err(|e| AdapterError::Protocol {
+                message: format!("sshpass prime check failed: {e}"),
+            })?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.trim() == "sudo-ok" {
+                return Ok(());
+            }
+            let mut push = std::process::Command::new("sshpass");
+            push.arg("-p").arg(password)
+                .arg("ssh")
+                .arg("-i").arg(identity_file)
+                .arg("-o").arg("StrictHostKeyChecking=yes")
+                .arg("-o").arg("ConnectTimeout=10")
+                .arg("-p").arg(port.to_string())
+                .arg(format!("{user_flag}{host}"))
+                .arg("echo 'tempo' | sudo -S bash -c 'echo \"%admin ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/99-rustynet-lab && chmod 0440 /etc/sudoers.d/99-rustynet-lab'");
+            let status = push.status().map_err(|e| AdapterError::Protocol {
+                message: format!("sshpass prime push failed: {e}"),
+            })?;
+            if !status.success() {
+                return Err(AdapterError::Protocol {
+                    message: "failed to push temporary sudoers grant".to_owned(),
+                });
+            }
+            Ok(())
+        }
+        _ => {
+            // Non-SSH or no password: assume sudo already works (Linux).
+            Ok(())
+        }
+    }
+}
+
 /// Stop the launchd service.
 pub fn stop_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     ssh::run_remote(

@@ -967,6 +967,7 @@ mod tests {
             Some("Administrator".to_owned()),
             std::path::PathBuf::from("/id_rsa"),
             f.path().to_path_buf(),
+            None,
         )
         .unwrap();
         // We cannot call collect_node_id without an SSH server, but we can verify

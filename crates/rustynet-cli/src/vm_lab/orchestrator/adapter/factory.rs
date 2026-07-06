@@ -81,6 +81,7 @@ mod tests {
             None,
             PathBuf::from("/id_rsa"),
             f.path().to_path_buf(),
+            None,
         )
         .unwrap()
     }

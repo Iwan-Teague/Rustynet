@@ -26,6 +26,7 @@ pub fn ssh_params(
             user,
             identity_file,
             known_hosts,
+            ..
         } => Ok((
             host.as_str(),
             *port,

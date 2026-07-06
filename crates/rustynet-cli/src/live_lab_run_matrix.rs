@@ -146,6 +146,9 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_stage_exit_demotion_residue_check",
     "macos_stage_exit_demotion_residue_check",
     "windows_stage_exit_demotion_residue_check",
+    "linux_stage_exit_dns_failclosed_check",
+    "macos_stage_exit_dns_failclosed_check",
+    "windows_stage_exit_dns_failclosed_check",
     "linux_stage_secrets_not_in_logs",
     "macos_stage_secrets_not_in_logs",
     "windows_stage_secrets_not_in_logs",
@@ -3031,6 +3034,7 @@ mod registry_equivalence_tests {
             "authenticode_validation" => Some("authenticode_check"),
             "ipv6_leak_validation" => Some("ipv6_leak_check"),
             "exit_demotion_residue_validation" => Some("exit_demotion_residue_check"),
+            "exit_dns_failclosed_validation" => Some("exit_dns_failclosed_check"),
             "cleanup" => Some("cleanup"),
             stage if stage.starts_with("chaos_") => Some("chaos"),
             stage if stage.contains("reboot") => Some("reboot_recovery"),
@@ -3066,6 +3070,7 @@ mod registry_equivalence_tests {
                 | "authenticode_validation"
                 | "ipv6_leak_validation"
                 | "exit_demotion_residue_validation"
+                | "exit_dns_failclosed_validation"
                 | "deploy_relay_service"
                 | "relay_validation"
                 | "traffic_test_matrix"

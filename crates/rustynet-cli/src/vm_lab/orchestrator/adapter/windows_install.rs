@@ -990,9 +990,7 @@ pub(crate) const WINDOWS_RELAY_SERVICE_NAME: &str = "RustyNetRelay";
 const WINDOWS_RUSTYNET_RELAY_PATH: &str = r"C:\Program Files\RustyNet\rustynet-relay.exe";
 const WINDOWS_RELAY_VERIFIER_KEY_PATH: &str = r"C:\ProgramData\RustyNet\relay-verifier.pub";
 
-pub(crate) fn deploy_relay_service(
-    conn: &NodeConnection,
-) -> Result<(), AdapterError> {
+pub(crate) fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     let short_timeout = Duration::from_secs(30);
 
     let assignment_pub_path = format!(r"{}\trust\assignment.pub", WINDOWS_STATE_ROOT);
@@ -1000,18 +998,28 @@ pub(crate) fn deploy_relay_service(
         "Get-Content -LiteralPath {} -Raw",
         ps_quote(&assignment_pub_path)?,
     );
-    let assignment_hex = run_remote_ps(conn, &read_script, short_timeout)?.trim().to_owned();
+    let assignment_hex = run_remote_ps(conn, &read_script, short_timeout)?
+        .trim()
+        .to_owned();
     if assignment_hex.is_empty() {
         return Err(AdapterError::Protocol {
             message: "assignment authority pubkey empty or missing; distributed verifier key required before relay deploy".to_owned(),
         });
     }
-    let verifier_bytes = crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex(&assignment_hex)
+    let verifier_bytes =
+        crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex(
+            &assignment_hex,
+        )
         .map_err(|message| AdapterError::Protocol { message })?;
 
     let tmp = write_temp_file("rn_relay_verifier_", ".pub", &verifier_bytes)?;
     let remote_tmp = format!(r"{}\rn-relay-verifier.pub", WINDOWS_STAGING_DIR);
-    let ship = ssh::scp_to(conn, tmp.as_path(), &remote_tmp.replace('\\', "/"), short_timeout);
+    let ship = ssh::scp_to(
+        conn,
+        tmp.as_path(),
+        &remote_tmp.replace('\\', "/"),
+        short_timeout,
+    );
     let _ = std::fs::remove_file(&tmp);
     ship?;
     let install_script = format!(
@@ -1045,7 +1053,11 @@ pub(crate) fn deploy_relay_service(
          $ProgressPreference = 'SilentlyContinue'; \
          {probe}",
     );
-    run_remote_ps(conn, &start_script, Duration::from_secs(WINDOWS_SERVICE_START_PROBE_MAX_SECS + 60))?;
+    run_remote_ps(
+        conn,
+        &start_script,
+        Duration::from_secs(WINDOWS_SERVICE_START_PROBE_MAX_SECS + 60),
+    )?;
 
     Ok(())
 }

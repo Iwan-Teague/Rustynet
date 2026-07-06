@@ -69,7 +69,10 @@ use rustynetd::windows_service_hardening::{
 /// (`windows_install::deploy_relay_service`, SCM-managed).
 /// iOS / Android do not host a relay service.
 pub fn relay_lab_runtime_implemented(platform: VmGuestPlatform) -> bool {
-    matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows)
+    matches!(
+        platform,
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+    )
 }
 
 /// Canonical systemd unit for the Linux relay (matches the unit the

@@ -207,6 +207,10 @@ impl NodeAdapter for MacosNodeAdapter {
         macos_traffic::cleanup_runtime_state(&self.conn)
     }
 
+    fn prime_remote_access(&self) -> Result<(), AdapterError> {
+        macos_install::prime_remote_access(&self.conn)
+    }
+
     fn collect_daemon_failure_reason(&self) -> Result<Option<String>, AdapterError> {
         macos_traffic::collect_daemon_failure_reason(&self.conn)
     }
@@ -265,6 +269,7 @@ mod tests {
             Some("admin".to_owned()),
             PathBuf::from("/id_rsa"),
             f.path().to_path_buf(),
+            None,
         )
         .unwrap();
         MacosNodeAdapter::new(alias, conn, None)
@@ -292,6 +297,7 @@ mod tests {
             None,
             PathBuf::from("/id_rsa"),
             f.path().to_path_buf(),
+            None,
         )
         .unwrap();
         let adapter = MacosNodeAdapter::new("mac", conn, Some("/Users/admin/rustynet".to_owned()));

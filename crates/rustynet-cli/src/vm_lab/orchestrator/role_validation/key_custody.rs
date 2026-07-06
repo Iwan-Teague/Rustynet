@@ -45,15 +45,9 @@ mod tests {
 
     #[test]
     fn runtime_implemented_linux_only() {
-        assert!(key_custody_runtime_implemented(
-            VmGuestPlatform::Linux
-        ));
-        assert!(!key_custody_runtime_implemented(
-            VmGuestPlatform::Macos
-        ));
-        assert!(!key_custody_runtime_implemented(
-            VmGuestPlatform::Windows
-        ));
+        assert!(key_custody_runtime_implemented(VmGuestPlatform::Linux));
+        assert!(!key_custody_runtime_implemented(VmGuestPlatform::Macos));
+        assert!(!key_custody_runtime_implemented(VmGuestPlatform::Windows));
     }
 
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};

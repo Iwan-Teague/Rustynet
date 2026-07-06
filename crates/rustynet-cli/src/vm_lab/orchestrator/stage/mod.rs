@@ -18,6 +18,7 @@ pub mod distribute_traversal;
 pub mod dns_failclosed_validation;
 pub mod enforce_runtime;
 pub mod exit_demotion_residue_validation;
+pub mod exit_dns_failclosed_validation;
 pub mod exit_handoff;
 pub mod final_cleanup;
 pub mod install;
@@ -71,13 +72,14 @@ pub enum StageId {
     ExitHandoff,
     ActiveExit,
     ExitDemotionResidueValidation,
+    ExitDnsFailclosedValidation,
     Cleanup,
 }
 
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 32] = [
+    pub const ALL: [StageId; 33] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -109,6 +111,7 @@ impl StageId {
         StageId::ExitHandoff,
         StageId::ActiveExit,
         StageId::ExitDemotionResidueValidation,
+        StageId::ExitDnsFailclosedValidation,
         StageId::Cleanup,
     ];
 
@@ -145,6 +148,7 @@ impl StageId {
             StageId::ExitHandoff => "exit_handoff",
             StageId::ActiveExit => "active_exit",
             StageId::ExitDemotionResidueValidation => "exit_demotion_residue_validation",
+            StageId::ExitDnsFailclosedValidation => "exit_dns_failclosed_validation",
             StageId::Cleanup => "cleanup",
         }
     }
