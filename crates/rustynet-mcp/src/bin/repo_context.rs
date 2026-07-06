@@ -2086,13 +2086,14 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 20 | `service_hardening_validation` | Per-node service-hardening daemon self-check (systemd unit hardening directives match shipped baseline) | `stage/service_hardening_validation.rs` |
 | 21 | `key_custody_validation` | Per-node key-custody daemon self-check (on-disk key material matches reviewed custody contract) | `stage/key_custody_validation.rs` |
 | 22 | `mesh_status_validation` | Per-node mesh-status daemon self-check (daemon's mesh-status view reports no drift) | `stage/mesh_status_validation.rs` |
-| 23 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
-| 24 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
-| 25 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
-| 26 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
-| 27 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
-| 28 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
-| 29 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 23 | `authenticode_validation` | Per-node authenticode daemon self-check (honest not-applicable verdict on Linux — runtime binary-signature attestation is Windows-specific) | `stage/authenticode_validation.rs` |
+| 24 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
+| 25 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
+| 26 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
+| 27 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
+| 28 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
+| 29 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
+| 30 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2171,6 +2172,7 @@ mod tests {
             "service_hardening_validation",
             "key_custody_validation",
             "mesh_status_validation",
+            "authenticode_validation",
             "deploy_relay_service",
             "relay_validation",
             "traffic_test_matrix",
