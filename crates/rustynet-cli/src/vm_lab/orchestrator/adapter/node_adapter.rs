@@ -242,6 +242,17 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
     /// must never appear in the archive.
     fn collect_artifacts(&self, dst: &Path) -> Result<(), AdapterError>;
 
+    /// Ensure passwordless sudo / equivalent access is configured on the
+    /// target so that subsequent `cleanup_runtime_state`, `install_daemon`,
+    /// and runtime operations can manage daemon processes and the network
+    /// stack without blocking for a password prompt. The grant is
+    /// temporary (cleared on reboot or by the bootstrap's EXIT trap) and
+    /// scoped to the lab subnet. Default: no-op (assumes already
+    /// configured or not applicable).
+    fn prime_remote_access(&self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+
     fn cleanup_runtime_state(&self) -> Result<(), AdapterError>;
 
     /// Best-effort: the daemon's own fail-closed/startup error reason, read from

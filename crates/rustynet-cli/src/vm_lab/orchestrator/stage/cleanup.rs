@@ -50,14 +50,22 @@ impl OrchestrationStage for CleanupHostsStage {
                     return None;
                 }
                 match ctx.adapters.get(alias.as_str()) {
+                    // Prime passwordless sudo before cleanup so that daemon-stop
+                    // and pf-utun teardown do not block for a password prompt.
+                    // An error here is NOT fatal (the node may already have
+                    // sudo configured); we proceed to cleanup_runtime_state,
+                    // which fails closed on its own if the daemon is still running.
                     // Reset the node, then assert it is actually clean — a reset
                     // that silently did not take (leftover killswitch / NRPT)
                     // must fail the stage here, not surface as a cargo DNS
                     // timeout in bootstrap five stages later.
-                    Some(adapter) => adapter
-                        .cleanup_runtime_state()
-                        .and_then(|()| adapter.assert_node_clean())
-                        .map_err(|e| e.to_string()),
+                    Some(adapter) => {
+                        let _ = adapter.prime_remote_access();
+                        adapter
+                            .cleanup_runtime_state()
+                            .and_then(|()| adapter.assert_node_clean())
+                            .map_err(|e| e.to_string())
+                    }
                     // An assigned node with no adapter is a construction bug, not
                     // "nothing to clean": its prior runtime state (incl. a
                     // default-deny killswitch) would be left in place and could

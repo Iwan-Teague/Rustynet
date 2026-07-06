@@ -211,6 +211,11 @@ impl NodeAdapter for WindowsNodeAdapter {
         windows_traffic::cleanup_runtime_state(&self.conn)
     }
 
+    fn prime_remote_access(&self) -> Result<(), AdapterError> {
+        // Windows SSH sessions run as Administrator by default; no sudo priming needed.
+        Ok(())
+    }
+
     fn collect_daemon_failure_reason(&self) -> Result<Option<String>, AdapterError> {
         windows_traffic::collect_daemon_failure_reason(&self.conn)
     }
@@ -308,6 +313,7 @@ mod tests {
             Some("Administrator".to_owned()),
             PathBuf::from("/id_rsa"),
             f.path().to_path_buf(),
+            None,
         )
         .unwrap();
         WindowsNodeAdapter::new(alias, conn, None)

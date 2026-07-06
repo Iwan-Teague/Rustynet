@@ -29,11 +29,12 @@ pub enum ArchiveSourceMode {
 /// falling back to `HEAD` would mis-report provenance. Fail closed instead.
 pub fn parse_archive_source_mode(value: Option<&str>) -> Result<ArchiveSourceMode, String> {
     match value.map(str::trim) {
-        None | Some("") | Some("head") | Some("local-head") => Ok(ArchiveSourceMode::Head),
+        None | Some("") => Ok(ArchiveSourceMode::WorkingTree),
+        Some("head") | Some("local-head") => Ok(ArchiveSourceMode::Head),
         Some("worktree") | Some("working-tree") => Ok(ArchiveSourceMode::WorkingTree),
         Some(other) => Err(format!(
             "unsupported --source-mode '{other}' for the Rust-native orchestrator; \
-             use 'local-head' (default) or 'working-tree'"
+             use 'working-tree' (default) or 'local-head'"
         )),
     }
 }
@@ -247,14 +248,13 @@ mod tests {
 
     #[test]
     fn parse_archive_source_mode_maps_known_values() {
-        assert_eq!(parse_archive_source_mode(None), Ok(ArchiveSourceMode::Head));
         assert_eq!(
-            parse_archive_source_mode(Some("")),
-            Ok(ArchiveSourceMode::Head)
+            parse_archive_source_mode(None),
+            Ok(ArchiveSourceMode::WorkingTree)
         );
         assert_eq!(
-            parse_archive_source_mode(Some("local-head")),
-            Ok(ArchiveSourceMode::Head)
+            parse_archive_source_mode(Some("")),
+            Ok(ArchiveSourceMode::WorkingTree)
         );
         assert_eq!(
             parse_archive_source_mode(Some("working-tree")),
@@ -263,6 +263,14 @@ mod tests {
         assert_eq!(
             parse_archive_source_mode(Some("worktree")),
             Ok(ArchiveSourceMode::WorkingTree)
+        );
+        assert_eq!(
+            parse_archive_source_mode(Some("head")),
+            Ok(ArchiveSourceMode::Head)
+        );
+        assert_eq!(
+            parse_archive_source_mode(Some("local-head")),
+            Ok(ArchiveSourceMode::Head)
         );
         assert!(parse_archive_source_mode(Some("repo-url")).is_err());
         assert!(parse_archive_source_mode(Some("garbage")).is_err());

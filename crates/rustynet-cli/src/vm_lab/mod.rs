@@ -20132,7 +20132,7 @@ fn macos_exit_dns_failclosed_artifact_set_complete(artifact_dir: &Path) -> Resul
 /// Mirrors the macOS/Windows exit DNS contracts, but reads the Linux
 /// nftables producer's `firewall_block_rules.json` and existing
 /// `linux_dns_failclosed_check.json` report.
-fn evaluate_linux_exit_dns_failclosed_artifact_dir(
+pub(crate) fn evaluate_linux_exit_dns_failclosed_artifact_dir(
     linux_alias: &str,
     artifact_dir: &Path,
 ) -> Result<String, String> {
@@ -35985,7 +35985,7 @@ mod tests {
         // runtime_acls_validation + service_hardening_validation +
         // key_custody_validation + mesh_status_validation + authenticode_validation +
         // ipv6_leak_validation + exit_demotion_residue_validation.
-        assert_eq!(cli_ids.len(), 32);
+        assert_eq!(cli_ids.len(), 33);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)

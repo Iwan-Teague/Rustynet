@@ -747,6 +747,20 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-engine exit DNS fail-closed: the six-artifact directory-based
+    // leak-proof evaluator folded into a first-class OrchestrationStage.
+    // state_machine_only — only the Rust `--node` plan dispatches it;
+    // the bash orchestrate path runs the check via its own artifact
+    // evaluator.
+    StageSpec {
+        name: "exit_dns_failclosed_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("exit_dns_failclosed_check"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,

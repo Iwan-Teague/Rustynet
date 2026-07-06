@@ -147,7 +147,10 @@ fn merge_demotion_residue_artifact(
 }
 
 fn after_val_str(val: &serde_json::Value, key: &str, default: &str) -> String {
-    val.get(key).and_then(|v| v.as_str()).unwrap_or(default).to_string()
+    val.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or(default)
+        .to_string()
 }
 
 fn after_val_bool(val: &serde_json::Value, key: &str, default: bool) -> bool {
@@ -217,8 +220,7 @@ mod tests {
             "--nat-table",
             "rustynet_nat_g1",
         ];
-        let demote_argv: [&'static str; 4] =
-            ["/usr/local/bin/rustynet", "role", "set", "client"];
+        let demote_argv: [&'static str; 4] = ["/usr/local/bin/rustynet", "role", "set", "client"];
         let daemon_argv: [&'static str; 4] =
             ["systemctl", "is-active", "--quiet", "rustynetd.service"];
 
@@ -276,11 +278,7 @@ mod tests {
     /// individual responses without repeating the constant definitions.
     fn setup_clean_demotion_workflow_items(
         mock: &MockShellHost,
-    ) -> (
-        [&'static str; 6],
-        [&'static str; 4],
-        [&'static str; 4],
-    ) {
+    ) -> ([&'static str; 6], [&'static str; 4], [&'static str; 4]) {
         setup_clean_demotion_workflow(mock)
     }
 

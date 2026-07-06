@@ -601,6 +601,7 @@ fn throwaway_conn(host: &str) -> crate::vm_lab::orchestrator::connection::NodeCo
         Some("debian".to_owned()),
         std::path::PathBuf::from("/tmp/id"),
         kh.path().to_path_buf(),
+        None,
     )
     .expect("conn")
 }
