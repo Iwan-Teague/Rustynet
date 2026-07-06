@@ -2083,13 +2083,14 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 17 | `security_audit_validation` | Eight Tier-0 daemon self-audits (membership-revoke, revoked-peer-denied, signature-forgery, privileged-helper-allowlist, policy-default-deny, gossip-revoked-readmit, enrollment-replay, hello-limiter-flood) | `stage/security_audit_validation.rs` |
 | 18 | `dns_failclosed_validation` | Per-node DNS-failclosed daemon self-check (resolv.conf loopback-only, killswitch DNS posture) | `stage/dns_failclosed_validation.rs` |
 | 19 | `runtime_acls_validation` | Per-node runtime-ACLs daemon self-check (canonical root set, per-path consistency) | `stage/runtime_acls_validation.rs` |
-| 20 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
-| 21 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
-| 22 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
-| 23 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
-| 24 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
-| 25 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
-| 26 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 20 | `service_hardening_validation` | Per-node service-hardening daemon self-check (systemd unit hardening directives match shipped baseline) | `stage/service_hardening_validation.rs` |
+| 21 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
+| 22 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
+| 23 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
+| 24 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
+| 25 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
+| 26 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
+| 27 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2165,6 +2166,7 @@ mod tests {
             "security_audit_validation",
             "dns_failclosed_validation",
             "runtime_acls_validation",
+            "service_hardening_validation",
             "deploy_relay_service",
             "relay_validation",
             "traffic_test_matrix",

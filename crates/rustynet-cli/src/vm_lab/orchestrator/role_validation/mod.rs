@@ -15,3 +15,4 @@ pub mod dns_failclosed;
 pub mod relay;
 pub mod runtime_acls;
 pub mod security_audit;
+pub mod service_hardening;

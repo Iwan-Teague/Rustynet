@@ -128,6 +128,9 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_stage_runtime_acls_check",
     "macos_stage_runtime_acls_check",
     "windows_stage_runtime_acls_check",
+    "linux_stage_service_hardening_check",
+    "macos_stage_service_hardening_check",
+    "windows_stage_service_hardening_check",
     "linux_stage_secrets_not_in_logs",
     "macos_stage_secrets_not_in_logs",
     "windows_stage_secrets_not_in_logs",
@@ -3007,6 +3010,7 @@ mod registry_equivalence_tests {
             "extended_soak" => Some("extended_soak"),
             "dns_failclosed_validation" => Some("dns_failclosed_check"),
             "runtime_acls_validation" => Some("runtime_acls_check"),
+            "service_hardening_validation" => Some("service_hardening_check"),
             "cleanup" => Some("cleanup"),
             stage if stage.starts_with("chaos_") => Some("chaos"),
             stage if stage.contains("reboot") => Some("reboot_recovery"),
@@ -3036,6 +3040,7 @@ mod registry_equivalence_tests {
                 | "security_audit_validation"
                 | "dns_failclosed_validation"
                 | "runtime_acls_validation"
+                | "service_hardening_validation"
                 | "deploy_relay_service"
                 | "relay_validation"
                 | "traffic_test_matrix"

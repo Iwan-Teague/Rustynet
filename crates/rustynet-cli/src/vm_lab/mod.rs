@@ -22072,7 +22072,7 @@ fn evaluate_linux_authenticode_report(linux_alias: &str, raw_json: &str) -> Resu
     }
 }
 
-fn evaluate_linux_service_hardening_report(
+pub(crate) fn evaluate_linux_service_hardening_report(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -35971,7 +35971,7 @@ mod tests {
         // anchor_validation + admin_issue + blind_exit + deploy_relay_service +
         // security_audit_validation + dns_failclosed_validation +
         // runtime_acls_validation.
-        assert_eq!(cli_ids.len(), 26);
+        assert_eq!(cli_ids.len(), 27);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)
