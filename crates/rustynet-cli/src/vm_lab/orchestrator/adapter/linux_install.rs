@@ -552,4 +552,15 @@ mod tests {
             "bootstrap registry probe count should remain configurable"
         );
     }
+
+    #[test]
+    fn bootstrap_root_timeout_wraps_child_command_not_sudo() {
+        // `timeout sudo resolvectl ...` can leave the root child alive after
+        // sudo exits. Run timeout under sudo so diagnostics cannot stall the
+        // Rust engine before the offline cargo fallback.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("sudo -n timeout --kill-after=5"),
+            "root command timeout must wrap the child command under sudo"
+        );
+    }
 }

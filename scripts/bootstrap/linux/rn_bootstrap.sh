@@ -15,7 +15,7 @@ run_root() {
 run_root_timed() {
   local timeout_secs="$1"
   shift
-  timeout "$timeout_secs" sudo -n "$@"
+  sudo -n timeout --kill-after=5 "$timeout_secs" "$@"
 }
 
 run_local_timed() {

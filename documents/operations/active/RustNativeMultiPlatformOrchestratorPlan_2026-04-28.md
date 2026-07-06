@@ -128,22 +128,52 @@ Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4
 >   `RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2`; and Linux bootstrap builds only
 >   the installed `rustynet-cli` binary (`--bin rustynet-cli`) instead of every
 >   helper bin in the package.
+> - **Full Linux Rust `--node` engine run reached the known dataplane failure
+>   with cleanup intact (2026-07-06).** Run
+>   `state/rust-node-full-linux-1783351836` executed the Rust engine with the
+>   Linux live suite enabled and `--skip-cross-network --skip-soak`. Result:
+>   27 pass / 1 fail / 17 skipped. The Rust engine proved discovery,
+>   source-archive preparation, SSH reachability, cleanup preflight, three-node
+>   bootstrap, pubkey collection, membership init/distribution, anchor/admin
+>   issue, assignment/traversal/DNS distribution, baseline enforcement,
+>   `validate_baseline_runtime`, `security_audit_validation`, the mapped daemon
+>   validator stages, relay deployment/validation, realtime `stages.tsv`,
+>   `orchestrate_result.json`, `parity_input.json`, run-matrix append, and final
+>   cleanup. The only failure was the known `traffic_test_matrix` client-client
+>   reachability gap:
+>   `debian-headless-2 -> debian-headless-3` and
+>   `debian-headless-3 -> debian-headless-2`; do not count this as an
+>   orchestrator migration blocker. Two engine fixes came from this run: clean
+>   tracked working trees now resolve `--source-mode working-tree` to `HEAD`
+>   before `git stash create` (avoids fatal `git stash create` exit 1), and
+>   Linux bootstrap root timeouts now run `timeout` under `sudo` so no-egress
+>   diagnostics such as `resolvectl query` cannot stall before offline cargo
+>   fallback.
+> - **Monitor/MCP Rust-engine launch wiring smoke-proven (2026-07-06).** Unit
+>   tests cover monitor arg synthesis (`rustynet-lab-monitor` launcher emits
+>   `rust_engine=true`/`--node` and no legacy flags) and DeepSeek MCP arg
+>   synthesis (`rustynet-mcp-deepseek` emits Rust `--node` flags and defaults
+>   next macOS targets to the Rust engine). A deterministic MCP dry-run,
+>   `deepseek_lab_run` job `labrun-1783352777027-13351-0`, launched
+>   `dry-run (rust --node): 3 node(s), 17 planned stage(s)` with
+>   `triage_on_failure=false`, proving launch -> wait -> capture -> report
+>   through the same driver the monitor loop uses. The OpenCode report-review
+>   harness also generated a read-only review prompt for failed Rust report
+>   `state/rust-node-full-linux-1783351836` and correctly identified
+>   `traffic_test_matrix` as the failed stage. A live external OpenCode review
+>   run was not executed because it would disclose local report/repo context to a
+>   model provider; it requires explicit operator approval for that trust-boundary
+>   crossing.
 >
-> **Remaining loop-readiness work (planned, grounded):** (prereq 1) port the
-> bash-only validators into the Rust `PlanBuilder` — RANK-0 is a report-mapping
-> win (the 6 daemon-probe results `ValidateBaselineRuntimeStage` already
-> computes → the `linux_runtime_acls/service_hardening/key_custody/mesh_status`
-> columns), RANK-1 is a new `SecurityAuditValidationStage` wrapping the 8
-> adversarial audit checks (logic exists in `evaluate_*_report` /
-> `run_validate_linux_*_stage`; needs an adapter-seam stage + `StageId`/registry/
-> `PlanBuilder` count bump); (prereq 2) an opt-in `rust_engine` param on
-> `deepseek_lab_run` that synthesizes `--node` from selectors + inventory
-> (`build_orchestrator_args`, needs an MCP rebuild). Tracked gap-hunt follow-ups
-> (non-blocking): `--node` path emits no `run_summary.json` so the run-matrix
-> `run_note` is dropped; `traffic_test_matrix` assumes all-pairs mesh
-> reachability (may be the correct mesh contract — do NOT weaken without a
-> topology-model decision); dead `applies_to_roles`/`fanout` trait methods;
-> best-effort parity/manifest writes.
+> **Remaining loop-readiness work (planned, grounded):** prove one
+> monitor-launched non-dry-run cycle end-to-end after explicit approval for
+> external OpenCode review/patch context sharing, then continue Rust-engine live
+> campaigns for chaos, cross-network, soak/reboot, and mixed macOS/Windows
+> topologies. Tracked gap-hunt follow-ups (non-blocking):
+> `traffic_test_matrix` assumes all-pairs mesh reachability (may be the correct
+> mesh contract — do NOT weaken without a topology-model decision);
+> `--node` dry-run does not persist a report dir by design; dead
+> `applies_to_roles`/`fanout` trait methods; best-effort parity/manifest writes.
 >
 > **The role-platform matrix in §3.4 is not yet validated end-to-end for
 > any non-Linux Exit deployment.** Windows-as-Exit and macOS-as-Exit
