@@ -59,6 +59,24 @@ pub struct SshConnectionParams {
     pub known_hosts: std::path::PathBuf,
 }
 
+impl SshConnectionParams {
+    pub fn new(
+        host: String,
+        port: u16,
+        user: Option<String>,
+        identity_file: std::path::PathBuf,
+        known_hosts: std::path::PathBuf,
+    ) -> Self {
+        SshConnectionParams {
+            host: format!("{host}:{port}"),
+            port,
+            user,
+            identity_file,
+            known_hosts,
+        }
+    }
+}
+
 /// Per-node, per-OS interface for the orchestration pipeline.
 /// Connection details are injected at construction via `NodeConnection`;
 /// no transport argument appears in any method signature.
