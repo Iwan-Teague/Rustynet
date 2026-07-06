@@ -19697,7 +19697,7 @@ pub(crate) fn evaluate_blind_exit_reversal_report(
 /// Pure evaluator for `rustynetd linux-blind-exit-dataplane-check`.
 /// The report must come from a live `nft list ruleset` capture, not a generated
 /// plan, and every fail-closed control must pass individually.
-fn evaluate_linux_blind_exit_dataplane_report(
+pub(crate) fn evaluate_linux_blind_exit_dataplane_report(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -35985,8 +35985,9 @@ mod tests {
         // runtime_acls_validation + service_hardening_validation +
         // key_custody_validation + mesh_status_validation + authenticode_validation +
         // ipv6_leak_validation + exit_demotion_residue_validation +
-        // exit_dns_failclosed_validation + exit_nat_lifecycle_validation.
-        assert_eq!(cli_ids.len(), 34);
+        // exit_dns_failclosed_validation + exit_nat_lifecycle_validation +
+        // blind_exit_dataplane_validation.
+        assert_eq!(cli_ids.len(), 35);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)

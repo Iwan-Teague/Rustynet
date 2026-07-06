@@ -12,6 +12,7 @@
 
 pub mod anchor;
 pub mod authenticode;
+pub mod blind_exit_dataplane;
 pub mod dns_failclosed;
 pub mod exit_demotion_residue;
 pub mod exit_dns_failclosed;

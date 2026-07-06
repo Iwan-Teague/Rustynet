@@ -8,6 +8,7 @@ pub mod admin_issue;
 pub mod anchor_validation;
 pub mod authenticode_validation;
 pub mod blind_exit;
+pub mod blind_exit_dataplane_validation;
 pub mod cleanup;
 pub mod collect_pubkeys;
 pub mod deploy_relay;
@@ -75,13 +76,14 @@ pub enum StageId {
     ExitDemotionResidueValidation,
     ExitDnsFailclosedValidation,
     ExitNatLifecycleValidation,
+    BlindExitDataplaneValidation,
     Cleanup,
 }
 
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 34] = [
+    pub const ALL: [StageId; 35] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -115,6 +117,7 @@ impl StageId {
         StageId::ExitDemotionResidueValidation,
         StageId::ExitDnsFailclosedValidation,
         StageId::ExitNatLifecycleValidation,
+        StageId::BlindExitDataplaneValidation,
         StageId::Cleanup,
     ];
 
@@ -153,6 +156,7 @@ impl StageId {
             StageId::ExitDemotionResidueValidation => "exit_demotion_residue_validation",
             StageId::ExitDnsFailclosedValidation => "exit_dns_failclosed_validation",
             StageId::ExitNatLifecycleValidation => "exit_nat_lifecycle_validation",
+            StageId::BlindExitDataplaneValidation => "blind_exit_dataplane_validation",
             StageId::Cleanup => "cleanup",
         }
     }

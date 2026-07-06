@@ -774,6 +774,20 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-engine blind_exit dataplane: live nft ruleset capture with
+    // five hardened subchecks (ruleset captured, mesh-scoped forward,
+    // no NAT, no unrestricted forward, no own-egress) — proof the
+    // blind-exit dataplane posture matches the reviewed contract.
+    // state_machine_only — only the Rust `--node` plan dispatches it.
+    StageSpec {
+        name: "blind_exit_dataplane_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("blind_exit_dataplane_check"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,
