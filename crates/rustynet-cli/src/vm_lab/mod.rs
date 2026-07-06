@@ -231,6 +231,7 @@ pub struct VmLabWriteLiveLabProfileConfig {
     pub cross_network_nat_profiles: Option<String>,
     pub cross_network_required_nat_profiles: Option<String>,
     pub cross_network_impairment_profile: Option<String>,
+    pub cross_network_substrate: Option<String>,
     pub backend: Option<String>,
     pub source_mode: Option<String>,
     pub repo_ref: Option<String>,
@@ -866,6 +867,10 @@ pub struct VmLabOrchestrateLiveLabConfig {
     pub skip_gates: bool,
     pub skip_soak: bool,
     pub skip_cross_network: bool,
+    pub cross_network_nat_profiles: Option<String>,
+    pub cross_network_required_nat_profiles: Option<String>,
+    pub cross_network_impairment_profile: Option<String>,
+    pub cross_network_substrate: Option<String>,
     pub utm_documents_root: Option<PathBuf>,
     pub utmctl_path: Option<PathBuf>,
     pub ssh_port: u16,
@@ -4584,6 +4589,9 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
     if let Some(value) = config.cross_network_impairment_profile.as_deref() {
         ensure_no_control_chars("cross-network impairment profile", value)?;
     }
+    if let Some(value) = config.cross_network_substrate.as_deref() {
+        ensure_no_control_chars("cross-network substrate", value)?;
+    }
     if let Some(value) = config.backend.as_deref() {
         ensure_no_control_chars("backend", value)?;
     }
@@ -4716,6 +4724,12 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
     if let Some(value) = config.cross_network_impairment_profile.as_deref() {
         lines.push(format_env_assignment(
             "CROSS_NETWORK_IMPAIRMENT_PROFILE",
+            value,
+        )?);
+    }
+    if let Some(value) = config.cross_network_substrate.as_deref() {
+        lines.push(format_env_assignment(
+            "RUSTYNET_CROSS_NETWORK_SUBSTRATE",
             value,
         )?);
     }
@@ -5580,6 +5594,7 @@ fn resolve_setup_live_lab_selection(
             cross_network_nat_profiles: None,
             cross_network_required_nat_profiles: None,
             cross_network_impairment_profile: None,
+            cross_network_substrate: None,
             backend: None,
             source_mode: config.source_mode.clone(),
             repo_ref: config.repo_ref.clone(),
@@ -7288,6 +7303,39 @@ fn registry_severity_str(stage: &str) -> &'static str {
     }
 }
 
+fn rust_native_stage_log_path(report_dir: &Path, stage: &str) -> PathBuf {
+    report_dir.join("logs").join(format!("{stage}.log"))
+}
+
+fn rust_native_vm_lab_stage_outcome(
+    report_dir: &Path,
+    parity_path: &Path,
+    id: &orchestrator::stage::StageId,
+    outcome: &orchestrator::error::StageOutcome,
+) -> VmLabStageOutcome {
+    use orchestrator::error::StageOutcome;
+
+    VmLabStageOutcome {
+        stage: id.as_str().to_owned(),
+        status: match outcome {
+            StageOutcome::Passed => VmLabStageStatus::Pass,
+            StageOutcome::Failed(_) => VmLabStageStatus::Fail,
+            StageOutcome::Skipped => VmLabStageStatus::Skipped,
+        },
+        summary: match outcome {
+            StageOutcome::Passed => String::new(),
+            StageOutcome::Failed(err) => err.clone(),
+            StageOutcome::Skipped => "skipped".to_owned(),
+        },
+        artifacts: vec![
+            rust_native_stage_log_path(report_dir, id.as_str())
+                .display()
+                .to_string(),
+            parity_path.display().to_string(),
+        ],
+    }
+}
+
 /// [`StageObserver`](orchestrator::runner::StageObserver) that emits the
 /// realtime `stages.tsv` contract for a `--node` run: a `running` row when a
 /// stage starts, replaced by its terminal outcome when it finishes. Recorder
@@ -7304,7 +7352,7 @@ impl RustNativeStageRecorder<'_> {
     /// captured to a file by default — this gives get_stage_log / diagnose /
     /// the monitor tail / validate_live_lab_run_artifacts a real path to read.
     fn stage_log_path(&self, name: &str) -> PathBuf {
-        self.report_dir.join("logs").join(format!("{name}.log"))
+        rust_native_stage_log_path(self.report_dir, name)
     }
 }
 
@@ -7463,6 +7511,143 @@ fn write_rust_native_run_summary(
         .map(|_| ())
 }
 
+fn write_rust_native_failure_digest(
+    report_dir: &Path,
+    run_id: &str,
+    network_id: &str,
+    overall_status: &str,
+) -> Result<(), String> {
+    let records = parse_live_lab_stage_records(report_dir)?;
+    let nodes_path = report_dir.join("state/nodes.tsv");
+    let nodes_body = fs::read_to_string(&nodes_path)
+        .map_err(|err| format!("read nodes.tsv '{}': {err}", nodes_path.display()))?;
+    let nodes = nodes_body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let cols = line.split('\t').collect::<Vec<_>>();
+            (cols.len() == 4).then(|| {
+                json!({
+                    "label": cols[0],
+                    "target": cols[1],
+                    "node_id": cols[2],
+                    "bootstrap_role": cols[3],
+                    "extra": {},
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let stages = records
+        .iter()
+        .map(|record| {
+            let likely_reason = if record.status == "fail" {
+                extract_iteration_likely_reason(record.log_path.as_path())
+            } else {
+                record.description.clone()
+            };
+            json!({
+                "stage": record.name,
+                "severity": record.severity,
+                "status": record.status,
+                "rc": record.rc.parse::<i64>().unwrap_or(1),
+                "description": record.description,
+                "log_path": record.log_path.display().to_string(),
+                "condensed_result": if record.description.is_empty() {
+                    format!("stage {}", record.status)
+                } else {
+                    record.description.clone()
+                },
+                "primary_failure_reason": likely_reason,
+                "likely_reason": likely_reason,
+                "failed_workers": [],
+                "extra": {},
+            })
+        })
+        .collect::<Vec<_>>();
+    let failed_stages = stages
+        .iter()
+        .filter(|stage| stage.get("status").and_then(Value::as_str) == Some("fail"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let first_failure = failed_stages.first().cloned().unwrap_or(Value::Null);
+    let digest = json!({
+        "schema_version": 1,
+        "run_id": run_id,
+        "network_id": network_id,
+        "report_dir": report_dir.display().to_string(),
+        "overall_status": overall_status,
+        "node_count": nodes.len() as u64,
+        "nodes": nodes,
+        "stages": stages,
+        "failed_stage_count": failed_stages.len() as u64,
+        "first_failure": first_failure,
+        "extra": {},
+    });
+
+    let output_json = report_dir.join("failure_digest.json");
+    let output_md = report_dir.join("failure_digest.md");
+    fs::write(
+        output_json.as_path(),
+        serde_json::to_string_pretty(&digest)
+            .map_err(|err| format!("serialize failure digest: {err}"))?
+            + "\n",
+    )
+    .map_err(|err| {
+        format!(
+            "write failure digest json '{}': {err}",
+            output_json.display()
+        )
+    })?;
+
+    let mut lines = vec![
+        format!("# Live Lab Failure Digest ({run_id})"),
+        String::new(),
+        format!("- overall_status: `{overall_status}`"),
+        format!("- report_dir: `{}`", report_dir.display()),
+        format!(
+            "- node_count: `{}`",
+            nodes_body.lines().filter(|l| !l.trim().is_empty()).count()
+        ),
+        String::new(),
+        "## Condensed Checks".to_owned(),
+        String::new(),
+    ];
+    for record in &records {
+        let detail = if record.description.is_empty() {
+            format!("stage {}", record.status)
+        } else {
+            record.description.clone()
+        };
+        lines.push(format!(
+            "- `{}` `{}`: {}",
+            record.status.to_ascii_uppercase(),
+            record.name,
+            detail
+        ));
+    }
+    lines.extend([String::new(), "## Failure Focus".to_owned(), String::new()]);
+    if let Some(first) = records.iter().find(|record| record.status == "fail") {
+        lines.push(format!("- first_failed_stage: `{}`", first.name));
+        lines.push(format!("- severity: `{}`", first.severity));
+        lines.push(format!("- rc: `{}`", first.rc));
+        lines.push(format!(
+            "- likely_reason: {}",
+            extract_iteration_likely_reason(first.log_path.as_path())
+        ));
+        lines.push(format!("- full_log: `{}`", first.log_path.display()));
+    } else {
+        lines.push("- no failed stage recorded".to_owned());
+    }
+    fs::write(output_md.as_path(), lines.join("\n") + "\n").map_err(|err| {
+        format!(
+            "write failure digest markdown '{}': {err}",
+            output_md.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn execute_rust_native_orchestration(
     config: VmLabOrchestrateLiveLabConfig,
 ) -> Result<String, String> {
@@ -7475,11 +7660,20 @@ fn execute_rust_native_orchestration(
     use orchestrator::stage::OrchestrationStage;
 
     // Capture scalar config while `config` is intact (fields below are consumed
-    // by value). The Rust-path manifest selectors are built LATER from the
-    // resolved topology (see `rust_native_manifest_selectors`) so the audit
-    // snapshot reflects only what THIS plan runs — never a bash-arm-only suite.
+    // by value). The Rust-path manifest selectors are built later from the
+    // resolved topology, so the audit snapshot reflects only what this plan
+    // actually honors.
     let dry_run = config.dry_run;
     let skip_live_suite = config.skip_linux_live_suite;
+    let enable_chaos_suite = config.enable_chaos_suite;
+    let enable_cross_network_suite = !config.skip_cross_network;
+    let cross_network_options = orchestrator::stage::cross_network::CrossNetworkOptions::from_cli(
+        enable_cross_network_suite,
+        config.cross_network_nat_profiles.as_deref(),
+        config.cross_network_required_nat_profiles.as_deref(),
+        config.cross_network_impairment_profile.as_deref(),
+        config.cross_network_substrate.as_deref(),
+    )?;
     let setup_only = config.setup_only;
     let run_only = config.run_only;
 
@@ -7753,19 +7947,23 @@ fn execute_rust_native_orchestration(
     };
 
     let stages = filter_rust_native_stages_for_mode(
-        build_rust_native_orchestration_stages(rebuild_only, source_mode, skip_live_suite),
+        build_rust_native_orchestration_stages(
+            rebuild_only,
+            source_mode,
+            skip_live_suite,
+            enable_chaos_suite,
+            config.skip_soak,
+            cross_network_options,
+        ),
         setup_only,
         run_only,
     );
 
-    // Build the manifest audit snapshot from THIS run's resolved topology + only
-    // the selectors the Rust plan actually honors. The bash-arm suite selectors
-    // (chaos, cross-network, macos_promote_exit, the role-platform election
-    // family) are NOT run by PlanBuilder, so stamping them active would be a
-    // false evidence claim (cross_network_suite defaults on!) — they are forced
-    // inactive here. wants_macos/windows come from the real `--node` guest
-    // platforms, not the ignored `*_platform` flags. skip_linux_live_suite IS
-    // honored by PlanBuilder (drops the live suite), so it is stamped truthfully.
+    // Build the manifest audit snapshot from this run's resolved topology and
+    // only the selectors the Rust plan honors. The `--node` plan now honors
+    // chaos, cross-network, soak, and skip-linux-live-suite; bash-only platform
+    // election selectors remain inactive. wants_macos/windows come from the real
+    // `--node` guest platforms, not the ignored `*_platform` flags.
     let manifest_selectors = crate::live_lab_stage_registry::TargetSelectors {
         wants_macos: node_entries
             .iter()
@@ -7781,9 +7979,9 @@ fn execute_rust_native_orchestration(
         blind_exit_platform: String::new(),
         role_switch_platform: String::new(),
         skip_linux_live_suite: skip_live_suite,
-        chaos_suite: false,
-        cross_network_suite: false,
-        soak_suite: false,
+        chaos_suite: enable_chaos_suite && !skip_live_suite,
+        cross_network_suite: enable_cross_network_suite && !skip_live_suite,
+        soak_suite: !config.skip_soak && !skip_live_suite,
         local_gate_suite: false,
     };
 
@@ -7956,6 +8154,17 @@ fn execute_rust_native_orchestration(
     ) {
         eprintln!("warning: failed to write run_summary for --node run: {err}");
     }
+    if failed > 0 {
+        let run_id = format!("rust-{run_started_unix}");
+        if let Err(err) = write_rust_native_failure_digest(
+            report_dir.as_path(),
+            run_id.as_str(),
+            ctx.network_id.as_str(),
+            "fail",
+        ) {
+            eprintln!("warning: failed to write failure_digest for --node run: {err}");
+        }
+    }
 
     // Emit the parity-input JSON snapshot used by the W5.5 cross-orchestrator
     // diff harness. Failure to write it does not fail the run; it is
@@ -8007,19 +8216,8 @@ fn execute_rust_native_orchestration(
     vm_lab_outcomes.extend(
         results
             .iter()
-            .map(|(id, outcome)| VmLabStageOutcome {
-                stage: id.as_str().to_owned(),
-                status: match outcome {
-                    StageOutcome::Passed => VmLabStageStatus::Pass,
-                    StageOutcome::Failed(_) => VmLabStageStatus::Fail,
-                    StageOutcome::Skipped => VmLabStageStatus::Skipped,
-                },
-                summary: match outcome {
-                    StageOutcome::Passed => String::new(),
-                    StageOutcome::Failed(err) => err.clone(),
-                    StageOutcome::Skipped => "skipped".to_owned(),
-                },
-                artifacts: vec![parity_path.display().to_string()],
+            .map(|(id, outcome)| {
+                rust_native_vm_lab_stage_outcome(report_dir.as_path(), &parity_path, id, outcome)
             })
             .collect::<Vec<_>>(),
     );
@@ -8034,12 +8232,10 @@ fn execute_rust_native_orchestration(
     );
     // Enforce the SAME artifact-completeness contract the bash path checks
     // (run_summary.json/.md + state/{stages,nodes}.tsv present, every recorded
-    // stage log exists, and a failure digest exists when a stage failed) — run
-    // AFTER finalize, which writes the failure digest. Best-effort: a gap is
+    // stage log exists, and a failure digest exists when a stage failed). Run
+    // after the Rust summary/digest writer and finalize. Best-effort: a gap is
     // surfaced to the operator log, not turned into a false pass/fail, so the
-    // finalize verdict still governs. Previously the Rust path never validated
-    // its own artifacts — a future regression could ship a green run missing
-    // evidence.
+    // finalize verdict still governs.
     if let Err(err) = validate_live_lab_run_artifacts(report_dir.as_path()) {
         eprintln!("warning: --node run artifact completeness check: {err}");
     }
@@ -8050,11 +8246,17 @@ fn build_rust_native_orchestration_stages(
     rebuild_only: Option<Vec<String>>,
     source_mode: orchestrator::stage::source_archive::ArchiveSourceMode,
     skip_live_suite: bool,
+    enable_chaos_suite: bool,
+    skip_soak: bool,
+    cross_network: orchestrator::stage::cross_network::CrossNetworkOptions,
 ) -> Vec<Box<dyn orchestrator::stage::OrchestrationStage>> {
     orchestrator::plan::PlanBuilder::new()
         .with_rebuild_only(rebuild_only)
         .with_source_mode(source_mode)
         .with_skip_live_suite(skip_live_suite)
+        .with_enable_chaos_suite(enable_chaos_suite)
+        .with_skip_soak(skip_soak)
+        .with_cross_network_options(cross_network)
         .build()
 }
 
@@ -8089,7 +8291,16 @@ fn filter_rust_native_stages_for_mode(
     } else if run_only {
         let setup = rust_native_setup_stage_ids();
         let live = orchestrator::plan::PlanBuilder::LIVE_SUITE_STAGES;
-        stages.retain(|stage| setup.contains(&stage.id()) || live.contains(&stage.id()));
+        let chaos = orchestrator::plan::PlanBuilder::CHAOS_SUITE_STAGES;
+        let cross_network = orchestrator::plan::PlanBuilder::CROSS_NETWORK_SUITE_STAGES;
+        let soak = orchestrator::plan::PlanBuilder::SOAK_SUITE_STAGES;
+        stages.retain(|stage| {
+            setup.contains(&stage.id())
+                || live.contains(&stage.id())
+                || chaos.contains(&stage.id())
+                || cross_network.contains(&stage.id())
+                || soak.contains(&stage.id())
+        });
     }
     stages
 }
@@ -8296,6 +8507,9 @@ fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::StageId> {
         None,
         orchestrator::stage::source_archive::ArchiveSourceMode::Head,
         false,
+        false,
+        false,
+        orchestrator::stage::cross_network::CrossNetworkOptions::default(),
     )
     .iter()
     .map(|stage| stage.id())
@@ -8312,6 +8526,9 @@ fn rust_native_orchestration_stage_ids_for_mode(
             None,
             orchestrator::stage::source_archive::ArchiveSourceMode::Head,
             false,
+            false,
+            false,
+            orchestrator::stage::cross_network::CrossNetworkOptions::default(),
         ),
         setup_only,
         run_only,
@@ -24182,6 +24399,7 @@ pub fn execute_ops_vm_lab_iterate_live_lab(
             cross_network_nat_profiles: None,
             cross_network_required_nat_profiles: None,
             cross_network_impairment_profile: None,
+            cross_network_substrate: None,
             backend: Some(
                 config
                     .backend
@@ -32413,6 +32631,8 @@ fn run_remote_shell_command(
     let mut command = Command::new("ssh");
     command.args([
         "-n",
+        "-F",
+        "/dev/null",
         "-o",
         "LogLevel=ERROR",
         "-o",
@@ -32448,6 +32668,8 @@ fn capture_remote_shell_command(
     let mut command = Command::new("ssh");
     command.args([
         "-n",
+        "-F",
+        "/dev/null",
         "-o",
         "LogLevel=ERROR",
         "-o",
@@ -32504,6 +32726,8 @@ fn scp_to_remote(
     let mut command = Command::new("scp");
     command.args([
         "-q",
+        "-F",
+        "/dev/null",
         "-o",
         "LogLevel=ERROR",
         "-o",
@@ -32567,6 +32791,8 @@ fn scp_from_remote(
     let mut command = Command::new("scp");
     command.args([
         "-q",
+        "-F",
+        "/dev/null",
         "-o",
         "LogLevel=ERROR",
         "-o",
@@ -34217,6 +34443,8 @@ fn prove_windows_ssh_access_for_target(
     let mut command = Command::new("ssh");
     command.args([
         "-n",
+        "-F",
+        "/dev/null",
         "-o",
         "LogLevel=ERROR",
         "-o",
@@ -35987,7 +36215,7 @@ mod tests {
         // ipv6_leak_validation + exit_demotion_residue_validation +
         // exit_dns_failclosed_validation + exit_nat_lifecycle_validation +
         // blind_exit_dataplane_validation.
-        assert_eq!(cli_ids.len(), 44);
+        assert_eq!(cli_ids.len(), 57);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)
@@ -36018,6 +36246,12 @@ mod tests {
             assert!(
                 ids.contains(&live_id),
                 "run-only plan must execute live stage {live_id:?}"
+            );
+        }
+        for soak_id in super::orchestrator::plan::PlanBuilder::SOAK_SUITE_STAGES {
+            assert!(
+                ids.contains(&soak_id),
+                "run-only plan must execute soak stage {soak_id:?}"
             );
         }
         assert!(!ids.contains(&super::orchestrator::stage::StageId::Cleanup));
@@ -38671,6 +38905,7 @@ directory = "vendor"
             cross_network_nat_profiles: None,
             cross_network_required_nat_profiles: None,
             cross_network_impairment_profile: None,
+            cross_network_substrate: None,
             backend: Some("linux-wireguard-userspace-shared".to_owned()),
             source_mode: Some("local-head".to_owned()),
             repo_ref: Some("HEAD".to_owned()),
@@ -38748,6 +38983,7 @@ directory = "vendor"
             cross_network_nat_profiles: None,
             cross_network_required_nat_profiles: None,
             cross_network_impairment_profile: None,
+            cross_network_substrate: None,
             backend: None,
             source_mode: Some("local-head".to_owned()),
             repo_ref: None,
@@ -47605,6 +47841,10 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             skip_gates: false,
             skip_soak: false,
             skip_cross_network: false,
+            cross_network_nat_profiles: None,
+            cross_network_required_nat_profiles: None,
+            cross_network_impairment_profile: None,
+            cross_network_substrate: None,
             utm_documents_root: None,
             utmctl_path: None,
             ssh_port: 22,
@@ -48053,6 +48293,74 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn rust_native_failure_digest_satisfies_artifact_completeness() {
+        let unique = super::unique_suffix();
+        let tmp = std::env::temp_dir().join(format!("rustynet-rust-digest-{unique}.dir"));
+        let state = tmp.join("state");
+        let logs = tmp.join("logs");
+        fs::create_dir_all(&state).expect("tmp state dir");
+        fs::create_dir_all(&logs).expect("tmp logs dir");
+        let pass_log = logs.join("preflight.log");
+        let fail_log = logs.join("bootstrap_hosts.log");
+        fs::write(&pass_log, "[stage:preflight] pass\n").expect("pass log");
+        fs::write(
+            &fail_log,
+            "[stage:bootstrap_hosts] fail\nmacos-utm-1: cargo registry unreachable\n",
+        )
+        .expect("fail log");
+        fs::write(
+            state.join("stages.tsv"),
+            format!(
+                "preflight\thard\tpass\t0\t{}\tok\t2026-01-01T00:00:00Z\t2026-01-01T00:00:01Z\n\
+                 bootstrap_hosts\thard\tfail\t1\t{}\tmacOS bootstrap failed\t2026-01-01T00:00:02Z\t2026-01-01T00:00:03Z\n",
+                pass_log.display(),
+                fail_log.display()
+            ),
+        )
+        .expect("write stages.tsv");
+
+        let node_targets = vec![(
+            "macos-utm-1".to_owned(),
+            "mac@192.168.0.210".to_owned(),
+            "anchor".to_owned(),
+        )];
+        let mut node_ids = std::collections::HashMap::new();
+        node_ids.insert("macos-utm-1".to_owned(), "macos-client-1".to_owned());
+        super::write_rust_native_run_summary(
+            &tmp,
+            &node_targets,
+            &node_ids,
+            "net-test",
+            1,
+            1,
+            0,
+            2,
+            100,
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("summary");
+        super::write_rust_native_failure_digest(&tmp, "rust-test", "net-test", "fail")
+            .expect("digest");
+
+        assert!(tmp.join("failure_digest.md").is_file());
+        let digest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(tmp.join("failure_digest.json")).expect("digest json"),
+        )
+        .expect("digest is json");
+        assert_eq!(digest["first_failure"]["stage"], "bootstrap_hosts");
+        assert!(
+            digest["first_failure"]["primary_failure_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cargo registry unreachable"),
+            "digest: {digest}"
+        );
+        super::validate_live_lab_run_artifacts(&tmp).expect("complete failed-run artifacts");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
     fn rust_native_recorder_writes_per_stage_log_and_records_its_path() {
         use super::orchestrator::error::StageOutcome;
         use super::orchestrator::runner::StageObserver;
@@ -48092,6 +48400,32 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "stages.tsv must record the log path: {tsv}"
         );
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn rust_native_stage_outcome_points_at_stage_log_artifact() {
+        use super::orchestrator::error::StageOutcome;
+        use super::orchestrator::stage::StageId;
+
+        let report_dir = PathBuf::from("/tmp/rust-node-report");
+        let parity_path = report_dir.join("parity_input.json");
+        let outcome = super::rust_native_vm_lab_stage_outcome(
+            report_dir.as_path(),
+            parity_path.as_path(),
+            &StageId::BootstrapHosts,
+            &StageOutcome::Failed("cargo registry unreachable".to_owned()),
+        );
+
+        assert_eq!(outcome.stage, "bootstrap_hosts");
+        assert_eq!(outcome.status, VmLabStageStatus::Fail);
+        assert_eq!(outcome.summary, "cargo registry unreachable");
+        assert_eq!(
+            outcome.artifacts,
+            vec![
+                "/tmp/rust-node-report/logs/bootstrap_hosts.log".to_owned(),
+                "/tmp/rust-node-report/parity_input.json".to_owned(),
+            ]
+        );
     }
 
     #[test]

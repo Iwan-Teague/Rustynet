@@ -2297,7 +2297,8 @@ run_root pkill -f 'apt-get update' >/dev/null 2>&1 || true
 run_root pkill -f '/usr/lib/apt/methods/' >/dev/null 2>&1 || true
 run_root pkill -f 'dpkg' >/dev/null 2>&1 || true
 run_root pkill -f 'dnf install -y' >/dev/null 2>&1 || true
-run_root pkill -f 'cargo build --release -p rustynetd -p rustynet-cli' >/dev/null 2>&1 || true
+run_root pkill -f 'cargo build --release -p rustynetd' >/dev/null 2>&1 || true
+run_root pkill -f 'cargo build --release -p rustynet-cli --bin rustynet-cli' >/dev/null 2>&1 || true
 
 run_root_timed 30 systemctl stop \
   rustynetd.service \
@@ -2691,7 +2692,7 @@ emit_bootstrap_network_diagnostics() {
     run_root_timed 30 resolvectl query "${host}" >&2 || true
   fi
   echo "--- getent ahosts ${host} ---" >&2
-  getent ahosts "${host}" >&2 || true
+  timeout 10 getent ahosts "${host}" >&2 || true
 }
 
 wait_for_bootstrap_rustup_endpoint() {
@@ -2762,7 +2763,8 @@ if ! rustup run "${RUST_TOOLCHAIN_CHANNEL}" rustc --version >/dev/null 2>&1 || !
 fi
 rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 
-run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
+run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd
+run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-cli --bin rustynet-cli
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
 # Co-deploy the sibling relay daemon binary on every Linux node. Role stages

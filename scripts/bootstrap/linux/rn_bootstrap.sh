@@ -340,17 +340,18 @@ emit_bootstrap_network_diagnostics() {
     run_root_timed 30 resolvectl query "${host}" >&2 || true
   fi
   echo "--- getent ahosts ${host} ---" >&2
-  getent ahosts "${host}" >&2 || true
+  timeout 10 getent ahosts "${host}" >&2 || true
 }
 
 wait_for_cargo_registry_endpoint() {
   local endpoint="https://index.crates.io/"
   local attempt
-  for attempt in $(seq 1 8); do
+  local max_attempts="${RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS:-8}"
+  for attempt in $(seq 1 "${max_attempts}"); do
     if run_local_timed 15 curl --ipv4 --fail --silent --head "${endpoint}" >/dev/null 2>&1; then
       return 0
     fi
-    echo "[bootstrap] cargo registry unreachable (attempt ${attempt}/8); repairing DNS" >&2
+    echo "[bootstrap] cargo registry unreachable (attempt ${attempt}/${max_attempts}); repairing DNS" >&2
     repair_bootstrap_dns_state
     sleep 2
   done
@@ -442,7 +443,8 @@ run_root bash -c 'rm -f /etc/resolv.conf; printf "nameserver 1.1.1.1\nnameserver
 # loudly for a genuine network problem and never silently builds stale/partial
 # state. Mirrors the macOS bootstrap's existing `cargo build --offline` path.
 if wait_for_cargo_registry_endpoint; then
-  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-cli --bin rustynet-cli
   # rustynet-relay is a separate binary whose bin target requires the `daemon`
   # feature, so it builds as its own invocation. Built on every node (cheap —
   # its deps are already compiled for rustynetd) so a node assigned, or later
@@ -453,7 +455,8 @@ if wait_for_cargo_registry_endpoint; then
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-relay --features daemon
 else
   echo "[bootstrap] cargo registry unreachable; falling back to offline build from cargo cache" >&2
-  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynetd -p rustynet-cli
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynetd
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-cli --bin rustynet-cli
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-relay --features daemon
 fi
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd

@@ -763,6 +763,8 @@ fn build_ssh_command(host: &RemoteHost, remote_script: &str) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.args([
         "-n",
+        "-F",
+        "/dev/null",
         "-o",
         "LogLevel=ERROR",
         "-o",
@@ -795,6 +797,8 @@ fn build_scp_to_command(host: &RemoteHost, local_path: &Path, remote_path: &str)
     let mut cmd = Command::new("scp");
     cmd.args([
         "-q",
+        "-F",
+        "/dev/null",
         "-o",
         "LogLevel=ERROR",
         "-o",

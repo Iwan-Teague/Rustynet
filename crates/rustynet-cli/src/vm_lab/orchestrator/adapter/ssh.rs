@@ -95,7 +95,14 @@ impl ControlMasterTeardown {
     /// Build the `ssh -O exit` command (argv-only; no shell construction).
     fn into_exit_command(self) -> Command {
         let mut cmd = Command::new("ssh");
-        cmd.args(["-o", "LogLevel=ERROR", "-o", "BatchMode=yes"]);
+        cmd.args([
+            "-F",
+            "/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "BatchMode=yes",
+        ]);
         cmd.arg("-O").arg("exit");
         cmd.arg("-o")
             .arg(format!("ControlPath={}", self.control_path));
@@ -121,6 +128,8 @@ fn base_ssh_command(
     let mut cmd = Command::new("ssh");
     cmd.args([
         "-n",
+        "-F",
+        "/dev/null",
         "-o",
         "LogLevel=ERROR",
         "-o",
@@ -163,6 +172,8 @@ fn base_scp_command(
     let mut cmd = Command::new("scp");
     cmd.args([
         "-q",
+        "-F",
+        "/dev/null",
         "-o",
         "LogLevel=ERROR",
         "-o",

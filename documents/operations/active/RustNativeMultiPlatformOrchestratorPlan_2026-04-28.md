@@ -108,6 +108,26 @@ Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4
 >   `--skip-stage`), plus a `catch_unwind` panic guard around `execute` so a
 >   panicking stage becomes `Failed` rather than aborting past cleanup. 578
 >   orchestrator tests green.
+> - **Cleanup ordering regression fixed (2026-07-06).** A focused
+>   `--skip-linux-live-suite --skip-cross-network --skip-soak` live run exposed
+>   that the topological runner's FIFO ready queue could run final `cleanup`
+>   immediately after `preflight` when its ordering dependency (`exit_handoff`)
+>   was filtered out. The runner now chooses the lowest original stage index from
+>   the ready set, so newly-unblocked earlier stages run before late independent
+>   teardown stages; regression test:
+>   `topological_order_prefers_original_order_for_newly_ready_stages`.
+> - **Core Rust `--node` live path green on 3 Debian VMs (2026-07-06).** Run
+>   `state/rust-node-engine-core-1783349776` passed 17/17 stages with
+>   `--skip-linux-live-suite --skip-cross-network --skip-soak`, proving
+>   `discover_local_utm` through `validate_baseline_runtime` and `cleanup` on
+>   the Rust engine. Fixes landed from the run: SSH/SCP command builders now use
+>   `-F /dev/null` so ambient `~/.ssh/config` (notably `BindAddress
+>   192.168.64.1`) cannot poison orchestrator transport; Linux bootstrap DNS
+>   diagnostics time-bound `getent ahosts` so no-egress guests reach the offline
+>   cargo fallback; Rust-native Linux bootstrap sets
+>   `RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2`; and Linux bootstrap builds only
+>   the installed `rustynet-cli` binary (`--bin rustynet-cli`) instead of every
+>   helper bin in the package.
 >
 > **Remaining loop-readiness work (planned, grounded):** (prereq 1) port the
 > bash-only validators into the Rust `PlanBuilder` — RANK-0 is a report-mapping
@@ -341,13 +361,13 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   relay_validation / traffic / role_switch / exit_handoff / active_exit), keeping
   setup → baseline → the always-run cleanup. Previously the Rust plan ignored it
   and the MCP loop's fast inner loop was a no-op.
-- **Correctness — Rust-path manifest evidence-integrity fixed** (`19e5e49`):
-  `execute_rust_native_orchestration` used to stamp the run manifest with the
-  bash-arm suite selectors (`cross_network_suite = !skip_cross_network` → TRUE by
-  default, plus chaos / macos_promote_exit / `*_platform`) that `PlanBuilder` never
-  runs — a green `--node` run advertised suites that never executed. Now the
-  manifest selectors are built from the resolved `--node` topology + only the
-  flags the plan honors; every un-honored suite is stamped inactive.
+- **Correctness — Rust-path manifest evidence-integrity fixed** (`19e5e49`,
+  extended 2026-07-06): `execute_rust_native_orchestration` used to stamp the
+  run manifest with bash-arm suite selectors that `PlanBuilder` did not run — a
+  green `--node` run advertised suites that never executed. The manifest is now
+  built from resolved `--node` topology + only selectors the Rust plan honors:
+  chaos, cross-network, soak, and skip-linux-live-suite are stamped from the real
+  Rust plan flags; bash-only platform-election selectors remain inactive.
 - **Correctness — macOS Exit `active_exit` no longer hard-fails** (`53a837c`): a
   macOS node elected Exit via `--node` hit the trait fail-closed default and turned
   the whole run RED. Now reported-skipped (`active_exit.reported_skips.json`, run
@@ -468,29 +488,18 @@ decomposes into three kinds of work:
    flip to live only after a live mac/win run proves each (§ promotion-follows-
    evidence). ~70 mac/win cells map here — no new `StageId`s, just adapter runtime +
    the reported-skip→live flip.
-3. **Genuinely new Rust stages (the real remaining port, ~50).** Behaviors the 22 do
-   not cover:
-   - **chaos ×9** (`chaos_daemon_fault`, `_sigstop_sigcont`, `_clock_attack`,
-     `_signed_state_adversarial`, `_crash_recovery`, `_resource_exhaustion`,
-     `_network_impairment`, `_membership_adversarial`, `_privileged_boundary`) —
-     opt-in (`--enable-chaos-suite`), self-contained.
-   - **cross-network ~14** (`cross_network_nat_classification`/`_matrix`/
-     `_controller_switch`/`_direct_remote_exit`/`_failback_roaming`, +
-     `validate_{linux,macos,windows}_exit_nat_lifecycle`).
-   - **rich Linux validators ~28** not consolidated (`live_two_hop`,
-     `live_managed_dns`, `validate_linux_ipv6_leak`, `_dns_failclosed`,
-     `_network_flap`, `_reboot_recovery`, `_lan_toggle`, `_mixed_topology`,
-     `_exit_demotion_residue`, `_blind_exit_dataplane`, `_secrets_not_in_logs`,
-     `_enrollment_restart`, the daemon validators, …). Most already have the logic
-     as bash-arm Rust functions (`run_validate_linux_*`), so each port is
-     "wrap the existing evaluator in an `OrchestrationStage` + the 7-place
-     checklist" — the `SecurityAuditValidationStage` pattern.
+3. **Genuinely new Rust stages (code mostly present; live proof deferred).**
+   Behaviors the original 22 did not cover are now represented in `StageId::ALL`
+   for the coded migration path: rich Linux live validators, `extended_soak`,
+   cross-network stages, and opt-in chaos stages. Remaining work is live evidence,
+   substrate hardening, and mac/win adapter promotion rather than adding these
+   named stages to the Rust plan.
 
-**Suggested port order (deferral OK):** rich Linux validators (reuse existing
-evaluators, cheapest) → chaos ×9 (self-contained, opt-in) → cross-network (needs the
-substrate) → mac/win adapter promotion (needs coordinated live proof). Live proof of
-each new/promoted cell **follows** the code (reported-skip until a live run proves it
-+ a run-matrix row exists; strictest-secure default).
+**Suggested evidence order (deferral OK):** rich Linux validators / extended soak
+→ chaos ×9 (self-contained, opt-in) → cross-network substrate profiles → mac/win
+adapter promotion. Live proof of each new/promoted cell **follows** the code
+(reported-skip until a live run proves it + a run-matrix row exists;
+strictest-secure default).
 
 **Coordination rule — stage-adding is SERIALIZED.** Adding a `StageId` touches the
 count/drift gates (`build_returns_N`, `rust_native_cli_stage_ids_match_plan_builder`,

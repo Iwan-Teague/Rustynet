@@ -35,8 +35,20 @@ use crate::vm_lab::orchestrator::stage::anchor_validation::AnchorValidationStage
 use crate::vm_lab::orchestrator::stage::authenticode_validation::AuthenticodeValidationStage;
 use crate::vm_lab::orchestrator::stage::blind_exit::BlindExitStage;
 use crate::vm_lab::orchestrator::stage::blind_exit_dataplane_validation::BlindExitDataplaneValidationStage;
+use crate::vm_lab::orchestrator::stage::chaos::{
+    ChaosClockAttackStage, ChaosCrashRecoveryStage, ChaosDaemonFaultStage,
+    ChaosDaemonSigstopSigcontStage, ChaosMembershipAdversarialStage, ChaosNetworkImpairmentStage,
+    ChaosPrivilegedBoundaryStage, ChaosResourceExhaustionStage, ChaosSignedStateAdversarialStage,
+};
 use crate::vm_lab::orchestrator::stage::cleanup::CleanupHostsStage;
 use crate::vm_lab::orchestrator::stage::collect_pubkeys::CollectPubkeysStage;
+use crate::vm_lab::orchestrator::stage::cross_network::{
+    CrossNetworkControllerSwitchStage, CrossNetworkDirectRemoteExitStage,
+    CrossNetworkFailbackRoamingStage, CrossNetworkNatClassificationStage,
+    CrossNetworkNatMatrixStage, CrossNetworkNodeNetworkSwitchStage, CrossNetworkOptions,
+    CrossNetworkPreflightStage, CrossNetworkRelayRemoteExitStage, CrossNetworkRemoteExitDnsStage,
+    CrossNetworkRemoteExitSoakStage, CrossNetworkTraversalAdversarialStage,
+};
 use crate::vm_lab::orchestrator::stage::deploy_relay::DeployRelayServiceStage;
 use crate::vm_lab::orchestrator::stage::distribute_assignments::DistributeAssignmentsStage;
 use crate::vm_lab::orchestrator::stage::distribute_dns_zone::DistributeDnsZoneStage;
@@ -52,7 +64,9 @@ use crate::vm_lab::orchestrator::stage::final_cleanup::FinalCleanupStage;
 use crate::vm_lab::orchestrator::stage::install::BootstrapHostsStage;
 use crate::vm_lab::orchestrator::stage::ipv6_leak_validation::Ipv6LeakValidationStage;
 use crate::vm_lab::orchestrator::stage::key_custody_validation::KeyCustodyValidationStage;
+use crate::vm_lab::orchestrator::stage::live_anchor::LiveAnchorStage;
 use crate::vm_lab::orchestrator::stage::live_enrollment_restart_validation::LiveEnrollmentRestartValidationStage;
+use crate::vm_lab::orchestrator::stage::live_extended_soak_validation::LiveExtendedSoakValidationStage;
 use crate::vm_lab::orchestrator::stage::live_key_custody_validation::LiveKeyCustodyValidationStage;
 use crate::vm_lab::orchestrator::stage::live_lan_toggle_validation::LiveLanToggleValidationStage;
 use crate::vm_lab::orchestrator::stage::live_managed_dns_validation::LiveManagedDnsValidationStage;
@@ -89,13 +103,21 @@ pub struct PlanBuilder {
     /// only setup → baseline → cleanup. The fast inner loop (mesh-health check /
     /// mac-win cell iteration) that the MCP loop tooling already emits.
     skip_live_suite: bool,
+    /// `--enable-chaos-suite`: append the opt-in chaos stages. They remain
+    /// outside the default plan so a normal live lab does not inject faults.
+    enable_chaos_suite: bool,
+    /// `--skip-soak`: drop the long-running extended soak composite.
+    skip_soak: bool,
+    /// `--skip-cross-network`: when false, run the Rust-owned cross-network
+    /// suite. Same-subnet/non-substrate cases are stage-level Skipped.
+    cross_network: CrossNetworkOptions,
 }
 
 impl PlanBuilder {
     /// The post-baseline live-validation + role stages, dropped when
     /// `--skip-linux-live-suite` is set. Setup (through `validate_baseline_runtime`)
     /// and the always-run `cleanup` are never in this set.
-    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 27] = {
+    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 28] = {
         use crate::vm_lab::orchestrator::stage::StageId;
         [
             StageId::SecurityAuditValidation,
@@ -116,6 +138,7 @@ impl PlanBuilder {
             StageId::ExitDnsFailclosedValidation,
             StageId::ExitNatLifecycleValidation,
             StageId::BlindExitDataplaneValidation,
+            StageId::LiveAnchor,
             StageId::LiveTwoHopValidation,
             StageId::LiveManagedDnsValidation,
             StageId::LiveNetworkFlapValidation,
@@ -125,6 +148,43 @@ impl PlanBuilder {
             StageId::LiveEnrollmentRestartValidation,
             StageId::LiveLanToggleValidation,
             StageId::LiveMixedTopologyValidation,
+        ]
+    };
+
+    pub const SOAK_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 1] = {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        [StageId::LiveExtendedSoakValidation]
+    };
+
+    pub const CHAOS_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 9] = {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        [
+            StageId::ChaosClockAttack,
+            StageId::ChaosCrashRecovery,
+            StageId::ChaosDaemonFault,
+            StageId::ChaosDaemonSigstopSigcont,
+            StageId::ChaosMembershipAdversarial,
+            StageId::ChaosNetworkImpairment,
+            StageId::ChaosPrivilegedBoundary,
+            StageId::ChaosResourceExhaustion,
+            StageId::ChaosSignedStateAdversarial,
+        ]
+    };
+
+    pub const CROSS_NETWORK_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 11] = {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        [
+            StageId::CrossNetworkPreflight,
+            StageId::CrossNetworkDirectRemoteExit,
+            StageId::CrossNetworkNodeNetworkSwitch,
+            StageId::CrossNetworkRelayRemoteExit,
+            StageId::CrossNetworkFailbackRoaming,
+            StageId::CrossNetworkControllerSwitch,
+            StageId::CrossNetworkTraversalAdversarial,
+            StageId::CrossNetworkRemoteExitDns,
+            StageId::CrossNetworkRemoteExitSoak,
+            StageId::CrossNetworkNatClassification,
+            StageId::CrossNetworkNatMatrix,
         ]
     };
 
@@ -152,11 +212,30 @@ impl PlanBuilder {
         self
     }
 
+    /// Append the opt-in chaos stages to the plan.
+    pub fn with_enable_chaos_suite(mut self, enable_chaos_suite: bool) -> Self {
+        self.enable_chaos_suite = enable_chaos_suite;
+        self
+    }
+
+    pub fn with_skip_soak(mut self, skip_soak: bool) -> Self {
+        self.skip_soak = skip_soak;
+        self
+    }
+
+    pub fn with_cross_network_options(mut self, cross_network: CrossNetworkOptions) -> Self {
+        self.cross_network = cross_network;
+        self
+    }
+
     pub fn build(self) -> Vec<Box<dyn OrchestrationStage>> {
         let PlanBuilder {
             rebuild_only,
             source_mode,
             skip_live_suite,
+            enable_chaos_suite,
+            skip_soak,
+            cross_network,
         } = self;
         let mut stages: Vec<Box<dyn OrchestrationStage>> = vec![
             Box::new(PreflightStage),
@@ -245,6 +324,7 @@ impl PlanBuilder {
             Box::new(ExitDnsFailclosedValidationStage),
             Box::new(ExitNatLifecycleValidationStage),
             Box::new(BlindExitDataplaneValidationStage),
+            Box::new(LiveAnchorStage),
             Box::new(LiveTwoHopValidationStage),
             Box::new(LiveManagedDnsValidationStage),
             Box::new(LiveNetworkFlapValidationStage),
@@ -256,12 +336,68 @@ impl PlanBuilder {
             Box::new(LiveMixedTopologyValidationStage),
             Box::new(FinalCleanupStage),
         ];
+        if !skip_soak {
+            stages.splice(
+                stages.len().saturating_sub(1)..stages.len().saturating_sub(1),
+                [Box::new(LiveExtendedSoakValidationStage) as Box<dyn OrchestrationStage>],
+            );
+        }
+        if cross_network.enable_suite {
+            stages.splice(
+                stages.len().saturating_sub(1)..stages.len().saturating_sub(1),
+                [
+                    Box::new(CrossNetworkPreflightStage::new(cross_network.clone()))
+                        as Box<dyn OrchestrationStage>,
+                    Box::new(CrossNetworkDirectRemoteExitStage::new(
+                        cross_network.clone(),
+                    )),
+                    Box::new(CrossNetworkNodeNetworkSwitchStage::new(
+                        cross_network.clone(),
+                    )),
+                    Box::new(CrossNetworkRelayRemoteExitStage::new(cross_network.clone())),
+                    Box::new(CrossNetworkFailbackRoamingStage::new(cross_network.clone())),
+                    Box::new(CrossNetworkControllerSwitchStage::new(
+                        cross_network.clone(),
+                    )),
+                    Box::new(CrossNetworkTraversalAdversarialStage::new(
+                        cross_network.clone(),
+                    )),
+                    Box::new(CrossNetworkRemoteExitDnsStage::new(cross_network.clone())),
+                    Box::new(CrossNetworkRemoteExitSoakStage::new(cross_network.clone())),
+                    Box::new(CrossNetworkNatClassificationStage::new(
+                        cross_network.clone(),
+                    )),
+                    Box::new(CrossNetworkNatMatrixStage::new(cross_network.clone())),
+                ],
+            );
+        }
+        if enable_chaos_suite {
+            stages.splice(
+                stages.len().saturating_sub(1)..stages.len().saturating_sub(1),
+                [
+                    Box::new(ChaosClockAttackStage) as Box<dyn OrchestrationStage>,
+                    Box::new(ChaosCrashRecoveryStage),
+                    Box::new(ChaosDaemonFaultStage),
+                    Box::new(ChaosDaemonSigstopSigcontStage),
+                    Box::new(ChaosMembershipAdversarialStage),
+                    Box::new(ChaosNetworkImpairmentStage),
+                    Box::new(ChaosPrivilegedBoundaryStage),
+                    Box::new(ChaosResourceExhaustionStage),
+                    Box::new(ChaosSignedStateAdversarialStage),
+                ],
+            );
+        }
         if skip_live_suite {
             // Drop the post-baseline live suite; setup + baseline + the
             // always-run cleanup remain. FinalCleanupStage (Cleanup) is never in
             // LIVE_SUITE_STAGES, so guest killswitch / exit-NAT residue is still
             // torn down.
-            stages.retain(|stage| !Self::LIVE_SUITE_STAGES.contains(&stage.id()));
+            stages.retain(|stage| {
+                !Self::LIVE_SUITE_STAGES.contains(&stage.id())
+                    && !Self::CHAOS_SUITE_STAGES.contains(&stage.id())
+                    && !Self::CROSS_NETWORK_SUITE_STAGES.contains(&stage.id())
+                    && !Self::SOAK_SUITE_STAGES.contains(&stage.id())
+            });
         }
         stages
     }
@@ -272,9 +408,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_44_stages() {
+    fn build_returns_57_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 44, "plan must contain exactly 44 stages");
+        assert_eq!(stages.len(), 57, "plan must contain exactly 57 stages");
+    }
+
+    #[test]
+    fn chaos_suite_opt_in_appends_9_fault_stages() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new().with_enable_chaos_suite(true).build();
+        let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
+        assert_eq!(ids.len(), 66, "chaos-enabled plan must contain 66 stages");
+        for chaos_id in PlanBuilder::CHAOS_SUITE_STAGES {
+            assert!(
+                ids.contains(&chaos_id),
+                "chaos-enabled plan must include {chaos_id:?}"
+            );
+        }
+        assert!(
+            ids.iter().position(|id| id == &StageId::ChaosClockAttack)
+                > ids
+                    .iter()
+                    .position(|id| id == &StageId::LiveMixedTopologyValidation)
+        );
+        assert_eq!(ids.last(), Some(&StageId::Cleanup));
     }
 
     #[test]
@@ -282,12 +439,29 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 44 total - 27 live-suite stages = 17.
-        assert_eq!(ids.len(), 44 - PlanBuilder::LIVE_SUITE_STAGES.len());
+        // 57 total - 28 live-suite stages - 11 cross-network stages - 1 soak stage = 17.
+        assert_eq!(
+            ids.len(),
+            57 - PlanBuilder::LIVE_SUITE_STAGES.len()
+                - PlanBuilder::CROSS_NETWORK_SUITE_STAGES.len()
+                - PlanBuilder::SOAK_SUITE_STAGES.len()
+        );
         for dropped in PlanBuilder::LIVE_SUITE_STAGES {
             assert!(
                 !ids.contains(&dropped),
                 "live-suite stage {dropped:?} must be dropped"
+            );
+        }
+        for dropped in PlanBuilder::CROSS_NETWORK_SUITE_STAGES {
+            assert!(
+                !ids.contains(&dropped),
+                "skip-live-suite must drop cross-network stage {dropped:?}"
+            );
+        }
+        for dropped in PlanBuilder::SOAK_SUITE_STAGES {
+            assert!(
+                !ids.contains(&dropped),
+                "skip-live-suite must drop soak stage {dropped:?}"
             );
         }
         // Setup boundary + the always-run cleanup remain.
@@ -298,6 +472,29 @@ mod tests {
             Some(&StageId::Cleanup),
             "cleanup must still run last so guest residue is torn down"
         );
+    }
+
+    #[test]
+    fn skip_live_suite_drops_opt_in_chaos_too() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new()
+            .with_enable_chaos_suite(true)
+            .with_skip_live_suite(true)
+            .build();
+        let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
+        assert_eq!(
+            ids.len(),
+            57 - PlanBuilder::LIVE_SUITE_STAGES.len()
+                - PlanBuilder::CROSS_NETWORK_SUITE_STAGES.len()
+                - PlanBuilder::SOAK_SUITE_STAGES.len()
+        );
+        for dropped in PlanBuilder::CHAOS_SUITE_STAGES {
+            assert!(
+                !ids.contains(&dropped),
+                "skip-live-suite must drop opt-in chaos stage {dropped:?}"
+            );
+        }
+        assert_eq!(ids.last(), Some(&StageId::Cleanup));
     }
 
     #[test]
@@ -343,6 +540,7 @@ mod tests {
                 StageId::ExitDnsFailclosedValidation,
                 StageId::ExitNatLifecycleValidation,
                 StageId::BlindExitDataplaneValidation,
+                StageId::LiveAnchor,
                 StageId::LiveTwoHopValidation,
                 StageId::LiveManagedDnsValidation,
                 StageId::LiveNetworkFlapValidation,
@@ -352,10 +550,58 @@ mod tests {
                 StageId::LiveEnrollmentRestartValidation,
                 StageId::LiveLanToggleValidation,
                 StageId::LiveMixedTopologyValidation,
+                StageId::LiveExtendedSoakValidation,
+                StageId::CrossNetworkPreflight,
+                StageId::CrossNetworkDirectRemoteExit,
+                StageId::CrossNetworkNodeNetworkSwitch,
+                StageId::CrossNetworkRelayRemoteExit,
+                StageId::CrossNetworkFailbackRoaming,
+                StageId::CrossNetworkControllerSwitch,
+                StageId::CrossNetworkTraversalAdversarial,
+                StageId::CrossNetworkRemoteExitDns,
+                StageId::CrossNetworkRemoteExitSoak,
+                StageId::CrossNetworkNatClassification,
+                StageId::CrossNetworkNatMatrix,
                 StageId::Cleanup,
             ],
             "orchestrator stage order is security-sensitive"
         );
+    }
+
+    #[test]
+    fn skip_soak_drops_extended_soak_only() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new().with_skip_soak(true).build();
+        let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
+        assert_eq!(ids.len(), 56);
+        assert!(!ids.contains(&StageId::LiveExtendedSoakValidation));
+        assert!(ids.contains(&StageId::LiveMixedTopologyValidation));
+        assert!(ids.contains(&StageId::CrossNetworkPreflight));
+        assert_eq!(ids.last(), Some(&StageId::Cleanup));
+    }
+
+    #[test]
+    fn disabled_cross_network_options_drop_only_cross_network_suite() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let mut cross_network = CrossNetworkOptions::default();
+        cross_network.enable_suite = false;
+        let stages = PlanBuilder::new()
+            .with_cross_network_options(cross_network)
+            .build();
+        let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
+        assert_eq!(
+            ids.len(),
+            57 - PlanBuilder::CROSS_NETWORK_SUITE_STAGES.len()
+        );
+        for dropped in PlanBuilder::CROSS_NETWORK_SUITE_STAGES {
+            assert!(
+                !ids.contains(&dropped),
+                "disabled cross-network suite must drop {dropped:?}"
+            );
+        }
+        assert!(ids.contains(&StageId::LiveExtendedSoakValidation));
+        assert!(ids.contains(&StageId::TrafficTestMatrix));
+        assert_eq!(ids.last(), Some(&StageId::Cleanup));
     }
 
     #[test]
@@ -402,5 +648,17 @@ mod tests {
         let stages = PlanBuilder::new().build();
         let ids: HashSet<_> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(ids.len(), stages.len(), "all stage IDs must be unique");
+    }
+
+    #[test]
+    fn chaos_stage_ids_are_unique_when_enabled() {
+        use std::collections::HashSet;
+        let stages = PlanBuilder::new().with_enable_chaos_suite(true).build();
+        let ids: HashSet<_> = stages.iter().map(|s| s.id()).collect();
+        assert_eq!(
+            ids.len(),
+            stages.len(),
+            "all chaos-enabled stage IDs must be unique"
+        );
     }
 }

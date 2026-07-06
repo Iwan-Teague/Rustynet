@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 use crate::vm_lab::VmGuestPlatform;
-use crate::vm_lab::orchestrator::adapter::node_adapter::SshConnectionParams;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
@@ -186,24 +185,6 @@ fn ssh_params_for_second_client(ctx: &OrchestrationContext) -> Result<ResolvedPa
         }
     }
     Err("no second client found: neither 'extra' nor 'aux' role label in assignments".into())
-}
-
-impl SshConnectionParams {
-    pub fn new(
-        host: String,
-        port: u16,
-        user: Option<String>,
-        identity_file: std::path::PathBuf,
-        known_hosts: std::path::PathBuf,
-    ) -> Self {
-        SshConnectionParams {
-            host: format!("{host}:{port}"),
-            port,
-            user,
-            identity_file,
-            known_hosts,
-        }
-    }
 }
 
 #[cfg(test)]

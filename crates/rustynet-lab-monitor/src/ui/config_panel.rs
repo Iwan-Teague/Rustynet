@@ -19,6 +19,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let config = &app.config;
     let fields: Vec<(&str, &str)> = vec![
         ("Area", &config.area),
+        ("engine", &config.engine),
         ("exit_vm", &config.exit_vm),
         ("client_vm", &config.client_vm),
         ("entry_vm", &config.entry_vm),

@@ -1,5 +1,6 @@
 use crate::config::MonitorConfig;
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -23,6 +24,7 @@ pub fn build_loop_args(config: &MonitorConfig) -> Vec<String> {
     let mut args = vec!["start".to_string(), area.clone()];
     let wants_macos = config.wants_macos();
     let wants_windows = config.wants_windows();
+    let rust_engine = config.engine.trim().eq_ignore_ascii_case("rust-node");
 
     if wants_macos {
         args.push("macos=true".to_string());
@@ -59,6 +61,11 @@ pub fn build_loop_args(config: &MonitorConfig) -> Vec<String> {
     if config.dry_run {
         args.push("dry_run=true".to_string());
     }
+    if rust_engine {
+        args.push("rust_engine=true".to_string());
+    } else {
+        args.push("legacy_bash=true".to_string());
+    }
     args
 }
 
@@ -83,51 +90,61 @@ pub fn build_orchestrator_args(
     a.push("--skip-cross-network".to_string());
     a.extend(["--source-mode".to_string(), "working-tree".to_string()]);
 
-    if !config.macos_vm.is_empty() {
-        a.extend(["--macos-vm".to_string(), config.macos_vm.clone()]);
-    }
-    if !config.windows_vm.is_empty() {
-        a.extend(["--windows-vm".to_string(), config.windows_vm.clone()]);
-    }
-    if !config.exit_vm.is_empty() {
-        a.extend(["--exit-vm".to_string(), config.exit_vm.clone()]);
-    }
-    if !config.client_vm.is_empty() {
-        a.extend(["--client-vm".to_string(), config.client_vm.clone()]);
-    }
-    if !config.rebuild_nodes.is_empty() {
-        a.extend(["--rebuild-nodes".to_string(), config.rebuild_nodes.clone()]);
-    }
+    if config.engine.trim().eq_ignore_ascii_case("rust-node") {
+        for assignment in synthesize_rust_node_args(config) {
+            a.extend(["--node".to_string(), assignment]);
+        }
+        if !config.rebuild_nodes.is_empty() {
+            a.extend(["--rebuild-nodes".to_string(), config.rebuild_nodes.clone()]);
+        }
+    } else {
+        if !config.macos_vm.is_empty() {
+            a.extend(["--macos-vm".to_string(), config.macos_vm.clone()]);
+        }
+        if !config.windows_vm.is_empty() {
+            a.extend(["--windows-vm".to_string(), config.windows_vm.clone()]);
+        }
+        if !config.exit_vm.is_empty() {
+            a.extend(["--exit-vm".to_string(), config.exit_vm.clone()]);
+        }
+        if !config.client_vm.is_empty() {
+            a.extend(["--client-vm".to_string(), config.client_vm.clone()]);
+        }
+        if !config.rebuild_nodes.is_empty() {
+            a.extend(["--rebuild-nodes".to_string(), config.rebuild_nodes.clone()]);
+        }
 
-    if !config.exit_platform.is_empty() {
-        a.extend(["--exit-platform".to_string(), config.exit_platform.clone()]);
-    }
-    if !config.relay_platform.is_empty() {
-        a.extend([
-            "--relay-platform".to_string(),
-            config.relay_platform.clone(),
-        ]);
-    }
-    if !config.anchor_platform.is_empty() {
-        a.extend([
-            "--anchor-platform".to_string(),
-            config.anchor_platform.clone(),
-        ]);
-    }
-    if !config.admin_platform.is_empty() {
-        a.extend([
-            "--admin-platform".to_string(),
-            config.admin_platform.clone(),
-        ]);
-    }
-    if !config.blind_exit_platform.is_empty() {
-        a.extend([
-            "--blind-exit-platform".to_string(),
-            config.blind_exit_platform.clone(),
-        ]);
-    }
-    if config.macos_promote_exit {
-        a.push("--macos-promote-exit".to_string());
+        if !config.exit_platform.is_empty() {
+            a.extend(["--exit-platform".to_string(), config.exit_platform.clone()]);
+        }
+        if !config.relay_platform.is_empty() {
+            a.extend([
+                "--relay-platform".to_string(),
+                config.relay_platform.clone(),
+            ]);
+        }
+        if !config.anchor_platform.is_empty() {
+            a.extend([
+                "--anchor-platform".to_string(),
+                config.anchor_platform.clone(),
+            ]);
+        }
+        if !config.admin_platform.is_empty() {
+            a.extend([
+                "--admin-platform".to_string(),
+                config.admin_platform.clone(),
+            ]);
+        }
+        if !config.blind_exit_platform.is_empty() {
+            a.extend([
+                "--blind-exit-platform".to_string(),
+                config.blind_exit_platform.clone(),
+            ]);
+        }
+        if config.macos_promote_exit {
+            a.push("--macos-promote-exit".to_string());
+        }
+        a.push("--legacy-bash-orchestrator".to_string());
     }
 
     let mut normalized = config.clone();
@@ -140,6 +157,54 @@ pub fn build_orchestrator_args(
     }
 
     a
+}
+
+fn synthesize_rust_node_args(config: &MonitorConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    let exit_platform = config.exit_platform.trim();
+    let non_linux_exit = config.macos_promote_exit
+        || matches!(exit_platform, "macos" | "windows");
+    if !non_linux_exit && !config.exit_vm.is_empty() {
+        out.push(format!("{}:exit", config.exit_vm));
+    }
+    if !config.client_vm.is_empty() {
+        out.push(format!("{}:client", config.client_vm));
+    }
+    if !config.entry_vm.is_empty() {
+        out.push(format!("{}:entry", config.entry_vm));
+    }
+    if config.wants_macos() && !config.macos_vm.is_empty() {
+        out.push(format!(
+            "{}:{}",
+            config.macos_vm,
+            rust_node_role_for_platform(config, "macos")
+        ));
+    }
+    if config.wants_windows() && !config.windows_vm.is_empty() {
+        out.push(format!(
+            "{}:{}",
+            config.windows_vm,
+            rust_node_role_for_platform(config, "windows")
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    out.retain(|arg| seen.insert(arg.clone()));
+    out
+}
+
+fn rust_node_role_for_platform(config: &MonitorConfig, platform: &str) -> &'static str {
+    let selected = |value: &str| value.eq_ignore_ascii_case(platform);
+    if (config.macos_promote_exit && platform == "macos") || selected(&config.exit_platform) {
+        "exit"
+    } else if selected(&config.relay_platform) {
+        "relay"
+    } else if selected(&config.anchor_platform) || selected(&config.admin_platform) {
+        "anchor"
+    } else if selected(&config.blind_exit_platform) {
+        "exit"
+    } else {
+        "client"
+    }
 }
 
 /// Spawn the orchestrator subprocess with its own process group and durable monitor job state.
@@ -267,6 +332,28 @@ mod tests {
 
         assert_eq!(args[0], "ops");
         assert_eq!(args[1], "vm-lab-orchestrate-live-lab");
+        assert!(args.iter().any(|arg| arg == "--node"));
+        assert!(!args.iter().any(|arg| arg == "--exit-vm"));
+        assert!(!args.iter().any(|arg| arg == "--legacy-bash-orchestrator"));
+    }
+
+    #[test]
+    fn direct_orchestrator_args_legacy_engine_uses_legacy_flags() {
+        let config = MonitorConfig {
+            engine: "legacy-bash".to_owned(),
+            ..MonitorConfig::default()
+        };
+        let args = build_orchestrator_args(
+            &config,
+            "inventory.json",
+            "id_ed25519",
+            "known_hosts",
+            "report",
+        );
+
+        assert!(args.windows(2).any(|w| w == ["--exit-vm", "debian-headless-1"]));
+        assert!(args.iter().any(|arg| arg == "--legacy-bash-orchestrator"));
+        assert!(!args.iter().any(|arg| arg == "--node"));
     }
 
     #[test]
@@ -287,5 +374,19 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "entry_vm=debian-headless-3"));
         assert!(args.iter().any(|arg| arg == "skip_linux_live_suite=true"));
         assert!(args.iter().any(|arg| arg == "triage_on_failure=false"));
+        assert!(args.iter().any(|arg| arg == "rust_engine=true"));
+        assert!(!args.iter().any(|arg| arg == "legacy_bash=true"));
+    }
+
+    #[test]
+    fn rust_node_synthesis_promotes_macos_exit_without_duplicate_linux_exit() {
+        let config = MonitorConfig {
+            macos_promote_exit: true,
+            ..MonitorConfig::default()
+        };
+        let assignments = synthesize_rust_node_args(&config);
+
+        assert!(assignments.contains(&"macos-utm-1:exit".to_owned()));
+        assert!(!assignments.contains(&"debian-headless-1:exit".to_owned()));
     }
 }

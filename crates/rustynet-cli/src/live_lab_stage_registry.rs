@@ -1757,6 +1757,7 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "live_anchor",
         logical: Some("anchor"),
+        rust_native: true,
         platform_rule: PlatformRule::ExitTarget,
         enable: EnableRule::LinuxLiveSuite,
         ..DEFAULT_SPEC
@@ -1919,7 +1920,11 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "extended_soak",
+        state_machine_only: true,
+        group: StageGroup::Live,
         logical: Some("extended_soak"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::SoakSuite,
         ..DEFAULT_SPEC
     },
@@ -1928,6 +1933,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_clock_attack",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
+        rust_native: true,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1935,6 +1941,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_crash_recovery",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
+        rust_native: true,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1942,6 +1949,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_daemon_fault",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
+        rust_native: true,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1949,6 +1957,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_daemon_sigstop_sigcont",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
+        rust_native: true,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1956,6 +1965,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_membership_adversarial",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
+        rust_native: true,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1963,6 +1973,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_network_impairment",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
+        rust_native: true,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1970,6 +1981,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_privileged_boundary",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
+        rust_native: true,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1977,6 +1989,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_resource_exhaustion",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
+        rust_native: true,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1984,12 +1997,15 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_signed_state_adversarial",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
+        rust_native: true,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
     // ── cross-network + job-level ───────────────────────────────────────
     StageSpec {
         name: "cross_network_nat_classification",
+        logical: Some("cross_network"),
+        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         // Cross-network auto mode decides at runtime whether the substrate
@@ -1999,6 +2015,8 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "cross_network_nat_matrix",
+        logical: Some("cross_network"),
+        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2006,6 +2024,8 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "cross_network_controller_switch",
+        logical: Some("cross_network"),
+        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2013,6 +2033,8 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "cross_network_direct_remote_exit",
+        logical: Some("cross_network"),
+        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2020,6 +2042,8 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "cross_network_failback_roaming",
+        logical: Some("cross_network"),
+        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2027,6 +2051,8 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "cross_network_node_network_switch",
+        logical: Some("cross_network"),
+        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2034,6 +2060,8 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "cross_network_relay_remote_exit",
+        logical: Some("cross_network"),
+        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2041,6 +2069,8 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "cross_network_remote_exit_dns",
+        logical: Some("cross_network"),
+        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2048,6 +2078,8 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "cross_network_remote_exit_soak",
+        logical: Some("cross_network"),
+        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2055,6 +2087,8 @@ pub const STAGES: &[StageSpec] = &[
     },
     StageSpec {
         name: "cross_network_traversal_adversarial",
+        logical: Some("cross_network"),
+        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2063,6 +2097,8 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "cross_network_preflight",
         group: StageGroup::Pre,
+        logical: Some("cross_network"),
+        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2183,6 +2219,9 @@ pub fn logical_stage_name(stage: &str) -> Option<&'static str> {
     if stage.starts_with("chaos_") {
         return Some("chaos");
     }
+    if stage.starts_with("cross_network_") {
+        return Some("cross_network");
+    }
     if stage.contains("reboot") {
         return Some("reboot_recovery");
     }
@@ -2205,6 +2244,8 @@ pub fn special_column(stage: &str) -> Option<&'static str> {
 #[allow(dead_code)] // kept for the drift gate; production platform choice goes through platform_rule
 pub fn is_rust_native_stage_name(stage: &str) -> bool {
     find_stage(stage).is_some_and(|spec| spec.rust_native)
+        || stage.starts_with("chaos_")
+        || stage.starts_with("cross_network_")
 }
 
 /// Registry-backed platform-resolution rule for shared stages, preserving

@@ -20,6 +20,7 @@
 mod live_lab_support;
 
 use std::path::PathBuf;
+use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{LiveLabContext, Logger, repo_root, run_cargo_ops};
@@ -58,6 +59,12 @@ fn run() -> Result<(), String> {
     let mut _exit_node_id = String::new();
     let mut client_host = String::new();
     let mut client_node_id = String::new();
+    let mut entry_host = String::new();
+    let mut entry_node_id = String::new();
+    let mut second_client_host = String::new();
+    let mut second_client_node_id = String::new();
+    let mut known_hosts: Option<PathBuf> = None;
+    let mut ssh_allow_cidrs = "192.168.18.0/24".to_owned();
     let mut report_path =
         root_dir.join("artifacts/live_lab/live_linux_reboot_recovery_report.json");
     let mut log_path = root_dir.join("artifacts/live_lab/live_linux_reboot_recovery.log");
@@ -84,6 +91,30 @@ fn run() -> Result<(), String> {
             "--client-node-id" => {
                 idx += 1;
                 client_node_id = req(&args, idx, "--client-node-id")?;
+            }
+            "--entry-host" => {
+                idx += 1;
+                entry_host = req(&args, idx, "--entry-host")?;
+            }
+            "--entry-node-id" => {
+                idx += 1;
+                entry_node_id = req(&args, idx, "--entry-node-id")?;
+            }
+            "--second-client-host" => {
+                idx += 1;
+                second_client_host = req(&args, idx, "--second-client-host")?;
+            }
+            "--second-client-node-id" => {
+                idx += 1;
+                second_client_node_id = req(&args, idx, "--second-client-node-id")?;
+            }
+            "--known-hosts" => {
+                idx += 1;
+                known_hosts = Some(PathBuf::from(req(&args, idx, "--known-hosts")?));
+            }
+            "--ssh-allow-cidrs" => {
+                idx += 1;
+                ssh_allow_cidrs = req(&args, idx, "--ssh-allow-cidrs")?;
             }
             "--report-path" => {
                 idx += 1;
@@ -126,7 +157,24 @@ fn run() -> Result<(), String> {
 
     let logger = Logger::new(&log_path)?;
     let ssh_id = PathBuf::from(&ssh_identity_file);
-    let mut ctx = LiveLabContext::new("rustynet-reboot-recovery", ssh_id.as_path())?;
+    let mut ctx = LiveLabContext::new_with_pinned_known_hosts(
+        "rustynet-reboot-recovery",
+        ssh_id.as_path(),
+        known_hosts.as_deref(),
+    )?;
+    let two_hop = TwoHopTopology::new(
+        ssh_id.clone(),
+        known_hosts.clone(),
+        exit_host.clone(),
+        client_host.clone(),
+        entry_host,
+        second_client_host,
+        _exit_node_id.clone(),
+        client_node_id.clone(),
+        entry_node_id,
+        second_client_node_id,
+        ssh_allow_cidrs,
+    );
 
     for target in [&exit_host, &client_host] {
         ctx.push_sudo_password(target)?;
@@ -153,6 +201,27 @@ fn run() -> Result<(), String> {
     if !exit_returned {
         observations.push_str("exit_reboot_wait=fail\n");
     }
+    let post_exit_dns_refresh = if exit_returned {
+        force_local_assignment_refresh(&mut ctx, &exit_host, &logger)?
+    } else {
+        CheckResult::Fail
+    };
+    observations.push_str(&format!(
+        "post_exit_dns_refresh={}\n",
+        post_exit_dns_refresh.as_str()
+    ));
+    let post_exit_twohop = if exit_returned {
+        run_two_hop_subcheck(
+            &two_hop,
+            "post-exit-reboot two-hop",
+            &report_path,
+            &log_path,
+            &logger,
+        )?
+    } else {
+        CheckResult::Fail
+    };
+    observations.push_str(&format!("post_exit_twohop={}\n", post_exit_twohop.as_str()));
 
     let exit_return_str = pass_fail(exit_returned);
     let exit_boot_change_str = pass_fail(
@@ -175,6 +244,30 @@ fn run() -> Result<(), String> {
     if !client_returned {
         observations.push_str("client_reboot_wait=fail\n");
     }
+    let post_client_dns_refresh = if client_returned {
+        force_local_assignment_refresh(&mut ctx, &client_host, &logger)?
+    } else {
+        CheckResult::Fail
+    };
+    observations.push_str(&format!(
+        "post_client_dns_refresh={}\n",
+        post_client_dns_refresh.as_str()
+    ));
+    let post_client_twohop = if client_returned {
+        run_two_hop_subcheck(
+            &two_hop,
+            "post-client-reboot two-hop",
+            &report_path,
+            &log_path,
+            &logger,
+        )?
+    } else {
+        CheckResult::Fail
+    };
+    observations.push_str(&format!(
+        "post_client_twohop={}\n",
+        post_client_twohop.as_str()
+    ));
 
     let client_return_str = pass_fail(client_returned);
     let client_boot_change_str = pass_fail(
@@ -216,17 +309,19 @@ fn run() -> Result<(), String> {
         "--exit-boot-change".to_owned(),
         exit_boot_change_str.to_owned(),
         "--post-exit-dns-refresh".to_owned(),
-        "skipped".to_owned(),
+        post_exit_dns_refresh.as_str().to_owned(),
         "--post-exit-twohop".to_owned(),
-        exit_twohop_str.to_owned(),
+        stronger_check(exit_twohop_str, post_exit_twohop)
+            .as_str()
+            .to_owned(),
         "--client-return".to_owned(),
         client_return_str.to_owned(),
         "--client-boot-change".to_owned(),
         client_boot_change_str.to_owned(),
         "--post-client-dns-refresh".to_owned(),
-        "skipped".to_owned(),
+        post_client_dns_refresh.as_str().to_owned(),
         "--post-client-twohop".to_owned(),
-        "skipped".to_owned(),
+        post_client_twohop.as_str().to_owned(),
         "--salvage-twohop".to_owned(),
         "skipped".to_owned(),
     ];
@@ -286,6 +381,209 @@ fn pass_fail(ok: bool) -> &'static str {
     if ok { "pass" } else { "fail" }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckResult {
+    Pass,
+    Fail,
+    Skipped,
+}
+
+impl CheckResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TwoHopTopology {
+    ssh_identity_file: PathBuf,
+    known_hosts: Option<PathBuf>,
+    exit_host: String,
+    client_host: String,
+    entry_host: String,
+    second_client_host: String,
+    exit_node_id: String,
+    client_node_id: String,
+    entry_node_id: String,
+    second_client_node_id: String,
+    ssh_allow_cidrs: String,
+}
+
+impl TwoHopTopology {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        ssh_identity_file: PathBuf,
+        known_hosts: Option<PathBuf>,
+        exit_host: String,
+        client_host: String,
+        entry_host: String,
+        second_client_host: String,
+        exit_node_id: String,
+        client_node_id: String,
+        entry_node_id: String,
+        second_client_node_id: String,
+        ssh_allow_cidrs: String,
+    ) -> Self {
+        Self {
+            ssh_identity_file,
+            known_hosts,
+            exit_host,
+            client_host,
+            entry_host,
+            second_client_host,
+            exit_node_id,
+            client_node_id,
+            entry_node_id,
+            second_client_node_id,
+            ssh_allow_cidrs,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        [
+            self.exit_host.as_str(),
+            self.client_host.as_str(),
+            self.entry_host.as_str(),
+            self.second_client_host.as_str(),
+            self.exit_node_id.as_str(),
+            self.client_node_id.as_str(),
+            self.entry_node_id.as_str(),
+            self.second_client_node_id.as_str(),
+            self.ssh_allow_cidrs.as_str(),
+        ]
+        .iter()
+        .all(|value| !value.trim().is_empty())
+    }
+}
+
+fn force_local_assignment_refresh(
+    ctx: &mut LiveLabContext,
+    target: &str,
+    logger: &Logger,
+) -> Result<CheckResult, String> {
+    logger.line(format!(
+        "[reboot-recovery] forcing local assignment refresh on {target}"
+    ))?;
+    let output = ctx.run_root_allow_failure(
+        target,
+        &["rustynet", "ops", "force-local-assignment-refresh-now"],
+    )?;
+    if output.status.success() {
+        Ok(CheckResult::Pass)
+    } else {
+        logger.line(format!(
+            "[reboot-recovery] assignment refresh failed on {target}: {}",
+            render_output(&output)
+        ))?;
+        Ok(CheckResult::Fail)
+    }
+}
+
+fn run_two_hop_subcheck(
+    topology: &TwoHopTopology,
+    label: &str,
+    report_path: &std::path::Path,
+    log_path: &std::path::Path,
+    logger: &Logger,
+) -> Result<CheckResult, String> {
+    if !topology.is_complete() {
+        logger.line(format!(
+            "[reboot-recovery] {label} skipped: incomplete two-hop topology"
+        ))?;
+        return Ok(CheckResult::Skipped);
+    }
+
+    let stem = sanitize_label(label);
+    let report =
+        report_path.with_file_name(format!("live_linux_reboot_recovery_{stem}_report.json"));
+    let log = log_path.with_file_name(format!("live_linux_reboot_recovery_{stem}.log"));
+    logger.line(format!("[reboot-recovery] running {label}"))?;
+
+    let mut command = Command::new("cargo");
+    command.args([
+        "run",
+        "--quiet",
+        "-p",
+        "rustynet-cli",
+        "--bin",
+        "live_linux_two_hop_test",
+        "--",
+        "--ssh-identity-file",
+    ]);
+    command.arg(&topology.ssh_identity_file);
+    if let Some(known_hosts) = &topology.known_hosts {
+        command.arg("--known-hosts").arg(known_hosts);
+    }
+    command.args([
+        "--final-exit-host",
+        topology.exit_host.as_str(),
+        "--final-exit-node-id",
+        topology.exit_node_id.as_str(),
+        "--client-host",
+        topology.client_host.as_str(),
+        "--client-node-id",
+        topology.client_node_id.as_str(),
+        "--entry-host",
+        topology.entry_host.as_str(),
+        "--entry-node-id",
+        topology.entry_node_id.as_str(),
+        "--second-client-host",
+        topology.second_client_host.as_str(),
+        "--second-client-node-id",
+        topology.second_client_node_id.as_str(),
+        "--ssh-allow-cidrs",
+        topology.ssh_allow_cidrs.as_str(),
+        "--report-path",
+    ]);
+    command.arg(report);
+    command.arg("--log-path").arg(log);
+
+    let output = command
+        .output()
+        .map_err(|err| format!("{label}: two-hop invocation failed: {err}"))?;
+    if output.status.success() {
+        Ok(CheckResult::Pass)
+    } else {
+        logger.line(format!(
+            "[reboot-recovery] {label} failed: {}",
+            render_output(&output)
+        ))?;
+        Ok(CheckResult::Fail)
+    }
+}
+
+fn stronger_check(base: &str, measured: CheckResult) -> CheckResult {
+    match measured {
+        CheckResult::Pass => CheckResult::Pass,
+        CheckResult::Fail => CheckResult::Fail,
+        CheckResult::Skipped => match base {
+            "pass" => CheckResult::Pass,
+            "fail" => CheckResult::Fail,
+            _ => CheckResult::Skipped,
+        },
+    }
+}
+
+fn render_output(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.trim().is_empty() {
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    } else {
+        stderr.trim().to_owned()
+    }
+}
+
+fn sanitize_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
 fn append_standalone_matrix_row(report_path: &std::path::Path, overall_pass: bool) {
     if std::env::var("RUSTYNET_ORCHESTRATOR_ACTIVE").is_ok() {
         return;
@@ -342,6 +640,12 @@ fn print_usage() {
         --client-host <user@host> \
         [--exit-node-id <id>] \
         [--client-node-id <id>] \
+        [--entry-host <user@host>] \
+        [--entry-node-id <id>] \
+        [--second-client-host <user@host>] \
+        [--second-client-node-id <id>] \
+        [--known-hosts <path>] \
+        [--ssh-allow-cidrs <cidrs>] \
         [--report-path <path>] \
         [--log-path <path>]"
     );

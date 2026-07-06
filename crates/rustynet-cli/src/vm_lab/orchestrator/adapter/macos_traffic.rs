@@ -11,6 +11,47 @@ use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, Tunnel
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Stop every RustyNet launchd surface that can own the daemon binary or keep
+/// stale role state alive across lab runs. The plain daemon profile is not the
+/// only process owner: macOS anchor deploys `com.rustynet.anchor`, which runs
+/// `/usr/local/bin/rustynetd` too, and relay/privileged-helper profiles can
+/// preserve sockets, pf anchors, or state contention. Use both service labels
+/// and plist paths because `launchctl bootout` behavior differs depending on
+/// whether the job was bootstrapped by label or file path. Then TERM/KILL as a
+/// backstop and wait on the real processes, not launchd state.
+const MACOS_LAUNCHD_STOP_COMMAND: &str = "sudo -n launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
+     sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.daemon.plist 2>/dev/null || true; \
+     sudo -n launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true; \
+     sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.privileged-helper.plist 2>/dev/null || true; \
+     sudo -n launchctl bootout system/com.rustynet.anchor 2>/dev/null || true; \
+     sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.anchor.plist 2>/dev/null || true; \
+     sudo -n launchctl bootout system/com.rustynet.relay 2>/dev/null || true; \
+     sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.relay.plist 2>/dev/null || true; \
+     sudo -n launchctl bootout system/com.rustynet.exit 2>/dev/null || true; \
+     sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.exit.plist 2>/dev/null || true; \
+     sudo -n pkill -TERM -x rustynetd 2>/dev/null || true; \
+     sudo -n pkill -TERM -f '/usr/local/bin/rustynetd.*privileged-helper' 2>/dev/null || true; \
+     sudo -n pkill -TERM -x rustynet-relay 2>/dev/null || true; \
+     for _ in $(seq 1 60); do \
+         if pgrep -x rustynetd >/dev/null 2>&1 || pgrep -x rustynet-relay >/dev/null 2>&1; then \
+             sleep 0.5; \
+         else \
+             break; \
+         fi; \
+     done; \
+     sudo -n launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true; \
+     sudo -n launchctl bootout system/com.rustynet.anchor 2>/dev/null || true; \
+     sudo -n pkill -KILL -x rustynetd 2>/dev/null || true; \
+     sudo -n pkill -KILL -f '/usr/local/bin/rustynetd.*privileged-helper' 2>/dev/null || true; \
+     sudo -n pkill -KILL -x rustynet-relay 2>/dev/null || true; \
+     for _ in $(seq 1 20); do \
+         if pgrep -x rustynetd >/dev/null 2>&1 || pgrep -x rustynet-relay >/dev/null 2>&1; then \
+             sleep 0.5; \
+         else \
+             break; \
+         fi; \
+     done";
+
 /// Tear down any residual RustyNet `pf` killswitch / exit-NAT anchor a crashed or
 /// torn-down daemon left loaded, then any leftover mesh `utun` interface. This is
 /// the macOS analogue of the Linux `LINUX_NFT_KILLSWITCH_RESET_COMMAND` +
@@ -325,21 +366,11 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
 
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
-    // Stop service first (best-effort). Wait until no rustynetd process remains
-    // BEFORE the pf/interface reset below, mirroring the Linux daemon-stop wait:
-    // a daemon mid-shutdown can re-load the killswitch anchor or re-create the
-    // utun after a single flush pass, tripping assert_node_clean. `bootout` is
-    // synchronous but a daemon launched outside the launchd job (or still
-    // tearing down) is waited out by keying on the actual process.
-    let _ = ssh::run_remote(
-        conn,
-        "sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
-         sudo -n pkill -x rustynetd 2>/dev/null || true; \
-         for _ in $(seq 1 60); do \
-             pgrep -x rustynetd >/dev/null 2>&1 && sleep 0.5 || break; \
-         done",
-        Duration::from_secs(60),
-    );
+    // Stop launchd/process surfaces first (best-effort). Wait until no
+    // rustynetd/rustynet-relay process remains BEFORE pf/interface reset:
+    // a live role daemon can re-load the killswitch anchor or re-create the
+    // utun after a single flush pass, tripping assert_node_clean.
+    let _ = ssh::run_remote(conn, MACOS_LAUNCHD_STOP_COMMAND, Duration::from_secs(90));
 
     // Flush every leftover RustyNet pf killswitch / exit-NAT anchor and tear down
     // any residual mesh `utun` interface the daemon left behind. Runs AFTER the
@@ -709,6 +740,35 @@ mod tests {
             !cmd.contains("while read"),
             "reset must not pipe into `while read` (inner sudo drains the pipe)"
         );
+    }
+
+    #[test]
+    fn macos_launchd_stop_command_unloads_all_rustynet_role_profiles() {
+        let cmd = MACOS_LAUNCHD_STOP_COMMAND;
+        for label in [
+            "com.rustynet.daemon",
+            "com.rustynet.privileged-helper",
+            "com.rustynet.anchor",
+            "com.rustynet.relay",
+            "com.rustynet.exit",
+        ] {
+            assert!(
+                cmd.contains(label),
+                "cleanup must unload stale launchd profile {label}"
+            );
+        }
+        assert!(cmd.contains("launchctl bootout system/com.rustynet.anchor"));
+        assert!(
+            cmd.contains(
+                "launchctl bootout system /Library/LaunchDaemons/com.rustynet.anchor.plist"
+            )
+        );
+        assert!(cmd.contains("pkill -TERM -x rustynetd"));
+        assert!(cmd.contains("pkill -TERM -f '/usr/local/bin/rustynetd.*privileged-helper'"));
+        assert!(cmd.contains("pkill -KILL -x rustynetd"));
+        assert!(cmd.contains("pkill -KILL -f '/usr/local/bin/rustynetd.*privileged-helper'"));
+        assert!(cmd.contains("pgrep -x rustynetd"));
+        assert!(cmd.contains("pkill -TERM -x rustynet-relay"));
     }
 
     #[test]

@@ -1193,7 +1193,7 @@ impl DeepSeekServer {
                 m.insert("macos".into(), json!(true));
                 m.insert("admin_platform".into(), json!("macos"));
                 m.insert("skip_linux_live_suite".into(), json!(true));
-                m.insert("legacy_bash".into(), json!(true));
+                m.insert("rust_engine".into(), json!(true));
             }
             "windows_admin" => {
                 area = "Windows admin live issue".into();
@@ -1206,7 +1206,7 @@ impl DeepSeekServer {
                 m.insert("macos".into(), json!(true));
                 m.insert("macos_promote_exit".into(), json!(true));
                 m.insert("skip_linux_live_suite".into(), json!(true));
-                m.insert("legacy_bash".into(), json!(true));
+                m.insert("rust_engine".into(), json!(true));
                 self.add_default_backbone(&mut m, true);
             }
             "windows_exit" => {
@@ -1221,14 +1221,14 @@ impl DeepSeekServer {
                 m.insert("macos".into(), json!(true));
                 m.insert("blind_exit_platform".into(), json!("macos"));
                 m.insert("skip_linux_live_suite".into(), json!(true));
-                m.insert("legacy_bash".into(), json!(true));
+                m.insert("rust_engine".into(), json!(true));
             }
             "macos_anchor" => {
                 area = "macOS anchor live bundle-pull".into();
                 m.insert("macos".into(), json!(true));
                 m.insert("anchor_platform".into(), json!("macos"));
                 m.insert("skip_linux_live_suite".into(), json!(true));
-                m.insert("legacy_bash".into(), json!(true));
+                m.insert("rust_engine".into(), json!(true));
             }
             "windows_anchor" => {
                 area = "Windows anchor live bundle-pull".into();
@@ -1241,7 +1241,7 @@ impl DeepSeekServer {
                 m.insert("macos".into(), json!(true));
                 m.insert("relay_platform".into(), json!("macos"));
                 m.insert("skip_linux_live_suite".into(), json!(true));
-                m.insert("legacy_bash".into(), json!(true));
+                m.insert("rust_engine".into(), json!(true));
             }
             "windows_relay" => {
                 area = "Windows relay lifecycle".into();
@@ -1941,6 +1941,7 @@ impl DeepSeekServer {
                 anchor_platform.as_deref(),
                 admin_platform.as_deref(),
                 blind_exit_platform.as_deref(),
+                macos_promote_exit,
             )
             .is_empty()
         {
@@ -4247,6 +4248,7 @@ fn synthesize_rust_node_args(
     anchor_platform: Option<&str>,
     admin_platform: Option<&str>,
     blind_exit_platform: Option<&str>,
+    macos_promote_exit: bool,
 ) -> Vec<String> {
     let role_for_os = |os: &str| -> &'static str {
         let is = |sel: Option<&str>| sel.is_some_and(|s| s.eq_ignore_ascii_case(os));
@@ -4257,7 +4259,7 @@ fn synthesize_rust_node_args(
         // right daemon role: Anchor→'admin' daemon role, and macOS Exit→blind_exit
         // daemon role. (The dedicated admin-issue / blind-exit VALIDATION stages
         // are not in the Rust plan yet — Bucket 1 — but the node joins correctly.)
-        if is(exit_platform) {
+        if (os == "macos" && macos_promote_exit) || is(exit_platform) {
             "exit"
         } else if is(relay_platform) {
             "relay"
@@ -4270,7 +4272,11 @@ fn synthesize_rust_node_args(
         }
     };
     let mut out = Vec::new();
-    if let Some(e) = exit_vm {
+    let non_linux_exit_selected =
+        macos_promote_exit || exit_platform.is_some_and(|p| matches!(p, "macos" | "windows"));
+    if let Some(e) = exit_vm
+        && !non_linux_exit_selected
+    {
         out.push(format!("{e}:exit"));
     }
     if let Some(c) = client_vm {
@@ -4337,6 +4343,7 @@ fn build_orchestrator_args(
             anchor_platform,
             admin_platform,
             blind_exit_platform,
+            macos_promote_exit,
         ) {
             a.extend(["--node".to_string(), assignment]);
         }
@@ -5223,7 +5230,7 @@ impl McpServer for DeepSeekServer {
                         "macos_promote_exit": json!({"type": "boolean", "description": "Option-B selector: elect macOS as a SECONDARY exit so the macOS exit cell runs live (drives is_macos_active_exit). Use alongside exit_vm/client_vm/entry_vm."}),
                         "entry_vm": json_schema_string("Linux entry-node alias for the Option-B exit topology (used alongside exit_vm/client_vm + macos_promote_exit)."),
                         "legacy_bash": json!({"type": "boolean", "description": "Route the Linux live suite through the legacy bash orchestrator instead of the default Rust one. OPTIONAL: both paths run the mac/win ROLE stages (activate_macos_exit_role + capture, relay/anchor lifecycle) when macos_vm + the role selector are set. The early 'no macOS nodes in topology' preflight line is a benign Linux-preflight artifact, not a skip of the macOS role stages."}),
-                        "rust_engine": json!({"type": "boolean", "description": "Route the run through the Rust-native --node orchestrator engine instead of the default bash path. Synthesizes --node <alias>:<role> from the guest (exit_vm/client_vm/entry_vm/macos_vm/windows_vm) + role-platform selectors, so the mesh is driven by the pure-Rust state machine (execute_rust_native_orchestration). Mutually exclusive with legacy_bash. NOTE (Full-Replacement DoD): the Rust engine currently runs the 21-stage core pipeline; it does NOT yet run the full Linux security suite / chaos / cross-network — use for setup+baseline+traffic+relay+role/exit backbone coverage while the remaining stage families are ported."}),
+                        "rust_engine": json!({"type": "boolean", "description": "Route the run through the Rust-native --node orchestrator engine instead of the legacy bash path. Synthesizes --node <alias>:<role> from the guest (exit_vm/client_vm/entry_vm/macos_vm/windows_vm) + role-platform selectors, so the mesh is driven by the pure-Rust state machine. Mutually exclusive with legacy_bash."}),
                         "skip_linux_live_suite": json!({"type": "boolean", "description": "FAST mac/win cell iteration: skip the ~30-45 min Linux live-validation suite (anchor/role-switch/exit-handoff/relay/two-hop/managed-dns/chaos) and jump straight to the mac/win role stages AFTER setup (bootstrap + membership + signed-bundle distribution still run, because the mac/win stages need the mesh). Pair with a role-platform selector (exit_platform/relay_platform/anchor_platform/blind_exit_platform or macos_promote_exit) to drive ONE mac/win cell live without paying for the whole Linux lab. The mac/win stages gate on setup's distribute_* outcomes, not the Linux suite, so they stay fully exercised. Use this whenever you are failing on a mac/win stage and the Linux suite would just be wasted time."}),
                         "windows_only": json!({"type": "boolean", "description": "Skip ALL Linux stages (incl. membership setup) and run ONLY the Windows bootstrap + validation stages; requires windows_vm. NOTE: this also skips membership distribution, so it only works when the Windows guest is already mesh-joined from a prior run — for a fresh Windows cell use skip_linux_live_suite instead (keeps setup)."}),
                         "allow_concurrent": json!({"type": "boolean", "description": "Opt into PARALLEL runs (default false = singleton). When true, up to 3 runs may overlap — you MUST give each disjoint guests (e.g. the macOS↔Windows pipeline: macOS on one Debian backbone, Windows on another). Each concurrent run gets its own CARGO_TARGET_DIR + report dir."}),
@@ -5870,6 +5877,25 @@ mod tests {
     }
 
     #[test]
+    fn next_live_lab_macos_targets_default_to_rust_engine() {
+        let s = server();
+        for key in [
+            "macos_admin",
+            "macos_exit",
+            "macos_blind_exit",
+            "macos_anchor",
+            "macos_relay",
+        ] {
+            let target = s.next_live_lab_target(Some(key)).unwrap();
+            assert_eq!(target.args.get("rust_engine"), Some(&json!(true)), "{key}");
+            assert!(
+                target.args.get("legacy_bash").is_none(),
+                "{key} must not route through legacy bash"
+            );
+        }
+    }
+
+    #[test]
     fn lab_run_concurrency_gate_rejects_at_limit() {
         // Reject paths only — they return before spawning a real orchestrator.
         let s = server();
@@ -5974,7 +6000,7 @@ mod tests {
     #[test]
     fn synthesize_rust_node_args_maps_every_role_to_a_parseable_token() {
         let node = |m, w, e, c, en, xp, rp, ap, adp, bxp| {
-            super::synthesize_rust_node_args(m, w, e, c, en, xp, rp, ap, adp, bxp)
+            super::synthesize_rust_node_args(m, w, e, c, en, xp, rp, ap, adp, bxp, false)
         };
         // Linux fixed roles.
         assert_eq!(
@@ -6130,6 +6156,43 @@ mod tests {
             "no --exit-platform: {m:?}"
         );
         assert!(!m.iter().any(|x| x == "--macos-vm"));
+    }
+
+    #[test]
+    fn rust_engine_macos_promote_exit_uses_macos_exit_without_duplicate_linux_exit() {
+        let a = build_orchestrator_args(
+            "inv",
+            "s",
+            "k",
+            "r",
+            Some("macos-utm-1"),
+            None,
+            Some("debian-1"),
+            Some("debian-2"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("debian-3"),
+            true,
+            false,
+            true,
+            false,
+            false,
+            true,
+        );
+        assert!(
+            a.windows(2).any(|w| w == ["--node", "macos-utm-1:exit"]),
+            "macos promote exit --node: {a:?}"
+        );
+        assert!(
+            !a.windows(2).any(|w| w == ["--node", "debian-1:exit"]),
+            "linux exit must not duplicate promoted macOS exit: {a:?}"
+        );
+        assert!(!a.iter().any(|x| x == "--macos-promote-exit"));
+        assert!(!a.iter().any(|x| x == "--legacy-bash-orchestrator"));
     }
 
     #[test]

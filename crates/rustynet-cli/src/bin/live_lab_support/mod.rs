@@ -599,14 +599,27 @@ fn scp_failure_is_transient(exit_code: Option<i32>, stderr_lower: &str) -> bool 
 
 impl LiveLabContext {
     pub fn new(prefix: &str, ssh_identity_file: &Path) -> Result<Self, String> {
+        Self::new_with_pinned_known_hosts(prefix, ssh_identity_file, None)
+    }
+
+    pub fn new_with_pinned_known_hosts(
+        prefix: &str,
+        ssh_identity_file: &Path,
+        pinned_known_hosts_file: Option<&Path>,
+    ) -> Result<Self, String> {
         require_local_file_mode(ssh_identity_file, "owner-only", "ssh identity file")?;
-        let pinned_known_hosts_file = env::var_os("LIVE_LAB_PINNED_KNOWN_HOSTS_FILE").map_or_else(
+        let pinned_known_hosts_file = pinned_known_hosts_file.map_or_else(
             || {
-                env::var_os("HOME")
-                    .map_or_else(|| PathBuf::from("/root"), PathBuf::from)
-                    .join(".ssh/known_hosts")
+                env::var_os("LIVE_LAB_PINNED_KNOWN_HOSTS_FILE").map_or_else(
+                    || {
+                        env::var_os("HOME")
+                            .map_or_else(|| PathBuf::from("/root"), PathBuf::from)
+                            .join(".ssh/known_hosts")
+                    },
+                    PathBuf::from,
+                )
             },
-            PathBuf::from,
+            Path::to_path_buf,
         );
         require_local_file_mode(
             pinned_known_hosts_file.as_path(),

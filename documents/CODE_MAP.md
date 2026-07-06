@@ -112,7 +112,7 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 | `NodeConnection` enum | `connection.rs` | Transport injection: Ssh, Adb, Mdm |
 | `OrchestrationContext` | `context.rs` | In-memory stage context plus persisted setup/run split state at `<report_dir>/state/orchestration_context.json` |
 | `OrchestrationStage` trait | `stage/mod.rs` | Single stage in the orchestration pipeline |
-| `PlanBuilder` | `plan.rs` | Builds the stage execution plan from role assignments |
+| `PlanBuilder` | `plan.rs` | Builds the stage execution plan from role assignments, including live-suite, soak, cross-network, and chaos selectors |
 | `StateMachineRunner` | `runner.rs` | Dependency-ordered stage runner; explicit skips can be injected as `Passed` for run-only setup dependencies |
 | `LinuxNodeAdapter` | `adapter/linux.rs` | Full Linux adapter |
 | `WindowsNodeAdapter` | `adapter/windows.rs` | Windows adapter (PowerShell-based) |
