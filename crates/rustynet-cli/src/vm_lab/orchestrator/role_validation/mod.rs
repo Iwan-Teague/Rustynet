@@ -12,6 +12,7 @@
 
 pub mod anchor;
 pub mod dns_failclosed;
+pub mod key_custody;
 pub mod relay;
 pub mod runtime_acls;
 pub mod security_audit;

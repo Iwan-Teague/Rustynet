@@ -45,6 +45,7 @@ use crate::vm_lab::orchestrator::stage::enforce_runtime::EnforceBaselineRuntimeS
 use crate::vm_lab::orchestrator::stage::exit_handoff::ExitHandoffStage;
 use crate::vm_lab::orchestrator::stage::final_cleanup::FinalCleanupStage;
 use crate::vm_lab::orchestrator::stage::install::BootstrapHostsStage;
+use crate::vm_lab::orchestrator::stage::key_custody_validation::KeyCustodyValidationStage;
 use crate::vm_lab::orchestrator::stage::membership_init::MembershipInitStage;
 use crate::vm_lab::orchestrator::stage::preflight::PreflightStage;
 use crate::vm_lab::orchestrator::stage::relay_validation::RelayValidationStage;
@@ -78,13 +79,14 @@ impl PlanBuilder {
     /// The post-baseline live-validation + role stages, dropped when
     /// `--skip-linux-live-suite` is set. Setup (through `validate_baseline_runtime`)
     /// and the always-run `cleanup` are never in this set.
-    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 10] = {
+    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 11] = {
         use crate::vm_lab::orchestrator::stage::StageId;
         [
             StageId::SecurityAuditValidation,
             StageId::DnsFailclosedValidation,
             StageId::RuntimeAclsValidation,
             StageId::ServiceHardeningValidation,
+            StageId::KeyCustodyValidation,
             StageId::DeployRelayService,
             StageId::RelayValidation,
             StageId::TrafficTestMatrix,
@@ -170,6 +172,12 @@ impl PlanBuilder {
             // systemd unit's hardening directives match the shipped baseline.
             // Runs after runtime_acls_validation and before relay deploy.
             Box::new(ServiceHardeningValidationStage),
+            // Key-custody per-node daemon self-check — the canonical
+            // Linux key-custody artifacts (encrypted WG private key,
+            // public key, keys dir, credentials dir, passphrase
+            // credentials) match the reviewed custody contract. Runs
+            // after service_hardening_validation and before relay deploy.
+            Box::new(KeyCustodyValidationStage),
             // Deploy the rustynet-relay sibling service onto every Relay node
             // (verifier key + `ops install-systemd-relay`) so relay_validation
             // has a live relay to prove. Closes the gap where the standard
@@ -203,9 +211,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_27_stages() {
+    fn build_returns_28_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 27, "plan must contain exactly 27 stages");
+        assert_eq!(stages.len(), 28, "plan must contain exactly 28 stages");
     }
 
     #[test]
@@ -213,8 +221,8 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 27 total - 10 live-suite stages = 17.
-        assert_eq!(ids.len(), 26 - PlanBuilder::LIVE_SUITE_STAGES.len());
+        // 28 total - 11 live-suite stages = 17.
+        assert_eq!(ids.len(), 28 - PlanBuilder::LIVE_SUITE_STAGES.len());
         for dropped in PlanBuilder::LIVE_SUITE_STAGES {
             assert!(
                 !ids.contains(&dropped),
@@ -260,6 +268,7 @@ mod tests {
                 StageId::DnsFailclosedValidation,
                 StageId::RuntimeAclsValidation,
                 StageId::ServiceHardeningValidation,
+                StageId::KeyCustodyValidation,
                 StageId::DeployRelayService,
                 StageId::RelayValidation,
                 StageId::TrafficTestMatrix,

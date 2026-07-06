@@ -22002,7 +22002,7 @@ fn evaluate_linux_mesh_status_report(linux_alias: &str, raw_json: &str) -> Resul
     ))
 }
 
-fn evaluate_linux_key_custody_report(linux_alias: &str, raw_json: &str) -> Result<String, String> {
+pub(crate) fn evaluate_linux_key_custody_report(linux_alias: &str, raw_json: &str) -> Result<String, String> {
     let report: rustynetd::linux_key_custody::LinuxKeyCustodyReport =
         serde_json::from_str(raw_json)
             .map_err(|err| format!("parse linux-key-custody-check JSON output failed: {err}"))?;
@@ -35970,8 +35970,9 @@ mod tests {
         // absolute size). 24 = the 18 baseline + cross-OS relay_validation +
         // anchor_validation + admin_issue + blind_exit + deploy_relay_service +
         // security_audit_validation + dns_failclosed_validation +
-        // runtime_acls_validation.
-        assert_eq!(cli_ids.len(), 27);
+        // runtime_acls_validation + service_hardening_validation +
+        // key_custody_validation.
+        assert_eq!(cli_ids.len(), 28);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)
