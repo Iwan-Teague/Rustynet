@@ -2098,13 +2098,16 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 32 | `live_reboot_recovery_validation` | Live reboot recovery on 2-node mesh (exit + client: reboot individually, verify boot-id changed, rustynetd recovered, WireGuard re-established, gossip epoch advanced) delegates to the proven `live_linux_reboot_recovery_test` binary | `stage/live_reboot_recovery_validation.rs` |
 | 33 | `live_secrets_not_in_logs_validation` | Live secrets-not-in-logs audit (client-only: scan daemon journal + state dir for plaintext keys/key material) delegates to the proven `live_linux_secrets_not_in_logs_test` binary | `stage/live_secrets_not_in_logs_validation.rs` |
 | 34 | `live_key_custody_validation` | Live key-custody enforcement proof (client-only: manipulate key file permissions on running daemon, validate rejection + recovery) delegates to the proven `live_linux_key_custody_test` binary | `stage/live_key_custody_validation.rs` |
-| 35 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
-| 36 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
-| 37 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
-| 38 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
-| 39 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
-| 40 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
-| 41 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 35 | `live_enrollment_restart_validation` | Live enrollment-restart proof (admin killed mid-enrollment, must recover + membership integrity intact) delegates to the proven `live_linux_enrollment_restart_test` binary | `stage/live_enrollment_restart_validation.rs` |
+| 36 | `live_lan_toggle_validation` | Live LAN-toggle three-cycle proof (off→on→off with enforcement evidence on each side + blind-exit rejection) delegates to the proven cross-OS `live_linux_lan_toggle_test` binary | `stage/live_lan_toggle_validation.rs` |
+| 37 | `live_mixed_topology_validation` | Live cross-OS mutual-visibility proof (one Linux + one macOS + one Windows node: all mutually visible in membership + datapath freshness) delegates to the proven `live_linux_mixed_topology_test` binary | `stage/live_mixed_topology_validation.rs` |
+| 38 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
+| 39 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
+| 40 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
+| 41 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
+| 42 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
+| 43 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
+| 44 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2195,6 +2198,9 @@ mod tests {
             "live_reboot_recovery_validation",
             "live_secrets_not_in_logs_validation",
             "live_key_custody_validation",
+            "live_enrollment_restart_validation",
+            "live_lan_toggle_validation",
+            "live_mixed_topology_validation",
             "deploy_relay_service",
             "relay_validation",
             "traffic_test_matrix",

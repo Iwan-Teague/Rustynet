@@ -3049,6 +3049,9 @@ mod registry_equivalence_tests {
             "live_reboot_recovery_validation" => Some("reboot_recovery"),
             "live_secrets_not_in_logs_validation" => Some("secrets_not_in_logs"),
             "live_key_custody_validation" => Some("key_custody"),
+            "live_enrollment_restart_validation" => Some("enrollment_restart"),
+            "live_lan_toggle_validation" => Some("lan_toggle"),
+            "live_mixed_topology_validation" => Some("mixed_topology"),
             "cleanup" => Some("cleanup"),
             stage if stage.starts_with("chaos_") => Some("chaos"),
             stage if stage.contains("reboot") => Some("reboot_recovery"),
@@ -3093,6 +3096,9 @@ mod registry_equivalence_tests {
                 | "live_reboot_recovery_validation"
                 | "live_secrets_not_in_logs_validation"
                 | "live_key_custody_validation"
+                | "live_enrollment_restart_validation"
+                | "live_lan_toggle_validation"
+                | "live_mixed_topology_validation"
                 | "deploy_relay_service"
                 | "relay_validation"
                 | "traffic_test_matrix"
