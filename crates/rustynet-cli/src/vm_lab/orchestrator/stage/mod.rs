@@ -17,6 +17,7 @@ pub mod distribute_membership;
 pub mod distribute_traversal;
 pub mod dns_failclosed_validation;
 pub mod enforce_runtime;
+pub mod exit_demotion_residue_validation;
 pub mod exit_handoff;
 pub mod final_cleanup;
 pub mod install;
@@ -69,13 +70,14 @@ pub enum StageId {
     RoleSwitchMatrix,
     ExitHandoff,
     ActiveExit,
+    ExitDemotionResidueValidation,
     Cleanup,
 }
 
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 31] = [
+    pub const ALL: [StageId; 32] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -106,6 +108,7 @@ impl StageId {
         StageId::RoleSwitchMatrix,
         StageId::ExitHandoff,
         StageId::ActiveExit,
+        StageId::ExitDemotionResidueValidation,
         StageId::Cleanup,
     ];
 
@@ -141,6 +144,7 @@ impl StageId {
             StageId::RoleSwitchMatrix => "role_switch_matrix",
             StageId::ExitHandoff => "exit_handoff",
             StageId::ActiveExit => "active_exit",
+            StageId::ExitDemotionResidueValidation => "exit_demotion_residue_validation",
             StageId::Cleanup => "cleanup",
         }
     }

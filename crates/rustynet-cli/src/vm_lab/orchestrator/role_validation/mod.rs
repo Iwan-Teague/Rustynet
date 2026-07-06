@@ -13,6 +13,7 @@
 pub mod anchor;
 pub mod authenticode;
 pub mod dns_failclosed;
+pub mod exit_demotion_residue;
 pub mod ipv6_leak;
 pub mod key_custody;
 pub mod mesh_status;
