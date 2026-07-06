@@ -65,7 +65,13 @@ impl OrchestrationStage for BootstrapHostsStage {
                     // skipped it too), reusing its existing daemon build.
                     // Downstream stages re-collect this node's identity from the
                     // live host over SSH, so no rebuild is required.
-                    return (alias.clone(), Ok(()));
+                    let r = match ctx.adapters.get(alias.as_str()) {
+                        Some(adapter) => validate_reused_daemon(alias, adapter.as_ref()),
+                        None => Err(format!(
+                            "no adapter for reused node '{alias}'; cannot validate daemon readiness"
+                        )),
+                    };
+                    return (alias.clone(), r);
                 }
                 let r = match ctx.adapters.get(alias.as_str()) {
                     Some(adapter) => adapter
@@ -89,10 +95,55 @@ impl OrchestrationStage for BootstrapHostsStage {
     }
 }
 
+fn validate_reused_daemon(
+    alias: &str,
+    adapter: &dyn crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter,
+) -> Result<(), String> {
+    adapter.collect_node_id().map_err(|err| {
+        format!(
+            "reused node excluded by --rebuild-nodes is not daemon-ready \
+             (node_id probe failed); include '{alias}' in --rebuild-nodes or run without \
+             --rebuild-nodes to rebuild all nodes: {err}"
+        )
+    })?;
+    adapter.collect_wireguard_public_key().map_err(|err| {
+        format!(
+            "reused node excluded by --rebuild-nodes is not daemon-ready \
+             (wireguard public-key probe failed); include '{alias}' in --rebuild-nodes or run \
+             without --rebuild-nodes to rebuild all nodes: {err}"
+        )
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+    use crate::vm_lab::orchestrator::source_archive::SourceArchive;
     use std::collections::HashMap;
+
+    fn ctx_with_assignment(alias: &str) -> OrchestrationContext {
+        OrchestrationContext {
+            assignments: vec![NodeRoleAssignment {
+                alias: alias.to_owned(),
+                role: NodeRole::Client,
+            }],
+            adapters: HashMap::new(),
+            source_archive: Some(SourceArchive {
+                path: std::env::temp_dir(),
+            }),
+            report_dir: std::env::temp_dir(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+        }
+    }
 
     #[test]
     fn no_source_archive_fails() {
@@ -135,5 +186,17 @@ mod tests {
         // An explicit empty set rebuilds no node (every node is reused as-is).
         let none: Vec<String> = vec![];
         assert!(!node_in_rebuild_set(Some(&none), "windows-utm-1"));
+    }
+
+    #[test]
+    fn reused_node_without_adapter_fails_at_bootstrap_gate() {
+        let mut ctx = ctx_with_assignment("reused-node");
+        let stage = BootstrapHostsStage::new(Some(vec!["other-node".to_owned()]));
+        let outcome = stage.execute(&mut ctx);
+        assert!(matches!(outcome, StageOutcome::Failed(_)));
+        let StageOutcome::Failed(message) = outcome else {
+            unreachable!("checked above");
+        };
+        assert!(message.contains("cannot validate daemon readiness"));
     }
 }
