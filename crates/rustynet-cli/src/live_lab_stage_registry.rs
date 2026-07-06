@@ -1841,7 +1841,42 @@ pub const STAGES: &[StageSpec] = &[
         logical: Some("key_custody"),
         rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
-        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    // Rust-engine live enrollment-restart test: admin node killed
+    // mid-enrollment, daemon must recover and membership integrity
+    // must remain intact. Single-stage binary, cross-OS.
+    StageSpec {
+        name: "live_enrollment_restart_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("enrollment_restart"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
+    // Rust-engine live LAN-toggle test: three cycles (off→on→off)
+    // proving LAN-access toggle with enforcement evidence and
+    // blind-exit rejection. Cross-OS (Linux/macOS/Windows via --platform).
+    StageSpec {
+        name: "live_lan_toggle_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("lan_toggle"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
+    // Rust-engine live mixed-topology test: one node per OS
+    // (Linux+macOS+Windows), mutual membership visibility +
+    // datapath freshness proof. All-platforms.
+    StageSpec {
+        name: "live_mixed_topology_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("mixed_topology"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
     StageSpec {
