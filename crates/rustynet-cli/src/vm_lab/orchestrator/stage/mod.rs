@@ -26,6 +26,7 @@ pub mod final_cleanup;
 pub mod install;
 pub mod ipv6_leak_validation;
 pub mod key_custody_validation;
+pub mod live_two_hop_validation;
 pub mod membership_init;
 pub mod mesh_status_validation;
 pub mod preflight;
@@ -67,6 +68,7 @@ pub enum StageId {
     MeshStatusValidation,
     AuthenticodeValidation,
     Ipv6LeakValidation,
+    LiveTwoHopValidation,
     DeployRelayService,
     RelayValidation,
     TrafficTestMatrix,
@@ -83,7 +85,7 @@ pub enum StageId {
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 35] = [
+    pub const ALL: [StageId; 36] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -108,6 +110,7 @@ impl StageId {
         StageId::MeshStatusValidation,
         StageId::AuthenticodeValidation,
         StageId::Ipv6LeakValidation,
+        StageId::LiveTwoHopValidation,
         StageId::DeployRelayService,
         StageId::RelayValidation,
         StageId::TrafficTestMatrix,
@@ -147,6 +150,7 @@ impl StageId {
             StageId::MeshStatusValidation => "mesh_status_validation",
             StageId::AuthenticodeValidation => "authenticode_validation",
             StageId::Ipv6LeakValidation => "ipv6_leak_validation",
+            StageId::LiveTwoHopValidation => "live_two_hop_validation",
             StageId::DeployRelayService => "deploy_relay_service",
             StageId::RelayValidation => "relay_validation",
             StageId::TrafficTestMatrix => "traffic_test_matrix",

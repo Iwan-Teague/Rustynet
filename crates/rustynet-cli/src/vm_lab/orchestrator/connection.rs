@@ -105,6 +105,30 @@ impl NodeConnection {
         }
     }
 
+    /// Full SSH connection parameters including known_hosts, for stages that
+    /// dispatch standalone e2e validation binaries.
+    pub fn ssh_connection_params(
+        &self,
+    ) -> Option<super::adapter::node_adapter::SshConnectionParams> {
+        match self {
+            NodeConnection::Ssh {
+                host,
+                port,
+                user,
+                identity_file,
+                known_hosts,
+                ..
+            } => Some(super::adapter::node_adapter::SshConnectionParams::new(
+                host.clone(),
+                *port,
+                user.clone(),
+                identity_file.clone(),
+                known_hosts.clone(),
+            )),
+            _ => None,
+        }
+    }
+
     /// SSH host+user+port for `sshpass`-based commands. `(host, port, user, identity_file, password)`.
     #[allow(clippy::type_complexity)]
     pub fn ssh_parts(&self) -> Option<(&str, u16, Option<&str>, &Path, Option<&str>)> {
