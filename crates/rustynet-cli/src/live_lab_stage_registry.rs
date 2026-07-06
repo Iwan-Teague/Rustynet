@@ -801,6 +801,21 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-native live managed DNS: delegates to the proven
+    // live_linux_managed_dns_test binary (cross-OS via --platform) — the
+    // same binary the bash orchestrator calls, now surfaced as a
+    // first-class OrchestrationStage (signer=exit, client=client, managed
+    // peers=everything else). state_machine_only — only the Rust `--node`
+    // plan dispatches it.
+    StageSpec {
+        name: "live_managed_dns_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("managed_dns"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,
