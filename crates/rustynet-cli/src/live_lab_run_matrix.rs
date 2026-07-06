@@ -140,6 +140,9 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_stage_authenticode_check",
     "macos_stage_authenticode_check",
     "windows_stage_authenticode_check",
+    "linux_stage_ipv6_leak_check",
+    "macos_stage_ipv6_leak_check",
+    "windows_stage_ipv6_leak_check",
     "linux_stage_secrets_not_in_logs",
     "macos_stage_secrets_not_in_logs",
     "windows_stage_secrets_not_in_logs",
@@ -3023,6 +3026,7 @@ mod registry_equivalence_tests {
             "key_custody_validation" => Some("key_custody_check"),
             "mesh_status_validation" => Some("mesh_status_check"),
             "authenticode_validation" => Some("authenticode_check"),
+            "ipv6_leak_validation" => Some("ipv6_leak_check"),
             "cleanup" => Some("cleanup"),
             stage if stage.starts_with("chaos_") => Some("chaos"),
             stage if stage.contains("reboot") => Some("reboot_recovery"),
@@ -3056,6 +3060,7 @@ mod registry_equivalence_tests {
                 | "key_custody_validation"
                 | "mesh_status_validation"
                 | "authenticode_validation"
+                | "ipv6_leak_validation"
                 | "deploy_relay_service"
                 | "relay_validation"
                 | "traffic_test_matrix"

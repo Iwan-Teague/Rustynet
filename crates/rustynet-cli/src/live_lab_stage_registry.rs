@@ -716,6 +716,22 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-engine IPv6 leak adversarial capture: the canonical Linux IPv6
+    // tunnel-leak proof folded into a first-class OrchestrationStage — real
+    // outbound IPv6 probe to a global address while tcpdump watches the
+    // egress interface; 0 leaked datagrams + probe blocked by containment
+    // control (disable_ipv6 or killswitch v6 drop). state_machine_only —
+    // only the Rust `--node` plan dispatches it; the bash orchestrate path
+    // captures and evaluates via the per-exit evidence pipeline.
+    StageSpec {
+        name: "ipv6_leak_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("ipv6_leak_check"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,

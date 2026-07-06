@@ -19281,7 +19281,10 @@ fn evaluate_linux_exit_demotion_residue_artifact(
 ///   - neither containment control is present (`ipv6_disabled == false` AND
 ///     `killswitch_v6_drop_present == false`) — there is nothing fail-closing
 ///     IPv6 at all.
-fn evaluate_linux_ipv6_leak_artifact(linux_alias: &str, raw_json: &str) -> Result<String, String> {
+pub(crate) fn evaluate_linux_ipv6_leak_artifact(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
     let report: Value = serde_json::from_str(raw_json)
         .map_err(|err| format!("parse linux IPv6 leak artifact failed: {err}"))?;
     require_json_u64(&report, "schema_version")?
@@ -35981,7 +35984,7 @@ mod tests {
         // security_audit_validation + dns_failclosed_validation +
         // runtime_acls_validation + service_hardening_validation +
         // key_custody_validation + mesh_status_validation + authenticode_validation.
-        assert_eq!(cli_ids.len(), 30);
+        assert_eq!(cli_ids.len(), 31);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)
