@@ -35987,7 +35987,7 @@ mod tests {
         // ipv6_leak_validation + exit_demotion_residue_validation +
         // exit_dns_failclosed_validation + exit_nat_lifecycle_validation +
         // blind_exit_dataplane_validation.
-        assert_eq!(cli_ids.len(), 40);
+        assert_eq!(cli_ids.len(), 41);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)

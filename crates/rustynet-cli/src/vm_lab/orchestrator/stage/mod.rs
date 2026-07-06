@@ -26,6 +26,7 @@ pub mod final_cleanup;
 pub mod install;
 pub mod ipv6_leak_validation;
 pub mod key_custody_validation;
+pub mod live_key_custody_validation;
 pub mod live_managed_dns_validation;
 pub mod live_network_flap_validation;
 pub mod live_reboot_recovery_validation;
@@ -77,6 +78,7 @@ pub enum StageId {
     LiveNetworkFlapValidation,
     LiveRebootRecoveryValidation,
     LiveSecretsNotInLogsValidation,
+    LiveKeyCustodyValidation,
     DeployRelayService,
     RelayValidation,
     TrafficTestMatrix,
@@ -93,7 +95,7 @@ pub enum StageId {
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 40] = [
+    pub const ALL: [StageId; 41] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -123,6 +125,7 @@ impl StageId {
         StageId::LiveNetworkFlapValidation,
         StageId::LiveRebootRecoveryValidation,
         StageId::LiveSecretsNotInLogsValidation,
+        StageId::LiveKeyCustodyValidation,
         StageId::DeployRelayService,
         StageId::RelayValidation,
         StageId::TrafficTestMatrix,
@@ -167,6 +170,7 @@ impl StageId {
             StageId::LiveNetworkFlapValidation => "live_network_flap_validation",
             StageId::LiveRebootRecoveryValidation => "live_reboot_recovery_validation",
             StageId::LiveSecretsNotInLogsValidation => "live_secrets_not_in_logs_validation",
+            StageId::LiveKeyCustodyValidation => "live_key_custody_validation",
             StageId::DeployRelayService => "deploy_relay_service",
             StageId::RelayValidation => "relay_validation",
             StageId::TrafficTestMatrix => "traffic_test_matrix",
