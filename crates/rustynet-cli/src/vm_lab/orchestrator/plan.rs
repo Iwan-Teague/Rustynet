@@ -32,6 +32,7 @@ use crate::vm_lab::orchestrator::stage::OrchestrationStage;
 use crate::vm_lab::orchestrator::stage::active_exit::ActiveExitStage;
 use crate::vm_lab::orchestrator::stage::admin_issue::AdminIssueStage;
 use crate::vm_lab::orchestrator::stage::anchor_validation::AnchorValidationStage;
+use crate::vm_lab::orchestrator::stage::authenticode_validation::AuthenticodeValidationStage;
 use crate::vm_lab::orchestrator::stage::blind_exit::BlindExitStage;
 use crate::vm_lab::orchestrator::stage::cleanup::CleanupHostsStage;
 use crate::vm_lab::orchestrator::stage::collect_pubkeys::CollectPubkeysStage;
@@ -80,7 +81,7 @@ impl PlanBuilder {
     /// The post-baseline live-validation + role stages, dropped when
     /// `--skip-linux-live-suite` is set. Setup (through `validate_baseline_runtime`)
     /// and the always-run `cleanup` are never in this set.
-    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 12] = {
+    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 13] = {
         use crate::vm_lab::orchestrator::stage::StageId;
         [
             StageId::SecurityAuditValidation,
@@ -89,6 +90,7 @@ impl PlanBuilder {
             StageId::ServiceHardeningValidation,
             StageId::KeyCustodyValidation,
             StageId::MeshStatusValidation,
+            StageId::AuthenticodeValidation,
             StageId::DeployRelayService,
             StageId::RelayValidation,
             StageId::TrafficTestMatrix,
@@ -185,6 +187,12 @@ impl PlanBuilder {
             // expected peer IDs present, within max-age bounds). Runs
             // after key_custody_validation and before relay deploy.
             Box::new(MeshStatusValidationStage),
+            // Authenticode per-node daemon self-check — honest not-applicable
+            // verdict on Linux (runtime binary-signature attestation is
+            // Windows-specific; Linux relies on dpkg/rpm install-time
+            // verification). Runs after mesh_status_validation and before
+            // relay deploy.
+            Box::new(AuthenticodeValidationStage),
             // Deploy the rustynet-relay sibling service onto every Relay node
             // (verifier key + `ops install-systemd-relay`) so relay_validation
             // has a live relay to prove. Closes the gap where the standard
@@ -218,9 +226,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_29_stages() {
+    fn build_returns_30_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 29, "plan must contain exactly 29 stages");
+        assert_eq!(stages.len(), 30, "plan must contain exactly 30 stages");
     }
 
     #[test]
@@ -228,8 +236,8 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 29 total - 12 live-suite stages = 17.
-        assert_eq!(ids.len(), 29 - PlanBuilder::LIVE_SUITE_STAGES.len());
+        // 30 total - 13 live-suite stages = 17.
+        assert_eq!(ids.len(), 30 - PlanBuilder::LIVE_SUITE_STAGES.len());
         for dropped in PlanBuilder::LIVE_SUITE_STAGES {
             assert!(
                 !ids.contains(&dropped),
@@ -277,6 +285,7 @@ mod tests {
                 StageId::ServiceHardeningValidation,
                 StageId::KeyCustodyValidation,
                 StageId::MeshStatusValidation,
+                StageId::AuthenticodeValidation,
                 StageId::DeployRelayService,
                 StageId::RelayValidation,
                 StageId::TrafficTestMatrix,

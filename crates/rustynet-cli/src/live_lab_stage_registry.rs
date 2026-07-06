@@ -700,6 +700,22 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-engine authenticode: the canonical Linux daemon self-check
+    // folded into a first-class OrchestrationStage — validates that the
+    // daemon reports an honest authenticode verdict (applicable: false on
+    // Linux — runtime binary-signature attestation is Windows-specific).
+    // state_machine_only — only the Rust `--node` plan dispatches it;
+    // the bash orchestrate path runs the check via its own per-check
+    // validators.
+    StageSpec {
+        name: "authenticode_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("authenticode_check"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,

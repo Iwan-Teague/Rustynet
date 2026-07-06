@@ -6,6 +6,7 @@ use crate::vm_lab::orchestrator::role::NodeRole;
 pub mod active_exit;
 pub mod admin_issue;
 pub mod anchor_validation;
+pub mod authenticode_validation;
 pub mod blind_exit;
 pub mod cleanup;
 pub mod collect_pubkeys;
@@ -59,6 +60,7 @@ pub enum StageId {
     ServiceHardeningValidation,
     KeyCustodyValidation,
     MeshStatusValidation,
+    AuthenticodeValidation,
     DeployRelayService,
     RelayValidation,
     TrafficTestMatrix,
@@ -71,7 +73,7 @@ pub enum StageId {
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 29] = [
+    pub const ALL: [StageId; 30] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -94,6 +96,7 @@ impl StageId {
         StageId::ServiceHardeningValidation,
         StageId::KeyCustodyValidation,
         StageId::MeshStatusValidation,
+        StageId::AuthenticodeValidation,
         StageId::DeployRelayService,
         StageId::RelayValidation,
         StageId::TrafficTestMatrix,
@@ -127,6 +130,7 @@ impl StageId {
             StageId::ServiceHardeningValidation => "service_hardening_validation",
             StageId::KeyCustodyValidation => "key_custody_validation",
             StageId::MeshStatusValidation => "mesh_status_validation",
+            StageId::AuthenticodeValidation => "authenticode_validation",
             StageId::DeployRelayService => "deploy_relay_service",
             StageId::RelayValidation => "relay_validation",
             StageId::TrafficTestMatrix => "traffic_test_matrix",

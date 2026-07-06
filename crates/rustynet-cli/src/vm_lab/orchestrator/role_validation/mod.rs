@@ -11,6 +11,7 @@
 //! surface (cross-OS); `relay` validates the relay service lifecycle.
 
 pub mod anchor;
+pub mod authenticode;
 pub mod dns_failclosed;
 pub mod key_custody;
 pub mod mesh_status;
