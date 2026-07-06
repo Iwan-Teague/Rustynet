@@ -12,6 +12,7 @@ use rustynet_control::roles::role_capability_csv;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
+const LINUX_MEMBERSHIP_LOG_PATH: &str = "/var/lib/rustynet/membership.log";
 
 /// Read the membership owner public key from the exit node.
 /// The exit node is the only node that holds the owner signing key;
@@ -140,12 +141,21 @@ pub fn distribute_signed_bundle(
     } else {
         ("0640", "root")
     };
+    let log_init = if matches!(kind, BundleKind::Membership) {
+        format!(
+            " && sudo -n touch '{LINUX_MEMBERSHIP_LOG_PATH}' && \
+             sudo -n chown rustynetd:rustynetd '{LINUX_MEMBERSHIP_LOG_PATH}' && \
+             sudo -n chmod 0600 '{LINUX_MEMBERSHIP_LOG_PATH}'"
+        )
+    } else {
+        String::new()
+    };
     ssh::run_remote(
         conn,
         &format!(
             "sudo -n install -d -m 0700 -o rustynetd -g rustynetd {install_dir} && \
              sudo -n install -m {mode} -o {owner} -g rustynetd '{remote_tmp}' '{install_dst}' && \
-             sudo -n rm -f '{remote_tmp}'"
+             sudo -n rm -f '{remote_tmp}'{log_init}"
         ),
         SHORT_TIMEOUT,
     )?;
