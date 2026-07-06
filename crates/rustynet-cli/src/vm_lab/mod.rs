@@ -19188,7 +19188,7 @@ fn evaluate_linux_exit_nat_lifecycle_artifact(
 ///   - the demotion CLI returned non-zero;
 ///   - the daemon did not stay running (else it masquerades as the
 ///     daemon-stop lifecycle test).
-fn evaluate_linux_exit_demotion_residue_artifact(
+pub(crate) fn evaluate_linux_exit_demotion_residue_artifact(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -35983,8 +35983,9 @@ mod tests {
         // anchor_validation + admin_issue + blind_exit + deploy_relay_service +
         // security_audit_validation + dns_failclosed_validation +
         // runtime_acls_validation + service_hardening_validation +
-        // key_custody_validation + mesh_status_validation + authenticode_validation.
-        assert_eq!(cli_ids.len(), 31);
+        // key_custody_validation + mesh_status_validation + authenticode_validation +
+        // ipv6_leak_validation + exit_demotion_residue_validation.
+        assert_eq!(cli_ids.len(), 32);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)

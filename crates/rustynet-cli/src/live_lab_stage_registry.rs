@@ -732,6 +732,21 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-engine exit-demotion-residue: the two-phase exit→client
+    // demotion capture folded into a first-class OrchestrationStage —
+    // proves NAT torn down + forwarding restored with daemon still
+    // running. state_machine_only — only the Rust `--node` plan
+    // dispatches it; the bash orchestrate path validates the residue
+    // via its own artifact-evaluator stage.
+    StageSpec {
+        name: "exit_demotion_residue_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("exit_demotion_residue_check"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,
