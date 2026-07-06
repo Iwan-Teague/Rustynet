@@ -55,6 +55,7 @@ static LIVE_LAB_COMMON: &str = include_str!("../../../../../../scripts/e2e/live_
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(300);
+const SUDO_N: &str = "sudo -n";
 
 /// Bootstrap the daemon on a macOS host. Transfers the source archive and
 /// bootstrap script, runs the bootstrap, waits for the daemon socket.
@@ -124,7 +125,7 @@ pub fn install_daemon(
     ssh::run_remote(
         conn,
         "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
-         sudo bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env",
+         sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env",
         BUILD_TIMEOUT,
     )?;
 
@@ -256,7 +257,7 @@ pub fn install_daemon_from_workdir(
         ssh::scp_to(conn, source.path(), "/tmp/rn_source.tar.gz", BUILD_TIMEOUT)?;
         "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
              echo 'SOURCE_ARCHIVE=/tmp/rn_source.tar.gz' >> /tmp/rn_macos_bootstrap.env && \
-             sudo bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
+             sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
             .to_owned()
     } else if workdir_present {
         // No fresh archive carried, but a workdir exists (e.g. an operator
@@ -265,7 +266,7 @@ pub fn install_daemon_from_workdir(
             "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
              cd '{workdir}' && tar -czf /tmp/rn_source.tar.gz . && \
              echo 'SOURCE_ARCHIVE=/tmp/rn_source.tar.gz' >> /tmp/rn_macos_bootstrap.env && \
-             sudo bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
+             sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
         )
     } else {
         // No workdir AND no source — last-resort legacy path: rely on
@@ -274,7 +275,7 @@ pub fn install_daemon_from_workdir(
         "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
              echo 'SKIP_BUILD=1' >> /tmp/rn_macos_bootstrap.env && \
              echo 'SOURCE_ARCHIVE=/dev/null' >> /tmp/rn_macos_bootstrap.env && \
-             sudo bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
+             sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
             .to_owned()
     };
     ssh::run_remote(conn, &build_cmd, BUILD_TIMEOUT)?;
@@ -317,7 +318,7 @@ fn wait_for_macos_daemon_socket(conn: &NodeConnection) -> Result<(), AdapterErro
     // ≈ 80 s budget, comfortably longer than observed daemon startup.
     let probe = format!(
         "for i in $(seq 1 8); do \
-            if sudo test -S {socket}; then echo socket-ready; exit 0; fi; \
+            if {SUDO_N} test -S {socket}; then echo socket-ready; exit 0; fi; \
             sleep 1; \
          done; \
          echo socket-missing; exit 1"
@@ -349,8 +350,8 @@ pub fn start_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     ssh::run_remote(
         conn,
         &format!(
-            "sudo launchctl bootstrap system '{plist}' 2>/dev/null || \
-             sudo launchctl kickstart system/com.rustynet.daemon 2>/dev/null || true"
+            "sudo -n launchctl bootstrap system '{plist}' 2>/dev/null || \
+             sudo -n launchctl kickstart system/com.rustynet.daemon"
         ),
         Duration::from_secs(30),
     )?;
@@ -417,7 +418,7 @@ pub fn prime_remote_access(conn: &NodeConnection) -> Result<(), AdapterError> {
 pub fn stop_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     ssh::run_remote(
         conn,
-        "sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true",
+        "sudo -n launchctl bootout system/com.rustynet.daemon 2>/dev/null || true",
         Duration::from_secs(30),
     )?;
     Ok(())
@@ -513,7 +514,7 @@ pub fn enforce_daemon(
     // duration of any reasonable lab run without requiring a separate refresh.
     let script = format!(
         "chmod 700 /tmp/Install-RustyNetMacosService.sh && \
-         sudo /tmp/Install-RustyNetMacosService.sh \
+         sudo -n /tmp/Install-RustyNetMacosService.sh \
            --rustynetd-bin {MACOS_RUSTYNETD_PATH} \
            --state-root {MACOS_STATE_ROOT} \
            --node-id '{node_id_arg}' \
@@ -546,9 +547,9 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     ssh::run_remote(
         conn,
         &format!(
-            "sudo rm -f {MACOS_RUSTYNETD_PATH} {MACOS_RUSTYNET_PATH} \
+            "sudo -n rm -f {MACOS_RUSTYNETD_PATH} {MACOS_RUSTYNET_PATH} \
              /Library/LaunchDaemons/com.rustynet.daemon.plist && \
-             sudo rm -rf {MACOS_STATE_ROOT} /usr/local/etc/rustynet /private/var/run/rustynet",
+             sudo -n rm -rf {MACOS_STATE_ROOT} /usr/local/etc/rustynet /private/var/run/rustynet",
         ),
         timeout,
     )?;
@@ -658,8 +659,11 @@ pub fn deploy_relay_service(
     //    with sudo. The path is a compile-time constant; nothing untrusted is
     //    interpolated.
     let assignment_pub = format!("{MACOS_STATE_ROOT}/trust/assignment.pub");
-    let assignment_hex =
-        ssh::run_remote(conn, &format!("sudo cat '{assignment_pub}'"), short_timeout)?;
+    let assignment_hex = ssh::run_remote(
+        conn,
+        &format!("sudo -n cat '{assignment_pub}'"),
+        short_timeout,
+    )?;
 
     // 2. Decode hex -> raw 32 bytes (fail-closed); the relay --verifier-key
     //    loader requires exactly 32 raw bytes.
@@ -683,7 +687,7 @@ pub fn deploy_relay_service(
     ssh::run_remote(
         conn,
         &format!(
-            "sudo sh -c 'mkdir -p {MACOS_STATE_ROOT} && \
+            "sudo -n sh -c 'mkdir -p {MACOS_STATE_ROOT} && \
              install -m 0644 /tmp/rn-relay-verifier.pub {MACOS_STATE_ROOT}/relay-verifier.pub && \
              rm -f /tmp/rn-relay-verifier.pub'"
         ),
@@ -713,7 +717,7 @@ pub fn deploy_relay_service(
     };
     let src_dir_esc = src_dir.replace('\'', "'\\''");
     let install_cmd = format!(
-        "sudo env RN_SRC='{src_dir_esc}' sh -c 'cd \"$RN_SRC\" && {MACOS_RUSTYNET_PATH} ops install-macos-relay'"
+        "sudo -n env RN_SRC='{src_dir_esc}' sh -c 'cd \"$RN_SRC\" && {MACOS_RUSTYNET_PATH} ops install-macos-relay'"
     );
     ssh::run_remote(conn, &install_cmd, Duration::from_secs(120))?;
     Ok(())
@@ -1752,7 +1756,7 @@ mod tests {
         let expected_iface = utun_name_for_node_id(node_id);
         // Reconstruct the relevant portion of the enforce_daemon command.
         let script = format!(
-            "sudo /tmp/Install-RustyNetMacosService.sh \
+            "sudo -n /tmp/Install-RustyNetMacosService.sh \
                --node-id '{node_id}' \
                --wg-interface '{expected_iface}'"
         );

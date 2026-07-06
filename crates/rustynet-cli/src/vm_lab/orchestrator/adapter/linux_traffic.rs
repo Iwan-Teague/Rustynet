@@ -222,17 +222,22 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
 
 /// Positive connectivity: ping `peer_mesh_ip` 3 times via the tunnel.
 /// Returns `TrafficTestResult::Reachable` on success.
+/// On failure, captures the full ping stdout/stderr so the stage log
+/// carries diagnostic detail (timeout vs unreachable vs packet loss)
+/// instead of a bare "ping to X failed".
 pub fn ping_mesh_peer(
     conn: &NodeConnection,
     peer_mesh_ip: &str,
 ) -> Result<TrafficTestResult, AdapterError> {
     validate_ip_arg(peer_mesh_ip)?;
-    let script = format!("ping -c 3 -W 5 {peer_mesh_ip} >/dev/null 2>&1");
-    match ssh::run_remote_check(conn, &script, Duration::from_secs(30))? {
-        true => Ok(TrafficTestResult::Reachable),
-        false => Ok(TrafficTestResult::Error(format!(
-            "ping to {peer_mesh_ip} failed"
+    let script = format!("ping -c 3 -W 5 {peer_mesh_ip} 2>&1");
+    match ssh::run_remote(conn, &script, Duration::from_secs(30)) {
+        Ok(_stdout) => Ok(TrafficTestResult::Reachable),
+        Err(AdapterError::Command { stderr, .. }) => Ok(TrafficTestResult::Error(format!(
+            "ping to {peer_mesh_ip} failed: {}",
+            stderr.trim()
         ))),
+        Err(other) => Err(other),
     }
 }
 
