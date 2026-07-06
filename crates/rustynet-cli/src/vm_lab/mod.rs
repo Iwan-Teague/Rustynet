@@ -3227,6 +3227,7 @@ pub fn execute_ops_vm_lab_diagnose(config: VmLabDiagnoseConfig) -> Result<String
         entry.ssh_user.clone(),
         config.ssh_identity_file.clone(),
         config.known_hosts_path.clone(),
+        entry.ssh_password.clone(),
     )
     .map_err(|err| {
         format!(
@@ -7703,6 +7704,7 @@ fn execute_rust_native_orchestration(
             entry.ssh_user.clone(),
             config.ssh_identity_file.clone(),
             known_hosts.clone(),
+            entry.ssh_password.clone(),
         )
         .map_err(|err| {
             format!(
@@ -22105,7 +22107,7 @@ fn evaluate_linux_service_hardening_report(
     ))
 }
 
-fn evaluate_linux_dns_failclosed_report(
+pub(crate) fn evaluate_linux_dns_failclosed_report(
     linux_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -35964,8 +35966,8 @@ mod tests {
         // the CLI builder and the plan builder stay in sync; this guards the
         // absolute size). 24 = the 18 baseline + cross-OS relay_validation +
         // anchor_validation + admin_issue + blind_exit + deploy_relay_service +
-        // security_audit_validation.
-        assert_eq!(cli_ids.len(), 24);
+        // security_audit_validation + dns_failclosed_validation.
+        assert_eq!(cli_ids.len(), 25);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)
