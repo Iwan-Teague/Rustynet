@@ -8,6 +8,7 @@ use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot, NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
+use rustynet_control::membership::MEMBERSHIP_SCHEMA_VERSION;
 use rustynet_control::roles::role_capability_csv;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -142,8 +143,10 @@ pub fn distribute_signed_bundle(
         ("0640", "root")
     };
     let log_init = if matches!(kind, BundleKind::Membership) {
+        let log_header = membership_log_header();
         format!(
-            " && sudo -n touch '{LINUX_MEMBERSHIP_LOG_PATH}' && \
+            " && (sudo -n test -s '{LINUX_MEMBERSHIP_LOG_PATH}' || \
+             printf '%s\n' '{log_header}' | sudo -n tee '{LINUX_MEMBERSHIP_LOG_PATH}' >/dev/null) && \
              sudo -n chown rustynetd:rustynetd '{LINUX_MEMBERSHIP_LOG_PATH}' && \
              sudo -n chmod 0600 '{LINUX_MEMBERSHIP_LOG_PATH}'"
         )
@@ -217,6 +220,10 @@ fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
             "/var/lib/rustynet/rustynetd.dns-zone".to_owned(),
         ),
     }
+}
+
+fn membership_log_header() -> String {
+    format!("version={MEMBERSHIP_SCHEMA_VERSION}")
 }
 
 /// Reject shell-dangerous characters to prevent injection via alias strings.
@@ -330,5 +337,10 @@ mod tests {
         let (tmp, dst) = remote_bundle_paths(&BundleKind::Assignment);
         assert!(tmp.contains("assignment"));
         assert!(dst.contains("rustynetd.assignment"));
+    }
+
+    #[test]
+    fn membership_log_header_matches_control_schema() {
+        assert_eq!(membership_log_header(), "version=1");
     }
 }

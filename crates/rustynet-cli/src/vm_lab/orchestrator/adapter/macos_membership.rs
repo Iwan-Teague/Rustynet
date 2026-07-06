@@ -12,6 +12,7 @@ use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot, NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
+use rustynet_control::membership::MEMBERSHIP_SCHEMA_VERSION;
 use rustynet_control::roles::role_capability_csv;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -136,10 +137,12 @@ pub fn distribute_signed_bundle(
         ("0640", "root")
     };
     let log_init = if matches!(kind, BundleKind::Membership) {
+        let log_header = membership_log_header();
         format!(
-            " && sudo touch '{MACOS_MEMBERSHIP_LOG_PATH}' && \
-             sudo chown rustynetd:rustynetd '{MACOS_MEMBERSHIP_LOG_PATH}' && \
-             sudo chmod 0600 '{MACOS_MEMBERSHIP_LOG_PATH}'"
+            " && (sudo -n test -s '{MACOS_MEMBERSHIP_LOG_PATH}' || \
+             printf '%s\n' '{log_header}' | sudo -n tee '{MACOS_MEMBERSHIP_LOG_PATH}' >/dev/null) && \
+             sudo -n chown rustynetd:rustynetd '{MACOS_MEMBERSHIP_LOG_PATH}' && \
+             sudo -n chmod 0600 '{MACOS_MEMBERSHIP_LOG_PATH}'"
         )
     } else {
         String::new()
@@ -147,9 +150,9 @@ pub fn distribute_signed_bundle(
     ssh::run_remote(
         conn,
         &format!(
-            "sudo install -d -m 0700 -o rustynetd -g rustynetd '{install_dir}' && \
-             sudo install -m {mode} -o {owner} -g rustynetd '{remote_tmp}' '{install_dst}' && \
-             sudo rm -f '{remote_tmp}'{log_init}"
+            "sudo -n install -d -m 0700 -o rustynetd -g rustynetd '{install_dir}' && \
+             sudo -n install -m {mode} -o {owner} -g rustynetd '{remote_tmp}' '{install_dst}' && \
+             sudo -n rm -f '{remote_tmp}'{log_init}"
         ),
         SHORT_TIMEOUT,
     )?;
@@ -222,6 +225,10 @@ fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
             format!("{state}/trust/rustynetd.dns-zone"),
         ),
     }
+}
+
+fn membership_log_header() -> String {
+    format!("version={MEMBERSHIP_SCHEMA_VERSION}")
 }
 
 /// Reject shell-dangerous characters to prevent injection via alias strings.
@@ -334,6 +341,11 @@ mod tests {
             MACOS_MEMBERSHIP_SNAPSHOT_PATH.starts_with(MACOS_MEMBERSHIP_DIR),
             "snapshot path must be under membership dir: {MACOS_MEMBERSHIP_SNAPSHOT_PATH}"
         );
+    }
+
+    #[test]
+    fn membership_log_header_matches_control_schema() {
+        assert_eq!(membership_log_header(), "version=1");
     }
 
     #[test]
