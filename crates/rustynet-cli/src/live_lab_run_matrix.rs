@@ -3031,6 +3031,7 @@ mod registry_equivalence_tests {
             "live_key_custody" => Some("key_custody"),
             "live_enrollment_restart" => Some("enrollment_restart"),
             "live_network_flap" => Some("network_flap"),
+            "live_network_flap_validation" => Some("network_flap"),
             "extended_soak" => Some("extended_soak"),
             "dns_failclosed_validation" => Some("dns_failclosed_check"),
             "runtime_acls_validation" => Some("runtime_acls_check"),
@@ -3085,6 +3086,7 @@ mod registry_equivalence_tests {
                 | "blind_exit_dataplane_validation"
                 | "live_two_hop_validation"
                 | "live_managed_dns_validation"
+                | "live_network_flap_validation"
                 | "deploy_relay_service"
                 | "relay_validation"
                 | "traffic_test_matrix"
