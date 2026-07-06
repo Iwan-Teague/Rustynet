@@ -98,16 +98,26 @@ const MACOS_RESET_COMMAND: &str = "rn_anchors=$(sudo -n pfctl -s Anchors 2>/dev/
 /// the macOS analogue of `linux_traffic::LINUX_NODE_CLEAN_PROBE`. Emits exactly
 /// three space-separated tokens on a single line that
 /// [`parse_macos_node_clean_probe`] interprets:
-///   `pf=<names|->`    leftover RustyNet pf anchor names, or `-` if none
+///   `pf=<names|->`    active leftover RustyNet pf anchor names, or `-` if none
 ///   `daemon=<up|down>` whether a `rustynetd` process is still running
 ///   `iface=<names|->`  leftover mesh `utun` interface names (a `utun` carrying a
 ///                      `100.64.0.0/10` mesh address), or `-` if none
 ///
 /// A node is clean only when all three are benign (`pf=-`, `daemon=down`,
-/// `iface=-`). Each sub-probe tolerates the relevant tool being absent and is
-/// read-only (mutates nothing), so it is safe to run repeatedly.
-const MACOS_NODE_CLEAN_PROBE: &str = "rn_pf=$(sudo -n pfctl -s Anchors 2>/dev/null \
-         | sed 's/^[[:space:]]*//' | grep -i rustynet | tr '\\n' ',' || true); \
+/// `iface=-`). `pfctl -s Anchors` can retain an empty parent anchor name after
+/// rules/state are flushed, so the pf dimension reports only anchors that still
+/// carry rules, NAT rules, or state. Each sub-probe tolerates the relevant tool
+/// being absent and is read-only (mutates nothing), so it is safe to run
+/// repeatedly.
+const MACOS_NODE_CLEAN_PROBE: &str = "rn_pf=''; \
+     for a in $(sudo -n pfctl -s Anchors 2>/dev/null \
+         | sed 's/^[[:space:]]*//' | grep -i rustynet || true); do \
+         if sudo -n pfctl -a \"$a\" -sr 2>/dev/null | grep -q . \
+             || sudo -n pfctl -a \"$a\" -sn 2>/dev/null | grep -q . \
+             || sudo -n pfctl -a \"$a\" -ss 2>/dev/null | grep -q .; then \
+             rn_pf=\"${rn_pf}${a},\"; \
+         fi; \
+     done; \
      rn_daemon=$(pgrep -x rustynetd >/dev/null 2>&1 && echo up || echo down); \
      rn_iface=$(for dev in $(ifconfig -l 2>/dev/null | tr ' ' '\\n' | grep '^utun'); do \
              if ifconfig \"$dev\" 2>/dev/null \
