@@ -2096,13 +2096,14 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 30 | `live_managed_dns_validation` | Live managed-DNS issuance/refresh/fail-closed proof (signer=exit, client=client, managed peers=others) delegates to the proven cross-OS `live_linux_managed_dns_test` binary | `stage/live_managed_dns_validation.rs` |
 | 31 | `live_network_flap_validation` | Live WG tunnel recovery after network flap (exit + client: baseline handshake, induce disruption, prove recovery with membership + gossip intact) delegates to the proven cross-OS `live_linux_network_flap_test` binary | `stage/live_network_flap_validation.rs` |
 | 32 | `live_reboot_recovery_validation` | Live reboot recovery on 2-node mesh (exit + client: reboot individually, verify boot-id changed, rustynetd recovered, WireGuard re-established, gossip epoch advanced) delegates to the proven `live_linux_reboot_recovery_test` binary | `stage/live_reboot_recovery_validation.rs` |
-| 33 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
-| 34 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
-| 35 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
-| 36 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
-| 37 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
-| 38 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
-| 39 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 33 | `live_secrets_not_in_logs_validation` | Live secrets-not-in-logs audit (client-only: scan daemon journal + state dir for plaintext keys/key material) delegates to the proven `live_linux_secrets_not_in_logs_test` binary | `stage/live_secrets_not_in_logs_validation.rs` |
+| 34 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
+| 35 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
+| 36 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
+| 37 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
+| 38 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
+| 39 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
+| 40 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2191,6 +2192,7 @@ mod tests {
             "live_managed_dns_validation",
             "live_network_flap_validation",
             "live_reboot_recovery_validation",
+            "live_secrets_not_in_logs_validation",
             "deploy_relay_service",
             "relay_validation",
             "traffic_test_matrix",
