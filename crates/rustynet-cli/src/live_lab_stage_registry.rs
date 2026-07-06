@@ -655,6 +655,19 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-engine service-hardening: the canonical Linux daemon self-check
+    // folded into a first-class OrchestrationStage. state_machine_only — only
+    // the Rust `--node` plan dispatches it; the bash orchestrate path runs
+    // the check via its own per-check validators.
+    StageSpec {
+        name: "service_hardening_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("service_hardening_check"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,
