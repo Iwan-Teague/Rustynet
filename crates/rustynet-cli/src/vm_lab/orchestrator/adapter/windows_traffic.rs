@@ -58,22 +58,30 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
 /// Ping `peer_mesh_ip` 3 times via `Test-Connection`. Returns `Reachable` on success.
 ///
 /// Uses explicit `exit 0`/`exit 1` because `Test-Connection -Quiet` always
-/// exits with code 0 regardless of result; the shell exit code is what
-/// `run_remote_ps_check` inspects.
+/// exits with code 0 regardless of result. On failure the error output is
+/// captured so the stage log carries diagnostic detail (exception message
+/// vs no-response) instead of a bare "Test-Connection to X returned false".
 pub fn ping_mesh_peer(
     conn: &NodeConnection,
     peer_mesh_ip: &str,
 ) -> Result<TrafficTestResult, AdapterError> {
     validate_ip_arg(peer_mesh_ip)?;
+    let ip_q = ps_quote(peer_mesh_ip)?;
     let script = format!(
-        "if (Test-Connection -ComputerName {ip_q} -Count 3 -Quiet -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}",
-        ip_q = ps_quote(peer_mesh_ip)?
+        "try {{ \
+          if (Test-Connection -ComputerName {ip_q} -Count 3 -Quiet -ErrorAction Stop) {{ exit 0 }} \
+          else {{ Write-Output 'no response (Quiet=false)'; exit 1 }} \
+         }} catch {{ \
+          Write-Output \"$($_.Exception.GetType().Name): $($_.Exception.Message)\"; exit 1 \
+         }}"
     );
-    match run_remote_ps_check(conn, &script, Duration::from_secs(30))? {
-        true => Ok(TrafficTestResult::Reachable),
-        false => Ok(TrafficTestResult::Error(format!(
-            "Test-Connection to {peer_mesh_ip} returned false"
+    match run_remote_ps(conn, &script, Duration::from_secs(30)) {
+        Ok(_stdout) => Ok(TrafficTestResult::Reachable),
+        Err(AdapterError::Command { stderr, .. }) => Ok(TrafficTestResult::Error(format!(
+            "Test-Connection to {peer_mesh_ip} failed: {}",
+            stderr.trim()
         ))),
+        Err(other) => Err(other),
     }
 }
 

@@ -280,23 +280,21 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
 }
 
 /// Ping `peer_mesh_ip` 3 times. Returns `Reachable` on success.
+/// On failure, captures the full ping stdout/stderr so the stage log
+/// carries diagnostic detail instead of a bare "ping to X failed".
 pub fn ping_mesh_peer(
     conn: &NodeConnection,
     peer_mesh_ip: &str,
 ) -> Result<TrafficTestResult, AdapterError> {
     validate_ip_arg(peer_mesh_ip)?;
-    // macOS `ping` uses -c (count) and -W (wait ms) like Linux.
-    let output = ssh::run_remote(
-        conn,
-        &format!("ping -c 3 -W 1000 '{peer_mesh_ip}' >/dev/null 2>&1 && echo ok || echo fail"),
-        Duration::from_secs(30),
-    )?;
-    if output.trim() == "ok" {
-        Ok(TrafficTestResult::Reachable)
-    } else {
-        Ok(TrafficTestResult::Error(format!(
-            "ping to {peer_mesh_ip} failed"
-        )))
+    let script = format!("ping -c 3 -W 1000 '{peer_mesh_ip}' 2>&1");
+    match ssh::run_remote(conn, &script, Duration::from_secs(30)) {
+        Ok(_stdout) => Ok(TrafficTestResult::Reachable),
+        Err(AdapterError::Command { stderr, .. }) => Ok(TrafficTestResult::Error(format!(
+            "ping to {peer_mesh_ip} failed: {}",
+            stderr.trim()
+        ))),
+        Err(other) => Err(other),
     }
 }
 
