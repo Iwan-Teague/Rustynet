@@ -36,10 +36,10 @@ fn detect_linux_egress_interface(shell: &dyn RemoteShellHost) -> Result<String, 
     let stdout = String::from_utf8_lossy(&out.stdout);
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if let Some(pos) = parts.iter().position(|p| *p == "dev") {
-            if let Some(iface) = parts.get(pos + 1) {
-                return Ok(iface.to_string());
-            }
+        if let Some(pos) = parts.iter().position(|p| *p == "dev")
+            && let Some(iface) = parts.get(pos + 1)
+        {
+            return Ok(iface.to_string());
         }
     }
     Err("default egress interface not found in `ip route show default` output".to_owned())
