@@ -2085,13 +2085,14 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 19 | `runtime_acls_validation` | Per-node runtime-ACLs daemon self-check (canonical root set, per-path consistency) | `stage/runtime_acls_validation.rs` |
 | 20 | `service_hardening_validation` | Per-node service-hardening daemon self-check (systemd unit hardening directives match shipped baseline) | `stage/service_hardening_validation.rs` |
 | 21 | `key_custody_validation` | Per-node key-custody daemon self-check (on-disk key material matches reviewed custody contract) | `stage/key_custody_validation.rs` |
-| 22 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
-| 23 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
-| 24 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
-| 25 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
-| 26 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
-| 27 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
-| 28 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 22 | `mesh_status_validation` | Per-node mesh-status daemon self-check (daemon's mesh-status view reports no drift) | `stage/mesh_status_validation.rs` |
+| 23 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
+| 24 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
+| 25 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
+| 26 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
+| 27 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
+| 28 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
+| 29 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2169,6 +2170,7 @@ mod tests {
             "runtime_acls_validation",
             "service_hardening_validation",
             "key_custody_validation",
+            "mesh_status_validation",
             "deploy_relay_service",
             "relay_validation",
             "traffic_test_matrix",

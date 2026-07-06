@@ -21,6 +21,7 @@ pub mod final_cleanup;
 pub mod install;
 pub mod key_custody_validation;
 pub mod membership_init;
+pub mod mesh_status_validation;
 pub mod preflight;
 pub mod relay_validation;
 pub mod role_switch_matrix;
@@ -57,6 +58,7 @@ pub enum StageId {
     RuntimeAclsValidation,
     ServiceHardeningValidation,
     KeyCustodyValidation,
+    MeshStatusValidation,
     DeployRelayService,
     RelayValidation,
     TrafficTestMatrix,
@@ -69,7 +71,7 @@ pub enum StageId {
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 28] = [
+    pub const ALL: [StageId; 29] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -91,6 +93,7 @@ impl StageId {
         StageId::RuntimeAclsValidation,
         StageId::ServiceHardeningValidation,
         StageId::KeyCustodyValidation,
+        StageId::MeshStatusValidation,
         StageId::DeployRelayService,
         StageId::RelayValidation,
         StageId::TrafficTestMatrix,
@@ -123,6 +126,7 @@ impl StageId {
             StageId::RuntimeAclsValidation => "runtime_acls_validation",
             StageId::ServiceHardeningValidation => "service_hardening_validation",
             StageId::KeyCustodyValidation => "key_custody_validation",
+            StageId::MeshStatusValidation => "mesh_status_validation",
             StageId::DeployRelayService => "deploy_relay_service",
             StageId::RelayValidation => "relay_validation",
             StageId::TrafficTestMatrix => "traffic_test_matrix",
