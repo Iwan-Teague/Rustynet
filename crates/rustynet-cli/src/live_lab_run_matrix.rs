@@ -3047,6 +3047,7 @@ mod registry_equivalence_tests {
             "live_two_hop_validation" => Some("two_hop"),
             "live_managed_dns_validation" => Some("managed_dns"),
             "live_reboot_recovery_validation" => Some("reboot_recovery"),
+            "live_secrets_not_in_logs_validation" => Some("secrets_not_in_logs"),
             "cleanup" => Some("cleanup"),
             stage if stage.starts_with("chaos_") => Some("chaos"),
             stage if stage.contains("reboot") => Some("reboot_recovery"),
@@ -3089,6 +3090,7 @@ mod registry_equivalence_tests {
                 | "live_managed_dns_validation"
                 | "live_network_flap_validation"
                 | "live_reboot_recovery_validation"
+                | "live_secrets_not_in_logs_validation"
                 | "deploy_relay_service"
                 | "relay_validation"
                 | "traffic_test_matrix"
