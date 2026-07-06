@@ -106,15 +106,16 @@ const MACOS_RESET_COMMAND: &str = "rn_anchors=$(sudo -n pfctl -s Anchors 2>/dev/
 /// A node is clean only when all three are benign (`pf=-`, `daemon=down`,
 /// `iface=-`). `pfctl -s Anchors` can retain an empty parent anchor name after
 /// rules/state are flushed, so the pf dimension reports only anchors that still
-/// carry rules, NAT rules, or state. Each sub-probe tolerates the relevant tool
-/// being absent and is read-only (mutates nothing), so it is safe to run
-/// repeatedly.
+/// carry rules or NAT rules. Do not use `pfctl -a <anchor> -ss` here: on macOS
+/// an empty parent anchor can still print unrelated global connection state,
+/// including the SSH session running the probe, which would make clean nodes
+/// fail dirty. Each sub-probe tolerates the relevant tool being absent and is
+/// read-only (mutates nothing), so it is safe to run repeatedly.
 const MACOS_NODE_CLEAN_PROBE: &str = "rn_pf=''; \
      for a in $(sudo -n pfctl -s Anchors 2>/dev/null \
          | sed 's/^[[:space:]]*//' | grep -i rustynet || true); do \
          if sudo -n pfctl -a \"$a\" -sr 2>/dev/null | grep -q . \
-             || sudo -n pfctl -a \"$a\" -sn 2>/dev/null | grep -q . \
-             || sudo -n pfctl -a \"$a\" -ss 2>/dev/null | grep -q .; then \
+             || sudo -n pfctl -a \"$a\" -sn 2>/dev/null | grep -q .; then \
              rn_pf=\"${rn_pf}${a},\"; \
          fi; \
      done; \
@@ -718,6 +719,10 @@ mod tests {
         // pf dimension: leftover RustyNet anchors enumerated from pfctl -s Anchors.
         assert!(p.contains("pfctl -s Anchors"));
         assert!(p.contains("grep -i rustynet"));
+        assert!(
+            !p.contains("-ss"),
+            "state listing on an empty parent anchor can include unrelated global state"
+        );
         // daemon dimension: a still-running rustynetd (same process name as Linux).
         assert!(p.contains("pgrep -x rustynetd"));
         // interface dimension: a utun carrying a 100.64.0.0/10 mesh address.
