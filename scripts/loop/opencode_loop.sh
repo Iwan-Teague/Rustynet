@@ -113,7 +113,7 @@ import json, sys
 area = sys.argv[1]
 bool_keys = {
     "macos", "windows", "macos_promote_exit", "allow_concurrent", "dry_run",
-    "skip_linux_live_suite", "windows_only", "legacy_bash", "triage_on_failure",
+    "skip_linux_live_suite", "windows_only", "legacy_bash", "rust_engine", "triage_on_failure",
 }
 str_keys = {
     "exit_vm", "client_vm", "entry_vm", "macos_vm", "windows_vm",
@@ -740,11 +740,16 @@ main() {
 
     local area_lower has_skip="" has_triage=""
     area_lower=$(printf '%s' "$area" | tr '[:upper:]' '[:lower:]')
-    local normalized=() saw_macos_exit_platform="" has_macos_promote="" has_macos_flag="" has_legacy=""
+    local normalized=() saw_macos_exit_platform="" has_macos_promote="" has_macos_flag="" has_legacy="" has_rust_engine=""
+    for p in "${params[@]}"; do
+        case "$p" in
+            rust_engine=true|rust_engine=1|rust_engine=yes|rust_engine=on) has_rust_engine=1 ;;
+        esac
+    done
     for p in "${params[@]}"; do
         case "$p" in
             exit_platform=macos)
-                if printf '%s' "$area_lower" | grep -q 'macos' && printf '%s' "$area_lower" | grep -q 'exit'; then
+                if [ -z "$has_rust_engine" ] && printf '%s' "$area_lower" | grep -q 'macos' && printf '%s' "$area_lower" | grep -q 'exit'; then
                     saw_macos_exit_platform=1
                     continue
                 fi
@@ -760,7 +765,7 @@ main() {
         log "normalized macOS exit selector: exit_platform=macos -> macos_promote_exit=true (keeps Linux exit backbone)"
         [ -n "$has_macos_promote" ] || params+=("macos_promote_exit=true")
         [ -n "$has_macos_flag" ] || params+=("macos=true")
-        [ -n "$has_legacy" ] || params+=("legacy_bash=true")
+        [ -n "$has_legacy" ] || [ -n "$has_rust_engine" ] || params+=("legacy_bash=true")
     fi
     for p in "${params[@]}"; do [ "${p%%=*}" = "skip_linux_live_suite" ] && has_skip=1; done
     for p in "${params[@]}"; do [ "${p%%=*}" = "triage_on_failure" ] && has_triage=1; done

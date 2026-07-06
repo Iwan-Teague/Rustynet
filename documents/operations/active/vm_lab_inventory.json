@@ -9,9 +9,10 @@
       },
       "exit_capable": true,
       "lab_role": "exit",
-      "last_known_ip": "192.168.0.200",
-      "last_known_network": "lan-192.168.0.0/24",
+      "last_known_ip": "192.168.64.200",
+      "last_known_network": "utm-shared-192.168.64.0/24",
       "live_ips": [
+        "192.168.64.200",
         "192.168.0.200",
         "192.168.64.8",
         "192.168.64.3",
@@ -20,14 +21,14 @@
         "fe80::6023:d956:36c2:c94e"
       ],
       "mesh_ip": "100.64.0.1",
-      "network_group": "lan-192.168.0.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
       "node_id": "exit-1",
       "os": "Debian/Linux",
       "parent_device": "iwan's MacBook Pro",
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "192.168.0.200",
+      "ssh_target": "192.168.64.200",
       "ssh_user": "debian"
     },
     {
@@ -39,9 +40,10 @@
       },
       "exit_capable": false,
       "lab_role": "client",
-      "last_known_ip": "192.168.0.201",
-      "last_known_network": "lan-192.168.0.0/24",
+      "last_known_ip": "192.168.64.201",
+      "last_known_network": "utm-shared-192.168.64.0/24",
       "live_ips": [
+        "192.168.64.201",
         "192.168.0.201",
         "192.168.65.4",
         "192.168.64.4",
@@ -49,14 +51,14 @@
         "fe80::a419:949:1c4a:4d9f"
       ],
       "mesh_ip": "100.64.0.2",
-      "network_group": "lan-192.168.0.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
       "node_id": "client-1",
       "os": "Debian/Linux",
       "parent_device": "iwan's MacBook Pro",
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "192.168.0.201",
+      "ssh_target": "192.168.64.201",
       "ssh_user": "debian"
     },
     {
@@ -68,9 +70,10 @@
       },
       "exit_capable": false,
       "lab_role": "relay",
-      "last_known_ip": "192.168.0.202",
-      "last_known_network": "lan-192.168.0.0/24",
+      "last_known_ip": "192.168.64.202",
+      "last_known_network": "utm-shared-192.168.64.0/24",
       "live_ips": [
+        "192.168.64.202",
         "192.168.0.202",
         "192.168.65.6",
         "192.168.64.9",
@@ -79,14 +82,14 @@
         "fe80::bec8:79f7:a83d:ddc"
       ],
       "mesh_ip": "100.64.0.3",
-      "network_group": "lan-192.168.0.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
       "node_id": "relay-1",
       "os": "Debian/Linux",
       "parent_device": "iwan's MacBook Pro",
       "relay_capable": true,
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "192.168.0.202",
+      "ssh_target": "192.168.64.202",
       "ssh_user": "debian"
     },
     {

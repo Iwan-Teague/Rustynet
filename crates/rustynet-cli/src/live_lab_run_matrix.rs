@@ -80,6 +80,7 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_stage_mixed_topology",
     "linux_stage_reboot_recovery",
     "linux_stage_extended_soak",
+    "linux_stage_cross_network",
     "linux_stage_chaos",
     "linux_stage_cleanup",
     "macos_stage_bootstrap",
@@ -100,6 +101,7 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "macos_stage_mixed_topology",
     "macos_stage_reboot_recovery",
     "macos_stage_extended_soak",
+    "macos_stage_cross_network",
     "macos_stage_chaos",
     "macos_stage_cleanup",
     "windows_stage_bootstrap",
@@ -120,6 +122,7 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "windows_stage_mixed_topology",
     "windows_stage_reboot_recovery",
     "windows_stage_extended_soak",
+    "windows_stage_cross_network",
     "windows_stage_chaos",
     "windows_stage_cleanup",
     "linux_stage_dns_failclosed_check",
@@ -3053,6 +3056,7 @@ mod registry_equivalence_tests {
             "live_lan_toggle_validation" => Some("lan_toggle"),
             "live_mixed_topology_validation" => Some("mixed_topology"),
             "cleanup" => Some("cleanup"),
+            stage if stage.starts_with("cross_network_") => Some("cross_network"),
             stage if stage.starts_with("chaos_") => Some("chaos"),
             stage if stage.contains("reboot") => Some("reboot_recovery"),
             _ => None,
@@ -3060,6 +3064,9 @@ mod registry_equivalence_tests {
     }
 
     fn oracle_is_rust_native(stage: &str) -> bool {
+        if stage.starts_with("chaos_") || stage.starts_with("cross_network_") {
+            return true;
+        }
         matches!(
             stage,
             "preflight"
@@ -3090,6 +3097,7 @@ mod registry_equivalence_tests {
                 | "exit_dns_failclosed_validation"
                 | "exit_nat_lifecycle_validation"
                 | "blind_exit_dataplane_validation"
+                | "live_anchor"
                 | "live_two_hop_validation"
                 | "live_managed_dns_validation"
                 | "live_network_flap_validation"
@@ -3099,6 +3107,7 @@ mod registry_equivalence_tests {
                 | "live_enrollment_restart_validation"
                 | "live_lan_toggle_validation"
                 | "live_mixed_topology_validation"
+                | "extended_soak"
                 | "deploy_relay_service"
                 | "relay_validation"
                 | "traffic_test_matrix"

@@ -265,3 +265,43 @@ timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
 2026-07-06T10:03:57Z,8d87345,dirty,check,-p rustynet-cli -p rustynet-mcp,2,fail
 2026-07-06T10:06:07Z,8d87345,dirty,fmt,-p rustynet-cli -p rustynet-mcp,1,fail
 2026-07-06T10:06:18Z,8d87345,dirty,fmt,-p rustynet-cli -p rustynet-mcp,1,pass
+2026-07-06T10:06:22Z,8d87345,dirty,check,-p rustynet-cli -p rustynet-mcp,4,pass
+2026-07-06T10:06:28Z,8d87345,dirty,clippy,-p rustynet-cli -p rustynet-mcp,6,fail
+2026-07-06T10:06:40Z,6908f20,dirty,fmt,-p rustynet-cli -p rustynet-mcp,1,pass
+2026-07-06T10:06:42Z,6908f20,dirty,check,-p rustynet-cli -p rustynet-mcp,2,pass
+2026-07-06T10:06:48Z,6908f20,dirty,clippy,-p rustynet-cli -p rustynet-mcp,6,pass
+2026-07-06T10:09:12Z,6908f20,dirty,test,-p rustynet-cli -p rustynet-mcp,143,fail
+2026-07-06T10:57:26Z,a1f4347,dirty,fmt,-p rustynet-cli,1,pass
+2026-07-06T10:57:30Z,a1f4347,dirty,check,-p rustynet-cli,3,fail
+2026-07-06T10:58:25Z,a1f4347,dirty,fmt,-p rustynet-cli,2,pass
+2026-07-06T10:58:27Z,a1f4347,dirty,check,-p rustynet-cli,2,pass
+2026-07-06T10:58:34Z,a1f4347,dirty,clippy,-p rustynet-cli,6,pass
+2026-07-06T11:09:52Z,a7a02cf,dirty,fmt,-p rustynet-cli,2,fail
+2026-07-06T11:10:03Z,a7a02cf,dirty,fmt,-p rustynet-cli,2,pass
+2026-07-06T11:10:06Z,a7a02cf,dirty,check,-p rustynet-cli,3,pass
+2026-07-06T11:10:12Z,a7a02cf,dirty,clippy,-p rustynet-cli,5,fail
+2026-07-06T11:10:23Z,a7a02cf,dirty,fmt,-p rustynet-cli,1,pass
+2026-07-06T11:10:26Z,a7a02cf,dirty,check,-p rustynet-cli,2,pass
+2026-07-06T11:10:31Z,a7a02cf,dirty,clippy,-p rustynet-cli,5,pass
+2026-07-06T11:11:41Z,a7a02cf,dirty,test,-p rustynet-cli,70,fail
+2026-07-06T11:19:37Z,edc55a1,dirty,fmt,-p rustynet-cli -p rustynet-mcp,2,fail
+2026-07-06T11:19:51Z,edc55a1,dirty,fmt,-p rustynet-cli -p rustynet-mcp,1,pass
+2026-07-06T11:19:57Z,edc55a1,dirty,check,-p rustynet-cli -p rustynet-mcp,5,fail
+2026-07-06T11:21:18Z,edc55a1,dirty,fmt,-p rustynet-cli -p rustynet-mcp,1,pass
+2026-07-06T11:21:23Z,edc55a1,dirty,check,-p rustynet-cli -p rustynet-mcp,4,pass
+2026-07-06T11:21:29Z,edc55a1,dirty,clippy,-p rustynet-cli -p rustynet-mcp,6,pass
+2026-07-06T11:23:02Z,edc55a1,dirty,test,-p rustynet-cli -p rustynet-mcp,92,fail
+2026-07-06T11:28:15Z,69d6f62,dirty,fmt,-p rustynet-cli -p rustynet-mcp,2,fail
+2026-07-06T11:28:27Z,69d6f62,dirty,fmt,-p rustynet-cli -p rustynet-mcp,1,pass
+2026-07-06T11:28:32Z,69d6f62,dirty,check,-p rustynet-cli -p rustynet-mcp,5,pass
+2026-07-06T11:28:38Z,69d6f62,dirty,clippy,-p rustynet-cli -p rustynet-mcp,5,pass
+2026-07-06T11:29:48Z,69d6f62,dirty,test,-p rustynet-cli -p rustynet-mcp,69,fail
+2026-07-06T11:34:04Z,0b10eb3,dirty,fmt,-p rustynet-cli -p rustynet-mcp,1,pass
+2026-07-06T11:34:09Z,0b10eb3,dirty,check,-p rustynet-cli -p rustynet-mcp,4,pass
+2026-07-06T11:34:15Z,0b10eb3,dirty,clippy,-p rustynet-cli -p rustynet-mcp,5,pass
+2026-07-06T11:45:23Z,62ae49d,dirty,fmt,-p rustynet-cli,1,fail
+2026-07-06T13:56:34Z,cac0830,dirty,fmt,-p rustynet-cli -p rustynet-lab-monitor -p rustynet-mcp,2,pass
+2026-07-06T13:56:34Z,cac0830,dirty,check,-p rustynet-cli -p rustynet-lab-monitor -p rustynet-mcp,0,fail
+2026-07-06T13:56:43Z,cac0830,dirty,fmt,-p rustynet-cli,2,pass
+2026-07-06T13:56:54Z,cac0830,dirty,check,-p rustynet-cli,10,pass
+2026-07-06T13:57:05Z,cac0830,dirty,clippy,-p rustynet-cli,11,pass

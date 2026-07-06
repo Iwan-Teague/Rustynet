@@ -365,7 +365,7 @@ fn build_bootstrap_env(node_id: &str, role: &NodeRole, ctx: &OrchestrationContex
     let ssh_allow_cidrs = &ctx.ssh_allow_cidrs;
     let network_id = &ctx.network_id;
     format!(
-        "ROLE={role_str}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE=/tmp/rn_source.tar.gz\n"
+        "ROLE={role_str}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE=/tmp/rn_source.tar.gz\nRUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n"
     )
 }
 
@@ -425,6 +425,10 @@ mod tests {
         assert!(
             env.contains("NETWORK_ID=test-net"),
             "must contain NETWORK_ID: {env}"
+        );
+        assert!(
+            env.contains("RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2"),
+            "Rust-native lab bootstrap should reach offline fallback quickly on no-egress guests: {env}"
         );
     }
 
@@ -517,6 +521,35 @@ mod tests {
         assert!(
             BOOTSTRAP_SCRIPT.contains("install -m 0755 target/release/rustynet-relay"),
             "bootstrap must install rustynet-relay to /usr/local/bin"
+        );
+    }
+
+    #[test]
+    fn bootstrap_script_builds_only_the_installed_cli_binary() {
+        // `cargo build -p rustynet-cli` builds every bin target in that package.
+        // The lab installs only target/release/rustynet-cli, so building helper
+        // bins on every node is dead work and made no-egress bootstrap much slower.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("-p rustynet-cli --bin rustynet-cli"),
+            "bootstrap must compile only the installed rustynet-cli binary"
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("-p rustynetd -p rustynet-cli"),
+            "bootstrap must not build the whole rustynet-cli package bin set"
+        );
+    }
+
+    #[test]
+    fn bootstrap_network_diagnostics_timeout_getent_before_offline_fallback() {
+        // No-egress UTM guests can leave getent blocked indefinitely. Diagnostics
+        // must be bounded so the script reaches the cargo --offline fallback.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("timeout 10 getent ahosts"),
+            "bootstrap DNS diagnostics must not hang before offline cargo fallback"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS:-8"),
+            "bootstrap registry probe count should remain configurable"
         );
     }
 }

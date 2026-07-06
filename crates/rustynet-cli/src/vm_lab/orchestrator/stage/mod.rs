@@ -9,8 +9,10 @@ pub mod anchor_validation;
 pub mod authenticode_validation;
 pub mod blind_exit;
 pub mod blind_exit_dataplane_validation;
+pub mod chaos;
 pub mod cleanup;
 pub mod collect_pubkeys;
+pub mod cross_network;
 pub mod deploy_relay;
 pub mod distribute_assignments;
 pub mod distribute_dns_zone;
@@ -26,7 +28,9 @@ pub mod final_cleanup;
 pub mod install;
 pub mod ipv6_leak_validation;
 pub mod key_custody_validation;
+pub mod live_anchor;
 pub mod live_enrollment_restart_validation;
+pub mod live_extended_soak_validation;
 pub mod live_key_custody_validation;
 pub mod live_lan_toggle_validation;
 pub mod live_managed_dns_validation;
@@ -76,6 +80,7 @@ pub enum StageId {
     MeshStatusValidation,
     AuthenticodeValidation,
     Ipv6LeakValidation,
+    LiveAnchor,
     LiveTwoHopValidation,
     LiveManagedDnsValidation,
     LiveNetworkFlapValidation,
@@ -85,6 +90,27 @@ pub enum StageId {
     LiveEnrollmentRestartValidation,
     LiveLanToggleValidation,
     LiveMixedTopologyValidation,
+    LiveExtendedSoakValidation,
+    CrossNetworkPreflight,
+    CrossNetworkDirectRemoteExit,
+    CrossNetworkNodeNetworkSwitch,
+    CrossNetworkRelayRemoteExit,
+    CrossNetworkFailbackRoaming,
+    CrossNetworkControllerSwitch,
+    CrossNetworkTraversalAdversarial,
+    CrossNetworkRemoteExitDns,
+    CrossNetworkRemoteExitSoak,
+    CrossNetworkNatClassification,
+    CrossNetworkNatMatrix,
+    ChaosClockAttack,
+    ChaosCrashRecovery,
+    ChaosDaemonFault,
+    ChaosDaemonSigstopSigcont,
+    ChaosMembershipAdversarial,
+    ChaosNetworkImpairment,
+    ChaosPrivilegedBoundary,
+    ChaosResourceExhaustion,
+    ChaosSignedStateAdversarial,
     DeployRelayService,
     RelayValidation,
     TrafficTestMatrix,
@@ -101,7 +127,7 @@ pub enum StageId {
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 44] = [
+    pub const ALL: [StageId; 66] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -126,15 +152,6 @@ impl StageId {
         StageId::MeshStatusValidation,
         StageId::AuthenticodeValidation,
         StageId::Ipv6LeakValidation,
-        StageId::LiveTwoHopValidation,
-        StageId::LiveManagedDnsValidation,
-        StageId::LiveNetworkFlapValidation,
-        StageId::LiveRebootRecoveryValidation,
-        StageId::LiveSecretsNotInLogsValidation,
-        StageId::LiveKeyCustodyValidation,
-        StageId::LiveEnrollmentRestartValidation,
-        StageId::LiveLanToggleValidation,
-        StageId::LiveMixedTopologyValidation,
         StageId::DeployRelayService,
         StageId::RelayValidation,
         StageId::TrafficTestMatrix,
@@ -145,6 +162,37 @@ impl StageId {
         StageId::ExitDnsFailclosedValidation,
         StageId::ExitNatLifecycleValidation,
         StageId::BlindExitDataplaneValidation,
+        StageId::LiveAnchor,
+        StageId::LiveTwoHopValidation,
+        StageId::LiveManagedDnsValidation,
+        StageId::LiveNetworkFlapValidation,
+        StageId::LiveRebootRecoveryValidation,
+        StageId::LiveSecretsNotInLogsValidation,
+        StageId::LiveKeyCustodyValidation,
+        StageId::LiveEnrollmentRestartValidation,
+        StageId::LiveLanToggleValidation,
+        StageId::LiveMixedTopologyValidation,
+        StageId::LiveExtendedSoakValidation,
+        StageId::CrossNetworkPreflight,
+        StageId::CrossNetworkDirectRemoteExit,
+        StageId::CrossNetworkNodeNetworkSwitch,
+        StageId::CrossNetworkRelayRemoteExit,
+        StageId::CrossNetworkFailbackRoaming,
+        StageId::CrossNetworkControllerSwitch,
+        StageId::CrossNetworkTraversalAdversarial,
+        StageId::CrossNetworkRemoteExitDns,
+        StageId::CrossNetworkRemoteExitSoak,
+        StageId::CrossNetworkNatClassification,
+        StageId::CrossNetworkNatMatrix,
+        StageId::ChaosClockAttack,
+        StageId::ChaosCrashRecovery,
+        StageId::ChaosDaemonFault,
+        StageId::ChaosDaemonSigstopSigcont,
+        StageId::ChaosMembershipAdversarial,
+        StageId::ChaosNetworkImpairment,
+        StageId::ChaosPrivilegedBoundary,
+        StageId::ChaosResourceExhaustion,
+        StageId::ChaosSignedStateAdversarial,
         StageId::Cleanup,
     ];
 
@@ -174,6 +222,7 @@ impl StageId {
             StageId::MeshStatusValidation => "mesh_status_validation",
             StageId::AuthenticodeValidation => "authenticode_validation",
             StageId::Ipv6LeakValidation => "ipv6_leak_validation",
+            StageId::LiveAnchor => "live_anchor",
             StageId::LiveTwoHopValidation => "live_two_hop_validation",
             StageId::LiveManagedDnsValidation => "live_managed_dns_validation",
             StageId::LiveNetworkFlapValidation => "live_network_flap_validation",
@@ -183,6 +232,27 @@ impl StageId {
             StageId::LiveEnrollmentRestartValidation => "live_enrollment_restart_validation",
             StageId::LiveLanToggleValidation => "live_lan_toggle_validation",
             StageId::LiveMixedTopologyValidation => "live_mixed_topology_validation",
+            StageId::LiveExtendedSoakValidation => "extended_soak",
+            StageId::CrossNetworkPreflight => "cross_network_preflight",
+            StageId::CrossNetworkDirectRemoteExit => "cross_network_direct_remote_exit",
+            StageId::CrossNetworkNodeNetworkSwitch => "cross_network_node_network_switch",
+            StageId::CrossNetworkRelayRemoteExit => "cross_network_relay_remote_exit",
+            StageId::CrossNetworkFailbackRoaming => "cross_network_failback_roaming",
+            StageId::CrossNetworkControllerSwitch => "cross_network_controller_switch",
+            StageId::CrossNetworkTraversalAdversarial => "cross_network_traversal_adversarial",
+            StageId::CrossNetworkRemoteExitDns => "cross_network_remote_exit_dns",
+            StageId::CrossNetworkRemoteExitSoak => "cross_network_remote_exit_soak",
+            StageId::CrossNetworkNatClassification => "cross_network_nat_classification",
+            StageId::CrossNetworkNatMatrix => "cross_network_nat_matrix",
+            StageId::ChaosClockAttack => "chaos_clock_attack",
+            StageId::ChaosCrashRecovery => "chaos_crash_recovery",
+            StageId::ChaosDaemonFault => "chaos_daemon_fault",
+            StageId::ChaosDaemonSigstopSigcont => "chaos_daemon_sigstop_sigcont",
+            StageId::ChaosMembershipAdversarial => "chaos_membership_adversarial",
+            StageId::ChaosNetworkImpairment => "chaos_network_impairment",
+            StageId::ChaosPrivilegedBoundary => "chaos_privileged_boundary",
+            StageId::ChaosResourceExhaustion => "chaos_resource_exhaustion",
+            StageId::ChaosSignedStateAdversarial => "chaos_signed_state_adversarial",
             StageId::DeployRelayService => "deploy_relay_service",
             StageId::RelayValidation => "relay_validation",
             StageId::TrafficTestMatrix => "traffic_test_matrix",

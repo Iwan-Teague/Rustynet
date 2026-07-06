@@ -157,16 +157,16 @@ fn topological_order(stages: &[Box<dyn OrchestrationStage>]) -> Vec<usize> {
         }
     }
 
-    let mut queue: std::collections::VecDeque<usize> =
+    let mut ready: std::collections::BTreeSet<usize> =
         (0..n).filter(|&i| in_degree[i] == 0).collect();
 
     let mut order = Vec::with_capacity(n);
-    while let Some(node) = queue.pop_front() {
+    while let Some(node) = ready.pop_first() {
         order.push(node);
         for &next in &adj[node] {
             in_degree[next] -= 1;
             if in_degree[next] == 0 {
-                queue.push_back(next);
+                ready.insert(next);
             }
         }
     }
@@ -367,6 +367,36 @@ mod tests {
             outcome_of(&StageId::Cleanup),
             Some(&StageOutcome::Passed),
             "always_run cleanup MUST run after a panicking stage"
+        );
+    }
+
+    #[test]
+    fn topological_order_prefers_original_order_for_newly_ready_stages() {
+        // Regression: with the old FIFO ready queue, a late cleanup stage whose
+        // dependency was filtered out by --skip-linux-live-suite started ready at
+        // time zero. After preflight passed, it ran before prepare_source_archive
+        // because prepare was appended behind cleanup in the queue. Cleanup must
+        // stay last in the retained vector unless a real dependency says
+        // otherwise.
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            pass_stage(StageId::Preflight, vec![]),
+            pass_stage(StageId::PrepareSourceArchive, vec![StageId::Preflight]),
+            pass_stage(
+                StageId::VerifySshReachability,
+                vec![StageId::PrepareSourceArchive],
+            ),
+            always_run_stage(StageId::Cleanup, vec![StageId::ExitHandoff]),
+        ];
+        let results = StateMachineRunner::new(stages).run(&mut make_ctx());
+        let ids: Vec<StageId> = results.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                StageId::Preflight,
+                StageId::PrepareSourceArchive,
+                StageId::VerifySshReachability,
+                StageId::Cleanup,
+            ]
         );
     }
 

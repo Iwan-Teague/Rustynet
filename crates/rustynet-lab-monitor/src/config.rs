@@ -35,6 +35,11 @@ pub struct MonitorConfig {
     pub triage_on_failure: bool,
     #[serde(default)]
     pub dry_run: bool,
+    /// Launch engine for live-lab runs started from the monitor.
+    /// Default is the Rust-native `--node` path; use `legacy-bash` only as an
+    /// explicit escape hatch while comparing old evidence.
+    #[serde(default = "default_engine")]
+    pub engine: String,
     #[serde(default)]
     pub disabled_stages: Vec<String>,
     #[serde(default)]
@@ -75,6 +80,7 @@ impl Default for MonitorConfig {
             rebuild_nodes: String::new(),
             triage_on_failure: false,
             dry_run: false,
+            engine: default_engine(),
             disabled_stages: Vec::new(),
             patch_model_idx: 0,
             patch_variant_idx: 0,
@@ -177,11 +183,16 @@ impl MonitorConfig {
                 "skip_linux_live_suite" => assign_bool(&mut self.skip_linux_live_suite, value),
                 "triage_on_failure" => assign_bool(&mut self.triage_on_failure, value),
                 "dry_run" => assign_bool(&mut self.dry_run, value),
+                "engine" => assign_string(&mut self.engine, value),
                 _ => {}
             }
         }
         self.apply_fast_stage_defaults();
     }
+}
+
+fn default_engine() -> String {
+    "rust-node".to_owned()
 }
 
 fn config_path(repo_root: &Path) -> PathBuf {
@@ -269,5 +280,29 @@ fn assign_string(target: &mut String, value: &serde_json::Value) {
 fn assign_bool(target: &mut bool, value: &serde_json::Value) {
     if let Some(value) = value.as_bool() {
         *target = value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_engine_in_persisted_config_defaults_to_rust_node() {
+        let legacy_shape = r#"
+area = "macOS admin"
+exit_vm = "debian-headless-2"
+client_vm = "debian-headless-1"
+macos_vm = "macos-utm-1"
+windows_vm = "windows-utm-1"
+relay_platform = ""
+anchor_platform = ""
+exit_platform = ""
+admin_platform = "macos"
+blind_exit_platform = ""
+rebuild_nodes = "macos-utm-1"
+"#;
+        let config: MonitorConfig = toml::from_str(legacy_shape).unwrap();
+        assert_eq!(config.engine, "rust-node");
     }
 }
