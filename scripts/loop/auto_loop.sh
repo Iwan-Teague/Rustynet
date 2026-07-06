@@ -5,7 +5,13 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && /bin/pwd -P)"
 DRIVER="$REPO/scripts/mcp/drive_deepseek.py"
-BIN="$REPO/bin/rustynet-mcp-deepseek"
+if [ -n "${RUSTYNET_MCP_BIN:-}" ]; then
+    BIN="$RUSTYNET_MCP_BIN"
+elif [ -x "$REPO/target/debug/rustynet-mcp-deepseek" ]; then
+    BIN="$REPO/target/debug/rustynet-mcp-deepseek"
+else
+    BIN="$REPO/bin/rustynet-mcp-deepseek"
+fi
 PROMPT="$REPO/state/loop-cycle-prompt.md"
 HISTORY="$REPO/state/loop-cycle-history.jsonl"
 JOBS_DIR="$REPO/state/deepseek-mcp-jobs"
@@ -611,10 +617,14 @@ main() {
     log "launching initial deepseek_lab_run..."
     report=$("$DRIVER" --bin "$BIN" --tool deepseek_lab_run \
         --args "$args_json" --poll-timeout "$MAX_RUN_WAIT" 2>&1) || {
-        log "initial launch failed — retry once in 60s"; sleep 60
+        log "initial launch failed — retry once in 60s"
+        printf '%s\n' "$report" >&2
+        sleep 60
         report=$("$DRIVER" --bin "$BIN" --tool deepseek_lab_run \
             --args "$args_json" --poll-timeout "$MAX_RUN_WAIT" 2>&1) || {
-            log "initial launch failed again — aborting"; return 1
+            log "initial launch failed again — aborting"
+            printf '%s\n' "$report" >&2
+            return 1
         }
     }
     local parsed_jid; parsed_jid="$(printf '%s' "$report" | extract_job_id)"

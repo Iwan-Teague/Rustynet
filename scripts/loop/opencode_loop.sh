@@ -8,7 +8,13 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && /bin/pwd -P)"
 DRIVER="$REPO/scripts/mcp/drive_deepseek.py"
-BIN="$REPO/bin/rustynet-mcp-deepseek"
+if [ -n "${RUSTYNET_MCP_BIN:-}" ]; then
+    BIN="$RUSTYNET_MCP_BIN"
+elif [ -x "$REPO/target/debug/rustynet-mcp-deepseek" ]; then
+    BIN="$REPO/target/debug/rustynet-mcp-deepseek"
+else
+    BIN="$REPO/bin/rustynet-mcp-deepseek"
+fi
 JOBS_DIR="$REPO/state/deepseek-mcp-jobs"
 STATE_DIR="$REPO/state/opencode-loop"
 PROMPT="$STATE_DIR/main-prompt.md"
@@ -334,6 +340,7 @@ run_lab() {
     report=$("$DRIVER" --bin "$BIN" --tool deepseek_lab_run \
         --args "$args_json" --poll-timeout "$MAX_RUN_WAIT" 2>&1) || {
         log "initial lab command failed"
+        printf '%s\n' "$report" >&2
         return 1
     }
     jid="$(printf '%s' "$report" | extract_job_id)"
@@ -803,6 +810,11 @@ main() {
             review_iter=$((review_iter + 1))
             run_review_if_needed "$jid" "$result" || log "review iter $review_iter failed; continuing"
         done
+
+        if [ "$OPENCODE_MAIN_ITERATIONS" -le 0 ]; then
+            log "main iterations disabled; exiting after lab/review cycle $cycle"
+            exit 0
+        fi
 
         # Main/patch iterations (0 = skip, lab only)
         main_iter=0

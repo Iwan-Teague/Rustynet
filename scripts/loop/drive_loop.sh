@@ -23,7 +23,13 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DRIVER="$REPO/scripts/mcp/drive_deepseek.py"
 PROMPT_FILE="$REPO/state/loop-cycle-prompt.md"
 STATE_FILE="$REPO/state/loop-cycle-state.json"
-DEEEPSEEK_BIN="$REPO/bin/rustynet-mcp-deepseek"
+if [ -n "${RUSTYNET_MCP_BIN:-}" ]; then
+    DEEPSEEK_BIN="$RUSTYNET_MCP_BIN"
+elif [ -x "$REPO/target/debug/rustynet-mcp-deepseek" ]; then
+    DEEPSEEK_BIN="$REPO/target/debug/rustynet-mcp-deepseek"
+else
+    DEEPSEEK_BIN="$REPO/bin/rustynet-mcp-deepseek"
+fi
 
 log() { printf '[loop %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
@@ -57,19 +63,18 @@ log "cycle area: $AREA"
 log "args: $ARGS_JSON"
 
 # ── Verify the deepseek binary exists ────────────────────────────────
-if [ ! -x "$DEEEPSEEK_BIN" ]; then
-    log "deepseek binary missing at $DEEEPSEEK_BIN — building..."
+if [ ! -x "$DEEPSEEK_BIN" ]; then
+    log "deepseek binary missing at $DEEPSEEK_BIN — building..."
     (cd "$REPO" && cargo build --release --bin rustynet-mcp-deepseek) || {
         log "FATAL: build failed"; exit 1
     }
-    cp "$REPO/target/release/rustynet-mcp-deepseek" "$DEEEPSEEK_BIN.new" && \
-        mv -f "$DEEEPSEEK_BIN.new" "$DEEEPSEEK_BIN"
+    DEEPSEEK_BIN="$REPO/target/release/rustynet-mcp-deepseek"
     log "binary installed"
 fi
 
 # ── Launch deepseek_lab_run and wait for the report ──────────────────
 log "launching deepseek_lab_run..."
-REPORT=$("$DRIVER" --bin "$DEEEPSEEK_BIN" --tool deepseek_lab_run --args "$ARGS_JSON" --poll-timeout 5400 2>&1) || {
+REPORT=$("$DRIVER" --bin "$DEEPSEEK_BIN" --tool deepseek_lab_run --args "$ARGS_JSON" --poll-timeout 5400 2>&1) || {
     log "FATAL: deepseek_lab_run failed"
     echo "$REPORT" >&2
     exit 1
