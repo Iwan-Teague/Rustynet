@@ -125,6 +125,9 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_stage_dns_failclosed_check",
     "macos_stage_dns_failclosed_check",
     "windows_stage_dns_failclosed_check",
+    "linux_stage_runtime_acls_check",
+    "macos_stage_runtime_acls_check",
+    "windows_stage_runtime_acls_check",
     "linux_stage_secrets_not_in_logs",
     "macos_stage_secrets_not_in_logs",
     "windows_stage_secrets_not_in_logs",
@@ -3003,6 +3006,7 @@ mod registry_equivalence_tests {
             "live_network_flap" => Some("network_flap"),
             "extended_soak" => Some("extended_soak"),
             "dns_failclosed_validation" => Some("dns_failclosed_check"),
+            "runtime_acls_validation" => Some("runtime_acls_check"),
             "cleanup" => Some("cleanup"),
             stage if stage.starts_with("chaos_") => Some("chaos"),
             stage if stage.contains("reboot") => Some("reboot_recovery"),
@@ -3031,6 +3035,7 @@ mod registry_equivalence_tests {
                 | "validate_baseline_runtime"
                 | "security_audit_validation"
                 | "dns_failclosed_validation"
+                | "runtime_acls_validation"
                 | "deploy_relay_service"
                 | "relay_validation"
                 | "traffic_test_matrix"
