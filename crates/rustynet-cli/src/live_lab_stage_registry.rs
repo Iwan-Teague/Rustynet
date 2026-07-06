@@ -684,6 +684,22 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-engine mesh-status: the canonical Linux daemon self-check
+    // folded into a first-class OrchestrationStage — validates the
+    // daemon's mesh-status view reports no drift (no stale state,
+    // expected peer IDs present, within max-age bounds).
+    // state_machine_only — only the Rust `--node` plan dispatches it;
+    // the bash orchestrate path runs the check via its own per-check
+    // validators.
+    StageSpec {
+        name: "mesh_status_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("mesh_status_check"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,

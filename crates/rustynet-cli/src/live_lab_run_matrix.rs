@@ -134,6 +134,9 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_stage_key_custody_check",
     "macos_stage_key_custody_check",
     "windows_stage_key_custody_check",
+    "linux_stage_mesh_status_check",
+    "macos_stage_mesh_status_check",
+    "windows_stage_mesh_status_check",
     "linux_stage_secrets_not_in_logs",
     "macos_stage_secrets_not_in_logs",
     "windows_stage_secrets_not_in_logs",
@@ -3015,6 +3018,7 @@ mod registry_equivalence_tests {
             "runtime_acls_validation" => Some("runtime_acls_check"),
             "service_hardening_validation" => Some("service_hardening_check"),
             "key_custody_validation" => Some("key_custody_check"),
+            "mesh_status_validation" => Some("mesh_status_check"),
             "cleanup" => Some("cleanup"),
             stage if stage.starts_with("chaos_") => Some("chaos"),
             stage if stage.contains("reboot") => Some("reboot_recovery"),
@@ -3046,6 +3050,7 @@ mod registry_equivalence_tests {
                 | "runtime_acls_validation"
                 | "service_hardening_validation"
                 | "key_custody_validation"
+                | "mesh_status_validation"
                 | "deploy_relay_service"
                 | "relay_validation"
                 | "traffic_test_matrix"
