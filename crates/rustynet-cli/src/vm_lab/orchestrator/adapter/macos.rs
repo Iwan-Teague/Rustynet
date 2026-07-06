@@ -7,6 +7,7 @@ use crate::vm_lab::orchestrator::adapter::macos_install::{self, MACOS_RUSTYNETD_
 use crate::vm_lab::orchestrator::adapter::macos_membership;
 use crate::vm_lab::orchestrator::adapter::macos_traffic;
 use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
+use crate::vm_lab::orchestrator::adapter::node_adapter::SshConnectionParams;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
@@ -47,6 +48,10 @@ impl NodeAdapter for MacosNodeAdapter {
 
     fn alias(&self) -> &str {
         &self.alias
+    }
+
+    fn ssh_connection_params(&self) -> Option<SshConnectionParams> {
+        self.conn.ssh_connection_params()
     }
 
     /// Build a cross-OS RemoteShellHost from this node's SSH connection, so the

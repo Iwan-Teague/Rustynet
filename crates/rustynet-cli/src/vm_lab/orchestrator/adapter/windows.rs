@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::vm_lab::DaemonProbeOp;
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
+use crate::vm_lab::orchestrator::adapter::node_adapter::SshConnectionParams;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
     self, WINDOWS_RUSTYNETD_PATH, run_remote_ps,
 };
@@ -48,6 +49,10 @@ impl NodeAdapter for WindowsNodeAdapter {
 
     fn alias(&self) -> &str {
         &self.alias
+    }
+
+    fn ssh_connection_params(&self) -> Option<SshConnectionParams> {
+        self.conn.ssh_connection_params()
     }
 
     /// Build a cross-OS RemoteShellHost from this node's SSH connection, so the

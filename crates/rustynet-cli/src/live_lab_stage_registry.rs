@@ -788,6 +788,19 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-native live two-hop: delegates to the proven live_linux_two_hop_test
+    // binary (cross-OS via --platform) — the same binary the bash orchestrator
+    // calls, now surfaced as a first-class OrchestrationStage.
+    // state_machine_only — only the Rust `--node` plan dispatches it.
+    StageSpec {
+        name: "live_two_hop_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("two_hop"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "traffic_test_matrix",
         state_machine_only: true,

@@ -47,6 +47,18 @@ pub(crate) const REQUIRED_DAEMON_LAUNCH_FLAGS: &[&str] = &[
     "--auto-tunnel-enforce",
 ];
 
+/// SSH connection parameters exposed so orchestrator stages that dispatch
+/// standalone e2e validation binaries can construct the correct command line.
+/// Not used by general-purpose stages; those go through `RemoteShellHost`.
+#[derive(Debug, Clone)]
+pub struct SshConnectionParams {
+    pub host: String,
+    pub port: u16,
+    pub user: Option<String>,
+    pub identity_file: std::path::PathBuf,
+    pub known_hosts: std::path::PathBuf,
+}
+
 /// Per-node, per-OS interface for the orchestration pipeline.
 /// Connection details are injected at construction via `NodeConnection`;
 /// no transport argument appears in any method signature.
@@ -55,6 +67,12 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
 
     /// The alias this adapter was constructed for (matches `NodeRoleAssignment::alias`).
     fn alias(&self) -> &str;
+
+    /// SSH connection parameters for stages that dispatch standalone e2e
+    /// validation binaries. Returns `None` for non-SSH transports (ADB, MDM).
+    fn ssh_connection_params(&self) -> Option<SshConnectionParams> {
+        None
+    }
 
     // ── Install lifecycle ─────────────────────────────────────────
 
