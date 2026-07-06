@@ -51,6 +51,12 @@ fn resolve_source_tree_ish(repo_dir: &Path, mode: ArchiveSourceMode) -> Result<S
     match mode {
         ArchiveSourceMode::Head => Ok("HEAD".to_owned()),
         ArchiveSourceMode::WorkingTree => {
+            if !working_tree_has_tracked_changes(repo_dir)? {
+                // Clean tracked tree (nothing `git stash create` can snapshot) —
+                // equivalent to HEAD. Untracked files are intentionally excluded
+                // from working-tree archives.
+                return Ok("HEAD".to_owned());
+            }
             let out = std::process::Command::new("git")
                 .args(["stash", "create"])
                 .current_dir(repo_dir)
@@ -61,13 +67,24 @@ fn resolve_source_tree_ish(repo_dir: &Path, mode: ArchiveSourceMode) -> Result<S
             }
             let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
             if sha.is_empty() {
-                // Clean tree (nothing to stash) — equivalent to HEAD.
-                Ok("HEAD".to_owned())
+                Err("git stash create produced no snapshot for a dirty tracked tree".to_owned())
             } else {
                 Ok(sha)
             }
         }
     }
+}
+
+fn working_tree_has_tracked_changes(repo_dir: &Path) -> Result<bool, String> {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=no"])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("git status spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git status exited with {}", out.status));
+    }
+    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
 /// Build a `tar.gz` source archive at `out_path` from `repo_dir` for `mode`.
@@ -373,6 +390,21 @@ mod tests {
 
         // Clean tree: `git stash create` prints nothing, so resolve to HEAD.
         let tree_ish = resolve_source_tree_ish(repo, ArchiveSourceMode::WorkingTree).unwrap();
+        assert_eq!(tree_ish, "HEAD");
+    }
+
+    #[test]
+    fn worktree_mode_ignores_untracked_only_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), b"committed\n").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-q", "-m", "initial"]);
+        std::fs::write(repo.join("untracked.txt"), b"not archived\n").unwrap();
+
+        let tree_ish = resolve_source_tree_ish(repo, ArchiveSourceMode::WorkingTree).unwrap();
+
         assert_eq!(tree_ish, "HEAD");
     }
 
