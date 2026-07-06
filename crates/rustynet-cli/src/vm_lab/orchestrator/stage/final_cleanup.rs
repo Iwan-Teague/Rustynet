@@ -2,9 +2,22 @@
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::stage::install::node_in_rebuild_set;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-pub struct FinalCleanupStage;
+pub struct FinalCleanupStage {
+    /// `--rebuild-nodes`: when `Some`, only these aliases are torn down at
+    /// final cleanup. Nodes outside the set were reused by this run, so their
+    /// daemon must stay up for future partial-rebuild runs.
+    /// `None` = clean every node (the default).
+    rebuild_only: Option<Vec<String>>,
+}
+
+impl FinalCleanupStage {
+    pub fn new(rebuild_only: Option<Vec<String>>) -> Self {
+        FinalCleanupStage { rebuild_only }
+    }
+}
 
 impl OrchestrationStage for FinalCleanupStage {
     fn id(&self) -> StageId {
@@ -34,10 +47,14 @@ impl OrchestrationStage for FinalCleanupStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        let rebuild_only = self.rebuild_only.as_deref();
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
         let results: Vec<(String, Result<(), String>)> = aliases
             .iter()
-            .map(|alias| {
+            .filter_map(|alias| {
+                if !node_in_rebuild_set(rebuild_only, alias) {
+                    return None;
+                }
                 let r = match ctx.adapters.get(alias.as_str()) {
                     Some(adapter) => adapter.cleanup_runtime_state().map_err(|e| e.to_string()),
                     // An assigned node with no adapter is a construction bug, not
@@ -47,7 +64,7 @@ impl OrchestrationStage for FinalCleanupStage {
                         "no adapter for assigned node; cannot clean prior runtime state".to_owned(),
                     ),
                 };
-                (alias.clone(), r)
+                Some((alias.clone(), r))
             })
             .collect();
         let errors: Vec<String> = results
@@ -65,7 +82,42 @@ impl OrchestrationStage for FinalCleanupStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
     use std::collections::HashMap;
+
+    fn ctx_with_assignment(alias: &str) -> OrchestrationContext {
+        OrchestrationContext {
+            assignments: vec![NodeRoleAssignment {
+                alias: alias.to_owned(),
+                role: NodeRole::Client,
+            }],
+            adapters: HashMap::new(),
+            source_archive: None,
+            report_dir: std::env::temp_dir(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn node_outside_rebuild_set_is_skipped_not_failed() {
+        let mut ctx = ctx_with_assignment("reused-node");
+        let stage = FinalCleanupStage::new(Some(vec!["other-node".to_owned()]));
+        assert_eq!(stage.execute(&mut ctx), StageOutcome::Passed);
+    }
+
+    #[test]
+    fn node_with_no_adapter_in_rebuild_set_fails_closed() {
+        let mut ctx = ctx_with_assignment("reused-node");
+        let stage = FinalCleanupStage::new(None);
+        assert!(matches!(stage.execute(&mut ctx), StageOutcome::Failed(_)));
+    }
 
     #[test]
     fn empty_assignments_passes() {
@@ -83,6 +135,9 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
         };
-        assert_eq!(FinalCleanupStage.execute(&mut ctx), StageOutcome::Passed);
+        assert_eq!(
+            FinalCleanupStage::new(None).execute(&mut ctx),
+            StageOutcome::Passed
+        );
     }
 }

@@ -244,7 +244,7 @@ impl PlanBuilder {
             // cleanup + bootstrap must share the same rebuild set: a node we
             // refuse to clean must also be refused a rebuild (and vice versa).
             Box::new(CleanupHostsStage::new(rebuild_only.clone())),
-            Box::new(BootstrapHostsStage::new(rebuild_only)),
+            Box::new(BootstrapHostsStage::new(rebuild_only.clone())),
             Box::new(CollectPubkeysStage),
             Box::new(MembershipInitStage),
             Box::new(DistributeMembershipStage),
@@ -334,7 +334,7 @@ impl PlanBuilder {
             Box::new(LiveEnrollmentRestartValidationStage),
             Box::new(LiveLanToggleValidationStage),
             Box::new(LiveMixedTopologyValidationStage),
-            Box::new(FinalCleanupStage),
+            Box::new(FinalCleanupStage::new(rebuild_only)),
         ];
         if !skip_soak {
             stages.splice(
