@@ -92,10 +92,22 @@ impl OrchestrationStage for TrafficTestMatrixStage {
         // stable, which may be before the first handshake completes.  Retry each
         // positive ping for up to PING_SETTLE_SECS so a slow-starting handshake does
         // not produce a false failure.
-        const PING_SETTLE_SECS: u64 = 90;
-        const PING_RETRY_INTERVAL_SECS: u64 = 5;
+        const PING_SETTLE_SECS: u64 = 30;
+        const PING_RETRY_INTERVAL_SECS: u64 = 2;
+
+        let progress_log = ctx.report_dir.join("logs/traffic_test_matrix_progress.log");
+        let _ = std::fs::create_dir_all(progress_log.parent().unwrap());
 
         for src_alias in &aliases {
+            eprintln!(
+                "traffic_test_matrix: probing peer-pairs from {src_alias} ({}/{} nodes)",
+                aliases.iter().position(|a| a == src_alias).unwrap_or(0) + 1,
+                aliases.len(),
+            );
+            let _ = std::fs::write(
+                &progress_log,
+                format!("{src_alias}: probing peer-pairs\n"),
+            );
             // Tracks whether this src demonstrated baseline mesh reachability
             // (reached at least one peer). The default-deny negative test below
             // is only meaningful once we know the data path works: otherwise a

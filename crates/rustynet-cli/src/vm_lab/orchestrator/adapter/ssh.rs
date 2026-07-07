@@ -494,7 +494,7 @@ fn run_output_with_timeout(
                     // write-ends close and the drains unblock promptly. Best
                     // effort: a missing/already-gone master is harmless.
                     if let Some(teardown) = control_master_teardown {
-                        let _ = teardown.into_exit_command().status();
+                        teardown_control_master(teardown);
                     }
                     // Flush remaining log data before returning.
                     let _ = stdout_thread.join();
@@ -600,6 +600,29 @@ pub fn remote_home_for_user(user: Option<&str>, heap_user: &str) -> PathBuf {
         Some("root") => PathBuf::from("/root"),
         Some(u) => PathBuf::from(format!("/home/{u}")),
         None => PathBuf::from(format!("/home/{heap_user}")),
+    }
+}
+
+fn teardown_control_master(teardown: ControlMasterTeardown) {
+    let mut cmd = teardown.into_exit_command();
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(_) => return,
+                }
+            }
+        }
+        Err(_) => {}
     }
 }
 
