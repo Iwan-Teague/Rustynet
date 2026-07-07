@@ -10,8 +10,10 @@
 //! The `anchor` submodule validates the anchor capability-advertisement
 //! surface (cross-OS); `relay` validates the relay service lifecycle.
 
+pub mod admin_issue;
 pub mod anchor;
 pub mod authenticode;
+pub mod blind_exit;
 pub mod blind_exit_dataplane;
 pub mod dns_failclosed;
 pub mod exit_demotion_residue;

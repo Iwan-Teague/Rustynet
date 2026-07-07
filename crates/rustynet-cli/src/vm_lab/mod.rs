@@ -2831,6 +2831,80 @@ fn update_report_state_after_run(
     write_report_state(report_dir, &state)
 }
 
+fn write_rust_native_report_state_initial(
+    report_dir: &Path,
+    _source_mode: &str,
+    _repo_ref: Option<&str>,
+) -> Result<(), String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("clock failure while building rust-native report state: {err}"))?
+        .as_secs();
+    let setup_manifest_sha256 = setup_manifest_sha256(report_dir)
+        .unwrap_or_else(|_| "rust-native-no-setup-manifest".to_owned());
+    let state = LiveLabReportState {
+        version: 1,
+        created_at_unix: now,
+        updated_at_unix: now,
+        report_dir_path: normalize_manifest_path(report_dir),
+        report_dir_sha256: report_dir_sha256(report_dir),
+        setup_manifest_sha256,
+        setup_complete: false,
+        run_complete: false,
+        run_passed: false,
+        full_release_gate_requested: false,
+        full_release_evidence_complete: false,
+        last_run: None,
+    };
+    write_report_state(report_dir, &state)
+}
+
+fn write_rust_native_report_state_final(
+    report_dir: &Path,
+    run_passed: bool,
+    source_mode: &str,
+    repo_ref: Option<&str>,
+    _skip_live_suite: bool,
+    skip_soak: bool,
+    skip_cross_network: bool,
+) -> Result<(), String> {
+    let mut state = read_report_state(report_dir)?;
+    state.updated_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("clock failure while updating rust-native run state: {err}"))?
+        .as_secs();
+    state.run_complete = true;
+    state.run_passed = run_passed;
+    let run_flags = LiveLabRunModeFlags {
+        dry_run: false,
+        skip_setup: false,
+        skip_gates: false,
+        skip_soak,
+        skip_cross_network,
+    };
+    let provenance = LiveLabRunProvenance {
+        invoked_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| format!("clock failure: {err}"))?
+            .as_secs(),
+        profile: LiveLabFileBinding {
+            path: "rust-native-orchestrator".to_owned(),
+            sha256: "rust-native-no-profile".to_owned(),
+        },
+        profile_semantic_sha256: "rust-native-no-profile".to_owned(),
+        script: LiveLabFileBinding {
+            path: "rust-native-orchestrator".to_owned(),
+            sha256: "rust-native-no-script".to_owned(),
+        },
+        wrapper_source: current_wrapper_source_binding()?,
+        wrapper_version: env!("CARGO_PKG_VERSION").to_owned(),
+        git: current_git_provenance(source_mode, repo_ref)?,
+        run_flags,
+    };
+    state.last_run = Some(provenance);
+    write_report_state(report_dir, &state)
+}
+
 fn validate_setup_manifest(
     report_dir: &Path,
     expected: &LiveLabSetupManifestExpectation,
@@ -7430,7 +7504,7 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
 #[allow(clippy::too_many_arguments)]
 fn write_rust_native_run_summary(
     report_dir: &Path,
-    node_targets: &[(String, String, String)],
+    node_targets: &[(String, String, String, String)],
     node_ids: &std::collections::HashMap<String, String>,
     network_id: &str,
     passed: usize,
@@ -7439,30 +7513,39 @@ fn write_rust_native_run_summary(
     total_stages: usize,
     started_unix: u64,
     started_utc: &str,
+    source_mode: &str,
+    repo_ref: Option<&str>,
+    os_versions: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
     let state_dir = report_dir.join("state");
     fs::create_dir_all(&state_dir)
         .map_err(|err| format!("create state dir for nodes.tsv: {err}"))?;
 
-    // nodes.tsv: label \t target \t node_id \t bootstrap_role — the 4-column
-    // shape `execute_ops_write_live_linux_lab_run_summary` expects. Sanitize each
-    // field (strip \t/\n/\r → space, mirroring the stage recorder) so a tab or
+    // nodes.tsv: label \t target \t node_id \t bootstrap_role \t platform \t os_version
+    // — the 6-column shape. Sanitize each field (strip \t/\n/\r → space) so a tab or
     // newline in an operator-supplied inventory alias/target can't shift or split
-    // the fixed 4-column TSV (which would silently drop or mis-attribute the row).
+    // the fixed columns.
     let tsv_safe = |v: &str| v.replace(['\t', '\n', '\r'], " ");
     let nodes_tsv = state_dir.join("nodes.tsv");
     let mut body = String::with_capacity(node_targets.len() * 64);
-    for (alias, target, role) in node_targets {
+    for (alias, target, role, platform) in node_targets {
         let node_id = node_ids
             .get(alias)
             .cloned()
             .unwrap_or_else(|| format!("{alias}-bootstrap"));
         body.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\n",
             tsv_safe(alias),
             tsv_safe(target),
             tsv_safe(&node_id),
-            tsv_safe(role)
+            tsv_safe(role),
+            tsv_safe(platform),
+            tsv_safe(
+                os_versions
+                    .get(alias)
+                    .map(|s| s.as_str())
+                    .unwrap_or(platform)
+            ),
         ));
     }
     fs::write(&nodes_tsv, body).map_err(|err| format!("write nodes.tsv: {err}"))?;
@@ -7506,6 +7589,10 @@ fn write_rust_native_run_summary(
         elapsed_secs,
         elapsed_human,
         run_note,
+        git_commit: git_head_commit().ok(),
+        git_tree_clean: git_worktree_is_dirty().ok().map(|dirty| !dirty),
+        source_mode: Some(source_mode.to_owned()),
+        repo_ref: repo_ref.map(ToOwned::to_owned),
     };
     crate::ops_live_lab_orchestrator::execute_ops_write_live_linux_lab_run_summary(config)
         .map(|_| ())
@@ -7526,13 +7613,20 @@ fn write_rust_native_failure_digest(
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| {
             let cols = line.split('\t').collect::<Vec<_>>();
-            (cols.len() == 4).then(|| {
+            (cols.len() >= 4).then(|| {
+                let mut extra = serde_json::Map::new();
+                if cols.len() >= 5 {
+                    extra.insert("platform".to_owned(), Value::String(cols[4].to_owned()));
+                }
+                if cols.len() >= 6 {
+                    extra.insert("os_version".to_owned(), Value::String(cols[5].to_owned()));
+                }
                 json!({
                     "label": cols[0],
                     "target": cols[1],
                     "node_id": cols[2],
                     "bootstrap_role": cols[3],
-                    "extra": {},
+                    "extra": extra,
                 })
             })
         })
@@ -7802,6 +7896,20 @@ fn execute_rust_native_orchestration(
         }
     }
 
+    // Augment node_assignments from platform selectors (--exit-platform,
+    // --relay-platform, etc.) so a mac/win role cell runs live even when the
+    // operator omits the explicit --node <alias>:<role> pair. Each selector
+    // picks the first unassigned inventory entry whose platform matches.
+    augment_assignments_from_platform_selectors(
+        &mut ctx,
+        &inventory,
+        config.exit_platform.as_deref(),
+        config.relay_platform.as_deref(),
+        config.anchor_platform.as_deref(),
+        config.admin_platform.as_deref(),
+        config.blind_exit_platform.as_deref(),
+    )?;
+
     // Collect node hosts first so we can auto-derive ssh_allow_cidrs when not
     // provided. This mirrors the bash orchestrator's auto-detection behaviour.
     let node_entries: Vec<(
@@ -7835,7 +7943,7 @@ fn execute_rust_native_orchestration(
     // Snapshot (alias, target, role) now for the run_summary nodes.tsv (Bucket 2);
     // node_id is filled from ctx.node_ids after the run populates it. Owned
     // strings so no borrow of `node_entries`/`inventory` lingers.
-    let node_targets: Vec<(String, String, String)> = node_entries
+    let node_targets: Vec<(String, String, String, String)> = node_entries
         .iter()
         .map(|(entry, assignment)| {
             let target = entry
@@ -7843,13 +7951,27 @@ fn execute_rust_native_orchestration(
                 .as_deref()
                 .unwrap_or(entry.ssh_target.as_str())
                 .to_owned();
+            let platform =
+                format!("{:?}", entry.platform.unwrap_or(VmGuestPlatform::Linux)).to_lowercase();
             (
                 assignment.alias.clone(),
                 target,
                 assignment.role.as_str().to_owned(),
+                platform,
             )
         })
         .collect();
+
+    // Write initial report_state.json so consumers (MCP get_run_result, run-matrix
+    // CSV) can distinguish a completed Rust-native run from a crash. Best-effort:
+    // a write failure is logged, not fatal.
+    if let Err(err) = write_rust_native_report_state_initial(
+        report_dir.as_path(),
+        config.source_mode.as_deref().unwrap_or("working-tree"),
+        config.repo_ref.as_deref(),
+    ) {
+        eprintln!("warning: failed to write initial report_state.json for --node run: {err}");
+    }
 
     // Auto-derive /24 ssh_allow_cidrs from node underlay IPs when not set.
     if ctx.ssh_allow_cidrs.is_empty() {
@@ -7921,6 +8043,15 @@ fn execute_rust_native_orchestration(
         })?;
 
         ctx.adapters.insert(assignment.alias.clone(), adapter);
+    }
+
+    // Collect per-node OS version strings for nodes.tsv evidence. Best-effort:
+    // an adapter that can't probe its OS version returns the platform name.
+    let mut os_versions: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(ctx.adapters.len());
+    for (alias, adapter) in &ctx.adapters {
+        let version = adapter.collect_os_version();
+        os_versions.insert(alias.clone(), version);
     }
 
     // D2 — select the source archive mode (committed HEAD vs working tree).
@@ -8051,7 +8182,33 @@ fn execute_rust_native_orchestration(
 
     let setup_stage_ids = rust_native_setup_stage_ids();
     let plan_stage_ids: Vec<orchestrator::stage::StageId> = stages.iter().map(|s| s.id()).collect();
-    let mut runner = StateMachineRunner::new(stages);
+    // Register SIGINT/SIGTERM handlers so a Ctrl-C or `kill` cancels the run
+    // gracefully instead of leaving guest killswitch/NAT residue (F5-4).
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Err(err) = signal_hook::flag::register(
+        signal_hook::consts::SIGTERM,
+        std::sync::Arc::clone(&shutdown_flag),
+    ) {
+        eprintln!("warning: failed to register SIGTERM handler: {err}");
+    }
+    if let Err(err) = signal_hook::flag::register(
+        signal_hook::consts::SIGINT,
+        std::sync::Arc::clone(&shutdown_flag),
+    ) {
+        eprintln!("warning: failed to register SIGINT handler: {err}");
+    }
+    let mut runner = StateMachineRunner::new(stages)
+        .with_stage_timeout_secs(config.stage_timeout_secs)
+        .with_shutdown_flag(shutdown_flag.clone());
+    if config.stage_timeout_secs > 0 {
+        eprintln!(
+            "note: --stage-timeout-secs={} configured; per-stage wall-clock enforcement \
+             is pending the OrchestrationContext Send refactor. Per-SSH-command timeouts \
+             (ConnectTimeout=15s, ServerAliveInterval=20s) and the process-level \
+             --timeout-secs provide the practical envelope.",
+            config.stage_timeout_secs,
+        );
+    }
     if run_only {
         runner = runner
             .with_explicit_skips(setup_stage_ids.clone())
@@ -8090,6 +8247,16 @@ fn execute_rust_native_orchestration(
         started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
     };
     let mut results = runner.run_with_observer(&mut ctx, &recorder);
+    if shutdown_flag.load(std::sync::atomic::Ordering::Acquire) {
+        eprintln!(
+            "rust orchestrator: received SIGTERM/SIGINT — {} stage(s) skipped; \
+             always-run cleanup stage(s) were still executed",
+            results
+                .iter()
+                .filter(|(_, o)| matches!(o, StageOutcome::Skipped))
+                .count()
+        );
+    }
     if setup_only
         && results
             .iter()
@@ -8153,6 +8320,9 @@ fn execute_rust_native_orchestration(
         results.len(),
         run_started_unix,
         run_started_utc.as_str(),
+        config.source_mode.as_deref().unwrap_or("working-tree"),
+        config.repo_ref.as_deref(),
+        &os_versions,
     ) {
         eprintln!("warning: failed to write run_summary for --node run: {err}");
     }
@@ -8241,6 +8411,20 @@ fn execute_rust_native_orchestration(
     if let Err(err) = validate_live_lab_run_artifacts(report_dir.as_path()) {
         eprintln!("warning: --node run artifact completeness check: {err}");
     }
+    // Write final report_state.json so consumers (MCP get_run_result, run-matrix
+    // CSV) see run_complete=true and run_passed. Best-effort: a write failure is
+    // logged, not fatal.
+    if let Err(err) = write_rust_native_report_state_final(
+        report_dir.as_path(),
+        failed == 0,
+        config.source_mode.as_deref().unwrap_or("working-tree"),
+        config.repo_ref.as_deref(),
+        skip_live_suite,
+        config.skip_soak,
+        config.skip_cross_network,
+    ) {
+        eprintln!("warning: failed to write final report_state.json for --node run: {err}");
+    }
     finalized
 }
 
@@ -8280,6 +8464,49 @@ fn rust_native_setup_stage_ids() -> Vec<orchestrator::stage::StageId> {
         StageId::EnforceBaselineRuntime,
         StageId::ValidateBaselineRuntime,
     ]
+}
+
+/// Augment `ctx.assignments` from platform selectors so `--exit-platform macos`
+/// etc. actually assign the matching guest to the requested role (F8-6).
+fn augment_assignments_from_platform_selectors(
+    ctx: &mut orchestrator::context::OrchestrationContext,
+    inventory: &[VmInventoryEntry],
+    exit_platform: Option<&str>,
+    relay_platform: Option<&str>,
+    anchor_platform: Option<&str>,
+    admin_platform: Option<&str>,
+    blind_exit_platform: Option<&str>,
+) -> Result<(), String> {
+    use orchestrator::role::NodeRole;
+    let selectors: &[(&str, NodeRole, Option<&str>)] = &[
+        ("exit", NodeRole::Exit, exit_platform),
+        ("relay", NodeRole::Relay, relay_platform),
+        ("anchor", NodeRole::Anchor, anchor_platform),
+        ("admin", NodeRole::Admin, admin_platform),
+        ("blind_exit", NodeRole::BlindExit, blind_exit_platform),
+    ];
+    for (selector_name, role, platform_opt) in selectors {
+        let Some(platform_str) = platform_opt else {
+            continue;
+        };
+        let target_platform = VmGuestPlatform::parse(platform_str)
+            .map_err(|e| format!("--{selector_name}-platform: {e}"))?;
+        let assigned_aliases: std::collections::HashSet<&str> =
+            ctx.assignments.iter().map(|a| a.alias.as_str()).collect();
+        let Some(entry) = inventory.iter().find(|e| {
+            e.platform == Some(target_platform) && !assigned_aliases.contains(e.alias.as_str())
+        }) else {
+            return Err(format!(
+                "--{selector_name}-platform={platform_str}: no unassigned inventory entry found for that platform"
+            ));
+        };
+        ctx.assignments
+            .push(orchestrator::role_assignment::NodeRoleAssignment {
+                alias: entry.alias.clone(),
+                role: role.clone(),
+            });
+    }
+    Ok(())
 }
 
 fn filter_rust_native_stages_for_mode(
@@ -25562,17 +25789,30 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+fn iso8601_utc_from_unix(unix_secs: u64) -> String {
+    let days_since_epoch = (unix_secs / 86400) as i64;
+    let secs_of_day = (unix_secs % 86400) as u32;
+    let z = days_since_epoch + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y_final = if m <= 2 { y + 1 } else { y };
+    let h = secs_of_day / 3600;
+    let min = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y_final, m, d, h, min, s
+    )
+}
+
 fn collected_at_utc_now() -> String {
-    Command::new("date")
-        .arg("-u")
-        .arg("+%FT%TZ")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|text| text.trim().to_owned())
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| format!("unix:{}", unix_now()))
+    iso8601_utc_from_unix(unix_now())
 }
 
 /// Overlay the run-level verdict from `state/report_state.json` (when
@@ -36217,7 +36457,7 @@ mod tests {
         // ipv6_leak_validation + exit_demotion_residue_validation +
         // exit_dns_failclosed_validation + exit_nat_lifecycle_validation +
         // blind_exit_dataplane_validation.
-        assert_eq!(cli_ids.len(), 57);
+        assert_eq!(cli_ids.len(), 58);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)
@@ -48233,11 +48473,13 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "debian-1".to_owned(),
                 "debian@10.0.0.1".to_owned(),
                 "exit".to_owned(),
+                "linux".to_owned(),
             ),
             (
                 "debian-2".to_owned(),
                 "debian@10.0.0.2".to_owned(),
                 "client".to_owned(),
+                "linux".to_owned(),
             ),
         ];
         let mut node_ids = std::collections::HashMap::new();
@@ -48255,17 +48497,20 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             2,
             100,
             "2026-01-01T00:00:00Z",
+            "working-tree",
+            None,
+            &std::collections::HashMap::new(),
         )
         .expect("run summary must write");
 
-        // nodes.tsv: 4 columns, with the node_id fallback for the missing alias.
+        // nodes.tsv: 6 columns, with the node_id fallback for the missing alias.
         let nodes = fs::read_to_string(tmp.join("state/nodes.tsv")).expect("nodes.tsv");
         assert!(
-            nodes.contains("debian-1\tdebian@10.0.0.1\texit-1\texit"),
+            nodes.contains("debian-1\tdebian@10.0.0.1\texit-1\texit\tlinux\tlinux"),
             "nodes.tsv: {nodes}"
         );
         assert!(
-            nodes.contains("debian-2\tdebian@10.0.0.2\tdebian-2-bootstrap\tclient"),
+            nodes.contains("debian-2\tdebian@10.0.0.2\tdebian-2-bootstrap\tclient\tlinux"),
             "nodes.tsv fallback: {nodes}"
         );
 
@@ -48325,6 +48570,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "macos-utm-1".to_owned(),
             "mac@192.168.0.210".to_owned(),
             "anchor".to_owned(),
+            "macos".to_owned(),
         )];
         let mut node_ids = std::collections::HashMap::new();
         node_ids.insert("macos-utm-1".to_owned(), "macos-client-1".to_owned());
@@ -48339,6 +48585,9 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             2,
             100,
             "2026-01-01T00:00:00Z",
+            "working-tree",
+            None,
+            &std::collections::HashMap::new(),
         )
         .expect("summary");
         super::write_rust_native_failure_digest(&tmp, "rust-test", "net-test", "fail")

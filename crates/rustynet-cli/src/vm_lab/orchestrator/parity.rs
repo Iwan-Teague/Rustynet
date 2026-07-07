@@ -43,6 +43,29 @@ pub fn build_live_lab_run_report(
     ctx: &OrchestrationContext,
     results: &[(StageId, StageOutcome)],
 ) -> LiveLabRunReport {
+    let stage_durations: HashMap<String, u64> = {
+        let path = ctx.report_dir.join("state/stages.tsv");
+        std::fs::read_to_string(&path)
+            .ok()
+            .map(|body| {
+                body.lines()
+                    .filter_map(|line| {
+                        let line = line.trim_end_matches('\r');
+                        if line.is_empty() || line.starts_with('#') {
+                            return None;
+                        }
+                        let cols: Vec<&str> = line.split('\t').collect();
+                        if cols.len() < 8 {
+                            return None;
+                        }
+                        let stage_id = cols[0].trim().to_owned();
+                        parse_stage_duration_ms(&cols).map(|d| (stage_id, d))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
     let stages: Vec<StageReport> = results
         .iter()
         .map(|(id, outcome)| {
@@ -55,7 +78,7 @@ pub fn build_live_lab_run_report(
                 stage_id: id.as_str().to_owned(),
                 stage_name: id.as_str().to_owned(),
                 outcome: rec,
-                duration_ms: 0,
+                duration_ms: stage_durations.get(id.as_str()).copied().unwrap_or(0),
                 error_detail,
             }
         })
@@ -273,6 +296,55 @@ fn report_from_orchestrate_result(report_dir: &Path) -> Option<(RunStatus, Vec<S
     Some((overall_status, stages))
 }
 
+/// Parse a stage timestamp in the format written by the realtime recorder:
+/// `YYYY-MM-DDTHH:MM:SSZ`. Returns Unix milliseconds from the epoch, or None.
+fn parse_stage_iso8601_ms(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.len() < 20 {
+        return None;
+    }
+    let (date_part, time_part) = s.split_at(10);
+    let time_part = time_part.strip_prefix('T')?;
+    let time_part = time_part.strip_suffix('Z').unwrap_or(time_part);
+    let y: i64 = date_part.get(0..4)?.parse().ok()?;
+    let mon: u32 = date_part.get(5..7)?.parse().ok()?;
+    let d: u32 = date_part.get(8..10)?.parse().ok()?;
+    let h: u32 = time_part.get(0..2)?.parse().ok()?;
+    let min: u32 = time_part.get(3..5)?.parse().ok()?;
+    let sec: u32 = time_part.get(6..8)?.parse().ok()?;
+    if !(1..=12).contains(&mon)
+        || !(1..=31).contains(&d)
+        || !(0..=23).contains(&h)
+        || !(0..=59).contains(&min)
+        || !(0..=60).contains(&sec)
+    {
+        return None;
+    }
+    let days_before_month: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    let epoch_days = (y - 1970) * 365 + ((y - 1969) / 4) - ((y - 1901) / 100)
+        + ((y - 1601) / 400)
+        + days_before_month[(mon - 1) as usize]
+        + if mon > 2 && leap { 1 } else { 0 }
+        + (d as i64)
+        - 1;
+    let total_secs = epoch_days * 86400 + h as i64 * 3600 + min as i64 * 60 + sec as i64;
+    if total_secs < 0 {
+        return None;
+    }
+    Some((total_secs as u64) * 1000)
+}
+
+fn parse_stage_duration_ms(cols: &[&str]) -> Option<u64> {
+    let started = parse_stage_iso8601_ms(cols.get(6)?.trim())?;
+    let finished = parse_stage_iso8601_ms(cols.get(7)?.trim())?;
+    if finished >= started {
+        Some(finished - started)
+    } else {
+        None
+    }
+}
+
 /// Fallback source: `<report_dir>/state/stages.tsv` (the realtime recorder
 /// TSV). Complete for a Rust `--node` run; for a bash run it holds only the
 /// setup stages, which is why `orchestrate_result.json` is preferred. Fails
@@ -321,7 +393,7 @@ fn report_from_stages_tsv(report_dir: &Path) -> Result<(RunStatus, Vec<StageRepo
             stage_id: stage_id.to_owned(),
             stage_name: stage_id.to_owned(),
             outcome,
-            duration_ms: 0,
+            duration_ms: parse_stage_duration_ms(&cols).unwrap_or(0),
             error_detail,
         });
     }

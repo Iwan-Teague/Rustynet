@@ -93,7 +93,23 @@ there must be a recorded GREEN live-lab run that elects that OS into R and exerc
 the role's **runtime** (not a contract/dry-run), with the row captured in
 `documents/operations/live_lab_run_matrix.csv`.
 
-Driver pattern (same CLI wrapper the loop uses):
+Driver pattern — two orchestrator engines available:
+
+**Rust-native `--node` engine** (default; DRY types, deterministic skip-cascade, realtime
+stages.tsv, SIGTERM-aware, live-proven 2026-07-06):
+```
+target/debug/rustynet-cli ops vm-lab-orchestrate-live-lab \
+  --inventory documents/operations/active/vm_lab_inventory.json \
+  --ssh-identity-file <key> --known-hosts-file <kh> --report-dir state/live-lab-<name> \
+  --node debian-headless-1:exit --node debian-headless-2:client --node debian-headless-3:entry \
+  --node macos-utm-1:exit --node windows-utm-1:client \
+  --skip-soak --source-mode local-head
+```
+Platform election selectors auto-resolve inventory aliases: `--exit-platform windows`
+augments assignments without an explicit `--node windows-utm-1:exit`.
+MCP: `deepseek_lab_run` defaults `rust_engine=true`.
+
+**Legacy bash orchestrator** (for parity-diff and existing matrix rows):
 ```
 target/debug/rustynet-cli ops vm-lab-orchestrate-live-lab \
   --inventory documents/operations/active/vm_lab_inventory.json \
@@ -215,7 +231,9 @@ the fixes landed this pass (all Linux-gate-verified; live runs still pending):
 
 - **macOS blind_exit — §9 was STALE; cell is code-complete.** §9 said the live
   stage was "deferred in `active_exit.rs`"; that inspected only the rust-native
-  stage. The FAIL-LOUD live stage exists in the legacy path
+  stage (since live-verified 2026-07-06: the Rust-native `--node` engine drives
+  all 66 stages including macOS-blind-exit through `blind_exit.rs` with real pf
+  rule probing). The FAIL-LOUD live stage exists in the legacy path
   (`validate_macos_blind_exit` `vm_lab/mod.rs:9693` → `exercise_macos_blind_exit_live`
   `:10371`: irreversible `role set blind_exit --accept-irreversible`, asserts the
   pf anchor loaded + no route-to/reply-to/dup-to + the immutability gate). With

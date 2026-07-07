@@ -115,10 +115,11 @@ impl OrchestrationStage for AnchorValidationStage {
             .collect();
 
         // No Anchor nodes in this lab → nothing to validate. Skip-noop:
-        // pass without touching any host, like relay_validation's
-        // empty-assignment case.
+        // StageOutcome::Skipped (not Passed) so the run goes Partial —
+        // this stage was not exercised, and a false-green Pass would
+        // mask the gap.
         if anchor_aliases.is_empty() {
-            return StageOutcome::Passed;
+            return StageOutcome::Skipped;
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -300,18 +301,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_assignments_passes_skip_noop() {
+    fn empty_assignments_skips_skip_noop() {
         let mut ctx = empty_ctx();
         assert_eq!(
             AnchorValidationStage.execute(&mut ctx),
-            StageOutcome::Passed
+            StageOutcome::Skipped
         );
     }
 
     #[test]
-    fn no_anchor_role_among_non_anchor_assignments_passes_skip_noop() {
-        // Assignments present but none Anchor → still a skip-noop pass:
-        // the stage only validates Anchor nodes.
+    fn no_anchor_role_among_non_anchor_assignments_skips_skip_noop() {
+        // Assignments present but none Anchor → still a skip-noop Skipped:
+        // the stage only validates Anchor nodes, and no nodes ⇒ not exercised.
         use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
         let mut ctx = empty_ctx();
         ctx.assignments = vec![
@@ -326,7 +327,7 @@ mod tests {
         ];
         assert_eq!(
             AnchorValidationStage.execute(&mut ctx),
-            StageOutcome::Passed
+            StageOutcome::Skipped
         );
     }
 
@@ -461,12 +462,10 @@ mod tests {
     }
 
     #[test]
-    fn passing_run_invokes_reported_skips_note_write() {
-        // On a passing run the stage records the reported-skip note as
-        // evidence. The write itself is best-effort by design (a write
-        // failure never fails the stage), so this exercises the passing
-        // path end-to-end; the note *content* is asserted, with no
-        // filesystem dependency, by
+    fn skip_noop_run_invokes_reported_skips_note_write() {
+        // On an empty-assignment run the stage returns Skipped and records
+        // the reported-skip note as evidence. The write is best-effort; the
+        // note *content* is asserted by
         // `reported_skips_json_bytes_is_valid_json_naming_every_substage`.
         //
         // We do not read the file back here: the unit-test sandbox
@@ -476,7 +475,7 @@ mod tests {
         let mut ctx = empty_ctx();
         assert_eq!(
             AnchorValidationStage.execute(&mut ctx),
-            StageOutcome::Passed
+            StageOutcome::Skipped
         );
     }
 }

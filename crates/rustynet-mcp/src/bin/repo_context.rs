@@ -2108,28 +2108,29 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 42 | `live_enrollment_restart_validation` | Live enrollment-restart proof (admin killed mid-enrollment, must recover + membership integrity intact) delegates to the proven `live_linux_enrollment_restart_test` binary | `stage/live_enrollment_restart_validation.rs` |
 | 43 | `live_lan_toggle_validation` | Live LAN-toggle three-cycle proof (off→on→off with enforcement evidence on each side + blind-exit rejection) delegates to the proven cross-OS `live_linux_lan_toggle_test` binary | `stage/live_lan_toggle_validation.rs` |
 | 44 | `live_mixed_topology_validation` | Live cross-OS mutual-visibility proof (one Linux + one macOS + one Windows node: all mutually visible in membership + datapath freshness) delegates to the proven `live_linux_mixed_topology_test` binary | `stage/live_mixed_topology_validation.rs` |
-| 45 | `extended_soak` | Extended soak composite over two-hop, exit-handoff, LAN-toggle, and reboot-recovery live validators | `stage/live_extended_soak_validation.rs` |
-| 46 | `cross_network_preflight` | Cross-network preflight report from the Rust run context | `stage/cross_network.rs` |
-| 47 | `cross_network_direct_remote_exit` | Cross-network direct remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 48 | `cross_network_node_network_switch` | Cross-network node-network switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 49 | `cross_network_relay_remote_exit` | Cross-network relay remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 50 | `cross_network_failback_roaming` | Cross-network failback/roaming validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 51 | `cross_network_controller_switch` | Cross-network controller-switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 52 | `cross_network_traversal_adversarial` | Cross-network traversal adversarial validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 53 | `cross_network_remote_exit_dns` | Cross-network remote-exit DNS validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 54 | `cross_network_remote_exit_soak` | Cross-network remote-exit soak validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 55 | `cross_network_nat_classification` | Rust-native registered netns classification stage; skips until substrate staging is ported | `stage/cross_network.rs` |
-| 56 | `cross_network_nat_matrix` | Cross-network NAT matrix validation via `ops validate-cross-network-nat-matrix` | `stage/cross_network.rs` |
-| 57 | `chaos_clock_attack` | Opt-in chaos clock-attack stage, delegated to `live_chaos_clock_attack_test` | `stage/chaos.rs` |
-| 58 | `chaos_crash_recovery` | Opt-in chaos crash-recovery stage, delegated to `live_chaos_crash_recovery_test` | `stage/chaos.rs` |
-| 59 | `chaos_daemon_fault` | Opt-in daemon-fault chaos stage, delegated to `live_chaos_daemon_fault_test` | `stage/chaos.rs` |
-| 60 | `chaos_daemon_sigstop_sigcont` | Opt-in daemon SIGSTOP/SIGCONT chaos stage, delegated to `live_chaos_daemon_fault_test --fault-mode sigstop-cont` | `stage/chaos.rs` |
-| 61 | `chaos_membership_adversarial` | Opt-in membership-adversarial chaos stage, delegated to `live_chaos_membership_adversarial_test` | `stage/chaos.rs` |
-| 62 | `chaos_network_impairment` | Opt-in network-impairment chaos stage, delegated to `live_chaos_network_impairment_test` | `stage/chaos.rs` |
-| 63 | `chaos_privileged_boundary` | Opt-in privileged-boundary chaos stage, delegated to `live_chaos_privileged_boundary_test` | `stage/chaos.rs` |
-| 64 | `chaos_resource_exhaustion` | Opt-in resource-exhaustion chaos stage, delegated to `live_chaos_resource_exhaustion_test` | `stage/chaos.rs` |
-| 65 | `chaos_signed_state_adversarial` | Opt-in signed-state adversarial chaos stage, delegated to `live_chaos_signed_state_adversarial_test` | `stage/chaos.rs` |
-| 66 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 45 | `live_hello_limiter_flood_validation` | Live hello-limiter flood proof (relay hello-limiter audit: validates flood detection and rate-limit enforcement on relay-hosting nodes) delegates to the `hello-limiter-audit` subcommand of `rustynet-relay` | `stage/live_hello_limiter_flood_validation.rs` |
+| 46 | `extended_soak` | Extended soak composite over two-hop, exit-handoff, LAN-toggle, and reboot-recovery live validators | `stage/live_extended_soak_validation.rs` |
+| 47 | `cross_network_preflight` | Cross-network preflight report from the Rust run context | `stage/cross_network.rs` |
+| 48 | `cross_network_direct_remote_exit` | Cross-network direct remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 49 | `cross_network_node_network_switch` | Cross-network node-network switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 50 | `cross_network_relay_remote_exit` | Cross-network relay remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 51 | `cross_network_failback_roaming` | Cross-network failback/roaming validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 52 | `cross_network_controller_switch` | Cross-network controller-switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 53 | `cross_network_traversal_adversarial` | Cross-network traversal adversarial validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 54 | `cross_network_remote_exit_dns` | Cross-network remote-exit DNS validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 55 | `cross_network_remote_exit_soak` | Cross-network remote-exit soak validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 56 | `cross_network_nat_classification` | Rust-native registered netns classification stage; skips until substrate staging is ported | `stage/cross_network.rs` |
+| 57 | `cross_network_nat_matrix` | Cross-network NAT matrix validation via `ops validate-cross-network-nat-matrix` | `stage/cross_network.rs` |
+| 58 | `chaos_clock_attack` | Opt-in chaos clock-attack stage, delegated to `live_chaos_clock_attack_test` | `stage/chaos.rs` |
+| 59 | `chaos_crash_recovery` | Opt-in chaos crash-recovery stage, delegated to `live_chaos_crash_recovery_test` | `stage/chaos.rs` |
+| 60 | `chaos_daemon_fault` | Opt-in daemon-fault chaos stage, delegated to `live_chaos_daemon_fault_test` | `stage/chaos.rs` |
+| 61 | `chaos_daemon_sigstop_sigcont` | Opt-in daemon SIGSTOP/SIGCONT chaos stage, delegated to `live_chaos_daemon_fault_test --fault-mode sigstop-cont` | `stage/chaos.rs` |
+| 62 | `chaos_membership_adversarial` | Opt-in membership-adversarial chaos stage, delegated to `live_chaos_membership_adversarial_test` | `stage/chaos.rs` |
+| 63 | `chaos_network_impairment` | Opt-in network-impairment chaos stage, delegated to `live_chaos_network_impairment_test` | `stage/chaos.rs` |
+| 64 | `chaos_privileged_boundary` | Opt-in privileged-boundary chaos stage, delegated to `live_chaos_privileged_boundary_test` | `stage/chaos.rs` |
+| 65 | `chaos_resource_exhaustion` | Opt-in resource-exhaustion chaos stage, delegated to `live_chaos_resource_exhaustion_test` | `stage/chaos.rs` |
+| 66 | `chaos_signed_state_adversarial` | Opt-in signed-state adversarial chaos stage, delegated to `live_chaos_signed_state_adversarial_test` | `stage/chaos.rs` |
+| 67 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2230,6 +2231,7 @@ mod tests {
             "live_enrollment_restart_validation",
             "live_lan_toggle_validation",
             "live_mixed_topology_validation",
+            "live_hello_limiter_flood_validation",
             "extended_soak",
             "cross_network_preflight",
             "cross_network_direct_remote_exit",

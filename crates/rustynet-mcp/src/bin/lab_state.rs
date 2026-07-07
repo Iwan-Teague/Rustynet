@@ -2154,6 +2154,16 @@ impl LabStateServer {
                     if let Some(cs) = current {
                         out.push_str(&format!("- **latest stage seen (heuristic):** {cs}\n"));
                     }
+                    // Authoritative current stage: read the `running` row from
+                    // stages.tsv (upserted in real time by RustNativeStageRecorder).
+                    // This is the canonical realtime contract — the heuristic
+                    // log-line approach above is best-effort.
+                    let stages_path = rd.join("state/stages.tsv");
+                    if let Some(active) =
+                        read_rust_native_running_stage_from_tsv(stages_path.as_path())
+                    {
+                        out.push_str(&format!("- **active stage (stages.tsv):** {active}\n"));
+                    }
                     let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
                     let start = lines.len().saturating_sub(12);
                     out.push_str("\n## Latest log lines\n```\n");
@@ -2231,6 +2241,24 @@ fn mtime_age_secs(path: &Path) -> Option<u64> {
         .elapsed()
         .ok()
         .map(|d| d.as_secs())
+}
+
+/// Read the first `running` row from a stages.tsv file and return the stage
+/// name (column 0). Returns None when the file is absent, unparseable, or has
+/// no `running` row.
+///
+/// stages.tsv columns: stage \t tier \t status \t rc \t log_path \t summary \t started_at \t finished_at
+/// The Rust engine upserts a `status=running` row at stage start and replaces
+/// it at stage finish — this is the canonical realtime active-stage signal.
+fn read_rust_native_running_stage_from_tsv(path: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(path).ok()?;
+    for line in body.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() >= 3 && cols[2].trim() == "running" && !cols[0].trim().is_empty() {
+            return Some(cols[0].trim().to_owned());
+        }
+    }
+    None
 }
 
 /// Parse `ps -o state=,lstart=` output into the process start-time token, or

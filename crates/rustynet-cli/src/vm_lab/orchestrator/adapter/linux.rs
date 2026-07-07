@@ -42,6 +42,13 @@ impl NodeAdapter for LinuxNodeAdapter {
         VmGuestPlatform::Linux
     }
 
+    fn collect_os_version(&self) -> String {
+        use crate::vm_lab::orchestrator::adapter::ssh;
+        ssh::run_remote(&self.conn, "uname -r", Duration::from_secs(10))
+            .map(|v| format!("Linux {}", v.trim()))
+            .unwrap_or_else(|_| "linux".to_owned())
+    }
+
     fn alias(&self) -> &str {
         &self.alias
     }

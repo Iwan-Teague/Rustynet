@@ -1758,7 +1758,7 @@ pub const STAGES: &[StageSpec] = &[
         name: "live_anchor",
         logical: Some("anchor"),
         rust_native: true,
-        platform_rule: PlatformRule::ExitTarget,
+        platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::LinuxLiveSuite,
         ..DEFAULT_SPEC
     },
@@ -1919,6 +1919,15 @@ pub const STAGES: &[StageSpec] = &[
         ..DEFAULT_SPEC
     },
     StageSpec {
+        name: "live_hello_limiter_flood_validation",
+        group: StageGroup::Live,
+        logical: Some("hello_limiter_flood"),
+        rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::LinuxLiveSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
         name: "extended_soak",
         state_machine_only: true,
         group: StageGroup::Live,
@@ -1934,6 +1943,7 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Chaos,
         logical: Some("chaos"),
         rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1942,6 +1952,7 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Chaos,
         logical: Some("chaos"),
         rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1950,6 +1961,7 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Chaos,
         logical: Some("chaos"),
         rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1958,6 +1970,7 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Chaos,
         logical: Some("chaos"),
         rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1966,6 +1979,7 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Chaos,
         logical: Some("chaos"),
         rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1974,6 +1988,7 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Chaos,
         logical: Some("chaos"),
         rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1982,6 +1997,7 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Chaos,
         logical: Some("chaos"),
         rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1990,6 +2006,7 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Chaos,
         logical: Some("chaos"),
         rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -1998,6 +2015,7 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Chaos,
         logical: Some("chaos"),
         rust_native: true,
+        platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
@@ -2256,7 +2274,7 @@ pub fn platform_rule(stage: &str) -> PlatformRule {
     if let Some(spec) = find_stage(stage) {
         return spec.platform_rule;
     }
-    if stage.starts_with("cross_network_") {
+    if stage.starts_with("cross_network_") || stage.starts_with("chaos_") {
         PlatformRule::AllPlatforms
     } else {
         PlatformRule::LinuxOnly

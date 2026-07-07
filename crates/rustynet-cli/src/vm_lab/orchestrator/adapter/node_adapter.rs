@@ -83,6 +83,13 @@ impl SshConnectionParams {
 pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
     fn platform(&self) -> VmGuestPlatform;
 
+    /// Return a human-readable OS version string for evidence capture
+    /// (e.g. "Linux 6.1.0-26-amd64", "macOS 14.5"). Default implementation
+    /// returns the platform name in lowercase.
+    fn collect_os_version(&self) -> String {
+        format!("{:?}", self.platform()).to_lowercase()
+    }
+
     /// The alias this adapter was constructed for (matches `NodeRoleAssignment::alias`).
     fn alias(&self) -> &str;
 

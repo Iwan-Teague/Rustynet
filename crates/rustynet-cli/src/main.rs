@@ -2690,6 +2690,10 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         .as_deref()
                         .map(str::to_owned)
                         .unwrap_or_default(),
+                    git_commit: None,
+                    git_tree_clean: None,
+                    source_mode: None,
+                    repo_ref: None,
                 },
             })
         }

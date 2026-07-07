@@ -31,6 +31,7 @@ pub mod key_custody_validation;
 pub mod live_anchor;
 pub mod live_enrollment_restart_validation;
 pub mod live_extended_soak_validation;
+pub mod live_hello_limiter_flood_validation;
 pub mod live_key_custody_validation;
 pub mod live_lan_toggle_validation;
 pub mod live_managed_dns_validation;
@@ -91,6 +92,7 @@ pub enum StageId {
     LiveLanToggleValidation,
     LiveMixedTopologyValidation,
     LiveExtendedSoakValidation,
+    LiveHelloLimiterFloodValidation,
     CrossNetworkPreflight,
     CrossNetworkDirectRemoteExit,
     CrossNetworkNodeNetworkSwitch,
@@ -127,7 +129,7 @@ pub enum StageId {
 impl StageId {
     /// Every variant, in pipeline order — the drift gate asserts each is
     /// registered in `live_lab_stage_registry` (finding 1D).
-    pub const ALL: [StageId; 66] = [
+    pub const ALL: [StageId; 67] = [
         StageId::Preflight,
         StageId::PrepareSourceArchive,
         StageId::VerifySshReachability,
@@ -173,6 +175,7 @@ impl StageId {
         StageId::LiveLanToggleValidation,
         StageId::LiveMixedTopologyValidation,
         StageId::LiveExtendedSoakValidation,
+        StageId::LiveHelloLimiterFloodValidation,
         StageId::CrossNetworkPreflight,
         StageId::CrossNetworkDirectRemoteExit,
         StageId::CrossNetworkNodeNetworkSwitch,
@@ -233,6 +236,7 @@ impl StageId {
             StageId::LiveLanToggleValidation => "live_lan_toggle_validation",
             StageId::LiveMixedTopologyValidation => "live_mixed_topology_validation",
             StageId::LiveExtendedSoakValidation => "extended_soak",
+            StageId::LiveHelloLimiterFloodValidation => "live_hello_limiter_flood_validation",
             StageId::CrossNetworkPreflight => "cross_network_preflight",
             StageId::CrossNetworkDirectRemoteExit => "cross_network_direct_remote_exit",
             StageId::CrossNetworkNodeNetworkSwitch => "cross_network_node_network_switch",
