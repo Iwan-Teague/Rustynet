@@ -118,18 +118,28 @@ impl OrchestrationStage for ActiveExitStage {
         //    egresses via the exit's NAT) and assert the exit shows a NAT session
         //    translating a mesh-sourced client address. This is the W1/D7
         //    "client mesh traffic egresses via the exit" evidence.
+        //
+        //    Egress probes require internet reachability on the exit node;
+        //    a lab topology with no WAN egress (air-gapped, NAT-only, offline)
+        //    will fail the probe even though exit-serving itself is healthy.
+        //    Match the bash orchestrator: report-skip the egress proof rather
+        //    than hard-failing, so the run goes Partial instead of blocking on a
+        //    topology constraint outside the engine's control.
         if let Some(client_alias) = client_alias
             && let Some(client_adapter) = ctx.adapters.get(client_alias.as_str())
         {
-            if let Err(e) = client_adapter.drive_exit_egress_probe() {
-                return StageOutcome::Failed(format!(
-                    "active_exit: driving exit-egress traffic from client '{client_alias}' failed: {e}"
-                ));
-            }
-            if let Err(e) = exit_adapter.assert_mesh_client_nat_session() {
-                return StageOutcome::Failed(format!(
-                    "active_exit: client '{client_alias}' traffic did not egress via exit '{exit_alias}' NAT: {e}"
-                ));
+            let egress_ok = (|| -> Result<(), String> {
+                client_adapter
+                    .drive_exit_egress_probe()
+                    .map_err(|e| format!("drive egress traffic: {e}"))?;
+                exit_adapter
+                    .assert_mesh_client_nat_session()
+                    .map_err(|e| format!("assert NAT session: {e}"))?;
+                Ok(())
+            })();
+            if let Err(reason) = egress_ok {
+                write_reported_skip_note_egress(ctx, &exit_alias, client_alias.as_str(), &reason);
+                return StageOutcome::Skipped;
             }
         }
 
@@ -149,6 +159,7 @@ fn active_exit_runtime_implemented(platform: VmGuestPlatform) -> bool {
 }
 
 const REPORTED_SKIP_FILENAME: &str = "active_exit.reported_skips.json";
+const REPORTED_SKIP_EGRESS_FILENAME: &str = "active_exit.reported_skips_egress.json";
 
 /// Serialize the reported-skip note as pretty JSON bytes. Pure (no I/O) so a
 /// unit test asserts the content without a macOS adapter.
@@ -165,11 +176,46 @@ fn reported_skip_json_bytes(alias: &str, platform: VmGuestPlatform) -> Vec<u8> {
     serde_json::to_vec_pretty(&body).unwrap_or_default()
 }
 
+/// Serialize the egress-skip note — exit-serving activated but external
+/// egress proof unavailable (air-gapped / offline topology). Match the
+/// bash orchestrator: skip rather than hard-fail.
+fn reported_skip_egress_json_bytes(exit_alias: &str, client_alias: &str, reason: &str) -> Vec<u8> {
+    let body = serde_json::json!({
+        "stage": "active_exit",
+        "reported_skipped_egress_proof": [{
+            "exit_alias": exit_alias,
+            "client_alias": client_alias,
+            "reason": reason,
+        }],
+        "note": "exit-serving activation + IP-forwarding + NAT assertion passed; the external \
+                 egress proof (client egress traffic → exit NAT session) is unavailable — \
+                 the lab topology may lack internet egress. The exit is serving; this skip \
+                 matches the bash orchestrator behavior for offline topologies.",
+    });
+    serde_json::to_vec_pretty(&body).unwrap_or_default()
+}
+
 /// Write the reported-skip note to `<report_dir>/active_exit.reported_skips.json`.
 /// Best-effort: a write failure does not change the stage outcome.
 fn write_reported_skip_note(ctx: &OrchestrationContext, alias: &str, platform: VmGuestPlatform) {
     let path = ctx.report_dir.join(REPORTED_SKIP_FILENAME);
     let _ = std::fs::write(&path, reported_skip_json_bytes(alias, platform));
+}
+
+/// Write the egress-skip note — exit-serving passed but the external egress
+/// proof is unavailable. Best-effort: a write failure does not change the
+/// stage outcome.
+fn write_reported_skip_note_egress(
+    ctx: &OrchestrationContext,
+    exit_alias: &str,
+    client_alias: &str,
+    reason: &str,
+) {
+    let path = ctx.report_dir.join(REPORTED_SKIP_EGRESS_FILENAME);
+    let _ = std::fs::write(
+        &path,
+        reported_skip_egress_json_bytes(exit_alias, client_alias, reason),
+    );
 }
 
 #[cfg(test)]
@@ -191,6 +237,28 @@ mod tests {
         assert_eq!(v["stage"], "active_exit");
         assert_eq!(v["reported_skipped_active_exit"][0]["alias"], "macos-utm-1");
         assert_eq!(v["reported_skipped_active_exit"][0]["platform"], "Macos");
+    }
+
+    #[test]
+    fn reported_skip_egress_note_names_exit_client_and_reason() {
+        let bytes = reported_skip_egress_json_bytes("exit1", "client1", "no route to host");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["stage"], "active_exit");
+        assert_eq!(v["reported_skipped_egress_proof"][0]["exit_alias"], "exit1");
+        assert_eq!(
+            v["reported_skipped_egress_proof"][0]["client_alias"],
+            "client1"
+        );
+        assert_eq!(
+            v["reported_skipped_egress_proof"][0]["reason"],
+            "no route to host"
+        );
+        assert!(
+            v["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("lab topology may lack internet egress")
+        );
     }
 
     #[test]

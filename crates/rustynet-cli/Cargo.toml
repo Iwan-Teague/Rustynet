@@ -40,9 +40,10 @@ socket2 = { version = "0.6", features = [] }
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 zeroize = "1"
+tempfile = "3"
+signal-hook = { version = "0.3", default-features = false }
 
 [dev-dependencies]
-tempfile = "3"
 
 [lints]
 workspace = true

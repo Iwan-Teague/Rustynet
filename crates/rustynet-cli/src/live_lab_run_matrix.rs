@@ -170,6 +170,9 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_stage_network_flap",
     "macos_stage_network_flap",
     "windows_stage_network_flap",
+    "linux_stage_hello_limiter_flood",
+    "macos_stage_hello_limiter_flood",
+    "windows_stage_hello_limiter_flood",
     "cross_os_bootstrap",
     "cross_os_membership_convergence",
     "cross_os_peer_visibility",
@@ -3035,6 +3038,7 @@ mod registry_equivalence_tests {
             "live_enrollment_restart" => Some("enrollment_restart"),
             "live_network_flap" => Some("network_flap"),
             "live_network_flap_validation" => Some("network_flap"),
+            "live_hello_limiter_flood_validation" => Some("hello_limiter_flood"),
             "extended_soak" => Some("extended_soak"),
             "dns_failclosed_validation" => Some("dns_failclosed_check"),
             "runtime_acls_validation" => Some("runtime_acls_check"),
@@ -3107,6 +3111,7 @@ mod registry_equivalence_tests {
                 | "live_enrollment_restart_validation"
                 | "live_lan_toggle_validation"
                 | "live_mixed_topology_validation"
+                | "live_hello_limiter_flood_validation"
                 | "extended_soak"
                 | "deploy_relay_service"
                 | "relay_validation"

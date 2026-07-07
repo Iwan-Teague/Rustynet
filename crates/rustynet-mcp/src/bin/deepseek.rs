@@ -1905,7 +1905,7 @@ impl DeepSeekServer {
         let rust_engine = args
             .get("rust_engine")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(true); // default to Rust engine per F9-7
         if rust_engine && legacy_bash {
             return tool_error("rust_engine and legacy_bash are mutually exclusive");
         }

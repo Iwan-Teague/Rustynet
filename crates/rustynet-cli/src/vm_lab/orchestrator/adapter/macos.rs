@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::path::Path;
+use std::time::Duration;
 
 use crate::vm_lab::DaemonProbeOp;
 use crate::vm_lab::VmGuestPlatform;
@@ -44,6 +45,17 @@ impl MacosNodeAdapter {
 impl NodeAdapter for MacosNodeAdapter {
     fn platform(&self) -> VmGuestPlatform {
         VmGuestPlatform::Macos
+    }
+
+    fn collect_os_version(&self) -> String {
+        use crate::vm_lab::orchestrator::adapter::ssh;
+        ssh::run_remote(
+            &self.conn,
+            "sw_vers -productVersion",
+            Duration::from_secs(10),
+        )
+        .map(|v| format!("macOS {}", v.trim()))
+        .unwrap_or_else(|_| "macos".to_owned())
     }
 
     fn alias(&self) -> &str {

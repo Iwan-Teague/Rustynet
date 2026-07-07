@@ -13,6 +13,8 @@ use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use std::path::PathBuf;
 
+use tempfile;
+
 const DEFAULT_KILLSWITCH_TABLE: &str = "rustynet_g1";
 const DEFAULT_MESH_HOSTNAME: &str = "exit-1.rustynet";
 
@@ -46,11 +48,12 @@ fn detect_linux_egress_interface(shell: &dyn RemoteShellHost) -> Result<String, 
 }
 
 fn create_local_artifact_dir() -> Result<PathBuf, String> {
-    let mut tmp = std::env::temp_dir();
-    tmp.push("rustynet-exit-dns");
-    std::fs::create_dir_all(&tmp)
-        .map_err(|err| format!("failed to create local tmp dir: {err}"))?;
-    Ok(tmp)
+    #[allow(deprecated)]
+    {
+        Ok(tempfile::tempdir()
+            .map_err(|err| format!("failed to create local temp dir: {err}"))?
+            .into_path())
+    }
 }
 
 pub fn validate_linux_exit_dns_failclosed(

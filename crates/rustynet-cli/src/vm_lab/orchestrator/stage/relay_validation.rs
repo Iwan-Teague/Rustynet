@@ -62,10 +62,11 @@ impl OrchestrationStage for RelayValidationStage {
             .collect();
 
         // No Relay nodes in this lab → nothing to validate. Skip-noop:
-        // pass without touching any host, like role_switch_matrix's
-        // empty-assignment case.
+        // StageOutcome::Skipped (not Passed) so the run goes Partial —
+        // this stage was not exercised, and a false-green Pass would
+        // mask the gap.
         if relay_aliases.is_empty() {
-            return StageOutcome::Passed;
+            return StageOutcome::Skipped;
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -232,15 +233,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_assignments_passes_skip_noop() {
+    fn empty_assignments_skips_skip_noop() {
         let mut ctx = empty_ctx();
-        assert_eq!(RelayValidationStage.execute(&mut ctx), StageOutcome::Passed);
+        assert_eq!(
+            RelayValidationStage.execute(&mut ctx),
+            StageOutcome::Skipped
+        );
     }
 
     #[test]
-    fn no_relay_role_among_non_relay_assignments_passes_skip_noop() {
-        // Assignments present but none Relay → still a skip-noop pass:
-        // the stage only validates Relay nodes.
+    fn no_relay_role_among_non_relay_assignments_skips_skip_noop() {
+        // Assignments present but none Relay → still a skip-noop Skipped:
+        // the stage only validates Relay nodes, and no nodes ⇒ not exercised.
         use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
         let mut ctx = empty_ctx();
         ctx.assignments = vec![
@@ -253,7 +257,10 @@ mod tests {
                 role: NodeRole::Client,
             },
         ];
-        assert_eq!(RelayValidationStage.execute(&mut ctx), StageOutcome::Passed);
+        assert_eq!(
+            RelayValidationStage.execute(&mut ctx),
+            StageOutcome::Skipped
+        );
     }
 
     #[test]

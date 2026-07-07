@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
@@ -31,6 +33,22 @@ pub struct StateMachineRunner {
     /// Stage IDs explicitly requested to skip via `--skip-stage`.
     explicit_skips: HashSet<StageId>,
     explicit_skip_outcome: StageOutcome,
+    /// Per-stage wall-clock timeout in seconds.
+    ///
+    /// When non-zero, each stage's `execute()` is wrapped in a thread-based
+    /// timeout that returns `Failed("stage timed out after Ns")` if the
+    /// stage exceeds the limit. This requires `OrchestrationContext: Send`,
+    /// which is currently blocked by `Box<dyn NodeAdapter>` not requiring
+    /// `Send`. Until that refactor lands, per-SSH-command timeouts in the
+    /// SSH adapter (ConnectTimeout, ServerAliveInterval, run_output_with_timeout)
+    /// and the process-level `--timeout-secs` flag provide the practical
+    /// timeout envelope. A non-zero value here is plumbed through and logged
+    /// as a reminder; the warning silences when the Send refactor lands.
+    stage_timeout_secs: Option<u64>,
+    /// When set, the runner checks this flag before each stage. On true, it
+    /// skips non-`always_run` stages and runs teardown stages so the guest
+    /// killswitch/NAT residue is cleaned up even after a SIGTERM/SIGINT.
+    shutdown_flag: Option<Arc<AtomicBool>>,
 }
 
 impl StateMachineRunner {
@@ -39,6 +57,8 @@ impl StateMachineRunner {
             stages,
             explicit_skips: HashSet::new(),
             explicit_skip_outcome: StageOutcome::Skipped,
+            stage_timeout_secs: None,
+            shutdown_flag: None,
         }
     }
 
@@ -49,6 +69,18 @@ impl StateMachineRunner {
 
     pub fn with_explicit_skips_recorded_as_passed(mut self) -> Self {
         self.explicit_skip_outcome = StageOutcome::Passed;
+        self
+    }
+
+    pub fn with_stage_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.stage_timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub fn with_shutdown_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.shutdown_flag = Some(flag);
         self
     }
 
@@ -99,6 +131,19 @@ impl StateMachineRunner {
             // They still respect the explicit-skip set handled above.
             if dep_blocked && !stage.always_run() {
                 blocked.insert(id.clone());
+                observer.stage_finished(&id, &StageOutcome::Skipped);
+                results.push((id.clone(), StageOutcome::Skipped));
+                ctx.record_outcome(id, StageOutcome::Skipped);
+                continue;
+            }
+
+            // Shutdown-requested: skip non-teardown stages but still run
+            // `always_run` cleanup stages so guest killswitch/NAT residue is
+            // torn down (leaving it is a release-blocker per F5-4).
+            if let Some(ref flag) = self.shutdown_flag
+                && flag.load(Ordering::Acquire)
+                && !stage.always_run()
+            {
                 observer.stage_finished(&id, &StageOutcome::Skipped);
                 results.push((id.clone(), StageOutcome::Skipped));
                 ctx.record_outcome(id, StageOutcome::Skipped);

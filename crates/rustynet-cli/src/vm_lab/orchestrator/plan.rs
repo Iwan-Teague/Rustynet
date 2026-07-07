@@ -67,6 +67,7 @@ use crate::vm_lab::orchestrator::stage::key_custody_validation::KeyCustodyValida
 use crate::vm_lab::orchestrator::stage::live_anchor::LiveAnchorStage;
 use crate::vm_lab::orchestrator::stage::live_enrollment_restart_validation::LiveEnrollmentRestartValidationStage;
 use crate::vm_lab::orchestrator::stage::live_extended_soak_validation::LiveExtendedSoakValidationStage;
+use crate::vm_lab::orchestrator::stage::live_hello_limiter_flood_validation::LiveHelloLimiterFloodValidationStage;
 use crate::vm_lab::orchestrator::stage::live_key_custody_validation::LiveKeyCustodyValidationStage;
 use crate::vm_lab::orchestrator::stage::live_lan_toggle_validation::LiveLanToggleValidationStage;
 use crate::vm_lab::orchestrator::stage::live_managed_dns_validation::LiveManagedDnsValidationStage;
@@ -117,7 +118,7 @@ impl PlanBuilder {
     /// The post-baseline live-validation + role stages, dropped when
     /// `--skip-linux-live-suite` is set. Setup (through `validate_baseline_runtime`)
     /// and the always-run `cleanup` are never in this set.
-    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 28] = {
+    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 29] = {
         use crate::vm_lab::orchestrator::stage::StageId;
         [
             StageId::SecurityAuditValidation,
@@ -148,6 +149,7 @@ impl PlanBuilder {
             StageId::LiveEnrollmentRestartValidation,
             StageId::LiveLanToggleValidation,
             StageId::LiveMixedTopologyValidation,
+            StageId::LiveHelloLimiterFloodValidation,
         ]
     };
 
@@ -334,6 +336,7 @@ impl PlanBuilder {
             Box::new(LiveEnrollmentRestartValidationStage),
             Box::new(LiveLanToggleValidationStage),
             Box::new(LiveMixedTopologyValidationStage),
+            Box::new(LiveHelloLimiterFloodValidationStage),
             Box::new(FinalCleanupStage::new(rebuild_only)),
         ];
         if !skip_soak {
@@ -408,9 +411,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_57_stages() {
+    fn build_returns_58_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 57, "plan must contain exactly 57 stages");
+        assert_eq!(stages.len(), 58, "plan must contain exactly 58 stages");
     }
 
     #[test]
@@ -418,7 +421,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_enable_chaos_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        assert_eq!(ids.len(), 66, "chaos-enabled plan must contain 66 stages");
+        assert_eq!(ids.len(), 67, "chaos-enabled plan must contain 67 stages");
         for chaos_id in PlanBuilder::CHAOS_SUITE_STAGES {
             assert!(
                 ids.contains(&chaos_id),
@@ -439,10 +442,10 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 57 total - 28 live-suite stages - 11 cross-network stages - 1 soak stage = 17.
+        // 58 total - 29 live-suite stages - 11 cross-network stages - 1 soak stage = 17.
         assert_eq!(
             ids.len(),
-            57 - PlanBuilder::LIVE_SUITE_STAGES.len()
+            58 - PlanBuilder::LIVE_SUITE_STAGES.len()
                 - PlanBuilder::CROSS_NETWORK_SUITE_STAGES.len()
                 - PlanBuilder::SOAK_SUITE_STAGES.len()
         );
@@ -484,7 +487,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            57 - PlanBuilder::LIVE_SUITE_STAGES.len()
+            58 - PlanBuilder::LIVE_SUITE_STAGES.len()
                 - PlanBuilder::CROSS_NETWORK_SUITE_STAGES.len()
                 - PlanBuilder::SOAK_SUITE_STAGES.len()
         );
@@ -550,6 +553,7 @@ mod tests {
                 StageId::LiveEnrollmentRestartValidation,
                 StageId::LiveLanToggleValidation,
                 StageId::LiveMixedTopologyValidation,
+                StageId::LiveHelloLimiterFloodValidation,
                 StageId::LiveExtendedSoakValidation,
                 StageId::CrossNetworkPreflight,
                 StageId::CrossNetworkDirectRemoteExit,
@@ -573,7 +577,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_soak(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        assert_eq!(ids.len(), 56);
+        assert_eq!(ids.len(), 57);
         assert!(!ids.contains(&StageId::LiveExtendedSoakValidation));
         assert!(ids.contains(&StageId::LiveMixedTopologyValidation));
         assert!(ids.contains(&StageId::CrossNetworkPreflight));
@@ -583,15 +587,17 @@ mod tests {
     #[test]
     fn disabled_cross_network_options_drop_only_cross_network_suite() {
         use crate::vm_lab::orchestrator::stage::StageId;
-        let mut cross_network = CrossNetworkOptions::default();
-        cross_network.enable_suite = false;
+        let cross_network = CrossNetworkOptions {
+            enable_suite: false,
+            ..CrossNetworkOptions::default()
+        };
         let stages = PlanBuilder::new()
             .with_cross_network_options(cross_network)
             .build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            57 - PlanBuilder::CROSS_NETWORK_SUITE_STAGES.len()
+            58 - PlanBuilder::CROSS_NETWORK_SUITE_STAGES.len()
         );
         for dropped in PlanBuilder::CROSS_NETWORK_SUITE_STAGES {
             assert!(

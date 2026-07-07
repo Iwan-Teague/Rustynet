@@ -87,10 +87,11 @@ impl OrchestrationStage for DeployRelayServiceStage {
             .map(|a| a.alias.clone())
             .collect();
 
-        // No Relay nodes in this lab → nothing to deploy. Skip-noop, mirroring
-        // relay_validation's empty-assignment case.
+        // No Relay nodes in this lab → nothing to deploy. Skip-noop: return
+        // StageOutcome::Skipped (not Passed) so the run goes Partial — this
+        // stage was not exercised, and a false-green Pass would mask the gap.
         if relay_aliases.is_empty() {
-            return StageOutcome::Passed;
+            return StageOutcome::Skipped;
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -223,16 +224,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_assignments_passes_skip_noop() {
+    fn empty_assignments_skips_skip_noop() {
         let mut ctx = empty_ctx();
         assert_eq!(
             DeployRelayServiceStage.execute(&mut ctx),
-            StageOutcome::Passed
+            StageOutcome::Skipped
         );
     }
 
     #[test]
-    fn no_relay_role_among_non_relay_assignments_passes_skip_noop() {
+    fn no_relay_role_among_non_relay_assignments_skips_skip_noop() {
         let mut ctx = empty_ctx();
         ctx.assignments = vec![
             NodeRoleAssignment {
@@ -246,7 +247,7 @@ mod tests {
         ];
         assert_eq!(
             DeployRelayServiceStage.execute(&mut ctx),
-            StageOutcome::Passed
+            StageOutcome::Skipped
         );
     }
 

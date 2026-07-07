@@ -103,6 +103,10 @@ pub struct WriteLiveLinuxLabRunSummaryConfig {
     pub elapsed_secs: u64,
     pub elapsed_human: String,
     pub run_note: String,
+    pub git_commit: Option<String>,
+    pub git_tree_clean: Option<bool>,
+    pub source_mode: Option<String>,
+    pub repo_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,17 +559,30 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+fn iso8601_utc_from_unix(unix_secs: u64) -> String {
+    let days_since_epoch = (unix_secs / 86400) as i64;
+    let secs_of_day = (unix_secs % 86400) as u32;
+    let z = days_since_epoch + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y_final = if m <= 2 { y + 1 } else { y };
+    let h = secs_of_day / 3600;
+    let min = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y_final, m, d, h, min, s
+    )
+}
+
 fn collected_at_utc_now() -> String {
-    Command::new("date")
-        .arg("-u")
-        .arg("+%FT%TZ")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|text| text.trim().to_owned())
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| format!("unix:{}", unix_now()))
+    iso8601_utc_from_unix(unix_now())
 }
 
 fn sha256_hex_for_file(path: &Path) -> Result<String, String> {
@@ -1984,13 +2001,22 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
 
     let nodes: Vec<RunSummaryNodeView> = node_rows
         .into_iter()
-        .filter(|row| row.len() == 4)
-        .map(|row| RunSummaryNodeView {
-            label: row[0].clone(),
-            target: row[1].clone(),
-            node_id: row[2].clone(),
-            bootstrap_role: row[3].clone(),
-            extra: Map::new(),
+        .filter(|row| row.len() >= 4)
+        .map(|row| {
+            let mut extra = Map::new();
+            if row.len() >= 5 {
+                extra.insert("platform".to_owned(), Value::String(row[4].clone()));
+            }
+            if row.len() >= 6 {
+                extra.insert("os_version".to_owned(), Value::String(row[5].clone()));
+            }
+            RunSummaryNodeView {
+                label: row[0].clone(),
+                target: row[1].clone(),
+                node_id: row[2].clone(),
+                bootstrap_role: row[3].clone(),
+                extra,
+            }
         })
         .collect();
 
@@ -2046,6 +2072,20 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
         })
         .collect();
 
+    let mut extra = Map::new();
+    if let Some(ref commit) = config.git_commit {
+        extra.insert("git_commit".to_owned(), Value::String(commit.clone()));
+    }
+    if let Some(clean) = config.git_tree_clean {
+        extra.insert("git_tree_clean".to_owned(), Value::Bool(clean));
+    }
+    if let Some(ref mode) = config.source_mode {
+        extra.insert("source_mode".to_owned(), Value::String(mode.clone()));
+    }
+    if let Some(ref repo_ref) = config.repo_ref {
+        extra.insert("repo_ref".to_owned(), Value::String(repo_ref.clone()));
+    }
+
     let summary = LiveLabRunSummaryView {
         schema_version: 1,
         run_id: config.run_id.clone(),
@@ -2063,7 +2103,7 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
         run_note: config.run_note.clone(),
         nodes,
         stages,
-        extra: Map::new(),
+        extra,
     };
 
     ensure_parent_dir(summary_json.as_path())?;
@@ -4389,6 +4429,10 @@ mod tests {
             elapsed_secs: 10,
             elapsed_human: "00m 10s".to_owned(),
             run_note: String::new(),
+            git_commit: None,
+            git_tree_clean: None,
+            source_mode: None,
+            repo_ref: None,
         })
         .expect("summary should write");
 

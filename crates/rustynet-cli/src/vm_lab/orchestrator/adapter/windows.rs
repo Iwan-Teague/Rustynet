@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::path::Path;
+use std::time::Duration;
 
 use crate::vm_lab::DaemonProbeOp;
 use crate::vm_lab::VmGuestPlatform;
@@ -45,6 +46,13 @@ impl WindowsNodeAdapter {
 impl NodeAdapter for WindowsNodeAdapter {
     fn platform(&self) -> VmGuestPlatform {
         VmGuestPlatform::Windows
+    }
+
+    fn collect_os_version(&self) -> String {
+        use crate::vm_lab::orchestrator::adapter::ssh;
+        ssh::run_remote(&self.conn, "cmd /c ver", Duration::from_secs(10))
+            .map(|v| format!("Windows {}", v.trim()))
+            .unwrap_or_else(|_| "windows".to_owned())
     }
 
     fn alias(&self) -> &str {
