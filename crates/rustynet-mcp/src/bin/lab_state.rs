@@ -665,6 +665,33 @@ impl LabStateServer {
         })
     }
 
+    /// `(alias, lab_role)` for every Linux inventory entry (no `platform`
+    /// field) that has both `alias` and `lab_role` set. This is the same
+    /// Linux-backbone data `get_lab_topology` renders under "linux nodes (by
+    /// lab_role)" — used here to auto-synthesize a Rust `--node` topology.
+    fn inventory_linux_lab_roles(&self) -> Vec<(String, String)> {
+        let Ok(s) = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)) else {
+            return Vec::new();
+        };
+        let Ok(inv) = serde_json::from_str::<Value>(&s) else {
+            return Vec::new();
+        };
+        inv.get("entries")
+            .and_then(|v| v.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| e.get("platform").and_then(|v| v.as_str()).is_none())
+                    .filter_map(|e| {
+                        let alias = e.get("alias").and_then(|v| v.as_str())?;
+                        let role = e.get("lab_role").and_then(|v| v.as_str())?;
+                        Some((alias.to_owned(), role.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Untracked files under `crates/` — these are NOT captured by working-tree
     /// source deploy (`git stash create` only stashes tracked changes), so a
     /// patch that adds a new file won't reach the VMs until it's `git add`ed.
@@ -2545,6 +2572,86 @@ fn arg_bool(args: Option<&Value>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Auto-synthesize a full `nodes` (`alias:role`) topology from role-platform
+/// selectors + inventory, so `start_live_lab_run` routes through the Rust
+/// `--node` engine instead of the legacy bash arm whenever a selector is used
+/// without explicit `nodes`. Bash is slated for removal once Rust parity
+/// evidence is complete, so a selector-driven run should exercise Rust by
+/// default. Role priority mirrors deepseek_lab_run's `synthesize_rust_node_args`:
+/// `admin`/`blind_exit` are first-class `--node` role tokens (Bucket 1.5;
+/// `NodeRole::parse` accepts both, and `is_lab_assignable_for_platform` allows
+/// any OS for lab-evidence purposes) so each selector maps to its own real
+/// role instead of aliasing onto anchor/exit.
+///
+/// `linux_lab_roles` is `(alias, lab_role)` for every Linux inventory entry
+/// (see `inventory_linux_lab_roles`) — this is the same data bash's own
+/// auto-topology derives its Linux backbone from, kept 1:1 so a
+/// selector-driven Rust run covers the same nodes a bash run would.
+#[allow(clippy::too_many_arguments)]
+fn synthesize_nodes_from_platform_selectors(
+    linux_lab_roles: &[(String, String)],
+    macos_alias: Option<&str>,
+    windows_alias: Option<&str>,
+    exit_platform: Option<&str>,
+    relay_platform: Option<&str>,
+    anchor_platform: Option<&str>,
+    admin_platform: Option<&str>,
+    blind_exit_platform: Option<&str>,
+    macos_promote_exit: bool,
+) -> Vec<String> {
+    let role_for_os = |os: &str| -> &'static str {
+        let is = |sel: Option<&str>| sel.is_some_and(|s| s.eq_ignore_ascii_case(os));
+        if is(admin_platform) {
+            "admin"
+        } else if is(blind_exit_platform) {
+            "blind_exit"
+        } else if (os == "macos" && macos_promote_exit) || is(exit_platform) {
+            "exit"
+        } else if is(relay_platform) {
+            "relay"
+        } else if is(anchor_platform) {
+            "anchor"
+        } else {
+            "client"
+        }
+    };
+    // A mac/win node taking the exit role replaces the Linux exit, not adds
+    // to it — Exit is the membership-issuing singleton.
+    let non_linux_exit_selected =
+        macos_promote_exit || exit_platform.is_some_and(|p| matches!(p, "macos" | "windows"));
+
+    let mut out = Vec::new();
+    for (alias, role) in linux_lab_roles {
+        if role == "exit" && non_linux_exit_selected {
+            continue;
+        }
+        out.push(format!("{alias}:{role}"));
+    }
+    if let Some(m) = macos_alias {
+        out.push(format!("{m}:{}", role_for_os("macos")));
+    }
+    if let Some(w) = windows_alias {
+        out.push(format!("{w}:{}", role_for_os("windows")));
+    }
+    out
+}
+
+/// True when at least one role-platform selector (or the Option-B macOS
+/// secondary-exit selector) is present in the tool args — the signal that a
+/// selector-driven run should synthesize `--node` instead of falling to bash.
+fn has_role_platform_selector(args: Option<&Value>) -> bool {
+    arg_bool(args, "macos_promote_exit")
+        || [
+            "exit_platform",
+            "relay_platform",
+            "anchor_platform",
+            "admin_platform",
+            "blind_exit_platform",
+        ]
+        .into_iter()
+        .any(|k| arg_str(args, k).is_some())
+}
+
 const OVERNIGHT_PLAYBOOK: &str = r#"# Overnight live-lab autonomous loop
 
 Drive: run live lab (Windows + macOS + Linux) → catch bugs → patch → re-verify,
@@ -2872,7 +2979,7 @@ impl McpServer for LabStateServer {
             // ── Async live-lab jobs ──
             Tool {
                 name: "start_live_lab_run".into(),
-                description: "Launch a live-lab run as a DETACHED background job and return immediately with a job_id (does NOT block). mode=orchestrate (one-shot discover→setup→run→diagnose, all 3 OS), run (against an existing profile), or setup. Poll with get_job_status; results via get_run_result. Survives an MCP-server reload. Use dry_run to validate quickly. FAST RE-VERIFY after a per-node code patch: pass nodes=[topology] + rebuild_nodes=[patched node] + skip_soak — redeploys only that node (others keep state) instead of a full multi-node rebuild. (No mid-stage resume; see explain_stage.)".into(),
+                description: "Launch a live-lab run as a DETACHED background job and return immediately with a job_id (does NOT block). mode=orchestrate (one-shot discover→setup→run→diagnose, all 3 OS), run (against an existing profile), or setup. Poll with get_job_status; results via get_run_result. Survives an MCP-server reload. Use dry_run to validate quickly. FAST RE-VERIFY after a per-node code patch: pass nodes=[topology] + rebuild_nodes=[patched node] + skip_soak — redeploys only that node (others keep state) instead of a full multi-node rebuild. (No mid-stage resume; see explain_stage.) ENGINE ROUTING: `nodes=[\"alias:role\", ...]` is the ONLY thing that drives the Rust `--node` engine — dry_run's own log line confirms it with \"rust --node: N node(s), M planned stage(s)\". The `*_platform` role-election selectors below (exit_platform/relay_platform/anchor_platform/admin_platform/blind_exit_platform/macos_promote_exit) are mutually exclusive with `nodes` and currently route through the LEGACY BASH orchestrator instead — real stage names in the resulting logs look like `bootstrap_macos_host.log` / `validate_windows_key_custody.log`, not Rust `StageId`s. If you're verifying the Rust engine specifically (not just the underlying daemon subcommand), use `nodes` with an explicit role per alias, not a `*_platform` selector.".into(),
                 input_schema: json_schema_object(
                     json!({
                         "mode": json_schema_string("orchestrate | run | setup (default: orchestrate)"),
@@ -2895,12 +3002,12 @@ impl McpServer for LabStateServer {
                         "skip_gates": json_schema_boolean("Skip gate stages"),
                         "skip_soak": json_schema_boolean("Skip soak stages"),
                         "skip_cross_network": json_schema_boolean("Skip cross-network stages"),
-                        "exit_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the EXIT role so the focused mac/win exit cell runs live instead of skipping."),
-                        "relay_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the RELAY role."),
-                        "anchor_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the ANCHOR role."),
-                        "admin_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the ADMIN role."),
-                        "blind_exit_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos) into the BLIND_EXIT role (irreversible; Windows unsupported by design)."),
-                        "macos_promote_exit": json_schema_boolean("orchestrate: Option-B macOS secondary-exit selector — promote the macOS node to an active exit."),
+                        "exit_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the EXIT role so the focused mac/win exit cell runs live instead of skipping. Routes through the LEGACY BASH orchestrator, NOT the Rust --node engine (mutually exclusive with `nodes`) — use `nodes=[\"alias:exit\", ...]` instead to test the Rust engine."),
+                        "relay_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the RELAY role. Routes through the LEGACY BASH orchestrator, NOT the Rust --node engine (mutually exclusive with `nodes`) — use `nodes=[\"alias:relay\", ...]` instead to test the Rust engine."),
+                        "anchor_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the ANCHOR role. Routes through the LEGACY BASH orchestrator, NOT the Rust --node engine (mutually exclusive with `nodes`) — use `nodes=[\"alias:anchor\", ...]` instead to test the Rust engine."),
+                        "admin_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the ADMIN role. Routes through the LEGACY BASH orchestrator, NOT the Rust --node engine (mutually exclusive with `nodes`) — use `nodes=[\"alias:admin\", ...]` instead to test the Rust engine."),
+                        "blind_exit_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos) into the BLIND_EXIT role (irreversible; Windows unsupported by design). Routes through the LEGACY BASH orchestrator, NOT the Rust --node engine (mutually exclusive with `nodes`) — use `nodes=[\"alias:blind_exit\", ...]` instead to test the Rust engine."),
+                        "macos_promote_exit": json_schema_boolean("orchestrate: Option-B macOS secondary-exit selector — promote the macOS node to an active exit. Routes through the LEGACY BASH orchestrator, NOT the Rust --node engine."),
                         "skip_linux_live_suite": json_schema_boolean("orchestrate: skip the ~30-45 min Linux live-validation suite and jump to the mac/win role stages after setup. Pair with a role-platform selector to drive ONE mac/win cell fast."),
                     }),
                     vec![],
@@ -3580,9 +3687,7 @@ impl LabStateServer {
                     }
                 }
                 // Windows/macOS: explicit arg wins; otherwise auto-topology
-                // (default on) fills them from the inventory so a run covers all
-                // three OSes by default. Linux nodes auto-resolve from inventory
-                // lab_role metadata in the CLI, so no Linux handling needed here.
+                // (default on) fills them from the inventory.
                 let auto = args
                     .and_then(|a| a.get("auto_topology"))
                     .and_then(|v| v.as_bool())
@@ -3591,18 +3696,75 @@ impl LabStateServer {
                     auto.then(|| self.inventory_alias_for_platform("windows"))
                         .flatten()
                 });
-                if let Some(w) = win {
-                    cli.extend(["--windows-vm".into(), w]);
-                }
                 let mac = arg_str(args, "macos_vm").map(String::from).or_else(|| {
                     auto.then(|| self.inventory_alias_for_platform("macos"))
                         .flatten()
                 });
-                if let Some(m) = mac {
-                    cli.extend(["--macos-vm".into(), m]);
-                }
-                for n in string_array(args, "nodes") {
-                    cli.extend(["--node".into(), n]);
+
+                let explicit_nodes = string_array(args, "nodes");
+                // Role-platform selectors (Bucket 5) ELECT an OS into a role so the
+                // focused mac/win cell runs live instead of skipping. Bash is slated
+                // for removal once Rust parity evidence is complete, so — unlike the
+                // raw `--exit-platform` etc. CLI flags, which only the legacy bash
+                // arm honors — a selector-driven run here AUTO-SYNTHESIZES a full
+                // `--node alias:role` topology (mirrors deepseek_lab_run's default
+                // `rust_engine: true` behavior) instead of falling to bash. The
+                // earlier mutual-exclusivity check guarantees `explicit_nodes` is
+                // empty whenever a selector is present, so this and the
+                // `!explicit_nodes.is_empty()` branch below never both fire.
+                if explicit_nodes.is_empty() && has_role_platform_selector(args) {
+                    let linux_lab_roles = self.inventory_linux_lab_roles();
+                    let synthesized = synthesize_nodes_from_platform_selectors(
+                        &linux_lab_roles,
+                        mac.as_deref(),
+                        win.as_deref(),
+                        arg_str(args, "exit_platform"),
+                        arg_str(args, "relay_platform"),
+                        arg_str(args, "anchor_platform"),
+                        arg_str(args, "admin_platform"),
+                        arg_str(args, "blind_exit_platform"),
+                        arg_bool(args, "macos_promote_exit"),
+                    );
+                    if synthesized.is_empty() {
+                        return tool_error(
+                            "a role-platform selector was set but no --node topology could be \
+                             synthesized: the inventory has no Linux lab_role entries and the \
+                             selected OS did not resolve to an alias (check windows_vm/macos_vm \
+                             or the inventory's platform field). Without this, the run would \
+                             silently emit zero --node flags and fall back to bash.",
+                        );
+                    }
+                    for n in synthesized {
+                        cli.extend(["--node".into(), n]);
+                    }
+                } else {
+                    if let Some(w) = &win {
+                        cli.extend(["--windows-vm".into(), w.clone()]);
+                    }
+                    if let Some(m) = &mac {
+                        cli.extend(["--macos-vm".into(), m.clone()]);
+                    }
+                    for n in explicit_nodes {
+                        cli.extend(["--node".into(), n]);
+                    }
+                    // Raw platform-selector flags only reach the CLI here if
+                    // `nodes` was also set — the earlier mutual-exclusivity check
+                    // already rejected that combination, so this is unreachable
+                    // in practice; kept as a fail-safe rather than a silent drop.
+                    for (flag, key) in [
+                        ("--exit-platform", "exit_platform"),
+                        ("--relay-platform", "relay_platform"),
+                        ("--anchor-platform", "anchor_platform"),
+                        ("--admin-platform", "admin_platform"),
+                        ("--blind-exit-platform", "blind_exit_platform"),
+                    ] {
+                        if let Some(v) = arg_str(args, key) {
+                            cli.extend([flag.into(), v.into()]);
+                        }
+                    }
+                    if arg_bool(args, "macos_promote_exit") {
+                        cli.push("--macos-promote-exit".into());
+                    }
                 }
                 // Fast re-verify of a code patch: redeploy ONLY the affected
                 // node(s); others keep their daemon + distributed state. The full
@@ -3613,26 +3775,6 @@ impl LabStateServer {
                 if !rebuild.is_empty() {
                     cli.push("--rebuild-nodes".into());
                     cli.push(rebuild.join(","));
-                }
-                // Role-platform selectors (Bucket 5): ELECT an OS into a role so
-                // the focused mac/win cell runs live instead of skipping — parity
-                // with the CLI + DeepSeek MCP. Values (linux|macos|windows) are
-                // validated by the CLI parser. macos_promote_exit is the Option-B
-                // macOS secondary-exit selector; skip_linux_live_suite jumps to
-                // the mac/win role stages after setup.
-                for (flag, key) in [
-                    ("--exit-platform", "exit_platform"),
-                    ("--relay-platform", "relay_platform"),
-                    ("--anchor-platform", "anchor_platform"),
-                    ("--admin-platform", "admin_platform"),
-                    ("--blind-exit-platform", "blind_exit_platform"),
-                ] {
-                    if let Some(v) = arg_str(args, key) {
-                        cli.extend([flag.into(), v.into()]);
-                    }
-                }
-                if arg_bool(args, "macos_promote_exit") {
-                    cli.push("--macos-promote-exit".into());
                 }
                 if arg_bool(args, "skip_linux_live_suite") {
                     cli.push("--skip-linux-live-suite".into());
@@ -6831,6 +6973,210 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             result2.is_error.is_some(),
             "nodes + macos_promote_exit must error; got: {:?}",
             result2.content
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Rust-engine synthesis from role-platform selectors ──────────────
+
+    #[test]
+    fn synthesize_nodes_maps_each_selector_to_its_own_role() {
+        let linux: Vec<(String, String)> = vec![];
+        let node = |ep, rp, ap, adp, bxp| {
+            synthesize_nodes_from_platform_selectors(
+                &linux,
+                Some("mac-1"),
+                None,
+                ep,
+                rp,
+                ap,
+                adp,
+                bxp,
+                false,
+            )
+        };
+        assert_eq!(
+            node(Some("macos"), None, None, None, None),
+            vec!["mac-1:exit"]
+        );
+        assert_eq!(
+            node(None, Some("macos"), None, None, None),
+            vec!["mac-1:relay"]
+        );
+        assert_eq!(
+            node(None, None, Some("macos"), None, None),
+            vec!["mac-1:anchor"]
+        );
+        assert_eq!(
+            node(None, None, None, Some("macos"), None),
+            vec!["mac-1:admin"],
+            "admin is a first-class --node role (Bucket 1.5), not aliased to anchor"
+        );
+        assert_eq!(
+            node(None, None, None, None, Some("macos")),
+            vec!["mac-1:blind_exit"],
+            "blind_exit is a first-class --node role (Bucket 1.5), not aliased to exit"
+        );
+        assert_eq!(
+            node(None, None, None, None, None),
+            vec!["mac-1:client"],
+            "no matching selector → client"
+        );
+    }
+
+    #[test]
+    fn synthesize_nodes_keeps_linux_backbone_and_appends_the_selected_guest() {
+        let linux = vec![
+            ("deb-1".to_string(), "exit".to_string()),
+            ("deb-2".to_string(), "client".to_string()),
+        ];
+        let out = synthesize_nodes_from_platform_selectors(
+            &linux,
+            None,
+            Some("win-1"),
+            None,
+            Some("windows"),
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(out, vec!["deb-1:exit", "deb-2:client", "win-1:relay"]);
+    }
+
+    #[test]
+    fn synthesize_nodes_drops_linux_exit_when_a_non_linux_exit_is_selected() {
+        let linux = vec![
+            ("deb-1".to_string(), "exit".to_string()),
+            ("deb-2".to_string(), "client".to_string()),
+        ];
+        // exit_platform=windows: the Linux exit is superseded, not duplicated.
+        let out = synthesize_nodes_from_platform_selectors(
+            &linux,
+            None,
+            Some("win-1"),
+            Some("windows"),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(out, vec!["deb-2:client", "win-1:exit"]);
+
+        // macos_promote_exit: same supersession rule.
+        let out2 = synthesize_nodes_from_platform_selectors(
+            &linux,
+            Some("mac-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(out2, vec!["deb-2:client", "mac-1:exit"]);
+    }
+
+    #[test]
+    fn synthesize_nodes_empty_when_no_backbone_and_no_resolved_guest() {
+        let linux: Vec<(String, String)> = vec![];
+        let out = synthesize_nodes_from_platform_selectors(
+            &linux,
+            None,
+            None,
+            Some("windows"),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            out.is_empty(),
+            "no inventory + unresolved windows alias → nothing to synthesize: {out:?}"
+        );
+    }
+
+    #[test]
+    fn has_role_platform_selector_detects_each_field() {
+        assert!(has_role_platform_selector(Some(
+            &json!({"exit_platform": "windows"})
+        )));
+        assert!(has_role_platform_selector(Some(
+            &json!({"blind_exit_platform": "macos"})
+        )));
+        assert!(has_role_platform_selector(Some(
+            &json!({"macos_promote_exit": true})
+        )));
+        assert!(!has_role_platform_selector(Some(
+            &json!({"macos_promote_exit": false})
+        )));
+        assert!(!has_role_platform_selector(Some(
+            &json!({"nodes": ["a:exit"]})
+        )));
+        assert!(!has_role_platform_selector(None));
+    }
+
+    #[test]
+    fn inventory_linux_lab_roles_reads_only_linux_entries_with_both_fields() {
+        let tmp = std::env::temp_dir().join(format!("mcp-linux-lab-roles-{}", std::process::id()));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[
+                {"alias":"deb-1","lab_role":"exit"},
+                {"alias":"deb-2","lab_role":"client"},
+                {"alias":"deb-3"},
+                {"alias":"mac-1","platform":"macos","lab_role":"macos_client"},
+                {"alias":"win-1","platform":"windows","lab_role":"windows_client"}
+            ]}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let roles = srv.inventory_linux_lab_roles();
+        assert_eq!(
+            roles,
+            vec![
+                ("deb-1".to_string(), "exit".to_string()),
+                ("deb-2".to_string(), "client".to_string()),
+            ],
+            "must skip the no-lab_role Linux entry and every platform-tagged (mac/win) entry"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn start_live_lab_run_fails_closed_instead_of_silently_falling_back_to_bash() {
+        // Regression test: a role-platform selector with no synthesizable --node
+        // topology (empty inventory, no explicit guest) used to silently emit the
+        // raw --relay-platform flag and spawn the legacy bash arm. It must now
+        // fail closed with a clear message instead.
+        let tmp =
+            std::env::temp_dir().join(format!("mcp-selector-failclosed-{}", std::process::id()));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(inv_dir.join("vm_lab_inventory.json"), r#"{"entries":[]}"#).unwrap();
+        let srv = test_server(&tmp);
+
+        let args = json!({
+            "mode": "orchestrate",
+            "relay_platform": "windows",
+            "auto_topology": false
+        });
+        let result = srv.start_live_lab_run(Some(&args));
+        assert!(
+            result.is_error.is_some(),
+            "must fail closed rather than silently routing to bash; got: {:?}",
+            result.content
+        );
+        let text = result.content[0].text.to_lowercase();
+        assert!(
+            text.contains("no --node topology could be synthesized"),
+            "error must explain the synthesis failure; got: {text}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

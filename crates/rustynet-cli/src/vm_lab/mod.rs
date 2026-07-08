@@ -3510,9 +3510,24 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             authoritative_target_present = true;
             ssh_target_source = "inventory".to_owned();
             ssh_user = entry.ssh_user.clone();
-            if let Some(ip) = resolve_local_utm_live_host(entry, utmctl_path.as_path()) {
+            let entry_bundle_path = entry
+                .controller
+                .as_ref()
+                .map(|VmController::LocalUtm { bundle_path, .. }| bundle_path.as_path());
+            if let Some(ip) = resolve_local_utm_live_host_via_utmctl(
+                utm_name.as_str(),
+                entry.last_known_ip.as_deref(),
+                entry.mesh_ip.as_deref(),
+                utmctl_path.as_path(),
+            ) {
                 live_ip_source = "utmctl".to_owned();
                 live_ip = Some(ip);
+            } else if let Some(ip) = entry_bundle_path.and_then(resolve_local_utm_live_host_via_arp)
+            {
+                live_ip_source = "arp-by-mac".to_owned();
+                live_ip = Some(ip);
+                discovery_notes
+                    .push("utmctl-ip-address-unavailable-resolved-via-arp-by-mac".to_owned());
             } else if let Some(ip) = entry.last_known_ip.as_deref() {
                 live_ip_source = "inventory.last_known_ip".to_owned();
                 live_ip = Some(ip.to_owned());
@@ -3524,7 +3539,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             let inferred_platform =
                 VmGuestPlatform::infer(None, None, utm_name.as_str(), Some(utm_name.as_str()));
             let profile = default_platform_profile(inferred_platform);
-            if let Some(ip) = resolve_local_utm_live_host_by_name(
+            if let Some(ip) = resolve_local_utm_live_host_via_utmctl(
                 utm_name.as_str(),
                 None,
                 None,
@@ -3532,6 +3547,11 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             ) {
                 live_ip_source = "utmctl".to_owned();
                 live_ip = Some(ip);
+            } else if let Some(ip) = resolve_local_utm_live_host_via_arp(bundle_path.as_path()) {
+                live_ip_source = "arp-by-mac".to_owned();
+                live_ip = Some(ip);
+                discovery_notes
+                    .push("utmctl-ip-address-unavailable-resolved-via-arp-by-mac".to_owned());
             }
             if let Some(ip) = live_ip.clone() {
                 ssh_target_source =
@@ -3551,7 +3571,12 @@ pub fn execute_ops_vm_lab_discover_local_utm(
         let discovery_platform = discovery_platform_profile.platform;
 
         let live_ip_state = match live_ip.clone() {
-            Some(ip) if live_ip_source == "utmctl" => ProbeState::Ok { value: ip },
+            // "arp-by-mac" is a genuine live discovery (a fresh host ARP-table
+            // hit for the guest's MAC), not a trust-the-old-data fallback like
+            // inventory.last_known_ip below — treat it as authoritative.
+            Some(ip) if live_ip_source == "utmctl" || live_ip_source == "arp-by-mac" => {
+                ProbeState::Ok { value: ip }
+            }
             Some(ip) if live_ip_source == "inventory.last_known_ip" => ProbeState::Fallback {
                 value: ip,
                 reason: "utmctl-ip-address-unavailable".to_owned(),
@@ -3699,15 +3724,16 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             &ssh_auth_state,
             ProbeState::Ok { value } if value == "ok" || value == "ready"
         );
+        let live_ip_known = matches!(
+            live_ip_state,
+            ProbeState::Ok { .. } | ProbeState::Fallback { .. }
+        );
         let ready = if discovery_platform == VmGuestPlatform::Windows {
             readiness.execution_ready
         } else {
             discover_local_utm_target_ready(
                 process_present,
-                matches!(
-                    live_ip_state,
-                    ProbeState::Ok { .. } | ProbeState::Fallback { .. }
-                ),
+                live_ip_known,
                 ssh_port_status == "open",
                 ssh_auth_ok,
                 authoritative_target_present,
@@ -3715,24 +3741,32 @@ pub fn execute_ops_vm_lab_discover_local_utm(
         };
         if ready {
             ready_count += 1;
-            if inventory_match.is_some() {
-                ready_inventory_states.push(LocalUtmReadyState {
-                    alias: inventory_alias.clone().unwrap_or_else(|| utm_name.clone()),
-                    utm_name: utm_name.clone(),
-                    process_present,
-                    live_ip: live_ip.clone(),
-                    ssh_port_status: ssh_port_status.clone(),
-                    ssh_auth_status: match &ssh_auth_state {
-                        ProbeState::Ok { value } | ProbeState::Fallback { value, .. } => {
-                            value.clone()
-                        }
-                        ProbeState::Missing { reason } | ProbeState::Error { reason } => {
-                            reason.clone()
-                        }
-                    },
-                    platform: discovery_platform,
-                });
-            }
+        }
+        // Persisting a fresher live IP is safe on strictly weaker evidence than
+        // `ready`: it only needs a matched alias with a live, powered, networked
+        // VM — NOT a confirmed-reachable SSH port. Both the raw-TCP probe and the
+        // real-ssh auth probe above can be blind in a sandboxed/odd-routing
+        // context (see `discover_local_utm_target_ready`'s doc comment) even
+        // though the VM is genuinely reachable from an unsandboxed caller. Gating
+        // the IP write on full readiness meant a single unreachable-per-this-probe
+        // node blocked the inventory from ever learning ANY node's current
+        // address — the exact condition that makes the stale-IP problem
+        // self-perpetuating. `ready`/`ready_count` (and therefore `overall_status`)
+        // keep their strict meaning; only the write-eligibility set is widened.
+        let ip_observed = process_present && live_ip_known && authoritative_target_present;
+        if ip_observed && inventory_match.is_some() {
+            ready_inventory_states.push(LocalUtmReadyState {
+                alias: inventory_alias.clone().unwrap_or_else(|| utm_name.clone()),
+                utm_name: utm_name.clone(),
+                process_present,
+                live_ip: live_ip.clone(),
+                ssh_port_status: ssh_port_status.clone(),
+                ssh_auth_status: match &ssh_auth_state {
+                    ProbeState::Ok { value } | ProbeState::Fallback { value, .. } => value.clone(),
+                    ProbeState::Missing { reason } | ProbeState::Error { reason } => reason.clone(),
+                },
+                platform: discovery_platform,
+            });
         }
 
         entries.push(json!({
@@ -3791,17 +3825,23 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 "inventory live IP update skipped because no inventory-matched local UTM bundles were discovered in {}",
                 inventory_path.display()
             )
-        } else if ready_inventory_states.len() != matched_inventory_count {
+        } else if ready_inventory_states.is_empty() {
             format!(
-                "inventory live IP update skipped because only {}/{} inventory-matched local UTM bundles were execution-ready",
-                ready_inventory_states.len(),
-                matched_inventory_count
+                "inventory live IP update skipped because none of the {matched_inventory_count} inventory-matched local UTM bundles had an observed live IP (process not confirmed running, or address undiscoverable)"
             )
         } else {
-            persist_local_utm_ready_states_to_inventory(
+            let observed = ready_inventory_states.len();
+            let note = persist_local_utm_ready_states_to_inventory(
                 inventory_path,
                 ready_inventory_states.as_slice(),
-            )?
+            )?;
+            if observed == matched_inventory_count {
+                note
+            } else {
+                format!(
+                    "{note} ({observed}/{matched_inventory_count} inventory-matched bundles had an observed live IP; the rest are unchanged)"
+                )
+            }
         })
     } else {
         None
@@ -7748,6 +7788,7 @@ fn execute_rust_native_orchestration(
     use orchestrator::adapter::factory::node_adapter_for;
     use orchestrator::connection::NodeConnection;
     use orchestrator::context::OrchestrationContext;
+    use orchestrator::context::OrchestratorDialect;
     use orchestrator::error::StageOutcome;
     use orchestrator::runner::StageObserver;
     use orchestrator::runner::StateMachineRunner;
@@ -7889,6 +7930,9 @@ fn execute_rust_native_orchestration(
             network_id,
         )
     };
+    // Set the dialect signal so any downstream tool can determine which
+    // orchestrator engine produced this run (Bucket 4 dialect-awareness).
+    ctx.set_dialect(OrchestratorDialect::RustNative);
     if let Some(cidrs) = config.orchestrate_ssh_allow_cidrs.as_deref() {
         let trimmed = cidrs.trim();
         if !trimmed.is_empty() {
@@ -22489,6 +22533,41 @@ pub(crate) fn evaluate_linux_key_custody_report(
     ))
 }
 
+pub(crate) fn evaluate_macos_key_custody_report(
+    macos_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::macos_key_custody::MacosKeyCustodyReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse macos-key-custody-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "macos-key-custody-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.entries.is_empty() {
+        return Err(
+            "macos-key-custody-check returned an empty entries list; expected the canonical \
+             macOS key-custody artifacts"
+                .to_owned(),
+        );
+    }
+    if !report.overall_ok {
+        let summary = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons were recorded; output is inconsistent"
+                .to_owned()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!("macOS key custody drift detected: {summary}"));
+    }
+    Ok(format!(
+        "macOS key custody verified on {macos_alias}: {} reviewed artifacts checked",
+        report.entries.len()
+    ))
+}
+
 pub(crate) fn evaluate_linux_authenticode_report(
     linux_alias: &str,
     raw_json: &str,
@@ -29460,6 +29539,7 @@ fn observe_local_utm_target_ready(
         target.last_known_ip.as_deref(),
         target.mesh_ip.as_deref(),
         utmctl_path,
+        Some(target.bundle_path.as_path()),
     );
     // SSH is only probed for Linux and macOS targets. Windows VMs may have SSH
     // firewalled or unconfigured; they are considered ready once powered + networked.
@@ -29946,18 +30026,43 @@ fn resolved_inventory_ssh_target_with_utmctl(
 }
 
 fn resolve_local_utm_live_host(entry: &VmInventoryEntry, utmctl_path: &Path) -> Option<String> {
-    let utm_name = match entry.controller.as_ref()? {
-        VmController::LocalUtm { utm_name, .. } => utm_name,
+    let (utm_name, bundle_path) = match entry.controller.as_ref()? {
+        VmController::LocalUtm {
+            utm_name,
+            bundle_path,
+        } => (utm_name, bundle_path.as_path()),
     };
     resolve_local_utm_live_host_by_name(
         utm_name.as_str(),
         entry.last_known_ip.as_deref(),
         entry.mesh_ip.as_deref(),
         utmctl_path,
+        Some(bundle_path),
     )
 }
 
 fn resolve_local_utm_live_host_by_name(
+    utm_name: &str,
+    last_known_ip: Option<&str>,
+    mesh_ip: Option<&str>,
+    utmctl_path: &Path,
+    bundle_path: Option<&Path>,
+) -> Option<String> {
+    resolve_local_utm_live_host_via_utmctl(utm_name, last_known_ip, mesh_ip, utmctl_path)
+        .or_else(|| bundle_path.and_then(resolve_local_utm_live_host_via_arp))
+}
+
+/// `utmctl ip-address` is unsupported for the Apple Virtualization backend
+/// (macOS guests) — it fails with OSStatus -2700 "Operation not supported by
+/// the backend", every call, unconditionally. This is the fallback: resolve
+/// the guest's live IP via the host ARP table, keyed by the guest's MAC
+/// address read from its UTM bundle config.plist.
+fn resolve_local_utm_live_host_via_arp(bundle_path: &Path) -> Option<String> {
+    let mac = mac_address_from_utm_config_plist(bundle_path)?;
+    resolve_live_ip_via_arp_by_mac(mac.as_str())
+}
+
+fn resolve_local_utm_live_host_via_utmctl(
     utm_name: &str,
     last_known_ip: Option<&str>,
     mesh_ip: Option<&str>,
@@ -29978,6 +30083,87 @@ fn resolve_local_utm_live_host_by_name(
     }
     let stdout = String::from_utf8(output.stdout).ok()?;
     select_live_ssh_host_from_utm_output(stdout.as_str(), last_known_ip, mesh_ip)
+}
+
+/// Extract the first `<key>MacAddress</key><string>…</string>` value from a
+/// UTM bundle's `config.plist` (UTM always writes this as XML, not binary
+/// plist). Text-scan rather than a plist dependency: the schema is simple and
+/// stable, and this keeps the fallback dependency-free.
+fn mac_address_from_utm_config_plist(bundle_path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(bundle_path.join("config.plist")).ok()?;
+    let key_pos = contents.find("<key>MacAddress</key>")?;
+    let after_key = &contents[key_pos + "<key>MacAddress</key>".len()..];
+    let string_start = after_key.find("<string>")? + "<string>".len();
+    let string_end = after_key[string_start..].find("</string>")?;
+    normalize_mac_address(after_key[string_start..string_start + string_end].trim())
+}
+
+/// Normalize a MAC address to lowercase, zero-padded colon-hex (`aa:bb:...`).
+/// macOS's `arp -a` omits leading zeros per octet (e.g. `6:2b:b:28:e3:ff`),
+/// while UTM's config.plist writes them zero-padded — normalize both sides
+/// before comparing.
+fn normalize_mac_address(mac: &str) -> Option<String> {
+    let octets: Vec<&str> = mac.split(':').collect();
+    if octets.len() != 6 {
+        return None;
+    }
+    let mut normalized = String::with_capacity(17);
+    for (index, octet) in octets.iter().enumerate() {
+        if octet.is_empty() || octet.len() > 2 || !octet.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        if index > 0 {
+            normalized.push(':');
+        }
+        if octet.len() == 1 {
+            normalized.push('0');
+        }
+        normalized.push_str(&octet.to_ascii_lowercase());
+    }
+    Some(normalized)
+}
+
+/// Resolve a guest's live IP by scanning the host's `arp -a` table for the
+/// row matching `mac` (already normalized). Returns `None` on any I/O
+/// failure, timeout, or no match — this is a best-effort fallback.
+fn resolve_live_ip_via_arp_by_mac(mac: &str) -> Option<String> {
+    let mut command = Command::new("arp");
+    command.arg("-a");
+    let output = run_output_with_timeout(
+        &mut command,
+        Duration::from_secs(DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS),
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    extract_ip_for_mac_from_arp_output(stdout.as_str(), mac)
+}
+
+/// Parse macOS `arp -a` output (`? (10.0.0.5) at aa:bb:cc:dd:ee:ff on en0 …`)
+/// for the first row whose MAC matches `target_mac` (already normalized).
+/// Skips `(incomplete)` rows, which carry no resolvable MAC.
+fn extract_ip_for_mac_from_arp_output(arp_output: &str, target_mac: &str) -> Option<String> {
+    for line in arp_output.lines() {
+        let ip_start = line.find('(')? + 1;
+        let Some(ip_end) = line[ip_start..].find(')') else {
+            continue;
+        };
+        let ip = &line[ip_start..ip_start + ip_end];
+        let Some(at_pos) = line.find(" at ") else {
+            continue;
+        };
+        let after_at = line[at_pos + " at ".len()..].trim_start();
+        let mac_token = after_at.split_whitespace().next().unwrap_or("");
+        if mac_token == "(incomplete)" {
+            continue;
+        }
+        if normalize_mac_address(mac_token).as_deref() == Some(target_mac) {
+            return Some(ip.to_owned());
+        }
+    }
+    None
 }
 
 fn matches_local_utm_inventory_entry(
@@ -30225,9 +30411,16 @@ fn select_preferred_live_ssh_ip(
     // If no IPv4 candidate survives (only IPv6 secondary/tunnel addresses like
     // SLAAC ULA from bridge100 or a stale WireGuard interface), include
     // last_known_ip as a fallback to avoid selecting a non-SSH-accessible IPv6.
+    // Gated on `!candidates.is_empty()`: a fully empty candidate list means
+    // utmctl produced zero IP-shaped output lines at all (e.g. the Apple
+    // Virtualization backend's "operation not supported" error text, which
+    // still exits 0) — a real command failure, not an IPv6-only success, and
+    // must NOT silently resolve to a possibly-stale last_known_ip here so the
+    // caller can fall through to a more authoritative discovery method.
     let has_ipv4 = viable.iter().any(IpAddr::is_ipv4);
     let mut all_candidates = viable;
     if !has_ipv4
+        && !candidates.is_empty()
         && let Some(lk) = last_known_ip
         && lk.is_ipv4()
         && is_viable_live_ssh_ip(lk)
@@ -35991,10 +36184,11 @@ mod tests {
         execute_ops_vm_lab_diff_live_lab_runs, execute_ops_vm_lab_discover_local_utm,
         execute_ops_vm_lab_discover_local_utm_summary,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
-        is_macos_metadata_artifact_name, live_lab_stage_forensics_notes, load_inventory,
-        load_live_lab_profile, local_utm_process_present_in_ps_output,
-        local_utm_process_present_with_ps, macos_peer_list_indicates_mesh_join,
-        materialize_orchestration_staging_dir, parse_live_lab_stage_records,
+        extract_ip_for_mac_from_arp_output, is_macos_metadata_artifact_name,
+        live_lab_stage_forensics_notes, load_inventory, load_live_lab_profile,
+        local_utm_process_present_in_ps_output, local_utm_process_present_with_ps,
+        mac_address_from_utm_config_plist, macos_peer_list_indicates_mesh_join,
+        materialize_orchestration_staging_dir, normalize_mac_address, parse_live_lab_stage_records,
         parse_local_utm_list_started_status, parse_membership_active_nodes,
         parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
         path_contains_macos_metadata_artifact, persist_local_utm_ready_states_to_inventory,
@@ -36006,8 +36200,8 @@ mod tests {
         resolve_live_lab_vm_aliases, resolve_remote_targets, resolve_repo_sync_source,
         resolve_start_targets, resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
         select_inventory_entries, select_live_ssh_host_from_utm_output,
-        selected_local_utm_readiness_from_report, should_skip_local_source_path,
-        ssh_auth_probe_command, summarize_live_lab_report,
+        select_preferred_live_ssh_ip, selected_local_utm_readiness_from_report,
+        should_skip_local_source_path, ssh_auth_probe_command, summarize_live_lab_report,
         transition_local_utm_vm_with_process_probe, validate_live_lab_run_artifacts,
         windows_bootstrap_helper_script_local_path, windows_diagnostics_helper_script_local_path,
         windows_helper_script_remote_path, windows_relay_service_install_helper_script_local_path,
@@ -36020,6 +36214,7 @@ mod tests {
     };
     use serde_json::json;
     use std::fs;
+    use std::net::IpAddr;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36787,6 +36982,121 @@ mod tests {
                 .parent()
                 .expect("temp executable parent should exist"),
         );
+    }
+
+    #[test]
+    fn select_preferred_live_ssh_ip_returns_none_on_fully_empty_candidates() {
+        // A backend that always exits 0 but prints only error text (the
+        // Apple Virtualization "operation not supported" case) yields zero
+        // IP-shaped output lines. Must NOT silently resolve to a possibly-
+        // stale last_known_ip here — the caller needs None to fall through
+        // to a more authoritative discovery method (e.g. ARP-by-MAC).
+        let candidates: Vec<IpAddr> = Vec::new();
+        assert_eq!(
+            select_preferred_live_ssh_ip(candidates.as_slice(), Some("192.168.0.210"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn select_preferred_live_ssh_ip_falls_back_to_last_known_on_ipv6_only_candidates() {
+        // A genuine ip-address response with only a link-local/tunnel IPv6
+        // candidate (no IPv4) is the case this fallback exists for.
+        let candidates = vec!["fe80::1".parse::<IpAddr>().expect("valid ipv6")];
+        assert_eq!(
+            select_preferred_live_ssh_ip(candidates.as_slice(), Some("192.168.0.210"), None),
+            Some("192.168.0.210".parse::<IpAddr>().expect("valid ipv4"))
+        );
+    }
+
+    #[test]
+    fn normalize_mac_address_zero_pads_and_lowercases() {
+        assert_eq!(
+            normalize_mac_address("6:2b:b:28:e3:ff").as_deref(),
+            Some("06:2b:0b:28:e3:ff")
+        );
+        assert_eq!(
+            normalize_mac_address("32:6B:39:DF:D7:4E").as_deref(),
+            Some("32:6b:39:df:d7:4e")
+        );
+    }
+
+    #[test]
+    fn normalize_mac_address_rejects_malformed_input() {
+        assert_eq!(normalize_mac_address("not-a-mac"), None);
+        assert_eq!(normalize_mac_address("32:6b:39:df:d7"), None);
+        assert_eq!(normalize_mac_address("32:6b:39:df:d7:4e:00"), None);
+        assert_eq!(normalize_mac_address("zz:6b:39:df:d7:4e"), None);
+    }
+
+    #[test]
+    fn extract_ip_for_mac_from_arp_output_matches_unpadded_host_mac() {
+        let arp_output = "? (10.47.225.138) at 6:2b:b:28:e3:ff on en0 ifscope [ethernet]\n\
+             ? (192.168.64.18) at 32:6b:39:df:d7:4e on bridge101 ifscope [bridge]\n";
+        let target = normalize_mac_address("32:6b:39:df:d7:4e").expect("valid mac");
+        assert_eq!(
+            extract_ip_for_mac_from_arp_output(arp_output, target.as_str()).as_deref(),
+            Some("192.168.64.18")
+        );
+    }
+
+    #[test]
+    fn extract_ip_for_mac_from_arp_output_skips_incomplete_rows() {
+        let arp_output = "? (10.47.225.50) at (incomplete) on en0 ifscope [ethernet]\n\
+             ? (192.168.64.18) at 32:6b:39:df:d7:4e on bridge101 ifscope [bridge]\n";
+        let target = normalize_mac_address("32:6b:39:df:d7:4e").expect("valid mac");
+        assert_eq!(
+            extract_ip_for_mac_from_arp_output(arp_output, target.as_str()).as_deref(),
+            Some("192.168.64.18")
+        );
+    }
+
+    #[test]
+    fn extract_ip_for_mac_from_arp_output_returns_none_when_absent() {
+        let arp_output =
+            "? (10.47.225.56) at 5e:55:cf:16:b3:ed on en0 ifscope permanent [ethernet]\n";
+        let target = normalize_mac_address("32:6b:39:df:d7:4e").expect("valid mac");
+        assert_eq!(
+            extract_ip_for_mac_from_arp_output(arp_output, target.as_str()),
+            None
+        );
+    }
+
+    #[test]
+    fn mac_address_from_utm_config_plist_reads_shared_network_mac() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let bundle = std::env::temp_dir().join(format!("rustynet-vm-lab-mac-plist-{unique}.utm"));
+        fs::create_dir_all(&bundle).expect("bundle dir should be created");
+        fs::write(
+            bundle.join("config.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <plist version=\"1.0\"><dict>\n\
+             <key>Network</key><array><dict>\n\
+             <key>MacAddress</key><string>32:6b:39:df:d7:4e</string>\n\
+             <key>Mode</key><string>Shared</string>\n\
+             </dict></array>\n\
+             </dict></plist>\n",
+        )
+        .expect("config.plist should be written");
+
+        let mac = mac_address_from_utm_config_plist(bundle.as_path());
+        assert_eq!(mac.as_deref(), Some("32:6b:39:df:d7:4e"));
+
+        let _ = fs::remove_dir_all(&bundle);
+    }
+
+    #[test]
+    fn mac_address_from_utm_config_plist_returns_none_when_missing() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let bundle =
+            std::env::temp_dir().join(format!("rustynet-vm-lab-mac-plist-missing-{unique}.utm"));
+        assert_eq!(mac_address_from_utm_config_plist(bundle.as_path()), None);
     }
 
     #[test]
@@ -38561,7 +38871,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_ops_vm_lab_discover_local_utm_skips_inventory_update_until_all_ready() {
+    fn execute_ops_vm_lab_discover_local_utm_skips_inventory_update_when_no_live_ip_observed() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be valid")
@@ -38612,11 +38922,88 @@ mod tests {
         assert_eq!(
             parsed["inventory_update"].as_str(),
             Some(
-                "inventory live IP update skipped because only 0/1 inventory-matched local UTM bundles were execution-ready"
+                "inventory live IP update skipped because none of the 1 inventory-matched local UTM bundles had an observed live IP (process not confirmed running, or address undiscoverable)"
             )
         );
         let updated = fs::read_to_string(inventory.as_path()).expect("inventory should reread");
         assert_eq!(original, updated);
+
+        cleanup_temp_inventory(inventory.as_path());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(
+            utmctl
+                .parent()
+                .expect("temp executable parent should exist"),
+        );
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_discover_local_utm_updates_inventory_ip_even_when_ssh_unreachable() {
+        // Regression test: the raw-TCP probe (and even the real-ssh auth probe)
+        // can be blind in a sandboxed/odd-routing context and report a genuinely
+        // reachable VM as unreachable. The inventory-refresh path must not let
+        // that block IP persistence — only `process_present` + a live IP +
+        // an authoritative ssh target should gate the write, not SSH reachability.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
+        let bundle = root.join("nested").join("alpha.utm");
+        fs::create_dir_all(&bundle).expect("bundle should exist");
+
+        let inventory = write_temp_inventory(&format!(
+            r#"{{
+  "version": 1,
+  "entries": [
+    {{
+      "alias": "alpha",
+      "ssh_target": "alpha-host",
+      "ssh_user": "debian",
+      "last_known_ip": "192.168.64.20",
+      "mesh_ip": "100.64.0.1",
+      "controller": {{
+        "type": "local_utm",
+        "utm_name": "alpha",
+        "bundle_path": "{}"
+      }}
+    }}
+  ]
+}}"#,
+            bundle.display()
+        ));
+
+        // Reserved TEST-NET-1 address (RFC 5737): never routable, so the SSH
+        // TCP/auth probes are guaranteed to fail exactly like a sandbox-blind
+        // probe would — this is the scenario being regression-tested.
+        let utmctl = write_temp_executable(
+            "#!/bin/sh\nif [ \"$1\" = \"list\" ]; then\n  printf 'UUID Status Name\\nabc started alpha\\n'\n  exit 0\nfi\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"alpha\" ]; then\n  printf '192.0.2.99\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
+        );
+        let report = execute_ops_vm_lab_discover_local_utm(VmLabDiscoverLocalUtmConfig {
+            inventory_path: Some(inventory.clone()),
+            utm_documents_root: Some(root.clone()),
+            utmctl_path: Some(utmctl.clone()),
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            ssh_port: 65_534,
+            timeout_secs: 2,
+            update_inventory_live_ips: true,
+            report_dir: None,
+        })
+        .expect("discovery report should be produced");
+        let parsed: serde_json::Value =
+            serde_json::from_str(report.as_str()).expect("discovery report should parse as JSON");
+        let update_note = parsed["inventory_update"]
+            .as_str()
+            .expect("inventory_update note should be present");
+        assert!(
+            update_note.contains("updated inventory live IPs"),
+            "expected an IP update despite SSH being unreachable, got: {update_note}"
+        );
+        assert!(update_note.contains("192.0.2.99"), "{update_note}");
+
+        let updated = fs::read_to_string(inventory.as_path()).expect("inventory should reread");
+        assert!(updated.contains("192.0.2.99"));
 
         cleanup_temp_inventory(inventory.as_path());
         let _ = fs::remove_dir_all(&root);

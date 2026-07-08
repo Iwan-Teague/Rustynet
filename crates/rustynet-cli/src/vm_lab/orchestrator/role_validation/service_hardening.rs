@@ -11,12 +11,12 @@
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
-/// True only where service-hardening validation runs live today (Linux).
-/// macOS / Windows nodes are reported-skipped — named on disk, never a silent
-/// pass — until their per-OS service-hardening probes are proven through the
-/// Rust engine.
+/// True where service-hardening validation runs live (Linux, macOS, Windows).
 pub fn service_hardening_runtime_implemented(platform: VmGuestPlatform) -> bool {
-    matches!(platform, VmGuestPlatform::Linux)
+    matches!(
+        platform,
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+    )
 }
 
 /// Run the Linux service-hardening daemon self-check through the shell seam,
@@ -39,19 +39,49 @@ pub fn validate_linux_service_hardening(
     Ok(())
 }
 
+pub fn validate_macos_service_hardening(
+    shell: &dyn RemoteShellHost,
+    daemon_path: &str,
+    alias: &str,
+) -> Result<(), String> {
+    const SUBCOMMAND: &str = "macos-service-hardening-check";
+    let argv = [daemon_path, SUBCOMMAND];
+    let out = shell
+        .run_argv(&argv, &[], &[])
+        .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    crate::vm_lab::evaluate_macos_service_hardening_report(alias, &stdout)?;
+    Ok(())
+}
+
+pub fn validate_windows_service_hardening(
+    shell: &dyn RemoteShellHost,
+    daemon_path: &str,
+    alias: &str,
+) -> Result<(), String> {
+    const SUBCOMMAND: &str = "windows-service-hardening-check";
+    let argv = [daemon_path, SUBCOMMAND];
+    let out = shell
+        .run_argv(&argv, &[], &[])
+        .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    crate::vm_lab::evaluate_windows_service_hardening_report(alias, &stdout)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn runtime_implemented_linux_only() {
+    fn runtime_implemented_all_desktop() {
         assert!(service_hardening_runtime_implemented(
             VmGuestPlatform::Linux
         ));
-        assert!(!service_hardening_runtime_implemented(
+        assert!(service_hardening_runtime_implemented(
             VmGuestPlatform::Macos
         ));
-        assert!(!service_hardening_runtime_implemented(
+        assert!(service_hardening_runtime_implemented(
             VmGuestPlatform::Windows
         ));
     }

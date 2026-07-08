@@ -7,6 +7,7 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::dns_failclosed::{
     dns_failclosed_runtime_implemented, validate_linux_dns_failclosed,
+    validate_macos_dns_failclosed, validate_windows_dns_failclosed,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -82,7 +83,19 @@ impl OrchestrationStage for DnsFailclosedValidationStage {
                     continue;
                 }
             };
-            if let Err(e) = validate_linux_dns_failclosed(&*shell, daemon_path, alias) {
+            let result = match platform {
+                VmGuestPlatform::Linux => {
+                    validate_linux_dns_failclosed(&*shell, daemon_path, alias)
+                }
+                VmGuestPlatform::Macos => {
+                    validate_macos_dns_failclosed(&*shell, daemon_path, alias)
+                }
+                VmGuestPlatform::Windows => {
+                    validate_windows_dns_failclosed(&*shell, daemon_path, alias)
+                }
+                _ => unreachable!("non-desktop platform filtered above"),
+            };
+            if let Err(e) = result {
                 failures.push(format!("{alias}: {e}"));
             }
         }

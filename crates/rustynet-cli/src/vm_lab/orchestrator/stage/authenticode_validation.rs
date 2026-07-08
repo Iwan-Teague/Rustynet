@@ -6,7 +6,8 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::authenticode::{
-    authenticode_runtime_implemented, validate_linux_authenticode,
+    authenticode_runtime_implemented, validate_linux_authenticode, validate_macos_authenticode,
+    validate_windows_authenticode,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -84,7 +85,15 @@ impl OrchestrationStage for AuthenticodeValidationStage {
                     continue;
                 }
             };
-            if let Err(e) = validate_linux_authenticode(&*shell, daemon_path, alias) {
+            let result = match platform {
+                VmGuestPlatform::Linux => validate_linux_authenticode(&*shell, daemon_path, alias),
+                VmGuestPlatform::Macos => validate_macos_authenticode(&*shell, daemon_path, alias),
+                VmGuestPlatform::Windows => {
+                    validate_windows_authenticode(&*shell, daemon_path, alias)
+                }
+                _ => unreachable!("non-desktop platform filtered above"),
+            };
+            if let Err(e) = result {
                 failures.push(format!("{alias}: {e}"));
             }
         }

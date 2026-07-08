@@ -1019,7 +1019,7 @@ mod tests {
                 REVIEWED_WINDOWS_RELAY_HEALTH_PORT
             )
         );
-        assert_eq!(REVIEWED_WINDOWS_RELAY_BIND_PORT, 4500);
+        assert_eq!(REVIEWED_WINDOWS_RELAY_BIND_PORT, 4600);
         assert_eq!(REVIEWED_WINDOWS_RELAY_HEALTH_PORT, 9100);
     }
 

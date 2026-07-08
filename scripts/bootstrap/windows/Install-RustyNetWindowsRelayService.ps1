@@ -6,7 +6,13 @@ param(
     [string]$RelayId = 'relay-win-1',
     [string]$VerifierKeyPath = 'C:\ProgramData\RustyNet\relay\control.pub',
     [string]$ReplayStorePath = 'C:\ProgramData\RustyNet\relay\replay.store',
-    [string]$Bind = '0.0.0.0:4500',
+    # NOT 4500: Windows's built-in IKEEXT/IPsec Policy Agent service binds
+    # UDP 4500 system-wide (IPsec NAT-Traversal) even for a loopback- or
+    # address-specific bind request, so rustynet-relay's UdpSocket::bind
+    # fails closed with WSAEACCES (os error 10013) on every real Windows
+    # host at that port. Matches REVIEWED_WINDOWS_RELAY_BIND_PORT in
+    # rustynetd/src/windows_service_hardening.rs — keep both in sync.
+    [string]$Bind = '0.0.0.0:4600',
     [string]$PortRange = '50000-59999',
     [string]$HealthBind = '127.0.0.1:9100',
     [switch]$StartService,

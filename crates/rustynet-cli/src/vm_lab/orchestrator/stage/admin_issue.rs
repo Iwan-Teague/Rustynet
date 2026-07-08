@@ -5,8 +5,6 @@ use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::admin_issue::validate_admin_issue;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-const REPORTED_SKIPS_FILENAME: &str = "admin_issue.reported_skips.json";
-
 pub struct AdminIssueStage;
 
 impl OrchestrationStage for AdminIssueStage {
@@ -87,6 +85,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         assert_eq!(AdminIssueStage.execute(&mut ctx), StageOutcome::Skipped);
     }

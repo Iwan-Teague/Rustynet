@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
-    WINDOWS_SERVICE_NAME, WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT, ps_quote, run_remote_ps,
-    run_remote_ps_check,
+    WINDOWS_RELAY_SERVICE_NAME, WINDOWS_SERVICE_NAME, WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT,
+    ps_quote, run_remote_ps, run_remote_ps_check,
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
@@ -324,12 +324,25 @@ fn windows_dataplane_reset_script() -> String {
 
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
-    // Stop service first (best-effort).
+    // Stop the daemon service first (best-effort).
     let stop_script = format!(
         "Stop-Service -Name {} -Force -ErrorAction SilentlyContinue",
         ps_quote(WINDOWS_SERVICE_NAME)?
     );
     let _ = run_remote_ps(conn, &stop_script, SHORT_TIMEOUT);
+
+    // Stop the relay sibling service too (best-effort; absent on a node that
+    // was never elected Relay). Without this, a still-running RustyNetRelay
+    // from a prior run holds `rustynet-relay.exe` open and the next
+    // bootstrap's binary overwrite fails with "The process cannot access
+    // the file ... because it is being used by another process." — live-lab
+    // evidence: this reached a real re-run of the guest and failed
+    // bootstrap_hosts on the very next attempt after a relay was deployed.
+    let stop_relay_script = format!(
+        "Stop-Service -Name {} -Force -ErrorAction SilentlyContinue",
+        ps_quote(WINDOWS_RELAY_SERVICE_NAME)?
+    );
+    let _ = run_remote_ps(conn, &stop_relay_script, SHORT_TIMEOUT);
 
     // Best-effort reset of leftover RustyNet dataplane artifacts (killswitch
     // firewall rules + default-deny outbound policy, the DNS fail-closed NRPT

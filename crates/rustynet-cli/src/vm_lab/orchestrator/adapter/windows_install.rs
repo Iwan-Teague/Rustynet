@@ -986,9 +986,138 @@ fn write_temp_file(
     Ok(path)
 }
 
-pub(crate) const WINDOWS_RELAY_SERVICE_NAME: &str = "RustyNetRelay";
+// Single source of truth shared with `relay_validation` (the stage that
+// checks the deployed service against these exact values) and the legacy
+// bash-path `live_linux_relay_test` binary — importing rather than
+// duplicating means a future change can't drift the deploy adapter out of
+// sync with what the validator checks.
+pub(crate) use rustynetd::windows_service_hardening::REVIEWED_WINDOWS_RELAY_SERVICE_NAME as WINDOWS_RELAY_SERVICE_NAME;
+use rustynetd::windows_service_hardening::{
+    REVIEWED_WINDOWS_RELAY_BIND_PORT, REVIEWED_WINDOWS_RELAY_HEALTH_PORT,
+};
 const WINDOWS_RUSTYNET_RELAY_PATH: &str = r"C:\Program Files\RustyNet\rustynet-relay.exe";
-const WINDOWS_RELAY_VERIFIER_KEY_PATH: &str = r"C:\ProgramData\RustyNet\relay-verifier.pub";
+// Must stay under rustynet-relay's own reviewed root
+// (`DEFAULT_WINDOWS_RELAY_ROOT` = `C:\ProgramData\RustyNet\relay` in
+// `rustynet-relay/src/main.rs`) — every path the relay's Windows-service
+// runtime-arg validator checks (verifier key, replay store, env-file, and
+// each one's PARENT) must be this directory or a child of it, or the relay
+// process fails closed at startup with a path-policy error.
+const WINDOWS_RELAY_ROOT: &str = r"C:\ProgramData\RustyNet\relay";
+const WINDOWS_RELAY_VERIFIER_KEY_PATH: &str = r"C:\ProgramData\RustyNet\relay\relay-verifier.pub";
+const WINDOWS_RELAY_REPLAY_STORE_PATH: &str = r"C:\ProgramData\RustyNet\relay\relay.replay";
+const WINDOWS_RELAY_ENV_FILE_PATH: &str = r"C:\ProgramData\RustyNet\relay\relay-service.env";
+const WINDOWS_RELAY_ARGS_ENV_KEY: &str = "RUSTYNET_RELAY_ARGS_JSON";
+
+/// Harden a Windows relay runtime path (directory or file, already created)
+/// with a protected, SYSTEM+Administrators-only DACL — the exact ACL shape
+/// `rustynet-relay`'s `evaluate_windows_relay_service_acl_sddl` requires:
+/// `D:P` (protected, no inherited ACEs), no Everyone/Authenticated-Users/
+/// Users grant, SY + BA present, owner SY or BA. Uses well-known SIDs
+/// (`*S-1-5-18` = SYSTEM, `*S-1-5-32-544` = Administrators), never display
+/// names, so it is correct on any locale.
+fn harden_relay_acl_script(path_q: &str) -> String {
+    format!(
+        "$p = {path_q}; \
+         $r = (icacls $p /inheritance:r 2>&1) -join ' '; \
+         if ($LASTEXITCODE -ne 0) {{ throw ('icacls /inheritance:r failed for ' + $p + ': ' + $r) }}; \
+         $r = (icacls $p /grant:r '*S-1-5-18:F' 2>&1) -join ' '; \
+         if ($LASTEXITCODE -ne 0) {{ throw ('icacls grant SYSTEM failed for ' + $p + ': ' + $r) }}; \
+         $r = (icacls $p /grant:r '*S-1-5-32-544:F' 2>&1) -join ' '; \
+         if ($LASTEXITCODE -ne 0) {{ throw ('icacls grant Administrators failed for ' + $p + ': ' + $r) }}; \
+         $r = (icacls $p /setowner '*S-1-5-18' 2>&1) -join ' '; \
+         if ($LASTEXITCODE -ne 0) {{ throw ('icacls /setowner SYSTEM failed for ' + $p + ': ' + $r) }}",
+    )
+}
+
+/// The relay's Windows-service argv, JSON-encoded — the exact contract
+/// `rustynet-relay`'s `RUSTYNET_RELAY_ARGS_JSON` env-file variable expects
+/// (`parse_windows_relay_service_args_from_text` decodes it as
+/// `Vec<String>`). Mirrors the Linux systemd unit's `ExecStart` argv
+/// (`scripts/systemd/rustynet-relay.service`) so the two platforms run the
+/// relay with equivalent posture (same port range / session caps), modulo
+/// Windows-appropriate paths.
+fn relay_windows_service_args_json() -> Result<String, AdapterError> {
+    let args = vec![
+        "--relay-id".to_owned(),
+        "relay-windows".to_owned(),
+        "--bind".to_owned(),
+        format!("127.0.0.1:{REVIEWED_WINDOWS_RELAY_BIND_PORT}"),
+        "--verifier-key".to_owned(),
+        WINDOWS_RELAY_VERIFIER_KEY_PATH.to_owned(),
+        "--replay-store".to_owned(),
+        WINDOWS_RELAY_REPLAY_STORE_PATH.to_owned(),
+        "--port-range".to_owned(),
+        "40000-49999".to_owned(),
+        "--max-sessions-per-node".to_owned(),
+        "8".to_owned(),
+        "--max-total-sessions".to_owned(),
+        "4096".to_owned(),
+        "--health-bind".to_owned(),
+        format!("127.0.0.1:{REVIEWED_WINDOWS_RELAY_HEALTH_PORT}"),
+    ];
+    serde_json::to_string(&args).map_err(|err| AdapterError::Protocol {
+        message: format!("failed to encode relay Windows-service args: {err}"),
+    })
+}
+
+/// Build the PS script that creates (idempotently) the relay SCM service,
+/// pointed at the binary with `--windows-service --service-name <name>
+/// --env-file <path>` — the arguments `rustynet-relay` requires to enter its
+/// Windows-service dispatch path at all (live-lab evidence: without them,
+/// `sc.exe create`/`start` succeed but the process never calls
+/// `StartServiceCtrlDispatcher`, and SCM kills the start with error 1053,
+/// "did not respond ... in a timely fashion").
+///
+/// Self-healing, not merely create-if-missing: an EXISTING service gets its
+/// binPath reconfigured via `sc.exe config` to match the desired command
+/// line every deploy, rather than being left as whatever it was created
+/// with on a prior (possibly broken) run — the create-only version of this
+/// script left a stale, mis-wired service registration on the guest after
+/// the binPath contract changed, silently skipping the fix on redeploy.
+///
+/// `svc_q` is reused for the `Get-Service`/`sc.exe create`/`sc.exe config`
+/// arguments AND for the failure messages — it must be concatenated as its
+/// own token (`+`) into each `throw (...)` string, never interpolated
+/// inside another single-quoted literal: `ps_quote` already wraps it in its
+/// own `'...'`, and PowerShell does not support nesting an unescaped quoted
+/// string inside another one of the same quote style (live-lab evidence:
+/// this exact nesting bug also reached a real Windows guest and broke
+/// `sc.exe create` with a `ParserError`).
+fn relay_create_service_script(
+    service_name: &str,
+    binary_path: &str,
+    env_file_path: &str,
+) -> Result<String, AdapterError> {
+    let svc_q = ps_quote(service_name)?;
+    // The exe path and env-file path need embedded quoting (Windows binPath
+    // parsing must know where the space-containing exe path ends and the
+    // first flag begins), but PowerShell handing a variable with BARE `"`
+    // characters to a native command via `&` lets Win32 argv parsing
+    // (CommandLineToArgvW) treat each embedded `"..."` as a fresh token
+    // boundary, silently re-splitting what was meant to be one binPath
+    // argument into several — `sc.exe` then sees unrecognized bare tokens
+    // and dumps its USAGE text instead of erroring on the real problem
+    // (live-lab evidence: `sc.exe config` failed exactly this way once the
+    // dispatch-args fix above added a multi-token binPath value). Escaping
+    // the inner quotes as `\"` keeps them as literal characters within the
+    // single argv token, matching the standard `sc.exe binPath=
+    // "\"<exe>\" <args>"` idiom.
+    let bin_cmdline = format!(
+        "\\\"{binary_path}\\\" --windows-service --service-name {service_name} --env-file \\\"{env_file_path}\\\""
+    );
+    let bin_q = ps_quote(&bin_cmdline)?;
+    Ok(format!(
+        "$svc = Get-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
+         $bin = {bin_q}; \
+         if ($null -eq $svc) {{ \
+             $scOut = (& sc.exe create {svc_q} binPath= $bin start= auto 2>&1) -join ' '; \
+             if ($LASTEXITCODE -ne 0) {{ throw ('sc.exe create ' + {svc_q} + ' failed: ' + $scOut) }} \
+         }} else {{ \
+             $scOut = (& sc.exe config {svc_q} binPath= $bin start= auto 2>&1) -join ' '; \
+             if ($LASTEXITCODE -ne 0) {{ throw ('sc.exe config ' + {svc_q} + ' failed: ' + $scOut) }} \
+         }}",
+    ))
+}
 
 pub(crate) fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     let short_timeout = Duration::from_secs(30);
@@ -1012,6 +1141,20 @@ pub(crate) fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterE
         )
         .map_err(|message| AdapterError::Protocol { message })?;
 
+    // 1. Create the relay's reviewed runtime root and harden it (protected,
+    //    SYSTEM+Administrators-only DACL) BEFORE anything is placed inside —
+    //    every file placed under it gets its own explicit hardening too
+    //    (below), since the relay's ACL validator requires each individual
+    //    file protected, not merely inheriting from an already-hardened
+    //    parent (an inherited DACL reads "AI" in SDDL, not the required "P").
+    let root_q = ps_quote(WINDOWS_RELAY_ROOT)?;
+    let mkroot_script = format!(
+        "New-Item -ItemType Directory -Force -Path {root_q} | Out-Null; {}",
+        harden_relay_acl_script(&root_q)
+    );
+    run_remote_ps(conn, &mkroot_script, short_timeout)?;
+
+    // 2. Ship + install the verifier key under the reviewed root, then harden.
     let tmp = write_temp_file("rn_relay_verifier_", ".pub", &verifier_bytes)?;
     let remote_tmp = format!(r"{}\rn-relay-verifier.pub", WINDOWS_STAGING_DIR);
     let ship = ssh::scp_to(
@@ -1022,28 +1165,66 @@ pub(crate) fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterE
     );
     let _ = std::fs::remove_file(&tmp);
     ship?;
-    let install_script = format!(
+    let verifier_q = ps_quote(WINDOWS_RELAY_VERIFIER_KEY_PATH)?;
+    let install_verifier_script = format!(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
-         New-Item -ItemType Directory -Force -Path {state_q} | Out-Null; \
-         Move-Item -LiteralPath {src_q} -Destination {dst_q} -Force",
-        state_q = ps_quote(WINDOWS_STATE_ROOT)?,
+         Move-Item -LiteralPath {src_q} -Destination {verifier_q} -Force; \
+         {harden}",
         src_q = ps_quote(&remote_tmp)?,
-        dst_q = ps_quote(WINDOWS_RELAY_VERIFIER_KEY_PATH)?,
+        harden = harden_relay_acl_script(&verifier_q),
     );
-    run_remote_ps(conn, &install_script, short_timeout)?;
+    run_remote_ps(conn, &install_verifier_script, short_timeout)?;
 
-    let svc_q = ps_quote(WINDOWS_RELAY_SERVICE_NAME)?;
-    let create_svc_script = format!(
-        "$svc = Get-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
-         if ($null -eq $svc) {{ \
-             $bin = {bin_q}; \
-             $scOut = (& sc.exe create {svc_q} binPath= $bin start= auto 2>&1) -join ' '; \
-             if ($LASTEXITCODE -ne 0) {{ throw ('sc.exe create {svc_q} failed: ' + $scOut) }} \
-         }}",
-        bin_q = ps_quote(WINDOWS_RUSTYNET_RELAY_PATH)?,
+    // 3. Pre-create an empty, hardened replay-store file. The relay's
+    //    Windows-service runtime-arg validator checks the FILE's own ACL
+    //    (not just its parent), so leaving it for the relay process to
+    //    create at first run would produce an inherited (non-protected) DACL
+    //    that fails the same check the verifier key must pass.
+    let replay_q = ps_quote(WINDOWS_RELAY_REPLAY_STORE_PATH)?;
+    let replay_store_script = format!(
+        "if (-not (Test-Path -LiteralPath {replay_q})) {{ \
+             New-Item -ItemType File -Force -Path {replay_q} | Out-Null \
+         }}; \
+         {harden}",
+        harden = harden_relay_acl_script(&replay_q),
     );
+    run_remote_ps(conn, &replay_store_script, short_timeout)?;
+
+    // 4. Ship + install the Windows-service env-file (RUSTYNET_RELAY_ARGS_JSON)
+    //    under the reviewed root, then harden — the argv `rustynet-relay`
+    //    needs to actually enter its SCM dispatch path (see
+    //    `relay_create_service_script`'s doc comment).
+    let args_json = relay_windows_service_args_json()?;
+    let env_file_contents = format!("{WINDOWS_RELAY_ARGS_ENV_KEY}={args_json}\r\n");
+    let tmp_env = write_temp_file("rn_relay_env_", ".env", env_file_contents.as_bytes())?;
+    let remote_tmp_env = format!(r"{}\rn-relay-service.env", WINDOWS_STAGING_DIR);
+    let ship_env = ssh::scp_to(
+        conn,
+        tmp_env.as_path(),
+        &remote_tmp_env.replace('\\', "/"),
+        short_timeout,
+    );
+    let _ = std::fs::remove_file(&tmp_env);
+    ship_env?;
+    let env_q = ps_quote(WINDOWS_RELAY_ENV_FILE_PATH)?;
+    let install_env_script = format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         Move-Item -LiteralPath {src_q} -Destination {env_q} -Force; \
+         {harden}",
+        src_q = ps_quote(&remote_tmp_env)?,
+        harden = harden_relay_acl_script(&env_q),
+    );
+    run_remote_ps(conn, &install_env_script, short_timeout)?;
+
+    let create_svc_script = relay_create_service_script(
+        WINDOWS_RELAY_SERVICE_NAME,
+        WINDOWS_RUSTYNET_RELAY_PATH,
+        WINDOWS_RELAY_ENV_FILE_PATH,
+    )?;
     run_remote_ps(conn, &create_svc_script, short_timeout)?;
 
     let probe = windows_service_start_probe_fragment(WINDOWS_RELAY_SERVICE_NAME)?;
@@ -1103,6 +1284,155 @@ mod tests {
         assert!(
             BOOTSTRAP_SCRIPT.matches("$daemonBuildArgsOffline").count() >= 2,
             "the daemon --offline fallback must be invoked, not just defined"
+        );
+    }
+
+    #[test]
+    fn relay_create_service_script_does_not_nest_a_quoted_literal_inside_another() {
+        // Regression test for a real live-lab failure: PowerShell CLIXML
+        // ParserError "Unexpected token 'RustyNetRelay' failed: '' in
+        // expression or statement" from `sc.exe create 'RustyNetRelay'
+        // binPath= ...` — caused by embedding the already-single-quoted
+        // service name directly inside another single-quoted throw message
+        // literal, e.g. `'sc.exe create 'RustyNetRelay' failed: '`.
+        let script = relay_create_service_script(
+            "RustyNetRelay",
+            r"C:\Program Files\RustyNet\rustynet-relay.exe",
+            r"C:\ProgramData\RustyNet\relay\relay-service.env",
+        )
+        .expect("script build should succeed for a plain service name");
+        assert!(
+            !script.contains("'sc.exe create 'RustyNetRelay' failed"),
+            "must not nest the quoted service name inside another single-quoted \
+             literal (invalid PowerShell): {script}"
+        );
+        assert!(
+            script.contains("'sc.exe create ' + 'RustyNetRelay' + ' failed: '"),
+            "the quoted service name must be concatenated as its own token via `+`: {script}"
+        );
+        // sc.exe create + Get-Service both still receive the correctly quoted
+        // service name as a standalone argument.
+        assert!(script.contains("Get-Service -Name 'RustyNetRelay'"));
+        assert!(script.contains("sc.exe create 'RustyNetRelay' binPath="));
+    }
+
+    #[test]
+    fn relay_create_service_script_escapes_a_service_name_containing_a_quote() {
+        // ps_quote doubles embedded single quotes; confirm that survives the
+        // concatenation unbroken for both the argument and message uses.
+        let script = relay_create_service_script("Rusty'Net", r"C:\bin.exe", r"C:\env.env")
+            .expect("script build should succeed for a name containing a quote");
+        assert!(script.contains("'Rusty''Net'"));
+    }
+
+    #[test]
+    fn relay_create_service_script_binpath_enters_windows_service_dispatch() {
+        // Regression test for the follow-on live-lab failure once the quoting
+        // bug above was fixed: `sc.exe create`/`start` succeeded, but SCM
+        // killed the start with error 1053 ("did not respond ... in a timely
+        // fashion") because binPath launched the bare exe with no arguments,
+        // so `rustynet-relay` never entered its Windows-service dispatch path
+        // (which requires `--windows-service --env-file <path>`).
+        let script = relay_create_service_script(
+            "RustyNetRelay",
+            r"C:\Program Files\RustyNet\rustynet-relay.exe",
+            r"C:\ProgramData\RustyNet\relay\relay-service.env",
+        )
+        .expect("script build should succeed");
+        // Inner quotes must be backslash-escaped (`\"`), not bare (`"`) —
+        // live-lab evidence: a bare-quoted multi-arg binPath value gets
+        // re-split by Win32 argv parsing when PowerShell hands it to a
+        // native command via `&`, and `sc.exe` dumps its USAGE text instead
+        // of applying the config.
+        assert!(
+            script.contains(
+                r#"'\"C:\Program Files\RustyNet\rustynet-relay.exe\" --windows-service --service-name RustyNetRelay --env-file \"C:\ProgramData\RustyNet\relay\relay-service.env\"'"#
+            ),
+            "binPath must invoke the exe with --windows-service + --env-file, with \
+             backslash-escaped inner quotes so it survives as one argv token: {script}"
+        );
+    }
+
+    #[test]
+    fn relay_create_service_script_reconfigures_an_existing_service_instead_of_skipping() {
+        // Regression test: a stale service left by a prior (broken) deploy
+        // must have its binPath corrected on redeploy, not silently keep the
+        // old wrong config just because Get-Service found it already exists.
+        let script = relay_create_service_script(
+            "RustyNetRelay",
+            r"C:\Program Files\RustyNet\rustynet-relay.exe",
+            r"C:\ProgramData\RustyNet\relay\relay-service.env",
+        )
+        .expect("script build should succeed");
+        assert!(
+            script.contains("sc.exe config 'RustyNetRelay' binPath="),
+            "an existing service must be reconfigured via sc.exe config: {script}"
+        );
+        assert!(
+            !script.contains("'sc.exe config 'RustyNetRelay' failed"),
+            "the config-branch error message must not nest quotes either: {script}"
+        );
+    }
+
+    #[test]
+    fn relay_windows_service_args_json_includes_the_full_relay_contract() {
+        let encoded = relay_windows_service_args_json().expect("args JSON encoding should succeed");
+        let args: Vec<String> =
+            serde_json::from_str(&encoded).expect("must round-trip as a JSON string array");
+        // Mirrors the Linux systemd unit's ExecStart argv contract exactly —
+        // rustynet-relay requires --verifier-key and --replay-store to start.
+        for flag in [
+            "--relay-id",
+            "--bind",
+            "--verifier-key",
+            "--replay-store",
+            "--port-range",
+            "--max-sessions-per-node",
+            "--max-total-sessions",
+            "--health-bind",
+        ] {
+            assert!(args.iter().any(|a| a == flag), "missing {flag}: {args:?}");
+        }
+        assert!(args.contains(&WINDOWS_RELAY_VERIFIER_KEY_PATH.to_owned()));
+        assert!(args.contains(&WINDOWS_RELAY_REPLAY_STORE_PATH.to_owned()));
+        // Both runtime paths must live under the relay's own reviewed root,
+        // or `rustynet-relay` fails closed on startup (path-policy gate).
+        for path in [
+            WINDOWS_RELAY_VERIFIER_KEY_PATH,
+            WINDOWS_RELAY_REPLAY_STORE_PATH,
+        ] {
+            assert!(
+                path.starts_with(WINDOWS_RELAY_ROOT),
+                "{path} must be under the reviewed relay root {WINDOWS_RELAY_ROOT}"
+            );
+        }
+        // Regression pin: NOT 4500/4501 — 4500 is Windows's reserved
+        // IKEEXT/IPsec NAT-T port; binding it crashed the service on every
+        // real live-lab attempt (WSAEACCES / os error 10013). Must match
+        // rustynetd's REVIEWED_WINDOWS_RELAY_BIND_PORT /
+        // REVIEWED_WINDOWS_RELAY_HEALTH_PORT — the exact values
+        // `relay_validation` checks the deployed service against.
+        assert!(args.contains(&"127.0.0.1:4600".to_owned()), "{args:?}");
+        assert!(args.contains(&"127.0.0.1:9100".to_owned()), "{args:?}");
+        assert!(!args.iter().any(|a| a.contains(":4500")), "{args:?}");
+        assert!(!args.iter().any(|a| a.contains(":4501")), "{args:?}");
+    }
+
+    #[test]
+    fn harden_relay_acl_script_uses_locale_independent_sids_and_protects_inheritance() {
+        let script = harden_relay_acl_script("'C:\\ProgramData\\RustyNet\\relay'");
+        assert!(script.contains("/inheritance:r"), "{script}");
+        assert!(
+            script.contains("*S-1-5-18:F"),
+            "must grant SYSTEM by well-known SID, not display name: {script}"
+        );
+        assert!(
+            script.contains("*S-1-5-32-544:F"),
+            "must grant Administrators by well-known SID, not display name: {script}"
+        );
+        assert!(
+            script.contains("/setowner '*S-1-5-18'"),
+            "owner must be set to SYSTEM by SID: {script}"
         );
     }
 

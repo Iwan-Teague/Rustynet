@@ -11,11 +11,12 @@
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
-/// True only where DNS-failclosed validation runs live today (Linux). macOS /
-/// Windows nodes are reported-skipped — named on disk, never a silent pass —
-/// until their per-OS DNS-failclosed probes are proven through the Rust engine.
+/// True where DNS-failclosed validation runs live (Linux, macOS, Windows).
 pub fn dns_failclosed_runtime_implemented(platform: VmGuestPlatform) -> bool {
-    matches!(platform, VmGuestPlatform::Linux)
+    matches!(
+        platform,
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+    )
 }
 
 /// Run the Linux DNS-failclosed daemon self-check through the shell seam,
@@ -37,17 +38,45 @@ pub fn validate_linux_dns_failclosed(
     Ok(())
 }
 
+pub fn validate_macos_dns_failclosed(
+    shell: &dyn RemoteShellHost,
+    daemon_path: &str,
+    alias: &str,
+) -> Result<(), String> {
+    const SUBCOMMAND: &str = "macos-dns-failclosed-check";
+    let argv = [daemon_path, SUBCOMMAND, "--no-fail-on-drift"];
+    let out = shell
+        .run_argv(&argv, &[], &[])
+        .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    crate::vm_lab::evaluate_macos_dns_failclosed_report(alias, &stdout)?;
+    Ok(())
+}
+
+pub fn validate_windows_dns_failclosed(
+    shell: &dyn RemoteShellHost,
+    daemon_path: &str,
+    alias: &str,
+) -> Result<(), String> {
+    const SUBCOMMAND: &str = "windows-dns-failclosed-check";
+    let argv = [daemon_path, SUBCOMMAND, "--no-fail-on-drift"];
+    let out = shell
+        .run_argv(&argv, &[], &[])
+        .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    crate::vm_lab::evaluate_windows_dns_failclosed_report(alias, &stdout)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn runtime_implemented_linux_only() {
+    fn runtime_implemented_all_desktop() {
         assert!(dns_failclosed_runtime_implemented(VmGuestPlatform::Linux));
-        assert!(!dns_failclosed_runtime_implemented(VmGuestPlatform::Macos));
-        assert!(!dns_failclosed_runtime_implemented(
-            VmGuestPlatform::Windows
-        ));
+        assert!(dns_failclosed_runtime_implemented(VmGuestPlatform::Macos));
+        assert!(dns_failclosed_runtime_implemented(VmGuestPlatform::Windows));
     }
 
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};

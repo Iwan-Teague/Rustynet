@@ -10,7 +10,25 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 use crate::vm_lab::orchestrator::stage::StageId;
 use serde::{Deserialize, Serialize};
 
-pub const ORCHESTRATION_CONTEXT_SCHEMA_VERSION: u64 = 1;
+pub const ORCHESTRATION_CONTEXT_SCHEMA_VERSION: u64 = 2;
+
+pub const ENV_ORCHESTRATOR_DIALECT: &str = "RUSTYNET_ORCHESTRATOR_DIALECT";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OrchestratorDialect {
+    RustNative,
+    LegacyBash,
+}
+
+impl OrchestratorDialect {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OrchestratorDialect::RustNative => "rust-native",
+            OrchestratorDialect::LegacyBash => "legacy-bash",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PersistedOrchestrationContext {
@@ -24,6 +42,8 @@ struct PersistedOrchestrationContext {
     network_id: String,
     #[serde(default)]
     ssh_allow_cidrs: String,
+    #[serde(default)]
+    orchestrator_dialect: Option<OrchestratorDialect>,
 }
 
 /// Shared state threaded through all orchestration stages.
@@ -56,6 +76,8 @@ pub struct OrchestrationContext {
     pub mesh_ips: HashMap<String, String>,
     /// `WireGuard` endpoint (host:port) per alias, collected during `CollectPubkeys`.
     pub endpoints: HashMap<String, String>,
+    /// Orchestrator engine that produced this run (set before stage execution).
+    pub orchestrator_dialect: Option<OrchestratorDialect>,
 }
 
 impl OrchestrationContext {
@@ -77,7 +99,12 @@ impl OrchestrationContext {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         }
+    }
+
+    pub fn set_dialect(&mut self, dialect: OrchestratorDialect) {
+        self.orchestrator_dialect = Some(dialect);
     }
 
     pub fn record_outcome(&mut self, stage: StageId, outcome: StageOutcome) {
@@ -99,6 +126,7 @@ impl OrchestrationContext {
             endpoints: self.endpoints.clone(),
             network_id: self.network_id.clone(),
             ssh_allow_cidrs: self.ssh_allow_cidrs.clone(),
+            orchestrator_dialect: self.orchestrator_dialect,
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
@@ -153,6 +181,7 @@ impl OrchestrationContext {
             membership_snapshot: snapshot.membership_snapshot,
             mesh_ips: snapshot.mesh_ips,
             endpoints: snapshot.endpoints,
+            orchestrator_dialect: snapshot.orchestrator_dialect,
         })
     }
 }
@@ -184,6 +213,7 @@ mod tests {
         ctx.endpoints
             .insert("exit".to_owned(), "192.0.2.10:51820".to_owned());
         ctx.ssh_allow_cidrs = "192.0.2.0/24".to_owned();
+        ctx.set_dialect(OrchestratorDialect::RustNative);
 
         let path = tmp.path().join("state/orchestration_context.json");
         ctx.save(path.as_path()).unwrap();
@@ -197,6 +227,10 @@ mod tests {
         assert_eq!(loaded.endpoints, ctx.endpoints);
         assert_eq!(loaded.network_id, ctx.network_id);
         assert_eq!(loaded.ssh_allow_cidrs, ctx.ssh_allow_cidrs);
+        assert_eq!(
+            loaded.orchestrator_dialect,
+            Some(OrchestratorDialect::RustNative)
+        );
         assert!(loaded.adapters.is_empty());
         assert!(loaded.stage_outcomes.is_empty());
     }

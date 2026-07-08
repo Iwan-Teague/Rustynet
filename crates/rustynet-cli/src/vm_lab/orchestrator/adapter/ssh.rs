@@ -605,24 +605,21 @@ pub fn remote_home_for_user(user: Option<&str>, heap_user: &str) -> PathBuf {
 
 fn teardown_control_master(teardown: ControlMasterTeardown) {
     let mut cmd = teardown.into_exit_command();
-    match cmd.spawn() {
-        Ok(mut child) => {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => {
-                        if std::time::Instant::now() >= deadline {
-                            let _ = child.kill();
-                            return;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+    if let Ok(mut child) = cmd.spawn() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return;
                     }
-                    Err(_) => return,
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
+                Err(_) => return,
             }
         }
-        Err(_) => {}
     }
 }
 

@@ -118,6 +118,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
             ssh_allow_cidrs: String::new(),
             adapters: HashMap::new(),
             stage_outcomes: HashMap::new(),

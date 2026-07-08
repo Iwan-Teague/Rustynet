@@ -684,7 +684,7 @@ impl App {
         );
         // Show the run's ENABLED plan (the manifest's in-scope stages), not the
         // full ~166-stage catalog — so the grid + counts reflect what this run
-        // actually planned/ran (e.g. the 21-stage Rust plan) rather than being
+        // actually planned/ran (e.g. a full Rust plan of up to 67 stages) rather than being
         // diluted by the disabled catalog. Groups with nothing enabled are hidden.
         let _ = writeln!(out, "\nSTAGE GRID:");
         for group in self.planned_stage_groups() {

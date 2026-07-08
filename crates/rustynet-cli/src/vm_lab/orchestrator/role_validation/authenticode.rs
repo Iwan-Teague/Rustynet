@@ -12,12 +12,12 @@
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
-/// True only where authenticode validation runs live today (Linux).
-/// macOS / Windows nodes are reported-skipped — named on disk, never a silent
-/// pass — until their per-OS authenticode probes are proven through the
-/// Rust engine.
+/// True where authenticode validation runs live (Linux, macOS, Windows).
 pub fn authenticode_runtime_implemented(platform: VmGuestPlatform) -> bool {
-    matches!(platform, VmGuestPlatform::Linux)
+    matches!(
+        platform,
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+    )
 }
 
 /// Run the Linux authenticode daemon self-check through the shell seam,
@@ -41,15 +41,45 @@ pub fn validate_linux_authenticode(
     Ok(())
 }
 
+pub fn validate_macos_authenticode(
+    shell: &dyn RemoteShellHost,
+    daemon_path: &str,
+    alias: &str,
+) -> Result<(), String> {
+    const SUBCOMMAND: &str = "macos-authenticode-check";
+    let argv = [daemon_path, SUBCOMMAND];
+    let out = shell
+        .run_argv(&argv, &[], &[])
+        .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    crate::vm_lab::evaluate_macos_authenticode_report(alias, &stdout)?;
+    Ok(())
+}
+
+pub fn validate_windows_authenticode(
+    shell: &dyn RemoteShellHost,
+    daemon_path: &str,
+    alias: &str,
+) -> Result<(), String> {
+    const SUBCOMMAND: &str = "windows-authenticode-check";
+    let argv = [daemon_path, SUBCOMMAND];
+    let out = shell
+        .run_argv(&argv, &[], &[])
+        .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    crate::vm_lab::evaluate_windows_authenticode_report(alias, &stdout)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn runtime_implemented_linux_only() {
+    fn runtime_implemented_all_desktop() {
         assert!(authenticode_runtime_implemented(VmGuestPlatform::Linux));
-        assert!(!authenticode_runtime_implemented(VmGuestPlatform::Macos));
-        assert!(!authenticode_runtime_implemented(VmGuestPlatform::Windows));
+        assert!(authenticode_runtime_implemented(VmGuestPlatform::Macos));
+        assert!(authenticode_runtime_implemented(VmGuestPlatform::Windows));
     }
 
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};

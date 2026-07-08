@@ -1751,7 +1751,7 @@ mod tests {
         // Install-RustyNetWindowsRelayService.ps1 default surfaces
         // here.
         assert_eq!(super::REVIEWED_WINDOWS_RELAY_SERVICE_NAME, "RustyNetRelay");
-        assert_eq!(super::REVIEWED_WINDOWS_RELAY_BIND_PORT, 4500);
+        assert_eq!(super::REVIEWED_WINDOWS_RELAY_BIND_PORT, 4600);
         assert_eq!(super::REVIEWED_WINDOWS_RELAY_HEALTH_PORT, 9100);
     }
 }
