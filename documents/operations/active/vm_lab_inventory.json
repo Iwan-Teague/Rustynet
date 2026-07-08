@@ -1,38 +1,6 @@
 {
   "entries": [
     {
-      "alias": "debian-headless-1",
-      "controller": {
-        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-1.utm",
-        "type": "local_utm",
-        "utm_name": "debian-headless-1"
-      },
-      "exit_capable": true,
-      "lab_role": "exit",
-      "last_known_ip": "192.168.64.8",
-      "last_known_network": "utm-shared-192.168.64.0/24",
-      "live_ips": [
-        "192.168.64.8",
-        "10.47.225.58",
-        "192.168.64.200",
-        "192.168.0.200",
-        "192.168.64.3",
-        "fd21:69d4:6afd:fa50:3cae:a9ff:fe5a:6182",
-        "fd21:69d4:6afd:fa50:9a08:e072:9844:b7ad",
-        "fe80::6023:d956:36c2:c94e"
-      ],
-      "mesh_ip": "100.64.0.1",
-      "network_group": "utm-shared-192.168.64.0/24",
-      "node_id": "exit-1",
-      "os": "Debian/Linux",
-      "parent_device": "iwan's MacBook Pro",
-      "relay_capable": false,
-      "rustynet_src_dir": "/home/debian/Rustynet",
-      "ssh_password": "tempo",
-      "ssh_target": "192.168.64.8",
-      "ssh_user": "debian"
-    },
-    {
       "alias": "debian-headless-2",
       "controller": {
         "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-2.utm",
@@ -61,38 +29,6 @@
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
       "ssh_target": "192.168.64.4",
-      "ssh_user": "debian"
-    },
-    {
-      "alias": "debian-headless-3",
-      "controller": {
-        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-3.utm",
-        "type": "local_utm",
-        "utm_name": "debian-headless-3"
-      },
-      "exit_capable": false,
-      "lab_role": "relay",
-      "last_known_ip": "192.168.64.9",
-      "last_known_network": "utm-shared-192.168.64.0/24",
-      "live_ips": [
-        "192.168.64.9",
-        "10.47.225.62",
-        "192.168.64.202",
-        "192.168.0.202",
-        "192.168.65.6",
-        "192.168.64.5",
-        "fd21:69d4:6afd:fa50:6259:ad04:5665:deda",
-        "fe80::bec8:79f7:a83d:ddc"
-      ],
-      "mesh_ip": "100.64.0.3",
-      "network_group": "utm-shared-192.168.64.0/24",
-      "node_id": "relay-1",
-      "os": "Debian/Linux",
-      "parent_device": "iwan's MacBook Pro",
-      "relay_capable": true,
-      "rustynet_src_dir": "/home/debian/Rustynet",
-      "ssh_password": "tempo",
-      "ssh_target": "192.168.64.9",
       "ssh_user": "debian"
     },
     {
@@ -138,35 +74,6 @@
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
       "ssh_target": "debian-lan-11",
-      "ssh_user": "debian"
-    },
-    {
-      "alias": "debian-headless-5",
-      "controller": {
-        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-5.utm",
-        "type": "local_utm",
-        "utm_name": "debian-headless-5"
-      },
-      "exit_capable": false,
-      "lab_role": "extra",
-      "last_known_ip": "192.168.15.221",
-      "last_known_network": "lan-192.168.0.0/24",
-      "live_ips": [
-        "192.168.15.221",
-        "10.47.225.59",
-        "192.168.0.204",
-        "192.168.65.7",
-        "fe80::7ffa:3176:cf30:8856"
-      ],
-      "mesh_ip": "100.64.0.5",
-      "network_group": "lan-192.168.0.0/24",
-      "node_id": "extra-1",
-      "os": "Debian/Linux",
-      "parent_device": "iwan's MacBook Pro",
-      "relay_capable": false,
-      "rustynet_src_dir": "/home/debian/Rustynet",
-      "ssh_password": "tempo",
-      "ssh_target": "192.168.15.221",
       "ssh_user": "debian"
     },
     {
@@ -223,6 +130,59 @@
       "ssh_target": "192.168.15.241",
       "ssh_user": "windows",
       "utm_staging_dir": "C:\\Users\\windows\\rustynet-utm-stage"
+    },
+    {
+      "alias": "fedora-utm-1",
+      "controller": {
+        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/Fedora.utm",
+        "type": "local_utm",
+        "utm_name": "Fedora"
+      },
+      "exit_capable": false,
+      "lab_role": "fedora_client",
+      "last_known_ip": "10.47.225.57",
+      "last_known_network": "utm-shared-192.168.64.0/24",
+      "live_ips": [
+        "10.47.225.57",
+        "192.168.64.20"
+      ],
+      "mesh_ip": "100.64.0.8",
+      "network_group": "utm-shared-192.168.64.0/24",
+      "node_id": "fedora-client-1",
+      "os": "Fedora Linux 44 (Server Edition, aarch64)",
+      "parent_device": "iwan's MacBook Pro",
+      "platform": "linux",
+      "relay_capable": false,
+      "rustynet_src_dir": "/home/fedora/Rustynet",
+      "ssh_password": "password",
+      "ssh_target": "10.47.225.57",
+      "ssh_user": "fedora"
+    },
+    {
+      "alias": "ubuntu-utm-1",
+      "controller": {
+        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/ubuntu.utm",
+        "type": "local_utm",
+        "utm_name": "ubuntu"
+      },
+      "exit_capable": false,
+      "lab_role": "ubuntu_client",
+      "last_known_ip": "192.168.64.21",
+      "last_known_network": "utm-shared-192.168.64.0/24",
+      "live_ips": [
+        "192.168.64.21"
+      ],
+      "mesh_ip": "100.64.0.9",
+      "network_group": "utm-shared-192.168.64.0/24",
+      "node_id": "ubuntu-client-1",
+      "os": "Ubuntu Server 24.04 LTS (Noble Numbat, aarch64)",
+      "parent_device": "iwan's MacBook Pro",
+      "platform": "linux",
+      "relay_capable": false,
+      "rustynet_src_dir": "/home/ubuntu/Rustynet",
+      "ssh_password": "password",
+      "ssh_target": "192.168.64.21",
+      "ssh_user": "ubuntu"
     }
   ],
   "version": 1

@@ -1602,6 +1602,489 @@ impl LabStateServer {
         ))
     }
 
+    /// Real TCP-level check that a guest can actually reach the internet
+    /// THROUGH the tunnel (not just that the tunnel process is alive) — run
+    /// on the guest itself over the existing key-based SSH exec, same
+    /// mechanism every other remote-command tool here uses.
+    fn check_vm_internet_reachable(&self, ssh_target: &str, ssh_user: &str) -> bool {
+        let script = format!(
+            "curl -sS -x socks5h://127.0.0.1:{VM_INTERNET_PROXY_PORT} -m 8 -o /dev/null -w '%{{http_code}}' https://static.rust-lang.org/ 2>/dev/null"
+        );
+        self.ssh_exec(ssh_target, ssh_user, &script, Duration::from_secs(15))
+            .map(|o| o.success && o.stdout.trim().starts_with('2'))
+            .unwrap_or(false)
+    }
+
+    /// Same check with no proxy involved — is the guest's own, un-tunneled
+    /// route to the internet working right now?
+    fn check_vm_internet_reachable_direct(&self, ssh_target: &str, ssh_user: &str) -> bool {
+        let script = "curl -sS -m 8 -o /dev/null -w '%{http_code}' https://static.rust-lang.org/ 2>/dev/null";
+        self.ssh_exec(ssh_target, ssh_user, script, Duration::from_secs(15))
+            .map(|o| o.success && o.stdout.trim().starts_with('2'))
+            .unwrap_or(false)
+    }
+
+    /// Explain WHY a guest can't reach the internet directly, distinguishing
+    /// the two failure modes found live in this lab: (1) UTM's isolated
+    /// internal Shared-Network bridge not completing its own NAT forward —
+    /// independent of which physical network the host is on, confirmed by
+    /// it failing identically across a host network change; vs (2) the
+    /// guest sitting on a REAL physical-LAN gateway (MACNAT'd) that the
+    /// physical network itself gates by MAC address (captive portal /
+    /// 802.1X) — the guest's virtual MAC was never individually admitted,
+    /// unlike the host's own physical MAC. Both present identically as
+    /// "reaches gateway, nothing beyond" if you only check reachability;
+    /// this tells them apart so the fix (or "not fixable, use the tunnel")
+    /// is clear instead of another blind diagnosis-by-hand.
+    fn diagnose_guest_internet_blocker(&self, ssh_target: &str, ssh_user: &str) -> String {
+        let host_has_internet = run_with_timeout(
+            "curl",
+            &[
+                "-sS",
+                "-m",
+                "5",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "https://static.rust-lang.org/",
+            ],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(10),
+        )
+        .map(|o| o.success && o.stdout.trim().starts_with('2'))
+        .unwrap_or(false);
+        if !host_has_internet {
+            return "the HOST itself has no internet access right now — not fixable from this tool; check the host's own network connection.".to_owned();
+        }
+
+        let Ok(target) = ssh_target.parse::<Ipv4Addr>() else {
+            return "internet reachable from the host, but the guest's target IP isn't a parseable IPv4 address, so its network path couldn't be classified.".to_owned();
+        };
+        let owning = host_interfaces_in_same_slash24(target);
+        let network_path = classify_guest_network_path(&owning);
+
+        let gateway = self
+            .ssh_exec(
+                ssh_target,
+                ssh_user,
+                "ip route 2>/dev/null | awk '/default/{print $3; exit}'",
+                Duration::from_secs(10),
+            )
+            .map(|o| o.stdout.trim().to_owned())
+            .unwrap_or_default();
+        let gateway_reachable = if gateway.is_empty() {
+            false
+        } else {
+            let ping_script =
+                format!("ping -c2 -W2 {gateway} >/dev/null 2>&1 && echo OK || echo FAIL");
+            self.ssh_exec(ssh_target, ssh_user, &ping_script, Duration::from_secs(15))
+                .map(|o| o.stdout.trim() == "OK")
+                .unwrap_or(false)
+        };
+
+        if !gateway_reachable {
+            return format!(
+                "the guest can't even reach its own gateway ({}) — this is a host-routing or guest-network-config issue, not an internet-access one; see diagnose_host_lab_network.",
+                if gateway.is_empty() {
+                    "unknown".to_owned()
+                } else {
+                    gateway
+                }
+            );
+        }
+        match network_path {
+            "physical-lan" => "guest reaches its gateway (a REAL physical-LAN router, the same one the host uses) but not beyond, while the host itself has full internet — classic per-device network admission control (captive portal / 802.1X): the guest's own virtual MAC was never individually authenticated to this network, unlike the host's physical MAC. Not fixable by this tool; use set_vm_internet_access enable, or sign this guest's MAC into the portal directly if the network supports multiple devices.".to_owned(),
+            "isolated-utm-bridge" => "guest reaches its (UTM-internal virtual) gateway but not beyond, while the host itself has full internet — this looks like UTM/Apple-Virtualization's Shared-Network NAT not completing the forward to the real network, independent of which physical network the host is on (the same bridge failed identically across a host network change). Not something fixable directly; use set_vm_internet_access enable to route around it.".to_owned(),
+            _ => "guest reaches its gateway but not beyond, and the owning interface's nature could not be classified. Use set_vm_internet_access enable to route around it regardless.".to_owned(),
+        }
+    }
+
+    /// Give a lab VM internet access without an agent ever hand-typing SSH:
+    /// spawns (enable), tears down (disable), or reports (status) a reverse
+    /// dynamic SOCKS tunnel — `ssh -R 1080 user@guest` — so the guest routes
+    /// outbound traffic through the HOST's own internet connection. Exists
+    /// because UTM's "Shared" NAT subnets have no outbound path of their own
+    /// in this lab (confirmed live: guest reaches its gateway, nothing
+    /// beyond it, despite host IP forwarding being on — a UTM/vmnet-layer
+    /// gap, not a rustynet one), which otherwise blocks `dnf`/`apt-get`
+    /// install and the rustup bootstrap entirely on a fresh guest.
+    fn set_vm_internet_access(&self, args: Option<&Value>) -> ToolCallResult {
+        let Some(alias) = arg_str(args, "alias") else {
+            return tool_error("Missing required parameter: alias");
+        };
+        let action = arg_str(args, "action").unwrap_or("enable");
+        if !is_valid_vm_internet_access_action(action) {
+            return tool_error(&format!(
+                "Unknown action '{action}' — expected enable, disable, or status"
+            ));
+        }
+
+        let inv_entries = match std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)) {
+            Ok(s) => match serde_json::from_str::<Value>(&s) {
+                Ok(v) => v
+                    .get("entries")
+                    .and_then(|e| e.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                Err(e) => return tool_error(&format!("inventory invalid JSON: {e}")),
+            },
+            Err(e) => return tool_error(&format!("inventory unreadable: {e}")),
+        };
+        let Some(entry) = inv_entries
+            .iter()
+            .find(|e| e.get("alias").and_then(|v| v.as_str()) == Some(alias))
+        else {
+            return tool_error(&format!("Unknown alias '{alias}' (not in inventory)"));
+        };
+        let ssh_target = entry
+            .get("last_known_ip")
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.get("ssh_target").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let ssh_user = entry.get("ssh_user").and_then(|v| v.as_str()).unwrap_or("");
+        if ssh_target.is_empty() || ssh_user.is_empty() {
+            return tool_error(&format!(
+                "'{alias}' is missing ssh_target/ssh_user in inventory"
+            ));
+        }
+
+        let existing_pid = read_vm_internet_tunnel_pid(&self.repo_root, alias);
+        let tunnel_alive = existing_pid.map(host_pid_alive).unwrap_or(false);
+
+        match action {
+            "status" => {
+                let direct_reachable =
+                    self.check_vm_internet_reachable_direct(ssh_target, ssh_user);
+                let mut out = format!(
+                    "# VM internet access: {alias}\n\n- direct internet (no tunnel): {direct_reachable}\n"
+                );
+                if !direct_reachable {
+                    out.push_str(&format!(
+                        "  - diagnosis: {}\n",
+                        self.diagnose_guest_internet_blocker(ssh_target, ssh_user)
+                    ));
+                }
+                if tunnel_alive {
+                    let reachable = self.check_vm_internet_reachable(ssh_target, ssh_user);
+                    out.push_str(&format!(
+                        "- tunnel: ACTIVE (host pid {})\n- internet reachable through tunnel: {reachable}\n",
+                        existing_pid.unwrap_or(0)
+                    ));
+                } else {
+                    out.push_str("- tunnel: not active\n");
+                }
+                tool_success(&out)
+            }
+            "disable" => {
+                if tunnel_alive {
+                    self.kill_process_group(u64::from(existing_pid.unwrap_or(0)));
+                }
+                remove_vm_internet_tunnel_state(&self.repo_root, alias);
+                tool_success(&format!(
+                    "# VM internet access: {alias}\n\n✅ Disabled{}.\n",
+                    if tunnel_alive {
+                        " — tunnel stopped"
+                    } else {
+                        " (nothing was running)"
+                    }
+                ))
+            }
+            "enable" => {
+                if tunnel_alive {
+                    let reachable = self.check_vm_internet_reachable(ssh_target, ssh_user);
+                    return tool_success(&format!(
+                        "# VM internet access: {alias}\n\nAlready enabled (host pid {}) — internet reachable through it: {reachable}.\n",
+                        existing_pid.unwrap_or(0)
+                    ));
+                }
+                let identity = default_ssh_identity();
+                let dest = format!("{ssh_user}@{ssh_target}");
+                let port_arg = VM_INTERNET_PROXY_PORT.to_string();
+                let log_dir = self.repo_root.join("state/vm-internet-tunnels");
+                if let Err(e) = std::fs::create_dir_all(&log_dir) {
+                    return tool_error(&format!("cannot create {}: {e}", log_dir.display()));
+                }
+                let log_path = log_dir.join(format!("{alias}.log"));
+                let argv: Vec<&str> = vec![
+                    "-i",
+                    &identity,
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "ExitOnForwardFailure=yes",
+                    "-N",
+                    "-R",
+                    &port_arg,
+                    &dest,
+                ];
+                let pid = match spawn_logged("ssh", &argv, &self.repo_root, &[], &log_path) {
+                    Ok(child) => child.id(),
+                    Err(e) => return tool_error(&format!("failed to start tunnel: {e}")),
+                };
+                std::thread::sleep(Duration::from_millis(1500));
+                if !host_pid_alive(pid) {
+                    return tool_error(&format!(
+                        "SSH reverse tunnel for '{alias}' exited immediately — check {} for details (likely auth or connectivity failure).",
+                        log_path.display()
+                    ));
+                }
+                if !self.check_vm_internet_reachable(ssh_target, ssh_user) {
+                    self.kill_process_group(u64::from(pid));
+                    return tool_error(&format!(
+                        "Tunnel process started (pid {pid}) but the guest still can't reach the internet through it — check {} and the guest's own network state.",
+                        log_path.display()
+                    ));
+                }
+                if let Err(e) = write_vm_internet_tunnel_pid(&self.repo_root, alias, pid) {
+                    return tool_error(&format!("tunnel is live but failed to persist state: {e}"));
+                }
+                tool_success(&format!(
+                    "# VM internet access: {alias}\n\n✅ Enabled — reverse SOCKS proxy on the guest's 127.0.0.1:{VM_INTERNET_PROXY_PORT} (host pid {pid}), internet reachability confirmed.\n\nGuest-side usage: `curl -x socks5h://127.0.0.1:{VM_INTERNET_PROXY_PORT} ...`, or for a package manager: `http_proxy=socks5h://127.0.0.1:{VM_INTERNET_PROXY_PORT} https_proxy=socks5h://127.0.0.1:{VM_INTERNET_PROXY_PORT} apt-get ...` / `dnf --setopt=proxy=socks5h://127.0.0.1:{VM_INTERNET_PROXY_PORT} install ...`.\n"
+                ))
+            }
+            _ => unreachable!("validated above"),
+        }
+    }
+
+    /// Load an inventory entry's fields needed by the LAN-presence tools:
+    /// bundle_path (to read config.plist / resolve via ARP-by-MAC),
+    /// last_known_ip (fallback if ARP-by-MAC finds nothing fresh), and
+    /// utm_name (for stop/start).
+    fn vm_lan_presence_entry(&self, alias: &str) -> Result<(String, String, String), String> {
+        let inv_entries = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY))
+            .map_err(|e| format!("inventory unreadable: {e}"))
+            .and_then(|s| {
+                serde_json::from_str::<Value>(&s)
+                    .map_err(|e| format!("inventory invalid JSON: {e}"))
+            })?
+            .get("entries")
+            .and_then(|e| e.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let entry = inv_entries
+            .iter()
+            .find(|e| e.get("alias").and_then(|v| v.as_str()) == Some(alias))
+            .ok_or_else(|| format!("Unknown alias '{alias}' (not in inventory)"))?
+            .clone();
+        let bundle_path = entry
+            .get("controller")
+            .and_then(|c| c.get("bundle_path"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("'{alias}' has no controller.bundle_path in inventory"))?
+            .to_owned();
+        let utm_name = entry
+            .get("controller")
+            .and_then(|c| c.get("utm_name"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("'{alias}' has no controller.utm_name in inventory"))?
+            .to_owned();
+        let fallback_ip = entry
+            .get("last_known_ip")
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.get("ssh_target").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_owned();
+        Ok((bundle_path, utm_name, fallback_ip))
+    }
+
+    /// The guest's CURRENT live IP (fresh ARP-by-MAC, falling back to
+    /// inventory only if that fails) and its network-path classification.
+    fn classify_vm_current_network_path(
+        &self,
+        bundle_path: &str,
+        fallback_ip: &str,
+    ) -> (String, &'static str) {
+        let ip = resolve_live_ip_via_arp_by_mac(Path::new(bundle_path))
+            .unwrap_or_else(|| fallback_ip.to_owned());
+        let Ok(target) = ip.parse::<Ipv4Addr>() else {
+            return (ip, "unknown");
+        };
+        let owning = host_interfaces_in_same_slash24(target);
+        (ip, classify_guest_network_path(&owning))
+    }
+
+    fn stop_vm_by_alias(&self, alias: &str) -> Result<(), String> {
+        let result = self.run_ops("vm-lab-stop", &["--vm", alias], 120);
+        if result.is_error.unwrap_or(false) {
+            let text = result
+                .content
+                .first()
+                .map(|c| c.text.clone())
+                .unwrap_or_default();
+            return Err(format!("failed to stop '{alias}': {text}"));
+        }
+        Ok(())
+    }
+
+    fn start_vm_by_alias(&self, alias: &str) -> Result<(), String> {
+        let result = self.run_ops("vm-lab-start", &["--vm", alias], 120);
+        if result.is_error.unwrap_or(false) {
+            let text = result
+                .content
+                .first()
+                .map(|c| c.text.clone())
+                .unwrap_or_default();
+            return Err(format!("failed to start '{alias}': {text}"));
+        }
+        Ok(())
+    }
+
+    /// Read-only: is this VM (or all of them, if `alias` is omitted)
+    /// currently reachable directly on the physical LAN — a real DHCP
+    /// lease from the same router the host uses, like `debian-headless-4`
+    /// — or stuck on UTM's isolated internal Shared-Network bridge? Uses a
+    /// FRESH ARP-by-MAC resolution, not stale inventory, since a VM's
+    /// network path can change on every restart.
+    fn diagnose_vm_lan_presence(&self, alias: Option<&str>) -> ToolCallResult {
+        let inv_entries = match std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)) {
+            Ok(s) => match serde_json::from_str::<Value>(&s) {
+                Ok(v) => v
+                    .get("entries")
+                    .and_then(|e| e.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                Err(e) => return tool_error(&format!("inventory invalid JSON: {e}")),
+            },
+            Err(e) => return tool_error(&format!("inventory unreadable: {e}")),
+        };
+
+        let mut out = String::from("# VM LAN presence\n\n");
+        let mut checked = 0u32;
+        for entry in &inv_entries {
+            let entry_alias = entry.get("alias").and_then(|v| v.as_str()).unwrap_or("");
+            if entry_alias.is_empty() {
+                continue;
+            }
+            if let Some(only) = alias
+                && only != entry_alias
+            {
+                continue;
+            }
+            let Some(bundle_path) = entry
+                .get("controller")
+                .and_then(|c| c.get("bundle_path"))
+                .and_then(|v| v.as_str())
+            else {
+                out.push_str(&format!(
+                    "- ⏭️ {entry_alias}: no controller.bundle_path in inventory, skipped\n"
+                ));
+                continue;
+            };
+            let fallback_ip = entry
+                .get("last_known_ip")
+                .and_then(|v| v.as_str())
+                .or_else(|| entry.get("ssh_target").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            checked += 1;
+            let declared_mode = utm_config_network_mode(Path::new(bundle_path))
+                .unwrap_or_else(|| "unknown".to_owned());
+            let (live_ip, path_kind) =
+                self.classify_vm_current_network_path(bundle_path, fallback_ip);
+            let mark = if path_kind == "physical-lan" {
+                "✅"
+            } else {
+                "🛠️"
+            };
+            out.push_str(&format!(
+                "- {mark} {entry_alias} ({live_ip}): {path_kind} (declared UTM mode: {declared_mode})\n"
+            ));
+        }
+        if checked == 0 {
+            return tool_error(&match alias {
+                Some(a) => format!("no inventory entry '{a}' found"),
+                None => "no inventory entries found".to_string(),
+            });
+        }
+        out.push_str(&format!(
+            "\n**{checked} node(s) checked.** 🛠️ = not on the physical LAN — call apply_vm_bridged_network to fix.\n"
+        ));
+        tool_success(&out)
+    }
+
+    /// Force a VM directly onto the physical LAN, deterministically, like
+    /// `debian-headless-4` — instead of hoping UTM's "Shared" mode happens
+    /// to MACNAT it there (observed live: non-deterministic per VM, per
+    /// restart). No-ops if it's already there. Otherwise: flips the UTM
+    /// bundle's Network Mode from `Shared` to `Bridged` (verified live —
+    /// this lab's `Windows.utm` runs exactly this, successfully, with no
+    /// other config needed), power-cycles the VM, waits for a fresh
+    /// physical-LAN lease, and persists the new IP to inventory. Blocking,
+    /// minutes-scale (same class as `ensure_lab_ready`) — a VM reboot +
+    /// DHCP cycle takes real wall-clock time.
+    fn apply_vm_bridged_network(&self, alias: &str) -> ToolCallResult {
+        if alias.is_empty() {
+            return tool_error("Missing required parameter: alias");
+        }
+        let (bundle_path, utm_name, fallback_ip) = match self.vm_lan_presence_entry(alias) {
+            Ok(v) => v,
+            Err(e) => return tool_error(&e),
+        };
+
+        let (live_ip, path_kind) =
+            self.classify_vm_current_network_path(&bundle_path, &fallback_ip);
+        if path_kind == "physical-lan" {
+            return tool_success(&format!(
+                "# Bridged network: {alias}\n\nAlready on the physical LAN ({live_ip}) — nothing to do.\n"
+            ));
+        }
+
+        // UTM's own "update configuration" AppleScript command requires the
+        // VM to be stopped first — and is the mechanism that actually works
+        // (a raw config.plist edit does not; see set_utm_vm_bridged_via_applescript).
+        if let Err(e) = self.stop_vm_by_alias(alias) {
+            return tool_error(&e);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        if let Err(e) = set_utm_vm_bridged_via_applescript(&utm_name) {
+            return tool_error(&format!(
+                "'{alias}' is stopped, but the network configuration update failed: {e}. Safe to retry (this tool is idempotent)."
+            ));
+        }
+        if let Err(e) = self.start_vm_by_alias(alias) {
+            return tool_error(&format!(
+                "config updated but failed to restart '{alias}': {e}. It is now stopped with Bridged mode set — start it manually and retry this tool to finish verification."
+            ));
+        }
+
+        const POLL_INTERVAL: Duration = Duration::from_secs(5);
+        const MAX_WAIT: Duration = Duration::from_secs(120);
+        let mut waited = Duration::ZERO;
+        loop {
+            let (fresh_ip, fresh_kind) =
+                self.classify_vm_current_network_path(&bundle_path, &fallback_ip);
+            if fresh_kind == "physical-lan" {
+                // Reuse the same, already-hardened ARP-by-MAC-aware
+                // discovery path every other inventory refresh in this lab
+                // goes through — never hand-write the JSON here.
+                let refresh = self.run_ops(
+                    "vm-lab-discover-local-utm-summary",
+                    &["--update-inventory-live-ips"],
+                    DISCOVERY_TIMEOUT_SECS,
+                );
+                if refresh.is_error.unwrap_or(false) {
+                    return tool_success(&format!(
+                        "# Bridged network: {alias}\n\n✅ Now on the physical LAN ({fresh_ip}), but the inventory refresh failed — run update_inventory manually.\n"
+                    ));
+                }
+                return tool_success(&format!(
+                    "# Bridged network: {alias}\n\n✅ Switched to Bridged mode and confirmed on the physical LAN: {fresh_ip} (utm_name={utm_name}). Inventory refreshed.\n"
+                ));
+            }
+            if waited >= MAX_WAIT {
+                return tool_error(&format!(
+                    "Set Bridged mode and restarted '{alias}', but it still isn't on the physical LAN after {}s (currently: {fresh_kind}, ip {fresh_ip}). The VM may still be booting — try diagnose_vm_lan_presence again shortly, or re-run this tool (it's idempotent).",
+                    waited.as_secs()
+                ));
+            }
+            std::thread::sleep(POLL_INTERVAL);
+            waited += POLL_INTERVAL;
+        }
+    }
+
     /// Summarize the trend across the last N run-matrix rows (converging or stuck?).
     fn get_run_trend(&self, args: Option<&Value>) -> ToolCallResult {
         let limit = args
@@ -2848,6 +3331,70 @@ fn mac_address_from_utm_config_plist(bundle_path: &Path) -> Option<String> {
     normalize_mac_address(after_key[string_start..string_start + string_end].trim())
 }
 
+/// Extract the first `<key>Mode</key><string>…</string>` value from a UTM
+/// bundle's `config.plist` Network entry — `"Shared"` (UTM's internal
+/// vmnet NAT, may or may not land the guest on the physical LAN depending
+/// on Apple's own allocation) or `"Bridged"` (ties the virtual NIC directly
+/// to a real host interface, e.g. `en0`, guaranteeing a real DHCP lease
+/// from the physical router).
+fn utm_config_network_mode(bundle_path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(bundle_path.join("config.plist")).ok()?;
+    let key_pos = contents.find("<key>Mode</key>")?;
+    let after_key = &contents[key_pos + "<key>Mode</key>".len()..];
+    let string_start = after_key.find("<string>")? + "<string>".len();
+    let string_end = after_key[string_start..].find("</string>")?;
+    Some(
+        after_key[string_start..string_start + string_end]
+            .trim()
+            .to_owned(),
+    )
+}
+
+/// Set a UTM VM's network mode to Bridged (onto `en0`) via UTM's own
+/// AppleScript "UTM Configuration Suite" — `update configuration`. This is
+/// the mechanism that actually works: a raw `config.plist` edit (tried
+/// first, and it looked right — the file correctly showed `Bridged` and
+/// even survived a `--kill` hard-restart) still left the VM on its old
+/// internal vmnet bridge, because UTM's running app process holds its own
+/// in-memory configuration object that a bare file edit + power cycle never
+/// invalidates. Going through UTM's own scripting API is what forces it to
+/// actually rebuild the network device attachment — confirmed live:
+/// `fedora-utm-1` moved from an isolated bridge address to a real
+/// `en0`-owned physical-LAN address only after this, never after the file
+/// edit alone. UTM documents that `update configuration` requires the VM to
+/// be STOPPED first; the caller is responsible for that (this lab's
+/// `apply_vm_bridged_network` stops it before calling this).
+fn set_utm_vm_bridged_via_applescript(utm_name: &str) -> Result<(), String> {
+    let script = format!(
+        "tell application \"UTM\"\n\
+         \tset theVM to virtual machine {}\n\
+         \tset theConfig to configuration of theVM\n\
+         \tset netIfaces to network interfaces of theConfig\n\
+         \tset firstIface to item 1 of netIfaces\n\
+         \tset mode of firstIface to bridged\n\
+         \tset host interface of firstIface to \"en0\"\n\
+         \tset network interfaces of theConfig to netIfaces\n\
+         \tupdate configuration theVM with theConfig\n\
+         end tell",
+        apple_script_string_literal(utm_name)
+    );
+    let outcome = run_with_timeout(
+        "osascript",
+        &["-e", &script],
+        Path::new("/"),
+        &[],
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("failed to invoke osascript: {e}"))?;
+    if !outcome.success {
+        return Err(format!(
+            "UTM AppleScript configuration update failed: {}",
+            outcome.stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
 /// Normalize a MAC address to lowercase, zero-padded colon-hex. macOS's
 /// `arp -a` omits leading zeros per octet (e.g. `6:2b:b:28:e3:ff`), while
 /// UTM's config.plist writes them zero-padded — normalize both sides.
@@ -2966,6 +3513,77 @@ fn build_route_fix_shell_command(target_ip: &str, subnet: &str, interface: &str)
     format!(
         "/sbin/route delete -host {target_ip} >/dev/null 2>&1; /sbin/route delete -net {subnet} >/dev/null 2>&1; /sbin/route add -net {subnet} -interface {interface}"
     )
+}
+
+/// The guest-side port an internet-access reverse SOCKS tunnel listens on.
+/// Fixed rather than per-alias: the forwarded port lives in the GUEST's own
+/// network namespace, not the host's, so there is no host-side collision
+/// between multiple simultaneous tunnels to different guests.
+const VM_INTERNET_PROXY_PORT: u16 = 1080;
+
+/// Where a VM's internet-access tunnel state (host-side pid) is tracked, so
+/// enable/disable/status calls are idempotent across MCP-server reloads
+/// instead of spawning duplicate tunnels or losing track of one — mirrors
+/// the `state/mcp-jobs/*.json` pattern already used for live-lab jobs.
+fn vm_internet_tunnel_state_path(repo_root: &Path, alias: &str) -> PathBuf {
+    repo_root
+        .join("state/vm-internet-tunnels")
+        .join(format!("{alias}.json"))
+}
+
+fn read_vm_internet_tunnel_pid(repo_root: &Path, alias: &str) -> Option<u32> {
+    let contents = std::fs::read_to_string(vm_internet_tunnel_state_path(repo_root, alias)).ok()?;
+    let value: Value = serde_json::from_str(&contents).ok()?;
+    value.get("pid").and_then(Value::as_u64).map(|p| p as u32)
+}
+
+fn write_vm_internet_tunnel_pid(repo_root: &Path, alias: &str, pid: u32) -> Result<(), String> {
+    let path = vm_internet_tunnel_state_path(repo_root, alias);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, serde_json::json!({ "pid": pid }).to_string())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+fn remove_vm_internet_tunnel_state(repo_root: &Path, alias: &str) {
+    let _ = std::fs::remove_file(vm_internet_tunnel_state_path(repo_root, alias));
+}
+
+/// True if a HOST-local process with this pid still exists. `kill -0` sends
+/// no signal, only checks existence + permission — safe to call on a pid we
+/// don't own without side effects.
+fn host_pid_alive(pid: u32) -> bool {
+    run_with_timeout(
+        "kill",
+        &["-0", &pid.to_string()],
+        Path::new("/"),
+        &[],
+        Duration::from_secs(5),
+    )
+    .map(|o| o.success)
+    .unwrap_or(false)
+}
+
+fn is_valid_vm_internet_access_action(action: &str) -> bool {
+    matches!(action, "enable" | "disable" | "status")
+}
+
+/// Distinguish the two ways a guest's owning-subnet interface set can look
+/// when it reaches its gateway but not the internet: a real physical-LAN
+/// interface (`en0`, MACNAT'd — subject to the physical network's own
+/// per-device admission control) vs an isolated UTM virtual bridge
+/// (`bridgeNN` — subject to whatever limits UTM's own Shared-Network NAT
+/// has, independent of the physical network).
+fn classify_guest_network_path(owning_interfaces: &[String]) -> &'static str {
+    if owning_interfaces.iter().any(|i| i == "en0") {
+        "physical-lan"
+    } else if owning_interfaces.iter().any(|i| i.starts_with("bridge")) {
+        "isolated-utm-bridge"
+    } else {
+        "unknown"
+    }
 }
 
 /// Quote `s` as an AppleScript string literal (backslash + double-quote
@@ -3512,6 +4130,33 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "set_vm_internet_access".into(),
+                description: "Give a lab VM internet access without ever hand-typing SSH: enable (default)/disable/status a reverse dynamic SOCKS tunnel (`ssh -R 1080 user@guest`) so the guest routes outbound traffic through the HOST's own internet connection. `status` always reports DIRECT (no-tunnel) reachability first and, if that's failing, WHY — distinguishing (via gateway-ping + interface-ownership classification) an isolated UTM Shared-Network bridge whose own NAT isn't completing the forward (not fixable, host-independent) from a guest that's genuinely on the physical LAN but blocked by the network's own per-device admission control (captive portal / 802.1X — also not fixable by this tool, but a different kind of not-fixable). `enable` verifies REAL reachability through the tunnel before reporting success (not just that the process started) and is idempotent (safe to call repeatedly). Requires the node's SSH key already authorized (same requirement as every other lab-state remote-exec tool). Does NOT persist a system-wide proxy config on the guest — pass `http_proxy`/`https_proxy=socks5h://127.0.0.1:1080` (or dnf's `--setopt=proxy=`) to whatever command needs it.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "alias": json_schema_string("VM alias"),
+                        "action": json_schema_string("enable (default) | disable | status"),
+                    }),
+                    vec!["alias"],
+                ),
+            },
+            Tool {
+                name: "diagnose_vm_lan_presence".into(),
+                description: "Read-only: is this VM (all of them, if alias is omitted) directly on the physical LAN — a real DHCP lease from the same router the host uses, like debian-headless-4 achieved — or stuck on UTM's isolated internal Shared-Network bridge? Uses a FRESH ARP-by-MAC resolution (not stale inventory) plus the declared UTM config.plist Mode (Shared/Bridged) for context, since a 'Shared'-mode VM's actual network path is non-deterministic per restart — it can silently land on either side. Flags anything not on the physical LAN with the exact fix: apply_vm_bridged_network.".into(),
+                input_schema: json_schema_object(
+                    json!({"alias": json_schema_string("Optional: only check this VM (alias)")}),
+                    vec![],
+                ),
+            },
+            Tool {
+                name: "apply_vm_bridged_network".into(),
+                description: "Force a VM directly onto the physical LAN, deterministically, like debian-headless-4 — instead of hoping UTM's 'Shared' mode happens to MACNAT it there (observed live: non-deterministic per VM, per restart, even across the SAME VM's reboots). No-ops if it's already there. Otherwise: flips the UTM bundle's Network Mode from Shared to Bridged in config.plist (verified live — no explicit interface pin needed; this lab's Windows.utm runs exactly this, successfully), stops + restarts the VM, waits for a fresh physical-LAN lease (bounded poll, up to 2 minutes), and refreshes inventory through the standard ARP-by-MAC-aware discovery path (never hand-writes the JSON). Blocking, minutes-scale (same class as ensure_lab_ready) — a VM reboot + DHCP cycle takes real wall-clock time. Idempotent: safe to re-run if it times out mid-boot. Does NOT by itself fix internet access if the physical LAN has its own per-device admission control (captive portal) — see set_vm_internet_access for that.".into(),
+                input_schema: json_schema_object(
+                    json!({"alias": json_schema_string("VM alias to move onto the physical LAN")}),
+                    vec!["alias"],
+                ),
+            },
+            Tool {
                 name: "recover_stuck_vms".into(),
                 description: "Recover Linux QEMU VMs stuck behind a stale nftables killswitch (SSH closed but VM alive). Runs probe-and-recover.".into(),
                 input_schema: json_schema_object(
@@ -3984,6 +4629,11 @@ impl McpServer for LabStateServer {
             "diagnose_host_lab_network" => self.diagnose_host_lab_network(arg_str(args, "alias")),
             "apply_host_route_fix" => {
                 self.apply_host_route_fix(arg_str(args, "alias").unwrap_or(""))
+            }
+            "set_vm_internet_access" => self.set_vm_internet_access(args),
+            "diagnose_vm_lan_presence" => self.diagnose_vm_lan_presence(arg_str(args, "alias")),
+            "apply_vm_bridged_network" => {
+                self.apply_vm_bridged_network(arg_str(args, "alias").unwrap_or(""))
             }
 
             "recover_stuck_vms" => {
@@ -6739,6 +7389,353 @@ mod tests {
         let srv = test_server(&tmp);
         let result = srv.apply_host_route_fix("");
         assert!(result.is_error.unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn is_valid_vm_internet_access_action_accepts_only_the_three_modes() {
+        assert!(is_valid_vm_internet_access_action("enable"));
+        assert!(is_valid_vm_internet_access_action("disable"));
+        assert!(is_valid_vm_internet_access_action("status"));
+        assert!(!is_valid_vm_internet_access_action("reset"));
+        assert!(!is_valid_vm_internet_access_action(""));
+    }
+
+    #[test]
+    fn classify_guest_network_path_detects_physical_lan() {
+        assert_eq!(
+            classify_guest_network_path(&["en0".to_owned()]),
+            "physical-lan"
+        );
+    }
+
+    #[test]
+    fn classify_guest_network_path_detects_isolated_utm_bridge() {
+        assert_eq!(
+            classify_guest_network_path(&["bridge101".to_owned()]),
+            "isolated-utm-bridge"
+        );
+    }
+
+    #[test]
+    fn classify_guest_network_path_prefers_physical_lan_when_both_present() {
+        // A node could in principle be reachable via both an isolated
+        // bridge AND en0 (e.g. duplicate-subnet edge case) — physical-LAN
+        // wins because it's the more actionable diagnosis (captive portal
+        // is something the operator can potentially do something about;
+        // "vmnet's own NAT" is not).
+        assert_eq!(
+            classify_guest_network_path(&["bridge100".to_owned(), "en0".to_owned()]),
+            "physical-lan"
+        );
+    }
+
+    #[test]
+    fn classify_guest_network_path_unknown_when_neither_matches() {
+        assert_eq!(
+            classify_guest_network_path(&["utun7".to_owned()]),
+            "unknown"
+        );
+        assert_eq!(classify_guest_network_path(&[]), "unknown");
+    }
+
+    fn write_fixture_config_plist(bundle: &Path, mode: &str) {
+        std::fs::create_dir_all(bundle).unwrap();
+        std::fs::write(
+            bundle.join("config.plist"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <plist version=\"1.0\"><dict>\n\
+                 <key>Network</key><array><dict>\n\
+                 <key>MacAddress</key><string>32:6b:39:df:d7:4e</string>\n\
+                 <key>Mode</key>\n\t\t\t<string>{mode}</string>\n\
+                 <key>PortForward</key><array/>\n\
+                 </dict></array>\n\
+                 </dict></plist>\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn temp_bundle_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "mcp-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn utm_config_network_mode_reads_shared_and_bridged() {
+        let shared = temp_bundle_dir("mode-shared");
+        write_fixture_config_plist(&shared, "Shared");
+        assert_eq!(utm_config_network_mode(&shared).as_deref(), Some("Shared"));
+        let _ = std::fs::remove_dir_all(&shared);
+
+        let bridged = temp_bundle_dir("mode-bridged");
+        write_fixture_config_plist(&bridged, "Bridged");
+        assert_eq!(
+            utm_config_network_mode(&bridged).as_deref(),
+            Some("Bridged")
+        );
+        let _ = std::fs::remove_dir_all(&bridged);
+    }
+
+    #[test]
+    fn utm_config_network_mode_none_when_bundle_missing() {
+        let missing = temp_bundle_dir("mode-missing");
+        assert_eq!(utm_config_network_mode(&missing), None);
+    }
+
+    #[test]
+    fn set_utm_vm_bridged_via_applescript_fails_closed_for_unknown_vm_name() {
+        // A real osascript call (this MCP server is macOS-only by design,
+        // same as its other host-command tests) against a VM name that
+        // can't exist in UTM's registry — proves the error path surfaces
+        // osascript's failure instead of silently reporting success.
+        let result = set_utm_vm_bridged_via_applescript("definitely-not-a-real-utm-vm-name-9f3c7a");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn diagnose_vm_lan_presence_rejects_unknown_alias() {
+        let tmp = temp_bundle_dir("lan-presence-unknown");
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1"}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let result = srv.diagnose_vm_lan_presence(Some("does-not-exist"));
+        assert!(result.is_error.unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn apply_vm_bridged_network_rejects_missing_alias() {
+        let tmp = temp_bundle_dir("apply-bridge-missing-alias");
+        std::fs::create_dir_all(tmp.join("documents/operations/active")).unwrap();
+        let srv = test_server(&tmp);
+        let result = srv.apply_vm_bridged_network("");
+        assert!(result.is_error.unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn apply_vm_bridged_network_rejects_unknown_alias() {
+        let tmp = temp_bundle_dir("apply-bridge-unknown-alias");
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1"}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let result = srv.apply_vm_bridged_network("does-not-exist");
+        assert!(result.is_error.unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn apply_vm_bridged_network_rejects_entry_missing_bundle_path() {
+        let tmp = temp_bundle_dir("apply-bridge-no-bundle");
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1","last_known_ip":"192.0.2.1"}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let result = srv.apply_vm_bridged_network("deb-1");
+        assert!(result.is_error.unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn vm_internet_tunnel_pid_round_trips_through_state_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-vm-inet-roundtrip-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        assert_eq!(read_vm_internet_tunnel_pid(&tmp, "fedora-utm-1"), None);
+        write_vm_internet_tunnel_pid(&tmp, "fedora-utm-1", 4242).unwrap();
+        assert_eq!(
+            read_vm_internet_tunnel_pid(&tmp, "fedora-utm-1"),
+            Some(4242)
+        );
+        remove_vm_internet_tunnel_state(&tmp, "fedora-utm-1");
+        assert_eq!(read_vm_internet_tunnel_pid(&tmp, "fedora-utm-1"), None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn vm_internet_tunnel_state_is_scoped_per_alias() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-vm-inet-scoped-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        write_vm_internet_tunnel_pid(&tmp, "fedora-utm-1", 111).unwrap();
+        write_vm_internet_tunnel_pid(&tmp, "ubuntu-utm-1", 222).unwrap();
+        assert_eq!(read_vm_internet_tunnel_pid(&tmp, "fedora-utm-1"), Some(111));
+        assert_eq!(read_vm_internet_tunnel_pid(&tmp, "ubuntu-utm-1"), Some(222));
+        remove_vm_internet_tunnel_state(&tmp, "fedora-utm-1");
+        assert_eq!(read_vm_internet_tunnel_pid(&tmp, "fedora-utm-1"), None);
+        assert_eq!(read_vm_internet_tunnel_pid(&tmp, "ubuntu-utm-1"), Some(222));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn host_pid_alive_true_for_current_process_false_for_unlikely_pid() {
+        assert!(host_pid_alive(std::process::id()));
+        assert!(!host_pid_alive(999_999_999));
+    }
+
+    #[test]
+    fn set_vm_internet_access_rejects_unknown_alias() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-vm-inet-unknown-alias-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1","last_known_ip":"10.47.225.58","ssh_user":"debian"}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let result = srv.set_vm_internet_access(Some(&json!({"alias": "does-not-exist"})));
+        assert!(result.is_error.unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn set_vm_internet_access_rejects_unknown_action() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-vm-inet-bad-action-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1","last_known_ip":"10.47.225.58","ssh_user":"debian"}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let result =
+            srv.set_vm_internet_access(Some(&json!({"alias": "deb-1", "action": "reset"})));
+        assert!(result.is_error.unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn set_vm_internet_access_rejects_alias_missing_ssh_fields() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-vm-inet-missing-fields-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"no-ssh-info"}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let result = srv.set_vm_internet_access(Some(&json!({"alias": "no-ssh-info"})));
+        assert!(result.is_error.unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn set_vm_internet_access_status_reports_no_tunnel_when_none_tracked() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-vm-inet-status-none-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737): guaranteed unroutable, so the
+        // direct-reachability SSH attempt fails fast and deterministically
+        // instead of depending on the test host's actual network/routing
+        // state (or a real ConnectTimeout wait).
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1","last_known_ip":"192.0.2.1","ssh_user":"debian"}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let result =
+            srv.set_vm_internet_access(Some(&json!({"alias": "deb-1", "action": "status"})));
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result
+            .content
+            .first()
+            .map(|c| c.text.as_str())
+            .unwrap_or("");
+        assert!(text.contains("tunnel: not active"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn set_vm_internet_access_disable_is_idempotent_when_nothing_tracked() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-vm-inet-disable-noop-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1","last_known_ip":"10.47.225.58","ssh_user":"debian"}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let result =
+            srv.set_vm_internet_access(Some(&json!({"alias": "deb-1", "action": "disable"})));
+        assert!(!result.is_error.unwrap_or(false));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

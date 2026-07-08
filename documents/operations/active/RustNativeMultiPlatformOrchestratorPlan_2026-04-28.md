@@ -802,6 +802,165 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   `macos_client=pass`). **"macOS — zero orchestration stages actually run"
   above is resolved as of this run.**
 
+- **2026-07-08 — mixed the Linux OS fleet (Fedora Server 44, Ubuntu Server
+  24.04) into the lab, and a new MCP tool for a real infrastructure gap
+  this surfaced.** Added `fedora-utm-1` (`fedora_client` role) and
+  `ubuntu-utm-1` (`ubuntu_client` role) to the inventory — both SSH login
+  and `sudo` live-verified (password auth), then the lab's SSH key
+  (`~/.ssh/rustynet_lab_ed25519`) added to both guests' `authorized_keys`
+  so every existing key-only lab-state tool (`ssh_exec`/`scp_to` and
+  everything built on them) works against them identically to the
+  original nodes — this MCP server has no password-auth fallback at all,
+  so skipping this step would have silently broken every remote-exec
+  tool for these two nodes. Also removed 3 deleted debian VMs
+  (`debian-headless-1/3/5` — bundle + UTM registration + inventory entry,
+  all confirmed gone) that another agent had cleaned up during this
+  session.
+  <br>**Investigated whether the orchestrator's Linux bootstrap assumes
+  `apt` (it does not).** `scripts/bootstrap/linux/rn_bootstrap.sh`
+  (`install_prereqs`) already branches on `/etc/os-release`'s `ID`/`ID_LIKE`
+  and calls `dnf install` (Fedora/RHEL-family, including `rustup` itself)
+  or `apt-get install` (Debian-family) accordingly, with a hardened
+  retry+DNS-repair path for apt specifically and a clear failure for any
+  other package manager. `crates/.../adapter/linux_install.rs` (the Rust
+  wrapper) has no package-manager logic at all — the distro-awareness
+  lives entirely in the shell script it ships to the guest, which is easy
+  to miss by reading only the Rust adapter (a first pass at this
+  investigation checked the wrong file and nearly reported this as a gap
+  that doesn't actually exist). No code change needed here; this bullet
+  exists so the next person doesn't re-investigate the same question.
+  <br>**The REAL gap: UTM's "Shared" NAT subnet has no outbound internet
+  path in this lab at all**, for either new node — confirmed live: the
+  guest reaches its own gateway fine, nothing beyond it, even with the
+  host's `net.inet.ip.forwarding` sysctl on (a UTM/vmnet-layer gap, not a
+  rustynet one; not investigated further since it's Apple's own opaque
+  vmnet implementation, not our code). This blocks `dnf`/`apt-get install`
+  and the rustup bootstrap outright on a fresh guest — and the existing
+  `seed_cargo_cache` tool doesn't cover it, because that tool only
+  delta-syncs crates.io packages for an *already-installed* toolchain, not
+  the toolchain installer itself or OS-level packages. First fixed ad hoc
+  (an `ssh -R` reverse dynamic SOCKS tunnel driven by hand over several
+  SSH calls) to unblock the immediate rustup+`dnf`/`apt` installs — then,
+  per operator instruction, turned into a proper tool instead of leaving
+  the ad hoc version as the only path: **`set_vm_internet_access`**
+  (`enable`/`disable`/`status`) in `rustynet-mcp-lab-state`. Reuses
+  existing infra end to end rather than reinventing it — `ssh_exec` for
+  the guest-side reachability probe, `spawn_logged`/`kill_process_group`
+  for the detached tunnel process (the same pattern `start_live_lab_run`
+  already uses for jobs that must outlive an MCP-server reload), and a
+  `state/vm-internet-tunnels/<alias>.json` pid-tracking file (mirrors
+  `state/mcp-jobs/*.json`) so repeated `enable` calls are idempotent
+  instead of spawning duplicate tunnels. `enable` verifies REAL
+  reachability through the tunnel (not just that the ssh process started)
+  before reporting success. Deliberately does NOT persist a system-wide
+  proxy config on the guest (`/etc/profile.d/...`) in this first version —
+  scoped out to avoid embedding the guest's sudo password in a new
+  general-purpose tool; the caller passes `http_proxy`/`https_proxy` (or
+  dnf's `--setopt=proxy=`) to whatever command needs it. 9 new tests
+  (state-file round-trip, per-alias scoping, pid-liveness, all three
+  reject-paths), full suite 78/78, gates green. **Live-verified full
+  lifecycle on `fedora-utm-1`**: status (none) → enable (real internet
+  reachability confirmed) → status (active) → enable again (idempotent,
+  same pid, no duplicate spawned) → disable (process confirmed killed) →
+  status (none again) — then re-enabled on both `fedora-utm-1` and
+  `ubuntu-utm-1` for ongoing use, distinct host pids, no port collision
+  (the forwarded port lives in each guest's own network namespace).
+  <br>**Process note, from the operator catching it directly:** the ad hoc
+  SSH-based version above was built without first checking whether
+  existing MCP tooling already covered this ("is there an MCP function
+  for this? ... why wasn't it obvious for you to call?") — it didn't
+  (`seed_cargo_cache` is scoped to crates.io only), but the check should
+  have happened before, not after, reaching for a novel fix.
+  <br>**Root-caused the "why" the same day, live, in two parts — and it
+  changed once the host actually switched networks.** The operator's host
+  had been on a captive-portal network requiring a per-device web sign-in;
+  switching to an open network fixed `debian-headless-4` (MACNAT'd
+  directly onto the real physical LAN, same gateway the host itself uses)
+  exactly as expected — captive portals gate by MAC address, and the
+  guest's own virtual MAC was never individually signed in, unlike the
+  host's physical one. But `fedora-utm-1`/`ubuntu-utm-1` (on the
+  *isolated* UTM Shared-Network bridge, not MACNAT'd) still failed
+  identically after the network switch — proving the captive-portal
+  explanation was necessary but not sufficient: isolated-bridge guests
+  have a SEPARATE blocker, UTM/Apple-Virtualization's own Shared-Network
+  NAT not completing the forward, independent of the physical network
+  entirely. Folded both failure modes into `set_vm_internet_access`'s
+  `status` action as `diagnose_guest_internet_blocker`: checks the host's
+  own internet first, then the guest's gateway reachability, then
+  classifies the owning interface as `en0` (physical-LAN — captive-portal
+  class) vs `bridgeNN` (isolated bridge — vmnet-NAT class) via a new pure
+  `classify_guest_network_path` helper, and reports the specific,
+  correct-for-that-case explanation instead of a bare true/false. 4 more
+  tests (13 total for this tool), full suite 82/82, gates green,
+  live-verified against `fedora-utm-1` producing the exact
+  isolated-bridge diagnosis. Neither failure mode is fixable by this tool
+  or by rustynet — the tunnel remains the correct, durable workaround for
+  both, not a stopgap for a bug that could otherwise be patched.
+
+- **2026-07-08 — deterministic "put this VM on the physical LAN" tool
+  (`diagnose_vm_lan_presence` + `apply_vm_bridged_network`), so the
+  `debian-headless-4` outcome (real DHCP lease off the physical router,
+  same gateway the host itself uses) can be forced on demand instead of
+  hoping UTM's "Shared" mode happens to MACNAT a given VM there — observed
+  live to be non-deterministic per VM per restart.** `diagnose_vm_lan_presence`
+  is read-only: for one alias or the whole inventory, resolves each node's
+  live IP via the existing ARP-by-MAC path, classifies it
+  physical-LAN / isolated-bridge / unknown via `classify_guest_network_path`,
+  and reports the bundle's declared UTM Network Mode alongside it.
+  `apply_vm_bridged_network` is the fix: no-ops if already on the physical
+  LAN, otherwise stops the VM, flips its UTM Network Mode to Bridged
+  (pinned to `en0`, the same config `Windows.utm` already runs), restarts
+  it, and polls (5s interval, 120s budget) for a fresh physical-LAN lease —
+  on success it reuses the existing `vm-lab-discover-local-utm-summary
+  --update-inventory-live-ips` refresh path rather than hand-writing
+  inventory JSON.
+  <br>**First implementation (a raw `config.plist` text edit of the `Mode`
+  key) looked right and wasn't.** The file correctly showed `Bridged` and
+  even survived a hard VM restart — but the guest stayed on its old
+  internal vmnet bridge address regardless, because UTM's running app
+  process holds its own in-memory configuration object that a bare file
+  edit + power cycle never invalidates. Replaced with UTM's own
+  AppleScript "UTM Configuration Suite" (`update configuration`, which
+  UTM requires the VM to be stopped for) — `set_utm_vm_bridged_via_applescript`
+  drives UTM itself to rebuild the network device attachment, not just
+  the file backing it. Confirmed live: `fedora-utm-1` moved from its
+  isolated-bridge address to a real `en0`-owned physical-LAN address
+  (`10.47.225.57`) only after switching to the AppleScript path, never
+  after the file edit alone.
+  <br>**`ubuntu-utm-1` still doesn't land on the physical LAN with this
+  fix, and the reason is guest-side, not a tool bug.** Two full
+  stop → AppleScript-reconfigure → restart → 120s-poll cycles both timed
+  out; `apply_vm_bridged_network` reported this correctly and safely (a
+  clear, actionable, non-misleading error — not a false success). Live
+  inspection confirmed: the bundle's `config.plist` correctly shows
+  `BridgeInterface=en0` + `Mode=Bridged` with the MAC unchanged (same
+  mechanism that worked for Fedora), the guest fully boots to its `tty1`
+  login prompt (screenshot-verified, not stuck mid-boot), and yet its MAC
+  never appears in the host's `en0` ARP table and its old isolated-bridge
+  address goes to `(incomplete)` — the guest's own network stack never
+  requests a DHCP lease on the reattached NIC. Working theory: Ubuntu
+  Server's netplan (cloud-image/subiquity-generated) pins its config to a
+  specific interface identity captured at install time, and does not fall
+  back to "configure any Ethernet device" the way Fedora's NetworkManager
+  does — which is exactly why the identical UTM-side change took effect
+  on Fedora immediately but not Ubuntu. Console login to confirm via
+  `networkctl`/netplan YAML was attempted but blocked by unreliable
+  keystroke delivery into the UTM console window (the same class of
+  console-input flakiness noted elsewhere in this ledger) — not chased
+  further since the fix, if this theory holds, is a guest-side netplan
+  edit (match by MAC/wildcard instead of interface name), not anything in
+  rustynet or this tool. Tracked as a follow-up, not a blocker: `ubuntu-utm-1`
+  remains reachable and usable on its isolated-bridge address for
+  everything that doesn't require physical-LAN placement.
+  <br>13 new tests (`utm_config_network_mode` shared/bridged/missing,
+  `set_utm_vm_bridged_via_applescript` closed-fail on an unknown VM name,
+  `diagnose_vm_lan_presence`/`apply_vm_bridged_network` reject-paths —
+  missing alias, unknown alias, entry missing `bundle_path`), full suite
+  89/89, `cargo fmt`/`clippy -D warnings`/`check` all clean, binary
+  rebuilt and hot-swapped, both tools live-verified end-to-end against
+  the real lab (`fedora-utm-1` success path with inventory refresh
+  confirmed persisted; `ubuntu-utm-1` clean-failure path confirmed twice).
+
 **Still open per bucket (map `wf_ee06d0be-054`):** B1 — anchor-bundle-pull macOS/Windows
 (gated on Phase 8 token provisioning); chaos/cross-network stages. Setup/run modes + the Rust-path recovery
 gate are code-landed but
