@@ -9,13 +9,13 @@
       },
       "exit_capable": true,
       "lab_role": "exit",
-      "last_known_ip": "10.47.225.58",
+      "last_known_ip": "192.168.64.8",
       "last_known_network": "utm-shared-192.168.64.0/24",
       "live_ips": [
+        "192.168.64.8",
         "10.47.225.58",
         "192.168.64.200",
         "192.168.0.200",
-        "192.168.64.8",
         "192.168.64.3",
         "fd21:69d4:6afd:fa50:3cae:a9ff:fe5a:6182",
         "fd21:69d4:6afd:fa50:9a08:e072:9844:b7ad",
@@ -29,7 +29,7 @@
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "10.47.225.58",
+      "ssh_target": "192.168.64.8",
       "ssh_user": "debian"
     },
     {
@@ -41,14 +41,14 @@
       },
       "exit_capable": false,
       "lab_role": "client",
-      "last_known_ip": "10.47.225.61",
+      "last_known_ip": "192.168.64.4",
       "last_known_network": "utm-shared-192.168.64.0/24",
       "live_ips": [
+        "192.168.64.4",
         "10.47.225.61",
         "192.168.64.201",
         "192.168.0.201",
         "192.168.65.4",
-        "192.168.64.4",
         "fd21:69d4:6afd:fa50:4344:bf8a:e4ff:3154",
         "fe80::a419:949:1c4a:4d9f"
       ],
@@ -60,7 +60,7 @@
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "10.47.225.61",
+      "ssh_target": "192.168.64.4",
       "ssh_user": "debian"
     },
     {
@@ -72,14 +72,14 @@
       },
       "exit_capable": false,
       "lab_role": "relay",
-      "last_known_ip": "10.47.225.62",
+      "last_known_ip": "192.168.64.9",
       "last_known_network": "utm-shared-192.168.64.0/24",
       "live_ips": [
+        "192.168.64.9",
         "10.47.225.62",
         "192.168.64.202",
         "192.168.0.202",
         "192.168.65.6",
-        "192.168.64.9",
         "192.168.64.5",
         "fd21:69d4:6afd:fa50:6259:ad04:5665:deda",
         "fe80::bec8:79f7:a83d:ddc"
@@ -92,7 +92,7 @@
       "relay_capable": true,
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "10.47.225.62",
+      "ssh_target": "192.168.64.9",
       "ssh_user": "debian"
     },
     {
@@ -104,9 +104,10 @@
       },
       "exit_capable": false,
       "lab_role": "aux",
-      "last_known_ip": "10.47.225.60",
+      "last_known_ip": "192.168.15.253",
       "last_known_network": "lan-192.168.0.0/24",
       "live_ips": [
+        "192.168.15.253",
         "10.47.225.60",
         "192.168.0.203",
         "192.168.65.5",
@@ -123,7 +124,7 @@
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "10.47.225.60",
+      "ssh_target": "192.168.15.253",
       "ssh_user": "debian"
     },
     {
@@ -148,9 +149,10 @@
       },
       "exit_capable": false,
       "lab_role": "extra",
-      "last_known_ip": "10.47.225.59",
+      "last_known_ip": "192.168.15.221",
       "last_known_network": "lan-192.168.0.0/24",
       "live_ips": [
+        "192.168.15.221",
         "10.47.225.59",
         "192.168.0.204",
         "192.168.65.7",
@@ -164,7 +166,7 @@
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "10.47.225.59",
+      "ssh_target": "192.168.15.221",
       "ssh_user": "debian"
     },
     {
@@ -177,9 +179,10 @@
       "exit_capable": false,
       "include_in_all": false,
       "lab_role": "macos_client",
-      "last_known_ip": "192.168.64.18",
+      "last_known_ip": "192.168.65.2",
       "last_known_network": "lan-192.168.0.0/24",
       "live_ips": [
+        "192.168.65.2",
         "192.168.64.18",
         "192.168.0.210"
       ],
@@ -192,7 +195,7 @@
       "relay_capable": false,
       "rustynet_src_dir": "/Users/mac/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "192.168.64.18",
+      "ssh_target": "192.168.65.2",
       "ssh_user": "mac"
     },
     {
@@ -205,7 +208,7 @@
       "guest_exec_mode": "windows_powershell",
       "include_in_all": false,
       "lab_role": "windows_client",
-      "last_known_ip": "10.47.225.57",
+      "last_known_ip": "192.168.15.241",
       "last_known_network": "lan-192.168.0.0/24",
       "mesh_ip": "100.64.0.6",
       "network_group": "lan-192.168.0.0/24",
@@ -217,7 +220,7 @@
       "rustynet_src_dir": "C:\\Rustynet",
       "service_manager": "windows_service",
       "ssh_password": "tempo",
-      "ssh_target": "10.47.225.57",
+      "ssh_target": "192.168.15.241",
       "ssh_user": "windows",
       "utm_staging_dir": "C:\\Users\\windows\\rustynet-utm-stage"
     }

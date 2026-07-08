@@ -718,6 +718,90 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   tool doesn't rewrite these free-text labels); cosmetic only, does not
   affect connectivity.
 
+- **2026-07-08 — new MCP host-network diagnostic/fix tools
+  (`diagnose_host_lab_network` / `apply_host_route_fix` in
+  `rustynet-mcp-lab-state`), and the first-ever full-green `--node` engine
+  run with macOS in the topology.** Built two new tools to close a gap none
+  of the existing guest-facing lab tools could see: the HOST's own kernel
+  route table. `diagnose_host_lab_network` classifies each node's host
+  route (stale/missing → fixable, prints the exact `route add`; host
+  physically off that LAN → not fixable remotely); `apply_host_route_fix`
+  executes the fixable case via macOS's native `osascript ... with
+  administrator privileges` prompt (password/Touch ID goes straight to the
+  OS, never through the tool or any log), re-deriving the fix internally
+  from a fresh diagnosis rather than accepting a raw command — no
+  injection surface. Every branch was live-verified and each one caught a
+  real bug first: interface-name-matching alone wasn't enough (two UTM
+  bridges can claim the same default NAT subnet without both leading to
+  the same guest — real TCP-reachability checks are the actual bar now,
+  trying every candidate interface in turn); a stopped VM's bridge
+  interface doesn't exist, so both tools now check power state first
+  instead of surfacing a cryptic `route: bad address`; a kernel-cloned
+  HOST-specific (`/32`) route can go REJECT-flagged independently of the
+  `/24` network route after an ARP failure, so it's now cleared too; the
+  AppleScript prompt has no timeout of its own, so a silently-killed
+  watchdog now reports "prompt not seen in time" instead of a blank
+  failure. 10 new tests, gates green, binary hot-swapped.
+  <br>**Real design flaw found and fixed the same session, self-caught
+  after a wrong diagnosis.** `diagnose_host_lab_network` initially reported
+  "host off this LAN — reconnect" for the Linux/Windows backbone after a
+  VM restart, which was WRONG: these nodes use UTM's "Shared" network mode
+  (confirmed via `config.plist`, same as the macOS Apple-Virt subnet), not
+  Bridged — their subnet is host-internal and gets reallocated to a new
+  range on every restart (observed live: some guests land on an isolated
+  UTM bridge, e.g. `192.168.64.x`; others get MACNAT'd directly onto
+  whatever physical LAN the host is currently on, e.g. `192.168.15.x` —
+  non-deterministic per VM, per restart). The tool's "does any interface
+  own this /24 right now" heuristic cannot distinguish that from a
+  genuine physical-LAN disconnect — both present as zero owning
+  interfaces. The actual fix in both cases is IP rediscovery via
+  ARP-by-MAC (this morning's `rustynet-cli` fix), not a network reconnect
+  — and this was the second time in one session the same crate independently
+  re-implemented "trust stale `last_known_ip`" instead of verifying
+  freshness first. **Fixed the same session** (structural, not a
+  workaround): ported the MAC-from-`config.plist` + ARP-table-scan
+  functions into `rustynet-mcp/src/bin/lab_state.rs` (separate crate from
+  `rustynet-cli`, no code sharing — kept in sync by hand) and made
+  ARP-by-MAC resolution the FIRST step in both
+  `diagnose_host_lab_network` and `apply_host_route_fix`, ahead of route
+  classification. A stale-inventory case now reports "inventory is STALE —
+  says X, MAC resolves to Y" and diagnoses/fixes against the fresh address;
+  `OffLabLan` now only fires when ARP-by-MAC ALSO finds nothing anywhere,
+  so it can no longer be confused with subnet reallocation. 7 new tests
+  (MAC normalization/padding, ARP-output parsing incl. macOS's
+  unpadded-octet quirk, plist extraction), full suite 69/69, gates green,
+  live-verified against the real host with no regression on the
+  already-passing nodes.
+  <br>**Root-caused why macOS's guest was unreachable even with a correct
+  route: `rustynetd` was already running on the guest** (from earlier
+  testing) **and its own `--fail-closed-ssh-allow-cidrs` allowlist
+  (`192.168.0.0/24,192.168.64.0/24`) didn't include whatever subnet the
+  guest ended up on after the restart** (`192.168.65.0/24` this time) —
+  the mesh's default-deny security posture working exactly as designed,
+  not a bug, but a direct consequence of the same non-deterministic
+  subnet-reallocation behavior above. Stopped it via SSH
+  (`launchctl bootout system/com.rustynet.anchor` +
+  `.../com.rustynet.privileged-helper` — the on-guest label wasn't
+  `com.rustynet.daemon` as expected; this VM had been running under the
+  `anchor` role from prior testing) to restore a clean baseline for
+  orchestrator-driven bootstrap.
+  <br>**First full-green `--node` engine run with macOS in the topology**
+  (`debian-headless-1:exit, debian-headless-2:client, macos-utm-1:client`,
+  `--skip-linux-live-suite`): `run_passed=true`, Linux 7/7 stages pass,
+  macOS 7/7 stages pass, 0 failures — macOS's daemon passed ALL 6
+  validators including `MeshStatus` and `DnsFailclosed`. The first attempt
+  at this topology failed at `validate_baseline_runtime` — but
+  `validator_results.json` showed the failure was `debian-headless-1`'s
+  `MeshStatus`/`DnsFailclosed`, not macOS: a stale `/etc/resolv.conf`
+  symlink loop (`Too many levels of symbolic links`, likely residue from
+  today's many restart cycles) on that one node was driving `rustynetd`'s
+  DNS-apply into a fail-closed reconcile loop past its failure threshold.
+  Fixed the symlink on the guest and re-ran clean. Evidence: run-matrix
+  rows `livelab-1783509507-2150fa42ec86` (fail) and
+  `livelab-1783510334-2150fa42ec86` (pass, `macos_present=pass`,
+  `macos_client=pass`). **"macOS — zero orchestration stages actually run"
+  above is resolved as of this run.**
+
 **Still open per bucket (map `wf_ee06d0be-054`):** B1 — anchor-bundle-pull macOS/Windows
 (gated on Phase 8 token provisioning); chaos/cross-network stages. Setup/run modes + the Rust-path recovery
 gate are code-landed but
