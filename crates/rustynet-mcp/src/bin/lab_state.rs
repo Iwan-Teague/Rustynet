@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1208,6 +1208,361 @@ impl LabStateServer {
         tool_success(&out)
     }
 
+    /// Diagnose HOST-side routing to lab VM subnets — the failure class none
+    /// of the guest-facing tools (check_vm_reachable, reset_vm_network,
+    /// get_vm_network_info) can see, because it isn't a guest problem: the
+    /// host's own kernel route table doesn't know how to reach the VM's
+    /// subnet at all. Two distinct causes, both hit live in the same
+    /// session: (1) a QEMU-bridged/shared VM (linux/windows) — the host
+    /// physically isn't on that LAN right now (Wi-Fi/Ethernet roam), not
+    /// fixable remotely; (2) the macOS VM's Apple-Virtualization NAT subnet
+    /// — the host's route to it is stale or missing (a dead mesh-session
+    /// gateway, or a VPN default route swallowing it), fixable with one
+    /// `route add`, which this tool derives and prints but does not execute
+    /// (needs sudo). `alias` filters to one node; omit for all of them.
+    fn diagnose_host_lab_network(&self, alias: Option<&str>) -> ToolCallResult {
+        let inv_entries = match std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)) {
+            Ok(s) => match serde_json::from_str::<Value>(&s) {
+                Ok(v) => v
+                    .get("entries")
+                    .and_then(|e| e.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                Err(e) => return tool_error(&format!("inventory invalid JSON: {e}")),
+            },
+            Err(e) => return tool_error(&format!("inventory unreadable: {e}")),
+        };
+
+        let mut out = String::from("# Host lab-network diagnosis\n\n");
+        let mut any_actionable = false;
+        let mut checked = 0u32;
+
+        for e in &inv_entries {
+            let entry_alias = e.get("alias").and_then(|v| v.as_str()).unwrap_or("");
+            if entry_alias.is_empty() {
+                continue;
+            }
+            if let Some(only) = alias
+                && only != entry_alias
+            {
+                continue;
+            }
+            let platform = e
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .unwrap_or("linux");
+            let ip = e
+                .get("last_known_ip")
+                .and_then(|v| v.as_str())
+                .or_else(|| e.get("ssh_target").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let Ok(target) = ip.parse::<Ipv4Addr>() else {
+                out.push_str(&format!(
+                    "- ⏭️ {entry_alias}: no IPv4 last_known_ip/ssh_target in inventory, skipped\n"
+                ));
+                continue;
+            };
+            checked += 1;
+
+            // The most basic, most common cause of "unreachable" is simply
+            // "the VM is off" — check this BEFORE any host-routing
+            // diagnosis, or a stopped VM (whose UTM-managed bridge/vmenet
+            // interface gets torn down with it) reads as a confusing
+            // routing problem instead of the obvious fix.
+            if let Some(utm_name) = e
+                .get("controller")
+                .and_then(|c| c.get("utm_name"))
+                .and_then(|v| v.as_str())
+                && let Some(power) = self.utm_power_status(utm_name)
+                && power != "started"
+            {
+                any_actionable = true;
+                out.push_str(&format!(
+                    "- ⏸️ {entry_alias} ({ip}, {platform}): VM is '{power}', not running — power_on_vm first. (Any host-routing state below would be stale/misleading while the VM's bridge interface doesn't exist.)\n"
+                ));
+                continue;
+            }
+
+            let route_out = run_with_timeout(
+                "route",
+                &["get", &target.to_string()],
+                &self.repo_root,
+                &[],
+                Duration::from_secs(5),
+            );
+            let route = match &route_out {
+                Ok(o) if o.success => parse_route_get_output(&o.stdout),
+                Ok(o) => {
+                    out.push_str(&format!(
+                        "- ❌ {entry_alias} ({ip}): `route get` failed — {}\n",
+                        truncate_output(o.stderr.trim(), 2, 200)
+                    ));
+                    continue;
+                }
+                Err(err) => {
+                    out.push_str(&format!(
+                        "- ❌ {entry_alias} ({ip}): could not run `route get` — {err}\n"
+                    ));
+                    continue;
+                }
+            };
+            let Some(route) = route else {
+                out.push_str(&format!(
+                    "- ❌ {entry_alias} ({ip}): unparseable `route get` output\n"
+                ));
+                continue;
+            };
+
+            let owning = host_interfaces_in_same_slash24(target);
+            let verdict = classify_host_route(&route, &owning);
+            let observed_iface = route.interface.as_deref().unwrap_or("(none)");
+            let port = e.get("ssh_port").and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+
+            match verdict {
+                HostLabRouteVerdict::Correct => {
+                    // The route table alone isn't sufficient: two UTM
+                    // bridges can both legitimately own the same default
+                    // NAT subnet without both leading to THIS VM (found
+                    // live — a shared multi-VM bridge and a private per-VM
+                    // bridge both claiming 192.168.64.0/24). Confirm real
+                    // reachability, not just an interface-name match.
+                    if tcp_reachable(ip, port, Duration::from_secs(2)) {
+                        out.push_str(&format!(
+                            "- ✅ {entry_alias} ({ip}, {platform}): host route correct (via `{observed_iface}`), TCP/{port} reachable\n"
+                        ));
+                    } else {
+                        any_actionable = true;
+                        out.push_str(&format!(
+                            "- ⚠️ {entry_alias} ({ip}, {platform}): host route LOOKS correct (via `{observed_iface}`) but TCP/{port} is NOT reachable — possible duplicate-subnet bridge collision (another interface may also claim this /24 without actually leading here) or a guest-side issue (see check_vm_reachable/reset_vm_network).\n"
+                        ));
+                    }
+                }
+                HostLabRouteVerdict::StaleOrMissing => {
+                    any_actionable = true;
+                    let expected = owning.first().map(String::as_str).unwrap_or("?");
+                    let octets = target.octets();
+                    let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+                    out.push_str(&format!(
+                        "- 🛠️ {entry_alias} ({ip}, {platform}): HOST ROUTE STALE/MISSING — resolves via `{observed_iface}` (destination `{}`) but `{expected}` actually owns this subnet.\n  **Fix:** `sudo route add -net {subnet} -interface {expected}` (or call apply_host_route_fix, which verifies real reachability and tries every candidate interface if there's more than one)\n",
+                        route.destination
+                    ));
+                    if owning.len() > 1 {
+                        out.push_str(&format!(
+                            "  ⚠️ {} interfaces claim this subnet ({}) — likely two UTM VMs both defaulted to the same NAT range; the suggested fix above may pick the wrong one, worth investigating separately.\n",
+                            owning.len(),
+                            owning.join(", ")
+                        ));
+                    }
+                }
+                HostLabRouteVerdict::OffLabLan => {
+                    any_actionable = true;
+                    out.push_str(&format!(
+                        "- 🌐 {entry_alias} ({ip}, {platform}): HOST OFF THIS LAN — no local interface currently owns this subnet (resolves via `{observed_iface}`, destination `{}`). This is a physical network change, not fixable remotely — reconnect the host to the lab network.\n",
+                        route.destination
+                    ));
+                }
+            }
+        }
+
+        if checked == 0 {
+            return tool_error(&match alias {
+                Some(a) => format!("no inventory entry '{a}' with a usable IP found"),
+                None => "no inventory entries with a usable IP found".to_string(),
+            });
+        }
+
+        out.push_str(&format!(
+            "\n**{checked} node(s) checked{}.**\n",
+            if any_actionable {
+                " — action needed on at least one (see 🛠️/🌐 above)"
+            } else {
+                ", all host routes look correct"
+            }
+        ));
+        tool_success(&out)
+    }
+
+    /// Apply the fix `diagnose_host_lab_network` can only prescribe: re-runs
+    /// the SAME diagnosis fresh (this tool never accepts a raw command from
+    /// the caller — the fix command is always derived internally from the
+    /// live route/interface state, never free text), and if the verdict is
+    /// the fixable one (stale/missing host route), runs the `route`
+    /// delete+add pair via `osascript ... with administrator privileges`.
+    /// That's macOS's native authorization prompt: the password/Touch ID
+    /// goes straight into the OS's Security Server on the user's own
+    /// screen — this process, and the calling agent, never see it, never
+    /// log it, never transmit it. If the verdict is "host off this LAN"
+    /// there is nothing to fix (a physical network fact); if it's already
+    /// correct this is a no-op. Re-verifies the route after a successful
+    /// run before reporting success.
+    fn apply_host_route_fix(&self, alias: &str) -> ToolCallResult {
+        if alias.is_empty() {
+            return tool_error("Missing required parameter: alias");
+        }
+        let inv_entries = match std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)) {
+            Ok(s) => match serde_json::from_str::<Value>(&s) {
+                Ok(v) => v
+                    .get("entries")
+                    .and_then(|e| e.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                Err(e) => return tool_error(&format!("inventory invalid JSON: {e}")),
+            },
+            Err(e) => return tool_error(&format!("inventory unreadable: {e}")),
+        };
+        let Some(entry) = inv_entries
+            .iter()
+            .find(|e| e.get("alias").and_then(|v| v.as_str()) == Some(alias))
+        else {
+            return tool_error(&format!("Unknown alias '{alias}' (not in inventory)"));
+        };
+        let platform = entry
+            .get("platform")
+            .and_then(|v| v.as_str())
+            .unwrap_or("linux");
+        let ip = entry
+            .get("last_known_ip")
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.get("ssh_target").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let Ok(target) = ip.parse::<Ipv4Addr>() else {
+            return tool_error(&format!(
+                "'{alias}' has no IPv4 last_known_ip/ssh_target in inventory"
+            ));
+        };
+
+        // Refuse outright if the VM is off — its UTM-managed bridge/vmenet
+        // interface is torn down with it, so any route-add attempt fails
+        // with a confusing `route: bad address: <iface>` error instead of
+        // the actual, obvious fix (power_on_vm).
+        if let Some(utm_name) = entry
+            .get("controller")
+            .and_then(|c| c.get("utm_name"))
+            .and_then(|v| v.as_str())
+            && let Some(power) = self.utm_power_status(utm_name)
+            && power != "started"
+        {
+            return tool_error(&format!(
+                "'{alias}' ({ip}, {platform}): VM is '{power}', not running — power_on_vm first, then retry. A stopped VM's bridge interface doesn't exist, so any route fix would fail anyway."
+            ));
+        }
+
+        let route = match run_with_timeout(
+            "route",
+            &["get", &target.to_string()],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(5),
+        ) {
+            Ok(o) if o.success => parse_route_get_output(&o.stdout),
+            Ok(o) => {
+                return tool_error(&format!("`route get` failed: {}", o.stderr.trim()));
+            }
+            Err(e) => return tool_error(&format!("could not run `route get`: {e}")),
+        };
+        let Some(route) = route else {
+            return tool_error("unparseable `route get` output");
+        };
+        let owning = host_interfaces_in_same_slash24(target);
+        let verdict = classify_host_route(&route, &owning);
+        let port = entry.get("ssh_port").and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+
+        // Reachability, not the route-table classification alone, is the
+        // single source of truth for "is there anything to do" — two UTM
+        // bridges can both legitimately own the same default NAT subnet
+        // without both leading to THIS VM (found live: a shared multi-VM
+        // bridge and a private per-VM bridge both claiming
+        // 192.168.64.0/24), so `classify_host_route` saying "Correct" does
+        // NOT guarantee the guest actually answers.
+        if verdict != HostLabRouteVerdict::OffLabLan
+            && tcp_reachable(&target.to_string(), port, Duration::from_secs(3))
+        {
+            return tool_success(&format!(
+                "# Route fix: {alias}\n\nAlready correct (via `{}`) and TCP/{port} reachable — nothing to do.\n",
+                route.interface.as_deref().unwrap_or("?")
+            ));
+        }
+        if verdict == HostLabRouteVerdict::OffLabLan {
+            return tool_error(&format!(
+                "'{alias}' ({ip}, {platform}): host is off this VM's LAN — no local interface currently owns that subnet. This is a physical network change, not something this tool can fix — reconnect the host, then retry."
+            ));
+        }
+        if owning.is_empty() {
+            return tool_error("internal error: not OffLabLan but no owning interface");
+        }
+
+        let octets = target.octets();
+        let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+        let mut tried: Vec<String> = Vec::new();
+
+        for interface in &owning {
+            if !is_safe_interface_name(interface) {
+                continue;
+            }
+            tried.push(interface.clone());
+            let shell_cmd = build_route_fix_shell_command(&target.to_string(), &subnet, interface);
+            let prompt = format!(
+                "RustyNet lab wants to fix the host route to {subnet} (via {interface}) for VM '{alias}'."
+            );
+            let applescript = format!(
+                "do shell script {} with prompt {} with administrator privileges",
+                apple_script_string_literal(&shell_cmd),
+                apple_script_string_literal(&prompt)
+            );
+            match run_with_timeout(
+                "osascript",
+                &["-e", &applescript],
+                &self.repo_root,
+                &[],
+                Duration::from_secs(240),
+            ) {
+                Ok(o) if o.success => {
+                    std::thread::sleep(Duration::from_millis(300));
+                    if tcp_reachable(&target.to_string(), port, Duration::from_secs(5)) {
+                        return tool_success(&format!(
+                            "# Route fix: {alias}\n\n✅ Applied and confirmed reachable: `{subnet}` now routes via `{interface}` (TCP/{port} open).\n"
+                        ));
+                    }
+                    // Route looks structurally fine but the guest still
+                    // isn't answering here — try the next candidate
+                    // interface, if any.
+                }
+                Ok(o) if o.timed_out => {
+                    // The AppleScript authorization dialog has no timeout of
+                    // its own — this is OUR watchdog killing a process that
+                    // was (as far as we know) still waiting on the user.
+                    // Report this distinctly from a real failure: an empty
+                    // stderr + "failed" reads as a mysterious dead end,
+                    // when what actually happened is the dialog was never
+                    // seen/approved in time.
+                    return tool_error(&format!(
+                        "No response within 240s to the authorization prompt for `{interface}` — it may have appeared behind another window/Space, or on a display that wasn't visible. No changes made. Bring the frontmost app to Terminal/Claude and retry, watching for a native macOS password/Touch ID dialog."
+                    ));
+                }
+                Ok(o) => {
+                    let stderr = o.stderr.trim();
+                    if stderr.contains("User canceled") || stderr.contains("(-128)") {
+                        return tool_error(
+                            "Authorization prompt was canceled by the user — no changes made.",
+                        );
+                    }
+                    return tool_error(&format!(
+                        "route fix failed via `{interface}`: {}",
+                        truncate_output(stderr, 5, 400)
+                    ));
+                }
+                Err(e) => return tool_error(&format!("could not invoke osascript: {e}")),
+            }
+        }
+
+        tool_error(&format!(
+            "Tried {} interface(s) claiming `{subnet}` ({}) — none resulted in a reachable TCP/{port} on {alias} ({ip}). The route table now points at `{}`, but the guest still isn't answering; this may be a guest-side issue (see check_vm_reachable/reset_vm_network) rather than a host-routing one.",
+            tried.len(),
+            tried.join(", "),
+            tried.last().map(String::as_str).unwrap_or("?")
+        ))
+    }
+
     /// Summarize the trend across the last N run-matrix rows (converging or stuck?).
     fn get_run_trend(&self, args: Option<&Value>) -> ToolCallResult {
         let limit = args
@@ -2390,6 +2745,119 @@ fn tcp_reachable(ip: &str, port: u16, timeout: Duration) -> bool {
     false
 }
 
+/// The fields of macOS `route get <ip>` output that matter for diagnosing
+/// lab connectivity: which interface the kernel would actually send packets
+/// out on, and whether that's a specific route or a fallback to the default
+/// route (`destination: default` — no more-specific route exists at all).
+struct RouteGetResult {
+    destination: String,
+    interface: Option<String>,
+}
+
+fn parse_route_get_output(output: &str) -> Option<RouteGetResult> {
+    let mut destination = None;
+    let mut interface = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("destination:") {
+            destination = Some(v.trim().to_owned());
+        } else if let Some(v) = line.strip_prefix("interface:") {
+            interface = Some(v.trim().to_owned());
+        }
+    }
+    destination.map(|destination| RouteGetResult {
+        destination,
+        interface,
+    })
+}
+
+/// Host network interfaces currently carrying an IPv4 address in the same
+/// /24 as `target`. Used to find which local interface (e.g. a UTM NAT
+/// bridge) actually owns a lab-VM subnet right now, independent of what the
+/// kernel's route table currently resolves — the two can disagree when a
+/// stale route lingers after a network change.
+fn host_interfaces_in_same_slash24(target: Ipv4Addr) -> Vec<String> {
+    let target_prefix = {
+        let o = target.octets();
+        [o[0], o[1], o[2]]
+    };
+    nix::ifaddrs::getifaddrs()
+        .map(|addrs| {
+            addrs
+                .filter_map(|ia| {
+                    let v4 = ia.address?.as_sockaddr_in()?.ip();
+                    let o = v4.octets();
+                    ([o[0], o[1], o[2]] == target_prefix && v4 != target)
+                        .then_some(ia.interface_name)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Diagnosis of whether the host's current route to a lab VM's subnet is
+/// trustworthy, distinguishing the two failure modes found live: a stale
+/// route pointing at the wrong interface (fixable with one `route add`) vs
+/// the host simply not being on that LAN at all right now (not fixable
+/// remotely — a physical network change).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostLabRouteVerdict {
+    Correct,
+    StaleOrMissing,
+    OffLabLan,
+}
+
+fn classify_host_route(
+    route: &RouteGetResult,
+    owning_interfaces: &[String],
+) -> HostLabRouteVerdict {
+    if owning_interfaces.is_empty() {
+        return HostLabRouteVerdict::OffLabLan;
+    }
+    match route.interface.as_deref() {
+        Some(iface) if owning_interfaces.iter().any(|i| i == iface) => HostLabRouteVerdict::Correct,
+        _ => HostLabRouteVerdict::StaleOrMissing,
+    }
+}
+
+/// True only for OS-reported interface names (`en0`, `bridge101`, `utun7`,
+/// ...), which are always plain ASCII alphanumerics. Defense-in-depth before
+/// this string is interpolated into a shell command that runs with
+/// administrator privileges — even though it's always sourced from
+/// `nix::ifaddrs`, never from caller input, a string that fails this check
+/// is refused rather than shelled out.
+fn is_safe_interface_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Build the idempotent fix. Three steps, each best-effort (failure
+/// swallowed via `>/dev/null 2>&1` — only the final add's outcome matters):
+/// (1) delete any kernel-cloned HOST-specific route for `target_ip` — the
+/// kernel auto-creates one of these on ARP resolution and can leave it
+/// REJECT-flagged (a blackhole) after repeated ARP failures, e.g. right
+/// after a VM boots and briefly doesn't answer ARP; this is a MORE SPECIFIC
+/// route than the network one below, so fixing the network route alone
+/// does not clear it — found live, the guest stayed unreachable with a
+/// structurally-correct network route until this was added; (2) delete any
+/// existing (possibly wrong) route for `subnet`; (3) add the correct one
+/// pinned to `interface`.
+fn build_route_fix_shell_command(target_ip: &str, subnet: &str, interface: &str) -> String {
+    format!(
+        "/sbin/route delete -host {target_ip} >/dev/null 2>&1; /sbin/route delete -net {subnet} >/dev/null 2>&1; /sbin/route add -net {subnet} -interface {interface}"
+    )
+}
+
+/// Quote `s` as an AppleScript string literal (backslash + double-quote
+/// escaped). Used to embed a shell command inside a `do shell script`
+/// AppleScript statement without going through an intermediate shell parse —
+/// `Command::new("osascript").arg(...)` passes the AppleScript source as a
+/// single argv element, so this only needs to satisfy AppleScript's own
+/// string-literal syntax, not shell quoting.
+fn apple_script_string_literal(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 /// RFC4180-aware single-line CSV split (handles quoted fields with commas).
 fn split_csv_line(line: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -2907,6 +3375,22 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "diagnose_host_lab_network".into(),
+                description: "Diagnose HOST-side routing to lab VM subnets — a failure class none of the guest-facing tools can see, because it isn't a guest problem: the host's own kernel route table doesn't know how to reach the VM's subnet. Distinguishes two causes: a stale/missing host route (e.g. the macOS VM's Apple-Virtualization NAT subnet after a VPN or mesh-session route clobbered it — fixable, prints the exact `sudo route add` command) vs the host simply being off that VM's LAN right now (a physical Wi-Fi/Ethernet roam — not fixable remotely, just diagnosed clearly instead of every node timing out mysteriously). Read-only; does not execute the fix. Omit alias to check every inventory node at once.".into(),
+                input_schema: json_schema_object(
+                    json!({"alias": json_schema_string("Optional: only check this VM (alias)")}),
+                    vec![],
+                ),
+            },
+            Tool {
+                name: "apply_host_route_fix".into(),
+                description: "Apply the fix diagnose_host_lab_network can only prescribe, for ONE node's stale/missing host route. Re-derives the exact fix command internally from a fresh diagnosis (never accepts a raw command — no injection surface), then runs it via macOS's native `osascript ... with administrator privileges` prompt: the password/Touch ID goes straight to the OS's Security Server on the user's own screen, never through this tool, the agent, or any log. No-ops if the route is already correct; refuses (with an explanation) if the verdict is 'host off this LAN' — that's a physical network fact, not fixable by any tool. Verifies REAL TCP reachability after applying (not just that the route table looks right) — if multiple interfaces claim the same subnet (a UTM bridge-collision edge case), tries each in turn, which can mean approving more than one prompt. Requires the user to be at the keyboard to approve the OS prompt(s).".into(),
+                input_schema: json_schema_object(
+                    json!({"alias": json_schema_string("VM alias whose host route to fix")}),
+                    vec!["alias"],
+                ),
+            },
+            Tool {
                 name: "recover_stuck_vms".into(),
                 description: "Recover Linux QEMU VMs stuck behind a stale nftables killswitch (SSH closed but VM alive). Runs probe-and-recover.".into(),
                 input_schema: json_schema_object(
@@ -3376,6 +3860,10 @@ impl McpServer for LabStateServer {
             "check_vm_reachable" => self.check_vm_reachable(arg_str(args, "alias").unwrap_or("")),
             "reset_vm_network" => self.reset_vm_network(arg_str(args, "alias").unwrap_or("")),
             "get_vm_network_info" => self.get_vm_network_info(arg_str(args, "alias").unwrap_or("")),
+            "diagnose_host_lab_network" => self.diagnose_host_lab_network(arg_str(args, "alias")),
+            "apply_host_route_fix" => {
+                self.apply_host_route_fix(arg_str(args, "alias").unwrap_or(""))
+            }
 
             "recover_stuck_vms" => {
                 let aliases = string_array(args, "aliases");
@@ -5841,6 +6329,209 @@ impl LabStateServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_route_get_output_reads_specific_route() {
+        // Real captured output: host route correctly pinned to the UTM bridge.
+        let output = "   route to: 192.168.64.18\n\
+             destination: 192.168.64.18\n  interface: bridge101\n\
+             flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>\n";
+        let route = parse_route_get_output(output).expect("should parse");
+        assert_eq!(route.destination, "192.168.64.18");
+        assert_eq!(route.interface.as_deref(), Some("bridge101"));
+    }
+
+    #[test]
+    fn parse_route_get_output_reads_default_fallback() {
+        // Real captured output: no specific route, falls through to a VPN
+        // tunnel's default route — the "host route missing" signature.
+        let output = "   route to: 192.168.64.18\n\
+             destination: default\n       mask: default\n\
+             interface: utun7\n";
+        let route = parse_route_get_output(output).expect("should parse");
+        assert_eq!(route.destination, "default");
+        assert_eq!(route.interface.as_deref(), Some("utun7"));
+    }
+
+    #[test]
+    fn parse_route_get_output_reads_stale_gateway_route() {
+        // Real captured output: a specific route exists, but it points at a
+        // dead lab-node gateway via en0 instead of the local NAT bridge.
+        let output = "   route to: 192.168.64.18\n\
+             destination: 192.168.64.0\n       mask: 255.255.255.0\n\
+             gateway: 10.47.225.138\n  interface: en0\n";
+        let route = parse_route_get_output(output).expect("should parse");
+        assert_eq!(route.destination, "192.168.64.0");
+        assert_eq!(route.interface.as_deref(), Some("en0"));
+    }
+
+    #[test]
+    fn parse_route_get_output_returns_none_without_destination_line() {
+        assert!(parse_route_get_output("garbage\nno destination here\n").is_none());
+    }
+
+    #[test]
+    fn classify_host_route_correct_when_interface_owns_subnet() {
+        let route = RouteGetResult {
+            destination: "192.168.64.18".to_owned(),
+            interface: Some("bridge101".to_owned()),
+        };
+        let owning = vec!["bridge101".to_owned()];
+        assert_eq!(
+            classify_host_route(&route, &owning),
+            HostLabRouteVerdict::Correct
+        );
+    }
+
+    #[test]
+    fn classify_host_route_stale_when_default_fallback() {
+        let route = RouteGetResult {
+            destination: "default".to_owned(),
+            interface: Some("utun7".to_owned()),
+        };
+        let owning = vec!["bridge101".to_owned()];
+        assert_eq!(
+            classify_host_route(&route, &owning),
+            HostLabRouteVerdict::StaleOrMissing
+        );
+    }
+
+    #[test]
+    fn classify_host_route_stale_when_specific_route_points_elsewhere() {
+        let route = RouteGetResult {
+            destination: "192.168.64.0".to_owned(),
+            interface: Some("en0".to_owned()),
+        };
+        let owning = vec!["bridge101".to_owned()];
+        assert_eq!(
+            classify_host_route(&route, &owning),
+            HostLabRouteVerdict::StaleOrMissing
+        );
+    }
+
+    #[test]
+    fn classify_host_route_off_lan_when_nothing_owns_the_subnet() {
+        let route = RouteGetResult {
+            destination: "default".to_owned(),
+            interface: Some("en0".to_owned()),
+        };
+        assert_eq!(
+            classify_host_route(&route, &[]),
+            HostLabRouteVerdict::OffLabLan
+        );
+    }
+
+    #[test]
+    fn classify_host_route_correct_when_multiple_interfaces_own_subnet() {
+        // The duplicate-NAT-subnet case (two UTM VMs both on 192.168.64.0/24)
+        // should still classify as correct as long as the route matches one
+        // of them.
+        let route = RouteGetResult {
+            destination: "192.168.64.18".to_owned(),
+            interface: Some("bridge101".to_owned()),
+        };
+        let owning = vec!["bridge100".to_owned(), "bridge101".to_owned()];
+        assert_eq!(
+            classify_host_route(&route, &owning),
+            HostLabRouteVerdict::Correct
+        );
+    }
+
+    #[test]
+    fn diagnose_host_lab_network_reports_no_entries_for_unknown_alias() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-diagnose-host-net-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1","last_known_ip":"10.47.225.58","platform":"linux","controller":{"utm_name":"debian-headless-1"}}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let result = srv.diagnose_host_lab_network(Some("does-not-exist"));
+        assert!(result.is_error.unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn is_safe_interface_name_accepts_real_os_names() {
+        assert!(is_safe_interface_name("en0"));
+        assert!(is_safe_interface_name("bridge101"));
+        assert!(is_safe_interface_name("utun7"));
+    }
+
+    #[test]
+    fn is_safe_interface_name_rejects_anything_with_shell_metacharacters() {
+        assert!(!is_safe_interface_name(""));
+        assert!(!is_safe_interface_name("en0; rm -rf /"));
+        assert!(!is_safe_interface_name("en0 && echo hi"));
+        assert!(!is_safe_interface_name("en0\nrm -rf /"));
+        assert!(!is_safe_interface_name("$(whoami)"));
+    }
+
+    #[test]
+    fn build_route_fix_shell_command_is_idempotent_delete_then_add() {
+        let cmd = build_route_fix_shell_command("192.168.64.18", "192.168.64.0/24", "bridge101");
+        assert_eq!(
+            cmd,
+            "/sbin/route delete -host 192.168.64.18 >/dev/null 2>&1; /sbin/route delete -net 192.168.64.0/24 >/dev/null 2>&1; /sbin/route add -net 192.168.64.0/24 -interface bridge101"
+        );
+    }
+
+    #[test]
+    fn apple_script_string_literal_escapes_quotes_and_backslashes() {
+        assert_eq!(
+            apple_script_string_literal(r#"say "hi" \ bye"#),
+            r#""say \"hi\" \\ bye""#
+        );
+    }
+
+    #[test]
+    fn apply_host_route_fix_rejects_unknown_alias() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-fix-host-net-unknown-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1","last_known_ip":"10.47.225.58","platform":"linux","controller":{"utm_name":"debian-headless-1"}}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let result = srv.apply_host_route_fix("does-not-exist");
+        assert!(result.is_error.unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn apply_host_route_fix_rejects_missing_alias_param() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-fix-host-net-empty-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join("documents/operations/active")).unwrap();
+        let srv = test_server(&tmp);
+        let result = srv.apply_host_route_fix("");
+        assert!(result.is_error.unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn split_csv_handles_quoted_commas() {
