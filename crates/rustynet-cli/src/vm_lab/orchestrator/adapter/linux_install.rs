@@ -412,6 +412,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         let env = build_bootstrap_env("exit-node1-abc123", &NodeRole::Exit, &ctx);
         assert!(
@@ -448,6 +449,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         for role in [
             NodeRole::Client,

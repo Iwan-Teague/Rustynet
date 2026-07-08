@@ -32,10 +32,20 @@ pub const REVIEWED_WINDOWS_BINARY_FILE_NAME: &str = "rustynetd.exe";
 /// break in every call site.
 pub const REVIEWED_WINDOWS_RELAY_SERVICE_NAME: &str = "RustyNetRelay";
 
-/// Reviewed Windows relay datapath UDP port. The `rustynet-relay`
-/// daemon binds UDP on 0.0.0.0:4500 by default — operators may widen
-/// the bind address but the port stays pinned.
-pub const REVIEWED_WINDOWS_RELAY_BIND_PORT: u16 = 4500;
+/// Reviewed Windows relay datapath UDP port. NOT 4500 (the Linux + macOS
+/// default, `RELAY_BIND_PORT` in `role_validation/relay.rs`): Windows's
+/// built-in IKEEXT/IPsec Policy Agent service binds UDP 4500 system-wide
+/// (`0.0.0.0:4500` and `::4500`, for IPsec NAT-Traversal) even for a
+/// loopback-specific bind request, so `rustynet-relay`'s
+/// `UdpSocket::bind(127.0.0.1:4500)` fails closed with `os error 10013`
+/// (WSAEACCES) on every real Windows host — live-lab evidence: this
+/// reached a real guest and crashed the service on every attempt, with the
+/// generic SCM failure ("Incorrect function", Win32 exit code 1) giving no
+/// hint of the real cause until the binary was run directly, off the
+/// service framework. 4600 confirmed free via `Get-NetUDPEndpoint` on the
+/// live guest. Operators may widen the bind address but the port stays
+/// pinned.
+pub const REVIEWED_WINDOWS_RELAY_BIND_PORT: u16 = 4600;
 
 /// Reviewed Windows relay health TCP port. The Windows installer
 /// pins :9100 (distinct from the Linux + macOS default of 4501) to

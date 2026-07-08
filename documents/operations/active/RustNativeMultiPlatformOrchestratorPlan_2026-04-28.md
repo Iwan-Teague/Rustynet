@@ -41,17 +41,18 @@ Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4
 > debian-headless-3:client --source-mode working-tree` executed the full
 > `PlanBuilder` pipeline against the real 3-node Debian lab (report dir
 > `state/rust-native-linux-1783185441`, run-matrix row
-> `livelab-1783187272-42afa4bd910a`). Result: **15 of 21 stages PASS**, covering
+> `livelab-1783187272-42afa4bd910a`). Result: **15 of the 21 post-baseline stages PASS** (the full
+> plan at the time), covering
 > **every Rust-dialect stage** — `membership_init`, `distribute_membership`,
 > `anchor_validation`, `distribute_assignments`/`traversal`/`dns_zone`,
 > `enforce_baseline_runtime`, **`validate_baseline_runtime` (mesh functionally
 > validated)**, and `deploy_relay_service`/`relay_validation`. The bootstrap's
 > retry+DNS-repair recovered all three flaky-egress nodes live. The state-machine
 > runner emitted every recording artifact and they were verified: the run-scoped
-> `stage_manifest.json` (166-entry catalog, 21 enabled = the Rust plan,
-> `membership_init` enabled / `membership_setup` disabled), realtime `stages.tsv`
+> `stage_manifest.json` (166-entry catalog, 21 enabled = the Rust plan at the time;
+> the current plan has grown to 67 stages), realtime `stages.tsv`
 > (clean `running`→terminal per stage, no dup rows), `orchestrate_result.json`,
-> and `parity_input.json` (21-stage `LiveLabRunReport`, `overall_status: failed`,
+> and `parity_input.json` (21-stage `LiveLabRunReport` from the old plan, `overall_status: failed`,
 > 3 `node_statuses`). The single failure is `traffic_test_matrix` — the all-pairs
 > mesh ping failed **only** on the client↔client pair (`debian-headless-2 ↔
 > debian-headless-3`); client↔exit passed. Every orchestration *setup* stage
@@ -263,18 +264,35 @@ Rust engine.
 ### Gap buckets — the real remaining replacement work
 
 **BUCKET 1 — Orchestrator stage / mode / flag parity (largest).** The Rust
-engine runs ONLY the 21-stage `PlanBuilder`. Missing / bash-routed:
-- **Stage families:** the Linux live **security suite** (~13 hard validators:
-  two_hop, managed_dns, network_flap, reboot_recovery, secrets_not_in_logs,
-  key_custody, enrollment_restart, lan_toggle, mixed_topology, membership-revoke /
-  signature-forgery / privileged-helper-allowlist / policy-default-deny /
-  gossip-revoked-readmit / enrollment-replay / hello-limiter-flood); the
-  **mac/win role-election + validator stages** (~20 macOS, ~25 Windows — these
-  ALREADY EXIST as Rust helper stages but are only reachable from the bash-router
-  arm; wire them into the Rust plan / `--node` role dispatch); the **chaos** suite
-  (9 stages) and **cross-network** suite (~10 families per NAT profile) —
-  implement Rust-native OR explicitly scope out of the parity claim with a
-  documented blocker.
+engine's `PlanBuilder` now builds a **67-stage** pipeline (all `StageId::ALL`
+variants). The remaining gap is NOT missing stages — it's **per-platform execution
+wiring** for mac/win role cells. Status per stage family:
+- **Security suite** (9 post-baseline validators: security_audit, dns_failclosed,
+  runtime_acls, service_hardening, key_custody, mesh_status, authenticode,
+  ipv6_leak) — **IN the Rust plan** and live-proven on Linux. mac/win nodes
+  reported-skipped (per-platform evaluators not yet implemented for those OSes).
+- **Live suite** (12 stages: live_anchor, live_two_hop, live_managed_dns,
+  live_network_flap, live_reboot_recovery, live_secrets_not_in_logs,
+  live_key_custody, live_enrollment_restart, live_lan_toggle,
+  live_mixed_topology, live_extended_soak, live_hello_limiter_flood) — **IN the
+  Rust plan.** mac/win per-platform wrappers (bash's `live_macos_*_test.sh` /
+  `live_windows_*_test.sh`) are NOT implemented in Rust yet — mac/win nodes
+  reported-skipped in these stages.
+- **Role lifecycle** (10 stages: deploy_relay, relay_validation, traffic_test,
+  role_switch, exit_handoff, active_exit, exit_demotion_residue, exit_dns_failclosed,
+  exit_nat_lifecycle, blind_exit_dataplane) — **IN the Rust plan.** macOS relay
+  runs live; Windows relay deploy adapter code-landed (live proof pending). Exit
+  lifecycle validators report-skip for non-Linux.
+- **Chaos suite** (9 stages) — **IN the Rust plan** (opt-in via
+  `--enable-chaos-suite`).
+- **Cross-network suite** (11 stages) — **IN the Rust plan** (opt-out via
+  `--skip-cross-network`).
+- **Bash-exclusive stages** (6): `prime_remote_access` (Rust does it implicitly),
+  `macos_preflight_check` (soft, never fails), `upgrade_admin_node_membership`
+  (5-node topo only), `local_full_gate_suite` (by design, not a lab stage),
+  `fresh_install_os_matrix_report` (reporting infra), `cross_network_daemon_path`
+  (single warn-level netns proof — the rust cross-network suite covers the rest).
+  All but `cross_network_daemon_path` are scoped out of the parity claim.
 - **Recovery / readiness gate:** `restart_unready_vms` / `rediscover_local_utm` /
   probe-and-recover + the `--trust-inventory-ready` opt-out. **Code landed
   2026-07-05 for the Rust `--node` path:** it discovers selected aliases,
@@ -295,23 +313,31 @@ engine runs ONLY the 21-stage `PlanBuilder`. Missing / bash-routed:
   `--topology-profile`) which currently take effect ONLY in the bash-router arm,
   and honoring `--repo-ref` in the Rust archive stage.
 
-**BUCKET 2 — Evidence parity.** The Rust finalize path writes
-`orchestrate_result.json` + `parity_input.json` but NOT `run_summary.json` /
-`run_summary.md`, so `validate_live_lab_run_artifacts` and the run-matrix
-`run_note` are dropped for Rust runs. Emit them; carry `run_note` through
-finalize (stop hardcoding `notes: None`).
+**BUCKET 2 — Evidence parity.** **DONE** (code-landed 2026-07-04, verified
+2026-07-07). The Rust finalize path (`write_rust_native_run_summary()` at
+`mod.rs:7495-7597`, called from `execute_rust_native_orchestration` at line 8312)
+emits both `run_summary.json` and `run_summary.md` with stage counts,
+pass/fail/rc breakdown, and node status — the same consumer contract as bash.
+`validate_live_lab_run_artifacts` and run-matrix `run_note` are fed from this.
 
-**BUCKET 3 — Monitor.** Add a headless `--snapshot`/`--once` mode (grid + counts
-+ VM roles to stdout/JSON, no TUI) so Rust-run rendering is verifiable in scripts
-and CI. (Grid/counts already render — see above.)
+**BUCKET 3 — Monitor.** **DONE** (code-landed, verified 2026-07-07).
+`crates/rustynet-lab-monitor/src/main.rs:116-131` implements `--snapshot`
+headless mode: builds the `App` model, refreshes state once, calls
+`snapshot_text()` (`app.rs:663-720` — stage grid + VM roles to plain text, no
+TUI), prints to stdout, exits. Works on both bash and `--node` runs (reads
+`stage_outcomes` abstractly, dialect-agnostic).
 
-**BUCKET 4 — Loop / next-target dialect-awareness.** `key_for_stage_or_cell`
-(deepseek.rs) only maps a cell when the name contains `macos`/`windows`; a Rust
-`first_failed_stage` recorded as a raw Linux `StageId` (e.g. `traffic_test_matrix`,
-`distribute_traversal`) is a next-target blind spot. Make next-target recognize
-Rust-dialect stage IDs; add the `rust_engine` opt-in on `deepseek_lab_run` (and
-`start_live_lab_run` role-platform selectors) that synthesizes `--node` from
-selectors + inventory.
+**BUCKET 4 — Loop / next-target dialect-awareness.** **DONE** (code-landed
+2026-07-07). `OrchestrationContext` now carries an `OrchestratorDialect` field
+(`context.rs:19-22`) serialized as `"rust-native"` or `"legacy-bash"` in
+`orchestration_context.json`. Set to `RustNative` at the top of
+`execute_rust_native_orchestration` (`mod.rs:7894`). `PersistedOrchestrationContext`
+uses `#[serde(default)]` so older context files remain loadable (manifests as
+`None`). Schema version bumped to 2. The `ENV_ORCHESTRATOR_DIALECT` constant
+(`"RUSTYNET_ORCHESTRATOR_DIALECT"`) is defined for downstream tooling;
+`set_env` is not used (workspace `forbid(unsafe_code)`). 36 test constructors
+updated across 24 files. Test coverage: context save/load round-trip verifies
+dialect preservation.
 
 **BUCKET 5 — MCP lab-state.** `diagnose_live_lab_failure` auto-resolves a
 bash-style profile from the matrix row; make it work on a profile-less Rust
@@ -327,16 +353,13 @@ role-platform / promote-exit / skip-linux-live-suite selectors on
 > macos_promote_exit, skip_linux_live_suite) as pass-through CLI flags with
 > mutually-exclusive validation against `nodes`. 6 tests added.
 
-**BUCKET 6 — Overnight driver.** **Route it to the Rust engine:** the executor
-(`verify_cell`, executor.rs:369) invokes `vm-lab-orchestrate-live-lab` with
-`--{role}-platform` selectors but **no `--node`**, so it currently routes to
-BASH — emit `--node` (synthesized from the cell) so the overnight oracle drives
-the Rust engine. Run the live path (`run_loop` + `LiveExecutor`)
-end-to-end against the real lab at least once (only `--dry-run`/mocks have run);
-give the spawned agent a real `--mcp-config`/`--allowedTools`; enforce
-`agent_timeout_secs`; wire run-matrix auto-seeding, the adversarial second-review
-agent, and `--auto-merge-safe-cells` (or scope them out). blind_exit cells never
-scheduled/merged.
+**BUCKET 6 — Overnight driver.** **DONE** (code-landed, verified 2026-07-07).
+`verify_cell()` at `executor.rs:860` calls `orchestrate_argv_for_cell()` which
+synthesizes `--node <alias>:<role>` args from cell selectors + inventory —
+already routes to the Rust engine, not bash. The remaining items (live
+end-to-end path, agent timeout, run-matrix auto-seeding, adversarial
+second-review agent, `--auto-merge-safe-cells`) are overnight-loop tuning, not
+`--node` green blockers.
 
 **BUCKET 7 — Parity proof.** `vm-lab-diff-orchestrator-parity --mode functional`
 passes (shared logical work + overall status + node count) between a bash run and
@@ -466,6 +489,234 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
    + registry + MCP tables (deepseek `is_rust_native_stage`, repo-context stage table).
    Overnight `march_role_to_node_role` returns `Some` for both. 662 orchestrator tests
    pass (629 CLI + 33 MCP). Admin/BlindExit removed from B1 still-open list.
+
+- **Bucket 1 — macOS+Windows per-platform security-check evaluators (Group A): LANDED**
+  (2026-07-06, head of `--node` green drive). 6 security-validation stages now
+  dispatch live on macOS and Windows, not just Linux-reported-skip:
+  `key_custody_validation`, `dns_failclosed_validation`, `service_hardening_validation`,
+  `runtime_acls_validation`, `mesh_status_validation`, `authenticode_validation`.
+  Each `role_validation/*.rs` module gained `validate_macos_*` + `validate_windows_*`
+  functions dispatching `macos-*-check` / `windows-*-check` daemon subcommands
+  (all existed pre-patch) through the typed evaluators that were already in `mod.rs`
+  (`evaluate_macos_runtime_acls_report`, `evaluate_windows_key_custody_report`, etc.).
+  One missing evaluator added: `evaluate_macos_key_custody_report`. Each
+  `*_runtime_implemented` predicate now returns `true` for Linux|Macos|Windows.
+  Stage `execute()` methods gained per-platform `match` dispatch. 685 orchestrator
+  tests pass. Live lab evidence needed for mac/win cells; remaining Group B+
+  stages: exit_nat_lifecycle, ipv6_leak, exit_dns_failclosed, exit_demotion_residue,
+  blind_exit_dataplane, active_exit (macOS), relay (Windows deploy adapter exists
+  but not live-proven).
+
+- **2026-07-07 verification session.** Found + fixed a tooling gap that was
+  masking Bucket-1 progress: `mcp__rustynet-lab-state__start_live_lab_run`'s
+  `*_platform` role selectors always routed through the LEGACY BASH arm (raw
+  `--exit-platform` etc. CLI flags), with no docs warning of this — an agent
+  using the "obvious" tool call got bash, not the Rust engine, silently. Fixed
+  by making the MCP tool auto-synthesize a `--node alias:role` topology from
+  the selector + inventory `lab_role` data whenever `nodes` isn't explicitly
+  given (mirrors `deepseek_lab_run`'s existing `rust_engine` default), with a
+  fail-closed error instead of a silent bash fallback when nothing can be
+  synthesized. Also fixed a real bug found in the process:
+  `deepseek_lab_run`'s `synthesize_rust_node_args` mapped `admin_platform`→
+  `anchor` and `blind_exit_platform`→`exit` per a stale comment claiming those
+  weren't parseable `--node` role tokens — `NodeRole::parse("admin"/"blind_exit")`
+  are valid as of Bucket 1.5, so selector-driven runs were silently exercising
+  the wrong stage. Both fixed, tested (11 new/updated tests across the two MCP
+  servers), gates green, binaries rebuilt + hot-swapped.
+  <br>Separately, root-caused why the lab looked fully down: another session's
+  DHCP/DNS fix on the Debian guests left `vm_lab_inventory.json`'s IPs stale,
+  and `update_inventory`'s IP-write was itself gated on full SSH-readiness —
+  a catch-22 where the refresh tool wouldn't write an IP until it could prove
+  the node ready, but readiness proof needs the IP. Fixed in
+  `execute_ops_vm_lab_discover_local_utm` (`crates/rustynet-cli/src/vm_lab/mod.rs`):
+  IP persistence now only requires `process_present && live_ip_known &&
+  authoritative_target_present` (independent of SSH reachability), and writes
+  whatever subset of nodes it can rather than all-or-nothing. Also pinned SSH
+  host keys for the post-DHCP IPs (`~/.ssh/known_hosts`) per the documented
+  re-IP ceremony (`UTMVirtualMachineInventory_2026-03-31.md`) — this was the
+  actual blocker on the first two live attempts this session (bash-routed by
+  the tooling gap above, then failing on unpinned host keys).
+  <br>**First-ever live evidence: Windows in the RELAY role via the Rust
+  `--node` engine, real 4-node mesh (`debian-headless-1:exit,
+  debian-headless-2:client, debian-headless-3:client, windows-utm-1:relay`).**
+  Fast run (`--skip-linux-live-suite`): 14/17 stages pass, 0 fail, 3 correctly
+  skipped (no anchor/admin/blind_exit role in this topology) — confirms
+  bootstrap→membership→mesh works with Windows actively in the topology, not
+  just reported-skipped. Windows cold `cargo build` over the bootstrap SSH
+  session took ~90 minutes (no prior `target-livelab` cache for that guest);
+  worth knowing as a lab-timing fact, not a defect. A full-suite follow-up run
+  (no `--skip-linux-live-suite`, same topology) was in flight at the time of
+  this note, specifically to reach `deploy_relay_service` /
+  `relay_validation` / `security_audit_validation` — the fast run's plan
+  doesn't include those stages, so Windows relay deploy is still not
+  live-proven as of this bullet. Update this bullet with that run's result
+  before treating "relay (Windows deploy adapter exists but not live-proven)"
+  above as resolved.
+  <br>**The full-suite run landed — and found `deploy_relay_service` was
+  genuinely broken on Windows, in two layers.** (1) A PowerShell quoting bug:
+  the pre-`ps_quote`'d service-name token was nested inside another
+  single-quoted `throw (...)` message literal, which PowerShell cannot
+  parse (`ParserError: Unexpected token 'RustyNetRelay' failed: ''`). Fixed
+  by concatenating it as its own token via `+`, matching the pattern already
+  used correctly elsewhere in the same file (`windows_membership.rs:309`).
+  (2) Once that was fixed, `sc.exe create`/`start` succeeded but SCM killed
+  the start with error 1053 ("did not respond ... in a timely fashion") —
+  `binPath=` pointed at the bare `rustynet-relay.exe` with **no arguments**,
+  so the process never called `StartServiceCtrlDispatcher` at all. The
+  binary's Windows-service dispatch requires `--windows-service
+  --env-file <path>`, where the env-file supplies `RUSTYNET_RELAY_ARGS_JSON`
+  (a JSON array mirroring the Linux systemd unit's `ExecStart` argv:
+  `--relay-id --bind --verifier-key --replay-store --port-range
+  --max-sessions-per-node --max-total-sessions --health-bind`). Its runtime-arg
+  validator also requires every referenced path (verifier-key, replay-store,
+  env-file, and each one's PARENT dir) to sit under `rustynet-relay`'s own
+  reviewed root (`C:\ProgramData\RustyNet\relay`) with a **protected**
+  (non-inherited) DACL granting only SYSTEM + Administrators — the prior
+  verifier-key path (`C:\ProgramData\RustyNet\relay-verifier.pub`, a
+  *sibling* of the reviewed root, not a child) would have failed this even
+  once the dispatch args were fixed. `deploy_relay_service` now: creates +
+  hardens the reviewed root; ships the verifier key under it; pre-creates +
+  hardens an empty replay-store file (must exist with its OWN protected ACL
+  before first run — an auto-created file would inherit a non-protected
+  ACL and fail the same check); builds + ships the env-file; and points
+  `binPath=` at `"<exe>" --windows-service --service-name RustyNetRelay
+  --env-file "<path>"`. ACL hardening uses locale-independent well-known
+  SIDs (`*S-1-5-18` SYSTEM, `*S-1-5-32-544` Administrators) via `icacls
+  /inheritance:r` + `/grant:r` + `/setowner`, never display names. Also made
+  the SCM-service creation self-healing (`sc.exe config` when the service
+  already exists, not just create-if-missing) — the create-only version
+  would have silently left a stale/broken service registration on any guest
+  that had already gone through a failed deploy attempt, masking the fix on
+  redeploy. 5 new tests (quoting, dispatch-args, self-heal-reconfigure, argv
+  contract, ACL-script SID correctness); full suite 2130/2130 (1 pre-existing
+  unrelated flake, `source_archive_marker_matches_worktree_snapshot_commit`,
+  passes in isolation). A live re-verification run was in flight at the time
+  of this note — **do not mark Windows relay deploy live-proven until that
+  run's `deploy_relay_service` + `relay_validation` stages are confirmed
+  PASS**, since none of the ACL-hardening / SCM-dispatch code above has ever
+  executed against a real Windows guest yet (all of `rustynet_windows_native`'s
+  ACL-inspection surface is `#[cfg(windows)]`-gated and untestable from this
+  macOS host).
+  <br>**Two more real bugs surfaced by that re-verification run, both now
+  fixed and live-confirmed.** (3) Embedded-quote reparsing: the fixed binPath
+  command line (`"<exe>" --windows-service ...`) used bare `"..."` quotes: a
+  PowerShell variable containing embedded bare double-quotes, handed to a
+  native command via `&`, gets re-split by Win32 argv parsing
+  (`CommandLineToArgvW`) at each embedded quote — `sc.exe` saw unrecognized
+  bare tokens and dumped its USAGE text. Fixed by backslash-escaping the
+  inner quotes (`\"..\"`), the standard `binPath= "\"<exe>\" <args>"` idiom.
+  (4) Port collision: `rustynet-relay --bind 127.0.0.1:4500` failed closed
+  with `os error 10013` (WSAEACCES) — confirmed via direct SSH
+  (`Get-NetUDPEndpoint`) that Windows's own IKEEXT/IPsec Policy Agent service
+  already holds UDP 4500 system-wide (`0.0.0.0:4500` + `::4500`, for IPsec
+  NAT-Traversal) regardless of the more-specific loopback bind requested.
+  **This was not just a deploy-script bug — `REVIEWED_WINDOWS_RELAY_BIND_PORT`
+  in `rustynetd/src/windows_service_hardening.rs` (the canonical constant
+  `relay_validation` itself checks against) was ALSO pinned to 4500**,
+  apparently never caught because live deploy had never gotten far enough to
+  hit it before this session. Fixed the canonical constant → 4600 (health
+  stays 9100, already collision-free), updated the two drift-pinning tests,
+  fixed the same default in the legacy bash-path installer
+  (`Install-RustyNetWindowsRelayService.ps1`), and consolidated
+  `windows_install.rs` to import the canonical constants instead of
+  duplicating them (a future change can no longer drift the deploy adapter
+  out of sync with what the validator checks). Diagnosed both by SSHing into
+  the live guest directly and running the relay binary off the service
+  framework — the SCM only ever surfaced a generic "Incorrect function"
+  (Win32 exit code 1) for every internal failure, so the 20-minute
+  orchestrator round-trip gave no signal beyond "it crashed"; direct
+  execution surfaced the real `stderr`.
+  <br>Found one more gap the SAME way, on the NEXT re-run: with the service
+  now actually reaching `Running`, a stale `RustyNetRelay` instance from the
+  prior run held `rustynet-relay.exe` open, and `bootstrap_hosts` failed
+  trying to overwrite it ("process cannot access the file ... being used by
+  another process"). `cleanup_runtime_state` (Windows) only stopped the
+  daemon service, never the relay sibling. Added a best-effort relay-service
+  stop alongside the daemon stop in
+  `adapter/windows_traffic.rs::cleanup_runtime_state`.
+  <br>**`deploy_relay_service` PASSES.** Live-confirmed on run
+  `rust-1783460051` (`state/live-lab-manual-verify-7`): 23/58 stages passed,
+  0 failures on the relay path — `deploy_relay_service` AND
+  `relay_validation` both pass; the two remaining failures in that run
+  (`traffic_test_matrix` client↔client, `live_hello_limiter_flood_validation`
+  on Windows) are unrelated to relay deploy — the first is the pre-existing
+  documented mesh-topology gap, the second is a newly-observed Windows
+  hello-limiter-audit transport failure not yet investigated. **"relay
+  (Windows deploy adapter exists but not live-proven)" above is resolved as
+  of this run** — Windows relay deploy is live-proven through the Rust
+  `--node` engine.
+
+- **2026-07-08 — macOS lab VM recovery + a real discovery-tool bug found in
+  the process.** `macos-utm-1` was totally unreachable (host↔guest, both
+  directions) on its old Bridged network config: guest-side, a stale
+  rustynet killswitch blackhole route (`!`-flagged) in the guest's own
+  routing table was rejecting all `192.168.0.0/24` traffic, left over from a
+  prior lab session that suspended rather than cleanly shut down (deleted via
+  `sudo route delete -net 192.168.0.0 -netmask 255.255.255.0` inside the
+  guest). Even after that fix, host↔guest still failed — the host's Bridged
+  LAN (`192.168.0.0/24`) had its own unrelated anomaly (a malformed broadcast
+  address on the host's LAN alias) not worth chasing further. Pragmatic fix:
+  switched the VM's UTM Network Mode from Bridged to Shared Network (matching
+  every other lab VM) and set the guest's `Ethernet` service to DHCP
+  (`sudo networksetup -setdhcp Ethernet`), landing it on
+  `192.168.64.0/24` — the Apple Virtualization framework's own NAT subnet,
+  distinct from the QEMU-backend guests' `10.47.225.x`. The host itself
+  needed two more one-off fixes (both require the operator's own sudo, not
+  scriptable from here): a stale rustynet-mesh-session route was blackholing
+  the *host's* route to `192.168.64.0/24` via a dead lab-guest gateway
+  (`sudo route delete -net 192.168.64.0/24 <stale-gateway>`), and — because
+  Apple's Virtualization NAT subnet collides with Docker/Lima/other tools'
+  common `192.168.64.0/24` default — the host needs an explicit route pinned
+  to the VM's bridge interface (`sudo route add -net 192.168.64.0/24
+  -interface bridge101`) to outrank a full-tunnel VPN default route. This
+  host route is **not persistent** — it was silently dropped once already
+  this session on a Wi-Fi roam (gateway change) and will need re-adding after
+  reboots / network changes until/unless made permanent (e.g. a login-item
+  script), which was deliberately left to the operator rather than automated
+  from an agent session.
+  <br>**Real bug found while re-registering the new IP through the standard
+  inventory-refresh tool (`ops vm-lab-discover-local-utm-summary
+  --update-inventory-live-ips`) instead of hand-editing the inventory.** The
+  refresh kept reporting the *old* stale IP even with the guest fully up and
+  SSH-reachable. Root cause, two layers: (1) `utmctl ip-address <name>`
+  is unsupported for the Apple Virtualization backend (macOS guests) — it
+  exits **0** while printing "Operation not supported by the backend." to
+  stdout, every call, unconditionally (confirmed directly). (2)
+  `select_preferred_live_ssh_ip`'s existing "no IPv4 candidate survived →
+  fall back to `last_known_ip`" logic (intended for a genuine IPv6-only
+  utmctl response, e.g. a stale SLAAC/tunnel address) could not distinguish
+  that from *zero parseable IP lines at all* — both hit `!has_ipv4`, so the
+  Apple-backend failure silently, permanently resolved to whatever stale IP
+  was already in inventory and reported success. This meant **macOS lab VMs
+  could never have their live IP rediscovered by this tool, ever** — every
+  refresh just echoed back old data with no error. Fixed in
+  `crates/rustynet-cli/src/vm_lab/mod.rs`: (a) gated the `last_known_ip`
+  fallback in `select_preferred_live_ssh_ip` on the raw candidate list being
+  non-empty, so a true zero-output failure now correctly returns `None`
+  instead of masking as success; (b) added an ARP-by-MAC discovery fallback —
+  `mac_address_from_utm_config_plist` text-scans the UTM bundle's
+  `config.plist` (always XML) for the guest's MAC, then
+  `resolve_live_ip_via_arp_by_mac` matches it against the host's `arp -a`
+  table (normalizing both sides, since macOS `arp -a` omits leading zeros
+  per octet while the plist doesn't) — wired into all three
+  `resolve_local_utm_live_host*` call sites (the discovery-summary loop, the
+  unmatched-bundle branch, and `observe_local_utm_target_ready`, the actual
+  readiness gate a live orchestrator run uses); (c) taught the
+  discovery-summary's `live_ip_state` classification that `arp-by-mac` is a
+  genuine live discovery (`ProbeState::Ok`), not a stale-data fallback like
+  `inventory.last_known_ip`, so `readiness.networked`/`execution_ready`
+  correctly go green instead of reporting `live-ip-not-authoritative`. 10 new
+  tests (MAC normalization/padding, ARP-output parsing incl. macOS's
+  unpadded-octet quirk, plist extraction, the `select_preferred_live_ssh_ip`
+  empty-vs-IPv6-only distinction); `cargo fmt`/`clippy -D warnings` clean for
+  `rustynet-cli`. **Live-verified**: `macos-utm-1` now resolves
+  `192.168.64.18` via `arp-by-mac`, `ssh_port_status=open`,
+  `readiness.execution_ready=true`, `ready=true`, and the inventory JSON was
+  correctly auto-updated (`last_known_ip`/`ssh_target=192.168.64.18`) via the
+  standard tool — no hand-editing needed after the fix. `network_group`/
+  `last_known_network` labels still read the old `lan-192.168.0.0/24` (the
+  tool doesn't rewrite these free-text labels); cosmetic only, does not
+  affect connectivity.
 
 **Still open per bucket (map `wf_ee06d0be-054`):** B1 — anchor-bundle-pull macOS/Windows
 (gated on Phase 8 token provisioning); chaos/cross-network stages. Setup/run modes + the Rust-path recovery
@@ -1101,21 +1352,21 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 
 **Deliverable:** All 17 stages from §2.1 ported from bash to Rust as `OrchestrationStage` impls. Each stage is its own file under `orchestrator/stage/`, calls `NodeAdapter` methods, and emits typed `StageOutcome`.
 
-**Current 2026-04-29 hardening state:** all 17 stage files are present and `execute_rust_native_orchestration` now builds its runtime stage vector from `PlanBuilder`, so the CLI path includes `FinalCleanupStage` and cannot drift from the plan list. A unit test pins exact stage-ID parity with `PlanBuilder`. The live parity runner/evidence remains pending, so W5.5 is not fully closed.
+**Current 2026-07-07 hardening state:** all 67 `StageId::ALL` variants are present and `execute_rust_native_orchestration` builds its runtime stage vector from `PlanBuilder`. The 21-stage core from April has grown to the full 67-stage pipeline (security suite, live suite, role lifecycle, chaos, cross-network all in the Rust plan). mac/win role cells are wired in the plan but reported-skipped for per-platform evaluators not yet implemented. The live parity runner/evidence remains pending, so W5.5 is not fully closed.
 
 **Files added:** 17 stage files under `crates/rustynet-cli/src/vm_lab/orchestrator/stage/`.
 
 **Tests per stage:** unit test of the stage's logic with a mocked `NodeAdapter`. Integration test (gated) drives the stage against a live VM.
 
 **Acceptance criteria:**
-- Side-by-side parity run: invoke `vm-lab-orchestrate-live-lab` once with `--legacy-bash-orchestrator` and once with the new code path against the same lab. **Parity was originally defined as:** (a) identical set of stage IDs executed; (b) identical pass/fail status for every stage; (c) identical overall exit code; (d) per-stage JSON `outcome` field values match exactly; (e) numeric peer counts and validator counts within ±0. **⚠️ SUPERSEDED (2026-07-04):** criterion (a) — and therefore the mechanical `overall_parity_pass` — is **unsatisfiable** because the bash and Rust dialects use divergent stage IDs by design (only 8 of ~21 overlap; see the parity-gate finding at the top of this doc). The redefined gate is **functional/outcome parity**: both dialects reach mesh setup + `validate_baseline_runtime` PASS with equal validator pass/total counts on the same topology, optionally with a mechanical diff restricted to the shared-ID stages. Capture diff + summary as evidence.
+- Side-by-side parity run: invoke `vm-lab-orchestrate-live-lab` once with `--legacy-bash-orchestrator` and once with the new code path against the same lab. **Parity was originally defined as:** (a) identical set of stage IDs executed; (b) identical pass/fail status for every stage; (c) identical overall exit code; (d) per-stage JSON `outcome` field values match exactly; (e) numeric peer counts and validator counts within ±0. **⚠️ SUPERSEDED (2026-07-04):** criterion (a) — and therefore the mechanical `overall_parity_pass` — is **unsatisfiable** because the bash and Rust dialects use divergent stage IDs by design (only ~8 of 67 overlap; see the parity-gate finding at the top of this doc). The redefined gate is **functional/outcome parity**: both dialects reach mesh setup + `validate_baseline_runtime` PASS with equal validator pass/total counts on the same topology, optionally with a mechanical diff restricted to the shared-ID stages. Capture diff + summary as evidence.
 - `TrafficTestMatrix` stage includes both **positive probes** (mesh peers reachable via tunnel — N×N) and **negative probes** (default-deny ACL blocks a non-mesh probe IP from each node). Stage result is PASS only when all positive probes succeed AND all negative probes return `Blocked`. A `Reachable` result on any negative probe is a security failure that fails the stage and blocks phase progression. Both probe sets are documented in per-stage evidence.
 - All gates pass.
 
 **Status (2026-04-29):**
 - W5.5a — 17 stage execute() impls + `PlanBuilder::build()` shipped in `c63084b`. Stages walk in dep order, emit typed `StageOutcome`, route through `NodeAdapter`. Unit tests on the runner / plan / per-stage logic with mocked adapters.
 - W5.5b — parity-diff harness shipped in `85e786d`. Rust orchestrator now writes `<report-dir>/parity_input.json` (a `LiveLabRunReport`) at end-of-run. New `vm-lab-diff-orchestrator-parity --left <bash.json> --right <rust.json> --output <diff.json>` subcommand emits `ParityDiff` covering every dimension above (stage list, per-stage outcome, overall status, node count, validator pass/total counts). 11 unit tests cover the diff function + every drift dimension; 2 tests cover the executor end-to-end. Returns Err on drift so CI can gate.
-- 🟡 **Rust-side live parity evidence CAPTURED (2026-07-04, `42afa4b`).** The Rust orchestrator wrote a live `parity_input.json` (`state/rust-native-linux-1783185441`, 21-stage `LiveLabRunReport`) from a real 3-node Linux run — all Rust-dialect stages PASS through `deploy_relay_service`; only the downstream `traffic_test_matrix` client↔client pair failed (known dataplane gap, not migration). The **bash** side still emits no `parity_input.json`, and — critically — even if it did, the mechanical `overall_parity_pass` cannot go green bash↔Rust because the two dialects' stage-ID sets differ by design (parity-gate finding, top of doc). Next: redefine the gate to functional/outcome parity (or shared-ID-only diff), then a paired bash↔Rust run on an all-pairs-reachable topology.
+- 🟡 **Rust-side live parity evidence CAPTURED (2026-07-04, `42afa4b`).** The Rust orchestrator wrote a live `parity_input.json` (`state/rust-native-linux-1783185441`, from the old 21-stage plan; the current plan is 67 stages) from a real 3-node Linux run — all Rust-dialect stages PASS through `deploy_relay_service`; only the downstream `traffic_test_matrix` client↔client pair failed (known dataplane gap, not migration). The **bash** side still emits no `parity_input.json`, and — critically — even if it did, the mechanical `overall_parity_pass` cannot go green bash↔Rust because the two dialects' stage-ID sets differ by design (parity-gate finding, top of doc). Next: redefine the gate to functional/outcome parity (or shared-ID-only diff), then a paired bash↔Rust run on an all-pairs-reachable topology.
 
 **Estimated LOC:** 3000-4000 across 17 stage files + per-stage tests.
 

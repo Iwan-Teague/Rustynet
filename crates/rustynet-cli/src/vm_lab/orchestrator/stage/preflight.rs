@@ -92,6 +92,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         }
     }
 
@@ -125,6 +126,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         let outcome = PreflightStage.execute(&mut ctx);
         assert!(

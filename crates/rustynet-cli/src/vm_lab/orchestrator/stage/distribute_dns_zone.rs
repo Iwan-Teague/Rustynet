@@ -49,6 +49,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         assert!(matches!(
             DistributeDnsZoneStage.execute(&mut ctx),

@@ -4252,21 +4252,22 @@ fn synthesize_rust_node_args(
 ) -> Vec<String> {
     let role_for_os = |os: &str| -> &'static str {
         let is = |sel: Option<&str>| sel.is_some_and(|s| s.eq_ignore_ascii_case(os));
-        // NOTE: `admin` and `blind_exit` are DAEMON roles, not lab-role `--node`
-        // tokens (parse_node_role_arg only accepts exit/client/entry/aux/extra/
-        // relay/anchor). Emitting `:admin` / `:blind_exit` fails the CLI parse
-        // and aborts the whole run. Map them to the lab role that resolves to the
-        // right daemon role: Anchor→'admin' daemon role, and macOS Exit→blind_exit
-        // daemon role. (The dedicated admin-issue / blind-exit VALIDATION stages
-        // are not in the Rust plan yet — Bucket 1 — but the node joins correctly.)
-        if (os == "macos" && macos_promote_exit) || is(exit_platform) {
+        // `admin` and `blind_exit` are first-class `--node` role tokens as of
+        // Bucket 1.5 (NodeRole::parse accepts both; is_lab_assignable_for_platform
+        // allows any OS for lab-evidence purposes even though is_supported_for_platform
+        // stays Linux-only/Linux+macOS respectively for production posture). Map
+        // each selector to its own real role so the dedicated AdminIssueStage /
+        // BlindExitStage actually run, instead of aliasing onto anchor/exit.
+        if is(admin_platform) {
+            "admin"
+        } else if is(blind_exit_platform) {
+            "blind_exit"
+        } else if (os == "macos" && macos_promote_exit) || is(exit_platform) {
             "exit"
         } else if is(relay_platform) {
             "relay"
-        } else if is(anchor_platform) || is(admin_platform) {
+        } else if is(anchor_platform) {
             "anchor"
-        } else if is(blind_exit_platform) {
-            "exit"
         } else {
             "client"
         }
@@ -5222,15 +5223,15 @@ impl McpServer for DeepSeekServer {
                         "rebuild_nodes": json_schema_string("Comma-separated node aliases to redeploy ONLY (fast re-verify after a per-node patch)."),
                         "exit_vm": json_schema_string("Linux exit-node alias for this run's backbone (use a DISJOINT exit_vm/client_vm per run when running concurrently)."),
                         "client_vm": json_schema_string("Linux client-node alias for this run's backbone."),
-                        "exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the EXIT role so the focused mac/win exit cell runs live instead of skipping."),
-                        "relay_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the RELAY role so the focused mac/win relay cell runs live instead of skipping."),
-                        "anchor_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the ANCHOR role so the focused mac/win anchor cell runs live instead of skipping."),
-                        "admin_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the ADMIN role so the focused mac/win admin issue cell runs live instead of skipping."),
-                        "blind_exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the BLIND_EXIT role so the focused mac/win blind-exit cell runs live instead of skipping."),
-                        "macos_promote_exit": json!({"type": "boolean", "description": "Option-B selector: elect macOS as a SECONDARY exit so the macOS exit cell runs live (drives is_macos_active_exit). Use alongside exit_vm/client_vm/entry_vm."}),
+                        "exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the EXIT role so the focused mac/win exit cell runs live instead of skipping. Routes through the Rust --node engine by DEFAULT (rust_engine defaults to true); pass legacy_bash: true to force the old bash path instead."),
+                        "relay_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the RELAY role so the focused mac/win relay cell runs live instead of skipping. Routes through the Rust --node engine by DEFAULT (rust_engine defaults to true); pass legacy_bash: true to force the old bash path instead."),
+                        "anchor_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the ANCHOR role so the focused mac/win anchor cell runs live instead of skipping. Routes through the Rust --node engine by DEFAULT (rust_engine defaults to true); pass legacy_bash: true to force the old bash path instead."),
+                        "admin_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the ADMIN role so the focused mac/win admin issue cell runs live instead of skipping. Routes through the Rust --node engine by DEFAULT (rust_engine defaults to true); pass legacy_bash: true to force the old bash path instead."),
+                        "blind_exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the BLIND_EXIT role so the focused mac/win blind-exit cell runs live instead of skipping. Routes through the Rust --node engine by DEFAULT (rust_engine defaults to true); pass legacy_bash: true to force the old bash path instead."),
+                        "macos_promote_exit": json!({"type": "boolean", "description": "Option-B selector: elect macOS as a SECONDARY exit so the macOS exit cell runs live (drives is_macos_active_exit). Use alongside exit_vm/client_vm/entry_vm. Routes through the Rust --node engine by DEFAULT; pass legacy_bash: true to force the old bash path instead."}),
                         "entry_vm": json_schema_string("Linux entry-node alias for the Option-B exit topology (used alongside exit_vm/client_vm + macos_promote_exit)."),
-                        "legacy_bash": json!({"type": "boolean", "description": "Route the Linux live suite through the legacy bash orchestrator instead of the default Rust one. OPTIONAL: both paths run the mac/win ROLE stages (activate_macos_exit_role + capture, relay/anchor lifecycle) when macos_vm + the role selector are set. The early 'no macOS nodes in topology' preflight line is a benign Linux-preflight artifact, not a skip of the macOS role stages."}),
-                        "rust_engine": json!({"type": "boolean", "description": "Route the run through the Rust-native --node orchestrator engine instead of the legacy bash path. Synthesizes --node <alias>:<role> from the guest (exit_vm/client_vm/entry_vm/macos_vm/windows_vm) + role-platform selectors, so the mesh is driven by the pure-Rust state machine. Mutually exclusive with legacy_bash."}),
+                        "legacy_bash": json!({"type": "boolean", "description": "Force this run through the legacy bash orchestrator instead of the DEFAULT Rust --node engine. Bash is slated for removal once Rust parity evidence is complete — only set this for an explicit bash-vs-rust comparison, or if a stage genuinely isn't ported to Rust yet. Mutually exclusive with rust_engine: true (which is already the default)."}),
+                        "rust_engine": json!({"type": "boolean", "description": "Route the run through the Rust-native --node orchestrator engine. DEFAULTS TO TRUE — you do not need to set this explicitly; it exists so callers can see/assert the routing, and so legacy_bash can be validated as mutually exclusive. Synthesizes --node <alias>:<role> from the guest (exit_vm/client_vm/entry_vm/macos_vm/windows_vm) + role-platform selectors, so the mesh is driven by the pure-Rust state machine."}),
                         "skip_linux_live_suite": json!({"type": "boolean", "description": "FAST mac/win cell iteration: skip the ~30-45 min Linux live-validation suite (anchor/role-switch/exit-handoff/relay/two-hop/managed-dns/chaos) and jump straight to the mac/win role stages AFTER setup (bootstrap + membership + signed-bundle distribution still run, because the mac/win stages need the mesh). Pair with a role-platform selector (exit_platform/relay_platform/anchor_platform/blind_exit_platform or macos_promote_exit) to drive ONE mac/win cell live without paying for the whole Linux lab. The mac/win stages gate on setup's distribute_* outcomes, not the Linux suite, so they stay fully exercised. Use this whenever you are failing on a mac/win stage and the Linux suite would just be wasted time."}),
                         "windows_only": json!({"type": "boolean", "description": "Skip ALL Linux stages (incl. membership setup) and run ONLY the Windows bootstrap + validation stages; requires windows_vm. NOTE: this also skips membership distribution, so it only works when the Windows guest is already mesh-joined from a prior run — for a fresh Windows cell use skip_linux_live_suite instead (keeps setup)."}),
                         "allow_concurrent": json!({"type": "boolean", "description": "Opt into PARALLEL runs (default false = singleton). When true, up to 3 runs may overlap — you MUST give each disjoint guests (e.g. the macOS↔Windows pipeline: macOS on one Debian backbone, Windows on another). Each concurrent run gets its own CARGO_TARGET_DIR + report dir."}),
@@ -6018,9 +6019,8 @@ mod tests {
             ),
             vec!["d1:exit", "d2:client", "d3:entry"]
         );
-        // Each role-platform selector elects the mac guest into a PARSEABLE role.
-        // exit/relay/anchor map 1:1; admin→anchor and blind_exit→exit because
-        // `admin`/`blind_exit` are daemon roles, not lab-role --node tokens.
+        // Each role-platform selector elects the mac guest into its own real,
+        // parseable role — including admin/blind_exit (Bucket 1.5 first-class roles).
         let mac = |sel: &str| {
             let p = Some("macos");
             match sel {
@@ -6048,13 +6048,13 @@ mod tests {
         assert_eq!(mac("anchor"), vec!["m:anchor"]);
         assert_eq!(
             mac("admin"),
-            vec!["m:anchor"],
-            "admin→anchor (daemon-role bridge)"
+            vec!["m:admin"],
+            "admin is a first-class --node role (Bucket 1.5)"
         );
         assert_eq!(
             mac("blind_exit"),
-            vec!["m:exit"],
-            "blind_exit→exit (macOS Exit=blind_exit)"
+            vec!["m:blind_exit"],
+            "blind_exit is a first-class --node role (Bucket 1.5)"
         );
         assert_eq!(
             mac("default"),
@@ -6075,7 +6075,15 @@ mod tests {
             assert!(
                 matches!(
                     role,
-                    "exit" | "client" | "entry" | "relay" | "anchor" | "aux" | "extra"
+                    "exit"
+                        | "client"
+                        | "entry"
+                        | "relay"
+                        | "anchor"
+                        | "aux"
+                        | "extra"
+                        | "admin"
+                        | "blind_exit"
                 ),
                 "unparseable --node role token: {role}"
             );

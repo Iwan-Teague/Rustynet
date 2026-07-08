@@ -93,6 +93,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         assert!(matches!(
             DistributeMembershipStage.execute(&mut ctx),
@@ -118,6 +119,7 @@ mod tests {
             membership_snapshot: Some(vec![1, 2, 3]),
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         // Only exit node — nothing to distribute to
         assert_eq!(

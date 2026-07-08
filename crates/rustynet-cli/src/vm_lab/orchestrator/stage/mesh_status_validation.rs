@@ -6,7 +6,8 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::mesh_status::{
-    mesh_status_runtime_implemented, validate_linux_mesh_status,
+    mesh_status_runtime_implemented, validate_linux_mesh_status, validate_macos_mesh_status,
+    validate_windows_mesh_status,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -82,7 +83,15 @@ impl OrchestrationStage for MeshStatusValidationStage {
                     continue;
                 }
             };
-            if let Err(e) = validate_linux_mesh_status(&*shell, daemon_path, alias) {
+            let result = match platform {
+                VmGuestPlatform::Linux => validate_linux_mesh_status(&*shell, daemon_path, alias),
+                VmGuestPlatform::Macos => validate_macos_mesh_status(&*shell, daemon_path, alias),
+                VmGuestPlatform::Windows => {
+                    validate_windows_mesh_status(&*shell, daemon_path, alias)
+                }
+                _ => unreachable!("non-desktop platform filtered above"),
+            };
+            if let Err(e) = result {
                 failures.push(format!("{alias}: {e}"));
             }
         }

@@ -7,6 +7,7 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::service_hardening::{
     service_hardening_runtime_implemented, validate_linux_service_hardening,
+    validate_macos_service_hardening, validate_windows_service_hardening,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -81,7 +82,19 @@ impl OrchestrationStage for ServiceHardeningValidationStage {
                     continue;
                 }
             };
-            if let Err(e) = validate_linux_service_hardening(&*shell, daemon_path, alias) {
+            let result = match platform {
+                VmGuestPlatform::Linux => {
+                    validate_linux_service_hardening(&*shell, daemon_path, alias)
+                }
+                VmGuestPlatform::Macos => {
+                    validate_macos_service_hardening(&*shell, daemon_path, alias)
+                }
+                VmGuestPlatform::Windows => {
+                    validate_windows_service_hardening(&*shell, daemon_path, alias)
+                }
+                _ => unreachable!("non-desktop platform filtered above"),
+            };
+            if let Err(e) = result {
                 failures.push(format!("{alias}: {e}"));
             }
         }

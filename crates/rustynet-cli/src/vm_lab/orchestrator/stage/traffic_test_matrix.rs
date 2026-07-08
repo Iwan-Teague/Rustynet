@@ -104,10 +104,7 @@ impl OrchestrationStage for TrafficTestMatrixStage {
                 aliases.iter().position(|a| a == src_alias).unwrap_or(0) + 1,
                 aliases.len(),
             );
-            let _ = std::fs::write(
-                &progress_log,
-                format!("{src_alias}: probing peer-pairs\n"),
-            );
+            let _ = std::fs::write(&progress_log, format!("{src_alias}: probing peer-pairs\n"));
             // Tracks whether this src demonstrated baseline mesh reachability
             // (reached at least one peer). The default-deny negative test below
             // is only meaningful once we know the data path works: otherwise a
@@ -234,6 +231,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         // No assignments, no adapters, no mesh IPs → fail
         assert!(matches!(

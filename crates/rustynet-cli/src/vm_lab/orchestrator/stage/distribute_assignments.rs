@@ -278,6 +278,7 @@ mod tests {
             membership_snapshot: Some(vec![1, 2, 3]),
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         ctx.node_ids
             .insert("exit-1".to_owned(), "exit-node-id-abc".to_owned());
@@ -339,6 +340,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         assert!(matches!(
             DistributeAssignmentsStage.execute(&mut ctx),

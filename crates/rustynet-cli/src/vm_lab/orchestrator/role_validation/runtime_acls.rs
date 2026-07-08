@@ -11,11 +11,12 @@
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
-/// True only where runtime-ACLs validation runs live today (Linux). macOS /
-/// Windows nodes are reported-skipped — named on disk, never a silent pass —
-/// until their per-OS runtime-ACLs probes are proven through the Rust engine.
+/// True where runtime-ACLs validation runs live (Linux, macOS, Windows).
 pub fn runtime_acls_runtime_implemented(platform: VmGuestPlatform) -> bool {
-    matches!(platform, VmGuestPlatform::Linux)
+    matches!(
+        platform,
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+    )
 }
 
 /// Run the Linux runtime-ACLs daemon self-check through the shell seam,
@@ -38,15 +39,45 @@ pub fn validate_linux_runtime_acls(
     Ok(())
 }
 
+pub fn validate_macos_runtime_acls(
+    shell: &dyn RemoteShellHost,
+    daemon_path: &str,
+    alias: &str,
+) -> Result<(), String> {
+    const SUBCOMMAND: &str = "macos-runtime-acls-check";
+    let argv = [daemon_path, SUBCOMMAND];
+    let out = shell
+        .run_argv(&argv, &[], &[])
+        .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    crate::vm_lab::evaluate_macos_runtime_acls_report(alias, &stdout)?;
+    Ok(())
+}
+
+pub fn validate_windows_runtime_acls(
+    shell: &dyn RemoteShellHost,
+    daemon_path: &str,
+    alias: &str,
+) -> Result<(), String> {
+    const SUBCOMMAND: &str = "windows-runtime-acls-check";
+    let argv = [daemon_path, SUBCOMMAND];
+    let out = shell
+        .run_argv(&argv, &[], &[])
+        .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    crate::vm_lab::evaluate_windows_runtime_acls_report(alias, &stdout)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn runtime_implemented_linux_only() {
+    fn runtime_implemented_all_desktop() {
         assert!(runtime_acls_runtime_implemented(VmGuestPlatform::Linux));
-        assert!(!runtime_acls_runtime_implemented(VmGuestPlatform::Macos));
-        assert!(!runtime_acls_runtime_implemented(VmGuestPlatform::Windows));
+        assert!(runtime_acls_runtime_implemented(VmGuestPlatform::Macos));
+        assert!(runtime_acls_runtime_implemented(VmGuestPlatform::Windows));
     }
 
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};

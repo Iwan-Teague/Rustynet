@@ -143,6 +143,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         assert!(matches!(
             MembershipInitStage.execute(&mut ctx),
@@ -174,6 +175,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         let exit_key = "a".repeat(64);
         let client_key = "b".repeat(64);
@@ -213,6 +215,7 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            orchestrator_dialect: None,
         };
         ctx.node_ids
             .insert("client-1".to_owned(), "client-node-id".to_owned());
