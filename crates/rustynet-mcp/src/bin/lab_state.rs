@@ -1251,11 +1251,23 @@ impl LabStateServer {
                 .get("platform")
                 .and_then(|v| v.as_str())
                 .unwrap_or("linux");
-            let ip = e
+            let inventory_ip = e
                 .get("last_known_ip")
                 .and_then(|v| v.as_str())
                 .or_else(|| e.get("ssh_target").and_then(|v| v.as_str()))
                 .unwrap_or("");
+            // Freshness FIRST, before any route diagnosis: a VM's UTM
+            // "Shared" subnet can be silently reallocated on every restart,
+            // which otherwise looks identical to "host off this LAN" (both
+            // present as zero interfaces owning the stale subnet). Resolve
+            // the CURRENT live IP via ARP-by-MAC and diagnose against that
+            // instead of blindly trusting inventory.
+            let bundle_path = e
+                .get("controller")
+                .and_then(|c| c.get("bundle_path"))
+                .and_then(|v| v.as_str());
+            let fresh_ip = bundle_path.and_then(|p| resolve_live_ip_via_arp_by_mac(Path::new(p)));
+            let ip: String = fresh_ip.clone().unwrap_or_else(|| inventory_ip.to_owned());
             let Ok(target) = ip.parse::<Ipv4Addr>() else {
                 out.push_str(&format!(
                     "- ⏭️ {entry_alias}: no IPv4 last_known_ip/ssh_target in inventory, skipped\n"
@@ -1263,6 +1275,15 @@ impl LabStateServer {
                 continue;
             };
             checked += 1;
+            if let Some(fresh) = fresh_ip.as_deref()
+                && !inventory_ip.is_empty()
+                && fresh != inventory_ip
+            {
+                any_actionable = true;
+                out.push_str(&format!(
+                    "  ℹ️ {entry_alias}: inventory is STALE — says {inventory_ip}, but the VM's MAC currently resolves to {fresh} (ARP). Diagnosing against the fresh address below; run update_inventory to persist it.\n"
+                ));
+            }
 
             // The most basic, most common cause of "unreachable" is simply
             // "the VM is off" — check this BEFORE any host-routing
@@ -1326,7 +1347,7 @@ impl LabStateServer {
                     // live — a shared multi-VM bridge and a private per-VM
                     // bridge both claiming 192.168.64.0/24). Confirm real
                     // reachability, not just an interface-name match.
-                    if tcp_reachable(ip, port, Duration::from_secs(2)) {
+                    if tcp_reachable(&ip, port, Duration::from_secs(2)) {
                         out.push_str(&format!(
                             "- ✅ {entry_alias} ({ip}, {platform}): host route correct (via `{observed_iface}`), TCP/{port} reachable\n"
                         ));
@@ -1357,7 +1378,7 @@ impl LabStateServer {
                 HostLabRouteVerdict::OffLabLan => {
                     any_actionable = true;
                     out.push_str(&format!(
-                        "- 🌐 {entry_alias} ({ip}, {platform}): HOST OFF THIS LAN — no local interface currently owns this subnet (resolves via `{observed_iface}`, destination `{}`). This is a physical network change, not fixable remotely — reconnect the host to the lab network.\n",
+                        "- 🌐 {entry_alias} ({ip}, {platform}): HOST OFF THIS LAN — no local interface currently owns this subnet (resolves via `{observed_iface}`, destination `{}`), and the VM's MAC could not be resolved anywhere via ARP either (already checked above, not just a stale-inventory case). This is a physical network change, not fixable remotely — reconnect the host to the lab network.\n",
                         route.destination
                     ));
                 }
@@ -1420,11 +1441,29 @@ impl LabStateServer {
             .get("platform")
             .and_then(|v| v.as_str())
             .unwrap_or("linux");
-        let ip = entry
+        let inventory_ip = entry
             .get("last_known_ip")
             .and_then(|v| v.as_str())
             .or_else(|| entry.get("ssh_target").and_then(|v| v.as_str()))
             .unwrap_or("");
+        // Freshness FIRST, same reasoning as diagnose_host_lab_network: a
+        // VM's UTM "Shared" subnet can be silently reallocated on every
+        // restart, so trust ARP-by-MAC over inventory's possibly-stale IP.
+        let bundle_path = entry
+            .get("controller")
+            .and_then(|c| c.get("bundle_path"))
+            .and_then(|v| v.as_str());
+        let fresh_ip = bundle_path.and_then(|p| resolve_live_ip_via_arp_by_mac(Path::new(p)));
+        let stale_inventory_note = fresh_ip
+            .as_deref()
+            .filter(|fresh| !inventory_ip.is_empty() && *fresh != inventory_ip)
+            .map(|fresh| {
+                format!(
+                    "inventory was stale (said {inventory_ip}, MAC resolves to {fresh} via ARP) — "
+                )
+            })
+            .unwrap_or_default();
+        let ip: String = fresh_ip.clone().unwrap_or_else(|| inventory_ip.to_owned());
         let Ok(target) = ip.parse::<Ipv4Addr>() else {
             return tool_error(&format!(
                 "'{alias}' has no IPv4 last_known_ip/ssh_target in inventory"
@@ -1478,13 +1517,13 @@ impl LabStateServer {
             && tcp_reachable(&target.to_string(), port, Duration::from_secs(3))
         {
             return tool_success(&format!(
-                "# Route fix: {alias}\n\nAlready correct (via `{}`) and TCP/{port} reachable — nothing to do.\n",
+                "# Route fix: {alias}\n\n{stale_inventory_note}Already correct (via `{}`) and TCP/{port} reachable — nothing to do.\n",
                 route.interface.as_deref().unwrap_or("?")
             ));
         }
         if verdict == HostLabRouteVerdict::OffLabLan {
             return tool_error(&format!(
-                "'{alias}' ({ip}, {platform}): host is off this VM's LAN — no local interface currently owns that subnet. This is a physical network change, not something this tool can fix — reconnect the host, then retry."
+                "'{alias}' ({ip}, {platform}): host is off this VM's LAN — no local interface currently owns that subnet, and the VM's MAC could not be resolved anywhere via ARP either (not just a stale-inventory case). This is a physical network change, not something this tool can fix — reconnect the host, then retry."
             ));
         }
         if owning.is_empty() {
@@ -1520,7 +1559,7 @@ impl LabStateServer {
                     std::thread::sleep(Duration::from_millis(300));
                     if tcp_reachable(&target.to_string(), port, Duration::from_secs(5)) {
                         return tool_success(&format!(
-                            "# Route fix: {alias}\n\n✅ Applied and confirmed reachable: `{subnet}` now routes via `{interface}` (TCP/{port} open).\n"
+                            "# Route fix: {alias}\n\n{stale_inventory_note}✅ Applied and confirmed reachable: `{subnet}` now routes via `{interface}` (TCP/{port} open).\n"
                         ));
                     }
                     // Route looks structurally fine but the guest still
@@ -2793,6 +2832,88 @@ fn host_interfaces_in_same_slash24(target: Ipv4Addr) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Extract the first `<key>MacAddress</key><string>…</string>` value from a
+/// UTM bundle's `config.plist` (UTM always writes this as XML, not binary
+/// plist). Text-scan rather than a plist dependency: the schema is simple
+/// and stable. Mirrors `rustynet-cli`'s function of the same purpose
+/// (separate crate, no code sharing — kept in sync by hand).
+fn mac_address_from_utm_config_plist(bundle_path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(bundle_path.join("config.plist")).ok()?;
+    let key_pos = contents.find("<key>MacAddress</key>")?;
+    let after_key = &contents[key_pos + "<key>MacAddress</key>".len()..];
+    let string_start = after_key.find("<string>")? + "<string>".len();
+    let string_end = after_key[string_start..].find("</string>")?;
+    normalize_mac_address(after_key[string_start..string_start + string_end].trim())
+}
+
+/// Normalize a MAC address to lowercase, zero-padded colon-hex. macOS's
+/// `arp -a` omits leading zeros per octet (e.g. `6:2b:b:28:e3:ff`), while
+/// UTM's config.plist writes them zero-padded — normalize both sides.
+fn normalize_mac_address(mac: &str) -> Option<String> {
+    let octets: Vec<&str> = mac.split(':').collect();
+    if octets.len() != 6 {
+        return None;
+    }
+    let mut normalized = String::with_capacity(17);
+    for (index, octet) in octets.iter().enumerate() {
+        if octet.is_empty() || octet.len() > 2 || !octet.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        if index > 0 {
+            normalized.push(':');
+        }
+        if octet.len() == 1 {
+            normalized.push('0');
+        }
+        normalized.push_str(&octet.to_ascii_lowercase());
+    }
+    Some(normalized)
+}
+
+/// Parse macOS `arp -a` output (`? (10.0.0.5) at aa:bb:cc:dd:ee:ff on en0 …`)
+/// for the first row whose MAC matches `target_mac` (already normalized).
+/// Skips `(incomplete)` rows, which carry no resolvable MAC.
+fn extract_ip_for_mac_from_arp_output(arp_output: &str, target_mac: &str) -> Option<String> {
+    for line in arp_output.lines() {
+        let ip_start = line.find('(')? + 1;
+        let Some(ip_end) = line[ip_start..].find(')') else {
+            continue;
+        };
+        let ip = &line[ip_start..ip_start + ip_end];
+        let Some(at_pos) = line.find(" at ") else {
+            continue;
+        };
+        let after_at = line[at_pos + " at ".len()..].trim_start();
+        let mac_token = after_at.split_whitespace().next().unwrap_or("");
+        if mac_token == "(incomplete)" {
+            continue;
+        }
+        if normalize_mac_address(mac_token).as_deref() == Some(target_mac) {
+            return Some(ip.to_owned());
+        }
+    }
+    None
+}
+
+/// Resolve a lab VM's CURRENT live IP by reading its MAC from the UTM
+/// bundle's config.plist, then scanning the host `arp -a` table for a
+/// match. This is the freshness check that must run BEFORE any host-route
+/// diagnosis: a VM's UTM "Shared" network subnet can be silently
+/// reallocated to a different range on every restart (found live — some
+/// guests land on an isolated UTM bridge, others get MACNAT'd onto
+/// whichever physical LAN the host is currently on), so inventory's
+/// `last_known_ip` can be stale in a way that looks identical to "host
+/// physically off this LAN" if you only look at routing.
+fn resolve_live_ip_via_arp_by_mac(bundle_path: &Path) -> Option<String> {
+    let mac = mac_address_from_utm_config_plist(bundle_path)?;
+    let output =
+        run_with_timeout("arp", &["-a"], Path::new("/"), &[], Duration::from_secs(5)).ok()?;
+    if !output.success {
+        return None;
+    }
+    extract_ip_for_mac_from_arp_output(&output.stdout, mac.as_str())
 }
 
 /// Diagnosis of whether the host's current route to a lab VM's subnet is
@@ -6435,6 +6556,94 @@ mod tests {
             classify_host_route(&route, &owning),
             HostLabRouteVerdict::Correct
         );
+    }
+
+    #[test]
+    fn normalize_mac_address_zero_pads_and_lowercases() {
+        assert_eq!(
+            normalize_mac_address("6:2b:b:28:e3:ff").as_deref(),
+            Some("06:2b:0b:28:e3:ff")
+        );
+        assert_eq!(
+            normalize_mac_address("32:6B:39:DF:D7:4E").as_deref(),
+            Some("32:6b:39:df:d7:4e")
+        );
+    }
+
+    #[test]
+    fn normalize_mac_address_rejects_malformed_input() {
+        assert_eq!(normalize_mac_address("not-a-mac"), None);
+        assert_eq!(normalize_mac_address("32:6b:39:df:d7"), None);
+        assert_eq!(normalize_mac_address("zz:6b:39:df:d7:4e"), None);
+    }
+
+    #[test]
+    fn extract_ip_for_mac_from_arp_output_matches_unpadded_host_mac() {
+        let arp_output = "? (10.47.225.138) at 6:2b:b:28:e3:ff on en0 ifscope [ethernet]\n\
+             ? (192.168.65.2) at 32:6b:39:df:d7:4e on bridge102 ifscope [bridge]\n";
+        let target = normalize_mac_address("32:6b:39:df:d7:4e").expect("valid mac");
+        assert_eq!(
+            extract_ip_for_mac_from_arp_output(arp_output, target.as_str()).as_deref(),
+            Some("192.168.65.2")
+        );
+    }
+
+    #[test]
+    fn extract_ip_for_mac_from_arp_output_skips_incomplete_rows() {
+        let arp_output = "? (10.47.225.50) at (incomplete) on en0 ifscope [ethernet]\n\
+             ? (192.168.65.2) at 32:6b:39:df:d7:4e on bridge102 ifscope [bridge]\n";
+        let target = normalize_mac_address("32:6b:39:df:d7:4e").expect("valid mac");
+        assert_eq!(
+            extract_ip_for_mac_from_arp_output(arp_output, target.as_str()).as_deref(),
+            Some("192.168.65.2")
+        );
+    }
+
+    #[test]
+    fn extract_ip_for_mac_from_arp_output_returns_none_when_absent() {
+        let arp_output =
+            "? (10.47.225.56) at 5e:55:cf:16:b3:ed on en0 ifscope permanent [ethernet]\n";
+        let target = normalize_mac_address("32:6b:39:df:d7:4e").expect("valid mac");
+        assert_eq!(
+            extract_ip_for_mac_from_arp_output(arp_output, target.as_str()),
+            None
+        );
+    }
+
+    #[test]
+    fn mac_address_from_utm_config_plist_reads_shared_network_mac() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let bundle = std::env::temp_dir().join(format!("mcp-mac-plist-{unique}.utm"));
+        std::fs::create_dir_all(&bundle).expect("bundle dir should be created");
+        std::fs::write(
+            bundle.join("config.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <plist version=\"1.0\"><dict>\n\
+             <key>Network</key><array><dict>\n\
+             <key>MacAddress</key><string>32:6b:39:df:d7:4e</string>\n\
+             <key>Mode</key><string>Shared</string>\n\
+             </dict></array>\n\
+             </dict></plist>\n",
+        )
+        .expect("config.plist should be written");
+
+        let mac = mac_address_from_utm_config_plist(bundle.as_path());
+        assert_eq!(mac.as_deref(), Some("32:6b:39:df:d7:4e"));
+
+        let _ = std::fs::remove_dir_all(&bundle);
+    }
+
+    #[test]
+    fn mac_address_from_utm_config_plist_returns_none_when_missing() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let bundle = std::env::temp_dir().join(format!("mcp-mac-plist-missing-{unique}.utm"));
+        assert_eq!(mac_address_from_utm_config_plist(bundle.as_path()), None);
     }
 
     #[test]
