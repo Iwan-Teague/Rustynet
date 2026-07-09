@@ -1,9 +1,7 @@
-//! The live macOS node install (runs as root on a macOS host). This is
-//! "Increment 1": it provisions everything a node needs up to and including the
-//! trust anchor, in the exact ordering the macOS key-custody model requires, but
-//! stops before launchd service registration (that + the fail-closed
-//! "awaiting-enrollment" launchd gate land in the next increment, because the
-//! gate changes reviewed plist directives).
+//! The live macOS node install (runs as root on a macOS host). Provisions a bare
+//! machine into a hardened rustynet node in the exact ordering the macOS
+//! key-custody + launchd model requires, reaching the same fail-closed
+//! "installed, awaiting enrollment" terminal state as Linux.
 //!
 //! Ordering invariant (each step depends on the previous):
 //!   1. ensure the `wg` prerequisite (key init shells `wg genkey`/`wg pubkey`)
@@ -14,18 +12,27 @@
 //!   5. key custody: `rustynetd key init` (encrypted key + pubkey) then
 //!      `rustynetd key store-passphrase` into the System keychain (owned identity)
 //!   6. deliver + thumbprint-verify the membership owner-key trust anchor
+//!   7. register the launchd services (embedded reviewed installer script, gated
+//!      mode): privileged-helper bootstrapped + running, daemon plist installed
+//!      but `launchctl disable`d so it stays down until the (deferred) enrollment
+//!      seam runs `launchctl enable` + `bootstrap` — the macOS analogue of
+//!      Linux's ExecStartPre-gated (enabled-but-down) systemd unit.
 //!
 //! Unlike Linux (systemd-creds), macOS stores the passphrase in the Keychain via
 //! the daemon's own `key store-passphrase` verb, read back by the launchd daemon
-//! under its own code signature.
+//! under its own code signature. The daemon plist is rendered by the embedded
+//! `Install-RustyNetMacosService.sh` (the single reviewed renderer, shared with
+//! the live-lab hardening validator) rather than a second Rust renderer.
 
 use super::acquire::Acquired;
 use super::common::{
-    RUSTYNETD, command, deliver_trust_anchor, ensure_dir, place_binaries, random_hex_32,
-    resolve_node_id, run, which, write_file,
+    RUSTYNETD, command, command_clean, deliver_trust_anchor, ensure_dir, place_binaries,
+    random_hex_32, resolve_node_id, run, which, write_file,
 };
 use super::{InstallRequest, InstallRole};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 const STATE_ROOT: &str = "/usr/local/var/rustynet";
 const KEYS_DIR: &str = "/usr/local/var/rustynet/keys";
@@ -35,6 +42,14 @@ const ENCRYPTED_KEY: &str = "/usr/local/var/rustynet/keys/wireguard.key.enc";
 const PUBLIC_KEY: &str = "/usr/local/var/rustynet/keys/wireguard.pub";
 const PASSPHRASE_FILE: &str = "/usr/local/var/rustynet/bootstrap/wireguard.passphrase";
 const SYSTEM_KEYCHAIN: &str = "/Library/Keychains/System.keychain";
+
+/// The reviewed macOS service-install script, embedded so the installer needs no
+/// on-target source tree (it renders both launchd plists inline — it reads no
+/// template file). This is the single reviewed daemon-plist renderer, also used
+/// (via its own `include_str!`) by the live-lab macOS adapter, so there is one
+/// plist shape and one hardening-validated body.
+const INSTALL_SERVICE_SCRIPT: &str =
+    include_str!("../../../../scripts/bootstrap/macos/Install-RustyNetMacosService.sh");
 
 pub(super) fn install(req: &InstallRequest, acquired: &Acquired) -> Result<String, String> {
     let node_id = resolve_node_id(&req.node_id)?;
@@ -48,12 +63,12 @@ pub(super) fn install(req: &InstallRequest, acquired: &Acquired) -> Result<Strin
     setup_state_dirs()?;
     setup_key_custody(&node_id, &wg)?;
     let anchor = deliver_trust_anchor(&req.trust_anchor)?;
+    let svc = register_service_gated(&node_id)?;
 
     Ok(format!(
-        "rustynet provisioned on macOS (node_id={node_id}, role=client): acquired binaries ({}); \
+        "rustynet installed on macOS (node_id={node_id}, role=client): acquired binaries ({}); \
          {placed} binaries in /usr/local/bin; rustynetd re-signed (ad-hoc); key custody in the \
-         System keychain (account wg-passphrase-{node_id}, wg={}); {anchor} Service registration \
-         (launchd) + the enrollment-gated start land in the next increment.",
+         System keychain (account wg-passphrase-{node_id}, wg={}); {anchor} {svc}",
         acquired.notes.join("; "),
         wg.display()
     ))
@@ -277,6 +292,101 @@ fn setup_key_custody(node_id: &str, wg: &Path) -> Result<(), String> {
     run("chown", &["-R", "rustynetd:rustynetd", KEYS_DIR])
 }
 
+/// Register the launchd services by shelling the embedded reviewed service-install
+/// script in its `--no-daemon-start` gated mode: it renders + installs both
+/// plists and bootstraps the privileged helper, then `launchctl disable`s the
+/// daemon so it stays down (now and across reboots) until the deferred enrollment
+/// seam runs `launchctl enable` + `bootstrap`. This is the macOS analogue of
+/// Linux's "installed + enabled, ExecStartPre-gated" awaiting-enrollment state.
+///
+/// `node_id` MUST match the id Increment 1's key custody used for the keychain
+/// account (`wg-passphrase-<node_id>`), or the daemon cannot decrypt its key.
+fn register_service_gated(node_id: &str) -> Result<String, String> {
+    // Pipe the embedded script to `bash -s` via stdin — there is NO on-disk
+    // script for an attacker to swap between write and exec. (`/usr/local` is
+    // admin-group-writable on macOS, so a predictable temp path there would be a
+    // TOCTOU root-exec hazard.) `bash -s -- <args>` runs the stdin script with
+    // <args> as positional parameters, exactly as the script's flag parser wants.
+    let mut child = command_clean("bash")
+        .args([
+            "-s",
+            "--",
+            "--rustynetd-bin",
+            RUSTYNETD,
+            "--state-root",
+            STATE_ROOT,
+            "--log-dir",
+            "/usr/local/var/log/rustynet",
+            "--node-id",
+            node_id,
+            "--node-role",
+            "client",
+            "--network-id",
+            "",
+            "--wg-interface",
+            "utun9",
+            "--no-daemon-start",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn the macOS service installer: {err}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "no stdin handle for the macOS service installer".to_owned())?
+        .write_all(INSTALL_SERVICE_SCRIPT.as_bytes())
+        .map_err(|err| format!("failed to pipe the macOS service installer script: {err}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|err| format!("the macOS service installer did not complete: {err}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "macOS service registration failed (exit {:?}).\nstdout: {}\nstderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // Fail closed if the daemon somehow started (or its state cannot be
+    // confirmed) — the gated install must leave it disabled/awaiting enrollment,
+    // never running without trust evidence.
+    if daemon_is_running() {
+        return Err(
+            "the macOS daemon may be running, or its state could not be confirmed, after a gated \
+             install (expected disabled/awaiting enrollment) — fail closed"
+                .to_owned(),
+        );
+    }
+    Ok(
+        "launchd services registered: privileged-helper running; the daemon plist is installed \
+        and disabled, awaiting enrollment — it activates once trust material is delivered and the \
+        service is enabled + bootstrapped. This is the correct fail-closed terminal state for a \
+        fresh node."
+            .to_owned(),
+    )
+}
+
+/// True iff the `com.rustynet.daemon` launchd job is loaded AND running. A gated
+/// (disabled, not bootstrapped) job is not loaded, so `launchctl print` fails and
+/// this returns false.
+fn daemon_is_running() -> bool {
+    match command("launchctl")
+        .args(["print", "system/com.rustynet.daemon"])
+        .output()
+    {
+        // A successful launchctl run: "state = running" means running; a non-zero
+        // exit ("Could not find service …") means not loaded — the gated state.
+        Ok(o) => {
+            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("state = running")
+        }
+        // Could not even run launchctl: we cannot confirm the daemon is stopped,
+        // so treat it as possibly-running and fail closed.
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +423,34 @@ mod tests {
         ] {
             assert!(p.starts_with(STATE_ROOT), "{p}");
         }
+    }
+
+    #[test]
+    fn embedded_service_script_supports_the_gated_flag() {
+        // The embedded copy must carry the gated-install flag + the disable path
+        // we depend on, and must still render the reviewed plist body.
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("--no-daemon-start"),
+            "flag arm missing"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("launchctl disable system/com.rustynet.daemon"),
+            "disable path missing"
+        );
+        // The non-gated branch must re-enable before bootstrap so a host a prior
+        // gated install disabled can still be started by a non-gated caller.
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("launchctl enable system/com.rustynet.daemon"),
+            "recovery enable missing"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("NO_DAEMON_START"),
+            "gate variable missing"
+        );
+        // Reviewed plist body must be untouched (RunAtLoad stays true).
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("<key>RunAtLoad</key>"),
+            "plist body missing"
+        );
     }
 }

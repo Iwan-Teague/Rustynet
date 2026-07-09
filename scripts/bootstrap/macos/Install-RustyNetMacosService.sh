@@ -66,6 +66,15 @@ if [[ -x "/opt/homebrew/bin/brew" ]]; then
 else
   BREW_PREFIX="/usr/local"
 fi
+# Gated ("awaiting enrollment") install: render + install both plists and
+# bootstrap ONLY the privileged helper, but do NOT bootstrap the daemon —
+# instead `launchctl disable` it so it stays down until the enrollment seam runs
+# `launchctl enable` + `launchctl bootstrap`. Default false preserves the
+# bootstrap-and-start behaviour every existing caller relies on. Used by the
+# `rustynet install` engine, which provisions a fresh node up to the deferred
+# enrollment seam (the daemon has no trust evidence yet, so starting it would
+# crash-loop).
+NO_DAEMON_START="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -85,6 +94,7 @@ while [[ $# -gt 0 ]]; do
     --wg-interface)                WG_INTERFACE="$2";                shift 2 ;;
     --fail-closed-ssh-allow)       FAIL_CLOSED_SSH_ALLOW="$2";       shift 2 ;;
     --fail-closed-ssh-allow-cidrs) FAIL_CLOSED_SSH_ALLOW_CIDRS="$2"; shift 2 ;;
+    --no-daemon-start)             NO_DAEMON_START="true";           shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -509,7 +519,22 @@ if [[ ! -S "${PRIVILEGED_HELPER_SOCKET}" ]]; then
   exit 1
 fi
 
-launchctl bootstrap system "${PLIST_DST}"
+if [[ "${NO_DAEMON_START}" == "true" ]]; then
+  # Gated install: the reviewed daemon plist is written (RunAtLoad=true,
+  # unchanged) but the daemon is NOT bootstrapped. Disable it so it stays down —
+  # both now and across reboots — until the enrollment seam re-enables
+  # (`launchctl enable system/com.rustynet.daemon`) and bootstraps it. A fresh
+  # node has no trust evidence, so a running daemon would only crash-loop; this
+  # is the macOS analogue of Linux's ExecStartPre-gated (enabled-but-down) unit.
+  launchctl disable system/com.rustynet.daemon
+  echo "[install-service] com.rustynet.daemon INSTALLED + DISABLED (awaiting enrollment; not bootstrapped, brew-prefix=${BREW_PREFIX})"
+else
+  # `launchctl enable` is idempotent (a no-op on a never-disabled label) but is
+  # REQUIRED to recover a host that a prior gated install disabled — otherwise
+  # `bootstrap` fails with "Service is disabled" and the daemon never starts.
+  launchctl enable system/com.rustynet.daemon
+  launchctl bootstrap system "${PLIST_DST}"
+  echo "[install-service] com.rustynet.daemon loaded via launchctl bootstrap (brew-prefix=${BREW_PREFIX})"
+fi
 
 echo "[install-service] com.rustynet.privileged-helper loaded via launchctl bootstrap (socket=${PRIVILEGED_HELPER_SOCKET})"
-echo "[install-service] com.rustynet.daemon loaded via launchctl bootstrap (brew-prefix=${BREW_PREFIX})"
