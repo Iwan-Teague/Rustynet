@@ -95,6 +95,9 @@ pub struct InstallRequest {
     pub role: InstallRole,
     pub acquisition: AcquisitionMode,
     pub trust_anchor: TrustAnchorSource,
+    /// The node identity (`RUSTYNET_NODE_ID`). Defaults to the hostname when the
+    /// live install runs; `--node-id` overrides.
+    pub node_id: Option<String>,
     pub unattended: bool,
     pub dry_run: bool,
     pub uninstall: bool,
@@ -110,6 +113,7 @@ impl InstallRequest {
         let mut build_from_source = false;
         let mut owner_key_file: Option<PathBuf> = None;
         let mut expected_thumbprint: Option<String> = None;
+        let mut node_id: Option<String> = None;
         let mut unattended = false;
         let mut dry_run = false;
         let mut uninstall = false;
@@ -135,6 +139,7 @@ impl InstallRequest {
                 "--owner-key-thumbprint" => {
                     expected_thumbprint = Some(next_value(args, &mut i, "--owner-key-thumbprint")?)
                 }
+                "--node-id" => node_id = Some(next_value(args, &mut i, "--node-id")?),
                 "--unattended" => unattended = true,
                 "--dry-run" => dry_run = true,
                 "--uninstall" => uninstall = true,
@@ -160,6 +165,7 @@ impl InstallRequest {
                 owner_key_file,
                 expected_thumbprint,
             },
+            node_id,
             unattended,
             dry_run,
             uninstall,
@@ -219,7 +225,7 @@ pub fn run(req: InstallRequest) -> Result<String, String> {
         std::env::temp_dir().join(format!("rustynet-install-staging-{}", std::process::id()));
     let acquired = acquire::acquire(&req.acquisition, triple, ext, &staging)?;
     let outcome = match facts.family {
-        OsFamily::Linux => live_linux::install(facts.pkg_family, &acquired),
+        OsFamily::Linux => live_linux::install(&req, facts.pkg_family, &acquired),
         OsFamily::Macos | OsFamily::Windows => Err(format!(
             "live install for {} is not yet wired in the engine (Linux is wired first); its \
              existing per-OS bootstrap does the work. Preview with --dry-run.",
@@ -473,12 +479,8 @@ mod tests {
         assert_eq!(d.acquisition, AcquisitionMode::VerifiedDownload);
         assert!(!d.unattended && !d.dry_run && !d.uninstall);
 
-        let r = InstallRequest::from_args(
-            &["--role", "relay", "--dry-run", "--build-from-source"]
-                .map(str::to_owned)
-                .to_vec(),
-        )
-        .unwrap();
+        let relay_args = ["--role", "relay", "--dry-run", "--build-from-source"].map(str::to_owned);
+        let r = InstallRequest::from_args(&relay_args).unwrap();
         assert_eq!(r.role, InstallRole::Relay);
         assert!(r.dry_run);
         assert_eq!(r.acquisition, AcquisitionMode::BuildFromSource);
@@ -486,14 +488,8 @@ mod tests {
 
     #[test]
     fn from_args_rejects_conflicts_and_relative_paths_and_unknown_flags() {
-        assert!(
-            InstallRequest::from_args(
-                &["--from-dir", "/tmp/x", "--build-from-source"]
-                    .map(str::to_owned)
-                    .to_vec()
-            )
-            .is_err()
-        );
+        let conflict_args = ["--from-dir", "/tmp/x", "--build-from-source"].map(str::to_owned);
+        assert!(InstallRequest::from_args(&conflict_args).is_err());
         assert!(
             InstallRequest::from_args(&["--from-dir".to_owned(), "relative/path".to_owned()])
                 .is_err()
@@ -526,6 +522,7 @@ mod tests {
                 owner_key_file: Some(PathBuf::from("/etc/rustynet/owner.pub")),
                 expected_thumbprint: Some("abcd".to_owned()),
             },
+            node_id: None,
             unattended: true,
             dry_run: true,
             uninstall: false,
@@ -592,6 +589,7 @@ mod tests {
                 owner_key_file: None,
                 expected_thumbprint: None,
             },
+            node_id: None,
             unattended: false,
             dry_run: false,
             uninstall: true,
