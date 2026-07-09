@@ -119,6 +119,23 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 | `MacosNodeAdapter` | `adapter/macos.rs` | macOS adapter |
 | `node_adapter_for()` | `adapter/factory.rs` | Factory: (platform, connection) → NodeAdapter |
 
+### Installer engine (`rustynet-cli/src/install/`)
+
+The `rustynet install` verb: detect → preflight/elevation → acquire (verified
+binaries) → per-OS live install → fail-closed terminal state. `--dry-run` renders
+the plan per OS. Reuses the existing hardened `ops install-*` / `rustynetd key
+init` / `key store-passphrase` verbs rather than reinventing them.
+
+| Type | Location | Purpose |
+|---|---|---|
+| `run` (state machine) + `InstallRequest`/`InstallRole`/`AcquisitionMode`/`TrustAnchorSource` | `install/mod.rs` | Request parse, host detect (`rustynet_sysinfo::host_facts`), plan render, per-OS dispatch |
+| `acquire()` (`VerifiedDownload`/`FromDir`/`BuildFromSource`) | `install/acquire.rs` | Stage + integrity-verify the shipping binaries before install (co-located signed manifest) |
+| `require_elevation()` | `install/preflight.rs` | Root (Linux/macOS euid==0) / Administrator (Windows) gate; never self-elevate |
+| Shared Unix primitives (`command`, `place_binaries`, `deliver_trust_anchor`, `resolve_node_id`, `which`, `run`/`ensure_dir`/`write_file`) | `install/common.rs` | OS-agnostic, argv-only, PATH-pinned exec + §6.B owner-key anchor delivery, shared by Linux + macOS |
+| `live_linux::install()` | `install/live_linux.rs` | Linux: apt/dnf prereqs, placement, key custody (`key init` + systemd-creds), `ops install-systemd`, awaiting-enrollment classification |
+| `live_macos::install()` | `install/live_macos.rs` | macOS provisioning: `wg` prereq, dscl identity, keychain unlock, place + `codesign`, key custody (`key init` + `key store-passphrase`), trust anchor (launchd service registration is Increment 2) |
+| `ReleaseManifest` (ed25519 signed) | `release_manifest.rs` + `ops_release_manifest.rs` | The installer's trust root: `ops create/verify-release-manifest`; per-artifact sha256 verified before staging |
+
 ### Security Verifiers (`rustynet-local-security`)
 
 | Type | Location | Purpose |
@@ -158,6 +175,7 @@ use rustynet_crypto::{SigningKey, VerificationKey, verify_detached};
 | A new node role | `rustynet-control/src/role_presets.rs` (add variant, update matrix) |
 | A new daemon subsystem | `rustynetd/src/<subsystem>.rs` + wiring in `daemon.rs` |
 | A new CLI subcommand | `rustynet-cli/src/ops_<name>.rs` or `src/vm_lab/` |
+| A new `rustynet install` OS/step | `rustynet-cli/src/install/` (shared → `common.rs`, per-OS → `live_<os>.rs`) |
 | A new security verifier | `rustynet-local-security` + per-OS adapter |
 | A new orchestration stage | `crates/rustynet-cli/src/vm_lab/orchestrator/stage/<name>.rs` |
 | A new MCP tool | `crates/rustynet-mcp/src/bin/<server>.rs` |
