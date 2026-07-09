@@ -1,7 +1,7 @@
 # UTM Virtual Machine Inventory
 
 Last updated:
-`2026-05-21T20:33:00Z`
+`2026-07-09T00:00:00Z`
 
 Repository root:
 `workspace root`
@@ -26,8 +26,20 @@ Purpose:
 - Active parent interface at time of capture: `en0`
 - Last known parent IP on active interface: `192.168.0.20/24`
 - Last known parent network SSID: unavailable from non-privileged local queries on this host
-- UTM bundle root:
-  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents`
+- UTM bundle root (post-2026-07-09 relocation):
+  `/Users/iwan/Desktop/OS_images/UTM images/`
+  — bundles were moved here out of UTM's sandbox container via UTM's own
+  "Move…" action; the old container
+  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents` now holds only
+  UTM's `Public` folder. Discovery still *defaults* to scanning the old
+  container and, finding no bundles there, degrades to the inventory-recorded
+  `controller.bundle_path` values, so
+  `documents/operations/active/vm_lab_inventory.json` is the authoritative
+  per-node bundle path (the per-node paths listed further down this doc are
+  historical and may be stale — trust the inventory). To point the container
+  scan at the new library directly (e.g. to auto-discover a new, un-inventoried
+  bundle), export
+  `RUSTYNET_UTM_DOCUMENTS_ROOT="/Users/iwan/Desktop/OS_images/UTM images"`.
 
 ## SSH Operator Key
 
@@ -53,8 +65,10 @@ Security note:
 
 ## Inventory Notes
 
-- The five Debian lab nodes and the local Windows 11 validation guest are all
-  UTM `QEMU` guests.
+- The two remaining Debian lab nodes and the local Windows 11 validation guest
+  are all UTM `QEMU` guests. Two additional Linux clients — a Fedora Server 44
+  guest (`fedora-utm-1`) and an Ubuntu Server 24.04 guest (`ubuntu-utm-1`) — were
+  onboarded later via commit `e878936`.
 - The Debian lab nodes are configured as `aarch64` Debian/Linux guests with
   `2048 MB` memory.
 - UTM currently reports one shared network interface per VM in the configuration record.
@@ -66,7 +80,7 @@ Security note:
   the fleet standard. Rustynet source directory target: `/Users/mac/Rustynet`.
 - Live guest-agent verification was performed with UTM `query ip` on `2026-04-07`; live SSH reachability was rechecked in this pass over the IPv4 SSH endpoints because they were the stable SSH form on this host.
 - The per-VM IPv4s below are live-confirmed from the running guests, not inferred from hostname history.
-- One extra UTM-style historical IP, `192.168.64.18`, still exists in older host-key history but could not be tied to the current five bundles during this pass.
+- The UTM-style IP `192.168.64.18` — previously unmatched in host-key history — is now recorded as a live address of the macOS guest (`macos-utm-1`) in `vm_lab_inventory.json`.
 
 ## Probe-and-Recover Runbook
 
@@ -140,7 +154,7 @@ is now the operator-facing source for `rustynet-cli ops vm-lab-*`.
 
 Entry model:
 
-- `alias`: stable operator label such as `debian-headless-1`
+- `alias`: stable operator label such as `debian-headless-2`
 - `ssh_target`: SSH alias, hostname, or `user@host` target that is reachable from this Mac
 - `ssh_user`: optional default SSH username override
 - `ssh_password`: optional bootstrap-only password used to refresh SSH keys or recover access
@@ -245,25 +259,30 @@ cargo run -q -p rustynet-cli -- \
   --arg build \
   --arg --release
 
+# NOTE: debian-headless-1/3/5 were removed (commit e878936). The historical
+# five-node same-network Debian live-lab topology no longer exists. Current
+# Linux guests: debian-headless-2, fedora-utm-1, ubuntu-utm-1 (all on
+# utm-shared-192.168.64.0/24) and debian-headless-4 (bridged to the LAN), plus
+# the macOS and Windows guests. The live-lab examples below use the three
+# same-network utm-shared guests. Note --all now spans utm-shared + LAN, so it
+# can no longer be combined with --require-same-network; pick an explicit
+# same-network subset from vm_lab_inventory.json instead.
 cargo run -q -p rustynet-cli -- \
   ops vm-lab-write-live-lab-profile \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --output profiles/live_lab/generated_vm_lab.env \
   --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
   --ssh-known-hosts-file ~/.ssh/known_hosts \
-  --exit-vm debian-headless-1 \
-  --client-vm debian-headless-2 \
-  --entry-vm debian-headless-3 \
-  --aux-vm debian-headless-4 \
-  --extra-vm debian-headless-5 \
+  --exit-vm debian-headless-2 \
+  --client-vm fedora-utm-1 \
+  --entry-vm ubuntu-utm-1 \
   --require-same-network
 
 cargo run -q -p rustynet-cli -- \
   ops vm-lab-validate-live-lab-profile \
   --profile profiles/live_lab/generated_vm_lab.env \
   --expected-backend linux-wireguard-userspace-shared \
-  --expected-source-mode local-head \
-  --require-five-node
+  --expected-source-mode local-head
 
 cargo run -q -p rustynet-cli -- \
   ops vm-lab-setup-live-lab \
@@ -271,11 +290,9 @@ cargo run -q -p rustynet-cli -- \
   --report-dir artifacts/live_lab/setup_example \
   --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
   --known-hosts-file ~/.ssh/known_hosts \
-  --exit-vm debian-headless-1 \
-  --client-vm debian-headless-2 \
-  --entry-vm debian-headless-3 \
-  --aux-vm debian-headless-4 \
-  --extra-vm debian-headless-5 \
+  --exit-vm debian-headless-2 \
+  --client-vm fedora-utm-1 \
+  --entry-vm ubuntu-utm-1 \
   --require-same-network
 
 cargo run -q -p rustynet-cli -- \
@@ -283,11 +300,9 @@ cargo run -q -p rustynet-cli -- \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
   --ssh-known-hosts-file ~/.ssh/known_hosts \
-  --exit-vm debian-headless-1 \
-  --client-vm debian-headless-2 \
-  --entry-vm debian-headless-3 \
-  --aux-vm debian-headless-4 \
-  --extra-vm debian-headless-5 \
+  --exit-vm debian-headless-2 \
+  --client-vm fedora-utm-1 \
+  --entry-vm ubuntu-utm-1 \
   --require-same-network \
   --backend linux-wireguard-userspace-shared \
   --require-clean-tree \
@@ -368,35 +383,9 @@ cargo run -q -p rustynet-cli -- \
 
 ### VM 1
 
-- Display name: `debian-headless-1`
-- Bundle path:
-  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-1.utm`
-- UTM UUID: `40F90934-537F-484D-B9CC-D8012202DE0F`
-- Guest OS family: `Debian/Linux`
-- Backend: `QEMU`
-- Architecture: `aarch64`
-- Memory: `2048 MB`
-- Network adapters:
-  - Shared NIC MAC: `3E:AE:A9:5A:61:82`
-- Last-known guest IP: `192.168.64.3`
-- Live IPs from UTM query:
-  - `192.168.64.3`
-  - `fd21:69d4:6afd:fa50:3cae:a9ff:fe5a:6182`
-  - `fd21:69d4:6afd:fa50:9a08:e072:9844:b7ad`
-  - `fe80::6023:d956:36c2:c94e`
-- Last-known IP confidence: `live-confirmed via UTM query ip on 2026-04-07T16:20:45Z`
-- Suggested Rustynet node ID: `exit-1`
-- Suggested lab role: `exit`
-- Suggested mesh IP: `100.64.0.1`
-- SSH operator key: `~/.ssh/rustynet_lab_ed25519`
-- Suggested connect template:
-  `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.64.3`
-
-### VM 2
-
 - Display name: `debian-headless-2`
 - Bundle path:
-  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-2.utm`
+  `/Users/iwan/Desktop/OS_images/UTM images/debian-headless-2.utm`
 - UTM UUID: `7BD5A6C3-4138-4394-936A-A61F6A4480AE`
 - Guest OS family: `Debian/Linux`
 - Backend: `QEMU`
@@ -417,36 +406,11 @@ cargo run -q -p rustynet-cli -- \
 - Suggested connect template:
   `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.64.4`
 
-### VM 3
-
-- Display name: `debian-headless-3`
-- Bundle path:
-  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-3.utm`
-- UTM UUID: `58123566-1DAC-4B6F-8BA3-A6BFB561B439`
-- Guest OS family: `Debian/Linux`
-- Backend: `QEMU`
-- Architecture: `aarch64`
-- Memory: `2048 MB`
-- Network adapters:
-  - Shared NIC MAC: `3E:AE:A9:5A:61:82`
-- Last-known guest IP: `192.168.64.5`
-- Live IPs from UTM query:
-  - `192.168.64.5`
-  - `fd21:69d4:6afd:fa50:6259:ad04:5665:deda`
-  - `fe80::bec8:79f7:a83d:ddc`
-- Last-known IP confidence: `live-confirmed via UTM query ip on 2026-04-07T16:20:45Z`
-- Suggested Rustynet node ID: `relay-1`
-- Suggested lab role: `relay`
-- Suggested mesh IP: `100.64.0.3`
-- SSH operator key: `~/.ssh/rustynet_lab_ed25519`
-- Suggested connect template:
-  `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.64.5`
-
-### VM 4
+### VM 2
 
 - Display name: `debian-headless-4`
 - Bundle path:
-  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-4.utm`
+  `/Users/iwan/Desktop/OS_images/UTM images/debian-headless-4.utm`
 - UTM UUID: `80C0AC91-4384-4FB0-A44F-3F3E94892F28`
 - Guest OS family: `Debian/Linux`
 - Backend: `QEMU`
@@ -454,71 +418,160 @@ cargo run -q -p rustynet-cli -- \
 - Memory: `2048 MB`
 - Network adapters:
   - Shared NIC MAC: `3E:AE:A9:5A:61:82`
-- Last-known guest IP: `192.168.64.6`
-- Live IPs from UTM query:
+- Last-known guest IP: `192.168.15.253`
+- Last-known network: `lan-192.168.0.0/24`
+- Inventory network group: `lan-192.168.0.0/24`
+- Live IPs (from inventory):
+  - `192.168.15.253`
+  - `10.47.225.60`
+  - `192.168.0.203`
+  - `192.168.65.5`
+  - `192.168.64.10`
   - `192.168.64.6`
   - `fd21:69d4:6afd:fa50:dc8c:2918:43ca:d40d`
   - `fe80::cadd:6589:4e14:8590`
-- Last-known IP confidence: `live-confirmed via UTM query ip on 2026-04-07T16:20:45Z`
+- Last-known IP confidence: `sourced from vm_lab_inventory.json (authoritative; multi-homed after LAN bridging)`
 - Suggested Rustynet node ID: `aux-1`
 - Suggested lab role: `aux`
 - Suggested mesh IP: `100.64.0.4`
 - SSH operator key: `~/.ssh/rustynet_lab_ed25519`
 - Suggested connect template:
-  `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.64.6`
+  `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.15.253`
+
+### VM 3
+
+- Display name: `Fedora`
+- Inventory alias: `fedora-utm-1`
+- Bundle path:
+  `/Users/iwan/Desktop/OS_images/UTM images/Fedora.utm`
+- Guest OS family: `Fedora Linux 44 (Server Edition, aarch64)`
+- Last-known guest IP: `10.47.225.57`
+- Last-known network: `utm-shared-192.168.64.0/24`
+- Inventory network group: `utm-shared-192.168.64.0/24`
+- Live IPs (from inventory):
+  - `10.47.225.57`
+  - `192.168.64.20`
+- Inventory lab role: `fedora_client`
+- Inventory platform metadata:
+  - `platform=linux`
+- Exit-capable: `false`
+- Relay-capable: `false`
+- Suggested Rustynet node ID: `fedora-client-1`
+- Suggested mesh IP: `100.64.0.8`
+- Last-known Rustynet source dir: `/home/fedora/Rustynet`
+- Inventory SSH user: `fedora`
+- Inventory SSH target: `10.47.225.57`
+- SSH operator key: `~/.ssh/rustynet_lab_ed25519`
+- Suggested connect template:
+  `ssh -i ~/.ssh/rustynet_lab_ed25519 fedora@10.47.225.57`
+- Operator note:
+  onboarded via commit `e878936` as a Fedora Server 44 Linux client for
+  cross-distro live-lab coverage; not one of the core Debian live-lab nodes.
+
+### VM 4
+
+- Display name: `ubuntu`
+- Inventory alias: `ubuntu-utm-1`
+- Bundle path:
+  `/Users/iwan/Desktop/OS_images/UTM images/ubuntu.utm`
+- Guest OS family: `Ubuntu Server 24.04 LTS (Noble Numbat, aarch64)`
+- Last-known guest IP: `192.168.64.21`
+- Last-known network: `utm-shared-192.168.64.0/24`
+- Inventory network group: `utm-shared-192.168.64.0/24`
+- Live IPs (from inventory):
+  - `192.168.64.21`
+- Inventory lab role: `ubuntu_client`
+- Inventory platform metadata:
+  - `platform=linux`
+- Exit-capable: `false`
+- Relay-capable: `false`
+- Suggested Rustynet node ID: `ubuntu-client-1`
+- Suggested mesh IP: `100.64.0.9`
+- Last-known Rustynet source dir: `/home/ubuntu/Rustynet`
+- Inventory SSH user: `ubuntu`
+- Inventory SSH target: `192.168.64.21`
+- SSH operator key: `~/.ssh/rustynet_lab_ed25519`
+- Suggested connect template:
+  `ssh -i ~/.ssh/rustynet_lab_ed25519 ubuntu@192.168.64.21`
+- Operator note:
+  onboarded via commit `e878936` as an Ubuntu Server 24.04 Linux client for
+  cross-distro live-lab coverage; not one of the core Debian live-lab nodes.
 
 ### VM 5
 
-- Display name: `debian-headless-5`
+- Display name: `macOS`
+- Inventory alias: `macos-utm-1`
 - Bundle path:
-  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-5.utm`
-- UTM UUID: `72E7F328-6080-4A22-80A7-F601DCA592B0`
-- Guest OS family: `Debian/Linux`
-- Backend: `QEMU`
-- Architecture: `aarch64`
-- Memory: `2048 MB`
-- Network adapters:
-  - Shared NIC MAC: `3E:AE:A9:5A:61:82`
-- Last-known guest IP: `192.168.64.7`
-- Live IPs from UTM query:
-  - `192.168.64.7`
-  - `fd21:69d4:6afd:fa50:f0c2:96e5:4c55:6a59`
-  - `fe80::a42a:e764:39c7:4f33`
-- Last-known IP confidence: `live-confirmed via UTM query ip on 2026-04-07T16:20:45Z`
-- Suggested Rustynet node ID: `extra-1`
-- Suggested lab role: `extra`
-- Suggested mesh IP: `100.64.0.5`
+  `/Users/iwan/Desktop/OS_images/UTM images/macOS.utm`
+- Guest OS family: `macOS 26.5 (arm64)`
+- Backend: `Apple Virtualization` (UTM Apple backend; `utmctl exec` is
+  unavailable — recover via serial console / VNC per the Probe-and-Recover
+  Runbook)
+- Last-known guest IP: `192.168.65.2`
+- Last-known network: `lan-192.168.0.0/24`
+- Inventory network group: `lan-192.168.0.0/24`
+- Live IPs (from inventory):
+  - `192.168.65.2`
+  - `192.168.64.18`
+  - `192.168.0.210`
+- Inventory lab role: `macos_client`
+- Inventory platform metadata:
+  - `platform=macos`
+- Exit-capable: `false`
+- Relay-capable: `false`
+- Include in `--all`: `false` (recovery/sidecar guest, excluded from bulk lab
+  selection)
+- Suggested Rustynet node ID: `macos-client-1`
+- Suggested mesh IP: `100.64.0.7`
+- Last-known Rustynet source dir: `/Users/mac/Rustynet`
+- Inventory SSH user: `mac`
+- Inventory SSH target: `192.168.65.2`
 - SSH operator key: `~/.ssh/rustynet_lab_ed25519`
 - Suggested connect template:
-  `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.64.7`
+  `ssh -i ~/.ssh/rustynet_lab_ed25519 mac@192.168.65.2`
+- Operator note:
+  added 2026-05-21 on the Apple Virtualization backend (separate
+  `bridge101`/`192.168.65.0/24`); tracked for macOS bootstrap/service and
+  `--macos-vm` role validation, not as one of the core Linux live-lab nodes.
 
 ### VM 6
 
 - Display name: `Windows`
 - Inventory alias: `windows-utm-1`
 - Bundle path:
-  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/Windows.utm`
+  `/Users/iwan/Desktop/OS_images/UTM images/Windows.utm`
 - UTM UUID: `2CAECCF7-92FF-44E8-99B6-18C0FC9D9235`
 - Guest OS family: `Windows 11`
 - Backend: `QEMU`
-- Last-known guest IP: `192.168.64.14`
-- Last-known network: `utm-shared-192.168.64.0/24`
-- Inventory network group: `utm-shared-192.168.64.0/24`
+- Last-known guest IP: `192.168.15.241`
+- Last-known network: `lan-192.168.0.0/24`
+- Inventory network group: `lan-192.168.0.0/24`
 - Inventory lab role: `windows_client`
 - Inventory platform metadata:
   - `platform=windows`
   - `remote_shell=powershell`
   - `guest_exec_mode=windows_powershell`
   - `service_manager=windows_service`
+- Include in `--all`: `false` (recovery/sidecar guest, excluded from bulk lab
+  selection)
+- Suggested Rustynet node ID: `windows-client-1`
+- Suggested mesh IP: `100.64.0.6`
 - Last-known Rustynet source dir: `C:\Rustynet`
-- Inventory SSH user: `Administrator`
-- Inventory SSH target: `192.168.64.14`
+- UTM staging dir: `C:\Users\windows\rustynet-utm-stage`
+- Inventory SSH user: `windows`
+- Inventory SSH target: `192.168.15.241`
 - Operator note:
   this guest is tracked for Windows bootstrap/service validation and optional
-  `--windows-vm` sidecar orchestration, not as one of the five Linux live-lab
+  `--windows-vm` sidecar orchestration, not as one of the core Linux live-lab
   nodes.
 
 ## Historical IP Evidence Used In This Pass
+
+> Superseded (2026-07-09): this section records the 2026-04-07 UTM `query ip`
+> pass and is retained as historical evidence only. Three of the guests below
+> (`192.168.64.3`/`.5`/`.7` = debian-headless-1/3/5) were later removed and the
+> Windows guest re-IP'd to `192.168.15.241`. For current per-node addresses use
+> the VM sections above and `vm_lab_inventory.json` (authoritative).
 
 Current live guest IPs from UTM `query ip`:
 
