@@ -34,6 +34,18 @@ pub(super) fn command(program: &str) -> Command {
     c
 }
 
+/// A [`Command`] with a fully cleared environment except a pinned
+/// [`TRUSTED_PATH`]. Use this when spawning a **shell** as root (e.g. `bash`),
+/// because a shell honors additional env-based code-execution channels that PATH
+/// pinning does not cover — `BASH_ENV`/`ENV` (a script sourced at startup) and
+/// exported shell functions (`BASH_FUNC_*`). Clearing the environment neutralizes
+/// those; the installer's shell scripts take all input via argv, never env.
+pub(super) fn command_clean(program: &str) -> Command {
+    let mut c = Command::new(program);
+    c.env_clear().env("PATH", TRUSTED_PATH);
+    c
+}
+
 /// Resolve the node id: the explicit `--node-id`, else the host's name.
 pub(super) fn resolve_node_id(node_id: &Option<String>) -> Result<String, String> {
     if let Some(id) = node_id {
