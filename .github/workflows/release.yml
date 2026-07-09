@@ -1,0 +1,251 @@
+name: Release (multi-OS signed binaries + manifest)
+
+# Tag-triggered release pipeline (Phase 1 of the installer plan). For every
+# supported OS x CPU target it builds the shipping binaries (rustynetd,
+# rustynet, rustynet-relay), then a single aggregation job produces the
+# ed25519-SIGNED release manifest (crate: rustynet-cli `ops create-release-manifest`)
+# that lists every artifact's sha256. That manifest is the installer's trust
+# root (finding SR-017: digest+signature verified before execution) and is the
+# ALWAYS-required signature. Per-OS code signing (Authenticode / codesign /
+# GPG) is an ADDITIONAL, layered signature for OS-native trust (Gatekeeper /
+# SmartScreen) and is applied conditionally when the relevant secret is present
+# — so this pipeline proves the whole build->manifest->publish mechanics with
+# only the (free) manifest key configured, and the paid code-signing certs slot
+# in later without touching the trust root.
+#
+# Required GitHub Secret (fail-loud on a real tag push):
+#   RUSTYNET_RELEASE_MANIFEST_SEED_HEX  — 64 hex chars (32-byte ed25519 seed).
+#     Generate once, store as a secret; its PUBLIC verifier key (printed by the
+#     `manifest` job) is what the Phase-2 installer pins. NEVER commit the seed.
+#
+# Optional per-OS code-signing secrets (steps skip cleanly when absent):
+#   RUSTYNET_SIGNING_PFX_BASE64 / RUSTYNET_SIGNING_PFX_PASSWORD  — Windows Authenticode
+#   RUSTYNET_GPG_PRIVATE_KEY / RUSTYNET_GPG_KEY_ID               — Linux detached .sig
+#   (macOS uses ad-hoc codesign in this phase; Developer-ID + notarization is a follow-up.)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build + manifest only; do not upload to a GitHub Release"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write # release upload
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: "", family: linux }
+          # Native ARM Linux runner (free for public repos). If unavailable in
+          # your plan, swap for a cross-compile leg on ubuntu-latest.
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: "", family: linux }
+          - { os: macos-14, target: aarch64-apple-darwin, ext: "", family: macos }
+          - { os: macos-13, target: x86_64-apple-darwin, ext: "", family: macos }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, ext: ".exe", family: windows }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pinned toolchain + target
+        run: |
+          # `rustup show` installs the toolchain pinned in rust-toolchain.toml.
+          rustup show
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build shipping binaries
+        run: |
+          set -euxo pipefail
+          T="${{ matrix.target }}"
+          cargo build --release --locked --target "$T" -p rustynetd
+          cargo build --release --locked --target "$T" -p rustynet-cli --bin rustynet-cli
+          cargo build --release --locked --target "$T" -p rustynet-relay --features daemon
+
+      - name: Stage binaries as <name>-<target>[.exe]
+        run: |
+          set -euxo pipefail
+          T="${{ matrix.target }}"
+          X="${{ matrix.ext }}"
+          BIN="target/$T/release"
+          mkdir -p dist
+          cp "$BIN/rustynetd$X"      "dist/rustynetd-$T$X"
+          # rustynet-cli ships as `rustynet`.
+          cp "$BIN/rustynet-cli$X"   "dist/rustynet-$T$X"
+          cp "$BIN/rustynet-relay$X" "dist/rustynet-relay-$T$X"
+          ls -la dist
+
+      # --- Optional per-OS code signing (layered on top of the manifest) ---
+      # `secrets.*` is not reliable inside a step `if:`, so detect presence in a
+      # run step (secrets are allowed in `env:`) and gate on the output.
+      - name: Detect optional signing secrets
+        id: sig
+        env:
+          PFX: ${{ secrets.RUSTYNET_SIGNING_PFX_BASE64 }}
+          GPG: ${{ secrets.RUSTYNET_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -n "${PFX:-}" ]; then echo "windows=true" >> "$GITHUB_OUTPUT"; else echo "windows=false" >> "$GITHUB_OUTPUT"; fi
+          if [ -n "${GPG:-}" ]; then echo "linux=true" >> "$GITHUB_OUTPUT"; else echo "linux=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Windows Authenticode sign (if PFX secret present)
+        if: matrix.family == 'windows' && steps.sig.outputs.windows == 'true'
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.RUSTYNET_SIGNING_PFX_BASE64 }}
+          RUSTYNET_SIGNING_PFX_PASSWORD: ${{ secrets.RUSTYNET_SIGNING_PFX_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'release-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_BASE64))
+          icacls $pfx /inheritance:r | Out-Null
+          icacls $pfx /grant:r "$($env:USERNAME):F" | Out-Null
+          $ts = $env:RUSTYNET_SIGNING_TIMESTAMP_URL
+          if ([string]::IsNullOrEmpty($ts)) { $ts = 'http://timestamp.digicert.com' }
+          Get-ChildItem dist -Filter *.exe | ForEach-Object {
+            & .\scripts\release\Sign-RustyNetWindowsBinary.ps1 `
+              -BinaryPath $_.FullName `
+              -CertificatePath $pfx `
+              -CertificatePasswordEnvVar 'RUSTYNET_SIGNING_PFX_PASSWORD' `
+              -TimestampUrl $ts
+          }
+          Remove-Item -LiteralPath $pfx -Force
+          # W2.1b: our own WinVerifyTrust wrapper is the final say on a
+          # release-signed binary. Use the signed rustynetd to validate every
+          # signed exe; fail the release if any does not pass.
+          $rd = (Get-ChildItem dist -Filter 'rustynetd-*.exe' | Select-Object -First 1).FullName
+          Get-ChildItem dist -Filter *.exe | ForEach-Object {
+            & $rd windows-authenticode-check --binary-path $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "W2.1b chain validation failed for $($_.Name)" }
+          }
+
+      - name: macOS ad-hoc codesign (Developer-ID + notarization is a follow-up)
+        if: matrix.family == 'macos'
+        run: |
+          set -euxo pipefail
+          # Ad-hoc signature (`-s -`) has no trust chain but proves the signing
+          # step and satisfies local codesign checks. Swap for a Developer-ID
+          # identity + notarytool staple once the Apple cert is provisioned.
+          for f in dist/*-"${{ matrix.target }}"; do
+            codesign --force --timestamp=none --sign - "$f" || true
+          done
+
+      - name: Linux GPG detached signatures (if key secret present)
+        if: matrix.family == 'linux' && steps.sig.outputs.linux == 'true'
+        env:
+          RUSTYNET_GPG_PRIVATE_KEY: ${{ secrets.RUSTYNET_GPG_PRIVATE_KEY }}
+          RUSTYNET_GPG_KEY_ID: ${{ secrets.RUSTYNET_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          echo "$RUSTYNET_GPG_PRIVATE_KEY" | gpg --batch --import
+          for f in dist/*-"${{ matrix.target }}"; do
+            gpg --batch --yes --local-user "$RUSTYNET_GPG_KEY_ID" --armor --detach-sign "$f"
+          done
+
+      - name: Upload built binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bins-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  manifest:
+    name: sign manifest + publish
+    needs: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Download all built binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: bins-*
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve manifest signing seed
+        id: seed
+        env:
+          SEED: ${{ secrets.RUSTYNET_RELEASE_MANIFEST_SEED_HEX }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SEED:-}" ]; then
+            printf '%s' "$SEED" > "$RUNNER_TEMP/manifest-seed.hex"
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # No secret on a manual dry-run: generate a throwaway DEMO seed so the
+            # build->manifest->verify mechanics can be validated. NOT for pinning.
+            openssl rand -hex 32 > "$RUNNER_TEMP/manifest-seed.hex"
+            echo "::warning::RUSTYNET_RELEASE_MANIFEST_SEED_HEX not set — using a throwaway DEMO seed (verifier key will not be stable)."
+            echo "mode=demo" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::RUSTYNET_RELEASE_MANIFEST_SEED_HEX is not configured — cannot sign the release manifest. No unsigned fallback."
+            exit 1
+          fi
+
+      - name: Create + verify the signed release manifest
+        env:
+          TARGETS: "x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc"
+          NAMES: "rustynetd rustynet rustynet-relay"
+        run: |
+          set -euo pipefail
+          args=()
+          for t in $TARGETS; do
+            ext=""; case "$t" in *windows*) ext=".exe";; esac
+            for n in $NAMES; do
+              f="dist/${n}-${t}${ext}"
+              if [ -f "$f" ]; then args+=(--artifact "${n}:${t}:${f}"); fi
+            done
+          done
+          if [ "${#args[@]}" -eq 0 ]; then
+            echo "::error::no built binaries found under dist/ to put in the manifest"; exit 1
+          fi
+          # Build rustynet-cli once, then invoke it (avoids recompiling per call).
+          cargo build --release --locked -p rustynet-cli --bin rustynet-cli
+          CLI="target/release/rustynet-cli"
+          "$CLI" ops create-release-manifest "${args[@]}" \
+            --signing-seed-file "$RUNNER_TEMP/manifest-seed.hex" \
+            --release-track beta \
+            --key-id "ed25519:release" \
+            --output dist/release-manifest.json
+          VKEY="$(python3 -c "import json;print(json.load(open('dist/release-manifest.json'))['verifier_key_hex'])")"
+          printf '%s\n' "$VKEY" > dist/release-manifest.verifier-key.hex
+          # Gate: the manifest signature + every artifact digest must verify.
+          "$CLI" ops verify-release-manifest \
+            --manifest dist/release-manifest.json \
+            --pinned-verifier-key-hex "$VKEY" \
+            --artifacts-dir dist
+          echo "::notice::Release manifest verifier key (PIN THIS in the installer): $VKEY"
+
+      - name: Generate release SBOM
+        run: |
+          cargo run --release --quiet --locked -p rustynet-cli -- ops generate-release-sbom
+          cp artifacts/release/sbom.cargo-metadata.json artifacts/release/sbom.sha256 dist/
+
+      - name: Upload everything to the GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/rustynetd-*
+            dist/rustynet-*
+            dist/release-manifest.json
+            dist/release-manifest.verifier-key.hex
+            dist/sbom.cargo-metadata.json
+            dist/sbom.sha256
