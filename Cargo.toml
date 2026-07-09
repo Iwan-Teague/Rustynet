@@ -33,8 +33,12 @@ exclude = ["gui", "crates/rustynet-lab-monitor"]
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
-license = "MIT"
-authors = ["Rustynet Team"]
+# Source-available, noncommercial. See ./LICENSE for the full text + the
+# third_party/ carve-out. Not open source (yet): commercial use requires a
+# separate license from the copyright holder; may be relicensed to a permissive
+# open-source license at a future stable release.
+license = "PolyForm-Noncommercial-1.0.0"
+authors = ["Iwan Teague"]
 
 [workspace.dependencies]
 rand = "0.9.3"
