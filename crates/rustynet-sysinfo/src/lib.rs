@@ -6778,6 +6778,177 @@ fn performance_regression_detection_internal(
     regressions
 }
 
+// ============================================================================
+// Host facts — OS family / Linux distro / CPU arch detection for the installer.
+// The install engine's detect step needs to know which OS family it is on, which
+// package manager provisions prerequisites (Linux), the CPU arch, and the release
+// target-triple to fetch. Kept std-only and fail-closed (unknown -> Unsupported /
+// None), so the caller never guesses.
+// ============================================================================
+
+/// Operating-system family. `Unsupported` is the fail-closed default for any OS
+/// the installer does not handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsFamily {
+    Linux,
+    Macos,
+    Windows,
+    Unsupported,
+}
+
+/// The package-manager family used to provision runtime prerequisites on Linux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PkgFamily {
+    /// Debian / Ubuntu / Mint family (`apt-get`).
+    Apt,
+    /// Fedora / RHEL / Rocky / Alma / CentOS family (`dnf`).
+    Dnf,
+}
+
+/// Resolved facts about the host the installer runs on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostFacts {
+    pub family: OsFamily,
+    /// `/etc/os-release` `ID` (lowercased), e.g. `debian`, `ubuntu`, `fedora`,
+    /// `rocky`. `None` off Linux or if os-release is unreadable.
+    pub distro_id: Option<String>,
+    /// `/etc/os-release` `ID_LIKE` tokens (lowercased), e.g. `["rhel","fedora"]`.
+    pub distro_like: Vec<String>,
+    /// CPU architecture from `std::env::consts::ARCH` (e.g. `x86_64`, `aarch64`).
+    pub arch: String,
+    /// Package-manager family for prereq provisioning; `None` off Linux or for an
+    /// unrecognized distro (fail-closed: the caller must not guess a manager).
+    pub pkg_family: Option<PkgFamily>,
+}
+
+impl HostFacts {
+    /// The release target-triple for this host, matching the artifact names the
+    /// release pipeline publishes (the `release.yml` matrix). `None` if this
+    /// `(family, arch)` is not a published target — the verified-download step
+    /// must then fail closed rather than fetch a wrong-arch binary.
+    pub fn target_triple(&self) -> Option<&'static str> {
+        match (self.family, self.arch.as_str()) {
+            (OsFamily::Linux, "x86_64") => Some("x86_64-unknown-linux-gnu"),
+            (OsFamily::Linux, "aarch64") => Some("aarch64-unknown-linux-gnu"),
+            (OsFamily::Macos, "aarch64") => Some("aarch64-apple-darwin"),
+            (OsFamily::Macos, "x86_64") => Some("x86_64-apple-darwin"),
+            (OsFamily::Windows, "x86_64") => Some("x86_64-pc-windows-msvc"),
+            _ => None,
+        }
+    }
+}
+
+/// Detect host facts for the current process: OS family from
+/// `std::env::consts::OS`, arch from `std::env::consts::ARCH`, and — on Linux —
+/// the distro identity + package family from `/etc/os-release` (falling back to
+/// `/usr/lib/os-release`).
+pub fn host_facts() -> HostFacts {
+    let family = match std::env::consts::OS {
+        "linux" => OsFamily::Linux,
+        "macos" => OsFamily::Macos,
+        "windows" => OsFamily::Windows,
+        _ => OsFamily::Unsupported,
+    };
+    let arch = std::env::consts::ARCH.to_owned();
+    let (distro_id, distro_like) = if family == OsFamily::Linux {
+        read_os_release()
+            .map(|content| parse_os_release(&content))
+            .unwrap_or((None, Vec::new()))
+    } else {
+        (None, Vec::new())
+    };
+    let pkg_family = if family == OsFamily::Linux {
+        pkg_family_for(distro_id.as_deref(), &distro_like)
+    } else {
+        None
+    };
+    HostFacts {
+        family,
+        distro_id,
+        distro_like,
+        arch,
+        pkg_family,
+    }
+}
+
+fn read_os_release() -> Option<String> {
+    fs::read_to_string("/etc/os-release")
+        .or_else(|_| fs::read_to_string("/usr/lib/os-release"))
+        .ok()
+}
+
+/// Parse `/etc/os-release` (a shell-like `KEY=value` file; values may be quoted)
+/// for `ID` and `ID_LIKE`, both lowercased. `ID_LIKE` is space-separated.
+fn parse_os_release(content: &str) -> (Option<String>, Vec<String>) {
+    let mut id = None;
+    let mut id_like = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("ID=") {
+            id = Some(unquote(rest).to_ascii_lowercase());
+        } else if let Some(rest) = line.strip_prefix("ID_LIKE=") {
+            id_like = unquote(rest)
+                .split_whitespace()
+                .map(|token| token.to_ascii_lowercase())
+                .collect();
+        }
+    }
+    (id, id_like)
+}
+
+fn unquote(value: &str) -> &str {
+    let v = value.trim();
+    v.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(v)
+}
+
+/// Map a distro to its package-manager family: exact `ID` first, then `ID_LIKE`
+/// fallback. Returns `None` for an unrecognized distro so the installer fails
+/// closed instead of guessing a package manager.
+fn pkg_family_for(distro_id: Option<&str>, distro_like: &[String]) -> Option<PkgFamily> {
+    const APT: &[&str] = &[
+        "debian",
+        "ubuntu",
+        "linuxmint",
+        "mint",
+        "pop",
+        "raspbian",
+        "elementary",
+        "neon",
+        "devuan",
+    ];
+    const DNF: &[&str] = &[
+        "fedora",
+        "rhel",
+        "centos",
+        "rocky",
+        "almalinux",
+        "alma",
+        "ol",
+        "oracle",
+        "amzn",
+    ];
+    if let Some(id) = distro_id {
+        if APT.contains(&id) {
+            return Some(PkgFamily::Apt);
+        }
+        if DNF.contains(&id) {
+            return Some(PkgFamily::Dnf);
+        }
+    }
+    for like in distro_like {
+        if APT.contains(&like.as_str()) {
+            return Some(PkgFamily::Apt);
+        }
+        if DNF.contains(&like.as_str()) {
+            return Some(PkgFamily::Dnf);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_arp_n_row;
@@ -7179,5 +7350,109 @@ short
         assert_eq!(z.total, 0);
         let h = super::parse_proc_net_tcp_states("sl local rem st ...\n");
         assert_eq!(h.total, 0);
+    }
+
+    #[test]
+    fn parse_os_release_debian_and_ubuntu() {
+        let (id, like) = super::parse_os_release(
+            "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID=\"24.04\"\n",
+        );
+        assert_eq!(id.as_deref(), Some("ubuntu"));
+        assert_eq!(like, vec!["debian".to_owned()]);
+        assert_eq!(
+            super::pkg_family_for(id.as_deref(), &like),
+            Some(super::PkgFamily::Apt)
+        );
+
+        let (id, _) = super::parse_os_release("ID=debian\nVERSION_ID=\"13\"\n");
+        assert_eq!(id.as_deref(), Some("debian"));
+        assert_eq!(
+            super::pkg_family_for(id.as_deref(), &[]),
+            Some(super::PkgFamily::Apt)
+        );
+    }
+
+    #[test]
+    fn parse_os_release_fedora_and_rocky() {
+        let (id, like) = super::parse_os_release("ID=fedora\nVERSION_ID=44\n");
+        assert_eq!(id.as_deref(), Some("fedora"));
+        assert!(like.is_empty());
+        assert_eq!(
+            super::pkg_family_for(id.as_deref(), &like),
+            Some(super::PkgFamily::Dnf)
+        );
+
+        // Rocky: quoted ID + multi-token quoted ID_LIKE.
+        let (id, like) = super::parse_os_release("ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n");
+        assert_eq!(id.as_deref(), Some("rocky"));
+        assert_eq!(like, vec!["rhel", "centos", "fedora"]);
+        assert_eq!(
+            super::pkg_family_for(id.as_deref(), &like),
+            Some(super::PkgFamily::Dnf)
+        );
+    }
+
+    #[test]
+    fn pkg_family_falls_back_to_id_like_then_none() {
+        // Unknown ID, but ID_LIKE tells us the family.
+        assert_eq!(
+            super::pkg_family_for(Some("somederivative"), &["ubuntu".to_owned()]),
+            Some(super::PkgFamily::Apt)
+        );
+        assert_eq!(
+            super::pkg_family_for(Some("weirdrhelclone"), &["rhel".to_owned()]),
+            Some(super::PkgFamily::Dnf)
+        );
+        // Unrecognized distro -> None (fail closed, do not guess).
+        assert_eq!(
+            super::pkg_family_for(Some("arch"), &["archlinux".to_owned()]),
+            None
+        );
+        assert_eq!(super::pkg_family_for(None, &[]), None);
+    }
+
+    #[test]
+    fn target_triple_maps_published_targets_and_rejects_others() {
+        use super::{HostFacts, OsFamily};
+        let mk = |family, arch: &str| HostFacts {
+            family,
+            distro_id: None,
+            distro_like: Vec::new(),
+            arch: arch.to_owned(),
+            pkg_family: None,
+        };
+        assert_eq!(
+            mk(OsFamily::Linux, "x86_64").target_triple(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            mk(OsFamily::Linux, "aarch64").target_triple(),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            mk(OsFamily::Macos, "aarch64").target_triple(),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(
+            mk(OsFamily::Macos, "x86_64").target_triple(),
+            Some("x86_64-apple-darwin")
+        );
+        assert_eq!(
+            mk(OsFamily::Windows, "x86_64").target_triple(),
+            Some("x86_64-pc-windows-msvc")
+        );
+        // Unpublished (family, arch) pairs must fail closed.
+        assert_eq!(mk(OsFamily::Linux, "riscv64").target_triple(), None);
+        assert_eq!(mk(OsFamily::Windows, "aarch64").target_triple(), None);
+        assert_eq!(mk(OsFamily::Unsupported, "x86_64").target_triple(), None);
+    }
+
+    #[test]
+    fn host_facts_reports_a_supported_family_on_the_test_host() {
+        // Smoke test: on any dev/CI host (linux/macos/windows) the family is
+        // resolved and arch is populated.
+        let facts = super::host_facts();
+        assert!(!facts.arch.is_empty());
+        assert_ne!(facts.family, super::OsFamily::Unsupported);
     }
 }
