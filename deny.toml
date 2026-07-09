@@ -70,6 +70,10 @@ wrappers = []
 [licenses]
 confidence-threshold = 0.8
 allow = [
+  # Rustynet's own (first-party) source-available license, applied to the
+  # workspace crates via [workspace.package] license. Third-party dependencies
+  # must still be one of the permissive licenses listed below. See ./LICENSE.
+  "PolyForm-Noncommercial-1.0.0",
   "MIT",
   "Apache-2.0",
   "Unicode-3.0",

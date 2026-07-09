@@ -1,5 +1,15 @@
 # Rustynet
 
+> **License — source-available, not (yet) open source.** Rustynet is licensed
+> under the [PolyForm Noncommercial License 1.0.0](./LICENSE): you may read, run,
+> modify, and share it freely for any **non-commercial** purpose (personal, home,
+> research, education, security auditing), but **commercial use is not granted**
+> and requires a separate license from the copyright holder. This is an
+> early-stage project and may be relicensed under a permissive open-source
+> license at a future stable release. Vendored `third_party/` components (e.g.
+> `boringtun`, BSD-3-Clause) and crates.io dependencies keep their own licenses.
+> Copyright © 2026 Iwan Teague.
+
 ## Current Focus
 
 - finish an honest production transport-owning backend for traversal and relay on the real peer-traffic path
