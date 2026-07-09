@@ -2,6 +2,7 @@
 
 mod anchor_init;
 mod env_file;
+mod install;
 mod live_lab_coverage;
 mod live_lab_results;
 mod live_lab_run_matrix;
@@ -168,6 +169,10 @@ enum CliCommand {
     /// daemon's gossip routing table.
     Enrollment(Box<EnrollmentCliCommand>),
     Trust(Box<TrustCommand>),
+    /// `rustynet install` — the cross-OS installer. Holds the raw flags so
+    /// parse errors surface with a proper exit code (via `execute`) instead of
+    /// being swallowed into a help dump.
+    Install(Vec<String>),
     Ops(Box<OpsCommand>),
     Node(NodeCommand),
     Policy(PolicyCommand),
@@ -1875,6 +1880,7 @@ fn parse_command(args: &[String]) -> CliCommand {
             Ok(command) => CliCommand::Enrollment(Box::new(command)),
             Err(_) => CliCommand::Help,
         },
+        [cmd, rest @ ..] if cmd == "install" => CliCommand::Install(rest.to_vec()),
         [cmd, rest @ ..] if cmd == "trust" => match parse_trust_command(rest) {
             Ok(command) => CliCommand::Trust(Box::new(command)),
             Err(_) => CliCommand::Help,
@@ -5785,6 +5791,9 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Anchor(command) => execute_anchor(*command),
         CliCommand::Enrollment(command) => execute_enrollment(*command),
         CliCommand::Trust(command) => execute_trust(*command),
+        CliCommand::Install(args) => {
+            install::InstallRequest::from_args(&args).and_then(install::run)
+        }
         CliCommand::Ops(command) => execute_ops(*command),
         CliCommand::Node(command) => execute_node(command),
         CliCommand::Policy(command) => execute_policy(command),
@@ -15439,6 +15448,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::Capability(_)
         | CliCommand::Llm(_)
         | CliCommand::Anchor(_)
+        | CliCommand::Install(_)
         | CliCommand::ConnectivityTest
         | CliCommand::PeerStats
         | CliCommand::Bandwidth
@@ -18764,6 +18774,7 @@ fn help_text() -> String {
         "  metrics",
         "  dns-test [<domain>]",
         "  state refresh",
+        "  install [--role node|relay|exit|anchor] [--dry-run] [--unattended] [--from-dir <abs> | --build-from-source] [--owner-key-file <abs>] [--owner-key-thumbprint <hex>] [--uninstall]",
         "  operator menu",
         "  exit-node select <node>",
         "  exit-node off",
