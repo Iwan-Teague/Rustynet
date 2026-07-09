@@ -12,6 +12,8 @@
 //! `--dry-run` is fully functional today: it detects the host and prints exactly
 //! what a live run would do, per OS, mutating nothing.
 
+mod acquire;
+
 use rustynet_sysinfo::{HostFacts, OsFamily, PkgFamily, host_facts};
 use std::path::PathBuf;
 
@@ -200,14 +202,36 @@ pub fn run(req: InstallRequest) -> Result<String, String> {
     if req.dry_run {
         return Ok(rendered);
     }
-    // Fail closed rather than half-install: the live mutation steps (acquire,
-    // prereqs, place, custody, trust-anchor, service register) are landing
-    // incrementally on top of this planner. Preview with --dry-run.
+    if req.uninstall {
+        return Err(format!(
+            "{rendered}\n\nlive uninstall is not yet wired; it lands with the install mutation steps."
+        ));
+    }
+
+    // Live install — execute the steps in order, fail-closed on any error. Steps
+    // are wired incrementally; until a step lands, execution stops here rather
+    // than half-installing.
+    let ext = binary_ext(facts.family);
+    let staging =
+        std::env::temp_dir().join(format!("rustynet-install-staging-{}", std::process::id()));
+    let acquired = acquire::acquire(&req.acquisition, triple, ext, &staging)?;
+    let count = acquire::SHIPPING.len();
+    let notes = acquired.notes.join("; ");
+    // Nothing downstream consumes the staged binaries yet, so don't leave them.
+    let _ = std::fs::remove_dir_all(&acquired.staging_dir);
     Err(format!(
-        "{rendered}\n\nlive `rustynet install` execution is not yet wired in this build — \
-         re-run with --dry-run to preview, or use the per-OS `ops install-*` verbs directly. \
-         (engine mutation steps land incrementally)"
+        "{rendered}\n\nacquire OK — staged + verified {count} shipping binaries ({notes}).\n\
+         Remaining live steps (prerequisites, place binaries + identities, key custody, \
+         trust anchor, service register) are not yet wired; they land incrementally. \
+         Preview the full plan with --dry-run."
     ))
+}
+
+fn binary_ext(family: OsFamily) -> &'static str {
+    match family {
+        OsFamily::Windows => ".exe",
+        _ => "",
+    }
 }
 
 fn validate_host(facts: &HostFacts) -> Result<(), String> {
