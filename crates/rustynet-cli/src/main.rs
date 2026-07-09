@@ -26,9 +26,11 @@ mod ops_network_discovery;
 mod ops_peer_store;
 mod ops_phase1;
 mod ops_phase9;
+mod ops_release_manifest;
 mod ops_security_audit;
 mod ops_security_audit_workflows;
 mod ops_write_daemon_env;
+mod release_manifest;
 mod security_audit_catalog;
 mod vm_lab;
 
@@ -1079,6 +1081,20 @@ enum OpsCommand {
         verifier_dest: PathBuf,
         trust_dest: PathBuf,
         daemon_group: String,
+    },
+    CreateReleaseManifest {
+        artifacts: Vec<String>,
+        release_track: String,
+        signing_seed_file: PathBuf,
+        key_id: String,
+        output: PathBuf,
+        generated_at_unix: u64,
+    },
+    VerifyReleaseManifest {
+        manifest: PathBuf,
+        pinned_verifier_key_hex: Option<String>,
+        pinned_verifier_key_file: Option<PathBuf>,
+        artifacts_dir: Option<PathBuf>,
     },
     ApplyManagedDnsRouting,
     ClearManagedDnsRouting,
@@ -4456,6 +4472,36 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 .value("--daemon-group")
                 .unwrap_or_else(|| "rustynetd".to_owned()),
         }),
+        "create-release-manifest" => {
+            let generated_at_unix = match parser.value("--generated-at-unix") {
+                Some(raw) => raw
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid --generated-at-unix: {err}"))?,
+                None => SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            };
+            Ok(OpsCommand::CreateReleaseManifest {
+                artifacts: collect_repeated_option_values(&args[1..], "--artifact"),
+                release_track: parser
+                    .value("--release-track")
+                    .unwrap_or_else(|| "beta".to_owned()),
+                signing_seed_file: parser.required_path("--signing-seed-file")?,
+                key_id: parser
+                    .value("--key-id")
+                    .unwrap_or_else(|| "ed25519:release".to_owned()),
+                output: parser.required_path("--output")?,
+                generated_at_unix,
+            })
+        }
+        "verify-release-manifest" => Ok(OpsCommand::VerifyReleaseManifest {
+            manifest: parser.required_path("--manifest")?,
+            pinned_verifier_key_hex: parser.value("--pinned-verifier-key-hex"),
+            pinned_verifier_key_file: parser.optional_path("--pinned-verifier-key-file"),
+            artifacts_dir: parser.optional_path("--artifacts-dir"),
+        }),
         "apply-managed-dns-routing" => {
             if args.len() != 1 {
                 return Err("ops apply-managed-dns-routing does not accept options".to_owned());
@@ -7640,6 +7686,32 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             verifier_dest,
             trust_dest,
             daemon_group,
+        ),
+        OpsCommand::CreateReleaseManifest {
+            artifacts,
+            release_track,
+            signing_seed_file,
+            key_id,
+            output,
+            generated_at_unix,
+        } => ops_release_manifest::execute_ops_create_release_manifest(
+            artifacts,
+            release_track,
+            signing_seed_file,
+            key_id,
+            output,
+            generated_at_unix,
+        ),
+        OpsCommand::VerifyReleaseManifest {
+            manifest,
+            pinned_verifier_key_hex,
+            pinned_verifier_key_file,
+            artifacts_dir,
+        } => ops_release_manifest::execute_ops_verify_release_manifest(
+            manifest,
+            pinned_verifier_key_hex,
+            pinned_verifier_key_file,
+            artifacts_dir,
         ),
         OpsCommand::ApplyManagedDnsRouting => execute_ops_apply_managed_dns_routing(),
         OpsCommand::ClearManagedDnsRouting => execute_ops_clear_managed_dns_routing(),
@@ -18856,6 +18928,8 @@ fn help_text() -> String {
         "  ops start-assignment-refresh-service",
         "  ops check-assignment-refresh-availability",
         "  ops install-trust-material --verifier-source <absolute-path> --trust-source <absolute-path> --verifier-dest <absolute-path> --trust-dest <absolute-path> [--daemon-group <group>]",
+        "  ops create-release-manifest --artifact <name>:<target>:<path> [--artifact ...] --signing-seed-file <path> --output <path> [--release-track <track>] [--key-id <id>] [--generated-at-unix <secs>]",
+        "  ops verify-release-manifest --manifest <path> (--pinned-verifier-key-hex <hex> | --pinned-verifier-key-file <path>) [--artifacts-dir <dir>]",
         "  ops apply-managed-dns-routing",
         "  ops clear-managed-dns-routing",
         "  ops disconnect-cleanup",
