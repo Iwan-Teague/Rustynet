@@ -161,9 +161,65 @@ fn setup_key_custody() -> Result<(), String> {
     custody
 }
 
+/// The systemd unit templates `ops install-systemd` reads from
+/// `<source_root>/scripts/systemd/`, embedded so the installer works on a bare
+/// end-user machine that has only the binaries and no source checkout.
+const SYSTEMD_UNIT_TEMPLATES: &[(&str, &str)] = &[
+    (
+        "rustynetd.service",
+        include_str!("../../../../scripts/systemd/rustynetd.service"),
+    ),
+    (
+        "rustynetd-privileged-helper.service",
+        include_str!("../../../../scripts/systemd/rustynetd-privileged-helper.service"),
+    ),
+    (
+        "rustynetd-trust-refresh.service",
+        include_str!("../../../../scripts/systemd/rustynetd-trust-refresh.service"),
+    ),
+    (
+        "rustynetd-trust-refresh.timer",
+        include_str!("../../../../scripts/systemd/rustynetd-trust-refresh.timer"),
+    ),
+    (
+        "rustynetd-assignment-refresh.service",
+        include_str!("../../../../scripts/systemd/rustynetd-assignment-refresh.service"),
+    ),
+    (
+        "rustynetd-assignment-refresh.timer",
+        include_str!("../../../../scripts/systemd/rustynetd-assignment-refresh.timer"),
+    ),
+    (
+        "rustynetd-managed-dns.service",
+        include_str!("../../../../scripts/systemd/rustynetd-managed-dns.service"),
+    ),
+];
+
+/// Root-only staging root the embedded unit templates are materialized under so
+/// `ops install-systemd` can read them. Under /etc/rustynet (0750 root), so a
+/// non-root user cannot swap a template between materialize and read (a unit
+/// installed from a swapped template would run as root — a privesc hazard).
+const INSTALL_SRC_ROOT: &str = "/etc/rustynet/.install-src";
+
+/// Write the embedded systemd unit templates into a root-only source tree and
+/// return its path (for RUSTYNET_INSTALL_SOURCE_ROOT), so the install works with
+/// no repo on disk.
+fn materialize_systemd_source_root() -> Result<String, String> {
+    ensure_dir("/etc/rustynet", 0o750)?;
+    ensure_dir(INSTALL_SRC_ROOT, 0o700)?;
+    let scripts = format!("{INSTALL_SRC_ROOT}/scripts");
+    ensure_dir(&scripts, 0o700)?;
+    let systemd = format!("{scripts}/systemd");
+    ensure_dir(&systemd, 0o700)?;
+    for (name, body) in SYSTEMD_UNIT_TEMPLATES {
+        write_file(&Path::new(&systemd).join(name), body.as_bytes(), 0o600)?;
+    }
+    Ok(INSTALL_SRC_ROOT.to_owned())
+}
+
 /// Delegate user/dirs/units/service to `ops install-systemd`. Shelled with env
-/// via Command (set_var is forbidden-unsafe). Needs the scripts/systemd/ unit
-/// templates, resolved from cwd (a source checkout) or RUSTYNET_INSTALL_SOURCE_ROOT.
+/// via Command (set_var is forbidden-unsafe). The scripts/systemd/ unit templates
+/// are materialized from the embedded copies (no source checkout required).
 ///
 /// On a fresh, unenrolled node the daemon's ExecStartPre gate requires the
 /// trust-evidence + verifier-key that only enrollment delivers, so
@@ -173,8 +229,7 @@ fn setup_key_custody() -> Result<(), String> {
 /// the node is genuinely pre-enrollment (no trust-evidence file), report the
 /// clean awaiting-enrollment outcome; otherwise surface the real error.
 fn register_service(node_id: &str, role: &str) -> Result<String, String> {
-    let source_root = std::env::current_dir()
-        .map_err(|err| format!("cannot resolve the current dir for install-systemd: {err}"))?;
+    let source_root = materialize_systemd_source_root()?;
     let out = command(RUSTYNET)
         .args(["ops", "install-systemd"])
         .env("RUSTYNET_NODE_ID", node_id)
@@ -182,7 +237,10 @@ fn register_service(node_id: &str, role: &str) -> Result<String, String> {
         .env("RUSTYNET_INSTALL_SOURCE_ROOT", &source_root)
         .current_dir(&source_root)
         .output()
-        .map_err(|err| format!("failed to run `rustynet ops install-systemd`: {err}"))?;
+        .map_err(|err| format!("failed to run `rustynet ops install-systemd`: {err}"));
+    // The materialized templates are only needed during install; remove them.
+    let _ = std::fs::remove_dir_all(INSTALL_SRC_ROOT);
+    let out = out?;
 
     if out.status.success() {
         return Ok(if service_is_active("rustynetd.service") {
@@ -305,6 +363,35 @@ mod tests {
         let m = awaiting_enrollment_message();
         assert!(m.contains("enrollment"), "{m}");
         assert!(m.contains("enabled"), "{m}");
+    }
+
+    #[test]
+    fn embedded_systemd_templates_are_complete_and_nonempty() {
+        // ops install-systemd requires exactly these seven files under
+        // scripts/systemd/; the embedded copies must cover them and be non-empty.
+        let names: Vec<&str> = SYSTEMD_UNIT_TEMPLATES.iter().map(|(n, _)| *n).collect();
+        for expected in [
+            "rustynetd.service",
+            "rustynetd-privileged-helper.service",
+            "rustynetd-trust-refresh.service",
+            "rustynetd-trust-refresh.timer",
+            "rustynetd-assignment-refresh.service",
+            "rustynetd-assignment-refresh.timer",
+            "rustynetd-managed-dns.service",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing embedded template {expected}"
+            );
+        }
+        assert_eq!(SYSTEMD_UNIT_TEMPLATES.len(), 7);
+        for (name, body) in SYSTEMD_UNIT_TEMPLATES {
+            assert!(!body.trim().is_empty(), "empty template {name}");
+            assert!(
+                body.contains("[Unit]"),
+                "template {name} is not a unit file"
+            );
+        }
     }
 
     #[test]
