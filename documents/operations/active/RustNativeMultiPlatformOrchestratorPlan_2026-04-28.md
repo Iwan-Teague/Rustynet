@@ -1003,6 +1003,50 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   (same pre-existing, already-documented netplan gap above, unrelated to
   and unaffected by this move).
 
+- **2026-07-09 — hardened the fallout of the bundle relocation above: fixed the
+  discovery-scan regression it introduced, plus three `set_vm_internet_access`
+  robustness fixes found in review.** The relocation (previous entry) moved every
+  UTM bundle OUT of the sandbox container that `default_utm_documents_root()`
+  scans by default, but left the scan pointed there. On a successful-but-EMPTY
+  scan the old code hard-errored (`no UTM bundle directories found under …`)
+  instead of degrading — so `ops vm-lab-discover-local-utm-summary` (incl.
+  `--update-inventory-live-ips`, the *only* supported IP-refresh path, and the
+  refresh `apply_vm_bridged_network` runs internally) broke, even though every
+  node's real `bundle_path` was already in the inventory. The post-move check
+  (`diagnose_vm_lan_presence`) passed only because it reads inventory
+  `bundle_path` directly and bypasses the scan, so the break went unnoticed.
+  Fix (`crates/rustynet-cli/src/vm_lab/mod.rs`): extracted a pure
+  `resolve_discovery_bundle_paths` that degrades a successful-but-empty scan to
+  the inventory-recorded bundle paths — the same fallback the TCC scan-error arm
+  already used — erroring only when BOTH the scan and the inventory are empty.
+  The degradation note is now surfaced BOTH in the JSON report (`bundle_scan_error`)
+  and on the operator summary surface (`discovery_summary.bundle_scan_error` in
+  `render_local_utm_discovery_summary`) so the fallback is never silent. Added
+  `RUSTYNET_UTM_DOCUMENTS_ROOT` to `default_utm_documents_root()` so the scan can
+  be pointed at the relocated library to also auto-discover NEW un-inventoried
+  bundles (no hardcoded machine path in the repo; defaults to the container when
+  unset). 4 new unit tests over the fallback matrix. **Live-verified read-only:**
+  `discover-local-utm-summary` against the now-emptied container
+  (`utm_documents_root=…/Containers/com.utmapp.UTM/Data/Documents`) resolves all
+  6 lab nodes (`bundle_count=6, inventory_matched_count=6, live_ip_count=6`)
+  instead of erroring.
+  <br>**`set_vm_internet_access` review fixes** (`crates/rustynet-mcp/src/bin/
+  lab_state.rs`): (1) the reverse-SOCKS tunnel built its own SSH argv with
+  `StrictHostKeyChecking=no`, weaker than — and divergent from — the reachability
+  probe (`ssh_exec`, `StrictHostKeyChecking=yes`); a guest the tunnel accepted but
+  the probe rejected got its healthy tunnel torn down as a false "unreachable".
+  Now assembled by a pure `build_vm_internet_tunnel_argv` from the crate's
+  hardened `ssh_transport_opts()` plus the `-N -R` forwarding flags, so tunnel and
+  probe share one host-key policy (+ two regression tests: the builder preserves
+  strict checking and appends the forwarding args, and `ssh_transport_opts()`
+  itself never emits `=no`). (2) `disable` binds the real pid instead of
+  `unwrap_or(0)`, making the `tunnel_alive ⟹ Some(pid)` invariant explicit and
+  keeping a stray `0` out of `kill_process_group` (defense-in-depth — the server
+  self-signal was already unreachable). (3) a tunnel whose state fails to persist
+  is now stopped rather than leaked as an untracked orphan. All fixes
+  adversarially cross-checked by three grounded read-only reviewers against the
+  working tree; workspace-wide `fmt`/`check`/`clippy -D warnings`/`test` green.
+
 **Still open per bucket (map `wf_ee06d0be-054`):** B1 — anchor-bundle-pull macOS/Windows
 (gated on Phase 8 token provisioning); chaos/cross-network stages. Setup/run modes + the Rust-path recovery
 gate are code-landed but

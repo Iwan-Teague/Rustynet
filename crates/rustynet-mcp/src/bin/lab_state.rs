@@ -1778,8 +1778,15 @@ impl LabStateServer {
                 tool_success(&out)
             }
             "disable" => {
-                if tunnel_alive {
-                    self.kill_process_group(u64::from(existing_pid.unwrap_or(0)));
+                // Bind the real pid rather than `unwrap_or(0)`: makes the
+                // `tunnel_alive ⟹ existing_pid.is_some()` invariant explicit and
+                // keeps a stray 0 out of `kill_process_group` (`kill -- -<pid>`,
+                // where group 0 means "the caller's own group"). The server
+                // self-signal is already unreachable — both via that invariant and
+                // because `run_with_timeout` runs each `kill` in its own process
+                // group — so this is defense-in-depth + clarity, not a live-bug fix.
+                if tunnel_alive && let Some(pid) = existing_pid {
+                    self.kill_process_group(u64::from(pid));
                 }
                 remove_vm_internet_tunnel_state(&self.repo_root, alias);
                 tool_success(&format!(
@@ -1799,28 +1806,28 @@ impl LabStateServer {
                         existing_pid.unwrap_or(0)
                     ));
                 }
-                let identity = default_ssh_identity();
                 let dest = format!("{ssh_user}@{ssh_target}");
-                let port_arg = VM_INTERNET_PROXY_PORT.to_string();
                 let log_dir = self.repo_root.join("state/vm-internet-tunnels");
                 if let Err(e) = std::fs::create_dir_all(&log_dir) {
                     return tool_error(&format!("cannot create {}: {e}", log_dir.display()));
                 }
                 let log_path = log_dir.join(format!("{alias}.log"));
-                let argv: Vec<&str> = vec![
-                    "-i",
-                    &identity,
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "ConnectTimeout=10",
-                    "-o",
-                    "ExitOnForwardFailure=yes",
-                    "-N",
-                    "-R",
-                    &port_arg,
-                    &dest,
-                ];
+                // Reuse the crate's hardened SSH transport policy (strict host-key
+                // checking + BatchMode + IdentitiesOnly + known_hosts + identity)
+                // rather than a bespoke, weaker inline arg set. Beyond the obvious
+                // hardening (the old inline args used `StrictHostKeyChecking=no`),
+                // this keeps the persistent forwarding tunnel and the reachability
+                // probe (`ssh_exec`, which also builds on `ssh_transport_opts`) on
+                // IDENTICAL host-key policy: previously the tunnel used `=no` while
+                // the probe used `=yes`, so a guest the tunnel accepted but the
+                // probe rejected got its otherwise-healthy tunnel torn down as a
+                // false "unreachable".
+                let opts = build_vm_internet_tunnel_argv(
+                    self.ssh_transport_opts(),
+                    VM_INTERNET_PROXY_PORT,
+                    dest,
+                );
+                let argv: Vec<&str> = opts.iter().map(String::as_str).collect();
                 let pid = match spawn_logged("ssh", &argv, &self.repo_root, &[], &log_path) {
                     Ok(child) => child.id(),
                     Err(e) => return tool_error(&format!("failed to start tunnel: {e}")),
@@ -1840,7 +1847,12 @@ impl LabStateServer {
                     ));
                 }
                 if let Err(e) = write_vm_internet_tunnel_pid(&self.repo_root, alias, pid) {
-                    return tool_error(&format!("tunnel is live but failed to persist state: {e}"));
+                    // Can't track it → don't leave it: an unpersisted tunnel is an
+                    // orphan a later `disable` can't find. Stop it and fail loud.
+                    self.kill_process_group(u64::from(pid));
+                    return tool_error(&format!(
+                        "tunnel started (pid {pid}) but its state could not be persisted, so it was stopped to avoid an untracked orphan: {e}"
+                    ));
                 }
                 tool_success(&format!(
                     "# VM internet access: {alias}\n\n✅ Enabled — reverse SOCKS proxy on the guest's 127.0.0.1:{VM_INTERNET_PROXY_PORT} (host pid {pid}), internet reachability confirmed.\n\nGuest-side usage: `curl -x socks5h://127.0.0.1:{VM_INTERNET_PROXY_PORT} ...`, or for a package manager: `http_proxy=socks5h://127.0.0.1:{VM_INTERNET_PROXY_PORT} https_proxy=socks5h://127.0.0.1:{VM_INTERNET_PROXY_PORT} apt-get ...` / `dnf --setopt=proxy=socks5h://127.0.0.1:{VM_INTERNET_PROXY_PORT} install ...`.\n"
@@ -3568,6 +3580,26 @@ fn host_pid_alive(pid: u32) -> bool {
 
 fn is_valid_vm_internet_access_action(action: &str) -> bool {
     matches!(action, "enable" | "disable" | "status")
+}
+
+/// Assemble the `ssh` argv for the reverse-SOCKS internet tunnel: the crate's
+/// hardened transport options (strict host-key checking, BatchMode,
+/// IdentitiesOnly, known_hosts, identity — inherited verbatim so the tunnel and
+/// the reachability probe stay on ONE host-key policy) plus the persistent
+/// reverse-dynamic-forwarding flags. Pure builder so the policy is unit-testable
+/// without spawning ssh.
+fn build_vm_internet_tunnel_argv(
+    mut transport_opts: Vec<String>,
+    port: u16,
+    dest: String,
+) -> Vec<String> {
+    transport_opts.push("-o".to_owned());
+    transport_opts.push("ExitOnForwardFailure=yes".to_owned());
+    transport_opts.push("-N".to_owned());
+    transport_opts.push("-R".to_owned());
+    transport_opts.push(port.to_string());
+    transport_opts.push(dest);
+    transport_opts
 }
 
 /// Distinguish the two ways a guest's owning-subnet interface set can look
@@ -7399,6 +7431,80 @@ mod tests {
         assert!(is_valid_vm_internet_access_action("status"));
         assert!(!is_valid_vm_internet_access_action("reset"));
         assert!(!is_valid_vm_internet_access_action(""));
+    }
+
+    #[test]
+    fn vm_internet_tunnel_argv_inherits_strict_transport_and_appends_forwarding() {
+        // Simulates `ssh_transport_opts()` output: the hardened policy the tunnel
+        // must inherit (must NOT be downgraded to StrictHostKeyChecking=no, and
+        // must match the reachability probe's policy).
+        let transport = vec![
+            "-o".to_owned(),
+            "StrictHostKeyChecking=yes".to_owned(),
+            "-o".to_owned(),
+            "BatchMode=yes".to_owned(),
+            "-i".to_owned(),
+            "/home/lab/.ssh/id".to_owned(),
+        ];
+        let argv = build_vm_internet_tunnel_argv(transport, 1080, "fedora@10.0.0.5".to_owned());
+
+        // Hardened host-key policy preserved verbatim; no downgrade.
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "StrictHostKeyChecking=yes"),
+            "must inherit strict host-key checking: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "StrictHostKeyChecking=no"),
+            "must never downgrade host-key checking: {argv:?}"
+        );
+        // Fail-closed forwarding + persistent reverse-dynamic SOCKS flags appended.
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ExitOnForwardFailure=yes"),
+            "tunnel must fail closed on forward-setup failure: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "-N"),
+            "no remote command: {argv:?}"
+        );
+        let r = argv.iter().position(|a| a == "-R").expect("has -R forward");
+        assert_eq!(argv[r + 1], "1080", "port immediately follows -R");
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("fedora@10.0.0.5"),
+            "destination is the final argv element"
+        );
+    }
+
+    #[test]
+    fn ssh_transport_opts_enforce_strict_host_key_checking_at_the_source() {
+        // The builder test above proves the tunnel doesn't downgrade what it's
+        // GIVEN; this guards the real SOURCE both the tunnel and the reachability
+        // probe derive from, so `ssh_transport_opts()` can never regress to
+        // StrictHostKeyChecking=no (which would weaken the tunnel AND re-open the
+        // tunnel-accepts / probe-rejects host-key divergence).
+        let tmp = std::env::temp_dir().join(format!(
+            "mcp-ssh-transport-opts-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let srv = test_server(&tmp);
+        let opts = srv.ssh_transport_opts();
+        assert!(
+            opts.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "StrictHostKeyChecking=yes"),
+            "transport opts must enforce strict host-key checking: {opts:?}"
+        );
+        assert!(
+            !opts.iter().any(|o| o == "StrictHostKeyChecking=no"),
+            "transport opts must never disable host-key checking: {opts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

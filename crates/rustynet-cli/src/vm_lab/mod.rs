@@ -2392,11 +2392,36 @@ fn default_live_lab_setup_profile_path(report_dir: &Path) -> PathBuf {
     report_dir.join("setup_live_lab_profile.env")
 }
 
-fn default_utm_documents_root() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME")
+/// Resolve the UTM bundle-library root to scan, given the
+/// `RUSTYNET_UTM_DOCUMENTS_ROOT` override and `HOME`. Pure (env read left to the
+/// caller) so the precedence is unit-testable without mutating process env.
+///
+/// A non-empty override wins (operator relocated the bundle library out of UTM's
+/// sandbox container, e.g. via UTM's "Move…" action — no hardcoded machine path
+/// in the repo); an empty/unset override falls through to UTM's default
+/// sandboxed Documents container. NOTE: the explicit `--utm-documents-root` CLI
+/// flag still beats this — the call site prefers `config.utm_documents_root` and
+/// only falls back here when it is absent.
+fn resolve_utm_documents_root(
+    env_override: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    if let Some(root) = env_override
+        && !root.is_empty()
+    {
+        return Ok(PathBuf::from(root));
+    }
+    let home = home
         .map(PathBuf::from)
         .ok_or_else(|| "HOME is required to discover local UTM documents".to_owned())?;
     Ok(home.join("Library/Containers/com.utmapp.UTM/Data/Documents"))
+}
+
+fn default_utm_documents_root() -> Result<PathBuf, String> {
+    resolve_utm_documents_root(
+        std::env::var_os("RUSTYNET_UTM_DOCUMENTS_ROOT"),
+        std::env::var_os("HOME"),
+    )
 }
 
 fn setup_stage_names() -> &'static [&'static str] {
@@ -3354,6 +3379,62 @@ pub fn execute_ops_vm_lab_diagnose(config: VmLabDiagnoseConfig) -> Result<String
     Ok(lines.join("\n"))
 }
 
+/// Decide which UTM bundle paths discovery should operate on, given the bounded
+/// container-scan result and the inventory-recorded bundle paths.
+///
+/// A successful-but-EMPTY scan is not fatal: it degrades to the inventory paths,
+/// exactly like the scan-error (TCC) case. This is now an expected state — a
+/// bundle can be relocated out of UTM's sandbox container into a separate
+/// library (e.g. via UTM's own "Move…" action) while staying registered and
+/// runnable, at which point the default documents-root scan legitimately finds
+/// nothing but the inventory still knows every node's real `bundle_path`. Gating
+/// discovery on a non-empty scan meant relocating bundles silently broke
+/// live-IP refresh for KNOWN nodes. (`RUSTYNET_UTM_DOCUMENTS_ROOT` can point the
+/// scan at the library location to also auto-discover NEW, un-inventoried
+/// bundles there.)
+///
+/// Only errors when NEITHER the scan nor the inventory yields any bundle path.
+/// Returns the chosen paths plus an optional human-readable degradation note
+/// (surfaced in the discovery report's `bundle_scan_error` field — never a
+/// silent fallback).
+fn resolve_discovery_bundle_paths(
+    scan_result: Result<Vec<PathBuf>, String>,
+    inventory_bundle_paths: Vec<PathBuf>,
+    documents_root: &Path,
+) -> Result<(Vec<PathBuf>, Option<String>), String> {
+    match scan_result {
+        Ok(paths) if !paths.is_empty() => Ok((paths, None)),
+        Ok(_) => {
+            if inventory_bundle_paths.is_empty() {
+                return Err(format!(
+                    "no UTM bundle directories found under {} and the inventory \
+                     provides no local UTM bundle paths to fall back to",
+                    documents_root.display()
+                ));
+            }
+            let note = format!(
+                "no UTM bundles under {}; degraded to {} inventory-recorded bundle path(s)",
+                documents_root.display(),
+                inventory_bundle_paths.len()
+            );
+            Ok((inventory_bundle_paths, Some(note)))
+        }
+        Err(scan_err) => {
+            if inventory_bundle_paths.is_empty() {
+                return Err(format!(
+                    "UTM bundle scan failed ({scan_err}) and the inventory provides no \
+                     local UTM bundle paths to fall back to"
+                ));
+            }
+            let note = format!(
+                "{scan_err}; degraded to {} inventory-recorded bundle path(s)",
+                inventory_bundle_paths.len()
+            );
+            Ok((inventory_bundle_paths, Some(note)))
+        }
+    }
+}
+
 pub fn execute_ops_vm_lab_discover_local_utm(
     config: VmLabDiscoverLocalUtmConfig,
 ) -> Result<String, String> {
@@ -3392,43 +3473,25 @@ pub fn execute_ops_vm_lab_discover_local_utm(
     // when this process context lacks consent for the UTM container. Bound it
     // and degrade to inventory-recorded bundle paths — the scan only exists to
     // find bundles the inventory does not know about yet.
-    let mut bundle_scan_error = None::<String>;
-    let discovered_bundle_paths = match discover_local_utm_bundle_paths_bounded(
-        documents_root.clone(),
-        Duration::from_secs(UTM_BUNDLE_SCAN_TIMEOUT_SECS),
-    ) {
-        Ok(paths) => paths,
-        Err(scan_err) => {
-            let mut fallback: Vec<PathBuf> = inventory
-                .iter()
-                .filter_map(|entry| {
-                    entry
-                        .controller
-                        .as_ref()
-                        .map(|VmController::LocalUtm { bundle_path, .. }| bundle_path.clone())
-                })
-                .collect();
-            if fallback.is_empty() {
-                return Err(format!(
-                    "UTM bundle scan failed ({scan_err}) and the inventory provides no \
-                     local UTM bundle paths to fall back to"
-                ));
-            }
-            fallback.sort();
-            fallback.dedup();
-            bundle_scan_error = Some(format!(
-                "{scan_err}; degraded to {} inventory-recorded bundle path(s)",
-                fallback.len()
-            ));
-            fallback
-        }
-    };
-    if discovered_bundle_paths.is_empty() {
-        return Err(format!(
-            "no UTM bundle directories found under {}",
-            documents_root.display()
-        ));
-    }
+    let mut inventory_bundle_paths: Vec<PathBuf> = inventory
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .controller
+                .as_ref()
+                .map(|VmController::LocalUtm { bundle_path, .. }| bundle_path.clone())
+        })
+        .collect();
+    inventory_bundle_paths.sort();
+    inventory_bundle_paths.dedup();
+    let (discovered_bundle_paths, bundle_scan_error) = resolve_discovery_bundle_paths(
+        discover_local_utm_bundle_paths_bounded(
+            documents_root.clone(),
+            Duration::from_secs(UTM_BUNDLE_SCAN_TIMEOUT_SECS),
+        ),
+        inventory_bundle_paths,
+        documents_root.as_path(),
+    )?;
 
     let mut entries = Vec::new();
     let mut matched_inventory_count = 0usize;
@@ -3975,6 +4038,16 @@ fn render_local_utm_discovery_summary(
     }
     if let Some(value) = report_string("utmctl_path") {
         lines.push(format!("discovery_summary.utmctl_path={value}"));
+    }
+    // Surface the scan-degradation note here too, not only in the JSON report:
+    // this summary is the operator's first-check command (CLAUDE.md §12.3), so a
+    // container scan that found nothing and fell back to inventory-recorded
+    // bundle paths (e.g. bundles relocated out of the sandbox container, or a TCC
+    // timeout) must be visible, not silent.
+    if let Some(value) = report.get("bundle_scan_error").and_then(Value::as_str)
+        && !value.trim().is_empty()
+    {
+        lines.push(format!("discovery_summary.bundle_scan_error={value}"));
     }
     if let Some(value) = report.get("inventory_error").and_then(Value::as_str)
         && !value.trim().is_empty()
@@ -36196,9 +36269,10 @@ mod tests {
         remote_script_for_ssh_transport, render_live_lab_iteration_summary,
         render_live_lab_stage_forensics_review, render_local_utm_discovery_summary,
         render_vm_lab_progress_complete_line, render_vm_lab_progress_outcome_line,
-        repo_sync_dispatch_kind_for_target, resolve_iteration_source_selection,
-        resolve_live_lab_vm_aliases, resolve_remote_targets, resolve_repo_sync_source,
-        resolve_start_targets, resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
+        repo_sync_dispatch_kind_for_target, resolve_discovery_bundle_paths,
+        resolve_iteration_source_selection, resolve_live_lab_vm_aliases, resolve_remote_targets,
+        resolve_repo_sync_source, resolve_start_targets, resolve_utm_documents_root,
+        resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
         select_inventory_entries, select_live_ssh_host_from_utm_output,
         select_preferred_live_ssh_ip, selected_local_utm_readiness_from_report,
         should_skip_local_source_path, ssh_auth_probe_command, summarize_live_lab_report,
@@ -37165,6 +37239,99 @@ mod tests {
             err.contains("existing directory"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_utm_documents_root_prefers_nonempty_env_override() {
+        let out = resolve_utm_documents_root(
+            Some(std::ffi::OsString::from(
+                "/Users/x/Desktop/OS_images/UTM images",
+            )),
+            Some(std::ffi::OsString::from("/Users/x")),
+        )
+        .expect("override is a valid path");
+        assert_eq!(out, PathBuf::from("/Users/x/Desktop/OS_images/UTM images"));
+    }
+
+    #[test]
+    fn resolve_utm_documents_root_empty_env_falls_through_to_home_container() {
+        let out = resolve_utm_documents_root(
+            Some(std::ffi::OsString::from("")),
+            Some(std::ffi::OsString::from("/Users/x")),
+        )
+        .expect("empty override falls back to HOME container");
+        assert_eq!(
+            out,
+            PathBuf::from("/Users/x/Library/Containers/com.utmapp.UTM/Data/Documents")
+        );
+    }
+
+    #[test]
+    fn resolve_utm_documents_root_no_env_uses_home_container() {
+        let out = resolve_utm_documents_root(None, Some(std::ffi::OsString::from("/Users/x")))
+            .expect("no override uses HOME container");
+        assert_eq!(
+            out,
+            PathBuf::from("/Users/x/Library/Containers/com.utmapp.UTM/Data/Documents")
+        );
+    }
+
+    #[test]
+    fn resolve_utm_documents_root_errors_without_home_and_no_env() {
+        assert!(resolve_utm_documents_root(None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_discovery_bundle_paths_uses_scan_when_nonempty() {
+        let root = Path::new("/some/root");
+        let scan = vec![PathBuf::from("/some/root/A.utm")];
+        let inv = vec![PathBuf::from("/lib/A.utm")];
+        let (paths, note) =
+            resolve_discovery_bundle_paths(Ok(scan.clone()), inv, root).expect("scan hit");
+        assert_eq!(paths, scan, "a non-empty scan must win over inventory");
+        assert!(note.is_none(), "no degradation note when the scan succeeds");
+    }
+
+    #[test]
+    fn resolve_discovery_bundle_paths_degrades_to_inventory_on_empty_scan() {
+        // The e811687 regression: bundles relocated out of the scanned root, so
+        // the scan succeeds but finds nothing. Discovery must NOT hard-error — it
+        // degrades to the inventory-recorded bundle paths so live-IP refresh for
+        // known nodes keeps working.
+        let root = Path::new("/emptied/container");
+        let inv = vec![PathBuf::from("/lib/A.utm"), PathBuf::from("/lib/B.utm")];
+        let (paths, note) = resolve_discovery_bundle_paths(Ok(Vec::new()), inv.clone(), root)
+            .expect("must degrade");
+        assert_eq!(paths, inv, "empty scan must fall back to inventory paths");
+        let note = note.expect("degradation must be surfaced, not silent");
+        assert!(note.contains("no UTM bundles under"), "note: {note}");
+        assert!(note.contains("2 inventory-recorded"), "note: {note}");
+    }
+
+    #[test]
+    fn resolve_discovery_bundle_paths_degrades_to_inventory_on_scan_error() {
+        let root = Path::new("/container");
+        let inv = vec![PathBuf::from("/lib/A.utm")];
+        let (paths, note) =
+            resolve_discovery_bundle_paths(Err("TCC timeout".to_owned()), inv.clone(), root)
+                .expect("must degrade on scan error");
+        assert_eq!(paths, inv);
+        let note = note.expect("degradation surfaced");
+        assert!(note.contains("TCC timeout"), "note preserves cause: {note}");
+    }
+
+    #[test]
+    fn resolve_discovery_bundle_paths_errors_only_when_scan_and_inventory_both_empty() {
+        let root = Path::new("/nowhere");
+        let err = resolve_discovery_bundle_paths(Ok(Vec::new()), Vec::new(), root)
+            .expect_err("empty scan + empty inventory must fail closed");
+        assert!(
+            err.contains("no UTM bundle directories found under"),
+            "{err}"
+        );
+        let err = resolve_discovery_bundle_paths(Err("boom".to_owned()), Vec::new(), root)
+            .expect_err("scan error + empty inventory must fail closed");
+        assert!(err.contains("UTM bundle scan failed"), "{err}");
     }
 
     #[test]
