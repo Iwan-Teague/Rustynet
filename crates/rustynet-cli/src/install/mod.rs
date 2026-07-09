@@ -13,6 +13,8 @@
 //! what a live run would do, per OS, mutating nothing.
 
 mod acquire;
+mod live_linux;
+mod preflight;
 
 use rustynet_sysinfo::{HostFacts, OsFamily, PkgFamily, host_facts};
 use std::path::PathBuf;
@@ -208,23 +210,29 @@ pub fn run(req: InstallRequest) -> Result<String, String> {
         ));
     }
 
-    // Live install — execute the steps in order, fail-closed on any error. Steps
-    // are wired incrementally; until a step lands, execution stops here rather
-    // than half-installing.
+    // Live install. Elevation first (never self-elevate), then acquire, then the
+    // OS-specific install. Steps are wired incrementally; execution fail-closes
+    // where a step is not yet landed rather than half-installing.
+    preflight::require_elevation(facts.family)?;
     let ext = binary_ext(facts.family);
     let staging =
         std::env::temp_dir().join(format!("rustynet-install-staging-{}", std::process::id()));
     let acquired = acquire::acquire(&req.acquisition, triple, ext, &staging)?;
-    let count = acquire::SHIPPING.len();
-    let notes = acquired.notes.join("; ");
-    // Nothing downstream consumes the staged binaries yet, so don't leave them.
-    let _ = std::fs::remove_dir_all(&acquired.staging_dir);
-    Err(format!(
-        "{rendered}\n\nacquire OK — staged + verified {count} shipping binaries ({notes}).\n\
-         Remaining live steps (prerequisites, place binaries + identities, key custody, \
-         trust anchor, service register) are not yet wired; they land incrementally. \
-         Preview the full plan with --dry-run."
-    ))
+    let outcome = match facts.family {
+        OsFamily::Linux => live_linux::install(facts.pkg_family, &acquired),
+        OsFamily::Macos | OsFamily::Windows => Err(format!(
+            "live install for {} is not yet wired in the engine (Linux is wired first); its \
+             existing per-OS bootstrap does the work. Preview with --dry-run.",
+            os_label(facts.family)
+        )),
+        OsFamily::Unsupported => unreachable!("validated in validate_host"),
+    };
+    // Only the placement step copies out of staging; nothing else consumes it.
+    let _ = std::fs::remove_dir_all(&staging);
+    match outcome {
+        Ok(msg) => Ok(format!("{rendered}\n\n{msg}")),
+        Err(msg) => Err(format!("{rendered}\n\n{msg}")),
+    }
 }
 
 fn binary_ext(family: OsFamily) -> &'static str {
