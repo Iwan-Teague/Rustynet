@@ -13,7 +13,9 @@
 //! what a live run would do, per OS, mutating nothing.
 
 mod acquire;
+mod common;
 mod live_linux;
+mod live_macos;
 mod preflight;
 
 use rustynet_sysinfo::{HostFacts, OsFamily, PkgFamily, host_facts};
@@ -226,9 +228,10 @@ pub fn run(req: InstallRequest) -> Result<String, String> {
     let acquired = acquire::acquire(&req.acquisition, triple, ext, &staging)?;
     let outcome = match facts.family {
         OsFamily::Linux => live_linux::install(&req, facts.pkg_family, &acquired),
-        OsFamily::Macos | OsFamily::Windows => Err(format!(
-            "live install for {} is not yet wired in the engine (Linux is wired first); its \
-             existing per-OS bootstrap does the work. Preview with --dry-run.",
+        OsFamily::Macos => live_macos::install(&req, &acquired),
+        OsFamily::Windows => Err(format!(
+            "live install for {} is not yet wired in the engine (Linux + macOS are wired first); \
+             its existing per-OS bootstrap does the work. Preview with --dry-run.",
             os_label(facts.family)
         )),
         OsFamily::Unsupported => unreachable!("validated in validate_host"),
@@ -380,7 +383,12 @@ fn prereq_plan(facts: &HostFacts) -> String {
                 facts.distro_id.as_deref().unwrap_or("?")
             ),
         },
-        OsFamily::Macos => "none (bundled boringtun userspace backend)".to_owned(),
+        OsFamily::Macos => {
+            "wireguard-tools (provides `wg` for key genkey/pubkey); brew install wireguard-tools \
+             if absent. The dataplane is bundled boringtun (userspace-shared backend), so \
+             wireguard-go is NOT required"
+                .to_owned()
+        }
         OsFamily::Windows => {
             "ensure WireGuard for Windows is present (provides wireguard.exe/wg.exe + wintun)"
                 .to_owned()
@@ -409,7 +417,7 @@ fn custody_plan(family: OsFamily) -> &'static str {
 fn anchor_location(family: OsFamily) -> &'static str {
     match family {
         OsFamily::Linux => "/etc/rustynet/membership.owner.key.pub, root-only",
-        OsFamily::Macos => "reviewed macOS path, root-only",
+        OsFamily::Macos => "/etc/rustynet/membership.owner.key.pub, root-owned",
         OsFamily::Windows => r"C:\ProgramData\RustyNet\trust\membership.owner.key.pub, SYSTEM-only",
         OsFamily::Unsupported => "n/a",
     }
@@ -553,7 +561,8 @@ mod tests {
             "aarch64-apple-darwin",
         );
         let mj = mac.join("\n");
-        assert!(mj.contains("none (bundled boringtun"), "{mj}");
+        assert!(mj.contains("wireguard-tools"), "{mj}");
+        assert!(mj.contains("bundled boringtun"), "{mj}");
         assert!(mj.contains("Keychain"), "{mj}");
 
         let win = build_plan(
