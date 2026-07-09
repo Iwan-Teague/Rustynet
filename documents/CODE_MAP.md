@@ -133,7 +133,7 @@ init` / `key store-passphrase` verbs rather than reinventing them.
 | `require_elevation()` | `install/preflight.rs` | Root (Linux/macOS euid==0) / Administrator (Windows) gate; never self-elevate |
 | Shared Unix primitives (`command`, `place_binaries`, `deliver_trust_anchor`, `resolve_node_id`, `which`, `run`/`ensure_dir`/`write_file`) | `install/common.rs` | OS-agnostic, argv-only, PATH-pinned exec + §6.B owner-key anchor delivery, shared by Linux + macOS |
 | `live_linux::install()` | `install/live_linux.rs` | Linux: apt/dnf prereqs, placement, key custody (`key init` + systemd-creds), `ops install-systemd`, awaiting-enrollment classification |
-| `live_macos::install()` | `install/live_macos.rs` | macOS provisioning: `wg` prereq, dscl identity, keychain unlock, place + `codesign`, key custody (`key init` + `key store-passphrase`), trust anchor (launchd service registration is Increment 2) |
+| `live_macos::install()` | `install/live_macos.rs` | macOS: `wg` prereq, dscl identity, keychain unlock, place + `codesign`, key custody (`key init` + `key store-passphrase`), trust anchor, then gated launchd registration (embeds `Install-RustyNetMacosService.sh` via `include_str!`, `--no-daemon-start`: helper running, daemon plist installed + `launchctl disable`d → awaiting enrollment) |
 | `ReleaseManifest` (ed25519 signed) | `release_manifest.rs` + `ops_release_manifest.rs` | The installer's trust root: `ops create/verify-release-manifest`; per-artifact sha256 verified before staging |
 
 ### Security Verifiers (`rustynet-local-security`)
