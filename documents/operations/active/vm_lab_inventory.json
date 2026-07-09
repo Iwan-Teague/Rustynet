@@ -3,7 +3,7 @@
     {
       "alias": "debian-headless-2",
       "controller": {
-        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-2.utm",
+        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/debian-headless-2.utm",
         "type": "local_utm",
         "utm_name": "debian-headless-2"
       },
@@ -34,7 +34,7 @@
     {
       "alias": "debian-headless-4",
       "controller": {
-        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-4.utm",
+        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/debian-headless-4.utm",
         "type": "local_utm",
         "utm_name": "debian-headless-4"
       },
@@ -79,7 +79,7 @@
     {
       "alias": "macos-utm-1",
       "controller": {
-        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/macOS.utm",
+        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/macOS.utm",
         "type": "local_utm",
         "utm_name": "macOS"
       },
@@ -108,7 +108,7 @@
     {
       "alias": "windows-utm-1",
       "controller": {
-        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/Windows.utm",
+        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/Windows.utm",
         "type": "local_utm",
         "utm_name": "Windows"
       },
@@ -134,7 +134,7 @@
     {
       "alias": "fedora-utm-1",
       "controller": {
-        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/Fedora.utm",
+        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/Fedora.utm",
         "type": "local_utm",
         "utm_name": "Fedora"
       },
@@ -161,7 +161,7 @@
     {
       "alias": "ubuntu-utm-1",
       "controller": {
-        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/ubuntu.utm",
+        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/ubuntu.utm",
         "type": "local_utm",
         "utm_name": "ubuntu"
       },

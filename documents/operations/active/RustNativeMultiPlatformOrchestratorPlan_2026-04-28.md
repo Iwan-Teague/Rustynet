@@ -961,6 +961,48 @@ which is the authoritative file-by-file remaining-work reference for B1/B6/B7/B8
   the real lab (`fedora-utm-1` success path with inventory refresh
   confirmed persisted; `ubuntu-utm-1` clean-failure path confirmed twice).
 
+- **2026-07-09 — moved every UTM VM bundle out of UTM's sandboxed container
+  Documents folder into `~/Desktop/OS_images/UTM images/` (operator ask, for
+  disk-organization — the container folder was never meant as a bundle
+  library long-term).** All 9 bundles moved: the 6 lab-tracked nodes
+  (`debian-headless-2/4`, `macOS`, `Windows`, `Fedora`, `ubuntu`) plus 3
+  unrelated-project VMs (`CentOS`, `Rocky`, `Windows XP` — the last one was
+  already loose in `OS_images/` pre-move, never registered in UTM).
+  <br>**A plain `mv` of the bundle folders silently breaks UTM.** All 8
+  running VMs were stopped first (clean, via `utmctl stop`) before moving
+  any files — correct, but not sufficient. A raw `mv` left UTM's sidebar
+  still listing every VM with no visible error, but attempting to actually
+  start one failed closed with `The file "edk2-arm-vars.fd" doesn't
+  exist.` — UTM's per-VM launch path depends on more than the bundle
+  folder's own security-scoped reference (which does survive a plain move);
+  something in its launch bookkeeping still resolved to the old container
+  path and broke. Confirmed by moving one bundle (`Fedora.utm`) back to the
+  original container path, where it started clean again — isolating the
+  break to the relocation step itself, not the bundle contents.
+  <br>**Fix: UTM's own sidebar `Move…` action** (confirm dialog: "copy the
+  data to the new location, delete the data from the original location,
+  and then create a shortcut") instead of Finder/`mv`. Used this for all 9
+  bundles instead (each one first `mv`'d back to the container, since the
+  first pass had already relocated them by hand). Every VM now shows
+  `Path: /Users/iwan/Desktop/OS_images/UTM images/<name>.utm` in UTM's own
+  info panel and starts cleanly with no firmware error; the old container
+  folder holds nothing but UTM's own `Public` folder. All 6 lab-tracked
+  VMs live-verified: started, ran briefly, stopped again.
+  <br>**Inventory `controller.bundle_path` updated by hand for the 6
+  lab-tracked entries** (`debian-headless-2/4`, `macos-utm-1`,
+  `windows-utm-1`, `fedora-utm-1`, `ubuntu-utm-1`) — deliberately, not via
+  `--update-inventory-live-ips`. That flag (and the standing "never
+  hand-edit the inventory" rule) governs *live-probed* fields (IPs); a
+  bundle's on-disk path is a structural fact set once at onboarding, same
+  class of field as `ssh_user`/`node_id`, which this session has already
+  hand-set for every new entry. Re-verified post-edit with
+  `diagnose_vm_lan_presence`: ARP-by-MAC resolution (which reads
+  `config.plist` via `bundle_path`) still works correctly against the new
+  paths — `fedora-utm-1`/`windows-utm-1`/`debian-headless-4` correctly
+  reported `physical-lan`, `ubuntu-utm-1` still `isolated-utm-bridge`
+  (same pre-existing, already-documented netplan gap above, unrelated to
+  and unaffected by this move).
+
 **Still open per bucket (map `wf_ee06d0be-054`):** B1 — anchor-bundle-pull macOS/Windows
 (gated on Phase 8 token provisioning); chaos/cross-network stages. Setup/run modes + the Rust-path recovery
 gate are code-landed but
