@@ -16,6 +16,7 @@ mod acquire;
 mod common;
 mod live_linux;
 mod live_macos;
+mod live_windows;
 mod preflight;
 
 use rustynet_sysinfo::{HostFacts, OsFamily, PkgFamily, host_facts};
@@ -229,11 +230,7 @@ pub fn run(req: InstallRequest) -> Result<String, String> {
     let outcome = match facts.family {
         OsFamily::Linux => live_linux::install(&req, facts.pkg_family, &acquired),
         OsFamily::Macos => live_macos::install(&req, &acquired),
-        OsFamily::Windows => Err(format!(
-            "live install for {} is not yet wired in the engine (Linux + macOS are wired first); \
-             its existing per-OS bootstrap does the work. Preview with --dry-run.",
-            os_label(facts.family)
-        )),
+        OsFamily::Windows => live_windows::install(&req, &acquired),
         OsFamily::Unsupported => unreachable!("validated in validate_host"),
     };
     // Only the placement step copies out of staging; nothing else consumes it.
