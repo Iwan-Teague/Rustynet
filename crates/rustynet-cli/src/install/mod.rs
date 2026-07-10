@@ -18,6 +18,7 @@ mod live_linux;
 mod live_macos;
 mod live_windows;
 mod preflight;
+mod uninstall;
 
 use rustynet_sysinfo::{HostFacts, OsFamily, PkgFamily, host_facts};
 use std::path::PathBuf;
@@ -214,9 +215,11 @@ pub fn run(req: InstallRequest) -> Result<String, String> {
         return Ok(rendered);
     }
     if req.uninstall {
-        return Err(format!(
-            "{rendered}\n\nlive uninstall is not yet wired; it lands with the install mutation steps."
-        ));
+        preflight::require_elevation(facts.family)?;
+        return match uninstall::run(facts.family) {
+            Ok(msg) => Ok(format!("{rendered}\n\n{msg}")),
+            Err(msg) => Err(format!("{rendered}\n\n{msg}")),
+        };
     }
 
     // Live install. Elevation first (never self-elevate), then acquire, then the

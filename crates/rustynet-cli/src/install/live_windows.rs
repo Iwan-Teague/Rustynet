@@ -226,7 +226,7 @@ fn run_service_installer(src_root: &Path, node_id: &str, report: &Path) -> Resul
 /// Resolve a `System32` utility by absolute path (via `%SystemRoot%`, fallback
 /// `C:\Windows`), so a bare-name exec running as Administrator cannot be
 /// search-order / application-directory hijacked.
-fn system32(rel: &str) -> String {
+pub(super) fn system32(rel: &str) -> String {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
     format!(r"{root}\System32\{rel}")
 }
@@ -237,7 +237,7 @@ fn system32(rel: &str) -> String {
 /// grants only the reviewed principals with an inheritable ACE so children are
 /// covered too. Mirrors the reviewed PS1 ACL helpers (which also `/setowner`
 /// first). `/T` recurses so a directory's contents are locked in the same call.
-fn lock_admin_acl(path: &Path) -> Result<(), String> {
+pub(super) fn lock_admin_acl(path: &Path) -> Result<(), String> {
     let p = path.to_string_lossy().into_owned();
     let icacls = system32("icacls.exe");
     for args in [
