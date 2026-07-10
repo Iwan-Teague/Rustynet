@@ -32,14 +32,35 @@ fn require_root_unix() -> Result<(), String> {
 
 #[cfg(windows)]
 fn require_admin_windows() -> Result<(), String> {
-    // The Windows service-install path (Install-RustyNetWindowsService.ps1) does
-    // its own Administrator gate via `net session`; this is the early, legible
-    // check so we fail before any work. Full token-group inspection lands with
-    // the Windows live path.
-    Err(
-        "Windows live install is not yet wired in the engine; run the Windows bootstrap directly"
-            .to_owned(),
-    )
+    // Two independent Administrator-only operations run early (before any work);
+    // either succeeding proves an elevated token. `net session` is the common
+    // check but false-negatives when the Server (LanmanServer) service is
+    // stopped/disabled, so also accept `fsutil dirty query` (admin-only, no
+    // service dependency). Both are resolved by absolute System32 path so a
+    // bare-name exec cannot be search-order-hijacked into this elevated process.
+    // The engine never self-elevates; the operator runs from an elevated shell.
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned());
+    let net = format!(r"{sysroot}\System32\net.exe");
+    let fsutil = format!(r"{sysroot}\System32\fsutil.exe");
+    if admin_probe_ok(&net, &["session"]) || admin_probe_ok(&fsutil, &["dirty", "query", &drive]) {
+        Ok(())
+    } else {
+        Err(
+            "rustynet install must run as Administrator — re-run from an elevated \
+             (Run as administrator) PowerShell or Command Prompt"
+                .to_owned(),
+        )
+    }
+}
+
+#[cfg(windows)]
+fn admin_probe_ok(program: &str, args: &[&str]) -> bool {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(not(windows))]

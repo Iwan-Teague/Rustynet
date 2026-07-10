@@ -28,7 +28,14 @@ param(
     # EnforceBaselineRuntime re-runs the script with -EnforceAutoTunnel after
     # all verifier keys and bundles are in place, so the daemon applies
     # assignment bundles and brings up WireGuard tunnels.
-    [switch]$EnforceAutoTunnel
+    [switch]$EnforceAutoTunnel,
+    # Gated ("installed, awaiting enrollment") install: create the SCM service but
+    # do NOT self-seed trust evidence and do NOT start the daemon, leaving it
+    # Stopped until the deferred enrollment seam delivers trust material and
+    # starts it. Also skips the host-DNS fail-closed posture (nothing serves the
+    # resolver while Stopped). Default false preserves bootstrap-and-start for
+    # every current caller. Mirrors the macOS `--no-daemon-start` gate.
+    [switch]$NoDaemonStart
 )
 
 Set-StrictMode -Version Latest
@@ -1068,6 +1075,11 @@ $trustVerifierKeyPath = Join-Path $trustDir 'trust-evidence.pub'
 $trustEvidencePath = Join-Path $trustDir 'rustynetd.trust'
 $trustWatermarkPath = Join-Path $trustDir 'rustynetd.trust.watermark'
 $trustPassphrasePath = Join-Path $trustDir 'trust-evidence.passphrase.tmp'
+# Gated install: skip the trust-evidence self-seed entirely. A fresh node must
+# NOT manufacture its own trust to come up standalone — that is the "awaiting
+# enrollment" fail-closed posture Linux/macOS reach; the enrollment seam
+# delivers real trust material later.
+if (-not $NoDaemonStart) {
 $cliPath = Join-Path $InstallRoot 'rustynet.exe'
 if (-not (Test-Path -LiteralPath $cliPath)) {
     throw "rustynet.exe not found at $cliPath; cannot reissue trust evidence (was copy-cli-binary skipped?)"
@@ -1118,6 +1130,10 @@ finally {
         Remove-Item -Force -LiteralPath $trustPassphrasePath
     }
 }
+}
+else {
+    Write-Host "[install-helper] gated install (-NoDaemonStart): skipping trust-evidence self-seed (awaiting enrollment)"
+}
 
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
 Set-InstallProgressStep 'write-reviewed-env-file'
@@ -1129,8 +1145,18 @@ Write-Host ("[install-helper] selected backend label: {0} (wireguard.present={1}
 Write-ReviewedEnvFile -Path $configPath -BackendLabel $backendLabel -AutoTunnelEnforce ([bool]$EnforceAutoTunnel)
 
 Set-InstallProgressStep 'configure-dns-failclosed'
-$dnsFailClosedPosture = Set-RustyNetDnsFailClosedPosture
-Write-Host "[install-helper] DNS fail-closed posture configured (interface DNS + NRPT root loopback)"
+if (-not $NoDaemonStart) {
+    $dnsFailClosedPosture = Set-RustyNetDnsFailClosedPosture
+    Write-Host "[install-helper] DNS fail-closed posture configured (interface DNS + NRPT root loopback)"
+}
+else {
+    # Gated install: the daemon is Stopped, so nothing serves the loopback
+    # resolver — pointing host DNS at 127.0.0.1 now would blackhole all name
+    # resolution while "awaiting enrollment". The enrollment seam applies the
+    # DNS posture when it starts the daemon.
+    $dnsFailClosedPosture = $null
+    Write-Host "[install-helper] gated install (-NoDaemonStart): skipping host DNS fail-closed posture (awaiting enrollment)"
+}
 
 Set-InstallProgressStep 'probe-runtime-support'
 $runtimeSignals = Test-RustyNetWindowsRuntimeSupport -DaemonPath $daemonDest
@@ -1236,6 +1262,7 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
             }
         }
 
+        if (-not $NoDaemonStart) {
         $serviceStartAttempted = $true
         try {
             Set-InstallProgressStep 'start-runtime-service'
@@ -1252,6 +1279,16 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
             $startError = $_.Exception.Message
         }
         Start-Sleep -Seconds 3
+        }
+        else {
+            # Gated install: SCM service is created (New-Service above) but NOT
+            # started. Disable auto-start so it does not launch on the next boot
+            # before enrollment (it would crash-loop without trust evidence). The
+            # enrollment seam sets it back to Automatic + starts it. This is the
+            # SCM analogue of macOS `launchctl disable` / Linux's start gate.
+            Set-Service -Name $ServiceName -StartupType Disabled
+            Write-Host "[install-helper] gated install (-NoDaemonStart): SCM service created + set StartupType=Disabled, NOT started (awaiting enrollment)"
+        }
     }
 }
 
@@ -1333,6 +1370,19 @@ elseif (-not $runtimeAclApplied) {
 elseif ($backendLabel -eq 'windows-unsupported') {
     $status = 'blocked'
     $reason = 'windows-runtime-backend-explicitly-unsupported'
+}
+elseif ($NoDaemonStart) {
+    # Gated install: the SCM service is created but intentionally NOT started.
+    # A Stopped service IS the success terminal state ("installed, awaiting
+    # enrollment"); anything else means the gate leaked and the daemon ran —
+    # report fail-closed.
+    if ($serviceRuntime.status -eq 'Stopped' -or $serviceRuntime.status -eq 'StopPending') {
+        $status = 'pass'
+        $reason = 'windows-installed-awaiting-enrollment'
+    }
+    else {
+        $reason = 'windows-gated-install-service-not-stopped'
+    }
 }
 elseif ($serviceRuntime.status -ne 'Running') {
     $reason = 'windows-service-not-running'
