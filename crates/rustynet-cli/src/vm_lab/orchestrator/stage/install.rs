@@ -25,11 +25,21 @@ pub struct BootstrapHostsStage {
     /// When `Some`, only these aliases are (re)built; others reuse their
     /// existing daemon. `None` = rebuild every node (the default).
     rebuild_only: Option<Vec<String>>,
+    max_parallel_node_workers: usize,
+    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BootstrapHostsStage {
-    pub fn new(rebuild_only: Option<Vec<String>>) -> Self {
-        BootstrapHostsStage { rebuild_only }
+    pub fn new(
+        rebuild_only: Option<Vec<String>>,
+        max_parallel_node_workers: usize,
+        shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        BootstrapHostsStage {
+            rebuild_only,
+            max_parallel_node_workers: max_parallel_node_workers.max(1),
+            shutdown_flag,
+        }
     }
 }
 
@@ -57,9 +67,11 @@ impl OrchestrationStage for BootstrapHostsStage {
         };
         let rebuild_only = self.rebuild_only.as_deref();
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
-        let results: Vec<(String, Result<(), String>)> = aliases
-            .iter()
-            .map(|alias| {
+        let results = crate::vm_lab::orchestrator::parallel::bounded_parallel_map_cancellable(
+            &aliases,
+            self.max_parallel_node_workers,
+            &self.shutdown_flag,
+            |alias| {
                 if !node_in_rebuild_set(rebuild_only, alias) {
                     // Not in --rebuild-nodes: leave the node intact (cleanup_hosts
                     // skipped it too), reusing its existing daemon build.
@@ -81,8 +93,14 @@ impl OrchestrationStage for BootstrapHostsStage {
                     None => Err(format!("no adapter for '{alias}'")),
                 };
                 (alias.clone(), r)
-            })
-            .collect();
+            },
+            |alias| {
+                (
+                    alias.clone(),
+                    Err("cancelled before node work was admitted".to_owned()),
+                )
+            },
+        );
         let errors: Vec<String> = results
             .into_iter()
             .filter_map(|(alias, r)| r.err().map(|e| format!("{alias}: {e}")))
@@ -164,7 +182,12 @@ mod tests {
             orchestrator_dialect: None,
         };
         assert!(matches!(
-            BootstrapHostsStage::new(None).execute(&mut ctx),
+            BootstrapHostsStage::new(
+                None,
+                1,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .execute(&mut ctx),
             StageOutcome::Failed(_)
         ));
     }
@@ -193,7 +216,11 @@ mod tests {
     #[test]
     fn reused_node_without_adapter_fails_at_bootstrap_gate() {
         let mut ctx = ctx_with_assignment("reused-node");
-        let stage = BootstrapHostsStage::new(Some(vec!["other-node".to_owned()]));
+        let stage = BootstrapHostsStage::new(
+            Some(vec!["other-node".to_owned()]),
+            1,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let outcome = stage.execute(&mut ctx);
         assert!(matches!(outcome, StageOutcome::Failed(_)));
         let StageOutcome::Failed(message) = outcome else {

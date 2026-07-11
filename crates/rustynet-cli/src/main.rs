@@ -887,6 +887,18 @@ enum OpsCommand {
     VmLabDiscoverLocalUtmSummary {
         config: vm_lab::VmLabDiscoverLocalUtmConfig,
     },
+    VmLabNetworkAudit {
+        config: vm_lab::network_audit::VmLabNetworkAuditConfig,
+    },
+    VmLabNetworkPreflight {
+        config: vm_lab::network_audit::VmLabNetworkPreflightConfig,
+    },
+    VmLabNetworkPrepare {
+        config: vm_lab::network_prepare::VmLabNetworkPrepareConfig,
+    },
+    VmLabNetworkRestore {
+        config: vm_lab::network_prepare::VmLabNetworkRestoreConfig,
+    },
     VmLabStart {
         config: vm_lab::VmLabStartConfig,
     },
@@ -3237,6 +3249,65 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 report_dir: parser.optional_path("--report-dir"),
             },
         }),
+        "vm-lab-network-audit" => Ok(OpsCommand::VmLabNetworkAudit {
+            config: vm_lab::network_audit::VmLabNetworkAuditConfig {
+                inventory_path: parser.optional_path("--inventory"),
+                profile_dir: parser.optional_path("--profile-dir"),
+                profile: parser.value("--profile"),
+                utmctl_path: parser.optional_path("--utmctl-path"),
+                ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                output_path: parser.optional_path("--output"),
+                skip_guests: parser.has_flag("--skip-guests"),
+                repo_root: parser.optional_path("--repo-root"),
+            },
+        }),
+        "vm-lab-network-preflight" => Ok(OpsCommand::VmLabNetworkPreflight {
+            config: vm_lab::network_audit::VmLabNetworkPreflightConfig {
+                inventory_path: parser.optional_path("--inventory"),
+                profile_dir: parser.optional_path("--profile-dir"),
+                profile: parser
+                    .value("--profile")
+                    .ok_or_else(|| "vm-lab-network-preflight requires --profile".to_owned())?,
+                utmctl_path: parser.optional_path("--utmctl-path"),
+                ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                output_path: parser.optional_path("--output"),
+                skip_guests: parser.has_flag("--skip-guests"),
+                repo_root: parser.optional_path("--repo-root"),
+            },
+        }),
+        "vm-lab-network-prepare" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            Ok(OpsCommand::VmLabNetworkPrepare {
+                config: vm_lab::network_prepare::VmLabNetworkPrepareConfig {
+                    inventory_path: parser.optional_path("--inventory"),
+                    profile_dir: parser.optional_path("--profile-dir"),
+                    profile: parser
+                        .value("--profile")
+                        .ok_or_else(|| "vm-lab-network-prepare requires --profile".to_owned())?,
+                    vm_aliases,
+                    utmctl_path: parser.optional_path("--utmctl-path"),
+                    ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                    known_hosts_path: parser.optional_path("--known-hosts-file"),
+                    approve_reconfigure: parser.has_flag("--approve-reconfigure"),
+                    dry_run: parser.has_flag("--dry-run"),
+                    state_dir: parser.optional_path("--state-dir"),
+                },
+            })
+        }
+        "vm-lab-network-restore" => Ok(OpsCommand::VmLabNetworkRestore {
+            config: vm_lab::network_prepare::VmLabNetworkRestoreConfig {
+                transaction_id: parser.value("--transaction"),
+                list: parser.has_flag("--list"),
+                inventory_path: parser.optional_path("--inventory"),
+                utmctl_path: parser.optional_path("--utmctl-path"),
+                state_dir: parser.optional_path("--state-dir"),
+            },
+        }),
         "vm-lab-start" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -3446,6 +3517,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .path_or_default("--inventory", vm_lab::default_inventory_path()),
                 profile_path: parser.optional_path("--profile"),
                 profile_output_path: parser.optional_path("--profile-output"),
+                network_profile: parser.value("--network-profile"),
                 exit_vm: parser.value("--exit-vm"),
                 client_vm: parser.value("--client-vm"),
                 entry_vm: parser.value("--entry-vm"),
@@ -7524,6 +7596,18 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::VmLabDiscoverLocalUtmSummary { config } => {
             vm_lab::execute_ops_vm_lab_discover_local_utm_summary(config)
+        }
+        OpsCommand::VmLabNetworkAudit { config } => {
+            vm_lab::network_audit::execute_ops_vm_lab_network_audit(config)
+        }
+        OpsCommand::VmLabNetworkPreflight { config } => {
+            vm_lab::network_audit::execute_ops_vm_lab_network_preflight(config)
+        }
+        OpsCommand::VmLabNetworkPrepare { config } => {
+            vm_lab::network_prepare::execute_ops_vm_lab_network_prepare(config)
+        }
+        OpsCommand::VmLabNetworkRestore { config } => {
+            vm_lab::network_prepare::execute_ops_vm_lab_network_restore(config)
         }
         OpsCommand::VmLabStart { config } => vm_lab::execute_ops_vm_lab_start(config),
         OpsCommand::VmLabSyncRepo { config } => vm_lab::execute_ops_vm_lab_sync_repo(config),
@@ -18884,6 +18968,10 @@ fn help_text() -> String {
         "  ops vm-lab-diagnose --vm <alias> [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>]",
         "  ops vm-lab-discover-local-utm [--inventory <path>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>] [--timeout-secs <secs>] [--update-inventory-live-ips] [--report-dir <path>]",
         "  ops vm-lab-discover-local-utm-summary [--inventory <path>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>] [--timeout-secs <secs>] [--update-inventory-live-ips] [--report-dir <path>]",
+        "  ops vm-lab-network-audit [--inventory <path>] [--profile-dir <path>] [--profile <id>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only: observes UTM/host/guest network state, validates profile manifests, writes redacted evidence; never mutates)",
+        "  ops vm-lab-network-preflight --profile <id> [--inventory <path>] [--profile-dir <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only fail-closed gate: errors unless the observed fleet satisfies the profile)",
+        "  ops vm-lab-network-prepare --profile <id> [--inventory <path>] [--profile-dir <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--state-dir <path>] [--dry-run] [--approve-reconfigure]  (the ONLY VM network mutation path; without --approve-reconfigure prints the plan and changes nothing; atomic lease + stopped-VM-only apply + verified rollback)",
+        "  ops vm-lab-network-restore (--transaction <id> | --list) [--inventory <path>] [--utmctl-path <path>] [--state-dir <path>]  (verified, idempotent rollback of a recorded network transaction)",
         "  ops vm-lab-start [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
         "  ops vm-lab-sync-repo [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] (--repo-url <url> | --local-source-dir <path>) --dest-dir <absolute-path> [--branch <name>] [--remote <name>] [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-sync-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--require-same-network] (--repo-url <url> | --local-source-dir <path>) --dest-dir <absolute-path> [--workdir <absolute-path>] [--branch <name>] [--remote <name>] --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
@@ -18891,7 +18979,7 @@ fn help_text() -> String {
         "  ops vm-lab-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
         "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--dry-run]",
-        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--setup-only] [--run-only] [--legacy-bash-orchestrator] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--script <path>] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--skip-linux-live-suite] [--resume-from <stage>] [--rerun-stage <stage>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--trust-inventory-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>] [--admin-platform <linux|macos|windows>] [--blind-exit-platform <linux|macos|windows>]",
+        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] [--network-profile <id>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--setup-only] [--run-only] [--legacy-bash-orchestrator] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--script <path>] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--skip-linux-live-suite] [--resume-from <stage>] [--rerun-stage <stage>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--trust-inventory-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>] [--admin-platform <linux|macos|windows>] [--blind-exit-platform <linux|macos|windows>]",
         "  ops vm-lab-overnight --ssh-identity-file <path> [--inventory <path>] [--known-hosts-file <path>] [--branch-prefix <name>] [--backlog <path>] [--max-duration-secs <secs>] [--max-attempts-per-cell <n>] [--rotation <breadth-first|deep-first>] [--auto-merge-safe-cells] [--agent-cmd <path>] [--agent-timeout-secs <secs>] [--seed-status <os:role=status,...>] [--dry-run]",
         "  ops vm-lab-validate-windows-security --inventory <path> --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] [--ssh-port <port>] [--utm-documents-root <path>] [--utmctl-path <path>] --report-dir <path> [--dry-run] [--skip-access-bootstrap] [--skip-install] [--no-fail-on-authenticode] [--distribute-windows-membership-bundle <path>] [--distribute-windows-assignment-bundle <path>] [--distribute-windows-traversal-bundle <path>] [--distribute-windows-dns-zone-bundle <path>]",
         "  ops vm-lab-validate-linux-security [--inventory <path>] --linux-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--mesh-status-state-path <path>] [--mesh-status-expected-peer-ids <id[,id...]>] [--mesh-status-max-age-seconds <secs>]",

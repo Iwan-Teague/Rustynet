@@ -4,6 +4,27 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
+const MAX_LAB_CLOCK_SKEW_SECS: u64 = 90;
+
+fn parse_remote_unix_time(output: &[u8]) -> Result<u64, String> {
+    let text = std::str::from_utf8(output)
+        .map_err(|err| format!("remote clock output is not UTF-8: {err}"))?
+        .trim();
+    text.parse::<u64>()
+        .map_err(|err| format!("remote clock output is not a Unix timestamp ({text:?}): {err}"))
+}
+
+fn validate_clock_skew(host_unix: u64, guest_unix: u64, max_skew_secs: u64) -> Result<(), String> {
+    let skew = host_unix.abs_diff(guest_unix);
+    if skew > max_skew_secs {
+        Err(format!(
+            "guest clock skew is {skew}s (maximum {max_skew_secs}s; host={host_unix}, guest={guest_unix})"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub struct PreflightStage;
 
 impl OrchestrationStage for PreflightStage {
@@ -42,6 +63,30 @@ impl OrchestrationStage for PreflightStage {
         }
         let _ = std::fs::remove_file(&probe);
 
+        // 1b. network-profile immutability: the record written at launch must
+        // still verify against the on-repo manifests. Drift after launch
+        // fails closed (connectivity rulebook §15.4). Legacy report dirs
+        // without a record skip the check; the launch path always writes one.
+        let network_profile_record = ctx.report_dir.join("orchestration/network_profile.json");
+        if network_profile_record.is_file() {
+            let verified = std::fs::read_to_string(&network_profile_record)
+                .map_err(|err| format!("read network profile record failed: {err}"))
+                .and_then(|raw| {
+                    serde_json::from_str::<
+                        crate::vm_lab::network_profile::OrchestrationNetworkProfileRecord,
+                    >(&raw)
+                    .map_err(|err| format!("parse network profile record failed: {err}"))
+                })
+                .and_then(|record| {
+                    record.verify_against_manifests(std::path::Path::new(
+                        crate::vm_lab::network_profile::DEFAULT_NETWORK_PROFILE_DIR,
+                    ))
+                });
+            if let Err(err) = verified {
+                return StageOutcome::Failed(format!("network profile drift check failed: {err}"));
+            }
+        }
+
         // 2. ssh binary
         if std::process::Command::new("ssh")
             .arg("-V")
@@ -63,6 +108,63 @@ impl OrchestrationStage for PreflightStage {
             return StageOutcome::Failed(format!(
                 "lab requires exactly 1 Exit node, found {exit_count}"
             ));
+        }
+
+        // 4. signed-state freshness depends on synchronized clocks. A paused
+        // VM can be hours behind while SSH/readiness still look healthy; issuing
+        // bundles then makes the daemon reject them as future-dated. Detect the
+        // condition before bootstrap or signed-state mutation.
+        for (alias, adapter) in &ctx.adapters {
+            let host = match adapter.shell_host() {
+                Ok(host) => host,
+                Err(err) => {
+                    return StageOutcome::Failed(format!(
+                        "{alias}: cannot construct clock probe: {err}"
+                    ));
+                }
+            };
+            let platform = adapter.platform();
+            let argv: &[&str] = match platform {
+                crate::vm_lab::VmGuestPlatform::Windows => &[
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()",
+                ],
+                _ => &["date", "+%s"],
+            };
+            let status = match host.run_argv(argv, &[], &[]) {
+                Ok(status) => status,
+                Err(err) => {
+                    return StageOutcome::Failed(format!(
+                        "{alias}: remote clock probe failed: {err}"
+                    ));
+                }
+            };
+            if !status.is_success() {
+                return StageOutcome::Failed(format!(
+                    "{alias}: remote clock probe exited {}: {}",
+                    status.code,
+                    String::from_utf8_lossy(&status.stderr).trim()
+                ));
+            }
+            let guest_unix = match parse_remote_unix_time(&status.stdout) {
+                Ok(value) => value,
+                Err(err) => return StageOutcome::Failed(format!("{alias}: {err}")),
+            };
+            let host_unix = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            {
+                Ok(duration) => duration.as_secs(),
+                Err(err) => {
+                    return StageOutcome::Failed(format!(
+                        "orchestrator host clock precedes Unix epoch: {err}"
+                    ));
+                }
+            };
+            if let Err(err) = validate_clock_skew(host_unix, guest_unix, MAX_LAB_CLOCK_SKEW_SECS) {
+                return StageOutcome::Failed(format!("{alias}: {err}"));
+            }
         }
 
         StageOutcome::Passed
@@ -133,5 +235,15 @@ mod tests {
             matches!(outcome, StageOutcome::Failed(_)),
             "must fail with no exit node: {outcome:?}"
         );
+    }
+
+    #[test]
+    fn remote_clock_parser_and_skew_check_fail_closed() {
+        assert_eq!(parse_remote_unix_time(b"123\n"), Ok(123));
+        assert!(parse_remote_unix_time(b"").is_err());
+        assert!(parse_remote_unix_time(b"not-a-time").is_err());
+        assert!(validate_clock_skew(1_000, 910, 90).is_ok());
+        assert!(validate_clock_skew(1_000, 909, 90).is_err());
+        assert!(validate_clock_skew(909, 1_000, 90).is_err());
     }
 }

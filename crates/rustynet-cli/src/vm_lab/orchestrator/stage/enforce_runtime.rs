@@ -4,7 +4,22 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-pub struct EnforceBaselineRuntimeStage;
+pub struct EnforceBaselineRuntimeStage {
+    max_parallel_node_workers: usize,
+    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl EnforceBaselineRuntimeStage {
+    pub fn new(
+        max_parallel_node_workers: usize,
+        shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            max_parallel_node_workers: max_parallel_node_workers.max(1),
+            shutdown_flag,
+        }
+    }
+}
 
 impl OrchestrationStage for EnforceBaselineRuntimeStage {
     fn id(&self) -> StageId {
@@ -25,9 +40,11 @@ impl OrchestrationStage for EnforceBaselineRuntimeStage {
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
-        let results: Vec<(String, Result<(), String>)> = aliases
-            .iter()
-            .map(|alias| {
+        let results = crate::vm_lab::orchestrator::parallel::bounded_parallel_map_cancellable(
+            &aliases,
+            self.max_parallel_node_workers,
+            &self.shutdown_flag,
+            |alias| {
                 let r = match ctx.adapters.get(alias.as_str()) {
                     Some(adapter) => adapter.enforce_runtime(ctx).map_err(|e| {
                         // The adapter's enforce wait reports only the symptom
@@ -43,8 +60,14 @@ impl OrchestrationStage for EnforceBaselineRuntimeStage {
                     None => Err(format!("no adapter for '{alias}'")),
                 };
                 (alias.clone(), r)
-            })
-            .collect();
+            },
+            |alias| {
+                (
+                    alias.clone(),
+                    Err("cancelled before node work was admitted".to_owned()),
+                )
+            },
+        );
         let errors: Vec<String> = results
             .into_iter()
             .filter_map(|(alias, r)| r.err().map(|e| format!("{alias}: {e}")))
@@ -80,7 +103,11 @@ mod tests {
             orchestrator_dialect: None,
         };
         assert_eq!(
-            EnforceBaselineRuntimeStage.execute(&mut ctx),
+            EnforceBaselineRuntimeStage::new(
+                1,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .execute(&mut ctx),
             StageOutcome::Passed
         );
     }

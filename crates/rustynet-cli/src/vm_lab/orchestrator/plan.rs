@@ -112,6 +112,9 @@ pub struct PlanBuilder {
     /// `--skip-cross-network`: when false, run the Rust-owned cross-network
     /// suite. Same-subnet/non-substrate cases are stage-level Skipped.
     cross_network: CrossNetworkOptions,
+    /// Maximum concurrent per-node adapter operations.
+    max_parallel_node_workers: usize,
+    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PlanBuilder {
@@ -135,9 +138,9 @@ impl PlanBuilder {
             StageId::RoleSwitchMatrix,
             StageId::ExitHandoff,
             StageId::ActiveExit,
-            StageId::ExitDemotionResidueValidation,
             StageId::ExitDnsFailclosedValidation,
             StageId::ExitNatLifecycleValidation,
+            StageId::ExitDemotionResidueValidation,
             StageId::BlindExitDataplaneValidation,
             StageId::LiveAnchor,
             StageId::LiveTwoHopValidation,
@@ -230,6 +233,19 @@ impl PlanBuilder {
         self
     }
 
+    pub fn with_max_parallel_node_workers(mut self, max_workers: usize) -> Self {
+        self.max_parallel_node_workers = max_workers.max(1);
+        self
+    }
+
+    pub fn with_shutdown_flag(
+        mut self,
+        shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.shutdown_flag = shutdown_flag;
+        self
+    }
+
     pub fn build(self) -> Vec<Box<dyn OrchestrationStage>> {
         let PlanBuilder {
             rebuild_only,
@@ -238,6 +254,8 @@ impl PlanBuilder {
             enable_chaos_suite,
             skip_soak,
             cross_network,
+            max_parallel_node_workers,
+            shutdown_flag,
         } = self;
         let mut stages: Vec<Box<dyn OrchestrationStage>> = vec![
             Box::new(PreflightStage),
@@ -246,7 +264,11 @@ impl PlanBuilder {
             // cleanup + bootstrap must share the same rebuild set: a node we
             // refuse to clean must also be refused a rebuild (and vice versa).
             Box::new(CleanupHostsStage::new(rebuild_only.clone())),
-            Box::new(BootstrapHostsStage::new(rebuild_only.clone())),
+            Box::new(BootstrapHostsStage::new(
+                rebuild_only.clone(),
+                max_parallel_node_workers,
+                std::sync::Arc::clone(&shutdown_flag),
+            )),
             Box::new(CollectPubkeysStage),
             Box::new(MembershipInitStage),
             Box::new(DistributeMembershipStage),
@@ -257,12 +279,27 @@ impl PlanBuilder {
             // the anchor view) and before assignments are distributed.
             Box::new(AnchorValidationStage),
             Box::new(AdminIssueStage),
-            Box::new(DistributeAssignmentsStage),
-            Box::new(DistributeTraversalStage),
-            Box::new(DistributeDnsZoneStage),
-            Box::new(EnforceBaselineRuntimeStage),
+            Box::new(DistributeAssignmentsStage::new(
+                max_parallel_node_workers,
+                std::sync::Arc::clone(&shutdown_flag),
+            )),
+            Box::new(DistributeTraversalStage::new(
+                max_parallel_node_workers,
+                std::sync::Arc::clone(&shutdown_flag),
+            )),
+            Box::new(DistributeDnsZoneStage::new(
+                max_parallel_node_workers,
+                std::sync::Arc::clone(&shutdown_flag),
+            )),
+            Box::new(EnforceBaselineRuntimeStage::new(
+                max_parallel_node_workers,
+                std::sync::Arc::clone(&shutdown_flag),
+            )),
             Box::new(BlindExitStage),
-            Box::new(ValidateBaselineRuntimeStage),
+            Box::new(ValidateBaselineRuntimeStage::new(
+                max_parallel_node_workers,
+                std::sync::Arc::clone(&shutdown_flag),
+            )),
             // Eight Tier-0 adversarial daemon self-audits (membership-revoke,
             // revoked-peer-denied, membership-signature, privileged-helper-allowlist,
             // policy-default-deny, gossip-revoked-readmit, enrollment-replay,
@@ -322,9 +359,9 @@ impl PlanBuilder {
             Box::new(RoleSwitchMatrixStage),
             Box::new(ExitHandoffStage),
             Box::new(ActiveExitStage),
-            Box::new(ExitDemotionResidueValidationStage),
             Box::new(ExitDnsFailclosedValidationStage),
             Box::new(ExitNatLifecycleValidationStage),
+            Box::new(ExitDemotionResidueValidationStage),
             Box::new(BlindExitDataplaneValidationStage),
             Box::new(LiveAnchorStage),
             Box::new(LiveTwoHopValidationStage),

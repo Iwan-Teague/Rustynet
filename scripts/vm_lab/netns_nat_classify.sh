@@ -25,8 +25,10 @@ PROBE="${PROBE:-${SCRIPT_DIR}/nat_probe.py}"
 [ -f "$SIM" ] || SIM="/tmp/netns_internet_sim.sh"
 [ -f "$RESP" ] || RESP="/tmp/stun_responder.py"
 [ -f "$PROBE" ] || PROBE="/tmp/nat_probe.py"
-SVC_PRIMARY="100.64.0.254"
-SVC_SECONDARY="100.64.0.253"
+# Canonical simulated-transit service addresses (198.18.0.0/15); override
+# only for the explicit CGNAT collision profile.
+SVC_PRIMARY="${SVC_PRIMARY:-198.18.0.254}"
+SVC_SECONDARY="${SVC_SECONDARY:-198.18.0.253}"
 PORT=3478
 TMP_DIR=""
 declare -a STUN_PIDS=()

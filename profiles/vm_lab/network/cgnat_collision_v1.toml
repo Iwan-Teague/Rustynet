@@ -1,0 +1,32 @@
+# Explicit CGNAT collision/adversarial profile (rulebook §15.3): the ONLY
+# profile allowed to place underlay transit inside the Rustynet mesh range
+# 100.64.0.0/10. It exists to prove routing stays fail-closed despite the
+# real-world underlay/overlay overlap. It cannot reuse the ordinary NAT
+# oracle: requires_dedicated_oracle is mandatory.
+schema_version = 1
+id = "cgnat_collision_v1"
+evidence_tier = "netns"
+description = "Adversarial CGNAT collision profile: transit deliberately overlaps the Rustynet mesh 100.64.0.0/10 to prove fail-closed routing under underlay/overlay collision."
+
+[management]
+attachment = "shared"
+internet = true
+peer_to_peer = false
+security_mode = "routine"
+
+[scenario]
+substrate = "netns"
+address_family = "v4_only"
+internet_mode = "simulated"
+require_unique_site_subnets = true
+site_subnet_pool = "172.20.0.0/16"
+site_prefix_len = 24
+transit_subnet = "100.64.0.0/24"
+allow_cgnat_underlay_collision = true
+requires_dedicated_oracle = true
+
+[evidence]
+require_endpoint_capture = true
+require_router_capture = true
+require_negative_reachability = true
+forbid_socks_proxy = true

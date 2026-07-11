@@ -858,6 +858,7 @@ mod tests {
             inventory_path: PathBuf::from("/dev/null"),
             profile_path: None,
             profile_output_path: None,
+            network_profile: None,
             exit_vm: None,
             client_vm: None,
             entry_vm: None,

@@ -50,9 +50,13 @@ impl NodeAdapter for WindowsNodeAdapter {
 
     fn collect_os_version(&self) -> String {
         use crate::vm_lab::orchestrator::adapter::ssh;
-        ssh::run_remote(&self.conn, "cmd /c ver", Duration::from_secs(10))
-            .map(|v| format!("Windows {}", v.trim()))
-            .unwrap_or_else(|_| "windows".to_owned())
+        ssh::run_remote(
+            &self.conn,
+            "cmd /d /c \"ver & echo Architecture=%PROCESSOR_ARCHITECTURE%\"",
+            Duration::from_secs(10),
+        )
+        .map(|v| format!("Windows {}", v.trim()))
+        .unwrap_or_else(|_| "windows".to_owned())
     }
 
     fn alias(&self) -> &str {

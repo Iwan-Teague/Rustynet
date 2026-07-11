@@ -4,7 +4,22 @@ use crate::vm_lab::orchestrator::error::{BundleKind, StageOutcome};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-pub struct DistributeTraversalStage;
+pub struct DistributeTraversalStage {
+    max_parallel_node_workers: usize,
+    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DistributeTraversalStage {
+    pub fn new(
+        max_parallel_node_workers: usize,
+        shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            max_parallel_node_workers: max_parallel_node_workers.max(1),
+            shutdown_flag,
+        }
+    }
+}
 
 impl OrchestrationStage for DistributeTraversalStage {
     fn id(&self) -> StageId {
@@ -25,7 +40,14 @@ impl OrchestrationStage for DistributeTraversalStage {
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         use crate::vm_lab::orchestrator::stage::distribute_assignments::distribute_bundle_kind;
-        distribute_bundle_kind(ctx, BundleKind::Traversal, "rn-traversal", "traversal")
+        distribute_bundle_kind(
+            ctx,
+            BundleKind::Traversal,
+            "rn-traversal",
+            "traversal",
+            self.max_parallel_node_workers,
+            &self.shutdown_flag,
+        )
     }
 }
 
@@ -52,7 +74,11 @@ mod tests {
             orchestrator_dialect: None,
         };
         assert!(matches!(
-            DistributeTraversalStage.execute(&mut ctx),
+            DistributeTraversalStage::new(
+                1,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .execute(&mut ctx),
             StageOutcome::Failed(_)
         ));
     }

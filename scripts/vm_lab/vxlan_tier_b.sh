@@ -21,20 +21,33 @@ PROFILE_B="${PROFILE_B:-port_restricted_cone}"
 UDP_PORTS_A="${UDP_PORTS_A:-51820-51859}"
 UDP_PORTS_B="${UDP_PORTS_B:-51860-51900}"
 
-NODE_A_HOST="${NODE_A_HOST:-192.168.0.200}"      # debian-headless-1
-NODE_B_HOST="${NODE_B_HOST:-192.168.0.201}"      # debian-headless-2
-SVC_HOST="${SVC_HOST:-192.168.0.202}"            # debian-headless-3
-ROUTER_HOST="${ROUTER_HOST:-192.168.0.203}"      # debian-headless-4
-WORK_HOST="${WORK_HOST:-192.168.0.204}"          # debian-headless-5
+# Underlay hosts are REQUIRED inputs: the driver makes no assumption about
+# the current management subnet (the legacy 192.168.0.200-204 defaults named
+# a retired fleet). Pass the SSH-reachable management addresses of five lab
+# guests explicitly, e.g. NODE_A_HOST=... NODE_B_HOST=... SVC_HOST=...
+# ROUTER_HOST=... WORK_HOST=... vxlan_tier_b.sh setup
+NODE_A_HOST="${NODE_A_HOST:-}"
+NODE_B_HOST="${NODE_B_HOST:-}"
+SVC_HOST="${SVC_HOST:-}"
+ROUTER_HOST="${ROUTER_HOST:-}"
+WORK_HOST="${WORK_HOST:-}"
+for _required_host in NODE_A_HOST NODE_B_HOST SVC_HOST ROUTER_HOST WORK_HOST; do
+  if [ -z "${!_required_host}" ]; then
+    echo "vxlan_tier_b: ${_required_host} is required (no default underlay subnet is assumed; see CrossNetworkSimulationRunbook.md)" >&2
+    exit 2
+  fi
+done
 
-NODE_A_VX="172.16.10.2/24"
-NODE_A_GW="172.16.10.1"
-NODE_B_VX="172.16.20.2/24"
-NODE_B_GW="172.16.20.1"
-ROUTER_A_VX="172.16.10.1/24"
-ROUTER_B_VX="172.16.20.1/24"
-ROUTER_WAN_VX="10.200.0.11/24"
-SVC_VX="10.200.0.254/24"
+# Overlay site subnets come from the canonical scenario pool 172.20.0.0/16
+# (LiveLabVmConnectivityRulebook §15.3); overlay transit uses 198.18.0.0/15.
+NODE_A_VX="${NODE_A_VX:-172.20.10.2/24}"
+NODE_A_GW="${NODE_A_GW:-172.20.10.1}"
+NODE_B_VX="${NODE_B_VX:-172.20.20.2/24}"
+NODE_B_GW="${NODE_B_GW:-172.20.20.1}"
+ROUTER_A_VX="${ROUTER_A_VX:-172.20.10.1/24}"
+ROUTER_B_VX="${ROUTER_B_VX:-172.20.20.1/24}"
+ROUTER_WAN_VX="${ROUTER_WAN_VX:-198.18.1.11/24}"
+SVC_VX="${SVC_VX:-198.18.1.254/24}"
 VXLAN_PORT="${VXLAN_PORT:-4789}"
 STUN_PORT="${STUN_PORT:-3478}"
 SKIP_APT="${SKIP_APT:-true}"
@@ -122,22 +135,22 @@ nft delete table ip rustynet_natlab 2>/dev/null || true
 nft add table ip "\$table"
 nft add chain ip "\$table" postrouting '{ type nat hook postrouting priority srcnat; policy accept; }'
 case "$PROFILE_A" in
-  port_restricted_cone) nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.16.10.0/24 masquerade ;;
-  symmetric) nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.16.10.0/24 masquerade random ;;
+  port_restricted_cone) nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.20.10.0/24 masquerade ;;
+  symmetric) nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.20.10.0/24 masquerade random ;;
   full_cone)
     nft add chain ip "\$table" prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
-    nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.16.10.0/24 masquerade
-    nft add rule ip "\$table" prerouting iifname vxlan1 udp dport "$UDP_PORTS_A" dnat to 172.16.10.2
+    nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.20.10.0/24 masquerade
+    nft add rule ip "\$table" prerouting iifname vxlan1 udp dport "$UDP_PORTS_A" dnat to 172.20.10.2
     ;;
   *) echo "unsupported PROFILE_A=$PROFILE_A" >&2; exit 2 ;;
 esac
 case "$PROFILE_B" in
-  port_restricted_cone) nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.16.20.0/24 masquerade ;;
-  symmetric) nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.16.20.0/24 masquerade random ;;
+  port_restricted_cone) nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.20.20.0/24 masquerade ;;
+  symmetric) nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.20.20.0/24 masquerade random ;;
   full_cone)
     nft add chain ip "\$table" prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
-    nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.16.20.0/24 masquerade
-    nft add rule ip "\$table" prerouting iifname vxlan1 udp dport "$UDP_PORTS_B" dnat to 172.16.20.2
+    nft add rule ip "\$table" postrouting oifname vxlan1 ip saddr 172.20.20.0/24 masquerade
+    nft add rule ip "\$table" prerouting iifname vxlan1 udp dport "$UDP_PORTS_B" dnat to 172.20.20.2
     ;;
   *) echo "unsupported PROFILE_B=$PROFILE_B" >&2; exit 2 ;;
 esac
@@ -154,7 +167,7 @@ if [ -f "$STATE_ROOT/stun.pid" ]; then
   kill "\$old" 2>/dev/null || true
   rm -f "$STATE_ROOT/stun.pid"
 fi
-nohup python3 "$REMOTE_REPO/scripts/vm_lab/stun_responder.py" --bind 10.200.0.254 --port "$STUN_PORT" >"$STATE_ROOT/stun.log" 2>&1 &
+nohup python3 "$REMOTE_REPO/scripts/vm_lab/stun_responder.py" --bind 198.18.1.254 --port "$STUN_PORT" >"$STATE_ROOT/stun.log" 2>&1 &
 echo \$! > "$STATE_ROOT/stun.pid"
 EOF
 }
@@ -204,8 +217,8 @@ setup() {
 
   # Required helper invocations. The helper is single-LAN/table-reset today, so
   # the final active ruleset below combines both LANs after these checks.
-  remote "$ROUTER_HOST" "bash '$REMOTE_REPO/scripts/vm_lab/apply_nat_profile.sh' --profile '$PROFILE_A' --wan-if vxlan1 --lan-if vxlan100 --lan-host 172.16.10.2 --wan-udp-ports '$UDP_PORTS_A'"
-  remote "$ROUTER_HOST" "bash '$REMOTE_REPO/scripts/vm_lab/apply_nat_profile.sh' --profile '$PROFILE_B' --wan-if vxlan1 --lan-if vxlan200 --lan-host 172.16.20.2 --wan-udp-ports '$UDP_PORTS_B'"
+  remote "$ROUTER_HOST" "bash '$REMOTE_REPO/scripts/vm_lab/apply_nat_profile.sh' --profile '$PROFILE_A' --wan-if vxlan1 --lan-if vxlan100 --lan-host 172.20.10.2 --wan-udp-ports '$UDP_PORTS_A'"
+  remote "$ROUTER_HOST" "bash '$REMOTE_REPO/scripts/vm_lab/apply_nat_profile.sh' --profile '$PROFILE_B' --wan-if vxlan1 --lan-if vxlan200 --lan-host 172.20.20.2 --wan-udp-ports '$UDP_PORTS_B'"
   remote "$ROUTER_HOST" "$(install_combined_nat_cmd)"
   remote "$SVC_HOST" "$(start_stun_cmd)"
 
@@ -260,7 +273,7 @@ run_daemon_test() {
   ${RUSTYNET_CLI} ops run-debian-two-node-e2e \
     --exit-host "${SSH_USER}@${NODE_A_HOST}" \
     --client-host "${SSH_USER}@${NODE_B_HOST}" \
-    --ssh-allow-cidrs "172.16.0.0/12,10.200.0.0/24" \
+    --ssh-allow-cidrs "172.20.0.0/16,198.18.0.0/15" \
     --network-id "$NETWORK_ID" \
     --exit-node-id tier-b-a \
     --client-node-id tier-b-b \

@@ -194,6 +194,10 @@ pub fn distribute_verifier_key(
     kind: BundleKind,
     pub_key_path: &Path,
 ) -> Result<(), AdapterError> {
+    let expected_sha256 =
+        crate::vm_lab::orchestrator::adapter::verifier_key::validated_verifier_key_sha256(
+            pub_key_path,
+        )?;
     let (remote_staging, remote_dst) = windows_verifier_key_paths(&kind);
     let dst_parent = remote_dst
         .rsplit_once('\\')
@@ -214,9 +218,12 @@ pub fn distribute_verifier_key(
     let install_script = format!(
         "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
-         Move-Item -LiteralPath {src_q} -Destination {dst_q} -Force",
+         Move-Item -LiteralPath {src_q} -Destination {dst_q} -Force; \
+         $actual = (Get-FileHash -LiteralPath {dst_q} -Algorithm SHA256).Hash.ToLowerInvariant(); \
+         if ($actual -ne {expected_q}) {{ throw ('verifier key digest mismatch: ' + $actual) }}",
         src_q = ps_quote(&remote_staging)?,
         dst_q = ps_quote(&remote_dst)?,
+        expected_q = ps_quote(&expected_sha256)?,
     );
     run_remote_ps(conn, &install_script, SHORT_TIMEOUT)?;
     Ok(())

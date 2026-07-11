@@ -1,7 +1,10 @@
 #![allow(dead_code)]
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
 use crate::vm_lab::orchestrator::error::{StageOutcome, WireguardPublicKey};
@@ -10,7 +13,7 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 use crate::vm_lab::orchestrator::stage::StageId;
 use serde::{Deserialize, Serialize};
 
-pub const ORCHESTRATION_CONTEXT_SCHEMA_VERSION: u64 = 2;
+pub const ORCHESTRATION_CONTEXT_SCHEMA_VERSION: u64 = 3;
 
 pub const ENV_ORCHESTRATOR_DIALECT: &str = "RUSTYNET_ORCHESTRATOR_DIALECT";
 
@@ -32,18 +35,99 @@ impl OrchestratorDialect {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PersistedOrchestrationContext {
-    schema_version: u64,
     assignments: Vec<NodeRoleAssignment>,
-    node_ids: HashMap<String, String>,
-    collected_pubkeys: HashMap<String, WireguardPublicKey>,
+    node_ids: BTreeMap<String, String>,
+    collected_pubkeys: BTreeMap<String, WireguardPublicKey>,
     membership_snapshot: Option<Vec<u8>>,
-    mesh_ips: HashMap<String, String>,
-    endpoints: HashMap<String, String>,
+    mesh_ips: BTreeMap<String, String>,
+    endpoints: BTreeMap<String, String>,
     network_id: String,
     #[serde(default)]
     ssh_allow_cidrs: String,
     #[serde(default)]
     orchestrator_dialect: Option<OrchestratorDialect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationContextBinding {
+    pub report_dir: String,
+    pub inventory_sha256: String,
+    pub source_mode: String,
+    pub repo_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedOrchestrationContextEnvelope {
+    schema_version: u64,
+    binding: OrchestrationContextBinding,
+    payload_sha256: String,
+    payload: PersistedOrchestrationContext,
+}
+
+fn payload_digest(
+    binding: &OrchestrationContextBinding,
+    payload: &PersistedOrchestrationContext,
+) -> Result<String, String> {
+    let bytes = serde_json::to_vec(&(binding, payload))
+        .map_err(|err| format!("serialize orchestration context digest input: {err}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "orchestration context path has no parent: {}",
+            path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create orchestration context state dir '{}': {err}",
+            parent.display()
+        )
+    })?;
+    let tmp = parent.join(format!(
+        ".orchestration_context.json.{}.{}.tmp",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&tmp)
+        .map_err(|err| format!("create context temp '{}': {err}", tmp.display()))?;
+    let write_result = (|| {
+        file.write_all(bytes)
+            .map_err(|err| format!("write context temp '{}': {err}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("sync context temp '{}': {err}", tmp.display()))?;
+        fs::rename(&tmp, path).map_err(|err| {
+            format!(
+                "replace orchestration context '{}' from '{}': {err}",
+                path.display(),
+                tmp.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|err| format!("sync context directory '{}': {err}", parent.display()))?;
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result
 }
 
 /// Shared state threaded through all orchestration stages.
@@ -115,72 +199,102 @@ impl OrchestrationContext {
         self.stage_outcomes.get(stage)
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        let snapshot = PersistedOrchestrationContext {
-            schema_version: ORCHESTRATION_CONTEXT_SCHEMA_VERSION,
+    pub fn save_bound(
+        &self,
+        path: &Path,
+        binding: &OrchestrationContextBinding,
+    ) -> Result<(), String> {
+        let payload = PersistedOrchestrationContext {
             assignments: self.assignments.clone(),
-            node_ids: self.node_ids.clone(),
-            collected_pubkeys: self.collected_pubkeys.clone(),
+            node_ids: self.node_ids.clone().into_iter().collect(),
+            collected_pubkeys: self.collected_pubkeys.clone().into_iter().collect(),
             membership_snapshot: self.membership_snapshot.clone(),
-            mesh_ips: self.mesh_ips.clone(),
-            endpoints: self.endpoints.clone(),
+            mesh_ips: self.mesh_ips.clone().into_iter().collect(),
+            endpoints: self.endpoints.clone().into_iter().collect(),
             network_id: self.network_id.clone(),
             ssh_allow_cidrs: self.ssh_allow_cidrs.clone(),
             orchestrator_dialect: self.orchestrator_dialect,
         };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| {
-                format!(
-                    "create orchestration context state dir '{}': {err}",
-                    parent.display()
-                )
-            })?;
-        }
-        let bytes = serde_json::to_vec_pretty(&snapshot)
+        let envelope = PersistedOrchestrationContextEnvelope {
+            schema_version: ORCHESTRATION_CONTEXT_SCHEMA_VERSION,
+            payload_sha256: payload_digest(binding, &payload)?,
+            binding: binding.clone(),
+            payload,
+        };
+        let bytes = serde_json::to_vec_pretty(&envelope)
             .map_err(|err| format!("serialize orchestration context: {err}"))?;
-        fs::write(path, bytes).map_err(|err| {
-            format!(
-                "write orchestration context state '{}': {err}",
-                path.display()
-            )
-        })
+        atomic_write_private(path, &bytes)
     }
 
-    pub fn load(path: &Path, report_dir: PathBuf) -> Result<Self, String> {
+    pub fn load_bound(
+        path: &Path,
+        report_dir: PathBuf,
+        expected_binding: &OrchestrationContextBinding,
+    ) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(path)
+                .map_err(|err| format!("stat persisted context '{}': {err}", path.display()))?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "persisted orchestration context '{}' has insecure mode {mode:o}; expected 600",
+                    path.display()
+                ));
+            }
+        }
         let bytes = fs::read(path).map_err(|err| {
             format!(
                 "load persisted orchestration context '{}': {err}",
                 path.display()
             )
         })?;
-        let snapshot: PersistedOrchestrationContext =
-            serde_json::from_slice(&bytes).map_err(|err| {
+        let envelope: PersistedOrchestrationContextEnvelope = serde_json::from_slice(&bytes)
+            .map_err(|err| {
                 format!(
                     "parse persisted orchestration context '{}': {err}",
                     path.display()
                 )
             })?;
-        if snapshot.schema_version != ORCHESTRATION_CONTEXT_SCHEMA_VERSION {
+        if envelope.schema_version != ORCHESTRATION_CONTEXT_SCHEMA_VERSION {
             return Err(format!(
                 "stale persisted orchestration context '{}': schema_version={} expected={}",
                 path.display(),
-                snapshot.schema_version,
+                envelope.schema_version,
                 ORCHESTRATION_CONTEXT_SCHEMA_VERSION
             ));
         }
+        if &envelope.binding != expected_binding {
+            return Err(format!(
+                "persisted orchestration context '{}' provenance mismatch: actual={:?} expected={expected_binding:?}",
+                path.display(),
+                envelope.binding
+            ));
+        }
+        let actual_digest = payload_digest(&envelope.binding, &envelope.payload)?;
+        if actual_digest != envelope.payload_sha256 {
+            return Err(format!(
+                "persisted orchestration context '{}' digest mismatch",
+                path.display()
+            ));
+        }
+        let snapshot = envelope.payload;
         Ok(OrchestrationContext {
             assignments: snapshot.assignments,
             adapters: HashMap::new(),
             source_archive: None,
             report_dir,
             stage_outcomes: HashMap::new(),
-            collected_pubkeys: snapshot.collected_pubkeys,
+            collected_pubkeys: snapshot.collected_pubkeys.into_iter().collect(),
             network_id: snapshot.network_id,
-            node_ids: snapshot.node_ids,
+            node_ids: snapshot.node_ids.into_iter().collect(),
             ssh_allow_cidrs: snapshot.ssh_allow_cidrs,
             membership_snapshot: snapshot.membership_snapshot,
-            mesh_ips: snapshot.mesh_ips,
-            endpoints: snapshot.endpoints,
+            mesh_ips: snapshot.mesh_ips.into_iter().collect(),
+            endpoints: snapshot.endpoints.into_iter().collect(),
             orchestrator_dialect: snapshot.orchestrator_dialect,
         })
     }
@@ -216,8 +330,16 @@ mod tests {
         ctx.set_dialect(OrchestratorDialect::RustNative);
 
         let path = tmp.path().join("state/orchestration_context.json");
-        ctx.save(path.as_path()).unwrap();
-        let loaded = OrchestrationContext::load(path.as_path(), tmp.path().to_path_buf()).unwrap();
+        let binding = OrchestrationContextBinding {
+            report_dir: tmp.path().display().to_string(),
+            inventory_sha256: "inventory-digest".to_owned(),
+            source_mode: "working-tree".to_owned(),
+            repo_ref: None,
+        };
+        ctx.save_bound(path.as_path(), &binding).unwrap();
+        let loaded =
+            OrchestrationContext::load_bound(path.as_path(), tmp.path().to_path_buf(), &binding)
+                .unwrap();
 
         assert_eq!(loaded.assignments, ctx.assignments);
         assert_eq!(loaded.node_ids, ctx.node_ids);
@@ -233,5 +355,51 @@ mod tests {
         );
         assert!(loaded.adapters.is_empty());
         assert!(loaded.stage_outcomes.is_empty());
+    }
+
+    #[test]
+    fn orchestration_context_rejects_tamper_and_binding_mismatch() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = OrchestrationContext::new(Vec::new(), tmp.path().to_path_buf(), "net".to_owned());
+        let path = tmp.path().join("state/orchestration_context.json");
+        let binding = OrchestrationContextBinding {
+            report_dir: tmp.path().display().to_string(),
+            inventory_sha256: "inventory-a".to_owned(),
+            source_mode: "working-tree".to_owned(),
+            repo_ref: None,
+        };
+        ctx.save_bound(&path, &binding).expect("save");
+
+        let mut wrong = binding.clone();
+        wrong.inventory_sha256 = "inventory-b".to_owned();
+        assert!(OrchestrationContext::load_bound(&path, tmp.path().to_path_buf(), &wrong).is_err());
+
+        let body = fs::read_to_string(&path).expect("read context");
+        let tampered = body.replace("\"network_id\": \"net\"", "\"network_id\": \"evil\"");
+        fs::write(&path, tampered).expect("tamper context");
+        assert!(
+            OrchestrationContext::load_bound(&path, tmp.path().to_path_buf(), &binding).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orchestration_context_rejects_group_readable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let ctx = OrchestrationContext::new(Vec::new(), tmp.path().to_path_buf(), "net".to_owned());
+        let path = tmp.path().join("state/orchestration_context.json");
+        let binding = OrchestrationContextBinding {
+            report_dir: tmp.path().display().to_string(),
+            inventory_sha256: "inventory".to_owned(),
+            source_mode: "working-tree".to_owned(),
+            repo_ref: None,
+        };
+        ctx.save_bound(&path, &binding).expect("save");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("chmod");
+        assert!(
+            OrchestrationContext::load_bound(&path, tmp.path().to_path_buf(), &binding).is_err()
+        );
     }
 }

@@ -11,12 +11,10 @@
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::orchestrator::role_validation::discover_single_generated_nft_table;
 use std::path::PathBuf;
 
 use tempfile;
-
-const DEFAULT_KILLSWITCH_TABLE: &str = "rustynet_g1";
-const DEFAULT_MESH_HOSTNAME: &str = "exit-1.rustynet";
 
 const REQUIRED_ARTIFACTS: &[&str] = &[
     "firewall_block_rules.json",
@@ -60,8 +58,11 @@ pub fn validate_linux_exit_dns_failclosed(
     shell: &dyn RemoteShellHost,
     daemon_path: &str,
     alias: &str,
+    mesh_hostname: &str,
 ) -> Result<(), String> {
     let egress_iface = detect_linux_egress_interface(shell)?;
+    let killswitch_table =
+        discover_single_generated_nft_table(shell, "inet", "rustynet_g", "active killswitch")?;
 
     let remote_tmp_out = shell
         .run_argv(&["mktemp", "-d"], &[], &[])
@@ -75,10 +76,12 @@ pub fn validate_linux_exit_dns_failclosed(
     let remote_tmp_path = PathBuf::from(&remote_tmp);
 
     let cleanup = || {
-        let _ = shell.run_argv(&["rm", "-rf", &remote_tmp], &[], &[]);
+        let _ = shell.run_argv(&["sudo", "-n", "rm", "-rf", &remote_tmp], &[], &[]);
     };
 
-    let capture_argv: [&str; 8] = [
+    let capture_argv: [&str; 12] = [
+        "sudo",
+        "-n",
         daemon_path,
         "linux-exit-dns-failclosed-capture",
         "--output",
@@ -86,18 +89,23 @@ pub fn validate_linux_exit_dns_failclosed(
         "--lan-iface",
         &egress_iface,
         "--mesh-hostname",
-        DEFAULT_MESH_HOSTNAME,
+        mesh_hostname,
+        "--killswitch-table",
+        &killswitch_table,
     ];
-    let capture_result = shell.run_argv(&capture_argv, &[], &[]);
-    if let Err(e) = &capture_result {
-        let context = if e.to_string().len() > 200 {
-            format!("{}…", &e.to_string()[..200])
-        } else {
-            e.to_string()
-        };
+    let capture_out = shell.run_argv(&capture_argv, &[], &[]).map_err(|e| {
+        cleanup();
+        format!("dispatch of linux-exit-dns-failclosed-capture failed: {e}")
+    })?;
+    if capture_out.code != 0 {
+        let stdout = String::from_utf8_lossy(&capture_out.stdout);
+        let stderr = String::from_utf8_lossy(&capture_out.stderr);
         cleanup();
         return Err(format!(
-            "dispatch of linux-exit-dns-failclosed-capture failed: {context}"
+            "linux-exit-dns-failclosed-capture exited {}: {} {}",
+            capture_out.code,
+            stdout.trim(),
+            stderr.trim()
         ));
     }
 
@@ -105,9 +113,21 @@ pub fn validate_linux_exit_dns_failclosed(
 
     for artifact in REQUIRED_ARTIFACTS {
         let remote_path = remote_tmp_path.join(artifact);
-        let cat_argv: [&str; 2] = ["cat", remote_path.to_str().unwrap_or(artifact)];
+        let cat_argv: [&str; 4] = [
+            "sudo",
+            "-n",
+            "cat",
+            remote_path.to_str().unwrap_or(artifact),
+        ];
         match shell.run_argv(&cat_argv, &[], &[]) {
             Ok(out) => {
+                if out.code != 0 {
+                    cleanup();
+                    return Err(format!(
+                        "failed to pull {artifact} from remote: cat exited {}",
+                        out.code
+                    ));
+                }
                 let local_path = local_tmp.join(artifact);
                 std::fs::write(&local_path, &out.stdout).map_err(|err| {
                     cleanup();
@@ -148,6 +168,7 @@ mod tests {
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
 
     const TEST_DAEMON: &str = "/usr/local/bin/rustynetd";
+    const TEST_MESH_HOSTNAME: &str = "exit-1.rustynet";
 
     fn exit_ok(stdout: &str) -> RemoteExitStatus {
         RemoteExitStatus {
@@ -155,6 +176,13 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: Vec::new(),
         }
+    }
+
+    fn program_killswitch_discovery(mock: &MockShellHost) {
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "tables"],
+            exit_ok("table inet rustynet_g7\ntable inet rustynet_g7_dns\n"),
+        );
     }
 
     fn write_reviewed_linux_exit_dns_artifacts(dir: &Path) {
@@ -225,8 +253,10 @@ mod tests {
             &["ip", "route", "show", "default"],
             exit_ok("default via 192.168.1.1 dev enp0s1"),
         );
-        let err = validate_linux_exit_dns_failclosed(&mock, TEST_DAEMON, "deb-1")
-            .expect_err("dispatch error must fail the stage");
+        program_killswitch_discovery(&mock);
+        let err =
+            validate_linux_exit_dns_failclosed(&mock, TEST_DAEMON, "deb-1", TEST_MESH_HOSTNAME)
+                .expect_err("dispatch error must fail the stage");
         assert!(
             err.contains("mktemp"),
             "expected mktemp failure, got: {err}"
@@ -237,8 +267,9 @@ mod tests {
     fn validate_fails_closed_on_egress_detection_failure() {
         let mock = MockShellHost::new();
         mock.program_run_response(&["ip", "route", "show", "default"], exit_ok(""));
-        let err = validate_linux_exit_dns_failclosed(&mock, TEST_DAEMON, "deb-1")
-            .expect_err("egress detection failure must fail the stage");
+        let err =
+            validate_linux_exit_dns_failclosed(&mock, TEST_DAEMON, "deb-1", TEST_MESH_HOSTNAME)
+                .expect_err("egress detection failure must fail the stage");
         assert!(
             err.contains("egress"),
             "expected egress detection error, got: {err}"
@@ -256,10 +287,13 @@ mod tests {
             &["ip", "route", "show", "default"],
             exit_ok("default via 192.168.1.1 dev enp0s1\n"),
         );
+        program_killswitch_discovery(&mock);
         // mktemp -d
         mock.program_run_response(&["mktemp", "-d"], exit_ok("/tmp/tmp.testdir\n"));
         // capture subcommand (after egress, remote dir)
-        let capture_argv: [&str; 8] = [
+        let capture_argv: [&str; 12] = [
+            "sudo",
+            "-n",
             TEST_DAEMON,
             "linux-exit-dns-failclosed-capture",
             "--output",
@@ -267,20 +301,22 @@ mod tests {
             "--lan-iface",
             "enp0s1",
             "--mesh-hostname",
-            DEFAULT_MESH_HOSTNAME,
+            TEST_MESH_HOSTNAME,
+            "--killswitch-table",
+            "rustynet_g7",
         ];
         mock.program_run_response(&capture_argv, exit_ok(""));
 
         // cat each artifact
         for artifact in REQUIRED_ARTIFACTS {
             let cat_path = format!("/tmp/tmp.testdir/{artifact}");
-            let cat_argv: [&str; 2] = ["cat", &cat_path];
+            let cat_argv: [&str; 4] = ["sudo", "-n", "cat", &cat_path];
             let content =
                 std::fs::read_to_string(reviewed_dir.path().join(artifact)).expect("read artifact");
             mock.program_run_response(&cat_argv, exit_ok(&content));
         }
 
-        validate_linux_exit_dns_failclosed(&mock, TEST_DAEMON, "deb-1")
+        validate_linux_exit_dns_failclosed(&mock, TEST_DAEMON, "deb-1", TEST_MESH_HOSTNAME)
             .expect("reviewed artifacts must pass");
     }
 
@@ -294,8 +330,11 @@ mod tests {
             &["ip", "route", "show", "default"],
             exit_ok("default via 192.168.1.1 dev enp0s1\n"),
         );
+        program_killswitch_discovery(&mock);
         mock.program_run_response(&["mktemp", "-d"], exit_ok("/tmp/tmp.testdir\n"));
-        let capture_argv: [&str; 8] = [
+        let capture_argv: [&str; 12] = [
+            "sudo",
+            "-n",
             TEST_DAEMON,
             "linux-exit-dns-failclosed-capture",
             "--output",
@@ -303,13 +342,15 @@ mod tests {
             "--lan-iface",
             "enp0s1",
             "--mesh-hostname",
-            DEFAULT_MESH_HOSTNAME,
+            TEST_MESH_HOSTNAME,
+            "--killswitch-table",
+            "rustynet_g7",
         ];
         mock.program_run_response(&capture_argv, exit_ok(""));
 
         for artifact in REQUIRED_ARTIFACTS {
             let cat_path = format!("/tmp/tmp.testdir/{artifact}");
-            let cat_argv: [&str; 2] = ["cat", &cat_path];
+            let cat_argv: [&str; 4] = ["sudo", "-n", "cat", &cat_path];
             if artifact == &"tunnel_path_resolves.json" {
                 // omit response — un-programmed argv fails with Transport error
             } else {
@@ -319,8 +360,9 @@ mod tests {
             }
         }
 
-        let err = validate_linux_exit_dns_failclosed(&mock, TEST_DAEMON, "deb-1")
-            .expect_err("missing artifact must fail the stage");
+        let err =
+            validate_linux_exit_dns_failclosed(&mock, TEST_DAEMON, "deb-1", TEST_MESH_HOSTNAME)
+                .expect_err("missing artifact must fail the stage");
         assert!(
             err.contains("tunnel_path_resolves.json"),
             "expected missing tunnel_path_resolves error, got: {err}"
@@ -337,8 +379,11 @@ mod tests {
             &["ip", "route", "show", "default"],
             exit_ok("default via 192.168.1.1 dev enp0s1\n"),
         );
+        program_killswitch_discovery(&mock);
         mock.program_run_response(&["mktemp", "-d"], exit_ok("/tmp/tmp.testdir\n"));
-        let capture_argv: [&str; 8] = [
+        let capture_argv: [&str; 12] = [
+            "sudo",
+            "-n",
             TEST_DAEMON,
             "linux-exit-dns-failclosed-capture",
             "--output",
@@ -346,13 +391,15 @@ mod tests {
             "--lan-iface",
             "enp0s1",
             "--mesh-hostname",
-            DEFAULT_MESH_HOSTNAME,
+            TEST_MESH_HOSTNAME,
+            "--killswitch-table",
+            "rustynet_g7",
         ];
         mock.program_run_response(&capture_argv, exit_ok(""));
 
         for artifact in REQUIRED_ARTIFACTS {
             let cat_path = format!("/tmp/tmp.testdir/{artifact}");
-            let cat_argv: [&str; 2] = ["cat", &cat_path];
+            let cat_argv: [&str; 4] = ["sudo", "-n", "cat", &cat_path];
             if artifact == &"udp_block_pcap.txt" {
                 mock.program_run_response(&cat_argv, exit_ok("12:34:56 UDP leaked\n"));
             } else {
@@ -362,8 +409,9 @@ mod tests {
             }
         }
 
-        let err = validate_linux_exit_dns_failclosed(&mock, TEST_DAEMON, "deb-1")
-            .expect_err("nonempty pcap must fail the stage");
+        let err =
+            validate_linux_exit_dns_failclosed(&mock, TEST_DAEMON, "deb-1", TEST_MESH_HOSTNAME)
+                .expect_err("nonempty pcap must fail the stage");
         assert!(
             err.contains("pcap") || err.contains("UDP"),
             "expected nonempty pcap error, got: {err}"

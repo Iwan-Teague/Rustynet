@@ -7,6 +7,7 @@ use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, Tunnel
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
+const PING_EXIT_MARKER: &str = "__RUSTYNET_PING_EXIT=";
 
 /// Flush every `rustynet*` nftables table (the bootstrap killswitch
 /// `rustynet_boot` AND any runtime generation table such as `rustynet_g1` a
@@ -65,7 +66,7 @@ const LINUX_INTERFACE_RESET_COMMAND: &str = "if command -v ip >/dev/null 2>&1; t
 /// Emits exactly three space-separated tokens on a single line that
 /// [`parse_node_clean_probe`] interprets:
 ///   `nft=<names|->`   leftover `rustynet*` inet table names, or `-` if none
-///   `daemon=<up|down>` whether a `rustynetd` process is still running
+///   `daemon=<up|down>` whether `rustynetd` or `rustynet-relay` is still running
 ///   `iface=<names|->`  leftover `rustynet*` interface names, or `-` if none
 ///
 /// A node is clean only when all three are benign (`nft=-`, `daemon=down`,
@@ -76,7 +77,8 @@ const LINUX_INTERFACE_RESET_COMMAND: &str = "if command -v ip >/dev/null 2>&1; t
 const LINUX_NODE_CLEAN_PROBE: &str = "rn_nft=$(command -v nft >/dev/null 2>&1 && \
          sudo -n nft list tables 2>/dev/null \
          | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}' | tr '\\n' ',' || true); \
-     rn_daemon=$(pgrep -x rustynetd >/dev/null 2>&1 && echo up || echo down); \
+     rn_daemon=$(if pgrep -x rustynetd >/dev/null 2>&1 \
+         || pgrep -x rustynet-relay >/dev/null 2>&1; then echo up; else echo down; fi); \
      rn_iface=$(command -v ip >/dev/null 2>&1 && \
          ip -o link show 2>/dev/null \
          | awk -F': ' '{print $2}' | awk -F'@' '{print $1}' \
@@ -150,7 +152,7 @@ fn parse_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
     }
     match daemon {
         Some("down") => {}
-        Some("up") => dirty.push("rustynetd still running".to_owned()),
+        Some("up") => dirty.push("rustynetd or rustynet-relay still running".to_owned()),
         _ => dirty.push("daemon status unknown (probe token missing)".to_owned()),
     }
     match clean_list(iface) {
@@ -199,7 +201,7 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
     loop {
         let attempt_err = match ssh::run_remote(
             conn,
-            "sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status",
+            "sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock /usr/local/bin/rustynet status",
             SHORT_TIMEOUT,
         ) {
             Ok(status) => match ssh::parse_status_node_id(&status) {
@@ -230,14 +232,40 @@ pub fn ping_mesh_peer(
     peer_mesh_ip: &str,
 ) -> Result<TrafficTestResult, AdapterError> {
     validate_ip_arg(peer_mesh_ip)?;
-    let script = format!("ping -c 3 -W 5 {peer_mesh_ip} 2>&1");
-    match ssh::run_remote(conn, &script, Duration::from_secs(30)) {
-        Ok(_stdout) => Ok(TrafficTestResult::Reachable),
-        Err(AdapterError::Command { stderr, .. }) => Ok(TrafficTestResult::Error(format!(
-            "ping to {peer_mesh_ip} failed: {}",
-            stderr.trim()
-        ))),
-        Err(other) => Err(other),
+    // Always return a successful remote shell so the stage retains ping stdout
+    // on failure. `ssh::run_remote` otherwise returns only its transport error
+    // path, which erased the route/timeout evidence needed to diagnose the
+    // full-mesh client↔client failure. The IP is strictly validated above.
+    let script = format!(
+        "set +e; ping -c 3 -W 5 {peer_mesh_ip} 2>&1; rn_ping_status=$?; \
+         printf '\\n{PING_EXIT_MARKER}%s\\n' \"$rn_ping_status\"; exit 0"
+    );
+    let output = ssh::run_remote(conn, &script, Duration::from_secs(30))?;
+    parse_ping_result(peer_mesh_ip, output.as_str())
+}
+
+fn parse_ping_result(peer_mesh_ip: &str, output: &str) -> Result<TrafficTestResult, AdapterError> {
+    let Some((diagnostic, status)) = output.rsplit_once(PING_EXIT_MARKER) else {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "ping diagnostic protocol missing exit marker for {peer_mesh_ip} (fail closed)"
+            ),
+        });
+    };
+    let status = status.trim();
+    let exit_code = status.parse::<i32>().map_err(|_| AdapterError::Protocol {
+        message: format!(
+            "ping diagnostic protocol has invalid exit status {:?} for {peer_mesh_ip} (fail closed)",
+            status
+        ),
+    })?;
+    if exit_code == 0 {
+        Ok(TrafficTestResult::Reachable)
+    } else {
+        Ok(TrafficTestResult::Error(format!(
+            "ping to {peer_mesh_ip} failed (exit {exit_code}): {}",
+            diagnostic.trim()
+        )))
     }
 }
 
@@ -290,7 +318,7 @@ pub fn collect_active_tunnels(conn: &NodeConnection) -> Result<TunnelsList, Adap
     if kernel_wg_unusable {
         let status = ssh::run_remote(
             conn,
-            "sudo -n rustynet status 2>/dev/null || rustynet status 2>/dev/null || true",
+            "sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock /usr/local/bin/rustynet status 2>/dev/null || true",
             SHORT_TIMEOUT,
         )?;
         let derived = tunnels_from_daemon_status(&status);
@@ -365,7 +393,7 @@ const LINUX_DAEMON_SOCKET: &str = "/run/rustynet/rustynetd.sock";
 /// active NAT egress.
 ///
 /// The invocation is the same one the live bash orchestrator drives:
-/// `sudo -n env RUSTYNET_DAEMON_SOCKET=<sock> rustynet route advertise
+/// `sudo -n env RUSTYNET_DAEMON_SOCKET=<sock> /usr/local/bin/rustynet route advertise
 /// 0.0.0.0/0` — every token is a compile-time constant (no untrusted
 /// interpolation), so it is argv-only-safe. On the daemon rejecting the
 /// advertisement (e.g. a node not permitted to serve / restricted / safe-mode),
@@ -377,7 +405,7 @@ const LINUX_DAEMON_SOCKET: &str = "/run/rustynet/rustynetd.sock";
 pub fn activate_exit_serving(conn: &NodeConnection) -> Result<(), AdapterError> {
     let script = format!(
         "sudo -n env RUSTYNET_DAEMON_SOCKET={LINUX_DAEMON_SOCKET} \
-         rustynet route advertise 0.0.0.0/0"
+         /usr/local/bin/rustynet route advertise 0.0.0.0/0"
     );
     match ssh::run_remote(conn, &script, SHORT_TIMEOUT) {
         Ok(_) => Ok(()),
@@ -661,7 +689,7 @@ pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
     }
     let status = ssh::run_remote(
         conn,
-        "rustynet status 2>/dev/null || echo ''",
+        "sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock /usr/local/bin/rustynet status 2>/dev/null || echo ''",
         SHORT_TIMEOUT,
     )?;
     ssh::parse_status_field(&status, "mesh_ip")
@@ -963,7 +991,10 @@ fn verify_no_key_material(path: &std::path::Path) -> Result<(), AdapterError> {
     }
     let listing = String::from_utf8_lossy(&output.stdout);
     for entry in listing.lines() {
-        if entry.contains("keys/")
+        // GNU tar lists an empty directory as `.../keys/`. The directory name
+        // is not key material; reject only payload entries below it. Other key
+        // suffix checks remain fail-closed for files outside a `keys/` tree.
+        if (entry.contains("keys/") && !entry.ends_with('/'))
             || entry.ends_with(".priv")
             || entry.ends_with(".pem")
             || entry.ends_with(".key")
@@ -979,6 +1010,36 @@ fn verify_no_key_material(path: &std::path::Path) -> Result<(), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ping_diagnostic_reports_reachability_only_on_zero_exit() {
+        let result = parse_ping_result(
+            "100.75.227.10",
+            "PING 100.75.227.10 (100.75.227.10) 56(84) bytes of data.\n\n__RUSTYNET_PING_EXIT=0\n",
+        )
+        .expect("well-formed diagnostic must parse");
+        assert!(matches!(result, TrafficTestResult::Reachable));
+    }
+
+    #[test]
+    fn ping_diagnostic_preserves_failure_output() {
+        let result = parse_ping_result(
+            "100.75.227.10",
+            "PING 100.75.227.10 (100.75.227.10) 56(84) bytes of data.\nFrom 100.64.0.2 Destination Host Unreachable\n\n__RUSTYNET_PING_EXIT=1\n",
+        )
+        .expect("well-formed diagnostic must parse");
+        let TrafficTestResult::Error(message) = result else {
+            panic!("non-zero ping exit must be an error");
+        };
+        assert!(message.contains("exit 1"));
+        assert!(message.contains("Destination Host Unreachable"));
+    }
+
+    #[test]
+    fn ping_diagnostic_missing_or_invalid_marker_fails_closed() {
+        assert!(parse_ping_result("100.75.227.10", "no marker").is_err());
+        assert!(parse_ping_result("100.75.227.10", "__RUSTYNET_PING_EXIT=nope").is_err());
+    }
 
     #[test]
     fn linux_nft_killswitch_reset_enumerates_all_rustynet_tables() {
@@ -1076,7 +1137,10 @@ mod tests {
     fn parse_node_clean_probe_reports_running_daemon() {
         let err = parse_node_clean_probe("nft=- daemon=up iface=-")
             .expect_err("running daemon must fail");
-        assert!(err.to_string().contains("rustynetd still running"));
+        assert!(
+            err.to_string()
+                .contains("rustynetd or rustynet-relay still running")
+        );
     }
 
     #[test]
@@ -1094,7 +1158,7 @@ mod tests {
             .expect_err("multi-dirty must fail");
         let msg = err.to_string();
         assert!(msg.contains("rustynet_g1"));
-        assert!(msg.contains("rustynetd still running"));
+        assert!(msg.contains("rustynetd or rustynet-relay still running"));
         assert!(msg.contains("rustynet0"));
     }
 
@@ -1144,10 +1208,10 @@ mod tests {
         assert_eq!(LINUX_DAEMON_SOCKET, "/run/rustynet/rustynetd.sock");
         let script = format!(
             "sudo -n env RUSTYNET_DAEMON_SOCKET={LINUX_DAEMON_SOCKET} \
-             rustynet route advertise 0.0.0.0/0"
+             /usr/local/bin/rustynet route advertise 0.0.0.0/0"
         );
         assert!(script.contains("sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock"));
-        assert!(script.contains("rustynet route advertise 0.0.0.0/0"));
+        assert!(script.contains("/usr/local/bin/rustynet route advertise 0.0.0.0/0"));
     }
 
     #[test]
@@ -1324,6 +1388,31 @@ table ip other_nat {
             AdapterError::KeyExclusionViolation { .. } => {}
             other => panic!("wrong error variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn key_exclusion_allows_empty_keys_directory_entry() {
+        use tempfile::NamedTempFile;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("var/lib/rustynet/keys")).unwrap();
+
+        let archive = NamedTempFile::new().unwrap();
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(archive.path())
+            .arg("-C")
+            .arg(dir.path())
+            .arg("var/lib/rustynet/keys")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let result = verify_no_key_material(archive.path());
+        assert!(
+            result.is_ok(),
+            "empty key-directory metadata is not key material: {result:?}"
+        );
     }
 
     #[test]

@@ -8,6 +8,12 @@
 //! decode is OS-agnostic, so it lives here rather than in any one adapter — a
 //! macOS adapter importing it from `linux_install` would be backwards coupling.
 
+use std::path::Path;
+
+use sha2::{Digest, Sha256};
+
+use crate::vm_lab::orchestrator::error::AdapterError;
+
 /// Decode the hex-encoded ed25519 assignment authority public key (as stored in
 /// each OS's `trust/assignment.pub`: 64 hex chars, optionally newline-terminated)
 /// into the raw 32-byte form the `rustynet-relay --verifier-key` loader
@@ -35,9 +41,40 @@ pub(crate) fn decode_assignment_pubkey_hex(raw: &str) -> Result<Vec<u8>, String>
     Ok(bytes)
 }
 
+/// Validate a locally-issued verifier key and return the SHA-256 of the exact
+/// bytes copied to the guest. Adapters compare this digest after installation,
+/// so an empty, truncated, malformed, or stale active key fails closed.
+pub(crate) fn validated_verifier_key_sha256(path: &Path) -> Result<String, AdapterError> {
+    let bytes = std::fs::read(path).map_err(|err| AdapterError::Io {
+        message: format!("read verifier key '{}': {err}", path.display()),
+    })?;
+    if bytes.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: format!("verifier key '{}' is empty", path.display()),
+        });
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|err| AdapterError::Protocol {
+        message: format!("verifier key '{}' is not UTF-8: {err}", path.display()),
+    })?;
+    if text.trim().len() != 64 {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "verifier key '{}' must contain exactly 64 hex characters",
+                path.display()
+            ),
+        });
+    }
+    decode_assignment_pubkey_hex(text).map_err(|message| AdapterError::Protocol { message })?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn decode_assignment_pubkey_hex_decodes_64_hex_to_32_bytes() {
@@ -78,5 +115,29 @@ mod tests {
         let bad = format!("zz{}", "00".repeat(31)); // 64 chars, leading non-hex
         let err = decode_assignment_pubkey_hex(&bad).expect_err("non-hex must fail");
         assert!(err.contains("non-hex"), "got: {err}");
+    }
+
+    #[test]
+    fn verifier_key_digest_rejects_missing_empty_and_malformed_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(validated_verifier_key_sha256(&dir.path().join("missing.pub")).is_err());
+
+        let empty = dir.path().join("empty.pub");
+        std::fs::write(&empty, []).expect("empty file");
+        assert!(validated_verifier_key_sha256(&empty).is_err());
+
+        let malformed = dir.path().join("malformed.pub");
+        std::fs::write(&malformed, "z".repeat(64)).expect("malformed file");
+        assert!(validated_verifier_key_sha256(&malformed).is_err());
+    }
+
+    #[test]
+    fn verifier_key_digest_hashes_exact_deployed_bytes() {
+        let mut file = tempfile::NamedTempFile::new().expect("tempfile");
+        writeln!(file, "{}", "ab".repeat(32)).expect("write key");
+        let digest = validated_verifier_key_sha256(file.path()).expect("valid key");
+        let mut expected = Sha256::new();
+        expected.update(format!("{}\n", "ab".repeat(32)).as_bytes());
+        assert_eq!(digest, format!("{:x}", expected.finalize()));
     }
 }

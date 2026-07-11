@@ -26,7 +26,7 @@ for arg in "$@"; do
     esac
 done
 
-BINARIES=(rustynet-mcp-repo-context rustynet-mcp-gate-runner rustynet-mcp-lab-state)
+BINARIES=(rustynet-mcp-repo-context rustynet-mcp-gate-runner rustynet-mcp-lab-state rustynet-mcp-deepseek)
 
 if [ "$PRINT_ONLY" = false ]; then
     echo "==> Building MCP server binaries..."
@@ -37,14 +37,18 @@ if [ "$PRINT_ONLY" = false ]; then
         SRC="${REPO_ROOT}/target/${PROFILE_DIR}/${bin}"
         DST="${BIN_DIR}/${bin}"
         if [ -f "$SRC" ]; then
-            cp "$SRC" "$DST"
-            chmod 755 "$DST"
+            # Atomic install: a plain in-place cp TRUNCATES a binary the MCP
+            # client still has mmap'd (symptom: the server starts but emits
+            # nothing). Stage next to the destination, sign, then mv -f.
+            cp "$SRC" "${DST}.new"
+            chmod 755 "${DST}.new"
             # On Apple Silicon, copying a Mach-O invalidates its code signature
             # and the kernel SIGKILLs it on exec. Re-sign ad-hoc after copy.
             if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
-                codesign --force --sign - "$DST" >/dev/null 2>&1 || \
-                    echo "  WARNING: codesign failed for $DST (may be SIGKILLed on exec)"
+                codesign --force --sign - "${DST}.new" >/dev/null 2>&1 || \
+                    echo "  WARNING: codesign failed for ${DST}.new (may be SIGKILLed on exec)"
             fi
+            mv -f "${DST}.new" "$DST"
             echo "  installed: $DST"
         else
             echo "  WARNING: binary not found at $SRC"

@@ -6,7 +6,22 @@ use crate::vm_lab::orchestrator::error::{BundleKind, StageOutcome};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-pub struct DistributeAssignmentsStage;
+pub struct DistributeAssignmentsStage {
+    max_parallel_node_workers: usize,
+    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DistributeAssignmentsStage {
+    pub fn new(
+        max_parallel_node_workers: usize,
+        shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            max_parallel_node_workers: max_parallel_node_workers.max(1),
+            shutdown_flag,
+        }
+    }
+}
 
 impl OrchestrationStage for DistributeAssignmentsStage {
     fn id(&self) -> StageId {
@@ -26,7 +41,14 @@ impl OrchestrationStage for DistributeAssignmentsStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
-        distribute_bundle_kind(ctx, BundleKind::Assignment, "rn-assignment", "assignment")
+        distribute_bundle_kind(
+            ctx,
+            BundleKind::Assignment,
+            "rn-assignment",
+            "assignment",
+            self.max_parallel_node_workers,
+            &self.shutdown_flag,
+        )
     }
 }
 
@@ -140,6 +162,8 @@ pub(crate) fn distribute_bundle_kind(
     kind: BundleKind,
     file_prefix: &str,
     file_ext: &str,
+    max_parallel_node_workers: usize,
+    shutdown_flag: &std::sync::atomic::AtomicBool,
 ) -> StageOutcome {
     let exit_alias = match ctx.assignments.iter().find(|a| a.role == NodeRole::Exit) {
         Some(a) => a.alias.clone(),
@@ -186,10 +210,32 @@ pub(crate) fn distribute_bundle_kind(
         })
         .collect();
 
-    // Distribute to each node
-    let results: Vec<(String, Result<(), String>)> = aliases
-        .iter()
-        .map(|(alias, node_id)| {
+    // Verify and distribute the verifier key to EVERY node before ANY signed
+    // bundle is installed. A daemon must never observe a new bundle without
+    // its matching verifier. Missing/malformed issuer output fails closed.
+    let pub_key_path = tmp_dir.join(format!("rn-{kind}.pub"));
+    if let Err(err) =
+        crate::vm_lab::orchestrator::adapter::verifier_key::validated_verifier_key_sha256(
+            &pub_key_path,
+        )
+    {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return StageOutcome::Failed(format!("issued {kind} verifier key invalid: {err}"));
+    }
+    let errors = run_verifier_barrier(
+        &aliases,
+        max_parallel_node_workers,
+        shutdown_flag,
+        |(alias, _)| {
+            match ctx.adapters.get(alias.as_str()) {
+                Some(adapter) => adapter
+                    .distribute_verifier_key(kind.clone(), &pub_key_path)
+                    .map_err(|e| e.to_string()),
+                None => Err(format!("no adapter for '{alias}'")),
+            }
+            .map_err(|err| format!("{alias}: distribute verifier key: {err}"))
+        },
+        |(alias, node_id)| {
             let fname = format!("{file_prefix}-{node_id}.{file_ext}");
             let bundle_path = tmp_dir.join(&fname);
             let r = if !bundle_path.exists() {
@@ -202,50 +248,56 @@ pub(crate) fn distribute_bundle_kind(
                     None => Err(format!("no adapter for '{alias}'")),
                 }
             };
-            (alias.clone(), r)
-        })
-        .collect();
-
-    // Distribute verifier public key to all nodes (enables daemon to verify
-    // freshly-distributed bundles).  The issuance step writes `rn-{kind}.pub`
-    // to tmp_dir alongside the per-node bundle files.
-    let pub_key_path = tmp_dir.join(format!("rn-{kind}.pub"));
-    let verifier_results: Vec<(String, Result<(), String>)> = if pub_key_path.exists() {
-        aliases
-            .iter()
-            .map(|(alias, _)| {
-                let r = match ctx.adapters.get(alias.as_str()) {
-                    Some(adapter) => adapter
-                        .distribute_verifier_key(kind.clone(), &pub_key_path)
-                        .map_err(|e| e.to_string()),
-                    None => Err(format!("no adapter for '{alias}'")),
-                };
-                (alias.clone(), r)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+            r.map_err(|err| format!("{alias}: {err}"))
+        },
+    );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
-
-    let mut errors: Vec<String> = results
-        .into_iter()
-        .filter_map(|(alias, r): (String, Result<(), String>)| {
-            r.err().map(|e| format!("{alias}: {e}"))
-        })
-        .collect();
-    errors.extend(verifier_results.into_iter().filter_map(
-        |(alias, r): (String, Result<(), String>)| {
-            r.err()
-                .map(|e| format!("{alias}: distribute verifier key: {e}"))
-        },
-    ));
     if errors.is_empty() {
         StageOutcome::Passed
     } else {
         StageOutcome::Failed(errors.join("; "))
     }
+}
+
+/// Execute a strict two-phase barrier: every verifier precondition must pass
+/// before any signed bundle install is admitted.
+fn run_verifier_barrier<T, V, D>(
+    items: &[T],
+    max_parallel_node_workers: usize,
+    shutdown_flag: &std::sync::atomic::AtomicBool,
+    verify: V,
+    distribute: D,
+) -> Vec<String>
+where
+    T: Sync,
+    V: Fn(&T) -> Result<(), String> + Sync,
+    D: Fn(&T) -> Result<(), String> + Sync,
+{
+    let verifier_errors: Vec<String> =
+        crate::vm_lab::orchestrator::parallel::bounded_parallel_map_cancellable(
+            items,
+            max_parallel_node_workers,
+            shutdown_flag,
+            verify,
+            |_| Err("cancelled before verifier work was admitted".to_owned()),
+        )
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+    if !verifier_errors.is_empty() {
+        return verifier_errors;
+    }
+    crate::vm_lab::orchestrator::parallel::bounded_parallel_map_cancellable(
+        items,
+        max_parallel_node_workers,
+        shutdown_flag,
+        distribute,
+        |_| Err("cancelled before bundle work was admitted".to_owned()),
+    )
+    .into_iter()
+    .filter_map(Result::err)
+    .collect()
 }
 
 #[cfg(test)]
@@ -254,6 +306,7 @@ mod tests {
     use crate::vm_lab::orchestrator::error::WireguardPublicKey;
     use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     fn make_two_node_ctx() -> OrchestrationContext {
         let mut ctx = OrchestrationContext {
@@ -343,8 +396,86 @@ mod tests {
             orchestrator_dialect: None,
         };
         assert!(matches!(
-            DistributeAssignmentsStage.execute(&mut ctx),
+            DistributeAssignmentsStage::new(
+                1,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .execute(&mut ctx),
             StageOutcome::Failed(_)
         ));
+    }
+
+    #[test]
+    fn verifier_failure_prevents_every_bundle_install() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let verify_calls = Arc::clone(&calls);
+        let bundle_calls = Arc::clone(&calls);
+        let errors = run_verifier_barrier(
+            &["a", "b"],
+            2,
+            &std::sync::atomic::AtomicBool::new(false),
+            move |alias| {
+                verify_calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("key:{alias}"));
+                if *alias == "b" {
+                    Err("fingerprint mismatch".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            move |alias| {
+                bundle_calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("bundle:{alias}"));
+                Ok(())
+            },
+        );
+        assert_eq!(errors, vec!["fingerprint mismatch"]);
+        assert!(
+            calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .all(|call| call.starts_with("key:"))
+        );
+    }
+
+    #[test]
+    fn every_verifier_completes_before_first_bundle_install() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let verify_calls = Arc::clone(&calls);
+        let bundle_calls = Arc::clone(&calls);
+        let errors = run_verifier_barrier(
+            &["a", "b", "c"],
+            3,
+            &std::sync::atomic::AtomicBool::new(false),
+            move |alias| {
+                verify_calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("key:{alias}"));
+                Ok(())
+            },
+            move |alias| {
+                bundle_calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("bundle:{alias}"));
+                Ok(())
+            },
+        );
+        assert!(errors.is_empty());
+        let calls = calls.lock().expect("calls");
+        let first_bundle = calls
+            .iter()
+            .position(|call| call.starts_with("bundle:"))
+            .expect("bundle calls");
+        assert_eq!(
+            first_bundle, 3,
+            "all three verifier calls must precede bundles"
+        );
     }
 }

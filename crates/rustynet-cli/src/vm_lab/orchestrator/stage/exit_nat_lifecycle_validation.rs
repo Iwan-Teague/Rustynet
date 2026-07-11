@@ -18,9 +18,9 @@ const REPORTED_SKIPS_FILENAME: &str = "exit_nat_lifecycle_validation.reported_sk
 /// absent after daemon stop — a two-phase snapshot→stop→snapshot→merge→evaluate
 /// lifecycle check folded into the standard Rust orchestrator.
 ///
-/// Runs after `exit_dns_failclosed_validation` and before cleanup. This stage
-/// applies to every node regardless of role but only exercises nodes that have
-/// been in an exit-serving capacity; non-Linux nodes are reported-skipped.
+/// Runs after `exit_dns_failclosed_validation` while the assigned exit is still
+/// active. After proving stop-time teardown, it restarts/reactivates the exit so
+/// the following demotion-residue proof starts from a non-vacuous active state.
 pub struct ExitNatLifecycleValidationStage;
 
 impl OrchestrationStage for ExitNatLifecycleValidationStage {
@@ -34,57 +34,72 @@ impl OrchestrationStage for ExitNatLifecycleValidationStage {
         &[StageId::ExitDnsFailclosedValidation]
     }
     fn applies_to_roles(&self) -> &[NodeRole] {
-        &[]
+        &[NodeRole::Exit]
     }
     fn fanout(&self) -> StageFanout {
-        StageFanout::PerNode
+        StageFanout::Once
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
-        let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
-        if aliases.is_empty() {
-            return StageOutcome::Passed;
-        }
-
-        let mut failures: Vec<String> = Vec::new();
-        let mut reported_skips: Vec<(String, String)> = Vec::new();
-        for alias in &aliases {
-            let adapter = match ctx.adapters.get(alias.as_str()) {
-                Some(adapter) => adapter,
-                None => {
-                    failures.push(format!("{alias}: no adapter for exit-nat-lifecycle node"));
-                    continue;
-                }
-            };
-            let platform = adapter.platform();
-            if !exit_nat_lifecycle_runtime_implemented(platform) {
-                reported_skips.push((alias.clone(), format!("{platform:?}")));
-                continue;
+        let alias = match ctx.assignments.iter().find(|a| a.role == NodeRole::Exit) {
+            Some(assignment) => assignment.alias.clone(),
+            None => {
+                return StageOutcome::Failed(
+                    "exit-nat-lifecycle: no Exit node in assignments".to_owned(),
+                );
             }
-            let shell = match adapter.shell_host() {
-                Ok(shell) => shell,
-                Err(e) => {
-                    failures.push(format!("{alias}: shell host unavailable: {e}"));
-                    continue;
-                }
-            };
-            let daemon_path = match platform {
-                VmGuestPlatform::Linux => LINUX_RUSTYNETD_PATH,
-                VmGuestPlatform::Macos => MACOS_RUSTYNETD_PATH,
-                VmGuestPlatform::Windows => WINDOWS_RUSTYNETD_PATH,
-                _ => {
-                    reported_skips.push((alias.clone(), format!("{platform:?}")));
-                    continue;
-                }
-            };
-            if let Err(e) = validate_linux_exit_nat_lifecycle(&*shell, daemon_path, alias) {
-                failures.push(format!("{alias}: {e}"));
+        };
+        let adapter = match ctx.adapters.get(alias.as_str()) {
+            Some(adapter) => adapter,
+            None => {
+                return StageOutcome::Failed(format!(
+                    "{alias}: no adapter for exit-nat-lifecycle node"
+                ));
             }
-        }
-
-        if !reported_skips.is_empty() {
+        };
+        let platform = adapter.platform();
+        if !exit_nat_lifecycle_runtime_implemented(platform) {
+            let reported_skips = vec![(alias, format!("{platform:?}"))];
             write_reported_skips_note(ctx, &reported_skips);
+            return StageOutcome::Skipped;
         }
+        let shell = match adapter.shell_host() {
+            Ok(shell) => shell,
+            Err(e) => {
+                return StageOutcome::Failed(format!("{alias}: shell host unavailable: {e}"));
+            }
+        };
+        let daemon_path = match platform {
+            VmGuestPlatform::Linux => LINUX_RUSTYNETD_PATH,
+            VmGuestPlatform::Macos => MACOS_RUSTYNETD_PATH,
+            VmGuestPlatform::Windows => WINDOWS_RUSTYNETD_PATH,
+            _ => unreachable!("runtime implementation gate accepts desktop platforms only"),
+        };
+        if let Err(e) = validate_linux_exit_nat_lifecycle(&*shell, daemon_path, &alias) {
+            return StageOutcome::Failed(format!("{alias}: {e}"));
+        }
+
+        // Lifecycle proof deliberately stops rustynetd. Restore the exact
+        // active-exit precondition needed by exit-demotion-residue; failure to
+        // restore is itself a hard lifecycle failure, never a silent skip.
+        if let Err(e) = adapter.start_daemon() {
+            return StageOutcome::Failed(format!(
+                "{alias}: restart after NAT lifecycle proof failed: {e}"
+            ));
+        }
+        if let Err(e) = adapter.activate_exit_serving() {
+            return StageOutcome::Failed(format!(
+                "{alias}: reactivate exit after NAT lifecycle proof failed: {e}"
+            ));
+        }
+        if let Err(e) = adapter.assert_exit_actively_serving() {
+            return StageOutcome::Failed(format!(
+                "{alias}: reactivated exit failed active-serving assertion: {e}"
+            ));
+        }
+
+        let failures = Vec::new();
+        let reported_skips = Vec::new();
         outcome_for(&failures, &reported_skips)
     }
 }
@@ -121,6 +136,14 @@ fn write_reported_skips_note(ctx: &OrchestrationContext, reported_skips: &[(Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_evidence_is_scoped_to_assigned_exit() {
+        assert_eq!(
+            ExitNatLifecycleValidationStage.applies_to_roles(),
+            &[NodeRole::Exit]
+        );
+    }
 
     #[test]
     fn outcome_no_failures_no_skips_is_passed() {

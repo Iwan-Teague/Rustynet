@@ -18,11 +18,11 @@
 #     ns:ep-A (10.10.0.2)                         ns:ep-B (10.20.0.2)
 #          │ veth lan                                   │ veth lan
 #     ns:rtr-A ──┐ NAT(profile)            NAT(profile) ┌── ns:rtr-B
-#     100.64.0.11│                                      │100.64.0.12
+#     198.18.0.11│                                      │198.18.0.12
 #                └────────────  br:wanbr  ──────────────┘
-#                        (100.64.0.0/24  =  "the internet")
+#                        (198.18.0.0/24  =  "the internet")
 #                                  │
-#                          ns:svc (100.64.0.254)
+#                          ns:svc (198.18.0.254)
 #                       STUN responder + rustynet-relay
 #
 #   - Each endpoint reaches the wan only through its router's NAT, so the
@@ -56,8 +56,13 @@ set -euo pipefail
 
 NS_PREFIX="rnsim"
 WAN_BR="${NS_PREFIX}-wan"
-WAN_CIDR="100.64.0.0/24"
-WAN_BASE="100.64.0"
+# Ordinary simulated transit lives in the IANA benchmarking range
+# 198.18.0.0/15 (LiveLabVmConnectivityRulebook §15.3). The legacy default
+# 100.64.0.0/24 overlapped the Rustynet mesh 100.64.0.0/10 and is now valid
+# ONLY under the explicit cgnat_collision_v1 adversarial profile — pass
+# --wan-cidr 100.64.0.0/24 (or WAN_CIDR/WAN_BASE env) deliberately for that.
+WAN_CIDR="${WAN_CIDR:-198.18.0.0/24}"
+WAN_BASE="${WAN_BASE:-198.18.0}"
 SVC_HOST_OCTET="254"
 UDP_PORTS="51820-51900"
 MARKER="/run/${NS_PREFIX}_topology"

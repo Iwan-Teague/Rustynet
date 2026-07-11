@@ -27,7 +27,10 @@ impl OrchestrationStage for FinalCleanupStage {
         "cleanup"
     }
     fn dependencies(&self) -> &[StageId] {
-        &[StageId::ExitHandoff]
+        // PlanBuilder inserts cleanup last. Keeping this dependency-free makes
+        // filtered setup/run-only plans valid without inventing a dependency
+        // on an intentionally absent live stage.
+        &[]
     }
     fn applies_to_roles(&self) -> &[NodeRole] {
         &[]
@@ -36,9 +39,9 @@ impl OrchestrationStage for FinalCleanupStage {
         StageFanout::PerNode
     }
 
-    /// Cleanup is a teardown `finally` block: it lists `ExitHandoff` as a
-    /// dependency only for ORDERING (run last), but it must still run when an
-    /// earlier stage failed — otherwise a mid-pipeline failure would
+    /// Cleanup is a teardown `finally` block. It is inserted last for ordering
+    /// and must still run when an earlier
+    /// stage failed — otherwise a mid-pipeline failure would
     /// skip-cascade cleanup and leave this run's killswitch + exit NAT residue
     /// on the guests (a release-blocker). `always_run` exempts it from the
     /// skip-cascade while preserving its last-in-order placement.
@@ -56,7 +59,10 @@ impl OrchestrationStage for FinalCleanupStage {
                     return None;
                 }
                 let r = match ctx.adapters.get(alias.as_str()) {
-                    Some(adapter) => adapter.cleanup_runtime_state().map_err(|e| e.to_string()),
+                    Some(adapter) => cleanup_then_assert(
+                        || adapter.cleanup_runtime_state().map_err(|e| e.to_string()),
+                        || adapter.assert_node_clean().map_err(|e| e.to_string()),
+                    ),
                     // An assigned node with no adapter is a construction bug, not
                     // "nothing to clean"; fail closed rather than leave prior
                     // runtime state (incl. a killswitch) in place.
@@ -77,6 +83,14 @@ impl OrchestrationStage for FinalCleanupStage {
             StageOutcome::Failed(errors.join("; "))
         }
     }
+}
+
+fn cleanup_then_assert<C, A>(cleanup: C, assert_clean: A) -> Result<(), String>
+where
+    C: FnOnce() -> Result<(), String>,
+    A: FnOnce() -> Result<(), String>,
+{
+    cleanup().and_then(|()| assert_clean())
 }
 
 #[cfg(test)]
@@ -140,6 +154,18 @@ mod tests {
         assert_eq!(
             FinalCleanupStage::new(None).execute(&mut ctx),
             StageOutcome::Passed
+        );
+    }
+
+    #[test]
+    fn successful_cleanup_with_detected_residue_fails() {
+        let result = cleanup_then_assert(
+            || Ok(()),
+            || Err("node still dirty: relay service running".to_owned()),
+        );
+        assert_eq!(
+            result,
+            Err("node still dirty: relay service running".to_owned())
         );
     }
 }

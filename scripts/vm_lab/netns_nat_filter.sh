@@ -12,8 +12,11 @@ PROBE="${PROBE:-${SCRIPT_DIR}/nat_filter_probe.py}"
 [ -f "$RESP" ] || RESP="/tmp/stun_responder.py"
 [ -f "$PROBE" ] || PROBE="/tmp/nat_filter_probe.py"
 
-SVC_PRIMARY="100.64.0.254"
-SVC_SECONDARY="100.64.0.253"
+# Canonical simulated-transit service addresses (198.18.0.0/15); override
+# only for the explicit CGNAT collision profile.
+SVC_PRIMARY="${SVC_PRIMARY:-198.18.0.254}"
+SVC_SECONDARY="${SVC_SECONDARY:-198.18.0.253}"
+EP_A_WAN="${EP_A_WAN:-198.18.0.11}"
 STUN_PORT=3478
 EP_WG_PORT=51820
 DIFF_PORT=49378
@@ -136,7 +139,7 @@ run_scenario() {
       sleep 0.3
       ip netns exec rnsim-svc python3 "$PROBE" probe \
         --bind "${SVC_SECONDARY}:${COLD_PORT}" \
-        --target "100.64.0.11:${EP_WG_PORT}" \
+        --target "${EP_A_WAN}:${EP_WG_PORT}" \
         >"$probe_log" 2>&1
       wait "$init_pid" 2>/dev/null || true
       ;;

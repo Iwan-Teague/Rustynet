@@ -165,6 +165,10 @@ pub fn distribute_verifier_key(
     kind: BundleKind,
     pub_key_path: &Path,
 ) -> Result<(), AdapterError> {
+    let expected_sha256 =
+        crate::vm_lab::orchestrator::adapter::verifier_key::validated_verifier_key_sha256(
+            pub_key_path,
+        )?;
     let dst = macos_verifier_key_path(&kind);
     let remote_tmp = format!("{MACOS_STAGING_DIR}/rn-verifier-key.pub");
     ssh::run_remote(
@@ -185,7 +189,8 @@ pub fn distribute_verifier_key(
         &format!(
             "sudo install -d -m 0700 -o rustynetd -g rustynetd '{dst_dir}' && \
              sudo install -m 0644 -o root -g rustynetd '{remote_tmp}' '{dst}' && \
-             sudo rm -f '{remote_tmp}'"
+             sudo rm -f '{remote_tmp}' && \
+             test \"$(sudo shasum -a 256 '{dst}' | awk '{{print $1}}')\" = '{expected_sha256}'"
         ),
         SHORT_TIMEOUT,
     )?;

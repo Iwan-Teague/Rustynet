@@ -1,0 +1,30 @@
+# Tier 2: long-term default integration profile (rulebook §6 Tier 2).
+# Dual-plane VMs with unique scenario IPs on VXLAN-backed isolated sites and a
+# quarantined management plane. Mutation toward this profile is Slice B work
+# and requires an explicit prepare transaction; this manifest only declares
+# the target for read-only audit/preflight.
+schema_version = 1
+id = "isolated_multivm_v1"
+evidence_tier = "multi_vm"
+description = "Isolated multi-VM dual-plane profile: VXLAN scenario sites, quarantined management plane, deterministic simulated internet."
+
+[management]
+attachment = "host_only_or_shared"
+internet = false
+peer_to_peer = false
+security_mode = "quarantined"
+
+[scenario]
+substrate = "vxlan"
+address_family = "dual_stack"
+internet_mode = "simulated"
+require_unique_site_subnets = true
+site_subnet_pool = "172.20.0.0/16"
+site_prefix_len = 24
+transit_subnet = "198.18.0.0/15"
+
+[evidence]
+require_endpoint_capture = true
+require_router_capture = true
+require_negative_reachability = true
+forbid_socks_proxy = true

@@ -1924,6 +1924,27 @@ impl DeepSeekServer {
             .get("skip_linux_live_suite")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Cross-network coverage is ON by default (rulebook §11.2: the run
+        // launcher must stop unconditionally skipping traversal substrates);
+        // skipping is an explicit caller decision recorded in the args.
+        let cross_network = CrossNetworkRunOptions {
+            skip_cross_network: args
+                .get("skip_cross_network")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            substrate: get_str(args, "cross_network_substrate")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            nat_profiles: get_str(args, "cross_network_nat_profiles")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            impairment_profile: get_str(args, "cross_network_impairment_profile")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            network_profile: get_str(args, "network_profile")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        };
 
         // Fail closed: rust_engine with no synthesizable --node (no guest / role-
         // platform selector) emits zero --node flags and the CLI router silently
@@ -2051,6 +2072,7 @@ impl DeepSeekServer {
                 dry_run,
                 windows_only,
                 skip_linux_live_suite,
+                &cross_network,
             ));
             let arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
 
@@ -4222,12 +4244,27 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
+/// Cross-network + network-profile propagation for a deepseek_lab_run
+/// (LiveLabVmConnectivityRulebook §11.2). Cross-network coverage is ON by
+/// default: skipping it is an explicit caller choice, never a hardcoded
+/// default. The selected substrate / NAT profiles / impairment / network
+/// profile flow straight through to the orchestrator CLI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CrossNetworkRunOptions {
+    skip_cross_network: bool,
+    substrate: Option<String>,
+    nat_profiles: Option<String>,
+    impairment_profile: Option<String>,
+    network_profile: Option<String>,
+}
+
 /// Build the `ops vm-lab-orchestrate-live-lab` argument vector (everything after
 /// `cargo run --quiet -p rustynet-cli -- ops`) for a deepseek_lab_run. Pure +
 /// deterministic so it is unit-testable: there is NO LLM in this deploy path —
 /// the worker shells out to the same hardened orchestrator the lab-state MCP
-/// drives. Safe defaults: trust the prepared inventory, skip the slow gates/soak/
-/// cross-network legs, and ship the working tree (so uncommitted patches deploy).
+/// drives. Safe defaults: trust the prepared inventory, skip the slow gates/soak
+/// legs, and ship the working tree (so uncommitted patches deploy).
+/// Cross-network coverage runs unless the caller explicitly opts out.
 #[allow(clippy::too_many_arguments)] // a flat, deterministic CLI-arg builder; each arg is distinct.
 /// Synthesize `--node <alias>:<role>` assignments for the Rust engine from the
 /// deepseek_lab_run guest + role-platform selectors. A mac/win guest takes the
@@ -4318,6 +4355,7 @@ fn build_orchestrator_args(
     dry_run: bool,
     windows_only: bool,
     skip_linux_live_suite: bool,
+    cross_network: &CrossNetworkRunOptions,
 ) -> Vec<String> {
     let mut a: Vec<String> = vec!["vm-lab-orchestrate-live-lab".to_string()];
     a.extend(["--inventory".to_string(), inventory.to_string()]);
@@ -4327,7 +4365,30 @@ fn build_orchestrator_args(
     a.push("--trust-inventory-ready".to_string());
     a.push("--skip-gates".to_string());
     a.push("--skip-soak".to_string());
-    a.push("--skip-cross-network".to_string());
+    if cross_network.skip_cross_network {
+        a.push("--skip-cross-network".to_string());
+    }
+    if let Some(substrate) = cross_network.substrate.as_deref() {
+        a.extend([
+            "--cross-network-substrate".to_string(),
+            substrate.to_string(),
+        ]);
+    }
+    if let Some(profiles) = cross_network.nat_profiles.as_deref() {
+        a.extend([
+            "--cross-network-nat-profiles".to_string(),
+            profiles.to_string(),
+        ]);
+    }
+    if let Some(impairment) = cross_network.impairment_profile.as_deref() {
+        a.extend([
+            "--cross-network-impairment-profile".to_string(),
+            impairment.to_string(),
+        ]);
+    }
+    if let Some(network_profile) = cross_network.network_profile.as_deref() {
+        a.extend(["--network-profile".to_string(), network_profile.to_string()]);
+    }
     a.extend(["--source-mode".to_string(), "working-tree".to_string()]);
     if rust_engine {
         // Route to the Rust --node engine: synthesize alias:role from the guest
@@ -5238,6 +5299,11 @@ impl McpServer for DeepSeekServer {
                         "dry_run": json!({"type": "boolean", "description": "Run the orchestrator in --dry-run mode (fast; verifies the launch wiring without a real lab pass)."}),
                         "triage_on_failure": json!({"type": "boolean", "description": "Default true. When false, a failed live lab returns local report/log pointers without calling the external DeepSeek API. Use this when external triage has not been explicitly approved."}),
                         "max_steps": json!({"type": "integer", "description": "Max tool-calling steps per triage agent on failure (default 12, cap 20)."}),
+                        "skip_cross_network": json!({"type": "boolean", "description": "Default FALSE: cross-network traversal-substrate coverage now RUNS by default (LiveLabVmConnectivityRulebook §11.2 removed the old unconditional skip). Set true only when the run deliberately excludes cross-network stages, and say why in the area text."}),
+                        "cross_network_substrate": json_schema_string("Cross-network substrate selector passed through as --cross-network-substrate (netns|vxlan|slirp; orchestrator default netns)."),
+                        "cross_network_nat_profiles": json_schema_string("Comma-separated NAT profile labels passed through as --cross-network-nat-profiles (port_restricted_cone|full_cone|symmetric|double_nat_cgnat|baseline_lan)."),
+                        "cross_network_impairment_profile": json_schema_string("Impairment label passed through as --cross-network-impairment-profile (e.g. latency_50ms_loss_1pct)."),
+                        "network_profile": json_schema_string("Network profile id passed through as --network-profile (manifests under profiles/vm_lab/network/). Explicit ids are ENFORCED: the orchestrator stops before deployment when the observed fleet does not satisfy the profile. Omitted = the derived management-plane default, recorded but not blocking."),
                     }),
                     vec!["area"],
                 ),
@@ -5952,16 +6018,18 @@ mod tests {
             false,            // dry_run
             false,            // windows_only
             true,             // skip_linux_live_suite
+            &CrossNetworkRunOptions::default(),
         );
         assert_eq!(a[0], "vm-lab-orchestrate-live-lab");
-        for flag in [
-            "--trust-inventory-ready",
-            "--skip-gates",
-            "--skip-soak",
-            "--skip-cross-network",
-        ] {
+        for flag in ["--trust-inventory-ready", "--skip-gates", "--skip-soak"] {
             assert!(a.iter().any(|x| x == flag), "missing {flag}: {a:?}");
         }
+        // Rulebook §11.2: cross-network coverage is no longer skipped by
+        // default — the flag appears ONLY on explicit caller opt-out.
+        assert!(
+            !a.iter().any(|x| x == "--skip-cross-network"),
+            "cross-network must run by default: {a:?}"
+        );
         assert!(a.windows(2).any(|w| w == ["--source-mode", "working-tree"]));
         assert!(a.windows(2).any(|w| w == ["--macos-vm", "macos-utm-1"]));
         assert!(a.windows(2).any(|w| w == ["--exit-vm", "debian-2"]));
@@ -5983,8 +6051,28 @@ mod tests {
         // dry_run adds the flag; no macOS/Windows/backbone/rebuild/role-platform
         // selectors (incl. --macos-promote-exit) when omitted.
         let d = build_orchestrator_args(
-            "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None, None,
-            false, false, false, true, false, false,
+            "inv",
+            "s",
+            "k",
+            "r",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            &CrossNetworkRunOptions::default(),
         );
         assert!(d.iter().any(|x| x == "--dry-run"));
         assert!(!d.iter().any(|x| x == "--macos-vm"));
@@ -5996,6 +6084,50 @@ mod tests {
         assert!(!d.iter().any(|x| x == "--legacy-bash-orchestrator"));
         assert!(!d.iter().any(|x| x == "--skip-linux-live-suite"));
         assert!(!d.iter().any(|x| x == "--node"));
+    }
+
+    #[test]
+    fn cross_network_options_propagate_and_opt_out_is_explicit() {
+        let opted_out = CrossNetworkRunOptions {
+            skip_cross_network: true,
+            ..CrossNetworkRunOptions::default()
+        };
+        let a = build_orchestrator_args(
+            "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None, None,
+            false, false, true, false, false, false, &opted_out,
+        );
+        assert!(a.iter().any(|x| x == "--skip-cross-network"));
+
+        let selected = CrossNetworkRunOptions {
+            skip_cross_network: false,
+            substrate: Some("netns".to_string()),
+            nat_profiles: Some("port_restricted_cone,symmetric".to_string()),
+            impairment_profile: Some("latency_50ms_loss_1pct".to_string()),
+            network_profile: Some("crossnet_netns_v1".to_string()),
+        };
+        let b = build_orchestrator_args(
+            "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None, None,
+            false, false, true, false, false, false, &selected,
+        );
+        assert!(!b.iter().any(|x| x == "--skip-cross-network"));
+        assert!(
+            b.windows(2)
+                .any(|w| w == ["--cross-network-substrate", "netns"])
+        );
+        assert!(b.windows(2).any(|w| w
+            == [
+                "--cross-network-nat-profiles",
+                "port_restricted_cone,symmetric"
+            ]));
+        assert!(b.windows(2).any(|w| w
+            == [
+                "--cross-network-impairment-profile",
+                "latency_50ms_loss_1pct"
+            ]));
+        assert!(
+            b.windows(2)
+                .any(|w| w == ["--network-profile", "crossnet_netns_v1"])
+        );
     }
 
     #[test]
@@ -6115,6 +6247,7 @@ mod tests {
             false, // dry_run
             false, // windows_only
             false, // skip_linux_live_suite
+            &CrossNetworkRunOptions::default(),
         );
         // Emits --node alias:role for the router switch...
         assert!(
@@ -6154,6 +6287,7 @@ mod tests {
             false,
             false,
             false,
+            &CrossNetworkRunOptions::default(),
         );
         assert!(
             m.windows(2).any(|w| w == ["--node", "macos-utm-1:exit"]),
@@ -6190,6 +6324,7 @@ mod tests {
             false,
             false,
             true,
+            &CrossNetworkRunOptions::default(),
         );
         assert!(
             a.windows(2).any(|w| w == ["--node", "macos-utm-1:exit"]),

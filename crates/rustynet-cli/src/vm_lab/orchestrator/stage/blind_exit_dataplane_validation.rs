@@ -36,7 +36,7 @@ impl OrchestrationStage for BlindExitDataplaneValidationStage {
         "blind_exit_dataplane_validation"
     }
     fn dependencies(&self) -> &[StageId] {
-        &[StageId::ExitNatLifecycleValidation]
+        &[StageId::ExitDemotionResidueValidation]
     }
     fn applies_to_roles(&self) -> &[NodeRole] {
         &[]

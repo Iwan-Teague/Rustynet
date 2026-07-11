@@ -86,6 +86,9 @@ impl NodeRole {
     /// so the lab can produce the evidence required before posture promotion.
     /// Product support remains conservative until those artifacts pass.
     pub fn is_lab_assignable_for_platform(&self, platform: &VmGuestPlatform) -> bool {
+        if matches!(self, NodeRole::Custom(_)) {
+            return false;
+        }
         match platform {
             VmGuestPlatform::Ios | VmGuestPlatform::Android => false,
             VmGuestPlatform::Linux | VmGuestPlatform::Windows | VmGuestPlatform::Macos => true,
@@ -428,6 +431,18 @@ mod tests {
             NodeRole::Exit.is_lab_assignable_for_platform(&VmGuestPlatform::Macos),
             "macOS Exit is assignable through blind_exit PF parity"
         );
+    }
+
+    #[test]
+    fn custom_role_is_not_lab_assignable_without_explicit_mappings() {
+        let role = NodeRole::Custom("future-role".to_owned());
+        for platform in [
+            VmGuestPlatform::Linux,
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+        ] {
+            assert!(!role.is_lab_assignable_for_platform(&platform));
+        }
     }
 
     #[test]

@@ -2,9 +2,12 @@
 pub mod adapter;
 pub mod connection;
 pub mod context;
+pub mod diagnostics;
 pub mod error;
+pub mod parallel;
 pub mod parity;
 pub mod plan;
+pub mod readiness;
 pub mod remote_shell;
 pub mod report;
 pub mod role;

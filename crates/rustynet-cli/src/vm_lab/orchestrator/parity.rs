@@ -71,7 +71,11 @@ pub fn build_live_lab_run_report(
         .map(|(id, outcome)| {
             let (rec, error_detail) = match outcome {
                 StageOutcome::Passed => (StageOutcomeRecord::Passed, None),
-                StageOutcome::Skipped => (StageOutcomeRecord::Skipped, None),
+                StageOutcome::Skipped | StageOutcome::NotRun => (StageOutcomeRecord::Skipped, None),
+                StageOutcome::Reused { evidence_sha256 } => (
+                    StageOutcomeRecord::Skipped,
+                    Some(format!("reused prior evidence sha256={evidence_sha256}")),
+                ),
                 StageOutcome::Failed(msg) => (StageOutcomeRecord::Failed, Some(msg.clone())),
             };
             StageReport {
@@ -112,6 +116,7 @@ pub fn build_live_lab_run_report(
     };
 
     let mut node_statuses: HashMap<String, NodeStatus> = HashMap::new();
+    let recorded_nodes = node_statuses_from_nodes_tsv(&ctx.report_dir);
     for assignment in &ctx.assignments {
         let platform = ctx.adapters.get(&assignment.alias).map_or_else(
             || "unknown".to_owned(),
@@ -121,6 +126,15 @@ pub fn build_live_lab_run_report(
             assignment.alias.clone(),
             NodeStatus {
                 alias: assignment.alias.clone(),
+                target: recorded_nodes
+                    .get(&assignment.alias)
+                    .map(|node| node.target.clone())
+                    .unwrap_or_default(),
+                node_id: recorded_nodes
+                    .get(&assignment.alias)
+                    .map(|node| node.node_id.clone())
+                    .or_else(|| ctx.node_ids.get(&assignment.alias).cloned())
+                    .unwrap_or_default(),
                 platform,
                 role: assignment.role.as_str().to_owned(),
                 validator_results: validator_results
@@ -210,7 +224,21 @@ fn node_statuses_from_nodes_tsv(report_dir: &Path) -> HashMap<String, NodeStatus
                 alias.to_owned(),
                 NodeStatus {
                     alias: alias.to_owned(),
-                    platform: "unknown".to_owned(),
+                    target: cols
+                        .get(1)
+                        .map(|value| value.trim())
+                        .unwrap_or("")
+                        .to_owned(),
+                    node_id: cols
+                        .get(2)
+                        .map(|value| value.trim())
+                        .unwrap_or("")
+                        .to_owned(),
+                    platform: cols
+                        .get(4)
+                        .map(|value| value.trim())
+                        .unwrap_or("unknown")
+                        .to_owned(),
                     role,
                     validator_results: Vec::new(),
                 },
@@ -268,7 +296,9 @@ fn report_from_orchestrate_result(report_dir: &Path) -> Option<(RunStatus, Vec<S
                 Some(StageStatus::Fail | StageStatus::Aborted | StageStatus::TimedOut) => {
                     StageOutcomeRecord::Failed
                 }
-                Some(StageStatus::Skipped) => StageOutcomeRecord::Skipped,
+                Some(StageStatus::Skipped | StageStatus::NotRun | StageStatus::Reused) => {
+                    StageOutcomeRecord::Skipped
+                }
                 Some(StageStatus::Pending | StageStatus::Running | StageStatus::NotApplicable)
                 | None => continue,
             };
@@ -377,7 +407,9 @@ fn report_from_stages_tsv(report_dir: &Path) -> Result<(RunStatus, Vec<StageRepo
             Some(StageStatus::Fail | StageStatus::Aborted | StageStatus::TimedOut) => {
                 StageOutcomeRecord::Failed
             }
-            Some(StageStatus::Skipped) => StageOutcomeRecord::Skipped,
+            Some(StageStatus::Skipped | StageStatus::NotRun | StageStatus::Reused) => {
+                StageOutcomeRecord::Skipped
+            }
             Some(StageStatus::Pending | StageStatus::Running | StageStatus::NotApplicable)
             | None => continue,
         };
@@ -816,6 +848,8 @@ mod tests {
             alias.to_owned(),
             NodeStatus {
                 alias: alias.to_owned(),
+                target: String::new(),
+                node_id: alias.to_owned(),
                 platform: "linux".to_owned(),
                 role: "client".to_owned(),
                 validator_results,

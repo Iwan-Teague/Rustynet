@@ -1,0 +1,26 @@
+# Management-only convenience profile: build/install/role iteration over the
+# UTM Shared management plane. Carries NO network-fidelity claim (rulebook §7).
+# SOCKS bootstrap is permitted here because this profile never produces
+# network evidence.
+schema_version = 1
+id = "mgmt_shared_smoke_v1"
+evidence_tier = "management_only"
+description = "Shared-attachment management plane for builds, installs, and coarse smoke. No scenario plane, no network evidence claim."
+
+[management]
+attachment = "shared"
+internet = true
+peer_to_peer = false
+security_mode = "routine"
+
+[scenario]
+substrate = "none"
+address_family = "v4_only"
+internet_mode = "none"
+require_unique_site_subnets = false
+
+[evidence]
+require_endpoint_capture = false
+require_router_capture = false
+require_negative_reachability = false
+forbid_socks_proxy = false

@@ -7,6 +7,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 source "$1"
+export PATH="${HOME}/.cargo/bin:${PATH}"
 
 run_root() {
   sudo -n "$@"
@@ -64,11 +65,12 @@ wait_for_package_manager_idle() {
 }
 
 build_bootstrap_prereqs_present() {
-  local PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+  local PATH="${HOME}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
   local missing=0
   local cmd
   local llvm_found=0
-  for cmd in curl git make pkg-config clang nft wg rustup; do
+  local ca_bundle_found=0
+  for cmd in curl git make pkg-config clang nft wg rustup tar gzip tcpdump ping; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
       echo "[bootstrap] missing prerequisite command: ${cmd}" >&2
       missing=1
@@ -105,11 +107,62 @@ build_bootstrap_prereqs_present() {
       missing=1
     fi
   fi
-  if [[ ! -r /etc/ssl/certs/ca-certificates.crt ]]; then
-    echo "[bootstrap] missing readable CA certificate bundle at /etc/ssl/certs/ca-certificates.crt" >&2
+  for cmd in \
+    /etc/ssl/certs/ca-certificates.crt \
+    /etc/pki/tls/certs/ca-bundle.crt \
+    /etc/ssl/ca-bundle.pem; do
+    if [[ -r "${cmd}" ]]; then
+      ca_bundle_found=1
+      break
+    fi
+  done
+  if [[ "${ca_bundle_found}" -eq 0 ]]; then
+    echo "[bootstrap] missing readable CA certificate bundle (checked Debian, Fedora/RHEL, and SUSE paths)" >&2
     missing=1
   fi
   [[ "${missing}" -eq 0 ]]
+}
+
+install_rustup_hardened() {
+  export PATH="${HOME}/.cargo/bin:${PATH}"
+  command -v rustup >/dev/null 2>&1 && return 0
+
+  local target
+  case "$(uname -m)" in
+    aarch64|arm64) target="aarch64-unknown-linux-gnu" ;;
+    x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
+    *)
+      echo "unsupported architecture for rustup bootstrap: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+
+  local tmp_dir
+  local base_url="https://static.rust-lang.org/rustup/dist/${target}"
+  local attempt
+  tmp_dir="$(mktemp -d /tmp/rn-rustup-init.XXXXXX)"
+  for attempt in $(seq 1 3); do
+    if run_local_timed 300 curl --proto '=https' --tlsv1.2 --fail --location \
+      --silent --show-error "${base_url}/rustup-init" -o "${tmp_dir}/rustup-init" \
+      && run_local_timed 300 curl --proto '=https' --tlsv1.2 --fail --location \
+        --silent --show-error "${base_url}/rustup-init.sha256" -o "${tmp_dir}/rustup-init.sha256" \
+      && (cd "${tmp_dir}" && sha256sum -c rustup-init.sha256); then
+      chmod 0700 "${tmp_dir}/rustup-init"
+      "${tmp_dir}/rustup-init" -y --profile minimal --no-modify-path --default-toolchain none
+      rm -rf "${tmp_dir}"
+      export PATH="${HOME}/.cargo/bin:${PATH}"
+      command -v rustup >/dev/null 2>&1
+      return
+    fi
+    if [[ "${attempt}" -lt 3 ]]; then
+      echo "[bootstrap] rustup-init download attempt ${attempt} failed; repairing DNS" >&2
+      repair_bootstrap_dns_state
+      sleep 2
+    fi
+  done
+  rm -rf "${tmp_dir}"
+  echo "[bootstrap] checksum-verified rustup-init download failed" >&2
+  return 1
 }
 
 install_prereqs() {
@@ -129,16 +182,18 @@ install_prereqs() {
     wait_for_package_manager_idle 'dnf|rpm' 'dnf/rpm'
     run_root_timed 1800 dnf install -y \
       ca-certificates curl git gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
-      sqlite-devel clang llvm nftables wireguard-tools rustup
+      sqlite-devel clang llvm llvm-devel nftables wireguard-tools tar gzip tcpdump iputils
   elif [[ "${os_id}" == "debian" || "${os_id}" == "ubuntu" || "${os_id}" == "linuxmint" || "${os_like}" == *"debian"* ]] || command -v apt-get >/dev/null 2>&1; then
     run_apt_update_hardened
     run_apt_install_hardened \
       ca-certificates curl git build-essential pkg-config libssl-dev libsqlite3-dev \
-      clang llvm nftables wireguard-tools openssl systemd-resolved libnss-resolve rustup
+      clang llvm nftables wireguard-tools openssl systemd-resolved libnss-resolve tar gzip \
+      tcpdump iputils-ping
   else
     echo "unsupported package manager; expected apt-get or dnf" >&2
     exit 1
   fi
+  install_rustup_hardened
   if ! build_bootstrap_prereqs_present; then
     echo "[bootstrap] prerequisite verification failed after package installation" >&2
     exit 1
@@ -324,6 +379,47 @@ repair_bootstrap_dns_state() {
   fi
 }
 
+# Linux protected-mode DNS enforcement writes /etc/resolv.conf in place with
+# O_NOFOLLOW. Keep that security boundary intact: replace distro-managed
+# symlinks ourselves, then verify the leaf is a regular file before rustynetd
+# starts. NetworkManager/systemd-resolved may recreate the symlink during a long
+# cargo build, so callers must pin once for build egress and again immediately
+# before service installation/startup.
+pin_regular_resolv_conf() {
+  local primary_nameserver="$1"
+  local secondary_nameserver="${2:-}"
+  local secondary_line=""
+
+  if [[ -n "${secondary_nameserver}" ]]; then
+    secondary_line="nameserver ${secondary_nameserver}\\n"
+  fi
+  run_root bash -c \
+    'rm -f /etc/resolv.conf; printf "nameserver %s\\n%boptions timeout:2 attempts:2\\n" "$1" "$2" > /etc/resolv.conf; chmod 0644 /etc/resolv.conf' \
+    bash "${primary_nameserver}" "${secondary_line}"
+  if [[ -L /etc/resolv.conf || ! -f /etc/resolv.conf ]]; then
+    echo "failed to pin /etc/resolv.conf as a regular file" >&2
+    exit 1
+  fi
+}
+
+# Fedora/RHEL-family guests commonly run firewalld with only SSH admitted.
+# Preserve that firewall and open only Rustynet's reviewed WireGuard UDP port;
+# without this, peers can reach the node only after it initiates outbound first,
+# violating the live-lab any-node-to-any-node contract. This bootstrap is lab
+# scoped; production packaging owns its separate host-firewall policy.
+configure_lab_wireguard_firewall() {
+  if ! command -v systemctl >/dev/null 2>&1 \
+    || ! systemctl is-active --quiet firewalld.service 2>/dev/null; then
+    return 0
+  fi
+  if ! command -v firewall-cmd >/dev/null 2>&1; then
+    echo "firewalld is active but firewall-cmd is unavailable" >&2
+    exit 1
+  fi
+  run_root firewall-cmd --permanent --add-port=51820/udp >/dev/null
+  run_root firewall-cmd --add-port=51820/udp >/dev/null
+}
+
 emit_bootstrap_network_diagnostics() {
   local host="$1"
   echo "[bootstrap] network diagnostics for host=${host}" >&2
@@ -432,7 +528,7 @@ rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 # systemd-resolved regenerating stub-resolv.conf mid-build cannot race us
 # and revert nameservers to the broken 127.0.0.53 stub.
 echo "[bootstrap] pinning nameservers for cargo build" >&2
-run_root bash -c 'rm -f /etc/resolv.conf; printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" > /etc/resolv.conf' 2>/dev/null || true
+pin_regular_resolv_conf 1.1.1.1 8.8.8.8
 # Build rustynetd + rustynet-cli. Prefer an online build against a fresh
 # registry, but fall back to an offline build from the cargo cache when the
 # registry is unreachable. A node with a warm ${HOME}/.cargo cache — e.g. a lab
@@ -462,6 +558,12 @@ fi
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
 run_root install -m 0755 target/release/rustynet-relay /usr/local/bin/rustynet-relay
+# Re-pin after the potentially long build. Distro DNS managers can recreate a
+# stub-resolver symlink while cargo runs; rustynetd must start from a regular
+# fail-closed file because its privileged helper deliberately refuses symlinks.
+echo "[bootstrap] pinning regular fail-closed resolver before daemon start" >&2
+pin_regular_resolv_conf 127.0.0.1
+configure_lab_wireguard_firewall
 backend_env=()
 if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
   backend_env+=(RUSTYNET_BACKEND="${RUSTYNET_BACKEND}")
@@ -472,11 +574,12 @@ fi
 # interrupted. e2e-bootstrap-host forwards these into `ops install-systemd`,
 # which bakes them into the unit file. Production deployments leave these unset.
 run_root env RUSTYNET_INSTALL_SOURCE_ROOT="${HOME}/Rustynet" \
+  PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin \
   RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400 \
   RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400 \
   RUSTYNET_DNS_ZONE_MAX_AGE_SECS=86400 \
   "${backend_env[@]}" \
-  rustynet ops e2e-bootstrap-host \
+  /usr/local/bin/rustynet ops e2e-bootstrap-host \
   --role "${ROLE}" \
   --node-id "${NODE_ID}" \
   --network-id "${NETWORK_ID}" \

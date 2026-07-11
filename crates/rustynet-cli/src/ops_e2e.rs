@@ -264,6 +264,7 @@ pub fn execute_ops_e2e_bootstrap_host(
         "installing rustynet CLI failed during e2e bootstrap",
     )?;
     ensure_system_group("rustynetd")?;
+    ensure_system_user("rustynetd", "rustynetd")?;
     ensure_executable_file(
         Path::new("/usr/local/bin/rustynetd"),
         "installed rustynetd binary",
@@ -5298,6 +5299,41 @@ fn ensure_system_group(group_name: &str) -> Result<(), String> {
     )
 }
 
+fn system_useradd_args(user_name: &str, group_name: &str) -> Vec<String> {
+    vec![
+        "--system".to_owned(),
+        "--gid".to_owned(),
+        group_name.to_owned(),
+        "--no-create-home".to_owned(),
+        "--home-dir".to_owned(),
+        "/nonexistent".to_owned(),
+        "--shell".to_owned(),
+        "/sbin/nologin".to_owned(),
+        user_name.to_owned(),
+    ]
+}
+
+fn ensure_system_user(user_name: &str, group_name: &str) -> Result<(), String> {
+    if run_status(
+        "getent",
+        &["passwd", user_name],
+        &[],
+        "probing system user failed",
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    let args = system_useradd_args(user_name, group_name);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_status(
+        "useradd",
+        arg_refs.as_slice(),
+        &[],
+        format!("creating system user {user_name} failed").as_str(),
+    )
+}
+
 fn capture_stdout(program: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
     let mut command = Command::new(program);
     command.args(args);
@@ -7015,7 +7051,7 @@ mod tests {
         issue_assignment_bundle_artifacts, issue_dns_zone_bundle_artifacts,
         issue_traversal_bundle_artifacts, issue_two_node_traversal_artifacts,
         parse_generic_allow_specs, parse_generic_assignment_specs, parse_generic_nodes,
-        traversal_verifier_key_hex, write_assignment_refresh_env,
+        system_useradd_args, traversal_verifier_key_hex, write_assignment_refresh_env,
     };
     use rustynet_control::ControlPlaneCore;
     use rustynet_policy::PolicySet;
@@ -7024,6 +7060,25 @@ mod tests {
     fn safe_token_accepts_expected_charset() {
         assert!(ensure_safe_token("token", "abc-DEF_123:/,@+=").is_ok());
         assert!(ensure_safe_token("token", "bad value with spaces").is_err());
+    }
+
+    #[test]
+    fn service_user_is_system_nologin_without_home() {
+        let args = system_useradd_args("rustynetd", "rustynetd");
+        assert_eq!(
+            args,
+            [
+                "--system",
+                "--gid",
+                "rustynetd",
+                "--no-create-home",
+                "--home-dir",
+                "/nonexistent",
+                "--shell",
+                "/sbin/nologin",
+                "rustynetd",
+            ]
+        );
     }
 
     #[test]

@@ -24,6 +24,9 @@ impl StageObserver for NoopObserver {
     fn stage_finished(&self, _id: &StageId, _outcome: &StageOutcome) {}
 }
 
+type PreCleanupHook<'a> =
+    dyn Fn(&OrchestrationContext, &[(StageId, StageOutcome)]) -> Result<(), String> + 'a;
+
 /// Drives stages in dependency order with skip-cascade.
 ///
 /// Skip-cascade rule: if a stage fails or is skipped, every stage that lists
@@ -32,19 +35,7 @@ pub struct StateMachineRunner {
     stages: Vec<Box<dyn OrchestrationStage>>,
     /// Stage IDs explicitly requested to skip via `--skip-stage`.
     explicit_skips: HashSet<StageId>,
-    explicit_skip_outcome: StageOutcome,
-    /// Per-stage wall-clock timeout in seconds.
-    ///
-    /// When non-zero, each stage's `execute()` is wrapped in a thread-based
-    /// timeout that returns `Failed("stage timed out after Ns")` if the
-    /// stage exceeds the limit. This requires `OrchestrationContext: Send`,
-    /// which is currently blocked by `Box<dyn NodeAdapter>` not requiring
-    /// `Send`. Until that refactor lands, per-SSH-command timeouts in the
-    /// SSH adapter (ConnectTimeout, ServerAliveInterval, run_output_with_timeout)
-    /// and the process-level `--timeout-secs` flag provide the practical
-    /// timeout envelope. A non-zero value here is plumbed through and logged
-    /// as a reminder; the warning silences when the Send refactor lands.
-    stage_timeout_secs: Option<u64>,
+    reused_skips: HashMap<StageId, String>,
     /// When set, the runner checks this flag before each stage. On true, it
     /// skips non-`always_run` stages and runs teardown stages so the guest
     /// killswitch/NAT residue is cleaned up even after a SIGTERM/SIGINT.
@@ -52,14 +43,14 @@ pub struct StateMachineRunner {
 }
 
 impl StateMachineRunner {
-    pub fn new(stages: Vec<Box<dyn OrchestrationStage>>) -> Self {
-        StateMachineRunner {
+    pub fn new(stages: Vec<Box<dyn OrchestrationStage>>) -> Result<Self, String> {
+        validate_plan(&stages)?;
+        Ok(StateMachineRunner {
             stages,
             explicit_skips: HashSet::new(),
-            explicit_skip_outcome: StageOutcome::Skipped,
-            stage_timeout_secs: None,
+            reused_skips: HashMap::new(),
             shutdown_flag: None,
-        }
+        })
     }
 
     pub fn with_explicit_skips(mut self, skips: impl IntoIterator<Item = StageId>) -> Self {
@@ -67,14 +58,17 @@ impl StateMachineRunner {
         self
     }
 
-    pub fn with_explicit_skips_recorded_as_passed(mut self) -> Self {
-        self.explicit_skip_outcome = StageOutcome::Passed;
-        self
-    }
-
-    pub fn with_stage_timeout_secs(mut self, secs: u64) -> Self {
-        if secs > 0 {
-            self.stage_timeout_secs = Some(secs);
+    /// Mark selected skips as satisfied by validated prior evidence. The
+    /// digest binds every reused outcome to that evidence; unlisted explicit
+    /// skips remain `NotRun` and block their dependents.
+    pub fn with_reused_skips(
+        mut self,
+        skips: impl IntoIterator<Item = StageId>,
+        evidence_sha256: String,
+    ) -> Self {
+        for id in skips {
+            self.explicit_skips.insert(id.clone());
+            self.reused_skips.insert(id, evidence_sha256.clone());
         }
         self
     }
@@ -86,7 +80,10 @@ impl StateMachineRunner {
 
     /// Execute all stages in dependency order, applying skip-cascade.
     /// Returns a list of (`StageId`, `StageOutcome`) in execution order.
-    pub fn run(&self, ctx: &mut OrchestrationContext) -> Vec<(StageId, StageOutcome)> {
+    pub fn run(
+        &self,
+        ctx: &mut OrchestrationContext,
+    ) -> Result<Vec<(StageId, StageOutcome)>, String> {
         self.run_with_observer(ctx, &NoopObserver)
     }
 
@@ -97,17 +94,46 @@ impl StateMachineRunner {
         &self,
         ctx: &mut OrchestrationContext,
         observer: &dyn StageObserver,
-    ) -> Vec<(StageId, StageOutcome)> {
-        let ordered = topological_order(&self.stages);
+    ) -> Result<Vec<(StageId, StageOutcome)>, String> {
+        self.run_with_observer_and_pre_cleanup_hook(ctx, observer, None)
+    }
+
+    /// Run with an optional hook invoked immediately before the first
+    /// `always_run` teardown stage. This lets callers capture failure
+    /// diagnostics while runtime state still exists, without weakening the
+    /// guarantee that cleanup runs even when capture itself fails.
+    pub fn run_with_observer_and_pre_cleanup_hook(
+        &self,
+        ctx: &mut OrchestrationContext,
+        observer: &dyn StageObserver,
+        pre_cleanup_hook: Option<&PreCleanupHook<'_>>,
+    ) -> Result<Vec<(StageId, StageOutcome)>, String> {
+        let ordered = topological_order(&self.stages)?;
         let mut results: Vec<(StageId, StageOutcome)> = Vec::new();
         let mut blocked: HashSet<StageId> = HashSet::new();
+        let mut hook_ran = false;
+        let mut hook_error: Option<String> = None;
 
         for idx in ordered {
             let stage = &self.stages[idx];
             let id = stage.id();
 
+            if stage.always_run() && !hook_ran {
+                hook_ran = true;
+                if let Some(hook) = pre_cleanup_hook
+                    && let Err(err) = hook(ctx, &results)
+                {
+                    hook_error = Some(err);
+                }
+            }
+
             if self.explicit_skips.contains(&id) {
-                let outcome = self.explicit_skip_outcome.clone();
+                let outcome = self
+                    .reused_skips
+                    .get(&id)
+                    .map_or(StageOutcome::NotRun, |digest| StageOutcome::Reused {
+                        evidence_sha256: digest.clone(),
+                    });
                 if outcome.is_blocking() || matches!(outcome, StageOutcome::Skipped) {
                     blocked.insert(id.clone());
                 }
@@ -157,7 +183,7 @@ impl StateMachineRunner {
             // residue case. The mutable `ctx` borrow ends when `catch_unwind`
             // returns; `assignments`/`adapters` (all cleanup needs) are set
             // before the run and untouched by stage execution.
-            let outcome =
+            let mut outcome =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stage.execute(ctx)))
                     .unwrap_or_else(|_| {
                         StageOutcome::Failed(format!(
@@ -165,6 +191,19 @@ impl StateMachineRunner {
                             id.as_str()
                         ))
                     });
+
+            if stage.always_run()
+                && let Some(diagnostic_error) = hook_error.take()
+            {
+                outcome = match outcome {
+                    StageOutcome::Failed(cleanup_error) => StageOutcome::Failed(format!(
+                        "pre-cleanup diagnostics failed: {diagnostic_error}; cleanup failed: {cleanup_error}"
+                    )),
+                    _ => StageOutcome::Failed(format!(
+                        "pre-cleanup diagnostics failed: {diagnostic_error}; cleanup completed"
+                    )),
+                };
+            }
 
             if outcome.is_blocking() {
                 blocked.insert(id.clone());
@@ -175,18 +214,50 @@ impl StateMachineRunner {
             results.push((id, outcome));
         }
 
-        results
+        Ok(results)
     }
 }
 
 /// Topological sort of stages by `dependencies()`.
 /// Returns indices into `stages` in dependency-first order.
 /// Stages with no dependency relationship preserve insertion order.
-fn topological_order(stages: &[Box<dyn OrchestrationStage>]) -> Vec<usize> {
+fn validate_plan(stages: &[Box<dyn OrchestrationStage>]) -> Result<(), String> {
+    let mut ids = HashSet::with_capacity(stages.len());
+    for stage in stages {
+        let id = stage.id();
+        if !ids.insert(id.clone()) {
+            return Err(format!(
+                "orchestration plan contains duplicate stage '{}'",
+                id.as_str()
+            ));
+        }
+    }
+    for stage in stages {
+        for dependency in stage.dependencies() {
+            if !ids.contains(dependency) {
+                return Err(format!(
+                    "orchestration stage '{}' depends on missing stage '{}'",
+                    stage.id().as_str(),
+                    dependency.as_str()
+                ));
+            }
+        }
+    }
+    topological_order_unchecked(stages).map(|_| ())
+}
+
+fn topological_order(stages: &[Box<dyn OrchestrationStage>]) -> Result<Vec<usize>, String> {
+    validate_plan(stages)?;
+    topological_order_unchecked(stages)
+}
+
+fn topological_order_unchecked(
+    stages: &[Box<dyn OrchestrationStage>],
+) -> Result<Vec<usize>, String> {
     let id_to_idx: HashMap<StageId, usize> = stages
         .iter()
         .enumerate()
-        .map(|(i, s)| (s.id(), i))
+        .map(|(i, stage)| (stage.id(), i))
         .collect();
 
     let n = stages.len();
@@ -216,17 +287,18 @@ fn topological_order(stages: &[Box<dyn OrchestrationStage>]) -> Vec<usize> {
         }
     }
 
-    // Append any nodes not reached (cycles or missing deps) at the end.
-    // In practice the stage list is acyclic; this is a safety net.
     if order.len() < n {
-        for i in 0..n {
-            if !order.contains(&i) {
-                order.push(i);
-            }
-        }
+        let cyclic = (0..n)
+            .filter(|index| !order.contains(index))
+            .map(|index| stages[index].id().as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "orchestration plan contains dependency cycle: {cyclic}"
+        ));
     }
 
-    order
+    Ok(order)
 }
 
 #[cfg(test)]
@@ -345,9 +417,9 @@ mod tests {
                 vec![StageId::PrepareSourceArchive],
             ),
         ];
-        let runner = StateMachineRunner::new(stages);
+        let runner = StateMachineRunner::new(stages).expect("valid plan");
         let mut ctx = make_ctx();
-        let results = runner.run(&mut ctx);
+        let results = runner.run(&mut ctx).expect("run");
 
         assert_eq!(results.len(), 3);
 
@@ -378,7 +450,10 @@ mod tests {
             fail_stage(StageId::ExitHandoff, vec![StageId::Preflight]),
             always_run_stage(StageId::Cleanup, vec![StageId::ExitHandoff]),
         ];
-        let results = StateMachineRunner::new(stages).run(&mut make_ctx());
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut make_ctx())
+            .expect("run");
         let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
         assert!(matches!(
             outcome_of(&StageId::ExitHandoff),
@@ -399,7 +474,10 @@ mod tests {
             panic_stage(StageId::ExitHandoff, vec![]),
             always_run_stage(StageId::Cleanup, vec![StageId::ExitHandoff]),
         ];
-        let results = StateMachineRunner::new(stages).run(&mut make_ctx());
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut make_ctx())
+            .expect("run");
         let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
         assert!(
             matches!(
@@ -413,6 +491,66 @@ mod tests {
             Some(&StageOutcome::Passed),
             "always_run cleanup MUST run after a panicking stage"
         );
+    }
+
+    #[test]
+    fn failure_diagnostic_hook_runs_before_cleanup_and_hook_failure_does_not_skip_cleanup() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct HookAwareCleanup(Arc<AtomicBool>);
+        impl OrchestrationStage for HookAwareCleanup {
+            fn id(&self) -> StageId {
+                StageId::Cleanup
+            }
+            fn name(&self) -> &str {
+                "cleanup"
+            }
+            fn dependencies(&self) -> &[StageId] {
+                &[StageId::ExitHandoff]
+            }
+            fn applies_to_roles(&self) -> &[NodeRole] {
+                &[]
+            }
+            fn fanout(&self) -> StageFanout {
+                StageFanout::Once
+            }
+            fn execute(&self, _ctx: &mut OrchestrationContext) -> StageOutcome {
+                assert!(self.0.load(Ordering::SeqCst), "hook must precede cleanup");
+                StageOutcome::Passed
+            }
+            fn always_run(&self) -> bool {
+                true
+            }
+        }
+
+        let hook_called = Arc::new(AtomicBool::new(false));
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            fail_stage(StageId::ExitHandoff, vec![]),
+            Box::new(HookAwareCleanup(Arc::clone(&hook_called))),
+        ];
+        let runner = StateMachineRunner::new(stages).expect("valid plan");
+        let hook_flag = Arc::clone(&hook_called);
+        let hook = move |_ctx: &OrchestrationContext,
+                         prior: &[(StageId, StageOutcome)]|
+              -> Result<(), String> {
+            assert!(
+                prior
+                    .iter()
+                    .any(|(_, outcome)| matches!(outcome, StageOutcome::Failed(_)))
+            );
+            hook_flag.store(true, Ordering::SeqCst);
+            Err("diagnostic writer failed".to_owned())
+        };
+        let results = runner
+            .run_with_observer_and_pre_cleanup_hook(&mut make_ctx(), &NoopObserver, Some(&hook))
+            .expect("run");
+        assert!(hook_called.load(Ordering::SeqCst));
+        assert!(matches!(
+            results.last(),
+            Some((StageId::Cleanup, StageOutcome::Failed(message)))
+                if message.contains("diagnostic writer failed")
+        ));
     }
 
     #[test]
@@ -430,9 +568,12 @@ mod tests {
                 StageId::VerifySshReachability,
                 vec![StageId::PrepareSourceArchive],
             ),
-            always_run_stage(StageId::Cleanup, vec![StageId::ExitHandoff]),
+            always_run_stage(StageId::Cleanup, vec![]),
         ];
-        let results = StateMachineRunner::new(stages).run(&mut make_ctx());
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut make_ctx())
+            .expect("run");
         let ids: Vec<StageId> = results.into_iter().map(|(id, _)| id).collect();
         assert_eq!(
             ids,
@@ -471,10 +612,10 @@ mod tests {
             pass_stage(StageId::PrepareSourceArchive, vec![StageId::Preflight]),
             pass_stage(StageId::CleanupHosts, vec![]),
         ];
-        let runner = StateMachineRunner::new(stages);
+        let runner = StateMachineRunner::new(stages).expect("valid plan");
         let mut ctx = make_ctx();
         let observer = RecordingObserver::default();
-        runner.run_with_observer(&mut ctx, &observer);
+        runner.run_with_observer(&mut ctx, &observer).expect("run");
         let events = observer.events.borrow();
 
         // An executed stage emits start then finish.
@@ -515,9 +656,9 @@ mod tests {
             pass_stage(StageId::PrepareSourceArchive, vec![StageId::Preflight]),
             pass_stage(StageId::CleanupHosts, vec![]),
         ];
-        let runner = StateMachineRunner::new(stages);
+        let runner = StateMachineRunner::new(stages).expect("valid plan");
         let mut ctx = make_ctx();
-        let results = runner.run(&mut ctx);
+        let results = runner.run(&mut ctx).expect("run");
 
         let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
 
@@ -547,9 +688,9 @@ mod tests {
             pass_stage(StageId::PrepareSourceArchive, vec![]),
             pass_stage(StageId::Preflight, vec![]),
         ];
-        let runner = StateMachineRunner::new(stages);
+        let runner = StateMachineRunner::new(stages).expect("valid plan");
         let mut ctx = make_ctx();
-        let results = runner.run(&mut ctx);
+        let results = runner.run(&mut ctx).expect("run");
 
         let pos = |id: &StageId| results.iter().position(|(i, _)| i == id).unwrap();
 
@@ -570,16 +711,15 @@ mod tests {
             pass_stage(StageId::Preflight, vec![]),
             pass_stage(StageId::PrepareSourceArchive, vec![StageId::Preflight]),
         ];
-        let runner = StateMachineRunner::new(stages).with_explicit_skips([StageId::Preflight]);
+        let runner = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .with_explicit_skips([StageId::Preflight]);
         let mut ctx = make_ctx();
-        let results = runner.run(&mut ctx);
+        let results = runner.run(&mut ctx).expect("run");
 
         let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
 
-        assert_eq!(
-            outcome_of(&StageId::Preflight),
-            Some(&StageOutcome::Skipped)
-        );
+        assert_eq!(outcome_of(&StageId::Preflight), Some(&StageOutcome::NotRun));
         assert_eq!(
             outcome_of(&StageId::PrepareSourceArchive),
             Some(&StageOutcome::Skipped),
@@ -588,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_skip_recorded_as_passed_does_not_cascade_to_dependents() {
+    fn validated_reused_skip_does_not_cascade_or_claim_fresh_pass() {
         let stages: Vec<Box<dyn OrchestrationStage>> = vec![
             pass_stage(StageId::ValidateBaselineRuntime, vec![]),
             pass_stage(
@@ -597,22 +737,60 @@ mod tests {
             ),
         ];
         let runner = StateMachineRunner::new(stages)
-            .with_explicit_skips([StageId::ValidateBaselineRuntime])
-            .with_explicit_skips_recorded_as_passed();
+            .expect("valid plan")
+            .with_reused_skips([StageId::ValidateBaselineRuntime], "abc123".to_owned());
         let mut ctx = make_ctx();
-        let results = runner.run(&mut ctx);
+        let results = runner.run(&mut ctx).expect("run");
 
         let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
 
         assert_eq!(
             outcome_of(&StageId::ValidateBaselineRuntime),
-            Some(&StageOutcome::Passed),
-            "skipped setup dependency must be injected as Passed"
+            Some(&StageOutcome::Reused {
+                evidence_sha256: "abc123".to_owned()
+            }),
+            "reused setup dependency must retain its evidence binding"
         );
         assert_eq!(
             outcome_of(&StageId::TrafficTestMatrix),
             Some(&StageOutcome::Passed),
             "dependent live stage must run when setup dependency was injected Passed"
         );
+    }
+
+    #[test]
+    fn duplicate_stage_ids_are_rejected_before_execution() {
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            pass_stage(StageId::Preflight, vec![]),
+            pass_stage(StageId::Preflight, vec![]),
+        ];
+        let err = StateMachineRunner::new(stages)
+            .err()
+            .expect("duplicate IDs must fail");
+        assert!(err.contains("duplicate stage 'preflight'"));
+    }
+
+    #[test]
+    fn missing_dependency_is_rejected_before_execution() {
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![pass_stage(
+            StageId::PrepareSourceArchive,
+            vec![StageId::Preflight],
+        )];
+        let err = StateMachineRunner::new(stages)
+            .err()
+            .expect("missing dependency must fail");
+        assert!(err.contains("depends on missing stage 'preflight'"));
+    }
+
+    #[test]
+    fn dependency_cycle_is_rejected_before_execution() {
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            pass_stage(StageId::Preflight, vec![StageId::PrepareSourceArchive]),
+            pass_stage(StageId::PrepareSourceArchive, vec![StageId::Preflight]),
+        ];
+        let err = StateMachineRunner::new(stages)
+            .err()
+            .expect("cycle must fail");
+        assert!(err.contains("dependency cycle"));
     }
 }

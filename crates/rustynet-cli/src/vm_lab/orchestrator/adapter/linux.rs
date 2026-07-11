@@ -44,9 +44,18 @@ impl NodeAdapter for LinuxNodeAdapter {
 
     fn collect_os_version(&self) -> String {
         use crate::vm_lab::orchestrator::adapter::ssh;
-        ssh::run_remote(&self.conn, "uname -r", Duration::from_secs(10))
-            .map(|v| format!("Linux {}", v.trim()))
-            .unwrap_or_else(|_| "linux".to_owned())
+        ssh::run_remote(
+            &self.conn,
+            "if [ -r /etc/os-release ]; then \
+                 . /etc/os-release; \
+                 printf '%s (%s)' \"${PRETTY_NAME:-${NAME:-Linux}}\" \"$(uname -m)\"; \
+             else \
+                 printf 'Linux kernel %s (%s)' \"$(uname -r)\" \"$(uname -m)\"; \
+             fi",
+            Duration::from_secs(10),
+        )
+        .map(|v| v.trim().to_owned())
+        .unwrap_or_else(|_| "linux".to_owned())
     }
 
     fn alias(&self) -> &str {

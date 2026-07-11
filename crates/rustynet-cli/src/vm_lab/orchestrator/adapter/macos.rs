@@ -51,10 +51,10 @@ impl NodeAdapter for MacosNodeAdapter {
         use crate::vm_lab::orchestrator::adapter::ssh;
         ssh::run_remote(
             &self.conn,
-            "sw_vers -productVersion",
+            "printf 'macOS %s (%s)' \"$(sw_vers -productVersion)\" \"$(uname -m)\"",
             Duration::from_secs(10),
         )
-        .map(|v| format!("macOS {}", v.trim()))
+        .map(|v| v.trim().to_owned())
         .unwrap_or_else(|_| "macos".to_owned())
     }
 

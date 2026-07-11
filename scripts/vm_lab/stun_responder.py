@@ -17,7 +17,7 @@ supported.
 Usage:
     stun_responder.py [--bind ADDR] [--port N]   # default 0.0.0.0:3478, also ::
 Run inside the svc namespace, e.g.:
-    ip netns exec rnsim-svc python3 stun_responder.py --bind 100.64.0.254 --port 3478
+    ip netns exec rnsim-svc python3 stun_responder.py --bind 198.18.0.254 --port 3478
 """
 import argparse
 import socket

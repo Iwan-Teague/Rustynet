@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use std::io::Write as IoWrite;
 use std::time::Duration;
 
 use crate::vm_lab::VmGuestPlatform;
@@ -24,6 +23,16 @@ pub const LINUX_RUSTYNET_RELAY_PATH: &str = "/usr/local/bin/rustynet-relay";
 pub const LINUX_SERVICE_NAME: &str = "rustynetd";
 /// Daemon UNIX socket path.
 pub const LINUX_DAEMON_SOCKET: &str = "/run/rustynet/rustynetd.sock";
+
+const LINUX_DAEMON_READY_PROBE: &str = "for i in $(seq 1 40); do \
+       if sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock \
+          /usr/local/bin/rustynet status >/dev/null 2>&1; then \
+         echo daemon-ready; exit 0; \
+       fi; \
+       sleep 1; \
+     done; \
+     sudo -n systemctl status rustynetd.service --no-pager || true; \
+     echo daemon-not-ready; exit 1";
 
 /// Bootstrap script embedded at compile time from the reviewed copy at
 /// `scripts/bootstrap/linux/rn_bootstrap.sh`. The script is the same one
@@ -58,7 +67,7 @@ pub fn install_daemon(
     let script_tmp = write_temp_file("rn_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())?;
 
     // Write env file.
-    let env_content = build_bootstrap_env(&node_id, &role, ctx);
+    let env_content = build_bootstrap_env(&node_id, &role, ctx)?;
     let env_tmp = write_temp_file("rn_bootstrap_env_", ".env", env_content.as_bytes())?;
 
     let short_timeout = Duration::from_secs(30);
@@ -190,12 +199,13 @@ pub fn enforce_daemon(
     // causes dns_alarm_state=error once the bundle ages past 5 minutes, which
     // can block traffic validation in longer pipeline runs.
     let script = format!(
-        "sudo \
+        "sudo -n env \
+         PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin \
          RUSTYNET_INSTALL_SOURCE_ROOT={src_dir} \
          RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400 \
          RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400 \
          RUSTYNET_DNS_ZONE_MAX_AGE_SECS=86400 \
-         rustynet ops e2e-enforce-host \
+         {LINUX_RUSTYNET_PATH} ops e2e-enforce-host \
          --role {role_str} \
          --node-id '{node_id}' \
          --src-dir '{src_dir}' \
@@ -297,10 +307,11 @@ pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
 /// In the orchestration pipeline, prefer `enforce_daemon` over this function:
 /// `enforce_daemon` transitions the daemon from its bootstrap
 /// (`auto_tunnel_enforce=false`) to an enforcement-enabled configuration.
-/// `start_daemon` is a plain `systemctl start`, which is a no-op when the
-/// daemon is already running.
+/// `start_daemon` starts systemd, then waits until the daemon accepts a real
+/// status request. This closes the systemd-active -> socket-accepting race.
 pub fn start_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
-    run_systemctl(conn, "start")
+    run_systemctl(conn, "start")?;
+    wait_for_linux_daemon_ready(conn)
 }
 
 /// Stop the rustynetd systemd service.
@@ -310,7 +321,8 @@ pub fn stop_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
 
 /// Restart the rustynetd systemd service.
 pub fn restart_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
-    run_systemctl(conn, "restart")
+    run_systemctl(conn, "restart")?;
+    wait_for_linux_daemon_ready(conn)
 }
 
 /// Stop the service and remove daemon binaries and configuration.
@@ -358,15 +370,33 @@ fn run_systemctl(conn: &NodeConnection, action: &str) -> Result<(), AdapterError
     Ok(())
 }
 
-fn build_bootstrap_env(node_id: &str, role: &NodeRole, ctx: &OrchestrationContext) -> String {
+fn wait_for_linux_daemon_ready(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let output = ssh::run_remote(conn, LINUX_DAEMON_READY_PROBE, Duration::from_secs(60))?;
+    if output.contains("daemon-ready") {
+        Ok(())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!(
+                "Linux daemon failed readiness probe at {LINUX_DAEMON_SOCKET}: {}",
+                output.trim()
+            ),
+        })
+    }
+}
+
+fn build_bootstrap_env(
+    node_id: &str,
+    role: &NodeRole,
+    ctx: &OrchestrationContext,
+) -> Result<String, AdapterError> {
     let role_str = role
         .daemon_node_role_for_platform(&VmGuestPlatform::Linux)
-        .expect("Linux lab role must have explicit daemon role mapping");
+        .map_err(|message| AdapterError::Protocol { message })?;
     let ssh_allow_cidrs = &ctx.ssh_allow_cidrs;
     let network_id = &ctx.network_id;
-    format!(
+    Ok(format!(
         "ROLE={role_str}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE=/tmp/rn_source.tar.gz\nRUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n"
-    )
+    ))
 }
 
 /// Write `content` to a temp file with the given prefix and suffix.
@@ -376,15 +406,11 @@ fn write_temp_file(
     suffix: &str,
     content: &[u8],
 ) -> Result<std::path::PathBuf, AdapterError> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("{prefix}{}{suffix}", std::process::id()));
-    let mut file = std::fs::File::create(&path).map_err(|err| AdapterError::Io {
-        message: format!("create temp file failed: {err}"),
-    })?;
-    file.write_all(content).map_err(|err| AdapterError::Io {
-        message: format!("write temp file failed: {err}"),
-    })?;
-    Ok(path)
+    // Bootstrap runs per-node in parallel. A PID-only name lets workers
+    // overwrite one another's role/node-id env file before SCP, producing a
+    // valid build with the wrong identity. `tempfile` creates a collision-free
+    // mode-0600 file; persist it only until the caller finishes SCP.
+    super::write_secure_temp_file(prefix, suffix, content)
 }
 
 #[cfg(test)]
@@ -414,7 +440,7 @@ mod tests {
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
         };
-        let env = build_bootstrap_env("exit-node1-abc123", &NodeRole::Exit, &ctx);
+        let env = build_bootstrap_env("exit-node1-abc123", &NodeRole::Exit, &ctx).expect("env");
         assert!(
             env.contains("ROLE=admin"),
             "exit node must map to admin role: {env}"
@@ -431,6 +457,23 @@ mod tests {
             env.contains("RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2"),
             "Rust-native lab bootstrap should reach offline fallback quickly on no-egress guests: {env}"
         );
+    }
+
+    #[test]
+    fn parallel_temp_files_are_unique_and_keep_each_workers_content() {
+        let payloads = [b"exit-node".as_slice(), b"client-a", b"client-b"];
+        let paths = crate::vm_lab::orchestrator::parallel::bounded_parallel_map(
+            &payloads,
+            payloads.len(),
+            |payload| write_temp_file("rn_parallel_test_", ".env", payload).unwrap(),
+        );
+
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), payloads.len());
+        for (path, expected) in paths.iter().zip(payloads) {
+            assert_eq!(std::fs::read(path).unwrap(), expected);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -457,7 +500,7 @@ mod tests {
             NodeRole::Aux,
             NodeRole::Extra,
         ] {
-            let env = build_bootstrap_env("id1", &role, &ctx);
+            let env = build_bootstrap_env("id1", &role, &ctx).expect("env");
             assert!(
                 env.contains("ROLE=client"),
                 "non-exit role {role:?} must map to client: {env}"
@@ -542,6 +585,41 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_uses_absolute_installed_cli_under_sudo_secure_path() {
+        assert!(BOOTSTRAP_SCRIPT.contains("/usr/local/bin/rustynet ops e2e-bootstrap-host"));
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin")
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("\n  rustynet ops e2e-bootstrap-host"),
+            "Rocky sudo secure_path may exclude /usr/local/bin"
+        );
+    }
+
+    #[test]
+    fn bootstrap_repins_regular_fail_closed_resolver_immediately_before_daemon_start() {
+        assert!(BOOTSTRAP_SCRIPT.contains("pin_regular_resolv_conf()"));
+        assert!(BOOTSTRAP_SCRIPT.contains("pin_regular_resolv_conf 1.1.1.1 8.8.8.8"));
+        let protected_pin = BOOTSTRAP_SCRIPT
+            .find("pin_regular_resolv_conf 127.0.0.1")
+            .expect("protected resolver pin");
+        let daemon_start = BOOTSTRAP_SCRIPT
+            .find("/usr/local/bin/rustynet ops e2e-bootstrap-host")
+            .expect("daemon bootstrap invocation");
+        assert!(
+            protected_pin < daemon_start,
+            "regular loopback resolver must be pinned before rustynetd starts"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT[protected_pin..daemon_start]
+                .contains("failed to pin /etc/resolv.conf as a regular file")
+                || BOOTSTRAP_SCRIPT.contains("[[ -L /etc/resolv.conf || ! -f /etc/resolv.conf ]]"),
+            "bootstrap must fail closed if distro DNS management recreates a symlink"
+        );
+    }
+
+    #[test]
     fn bootstrap_network_diagnostics_timeout_getent_before_offline_fallback() {
         // No-egress UTM guests can leave getent blocked indefinitely. Diagnostics
         // must be bounded so the script reaches the cargo --offline fallback.
@@ -556,6 +634,29 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_prerequisites_support_fedora_ca_and_llvm_layout() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("/etc/pki/tls/certs/ca-bundle.crt"),
+            "Fedora/RHEL CA bundle must satisfy prerequisite validation"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("sqlite-devel clang llvm llvm-devel nftables"),
+            "Fedora/RHEL install must include llvm-devel, which provides llvm-config"
+        );
+        assert!(BOOTSTRAP_SCRIPT.contains("wireguard-tools tar gzip tcpdump iputils"));
+        assert!(BOOTSTRAP_SCRIPT.contains("tcpdump iputils-ping"));
+        assert!(BOOTSTRAP_SCRIPT.contains("gzip tcpdump ping"));
+        assert!(BOOTSTRAP_SCRIPT.contains("install_rustup_hardened"));
+        assert!(BOOTSTRAP_SCRIPT.contains("${HOME}/.cargo/bin:/usr/local/sbin"));
+        assert!(BOOTSTRAP_SCRIPT.contains("rustup-init.sha256"));
+        assert!(BOOTSTRAP_SCRIPT.contains("sha256sum -c rustup-init.sha256"));
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("wireguard-tools rustup"),
+            "Rocky repositories do not provide a rustup RPM; rustup must use the checksum-verified installer"
+        );
+    }
+
+    #[test]
     fn bootstrap_root_timeout_wraps_child_command_not_sudo() {
         // `timeout sudo resolvectl ...` can leave the root child alive after
         // sudo exits. Run timeout under sudo so diagnostics cannot stall the
@@ -564,5 +665,23 @@ mod tests {
             BOOTSTRAP_SCRIPT.contains("sudo -n timeout --kill-after=5"),
             "root command timeout must wrap the child command under sudo"
         );
+    }
+
+    #[test]
+    fn bootstrap_keeps_firewalld_enabled_and_opens_only_wireguard_udp() {
+        assert!(BOOTSTRAP_SCRIPT.contains("configure_lab_wireguard_firewall()"));
+        assert!(BOOTSTRAP_SCRIPT.contains("systemctl is-active --quiet firewalld.service"));
+        assert!(BOOTSTRAP_SCRIPT.contains("firewall-cmd --permanent --add-port=51820/udp"));
+        assert!(BOOTSTRAP_SCRIPT.contains("firewall-cmd --add-port=51820/udp"));
+        assert!(!BOOTSTRAP_SCRIPT.contains("systemctl stop firewalld"));
+        assert!(!BOOTSTRAP_SCRIPT.contains("systemctl disable firewalld"));
+    }
+
+    #[test]
+    fn daemon_start_readiness_requires_a_live_control_request() {
+        assert!(LINUX_DAEMON_READY_PROBE.contains("for i in $(seq 1 40)"));
+        assert!(LINUX_DAEMON_READY_PROBE.contains(LINUX_DAEMON_SOCKET));
+        assert!(LINUX_DAEMON_READY_PROBE.contains("/usr/local/bin/rustynet status"));
+        assert!(LINUX_DAEMON_READY_PROBE.contains("daemon-not-ready; exit 1"));
     }
 }

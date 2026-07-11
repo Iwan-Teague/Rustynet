@@ -99,7 +99,7 @@ const MACOS_RESET_COMMAND: &str = "rn_anchors=$(sudo -n pfctl -s Anchors 2>/dev/
 /// three space-separated tokens on a single line that
 /// [`parse_macos_node_clean_probe`] interprets:
 ///   `pf=<names|->`    active leftover RustyNet pf anchor names, or `-` if none
-///   `daemon=<up|down>` whether a `rustynetd` process is still running
+///   `daemon=<up|down>` whether `rustynetd` or `rustynet-relay` is still running
 ///   `iface=<names|->`  leftover mesh `utun` interface names (a `utun` carrying a
 ///                      `100.64.0.0/10` mesh address), or `-` if none
 ///
@@ -119,7 +119,8 @@ const MACOS_NODE_CLEAN_PROBE: &str = "rn_pf=''; \
              rn_pf=\"${rn_pf}${a},\"; \
          fi; \
      done; \
-     rn_daemon=$(pgrep -x rustynetd >/dev/null 2>&1 && echo up || echo down); \
+     rn_daemon=$(if pgrep -x rustynetd >/dev/null 2>&1 \
+         || pgrep -x rustynet-relay >/dev/null 2>&1; then echo up; else echo down; fi); \
      rn_iface=$(for dev in $(ifconfig -l 2>/dev/null | tr ' ' '\\n' | grep '^utun'); do \
              if ifconfig \"$dev\" 2>/dev/null \
                  | grep -Eq 'inet 100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.'; then \
@@ -195,7 +196,7 @@ fn parse_macos_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
     }
     match daemon {
         Some("down") => {}
-        Some("up") => dirty.push("rustynetd still running".to_owned()),
+        Some("up") => dirty.push("rustynetd or rustynet-relay still running".to_owned()),
         _ => dirty.push("daemon status unknown (probe token missing)".to_owned()),
     }
     match clean_list(iface) {
@@ -810,7 +811,10 @@ mod tests {
     fn parse_macos_node_clean_probe_reports_running_daemon() {
         let err = parse_macos_node_clean_probe("pf=- daemon=up iface=-")
             .expect_err("running daemon must fail");
-        assert!(err.to_string().contains("rustynetd still running"));
+        assert!(
+            err.to_string()
+                .contains("rustynetd or rustynet-relay still running")
+        );
     }
 
     #[test]
@@ -829,7 +833,7 @@ mod tests {
                 .expect_err("multi-dirty must fail");
         let msg = err.to_string();
         assert!(msg.contains("com.rustynet/blind_exit"));
-        assert!(msg.contains("rustynetd still running"));
+        assert!(msg.contains("rustynetd or rustynet-relay still running"));
         assert!(msg.contains("utun4095"));
     }
 
