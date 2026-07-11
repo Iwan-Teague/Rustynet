@@ -39,16 +39,30 @@ impl OrchestrationStage for BlindExitDataplaneValidationStage {
         &[StageId::ExitDemotionResidueValidation]
     }
     fn applies_to_roles(&self) -> &[NodeRole] {
-        &[]
+        &[NodeRole::BlindExit]
     }
     fn fanout(&self) -> StageFanout {
         StageFanout::PerNode
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
-        let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
+        // Only nodes ASSIGNED the blind_exit role carry the blind_exit forward
+        // chain to validate. Mirror the `blind_exit` deploy stage's role filter
+        // (`BlindExitStage`): validating every node would fail-loud on a regular
+        // exit / client that legitimately has no mesh-scoped forward rule. When
+        // no node holds the role the stage is a no-op — the same topology that
+        // makes the deploy stage skip.
+        let aliases: Vec<String> = ctx
+            .assignments
+            .iter()
+            .filter(|a| a.role == NodeRole::BlindExit)
+            .map(|a| a.alias.clone())
+            .collect();
         if aliases.is_empty() {
-            return StageOutcome::Passed;
+            // No blind_exit node in this topology — nothing to validate. Skipped
+            // (not Passed) so the evidence does not promise a dataplane check
+            // that never ran; mirrors the `blind_exit` deploy stage.
+            return StageOutcome::Skipped;
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -160,5 +174,44 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("mac-1") && s.contains("win-1"));
         assert!(s.contains("blind_exit_dataplane_validation"));
+    }
+
+    #[test]
+    fn non_blind_exit_assignments_skip_without_validating() {
+        use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+        use std::collections::HashMap;
+        // A topology with only exit + client (no blind_exit role) must SKIP —
+        // returning before any adapter is touched (empty map proves it never
+        // reaches validation) — instead of fail-closing on nodes that
+        // legitimately carry no blind_exit forward chain. Regression for the
+        // live-lab false failure unmasked once exit_demotion started passing.
+        let mut ctx = OrchestrationContext {
+            assignments: vec![
+                NodeRoleAssignment {
+                    alias: "exit-1".to_owned(),
+                    role: NodeRole::Exit,
+                },
+                NodeRoleAssignment {
+                    alias: "client-1".to_owned(),
+                    role: NodeRole::Client,
+                },
+            ],
+            adapters: HashMap::new(),
+            source_archive: None,
+            report_dir: std::env::temp_dir(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            orchestrator_dialect: None,
+        };
+        assert_eq!(
+            BlindExitDataplaneValidationStage.execute(&mut ctx),
+            StageOutcome::Skipped
+        );
     }
 }
