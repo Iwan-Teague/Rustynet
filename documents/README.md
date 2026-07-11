@@ -170,7 +170,9 @@ Start there when you need:
 - live-lab execution help
 - live-lab OS/role/stage evidence tracking:
   [operations/LiveLabRunMatrix.md](./operations/LiveLabRunMatrix.md) and
-  [operations/live_lab_run_matrix.csv](./operations/live_lab_run_matrix.csv)
+  [operations/live_lab_run_matrix.csv](./operations/live_lab_run_matrix.csv),
+  plus exact distro/version node-stage proof in
+  [operations/live_lab_node_stage_results.csv](./operations/live_lab_node_stage_results.csv)
 - release-gate expectations
 - platform support policy
 - evidence generation or incident response context

@@ -16,6 +16,14 @@ Purpose:
   `documents/operations/active/vm_lab_inventory.json`
   used by `rustynet-cli ops vm-lab-*`.
 
+Network attachments: this document does NOT own attachment truth. The
+read-only source of truth for per-VM attachment (Shared / Host Only /
+Bridged + pinned interface), inventory staleness, and address-plan drift is
+`rustynet ops vm-lab-network-audit`
+([LiveLabVmConnectivityRulebook.md](../LiveLabVmConnectivityRulebook.md));
+attachment changes happen ONLY through
+`rustynet ops vm-lab-network-prepare --approve-reconfigure` (ADR-004).
+
 ## Parent Device
 
 - Parent device: `iwan’s MacBook Pro`
