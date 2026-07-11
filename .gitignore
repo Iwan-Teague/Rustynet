@@ -14,6 +14,7 @@
 # Transient advisory lock for the shared live-lab run-matrix CSV append
 # (serializes concurrent disjoint-node lab runs; removed on clean release).
 /documents/operations/live_lab_run_matrix.csv.lock
+/documents/operations/live_lab_node_stage_results.csv.lock
 
 # MCP server build output (binaries built by scripts/mcp/install.sh into ./bin).
 # Build from source; do not commit the compiled servers.
