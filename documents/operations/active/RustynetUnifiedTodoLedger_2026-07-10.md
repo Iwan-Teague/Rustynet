@@ -95,6 +95,17 @@ dependency:
   stale-green, blocked, and unsupported-by-design.
 - [ ] Validate the TUI and MCP views against corrupt, missing, stale, concurrent,
   resumed, and aborted run data.
+- [ ] Fix the run-matrix updater rejecting the Linux umbrella OS family: a Rust
+  `--node` Linux run finalizes with `unrecognized OS family for fetched version
+  'linux' (platform=linux); refusing Linux-umbrella evidence` and appends no
+  `live_lab_run_matrix.csv` row, so even a green Linux `--node` run leaves no
+  §10.9 evidence row (2026-07-11, runs `state/live-lab-smoke-setup-1..3`).
+- [x] The 2026-07-10 quality-hardening commit `e4b3a0e` landed with two failing
+  `rustynet-cli` tests — a stale `build_returns_canonical_security_stage_order`
+  oracle (listed `ExitDemotionResidueValidation` before its declared dependency
+  `ExitNatLifecycleValidation`) and two `transition_local_utm_vm_*` tests that
+  shared a nanosecond-only temp-dir prefix and collided under the parallel test
+  run. Fixed in `b204579`; full workspace gates green (2297 tests).
 
 ### 4.2 Routine verification ladder
 
@@ -201,6 +212,13 @@ Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](./RustNati
   the 2026-07-10 run with isolated UTM underlays is not functional mesh proof.
 - [ ] Prevent untracked required Rust modules from being silently absent in
   working-tree deployment, or give a precise preflight blocker before shipping.
+- [ ] Make the Rust `--node` `preflight` clock-skew probe resilient to transient
+  SSH: it issues `ssh … date +%s` with no `ConnectTimeout` set (falls back to the
+  ~75s OS default) and no retry, so a single first-connection `Operation timed
+  out` hard-fails the whole run (cascade to skip-all + `cleanup` fail). Set a
+  bounded connect timeout and retry transient connect failures a few times before
+  failing the stage (2026-07-11, observed on 2/3 `--node` runs whose first SSH
+  hit `debian-headless-4`).
 
 ### 5.2 Platform adapter completeness
 
@@ -266,6 +284,12 @@ Implementation ledger: [LiveLabVmConnectivityImplementation_2026-07-10.md](./Liv
   participation, and evidence retention.
 - [ ] Keep live audits read-only by default. Mutation must be typed, stopped-VM,
   transactional, rollback-capable, and re-audited after apply.
+- [ ] Stabilize or replace `debian-headless-4` as a live-lab node: since the
+  2026-07-10 Shared-networking migration it intermittently drops host→guest TCP
+  reachability (>75s windows) at `192.168.64.10` while `fedora-utm-1` (`.20`)
+  stays stable; it was initially absent from the host `arp` cache and carries
+  many stale `live_ips`. Reset its Shared-net attachment or swap it for a stable
+  guest before using it as a `--node` target (2026-07-11).
 
 ### 6.1 MCP and autonomous-agent network behavior
 
@@ -612,6 +636,15 @@ Owning ledger: [DataplanePerfBacklog_2026-06-12.md](./DataplanePerfBacklog_2026-
 - [ ] Review `rustynet-advisor` and Fable/intelligent-system outputs as
   untrusted advisory data; require deterministic validation before any proposed
   action reaches an enforcement path.
+- [ ] Make `ops vm-lab-discover-local-utm` enumerate through `utmctl list`
+  (authoritative — it sees every registered VM) instead of scanning the UTM
+  container Documents root, which after the 2026-07-10 bundle relocation to
+  `~/Desktop/OS_images/UTM images/` holds one stale bundle and either reports
+  `bundle_count=1 / inventory_matched_count=0` or hits the 20s TCC scan timeout.
+  This intermittently fails a `--node` run at `discover_local_utm` (`local UTM
+  discovery did not report the selected aliases`) even when the inventory has
+  correct `controller.bundle_path`/`utm_name` and the guests are reachable
+  (2026-07-11).
 
 ## 19. Operations, evidence, and release
 
