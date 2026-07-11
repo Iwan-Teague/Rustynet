@@ -1639,10 +1639,20 @@ impl LinuxCommandSystem {
         // mesh-scoped final hop (record the prior value for restore). blind_exit
         // is a final-hop exit; the hardening is the filter policy below, not
         // disabling the forward path.
-        self.prior_ipv4_forwarding = Some(Self::read_sysctl_bool(
-            "/proc/sys/net/ipv4/ip_forward",
-            "net.ipv4.ip_forward",
-        )?);
+        // Capture the TRUE prior only once. This method re-runs on every
+        // re-enforce while the node keeps serving as an exit; an unconditional
+        // capture would read the already-enabled `1` on the second pass and
+        // clobber the real baseline (`0`), so a later demotion's
+        // `restore_ipv4_forwarding` would restore `1` and leave forwarding on
+        // (residue release-blocker). The persistent per-daemon applier retains
+        // this field across re-enforces, and `restore_ipv4_forwarding` clears it
+        // via `.take()`, so a later re-activation re-captures a fresh baseline.
+        if self.prior_ipv4_forwarding.is_none() {
+            self.prior_ipv4_forwarding = Some(Self::read_sysctl_bool(
+                "/proc/sys/net/ipv4/ip_forward",
+                "net.ipv4.ip_forward",
+            )?);
+        }
         self.set_ipv4_forwarding(true)
             .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
 
@@ -2149,10 +2159,20 @@ impl DataplaneSystem for LinuxCommandSystem {
             return self.apply_linux_blind_exit_locked(mesh_cidr);
         }
 
-        self.prior_ipv4_forwarding = Some(Self::read_sysctl_bool(
-            "/proc/sys/net/ipv4/ip_forward",
-            "net.ipv4.ip_forward",
-        )?);
+        // Capture the TRUE prior only once. This method re-runs on every
+        // re-enforce while the node keeps serving as an exit; an unconditional
+        // capture would read the already-enabled `1` on the second pass and
+        // clobber the real baseline (`0`), so a later demotion's
+        // `restore_ipv4_forwarding` would restore `1` and leave forwarding on
+        // (residue release-blocker). The persistent per-daemon applier retains
+        // this field across re-enforces, and `restore_ipv4_forwarding` clears it
+        // via `.take()`, so a later re-activation re-captures a fresh baseline.
+        if self.prior_ipv4_forwarding.is_none() {
+            self.prior_ipv4_forwarding = Some(Self::read_sysctl_bool(
+                "/proc/sys/net/ipv4/ip_forward",
+                "net.ipv4.ip_forward",
+            )?);
+        }
         self.set_ipv4_forwarding(true)
             .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
 
