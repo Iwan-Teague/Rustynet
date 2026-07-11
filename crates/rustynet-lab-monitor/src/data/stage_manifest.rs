@@ -20,6 +20,7 @@
 
 use std::path::Path;
 
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 pub const STAGE_MANIFEST_RELATIVE_PATH: &str = "orchestration/stage_manifest.json";
@@ -69,19 +70,30 @@ pub struct ManifestStage {
     /// Display-only aggregate; never appears in recorded outcomes.
     #[serde(default)]
     pub synthetic: bool,
+    /// True when this stage is a validation/check rather than setup,
+    /// cleanup, or display-only plumbing. Schema-v1 manifests omit this;
+    /// `None` keeps the UI honest instead of guessing from a stage name.
+    #[serde(default)]
+    pub counts_as_check: Option<bool>,
 }
 
-/// Read the manifest for a report dir, if one has been emitted. `None` for
-/// pre-manifest report dirs, an unreadable file, or an empty stage list —
-/// callers fall back to the hardcoded catalog in all three cases.
-pub fn read_stage_manifest(report_dir: &Path) -> Option<RunStageManifest> {
+/// Read the manifest for a report dir. Missing is distinct from malformed:
+/// an active run may briefly be waiting for emission, while malformed data is
+/// a producer defect that must be shown loudly instead of silently replaced
+/// by a plausible-looking local catalog.
+pub fn read_stage_manifest(report_dir: &Path) -> Result<Option<RunStageManifest>> {
     let path = report_dir.join(STAGE_MANIFEST_RELATIVE_PATH);
-    let body = std::fs::read_to_string(path).ok()?;
-    let manifest: RunStageManifest = serde_json::from_str(&body).ok()?;
-    if manifest.stages.is_empty() {
-        return None;
+    if !path.exists() {
+        return Ok(None);
     }
-    Some(manifest)
+    let body =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let manifest: RunStageManifest =
+        serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
+    if manifest.stages.is_empty() {
+        anyhow::bail!("stage manifest contains no stages: {}", path.display());
+    }
+    Ok(Some(manifest))
 }
 
 #[cfg(test)]
@@ -125,7 +137,9 @@ mod tests {
         )
         .unwrap();
 
-        let manifest = read_stage_manifest(dir.path()).expect("manifest parses");
+        let manifest = read_stage_manifest(dir.path())
+            .expect("manifest read")
+            .expect("manifest parses");
         assert_eq!(manifest.run_mode, "full");
         assert_eq!(manifest.stages.len(), 3);
         assert!(manifest.stages[0].enabled);
@@ -154,7 +168,9 @@ mod tests {
         )
         .unwrap();
 
-        let manifest = read_stage_manifest(dir.path()).expect("real emitter output parses");
+        let manifest = read_stage_manifest(dir.path())
+            .expect("real emitter output parses")
+            .expect("manifest present");
         assert_eq!(manifest.run_command, "vm-lab-orchestrate-live-lab");
         assert_eq!(manifest.run_mode, "full");
         assert!(manifest.stages.len() >= 150, "{}", manifest.stages.len());
@@ -176,9 +192,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_empty_manifest_yields_none() {
+    fn missing_manifest_is_distinct_from_invalid_manifest() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_stage_manifest(dir.path()).is_none());
+        assert!(read_stage_manifest(dir.path()).unwrap().is_none());
 
         let orchestration = dir.path().join("orchestration");
         std::fs::create_dir_all(&orchestration).unwrap();
@@ -187,12 +203,9 @@ mod tests {
             r#"{"schema_version": 1, "stages": []}"#,
         )
         .unwrap();
-        assert!(
-            read_stage_manifest(dir.path()).is_none(),
-            "an empty stage list must fall back to the catalog"
-        );
+        assert!(read_stage_manifest(dir.path()).is_err());
 
         std::fs::write(orchestration.join("stage_manifest.json"), "not json").unwrap();
-        assert!(read_stage_manifest(dir.path()).is_none());
+        assert!(read_stage_manifest(dir.path()).is_err());
     }
 }

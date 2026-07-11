@@ -8,30 +8,27 @@ use ratatui::{
 
 use crate::app::{App, Panel};
 use crate::data::run_matrix::{Os, ParityState, Role};
-use crate::data::vm_prober::VmStatus;
+use crate::data::vm_prober::{LabReadinessState, VmStatus};
 
-/// A single-character colored dot reflecting this VM's CURRENT role's
-/// Proven/Flaky/Failed/Unproven parity state for its platform, reusing
-/// Parity Matrix's own color scheme (see parity_panel.rs's `progress_bar`):
-/// Proven=Green, Failed=Red, Flaky=Yellow, Unproven=Gray. `None` when the VM
-/// has no role assigned right now (role_for_vm returns "-") -- there's no
-/// meaningful parity cell to reflect for "no role".
-fn parity_glyph_for_vm(app: &App, vm: &VmStatus) -> Option<Span<'static>> {
-    let os = Os::from_label(&vm.platform)?;
-    let role_label = app.role_for_vm(&vm.alias);
-    let role = Role::from_label(&role_label)?;
+fn evidence_for_vm(app: &App, vm: &VmStatus) -> (&'static str, Color) {
+    let Some(os) = Os::from_label(&vm.platform) else {
+        return ("—", Color::DarkGray);
+    };
+    let role_label = app.actual_role_for_vm(&vm.alias);
+    let Some(role) = Role::from_label(&role_label) else {
+        return ("—", Color::DarkGray);
+    };
     let state = app
         .parity_matrix
         .get(&(role, os))
         .copied()
         .unwrap_or(ParityState::Unproven);
-    let color = match state {
-        ParityState::Proven => Color::Green,
-        ParityState::Failed => Color::Red,
-        ParityState::Flaky => Color::Yellow,
-        ParityState::Unproven => Color::Gray,
-    };
-    Some(Span::styled("●", Style::default().fg(color)))
+    match state {
+        ParityState::Proven => ("PROVEN", Color::Green),
+        ParityState::Failed => ("FAILED", Color::Red),
+        ParityState::Flaky => ("FLAKY", Color::Yellow),
+        ParityState::Unproven => ("UNPROVEN", Color::Gray),
+    }
 }
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
@@ -40,9 +37,32 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let role_hint = if app.roles_locked_by_active_lab() {
         "roles locked to active lab"
     } else {
-        "←→ role"
+        "←→ plan next-run role"
     };
-    let title = format!("VM STATUS [1] ({count})  ↑↓ select  {role_hint}");
+    let unregistered = app
+        .vm_statuses
+        .iter()
+        .filter(|vm| !vm.inventory_registered)
+        .count();
+    let inventory_note = if unregistered > 0 {
+        format!("  *{unregistered} host-only")
+    } else {
+        String::new()
+    };
+    let online = app.vm_statuses.iter().filter(|vm| vm.ssh_ok).count();
+    let ready = app
+        .vm_statuses
+        .iter()
+        .filter(|vm| vm.lab_readiness.state == LabReadinessState::Ready)
+        .count();
+    let current = app
+        .vm_statuses
+        .iter()
+        .filter(|vm| app.run_use_for_vm(&vm.alias) == "CURRENT")
+        .count();
+    let title = format!(
+        "VM STATUS [1] {count} total · {online} online · {ready} ready · {current} current{inventory_note}  ↑↓ select  {role_hint}"
+    );
 
     let border_fg = if focused { Color::Yellow } else { Color::Cyan };
     let block = Block::default()
@@ -69,10 +89,22 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .take(max_lines)
         .map(|(idx, vm)| {
             let selected = focused && idx == app.selected_vm;
-            let ssh_mark = if vm.ssh_ok {
-                Span::styled("✓", Style::default().fg(Color::Green))
+            let (power, power_color) = match vm.power_state.as_str() {
+                "started" => ("ON", Color::Green),
+                "stopped" => ("OFF", Color::DarkGray),
+                "missing" => ("MISSING", Color::Red),
+                _ => ("UNKNOWN", Color::Yellow),
+            };
+            let (online, online_color) = if vm.ssh_ok {
+                ("YES", Color::Green)
             } else {
-                Span::styled("✗", Style::default().fg(Color::Red))
+                ("NO", Color::Red)
+            };
+            let (readiness, readiness_color) = match vm.lab_readiness.state {
+                LabReadinessState::Checking => ("CHECKING", Color::Yellow),
+                LabReadinessState::Ready => ("READY", Color::Green),
+                LabReadinessState::Blocked => ("BLOCKED", Color::Red),
+                LabReadinessState::Unknown => ("UNKNOWN", Color::DarkGray),
             };
 
             let alias_style = if vm.ssh_ok {
@@ -87,37 +119,63 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             };
 
             let marker = if selected { "▸" } else { " " };
-            let role = app.role_for_vm(&vm.alias);
-            let glyph = parity_glyph_for_vm(app, vm).unwrap_or_else(|| Span::raw(" "));
+            let role = app.actual_role_for_vm(&vm.alias);
+            let run_use = app.run_use_for_vm(&vm.alias);
+            let run_color = match run_use {
+                "CURRENT" => Color::Green,
+                "PREVIOUS" => Color::Blue,
+                _ => Color::DarkGray,
+            };
+            let (evidence, evidence_color) = evidence_for_vm(app, vm);
+            let alias = if vm.inventory_registered {
+                vm.alias.clone()
+            } else {
+                format!("*{}", vm.alias)
+            };
 
             Line::from(vec![
-                Span::raw(marker),
-                ssh_mark,
-                Span::raw(" "),
-                Span::styled(format!("{:<20}", vm.alias), alias_style),
+                Span::raw(format!("{marker} ")),
+                Span::styled(format!("{alias:<22}"), alias_style),
                 Span::styled(
-                    format!("{:<9}", vm.platform),
+                    format!("{:<10}", vm.platform),
                     Style::default().fg(Color::Gray),
                 ),
-                Span::styled(format!("{role:<16}"), Style::default().fg(Color::Yellow)),
-                Span::styled(format!("{:<16}", vm.ip), Style::default().fg(Color::Gray)),
-                glyph,
+                Span::styled(format!("{power:<10}"), Style::default().fg(power_color)),
+                Span::styled(format!("{online:<12}"), Style::default().fg(online_color)),
+                Span::styled(
+                    format!("{readiness:<13}"),
+                    Style::default().fg(readiness_color),
+                ),
+                Span::styled(format!("{run_use:<11}"), Style::default().fg(run_color)),
+                Span::styled(format!("{role:<14}"), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{:<17}", vm.ip), Style::default().fg(Color::Gray)),
+                Span::styled(evidence, Style::default().fg(evidence_color)),
             ])
         })
         .collect();
 
     // Show overflow count if some VMs hidden
     let extra = app.vm_statuses.len().saturating_sub(max_lines);
-    // 3-char prefix ("   ") to match each data row's marker(1) + ssh
-    // check(1) + space(1), so the header lines up with the values below
-    // instead of sitting one column short.
     let mut lines = vec![Line::from(vec![
-        Span::raw("   "),
-        Span::styled(format!("{:<20}", "ALIAS"), Style::default().fg(Color::Blue)),
-        Span::styled(format!("{:<9}", "OS"), Style::default().fg(Color::Blue)),
-        Span::styled(format!("{:<16}", "ROLE"), Style::default().fg(Color::Blue)),
-        Span::styled(format!("{:<16}", "IP"), Style::default().fg(Color::Blue)),
-        Span::styled("P", Style::default().fg(Color::Blue)),
+        Span::styled("  ", Style::default().fg(Color::Blue)),
+        Span::styled(format!("{:<22}", "VM"), Style::default().fg(Color::Blue)),
+        Span::styled(format!("{:<10}", "OS"), Style::default().fg(Color::Blue)),
+        Span::styled(format!("{:<10}", "POWER"), Style::default().fg(Color::Blue)),
+        Span::styled(
+            format!("{:<12}", "ONLINE/SSH"),
+            Style::default().fg(Color::Blue),
+        ),
+        Span::styled(
+            format!("{:<13}", "LAB READY"),
+            Style::default().fg(Color::Blue),
+        ),
+        Span::styled(
+            format!("{:<11}", "RUN USE"),
+            Style::default().fg(Color::Blue),
+        ),
+        Span::styled(format!("{:<14}", "ROLE"), Style::default().fg(Color::Blue)),
+        Span::styled(format!("{:<17}", "IP"), Style::default().fg(Color::Blue)),
+        Span::styled("EVIDENCE", Style::default().fg(Color::Blue)),
     ])];
     lines.extend(visible);
     if extra > 0 {
@@ -133,7 +191,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::vm_prober::VmStatus;
+    use crate::data::vm_prober::{LabReadiness, LabReadinessState, VmStatus};
     use ratatui::{Terminal, backend::TestBackend};
     use std::path::PathBuf;
 
@@ -157,19 +215,18 @@ mod tests {
 
     #[test]
     fn header_labels_line_up_with_the_data_columns_below() {
-        // Regression: the header row used a 2-char prefix ("  ") while
-        // every data row's actual prefix is 3 chars (marker + ssh-check +
-        // space), so "alias/os/role/ip" sat one column left of the values
-        // they were meant to label.
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.vm_statuses = vec![VmStatus {
             alias: "debian-headless-1".into(),
             ip: "192.168.0.200".into(),
             platform: "linux".into(),
             ssh_ok: true,
+            power_state: "started".into(),
+            inventory_registered: true,
+            lab_readiness: ready(),
         }];
 
-        let backend = TestBackend::new(70, 6);
+        let backend = TestBackend::new(150, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, f.area(), &app)).unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -177,9 +234,9 @@ mod tests {
         let header_row = 1;
         let data_row = 2;
         assert_eq!(
-            col_of(&buf, header_row, "ALIAS"),
+            col_of(&buf, header_row, "VM"),
             col_of(&buf, data_row, "debian-headless-1"),
-            "ALIAS header must start at the same column as the alias value"
+            "VM header must start at same column as alias"
         );
         assert_eq!(
             col_of(&buf, header_row, "OS"),
@@ -187,10 +244,32 @@ mod tests {
             "OS header must start at the same column as the platform value"
         );
         assert_eq!(
+            col_of(&buf, header_row, "POWER"),
+            col_of(&buf, data_row, "ON"),
+            "POWER header must align"
+        );
+        assert_eq!(
+            col_of(&buf, header_row, "ONLINE/SSH"),
+            col_of(&buf, data_row, "YES"),
+            "ONLINE header must align"
+        );
+        assert_eq!(
+            col_of(&buf, header_row, "LAB READY"),
+            col_of(&buf, data_row, "READY"),
+            "LAB READY header must align"
+        );
+        assert_eq!(
             col_of(&buf, header_row, "IP"),
             col_of(&buf, data_row, "192.168.0.200"),
-            "IP header must start at the same column as the ip value"
+            "IP header must align"
         );
+    }
+
+    fn ready() -> LabReadiness {
+        LabReadiness {
+            state: LabReadinessState::Ready,
+            detail: "all checks passed".to_owned(),
+        }
     }
 
     fn windows_vm() -> VmStatus {
@@ -199,6 +278,9 @@ mod tests {
             ip: "192.168.0.210".into(),
             platform: "windows".into(),
             ssh_ok: true,
+            power_state: "started".into(),
+            inventory_registered: true,
+            lab_readiness: ready(),
         }
     }
 
@@ -212,50 +294,53 @@ mod tests {
             ip: "192.168.0.209".into(),
             platform: "linux".into(),
             ssh_ok: true,
+            power_state: "started".into(),
+            inventory_registered: true,
+            lab_readiness: ready(),
         }
     }
 
     #[test]
-    fn parity_glyph_reflects_the_vms_role_state_with_parity_matrix_colors() {
+    fn evidence_word_reflects_actual_run_role_and_parity_state() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
-        app.config.windows_vm = "windows-utm-1".to_owned();
-        app.config.exit_platform = "windows".to_owned();
+        app.latest_run_roles
+            .insert("windows-utm-1".to_owned(), "exit".to_owned());
         app.parity_matrix
             .insert((Role::Exit, Os::Windows), ParityState::Proven);
 
-        let glyph = parity_glyph_for_vm(&app, &windows_vm()).expect("exit role has a glyph");
-        assert_eq!(glyph.content.as_ref(), "●");
-        assert_eq!(glyph.style.fg, Some(Color::Green));
+        assert_eq!(
+            evidence_for_vm(&app, &windows_vm()),
+            ("PROVEN", Color::Green)
+        );
 
         app.parity_matrix
             .insert((Role::Exit, Os::Windows), ParityState::Failed);
-        let glyph = parity_glyph_for_vm(&app, &windows_vm()).unwrap();
-        assert_eq!(glyph.style.fg, Some(Color::Red));
+        assert_eq!(evidence_for_vm(&app, &windows_vm()), ("FAILED", Color::Red));
 
         app.parity_matrix
             .insert((Role::Exit, Os::Windows), ParityState::Flaky);
-        let glyph = parity_glyph_for_vm(&app, &windows_vm()).unwrap();
-        assert_eq!(glyph.style.fg, Some(Color::Yellow));
+        assert_eq!(
+            evidence_for_vm(&app, &windows_vm()),
+            ("FLAKY", Color::Yellow)
+        );
     }
 
     #[test]
-    fn parity_glyph_is_none_when_the_vm_has_no_role_assigned() {
+    fn evidence_is_blank_when_vm_was_not_used_in_a_run() {
         let app = App::new(PathBuf::from("/tmp")).expect("app");
-        // linux_vm's alias doesn't match any config role slot, so
-        // role_for_vm falls back to a non-role placeholder label.
-        assert!(parity_glyph_for_vm(&app, &linux_vm()).is_none());
+        assert_eq!(evidence_for_vm(&app, &linux_vm()), ("—", Color::DarkGray));
     }
 
     #[test]
-    fn render_shows_the_glyph_column_aligned_with_the_header() {
+    fn render_shows_named_evidence_column_and_only_actual_run_roles() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.parity_matrix
             .insert((Role::Exit, Os::Windows), ParityState::Proven);
-        app.config.windows_vm = "windows-utm-1".to_owned();
-        app.config.exit_platform = "windows".to_owned();
+        app.latest_run_roles
+            .insert("windows-utm-1".to_owned(), "exit".to_owned());
         app.vm_statuses = vec![windows_vm(), linux_vm()];
 
-        let backend = TestBackend::new(110, 8);
+        let backend = TestBackend::new(150, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, f.area(), &app)).unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -263,20 +348,16 @@ mod tests {
         let header_row = 1;
         let windows_row = 2;
         let linux_row = 3;
-        // " P", not bare "P" -- "IP"'s own trailing P would otherwise be
-        // the first (wrong) match for a 1-char needle; "P" is now the very
-        // last header token, preceded only by the IP column's padding
-        // spaces, which " P" disambiguates against ("IP"'s P is preceded
-        // by "I", never a space).
-        let glyph_header_col = col_of(&buf, header_row, " P").map(|x| x + 1);
         assert_eq!(
-            glyph_header_col,
-            col_of(&buf, windows_row, "●"),
-            "the P header must line up with the parity glyph column"
+            col_of(&buf, header_row, "EVIDENCE"),
+            col_of(&buf, windows_row, "PROVEN"),
+            "named evidence header must align"
         );
         assert!(
-            col_of(&buf, linux_row, "●").is_none(),
-            "linux VM has no role assigned, so no parity glyph should render"
+            col_of(&buf, linux_row, "PROVEN").is_none(),
+            "unused VM must have no evidence claim"
         );
+        assert_eq!(app.actual_role_for_vm("debian-headless-9"), "—");
+        assert_eq!(app.run_use_for_vm("windows-utm-1"), "PREVIOUS");
     }
 }

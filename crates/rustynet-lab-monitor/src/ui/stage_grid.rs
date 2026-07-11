@@ -44,6 +44,27 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    if app
+        .planned_stage_groups()
+        .iter()
+        .all(|group| group.stages.is_empty())
+    {
+        let color = if app.data_errors.is_empty() {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        f.render_widget(
+            Paragraph::new(format!(
+                "{} — no local catalog substituted",
+                app.plan_source_label()
+            ))
+            .style(Style::default().fg(color)),
+            inner,
+        );
+        return;
+    }
+
     let mut status_by_stage = app
         .stage_outcomes
         .iter()
@@ -120,7 +141,8 @@ fn render_planned_with_statuses(
                 app.stage_enabled(stage)
                     && matches!(
                         status_by_stage.get(stage.as_str()),
-                        Some(&"fail") | Some(&"aborted") | Some(&"timed_out")
+                        Some(status)
+                            if crate::data::stage_reader::StageStatus::parse(status).is_failure()
                     )
             })
             .count();
@@ -227,43 +249,65 @@ fn render_planned_with_statuses(
 /// not right now; `disabled` (impossible for this config -- wrong
 /// platform/role) is the only grayed-out state.
 fn cell_for_status(status: &str) -> (&'static str, Style) {
-    match status {
-        "pass" => ("[██]", Style::default().fg(Color::Green)),
-        "fail" => ("[✗✗]", Style::default().fg(Color::Red)),
-        "running" | "active" => (
+    if status == "active" {
+        return (
+            spinner_glyph(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    if status == "disabled" {
+        return (
+            "[  ]",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        );
+    }
+    if status == "will_run" {
+        return ("[██]", Style::default().fg(Color::White));
+    }
+    if status == "excluded" {
+        return ("[  ]", Style::default().fg(Color::White));
+    }
+    match crate::data::stage_reader::StageStatus::parse(status) {
+        crate::data::stage_reader::StageStatus::Pass => ("[██]", Style::default().fg(Color::Green)),
+        crate::data::stage_reader::StageStatus::Reused => {
+            ("[↺↺]", Style::default().fg(Color::Cyan))
+        }
+        crate::data::stage_reader::StageStatus::Fail
+        | crate::data::stage_reader::StageStatus::Aborted
+        | crate::data::stage_reader::StageStatus::TimedOut => {
+            ("[✗✗]", Style::default().fg(Color::Red))
+        }
+        crate::data::stage_reader::StageStatus::Running => (
             spinner_glyph(),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        // "disabled" = genuinely impossible for this config (grayed out).
-        "disabled" => (
+        crate::data::stage_reader::StageStatus::Skipped
+        | crate::data::stage_reader::StageStatus::NotApplicable => (
             "[  ]",
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
         ),
-        "skipped" => (
-            "[  ]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
-        ),
-        "will_run" => ("[██]", Style::default().fg(Color::White)),
-        "excluded" => ("[  ]", Style::default().fg(Color::White)),
-        _ => ("[░░]", Style::default().fg(Color::DarkGray)),
+        crate::data::stage_reader::StageStatus::NotRun => {
+            ("[--]", Style::default().fg(Color::DarkGray))
+        }
+        crate::data::stage_reader::StageStatus::Pending => {
+            ("[░░]", Style::default().fg(Color::DarkGray))
+        }
+        crate::data::stage_reader::StageStatus::Unknown => {
+            ("[??]", Style::default().fg(Color::Magenta))
+        }
     }
 }
 
 fn is_final(status: &str) -> bool {
-    // Both skip dialects (bash writes "skipped", the Rust wrapper
-    // historically wrote "skip") plus the finding-3 terminal states — a
-    // stage the conclusion barrier marked aborted/timed_out is finished,
-    // not forever-pending.
-    matches!(
-        status,
-        "pass" | "fail" | "skipped" | "skip" | "aborted" | "timed_out" | "not_applicable"
-    )
+    crate::data::stage_reader::StageStatus::parse(status).is_terminal()
 }
 
 fn progress_bar_string(done: usize, total: usize, width: usize) -> String {
@@ -331,7 +375,7 @@ fn stage_group_header_spans(
         spans.push(Span::styled(format!("  {skipped} skipped"), header_style));
     }
     spans.push(Span::styled(
-        format!(" t{total}"),
+        format!(" catalog:{total}"),
         Style::default().fg(Color::DarkGray),
     ));
     spans
@@ -413,13 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn pass_fail_skipped_map_to_green_red_and_dim_grey() {
-        // The 3 real recorded-outcome statuses the orchestrator ever
-        // actually writes (confirmed against real state/stages.tsv and
-        // orchestrate_result.json history -- no run ever records anything
-        // else): pass -> green, fail -> red, skipped -> greyed-out (a
-        // stage the orchestrator itself decided didn't apply to this run's
-        // topology, same visual language as "disabled").
+    fn recorded_statuses_have_distinct_terminal_visuals() {
         let (symbol, style) = cell_for_status("pass");
         assert_eq!(symbol, "[██]");
         assert_eq!(style.fg, Some(Color::Green));
@@ -431,6 +469,16 @@ mod tests {
         let (symbol, style) = cell_for_status("skipped");
         assert_eq!(symbol, "[  ]");
         assert_eq!(style.fg, Some(Color::DarkGray));
+
+        let (symbol, style) = cell_for_status("reused");
+        assert_eq!(symbol, "[↺↺]");
+        assert_eq!(style.fg, Some(Color::Cyan));
+
+        for status in ["aborted", "timed_out"] {
+            let (symbol, style) = cell_for_status(status);
+            assert_eq!(symbol, "[✗✗]");
+            assert_eq!(style.fg, Some(Color::Red));
+        }
     }
 
     #[test]
@@ -460,11 +508,11 @@ mod tests {
         // The bar itself must be full (both of the 2 enabled stages done),
         // not read as 2-out-of-40 nearly-empty.
         assert!(text.contains("[████████]"));
-        // The group's full catalog size is still shown, as a compact "t40"
+        // The group's full catalog size is still shown, explicitly labeled
         // suffix, distinct from the enabled-based main fraction.
         assert!(
-            text.contains("t40"),
-            "expected a t40 total suffix: {text:?}"
+            text.contains("catalog:40"),
+            "expected a catalog total suffix: {text:?}"
         );
     }
 
@@ -489,9 +537,9 @@ mod tests {
         let spans = stage_group_header_spans("PRE", 1, 3, 0, 5, style);
         let total_span = spans
             .iter()
-            .find(|s| s.content.contains('t') && s.content.chars().any(|c| c.is_ascii_digit()))
+            .find(|s| s.content.contains("catalog:"))
             .expect("a total span");
-        assert_eq!(total_span.content.as_ref(), " t5");
+        assert_eq!(total_span.content.as_ref(), " catalog:5");
         assert_eq!(total_span.style.fg, Some(Color::DarkGray));
         let main_span = &spans[0];
         assert_eq!(main_span.style.fg, Some(Color::White));

@@ -7,7 +7,6 @@ use ratatui::{
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use crate::config::MonitorConfig;
@@ -52,6 +51,16 @@ pub struct StageGroup {
     pub stages: Vec<String>,
 }
 
+fn empty_stage_groups() -> Vec<StageGroup> {
+    ["PRE", "BOOTSTRAP", "LIVE LAB"]
+        .into_iter()
+        .map(|name| StageGroup {
+            name,
+            stages: Vec::new(),
+        })
+        .collect()
+}
+
 /// For a FAILED run, locates `first_failed_stage` (alias-prefix stripped)
 /// directly in the canonical PRE/BOOTSTRAP/LIVE LAB pipeline order (`groups`,
 /// i.e. `App::planned_stage_groups`) and derives (passed, total) per group
@@ -60,6 +69,7 @@ pub struct StageGroup {
 /// after it did not. Returns `None` if the bare stage name isn't found in
 /// any group at all (e.g. an unrecognized name), in which case the caller
 /// should keep whatever CSV-column-based approximation it already had.
+#[cfg(test)]
 fn position_based_failure_breakdown(
     groups: &[StageGroup],
     first_failed_stage: &str,
@@ -117,7 +127,9 @@ fn run_plan_summary(repo_root: &Path, run: &RunSummary) -> Option<PlanCounts> {
         return None;
     }
     let report_dir = resolve_report_dir(repo_root, run.report_dir.trim());
-    let manifest = crate::data::stage_manifest::read_stage_manifest(&report_dir)?;
+    let manifest = crate::data::stage_manifest::read_stage_manifest(&report_dir)
+        .ok()
+        .flatten()?;
     let outcomes = crate::data::stage_reader::read_orchestrate_result(&report_dir)
         .map(|result| result.outcomes)
         .unwrap_or_default();
@@ -151,9 +163,12 @@ fn run_plan_summary(repo_root: &Path, run: &RunSummary) -> Option<PlanCounts> {
         .filter(|stage| stage.enabled)
         .map(|stage| stage.name.as_str())
         .collect();
-    let frontier = enabled_names
-        .iter()
-        .rposition(|name| matches!(status_of.get(name).copied(), Some("pass") | Some("fail")));
+    let frontier = enabled_names.iter().rposition(|name| {
+        status_of.get(name).is_some_and(|status| {
+            let parsed = crate::data::stage_reader::StageStatus::parse(status);
+            parsed.is_satisfied() || parsed.is_failure()
+        })
+    });
 
     let mut section = [(0usize, 0usize); 3];
     let mut enabled_idx = 0usize;
@@ -173,7 +188,11 @@ fn run_plan_summary(repo_root: &Path, run: &RunSummary) -> Option<PlanCounts> {
         // failure) and DOES stay in the denominator, so an early failure
         // still reads "died at N of many", not a misleadingly near-complete
         // fraction.
-        if matches!(status, "skip" | "skipped") {
+        if matches!(
+            crate::data::stage_reader::StageStatus::parse(status),
+            crate::data::stage_reader::StageStatus::Skipped
+                | crate::data::stage_reader::StageStatus::NotApplicable
+        ) {
             continue;
         }
         // A no-outcome stage is passed-over plumbing rather than a
@@ -189,7 +208,7 @@ fn run_plan_summary(repo_root: &Path, run: &RunSummary) -> Option<PlanCounts> {
         }
         let gi = group_index(&stage.group);
         section[gi].1 += 1;
-        if status == "pass" {
+        if crate::data::stage_reader::StageStatus::parse(status).is_satisfied() {
             section[gi].0 += 1;
         }
     }
@@ -233,6 +252,7 @@ fn apply_plan_counts(run: &mut RunSummary, counts: PlanCounts) {
     // the in-scope count.
     run.total_stages = counts.grand_total.max(counts.subset_total);
     run.failing_section = counts.failing_section;
+    run.counts_exact = true;
 }
 
 /// Applies `position_based_failure_breakdown` to a single `RunSummary` in
@@ -246,6 +266,7 @@ fn apply_plan_counts(run: &mut RunSummary, counts: PlanCounts) {
 /// CSV-column value, which lives in a different universe and produced the
 /// "28/165 | 100" contradiction. A no-op for a passing run or an
 /// unrecognized stage name.
+#[cfg(test)]
 fn apply_position_based_failure_override(groups: &[StageGroup], run: &mut RunSummary) {
     if !run.overall_result.eq_ignore_ascii_case("fail") {
         return;
@@ -272,6 +293,11 @@ pub struct App {
     pub active_job: Option<JobState>,
     pub stage_outcomes: Vec<crate::data::stage_reader::StageOutcome>,
     pub active_stage: Option<String>,
+    pub stage_data_source: crate::data::stage_reader::OutcomeSource,
+    pub stage_data_modified: Option<std::time::SystemTime>,
+    /// Current refresh defects. Empty means every displayed source loaded;
+    /// non-empty is rendered in the header so cached data never looks fresh.
+    pub data_errors: Vec<String>,
     pub log_lines: Vec<String>,
     /// Lines above the bottom (0 = follow tail). Positive = user scrolled up / pinned.
     pub log_scroll: usize,
@@ -342,6 +368,9 @@ pub struct App {
 
     active_stage_start: Option<std::time::Instant>,
     last_vm_probe: Option<std::time::Instant>,
+    last_vm_readiness_probe: Option<std::time::Instant>,
+    vm_readiness_task:
+        Option<tokio::task::JoinHandle<HashMap<String, crate::data::vm_prober::LabReadiness>>>,
     /// The active (or most recently seen) run's own resolved plan, read
     /// from `<report_dir>/orchestration/stage_manifest.json`. When present
     /// the stage grid renders THIS instead of the hardcoded fallback
@@ -370,7 +399,7 @@ fn final_stage_for_idle_log(
 ) -> Option<String> {
     stage_outcomes
         .iter()
-        .find(|o| o.status == "fail")
+        .find(|o| crate::data::stage_reader::StageStatus::parse(&o.status).is_failure())
         .or_else(|| stage_outcomes.last())
         .map(|o| o.stage.clone())
 }
@@ -418,6 +447,9 @@ impl App {
             active_job: None,
             stage_outcomes: Vec::new(),
             active_stage: None,
+            stage_data_source: crate::data::stage_reader::OutcomeSource::None,
+            stage_data_modified: None,
+            data_errors: Vec::new(),
             log_lines: Vec::new(),
             log_scroll: 0,
             log_scroll_anchor: 0,
@@ -457,6 +489,8 @@ impl App {
             agents_view,
             active_stage_start: None,
             last_vm_probe: None,
+            last_vm_readiness_probe: None,
+            vm_readiness_task: None,
             run_manifest: None,
             run_manifest_dir: None,
             last_run_crashed: false,
@@ -483,11 +517,127 @@ impl App {
             .collect()
     }
 
+    /// Terminal pipeline stages over this run's manifest-enabled plan.
+    pub fn current_run_stage_progress(&self) -> (usize, usize) {
+        let enabled: HashSet<String> = self
+            .planned_stage_groups()
+            .into_iter()
+            .flat_map(|group| group.stages)
+            .filter(|stage| self.stage_enabled(stage))
+            .collect();
+        let completed = self
+            .stage_outcomes
+            .iter()
+            .filter(|outcome| {
+                enabled.contains(&outcome.stage)
+                    && crate::data::stage_reader::StageStatus::parse(&outcome.status).is_terminal()
+            })
+            .map(|outcome| outcome.stage.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        (completed, enabled.len())
+    }
+
+    /// Selected validation/check executions. `None` for schema-v1 manifests:
+    /// old evidence did not carry this fact, so guessing would violate the
+    /// monitor's emit-don't-infer contract.
+    pub fn current_run_check_progress(&self) -> Option<(usize, usize)> {
+        let manifest = self.run_manifest.as_ref()?;
+        let selected: Vec<&str> = manifest
+            .stages
+            .iter()
+            .filter(|stage| {
+                stage.enabled && !stage.synthetic && stage.counts_as_check == Some(true)
+            })
+            .map(|stage| stage.name.as_str())
+            .collect();
+        if manifest
+            .stages
+            .iter()
+            .any(|stage| stage.enabled && !stage.synthetic && stage.counts_as_check.is_none())
+        {
+            return None;
+        }
+        let completed = selected
+            .iter()
+            .filter(|name| {
+                self.stage_outcomes.iter().any(|outcome| {
+                    outcome.stage == **name
+                        && crate::data::stage_reader::StageStatus::parse(&outcome.status)
+                            .is_terminal()
+                })
+            })
+            .count();
+        Some((completed, selected.len()))
+    }
+
+    pub fn stage_source_title(&self) -> &'static str {
+        if !self.data_errors.is_empty() {
+            return "DATA ERROR";
+        }
+        if self.active_job.is_some() {
+            "LIVE RUN"
+        } else if self.stage_data_source != crate::data::stage_reader::OutcomeSource::None {
+            "PREVIOUS RUN"
+        } else {
+            "RUN DATA"
+        }
+    }
+
+    pub fn stage_source_value(&self) -> String {
+        if !self.data_errors.is_empty() {
+            return format!("{} source error(s)", self.data_errors.len());
+        }
+        let detail = match (self.active_job.is_some(), self.stage_data_source) {
+            (true, crate::data::stage_reader::OutcomeSource::LiveStagesTsv) => Some("TSV"),
+            (true, crate::data::stage_reader::OutcomeSource::FinalResultJson) => {
+                Some("legacy JSON")
+            }
+            (false, crate::data::stage_reader::OutcomeSource::LiveStagesTsv) => Some("TSV"),
+            (false, crate::data::stage_reader::OutcomeSource::FinalResultJson) => None,
+            (_, crate::data::stage_reader::OutcomeSource::None) => return "waiting".to_owned(),
+        };
+        let age = self
+            .stage_data_modified
+            .and_then(|time| time.elapsed().ok())
+            .map(|elapsed| {
+                let age = human_age(elapsed.as_secs());
+                if age == "now" {
+                    age
+                } else {
+                    format!("{age} ago")
+                }
+            })
+            .unwrap_or_else(|| "age unknown".to_owned());
+        match detail {
+            Some(detail) => format!("{detail} · {age}"),
+            None => age,
+        }
+    }
+
+    pub fn stage_source_label(&self) -> String {
+        format!(
+            "{}: {}",
+            self.stage_source_title(),
+            self.stage_source_value()
+        )
+    }
+
+    pub fn plan_source_label(&self) -> &'static str {
+        if self.run_manifest.is_some() {
+            "RUN MANIFEST"
+        } else if self.run_manifest_dir.is_some() {
+            "WAITING FOR MANIFEST"
+        } else {
+            "LEGACY PREVIEW"
+        }
+    }
+
     fn estimated_group_remaining_secs(&self, group_name: &str) -> u64 {
         let completed = self
             .stage_outcomes
             .iter()
-            .filter(|o| matches!(o.status.as_str(), "pass" | "fail" | "skipped"))
+            .filter(|o| crate::data::stage_reader::StageStatus::parse(&o.status).is_terminal())
             .map(|o| o.stage.as_str())
             .collect::<std::collections::HashSet<_>>();
         let active = self.active_stage.as_deref();
@@ -677,6 +827,22 @@ impl App {
             .collect();
         let mut out = String::new();
         let _ = writeln!(out, "=== rustynet-lab-monitor snapshot ===");
+        let (run_done, run_total) = self.current_run_stage_progress();
+        let run_checks = self
+            .current_run_check_progress()
+            .map(|(done, total)| format!("{done}/{total}"))
+            .unwrap_or_else(|| "n/a (manifest schema lacks counts_as_check)".to_owned());
+        let _ = writeln!(
+            out,
+            "plan_source: {}\ndata_source: {}\nrun_stages_settled: {run_done}/{run_total}\nrun_tests_settled: {run_checks}\ncoverage: {}/{}",
+            self.plan_source_label(),
+            self.stage_source_label(),
+            self.stage_progress.passed,
+            self.stage_progress.total
+        );
+        for error in &self.data_errors {
+            let _ = writeln!(out, "data_error: {error}");
+        }
         let _ = writeln!(
             out,
             "active_stage: {}",
@@ -696,11 +862,15 @@ impl App {
             if enabled.is_empty() {
                 continue;
             }
-            let passed = enabled
+            let completed = enabled
                 .iter()
-                .filter(|s| status_by_stage.get(s.as_str()) == Some(&"pass"))
+                .filter(|s| {
+                    status_by_stage.get(s.as_str()).is_some_and(|status| {
+                        crate::data::stage_reader::StageStatus::parse(status).is_terminal()
+                    })
+                })
                 .count();
-            let _ = writeln!(out, "  [{}] ({passed}/{})", group.name, enabled.len());
+            let _ = writeln!(out, "  [{}] ({completed}/{})", group.name, enabled.len());
             for stage in enabled {
                 let status = status_by_stage.get(stage.as_str()).copied().unwrap_or("-");
                 let _ = writeln!(out, "    {stage:<34} {status}");
@@ -710,10 +880,14 @@ impl App {
         for vm in &self.vm_statuses {
             let _ = writeln!(
                 out,
-                "  {:<20} {:<9} role={}",
+                "  {:<20} {:<9} power={:<8} online={} ready={:?} run={:<8} role={}",
                 vm.alias,
                 vm.platform,
-                self.role_for_vm(&vm.alias)
+                vm.power_state,
+                if vm.ssh_ok { "up" } else { "down" },
+                vm.lab_readiness.state,
+                self.run_use_for_vm(&vm.alias),
+                self.actual_role_for_vm(&vm.alias)
             );
         }
         out
@@ -740,7 +914,7 @@ impl App {
         let finished: HashSet<&str> = self
             .stage_outcomes
             .iter()
-            .filter(|o| matches!(o.status.as_str(), "pass" | "fail" | "skip" | "skipped"))
+            .filter(|o| crate::data::stage_reader::StageStatus::parse(&o.status).is_terminal())
             .map(|o| o.stage.as_str())
             .collect();
         let Some(furthest_done) = ordered
@@ -958,6 +1132,12 @@ impl App {
         if let Some(groups) = self.manifest_stage_groups() {
             return groups;
         }
+        // A run/report has been selected but its manifest is missing or
+        // invalid. Never replace run truth with a local catalog: render an
+        // explicit waiting/error state until the producer contract appears.
+        if self.run_manifest_dir.is_some() {
+            return empty_stage_groups();
+        }
         let pre = [
             "preflight",
             "prepare_source_archive",
@@ -1056,7 +1236,7 @@ impl App {
         let mut pre = Vec::new();
         let mut bootstrap = Vec::new();
         let mut live = Vec::new();
-        for stage in &manifest.stages {
+        for stage in manifest.stages.iter().filter(|stage| !stage.synthetic) {
             match stage.group.as_str() {
                 "pre" => pre.push(stage.name.clone()),
                 "bootstrap" => bootstrap.push(stage.name.clone()),
@@ -1080,6 +1260,7 @@ impl App {
     }
 
     pub async fn refresh_state(&mut self) {
+        self.data_errors.clear();
         if self.active_job.is_none()
             && let Ok(mut config) = MonitorConfig::load(&self.repo_root)
         {
@@ -1122,6 +1303,9 @@ impl App {
                 }
                 self.last_run_crashed = false;
                 let report_dir = self.repo_root.join(&job.report_dir);
+                // Mark active before plan/outcome calculations: if manifest
+                // has not arrived, callers must see WAITING, never preview.
+                self.active_job = Some(job.clone());
                 // Adopt the run's own stage manifest as it appears. A new
                 // report dir resets the held manifest; while the dir is
                 // unchanged and no manifest has been seen yet, keep
@@ -1131,13 +1315,28 @@ impl App {
                     self.run_manifest = None;
                     self.run_manifest_dir = Some(report_dir.clone());
                 }
-                if self.run_manifest.is_none() {
-                    self.run_manifest =
-                        crate::data::stage_manifest::read_stage_manifest(&report_dir);
+                // Re-read every poll. Resume/rerun may legitimately replace
+                // the manifest in the SAME report dir for a new invocation.
+                match crate::data::stage_manifest::read_stage_manifest(&report_dir) {
+                    Ok(manifest) => self.run_manifest = manifest,
+                    Err(err) => {
+                        self.run_manifest = None;
+                        self.data_errors.push(format!("manifest: {err}"));
+                    }
                 }
-                if let Ok(result) = crate::data::stage_reader::read_orchestrate_result(&report_dir)
-                {
-                    self.stage_outcomes = result.outcomes;
+                match crate::data::stage_reader::read_active_stage_state(&report_dir) {
+                    Ok(read) => {
+                        self.stage_outcomes = read.result.outcomes;
+                        self.stage_data_source = read.source;
+                        self.stage_data_modified = read.modified;
+                    }
+                    Err(err) => {
+                        self.stage_outcomes.clear();
+                        self.active_stage = None;
+                        self.stage_data_source = crate::data::stage_reader::OutcomeSource::None;
+                        self.stage_data_modified = None;
+                        self.data_errors.push(format!("stages: {err}"));
+                    }
                 }
                 let ordered_enabled_stages: Vec<String> = self
                     .planned_stage_groups()
@@ -1156,7 +1355,6 @@ impl App {
                     self.active_stage = active;
                     self.ensure_active_stage_visible();
                 }
-                self.active_job = Some(job);
             }
             Ok(None) => {
                 if let Some(prev_job) = self.active_job.take() {
@@ -1171,11 +1369,14 @@ impl App {
                     // Do one final read to replace any synthetic "running" entries
                     // with the definitive pass/fail outcomes before going idle.
                     let report_dir = self.repo_root.join(&prev_job.report_dir);
-                    if let Ok(result) =
-                        crate::data::stage_reader::read_orchestrate_result(&report_dir)
-                        && !result.outcomes.is_empty()
-                    {
-                        self.stage_outcomes = result.outcomes;
+                    match crate::data::stage_reader::read_completed_stage_state(&report_dir) {
+                        Ok(read) if !read.result.outcomes.is_empty() => {
+                            self.stage_outcomes = read.result.outcomes;
+                            self.stage_data_source = read.source;
+                            self.stage_data_modified = read.modified;
+                        }
+                        Ok(_) => {}
+                        Err(err) => self.data_errors.push(format!("final stages: {err}")),
                     }
                     // The "reload log for active stage" block below only runs
                     // while active_job is Some -- without a final catch-up
@@ -1202,7 +1403,7 @@ impl App {
                     // Keep stage_outcomes and log_lines — display last run until next one starts.
                 }
             }
-            Err(_) => {}
+            Err(err) => self.data_errors.push(format!("job state: {err}")),
         }
 
         // Reload log for active stage, falling back to monitor stdout/stderr during launch.
@@ -1233,65 +1434,123 @@ impl App {
             }
         }
 
-        // Probe VMs every 30s (run concurrently, don't block)
+        // Active lab: 5s reachability freshness. Idle: 30s to avoid needless
+        // LAN traffic. Stage state remains on the independent 2s cadence.
         let now = std::time::Instant::now();
+        let vm_probe_interval_secs = if self.active_job.is_some() { 5 } else { 30 };
         let should_probe = self
             .last_vm_probe
-            .map(|t| now.duration_since(t).as_secs() >= 30)
+            .map(|t| now.duration_since(t).as_secs() >= vm_probe_interval_secs)
             .unwrap_or(true);
 
         if should_probe {
             self.last_vm_probe = Some(now);
-            self.vm_statuses = probe_vms_sync(&self.repo_root).await;
+            let cached_readiness = self
+                .vm_statuses
+                .iter()
+                .map(|vm| (vm.alias.clone(), vm.lab_readiness.clone()))
+                .collect();
+            match probe_vms_sync(&self.repo_root, &cached_readiness).await {
+                Ok(statuses) => self.vm_statuses = statuses,
+                Err(err) => self.data_errors.push(format!("VM discovery: {err}")),
+            }
             if self.selected_vm >= self.vm_statuses.len() {
                 self.selected_vm = self.vm_statuses.len().saturating_sub(1);
             }
         }
 
-        if let Ok(matrix) = crate::data::run_matrix::load_parity_matrix(&self.repo_root) {
-            self.parity_matrix = matrix;
-        }
-        if let Ok(roles) = crate::data::run_matrix::load_latest_run_roles(&self.repo_root) {
-            self.latest_run_roles = roles;
-        }
-        if let Ok(sparklines) = crate::data::run_matrix::load_sparklines(&self.repo_root, 8) {
-            self.parity_sparklines = sparklines;
-        }
-        if let Ok(progress) = crate::data::run_matrix::load_stage_progress(&self.repo_root) {
-            self.stage_progress = progress;
-        }
-        if let Ok(stage_timings) = crate::data::timings::load_stage_timings(&self.repo_root) {
-            self.stage_timings = stage_timings;
-        }
-        if let Ok(full_stage_matrix) =
-            crate::data::run_matrix::load_full_stage_matrix(&self.repo_root)
+        // Tool readiness is slower than power/TCP discovery. Run canonical
+        // guest preflight off-loop, retain last result, refresh every minute.
+        if self
+            .vm_readiness_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+            && let Some(task) = self.vm_readiness_task.take()
         {
-            self.full_stage_matrix = full_stage_matrix;
+            match task.await {
+                Ok(results) => {
+                    for vm in &mut self.vm_statuses {
+                        if let Some(readiness) = results.get(&vm.alias) {
+                            vm.lab_readiness = readiness.clone();
+                        }
+                    }
+                }
+                Err(err) => self
+                    .data_errors
+                    .push(format!("VM lab readiness task: {err}")),
+            }
         }
-        if let Ok(runs) = crate::data::run_matrix::load_recent_runs(&self.repo_root, 3) {
-            self.recent_runs = runs;
-            // load_recent_runs computes section_stages/failing_section from
-            // CSV CHECK COLUMNS, a coarser, differently-shaped vocabulary
-            // than the pipeline STEP names Stage Grid uses (e.g. BOOTSTRAP
-            // is 12 CSV columns -- 4 suffixes x 3 OS -- vs 19 named pipeline
-            // steps) -- and `first_failed_stage` is always a pipeline step
-            // name (e.g. "bootstrap_windows_host"), which never matches a
-            // CSV column pattern, so the failing section silently defaulted
-            // to LIVE LAB every time regardless of where the failure
-            // actually was. Prefer the pipeline-position breakdown instead,
-            // wherever it resolves.
-            let groups = self.planned_stage_groups();
-            let repo_root = self.repo_root.clone();
-            for run in &mut self.recent_runs {
-                // Prefer the run's OWN manifest+outcomes (per-run-accurate,
-                // catalog-adaptive, always coherent); fall back to the
-                // pipeline-position CSV approximation only when that run's
-                // report dir is gone.
-                match run_plan_summary(&repo_root, run) {
-                    Some(counts) => apply_plan_counts(run, counts),
-                    None => apply_position_based_failure_override(&groups, run),
+        let readiness_due = self
+            .last_vm_readiness_probe
+            .map(|t| now.duration_since(t).as_secs() >= 60)
+            .unwrap_or(true);
+        if readiness_due && self.vm_readiness_task.is_none() {
+            let aliases = self
+                .vm_statuses
+                .iter_mut()
+                .filter(|vm| vm.inventory_registered && vm.ssh_ok)
+                .map(|vm| {
+                    vm.lab_readiness = crate::data::vm_prober::LabReadiness::checking();
+                    vm.alias.clone()
+                })
+                .collect::<Vec<_>>();
+            if !aliases.is_empty() {
+                self.last_vm_readiness_probe = Some(now);
+                let repo_root = self.repo_root.clone();
+                self.vm_readiness_task = Some(tokio::spawn(async move {
+                    crate::data::vm_prober::probe_lab_readiness(&repo_root, &aliases).await
+                }));
+            }
+        }
+
+        match crate::data::run_matrix::load_parity_matrix(&self.repo_root) {
+            Ok(matrix) => self.parity_matrix = matrix,
+            Err(err) => self.data_errors.push(format!("parity matrix: {err}")),
+        }
+        match crate::data::run_matrix::load_latest_run_roles(&self.repo_root) {
+            Ok(roles) => self.latest_run_roles = roles,
+            Err(err) => self.data_errors.push(format!("run roles: {err}")),
+        }
+        match crate::data::run_matrix::load_sparklines(&self.repo_root, 8) {
+            Ok(sparklines) => self.parity_sparklines = sparklines,
+            Err(err) => self.data_errors.push(format!("sparklines: {err}")),
+        }
+        match crate::data::run_matrix::load_stage_progress(&self.repo_root) {
+            Ok(progress) => self.stage_progress = progress,
+            Err(err) => self.data_errors.push(format!("coverage: {err}")),
+        }
+        match crate::data::timings::load_stage_timings(&self.repo_root) {
+            Ok(stage_timings) => self.stage_timings = stage_timings,
+            Err(err) => self.data_errors.push(format!("timings: {err}")),
+        }
+        match crate::data::run_matrix::load_full_stage_matrix(&self.repo_root) {
+            Ok(full_stage_matrix) => self.full_stage_matrix = full_stage_matrix,
+            Err(err) => self.data_errors.push(format!("stage matrix: {err}")),
+        }
+        match crate::data::run_matrix::load_recent_runs(&self.repo_root, 3) {
+            Ok(runs) => {
+                self.recent_runs = runs;
+                // load_recent_runs computes section_stages/failing_section from
+                // CSV CHECK COLUMNS, a coarser, differently-shaped vocabulary
+                // than the pipeline STEP names Stage Grid uses (e.g. BOOTSTRAP
+                // is 12 CSV columns -- 4 suffixes x 3 OS -- vs 19 named pipeline
+                // steps) -- and `first_failed_stage` is always a pipeline step
+                // name (e.g. "bootstrap_windows_host"), which never matches a
+                // CSV column pattern, so the failing section silently defaulted
+                // to LIVE LAB every time regardless of where the failure
+                // actually was. Prefer the pipeline-position breakdown instead,
+                // wherever it resolves.
+                let repo_root = self.repo_root.clone();
+                for run in &mut self.recent_runs {
+                    // Only a run's OWN manifest can produce exact pipeline
+                    // counts. With pruned evidence, keep the CSV-only summary
+                    // explicitly inexact; never substitute today's catalog.
+                    if let Some(counts) = run_plan_summary(&repo_root, run) {
+                        apply_plan_counts(run, counts);
+                    }
                 }
             }
+            Err(err) => self.data_errors.push(format!("recent runs: {err}")),
         }
         // Idle (no active job): render the NEWEST run's OWN manifest + outcomes so
         // the stage grid + counts reflect a finished / jobless run (e.g. a
@@ -1310,14 +1569,22 @@ impl App {
             if let Some(report_str) = newest_report {
                 let report_dir = resolve_report_dir(&self.repo_root, &report_str);
                 if self.run_manifest_dir.as_deref() != Some(report_dir.as_path()) {
-                    self.run_manifest =
-                        crate::data::stage_manifest::read_stage_manifest(&report_dir);
                     self.run_manifest_dir = Some(report_dir.clone());
-                    if let Ok(result) =
-                        crate::data::stage_reader::read_orchestrate_result(&report_dir)
-                    {
-                        self.stage_outcomes = result.outcomes;
+                }
+                match crate::data::stage_manifest::read_stage_manifest(&report_dir) {
+                    Ok(manifest) => self.run_manifest = manifest,
+                    Err(err) => {
+                        self.run_manifest = None;
+                        self.data_errors.push(format!("manifest: {err}"));
                     }
+                }
+                match crate::data::stage_reader::read_completed_stage_state(&report_dir) {
+                    Ok(read) => {
+                        self.stage_outcomes = read.result.outcomes;
+                        self.stage_data_source = read.source;
+                        self.stage_data_modified = read.modified;
+                    }
+                    Err(err) => self.data_errors.push(format!("held stages: {err}")),
                 }
             }
         }
@@ -1947,6 +2214,46 @@ impl App {
         label
     }
 
+    /// Role proven by actual current/previous run evidence. Planned config
+    /// and manual role edits never appear as VM STATUS facts.
+    pub fn actual_role_for_vm(&self, alias: &str) -> String {
+        self.actual_run_assignment(alias)
+            .map(|(role, _)| role)
+            .unwrap_or_else(|| "—".to_owned())
+    }
+
+    pub fn run_use_for_vm(&self, alias: &str) -> &'static str {
+        self.actual_run_assignment(alias)
+            .map(|(_, run_use)| run_use)
+            .unwrap_or("—")
+    }
+
+    fn actual_run_assignment(&self, alias: &str) -> Option<(String, &'static str)> {
+        let current = self.lab_is_actively_running() || self.orchestrator_pgid.is_some();
+        if current {
+            // Rust-native runs emit exact assignments. Once present, absence
+            // means this VM is not in the run; never fall back to config.
+            if self
+                .run_manifest
+                .as_ref()
+                .is_some_and(|manifest| !manifest.node_assignments.is_empty())
+            {
+                return self
+                    .role_from_run_manifest(alias)
+                    .map(|role| (role, "CURRENT"));
+            }
+            // Legacy runs have no assignment manifest. Their structured
+            // launch selectors are best available actual membership source.
+            return active_role_from_config(alias, &self.config_for_role_display())
+                .map(|role| (role, "CURRENT"));
+        }
+        self.latest_run_roles
+            .get(alias)
+            .filter(|role| !role.trim().is_empty())
+            .cloned()
+            .map(|role| (role, "PREVIOUS"))
+    }
+
     pub fn roles_locked_by_active_lab(&self) -> bool {
         self.active_job.is_some() || self.orchestrator_pgid.is_some()
     }
@@ -2393,6 +2700,42 @@ fn role_for_vm_from_config(alias: &str, config: &MonitorConfig) -> String {
     "—".into()
 }
 
+/// Mirrors launcher's structured `--node alias:role` synthesis for legacy
+/// runs that cannot emit `node_assignments` themselves.
+fn active_role_from_config(alias: &str, config: &MonitorConfig) -> Option<String> {
+    let role_for_platform = |platform: &str| {
+        if (platform == "macos" && config.macos_promote_exit) || config.exit_platform == platform {
+            "exit"
+        } else if config.relay_platform == platform {
+            "relay"
+        } else if config.anchor_platform == platform || config.admin_platform == platform {
+            "anchor"
+        } else if config.blind_exit_platform == platform {
+            "exit"
+        } else {
+            "client"
+        }
+    };
+    let non_linux_exit =
+        config.macos_promote_exit || matches!(config.exit_platform.as_str(), "macos" | "windows");
+    if alias == config.exit_vm && !non_linux_exit {
+        return Some("exit".to_owned());
+    }
+    if alias == config.client_vm {
+        return Some("client".to_owned());
+    }
+    if alias == config.entry_vm {
+        return Some("entry".to_owned());
+    }
+    if alias == config.macos_vm && config.wants_macos() {
+        return Some(role_for_platform("macos").to_owned());
+    }
+    if alias == config.windows_vm && config.wants_windows() {
+        return Some(role_for_platform("windows").to_owned());
+    }
+    None
+}
+
 fn set_role_platform(config: &mut MonitorConfig, role: &str, platform: &str) {
     match role {
         "exit" => config.exit_platform = platform.into(),
@@ -2501,6 +2844,16 @@ fn format_duration(secs: u64) -> String {
         format!("{mins}m")
     } else {
         format!("{secs}s")
+    }
+}
+
+fn human_age(secs: u64) -> String {
+    match secs {
+        0..=4 => "now".to_owned(),
+        5..=59 => format!("{secs}s"),
+        60..=3_599 => format!("{}m", secs / 60),
+        3_600..=86_399 => format!("{}h", secs / 3_600),
+        _ => format!("{}d", secs / 86_400),
     }
 }
 
@@ -2616,85 +2969,147 @@ fn default_vm_role_overrides(config: &MonitorConfig) -> HashMap<String, String> 
     roles
 }
 
-async fn probe_vms_sync(repo_root: &std::path::Path) -> Vec<crate::data::vm_prober::VmStatus> {
+#[derive(Debug, Clone)]
+struct InventoryVm {
+    alias: String,
+    utm_name: String,
+    ip: String,
+    platform: String,
+}
+
+async fn probe_vms_sync(
+    repo_root: &std::path::Path,
+    cached_readiness: &HashMap<String, crate::data::vm_prober::LabReadiness>,
+) -> Result<Vec<crate::data::vm_prober::VmStatus>> {
     let inventory_path = repo_root
         .join("documents")
         .join("operations")
         .join("active")
         .join("vm_lab_inventory.json");
 
-    if !inventory_path.exists() {
-        return Vec::new();
+    let inventory = load_inventory_vms(&inventory_path)?;
+    let host_vms = crate::data::vm_prober::list_utm_vms().await?;
+    let mut matched_inventory = HashSet::new();
+    let mut tasks = Vec::new();
+    for host_vm in host_vms {
+        let matched = inventory
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.utm_name == host_vm.name || entry.alias == host_vm.name);
+        let (alias, ip, platform, registered) = if let Some((idx, entry)) = matched {
+            matched_inventory.insert(idx);
+            (
+                entry.alias.clone(),
+                entry.ip.clone(),
+                entry.platform.clone(),
+                true,
+            )
+        } else {
+            (
+                host_vm.name.clone(),
+                "-".to_owned(),
+                "unknown".to_owned(),
+                false,
+            )
+        };
+        let readiness = cached_readiness.get(&alias).cloned();
+        tasks.push(tokio::spawn(async move {
+            crate::data::vm_prober::probe_vm(
+                &alias,
+                &ip,
+                &platform,
+                &host_vm.power_state,
+                registered,
+                readiness,
+            )
+            .await
+        }));
     }
 
-    let raw = match std::fs::read_to_string(&inventory_path) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-
-    let val: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    let entries = match val.get("entries").and_then(|e| e.as_array()) {
-        Some(arr) => arr,
-        None => return Vec::new(),
-    };
-
-    // Launch all probes concurrently
-    let mut tasks = Vec::new();
-    for entry in entries {
-        let alias = entry
-            .get("alias")
-            .and_then(|a| a.as_str())
-            .unwrap_or("?")
-            .to_string();
-        let ip = entry
-            .get("ssh_target")
-            .and_then(|a| a.as_str())
-            .unwrap_or("")
-            .to_string();
-        if !is_real_lab_vm_entry(entry, &alias, &ip) {
+    // Inventory may retain a VM bundle that UTM no longer lists. Keep it
+    // visible as `missing` rather than silently dropping configured lab data.
+    for (idx, entry) in inventory.into_iter().enumerate() {
+        if matched_inventory.contains(&idx) {
             continue;
         }
-        let utm_name = entry
-            .get("controller")
-            .and_then(|c| c.get("utm_name"))
-            .and_then(|n| n.as_str())
-            .unwrap_or(&alias)
-            .to_string();
-        let ssh_user = entry
-            .get("ssh_user")
-            .and_then(|u| u.as_str())
-            .unwrap_or("")
-            .to_string();
-        if !ip.is_empty() {
-            tasks.push(tokio::spawn(async move {
-                crate::data::vm_prober::probe_vm(&alias, &ip, &utm_name, &ssh_user).await
-            }));
-        }
+        let readiness = cached_readiness.get(&entry.alias).cloned();
+        tasks.push(tokio::spawn(async move {
+            crate::data::vm_prober::probe_vm(
+                &entry.alias,
+                &entry.ip,
+                &entry.platform,
+                "missing",
+                true,
+                readiness,
+            )
+            .await
+        }));
     }
 
     let mut statuses = Vec::new();
     for task in tasks {
-        if let Ok(status) = task.await {
-            statuses.push(status);
-        }
+        statuses.push(task.await.context("joining VM probe task")?);
     }
-
-    statuses
+    Ok(statuses)
 }
 
-fn is_real_lab_vm_entry(entry: &serde_json::Value, alias: &str, ssh_target: &str) -> bool {
-    if alias.is_empty() || alias == "?" || ssh_target.parse::<IpAddr>().is_err() {
-        return false;
+fn load_inventory_vms(path: &Path) -> Result<Vec<InventoryVm>> {
+    if !path.exists() {
+        return Ok(Vec::new());
     }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading VM inventory {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing VM inventory {}", path.display()))?;
+    let entries = value
+        .get("entries")
+        .and_then(|entries| entries.as_array())
+        .context("VM inventory has no entries array")?;
+    Ok(entries
+        .iter()
+        .filter(|entry| {
+            entry.pointer("/controller/type").and_then(|v| v.as_str()) == Some("local_utm")
+        })
+        .filter_map(|entry| {
+            let alias = entry.get("alias")?.as_str()?.to_owned();
+            let utm_name = entry
+                .pointer("/controller/utm_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or(&alias)
+                .to_owned();
+            let ip = entry
+                .get("ssh_target")
+                .and_then(|value| value.as_str())
+                .unwrap_or("-")
+                .to_owned();
+            let platform = inventory_platform(entry).unwrap_or_else(|| "unknown".to_owned());
+            Some(InventoryVm {
+                alias,
+                utm_name,
+                ip,
+                platform,
+            })
+        })
+        .collect())
+}
+
+fn inventory_platform(entry: &serde_json::Value) -> Option<String> {
     entry
-        .get("controller")
-        .and_then(|c| c.get("type"))
-        .and_then(|t| t.as_str())
-        == Some("local_utm")
+        .get("platform")
+        .and_then(|value| value.as_str())
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            let os = entry.get("os")?.as_str()?.to_ascii_lowercase();
+            if os.contains("windows") {
+                Some("windows".to_owned())
+            } else if os.contains("macos") || os.contains("mac os") {
+                Some("macos".to_owned())
+            } else if os.contains("linux") {
+                Some("linux".to_owned())
+            } else {
+                None
+            }
+        })
 }
 
 pub fn render_ui(f: &mut Frame, app: &App) {
@@ -2918,6 +3333,7 @@ mod tests {
             subset_passed_stages: 5,
             subset_total_stages: 57,
             failing_section: Some(2),
+            counts_exact: false,
         }
     }
 
@@ -3127,33 +3543,25 @@ mod tests {
     }
 
     #[test]
-    fn inventory_filter_rejects_hostname_without_utm_controller() {
-        let entry = json!({
-            "alias": "debian-lan-11",
-            "ssh_target": "debian-lan-11",
-            "ssh_user": "debian"
-        });
+    fn inventory_loader_keeps_local_utm_hostnames_and_excludes_non_utm_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inventory.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"entries": [
+                {"alias": "utm-vm", "ssh_target": "utm-vm.local", "os": "Debian/Linux",
+                 "controller": {"type": "local_utm", "utm_name": "UTM VM"}},
+                {"alias": "lan-vm", "ssh_target": "lan-vm.local", "os": "Debian/Linux"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
 
-        assert!(!is_real_lab_vm_entry(
-            &entry,
-            "debian-lan-11",
-            "debian-lan-11"
-        ));
-    }
-
-    #[test]
-    fn inventory_filter_accepts_local_utm_ip_entry() {
-        let entry = json!({
-            "alias": "debian-headless-1",
-            "ssh_target": "192.168.0.200",
-            "controller": {"type": "local_utm", "utm_name": "debian-headless-1"}
-        });
-
-        assert!(is_real_lab_vm_entry(
-            &entry,
-            "debian-headless-1",
-            "192.168.0.200"
-        ));
+        let entries = load_inventory_vms(&path).expect("inventory");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].alias, "utm-vm");
+        assert_eq!(entries[0].utm_name, "UTM VM");
+        assert_eq!(entries[0].ip, "utm-vm.local");
     }
 
     #[test]
@@ -3164,6 +3572,9 @@ mod tests {
             ip: "192.168.0.210".into(),
             platform: "macos".into(),
             ssh_ok: true,
+            power_state: "started".into(),
+            inventory_registered: true,
+            lab_readiness: crate::data::vm_prober::LabReadiness::checking(),
         };
 
         app.assign_vm_role(&vm, "exit");
@@ -3454,6 +3865,41 @@ mod tests {
     }
 
     #[test]
+    fn selected_run_without_manifest_never_uses_local_fallback_catalog() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.run_manifest_dir = Some(PathBuf::from("/tmp/active-report"));
+        app.run_manifest = None;
+
+        let groups = app.planned_stage_groups();
+
+        assert!(groups.iter().all(|group| group.stages.is_empty()));
+        assert_eq!(app.plan_source_label(), "WAITING FOR MANIFEST");
+    }
+
+    #[test]
+    fn run_test_count_comes_only_from_manifest_metadata() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.run_manifest = Some(manifest_from_json(
+            r#"{"schema_version": 2, "run_mode": "full", "stages": [
+                {"name": "prepare", "group": "pre", "enabled": true,
+                 "counts_as_check": false},
+                {"name": "validate", "group": "live", "enabled": true,
+                 "counts_as_check": true},
+                {"name": "disabled_check", "group": "live", "enabled": false,
+                 "counts_as_check": true}
+            ]}"#,
+        ));
+        app.stage_outcomes = vec![crate::data::stage_reader::StageOutcome {
+            stage: "validate".to_owned(),
+            status: "reused".to_owned(),
+            summary: String::new(),
+            artifacts: Vec::new(),
+        }];
+
+        assert_eq!(app.current_run_check_progress(), Some((1, 1)));
+    }
+
+    #[test]
     fn vm_role_comes_from_the_runs_own_manifest_topology() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         // Baseline: with no manifest, an alias the monitor's default slots +
@@ -3479,6 +3925,41 @@ mod tests {
         // An alias the run does NOT name is unaffected — falls through to the
         // same inference as with no manifest (no blanking, no override).
         assert_eq!(app.role_for_vm("debian-headless-5"), baseline_absent);
+    }
+
+    #[test]
+    fn vm_status_roles_only_describe_actual_current_or_previous_run_use() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+
+        // Default config plans these roles, but no run used them yet.
+        assert_eq!(app.actual_role_for_vm("debian-headless-1"), "—");
+        assert_eq!(app.run_use_for_vm("debian-headless-1"), "—");
+
+        app.latest_run_roles
+            .insert("debian-headless-5".to_owned(), "relay".to_owned());
+        assert_eq!(app.actual_role_for_vm("debian-headless-5"), "relay");
+        assert_eq!(app.run_use_for_vm("debian-headless-5"), "PREVIOUS");
+
+        app.active_job = Some(JobState {
+            job_id: "labrun-current".to_owned(),
+            state: "running".to_owned(),
+            pid: Some(std::process::id()),
+            started_unix: Some(1),
+            area: "current".to_owned(),
+            report_dir: "state/current".to_owned(),
+            request_args: None,
+        });
+        app.run_manifest = Some(manifest_from_json(
+            r#"{"run_mode":"full","stages":[],"node_assignments":[
+                {"alias":"debian-headless-2","role":"client"}
+            ]}"#,
+        ));
+
+        assert_eq!(app.actual_role_for_vm("debian-headless-2"), "client");
+        assert_eq!(app.run_use_for_vm("debian-headless-2"), "CURRENT");
+        // Previous role must not leak into active run membership.
+        assert_eq!(app.actual_role_for_vm("debian-headless-5"), "—");
+        assert_eq!(app.run_use_for_vm("debian-headless-5"), "—");
     }
 
     #[test]
@@ -3605,6 +4086,9 @@ mod tests {
             ip: "192.168.0.201".into(),
             platform: "linux".into(),
             ssh_ok: true,
+            power_state: "started".into(),
+            inventory_registered: true,
+            lab_readiness: crate::data::vm_prober::LabReadiness::checking(),
         };
 
         app.assign_vm_role(&vm, "relay");
@@ -3622,6 +4106,9 @@ mod tests {
             ip: "192.168.0.201".into(),
             platform: "linux".into(),
             ssh_ok: true,
+            power_state: "started".into(),
+            inventory_registered: true,
+            lab_readiness: crate::data::vm_prober::LabReadiness::checking(),
         };
 
         app.assign_vm_role(&vm, "relay");
@@ -3638,6 +4125,9 @@ mod tests {
             ip: "192.168.0.200".into(),
             platform: "linux".into(),
             ssh_ok: true,
+            power_state: "started".into(),
+            inventory_registered: true,
+            lab_readiness: crate::data::vm_prober::LabReadiness::checking(),
         };
 
         app.assign_vm_role(&vm, "relay");
@@ -3713,6 +4203,9 @@ mod tests {
             ip: "192.168.0.200".into(),
             platform: "linux".into(),
             ssh_ok: true,
+            power_state: "started".into(),
+            inventory_registered: true,
+            lab_readiness: crate::data::vm_prober::LabReadiness::checking(),
         });
         let overrides_before = app.vm_role_overrides.clone();
         app.active_job = Some(JobState {
@@ -3752,6 +4245,9 @@ mod tests {
             ip: "192.168.0.210".into(),
             platform: "macos".into(),
             ssh_ok: true,
+            power_state: "started".into(),
+            inventory_registered: true,
+            lab_readiness: crate::data::vm_prober::LabReadiness::checking(),
         });
 
         app.auto_select_next_target();
@@ -3784,6 +4280,9 @@ mod tests {
             ip: "192.168.0.210".into(),
             platform: "macos".into(),
             ssh_ok: true,
+            power_state: "started".into(),
+            inventory_registered: true,
+            lab_readiness: crate::data::vm_prober::LabReadiness::checking(),
         });
         app.page = Page::Run;
         app.focused_panel = Panel::StageGrid;
@@ -3837,6 +4336,9 @@ mod tests {
             ip: "192.168.0.220".into(),
             platform: "windows".into(),
             ssh_ok: true,
+            power_state: "started".into(),
+            inventory_registered: true,
+            lab_readiness: crate::data::vm_prober::LabReadiness::checking(),
         });
 
         app.auto_select_next_target();

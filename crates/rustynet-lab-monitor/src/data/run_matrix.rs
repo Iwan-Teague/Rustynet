@@ -171,21 +171,6 @@ pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), Parity
     Ok(matrix)
 }
 
-/// Legacy fallback for the Previous Runs panel ONLY, and only for runs whose
-/// per-run `stage_manifest.json` is no longer on disk (report dir pruned).
-/// PRE steps (preflight, SSH reachability, ...) never get their own CSV
-/// column, so a CSV-only reconstruction can't see them; a run that produced a
-/// CSV row by definition got past PRE, so its PRE section is shown complete.
-/// For live runs the authoritative source is the run's own manifest (see
-/// `App::run_plan_summary`), which counts the REAL, current PRE stage set (now
-/// 9-10 stages, not 5) — this constant is never consulted on that path.
-///
-/// The header CHECKS counter deliberately does NOT fold this in: it counts
-/// real pass/fail CHECK columns only, identically to the FULL STAGE MATRIX
-/// tab, so the two headline numbers always match. PRE steps are pipeline
-/// plumbing, not parity checks.
-const PRE_STAGE_COUNT: usize = 5;
-
 pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
     let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
     if !path.exists() {
@@ -262,8 +247,7 @@ pub struct RunSummary {
     pub overall_result: String,
     /// Name of the first stage that failed (from the `first_failed_stage` CSV column).
     pub first_failed_stage: String,
-    /// Number of `_stage_` / `cross_os_*` columns with outcome "pass", PLUS
-    /// PRE's always-complete 5 (see `section_stages`). Not currently
+    /// Number of fetched check columns with outcome `pass`. Not currently
     /// rendered directly -- the Previous Runs bar shows only the bare
     /// `total_stages` after the divider, with no matching numerator (see
     /// `subset_passed_stages` for the main fraction against this run's
@@ -278,35 +262,23 @@ pub struct RunSummary {
     /// doesn't apply to this run's topology/flags) is excluded, so a run
     /// that deliberately skips half the catalog doesn't shrink the
     /// denominator, but a run that fails early and never reaches the rest
-    /// still reports against the full possible count. PLUS PRE's
-    /// always-complete 5 -- see `passed_stages`.
+    /// still reports against the full possible count.
     pub total_stages: usize,
     /// Column name of the last stage with outcome "pass", for PASS run
     /// display — not just "the last non-not_run column", since that could
     /// be a skip and would misleadingly render with the pass-green check.
     pub last_passed_stage: String,
-    /// (passed, total) for the Previous Runs panel's 3-section bar, one pair
-    /// per Stage Grid group (PRE/BOOTSTRAP/LIVE LAB). PRE has no CSV
-    /// representation at all (its steps -- preflight, SSH reachability,
-    /// etc. -- never get a pass/fail column) and a run that failed during
-    /// PRE itself never gets far enough to produce a CSV row at all, so any
-    /// row that exists here by definition got past PRE -- always (5, 5),
-    /// unconditionally. BOOTSTRAP is the `{os}_stage_{bootstrap,
-    /// membership,assignments,baseline_runtime}` columns across all 3 OSes
-    /// (12 columns) -- a genuine semantic match to Stage Grid's BOOTSTRAP
-    /// phase, unlike a positional slice of the header (which mixed early and
-    /// late stages together, since the CSV is ordered OS-then-checktype, not
-    /// by pipeline phase, and produced a misleadingly near-empty BOOTSTRAP
-    /// section even when most of that phase actually passed). LIVE LAB is
-    /// every other real check column.
+    /// (passed, total) for the Previous Runs panel's 3-section bar. Exact
+    /// PRE/BOOTSTRAP/LIVE LAB values are installed from the run's manifest.
+    /// CSV-only fallback cannot reconstruct pipeline phases, so it leaves
+    /// PRE/BOOTSTRAP empty and places fetched checks in LIVE LAB.
     pub section_stages: [(usize, usize); 3],
     /// Same as `passed_stages`, but restricted to the OSes/cross-OS group
     /// that were actually part of this run's topology -- an OS with NO
     /// decisive (pass/fail) value anywhere in the row was never targeted at
     /// all (e.g. macOS columns on a Linux-only run) and is excluded
     /// entirely, rather than counting its wall of `not_run` against the
-    /// denominator as if those checks were ever going to run. PRE's
-    /// always-complete 5 is folded in here too (universal to every run).
+    /// denominator as if those checks were ever going to run.
     pub subset_passed_stages: usize,
     /// Same as `total_stages`, but restricted the same way as
     /// `subset_passed_stages`.
@@ -316,27 +288,16 @@ pub struct RunSummary {
     /// `None` for a passing run or when `first_failed_stage` is empty.
     /// PRE can never be the failing section (see `section_stages`).
     pub failing_section: Option<usize>,
+    /// True only when this run's own manifest/result artifacts were read.
+    /// False means counts are CSV checks only; UI labels them as such and
+    /// never invents missing PRE/pipeline stages.
+    pub counts_exact: bool,
 }
 
 /// True for columns that represent actual orchestrator stages (not role-presence summaries).
 /// Only `*_stage_*` and `cross_os_*` columns count as lab stages.
 fn is_lab_stage_column(header: &str) -> bool {
     header.contains("_stage_") || header.starts_with("cross_os_")
-}
-
-/// The 4 `_stage_` suffixes that correspond to Stage Grid's BOOTSTRAP phase
-/// (bootstrap_hosts/membership_setup+distribute_membership_state/
-/// issue_and_distribute_*/enforce+validate_baseline_runtime) -- see
-/// `RunSummary::section_stages`.
-const BOOTSTRAP_PHASE_STAGE_SUFFIXES: [&str; 4] =
-    ["bootstrap", "membership", "assignments", "baseline_runtime"];
-
-fn is_bootstrap_phase_stage_column(header: &str) -> bool {
-    Os::all().into_iter().any(|os| {
-        BOOTSTRAP_PHASE_STAGE_SUFFIXES
-            .iter()
-            .any(|suffix| header == format!("{}_stage_{suffix}", os.csv_prefix()))
-    })
 }
 
 /// Which of the 4 CSV column families a `is_full_stage_matrix_column` header
@@ -579,8 +540,6 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
             let mut subset_passed = 0usize;
             let mut subset_total = 0usize;
             let mut last_passed_stage = String::new();
-            let (mut boot_passed, mut boot_total) = (0usize, 0usize);
-            let (mut lab_passed, mut lab_total) = (0usize, 0usize);
 
             for (idx, col_name) in &stage_cols {
                 let v = row.get(*idx).unwrap_or("").trim();
@@ -603,47 +562,17 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
                         subset_passed += 1;
                     }
                 }
-                let (section_passed, section_total) = if is_bootstrap_phase_stage_column(col_name) {
-                    (&mut boot_passed, &mut boot_total)
-                } else {
-                    (&mut lab_passed, &mut lab_total)
-                };
-                *section_total += 1;
-                if is_pass {
-                    *section_passed += 1;
-                }
             }
 
-            // PRE has no CSV representation of its own (preflight, SSH
-            // reachability, etc. never get a pass/fail column) and a run
-            // that failed during PRE itself never gets far enough to
-            // produce a CSV row at all -- so any row that exists here by
-            // definition got past PRE. Always show it complete rather than
-            // conditionally inferring it, and fold its 5/5 into the
-            // displayed passed/total so the count text agrees with what the
-            // bar actually shows (previously "4/116" excluded PRE entirely
-            // while the bar still rendered it as a solid green section,
-            // reading as more evidence than the number backed up). PRE is
-            // universal to every run, so it's also folded into the subset.
-            let pre = (PRE_STAGE_COUNT, PRE_STAGE_COUNT);
-
-            // Which section (if any) contains the run's own named failure --
-            // None for a passing run, or when there's no specific stage name
-            // to attribute the failure to. Node-alias-prefixed names (e.g.
-            // "debian-headless-1::validate_linux_hello_limiter_flood") are
-            // stripped to their bare stage name first.
-            let failing_section = if overall_result.eq_ignore_ascii_case("fail") {
-                let bare = first_failed_stage.rsplit("::").next().unwrap_or("");
-                if bare.is_empty() {
-                    None
-                } else if is_bootstrap_phase_stage_column(bare) {
-                    Some(1)
-                } else {
+            // CSV has check outcomes, but no exact PRE/BOOTSTRAP execution
+            // plan. Keep every observed check in one explicit CSV section;
+            // never manufacture pipeline counts from a stale local constant.
+            let failing_section =
+                if overall_result.eq_ignore_ascii_case("fail") && !first_failed_stage.is_empty() {
                     Some(2)
-                }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
 
             RunSummary {
                 run_id,
@@ -651,13 +580,14 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
                 report_dir,
                 overall_result,
                 first_failed_stage,
-                passed_stages: passed + PRE_STAGE_COUNT,
-                total_stages: total + PRE_STAGE_COUNT,
-                subset_passed_stages: subset_passed + PRE_STAGE_COUNT,
-                subset_total_stages: subset_total + PRE_STAGE_COUNT,
+                passed_stages: passed,
+                total_stages: total,
+                subset_passed_stages: subset_passed,
+                subset_total_stages: subset_total,
                 last_passed_stage,
-                section_stages: [pre, (boot_passed, boot_total), (lab_passed, lab_total)],
+                section_stages: [(0, 0), (0, 0), (subset_passed, subset_total)],
                 failing_section,
+                counts_exact: false,
             }
         })
         .collect();
@@ -1263,19 +1193,19 @@ mod tests {
         assert_eq!(runs[0].first_failed_stage, "linux_stage_exit_handoff");
         // not_run still counts toward total (it was possible, just never
         // reached after the earlier failure) -- pass=1 fail=1 not_run=1 →
-        // total=3, plus PRE's always-complete 5/5 folded in (a row exists
-        // at all only if the run got past PRE) -> 6/8.
-        assert_eq!(runs[0].passed_stages, 6);
-        assert_eq!(runs[0].total_stages, 8);
+        // total=3. No PRE count is invented without a manifest.
+        assert_eq!(runs[0].passed_stages, 1);
+        assert_eq!(runs[0].total_stages, 3);
+        assert!(!runs[0].counts_exact);
         // The last column with outcome "fail" doesn't count as a passed
         // stage -- last_passed_stage must be the actual last PASS, not
         // just the last column that ran at all.
         assert_eq!(runs[0].last_passed_stage, "linux_stage_bootstrap");
-        // Older pass run: 3 stage columns all pass, plus PRE's 5/5 -> 8/8.
+        // Older pass run: 3 CSV check columns all pass.
         assert_eq!(runs[1].run_id, "run-old");
         assert_eq!(runs[1].overall_result, "pass");
-        assert_eq!(runs[1].passed_stages, 8);
-        assert_eq!(runs[1].total_stages, 8);
+        assert_eq!(runs[1].passed_stages, 3);
+        assert_eq!(runs[1].total_stages, 3);
         assert_eq!(runs[1].last_passed_stage, "linux_stage_exit_handoff");
     }
 
@@ -1292,10 +1222,9 @@ mod tests {
         // Only macos_stage_anchor is a real pass/fail outcome; the two
         // skips are deliberately-not-applicable, not "attempted and
         // stopped partway" -- must not inflate the denominator or look
-        // like the run only got 1/3 of the way through. Plus PRE's
-        // always-complete 5/5 folded in -> 6/6.
-        assert_eq!(runs[0].passed_stages, 6);
-        assert_eq!(runs[0].total_stages, 6);
+        // like the run only got 1/3 of the way through.
+        assert_eq!(runs[0].passed_stages, 1);
+        assert_eq!(runs[0].total_stages, 1);
         assert_eq!(runs[0].last_passed_stage, "macos_stage_anchor");
     }
 
@@ -1349,20 +1278,12 @@ mod tests {
         );
         let runs = load_recent_runs(dir.path(), 1).unwrap();
 
-        // 3 passed, 6 total from the CSV columns, plus PRE's always-complete
-        // 5/5 folded in -> 8/11.
-        assert_eq!(runs[0].passed_stages, 8);
-        assert_eq!(runs[0].total_stages, 11);
+        assert_eq!(runs[0].passed_stages, 3);
+        assert_eq!(runs[0].total_stages, 6);
     }
 
     #[test]
-    fn section_stages_classifies_columns_by_name_not_header_position() {
-        // Regression: section_stages must route each column into BOOTSTRAP
-        // or LIVE LAB by what it actually IS (its `_stage_{suffix}` name),
-        // not by where it happens to sit in the CSV header -- the CSV is
-        // ordered OS-then-checktype, not by pipeline phase, so a positional
-        // slice previously mixed early and late stages together and could
-        // show BOOTSTRAP as nearly empty even when most of it had passed.
+    fn csv_fallback_does_not_invent_pipeline_sections() {
         let dir = tempfile::tempdir().unwrap();
         write_matrix_csv(
             dir.path(),
@@ -1374,41 +1295,27 @@ mod tests {
         );
         let runs = load_recent_runs(dir.path(), 1).unwrap();
 
-        // 3 passed, 6 total from the CSV columns, plus PRE's always-complete
-        // 5/5 folded in -> 8/11.
-        assert_eq!(runs[0].passed_stages, 8);
-        assert_eq!(runs[0].total_stages, 11);
+        assert_eq!(runs[0].passed_stages, 3);
+        assert_eq!(runs[0].total_stages, 6);
         let [pre, bootstrap, live_lab] = runs[0].section_stages;
-        assert_eq!(pre, (5, 5));
-        // bootstrap/membership (linux, pass) + bootstrap/membership
-        // (windows, not_run) are all `_stage_{bootstrap,membership,
-        // assignments,baseline_runtime}` -- BOOTSTRAP-phase columns --
-        // regardless of OS or header position: linux_stage_bootstrap (pass),
-        // linux_stage_membership (pass), linux_stage_assignments (pass),
-        // windows_stage_bootstrap (not_run), windows_stage_membership
-        // (not_run) = 3 passed of 5 (windows_stage_assignments is skip,
-        // excluded).
-        assert_eq!(bootstrap, (3, 5));
-        // macos_stage_anchor (fail) is the only non-bootstrap-suffix column
-        // here -> LIVE LAB, 0 passed of 1.
-        assert_eq!(live_lab, (0, 1));
+        assert_eq!(pre, (0, 0));
+        assert_eq!(bootstrap, (0, 0));
+        assert_eq!(live_lab, (3, 4));
+        assert!(!runs[0].counts_exact);
     }
 
     #[test]
-    fn pre_section_is_always_complete_even_with_no_other_decisive_data() {
-        // A run that failed during PRE itself never gets far enough to
-        // produce a CSV row at all -- so any row that exists here, no
-        // matter how sparse, implies PRE was already past. No more "0/5"
-        // fallback: PRE is unconditionally (5, 5).
+    fn sparse_csv_does_not_claim_unrecorded_pre_work() {
         let dir = tempfile::tempdir().unwrap();
         write_matrix_csv(
             dir.path(),
             "run_id,overall_result,linux_stage_bootstrap\nrun-1,,skip\n",
         );
         let runs = load_recent_runs(dir.path(), 1).unwrap();
-        assert_eq!(runs[0].section_stages[0], (5, 5));
-        assert_eq!(runs[0].passed_stages, 5);
-        assert_eq!(runs[0].total_stages, 5);
+        assert_eq!(runs[0].section_stages[0], (0, 0));
+        assert_eq!(runs[0].passed_stages, 0);
+        assert_eq!(runs[0].total_stages, 0);
+        assert!(!runs[0].counts_exact);
     }
 
     #[test]

@@ -8,7 +8,14 @@ use ratatui::{
 
 use crate::app::App;
 
-pub fn render(f: &mut Frame, area: Rect, _app: &App) {
+pub fn render(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(error) = app.data_errors.first() {
+        f.render_widget(
+            Paragraph::new(format!(" DATA ERROR: {error}")).style(Style::default().fg(Color::Red)),
+            area,
+        );
+        return;
+    }
     let hints = [
         ("Tab", "page"),
         ("s", "start"),
