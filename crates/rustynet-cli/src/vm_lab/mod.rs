@@ -41322,10 +41322,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
 
     #[test]
     fn transition_local_utm_vm_skips_stop_when_vm_is_already_stopped() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let dir = std::env::temp_dir().join(format!("rustynet-vm-lab-transition-{unique}.dir"));
         fs::create_dir_all(&dir).expect("temp dir should exist");
         let bundle = dir.join("alpha.utm");
@@ -41382,10 +41379,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
 
     #[test]
     fn transition_local_utm_vm_skips_stop_when_utmctl_probe_spawn_fails_but_ps_reports_stopped() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let dir = std::env::temp_dir().join(format!("rustynet-vm-lab-transition-{unique}.dir"));
         fs::create_dir_all(&dir).expect("temp dir should exist");
         let bundle = dir.join("alpha.utm");
