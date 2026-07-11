@@ -4,6 +4,11 @@ Status: active evidence ledger. The CSV at
 [`live_lab_run_matrix.csv`](./live_lab_run_matrix.csv) is the append-only table
 for LiveLab attempts.
 
+[`live_lab_node_stage_results.csv`](./live_lab_node_stage_results.csv) is the
+normalized node-level companion ledger. It records one row per
+run × node × stage with fetched exact OS/version evidence. Use it—not the
+Linux umbrella columns—to prove Debian, Rocky, Ubuntu, and Fedora separately.
+
 ## Purpose
 
 Rustynet must be proven in mixed real-world topologies, not only Debian-only
@@ -27,9 +32,16 @@ The writer also emits the exact row for the current run at
 Linux role validation scripts that bypass these paths still require a manual row
 before claiming a run is green, regressed, unsupported, or at platform parity.
 
+Rust `--node` runs also emit
+`<report_dir>/state/live_lab_node_stage_results.csv` and upsert the same rows
+into the normalized repository ledger. Missing/unrecognized OS version data or
+missing planned-stage outcomes fail evidence finalization.
+
 ## Required Row Rules
 
 - One row per run attempt.
+- One normalized row per participating node and planned stage. Exact fetched
+  `os_family` + `os_version` are mandatory; generic `linux` is rejected.
 - `git_commit` must be the exact deployed and tested commit.
 - `git_dirty_state` must be `clean` or `dirty:<short reason>`.
 - `report_dir`, `failure_digest_path`, and `evidence_bundle_path` must point at
@@ -44,6 +56,14 @@ before claiming a run is green, regressed, unsupported, or at platform parity.
 - The Rust writer reads the current CSV header and writes values by column name.
   When built-in identity columns are missing, it extends the header and leaves
   older rows intact.
+- Network-profile provenance columns (`network_profile_id`,
+  `network_profile_digest`, `network_management_mode`,
+  `network_scenario_substrate`, `network_address_family`,
+  `network_internet_mode`, `network_evidence_path`) are filled from the
+  immutable `orchestration/network_profile.json` record the orchestrator
+  writes at launch (see
+  [LiveLabVmConnectivityRulebook.md](./LiveLabVmConnectivityRulebook.md) §10).
+  Legacy rows without a record stay blank; new runs always carry them.
 
 ## Status Vocabulary
 
@@ -72,6 +92,16 @@ The CSV tracks:
   Windows named-pipe and DPAPI custody, macOS Keychain and PF killswitch.
 - Node identity per OS role: alias, node ID, and target for client, admin,
   exit, blind_exit, relay, and anchor roles.
+
+The normalized companion CSV additionally tracks:
+
+- exact distro/platform family: `debian`, `rocky`, `ubuntu`, `fedora`, `macos`,
+  or `windows`;
+- fetched OS version and architecture;
+- node alias, node ID, assigned role, stage, result, evidence path, and failure
+  detail;
+- `stage_scope=node` for per-node proof and `stage_scope=topology` when the node
+  participated in a whole-lab proof such as an all-pairs traffic matrix.
 
 ## Current Truth
 

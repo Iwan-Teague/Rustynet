@@ -118,5 +118,13 @@ Scope: direct remote exit, relay remote exit, failback/roaming, traversal advers
 - [ ] Distinct client/exit network IDs confirmed.
 - [ ] Required scripts and binaries present on runner.
 - [ ] Artifact output directory writable.
+- [ ] Network profile selected and verified: `rustynet ops vm-lab-network-preflight
+      --profile <id>` passes (or the run's derived profile record exists) —
+      see [LiveLabVmConnectivityRulebook.md](./LiveLabVmConnectivityRulebook.md) §10.
+- [ ] No reverse-SOCKS bootstrap tunnel active (`set_vm_internet_access`
+      disabled for every alias); SOCKS presence blocks evidence stages.
+- [ ] Ordinary simulated transit is inside `198.18.0.0/15` (the netns
+      simulator default); `100.64.0.0/24` transit only under the explicit
+      `cgnat_collision_v1` profile.
 
 If any item fails, stop and remediate before running cross-network validators.

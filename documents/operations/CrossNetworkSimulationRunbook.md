@@ -8,6 +8,8 @@ using only the existing single-host UTM VM lab. This is the battle-testing subst
 defects before any move to real hardware.
 
 It complements, and does not replace:
+- [LiveLabVmConnectivityRulebook.md](./LiveLabVmConnectivityRulebook.md) — the canonical VM attachment,
+  management-plane, and internet-connectivity policy.
 - [CrossNetworkLiveLabPrerequisitesChecklist.md](./CrossNetworkLiveLabPrerequisitesChecklist.md) — the
   go/no-go prerequisites and the NAT-profile vocabulary.
 - [active/RustynetDataplaneExecutionPlan_2026-05-18.md](./active/RustynetDataplaneExecutionPlan_2026-05-18.md)
@@ -16,9 +18,14 @@ It complements, and does not replace:
 
 ## Why a simulation substrate is needed
 
-The UTM lab puts all VMs on one bridged L2 segment (192.168.0.0/24), so every VM-to-VM path is same-LAN —
-there is no NAT boundary to traverse, and a "cross-network" claim against that wiring is false. Two hard
-UTM constraints (established 2026-06-11) shape the options:
+The original Tier-B layout put its participating QEMU VMs on one bridged L2
+segment (`192.168.0.0/24`), so every VM-to-VM path was same-LAN: there was no
+NAT boundary to traverse, and a "cross-network" claim against that wiring was
+false. The current fleet has mixed Shared and Bridged attachments; the
+connectivity rulebook owns that state and the migration target. In either
+case, ordinary UTM attachment alone does not provide the selectable,
+deterministic NAT matrix required here. Two hard UTM constraints (established
+2026-06-11) shape the options:
 
 1. Editing a VM's `config.plist` while UTM is running is silently clobbered from UTM's in-memory model, so
    any VM network reconfiguration requires stop → quit UTM → rewrite → relaunch → start (a full-lab
@@ -49,17 +56,27 @@ Topology (default 2 sites; `--site` adds more):
      ns:ep-A (10.10.0.2)                         ns:ep-B (10.20.0.2)
           | veth lan                                   | veth lan
      ns:rtr-A --+ NAT(profile)            NAT(profile) +-- ns:rtr-B
-     100.64.0.11|                                      |100.64.0.12
+     198.18.0.11|                                      |198.18.0.12
                 +------------  br:rnsim-wan  -----------+
-                        (100.64.0.0/24  =  "the internet")
+                        (198.18.0.0/24  =  "the internet")
                                   |
-                          ns:svc (100.64.0.254)
+                          ns:svc (198.18.0.254)
                        STUN responder + rustynet-relay
 ```
 
 Each endpoint reaches the wan only through its own NAT, so the reflexive address it learns from the `svc`
 STUN responder is the router's translated `(ip:port)` — exactly as on a real home network. Endpoints
 cannot reach each other unsolicited; the routers' filtering rules enforce the NAT type.
+
+**Address plan (migrated 2026-07-10):** the ordinary simulated transit now
+defaults to `198.18.0.0/24` inside the canonical IANA benchmarking range
+`198.18.0.0/15`; the legacy `100.64.0.0/24` WAN overlapped Rustynet's
+`100.64.0.0/10` mesh range and is only valid when deliberately re-created via
+`--wan-cidr 100.64.0.0/24` under the explicit `cgnat_collision_v1` adversarial
+network profile (`profiles/vm_lab/network/cgnat_collision_v1.toml`), which
+requires its own dedicated oracle. `rustynet ops vm-lab-network-audit` flags
+any simulator source drift back to a mesh-overlapping transit. See
+[LiveLabVmConnectivityRulebook.md](./LiveLabVmConnectivityRulebook.md) §15.3.
 
 ### Prerequisites on the guest
 
@@ -86,15 +103,16 @@ sudo bash netns_internet_sim.sh build \
 sudo bash netns_internet_sim.sh status
 
 # run a command inside a namespace (svc | rtr-<NAME> | ep-<NAME>)
-sudo bash netns_internet_sim.sh exec ep-A -- ping -c2 100.64.0.254
+sudo bash netns_internet_sim.sh exec ep-A -- ping -c2 198.18.0.254
 
 # remove everything (idempotent; sweeps only rnsim-* namespaces + the rnsim-wan bridge)
 sudo bash netns_internet_sim.sh teardown
 ```
 
 Profiles use the same vocabulary as `apply_nat_profile.sh`: `port_restricted_cone` (plain masquerade),
-`full_cone` (masquerade + DNAT of the WG/relay UDP range to the endpoint), `symmetric` (masquerade with
-randomised source ports), `double_nat_cgnat` (built as a chained two-router site). Impairment labels
+`full_cone` (masquerade + DNAT of the WG/relay UDP range to the endpoint), and `symmetric` (masquerade with
+randomised source ports). `double_nat_cgnat` is recognized but currently refused because the required
+chained two-router site is not implemented. Impairment labels
 (`latency_50ms_loss_1pct`, `latency_120ms_loss_3pct`, `loss_5pct`) attach netem to the endpoint uplink.
 
 ### What is validated today
@@ -106,8 +124,8 @@ On `debian-headless-1`, 2026-06-11:
 - Endpoint isolation holds (an endpoint cannot reach another site's private address).
 - Concurrent multi-site reachability to the shared `svc` node from distinct translated wan IPs.
 - **NAT-reflexive (srflx) discovery** end-to-end: with `scripts/vm_lab/stun_responder.py` running in `svc`,
-  an endpoint behind its NAT learns its translated public mapping (ep-A → `100.64.0.11:<mapped>`, ep-B →
-  `100.64.0.12:<mapped>`). The responder speaks the exact wire format `crates/rustynetd/src/stun_client.rs`
+  an endpoint behind its NAT learns its translated public mapping (ep-A → `<rtr-A wan>:<mapped>`, ep-B →
+  `<rtr-B wan>:<mapped>`; validated on the legacy transit range pre-migration). The responder speaks the exact wire format `crates/rustynetd/src/stun_client.rs`
   parses (RFC 5389 binding request/response, XOR-MAPPED-ADDRESS), so the real client consumes it unchanged.
   It is lab tooling standing in for the public STUN servers — not a Rustynet component.
 - **NAT mapping-behaviour classification** (`netns_nat_classify.sh` + `nat_probe.py`): each
@@ -147,23 +165,28 @@ Expected matrix:
 ## Tier B — VXLAN-overlay multi-VM cross-NAT
 
 `scripts/vm_lab/vxlan_tier_b.sh` builds the separate-kernel Tier B topology without UTM network
-reconfiguration. It uses unicast VXLAN links over the existing `192.168.0.0/24` bridge:
+reconfiguration, using unicast VXLAN links over whatever management underlay the five guests
+share. **Underlay hosts are required inputs** (generalized 2026-07-10; the script no longer
+assumes the retired `192.168.0.200-204` fleet) and the overlay follows the canonical
+address plan (`LiveLabVmConnectivityRulebook` §15.3: sites from `172.20.0.0/16`,
+overlay transit from `198.18.0.0/15`):
 
-| VM | Role | Underlay | Overlay |
-|---|---|---:|---:|
-| `debian-headless-1` | client A | `192.168.0.200` | `vxlan100` `172.16.10.2/24`, gateway `172.16.10.1` |
-| `debian-headless-2` | client B | `192.168.0.201` | `vxlan200` `172.16.20.2/24`, gateway `172.16.20.1` |
-| `debian-headless-3` | svc / STUN / relay | `192.168.0.202` | `vxlan1` `10.200.0.254/24` |
-| `debian-headless-4` | router | `192.168.0.203` | `vxlan100` `172.16.10.1/24`, `vxlan200` `172.16.20.1/24`, `vxlan1` `10.200.0.11/24` |
-| `debian-headless-5` | sim work host | `192.168.0.204` | reserved for driving/capturing sim work |
+| Role | Underlay | Overlay |
+|---|---:|---:|
+| client A (`NODE_A_HOST`) | operator-supplied management IP | `vxlan100` `172.20.10.2/24`, gateway `172.20.10.1` |
+| client B (`NODE_B_HOST`) | operator-supplied management IP | `vxlan200` `172.20.20.2/24`, gateway `172.20.20.1` |
+| svc / STUN / relay (`SVC_HOST`) | operator-supplied management IP | `vxlan1` `198.18.1.254/24` |
+| router (`ROUTER_HOST`) | operator-supplied management IP | `vxlan100` `172.20.10.1/24`, `vxlan200` `172.20.20.1/24`, `vxlan1` `198.18.1.11/24` |
+| sim work host (`WORK_HOST`) | operator-supplied management IP | reserved for driving/capturing sim work |
 
-Commands from the Mac host:
+Commands from the Mac host (all five host variables are mandatory):
 
 ```
-scripts/vm_lab/vxlan_tier_b.sh setup
-scripts/vm_lab/vxlan_tier_b.sh status
-scripts/vm_lab/vxlan_tier_b.sh run-daemon-test
-scripts/vm_lab/vxlan_tier_b.sh teardown
+NODE_A_HOST=<ip> NODE_B_HOST=<ip> SVC_HOST=<ip> ROUTER_HOST=<ip> WORK_HOST=<ip> \
+  scripts/vm_lab/vxlan_tier_b.sh setup
+...same env... scripts/vm_lab/vxlan_tier_b.sh status
+...same env... scripts/vm_lab/vxlan_tier_b.sh run-daemon-test
+...same env... scripts/vm_lab/vxlan_tier_b.sh teardown
 ```
 
 The driver invokes `apply_nat_profile.sh` for both router LANs (`vxlan100/vxlan1` and

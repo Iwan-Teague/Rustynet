@@ -32,6 +32,7 @@ Each ADR follows the standard skeleton:
 | 001 | [Static no-secret-leakage source-walk audit](./ADR-001-secret-log-audit.md) | Accepted | 2026-05-17 |
 | 002 | [Per-module regression-coverage floor gate](./ADR-002-regression-coverage-floor-gate.md) | Accepted | 2026-05-17 |
 | 003 | [Shared CLI exit-code taxonomy](./ADR-003-cli-exit-code-taxonomy.md) | Accepted | 2026-05-17 |
+| 004 | [Dual-plane live-lab VM network architecture](./ADR-004-dual-plane-live-lab-network.md) | Accepted | 2026-07-10 |
 
 ## Related Reference Material
 
