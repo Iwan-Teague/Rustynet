@@ -27,6 +27,19 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        // Two-hop routing requires a distinct entry/relay hop AND a second
+        // client (client -> entry -> exit, with a second client). A minimal
+        // topology (e.g. exit + single client) has neither and cannot exercise
+        // two-hop — skip rather than fail-closed, matching the other role-gated
+        // live-suite stages (which already skip when their role is absent). This
+        // stage previously fail-closed on the missing 'entry' role; it only
+        // surfaced once blind_exit_dataplane_validation (its dependency) began
+        // reporting Skipped instead of Failed.
+        if alias_matching_label(ctx, "entry").is_none()
+            || ssh_params_for_second_client(ctx).is_err()
+        {
+            return StageOutcome::Skipped;
+        }
         let exit_params = match ssh_params_for_role(ctx, "exit") {
             Ok(p) => p,
             Err(e) => return StageOutcome::Failed(e),
@@ -216,5 +229,44 @@ mod tests {
     fn fanout_is_once() {
         let stage = LiveTwoHopValidationStage;
         assert_eq!(stage.fanout(), StageFanout::Once);
+    }
+
+    #[test]
+    fn skips_when_topology_lacks_entry_and_second_client() {
+        use crate::vm_lab::orchestrator::role::NodeRole;
+        use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+        use std::collections::HashMap;
+        // exit + single client: no 'entry' hop and no 'extra'/'aux' second
+        // client -> two-hop is inapplicable -> Skipped (not Failed), returning
+        // before any adapter/ssh resolution. Regression for the live-lab false
+        // failure "no node with role label 'entry' in assignments".
+        let mut ctx = OrchestrationContext {
+            assignments: vec![
+                NodeRoleAssignment {
+                    alias: "exit-1".to_owned(),
+                    role: NodeRole::Exit,
+                },
+                NodeRoleAssignment {
+                    alias: "client-1".to_owned(),
+                    role: NodeRole::Client,
+                },
+            ],
+            adapters: HashMap::new(),
+            source_archive: None,
+            report_dir: std::env::temp_dir(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            orchestrator_dialect: None,
+        };
+        assert_eq!(
+            LiveTwoHopValidationStage.execute(&mut ctx),
+            StageOutcome::Skipped
+        );
     }
 }
