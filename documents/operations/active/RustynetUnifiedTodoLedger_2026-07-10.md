@@ -230,8 +230,31 @@ Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](./RustNati
   install paths, and CI so lab-only attack surface does not ship as product.
 - [ ] RNQ-20: obtain Fedora passwordless-sudo lab prerequisite without weakening
   policy; run live bootstrap and residue proof.
-- [ ] Re-run the focused full-mesh topology on a valid shared scenario underlay;
-  the 2026-07-10 run with isolated UTM underlays is not functional mesh proof.
+- [x] Re-run the focused full-mesh topology on a valid shared scenario underlay
+  (2026-07-11). Proven on the `mgmt_shared_smoke_v1` shared plane
+  (192.168.64.0/24): `traffic_test_matrix` + `mesh_status_validation` green with
+  `debian-headless-2:exit` + `debian-headless-4:client`. Evidence rows
+  `livelab-1783793580-509e633` (first proof) and `livelab-1783800545-4d04af5`
+  (latest), commit-clean, network profile + digest recorded. The 2026-07-10
+  isolated-underlay run was not functional mesh proof; this is.
+  - Fixed en route (release-blocker): Linux exit→client demotion left
+    `net.ipv4.ip_forward=1` — `apply_nat_forwarding` re-captured
+    `prior_ipv4_forwarding` on every re-enforce, clobbering the true baseline.
+    Reconcile override (`696b8c5`) + capture-once guard (`9c425f5`);
+    `exit_demotion_residue_validation` now PASS (live-proven).
+  - Fixed 3 orchestrator false-failures unmasked as each upstream stage stopped
+    failing: `blind_exit_dataplane_validation` gated to `NodeRole::BlindExit`
+    (`0cec075`); `live_two_hop_validation` skips a topology without an entry hop
+    (`1f57564`); `live_managed_dns` arg + `--known-hosts-file` wiring
+    (`1b33e84`/`4d04af5`).
+  - OPEN (well-characterized, tracked): `live_managed_dns_validation` still
+    fails — the pinned-known_hosts lookup uses a `host:22` candidate that
+    `ssh-keygen -F` will not match against the standard plain-host entry
+    (`target_address` in `live_lab_support` does not strip the `:22` port
+    suffix). Distinct SSH-pinning bug; intersects §8/§15 managed-DNS evidence.
+  - Env note: the orchestrator needs `--utm-documents-root "<UTM images dir>"`
+    when lab bundles live outside the default UTM documents root, or
+    `discover_local_utm` reports only a stale bundle and fails alias selection.
 - [ ] Prevent untracked required Rust modules from being silently absent in
   working-tree deployment, or give a precise preflight blocker before shipping.
 - [x] Make the Rust `--node` `preflight` clock-skew probe resilient to transient
