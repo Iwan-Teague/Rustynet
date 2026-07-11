@@ -49,10 +49,15 @@ impl NodeAdapter for MacosNodeAdapter {
 
     fn collect_os_version(&self) -> String {
         use crate::vm_lab::orchestrator::adapter::ssh;
-        ssh::run_remote(
+        // Retry the read-only probe so a transient first-connection SSH timeout
+        // does not degrade to the bare "macos" placeholder (which the run-matrix
+        // finalizer rejects for lacking a version number). See ledger 2026-07-11.
+        ssh::run_remote_retrying(
             &self.conn,
             "printf 'macOS %s (%s)' \"$(sw_vers -productVersion)\" \"$(uname -m)\"",
             Duration::from_secs(10),
+            3,
+            Duration::from_millis(500),
         )
         .map(|v| v.trim().to_owned())
         .unwrap_or_else(|_| "macos".to_owned())

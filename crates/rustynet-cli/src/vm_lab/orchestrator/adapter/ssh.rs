@@ -301,6 +301,42 @@ fn run_remote_inner(
         })
 }
 
+/// Run an **idempotent, side-effect-free** `script` over SSH, retrying transient
+/// failures. Returns trimmed stdout on the first success.
+///
+/// A first-connection SSH failure (`ConnectTimeout` expiry, `Operation timed
+/// out`) surfaces as ssh's own exit 255 — an `AdapterError::Command`, not
+/// `AdapterError::Ssh` — so this retries on *any* error. That is only safe for
+/// read-only probes (OS-version capture, reachability), never for a mutation.
+/// Between attempts it sleeps `backoff`, doubling up to a 5s cap, so a single
+/// transient first-connection timeout no longer decides the whole probe.
+pub fn run_remote_retrying(
+    conn: &NodeConnection,
+    script: &str,
+    timeout: Duration,
+    attempts: u32,
+    backoff: Duration,
+) -> Result<String, AdapterError> {
+    let attempts = attempts.max(1);
+    let mut last_err: Option<AdapterError> = None;
+    let mut wait = backoff;
+    for attempt in 1..=attempts {
+        match run_remote(conn, script, timeout) {
+            Ok(out) => return Ok(out),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < attempts {
+                    thread::sleep(wait);
+                    wait = (wait * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AdapterError::Ssh {
+        message: "run_remote_retrying exhausted attempts with no captured error".to_owned(),
+    }))
+}
+
 /// Run `script` on the remote host. Returns `true` if exit code is 0.
 /// Never returns `Err` for non-zero exit — use this only for boolean probes.
 pub fn run_remote_check(
@@ -625,7 +661,10 @@ fn teardown_control_master(teardown: ControlMasterTeardown) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlMasterTeardown, validator_report_ok};
+    use super::{ControlMasterTeardown, run_remote_retrying, validator_report_ok};
+    use crate::vm_lab::orchestrator::connection::NodeConnection;
+    use crate::vm_lab::orchestrator::error::AdapterError;
+    use std::time::Duration;
 
     #[test]
     fn control_master_teardown_builds_argv_only_ssh_o_exit() {
@@ -693,6 +732,38 @@ mod tests {
         assert!(validator_report_ok(
             "WARN something\n{\n  \"overall_ok\": true\n}"
         ));
+    }
+
+    #[test]
+    fn run_remote_retrying_exhausts_attempts_and_returns_last_error() {
+        // Regression (ledger 2026-07-11): the OS-version probe must retry
+        // transient SSH before degrading. Drive the retry loop against a
+        // non-SSH connection so every attempt fails fast (ssh_params rejects it
+        // with no network I/O and no sleep inside run_remote); zero backoff
+        // keeps the test from sleeping while still exercising all attempts.
+        let adb = NodeConnection::Adb {
+            device_serial: "emulator-5554".to_owned(),
+        };
+        let err = run_remote_retrying(&adb, "printf hi", Duration::from_secs(1), 3, Duration::ZERO)
+            .expect_err("non-SSH connection must fail every attempt");
+        assert!(
+            matches!(err, AdapterError::Ssh { .. }),
+            "expected SSH-kind error from ssh_params rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn run_remote_retrying_clamps_zero_attempts_to_one() {
+        // attempts=0 must still run exactly once and return an error rather than
+        // silently succeeding or panicking.
+        let adb = NodeConnection::Adb {
+            device_serial: "emulator-5554".to_owned(),
+        };
+        assert!(
+            run_remote_retrying(&adb, "printf hi", Duration::from_secs(1), 0, Duration::ZERO)
+                .is_err(),
+            "zero attempts clamps to one real attempt and still fails closed"
+        );
     }
 
     #[test]

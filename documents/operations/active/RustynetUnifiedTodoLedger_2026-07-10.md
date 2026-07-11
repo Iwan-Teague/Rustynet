@@ -95,11 +95,33 @@ dependency:
   stale-green, blocked, and unsupported-by-design.
 - [ ] Validate the TUI and MCP views against corrupt, missing, stale, concurrent,
   resumed, and aborted run data.
-- [ ] Fix the run-matrix updater rejecting the Linux umbrella OS family: a Rust
-  `--node` Linux run finalizes with `unrecognized OS family for fetched version
-  'linux' (platform=linux); refusing Linux-umbrella evidence` and appends no
-  `live_lab_run_matrix.csv` row, so even a green Linux `--node` run leaves no
-  §10.9 evidence row (2026-07-11, runs `state/live-lab-smoke-setup-1..3`).
+- [x] Fix the run-matrix updater rejecting the Linux umbrella OS family: a Rust
+  `--node` Linux run finalized with `unrecognized OS family for fetched version
+  'linux' (platform=linux); refusing Linux-umbrella evidence` and appended no
+  `live_lab_run_matrix.csv` row, so even a green Linux `--node` run left no
+  §10.9 evidence row (2026-07-11, runs `state/live-lab-smoke-setup-1..3`). Root
+  cause was upstream, not the finalizer: `NodeAdapter::collect_os_version`
+  (linux/macos/windows) did a single SSH probe and, on a transient
+  first-connection timeout, silently degraded to a bare platform placeholder
+  (`"linux"`/`"macos"`/`"windows"`) — which the finalizer's `normalize_os_family`
+  correctly refuses, but the refusal then dropped the ENTIRE per-node append. Fix
+  keeps the refusal (evidence truth) and repairs the source: the OS-version probe
+  now retries transient SSH (`ssh::run_remote_retrying`, 3 attempts, 500ms→5s
+  backoff), and the native orchestrator's collection loop validates each fetched
+  version against the single `normalize_os_family` authority and fails loud,
+  early, and attributably instead of recording a placeholder that silently voids
+  the matrix append (mobile unsupported-by-design adapters are exempt). Regression
+  tests: `normalize_os_family_rejects_bare_platform_umbrella_placeholders`,
+  `normalize_os_family_accepts_real_fetched_distro_versions`,
+  `run_remote_retrying_exhausts_attempts_and_returns_last_error`,
+  `run_remote_retrying_clamps_zero_attempts_to_one`. Gates green on stable
+  toolchain (pinned 1.88.0 undownloadable in this env): `cargo fmt --all --
+  --check`, scoped `cargo check`/`cargo clippy -p rustynet-cli --all-targets
+  --all-features -- -D warnings`, and `cargo test -p rustynet-cli`
+  (2298 pass; the 3 unrelated failures are pre-existing environmental flakes —
+  a load-sensitive process-timeout timing test that also fails on baseline, plus
+  two UTM/`/tmp`-cleanup lab tests that pass in isolation). Live re-proof on a
+  real `--node` run still pending lab access.
 - [x] The 2026-07-10 quality-hardening commit `e4b3a0e` landed with two failing
   `rustynet-cli` tests — a stale `build_returns_canonical_security_stage_order`
   oracle (listed `ExitDemotionResidueValidation` before its declared dependency

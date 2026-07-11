@@ -44,7 +44,12 @@ impl NodeAdapter for LinuxNodeAdapter {
 
     fn collect_os_version(&self) -> String {
         use crate::vm_lab::orchestrator::adapter::ssh;
-        ssh::run_remote(
+        // Retry the read-only probe: a transient first-connection SSH timeout
+        // must not degrade to the bare "linux" umbrella placeholder, which the
+        // run-matrix finalizer then rejects — silently dropping the whole
+        // evidence append (ledger 2026-07-11). The placeholder remains only as a
+        // last resort; the collection loop validates it and fails loud.
+        ssh::run_remote_retrying(
             &self.conn,
             "if [ -r /etc/os-release ]; then \
                  . /etc/os-release; \
@@ -53,6 +58,8 @@ impl NodeAdapter for LinuxNodeAdapter {
                  printf 'Linux kernel %s (%s)' \"$(uname -r)\" \"$(uname -m)\"; \
              fi",
             Duration::from_secs(10),
+            3,
+            Duration::from_millis(500),
         )
         .map(|v| v.trim().to_owned())
         .unwrap_or_else(|_| "linux".to_owned())
