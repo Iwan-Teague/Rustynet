@@ -2103,6 +2103,35 @@ impl DataplaneSystem for LinuxCommandSystem {
         Ok(())
     }
 
+    /// Linux exit-NAT residue reconcile.
+    ///
+    /// The generation-numbered NAT tables self-heal via `prune_owned_tables`,
+    /// but `net.ipv4.ip_forward` is NOT generation state. `apply_nat_forwarding`
+    /// enables it and caches the prior value only in memory
+    /// (`prior_ipv4_forwarding`), so a former exit that demotes to client in a
+    /// LATER apply (new generation, fresh applier instance) — or restarts as a
+    /// client after a crash — has no cached prior and would otherwise leave
+    /// forwarding enabled with no path to restore it (CLAUDE.md §10.7 residue;
+    /// a non-exit node must not forward). Drive it back to the secure default
+    /// (0) whenever THIS generation does not serve an exit.
+    ///
+    /// Mirrors `MacosCommandSystem::reconcile_exit_nat_residue`.
+    /// `serve_exit_node` is true for a regular exit, `blind_exit`, AND
+    /// relay-with-upstream, so this never disables forwarding a forwarding role
+    /// legitimately needs. The normal in-process exit→client demotion still
+    /// restores the cached prior LATER via `rollback_nat_forwarding` (which runs
+    /// when `NatApplied` was recorded this pass), overriding this default; the
+    /// cross-generation and crash paths (no cached prior) rely on it. Best
+    /// effort (like the macOS pf flush): reconcile runs before the generation
+    /// stages on every apply, and the exit-demotion-residue validator is the
+    /// loud gate on a real forwarding leak.
+    fn reconcile_exit_nat_residue(&mut self, serving_exit: bool) -> Result<(), SystemError> {
+        if !serving_exit {
+            let _ = self.set_ipv4_forwarding(false);
+        }
+        Ok(())
+    }
+
     fn apply_nat_forwarding(
         &mut self,
         _serve_exit_node: bool,
@@ -9134,6 +9163,66 @@ mod tests {
             command_log
                 .iter()
                 .any(|c| c.contains("sysctl") && c.contains("net.inet.ip.forwarding=0")),
+            "must reset ip forwarding to the secure default; got: {command_log:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reconcile_exit_nat_residue_disables_forwarding_only_when_not_serving() {
+        // §10.7 regression guard. Linux `apply_nat_forwarding` enables
+        // `net.ipv4.ip_forward` and caches the prior value only in memory. NAT
+        // tables are generation-swept, but ip_forward is not: a former exit that
+        // demotes to client in a LATER apply (fresh instance, `prior_ipv4_forwarding
+        // = None`) or restarts as a client after a crash would leave forwarding
+        // enabled with no path to restore it. `reconcile_exit_nat_residue` must
+        // drive it back to 0 when the generation does not serve an exit — and
+        // must issue NOTHING when it does (so it never disables forwarding a
+        // regular exit / blind_exit / relay-with-upstream legitimately needs,
+        // and never races the `apply_nat_forwarding` enable in the same apply).
+        let socket_path = phase10_test_socket_path("lrnr");
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+
+        // Not serving an exit (demoted/restarted as client) → reset forwarding.
+        DataplaneSystem::reconcile_exit_nat_residue(&mut system, false)
+            .expect("reconcile should succeed");
+        let after_not_serving = commands.lock().expect("command log should lock").len();
+
+        // Serving an exit → must NOT touch forwarding (activation enables it).
+        DataplaneSystem::reconcile_exit_nat_residue(&mut system, true)
+            .expect("reconcile should succeed");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert_eq!(
+            after_not_serving, 1,
+            "not-serving reconcile must issue exactly the forwarding reset; got: {command_log:?}"
+        );
+        assert_eq!(
+            command_log.len(),
+            1,
+            "serving reconcile must issue no command; got: {command_log:?}"
+        );
+        assert!(
+            command_log
+                .iter()
+                .any(|c| c.contains("sysctl") && c.contains("net.ipv4.ip_forward=0")),
             "must reset ip forwarding to the secure default; got: {command_log:?}"
         );
     }
