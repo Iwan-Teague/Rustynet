@@ -58,7 +58,6 @@ impl OrchestrationStage for LiveManagedDnsValidationStage {
             .unwrap_or("live_managed_dns_report.json");
         let log_path_str = log_path.to_str().unwrap_or("live_managed_dns.log");
         let identity_file = signer_params.identity_file.to_str().unwrap_or("");
-        let known_hosts = signer_params.known_hosts.to_str().unwrap_or("");
 
         let managed_peers: Vec<String> = managed_peer_args(ctx);
 
@@ -72,8 +71,6 @@ impl OrchestrationStage for LiveManagedDnsValidationStage {
             "--",
             "--ssh-identity-file",
             identity_file,
-            "--known-hosts",
-            known_hosts,
             "--signer-host",
             &signer_target,
             "--signer-node-id",
