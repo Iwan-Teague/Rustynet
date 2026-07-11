@@ -234,13 +234,23 @@ Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](./RustNati
   the 2026-07-10 run with isolated UTM underlays is not functional mesh proof.
 - [ ] Prevent untracked required Rust modules from being silently absent in
   working-tree deployment, or give a precise preflight blocker before shipping.
-- [ ] Make the Rust `--node` `preflight` clock-skew probe resilient to transient
-  SSH: it issues `ssh … date +%s` with no `ConnectTimeout` set (falls back to the
-  ~75s OS default) and no retry, so a single first-connection `Operation timed
-  out` hard-fails the whole run (cascade to skip-all + `cleanup` fail). Set a
-  bounded connect timeout and retry transient connect failures a few times before
-  failing the stage (2026-07-11, observed on 2/3 `--node` runs whose first SSH
-  hit `debian-headless-4`).
+- [x] Make the Rust `--node` `preflight` clock-skew probe resilient to transient
+  SSH: a single first-connection `Operation timed out` hard-failed the whole run
+  (cascade to skip-all + `cleanup` fail) because the probe was a single attempt
+  (2026-07-11, observed on 2/3 `--node` runs whose first SSH hit
+  `debian-headless-4`). On review the connect timeout was already bounded — the
+  probe runs through `RemoteShellHost::run_argv` → `ssh::run_remote` →
+  `base_ssh_command`, which sets `ConnectTimeout=15` (not the ~75s OS default the
+  finding assumed) — so the real gap was the missing retry. Fix wraps ONLY the
+  transport in a bounded `retry_transient` (3 attempts, 750ms backoff) in
+  `stage/preflight.rs`; a non-zero exit / unparseable clock output stays
+  deterministic (no retry) and still fails closed. Regression tests:
+  `retry_transient_recovers_after_transient_failures`,
+  `retry_transient_returns_last_error_after_exhausting_attempts`,
+  `retry_transient_clamps_zero_attempts_to_one`. Scoped fmt/clippy(-D warnings)/
+  preflight tests green on the stable toolchain. Live re-proof on a real `--node`
+  run against `debian-headless-4` still pending lab access (see §6 stabilization
+  item).
 
 ### 5.2 Platform adapter completeness
 

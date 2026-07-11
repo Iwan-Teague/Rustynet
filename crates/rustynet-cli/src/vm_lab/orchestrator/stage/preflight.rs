@@ -1,10 +1,48 @@
 #![allow(dead_code)]
+use std::time::Duration;
+
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 const MAX_LAB_CLOCK_SKEW_SECS: u64 = 90;
+
+/// Clock-probe retry budget. The probe is the first SSH command a run issues
+/// against a guest, so it eats first-connection transients (control-master
+/// warm-up, ARP/route settle after a network reconfig). A single transient
+/// `Operation timed out` used to hard-fail the whole run (cascade to skip-all +
+/// cleanup fail); retry a few times before giving up (ledger 2026-07-11,
+/// observed on `debian-headless-4`). The underlying `ssh::run_remote` already
+/// bounds each attempt with `ConnectTimeout=15`, so this only adds retries, not
+/// an unbounded wait.
+const CLOCK_PROBE_ATTEMPTS: u32 = 3;
+const CLOCK_PROBE_RETRY_BACKOFF: Duration = Duration::from_millis(750);
+
+/// Run `op` up to `attempts` times (clamped to at least one), sleeping `backoff`
+/// between tries, returning the first `Ok`. Route ONLY transient transport
+/// failures here — a deterministic remote error (non-zero exit, unparseable
+/// output) is handled by the caller without retry.
+fn retry_transient<T, E>(
+    attempts: u32,
+    backoff: Duration,
+    mut op: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let attempts = attempts.max(1);
+    let mut last_err: Option<E> = None;
+    for attempt in 1..=attempts {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < attempts {
+                    std::thread::sleep(backoff);
+                }
+            }
+        }
+    }
+    Err(last_err.expect("attempts >= 1 guarantees at least one captured error"))
+}
 
 fn parse_remote_unix_time(output: &[u8]) -> Result<u64, String> {
     let text = std::str::from_utf8(output)
@@ -134,11 +172,18 @@ impl OrchestrationStage for PreflightStage {
                 ],
                 _ => &["date", "+%s"],
             };
-            let status = match host.run_argv(argv, &[], &[]) {
+            // Retry only the transport: a first-connection SSH transient must
+            // not decide the whole run. A non-zero exit / unparseable output
+            // below is deterministic and is NOT retried.
+            let status = match retry_transient(
+                CLOCK_PROBE_ATTEMPTS,
+                CLOCK_PROBE_RETRY_BACKOFF,
+                || host.run_argv(argv, &[], &[]),
+            ) {
                 Ok(status) => status,
                 Err(err) => {
                     return StageOutcome::Failed(format!(
-                        "{alias}: remote clock probe failed: {err}"
+                        "{alias}: remote clock probe failed after {CLOCK_PROBE_ATTEMPTS} attempts: {err}"
                     ));
                 }
             };
@@ -245,5 +290,53 @@ mod tests {
         assert!(validate_clock_skew(1_000, 910, 90).is_ok());
         assert!(validate_clock_skew(1_000, 909, 90).is_err());
         assert!(validate_clock_skew(909, 1_000, 90).is_err());
+    }
+
+    #[test]
+    fn retry_transient_recovers_after_transient_failures() {
+        // Regression (ledger 2026-07-11): a first-connection SSH transient must
+        // not decide the clock probe. Fail twice, then succeed on the third
+        // attempt — the value from the successful try is returned.
+        let calls = std::cell::Cell::new(0u32);
+        let result: Result<&str, &str> =
+            retry_transient(CLOCK_PROBE_ATTEMPTS, Duration::ZERO, || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                if n < 3 {
+                    Err("Operation timed out")
+                } else {
+                    Ok("ok")
+                }
+            });
+        assert_eq!(result, Ok("ok"));
+        assert_eq!(calls.get(), 3, "must retry until the probe succeeds");
+    }
+
+    #[test]
+    fn retry_transient_returns_last_error_after_exhausting_attempts() {
+        let calls = std::cell::Cell::new(0u32);
+        let result: Result<&str, String> =
+            retry_transient(CLOCK_PROBE_ATTEMPTS, Duration::ZERO, || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                Err(format!("timeout #{n}"))
+            });
+        assert_eq!(result, Err("timeout #3".to_owned()));
+        assert_eq!(
+            calls.get(),
+            CLOCK_PROBE_ATTEMPTS,
+            "must attempt exactly the configured budget before failing"
+        );
+    }
+
+    #[test]
+    fn retry_transient_clamps_zero_attempts_to_one() {
+        let calls = std::cell::Cell::new(0u32);
+        let result: Result<&str, &str> = retry_transient(0, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            Err("nope")
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1, "zero attempts clamps to exactly one try");
     }
 }
