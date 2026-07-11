@@ -8059,6 +8059,39 @@ fn write_rust_native_failure_digest(
     Ok(())
 }
 
+/// Validate a per-node OS-version string collected for `nodes.tsv` evidence.
+///
+/// Evidence truth (§4.1, ledger 2026-07-11): a Linux/macOS/Windows node must
+/// yield a real, attributable distro+version. A transient first-connection SSH
+/// probe used to degrade silently to a bare platform placeholder
+/// (`"linux"`/`"macos"`/`"windows"`), which the run-matrix finalizer then
+/// refused — silently dropping the ENTIRE per-node append so even a green run
+/// left no §10.9 row. This fails loud, early, and attributably against the
+/// single `normalize_os_family` authority instead. Unsupported-by-design mobile
+/// adapters (iOS/Android) do not assert attributable OS evidence and are exempt.
+fn validate_collected_os_version(
+    platform: VmGuestPlatform,
+    alias: &str,
+    version: &str,
+) -> Result<(), String> {
+    if !matches!(
+        platform,
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+    ) {
+        return Ok(());
+    }
+    let platform_str = format!("{platform:?}").to_ascii_lowercase();
+    crate::live_lab_run_matrix::normalize_os_family(&platform_str, version).map_err(|err| {
+        format!(
+            "node '{alias}': OS-version probe did not resolve an attributable distro+version \
+             (got '{version}'): {err}. The read-only SSH probe likely failed transiently after \
+             retries; refusing to record umbrella placeholder evidence that would silently void \
+             the run-matrix append."
+        )
+    })?;
+    Ok(())
+}
+
 fn execute_rust_native_orchestration(
     config: VmLabOrchestrateLiveLabConfig,
 ) -> Result<String, String> {
@@ -8497,23 +8530,7 @@ fn execute_rust_native_orchestration(
         std::collections::HashMap::with_capacity(ctx.adapters.len());
     for (alias, adapter) in &ctx.adapters {
         let version = adapter.collect_os_version();
-        let platform = adapter.platform();
-        if matches!(
-            platform,
-            VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
-        ) {
-            let platform_str = format!("{platform:?}").to_ascii_lowercase();
-            if let Err(err) =
-                crate::live_lab_run_matrix::normalize_os_family(&platform_str, &version)
-            {
-                return Err(format!(
-                    "node '{alias}': OS-version probe did not resolve an attributable \
-                     distro+version (got '{version}'): {err}. The read-only SSH probe likely \
-                     failed transiently after retries; refusing to record umbrella placeholder \
-                     evidence that would silently void the run-matrix append."
-                ));
-            }
-        }
+        validate_collected_os_version(adapter.platform(), alias, &version)?;
         os_versions.insert(alias.clone(), version);
     }
 
@@ -36585,9 +36602,10 @@ mod tests {
         select_inventory_entries, select_live_ssh_host_from_utm_output,
         select_preferred_live_ssh_ip, selected_local_utm_readiness_from_report,
         should_skip_local_source_path, ssh_auth_probe_command, summarize_live_lab_report,
-        transition_local_utm_vm_with_process_probe, validate_live_lab_run_artifacts,
-        windows_bootstrap_helper_script_local_path, windows_diagnostics_helper_script_local_path,
-        windows_helper_script_remote_path, windows_relay_service_install_helper_script_local_path,
+        transition_local_utm_vm_with_process_probe, validate_collected_os_version,
+        validate_live_lab_run_artifacts, windows_bootstrap_helper_script_local_path,
+        windows_diagnostics_helper_script_local_path, windows_helper_script_remote_path,
+        windows_relay_service_install_helper_script_local_path,
         windows_relay_service_uninstall_helper_script_local_path,
         windows_service_host_smoke_helper_script_local_path,
         windows_service_install_helper_script_local_path,
@@ -36601,6 +36619,63 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn validate_collected_os_version_accepts_real_desktop_versions() {
+        // Regression (ledger 2026-07-11): a real fetched distro+version must pass
+        // so a green `--node` run records its §10.9 evidence row.
+        assert!(
+            validate_collected_os_version(
+                VmGuestPlatform::Linux,
+                "debian-1",
+                "Debian GNU/Linux 12 (bookworm) (x86_64)"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_collected_os_version(VmGuestPlatform::Macos, "mac-1", "macOS 14.5 (arm64)")
+                .is_ok()
+        );
+        assert!(
+            validate_collected_os_version(
+                VmGuestPlatform::Windows,
+                "win-1",
+                "Windows [Version 10.0.22631.3737]"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_collected_os_version_rejects_bare_platform_placeholder() {
+        // The transient-SSH fallback placeholder must fail loud, early, and name
+        // the offending node — not silently void the whole run-matrix append.
+        let err =
+            validate_collected_os_version(VmGuestPlatform::Linux, "debian-headless-4", "linux")
+                .expect_err("bare 'linux' umbrella placeholder must be rejected");
+        assert!(
+            err.contains("debian-headless-4"),
+            "error must name the offending node: {err}"
+        );
+        assert!(
+            validate_collected_os_version(VmGuestPlatform::Macos, "mac-1", "macos").is_err(),
+            "bare 'macos' placeholder (no version) must be rejected"
+        );
+        assert!(
+            validate_collected_os_version(VmGuestPlatform::Windows, "win-1", "windows").is_err(),
+            "bare 'windows' placeholder (no version) must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_collected_os_version_exempts_unsupported_mobile_adapters() {
+        // iOS/Android are unsupported-by-design and do not assert attributable OS
+        // evidence, so their default placeholder must NOT hard-fail collection.
+        assert!(validate_collected_os_version(VmGuestPlatform::Ios, "ios-1", "ios").is_ok());
+        assert!(
+            validate_collected_os_version(VmGuestPlatform::Android, "android-1", "android").is_ok()
+        );
+    }
 
     #[test]
     fn macos_membership_capabilities_grants_anchor_for_exit() {
