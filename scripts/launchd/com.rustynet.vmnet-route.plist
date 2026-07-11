@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Self-healing route keeper for the UTM vmnet-shared lab subnet(s).
+  Re-asserts the connected route (192.168.64.0/24 -> bridge100, etc.) whenever
+  it is missing, so host->guest never silently misroutes out en0.
+
+  Install once (operator, needs sudo):
+    sudo mkdir -p /usr/local/lib/rustynet
+    sudo install -m 0755 scripts/vm_lab/ensure_vmnet_route.sh \
+        /usr/local/lib/rustynet/ensure_vmnet_route.sh
+    sudo install -m 0644 scripts/launchd/com.rustynet.vmnet-route.plist \
+        /Library/LaunchDaemons/com.rustynet.vmnet-route.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.vmnet-route.plist
+
+  Uninstall:
+    sudo launchctl bootout system/com.rustynet.vmnet-route
+    sudo rm /Library/LaunchDaemons/com.rustynet.vmnet-route.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rustynet.vmnet-route</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/usr/local/lib/rustynet/ensure_vmnet_route.sh</string>
+    </array>
+    <!-- Run at load and every 30s; the script is idempotent and cheap. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>30</integer>
+    <!-- Also re-run when the system routing/interface state changes. -->
+    <key>WatchPaths</key>
+    <array>
+        <string>/etc/resolv.conf</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/var/log/rustynet-vmnet-route.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/rustynet-vmnet-route.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
