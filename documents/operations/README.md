@@ -96,6 +96,7 @@ Cross-platform code-quality ledger:
 - [HeterogeneousLiveLabRunbook.md](./HeterogeneousLiveLabRunbook.md)
 - [LinuxDaemonValidatorRunbook.md](./LinuxDaemonValidatorRunbook.md)
 - [LiveLabVmConnectivityRulebook.md](./LiveLabVmConnectivityRulebook.md) — security-first VM-network architecture: dual-plane management + controlled scenario NICs, unique lab-subnet IPs, deterministic/physical/remote evidence tiers, MCP integration audit, and Rust profile/apply roadmap
+- [VmLabNetworkStandard.md](./VmLabNetworkStandard.md) — **the operational network standard + new-VM onboarding runbook**: one standard (UTM Shared + vmnet's stable per-MAC DHCP + a self-healing host route + host NAT), the one privileged setup step (the route-keeper launchd job), the few-step onboarding checklist, the macOS gotchas (vmnet route loss, raw-TCP LNP false-negative, plist-vs-running), and the verified dead-ends (vmnet ignores `/etc/bootptab`; per-guest static is fragile). Helper `scripts/vm_lab/ensure_vmnet_route.sh` + `scripts/launchd/com.rustynet.vmnet-route.plist`
 - [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md)
 - [LiveLabRunMatrix.md](./LiveLabRunMatrix.md) — append-only CSV-backed evidence ledger for LiveLab OS/role/stage coverage and regression commits
 - [MacosInstallRunbook.md](./MacosInstallRunbook.md) — manual install procedure, known gotchas (pf SSH block, EROFS socket path, disk space, boringtun submodule)
