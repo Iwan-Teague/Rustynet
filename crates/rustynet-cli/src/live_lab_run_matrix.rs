@@ -669,7 +669,13 @@ fn node_stage_scope(planned: &NodeStagePlanEntry) -> Result<&'static str, String
     }
 }
 
-fn normalize_os_family(platform: &str, os_version: &str) -> Result<String, String> {
+/// Map a fetched `(platform, os_version)` pair to a canonical OS family, or
+/// reject it. This is the single authority for "is this an attributable
+/// distro+version?" — the run-matrix finalizer uses it per node, and the native
+/// orchestrator's OS-version collection uses it to fail loud early (rather than
+/// recording a bare umbrella placeholder that would silently drop the whole
+/// evidence append at finalization). Keep both call sites on this one function.
+pub(crate) fn normalize_os_family(platform: &str, os_version: &str) -> Result<String, String> {
     let platform = normalize_platform(platform);
     let lower = os_version.to_ascii_lowercase();
     let family = if platform == "macos" || lower.contains("macos") {
@@ -2446,11 +2452,52 @@ mod tests {
     use super::{
         DEFAULT_MATRIX_COLUMNS, LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome,
         NodeRow, StageEvidence, TargetEvidence, build_live_lab_run_matrix_values, csv_escape,
-        parse_csv_record, populate_cross_os_values, populate_role_result_values,
-        populate_stage_values, render_csv_row, set_special_stage_values, validate_target_evidence,
+        normalize_os_family, parse_csv_record, populate_cross_os_values,
+        populate_role_result_values, populate_stage_values, render_csv_row,
+        set_special_stage_values, validate_target_evidence,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
+
+    #[test]
+    fn normalize_os_family_rejects_bare_platform_umbrella_placeholders() {
+        // Regression (ledger 2026-07-11): a transient OS-version SSH probe used
+        // to degrade to a bare platform placeholder, and normalize_os_family
+        // must keep rejecting it so umbrella evidence never lands in the matrix.
+        assert!(
+            normalize_os_family("linux", "linux").is_err(),
+            "bare 'linux' umbrella must be rejected"
+        );
+        // macos/windows placeholders name a family but carry no version number.
+        assert!(
+            normalize_os_family("macos", "macos").is_err(),
+            "bare 'macos' placeholder lacks a version and must be rejected"
+        );
+        assert!(
+            normalize_os_family("windows", "windows").is_err(),
+            "bare 'windows' placeholder lacks a version and must be rejected"
+        );
+    }
+
+    #[test]
+    fn normalize_os_family_accepts_real_fetched_distro_versions() {
+        assert_eq!(
+            normalize_os_family("linux", "Debian GNU/Linux 12 (bookworm) (x86_64)").unwrap(),
+            "debian"
+        );
+        assert_eq!(
+            normalize_os_family("linux", "Fedora Linux 40 (Server Edition) (aarch64)").unwrap(),
+            "fedora"
+        );
+        assert_eq!(
+            normalize_os_family("macos", "macOS 14.5 (arm64)").unwrap(),
+            "macos"
+        );
+        assert_eq!(
+            normalize_os_family("windows", "Windows [Version 10.0.22631.3737]").unwrap(),
+            "windows"
+        );
+    }
 
     #[test]
     fn every_registry_stage_column_reference_exists_in_the_csv_schema() {

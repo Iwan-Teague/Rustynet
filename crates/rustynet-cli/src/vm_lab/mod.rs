@@ -8484,12 +8484,36 @@ fn execute_rust_native_orchestration(
         ctx.adapters.insert(assignment.alias.clone(), adapter);
     }
 
-    // Collect per-node OS version strings for nodes.tsv evidence. Best-effort:
-    // an adapter that can't probe its OS version returns the platform name.
+    // Collect per-node OS version strings for nodes.tsv evidence. This must be a
+    // real, attributable distro+version: the probe retries transient SSH, and a
+    // bare platform placeholder ("linux"/"macos"/"windows") is rejected here and
+    // now. Previously a transient first-connection SSH failure degraded silently
+    // to the placeholder, which the run-matrix finalizer then refused as
+    // Linux-umbrella evidence — silently dropping the ENTIRE matrix append so
+    // even a green run left no §10.9 row (ledger 2026-07-11). Fail loud, early,
+    // and attributably instead. Unsupported-by-design mobile adapters do not
+    // assert attributable OS evidence, so they are exempt from the hard check.
     let mut os_versions: std::collections::HashMap<String, String> =
         std::collections::HashMap::with_capacity(ctx.adapters.len());
     for (alias, adapter) in &ctx.adapters {
         let version = adapter.collect_os_version();
+        let platform = adapter.platform();
+        if matches!(
+            platform,
+            VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+        ) {
+            let platform_str = format!("{platform:?}").to_ascii_lowercase();
+            if let Err(err) =
+                crate::live_lab_run_matrix::normalize_os_family(&platform_str, &version)
+            {
+                return Err(format!(
+                    "node '{alias}': OS-version probe did not resolve an attributable \
+                     distro+version (got '{version}'): {err}. The read-only SSH probe likely \
+                     failed transiently after retries; refusing to record umbrella placeholder \
+                     evidence that would silently void the run-matrix append."
+                ));
+            }
+        }
         os_versions.insert(alias.clone(), version);
     }
 

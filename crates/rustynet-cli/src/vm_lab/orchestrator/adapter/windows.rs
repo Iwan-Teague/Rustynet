@@ -50,10 +50,16 @@ impl NodeAdapter for WindowsNodeAdapter {
 
     fn collect_os_version(&self) -> String {
         use crate::vm_lab::orchestrator::adapter::ssh;
-        ssh::run_remote(
+        // Retry the read-only probe so a transient first-connection SSH timeout
+        // does not degrade to the bare "windows" placeholder (which the
+        // run-matrix finalizer rejects for lacking a version number). See ledger
+        // 2026-07-11.
+        ssh::run_remote_retrying(
             &self.conn,
             "cmd /d /c \"ver & echo Architecture=%PROCESSOR_ARCHITECTURE%\"",
             Duration::from_secs(10),
+            3,
+            Duration::from_millis(500),
         )
         .map(|v| format!("Windows {}", v.trim()))
         .unwrap_or_else(|_| "windows".to_owned())
