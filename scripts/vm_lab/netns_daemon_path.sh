@@ -74,11 +74,11 @@ WG_IFACE="rustynet0"
 # the router DNATs the WG UDP port range back to the endpoint, so each peer is
 # statically reachable (and port-stable) at <router_wan_ip>:<listen_port>. These
 # match netns_internet_sim.sh's build_site(): site index 1 (A) router WAN =
-# 100.64.0.11, site 2 (B) = 100.64.0.12.
+# 198.18.0.11, site 2 (B) = 198.18.0.12 (canonical 198.18.0.0/15 transit).
 EP_A_NS="rnsim-ep-A"
 EP_B_NS="rnsim-ep-B"
-EP_A_ENDPOINT="100.64.0.11:${WG_PORT}"
-EP_B_ENDPOINT="100.64.0.12:${WG_PORT}"
+EP_A_ENDPOINT="${EP_A_WAN:-198.18.0.11}:${WG_PORT}"
+EP_B_ENDPOINT="${EP_B_WAN:-198.18.0.12}:${WG_PORT}"
 
 RUSTYNETD_BIN="$(command -v rustynetd || true)"
 RUSTYNET_BIN="$(command -v rustynet || true)"

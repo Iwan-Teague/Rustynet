@@ -1,0 +1,30 @@
+# Tier 2 same-site variant (rulebook §6 Tier 2 / §7 "Same-LAN mesh and role
+# parity"): dual-plane VMs whose scenario NICs share ONE isolated lab fabric —
+# same-LAN direct-path and role-parity proof without the VXLAN router hop.
+# Mutation toward this profile is Slice B work behind an explicit prepare
+# transaction; this manifest only declares the target for audit/preflight.
+schema_version = 1
+id = "isolated_multivm_samesite_v1"
+evidence_tier = "multi_vm"
+description = "Isolated multi-VM dual-plane profile, same-site variant: one isolated scenario fabric shared by all VMs for same-LAN direct-path and role-parity evidence."
+
+[management]
+attachment = "host_only_or_shared"
+internet = false
+peer_to_peer = false
+security_mode = "quarantined"
+
+[scenario]
+substrate = "isolated_lan"
+address_family = "dual_stack"
+internet_mode = "simulated"
+require_unique_site_subnets = false
+site_subnet_pool = "172.20.0.0/16"
+site_prefix_len = 24
+transit_subnet = "198.18.0.0/15"
+
+[evidence]
+require_endpoint_capture = true
+require_router_capture = false
+require_negative_reachability = true
+forbid_socks_proxy = true

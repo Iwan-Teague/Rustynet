@@ -1,0 +1,29 @@
+# Tier 1: deterministic Linux netns NAT/firewall/path-selection regression
+# substrate (rulebook §6 Tier 1). Transit uses the canonical IANA benchmarking
+# range 198.18.0.0/15; the legacy simulator WAN 100.64.0.0/24 collides with the
+# Rustynet mesh 100.64.0.0/10 and is only valid under cgnat_collision_v1.
+schema_version = 1
+id = "crossnet_netns_v1"
+evidence_tier = "netns"
+description = "Deterministic Linux netns endpoint/router topology for NAT, conntrack, loss, and path-selection regression gates."
+
+[management]
+attachment = "shared"
+internet = true
+peer_to_peer = false
+security_mode = "routine"
+
+[scenario]
+substrate = "netns"
+address_family = "v4_only"
+internet_mode = "simulated"
+require_unique_site_subnets = true
+site_subnet_pool = "172.20.0.0/16"
+site_prefix_len = 24
+transit_subnet = "198.18.0.0/15"
+
+[evidence]
+require_endpoint_capture = true
+require_router_capture = true
+require_negative_reachability = true
+forbid_socks_proxy = true

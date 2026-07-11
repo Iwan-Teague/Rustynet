@@ -4,7 +4,22 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-pub struct ValidateBaselineRuntimeStage;
+pub struct ValidateBaselineRuntimeStage {
+    max_parallel_node_workers: usize,
+    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ValidateBaselineRuntimeStage {
+    pub fn new(
+        max_parallel_node_workers: usize,
+        shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            max_parallel_node_workers: max_parallel_node_workers.max(1),
+            shutdown_flag,
+        }
+    }
+}
 
 impl OrchestrationStage for ValidateBaselineRuntimeStage {
     fn id(&self) -> StageId {
@@ -38,9 +53,11 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
 
         // Collect pass: gather all results before any mutation
-        let all_results: Vec<(String, Vec<Result<bool, String>>)> = aliases
-            .iter()
-            .map(|alias| {
+        let all_results = crate::vm_lab::orchestrator::parallel::bounded_parallel_map_cancellable(
+            &aliases,
+            self.max_parallel_node_workers,
+            &self.shutdown_flag,
+            |alias| {
                 let op_results: Vec<Result<bool, String>> = OPS
                     .iter()
                     .map(|&op| match ctx.adapters.get(alias.as_str()) {
@@ -52,8 +69,16 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
                     })
                     .collect();
                 (alias.clone(), op_results)
-            })
-            .collect();
+            },
+            |alias| {
+                (
+                    alias.clone(),
+                    OPS.iter()
+                        .map(|_| Err("cancelled before node work was admitted".to_owned()))
+                        .collect(),
+                )
+            },
+        );
 
         use crate::vm_lab::orchestrator::report::ValidatorResult;
         use std::collections::HashMap;
@@ -124,7 +149,11 @@ mod tests {
             orchestrator_dialect: None,
         };
         assert_eq!(
-            ValidateBaselineRuntimeStage.execute(&mut ctx),
+            ValidateBaselineRuntimeStage::new(
+                1,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .execute(&mut ctx),
             StageOutcome::Passed
         );
     }

@@ -974,16 +974,7 @@ fn write_temp_file(
     suffix: &str,
     content: &[u8],
 ) -> Result<std::path::PathBuf, AdapterError> {
-    use std::io::Write;
-    let mut path = std::env::temp_dir();
-    path.push(format!("{prefix}{}{suffix}", std::process::id()));
-    let mut file = std::fs::File::create(&path).map_err(|err| AdapterError::Io {
-        message: format!("create temp file failed: {err}"),
-    })?;
-    file.write_all(content).map_err(|err| AdapterError::Io {
-        message: format!("write temp file failed: {err}"),
-    })?;
-    Ok(path)
+    super::write_secure_temp_file(prefix, suffix, content)
 }
 
 // Single source of truth shared with `relay_validation` (the stage that

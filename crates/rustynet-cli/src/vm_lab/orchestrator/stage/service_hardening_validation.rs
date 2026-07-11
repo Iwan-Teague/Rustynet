@@ -1,17 +1,9 @@
 #![allow(dead_code)]
-use crate::vm_lab::LINUX_RUSTYNETD_PATH;
-use crate::vm_lab::VmGuestPlatform;
-use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
+use crate::vm_lab::orchestrator::adapter::node_adapter::RoleValidatorKind;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
-use crate::vm_lab::orchestrator::role_validation::service_hardening::{
-    service_hardening_runtime_implemented, validate_linux_service_hardening,
-    validate_macos_service_hardening, validate_windows_service_hardening,
-};
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
-
-const WINDOWS_RUSTYNETD_PATH: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
 
 const REPORTED_SKIPS_FILENAME: &str = "service_hardening_validation.reported_skips.json";
 
@@ -62,39 +54,11 @@ impl OrchestrationStage for ServiceHardeningValidationStage {
                 }
             };
             let platform = adapter.platform();
-            if !service_hardening_runtime_implemented(platform) {
+            if !adapter.supports_role_validator(RoleValidatorKind::ServiceHardening) {
                 reported_skips.push((alias.clone(), format!("{platform:?}")));
                 continue;
             }
-            let shell = match adapter.shell_host() {
-                Ok(shell) => shell,
-                Err(e) => {
-                    failures.push(format!("{alias}: shell host unavailable: {e}"));
-                    continue;
-                }
-            };
-            let daemon_path = match platform {
-                VmGuestPlatform::Linux => LINUX_RUSTYNETD_PATH,
-                VmGuestPlatform::Macos => MACOS_RUSTYNETD_PATH,
-                VmGuestPlatform::Windows => WINDOWS_RUSTYNETD_PATH,
-                _ => {
-                    reported_skips.push((alias.clone(), format!("{platform:?}")));
-                    continue;
-                }
-            };
-            let result = match platform {
-                VmGuestPlatform::Linux => {
-                    validate_linux_service_hardening(&*shell, daemon_path, alias)
-                }
-                VmGuestPlatform::Macos => {
-                    validate_macos_service_hardening(&*shell, daemon_path, alias)
-                }
-                VmGuestPlatform::Windows => {
-                    validate_windows_service_hardening(&*shell, daemon_path, alias)
-                }
-                _ => unreachable!("non-desktop platform filtered above"),
-            };
-            if let Err(e) = result {
+            if let Err(e) = adapter.run_role_validator(RoleValidatorKind::ServiceHardening) {
                 failures.push(format!("{alias}: {e}"));
             }
         }

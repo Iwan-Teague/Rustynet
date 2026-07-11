@@ -41,6 +41,10 @@ pub enum StageOutcomeRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub alias: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub node_id: String,
     pub platform: String,
     pub role: String,
     pub validator_results: Vec<ValidatorResult>,

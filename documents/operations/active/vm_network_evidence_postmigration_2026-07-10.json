@@ -1,0 +1,824 @@
+{
+  "schema_version": 1,
+  "tool": "vm-lab-network-audit",
+  "read_only": true,
+  "generated_at_epoch_secs": 1783721235,
+  "git_commit": "b775156872e73a01355db1f3d6d1ea5db99c815d",
+  "git_dirty": true,
+  "validated_profiles": [
+    {
+      "id": "cgnat_collision_v1",
+      "digest": "sha256:ada7e078b25ea6f850f7529cecfdfdab7d18d5dcdedefef7ddc1bd63bc753345",
+      "evidence_tier": "netns"
+    },
+    {
+      "id": "crossnet_netns_v1",
+      "digest": "sha256:3d0778758f39ccd06323f5d738bf2ea871cbcaf8345888758d7725689c20c78c",
+      "evidence_tier": "netns"
+    },
+    {
+      "id": "isolated_multivm_samesite_v1",
+      "digest": "sha256:199d127ea6be7d5aedd3bdd2b5fea122bb7b7921151f13ad51132c7c864019f1",
+      "evidence_tier": "multi_vm"
+    },
+    {
+      "id": "isolated_multivm_v1",
+      "digest": "sha256:2a358be527e562abc88222c21b7479601b7d60f47932d22ad6799355453a3354",
+      "evidence_tier": "multi_vm"
+    },
+    {
+      "id": "mgmt_shared_smoke_v1",
+      "digest": "sha256:ab06a230edea88e605e3a81c6d0d1a5d413e65d1e8cd6771c93dccc92f4f67e4",
+      "evidence_tier": "management_only"
+    }
+  ],
+  "host": {
+    "utm_version": "4.6.5",
+    "interfaces": [
+      {
+        "name": "lo0",
+        "ipv4": [
+          "127.0.0.1"
+        ],
+        "ipv6_count": 2
+      },
+      {
+        "name": "gif0",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "stf0",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "anpi1",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "anpi0",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "anpi3",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "en4",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "en5",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "en6",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "en1",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "en2",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "en3",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "bridge0",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "ap1",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "en0",
+        "ipv4": [
+          "192.168.0.99",
+          "10.230.76.56"
+        ],
+        "ipv6_count": 1
+      },
+      {
+        "name": "awdl0",
+        "ipv4": [],
+        "ipv6_count": 1
+      },
+      {
+        "name": "llw0",
+        "ipv4": [],
+        "ipv6_count": 1
+      },
+      {
+        "name": "utun0",
+        "ipv4": [],
+        "ipv6_count": 1
+      },
+      {
+        "name": "utun1",
+        "ipv4": [],
+        "ipv6_count": 1
+      },
+      {
+        "name": "utun2",
+        "ipv4": [],
+        "ipv6_count": 1
+      },
+      {
+        "name": "utun3",
+        "ipv4": [],
+        "ipv6_count": 1
+      },
+      {
+        "name": "utun4",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "utun5",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "utun6",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "pktap0",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "utun7",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "utun8",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "utun9",
+        "ipv4": [
+          "100.86.234.84"
+        ],
+        "ipv6_count": 2
+      },
+      {
+        "name": "vmenet0",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "bridge100",
+        "ipv4": [
+          "192.168.64.1"
+        ],
+        "ipv6_count": 2
+      },
+      {
+        "name": "vmenet1",
+        "ipv4": [],
+        "ipv6_count": 0
+      },
+      {
+        "name": "vmenet2",
+        "ipv4": [],
+        "ipv6_count": 0
+      }
+    ],
+    "routes": [
+      {
+        "destination": "default",
+        "interface": "utun9"
+      },
+      {
+        "destination": "default",
+        "interface": "en0"
+      },
+      {
+        "destination": "default",
+        "interface": "bridge100"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "10.230.76.0/24",
+        "interface": "en0"
+      },
+      {
+        "destination": "10.230.76.56/32",
+        "interface": "en0"
+      },
+      {
+        "destination": "10.230.76.56/32",
+        "interface": "lo0"
+      },
+      {
+        "destination": "10.230.76.57/32",
+        "interface": "en0"
+      },
+      {
+        "destination": "10.230.76.58/32",
+        "interface": "en0"
+      },
+      {
+        "destination": "10.230.76.59/32",
+        "interface": "en0"
+      },
+      {
+        "destination": "10.230.76.157/32",
+        "interface": "en0"
+      },
+      {
+        "destination": "10.230.76.157/32",
+        "interface": "en0"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "100.64.0.0/10",
+        "interface": "utun9"
+      },
+      {
+        "destination": "100.86.234.84/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "100.100.100.100/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "100.100.100.100/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "100.123.146.3/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "127.0.0.0/8",
+        "interface": "lo0"
+      },
+      {
+        "destination": "127.0.0.1/32",
+        "interface": "lo0"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "169.254.0.0/16",
+        "interface": "en0"
+      },
+      {
+        "destination": "192.168.0.0/24",
+        "interface": "en0"
+      },
+      {
+        "destination": "192.168.64.0/24",
+        "interface": "en0"
+      },
+      {
+        "destination": "192.168.64.1/32",
+        "interface": "lo0"
+      },
+      {
+        "destination": "192.168.64.4/32",
+        "interface": "bridge100"
+      },
+      {
+        "destination": "192.168.64.10/32",
+        "interface": "bridge100"
+      },
+      {
+        "destination": "192.168.64.14/32",
+        "interface": "bridge100"
+      },
+      {
+        "destination": "192.168.64.20/32",
+        "interface": "bridge100"
+      },
+      {
+        "destination": "192.168.64.22/32",
+        "interface": "bridge100"
+      },
+      {
+        "destination": "public-redacted/4",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/4",
+        "interface": "en0"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "bridge100"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "en0"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "utun9"
+      },
+      {
+        "destination": "public-redacted/32",
+        "interface": "en0"
+      }
+    ],
+    "default_route_interface": "utun9",
+    "vpn_utun_interfaces": [
+      "utun0",
+      "utun1",
+      "utun2",
+      "utun3",
+      "utun4",
+      "utun5",
+      "utun6",
+      "utun7",
+      "utun8",
+      "utun9"
+    ],
+    "full_tunnel_vpn_suspected": true,
+    "proxy": {
+      "socks_enabled": false,
+      "http_enabled": false,
+      "https_enabled": false
+    }
+  },
+  "vms": [
+    {
+      "inventory_alias": "debian-headless-2",
+      "utm_name": "debian-headless-2",
+      "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/debian-headless-2.utm",
+      "backend": "qemu",
+      "configuration_version": 4,
+      "power_state": "stopped",
+      "nics": [
+        {
+          "index": 0,
+          "mode": "shared",
+          "mac": "3e:ae:a9:5a:61:82",
+          "hardware": "virtio-net-pci",
+          "isolate_from_host": false,
+          "port_forward_count": 0
+        }
+      ]
+    },
+    {
+      "inventory_alias": "debian-headless-4",
+      "utm_name": "debian-headless-4",
+      "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/debian-headless-4.utm",
+      "backend": "qemu",
+      "configuration_version": 4,
+      "power_state": "started",
+      "nics": [
+        {
+          "index": 0,
+          "mode": "shared",
+          "mac": "3e:ae:a9:5a:61:84",
+          "hardware": "virtio-net-pci",
+          "isolate_from_host": false,
+          "port_forward_count": 0
+        }
+      ]
+    },
+    {
+      "inventory_alias": "macos-utm-1",
+      "utm_name": "macOS",
+      "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/macOS.utm",
+      "backend": "apple",
+      "configuration_version": 4,
+      "power_state": "stopped",
+      "nics": [
+        {
+          "index": 0,
+          "mode": "shared",
+          "mac": "32:6b:39:df:d7:4e"
+        }
+      ]
+    },
+    {
+      "inventory_alias": "windows-utm-1",
+      "utm_name": "Windows",
+      "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/Windows.utm",
+      "backend": "qemu",
+      "configuration_version": 4,
+      "power_state": "started",
+      "nics": [
+        {
+          "index": 0,
+          "mode": "shared",
+          "mac": "7a:f1:41:67:e3:a7",
+          "hardware": "virtio-net-pci",
+          "isolate_from_host": false,
+          "port_forward_count": 0
+        }
+      ]
+    },
+    {
+      "inventory_alias": "fedora-utm-1",
+      "utm_name": "Fedora",
+      "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/Fedora.utm",
+      "backend": "qemu",
+      "configuration_version": 4,
+      "power_state": "started",
+      "nics": [
+        {
+          "index": 0,
+          "mode": "shared",
+          "mac": "7a:c9:3c:84:1b:99",
+          "hardware": "virtio-net-pci",
+          "isolate_from_host": false,
+          "port_forward_count": 0
+        }
+      ]
+    },
+    {
+      "inventory_alias": "ubuntu-utm-1",
+      "utm_name": "ubuntu",
+      "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/ubuntu.utm",
+      "backend": "qemu",
+      "configuration_version": 4,
+      "power_state": "stopped",
+      "nics": [
+        {
+          "index": 0,
+          "mode": "shared",
+          "mac": "a2:dc:f9:9b:0c:8a",
+          "hardware": "virtio-net-pci",
+          "isolate_from_host": false,
+          "port_forward_count": 0
+        }
+      ]
+    },
+    {
+      "inventory_alias": "rocky-utm-1",
+      "utm_name": "rocky_10",
+      "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/rocky_10.utm",
+      "backend": "qemu",
+      "configuration_version": 4,
+      "power_state": "stopped",
+      "nics": [
+        {
+          "index": 0,
+          "mode": "shared",
+          "mac": "16:d6:ef:da:5c:bd",
+          "hardware": "virtio-net-pci",
+          "isolate_from_host": false,
+          "port_forward_count": 0
+        }
+      ]
+    }
+  ],
+  "unmanaged_utm_vms": [
+    "CentOS",
+    "Rocky",
+    "Windows XP",
+    "Windows XP Harness"
+  ],
+  "guests": [
+    {
+      "alias": "debian-headless-2",
+      "status": "skipped",
+      "interfaces": [],
+      "dns_servers": []
+    },
+    {
+      "alias": "debian-headless-4",
+      "status": "skipped",
+      "interfaces": [],
+      "dns_servers": []
+    },
+    {
+      "alias": "macos-utm-1",
+      "status": "skipped",
+      "interfaces": [],
+      "dns_servers": []
+    },
+    {
+      "alias": "windows-utm-1",
+      "status": "skipped",
+      "interfaces": [],
+      "dns_servers": []
+    },
+    {
+      "alias": "fedora-utm-1",
+      "status": "skipped",
+      "interfaces": [],
+      "dns_servers": []
+    },
+    {
+      "alias": "ubuntu-utm-1",
+      "status": "skipped",
+      "interfaces": [],
+      "dns_servers": []
+    },
+    {
+      "alias": "rocky-utm-1",
+      "status": "skipped",
+      "interfaces": [],
+      "dns_servers": []
+    }
+  ],
+  "inventory_path": "documents/operations/active/vm_lab_inventory.json",
+  "inventory_entries": [
+    {
+      "alias": "debian-headless-2",
+      "ssh_target_host": "192.168.64.4",
+      "last_known_ip": "192.168.64.4",
+      "last_known_network": "utm-shared-192.168.64.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
+      "mesh_ip": "100.64.0.2",
+      "utm_name": "debian-headless-2",
+      "has_local_utm_controller": true
+    },
+    {
+      "alias": "debian-headless-4",
+      "ssh_target_host": "192.168.64.10",
+      "last_known_ip": "192.168.64.10",
+      "last_known_network": "lan-192.168.0.0/24",
+      "network_group": "lan-192.168.0.0/24",
+      "mesh_ip": "100.64.0.4",
+      "utm_name": "debian-headless-4",
+      "has_local_utm_controller": true
+    },
+    {
+      "alias": "debian-lan-11",
+      "ssh_target_host": "debian-lan-11",
+      "last_known_ip": "192.168.0.11",
+      "last_known_network": "192.168.0.0/24",
+      "network_group": "lan-192.168.0.0/24",
+      "has_local_utm_controller": false
+    },
+    {
+      "alias": "macos-utm-1",
+      "ssh_target_host": "192.168.65.2",
+      "last_known_ip": "192.168.65.2",
+      "last_known_network": "lan-192.168.0.0/24",
+      "network_group": "lan-192.168.0.0/24",
+      "mesh_ip": "100.64.0.7",
+      "utm_name": "macOS",
+      "has_local_utm_controller": true
+    },
+    {
+      "alias": "windows-utm-1",
+      "ssh_target_host": "192.168.64.14",
+      "last_known_ip": "192.168.64.14",
+      "last_known_network": "lan-192.168.0.0/24",
+      "network_group": "lan-192.168.0.0/24",
+      "mesh_ip": "100.64.0.6",
+      "utm_name": "Windows",
+      "has_local_utm_controller": true
+    },
+    {
+      "alias": "fedora-utm-1",
+      "ssh_target_host": "192.168.64.20",
+      "last_known_ip": "192.168.64.20",
+      "last_known_network": "lan-10.230.76.0/24",
+      "network_group": "lan-10.230.76.0/24",
+      "mesh_ip": "100.64.0.8",
+      "utm_name": "Fedora",
+      "has_local_utm_controller": true
+    },
+    {
+      "alias": "ubuntu-utm-1",
+      "ssh_target_host": "10.230.76.57",
+      "last_known_ip": "10.230.76.57",
+      "last_known_network": "lan-10.230.76.0/24",
+      "network_group": "lan-10.230.76.0/24",
+      "mesh_ip": "100.64.0.9",
+      "utm_name": "ubuntu",
+      "has_local_utm_controller": true
+    },
+    {
+      "alias": "rocky-utm-1",
+      "ssh_target_host": "192.168.64.22",
+      "last_known_ip": "192.168.64.22",
+      "last_known_network": "utm-shared-192.168.64.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
+      "mesh_ip": "100.64.0.10",
+      "utm_name": "rocky_10",
+      "has_local_utm_controller": true
+    }
+  ],
+  "substrate_sources": [
+    {
+      "script_path": "scripts/vm_lab/netns_internet_sim.sh",
+      "declared_wan_cidr": "${WAN_CIDR:-198.18.0.0/24}",
+      "collides_with_mesh": false
+    }
+  ],
+  "backend_capabilities": [
+    {
+      "backend": "qemu",
+      "attachment": "shared",
+      "support": "supported"
+    },
+    {
+      "backend": "qemu",
+      "attachment": "host_only",
+      "support": "supported"
+    },
+    {
+      "backend": "qemu",
+      "attachment": "bridged",
+      "support": "supported"
+    },
+    {
+      "backend": "qemu",
+      "attachment": "emulated",
+      "support": "supported"
+    },
+    {
+      "backend": "apple",
+      "attachment": "shared",
+      "support": "supported"
+    },
+    {
+      "backend": "apple",
+      "attachment": "host_only",
+      "support": "not_supported"
+    },
+    {
+      "backend": "apple",
+      "attachment": "bridged",
+      "support": "supported"
+    },
+    {
+      "backend": "apple",
+      "attachment": "emulated",
+      "support": "not_supported"
+    }
+  ],
+  "multi_nic_support": {
+    "apple": "unproven",
+    "qemu": "supported"
+  },
+  "findings": [
+    {
+      "severity": "error",
+      "kind": "host_route_collision",
+      "subject": "utun9",
+      "detail": "host route 100.64.0.0/10 via utun9 (VPN) overlaps mesh (100.64.0.0/10)"
+    },
+    {
+      "severity": "error",
+      "kind": "host_route_collision",
+      "subject": "utun9",
+      "detail": "host route 100.86.234.84/32 via utun9 (VPN) overlaps mesh (100.64.0.0/10)"
+    },
+    {
+      "severity": "error",
+      "kind": "host_route_collision",
+      "subject": "utun9",
+      "detail": "host route 100.100.100.100/32 via utun9 (VPN) overlaps mesh (100.64.0.0/10)"
+    },
+    {
+      "severity": "error",
+      "kind": "host_route_collision",
+      "subject": "utun9",
+      "detail": "host route 100.100.100.100/32 via utun9 (VPN) overlaps mesh (100.64.0.0/10)"
+    },
+    {
+      "severity": "error",
+      "kind": "host_route_collision",
+      "subject": "utun9",
+      "detail": "host route 100.123.146.3/32 via utun9 (VPN) overlaps mesh (100.64.0.0/10)"
+    },
+    {
+      "severity": "error",
+      "kind": "stale_network_group",
+      "subject": "debian-headless-4",
+      "detail": "network_group \"lan-192.168.0.0/24\" does not contain the recorded address 192.168.64.10; the label is stale"
+    },
+    {
+      "severity": "error",
+      "kind": "stale_network_group",
+      "subject": "fedora-utm-1",
+      "detail": "network_group \"lan-10.230.76.0/24\" does not contain the recorded address 192.168.64.20; the label is stale"
+    },
+    {
+      "severity": "error",
+      "kind": "stale_network_group",
+      "subject": "macos-utm-1",
+      "detail": "network_group \"lan-192.168.0.0/24\" does not contain the recorded address 192.168.65.2; the label is stale"
+    },
+    {
+      "severity": "error",
+      "kind": "stale_network_group",
+      "subject": "windows-utm-1",
+      "detail": "network_group \"lan-192.168.0.0/24\" does not contain the recorded address 192.168.64.14; the label is stale"
+    },
+    {
+      "severity": "warning",
+      "kind": "host_full_tunnel_vpn",
+      "subject": "utun0,utun1,utun2,utun3,utun4,utun5,utun6,utun7,utun8,utun9",
+      "detail": "a full-tunnel VPN appears active on the host; Shared-attachment guest egress meaning depends on it and it must be recorded as an environmental condition"
+    },
+    {
+      "severity": "info",
+      "kind": "unmanaged_utm_vm",
+      "subject": "CentOS",
+      "detail": "UTM knows this VM but the lab inventory does not; it is outside lab management"
+    },
+    {
+      "severity": "info",
+      "kind": "unmanaged_utm_vm",
+      "subject": "Rocky",
+      "detail": "UTM knows this VM but the lab inventory does not; it is outside lab management"
+    },
+    {
+      "severity": "info",
+      "kind": "unmanaged_utm_vm",
+      "subject": "Windows XP",
+      "detail": "UTM knows this VM but the lab inventory does not; it is outside lab management"
+    },
+    {
+      "severity": "info",
+      "kind": "unmanaged_utm_vm",
+      "subject": "Windows XP Harness",
+      "detail": "UTM knows this VM but the lab inventory does not; it is outside lab management"
+    }
+  ],
+  "overall_status": "fail",
+  "status_reason": "9 error finding(s); see findings",
+  "evidence_limitations": [
+    "read-only audit: reports observed state; it proves no dataplane behavior",
+    "management reachability is not dataplane proof (rulebook §3)",
+    "single-host observation cannot prove remote-network independence"
+  ]
+}

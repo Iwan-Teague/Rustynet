@@ -61,7 +61,7 @@ pub fn init_membership_snapshot(
         conn,
         &format!(
             "sudo -n env RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID='{exit_node_id_arg}' \
-             rustynet ops init-membership"
+             /usr/local/bin/rustynet ops init-membership"
         ),
         MEDIUM_TIMEOUT,
     )?;
@@ -81,7 +81,7 @@ pub fn init_membership_snapshot(
         ssh::run_remote(
             conn,
             &format!(
-                "sudo -n rustynet ops e2e-membership-add \
+                "sudo -n /usr/local/bin/rustynet ops e2e-membership-add \
                  --client-node-id '{node_id_arg}' \
                  --client-pubkey-hex '{pubkey_arg}' \
                  --capabilities '{capabilities_arg}' \
@@ -174,6 +174,10 @@ pub fn distribute_verifier_key(
     kind: BundleKind,
     pub_key_path: &Path,
 ) -> Result<(), AdapterError> {
+    let expected_sha256 =
+        crate::vm_lab::orchestrator::adapter::verifier_key::validated_verifier_key_sha256(
+            pub_key_path,
+        )?;
     let dst = linux_verifier_key_path(&kind);
     let remote_tmp = "/tmp/rn-verifier-key.pub";
     ssh::scp_to(conn, pub_key_path, remote_tmp, MEDIUM_TIMEOUT)?;
@@ -183,7 +187,8 @@ pub fn distribute_verifier_key(
         &format!(
             "sudo -n install -d -m 0755 -o root -g root '{dst_dir}' && \
              sudo -n install -m 0644 -o root -g root '{remote_tmp}' '{dst}' && \
-             sudo -n rm -f '{remote_tmp}'"
+             sudo -n rm -f '{remote_tmp}' && \
+             test \"$(sudo -n sha256sum '{dst}' | awk '{{print $1}}')\" = '{expected_sha256}'"
         ),
         SHORT_TIMEOUT,
     )?;

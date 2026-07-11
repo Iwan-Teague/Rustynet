@@ -23,6 +23,28 @@ const SETUP_MANIFEST_RELATIVE_PATH: &str = "state/setup_manifest.json";
 const REPORT_STATE_RELATIVE_PATH: &str = "state/report_state.json";
 const STAGES_RELATIVE_PATH: &str = "state/stages.tsv";
 const NODES_RELATIVE_PATH: &str = "state/nodes.tsv";
+const NODE_STAGE_PLAN_RELATIVE_PATH: &str = "state/node_stage_plan.json";
+const NODE_STAGE_RESULTS_RELATIVE_PATH: &str = "state/live_lab_node_stage_results.csv";
+
+const NODE_STAGE_COLUMNS: &[&str] = &[
+    "run_id",
+    "run_started_utc",
+    "run_finished_utc",
+    "git_commit",
+    "git_dirty_state",
+    "report_dir",
+    "alias",
+    "node_id",
+    "platform",
+    "os_family",
+    "os_version",
+    "role",
+    "stage",
+    "stage_scope",
+    "status",
+    "evidence_path",
+    "error_detail",
+];
 
 const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "run_id",
@@ -283,6 +305,13 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "windows_anchor_alias",
     "windows_anchor_node_id",
     "windows_anchor_target",
+    "network_profile_id",
+    "network_profile_digest",
+    "network_management_mode",
+    "network_scenario_substrate",
+    "network_address_family",
+    "network_internet_mode",
+    "network_evidence_path",
     "row_role",
 ];
 
@@ -353,6 +382,8 @@ struct NodeRow {
     target: String,
     node_id: String,
     bootstrap_role: String,
+    platform: String,
+    os_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +401,19 @@ struct StageEvidence {
     stage: String,
     status: String,
     artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct NodeStagePlanFile {
+    schema_version: u64,
+    stages: Vec<NodeStagePlanEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct NodeStagePlanEntry {
+    stage: String,
+    fanout: String,
+    roles: Vec<String>,
 }
 
 pub fn default_live_lab_run_matrix_path() -> PathBuf {
@@ -454,6 +498,14 @@ pub fn append_live_lab_run_matrix_row(
     let matrix_path = default_live_lab_run_matrix_path();
     let schema = ensure_matrix_schema(matrix_path.as_path())?;
     let values = build_live_lab_run_matrix_values(&schema, &config)?;
+    if config.row_role == LiveLabRunMatrixRowRole::Final
+        && config
+            .report_dir
+            .join(NODE_STAGE_PLAN_RELATIVE_PATH)
+            .is_file()
+    {
+        write_node_stage_result_ledgers(config.report_dir, &values)?;
+    }
     let written = upsert_csv_row(matrix_path.as_path(), &schema, &values, config.row_role)?;
     let report_row_path = if written {
         write_report_local_row(config.report_dir, &schema, &values)?
@@ -467,6 +519,306 @@ pub fn append_live_lab_run_matrix_row(
         matrix_path,
         report_row_path,
         run_id,
+    })
+}
+
+pub fn default_live_lab_node_stage_matrix_path() -> PathBuf {
+    workspace_root_path().join("documents/operations/live_lab_node_stage_results.csv")
+}
+
+fn write_node_stage_result_ledgers(
+    report_dir: &Path,
+    run_values: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let plan_path = report_dir.join(NODE_STAGE_PLAN_RELATIVE_PATH);
+    let plan_body = fs::read_to_string(&plan_path).map_err(|err| {
+        format!(
+            "read node-stage plan failed ({}): {err}",
+            plan_path.display()
+        )
+    })?;
+    let plan: NodeStagePlanFile = serde_json::from_str(&plan_body).map_err(|err| {
+        format!(
+            "parse node-stage plan failed ({}): {err}",
+            plan_path.display()
+        )
+    })?;
+    if plan.schema_version != 1 {
+        return Err(format!(
+            "node-stage plan has unsupported schema_version={} ({})",
+            plan.schema_version,
+            plan_path.display()
+        ));
+    }
+
+    let nodes = read_node_rows(report_dir.join(NODES_RELATIVE_PATH).as_path())?;
+    if nodes.is_empty() {
+        return Err("node-stage evidence requires at least one nodes.tsv row".to_owned());
+    }
+    let stages = read_stage_evidence(report_dir.join(STAGES_RELATIVE_PATH).as_path())?;
+    let stage_summaries: BTreeMap<String, String> =
+        read_tsv_rows(report_dir.join(STAGES_RELATIVE_PATH).as_path())?
+            .into_iter()
+            .filter(|row| row.len() >= 6)
+            .map(|row| (row[0].clone(), row[5].clone()))
+            .collect();
+
+    let field = |name: &str| run_values.get(name).cloned().unwrap_or_default();
+    let run_id = field("run_id");
+    let run_started = field("run_started_utc");
+    let report_dir_value = field("report_dir");
+    if run_id.is_empty() || run_started.is_empty() || report_dir_value.is_empty() {
+        return Err(
+            "node-stage evidence requires non-empty run_id, run_started_utc, and report_dir"
+                .to_owned(),
+        );
+    }
+
+    let mut rows: Vec<BTreeMap<String, String>> = Vec::new();
+    for node in &nodes {
+        if node.platform.trim().is_empty() || node.os_version.trim().is_empty() {
+            return Err(format!(
+                "node-stage evidence for '{}' requires fetched platform + exact OS version in nodes.tsv",
+                node.label
+            ));
+        }
+        let os_family = normalize_os_family(&node.platform, &node.os_version)?;
+        for planned in &plan.stages {
+            if !planned.roles.is_empty()
+                && !planned
+                    .roles
+                    .iter()
+                    .any(|role| role == &node.bootstrap_role)
+            {
+                continue;
+            }
+            let Some(stage) = stages.iter().find(|stage| stage.stage == planned.stage) else {
+                return Err(format!(
+                    "node-stage evidence plan stage '{}' has no terminal stages.tsv row",
+                    planned.stage
+                ));
+            };
+            let stage_scope = node_stage_scope(planned)?;
+            let summary = stage_summaries
+                .get(&planned.stage)
+                .cloned()
+                .unwrap_or_default();
+            let status = attributable_node_status(
+                stage.status.as_str(),
+                stage_scope,
+                node.label.as_str(),
+                summary.as_str(),
+            );
+            let mut row = BTreeMap::new();
+            for (key, value) in [
+                ("run_id", run_id.clone()),
+                ("run_started_utc", run_started.clone()),
+                ("run_finished_utc", field("run_finished_utc")),
+                ("git_commit", field("git_commit")),
+                ("git_dirty_state", field("git_dirty_state")),
+                ("report_dir", report_dir_value.clone()),
+                ("alias", node.label.clone()),
+                ("node_id", node.node_id.clone()),
+                ("platform", normalize_platform(&node.platform)),
+                ("os_family", os_family.clone()),
+                ("os_version", node.os_version.clone()),
+                ("role", node.bootstrap_role.clone()),
+                ("stage", planned.stage.clone()),
+                ("stage_scope", stage_scope.to_owned()),
+                ("status", status.to_owned()),
+                (
+                    "evidence_path",
+                    stage.artifacts.first().cloned().unwrap_or_default(),
+                ),
+                (
+                    "error_detail",
+                    if matches!(status, "fail" | "not_proven") {
+                        summary
+                    } else {
+                        String::new()
+                    },
+                ),
+            ] {
+                row.insert(key.to_owned(), value);
+            }
+            rows.push(row);
+        }
+    }
+    if rows.is_empty() {
+        return Err("node-stage evidence produced zero rows".to_owned());
+    }
+
+    let local_path = report_dir.join(NODE_STAGE_RESULTS_RELATIVE_PATH);
+    write_node_stage_csv(&local_path, &rows)?;
+    upsert_node_stage_csv(
+        default_live_lab_node_stage_matrix_path().as_path(),
+        &run_id,
+        &report_dir_value,
+        &rows,
+    )
+}
+
+fn node_stage_scope(planned: &NodeStagePlanEntry) -> Result<&'static str, String> {
+    match (planned.roles.is_empty(), planned.fanout.as_str()) {
+        (false, "per_node" | "once") | (true, "per_node") => Ok("node"),
+        (true, "once") => Ok("topology"),
+        (_, other) => Err(format!(
+            "node-stage plan stage '{}' has unknown fanout '{other}'",
+            planned.stage
+        )),
+    }
+}
+
+fn normalize_os_family(platform: &str, os_version: &str) -> Result<String, String> {
+    let platform = normalize_platform(platform);
+    let lower = os_version.to_ascii_lowercase();
+    let family = if platform == "macos" || lower.contains("macos") {
+        "macos"
+    } else if platform == "windows" || lower.contains("windows") {
+        "windows"
+    } else if lower.contains("debian") {
+        "debian"
+    } else if lower.contains("rocky") {
+        "rocky"
+    } else if lower.contains("ubuntu") {
+        "ubuntu"
+    } else if lower.contains("fedora") {
+        "fedora"
+    } else {
+        return Err(format!(
+            "unrecognized OS family for fetched version '{os_version}' (platform={platform}); refusing Linux-umbrella evidence"
+        ));
+    };
+    if !os_version.chars().any(|ch| ch.is_ascii_digit()) {
+        return Err(format!(
+            "fetched OS evidence lacks a version number: '{os_version}'"
+        ));
+    }
+    Ok(family.to_owned())
+}
+
+fn attributable_node_status<'a>(
+    status: &'a str,
+    stage_scope: &str,
+    alias: &str,
+    summary: &str,
+) -> &'a str {
+    if status != "fail" || stage_scope != "node" {
+        return status;
+    }
+    if summary.contains(&format!("{alias}:")) || summary.contains(&format!("{alias}/")) {
+        "fail"
+    } else {
+        "not_proven"
+    }
+}
+
+fn write_node_stage_csv(path: &Path, rows: &[BTreeMap<String, String>]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("node-stage CSV path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create node-stage CSV directory failed ({}): {err}",
+            parent.display()
+        )
+    })?;
+    let mut body = format!("{}\n", NODE_STAGE_COLUMNS.join(","));
+    for row in rows {
+        body.push_str(&render_named_csv_row(NODE_STAGE_COLUMNS, row));
+        body.push('\n');
+    }
+    fs::write(path, body)
+        .map_err(|err| format!("write node-stage CSV failed ({}): {err}", path.display()))
+}
+
+fn render_named_csv_row(columns: &[&str], values: &BTreeMap<String, String>) -> String {
+    columns
+        .iter()
+        .map(|column| csv_escape(values.get(*column).cloned().unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn upsert_node_stage_csv(
+    path: &Path,
+    run_id: &str,
+    report_dir: &str,
+    rows: &[BTreeMap<String, String>],
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("node-stage matrix path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create node-stage matrix directory failed ({}): {err}",
+            parent.display()
+        )
+    })?;
+    if !path.exists() {
+        fs::write(path, format!("{}\n", NODE_STAGE_COLUMNS.join(","))).map_err(|err| {
+            format!(
+                "initialize node-stage matrix failed ({}): {err}",
+                path.display()
+            )
+        })?;
+    }
+    let _lock = acquire_matrix_append_lock(matrix_lock_path_for(path).as_path())?;
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("read node-stage matrix failed ({}): {err}", path.display()))?;
+    let mut lines = body.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| format!("node-stage matrix is empty: {}", path.display()))?;
+    if header != NODE_STAGE_COLUMNS.join(",") {
+        return Err(format!(
+            "node-stage matrix schema mismatch ({}); expected exact normalized schema",
+            path.display()
+        ));
+    }
+    let run_index = NODE_STAGE_COLUMNS
+        .iter()
+        .position(|column| *column == "run_id")
+        .unwrap_or(0);
+    let report_index = NODE_STAGE_COLUMNS
+        .iter()
+        .position(|column| *column == "report_dir")
+        .unwrap_or(5);
+    let mut retained = Vec::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let replace = parse_csv_record(line).is_ok_and(|fields| {
+            fields.get(run_index).map(String::as_str) == Some(run_id)
+                && fields.get(report_index).map(String::as_str) == Some(report_dir)
+        });
+        if !replace {
+            retained.push(line.to_owned());
+        }
+    }
+    let mut output = format!("{}\n", NODE_STAGE_COLUMNS.join(","));
+    for line in retained {
+        output.push_str(&line);
+        output.push('\n');
+    }
+    for row in rows {
+        output.push_str(&render_named_csv_row(NODE_STAGE_COLUMNS, row));
+        output.push('\n');
+    }
+    let tmp = {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(".tmp");
+        PathBuf::from(value)
+    };
+    fs::write(&tmp, output).map_err(|err| {
+        format!(
+            "write node-stage matrix tmp failed ({}): {err}",
+            tmp.display()
+        )
+    })?;
+    fs::rename(&tmp, path).map_err(|err| {
+        format!(
+            "replace node-stage matrix failed ({}): {err}",
+            path.display()
+        )
     })
 }
 
@@ -579,6 +931,7 @@ fn build_live_lab_run_matrix_values(
         target_evidence =
             target_evidence_from_parity(config.report_dir.join("parity_input.json").as_path())?;
     }
+    validate_target_evidence(&target_evidence, &node_rows)?;
     let mut stage_evidence =
         read_stage_evidence(config.report_dir.join(STAGES_RELATIVE_PATH).as_path())?;
     stage_evidence.extend(read_orchestrator_outcome_evidence(
@@ -598,8 +951,13 @@ fn build_live_lab_run_matrix_values(
             }),
     );
     dedupe_stage_evidence(&mut stage_evidence);
-    apply_conclusion_barrier(&mut stage_evidence, config.report_dir);
+    apply_conclusion_barrier(&mut stage_evidence, config.report_dir)?;
     let unregistered_note = unregistered_stage_note(&stage_evidence);
+    if let Some(ref defect) = unregistered_note {
+        return Err(format!(
+            "run evidence contains terminal stages outside the registry: {defect}"
+        ));
+    }
 
     let mut values = BTreeMap::new();
     set_if_present(
@@ -725,6 +1083,31 @@ fn build_live_lab_run_matrix_values(
         set_if_present(&mut values, &schema_set, "notes", notes);
     }
 
+    // Network-profile provenance (rulebook §10): the immutable per-run record
+    // written by the orchestrator at launch. Absent for legacy runs → blank.
+    let network_record = read_json_optional(
+        config
+            .report_dir
+            .join("orchestration/network_profile.json")
+            .as_path(),
+    )?;
+    for (column, key) in [
+        ("network_profile_id", "id"),
+        ("network_profile_digest", "digest"),
+        ("network_management_mode", "management_mode"),
+        ("network_scenario_substrate", "scenario_substrate"),
+        ("network_address_family", "address_family"),
+        ("network_internet_mode", "internet_mode"),
+        ("network_evidence_path", "network_evidence_path"),
+    ] {
+        set_if_present(
+            &mut values,
+            &schema_set,
+            column,
+            json_string_path(&network_record, &[key]).unwrap_or_default(),
+        );
+    }
+
     populate_target_identity_values(&mut values, &schema_set, &target_evidence);
     populate_stage_values(
         &mut values,
@@ -749,13 +1132,21 @@ fn build_live_lab_run_matrix_values(
 /// this way — a setup-only / validate-only / dry run legitimately records
 /// nothing for the stages it never intended to reach. Pre-manifest report
 /// dirs (or unreadable manifests) change nothing.
-fn apply_conclusion_barrier(stages: &mut Vec<StageEvidence>, report_dir: &Path) {
+fn apply_conclusion_barrier(
+    stages: &mut Vec<StageEvidence>,
+    report_dir: &Path,
+) -> Result<(), String> {
     let manifest = match crate::live_lab_stage_manifest::read_stage_manifest(report_dir) {
         Ok(Some(manifest)) => manifest,
-        Ok(None) | Err(_) => return,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            return Err(format!(
+                "read stage manifest for conclusion barrier failed: {err}"
+            ));
+        }
     };
     if manifest.run_mode != "full" {
-        return;
+        return Ok(());
     }
     let recorded: BTreeSet<String> = stages
         .iter()
@@ -774,6 +1165,7 @@ fn apply_conclusion_barrier(stages: &mut Vec<StageEvidence>, report_dir: &Path) 
             });
         }
     }
+    Ok(())
 }
 
 /// Recorder validation (Finding 1C): a recorded stage name the registry
@@ -959,6 +1351,8 @@ fn read_node_rows(path: &Path) -> Result<Vec<NodeRow>, String> {
             target: row[1].clone(),
             node_id: row[2].clone(),
             bootstrap_role: row[3].clone(),
+            platform: row.get(4).cloned().unwrap_or_default(),
+            os_version: row.get(5).cloned().unwrap_or_default(),
         })
         .collect())
 }
@@ -1093,7 +1487,11 @@ fn target_evidence_from_parity(path: &Path) -> Result<Vec<TargetEvidence>, Strin
                 .to_owned();
             TargetEvidence {
                 label: alias_value.clone(),
-                target: String::new(),
+                target: node
+                    .get("target")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
                 alias: alias_value.clone(),
                 platform: node
                     .get("platform")
@@ -1104,7 +1502,7 @@ fn target_evidence_from_parity(path: &Path) -> Result<Vec<TargetEvidence>, Strin
                     .get("node_id")
                     .and_then(|value| value.as_str())
                     .filter(|value| !value.trim().is_empty())
-                    .unwrap_or(alias_value.as_str())
+                    .unwrap_or("")
                     .to_owned(),
                 bootstrap_role: node
                     .get("role")
@@ -1117,6 +1515,45 @@ fn target_evidence_from_parity(path: &Path) -> Result<Vec<TargetEvidence>, Strin
         .collect::<Vec<_>>();
     targets.sort_by(|a, b| a.alias.cmp(&b.alias));
     Ok(targets)
+}
+
+fn validate_target_evidence(targets: &[TargetEvidence], nodes: &[NodeRow]) -> Result<(), String> {
+    if targets.is_empty() || nodes.is_empty() {
+        return Ok(());
+    }
+    for target in targets {
+        let node = nodes
+            .iter()
+            .find(|node| node.label == target.label || node.label == target.alias)
+            .ok_or_else(|| {
+                format!(
+                    "target evidence alias '{}' has no matching nodes.tsv row",
+                    target.alias
+                )
+            })?;
+        if target.target.trim().is_empty() || target.node_id.trim().is_empty() {
+            return Err(format!(
+                "target evidence for '{}' is missing target or node_id",
+                target.alias
+            ));
+        }
+        if target.target != node.target
+            || target.node_id != node.node_id
+            || target.bootstrap_role != node.bootstrap_role
+        {
+            return Err(format!(
+                "target evidence mismatch for '{}': parity=({}, {}, {}) nodes.tsv=({}, {}, {})",
+                target.alias,
+                target.target,
+                target.node_id,
+                target.bootstrap_role,
+                node.target,
+                node.node_id,
+                node.bootstrap_role
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_platform(value: &str) -> String {
@@ -1305,7 +1742,7 @@ fn populate_stage_values(
 fn populate_role_result_values(
     values: &mut BTreeMap<String, String>,
     schema: &BTreeSet<String>,
-    report_dir: &Path,
+    _report_dir: &Path,
     targets: &[TargetEvidence],
     stages: &[StageEvidence],
 ) {
@@ -1321,9 +1758,6 @@ fn populate_role_result_values(
             );
         }
         match stage.stage.as_str() {
-            "bootstrap_hosts" | "validate_baseline_runtime" => {
-                set_target_role_statuses(values, schema, targets, status, |_| true);
-            }
             "anchor_validation" => {
                 set_target_role_statuses(values, schema, targets, status, |role| role == "anchor");
             }
@@ -1332,6 +1766,17 @@ fn populate_role_result_values(
             }
             "exit_handoff" | "active_exit" => {
                 set_target_role_statuses(values, schema, targets, status, |role| role == "exit");
+            }
+            "admin_issue" => {
+                set_target_role_statuses(values, schema, targets, status, |role| role == "admin");
+            }
+            "blind_exit" | "blind_exit_dataplane_validation" => {
+                set_target_role_statuses(values, schema, targets, status, |role| {
+                    role == "blind_exit"
+                });
+            }
+            "traffic_test_matrix" => {
+                set_target_role_statuses(values, schema, targets, status, |role| role == "client");
             }
             "live_anchor" => {
                 if let Some(exit) = targets.iter().find(|target| target.label == "exit") {
@@ -1366,37 +1811,6 @@ fn populate_role_result_values(
                 }
             }
             _ => {}
-        }
-    }
-    for stage in [
-        "validate_baseline_runtime",
-        "bootstrap_hosts",
-        "enforce_baseline_runtime",
-    ] {
-        let worker_results = if stages.iter().any(|evidence| evidence.stage == stage) {
-            read_parallel_stage_results(report_dir, stage)
-        } else {
-            Vec::new()
-        };
-        for worker in worker_results {
-            if let Some(target) = targets.iter().find(|target| target.label == worker.label) {
-                let status = if worker.rc == 0 { "pass" } else { "fail" };
-                match worker.role.as_str() {
-                    "admin" => set_status(
-                        values,
-                        schema,
-                        format!("{}_admin", target.platform).as_str(),
-                        status,
-                    ),
-                    "client" => set_status(
-                        values,
-                        schema,
-                        format!("{}_client", target.platform).as_str(),
-                        status,
-                    ),
-                    _ => {}
-                }
-            }
         }
     }
 }
@@ -1538,6 +1952,7 @@ fn status_rank(status: &str) -> u8 {
         "blocked" => 5,
         "pass" => 4,
         "skip" => 3,
+        "reused" => 2,
         "unknown" => 2,
         "not_run" => 1,
         "na" => 0,
@@ -1550,6 +1965,7 @@ fn normalize_status(status: &str) -> &str {
         "passed" | "pass" | "success" | "succeeded" => "pass",
         "failed" | "fail" | "error" => "fail",
         "skipped" | "skip" => "skip",
+        "reused" | "reuse" => "reused",
         "blocked" => "blocked",
         // Finding 3: the conclusion barrier's terminal states — a planned
         // stage that evaporated (aborted) or exceeded its watchdog
@@ -1579,25 +1995,38 @@ fn dedupe_stage_evidence(stages: &mut Vec<StageEvidence>) {
 }
 
 fn overall_result(report_state: &Option<Value>, stages: &[StageEvidence]) -> String {
+    // Terminal stage failure always dominates a claimed report-state pass.
+    if stages.iter().any(|stage| stage.status == "fail") {
+        return "fail".to_owned();
+    }
     // Finding 3: a run whose planned stages evaporated must not read as a
     // clean pass, even when the (Linux-side) report state says the suite it
     // ran passed — the conclusion barrier's synthesized outcomes demote it.
     let has_aborted = stages
         .iter()
         .any(|stage| stage.status == "aborted" || stage.status == "timed_out");
+    let has_incomplete = stages.iter().any(|stage| {
+        matches!(
+            normalize_status(stage.status.as_str()),
+            "skip" | "not_run" | "reused" | "unknown"
+        )
+    });
     if let Some(true) = json_bool_path(report_state, &["run_complete"]) {
         if json_bool_path(report_state, &["run_passed"]) == Some(true) {
             if has_aborted {
                 return "aborted".to_owned();
             }
+            if has_incomplete {
+                return "partial".to_owned();
+            }
             return "pass".to_owned();
         }
         return "fail".to_owned();
     }
-    if stages.iter().any(|stage| stage.status == "fail") {
-        "fail".to_owned()
-    } else if has_aborted {
+    if has_aborted {
         "aborted".to_owned()
+    } else if has_incomplete {
+        "partial".to_owned()
     } else if stages.iter().any(|stage| stage.status == "pass") {
         "pass".to_owned()
     } else {
@@ -2016,9 +2445,9 @@ pub(crate) fn parse_csv_record(line: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::{
         DEFAULT_MATRIX_COLUMNS, LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome,
-        StageEvidence, TargetEvidence, build_live_lab_run_matrix_values, csv_escape,
+        NodeRow, StageEvidence, TargetEvidence, build_live_lab_run_matrix_values, csv_escape,
         parse_csv_record, populate_cross_os_values, populate_role_result_values,
-        populate_stage_values, render_csv_row, set_special_stage_values,
+        populate_stage_values, render_csv_row, set_special_stage_values, validate_target_evidence,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
@@ -2511,6 +2940,39 @@ mod tests {
     }
 
     #[test]
+    fn baseline_pass_does_not_claim_role_specific_proof() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|column| (*column).to_owned())
+            .collect();
+        let targets = vec![TargetEvidence {
+            label: "relay".to_owned(),
+            target: "10.0.0.2".to_owned(),
+            alias: "relay-1".to_owned(),
+            platform: "linux".to_owned(),
+            node_id: "relay-node".to_owned(),
+            bootstrap_role: "relay".to_owned(),
+        }];
+        let baseline = [StageEvidence {
+            stage: "validate_baseline_runtime".to_owned(),
+            status: "pass".to_owned(),
+            artifacts: Vec::new(),
+        }];
+        let mut values = BTreeMap::new();
+        populate_role_result_values(&mut values, &schema, Path::new("."), &targets, &baseline);
+        assert_eq!(values.get("linux_relay"), None);
+        assert_eq!(values.get("linux_client"), None);
+
+        let role_proof = [StageEvidence {
+            stage: "relay_validation".to_owned(),
+            status: "pass".to_owned(),
+            artifacts: Vec::new(),
+        }];
+        populate_role_result_values(&mut values, &schema, Path::new("."), &targets, &role_proof);
+        assert_eq!(values.get("linux_relay").map(String::as_str), Some("pass"));
+    }
+
+    #[test]
     fn orchestrator_outcomes_feed_matrix_after_worker_reload() {
         let root = temp_dir("orchestrator-outcomes");
         fs::create_dir_all(root.join("state")).expect("state dir");
@@ -2706,6 +3168,44 @@ mod tests {
         assert_eq!(seen.len(), WRITERS, "every unique row present exactly once");
 
         let _ = fs::remove_dir_all(root.as_path());
+    }
+
+    #[test]
+    fn target_evidence_requires_exact_target_node_id_and_role_match() {
+        let nodes = vec![NodeRow {
+            label: "debian-exit".to_owned(),
+            target: "debian@192.0.2.10".to_owned(),
+            node_id: "exit-node-1".to_owned(),
+            bootstrap_role: "exit".to_owned(),
+            platform: "linux".to_owned(),
+            os_version: "Debian GNU/Linux 13 (trixie) (aarch64)".to_owned(),
+        }];
+        let valid = TargetEvidence {
+            label: "debian-exit".to_owned(),
+            target: "debian@192.0.2.10".to_owned(),
+            alias: "debian-exit".to_owned(),
+            platform: "linux".to_owned(),
+            node_id: "exit-node-1".to_owned(),
+            bootstrap_role: "exit".to_owned(),
+        };
+        validate_target_evidence(std::slice::from_ref(&valid), &nodes).expect("exact match");
+
+        for invalid in [
+            TargetEvidence {
+                target: "debian@192.0.2.11".to_owned(),
+                ..valid.clone()
+            },
+            TargetEvidence {
+                node_id: "wrong-id".to_owned(),
+                ..valid.clone()
+            },
+            TargetEvidence {
+                bootstrap_role: "client".to_owned(),
+                ..valid.clone()
+            },
+        ] {
+            assert!(validate_target_evidence(std::slice::from_ref(&invalid), &nodes).is_err());
+        }
     }
 
     #[test]
@@ -3538,9 +4038,13 @@ mod conclusion_barrier_tests {
     //! non-exempt stages with no outcome — and overall_result demotes a
     //! "passing" run whose plan has holes.
 
-    use super::{StageEvidence, apply_conclusion_barrier, overall_result};
+    use super::{
+        NodeStagePlanEntry, StageEvidence, apply_conclusion_barrier, attributable_node_status,
+        node_stage_scope, normalize_os_family, overall_result, upsert_node_stage_csv,
+    };
     use crate::live_lab_stage_manifest::{build_stage_manifest, write_stage_manifest};
     use crate::live_lab_stage_registry::TargetSelectors;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
 
@@ -3589,7 +4093,7 @@ mod conclusion_barrier_tests {
             .into_iter()
             .filter(|stage| stage.stage != "live_managed_dns")
             .collect();
-        apply_conclusion_barrier(&mut stages, dir.as_path());
+        apply_conclusion_barrier(&mut stages, dir.as_path()).expect("barrier");
         let synthesized: Vec<&StageEvidence> = stages
             .iter()
             .filter(|stage| stage.status == "aborted")
@@ -3606,7 +4110,7 @@ mod conclusion_barrier_tests {
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
         let mut stages = fully_recorded_evidence();
         let before = stages.len();
-        apply_conclusion_barrier(&mut stages, dir.as_path());
+        apply_conclusion_barrier(&mut stages, dir.as_path()).expect("barrier");
         assert_eq!(stages.len(), before);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3619,14 +4123,14 @@ mod conclusion_barrier_tests {
             build_stage_manifest("test", "setup_only", &TargetSelectors::default(), None);
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
         let mut stages = vec![evidence("preflight", "pass")];
-        apply_conclusion_barrier(&mut stages, dir.as_path());
+        apply_conclusion_barrier(&mut stages, dir.as_path()).expect("barrier");
         assert_eq!(stages.len(), 1, "setup_only must not synthesize");
         let _ = fs::remove_dir_all(&dir);
 
         // Missing manifest (pre-manifest report dirs): no-op.
         let dir = temp_report_dir("no_manifest");
         let mut stages = vec![evidence("preflight", "pass")];
-        apply_conclusion_barrier(&mut stages, dir.as_path());
+        apply_conclusion_barrier(&mut stages, dir.as_path()).expect("barrier");
         assert_eq!(stages.len(), 1);
         let _ = fs::remove_dir_all(&dir);
 
@@ -3638,7 +4142,7 @@ mod conclusion_barrier_tests {
         // Replace the flat record with a node-scoped one.
         stages.retain(|stage| stage.stage != "live_anchor");
         stages.push(evidence("debian-headless-1::live_anchor", "pass"));
-        apply_conclusion_barrier(&mut stages, dir.as_path());
+        apply_conclusion_barrier(&mut stages, dir.as_path()).expect("barrier");
         assert!(
             !stages
                 .iter()
@@ -3657,7 +4161,7 @@ mod conclusion_barrier_tests {
         let manifest = build_stage_manifest("test", "full", &TargetSelectors::default(), None);
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
         let mut stages = fully_recorded_evidence();
-        apply_conclusion_barrier(&mut stages, dir.as_path());
+        apply_conclusion_barrier(&mut stages, dir.as_path()).expect("barrier");
         assert!(
             !stages.iter().any(|stage| {
                 stage.status == "aborted"
@@ -3699,6 +4203,30 @@ mod conclusion_barrier_tests {
             overall_result(&state, &[evidence("preflight", "pass")]),
             "pass"
         );
+
+        // A stale/tampered report-state pass can never override stage failure.
+        let state = Some(json!({"run_complete": true, "run_passed": true}));
+        assert_eq!(
+            overall_result(&state, &[evidence("preflight", "fail")]),
+            "fail"
+        );
+
+        // Focused/reused evidence is honest partial proof, never comprehensive.
+        assert_eq!(
+            overall_result(&state, &[evidence("preflight", "reused")]),
+            "partial"
+        );
+    }
+
+    #[test]
+    fn conclusion_barrier_rejects_corrupt_manifest() {
+        let dir = temp_report_dir("corrupt-manifest");
+        let path = dir.join(crate::live_lab_stage_manifest::STAGE_MANIFEST_RELATIVE_PATH);
+        fs::create_dir_all(path.parent().expect("manifest parent")).expect("manifest dir");
+        fs::write(&path, b"{not-json").expect("corrupt manifest");
+        let mut stages = vec![evidence("preflight", "pass")];
+        assert!(apply_conclusion_barrier(&mut stages, dir.as_path()).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3712,5 +4240,88 @@ mod conclusion_barrier_tests {
         assert!(status_rank("timed_out") > status_rank("aborted"));
         assert!(status_rank("aborted") > status_rank("blocked"));
         assert!(status_rank("blocked") > status_rank("pass"));
+    }
+
+    #[test]
+    fn exact_os_family_normalization_rejects_linux_umbrella() {
+        for (platform, version, expected) in [
+            ("linux", "Debian GNU/Linux 13 (trixie) (aarch64)", "debian"),
+            ("linux", "Rocky Linux 10.2 (Red Quartz) (aarch64)", "rocky"),
+            ("linux", "Ubuntu 26.04 LTS (aarch64)", "ubuntu"),
+            (
+                "linux",
+                "Fedora Linux 44 (Server Edition) (aarch64)",
+                "fedora",
+            ),
+            ("macos", "macOS 26.5 (arm64)", "macos"),
+            ("windows", "Windows [Version 10.0.26100] AMD64", "windows"),
+        ] {
+            assert_eq!(normalize_os_family(platform, version).unwrap(), expected);
+        }
+        assert!(normalize_os_family("linux", "Linux 6.12.0").is_err());
+        assert!(normalize_os_family("linux", "linux").is_err());
+    }
+
+    #[test]
+    fn failed_per_node_stage_never_falsely_fails_unidentified_nodes() {
+        let summary = "rocky-utm-1: tcpdump missing";
+        assert_eq!(
+            attributable_node_status("fail", "node", "rocky-utm-1", summary),
+            "fail"
+        );
+        assert_eq!(
+            attributable_node_status("fail", "node", "debian-headless-2", summary),
+            "not_proven"
+        );
+        assert_eq!(
+            attributable_node_status("pass", "node", "debian-headless-2", ""),
+            "pass"
+        );
+    }
+
+    #[test]
+    fn role_scoped_once_stage_is_node_evidence() {
+        let exit_stage = NodeStagePlanEntry {
+            stage: "exit_dns_failclosed_validation".to_owned(),
+            fanout: "once".to_owned(),
+            roles: vec!["exit".to_owned()],
+        };
+        assert_eq!(node_stage_scope(&exit_stage).unwrap(), "node");
+
+        let topology_stage = NodeStagePlanEntry {
+            stage: "traffic_test_matrix".to_owned(),
+            fanout: "once".to_owned(),
+            roles: Vec::new(),
+        };
+        assert_eq!(node_stage_scope(&topology_stage).unwrap(), "topology");
+    }
+
+    #[test]
+    fn normalized_node_stage_csv_upserts_one_run_without_duplicates() {
+        let root = temp_report_dir("node-stage-upsert");
+        let path = root.join("node-stage.csv");
+        let row = |status: &str| {
+            let mut values = BTreeMap::new();
+            for (key, value) in [
+                ("run_id", "run-1"),
+                ("report_dir", "/tmp/report-1"),
+                ("alias", "rocky-utm-1"),
+                ("os_family", "rocky"),
+                ("os_version", "Rocky Linux 10.2 (aarch64)"),
+                ("stage", "bootstrap_hosts"),
+                ("status", status),
+            ] {
+                values.insert(key.to_owned(), value.to_owned());
+            }
+            values
+        };
+        upsert_node_stage_csv(&path, "run-1", "/tmp/report-1", &[row("fail")])
+            .expect("initial append");
+        upsert_node_stage_csv(&path, "run-1", "/tmp/report-1", &[row("pass")])
+            .expect("replace same run");
+        let body = std::fs::read_to_string(&path).expect("node-stage CSV");
+        assert_eq!(body.lines().count(), 2, "header + one replacement row");
+        assert!(body.contains("rocky-utm-1") && body.contains(",pass,"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

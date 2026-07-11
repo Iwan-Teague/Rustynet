@@ -193,17 +193,29 @@ pub enum StageOutcome {
     Passed,
     Failed(String),
     Skipped,
+    /// Deliberately not executed in this invocation. Unlike `Skipped`, this is
+    /// an operator-selected focused-run omission and blocks dependencies.
+    NotRun,
+    /// Satisfied by a terminal pass from a prior report whose evidence digest
+    /// was validated before execution. Never rendered as a fresh pass.
+    Reused {
+        evidence_sha256: String,
+    },
 }
 
 impl StageOutcome {
     pub fn is_blocking(&self) -> bool {
-        matches!(self, StageOutcome::Failed(_))
+        matches!(self, StageOutcome::Failed(_) | StageOutcome::NotRun)
     }
 
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            StageOutcome::Passed | StageOutcome::Failed(_) | StageOutcome::Skipped
+            StageOutcome::Passed
+                | StageOutcome::Failed(_)
+                | StageOutcome::Skipped
+                | StageOutcome::NotRun
+                | StageOutcome::Reused { .. }
         )
     }
 }

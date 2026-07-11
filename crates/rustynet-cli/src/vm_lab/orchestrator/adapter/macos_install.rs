@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use std::io::Write as IoWrite;
 use std::path::Path;
 use std::time::Duration;
 
@@ -95,7 +94,7 @@ pub fn install_daemon(
         ".sh",
         INSTALL_SERVICE_SCRIPT.as_bytes(),
     )?;
-    let env_content = build_bootstrap_env(&node_id, &role, ctx);
+    let env_content = build_bootstrap_env(&node_id, &role, ctx)?;
     let env_tmp = write_temp_file("rn_macos_env_", ".env", env_content.as_bytes())?;
 
     ssh::scp_to(
@@ -193,7 +192,7 @@ pub fn install_daemon_from_workdir(
     // protects against a future refactor producing an invalid utun name.
     validate_utun_name(&utun_name_for_node_id(&node_id))?;
 
-    let env_content = build_bootstrap_env(&node_id, &role, ctx);
+    let env_content = build_bootstrap_env(&node_id, &role, ctx)?;
     let env_tmp = write_temp_file("rn_macos_env_", ".env", env_content.as_bytes())?;
     let script_tmp = write_temp_file("rn_macos_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())?;
     let install_tmp = write_temp_file(
@@ -597,11 +596,15 @@ fn validate_utun_name(name: &str) -> Result<(), AdapterError> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn build_bootstrap_env(node_id: &str, role: &NodeRole, ctx: &OrchestrationContext) -> String {
+fn build_bootstrap_env(
+    node_id: &str,
+    role: &NodeRole,
+    ctx: &OrchestrationContext,
+) -> Result<String, AdapterError> {
     let role_str = role.as_str();
     let daemon_node_role = role
         .daemon_node_role_for_platform(&VmGuestPlatform::Macos)
-        .expect("macOS lab role must have explicit daemon role mapping");
+        .map_err(|message| AdapterError::Protocol { message })?;
     // Derive the per-node utun interface name and pass it through to the
     // bootstrap shell so the FIRST plist install already targets the
     // node-specific utun device. Without WG_INTERFACE in the env file the
@@ -611,12 +614,12 @@ fn build_bootstrap_env(node_id: &str, role: &NodeRole, ctx: &OrchestrationContex
     // utun9 would collide. Computing it here keeps the value identical in
     // both code paths and avoids re-deriving it in shell.
     let wg_interface = utun_name_for_node_id(node_id);
-    format!(
+    Ok(format!(
         "ROLE={role_str}\nDAEMON_NODE_ROLE={daemon_node_role}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\n\
          SSH_ALLOW_CIDRS={cidrs}\nWG_INTERFACE={wg_interface}\n",
         network_id = ctx.network_id,
         cidrs = ctx.ssh_allow_cidrs,
-    )
+    ))
 }
 
 /// Deploy the `rustynet-relay` sibling service onto this macOS Relay node so the
@@ -853,15 +856,7 @@ fn write_temp_file(
     suffix: &str,
     content: &[u8],
 ) -> Result<std::path::PathBuf, AdapterError> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("{prefix}{}{suffix}", std::process::id()));
-    let mut file = std::fs::File::create(&path).map_err(|err| AdapterError::Io {
-        message: format!("create temp file failed: {err}"),
-    })?;
-    file.write_all(content).map_err(|err| AdapterError::Io {
-        message: format!("write temp file failed: {err}"),
-    })?;
-    Ok(path)
+    super::write_secure_temp_file(prefix, suffix, content)
 }
 
 #[cfg(test)]
@@ -894,7 +889,7 @@ mod tests {
     #[test]
     fn bootstrap_env_contains_role_and_node_id() {
         let ctx = make_ctx(NodeRole::Client);
-        let env = build_bootstrap_env("mac-node-1", &NodeRole::Exit, &ctx);
+        let env = build_bootstrap_env("mac-node-1", &NodeRole::Exit, &ctx).expect("env");
         assert!(env.contains("ROLE=exit"));
         assert!(env.contains("DAEMON_NODE_ROLE=blind_exit"));
         assert!(env.contains("NODE_ID=mac-node-1"));
@@ -1863,7 +1858,7 @@ mod tests {
     #[test]
     fn build_bootstrap_env_emits_wg_interface_derived_from_node_id() {
         let ctx = make_ctx(NodeRole::Client);
-        let env = build_bootstrap_env("macos-client-1", &NodeRole::Client, &ctx);
+        let env = build_bootstrap_env("macos-client-1", &NodeRole::Client, &ctx).expect("env");
         let expected = utun_name_for_node_id("macos-client-1");
         assert!(
             env.contains(&format!("WG_INTERFACE={expected}")),

@@ -14,6 +14,7 @@
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::orchestrator::role_validation::discover_single_generated_nft_table;
 
 /// Exit-demotion-residue validation runs live on Linux today.
 /// macOS / Windows nodes are reported-skipped — named on disk, never a
@@ -29,9 +30,8 @@ pub fn exit_demotion_residue_runtime_implemented(platform: VmGuestPlatform) -> b
 /// RFC 6598 CGNAT prefix).
 const DEFAULT_MESH_CIDR: &str = "100.64.0.0/10";
 
-const DEFAULT_NAT_TABLE: &str = "rustynet_nat_g1";
-
 const RUSTYNET_CLI_PATH: &str = "/usr/local/bin/rustynet";
+const LINUX_DAEMON_SOCKET: &str = "/run/rustynet/rustynetd.sock";
 
 const SETTLE_SECS: &str = "4";
 
@@ -47,11 +47,13 @@ pub fn validate_linux_exit_demotion_residue(
     daemon_path: &str,
     alias: &str,
 ) -> Result<(), String> {
-    let during_snapshot = capture_nat_lifecycle_snapshot(shell, daemon_path)?;
+    let nat_table =
+        discover_single_generated_nft_table(shell, "ip", "rustynet_nat_g", "active exit NAT")?;
+    let during_snapshot = capture_nat_lifecycle_snapshot(shell, daemon_path, &nat_table)?;
     let demotion_exit_code = demote_to_client(shell)?;
     let daemon_still_running = check_daemon_running(shell);
     let _ = shell.run_argv(&["sleep", SETTLE_SECS], &[], &[]);
-    let after_snapshot = capture_nat_lifecycle_snapshot(shell, daemon_path)?;
+    let after_snapshot = capture_nat_lifecycle_snapshot(shell, daemon_path, &nat_table)?;
 
     let merged = merge_demotion_residue_artifact(
         &during_snapshot,
@@ -69,6 +71,7 @@ pub fn validate_linux_exit_demotion_residue(
 fn capture_nat_lifecycle_snapshot(
     shell: &dyn RemoteShellHost,
     daemon_path: &str,
+    nat_table: &str,
 ) -> Result<serde_json::Value, String> {
     let out = shell
         .run_argv(
@@ -78,7 +81,7 @@ fn capture_nat_lifecycle_snapshot(
                 "--mesh-cidr",
                 DEFAULT_MESH_CIDR,
                 "--nat-table",
-                DEFAULT_NAT_TABLE,
+                nat_table,
             ],
             &[],
             &[],
@@ -90,10 +93,40 @@ fn capture_nat_lifecycle_snapshot(
 }
 
 fn demote_to_client(shell: &dyn RemoteShellHost) -> Result<i32, String> {
-    let out = shell
-        .run_argv(&[RUSTYNET_CLI_PATH, "role", "set", "client"], &[], &[])
-        .map_err(|err| format!("demotion (role set client) failed: {err}"))?;
-    Ok(out.code)
+    // Hardened role planner intentionally blocks direct exit→client. Exit NAT
+    // must be retracted by exit→admin before least-privilege admin→client.
+    // Drive both transitions through the public CLI with the explicit daemon
+    // socket and sudo, matching the reviewed Linux operator path.
+    for target in ["admin", "client"] {
+        let socket_env = format!("RUSTYNET_DAEMON_SOCKET={LINUX_DAEMON_SOCKET}");
+        let out = shell
+            .run_argv(
+                &[
+                    "sudo",
+                    "-n",
+                    "env",
+                    socket_env.as_str(),
+                    RUSTYNET_CLI_PATH,
+                    "role",
+                    "set",
+                    target,
+                ],
+                &[],
+                &[],
+            )
+            .map_err(|err| format!("demotion (role set {target}) dispatch failed: {err}"))?;
+        if out.code != 0 {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!(
+                "demotion (role set {target}) exited {}: {}{}",
+                out.code,
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+    }
+    Ok(0)
 }
 
 fn check_daemon_running(shell: &dyn RemoteShellHost) -> bool {
@@ -209,34 +242,55 @@ mod tests {
         })
     }
 
-    fn setup_clean_demotion_workflow(
-        mock: &MockShellHost,
-    ) -> ([&'static str; 6], [&'static str; 4], [&'static str; 4]) {
-        let snapshot_argv: [&'static str; 6] = [
+    fn setup_clean_demotion_workflow(mock: &MockShellHost) {
+        let discover_argv: [&'static str; 5] = ["sudo", "-n", "nft", "list", "tables"];
+        let demote_admin_argv: [&'static str; 8] = [
+            "sudo",
+            "-n",
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "/usr/local/bin/rustynet",
+            "role",
+            "set",
+            "admin",
+        ];
+        let demote_client_argv: [&'static str; 8] = [
+            "sudo",
+            "-n",
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "/usr/local/bin/rustynet",
+            "role",
+            "set",
+            "client",
+        ];
+        let daemon_argv: [&'static str; 4] =
+            ["systemctl", "is-active", "--quiet", "rustynetd.service"];
+
+        mock.program_run_response(
+            &discover_argv,
+            exit_ok("table inet rustynet_g7\ntable ip rustynet_nat_g7\n"),
+        );
+        let during = demo_snapshot(true, "Enabled", "Enabled");
+        let generation_snapshot_argv: [&'static str; 6] = [
             TEST_DAEMON,
             "linux-exit-nat-lifecycle-snapshot",
             "--mesh-cidr",
             "100.64.0.0/10",
             "--nat-table",
-            "rustynet_nat_g1",
+            "rustynet_nat_g7",
         ];
-        let demote_argv: [&'static str; 4] = ["/usr/local/bin/rustynet", "role", "set", "client"];
-        let daemon_argv: [&'static str; 4] =
-            ["systemctl", "is-active", "--quiet", "rustynetd.service"];
+        mock.program_run_response(&generation_snapshot_argv, exit_ok(&during.to_string()));
 
-        let during = demo_snapshot(true, "Enabled", "Enabled");
-        mock.program_run_response(&snapshot_argv, exit_ok(&during.to_string()));
-
-        mock.program_run_response(&demote_argv, exit_code(0));
+        mock.program_run_response(&demote_admin_argv, exit_code(0));
+        mock.program_run_response(&demote_client_argv, exit_code(0));
 
         mock.program_run_response(&daemon_argv, exit_ok("active"));
 
         mock.program_run_response(&["sleep", "4"], exit_ok(""));
 
         let after = demo_snapshot(false, "Disabled", "Disabled");
-        mock.program_run_response(&snapshot_argv, exit_ok(&after.to_string()));
-
-        (snapshot_argv, demote_argv, daemon_argv)
+        mock.program_run_response(&generation_snapshot_argv, exit_ok(&after.to_string()));
     }
 
     #[test]
@@ -268,18 +322,80 @@ mod tests {
         let err = validate_linux_exit_demotion_residue(&mock, TEST_DAEMON, "deb-1")
             .expect_err("a dispatch error must fail the stage");
         assert!(
-            err.contains("dispatch of linux-exit-nat-lifecycle-snapshot failed")
+            err.contains("discover active exit NAT failed")
+                || err.contains("dispatch of linux-exit-nat-lifecycle-snapshot failed")
                 || err.contains("unsupported argv"),
             "unexpected error: {err}"
         );
     }
 
-    /// Returns the argv slices as owned values so the caller can modify
-    /// individual responses without repeating the constant definitions.
-    fn setup_clean_demotion_workflow_items(
-        mock: &MockShellHost,
-    ) -> ([&'static str; 6], [&'static str; 4], [&'static str; 4]) {
-        setup_clean_demotion_workflow(mock)
+    #[test]
+    fn nat_table_discovery_accepts_one_generated_table() {
+        let mock = MockShellHost::new();
+        let argv = ["sudo", "-n", "nft", "list", "tables"];
+        mock.program_run_response(
+            &argv,
+            exit_ok("table inet rustynet_g12\ntable ip rustynet_nat_g12\n"),
+        );
+        assert_eq!(
+            discover_single_generated_nft_table(&mock, "ip", "rustynet_nat_g", "active exit NAT",)
+                .unwrap(),
+            "rustynet_nat_g12"
+        );
+    }
+
+    #[test]
+    fn nat_table_discovery_rejects_none_or_multiple() {
+        let argv = ["sudo", "-n", "nft", "list", "tables"];
+
+        let none = MockShellHost::new();
+        none.program_run_response(&argv, exit_ok("table inet rustynet_g3\n"));
+        assert!(
+            discover_single_generated_nft_table(&none, "ip", "rustynet_nat_g", "active exit NAT",)
+                .is_err()
+        );
+
+        let multiple = MockShellHost::new();
+        multiple.program_run_response(
+            &argv,
+            exit_ok("table ip rustynet_nat_g2\ntable ip rustynet_nat_g9\n"),
+        );
+        let err = discover_single_generated_nft_table(
+            &multiple,
+            "ip",
+            "rustynet_nat_g",
+            "active exit NAT",
+        )
+        .unwrap_err();
+        assert!(err.contains("multiple") && err.contains("residual state"));
+    }
+
+    #[test]
+    fn demotion_uses_required_exit_admin_client_path() {
+        let mock = MockShellHost::new();
+        let admin = [
+            "sudo",
+            "-n",
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "/usr/local/bin/rustynet",
+            "role",
+            "set",
+            "admin",
+        ];
+        let client = [
+            "sudo",
+            "-n",
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "/usr/local/bin/rustynet",
+            "role",
+            "set",
+            "client",
+        ];
+        mock.program_run_response(&admin, exit_code(0));
+        mock.program_run_response(&client, exit_code(0));
+        assert_eq!(demote_to_client(&mock).unwrap(), 0);
     }
 
     #[test]

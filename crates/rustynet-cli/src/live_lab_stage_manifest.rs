@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::live_lab_stage_registry::{self, STAGES, TargetSelectors};
 
 pub const STAGE_MANIFEST_RELATIVE_PATH: &str = "orchestration/stage_manifest.json";
-pub const STAGE_MANIFEST_SCHEMA_VERSION: u64 = 1;
+pub const STAGE_MANIFEST_SCHEMA_VERSION: u64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageManifest {
@@ -121,6 +121,11 @@ pub struct ManifestStage {
     /// Display-only aggregate; never appears in recorded outcomes.
     #[serde(default)]
     pub synthetic: bool,
+    /// This execution contributes a real pass/fail check to the run-matrix
+    /// evidence model. Consumers use this emitted fact for run-local test
+    /// counts instead of guessing from names/groups.
+    #[serde(default)]
+    pub counts_as_check: bool,
     /// Exempt from the conclusion barrier: job-level bookkeeping stages
     /// and stages whose dispatch is runtime-gated beyond the selectors
     /// (audit sub-passes, cross-network auto mode) — a missing outcome is
@@ -197,6 +202,10 @@ pub fn build_stage_manifest(
                     live_lab_stage_registry::StageSeverity::Soft => "soft".to_owned(),
                 },
                 synthetic: spec.synthetic,
+                counts_as_check: spec.direct_platform.is_some()
+                    || spec.logical.is_some()
+                    || spec.cross_os.is_some()
+                    || spec.special.is_some(),
                 barrier_exempt,
             }
         })
@@ -282,9 +291,10 @@ pub fn ensure_stage_manifest(
 }
 
 /// Emit a manifest for the Rust state-machine `--node` path, whose plan is
-/// the explicit set of stage names the runner will dispatch. First-writer-
-/// wins like [`ensure_stage_manifest`]; drives enablement by plan membership
-/// (the dialect inversion — see [`build_stage_manifest`]).
+/// the explicit set of stage names the runner will dispatch. Unlike the bash
+/// wrapper's first-writer-wins helper, this REPLACES an existing manifest:
+/// run-only/resume/rerun reuse one report directory for multiple invocations,
+/// and every invocation must publish its own resolved plan before execution.
 pub fn ensure_stage_manifest_with_plan(
     report_dir: &Path,
     run_command: &str,
@@ -294,13 +304,11 @@ pub fn ensure_stage_manifest_with_plan(
     node_assignments: &[ManifestNodeAssignment],
 ) -> Result<(PathBuf, bool), String> {
     let path = report_dir.join(STAGE_MANIFEST_RELATIVE_PATH);
-    if path.exists() {
-        return Ok((path, false));
-    }
+    let newly_created = !path.exists();
     let mut manifest = build_stage_manifest(run_command, run_mode, selectors, Some(active_plan));
     manifest.node_assignments = node_assignments.to_vec();
     let path = write_stage_manifest(report_dir, &manifest)?;
-    Ok((path, true))
+    Ok((path, newly_created))
 }
 
 /// `ops emit-stage-manifest` parsed config (the bash orchestrator's entry
@@ -619,6 +627,65 @@ mod tests {
             None,
         );
         assert!(bash.node_assignments.is_empty());
+    }
+
+    #[test]
+    fn rust_plan_manifest_replaces_prior_invocation_in_reused_report_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_plan = rust_plan();
+        ensure_stage_manifest_with_plan(
+            dir.path(),
+            "vm-lab-orchestrate-live-lab",
+            "setup_only",
+            &TargetSelectors::default(),
+            &first_plan,
+            &[],
+        )
+        .expect("first manifest");
+
+        let second_plan = ["traffic_test_matrix".to_owned()].into_iter().collect();
+        let (_, newly_created) = ensure_stage_manifest_with_plan(
+            dir.path(),
+            "vm-lab-orchestrate-live-lab",
+            "run_only",
+            &TargetSelectors::default(),
+            &second_plan,
+            &[],
+        )
+        .expect("replacement manifest");
+
+        assert!(!newly_created);
+        let manifest = read_stage_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(manifest.run_mode, "run_only");
+        assert!(
+            manifest
+                .stages
+                .iter()
+                .find(|stage| stage.name == "traffic_test_matrix")
+                .is_some_and(|stage| stage.enabled)
+        );
+        assert!(
+            manifest
+                .stages
+                .iter()
+                .find(|stage| stage.name == "preflight")
+                .is_some_and(|stage| !stage.enabled)
+        );
+    }
+
+    #[test]
+    fn manifest_emits_check_classification_from_registry_mappings() {
+        let manifest = build_stage_manifest("test", "full", &full_selectors(), None);
+        let by_name = |name: &str| {
+            manifest
+                .stages
+                .iter()
+                .find(|stage| stage.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        assert!(by_name("validate_macos_anchor_bundle_pull").counts_as_check);
+        assert!(!by_name("restart_unready_vms").counts_as_check);
+        assert!(!by_name("linux_live_suite").counts_as_check);
     }
 
     #[test]

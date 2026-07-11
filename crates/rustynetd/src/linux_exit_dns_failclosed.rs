@@ -23,7 +23,11 @@ use crate::linux_dns_failclosed::{
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
@@ -451,7 +455,8 @@ fn capture_dns_block_path(
     query: &str,
     duration: Duration,
 ) -> Result<(String, String), String> {
-    let mut child = Command::new("/usr/sbin/tcpdump")
+    let tcpdump = resolve_tcpdump_binary()?;
+    let mut child = Command::new(tcpdump)
         .args(["-n", "-i", iface, protocol, "and", "port", "53"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -480,6 +485,39 @@ fn capture_dns_block_path(
         String::from_utf8_lossy(&output.stdout).into_owned(),
         probe_output,
     ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+const LINUX_TCPDUMP_CANDIDATES: [&str; 2] = ["/usr/bin/tcpdump", "/usr/sbin/tcpdump"];
+
+#[cfg(any(target_os = "linux", test))]
+fn select_tcpdump_candidate(mut is_executable: impl FnMut(&Path) -> bool) -> Option<&'static str> {
+    LINUX_TCPDUMP_CANDIDATES
+        .into_iter()
+        .find(|candidate| is_executable(Path::new(candidate)))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_tcpdump_binary() -> Result<PathBuf, String> {
+    let candidate = select_tcpdump_candidate(|path| {
+        fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    })
+    .ok_or_else(|| {
+        format!(
+            "tcpdump executable missing; checked {}",
+            LINUX_TCPDUMP_CANDIDATES.join(", ")
+        )
+    })?;
+    let canonical = fs::canonicalize(candidate)
+        .map_err(|err| format!("tcpdump canonicalization failed for {candidate}: {err}"))?;
+    if !canonical.is_absolute() {
+        return Err(format!(
+            "tcpdump canonical path is not absolute: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 /// Run a single `dig` DNS probe (argv-only) for `query` against `server` over
@@ -683,5 +721,16 @@ table inet rustynet_g1 {
         // A non-IP token (should never happen from `ip route`, but defense in
         // depth) is rejected by the probe-target validator.
         assert!(validate_probe_target("link#12").is_err());
+    }
+
+    #[test]
+    fn tcpdump_candidate_supports_debian_and_rhel_locations() {
+        let debian = select_tcpdump_candidate(|path| path == Path::new("/usr/bin/tcpdump"));
+        assert_eq!(debian, Some("/usr/bin/tcpdump"));
+
+        let rhel = select_tcpdump_candidate(|path| path == Path::new("/usr/sbin/tcpdump"));
+        assert_eq!(rhel, Some("/usr/sbin/tcpdump"));
+
+        assert_eq!(select_tcpdump_candidate(|_| false), None);
     }
 }

@@ -40,15 +40,15 @@
       },
       "exit_capable": false,
       "lab_role": "aux",
-      "last_known_ip": "10.230.76.58",
+      "last_known_ip": "192.168.64.10",
       "last_known_network": "lan-192.168.0.0/24",
       "live_ips": [
+        "192.168.64.10",
         "10.230.76.58",
         "192.168.15.253",
         "10.47.225.60",
         "192.168.0.203",
         "192.168.65.5",
-        "192.168.64.10",
         "192.168.64.6",
         "fd21:69d4:6afd:fa50:dc8c:2918:43ca:d40d",
         "fe80::cadd:6589:4e14:8590"
@@ -61,7 +61,7 @@
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "10.230.76.58",
+      "ssh_target": "192.168.64.10",
       "ssh_user": "debian"
     },
     {
@@ -116,7 +116,7 @@
       "guest_exec_mode": "windows_powershell",
       "include_in_all": false,
       "lab_role": "windows_client",
-      "last_known_ip": "10.230.76.60",
+      "last_known_ip": "192.168.64.14",
       "last_known_network": "lan-192.168.0.0/24",
       "mesh_ip": "100.64.0.6",
       "network_group": "lan-192.168.0.0/24",
@@ -128,7 +128,7 @@
       "rustynet_src_dir": "C:\\Rustynet",
       "service_manager": "windows_service",
       "ssh_password": "tempo",
-      "ssh_target": "10.230.76.60",
+      "ssh_target": "192.168.64.14",
       "ssh_user": "windows",
       "utm_staging_dir": "C:\\Users\\windows\\rustynet-utm-stage"
     },
@@ -141,9 +141,10 @@
       },
       "exit_capable": false,
       "lab_role": "fedora_client",
-      "last_known_ip": "10.230.76.59",
+      "last_known_ip": "192.168.64.20",
       "last_known_network": "lan-10.230.76.0/24",
       "live_ips": [
+        "192.168.64.20",
         "10.230.76.59"
       ],
       "mesh_ip": "100.64.0.8",
@@ -155,7 +156,7 @@
       "relay_capable": false,
       "rustynet_src_dir": "/home/fedora/Rustynet",
       "ssh_password": "password",
-      "ssh_target": "10.230.76.59",
+      "ssh_target": "192.168.64.20",
       "ssh_user": "fedora"
     },
     {

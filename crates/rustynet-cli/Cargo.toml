@@ -38,6 +38,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 socket2 = { version = "0.6", features = [] }
 tar = "0.4"
+toml = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 zeroize = "1"
 tempfile = "3"

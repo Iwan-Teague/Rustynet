@@ -20,7 +20,7 @@ const REPORTED_SKIPS_FILENAME: &str = "exit_demotion_residue_validation.reported
 /// first-class OrchestrationStage.
 ///
 /// Runs after `active_exit` (all exit lifecycle stages must complete
-/// before demotion). Applies ONLY to Linux exit nodes; a macOS / Windows
+/// before demotion). Applies ONLY to the assigned exit node; a macOS / Windows
 /// node is reported-skipped (named, never a silent pass) via
 /// [`exit_demotion_residue_runtime_implemented`].
 ///
@@ -37,62 +37,56 @@ impl OrchestrationStage for ExitDemotionResidueValidationStage {
         "exit_demotion_residue_validation"
     }
     fn dependencies(&self) -> &[StageId] {
-        &[StageId::ActiveExit]
+        &[StageId::ExitNatLifecycleValidation]
     }
     fn applies_to_roles(&self) -> &[NodeRole] {
-        &[]
+        &[NodeRole::Exit]
     }
     fn fanout(&self) -> StageFanout {
-        StageFanout::PerNode
+        StageFanout::Once
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
-        let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
-        if aliases.is_empty() {
-            return StageOutcome::Passed;
-        }
-
-        let mut failures: Vec<String> = Vec::new();
-        let mut reported_skips: Vec<(String, String)> = Vec::new();
-        for alias in &aliases {
-            let adapter = match ctx.adapters.get(alias.as_str()) {
-                Some(adapter) => adapter,
-                None => {
-                    failures.push(format!(
-                        "{alias}: no adapter for exit-demotion-residue node"
-                    ));
-                    continue;
-                }
-            };
-            let platform = adapter.platform();
-            if !exit_demotion_residue_runtime_implemented(platform) {
-                reported_skips.push((alias.clone(), format!("{platform:?}")));
-                continue;
+        let alias = match ctx.assignments.iter().find(|a| a.role == NodeRole::Exit) {
+            Some(assignment) => assignment.alias.clone(),
+            None => {
+                return StageOutcome::Failed(
+                    "exit-demotion-residue: no Exit node in assignments".to_owned(),
+                );
             }
-            let shell = match adapter.shell_host() {
-                Ok(shell) => shell,
-                Err(e) => {
-                    failures.push(format!("{alias}: shell host unavailable: {e}"));
-                    continue;
-                }
-            };
-            let daemon_path = match platform {
-                VmGuestPlatform::Linux => LINUX_RUSTYNETD_PATH,
-                VmGuestPlatform::Macos => MACOS_RUSTYNETD_PATH,
-                VmGuestPlatform::Windows => WINDOWS_RUSTYNETD_PATH,
-                _ => {
-                    reported_skips.push((alias.clone(), format!("{platform:?}")));
-                    continue;
-                }
-            };
-            if let Err(e) = validate_linux_exit_demotion_residue(&*shell, daemon_path, alias) {
-                failures.push(format!("{alias}: {e}"));
+        };
+        let adapter = match ctx.adapters.get(alias.as_str()) {
+            Some(adapter) => adapter,
+            None => {
+                return StageOutcome::Failed(format!(
+                    "{alias}: no adapter for exit-demotion-residue node"
+                ));
             }
-        }
-
-        if !reported_skips.is_empty() {
+        };
+        let platform = adapter.platform();
+        if !exit_demotion_residue_runtime_implemented(platform) {
+            let reported_skips = vec![(alias, format!("{platform:?}"))];
             write_reported_skips_note(ctx, &reported_skips);
+            return StageOutcome::Skipped;
         }
+        let shell = match adapter.shell_host() {
+            Ok(shell) => shell,
+            Err(e) => {
+                return StageOutcome::Failed(format!("{alias}: shell host unavailable: {e}"));
+            }
+        };
+        let daemon_path = match platform {
+            VmGuestPlatform::Linux => LINUX_RUSTYNETD_PATH,
+            VmGuestPlatform::Macos => MACOS_RUSTYNETD_PATH,
+            VmGuestPlatform::Windows => WINDOWS_RUSTYNETD_PATH,
+            _ => unreachable!("runtime implementation gate accepts desktop platforms only"),
+        };
+        let failures = match validate_linux_exit_demotion_residue(&*shell, daemon_path, &alias) {
+            Ok(()) => Vec::new(),
+            Err(e) => vec![format!("{alias}: {e}")],
+        };
+        let reported_skips = Vec::new();
+
         outcome_for(&failures, &reported_skips)
     }
 }
@@ -130,6 +124,15 @@ fn write_reported_skips_note(ctx: &OrchestrationContext, reported_skips: &[(Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn stage_evidence_is_scoped_to_assigned_exit() {
+        assert_eq!(
+            ExitDemotionResidueValidationStage.applies_to_roles(),
+            &[NodeRole::Exit]
+        );
+    }
 
     #[test]
     fn outcome_no_failures_no_skips_is_passed() {
@@ -164,5 +167,26 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("mac-1") && s.contains("win-1"));
         assert!(s.contains("exit_demotion_residue_validation"));
+    }
+
+    #[test]
+    fn no_exit_assignment_fails_closed() {
+        let mut ctx = OrchestrationContext {
+            assignments: vec![],
+            adapters: HashMap::new(),
+            source_archive: None,
+            report_dir: std::env::temp_dir(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            orchestrator_dialect: None,
+        };
+        let outcome = ExitDemotionResidueValidationStage.execute(&mut ctx);
+        assert!(matches!(outcome, StageOutcome::Failed(message) if message.contains("no Exit")));
     }
 }

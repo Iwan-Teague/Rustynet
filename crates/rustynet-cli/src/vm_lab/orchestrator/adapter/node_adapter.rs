@@ -47,6 +47,19 @@ pub(crate) const REQUIRED_DAEMON_LAUNCH_FLAGS: &[&str] = &[
     "--auto-tunnel-enforce",
 ];
 
+/// Typed role/posture validators whose platform command and evaluator policy
+/// are owned behind [`NodeAdapter`]. Stages select intent; adapters select OS
+/// paths and validation implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleValidatorKind {
+    RuntimeAcls,
+    ServiceHardening,
+    KeyCustody,
+    Authenticode,
+    MeshStatus,
+    DnsFailclosed,
+}
+
 /// SSH connection parameters exposed so orchestrator stages that dispatch
 /// standalone e2e validation binaries can construct the correct command line.
 /// Not used by general-purpose stages; those go through `RemoteShellHost`.
@@ -153,8 +166,9 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
     /// `pub_key_path` is a local file containing the hex-encoded verifier key
     /// (newline-terminated).  The adapter installs it at the platform-canonical
     /// path used by the daemon's `--{assignment,traversal,dns-zone}-verifier-key`
-    /// flag.  Must be called after `issue_bundles_to_dir` and before the daemon
-    /// starts, so the daemon can verify the freshly-distributed bundles.
+    /// flag. Must be called after `issue_bundles_to_dir` creates the local key,
+    /// but before any signed bundle is installed, so verify-before-apply cannot
+    /// observe a bundle without its matching verifier.
     fn distribute_verifier_key(
         &self,
         kind: BundleKind,
@@ -164,6 +178,17 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
     // ── Validators ────────────────────────────────────────────────
 
     fn run_validator(&self, op: DaemonProbeOp) -> Result<ValidatorReport, AdapterError>;
+
+    fn run_role_validator(&self, kind: RoleValidatorKind) -> Result<(), AdapterError> {
+        run_typed_role_validator(self, kind)
+    }
+
+    fn supports_role_validator(&self, _kind: RoleValidatorKind) -> bool {
+        matches!(
+            self.platform(),
+            VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+        )
+    }
 
     // ── Traffic tests ─────────────────────────────────────────────
 
@@ -336,6 +361,94 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         env_content: &str,
         local_out_dir: &Path,
     ) -> Result<(), AdapterError>;
+}
+
+fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
+    adapter: &T,
+    kind: RoleValidatorKind,
+) -> Result<(), AdapterError> {
+    use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
+    use crate::vm_lab::orchestrator::role_validation::{
+        authenticode, dns_failclosed, key_custody, mesh_status, runtime_acls, service_hardening,
+    };
+
+    const WINDOWS_DAEMON: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
+    let platform = adapter.platform();
+    if !matches!(
+        platform,
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+    ) {
+        return Err(AdapterError::UnsupportedPlatform {
+            platform,
+            message: format!("typed role validator {kind:?} is desktop-only"),
+        });
+    }
+    let daemon_path = match platform {
+        VmGuestPlatform::Linux => crate::vm_lab::LINUX_RUSTYNETD_PATH,
+        VmGuestPlatform::Macos => MACOS_RUSTYNETD_PATH,
+        VmGuestPlatform::Windows => WINDOWS_DAEMON,
+        _ => unreachable!("desktop platform checked above"),
+    };
+    let shell = adapter.shell_host()?;
+    let alias = adapter.alias();
+    let result = match (kind, platform) {
+        (RoleValidatorKind::RuntimeAcls, VmGuestPlatform::Linux) => {
+            runtime_acls::validate_linux_runtime_acls(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::RuntimeAcls, VmGuestPlatform::Macos) => {
+            runtime_acls::validate_macos_runtime_acls(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::RuntimeAcls, VmGuestPlatform::Windows) => {
+            runtime_acls::validate_windows_runtime_acls(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::ServiceHardening, VmGuestPlatform::Linux) => {
+            service_hardening::validate_linux_service_hardening(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::ServiceHardening, VmGuestPlatform::Macos) => {
+            service_hardening::validate_macos_service_hardening(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::ServiceHardening, VmGuestPlatform::Windows) => {
+            service_hardening::validate_windows_service_hardening(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::KeyCustody, VmGuestPlatform::Linux) => {
+            key_custody::validate_linux_key_custody(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::KeyCustody, VmGuestPlatform::Macos) => {
+            key_custody::validate_macos_key_custody(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::KeyCustody, VmGuestPlatform::Windows) => {
+            key_custody::validate_windows_key_custody(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::Authenticode, VmGuestPlatform::Linux) => {
+            authenticode::validate_linux_authenticode(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::Authenticode, VmGuestPlatform::Macos) => {
+            authenticode::validate_macos_authenticode(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::Authenticode, VmGuestPlatform::Windows) => {
+            authenticode::validate_windows_authenticode(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::MeshStatus, VmGuestPlatform::Linux) => {
+            mesh_status::validate_linux_mesh_status(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::MeshStatus, VmGuestPlatform::Macos) => {
+            mesh_status::validate_macos_mesh_status(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::MeshStatus, VmGuestPlatform::Windows) => {
+            mesh_status::validate_windows_mesh_status(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::DnsFailclosed, VmGuestPlatform::Linux) => {
+            dns_failclosed::validate_linux_dns_failclosed(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::DnsFailclosed, VmGuestPlatform::Macos) => {
+            dns_failclosed::validate_macos_dns_failclosed(&*shell, daemon_path, alias)
+        }
+        (RoleValidatorKind::DnsFailclosed, VmGuestPlatform::Windows) => {
+            dns_failclosed::validate_windows_dns_failclosed(&*shell, daemon_path, alias)
+        }
+        (_, _) => unreachable!("desktop platform checked above"),
+    };
+    result.map_err(|message| AdapterError::Protocol { message })
 }
 
 #[cfg(test)]

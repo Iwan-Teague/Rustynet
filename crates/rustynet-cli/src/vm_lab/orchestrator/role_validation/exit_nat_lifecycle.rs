@@ -10,13 +10,13 @@
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::orchestrator::role_validation::discover_single_generated_nft_table;
 
 pub fn exit_nat_lifecycle_runtime_implemented(platform: VmGuestPlatform) -> bool {
     matches!(platform, VmGuestPlatform::Linux)
 }
 
 const DEFAULT_MESH_CIDR: &str = "100.64.0.0/10";
-const DEFAULT_NAT_TABLE: &str = "rustynet_nat_g1";
 
 /// Run the full two-phase exit NAT lifecycle validation: snapshot during
 /// active exit → stop daemon → snapshot after stop → merge → evaluate.
@@ -26,9 +26,11 @@ pub fn validate_linux_exit_nat_lifecycle(
     daemon_path: &str,
     alias: &str,
 ) -> Result<(), String> {
-    let during = capture_nat_lifecycle_snapshot(shell, daemon_path, "during-run")?;
+    let nat_table =
+        discover_single_generated_nft_table(shell, "ip", "rustynet_nat_g", "active exit NAT")?;
+    let during = capture_nat_lifecycle_snapshot(shell, daemon_path, "during-run", &nat_table)?;
     stop_daemon(shell)?;
-    let after = capture_nat_lifecycle_snapshot(shell, daemon_path, "after-stop")?;
+    let after = capture_nat_lifecycle_snapshot(shell, daemon_path, "after-stop", &nat_table)?;
 
     let merged = rustynetd::linux_exit_nat_lifecycle::merge_linux_exit_nat_lifecycle_artifact(
         &during, &after,
@@ -44,6 +46,7 @@ fn capture_nat_lifecycle_snapshot(
     shell: &dyn RemoteShellHost,
     daemon_path: &str,
     phase: &str,
+    nat_table: &str,
 ) -> Result<rustynetd::linux_exit_nat_lifecycle::LinuxExitNatLifecycleSnapshot, String> {
     let out = shell
         .run_argv(
@@ -53,7 +56,7 @@ fn capture_nat_lifecycle_snapshot(
                 "--mesh-cidr",
                 DEFAULT_MESH_CIDR,
                 "--nat-table",
-                DEFAULT_NAT_TABLE,
+                nat_table,
             ],
             &[],
             &[],
@@ -65,9 +68,20 @@ fn capture_nat_lifecycle_snapshot(
 }
 
 fn stop_daemon(shell: &dyn RemoteShellHost) -> Result<(), String> {
-    shell
-        .run_argv(&["systemctl", "stop", "rustynetd"], &[], &[])
+    let out = shell
+        .run_argv(
+            &["sudo", "-n", "systemctl", "stop", "rustynetd.service"],
+            &[],
+            &[],
+        )
         .map_err(|err| format!("stop rustynetd for after-stop snapshot failed: {err}"))?;
+    if out.code != 0 {
+        return Err(format!(
+            "stop rustynetd for after-stop snapshot exited {}: {}",
+            out.code,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
     Ok(())
 }
 
@@ -107,12 +121,19 @@ mod tests {
             "--mesh-cidr",
             "100.64.0.0/10",
             "--nat-table",
-            "rustynet_nat_g1",
+            "rustynet_nat_g7",
         ]
     }
 
-    fn stop_argv() -> [&'static str; 3] {
-        ["systemctl", "stop", "rustynetd"]
+    fn stop_argv() -> [&'static str; 5] {
+        ["sudo", "-n", "systemctl", "stop", "rustynetd.service"]
+    }
+
+    fn program_nat_discovery(mock: &MockShellHost) {
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "tables"],
+            exit_ok("table inet rustynet_g7\ntable ip rustynet_nat_g7\n"),
+        );
     }
 
     fn during_snapshot() -> serde_json::Value {
@@ -120,8 +141,8 @@ mod tests {
             rustynetd::linux_exit_nat_lifecycle::build_linux_exit_nat_lifecycle_snapshot(
                 1700000000,
                 "100.64.0.0/10",
-                "rustynet_nat_g1",
-                "table ip rustynet_nat_g1 {\n chain postrouting {\n  oifname \"enp0s1\" masquerade\n }\n}\n",
+                "rustynet_nat_g7",
+                "table ip rustynet_nat_g7 {\n chain postrouting {\n  oifname \"enp0s1\" masquerade\n }\n}\n",
                 "1\n",
                 "0\n",
             ),
@@ -134,7 +155,7 @@ mod tests {
             rustynetd::linux_exit_nat_lifecycle::build_linux_exit_nat_lifecycle_snapshot(
                 1700000001,
                 "100.64.0.0/10",
-                "rustynet_nat_g1",
+                "rustynet_nat_g7",
                 "",
                 "0\n",
                 "0\n",
@@ -144,6 +165,7 @@ mod tests {
     }
 
     fn setup_clean_lifecycle_workflow(mock: &MockShellHost) {
+        program_nat_discovery(mock);
         let during = during_snapshot();
         mock.program_run_response(&snapshot_argv(), exit_ok(&during.to_string()));
 
@@ -167,7 +189,8 @@ mod tests {
         let err = validate_linux_exit_nat_lifecycle(&mock, TEST_DAEMON, "deb-1")
             .expect_err("a dispatch error must fail the stage");
         assert!(
-            err.contains("during-run exit NAT lifecycle snapshot failed")
+            err.contains("discover active exit NAT failed")
+                || err.contains("during-run exit NAT lifecycle snapshot failed")
                 || err.contains("unsupported argv"),
             "unexpected error: {err}"
         );
@@ -176,6 +199,7 @@ mod tests {
     #[test]
     fn validate_fails_closed_on_stop_error() {
         let mock = MockShellHost::new();
+        program_nat_discovery(&mock);
         let during = during_snapshot();
         mock.program_run_response(&snapshot_argv(), exit_ok(&during.to_string()));
         let err = validate_linux_exit_nat_lifecycle(&mock, TEST_DAEMON, "deb-1")
@@ -189,6 +213,7 @@ mod tests {
     #[test]
     fn validate_fails_closed_on_after_stop_snapshot_error() {
         let mock = MockShellHost::new();
+        program_nat_discovery(&mock);
         let during = during_snapshot();
         mock.program_run_response(&snapshot_argv(), exit_ok(&during.to_string()));
         mock.program_run_response(&stop_argv(), exit_ok(""));
@@ -208,8 +233,8 @@ mod tests {
             rustynetd::linux_exit_nat_lifecycle::build_linux_exit_nat_lifecycle_snapshot(
                 1700000001,
                 "100.64.0.0/10",
-                "rustynet_nat_g1",
-                "table ip rustynet_nat_g1 {\n chain postrouting {\n  oifname \"enp0s1\" masquerade\n }\n}\n",
+                "rustynet_nat_g7",
+                "table ip rustynet_nat_g7 {\n chain postrouting {\n  oifname \"enp0s1\" masquerade\n }\n}\n",
                 "0\n",
                 "0\n",
             ),

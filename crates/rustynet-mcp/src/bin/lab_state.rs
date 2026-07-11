@@ -986,6 +986,35 @@ impl LabStateServer {
         ))
     }
 
+    /// Network recovery invalidates prior network evidence and forces a
+    /// fresh preflight (LiveLabVmConnectivityRulebook §11.2/§11.3): the
+    /// current `state/vm_network_evidence.json` is renamed aside (never
+    /// deleted) and the caller is told to re-run audit/preflight.
+    fn invalidate_network_evidence(&self, reason: &str) -> String {
+        let evidence = self.repo_root.join("state/vm_network_evidence.json");
+        if !evidence.is_file() {
+            return format!(
+                "\n## Network evidence\nNo current network evidence to invalidate. Re-run audit_lab_network / preflight_check before the next evidence run ({reason}).\n"
+            );
+        }
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let aside = self.repo_root.join(format!(
+            "state/vm_network_evidence.invalidated-{stamp}.json"
+        ));
+        match std::fs::rename(&evidence, &aside) {
+            Ok(()) => format!(
+                "\n## Network evidence INVALIDATED\n{reason} changed network state, so the prior network evidence was moved aside to {}. Run audit_lab_network / preflight_check again before the next evidence run.\n",
+                aside.display()
+            ),
+            Err(e) => format!(
+                "\n## Network evidence\n\u{26a0}\u{fe0f} could not move the prior evidence aside ({e}); treat state/vm_network_evidence.json as STALE and re-run audit_lab_network before the next evidence run.\n"
+            ),
+        }
+    }
+
     fn reset_vm_network(&self, alias: &str) -> ToolCallResult {
         if alias.is_empty() {
             return tool_error("Missing required parameter: alias");
@@ -1071,6 +1100,7 @@ impl LabStateServer {
                 "\nStill unreachable from the host. Likely the VM is on the wrong UTM network (NAT vs bridged — fix the adapter in UTM, host-side), or its IP changed → run update_inventory then check_vm_reachable.\n",
             );
         }
+        out.push_str(&self.invalidate_network_evidence("reset_vm_network"));
         tool_success(&out)
     }
 
@@ -1558,8 +1588,9 @@ impl LabStateServer {
                 Ok(o) if o.success => {
                     std::thread::sleep(Duration::from_millis(300));
                     if tcp_reachable(&target.to_string(), port, Duration::from_secs(5)) {
+                        let invalidation = self.invalidate_network_evidence("apply_host_route_fix");
                         return tool_success(&format!(
-                            "# Route fix: {alias}\n\n{stale_inventory_note}✅ Applied and confirmed reachable: `{subnet}` now routes via `{interface}` (TCP/{port} open).\n"
+                            "# Route fix: {alias}\n\n{stale_inventory_note}✅ Applied and confirmed reachable: `{subnet}` now routes via `{interface}` (TCP/{port} open).\n{invalidation}"
                         ));
                     }
                     // Route looks structurally fine but the guest still
@@ -1866,45 +1897,6 @@ impl LabStateServer {
     /// bundle_path (to read config.plist / resolve via ARP-by-MAC),
     /// last_known_ip (fallback if ARP-by-MAC finds nothing fresh), and
     /// utm_name (for stop/start).
-    fn vm_lan_presence_entry(&self, alias: &str) -> Result<(String, String, String), String> {
-        let inv_entries = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY))
-            .map_err(|e| format!("inventory unreadable: {e}"))
-            .and_then(|s| {
-                serde_json::from_str::<Value>(&s)
-                    .map_err(|e| format!("inventory invalid JSON: {e}"))
-            })?
-            .get("entries")
-            .and_then(|e| e.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let entry = inv_entries
-            .iter()
-            .find(|e| e.get("alias").and_then(|v| v.as_str()) == Some(alias))
-            .ok_or_else(|| format!("Unknown alias '{alias}' (not in inventory)"))?
-            .clone();
-        let bundle_path = entry
-            .get("controller")
-            .and_then(|c| c.get("bundle_path"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("'{alias}' has no controller.bundle_path in inventory"))?
-            .to_owned();
-        let utm_name = entry
-            .get("controller")
-            .and_then(|c| c.get("utm_name"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("'{alias}' has no controller.utm_name in inventory"))?
-            .to_owned();
-        let fallback_ip = entry
-            .get("last_known_ip")
-            .and_then(|v| v.as_str())
-            .or_else(|| entry.get("ssh_target").and_then(|v| v.as_str()))
-            .unwrap_or("")
-            .to_owned();
-        Ok((bundle_path, utm_name, fallback_ip))
-    }
-
-    /// The guest's CURRENT live IP (fresh ARP-by-MAC, falling back to
-    /// inventory only if that fails) and its network-path classification.
     fn classify_vm_current_network_path(
         &self,
         bundle_path: &str,
@@ -1917,32 +1909,6 @@ impl LabStateServer {
         };
         let owning = host_interfaces_in_same_slash24(target);
         (ip, classify_guest_network_path(&owning))
-    }
-
-    fn stop_vm_by_alias(&self, alias: &str) -> Result<(), String> {
-        let result = self.run_ops("vm-lab-stop", &["--vm", alias], 120);
-        if result.is_error.unwrap_or(false) {
-            let text = result
-                .content
-                .first()
-                .map(|c| c.text.clone())
-                .unwrap_or_default();
-            return Err(format!("failed to stop '{alias}': {text}"));
-        }
-        Ok(())
-    }
-
-    fn start_vm_by_alias(&self, alias: &str) -> Result<(), String> {
-        let result = self.run_ops("vm-lab-start", &["--vm", alias], 120);
-        if result.is_error.unwrap_or(false) {
-            let text = result
-                .content
-                .first()
-                .map(|c| c.text.clone())
-                .unwrap_or_default();
-            return Err(format!("failed to start '{alias}': {text}"));
-        }
-        Ok(())
     }
 
     /// Read-only: is this VM (or all of them, if `alias` is omitted)
@@ -2027,74 +1993,29 @@ impl LabStateServer {
     /// physical-LAN lease, and persists the new IP to inventory. Blocking,
     /// minutes-scale (same class as `ensure_lab_ready`) — a VM reboot +
     /// DHCP cycle takes real wall-clock time.
+    /// DEPRECATED (LiveLabVmConnectivityRulebook §11.3): this tool used to
+    /// push a VM onto the host's everyday LAN (`en0`) via AppleScript with no
+    /// profile, transaction, rollback, or evidence contract. It now refuses
+    /// unconditionally. VM network mutation happens ONLY through the typed
+    /// Rust transaction (`prepare_lab_network` → `rustynet ops
+    /// vm-lab-network-prepare --approve-reconfigure`) under an explicitly
+    /// allowlisted physical profile — and `en0` is denied by policy at the
+    /// profile, plan, and render layers.
     fn apply_vm_bridged_network(&self, alias: &str) -> ToolCallResult {
-        if alias.is_empty() {
-            return tool_error("Missing required parameter: alias");
-        }
-        let (bundle_path, utm_name, fallback_ip) = match self.vm_lan_presence_entry(alias) {
-            Ok(v) => v,
-            Err(e) => return tool_error(&e),
+        let subject = if alias.is_empty() {
+            "<missing alias>"
+        } else {
+            alias
         };
-
-        let (live_ip, path_kind) =
-            self.classify_vm_current_network_path(&bundle_path, &fallback_ip);
-        if path_kind == "physical-lan" {
-            return tool_success(&format!(
-                "# Bridged network: {alias}\n\nAlready on the physical LAN ({live_ip}) — nothing to do.\n"
-            ));
-        }
-
-        // UTM's own "update configuration" AppleScript command requires the
-        // VM to be stopped first — and is the mechanism that actually works
-        // (a raw config.plist edit does not; see set_utm_vm_bridged_via_applescript).
-        if let Err(e) = self.stop_vm_by_alias(alias) {
-            return tool_error(&e);
-        }
-        std::thread::sleep(Duration::from_secs(2));
-        if let Err(e) = set_utm_vm_bridged_via_applescript(&utm_name) {
-            return tool_error(&format!(
-                "'{alias}' is stopped, but the network configuration update failed: {e}. Safe to retry (this tool is idempotent)."
-            ));
-        }
-        if let Err(e) = self.start_vm_by_alias(alias) {
-            return tool_error(&format!(
-                "config updated but failed to restart '{alias}': {e}. It is now stopped with Bridged mode set — start it manually and retry this tool to finish verification."
-            ));
-        }
-
-        const POLL_INTERVAL: Duration = Duration::from_secs(5);
-        const MAX_WAIT: Duration = Duration::from_secs(120);
-        let mut waited = Duration::ZERO;
-        loop {
-            let (fresh_ip, fresh_kind) =
-                self.classify_vm_current_network_path(&bundle_path, &fallback_ip);
-            if fresh_kind == "physical-lan" {
-                // Reuse the same, already-hardened ARP-by-MAC-aware
-                // discovery path every other inventory refresh in this lab
-                // goes through — never hand-write the JSON here.
-                let refresh = self.run_ops(
-                    "vm-lab-discover-local-utm-summary",
-                    &["--update-inventory-live-ips"],
-                    DISCOVERY_TIMEOUT_SECS,
-                );
-                if refresh.is_error.unwrap_or(false) {
-                    return tool_success(&format!(
-                        "# Bridged network: {alias}\n\n✅ Now on the physical LAN ({fresh_ip}), but the inventory refresh failed — run update_inventory manually.\n"
-                    ));
-                }
-                return tool_success(&format!(
-                    "# Bridged network: {alias}\n\n✅ Switched to Bridged mode and confirmed on the physical LAN: {fresh_ip} (utm_name={utm_name}). Inventory refreshed.\n"
-                ));
-            }
-            if waited >= MAX_WAIT {
-                return tool_error(&format!(
-                    "Set Bridged mode and restarted '{alias}', but it still isn't on the physical LAN after {}s (currently: {fresh_kind}, ip {fresh_ip}). The VM may still be booting — try diagnose_vm_lan_presence again shortly, or re-run this tool (it's idempotent).",
-                    waited.as_secs()
-                ));
-            }
-            std::thread::sleep(POLL_INTERVAL);
-            waited += POLL_INTERVAL;
-        }
+        tool_error(&format!(
+            "apply_vm_bridged_network is DEPRECATED and refuses to run (requested for '{subject}'). \
+             Bridging a lab VM onto the host's everyday LAN is never a default attachment \
+             (LiveLabVmConnectivityRulebook §5/§11.3). Use the sanctioned path instead: \
+             1) audit_lab_network to see current attachments; \
+             2) prepare_lab_network with an explicitly allowlisted physical network profile and \
+             approve_reconfigure=true — it runs the atomic stop→rewrite→verify→rollback transaction; \
+             3) restore_lab_network <transaction_id> to undo. en0 is denied by policy in every profile."
+        ))
     }
 
     /// Summarize the trend across the last N run-matrix rows (converging or stuck?).
@@ -3362,51 +3283,6 @@ fn utm_config_network_mode(bundle_path: &Path) -> Option<String> {
     )
 }
 
-/// Set a UTM VM's network mode to Bridged (onto `en0`) via UTM's own
-/// AppleScript "UTM Configuration Suite" — `update configuration`. This is
-/// the mechanism that actually works: a raw `config.plist` edit (tried
-/// first, and it looked right — the file correctly showed `Bridged` and
-/// even survived a `--kill` hard-restart) still left the VM on its old
-/// internal vmnet bridge, because UTM's running app process holds its own
-/// in-memory configuration object that a bare file edit + power cycle never
-/// invalidates. Going through UTM's own scripting API is what forces it to
-/// actually rebuild the network device attachment — confirmed live:
-/// `fedora-utm-1` moved from an isolated bridge address to a real
-/// `en0`-owned physical-LAN address only after this, never after the file
-/// edit alone. UTM documents that `update configuration` requires the VM to
-/// be STOPPED first; the caller is responsible for that (this lab's
-/// `apply_vm_bridged_network` stops it before calling this).
-fn set_utm_vm_bridged_via_applescript(utm_name: &str) -> Result<(), String> {
-    let script = format!(
-        "tell application \"UTM\"\n\
-         \tset theVM to virtual machine {}\n\
-         \tset theConfig to configuration of theVM\n\
-         \tset netIfaces to network interfaces of theConfig\n\
-         \tset firstIface to item 1 of netIfaces\n\
-         \tset mode of firstIface to bridged\n\
-         \tset host interface of firstIface to \"en0\"\n\
-         \tset network interfaces of theConfig to netIfaces\n\
-         \tupdate configuration theVM with theConfig\n\
-         end tell",
-        apple_script_string_literal(utm_name)
-    );
-    let outcome = run_with_timeout(
-        "osascript",
-        &["-e", &script],
-        Path::new("/"),
-        &[],
-        Duration::from_secs(30),
-    )
-    .map_err(|e| format!("failed to invoke osascript: {e}"))?;
-    if !outcome.success {
-        return Err(format!(
-            "UTM AppleScript configuration update failed: {}",
-            outcome.stderr.trim()
-        ));
-    }
-    Ok(())
-}
-
 /// Normalize a MAC address to lowercase, zero-padded colon-hex. macOS's
 /// `arp -a` omits leading zeros per octet (e.g. `6:2b:b:28:e3:ff`), while
 /// UTM's config.plist writes them zero-padded — normalize both sides.
@@ -3561,6 +3437,32 @@ fn write_vm_internet_tunnel_pid(repo_root: &Path, alias: &str, pid: u32) -> Resu
 
 fn remove_vm_internet_tunnel_state(repo_root: &Path, alias: &str) {
     let _ = std::fs::remove_file(vm_internet_tunnel_state_path(repo_root, alias));
+}
+
+/// Aliases with a LIVE reverse-SOCKS bootstrap tunnel (recorded pid still
+/// running). SOCKS bootstrap contaminates network evidence: it must be
+/// disabled and recorded absent before any evidence run launches
+/// (LiveLabVmConnectivityRulebook §9).
+fn active_vm_internet_tunnels(repo_root: &Path) -> Vec<String> {
+    let dir = repo_root.join("state/vm-internet-tunnels");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut live = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(alias) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if read_vm_internet_tunnel_pid(repo_root, alias).is_some_and(host_pid_alive) {
+            live.push(alias.to_owned());
+        }
+    }
+    live.sort();
+    live
 }
 
 /// True if a HOST-local process with this pid still exists. `kill -0` sends
@@ -4182,10 +4084,44 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "apply_vm_bridged_network".into(),
-                description: "Force a VM directly onto the physical LAN, deterministically, like debian-headless-4 — instead of hoping UTM's 'Shared' mode happens to MACNAT it there (observed live: non-deterministic per VM, per restart, even across the SAME VM's reboots). No-ops if it's already there. Otherwise: flips the UTM bundle's Network Mode from Shared to Bridged in config.plist (verified live — no explicit interface pin needed; this lab's Windows.utm runs exactly this, successfully), stops + restarts the VM, waits for a fresh physical-LAN lease (bounded poll, up to 2 minutes), and refreshes inventory through the standard ARP-by-MAC-aware discovery path (never hand-writes the JSON). Blocking, minutes-scale (same class as ensure_lab_ready) — a VM reboot + DHCP cycle takes real wall-clock time. Idempotent: safe to re-run if it times out mid-boot. Does NOT by itself fix internet access if the physical LAN has its own per-device admission control (captive portal) — see set_vm_internet_access for that.".into(),
+                description: "DEPRECATED — always refuses (LiveLabVmConnectivityRulebook §11.3). This tool used to bridge a VM onto the host's everyday LAN (en0) via AppleScript with no profile, transaction, rollback, or evidence contract; that mutation path has been removed. Use audit_lab_network to see current attachments and prepare_lab_network (explicit approve_reconfigure + an allowlisted physical network profile) for any attachment change; en0 is denied by policy.".into(),
                 input_schema: json_schema_object(
-                    json!({"alias": json_schema_string("VM alias to move onto the physical LAN")}),
-                    vec!["alias"],
+                    json!({"alias": json_schema_string("VM alias (recorded in the refusal message only)")}),
+                    vec![],
+                ),
+            },
+            Tool {
+                name: "audit_lab_network".into(),
+                description: "READ-ONLY network audit of the whole UTM fleet against the reviewed network profiles (profiles/vm_lab/network/*.toml). Runs `rustynet ops vm-lab-network-audit`: observes every VM's backend + per-NIC attachment (Shared/Host Only/Bridged + pinned interface), host routes/VPN/proxy, inventory staleness (duplicate IPs, drifted network_group labels), duplicate MACs, and the netns-simulator transit vs mesh 100.64.0.0/10 collision; writes redacted owner-only evidence to state/vm_network_evidence.json. NEVER mutates anything. Pass profile to evaluate drift against one profile id.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "profile": json_schema_string("Optional network profile id to evaluate drift against (e.g. mgmt_shared_smoke_v1, isolated_multivm_v1)"),
+                        "include_guests": json_schema_boolean("Also SSH into guests for address/route/DNS/MTU observations (slower; default false)"),
+                    }),
+                    vec![],
+                ),
+            },
+            Tool {
+                name: "prepare_lab_network".into(),
+                description: "The ONLY VM network mutation path (LiveLabVmConnectivityRulebook §11.2/§13). Runs `rustynet ops vm-lab-network-prepare --profile <id>`: WITHOUT approve_reconfigure=true it only prints the redacted dry-run plan (current vs target attachment per VM) and changes NOTHING. With approve_reconfigure=true it executes the atomic transaction: overlap-refusing network lease, full-config rollback snapshots (owner-only, outside committed evidence), stop every affected VM, apply, restart, verify, and roll everything back (verified by digest) on any failure. Autonomous loops MUST NOT set approve_reconfigure — it is an explicit operator authorization. en0 can never be a bridge target.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "profile": json_schema_string("Network profile id from profiles/vm_lab/network/ (required)"),
+                        "aliases": json_schema_array_string("Optional subset of inventory VM aliases; empty = every local-UTM VM"),
+                        "approve_reconfigure": json_schema_boolean("EXPLICIT mutation authorization. false/absent = dry-run plan only. Never set from an autonomous loop without operator approval."),
+                    }),
+                    vec!["profile"],
+                ),
+            },
+            Tool {
+                name: "restore_lab_network".into(),
+                description: "Verified, idempotent rollback of a recorded network transaction: runs `rustynet ops vm-lab-network-restore --transaction <id>` (restores every VM's snapshotted configuration + power state, digest-verified) or lists recorded transactions when list=true. Safe after an interrupted prepare — the journal under state/vm_lab_network_txn/ survives MCP reloads and crashes, so lease and transaction truth are preserved.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "transaction_id": json_schema_string("Transaction id to restore (from prepare_lab_network output or list=true)"),
+                        "list": json_schema_boolean("List recorded transactions and their outcomes instead of restoring"),
+                    }),
+                    vec![],
                 ),
             },
             Tool {
@@ -4198,13 +4134,23 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "ensure_lab_ready".into(),
-                description: "Pre-flight: discover → restart unready + wait SSH → re-confirm. Minutes-scale (blocking).".into(),
-                input_schema: json_schema_object(json!({}), vec![]),
+                description: "Pre-flight: discover → restart unready + wait SSH → re-confirm. Minutes-scale (blocking). Pass profile to PRESERVE and re-verify a network profile: the fleet's attachments are audited against it after the restart (verify-only, fail-closed on drift) — this tool never 'repairs' Shared into Bridged or mutates any attachment (use prepare_lab_network for that).".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "profile": json_schema_string("Optional network profile id to re-verify after readiness (verify-only; drift is reported, never repaired)"),
+                    }),
+                    vec![],
+                ),
             },
             Tool {
                 name: "preflight_check".into(),
-                description: "Fast, read-only loop-start go/no-go in ONE call: host tools (cargo/utmctl/ssh/git), ssh identity + known_hosts, inventory parseability, disk headroom, the working-tree deploy set (untracked crates/ that won't ship), and every node's power+TCP. Returns a 🛑 NO-GO / ⚠️ CAUTION / ✅ GO verdict. Use it before start_live_lab_run instead of calling host_disk_status + get_lab_topology + check_vm_reachable separately. (Does not mutate or restart anything — for active recovery use ensure_lab_ready.)".into(),
-                input_schema: json_schema_object(json!({}), vec![]),
+                description: "Fast, read-only loop-start go/no-go in ONE call: host tools (cargo/utmctl/ssh/git), ssh identity + known_hosts, inventory parseability, disk headroom, the working-tree deploy set (untracked crates/ that won't ship), and every node's power+TCP. Returns a 🛑 NO-GO / ⚠️ CAUTION / ✅ GO verdict. Pass profile to ALSO run the read-only network audit against that profile — the report then includes the network evidence path (state/vm_network_evidence.json) and the profile's canonical digest. Use it before start_live_lab_run instead of calling host_disk_status + get_lab_topology + check_vm_reachable separately. (Does not mutate or restart anything — for active recovery use ensure_lab_ready.)".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "profile": json_schema_string("Optional network profile id; adds the network audit + evidence path/digest to the report"),
+                    }),
+                    vec![],
+                ),
             },
             Tool {
                 name: "sync_repo_to_vm".into(),
@@ -4284,6 +4230,7 @@ impl McpServer for LabStateServer {
                         "skip_gates": json_schema_boolean("Skip gate stages"),
                         "skip_soak": json_schema_boolean("Skip soak stages"),
                         "skip_cross_network": json_schema_boolean("Skip cross-network stages"),
+                        "network_profile": json_schema_string("Network profile id (profiles/vm_lab/network/). Verify-only: recorded immutably at launch; an EXPLICIT id stops the run before deployment when the fleet does not satisfy it. Omitted = derived management-plane default (recorded, not blocking). This tool never mutates attachments — use prepare_lab_network."),
                         "exit_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the EXIT role so the focused mac/win exit cell runs live instead of skipping. Routes through the LEGACY BASH orchestrator, NOT the Rust --node engine (mutually exclusive with `nodes`) — use `nodes=[\"alias:exit\", ...]` instead to test the Rust engine."),
                         "relay_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the RELAY role. Routes through the LEGACY BASH orchestrator, NOT the Rust --node engine (mutually exclusive with `nodes`) — use `nodes=[\"alias:relay\", ...]` instead to test the Rust engine."),
                         "anchor_platform": json_schema_string("orchestrate: ELECT this OS (linux|macos|windows) into the ANCHOR role. Routes through the LEGACY BASH orchestrator, NOT the Rust --node engine (mutually exclusive with `nodes`) — use `nodes=[\"alias:anchor\", ...]` instead to test the Rust engine."),
@@ -4667,6 +4614,78 @@ impl McpServer for LabStateServer {
             "apply_vm_bridged_network" => {
                 self.apply_vm_bridged_network(arg_str(args, "alias").unwrap_or(""))
             }
+            "audit_lab_network" => {
+                let mut cli: Vec<String> = vec![
+                    "ops".into(),
+                    "vm-lab-network-audit".into(),
+                    "--inventory".into(),
+                    DEFAULT_INVENTORY.into(),
+                ];
+                if let Some(profile) = arg_str(args, "profile").filter(|p| !p.is_empty()) {
+                    cli.extend(["--profile".into(), profile.to_string()]);
+                }
+                let include_guests = arg_bool(args, "include_guests");
+                if !include_guests {
+                    cli.push("--skip-guests".into());
+                }
+                let refs: Vec<&str> = cli.iter().map(String::as_str).collect();
+                self.run_cli(&refs, "vm-lab-network-audit (read-only)", 300)
+            }
+            "prepare_lab_network" => {
+                let Some(profile) = arg_str(args, "profile").filter(|p| !p.is_empty()) else {
+                    return tool_error("Missing required parameter: profile");
+                };
+                let approve = arg_bool(args, "approve_reconfigure");
+                let mut cli: Vec<String> = vec![
+                    "ops".into(),
+                    "vm-lab-network-prepare".into(),
+                    "--inventory".into(),
+                    DEFAULT_INVENTORY.into(),
+                    "--profile".into(),
+                    profile.to_string(),
+                ];
+                for alias in string_array(args, "aliases") {
+                    cli.extend(["--vm".into(), alias]);
+                }
+                if approve {
+                    // The explicit operator authorization boundary — flows 1:1
+                    // into the Rust transaction's own --approve-reconfigure.
+                    cli.push("--approve-reconfigure".into());
+                } else {
+                    cli.push("--dry-run".into());
+                }
+                let refs: Vec<&str> = cli.iter().map(String::as_str).collect();
+                self.run_cli(
+                    &refs,
+                    if approve {
+                        "vm-lab-network-prepare (AUTHORIZED transaction)"
+                    } else {
+                        "vm-lab-network-prepare (dry-run plan; nothing changed)"
+                    },
+                    1800,
+                )
+            }
+            "restore_lab_network" => {
+                let list = arg_bool(args, "list");
+                let mut cli: Vec<String> = vec![
+                    "ops".into(),
+                    "vm-lab-network-restore".into(),
+                    "--inventory".into(),
+                    DEFAULT_INVENTORY.into(),
+                ];
+                if list {
+                    cli.push("--list".into());
+                } else if let Some(txn) = arg_str(args, "transaction_id").filter(|t| !t.is_empty())
+                {
+                    cli.extend(["--transaction".into(), txn.to_string()]);
+                } else {
+                    return tool_error(
+                        "restore_lab_network requires transaction_id, or list=true to enumerate",
+                    );
+                }
+                let refs: Vec<&str> = cli.iter().map(String::as_str).collect();
+                self.run_cli(&refs, "vm-lab-network-restore", 1800)
+            }
 
             "recover_stuck_vms" => {
                 let aliases = string_array(args, "aliases");
@@ -4712,6 +4731,37 @@ impl McpServer for LabStateServer {
                 );
                 if let Some(c) = confirm.content.first() {
                     result.push_str(&c.text);
+                }
+                // Rulebook §11.2: ensure_lab_ready(profile) preserves and
+                // re-verifies the profile after the restart. Verify-only —
+                // drift is reported fail-closed, never repaired here.
+                if let Some(profile) = arg_str(args, "profile").filter(|p| !p.is_empty()) {
+                    result.push_str("\n\n## Step 4: Network profile re-verify (read-only)\n\n");
+                    // vm-lab-network-preflight exits nonzero unless the
+                    // observed fleet satisfies the profile — the fail-closed
+                    // verify the rulebook requires.
+                    let verify = self.run_cli(
+                        &[
+                            "ops",
+                            "vm-lab-network-preflight",
+                            "--inventory",
+                            DEFAULT_INVENTORY,
+                            "--profile",
+                            profile,
+                            "--skip-guests",
+                        ],
+                        "vm-lab-network-preflight (post-readiness re-verify)",
+                        300,
+                    );
+                    if let Some(c) = verify.content.first() {
+                        result.push_str(&c.text);
+                    }
+                    if verify.is_error.unwrap_or(false) {
+                        result.push_str(
+                            "\n\n🛑 network profile re-verify FAILED — the lab is ready but does not satisfy the requested profile; do not run evidence stages against it (use prepare_lab_network with explicit operator approval to migrate).",
+                        );
+                        return tool_error(&result);
+                    }
                 }
                 tool_success(&result)
             }
@@ -4832,7 +4882,42 @@ impl McpServer for LabStateServer {
             "find_untested_work" => self.find_untested_work(args),
             "diff_runs" => self.diff_runs(args),
             "what_will_deploy" => self.what_will_deploy(args),
-            "preflight_check" => self.preflight_check(),
+            "preflight_check" => {
+                let base = self.preflight_check();
+                let Some(profile) = arg_str(args, "profile").filter(|p| !p.is_empty()) else {
+                    return base;
+                };
+                // Profile-aware preflight (rulebook §11.2): append the
+                // read-only network audit; its summary carries the profile's
+                // canonical digest and the evidence path.
+                let mut result = base
+                    .content
+                    .first()
+                    .map(|c| c.text.clone())
+                    .unwrap_or_default();
+                result.push_str("\n\n## Network audit (read-only)\n\n");
+                let audit = self.run_cli(
+                    &[
+                        "ops",
+                        "vm-lab-network-audit",
+                        "--inventory",
+                        DEFAULT_INVENTORY,
+                        "--profile",
+                        profile,
+                        "--skip-guests",
+                    ],
+                    "vm-lab-network-audit",
+                    300,
+                );
+                if let Some(c) = audit.content.first() {
+                    result.push_str(&c.text);
+                }
+                if base.is_error.unwrap_or(false) || audit.is_error.unwrap_or(false) {
+                    tool_error(&result)
+                } else {
+                    tool_success(&result)
+                }
+            }
             "write_loop_note" => self.write_loop_note(args),
             "get_loop_journal" => self.get_loop_journal(args),
             "prune_jobs" => self.prune_jobs(args),
@@ -4890,6 +4975,20 @@ impl LabStateServer {
         let profile = arg_str(args, "profile").unwrap_or("");
         if mode == "run" && profile.is_empty() {
             return tool_error("mode=run requires a 'profile'");
+        }
+        // SOCKS bootstrap blocks evidence stages (rulebook §9): a live
+        // reverse-SOCKS tunnel would contaminate egress/DNS/leak evidence.
+        // Dry-run wiring checks are exempt.
+        if !arg_bool(args, "dry_run") {
+            let live_tunnels = active_vm_internet_tunnels(&self.repo_root);
+            if !live_tunnels.is_empty() {
+                return tool_error(&format!(
+                    "refusing to launch: reverse-SOCKS bootstrap tunnel(s) are still active for [{}]. \
+                     They contaminate network evidence — run set_vm_internet_access with action=disable \
+                     for each alias first, then retry.",
+                    live_tunnels.join(", ")
+                ));
+            }
         }
 
         // Fail closed on the nodes + role-platform-selector conflict: passing
@@ -4976,6 +5075,15 @@ impl LabStateServer {
                     if arg_bool(args, key) {
                         cli.push(flag.into());
                     }
+                }
+                // Verify-only network-profile propagation (rulebook §11.2):
+                // the orchestrator records the profile immutably at launch and
+                // an explicit id is enforced fail-closed. This tool never
+                // mutates attachments to satisfy a profile.
+                if let Some(network_profile) =
+                    arg_str(args, "network_profile").filter(|p| !p.is_empty())
+                {
+                    cli.extend(["--network-profile".into(), network_profile.to_string()]);
                 }
                 // Windows/macOS: explicit arg wins; otherwise auto-topology
                 // (default on) fills them from the inventory.
@@ -7597,16 +7705,6 @@ mod tests {
     }
 
     #[test]
-    fn set_utm_vm_bridged_via_applescript_fails_closed_for_unknown_vm_name() {
-        // A real osascript call (this MCP server is macOS-only by design,
-        // same as its other host-command tests) against a VM name that
-        // can't exist in UTM's registry — proves the error path surfaces
-        // osascript's failure instead of silently reporting success.
-        let result = set_utm_vm_bridged_via_applescript("definitely-not-a-real-utm-vm-name-9f3c7a");
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn diagnose_vm_lan_presence_rejects_unknown_alias() {
         let tmp = temp_bundle_dir("lan-presence-unknown");
         let inv_dir = tmp.join("documents/operations/active");
@@ -7623,44 +7721,24 @@ mod tests {
     }
 
     #[test]
-    fn apply_vm_bridged_network_rejects_missing_alias() {
-        let tmp = temp_bundle_dir("apply-bridge-missing-alias");
+    fn apply_vm_bridged_network_always_refuses_as_deprecated() {
+        // Rulebook §11.3: the AppleScript/en0 mutation path is removed; the
+        // tool refuses unconditionally and points at the sanctioned
+        // prepare_lab_network transaction.
+        let tmp = temp_bundle_dir("apply-bridge-deprecated");
         std::fs::create_dir_all(tmp.join("documents/operations/active")).unwrap();
         let srv = test_server(&tmp);
-        let result = srv.apply_vm_bridged_network("");
-        assert!(result.is_error.unwrap_or(false));
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn apply_vm_bridged_network_rejects_unknown_alias() {
-        let tmp = temp_bundle_dir("apply-bridge-unknown-alias");
-        let inv_dir = tmp.join("documents/operations/active");
-        std::fs::create_dir_all(&inv_dir).unwrap();
-        std::fs::write(
-            inv_dir.join("vm_lab_inventory.json"),
-            r#"{"entries":[{"alias":"deb-1"}],"version":1}"#,
-        )
-        .unwrap();
-        let srv = test_server(&tmp);
-        let result = srv.apply_vm_bridged_network("does-not-exist");
-        assert!(result.is_error.unwrap_or(false));
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn apply_vm_bridged_network_rejects_entry_missing_bundle_path() {
-        let tmp = temp_bundle_dir("apply-bridge-no-bundle");
-        let inv_dir = tmp.join("documents/operations/active");
-        std::fs::create_dir_all(&inv_dir).unwrap();
-        std::fs::write(
-            inv_dir.join("vm_lab_inventory.json"),
-            r#"{"entries":[{"alias":"deb-1","last_known_ip":"192.0.2.1"}],"version":1}"#,
-        )
-        .unwrap();
-        let srv = test_server(&tmp);
-        let result = srv.apply_vm_bridged_network("deb-1");
-        assert!(result.is_error.unwrap_or(false));
+        for alias in ["", "fedora-utm-1"] {
+            let result = srv.apply_vm_bridged_network(alias);
+            assert!(result.is_error.unwrap_or(false));
+            let text = result
+                .content
+                .first()
+                .map(|c| c.text.clone())
+                .unwrap_or_default();
+            assert!(text.contains("DEPRECATED"), "{text}");
+            assert!(text.contains("prepare_lab_network"), "{text}");
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

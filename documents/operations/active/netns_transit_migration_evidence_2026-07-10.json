@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-07-10",
+  "subject": "netns simulator ordinary transit migration 100.64.0.0/24 -> 198.18.0.0/15 (LiveLabVmConnectivityRulebook §15.3, Slice C)",
+  "base_commit": "b775156",
+  "git_dirty_state": "dirty: connectivity-rulebook slices A-C in working tree",
+  "guest": {
+    "alias": "debian-headless-2",
+    "kernel": "6.12.74+deb13+1-arm64",
+    "management_host": "192.168.64.4"
+  },
+  "network_profile": {
+    "id": "crossnet_netns_v1",
+    "transit": "198.18.0.0/24 (within canonical 198.18.0.0/15)",
+    "legacy_transit_retained_for": "cgnat_collision_v1 adversarial profile only (--wan-cidr override)"
+  },
+  "results": {
+    "build": "pass (2 sites port_restricted_cone, svc at 198.18.0.254, wan_cidr=198.18.0.0/24)",
+    "positive_reachability": "pass (ep-A and ep-B -> 198.18.0.254, 0% loss)",
+    "negative_reachability": "pass (ep-A -> ep-B private 10.20.0.2 blocked; isolation held)",
+    "nat_mapping_classification": {
+      "port_restricted_cone": "pass (endpoint-independent as expected)",
+      "full_cone": "pass (endpoint-independent as expected)",
+      "symmetric": "pass (endpoint-dependent as expected)"
+    },
+    "nat_filtering_matrix": "pass 9/9 (full_cone/port_restricted_cone/symmetric x RETURN_EXACT/UNSOLICITED_DIFF_PORT/COLD_INBOUND all as expected)",
+    "teardown": "pass (rnsim-* namespaces and rnsim-wan bridge fully removed; zero residue)",
+    "audit_collision_finding": "netns_transit_mesh_collision no longer reported by rustynet ops vm-lab-network-audit after migration",
+    "double_nat_cgnat": "not_run (chained two-router site still unimplemented; simulator refuses it fail-loud)"
+  },
+  "limitations": [
+    "classification/filtering evidence only; the daemon-path validator on the new transit is future Slice C/X1-increment work",
+    "single-guest netns tier; no separate-kernel or physical-network claim"
+  ]
+}

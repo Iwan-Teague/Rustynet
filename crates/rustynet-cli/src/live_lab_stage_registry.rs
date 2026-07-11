@@ -112,6 +112,8 @@ pub enum StageStatus {
     Pass,
     Fail,
     Skipped,
+    NotRun,
+    Reused,
     NotApplicable,
     TimedOut,
     Aborted,
@@ -126,6 +128,8 @@ impl StageStatus {
             StageStatus::Pass => "pass",
             StageStatus::Fail => "fail",
             StageStatus::Skipped => "skipped",
+            StageStatus::NotRun => "not_run",
+            StageStatus::Reused => "reused",
             StageStatus::NotApplicable => "not_applicable",
             StageStatus::TimedOut => "timed_out",
             StageStatus::Aborted => "aborted",
@@ -150,9 +154,9 @@ pub fn parse_stage_status(raw: &str) -> Option<StageStatus> {
         "pass" | "passed" | "success" | "succeeded" | "ok" => Some(StageStatus::Pass),
         "fail" | "failed" | "error" => Some(StageStatus::Fail),
         "skip" | "skipped" => Some(StageStatus::Skipped),
-        "na" | "n/a" | "not_applicable" | "not-applicable" | "not_run" | "not-run" | "not run" => {
-            Some(StageStatus::NotApplicable)
-        }
+        "not_run" | "not-run" | "not run" => Some(StageStatus::NotRun),
+        "reused" | "reuse" => Some(StageStatus::Reused),
+        "na" | "n/a" | "not_applicable" | "not-applicable" => Some(StageStatus::NotApplicable),
         "timed_out" | "timedout" | "timeout" => Some(StageStatus::TimedOut),
         "aborted" | "abort" => Some(StageStatus::Aborted),
         _ => None,
@@ -2553,6 +2557,8 @@ mod tests {
             StageStatus::Pass,
             StageStatus::Fail,
             StageStatus::Skipped,
+            StageStatus::NotRun,
+            StageStatus::Reused,
             StageStatus::NotApplicable,
             StageStatus::TimedOut,
             StageStatus::Aborted,
@@ -2563,10 +2569,7 @@ mod tests {
         assert_eq!(parse_stage_status("skip"), Some(StageStatus::Skipped));
         assert_eq!(parse_stage_status("SKIPPED"), Some(StageStatus::Skipped));
         assert_eq!(parse_stage_status("passed"), Some(StageStatus::Pass));
-        assert_eq!(
-            parse_stage_status("not_run"),
-            Some(StageStatus::NotApplicable)
-        );
+        assert_eq!(parse_stage_status("not_run"), Some(StageStatus::NotRun));
         assert_eq!(parse_stage_status("n/a"), Some(StageStatus::NotApplicable));
         assert_eq!(parse_stage_status("timeout"), Some(StageStatus::TimedOut));
         // Unknown strings are a caller decision, not a silent bucket.

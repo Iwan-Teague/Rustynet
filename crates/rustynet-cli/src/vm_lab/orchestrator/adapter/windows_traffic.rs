@@ -408,10 +408,11 @@ pub fn collect_daemon_failure_reason(
 ///   `rules=<n>`         count of leftover RustyNet `dir=out` firewall rules
 ///   `outbound=<allow|block>` default outbound firewall policy posture
 ///   `service=<running|stopped|absent>` the `RustyNet` Windows service state
+///   `relay=<running|stopped|absent>` the relay sibling service state
 ///   `adapter=<names|->`  leftover RustyNet network adapter name(s), or `-`
 ///
-/// A node is clean only when all four are benign (`rules=0`, `outbound=allow`,
-/// `service=stopped`/`absent`, `adapter=-`). The service + adapter dimensions
+/// A node is clean only when all five are benign (`rules=0`, `outbound=allow`,
+/// both services stopped/absent, `adapter=-`). The service + adapter dimensions
 /// close the gap the firewall-only check left: a still-running service re-applies
 /// the killswitch and owns the adapter, and a leftover wintun/WireGuard adapter
 /// named `rustynet*` collides with the fresh bring-up. Read-only — it mutates
@@ -428,13 +429,17 @@ fn windows_node_clean_assert_script() -> String {
          if (-not $svc) {{ $svcState = 'absent' }} \
          elseif ($svc.Status -eq 'Running') {{ $svcState = 'running' }} \
          else {{ $svcState = 'stopped' }}; \
+         $relay = Get-Service -Name '{WINDOWS_RELAY_SERVICE_NAME}' -ErrorAction SilentlyContinue; \
+         if (-not $relay) {{ $relayState = 'absent' }} \
+         elseif ($relay.Status -eq 'Running') {{ $relayState = 'running' }} \
+         else {{ $relayState = 'stopped' }}; \
          $adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {{ \
              $_.Name -like '*rustynet*' -or $_.InterfaceDescription -like '*rustynet*' }} \
              | ForEach-Object {{ $_.Name }}); \
          $adapterTok = if ($adapters.Count -gt 0) {{ ($adapters -join ',') }} else {{ '-' }}; \
          $outboundTok = if ($blocked.Count -gt 0) {{ 'block' }} else {{ 'allow' }}; \
          Write-Output ('rules=' + $rules.Count + ' outbound=' + $outboundTok + \
-             ' service=' + $svcState + ' adapter=' + $adapterTok)"
+             ' service=' + $svcState + ' relay=' + $relayState + ' adapter=' + $adapterTok)"
     )
 }
 
@@ -451,7 +456,7 @@ fn windows_node_clean_assert_script() -> String {
 /// passing a node whose true state is unknown.
 fn parse_windows_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
     // The probe prints a single result line; tolerate leading log/banner lines
-    // by scanning for the line that carries the four expected tokens.
+    // by scanning for the line that carries the five expected tokens.
     let line = raw
         .lines()
         .map(str::trim)
@@ -461,6 +466,7 @@ fn parse_windows_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
             l.contains("rules=")
                 && l.contains("outbound=")
                 && l.contains("service=")
+                && l.contains("relay=")
                 && l.contains("adapter=")
         });
     let Some(line) = line else {
@@ -475,6 +481,7 @@ fn parse_windows_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
     let mut rules: Option<&str> = None;
     let mut outbound: Option<&str> = None;
     let mut service: Option<&str> = None;
+    let mut relay: Option<&str> = None;
     let mut adapter: Option<&str> = None;
     for tok in line.split_whitespace() {
         if let Some(v) = tok.strip_prefix("rules=") {
@@ -483,6 +490,8 @@ fn parse_windows_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
             outbound = Some(v);
         } else if let Some(v) = tok.strip_prefix("service=") {
             service = Some(v);
+        } else if let Some(v) = tok.strip_prefix("relay=") {
+            relay = Some(v);
         } else if let Some(v) = tok.strip_prefix("adapter=") {
             adapter = Some(v);
         }
@@ -506,6 +515,11 @@ fn parse_windows_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
         Some("running") => dirty.push("RustyNet service still running".to_owned()),
         _ => dirty.push("service status unknown (probe token missing)".to_owned()),
     }
+    match relay.map(str::trim) {
+        Some("stopped") | Some("absent") => {}
+        Some("running") => dirty.push("RustyNet relay service still running".to_owned()),
+        _ => dirty.push("relay-service status unknown (probe token missing)".to_owned()),
+    }
     // `-` (or empty) is the benign "no leftover adapter" sentinel; any other
     // value is a comma-joined list of leftover adapter names. A missing token is
     // unknown → dirty (fail closed).
@@ -524,7 +538,7 @@ fn parse_windows_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
     }
 }
 
-/// After cleanup, assert the node is verifiably clean across all four dimensions
+/// After cleanup, assert the node is verifiably clean across all five dimensions
 /// that break the next bootstrap, mirroring the Linux/macOS `assert_node_clean`:
 /// no leftover RustyNet `dir=out` killswitch firewall rule, the default outbound
 /// policy not left blocking (a residual default-block-outbound killswitch starves
@@ -806,13 +820,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn windows_node_clean_assert_script_covers_rules_outbound_service_and_adapter() {
+    fn windows_node_clean_assert_script_covers_rules_outbound_services_and_adapter() {
         let s = windows_node_clean_assert_script();
         // firewall-rule + outbound-policy dimensions (retained from the original).
         assert!(s.contains("Select-String 'RustyNet'"));
         assert!(s.contains("BlockOutbound"));
         // service dimension: the RustyNet Windows service state.
         assert!(s.contains("Get-Service -Name 'RustyNet'"));
+        assert!(s.contains("Get-Service -Name 'RustyNetRelay'"));
         assert!(s.contains("Running"));
         // adapter dimension: a leftover RustyNet network adapter.
         assert!(s.contains("Get-NetAdapter"));
@@ -821,24 +836,29 @@ mod tests {
         assert!(s.contains("'rules=' +"));
         assert!(s.contains("outbound="));
         assert!(s.contains("service="));
+        assert!(s.contains("relay="));
         assert!(s.contains("adapter="));
     }
 
     #[test]
     fn parse_windows_node_clean_probe_accepts_fully_clean_node() {
         assert!(
-            parse_windows_node_clean_probe("rules=0 outbound=allow service=stopped adapter=-\n")
-                .is_ok()
+            parse_windows_node_clean_probe(
+                "rules=0 outbound=allow service=stopped relay=stopped adapter=-\n"
+            )
+            .is_ok()
         );
         // An absent service is benign (a never-installed / uninstalled node).
         assert!(
-            parse_windows_node_clean_probe("rules=0 outbound=allow service=absent adapter=-")
-                .is_ok()
+            parse_windows_node_clean_probe(
+                "rules=0 outbound=allow service=absent relay=absent adapter=-"
+            )
+            .is_ok()
         );
         // Tolerates a leading banner/log line before the result line.
         assert!(
             parse_windows_node_clean_probe(
-                "WARNING: blah\nrules=0 outbound=allow service=stopped adapter=-"
+                "WARNING: blah\nrules=0 outbound=allow service=stopped relay=stopped adapter=-"
             )
             .is_ok()
         );
@@ -846,31 +866,34 @@ mod tests {
 
     #[test]
     fn parse_windows_node_clean_probe_reports_leftover_rules_and_outbound_block() {
-        let err =
-            parse_windows_node_clean_probe("rules=3 outbound=allow service=stopped adapter=-")
-                .expect_err("leftover firewall rules must fail");
+        let err = parse_windows_node_clean_probe(
+            "rules=3 outbound=allow service=stopped relay=stopped adapter=-",
+        )
+        .expect_err("leftover firewall rules must fail");
         assert!(
             err.to_string()
                 .contains("3 leftover RustyNet firewall rule")
         );
-        let err2 =
-            parse_windows_node_clean_probe("rules=0 outbound=block service=stopped adapter=-")
-                .expect_err("blocking outbound policy must fail");
+        let err2 = parse_windows_node_clean_probe(
+            "rules=0 outbound=block service=stopped relay=stopped adapter=-",
+        )
+        .expect_err("blocking outbound policy must fail");
         assert!(err2.to_string().contains("outbound policy left blocking"));
     }
 
     #[test]
     fn parse_windows_node_clean_probe_reports_running_service() {
-        let err =
-            parse_windows_node_clean_probe("rules=0 outbound=allow service=running adapter=-")
-                .expect_err("running service must fail");
+        let err = parse_windows_node_clean_probe(
+            "rules=0 outbound=allow service=running relay=stopped adapter=-",
+        )
+        .expect_err("running service must fail");
         assert!(err.to_string().contains("RustyNet service still running"));
     }
 
     #[test]
     fn parse_windows_node_clean_probe_reports_leftover_adapter() {
         let err = parse_windows_node_clean_probe(
-            "rules=0 outbound=allow service=stopped adapter=rustynet0",
+            "rules=0 outbound=allow service=stopped relay=stopped adapter=rustynet0",
         )
         .expect_err("leftover adapter must fail");
         let msg = err.to_string();
@@ -881,13 +904,14 @@ mod tests {
     #[test]
     fn parse_windows_node_clean_probe_aggregates_multiple_dirty_dimensions() {
         let err = parse_windows_node_clean_probe(
-            "rules=2 outbound=block service=running adapter=rustynet0",
+            "rules=2 outbound=block service=running relay=running adapter=rustynet0",
         )
         .expect_err("multi-dirty must fail");
         let msg = err.to_string();
         assert!(msg.contains("2 leftover RustyNet firewall rule"));
         assert!(msg.contains("outbound policy left blocking"));
         assert!(msg.contains("RustyNet service still running"));
+        assert!(msg.contains("RustyNet relay service still running"));
         assert!(msg.contains("rustynet0"));
     }
 
@@ -902,9 +926,10 @@ mod tests {
             .expect_err("missing service token must fail closed");
         assert!(err.to_string().contains("unrecognised") || err.to_string().contains("unknown"));
         // A garbled (non-numeric) rules count is unknown → dirty, never pass.
-        let err2 =
-            parse_windows_node_clean_probe("rules=NaN outbound=allow service=stopped adapter=-")
-                .expect_err("garbled rules count must fail closed");
+        let err2 = parse_windows_node_clean_probe(
+            "rules=NaN outbound=allow service=stopped relay=stopped adapter=-",
+        )
+        .expect_err("garbled rules count must fail closed");
         assert!(err2.to_string().contains("unknown"));
     }
 

@@ -108,16 +108,39 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 
 | Type | Location | Purpose |
 |---|---|---|
-| `NodeAdapter` trait | `adapter/node_adapter.rs` | Per-OS adapter interface — install, membership, traffic, validators |
+| `NodeAdapter` trait + `RoleValidatorKind` | `adapter/node_adapter.rs` | Per-OS adapter interface — install, membership, traffic, and typed OS-specific validator dispatch |
 | `NodeConnection` enum | `connection.rs` | Transport injection: Ssh, Adb, Mdm |
 | `OrchestrationContext` | `context.rs` | In-memory stage context plus persisted setup/run split state at `<report_dir>/state/orchestration_context.json` |
 | `OrchestrationStage` trait | `stage/mod.rs` | Single stage in the orchestration pipeline |
 | `PlanBuilder` | `plan.rs` | Builds the stage execution plan from role assignments, including live-suite, soak, cross-network, and chaos selectors |
-| `StateMachineRunner` | `runner.rs` | Dependency-ordered stage runner; explicit skips can be injected as `Passed` for run-only setup dependencies |
+| `StateMachineRunner` | `runner.rs` | Validated dependency-ordered stage runner; explicit omissions are `NotRun`, while prior stages become `Reused` only after sealed-evidence validation |
+| Bounded node executor | `parallel.rs` | Deterministic, worker-capped, cancellation-aware per-node fanout |
+| Rust-native readiness gate | `readiness.rs` | Local-UTM discovery, selected-node readiness, targeted restart, and rediscovery before stage execution |
+| Rust-native failure diagnostics | `diagnostics.rs` | Fatal signal registration and pre-cleanup daemon/artifact capture |
 | `LinuxNodeAdapter` | `adapter/linux.rs` | Full Linux adapter |
 | `WindowsNodeAdapter` | `adapter/windows.rs` | Windows adapter (PowerShell-based) |
 | `MacosNodeAdapter` | `adapter/macos.rs` | macOS adapter |
 | `node_adapter_for()` | `adapter/factory.rs` | Factory: (platform, connection) → NodeAdapter |
+
+### VM-lab network profile + audit (`rustynet-cli/src/vm_lab/`)
+
+Read-only Slice A of the VM connectivity rulebook
+(`documents/operations/LiveLabVmConnectivityRulebook.md` §15): typed profiles,
+observation, drift detection, redacted evidence. No mutation path exists here.
+
+| Type | Location | Purpose |
+|---|---|---|
+| `NetworkProfile` + `NetworkProfileId` + `parse_network_profile_toml` | `network_profile.rs` | Strict fail-closed TOML manifest model (`profiles/vm_lab/network/*.toml`) with canonical `sha256:` digest over the validated representation |
+| `AttachmentMode` / `ManagementPolicy` / `ScenarioSubstrate` / `InternetMode` / `EvidenceTier` | `network_profile.rs` | Typed vocabulary for the dual-plane lab-network architecture |
+| `NetworkEvidenceStatus` | `network_profile.rs` | External status vocabulary (`pass`/`fail`/`not_run`/`not_supported`/`expected_fail`); `skipped` is internal-only |
+| `IpCidr` + `backend_attachment_support` / `backend_multi_nic_support` | `network_profile.rs` | Exact v4/v6 overlap math and the conservative UTM QEMU/Apple capability matrix |
+| `UtmVmObservation` / `HostNetworkObservation` / `GuestNetworkObservation` | `network_audit.rs` | Redacted-by-construction observations of UTM configs (via `plutil -extract`), host routes/VPN/proxy, and guest addresses/routes/DNS/MTU |
+| `detect_*_findings` + `overall_status_from_findings` | `network_audit.rs` | Pure drift/overlap/duplicate/stale detection (mixed attachments, bridged-to-`en0`, unpinned bridges, duplicate MAC/IP, stale `network_group`, netns transit vs mesh `100.64.0.0/10` collision) |
+| `execute_ops_vm_lab_network_audit` / `..._preflight` | `network_audit.rs` | `ops vm-lab-network-audit` (report) and `ops vm-lab-network-preflight` (fail-closed gate); both write atomic owner-only `state/vm_network_evidence.json` behind a serialized-secret guard |
+| `NetworkTransactionEngine` + `TxnStep` + `NetworkTxnJournal` | `network_prepare.rs` | The ONLY sanctioned VM network mutation path (Slice B): journal-driven step machine, auto-rollback with byte-digest verification, resumable after interruption |
+| `NetworkMutationPort` (`LiveUtmMutationPort` + test mock) | `network_prepare.rs` | Side-effect seam: utmctl stop/start, stopped-VM-only plist rewrite, restore-bytes, management readiness; fully fault-injectable |
+| `LeaseStore` + `NetworkLease` + `ProcessProbe` | `network_prepare.rs` | Atomic network lease: overlapping transactions refused, disjoint allowed, stale recovery via pid+command identity (never pid alone) |
+| `execute_ops_vm_lab_network_prepare` / `..._restore` | `network_prepare.rs` | `ops vm-lab-network-prepare` (dry-run plan by default; `--approve-reconfigure` is the explicit mutation boundary) and `ops vm-lab-network-restore` (verified idempotent rollback) |
 
 ### Installer engine (`rustynet-cli/src/install/`)
 
