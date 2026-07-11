@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -406,29 +406,6 @@ pub fn scp_from(
     Ok(())
 }
 
-/// Poll until `socket_path` exists on the remote (a UNIX domain socket file).
-/// Returns `Err` if the socket does not appear within `timeout`.
-pub fn wait_for_remote_socket(
-    conn: &NodeConnection,
-    socket_path: &str,
-    timeout: Duration,
-) -> Result<(), AdapterError> {
-    let deadline = Instant::now() + timeout;
-    let poll = Duration::from_millis(500);
-    let script = format!("test -S {socket_path}");
-    loop {
-        if run_remote_check(conn, &script, Duration::from_secs(10))? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(AdapterError::Ssh {
-                message: format!("daemon socket {socket_path} did not appear within {timeout:?}"),
-            });
-        }
-        thread::sleep(poll);
-    }
-}
-
 // ── Private runtime helpers ───────────────────────────────────────────────────
 
 /// Run `command` with `timeout`. Drains stdout and stderr concurrently in
@@ -581,13 +558,11 @@ fn run_status_with_timeout(
 }
 
 /// Parse the `node_id=<value>` field from a `rustynet status` output line.
-/// The status response is `key=value key=value …` space-separated.
+/// The status response is `key=value key=value …` space-separated. Thin,
+/// well-named alias over [`parse_status_field`] so there is one parsing
+/// implementation to keep correct.
 pub fn parse_status_node_id(status_text: &str) -> Option<String> {
-    status_text.split_whitespace().find_map(|field| {
-        field
-            .strip_prefix("node_id=")
-            .map(std::string::ToString::to_string)
-    })
+    parse_status_field(status_text, "node_id")
 }
 
 /// Decide whether a daemon `*-check` JSON report indicates success.
@@ -622,23 +597,6 @@ pub fn parse_status_field(status_text: &str, key: &str) -> Option<String> {
     })
 }
 
-// ── Build remote path for a host+user combination ────────────────────────────
-
-pub fn remote_home(user: Option<&str>) -> &'static str {
-    match user {
-        Some("root") | None => "/root",
-        _ => "/home/",
-    }
-}
-
-pub fn remote_home_for_user(user: Option<&str>, heap_user: &str) -> PathBuf {
-    match user {
-        Some("root") => PathBuf::from("/root"),
-        Some(u) => PathBuf::from(format!("/home/{u}")),
-        None => PathBuf::from(format!("/home/{heap_user}")),
-    }
-}
-
 fn teardown_control_master(teardown: ControlMasterTeardown) {
     let mut cmd = teardown.into_exit_command();
     if let Ok(mut child) = cmd.spawn() {
@@ -661,7 +619,10 @@ fn teardown_control_master(teardown: ControlMasterTeardown) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlMasterTeardown, run_remote_retrying, validator_report_ok};
+    use super::{
+        ControlMasterTeardown, parse_status_field, parse_status_node_id, run_remote_retrying,
+        validator_report_ok,
+    };
     use crate::vm_lab::orchestrator::connection::NodeConnection;
     use crate::vm_lab::orchestrator::error::AdapterError;
     use std::time::Duration;
@@ -764,6 +725,22 @@ mod tests {
                 .is_err(),
             "zero attempts clamps to one real attempt and still fails closed"
         );
+    }
+
+    #[test]
+    fn parse_status_node_id_matches_generic_field_parser() {
+        // parse_status_node_id delegates to parse_status_field so there is one
+        // parsing implementation; lock that they agree, including the
+        // not-present and prefix-collision cases.
+        let status = "role=admin node_id=abc123 endpoint=1.2.3.4:51820";
+        assert_eq!(parse_status_node_id(status), Some("abc123".to_owned()));
+        assert_eq!(
+            parse_status_node_id(status),
+            parse_status_field(status, "node_id")
+        );
+        assert_eq!(parse_status_node_id("role=admin"), None);
+        // A field whose name merely ends with node_id must not match.
+        assert_eq!(parse_status_node_id("parent_node_id=zzz"), None);
     }
 
     #[test]
