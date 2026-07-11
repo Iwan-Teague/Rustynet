@@ -75,10 +75,17 @@ fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize, grou
     // left came from the manifest plan and the right from CSV columns -- two
     // different universes that could read e.g. "28/165 | 100" (in-scope
     // larger than the "total").
-    let count_str = format!(
-        " {}/{} │ {}",
-        run.subset_passed_stages, run.subset_total_stages, run.total_stages
-    );
+    let count_str = if run.counts_exact {
+        format!(
+            " {}/{} │ catalog {}",
+            run.subset_passed_stages, run.subset_total_stages, run.total_stages
+        )
+    } else {
+        format!(
+            " CSV {}/{} (plan unavailable)",
+            run.subset_passed_stages, run.subset_total_stages
+        )
+    };
     let bar_w = (area.width as usize)
         .saturating_sub(2 + count_str.chars().count()) // brackets + count
         .clamp(4, 20);

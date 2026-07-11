@@ -162,8 +162,7 @@ pub fn build_orchestrator_args(
 fn synthesize_rust_node_args(config: &MonitorConfig) -> Vec<String> {
     let mut out = Vec::new();
     let exit_platform = config.exit_platform.trim();
-    let non_linux_exit = config.macos_promote_exit
-        || matches!(exit_platform, "macos" | "windows");
+    let non_linux_exit = config.macos_promote_exit || matches!(exit_platform, "macos" | "windows");
     if !non_linux_exit && !config.exit_vm.is_empty() {
         out.push(format!("{}:exit", config.exit_vm));
     }
@@ -351,7 +350,10 @@ mod tests {
             "report",
         );
 
-        assert!(args.windows(2).any(|w| w == ["--exit-vm", "debian-headless-1"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--exit-vm", "debian-headless-1"])
+        );
         assert!(args.iter().any(|arg| arg == "--legacy-bash-orchestrator"));
         assert!(!args.iter().any(|arg| arg == "--node"));
     }

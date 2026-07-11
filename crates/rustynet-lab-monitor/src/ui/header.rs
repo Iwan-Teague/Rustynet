@@ -40,6 +40,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let value = Style::default().fg(Color::White);
     let sep = Style::default().fg(Color::DarkGray);
     let timers = app.stage_timer_labels();
+    let (run_done, run_total) = app.current_run_stage_progress();
+    let run_checks = app
+        .current_run_check_progress()
+        .map(|(done, total)| format!("{done}/{total}"))
+        .unwrap_or_else(|| "n/a".to_owned());
     let top = Line::from(vec![
         Span::styled("RUSTYNET", title),
         Span::styled(" │ ", sep),
@@ -56,12 +61,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Span::styled("VMS:", title),
         Span::styled(format!("{vms:<3}"), value),
         Span::styled(" │ ", sep),
-        // "CHECKS", not "STAGES" — distinct from the LOOP PIPELINE panel's
-        // "stages" (prepare VMs -> build -> ...); this counts real per-OS +
-        // cross-OS live-lab checks, same definition as the FULL STAGE
-        // MATRIX tab [7] (role-presence flags like linux_client are not
-        // checks and are excluded from both).
-        Span::styled("CHECKS:", title),
+        Span::styled("SETTLED:", title),
+        Span::styled(format!("{run_done}/{run_total}"), value),
+        Span::styled(" TESTS:", title),
+        Span::styled(run_checks, value),
+        Span::styled(" │ ", sep),
+        // History-wide coverage, discovered from matrix schema. Separate
+        // from this invocation's stage/test totals above.
+        Span::styled("COVERAGE:", title),
         Span::styled(
             format!("{}/{}", app.stage_progress.passed, app.stage_progress.total),
             value,
@@ -80,13 +87,23 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     ]);
     let job_area_line = Line::from(vec![
         Span::styled("JOB:", title),
-        Span::styled(format!(" {}", fixed(job, 56)), value),
+        Span::styled(format!(" {}", fixed(job, 46)), value),
         Span::styled(" │ ", sep),
         Span::styled("AREA:", title),
-        Span::styled(format!(" {}", fixed(area_name, 56)), value),
+        Span::styled(format!(" {}", fixed(area_name, 46)), value),
+    ]);
+    let source_line = Line::from(vec![
+        Span::styled("PLAN:", title),
+        Span::styled(format!(" {}", app.plan_source_label()), value),
+        Span::styled(" │ ", sep),
+        Span::styled(format!("{}:", app.stage_source_title()), title),
+        Span::styled(format!(" {}", app.stage_source_value()), value),
+        Span::styled(" │ ", sep),
+        Span::styled("REFRESH:", title),
+        Span::styled(" 2s stages / 5s active VMs", value),
     ]);
 
-    let p = Paragraph::new(vec![top, Line::from(""), job_area_line, Line::from("")]);
+    let p = Paragraph::new(vec![top, job_area_line, source_line, Line::from("")]);
     f.render_widget(p, area);
 }
 

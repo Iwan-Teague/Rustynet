@@ -1,6 +1,6 @@
 # Rustynet Lab Monitor TUI — Design Document
 
-**Status:** design-complete, awaiting implementation  
+**Status:** implemented; accuracy hardening tracked in [LiveLabMonitorTUIAccuracyImprovements_2026-07-10.md](LiveLabMonitorTUIAccuracyImprovements_2026-07-10.md)
 **Purpose:** Terminal UI for observing, controlling, and understanding the live-lab loop in real time — the GUI for the parity campaign.
 
 ---
@@ -108,7 +108,7 @@ Use Unicode block fill: `█` (full), `▓` (⅔), `░` (⅓), space (empty). R
 | Panel | Focus key | Description |
 |-------|-----------|-------------|
 | Stage Grid | `1` / Tab | Block grid of all stage outcomes for the current job |
-| VM Status | `2` / `^V` | Per-VM IP, SSH state, UTM power state |
+| VM Status | `2` / `^V` | Per-VM power, SSH-online, live-lab readiness, run use, actual role, IP, and evidence |
 | Parity Matrix | `3` / `^P` | role × OS proven-cell grid drawn from run-matrix CSV |
 | Log Viewer | `4` / `^L` | Scrollable tail of the active-stage log file |
 | Jobs Browser | `5` / `^J` | All `labrun-*` records, select to view history |
@@ -141,11 +141,12 @@ Use Unicode block fill: `█` (full), `▓` (⅔), `░` (⅓), space (empty). R
 - Poll: every 2s. Watch with `notify` for inotify/kqueue events.
 
 ### 6.2 Stage outcomes (current run)
-`state/deepseek-lab-{job_id}/orchestration/orchestrate_result.json`
-- Key: `outcomes[]` — array of `{stage, status, summary, artifacts[]}`
-- `status` values: `"pass"` | `"fail"` | `"skipped"` | `"partial"` | infer `"running"` (stage in `orchestrate.log` but no entry yet in outcomes)
-- Watch with `notify` for live updates; reload on change.
-- Infer active stage: last entry in `outcomes[]` with no successor, OR grep `orchestrate.log` for most recent `[INFO] STAGE:` line.
+`<report_dir>/state/stages.tsv` + `<report_dir>/orchestration/orchestrate_result.json`
+- Active invocation: `stages.tsv` is authoritative and polled every 2 seconds; its `running` row names the active stage directly.
+- Completed invocation: final JSON owns the verdict; TSV is crash-recovery fallback.
+- Closed statuses: `pending | running | pass | fail | skipped | not_run | reused | not_applicable | timed_out | aborted`.
+- Active/held plan: `stage_manifest.json`; missing → `WAITING FOR MANIFEST`, malformed → `DATA ERROR`. No local catalog substitution.
+- Log/pipeline inference remains only for legacy pre-recorder reports.
 
 ### 6.3 Stage log (active stage)
 `state/deepseek-lab-{job_id}/logs/{stage_name}.log`
@@ -165,10 +166,16 @@ Use Unicode block fill: `█` (full), `▓` (⅔), `░` (⅓), space (empty). R
 - Refresh: on any new row (file watcher).
 
 ### 6.6 VM status
-Probe each VM in `documents/operations/active/vm_lab_inventory.json` (or `state/deepseek-lab-{job_id}/orchestration/discover_initial.json` for the active run).
-- macOS UTM: `utmctl status {vm_name}` → parse `started`/`stopped`.
+Fetch the complete host VM registry with `utmctl list`, then enrich matches from `documents/operations/active/vm_lab_inventory.json`.
+- Every host UTM VM renders, including VMs absent from inventory (`host-only`).
+- Inventory-only UTM records absent from the host registry render as `missing`.
+- UTM list status supplies `started`/`stopped` power state.
 - SSH reachability: TCP connect to port 22, 2s timeout.
-- Poll: every 30s or on manual `^R`.
+- Poll: every 5s during an active run, every 30s while idle, or on manual refresh.
+- Live-lab readiness: non-blocking canonical `vm-lab-preflight` every 60s for SSH-online inventoried VMs, using the lab SSH identity when present. Required facts are authenticated guest execution, `git`, `cargo`, `rustc`, `rustup`, passwordless privilege, and at least 1 GiB free disk.
+- Display columns use full labels and words: `VM`, `OS`, `POWER`, `ONLINE/SSH`, `LAB READY`, `RUN USE`, `ROLE`, `IP`, `EVIDENCE`. No icon-only status columns.
+- `RUN USE` is `CURRENT`, `PREVIOUS`, or `—`. `ROLE` is populated only from actual run assignment evidence: current manifest topology, structured selectors for an active legacy run, or latest run-matrix alias/role fields. Next-run config roles are not presented as current facts.
+- `EVIDENCE` spells out `PROVEN`, `FAILED`, `FLAKY`, or `UNPROVEN`; it is blank when no run-backed role exists.
 
 ---
 
@@ -190,7 +197,7 @@ on each state refresh:
   total_eta = active_remaining + eta_remaining
 ```
 
-`all_expected_stages` is derived from the prior run's outcome count, or hardcoded to the known stage list from `get_orchestrator_stages` MCP tool output.
+`all_expected_stages` is the active/held run's manifest-enabled, non-synthetic stage list. No outcome-count or local-catalog inference is used for a selected report.
 
 ---
 

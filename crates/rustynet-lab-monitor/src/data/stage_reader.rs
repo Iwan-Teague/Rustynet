@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrchestrateResult {
@@ -24,6 +25,68 @@ pub struct StageOutcome {
     pub artifacts: Vec<String>,
 }
 
+/// Monitor-side view of the orchestrator's closed status taxonomy. Kept in
+/// one place so active-stage inference, counters, timers, and rendering do
+/// not each maintain a subtly different string match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageStatus {
+    Pending,
+    Running,
+    Pass,
+    Fail,
+    Skipped,
+    NotRun,
+    Reused,
+    NotApplicable,
+    TimedOut,
+    Aborted,
+    Unknown,
+}
+
+impl StageStatus {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "pending" | "" => Self::Pending,
+            "running" => Self::Running,
+            "pass" | "passed" | "success" | "succeeded" | "ok" => Self::Pass,
+            "fail" | "failed" | "error" => Self::Fail,
+            "skip" | "skipped" => Self::Skipped,
+            "not_run" | "not-run" | "not run" => Self::NotRun,
+            "reused" | "reuse" => Self::Reused,
+            "na" | "n/a" | "not_applicable" | "not-applicable" => Self::NotApplicable,
+            "timed_out" | "timedout" | "timeout" => Self::TimedOut,
+            "aborted" | "abort" => Self::Aborted,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Pending | Self::Running | Self::Unknown)
+    }
+
+    pub fn is_failure(self) -> bool {
+        matches!(self, Self::Fail | Self::TimedOut | Self::Aborted)
+    }
+
+    pub fn is_satisfied(self) -> bool {
+        matches!(self, Self::Pass | Self::Reused)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeSource {
+    LiveStagesTsv,
+    FinalResultJson,
+    None,
+}
+
+#[derive(Debug, Clone)]
+pub struct StageRead {
+    pub result: OrchestrateResult,
+    pub source: OutcomeSource,
+    pub modified: Option<SystemTime>,
+}
+
 pub fn read_orchestrate_result(report_dir: &Path) -> Result<OrchestrateResult> {
     let path = orchestrate_result_path(report_dir);
     if !path.exists() {
@@ -36,6 +99,82 @@ pub fn read_orchestrate_result(report_dir: &Path) -> Result<OrchestrateResult> {
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Read outcomes for an ACTIVE invocation. `stages.tsv` is the live recorder
+/// and therefore wins whenever present. A final JSON in a reused report dir
+/// may belong to the previous invocation and must never mask current rows.
+/// JSON remains a compatibility fallback for legacy runs without a recorder.
+pub fn read_active_stage_state(report_dir: &Path) -> Result<StageRead> {
+    let tsv = report_dir.join("state/stages.tsv");
+    if tsv.exists() {
+        return Ok(StageRead {
+            result: OrchestrateResult {
+                overall_status: String::new(),
+                report_dir: report_dir.display().to_string(),
+                outcomes: read_live_stages_tsv(report_dir)?,
+            },
+            source: OutcomeSource::LiveStagesTsv,
+            modified: modified_time(&tsv),
+        });
+    }
+
+    let json = orchestrate_result_path(report_dir);
+    if json.exists() {
+        return Ok(StageRead {
+            result: read_orchestrate_result(report_dir)?,
+            source: OutcomeSource::FinalResultJson,
+            modified: modified_time(&json),
+        });
+    }
+
+    Ok(StageRead {
+        result: OrchestrateResult {
+            overall_status: String::new(),
+            report_dir: report_dir.display().to_string(),
+            outcomes: Vec::new(),
+        },
+        source: OutcomeSource::None,
+        modified: None,
+    })
+}
+
+/// Read a completed/held run. Final JSON owns the verdict; TSV is the crash
+/// recovery fallback when finalization never happened.
+pub fn read_completed_stage_state(report_dir: &Path) -> Result<StageRead> {
+    let json = orchestrate_result_path(report_dir);
+    if json.exists() {
+        return Ok(StageRead {
+            result: read_orchestrate_result(report_dir)?,
+            source: OutcomeSource::FinalResultJson,
+            modified: modified_time(&json),
+        });
+    }
+    let tsv = report_dir.join("state/stages.tsv");
+    if tsv.exists() {
+        return Ok(StageRead {
+            result: OrchestrateResult {
+                overall_status: String::new(),
+                report_dir: report_dir.display().to_string(),
+                outcomes: read_live_stages_tsv(report_dir)?,
+            },
+            source: OutcomeSource::LiveStagesTsv,
+            modified: modified_time(&tsv),
+        });
+    }
+    Ok(StageRead {
+        result: OrchestrateResult {
+            overall_status: String::new(),
+            report_dir: report_dir.display().to_string(),
+            outcomes: Vec::new(),
+        },
+        source: OutcomeSource::None,
+        modified: None,
+    })
+}
+
+fn modified_time(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 /// Infer the active stage from the orchestrate.log file.
@@ -62,7 +201,10 @@ pub fn infer_active_stage(
     // no inference. Everything below is the legacy fallback for pre-recorder
     // report dirs (no running row) whose active stage must still be guessed
     // from logs / pipeline position.
-    if let Some(running) = outcomes.iter().find(|outcome| outcome.status == "running") {
+    if let Some(running) = outcomes
+        .iter()
+        .find(|outcome| StageStatus::parse(&outcome.status) == StageStatus::Running)
+    {
         return Ok(Some(running.stage.clone()));
     }
     // Log-based candidate (orchestrate.log STAGE: marker, then the newest
@@ -133,7 +275,7 @@ fn would_regress(
 fn finished_stage_set(outcomes: &[StageOutcome]) -> std::collections::HashSet<&str> {
     outcomes
         .iter()
-        .filter(|o| matches!(o.status.as_str(), "pass" | "fail" | "skip" | "skipped"))
+        .filter(|o| StageStatus::parse(&o.status).is_terminal())
         .map(|o| o.stage.as_str())
         .collect()
 }
@@ -435,6 +577,26 @@ mod tests {
     }
 
     #[test]
+    fn every_closed_terminal_status_advances_pipeline_position() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ordered = vec!["first".to_owned(), "second".to_owned()];
+        for status in [
+            "pass",
+            "fail",
+            "skipped",
+            "not_run",
+            "reused",
+            "not_applicable",
+            "timed_out",
+            "aborted",
+        ] {
+            let outcomes = vec![outcome("first", status)];
+            let stage = infer_active_stage(dir.path(), &ordered, &outcomes).expect("stage");
+            assert_eq!(stage.as_deref(), Some("second"), "status={status}");
+        }
+    }
+
+    #[test]
     fn log_based_detection_still_wins_over_the_pipeline_position_fallback() {
         // When a real "[stage:xxx] START" marker exists, it's more precise
         // (immediate, not just positional) than the fallback -- it must
@@ -470,5 +632,31 @@ mod tests {
         assert_eq!(result.outcomes.len(), 1);
         assert_eq!(result.outcomes[0].stage, "preflight");
         assert_eq!(result.outcomes[0].status, "pass");
+    }
+
+    #[test]
+    fn active_reader_prefers_live_tsv_over_stale_final_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        let orchestration = dir.path().join("orchestration");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::create_dir_all(&orchestration).expect("orchestration dir");
+        std::fs::write(
+            orchestration.join("orchestrate_result.json"),
+            r#"{"overall_status":"pass","outcomes":[{"stage":"old","status":"pass"}]}"#,
+        )
+        .expect("old result");
+        std::fs::write(
+            state.join("stages.tsv"),
+            "new\thard\trunning\t0\t/tmp/new.log\tactive\n",
+        )
+        .expect("live stages");
+
+        let read = read_active_stage_state(dir.path()).expect("active read");
+
+        assert_eq!(read.source, OutcomeSource::LiveStagesTsv);
+        assert_eq!(read.result.outcomes.len(), 1);
+        assert_eq!(read.result.outcomes[0].stage, "new");
+        assert_eq!(read.result.outcomes[0].status, "running");
     }
 }
