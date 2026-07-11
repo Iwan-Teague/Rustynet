@@ -105,7 +105,11 @@ fn run() -> Result<(), String> {
     }
 
     let ssh_identity = PathBuf::from(&config.ssh_identity_file);
-    let mut ctx = LiveLabContext::new("rustynet-managed-dns", ssh_identity.as_path())?;
+    let mut ctx = LiveLabContext::new_with_pinned_known_hosts(
+        "rustynet-managed-dns",
+        ssh_identity.as_path(),
+        config.known_hosts_file.as_deref(),
+    )?;
     let logger = Logger::new(&config.log_path)?;
 
     validate_targets(&config)?;
@@ -901,6 +905,7 @@ struct Config {
     dns_interface: String,
     dns_bind_addr: String,
     managed_peers: Vec<ManagedPeerSpec>,
+    known_hosts_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -919,6 +924,7 @@ impl Config {
             dns_interface: "rustynet0".to_owned(),
             dns_bind_addr: "127.0.0.1:53535".to_owned(),
             managed_peers: Vec::new(),
+            known_hosts_file: None,
         };
 
         let mut iter = args.into_iter();
@@ -930,6 +936,9 @@ impl Config {
                     )?;
                 }
                 "--ssh-identity-file" => config.ssh_identity_file = next_value(&mut iter, &arg)?,
+                "--known-hosts-file" => {
+                    config.known_hosts_file = Some(PathBuf::from(next_value(&mut iter, &arg)?))
+                }
                 "--signer-host" => config.signer_host = next_value(&mut iter, &arg)?,
                 "--client-host" => config.client_host = next_value(&mut iter, &arg)?,
                 "--signer-node-id" => config.signer_node_id = next_value(&mut iter, &arg)?,
