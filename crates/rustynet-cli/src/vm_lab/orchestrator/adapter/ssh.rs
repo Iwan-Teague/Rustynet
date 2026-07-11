@@ -118,6 +118,34 @@ impl ControlMasterTeardown {
     }
 }
 
+/// The `-o` connection-hardening options shared by EVERY ssh/scp invocation in
+/// this module. Named in one place so a test can assert both transports carry
+/// the full set — a security-relevant flag (StrictHostKeyChecking, BatchMode,
+/// IdentitiesOnly, ConnectTimeout, LogLevel) can no longer be added to the ssh
+/// path but silently forgotten on the scp path or vice-versa.
+const SHARED_HARDENING_O_FLAGS: &[&str] = &[
+    "LogLevel=ERROR",
+    "BatchMode=yes",
+    "StrictHostKeyChecking=yes",
+    "ConnectTimeout=15",
+    "IdentitiesOnly=yes",
+];
+
+/// Append the shared security posture to `cmd`: `-F /dev/null` (ignore system
+/// ssh_config), the [`SHARED_HARDENING_O_FLAGS`], the pinned identity key, and
+/// the pinned known-hosts file. Protocol-level differences (ssh `-p`/`-l`/`-n`
+/// vs scp `-P`/`-o User=`/`-q`, keepalives, ControlMaster teardown) are
+/// deliberately NOT here — each builder adds those itself.
+fn attach_shared_hardening(cmd: &mut Command, identity_file: &Path, known_hosts: &Path) {
+    cmd.args(["-F", "/dev/null"]);
+    for flag in SHARED_HARDENING_O_FLAGS {
+        cmd.arg("-o").arg(*flag);
+    }
+    cmd.arg("-i").arg(identity_file);
+    cmd.arg("-o")
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
+}
+
 fn base_ssh_command(
     host: &str,
     port: u16,
@@ -126,30 +154,18 @@ fn base_ssh_command(
     known_hosts: &Path,
 ) -> (Command, Option<ControlMasterTeardown>) {
     let mut cmd = Command::new("ssh");
+    cmd.arg("-n");
+    attach_shared_hardening(&mut cmd, identity_file, known_hosts);
+    // ssh-only: keepalives for long-lived sessions (bootstrap builds) + the
+    // lowercase `-p` port flag.
     cmd.args([
-        "-n",
-        "-F",
-        "/dev/null",
-        "-o",
-        "LogLevel=ERROR",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        "ConnectTimeout=15",
         "-o",
         "ServerAliveInterval=20",
         "-o",
         "ServerAliveCountMax=3",
-        "-o",
-        "IdentitiesOnly=yes",
         "-p",
         &port.to_string(),
     ]);
-    cmd.arg("-i").arg(identity_file);
-    cmd.arg("-o")
-        .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
     let teardown = attach_control_master(&mut cmd).map(|control_path| ControlMasterTeardown {
         host: host.to_owned(),
         port,
@@ -170,26 +186,11 @@ fn base_scp_command(
     user: Option<&str>,
 ) -> Command {
     let mut cmd = Command::new("scp");
-    cmd.args([
-        "-q",
-        "-F",
-        "/dev/null",
-        "-o",
-        "LogLevel=ERROR",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        "ConnectTimeout=15",
-        "-o",
-        "IdentitiesOnly=yes",
-        "-P",
-        &port.to_string(),
-    ]);
-    cmd.arg("-i").arg(identity_file);
-    cmd.arg("-o")
-        .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
+    cmd.arg("-q");
+    attach_shared_hardening(&mut cmd, identity_file, known_hosts);
+    // scp-only: the uppercase `-P` port flag, and the login name via
+    // `-o User=` (scp has no `-l`).
+    cmd.arg("-P").arg(port.to_string());
     // scp reuses any master opened by the ssh path; it does not need its own
     // teardown handle (scp runs short and its child exits before any timeout
     // path that would block on a lingering master).
@@ -620,12 +621,78 @@ fn teardown_control_master(teardown: ControlMasterTeardown) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlMasterTeardown, parse_status_field, parse_status_node_id, run_remote_retrying,
-        validator_report_ok,
+        ControlMasterTeardown, SHARED_HARDENING_O_FLAGS, base_scp_command, base_ssh_command,
+        parse_status_field, parse_status_node_id, run_remote_retrying, validator_report_ok,
     };
     use crate::vm_lab::orchestrator::connection::NodeConnection;
     use crate::vm_lab::orchestrator::error::AdapterError;
+    use std::path::Path;
+    use std::process::Command;
     use std::time::Duration;
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn ssh_and_scp_share_the_full_connection_hardening_set() {
+        // Both transports must carry the same security posture. This fails loudly
+        // if a hardening `-o` flag ever drifts out of one builder but not the
+        // other — the whole reason the shared helper exists.
+        let id = Path::new("/tmp/id_ed25519");
+        let kh = Path::new("/tmp/known_hosts");
+        let (ssh_cmd, _teardown) = base_ssh_command("host.example", 22, Some("debian"), id, kh);
+        let scp_cmd = base_scp_command(2222, id, kh, Some("debian"));
+        for (label, args) in [("ssh", args_of(&ssh_cmd)), ("scp", args_of(&scp_cmd))] {
+            assert!(
+                args.iter().any(|a| a == "/dev/null"),
+                "{label} must ignore system ssh_config (-F /dev/null): {args:?}"
+            );
+            for flag in SHARED_HARDENING_O_FLAGS {
+                assert!(
+                    args.iter().any(|a| a == flag),
+                    "{label} missing shared hardening flag {flag}: {args:?}"
+                );
+            }
+            assert!(
+                args.iter().any(|a| a == "-i"),
+                "{label} must pin the identity key: {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a.starts_with("UserKnownHostsFile=")),
+                "{label} must pin known-hosts: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_and_scp_keep_their_protocol_specific_flags() {
+        // The intended per-transport differences must survive the shared-helper
+        // refactor: ssh uses `-p`/`-l`, scp uses `-P`/`-o User=`.
+        let id = Path::new("/tmp/id_ed25519");
+        let kh = Path::new("/tmp/known_hosts");
+        let (ssh_cmd, _teardown) = base_ssh_command("host.example", 22, Some("debian"), id, kh);
+        let ssh_args = args_of(&ssh_cmd);
+        assert!(
+            ssh_args.iter().any(|a| a == "-p"),
+            "ssh uses -p: {ssh_args:?}"
+        );
+        let l_idx = ssh_args.iter().position(|a| a == "-l").expect("ssh -l");
+        assert_eq!(ssh_args[l_idx + 1], "debian");
+
+        let scp_cmd = base_scp_command(2222, id, kh, Some("debian"));
+        let scp_args = args_of(&scp_cmd);
+        assert!(
+            scp_args.iter().any(|a| a == "-P"),
+            "scp uses -P: {scp_args:?}"
+        );
+        assert!(
+            scp_args.iter().any(|a| a == "User=debian"),
+            "scp sets login via -o User=: {scp_args:?}"
+        );
+    }
 
     #[test]
     fn control_master_teardown_builds_argv_only_ssh_o_exit() {
