@@ -2297,6 +2297,51 @@ mod tests {
     }
 
     #[test]
+    fn privileged_argv_ip_and_chain_validators_enforce_allowlists() {
+        use super::{
+            is_allowed_ips_token, is_cidr_for_nft_family, is_exact_ip_for_nft_family,
+            is_nft_chain_token,
+        };
+
+        // Allowed-IPs list: non-empty, and every comma-separated part is a CIDR.
+        assert!(is_allowed_ips_token("10.0.0.0/8"));
+        assert!(is_allowed_ips_token("10.0.0.0/8,fd00::/64"));
+        assert!(!is_allowed_ips_token(""));
+        assert!(!is_allowed_ips_token("10.0.0.0/8,notacidr"));
+        assert!(!is_allowed_ips_token("10.0.0.0/8,")); // trailing empty part
+
+        // Exact IP must match the declared nft family.
+        assert!(is_exact_ip_for_nft_family("10.0.0.1", "ip"));
+        assert!(is_exact_ip_for_nft_family("fd00::1", "ip6"));
+        assert!(!is_exact_ip_for_nft_family("10.0.0.1", "ip6"));
+        assert!(!is_exact_ip_for_nft_family("fd00::1", "ip"));
+        assert!(!is_exact_ip_for_nft_family("10.0.0.1", "inet"));
+        assert!(!is_exact_ip_for_nft_family("notanip", "ip"));
+
+        // CIDR must match the family and stay within the prefix range.
+        assert!(is_cidr_for_nft_family("10.0.0.0/8", "ip"));
+        assert!(is_cidr_for_nft_family("fd00::/64", "ip6"));
+        assert!(!is_cidr_for_nft_family("10.0.0.0/8", "ip6"));
+        assert!(!is_cidr_for_nft_family("fd00::/64", "ip"));
+        assert!(!is_cidr_for_nft_family("10.0.0.0/33", "ip"));
+
+        // nft chain names are an exact allowlist.
+        for chain in [
+            "killswitch",
+            "forward",
+            "input",
+            "output",
+            "prerouting",
+            "postrouting",
+        ] {
+            assert!(is_nft_chain_token(chain), "{chain} should be allowed");
+        }
+        assert!(!is_nft_chain_token("INPUT"));
+        assert!(!is_nft_chain_token("evil"));
+        assert!(!is_nft_chain_token(""));
+    }
+
+    #[test]
     fn peer_uid_reports_connected_socket_owner_uid() {
         // RN-17 gate primitive: the client re-checks `peer_uid(&stream) == Some(0)`
         // on the *connected* fd to reject a swapped, non-root socket. Verify the
