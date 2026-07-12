@@ -87,9 +87,10 @@
       "exit_capable": false,
       "include_in_all": false,
       "lab_role": "macos_client",
-      "last_known_ip": "192.168.65.2",
+      "last_known_ip": "192.168.65.101",
       "last_known_network": "lan-192.168.0.0/24",
       "live_ips": [
+        "192.168.65.101",
         "192.168.65.2",
         "192.168.64.18",
         "192.168.0.210"
@@ -103,7 +104,7 @@
       "relay_capable": false,
       "rustynet_src_dir": "/Users/mac/Rustynet",
       "ssh_password": "tempo",
-      "ssh_target": "192.168.65.2",
+      "ssh_target": "192.168.65.101",
       "ssh_user": "mac"
     },
     {
