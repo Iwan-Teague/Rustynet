@@ -1098,6 +1098,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_wire_enforces_per_line_key_value_and_depth_bounds() {
+        // Each per-line bound is checked in the parse loop before the
+        // allowed-key check, so a single over-limit line exercises the exact
+        // control and must fail closed with the matching reason.
+        let long_key = format!("{}=v", "k".repeat(super::MAX_KEY_BYTES + 1));
+        let err = parse_signed_dns_zone_bundle_wire(&long_key).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("key exceeds maximum"),
+            "MAX_KEY_BYTES not enforced: {err:?}"
+        );
+
+        let long_value = format!("k={}", "v".repeat(super::MAX_VALUE_BYTES + 1));
+        let err = parse_signed_dns_zone_bundle_wire(&long_value).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("value exceeds maximum"),
+            "MAX_VALUE_BYTES not enforced: {err:?}"
+        );
+
+        // MAX_KEY_DEPTH+1 labels -> split('.').count() exceeds the depth cap.
+        let deep_key = format!("{}=v", ["a"; super::MAX_KEY_DEPTH + 1].join("."));
+        let err = parse_signed_dns_zone_bundle_wire(&deep_key).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("depth exceeds maximum"),
+            "MAX_KEY_DEPTH not enforced: {err:?}"
+        );
+    }
+
+    #[test]
     fn parse_wire_rejects_unsupported_version_duplicate_and_field_mismatch() {
         let wire = valid_wire_bundle();
 
