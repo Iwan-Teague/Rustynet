@@ -4390,6 +4390,45 @@ mod tests {
     }
 
     #[test]
+    fn strict_automation_scope_requires_tag_prefix_without_wildcards() {
+        use super::is_strict_automation_scope;
+        assert!(is_strict_automation_scope("tag:ci"));
+        assert!(is_strict_automation_scope("  tag:deploy  "));
+        // Empty, non-tag, wildcard, or space-containing scopes are rejected so
+        // an automation grant can never widen past one concrete tag.
+        assert!(!is_strict_automation_scope(""));
+        assert!(!is_strict_automation_scope("   "));
+        assert!(!is_strict_automation_scope("user:alice"));
+        assert!(!is_strict_automation_scope("tag:ci-*"));
+        assert!(!is_strict_automation_scope("*"));
+        assert!(!is_strict_automation_scope("tag:a b"));
+    }
+
+    #[test]
+    fn relay_session_token_key_allowlist_is_exact() {
+        use super::is_allowed_relay_session_token_key;
+        for k in [
+            "version",
+            "node_id",
+            "peer_node_id",
+            "relay_id",
+            "scope",
+            "issued_at_unix",
+            "expires_at_unix",
+            "nonce",
+            "signature",
+        ] {
+            assert!(is_allowed_relay_session_token_key(k), "{k} should be allowed");
+        }
+        // Unknown, mis-cased, trailing-space, or empty keys are rejected so an
+        // attacker cannot smuggle extra fields into a relay session token.
+        assert!(!is_allowed_relay_session_token_key("unknown"));
+        assert!(!is_allowed_relay_session_token_key("Version"));
+        assert!(!is_allowed_relay_session_token_key("signature "));
+        assert!(!is_allowed_relay_session_token_key(""));
+    }
+
+    #[test]
     fn auth_rate_limit_enforces_per_ip_limits() {
         let mut guard = AuthSurfaceGuard::new(
             AuthRateLimitConfig {
