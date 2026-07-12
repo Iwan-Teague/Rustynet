@@ -2939,6 +2939,7 @@ mod tests {
         Config {
             platform: super::live_lab_support::LiveLabPlatform::Linux,
             ssh_identity_file: "/tmp/rn-test-key".to_owned(),
+            known_hosts_file: None,
             signer_host: "debian@192.168.64.22".to_owned(),
             client_host: "debian@192.168.64.24".to_owned(),
             signer_node_id: "exit-1".to_owned(),

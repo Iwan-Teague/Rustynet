@@ -171,10 +171,21 @@ impl NodeRole {
                 Ok(vec![RoleCapability::BlindExit, RoleCapability::ExitServer])
             }
             // Linux Exit / BlindExit → both get ExitServer. Exit additionally
-            // gets Anchor (admin-owner) + RelayHost.
+            // gets Anchor (admin-owner) + RelayHost + Client. Client is
+            // REQUIRED, not optional: a regular exit runs the `client` daemon
+            // role (it is a client that also serves exit), and the daemon
+            // validates its own auto-tunnel bundle against that role
+            // (`validate_auto_tunnel_role_membership_alignment`, which requires
+            // the `client` capability for NodeRole::Client). Omitting it fails
+            // closed on the assignment refresh with "assignment target intent
+            // lacks required local capability client" — this matches the
+            // canonical admin-owner set `client,relay_host,exit_server,anchor`
+            // the exit-handoff harness exercises across the client→admin
+            // lifecycle.
             VmGuestPlatform::Linux if matches!(self, NodeRole::Exit | NodeRole::BlindExit) => {
                 if matches!(self, NodeRole::Exit) {
                     Ok(vec![
+                        RoleCapability::Client,
                         RoleCapability::Anchor,
                         RoleCapability::ExitServer,
                         RoleCapability::RelayHost,
@@ -186,7 +197,12 @@ impl NodeRole {
                 }
             }
             // Windows Exit → admin daemon role + full admin-owner capability
+            // set. Client is included for the same reason as Linux (the exit
+            // validates its assignment intent against the `client` daemon role
+            // during the client→admin lifecycle); mirrors the canonical
+            // `client,relay_host,exit_server,anchor` admin-owner set.
             VmGuestPlatform::Windows if matches!(self, NodeRole::Exit) => Ok(vec![
+                RoleCapability::Client,
                 RoleCapability::Anchor,
                 RoleCapability::ExitServer,
                 RoleCapability::RelayHost,
@@ -479,6 +495,7 @@ mod tests {
                 .product_capabilities_for_platform(&VmGuestPlatform::Linux)
                 .unwrap(),
             vec![
+                RoleCapability::Client,
                 RoleCapability::Anchor,
                 RoleCapability::ExitServer,
                 RoleCapability::RelayHost,
