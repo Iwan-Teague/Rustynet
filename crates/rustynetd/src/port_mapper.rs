@@ -2623,6 +2623,31 @@ mod tests {
     }
 
     #[test]
+    fn ssdp_header_lookup_case_insensitive_skips_first_line() {
+        let response = "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nLocation: http://192.168.1.1:5000/desc.xml\r\n";
+        // Case-insensitive name match; value is trimmed and keeps its own colons
+        // (split_once on the first ':').
+        assert_eq!(
+            parse_ssdp_header(response, "location").as_deref(),
+            Some("http://192.168.1.1:5000/desc.xml")
+        );
+        assert_eq!(
+            parse_ssdp_header(response, "CACHE-CONTROL").as_deref(),
+            Some("max-age=1800")
+        );
+        // Missing header -> None.
+        assert_eq!(parse_ssdp_header(response, "SERVER"), None);
+        // The first line (SSDP status/request line) is always skipped, so a
+        // header sitting on line 0 is never matched.
+        assert_eq!(parse_ssdp_header("FOO: bar\r\nBAZ: qux", "FOO"), None);
+        assert_eq!(
+            parse_ssdp_header("FOO: bar\r\nBAZ: qux", "BAZ").as_deref(),
+            Some("qux")
+        );
+        assert_eq!(parse_ssdp_header("", "location"), None);
+    }
+
+    #[test]
     fn nat_pmp_external_address_request_encoding_matches_rfc_6886() {
         let buf = NatPmpClient::encode_external_address_request();
         assert_eq!(buf, [0, 0], "version=0, opcode=0");
