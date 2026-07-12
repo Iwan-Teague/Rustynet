@@ -1046,6 +1046,23 @@ fn rustc_version_internal() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Whether a single-interface `ifconfig <iface>` stdout indicates the interface
+/// is up: the flags contain `UP` and do not contain `DOWN` (macOS/BSD
+/// convention; substring match, behavior unchanged). `allow(dead_code)`: only
+/// called under `target_os = "macos"`.
+#[allow(dead_code)]
+fn parse_macos_ifconfig_iface_up(stdout: &str) -> bool {
+    stdout.contains("UP") && !stdout.contains("DOWN")
+}
+
+/// Whether Windows `ipconfig` stdout mentions `interface` (case-insensitive
+/// substring) — the existing presence heuristic. `allow(dead_code)`: only
+/// called under `target_os = "windows"`.
+#[allow(dead_code)]
+fn windows_ipconfig_mentions_interface(stdout: &str, interface: &str) -> bool {
+    stdout.to_lowercase().contains(&interface.to_lowercase())
+}
+
 #[cfg(target_os = "linux")]
 fn wireguard_interface_info_internal(interface: &str) -> InterfaceInfo {
     let path = format!("/sys/class/net/{interface}");
@@ -1054,7 +1071,7 @@ fn wireguard_interface_info_internal(interface: &str) -> InterfaceInfo {
         exists,
         is_up: exists
             && fs::read_to_string(format!("{path}/operstate"))
-                .map(|state| state.trim() == "up")
+                .map(|state| parse_linux_operstate(&state))
                 .unwrap_or(false),
     }
 }
@@ -1073,7 +1090,7 @@ fn wireguard_interface_info_internal(interface: &str) -> InterfaceInfo {
             },
             |stdout| InterfaceInfo {
                 exists: true,
-                is_up: stdout.contains("UP") && !stdout.contains("DOWN"),
+                is_up: parse_macos_ifconfig_iface_up(&stdout),
             },
         ),
         _ => InterfaceInfo {
@@ -1091,7 +1108,7 @@ fn wireguard_interface_info_internal(interface: &str) -> InterfaceInfo {
         Ok(out) if out.status.success() => String::from_utf8(out.stdout)
             .ok()
             .map(|stdout| {
-                let exists = stdout.to_lowercase().contains(&interface.to_lowercase());
+                let exists = windows_ipconfig_mentions_interface(&stdout, interface);
                 InterfaceInfo {
                     exists,
                     is_up: exists,
@@ -7142,6 +7159,33 @@ Inter-|   Receive                                    |  Transmit
         assert_eq!(parse_sysctl_u32(" 42 "), 42);
         assert_eq!(parse_sysctl_u32("garbage"), 0);
         assert_eq!(parse_sysctl_u32(""), 0);
+    }
+
+    #[test]
+    fn macos_ifconfig_iface_up_requires_up_without_down() {
+        use super::parse_macos_ifconfig_iface_up;
+        assert!(parse_macos_ifconfig_iface_up("flags=8863<UP,BROADCAST,RUNNING> mtu 1500"));
+        // A DOWN flag anywhere wins (precedence documented).
+        assert!(!parse_macos_ifconfig_iface_up("flags=8802<DOWN,BROADCAST>"));
+        assert!(!parse_macos_ifconfig_iface_up("flags=<UP,BROADCAST> ... DOWN"));
+        // No UP flag at all.
+        assert!(!parse_macos_ifconfig_iface_up("flags=<BROADCAST,RUNNING>"));
+        assert!(!parse_macos_ifconfig_iface_up(""));
+    }
+
+    #[test]
+    fn windows_ipconfig_mentions_interface_is_case_insensitive() {
+        use super::windows_ipconfig_mentions_interface;
+        assert!(windows_ipconfig_mentions_interface(
+            "Ethernet adapter RustyNet0:",
+            "rustynet0"
+        ));
+        assert!(windows_ipconfig_mentions_interface("... WIRELESS lan ...", "wireless"));
+        assert!(!windows_ipconfig_mentions_interface(
+            "Ethernet adapter Ethernet:",
+            "rustynet0"
+        ));
+        assert!(!windows_ipconfig_mentions_interface("", "eth0"));
     }
 
     #[test]
