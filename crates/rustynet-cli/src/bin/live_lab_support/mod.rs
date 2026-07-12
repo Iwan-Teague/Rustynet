@@ -658,15 +658,28 @@ impl LiveLabContext {
     }
 
     pub fn target_address(target: &str) -> &str {
-        target.split_once('@').map_or(target, |(_, addr)| addr)
+        let addr = target.split_once('@').map_or(target, |(_, addr)| addr);
+        strip_host_port(addr)
+    }
+
+    /// The SSH/scp destination for `target` with any `:port` suffix removed
+    /// from the host. The port travels separately as an `-p`/`-P` flag (see
+    /// [`target_port`]); leaving it glued to the host makes OpenSSH treat
+    /// `192.168.64.4:22` as a literal hostname and fail to resolve it.
+    fn ssh_destination(target: &str) -> String {
+        match target.split_once('@') {
+            Some((user, _)) => format!("{user}@{}", Self::target_address(target)),
+            None => Self::target_address(target).to_owned(),
+        }
     }
 
     pub fn resolved_target_address(target: &str) -> Result<String, String> {
         if utm_transport_for_target(target).is_some() {
             return Ok(Self::target_address(target).to_owned());
         }
+        let destination = Self::ssh_destination(target);
         let resolved = Command::new("ssh")
-            .args(["-G", target])
+            .args(["-G", destination.as_str()])
             .stdin(Stdio::null())
             .output()
             .map_err(|err| format!("failed resolving SSH target address for {target}: {err}"))?;
@@ -697,8 +710,9 @@ impl LiveLabContext {
         if utm_transport_for_target(target).is_some() {
             return Ok(());
         }
+        let destination = Self::ssh_destination(target);
         let resolved = Command::new("ssh")
-            .args(["-G", target])
+            .args(["-G", destination.as_str()])
             .stdin(Stdio::null())
             .output()
             .map_err(|err| {
@@ -768,8 +782,11 @@ impl LiveLabContext {
             "-i",
         ]);
         command.arg(&self.ssh_identity_file);
+        if let Some(port) = target_port(target) {
+            command.arg("-p").arg(port.to_string());
+        }
         command.arg("--");
-        command.arg(target);
+        command.arg(Self::ssh_destination(target));
         command
     }
 
@@ -843,7 +860,8 @@ impl LiveLabContext {
         // so the operation is idempotent.
         let mut last_stderr = String::new();
         for attempt in 1..=SCP_RETRY_ATTEMPTS {
-            let output = Command::new("scp")
+            let mut command = Command::new("scp");
+            command
                 .arg("-q")
                 .args([
                     "-o",
@@ -869,10 +887,17 @@ impl LiveLabContext {
                     "IdentitiesOnly=yes",
                     "-i",
                 ])
-                .arg(&self.ssh_identity_file)
+                .arg(&self.ssh_identity_file);
+            // scp uses `-P` (capital) for the port; the host must be bare or
+            // scp reads `192.168.64.4:22:/path` as host `192.168.64.4` writing
+            // to a bogus `22:/path`.
+            if let Some(port) = target_port(target) {
+                command.arg("-P").arg(port.to_string());
+            }
+            let output = command
                 .arg("--")
                 .arg(src)
-                .arg(format!("{target}:{dst}"))
+                .arg(format!("{}:{dst}", Self::ssh_destination(target)))
                 .output()
                 .map_err(|err| format!("failed to run scp to {target}: {err}"))?;
             if output.status.success() {
@@ -1277,6 +1302,50 @@ fn known_hosts_lookup_host(host: &str, port: &str) -> Result<String, String> {
     }
 }
 
+/// Strip a trailing `:port` suffix and unwrap a bracketed IPv6 literal from a
+/// bare `host` / `host:port` fragment, yielding the host OpenSSH should
+/// resolve. Mirrors the orchestrator's `strip_ssh_host`. Unbracketed IPv6
+/// literals (which carry multiple colons) are left intact.
+fn strip_host_port(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return &rest[..end];
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port))
+            if !host.is_empty()
+                && !host.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            host
+        }
+        _ => addr,
+    }
+}
+
+/// Explicit TCP port carried by a `[user@]host:port` target, if any. `None`
+/// means "no explicit suffix; use the SSH default". Handles bracketed IPv6
+/// (`[::1]:2222`).
+fn target_port(target: &str) -> Option<u16> {
+    let addr = target.split_once('@').map_or(target, |(_, addr)| addr);
+    let port_str = if let Some(rest) = addr.strip_prefix('[') {
+        rest.split_once(']')
+            .and_then(|(_, tail)| tail.strip_prefix(':'))?
+    } else {
+        let (host, port) = addr.rsplit_once(':')?;
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        port
+    };
+    if port_str.is_empty() || !port_str.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    port_str.parse().ok()
+}
+
 fn ssh_g_value<'a>(resolved: &'a str, key: &str) -> Option<&'a str> {
     resolved.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -1296,7 +1365,14 @@ fn resolved_target_address_from_ssh_g(target: &str, resolved: &str) -> String {
 
 fn resolved_known_hosts_candidates(target: &str, resolved: &str) -> Result<Vec<String>, String> {
     let raw_host = LiveLabContext::target_address(target);
-    let port = ssh_g_value(resolved, "port").unwrap_or("22");
+    // An explicit `:port` on the target is authoritative for the known_hosts
+    // key so it stays consistent with the port the ssh/scp connect uses; fall
+    // back to ssh -G's resolved port, then the default.
+    let explicit_port = target_port(target).map(|port| port.to_string());
+    let port = explicit_port
+        .as_deref()
+        .or_else(|| ssh_g_value(resolved, "port"))
+        .unwrap_or("22");
     let mut lookup_candidates = Vec::new();
 
     if let Some(hostkeyalias) = ssh_g_value(resolved, "hostkeyalias")
@@ -1356,9 +1432,9 @@ pub fn run_remote_shell(
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabPlatform, enforce_linux_only_until_validator_lands, env_flag_truthy,
+        LiveLabContext, LiveLabPlatform, enforce_linux_only_until_validator_lands, env_flag_truthy,
         known_hosts_lookup_host, resolved_known_hosts_candidates,
-        resolved_target_address_from_ssh_g, scp_failure_is_transient,
+        resolved_target_address_from_ssh_g, scp_failure_is_transient, strip_host_port, target_port,
     };
 
     #[test]
@@ -1515,5 +1591,85 @@ port 22
             resolved_target_address_from_ssh_g("debian@debian-headless-1", resolved),
             "debian-headless-1"
         );
+    }
+
+    #[test]
+    fn target_address_strips_default_port_suffix() {
+        // Regression: the SshConnectionParams-derived target carries a `:22`
+        // suffix (`format!("{host}:{port}")`). The known_hosts candidate and
+        // the ssh/scp destination must both see the bare host, or OpenSSH
+        // treats `192.168.64.4:22` as a literal (unresolvable) hostname.
+        assert_eq!(
+            LiveLabContext::target_address("debian@192.168.64.4:22"),
+            "192.168.64.4"
+        );
+        assert_eq!(
+            LiveLabContext::target_address("debian@192.168.64.4:2222"),
+            "192.168.64.4"
+        );
+        assert_eq!(
+            LiveLabContext::target_address("debian@192.168.64.4"),
+            "192.168.64.4"
+        );
+        // Bracketed IPv6 literals unwrap; bare IPv6 (multi-colon) is untouched.
+        assert_eq!(
+            LiveLabContext::target_address("admin@[fe80::1]:2222"),
+            "fe80::1"
+        );
+        assert_eq!(LiveLabContext::target_address("root@fe80::1"), "fe80::1");
+    }
+
+    #[test]
+    fn ssh_destination_rebuilds_user_and_bare_host() {
+        assert_eq!(
+            LiveLabContext::ssh_destination("debian@192.168.64.4:22"),
+            "debian@192.168.64.4"
+        );
+        assert_eq!(
+            LiveLabContext::ssh_destination("192.168.64.4:22"),
+            "192.168.64.4"
+        );
+    }
+
+    #[test]
+    fn target_port_extracts_explicit_suffix_only() {
+        assert_eq!(target_port("debian@192.168.64.4:22"), Some(22));
+        assert_eq!(target_port("debian@192.168.64.4:2222"), Some(2222));
+        assert_eq!(target_port("admin@[fe80::1]:2200"), Some(2200));
+        // No suffix -> use the SSH default (None).
+        assert_eq!(target_port("debian@192.168.64.4"), None);
+        assert_eq!(target_port("root@fe80::1"), None);
+        assert_eq!(target_port("admin@[fe80::1]"), None);
+    }
+
+    #[test]
+    fn strip_host_port_matches_orchestrator_semantics() {
+        assert_eq!(strip_host_port("192.168.64.10"), "192.168.64.10");
+        assert_eq!(strip_host_port("192.168.64.10:2222"), "192.168.64.10");
+        assert_eq!(strip_host_port("[fe80::1]:2222"), "fe80::1");
+        assert_eq!(strip_host_port("fe80::1"), "fe80::1");
+    }
+
+    #[test]
+    fn resolved_known_hosts_candidates_strips_port_suffix_for_lookup() {
+        // ssh -G is fed the bare host, so its hostname/port fields are clean.
+        let resolved = "\
+hostname 192.168.64.4
+port 22
+";
+        let candidates = resolved_known_hosts_candidates("debian@192.168.64.4:22", resolved)
+            .expect("candidates");
+        assert_eq!(candidates, vec!["192.168.64.4".to_owned()]);
+    }
+
+    #[test]
+    fn resolved_known_hosts_candidates_prefers_explicit_nondefault_port() {
+        let resolved = "\
+hostname 192.168.64.4
+port 22
+";
+        let candidates = resolved_known_hosts_candidates("debian@192.168.64.4:2222", resolved)
+            .expect("candidates");
+        assert_eq!(candidates, vec!["[192.168.64.4]:2222".to_owned()]);
     }
 }
