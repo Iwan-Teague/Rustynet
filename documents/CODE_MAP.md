@@ -112,6 +112,7 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 | `NodeConnection` enum | `connection.rs` | Transport injection: Ssh, Adb, Mdm |
 | `OrchestrationContext` | `context.rs` | In-memory stage context plus persisted setup/run split state at `<report_dir>/state/orchestration_context.json` |
 | `OrchestrationStage` trait | `stage/mod.rs` | Single stage in the orchestration pipeline |
+| `define_stage_catalog!` / `StageId` / `StageSuite` | `stage/mod.rs` | The single typed stage authority (RNQ-16): one catalog row per stage = variant + canonical pipeline order + wire name + suite tag; plan build, mode filtering, suite lists, registry rust-native predicate, and matrix oracle derive from it |
 | `PlanBuilder` | `plan.rs` | Builds the stage execution plan from role assignments, including live-suite, soak, cross-network, and chaos selectors |
 | `StateMachineRunner` | `runner.rs` | Validated dependency-ordered stage runner; explicit omissions are `NotRun`, while prior stages become `Reused` only after sealed-evidence validation |
 | Bounded node executor | `parallel.rs` | Deterministic, worker-capped, cancellation-aware per-node fanout |

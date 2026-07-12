@@ -227,8 +227,14 @@ Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](./RustNati
   report-state, reuse seal). Behavior-preserving; `mod.rs` 49,731→47,972 lines;
   full `rustynet-cli` suite 2,321/2,321 green. `build_allow_spec` remains in
   `mod.rs` while the bash path consumes it (migrates at W5.7).
-- [ ] RNQ-16: make registry metadata, plan construction, validators, docs, MCP,
-  and historical oracle generation derive from one typed authority.
+- [x] RNQ-16 (2026-07-12): the stage catalog (`define_stage_catalog!` in
+  `stage/mod.rs`) is the single typed authority — one row per stage carries
+  variant, canonical order, wire name, suite tag. Plan build (exhaustive
+  match), mode filtering, suite id-lists, the registry rust-native predicate,
+  and the run-matrix oracle all derive from it; the catalog order was
+  corrected to the true build order (3 divergences found+fixed) and the MCP
+  doc table aligned. Residual by design: registry per-entry metadata is
+  single-copy registry-owned; MCP doc stays a cross-crate string gate.
 - [ ] RNQ-17: split lab robot/orchestrator from the product CLI crate and binary;
   update parser/dispatch, package boundaries, release artifacts, SBOM, signing,
   install paths, and CI so lab-only attack surface does not ship as product.

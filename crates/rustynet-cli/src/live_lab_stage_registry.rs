@@ -304,9 +304,6 @@ pub struct StageSpec {
     pub cross_os: Option<&'static str>,
     /// One-off check column. Mirrors `set_special_stage_values` arms.
     pub special: Option<&'static str>,
-    /// Member of the Rust state-machine's native stage vocabulary
-    /// (`StageId::as_str`). Mirrors `is_rust_native_stage_name`.
-    pub rust_native: bool,
     pub platform_rule: PlatformRule,
     pub enable: EnableRule,
     /// Cold-start time budget in seconds (fallback when no timing history
@@ -362,7 +359,6 @@ const DEFAULT_SPEC: StageSpec = StageSpec {
     role: None,
     cross_os: None,
     special: None,
-    rust_native: false,
     platform_rule: PlatformRule::LinuxOnly,
     enable: EnableRule::Always,
     budget_secs: 300,
@@ -389,7 +385,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Pre,
         logical: Some("bootstrap"),
         cross_os: Some("cross_os_bootstrap"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -399,7 +394,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Pre,
         logical: Some("bootstrap"),
         cross_os: Some("cross_os_bootstrap"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 30,
         ..DEFAULT_SPEC
@@ -409,7 +403,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Pre,
         logical: Some("bootstrap"),
         cross_os: Some("cross_os_bootstrap"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -432,7 +425,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Pre,
         logical: Some("bootstrap"),
         cross_os: Some("cross_os_bootstrap"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -443,7 +435,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Bootstrap,
         logical: Some("bootstrap"),
         cross_os: Some("cross_os_bootstrap"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 900,
         ..DEFAULT_SPEC
@@ -453,7 +444,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Bootstrap,
         logical: Some("bootstrap"),
         cross_os: Some("cross_os_bootstrap"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -501,7 +491,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "enforce_baseline_runtime",
         group: StageGroup::Bootstrap,
         logical: Some("baseline_runtime"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 300,
         ..DEFAULT_SPEC
@@ -510,7 +499,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "validate_baseline_runtime",
         group: StageGroup::Bootstrap,
         logical: Some("baseline_runtime"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 300,
         ..DEFAULT_SPEC
@@ -522,7 +510,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Bootstrap,
         logical: Some("membership"),
         cross_os: Some("cross_os_membership_convergence"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 120,
         ..DEFAULT_SPEC
@@ -533,7 +520,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Bootstrap,
         logical: Some("membership"),
         cross_os: Some("cross_os_membership_convergence"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -544,7 +530,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Live,
         logical: Some("anchor"),
         cross_os: Some("cross_os_anchor_bundle_pull"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -553,7 +538,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("admin"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -562,7 +546,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Bootstrap,
         logical: Some("assignments"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -573,7 +556,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Bootstrap,
         logical: Some("traversal"),
         cross_os: Some("cross_os_direct_path"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -584,7 +566,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Bootstrap,
         logical: Some("managed_dns"),
         cross_os: Some("cross_os_dns"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -594,7 +575,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("blind_exit"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -604,7 +584,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Live,
         logical: Some("relay_service_lifecycle"),
         cross_os: Some("cross_os_relay_path"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -614,7 +593,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Live,
         logical: Some("relay_service_lifecycle"),
         cross_os: Some("cross_os_relay_path"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -629,7 +607,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "security_audit_validation",
         state_machine_only: true,
         group: StageGroup::Live,
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -642,7 +619,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("dns_failclosed_check"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -655,7 +631,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("runtime_acls_check"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -668,7 +643,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("service_hardening_check"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -684,7 +658,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("key_custody_check"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -700,7 +673,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("mesh_status_check"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -716,7 +688,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("authenticode_check"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -732,7 +703,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("ipv6_leak_check"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -747,7 +717,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("exit_demotion_residue_check"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -761,7 +730,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("exit_dns_failclosed_check"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -774,7 +742,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("exit_nat_lifecycle_check"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -788,7 +755,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("blind_exit_dataplane_check"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -801,7 +767,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("two_hop"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -816,7 +781,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("managed_dns"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -826,7 +790,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Live,
         logical: Some("two_hop"),
         cross_os: Some("cross_os_peer_visibility"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -836,7 +799,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Live,
         logical: Some("role_switch_matrix"),
         cross_os: Some("cross_os_role_switch"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -846,7 +808,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Live,
         logical: Some("exit_handoff"),
         cross_os: Some("cross_os_exit_path"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -856,7 +817,6 @@ pub const STAGES: &[StageSpec] = &[
         group: StageGroup::Live,
         logical: Some("exit_handoff"),
         cross_os: Some("cross_os_exit_path"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -865,7 +825,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("cleanup"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -1761,7 +1720,6 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "live_anchor",
         logical: Some("anchor"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::LinuxLiveSuite,
         ..DEFAULT_SPEC
@@ -1814,7 +1772,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("network_flap"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::LinuxLiveSuite,
         ..DEFAULT_SPEC
@@ -1824,7 +1781,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("reboot_recovery"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::LinuxLiveSuite,
         ..DEFAULT_SPEC
@@ -1834,7 +1790,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("secrets_not_in_logs"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::LinuxLiveSuite,
         ..DEFAULT_SPEC
@@ -1844,7 +1799,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("key_custody"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -1856,7 +1810,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("enrollment_restart"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -1868,7 +1821,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("lan_toggle"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -1880,7 +1832,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("mixed_topology"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -1926,7 +1877,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "live_hello_limiter_flood_validation",
         group: StageGroup::Live,
         logical: Some("hello_limiter_flood"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::LinuxLiveSuite,
         ..DEFAULT_SPEC
@@ -1936,7 +1886,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("extended_soak"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::SoakSuite,
         ..DEFAULT_SPEC
@@ -1946,7 +1895,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_clock_attack",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
@@ -1955,7 +1903,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_crash_recovery",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
@@ -1964,7 +1911,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_daemon_fault",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
@@ -1973,7 +1919,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_daemon_sigstop_sigcont",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
@@ -1982,7 +1927,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_membership_adversarial",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
@@ -1991,7 +1935,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_network_impairment",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
@@ -2000,7 +1943,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_privileged_boundary",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
@@ -2009,7 +1951,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_resource_exhaustion",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
@@ -2018,7 +1959,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "chaos_signed_state_adversarial",
         group: StageGroup::Chaos,
         logical: Some("chaos"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
@@ -2027,7 +1967,6 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "cross_network_nat_classification",
         logical: Some("cross_network"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         // Cross-network auto mode decides at runtime whether the substrate
@@ -2038,7 +1977,6 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "cross_network_nat_matrix",
         logical: Some("cross_network"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2047,7 +1985,6 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "cross_network_controller_switch",
         logical: Some("cross_network"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2056,7 +1993,6 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "cross_network_direct_remote_exit",
         logical: Some("cross_network"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2065,7 +2001,6 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "cross_network_failback_roaming",
         logical: Some("cross_network"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2074,7 +2009,6 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "cross_network_node_network_switch",
         logical: Some("cross_network"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2083,7 +2017,6 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "cross_network_relay_remote_exit",
         logical: Some("cross_network"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2092,7 +2025,6 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "cross_network_remote_exit_dns",
         logical: Some("cross_network"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2101,7 +2033,6 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "cross_network_remote_exit_soak",
         logical: Some("cross_network"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2110,7 +2041,6 @@ pub const STAGES: &[StageSpec] = &[
     StageSpec {
         name: "cross_network_traversal_adversarial",
         logical: Some("cross_network"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2120,7 +2050,6 @@ pub const STAGES: &[StageSpec] = &[
         name: "cross_network_preflight",
         group: StageGroup::Pre,
         logical: Some("cross_network"),
-        rust_native: true,
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
@@ -2265,9 +2194,15 @@ pub fn special_column(stage: &str) -> Option<&'static str> {
 /// Registry-backed replacement for `is_rust_native_stage_name`.
 #[allow(dead_code)] // kept for the drift gate; production platform choice goes through platform_rule
 pub fn is_rust_native_stage_name(stage: &str) -> bool {
-    find_stage(stage).is_some_and(|spec| spec.rust_native)
-        || stage.starts_with("chaos_")
-        || stage.starts_with("cross_network_")
+    // RNQ-16: membership in the Rust engine's stage vocabulary is DERIVED
+    // from the typed authority (`StageId`), not stored per registry entry —
+    // the two can no longer drift. Aliases resolve to their canonical name
+    // first; unknown `chaos_`/`cross_network_` names keep the historical
+    // prefix fallback (they are Rust-suite families by construction).
+    let canonical = find_stage(stage).map(|spec| spec.name).unwrap_or(stage);
+    crate::vm_lab::orchestrator::stage::StageId::try_from(canonical).is_ok()
+        || canonical.starts_with("chaos_")
+        || canonical.starts_with("cross_network_")
 }
 
 /// Registry-backed platform-resolution rule for shared stages, preserving

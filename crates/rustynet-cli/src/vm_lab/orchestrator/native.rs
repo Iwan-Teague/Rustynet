@@ -868,23 +868,19 @@ fn build_rust_native_orchestration_stages(
 }
 
 pub(crate) fn rust_native_setup_stage_ids() -> Vec<orchestrator::stage::StageId> {
-    use orchestrator::stage::StageId;
-    vec![
-        StageId::Preflight,
-        StageId::PrepareSourceArchive,
-        StageId::VerifySshReachability,
-        StageId::CleanupHosts,
-        StageId::BootstrapHosts,
-        StageId::CollectPubkeys,
-        StageId::MembershipInit,
-        StageId::DistributeMembership,
-        StageId::AnchorValidation,
-        StageId::DistributeAssignments,
-        StageId::DistributeTraversal,
-        StageId::DistributeDnsZone,
-        StageId::EnforceBaselineRuntime,
-        StageId::ValidateBaselineRuntime,
-    ]
+    // Derived from the stage catalog's Setup suite tag (RNQ-16), minus
+    // `admin_issue` and `blind_exit` — the two Setup-suite stages the proven
+    // `--setup-only` contract has always omitted (pinned by the
+    // setup-only-plan mode tests in `vm_lab/mod.rs`).
+    use orchestrator::stage::{StageId, StageSuite};
+    StageId::ALL
+        .iter()
+        .filter(|id| {
+            id.suite() == StageSuite::Setup
+                && !matches!(id, StageId::AdminIssue | StageId::BlindExit)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Augment `ctx.assignments` from platform selectors so `--exit-platform macos`
@@ -935,22 +931,19 @@ fn filter_rust_native_stages_for_mode(
     setup_only: bool,
     run_only: bool,
 ) -> Vec<Box<dyn orchestrator::stage::OrchestrationStage>> {
+    use orchestrator::stage::StageSuite;
     if setup_only {
+        // Setup-only stops after the last Setup-suite stage (leaves the mesh
+        // up on success; the runner still cleans up on failure).
         let setup = rust_native_setup_stage_ids();
         stages.retain(|stage| setup.contains(&stage.id()));
     } else if run_only {
-        let setup = rust_native_setup_stage_ids();
-        let live = orchestrator::plan::PlanBuilder::LIVE_SUITE_STAGES;
-        let chaos = orchestrator::plan::PlanBuilder::CHAOS_SUITE_STAGES;
-        let cross_network = orchestrator::plan::PlanBuilder::CROSS_NETWORK_SUITE_STAGES;
-        let soak = orchestrator::plan::PlanBuilder::SOAK_SUITE_STAGES;
-        stages.retain(|stage| {
-            setup.contains(&stage.id())
-                || live.contains(&stage.id())
-                || chaos.contains(&stage.id())
-                || cross_network.contains(&stage.id())
-                || soak.contains(&stage.id())
-        });
+        // Run-only reloads persisted setup state and runs the live suites
+        // against the existing mesh — every suite EXCEPT the final teardown
+        // (the mesh stays up). Setup stages are retained so the runner can
+        // inject them as Passed dependencies. Suite tags are the RNQ-16
+        // authority; this can no longer drift from the catalog.
+        stages.retain(|stage| stage.id().suite() != StageSuite::Cleanup);
     }
     stages
 }

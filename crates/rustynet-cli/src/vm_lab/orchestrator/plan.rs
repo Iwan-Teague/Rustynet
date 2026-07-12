@@ -1,33 +1,33 @@
 #![allow(dead_code)]
 //! # Adding a stage to the Rust `--node` plan
 //!
-//! A new stage is a single source-of-truth item (its `StageId`), but it is
-//! surfaced in seven places that drift gates + full-suite asserts enforce.
-//! Adding a stage without updating all seven fails CI (each at a different
-//! test scope — the extensibility/drift gates catch the registry/doc omissions,
-//! the full `cargo test` suite catches the count + oracle omissions). Touch, in
-//! order:
+//! The stage catalog in `stage/mod.rs` is the single typed authority
+//! (RNQ-16): one catalog row carries the `StageId` variant, its canonical
+//! pipeline position, its wire name, and its suite tag. Plan membership +
+//! order derive from it, the registry rust-native predicate and the
+//! run-matrix oracle derive from `StageId::try_from`, and the instantiation
+//! match below is compiler-enforced exhaustive. Touch, in order:
 //!
-//! 1. `stage/mod.rs` — add the `StageId` variant, extend `StageId::ALL: [_; N]`
-//!    (bump N), add the `as_str` arm, and `pub mod <file>;`.
+//! 1. `stage/mod.rs` — ONE catalog row: `Variant => "wire_name" @ Suite`, at
+//!    the stage's true pipeline position, plus `pub mod <file>;`.
 //! 2. `stage/<name>.rs` — the `OrchestrationStage` impl (id / dependencies /
 //!    applies_to_roles / fanout / execute; override `always_run` for teardown).
-//! 3. `plan.rs` (this file) — `Box::new(<Stage>)` at the right pipeline
-//!    position, and update `build_returns_N_stages` + the canonical-order list
-//!    in `mod tests`.
+//! 3. `plan.rs` (this file) — the compiler now FORCES one `Box::new(<Stage>)`
+//!    arm in `build`'s exhaustive match (position no longer matters — order
+//!    comes from the catalog). Update `build_returns_N_stages` + the
+//!    canonical-order list in `mod tests` (the independent order pin).
 //! 4. `vm_lab/mod.rs` — the `rust_native_cli_stage_ids_match_plan_builder`
 //!    absolute-count assert (`cli_ids.len() == N`).
 //! 5. `live_lab_stage_registry.rs` — the `StageSpec` entry (the extensibility
 //!    gate asserts every `StageId::ALL` member is registered — finding 1D).
-//! 6. `live_lab_run_matrix.rs` — if the stage is rust-native, add it to the
-//!    `oracle_is_rust_native` historical copy (it also drives the
-//!    `registry_matches_historical_platform_resolution` expected-platform
-//!    branch); add `oracle_cross_os_column` / `oracle_special_column` arms only
-//!    if the stage owns such a column.
-//! 7. `rustynet-mcp/.../repo_context.rs` — add the row to the
+//!    `rust_native` is DERIVED from `StageId` (no flag to set); add
+//!    cross-os/special column fields only if the stage owns such a column
+//!    (mirrored by `oracle_cross_os_column`/`oracle_special_column` in
+//!    `live_lab_run_matrix.rs` tests).
+//! 6. `rustynet-mcp/.../repo_context.rs` — add the row to the
 //!    `ORCHESTRATOR_STAGES` doc table and the `EXPECTED` list in
-//!    `orchestrator_stages_doc_matches_the_rust_planbuilder` (the drift gate
-//!    asserts the doc == `StageId::ALL`).
+//!    `orchestrator_stages_doc_matches_the_rust_planbuilder` (cross-crate
+//!    string gate; keep it equal to `StageId::ALL` order).
 use crate::vm_lab::orchestrator::stage::OrchestrationStage;
 use crate::vm_lab::orchestrator::stage::active_exit::ActiveExitStage;
 use crate::vm_lab::orchestrator::stage::admin_issue::AdminIssueStage;
@@ -100,7 +100,7 @@ pub struct PlanBuilder {
     /// `--source-mode`: which tree the shipped source archive is built from.
     source_mode: ArchiveSourceMode,
     /// `--skip-linux-live-suite`: when true, drop the post-baseline live
-    /// validation + role stages ([`Self::LIVE_SUITE_STAGES`]) so the plan runs
+    /// validation + role stages ([`Self::live_suite_stages`]) so the plan runs
     /// only setup → baseline → cleanup. The fast inner loop (mesh-health check /
     /// mac-win cell iteration) that the MCP loop tooling already emits.
     skip_live_suite: bool,
@@ -120,78 +120,33 @@ pub struct PlanBuilder {
 impl PlanBuilder {
     /// The post-baseline live-validation + role stages, dropped when
     /// `--skip-linux-live-suite` is set. Setup (through `validate_baseline_runtime`)
-    /// and the always-run `cleanup` are never in this set.
-    pub const LIVE_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 29] = {
-        use crate::vm_lab::orchestrator::stage::StageId;
-        [
-            StageId::SecurityAuditValidation,
-            StageId::DnsFailclosedValidation,
-            StageId::RuntimeAclsValidation,
-            StageId::ServiceHardeningValidation,
-            StageId::KeyCustodyValidation,
-            StageId::MeshStatusValidation,
-            StageId::AuthenticodeValidation,
-            StageId::Ipv6LeakValidation,
-            StageId::DeployRelayService,
-            StageId::RelayValidation,
-            StageId::TrafficTestMatrix,
-            StageId::RoleSwitchMatrix,
-            StageId::ExitHandoff,
-            StageId::ActiveExit,
-            StageId::ExitDnsFailclosedValidation,
-            StageId::ExitNatLifecycleValidation,
-            StageId::ExitDemotionResidueValidation,
-            StageId::BlindExitDataplaneValidation,
-            StageId::LiveAnchor,
-            StageId::LiveTwoHopValidation,
-            StageId::LiveManagedDnsValidation,
-            StageId::LiveNetworkFlapValidation,
-            StageId::LiveRebootRecoveryValidation,
-            StageId::LiveSecretsNotInLogsValidation,
-            StageId::LiveKeyCustodyValidation,
-            StageId::LiveEnrollmentRestartValidation,
-            StageId::LiveLanToggleValidation,
-            StageId::LiveMixedTopologyValidation,
-            StageId::LiveHelloLimiterFloodValidation,
-        ]
-    };
+    /// and the always-run `cleanup` are never in this set. Derived from the
+    /// stage catalog's suite tags (RNQ-16) — cannot drift from `StageId::ALL`.
+    pub fn live_suite_stages() -> Vec<crate::vm_lab::orchestrator::stage::StageId> {
+        Self::stages_in_suite(crate::vm_lab::orchestrator::stage::StageSuite::Live)
+    }
 
-    pub const SOAK_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 1] = {
-        use crate::vm_lab::orchestrator::stage::StageId;
-        [StageId::LiveExtendedSoakValidation]
-    };
+    pub fn soak_suite_stages() -> Vec<crate::vm_lab::orchestrator::stage::StageId> {
+        Self::stages_in_suite(crate::vm_lab::orchestrator::stage::StageSuite::Soak)
+    }
 
-    pub const CHAOS_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 9] = {
-        use crate::vm_lab::orchestrator::stage::StageId;
-        [
-            StageId::ChaosClockAttack,
-            StageId::ChaosCrashRecovery,
-            StageId::ChaosDaemonFault,
-            StageId::ChaosDaemonSigstopSigcont,
-            StageId::ChaosMembershipAdversarial,
-            StageId::ChaosNetworkImpairment,
-            StageId::ChaosPrivilegedBoundary,
-            StageId::ChaosResourceExhaustion,
-            StageId::ChaosSignedStateAdversarial,
-        ]
-    };
+    pub fn chaos_suite_stages() -> Vec<crate::vm_lab::orchestrator::stage::StageId> {
+        Self::stages_in_suite(crate::vm_lab::orchestrator::stage::StageSuite::Chaos)
+    }
 
-    pub const CROSS_NETWORK_SUITE_STAGES: [crate::vm_lab::orchestrator::stage::StageId; 11] = {
-        use crate::vm_lab::orchestrator::stage::StageId;
-        [
-            StageId::CrossNetworkPreflight,
-            StageId::CrossNetworkDirectRemoteExit,
-            StageId::CrossNetworkNodeNetworkSwitch,
-            StageId::CrossNetworkRelayRemoteExit,
-            StageId::CrossNetworkFailbackRoaming,
-            StageId::CrossNetworkControllerSwitch,
-            StageId::CrossNetworkTraversalAdversarial,
-            StageId::CrossNetworkRemoteExitDns,
-            StageId::CrossNetworkRemoteExitSoak,
-            StageId::CrossNetworkNatClassification,
-            StageId::CrossNetworkNatMatrix,
-        ]
-    };
+    pub fn cross_network_suite_stages() -> Vec<crate::vm_lab::orchestrator::stage::StageId> {
+        Self::stages_in_suite(crate::vm_lab::orchestrator::stage::StageSuite::CrossNetwork)
+    }
+
+    fn stages_in_suite(
+        suite: crate::vm_lab::orchestrator::stage::StageSuite,
+    ) -> Vec<crate::vm_lab::orchestrator::stage::StageId> {
+        crate::vm_lab::orchestrator::stage::StageId::ALL
+            .iter()
+            .filter(|id| id.suite() == suite)
+            .cloned()
+            .collect()
+    }
 
     pub fn new() -> Self {
         PlanBuilder::default()
@@ -247,6 +202,7 @@ impl PlanBuilder {
     }
 
     pub fn build(self) -> Vec<Box<dyn OrchestrationStage>> {
+        use crate::vm_lab::orchestrator::stage::{StageId, StageSuite};
         let PlanBuilder {
             rebuild_only,
             source_mode,
@@ -257,189 +213,181 @@ impl PlanBuilder {
             max_parallel_node_workers,
             shutdown_flag,
         } = self;
-        let mut stages: Vec<Box<dyn OrchestrationStage>> = vec![
-            Box::new(PreflightStage),
-            Box::new(PrepareSourceArchiveStage::new(source_mode)),
-            Box::new(VerifySshReachabilityStage),
-            // cleanup + bootstrap must share the same rebuild set: a node we
-            // refuse to clean must also be refused a rebuild (and vice versa).
-            Box::new(CleanupHostsStage::new(rebuild_only.clone())),
-            Box::new(BootstrapHostsStage::new(
-                rebuild_only.clone(),
-                max_parallel_node_workers,
-                std::sync::Arc::clone(&shutdown_flag),
-            )),
-            Box::new(CollectPubkeysStage),
-            Box::new(MembershipInitStage),
-            Box::new(DistributeMembershipStage),
-            // Anchor capability-advertisement proof for any Anchor node —
-            // folds the capability-advertisement surface of the formerly
-            // Linux-only anchor test bin in, cross-OS. Runs after the
-            // membership snapshot is distributed (so the daemon can derive
-            // the anchor view) and before assignments are distributed.
-            Box::new(AnchorValidationStage),
-            Box::new(AdminIssueStage),
-            Box::new(DistributeAssignmentsStage::new(
-                max_parallel_node_workers,
-                std::sync::Arc::clone(&shutdown_flag),
-            )),
-            Box::new(DistributeTraversalStage::new(
-                max_parallel_node_workers,
-                std::sync::Arc::clone(&shutdown_flag),
-            )),
-            Box::new(DistributeDnsZoneStage::new(
-                max_parallel_node_workers,
-                std::sync::Arc::clone(&shutdown_flag),
-            )),
-            Box::new(EnforceBaselineRuntimeStage::new(
-                max_parallel_node_workers,
-                std::sync::Arc::clone(&shutdown_flag),
-            )),
-            Box::new(BlindExitStage),
-            Box::new(ValidateBaselineRuntimeStage::new(
-                max_parallel_node_workers,
-                std::sync::Arc::clone(&shutdown_flag),
-            )),
-            // Eight Tier-0 adversarial daemon self-audits (membership-revoke,
-            // revoked-peer-denied, membership-signature, privileged-helper-allowlist,
-            // policy-default-deny, gossip-revoked-readmit, enrollment-replay,
-            // blind-exit-reversal) — the exact set `rustynetd` exposes; folds the
-            // formerly bash-only Linux security suite into the Rust engine. After
-            // baseline-runtime validation (the daemon must be up + baseline-good)
-            // and before the traffic matrix.
-            Box::new(SecurityAuditValidationStage),
-            // DNS-failclosed per-node daemon self-check — resolv.conf
-            // loopback-only, no external resolver reachable through the
-            // killswitch. Runs after the security-audit suite (daemon must be
-            // up + baseline-good) and before relay deploy.
-            Box::new(DnsFailclosedValidationStage),
-            // Runtime-ACLs per-node daemon self-check — canonical runtime
-            // root set present, no unexpected additions, per-path status
-            // consistent. Runs after dns_failclosed_validation and before
-            // relay deploy.
-            Box::new(RuntimeAclsValidationStage),
-            // Service-hardening per-node daemon self-check — the installed
-            // systemd unit's hardening directives match the shipped baseline.
-            // Runs after runtime_acls_validation and before relay deploy.
-            Box::new(ServiceHardeningValidationStage),
-            // Key-custody per-node daemon self-check — the canonical
-            // Linux key-custody artifacts (encrypted WG private key,
-            // public key, keys dir, credentials dir, passphrase
-            // credentials) match the reviewed custody contract. Runs
-            // after service_hardening_validation and before relay deploy.
-            Box::new(KeyCustodyValidationStage),
-            // Mesh-status per-node daemon self-check — the daemon's
-            // mesh-status view reports no drift (no stale state,
-            // expected peer IDs present, within max-age bounds). Runs
-            // after key_custody_validation and before relay deploy.
-            Box::new(MeshStatusValidationStage),
-            // Authenticode per-node daemon self-check — honest not-applicable
-            // verdict on Linux (runtime binary-signature attestation is
-            // Windows-specific; Linux relies on dpkg/rpm install-time
-            // verification). Runs after mesh_status_validation and before
-            // relay deploy.
-            Box::new(AuthenticodeValidationStage),
-            // IPv6 leak adversarial capture — real outbound IPv6 probe while
-            // tcpdump watches the egress interface; 0 leaked datagrams + probe
-            // blocked by containment control (disable_ipv6 or killswitch v6 drop).
-            // Runs after authenticode_validation, before relay deploy.
-            Box::new(Ipv6LeakValidationStage),
-            // Deploy the rustynet-relay sibling service onto every Relay node
-            // (verifier key + `ops install-systemd-relay`) so relay_validation
-            // has a live relay to prove. Closes the gap where the standard
-            // orchestrator advertised relay_host in membership but never
-            // installed the relay runtime. Runs after baseline-runtime
-            // validation (no network needed) and before relay_validation.
-            Box::new(DeployRelayServiceStage),
-            // Relay-service-lifecycle proof for any Relay node — folds the
-            // formerly Linux-only relay test bin in, cross-OS. Runs after
-            // the relay runtime is deployed, before the traffic matrix.
-            Box::new(RelayValidationStage),
-            Box::new(TrafficTestMatrixStage),
-            Box::new(RoleSwitchMatrixStage),
-            Box::new(ExitHandoffStage),
-            Box::new(ActiveExitStage),
-            Box::new(ExitDnsFailclosedValidationStage),
-            Box::new(ExitNatLifecycleValidationStage),
-            Box::new(ExitDemotionResidueValidationStage),
-            Box::new(BlindExitDataplaneValidationStage),
-            Box::new(LiveAnchorStage),
-            Box::new(LiveTwoHopValidationStage),
-            Box::new(LiveManagedDnsValidationStage),
-            Box::new(LiveNetworkFlapValidationStage),
-            Box::new(LiveRebootRecoveryValidationStage),
-            Box::new(LiveSecretsNotInLogsValidationStage),
-            Box::new(LiveKeyCustodyValidationStage),
-            Box::new(LiveEnrollmentRestartValidationStage),
-            Box::new(LiveLanToggleValidationStage),
-            Box::new(LiveMixedTopologyValidationStage),
-            Box::new(LiveHelloLimiterFloodValidationStage),
-            Box::new(FinalCleanupStage::new(rebuild_only)),
-        ];
-        if !skip_soak {
-            stages.splice(
-                stages.len().saturating_sub(1)..stages.len().saturating_sub(1),
-                [Box::new(LiveExtendedSoakValidationStage) as Box<dyn OrchestrationStage>],
-            );
-        }
-        if cross_network.enable_suite {
-            stages.splice(
-                stages.len().saturating_sub(1)..stages.len().saturating_sub(1),
-                [
-                    Box::new(CrossNetworkPreflightStage::new(cross_network.clone()))
-                        as Box<dyn OrchestrationStage>,
-                    Box::new(CrossNetworkDirectRemoteExitStage::new(
-                        cross_network.clone(),
+
+        // Suite-inclusion authority (RNQ-16): the plan is StageId::ALL in
+        // canonical order, filtered by each stage's catalog suite tag.
+        // `--skip-linux-live-suite` keeps only setup → baseline → cleanup
+        // (cleanup is always-run teardown and is never dropped, so this
+        // run's own killswitch / exit-NAT residue is still removed).
+        let include = |suite: StageSuite| -> bool {
+            match suite {
+                StageSuite::Setup | StageSuite::Cleanup => true,
+                StageSuite::Live => !skip_live_suite,
+                StageSuite::Soak => !skip_live_suite && !skip_soak,
+                StageSuite::CrossNetwork => !skip_live_suite && cross_network.enable_suite,
+                StageSuite::Chaos => !skip_live_suite && enable_chaos_suite,
+            }
+        };
+
+        // One instantiation arm per stage, compiler-enforced exhaustive: a
+        // new StageId variant fails to compile here until it gets an arm, so
+        // plan membership can no longer silently drift from the catalog.
+        StageId::ALL
+            .iter()
+            .filter(|id| include(id.suite()))
+            .map(|id| -> Box<dyn OrchestrationStage> {
+                match id {
+                    StageId::Preflight => Box::new(PreflightStage),
+                    StageId::PrepareSourceArchive => {
+                        Box::new(PrepareSourceArchiveStage::new(source_mode))
+                    }
+                    StageId::VerifySshReachability => Box::new(VerifySshReachabilityStage),
+                    // cleanup + bootstrap must share the same rebuild set: a
+                    // node we refuse to clean must also be refused a rebuild
+                    // (and vice versa).
+                    StageId::CleanupHosts => Box::new(CleanupHostsStage::new(rebuild_only.clone())),
+                    StageId::BootstrapHosts => Box::new(BootstrapHostsStage::new(
+                        rebuild_only.clone(),
+                        max_parallel_node_workers,
+                        std::sync::Arc::clone(&shutdown_flag),
                     )),
-                    Box::new(CrossNetworkNodeNetworkSwitchStage::new(
-                        cross_network.clone(),
+                    StageId::CollectPubkeys => Box::new(CollectPubkeysStage),
+                    StageId::MembershipInit => Box::new(MembershipInitStage),
+                    StageId::DistributeMembership => Box::new(DistributeMembershipStage),
+                    // Anchor capability-advertisement proof for any Anchor
+                    // node — after the membership snapshot is distributed and
+                    // before assignments.
+                    StageId::AnchorValidation => Box::new(AnchorValidationStage),
+                    StageId::AdminIssue => Box::new(AdminIssueStage),
+                    StageId::BlindExit => Box::new(BlindExitStage),
+                    StageId::DistributeAssignments => Box::new(DistributeAssignmentsStage::new(
+                        max_parallel_node_workers,
+                        std::sync::Arc::clone(&shutdown_flag),
                     )),
-                    Box::new(CrossNetworkRelayRemoteExitStage::new(cross_network.clone())),
-                    Box::new(CrossNetworkFailbackRoamingStage::new(cross_network.clone())),
-                    Box::new(CrossNetworkControllerSwitchStage::new(
-                        cross_network.clone(),
+                    StageId::DistributeTraversal => Box::new(DistributeTraversalStage::new(
+                        max_parallel_node_workers,
+                        std::sync::Arc::clone(&shutdown_flag),
                     )),
-                    Box::new(CrossNetworkTraversalAdversarialStage::new(
-                        cross_network.clone(),
+                    StageId::DistributeDnsZone => Box::new(DistributeDnsZoneStage::new(
+                        max_parallel_node_workers,
+                        std::sync::Arc::clone(&shutdown_flag),
                     )),
-                    Box::new(CrossNetworkRemoteExitDnsStage::new(cross_network.clone())),
-                    Box::new(CrossNetworkRemoteExitSoakStage::new(cross_network.clone())),
-                    Box::new(CrossNetworkNatClassificationStage::new(
-                        cross_network.clone(),
+                    StageId::EnforceBaselineRuntime => Box::new(EnforceBaselineRuntimeStage::new(
+                        max_parallel_node_workers,
+                        std::sync::Arc::clone(&shutdown_flag),
                     )),
-                    Box::new(CrossNetworkNatMatrixStage::new(cross_network.clone())),
-                ],
-            );
-        }
-        if enable_chaos_suite {
-            stages.splice(
-                stages.len().saturating_sub(1)..stages.len().saturating_sub(1),
-                [
-                    Box::new(ChaosClockAttackStage) as Box<dyn OrchestrationStage>,
-                    Box::new(ChaosCrashRecoveryStage),
-                    Box::new(ChaosDaemonFaultStage),
-                    Box::new(ChaosDaemonSigstopSigcontStage),
-                    Box::new(ChaosMembershipAdversarialStage),
-                    Box::new(ChaosNetworkImpairmentStage),
-                    Box::new(ChaosPrivilegedBoundaryStage),
-                    Box::new(ChaosResourceExhaustionStage),
-                    Box::new(ChaosSignedStateAdversarialStage),
-                ],
-            );
-        }
-        if skip_live_suite {
-            // Drop the post-baseline live suite; setup + baseline + the
-            // always-run cleanup remain. FinalCleanupStage (Cleanup) is never in
-            // LIVE_SUITE_STAGES, so guest killswitch / exit-NAT residue is still
-            // torn down.
-            stages.retain(|stage| {
-                !Self::LIVE_SUITE_STAGES.contains(&stage.id())
-                    && !Self::CHAOS_SUITE_STAGES.contains(&stage.id())
-                    && !Self::CROSS_NETWORK_SUITE_STAGES.contains(&stage.id())
-                    && !Self::SOAK_SUITE_STAGES.contains(&stage.id())
-            });
-        }
-        stages
+                    StageId::ValidateBaselineRuntime => {
+                        Box::new(ValidateBaselineRuntimeStage::new(
+                            max_parallel_node_workers,
+                            std::sync::Arc::clone(&shutdown_flag),
+                        ))
+                    }
+                    // Eight Tier-0 adversarial daemon self-audits — after
+                    // baseline-runtime validation, before the traffic matrix.
+                    StageId::SecurityAuditValidation => Box::new(SecurityAuditValidationStage),
+                    StageId::DnsFailclosedValidation => Box::new(DnsFailclosedValidationStage),
+                    StageId::RuntimeAclsValidation => Box::new(RuntimeAclsValidationStage),
+                    StageId::ServiceHardeningValidation => {
+                        Box::new(ServiceHardeningValidationStage)
+                    }
+                    StageId::KeyCustodyValidation => Box::new(KeyCustodyValidationStage),
+                    StageId::MeshStatusValidation => Box::new(MeshStatusValidationStage),
+                    StageId::AuthenticodeValidation => Box::new(AuthenticodeValidationStage),
+                    StageId::Ipv6LeakValidation => Box::new(Ipv6LeakValidationStage),
+                    // Deploy the rustynet-relay sibling service onto every
+                    // Relay node so relay_validation has a live relay to prove.
+                    StageId::DeployRelayService => Box::new(DeployRelayServiceStage),
+                    StageId::RelayValidation => Box::new(RelayValidationStage),
+                    StageId::TrafficTestMatrix => Box::new(TrafficTestMatrixStage),
+                    StageId::RoleSwitchMatrix => Box::new(RoleSwitchMatrixStage),
+                    StageId::ExitHandoff => Box::new(ExitHandoffStage),
+                    StageId::ActiveExit => Box::new(ActiveExitStage),
+                    StageId::ExitDnsFailclosedValidation => {
+                        Box::new(ExitDnsFailclosedValidationStage)
+                    }
+                    StageId::ExitNatLifecycleValidation => {
+                        Box::new(ExitNatLifecycleValidationStage)
+                    }
+                    StageId::ExitDemotionResidueValidation => {
+                        Box::new(ExitDemotionResidueValidationStage)
+                    }
+                    StageId::BlindExitDataplaneValidation => {
+                        Box::new(BlindExitDataplaneValidationStage)
+                    }
+                    StageId::LiveAnchor => Box::new(LiveAnchorStage),
+                    StageId::LiveTwoHopValidation => Box::new(LiveTwoHopValidationStage),
+                    StageId::LiveManagedDnsValidation => Box::new(LiveManagedDnsValidationStage),
+                    StageId::LiveNetworkFlapValidation => Box::new(LiveNetworkFlapValidationStage),
+                    StageId::LiveRebootRecoveryValidation => {
+                        Box::new(LiveRebootRecoveryValidationStage)
+                    }
+                    StageId::LiveSecretsNotInLogsValidation => {
+                        Box::new(LiveSecretsNotInLogsValidationStage)
+                    }
+                    StageId::LiveKeyCustodyValidation => Box::new(LiveKeyCustodyValidationStage),
+                    StageId::LiveEnrollmentRestartValidation => {
+                        Box::new(LiveEnrollmentRestartValidationStage)
+                    }
+                    StageId::LiveLanToggleValidation => Box::new(LiveLanToggleValidationStage),
+                    StageId::LiveMixedTopologyValidation => {
+                        Box::new(LiveMixedTopologyValidationStage)
+                    }
+                    StageId::LiveHelloLimiterFloodValidation => {
+                        Box::new(LiveHelloLimiterFloodValidationStage)
+                    }
+                    StageId::LiveExtendedSoakValidation => {
+                        Box::new(LiveExtendedSoakValidationStage)
+                    }
+                    StageId::CrossNetworkPreflight => {
+                        Box::new(CrossNetworkPreflightStage::new(cross_network.clone()))
+                    }
+                    StageId::CrossNetworkDirectRemoteExit => Box::new(
+                        CrossNetworkDirectRemoteExitStage::new(cross_network.clone()),
+                    ),
+                    StageId::CrossNetworkNodeNetworkSwitch => Box::new(
+                        CrossNetworkNodeNetworkSwitchStage::new(cross_network.clone()),
+                    ),
+                    StageId::CrossNetworkRelayRemoteExit => {
+                        Box::new(CrossNetworkRelayRemoteExitStage::new(cross_network.clone()))
+                    }
+                    StageId::CrossNetworkFailbackRoaming => {
+                        Box::new(CrossNetworkFailbackRoamingStage::new(cross_network.clone()))
+                    }
+                    StageId::CrossNetworkControllerSwitch => Box::new(
+                        CrossNetworkControllerSwitchStage::new(cross_network.clone()),
+                    ),
+                    StageId::CrossNetworkTraversalAdversarial => Box::new(
+                        CrossNetworkTraversalAdversarialStage::new(cross_network.clone()),
+                    ),
+                    StageId::CrossNetworkRemoteExitDns => {
+                        Box::new(CrossNetworkRemoteExitDnsStage::new(cross_network.clone()))
+                    }
+                    StageId::CrossNetworkRemoteExitSoak => {
+                        Box::new(CrossNetworkRemoteExitSoakStage::new(cross_network.clone()))
+                    }
+                    StageId::CrossNetworkNatClassification => Box::new(
+                        CrossNetworkNatClassificationStage::new(cross_network.clone()),
+                    ),
+                    StageId::CrossNetworkNatMatrix => {
+                        Box::new(CrossNetworkNatMatrixStage::new(cross_network.clone()))
+                    }
+                    StageId::ChaosClockAttack => Box::new(ChaosClockAttackStage),
+                    StageId::ChaosCrashRecovery => Box::new(ChaosCrashRecoveryStage),
+                    StageId::ChaosDaemonFault => Box::new(ChaosDaemonFaultStage),
+                    StageId::ChaosDaemonSigstopSigcont => Box::new(ChaosDaemonSigstopSigcontStage),
+                    StageId::ChaosMembershipAdversarial => {
+                        Box::new(ChaosMembershipAdversarialStage)
+                    }
+                    StageId::ChaosNetworkImpairment => Box::new(ChaosNetworkImpairmentStage),
+                    StageId::ChaosPrivilegedBoundary => Box::new(ChaosPrivilegedBoundaryStage),
+                    StageId::ChaosResourceExhaustion => Box::new(ChaosResourceExhaustionStage),
+                    StageId::ChaosSignedStateAdversarial => {
+                        Box::new(ChaosSignedStateAdversarialStage)
+                    }
+                    StageId::Cleanup => Box::new(FinalCleanupStage::new(rebuild_only.clone())),
+                }
+            })
+            .collect()
     }
 }
 
@@ -459,7 +407,7 @@ mod tests {
         let stages = PlanBuilder::new().with_enable_chaos_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
         assert_eq!(ids.len(), 67, "chaos-enabled plan must contain 67 stages");
-        for chaos_id in PlanBuilder::CHAOS_SUITE_STAGES {
+        for chaos_id in PlanBuilder::chaos_suite_stages() {
             assert!(
                 ids.contains(&chaos_id),
                 "chaos-enabled plan must include {chaos_id:?}"
@@ -482,23 +430,23 @@ mod tests {
         // 58 total - 29 live-suite stages - 11 cross-network stages - 1 soak stage = 17.
         assert_eq!(
             ids.len(),
-            58 - PlanBuilder::LIVE_SUITE_STAGES.len()
-                - PlanBuilder::CROSS_NETWORK_SUITE_STAGES.len()
-                - PlanBuilder::SOAK_SUITE_STAGES.len()
+            58 - PlanBuilder::live_suite_stages().len()
+                - PlanBuilder::cross_network_suite_stages().len()
+                - PlanBuilder::soak_suite_stages().len()
         );
-        for dropped in PlanBuilder::LIVE_SUITE_STAGES {
+        for dropped in PlanBuilder::live_suite_stages() {
             assert!(
                 !ids.contains(&dropped),
                 "live-suite stage {dropped:?} must be dropped"
             );
         }
-        for dropped in PlanBuilder::CROSS_NETWORK_SUITE_STAGES {
+        for dropped in PlanBuilder::cross_network_suite_stages() {
             assert!(
                 !ids.contains(&dropped),
                 "skip-live-suite must drop cross-network stage {dropped:?}"
             );
         }
-        for dropped in PlanBuilder::SOAK_SUITE_STAGES {
+        for dropped in PlanBuilder::soak_suite_stages() {
             assert!(
                 !ids.contains(&dropped),
                 "skip-live-suite must drop soak stage {dropped:?}"
@@ -524,11 +472,11 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            58 - PlanBuilder::LIVE_SUITE_STAGES.len()
-                - PlanBuilder::CROSS_NETWORK_SUITE_STAGES.len()
-                - PlanBuilder::SOAK_SUITE_STAGES.len()
+            58 - PlanBuilder::live_suite_stages().len()
+                - PlanBuilder::cross_network_suite_stages().len()
+                - PlanBuilder::soak_suite_stages().len()
         );
-        for dropped in PlanBuilder::CHAOS_SUITE_STAGES {
+        for dropped in PlanBuilder::chaos_suite_stages() {
             assert!(
                 !ids.contains(&dropped),
                 "skip-live-suite must drop opt-in chaos stage {dropped:?}"
@@ -634,9 +582,9 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            58 - PlanBuilder::CROSS_NETWORK_SUITE_STAGES.len()
+            58 - PlanBuilder::cross_network_suite_stages().len()
         );
-        for dropped in PlanBuilder::CROSS_NETWORK_SUITE_STAGES {
+        for dropped in PlanBuilder::cross_network_suite_stages() {
             assert!(
                 !ids.contains(&dropped),
                 "disabled cross-network suite must drop {dropped:?}"

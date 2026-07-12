@@ -2094,9 +2094,9 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 28 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
 | 29 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
 | 30 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
-| 31 | `exit_demotion_residue_validation` | Two-phase exit→client demotion capture (NAT torn down, forwarding restored, daemon still running) | `stage/exit_demotion_residue_validation.rs` |
-| 32 | `exit_dns_failclosed_validation` | Per-node exit DNS fail-closed leak proof (six-artifact directory: firewall rules, block pcaps, active off-tunnel probe, tunnel positive control) | `stage/exit_dns_failclosed_validation.rs` |
-| 33 | `exit_nat_lifecycle_validation` | Two-phase exit NAT lifecycle check (snapshot during active exit → stop daemon → snapshot again → prove NAT gone) | `stage/exit_nat_lifecycle_validation.rs` |
+| 31 | `exit_dns_failclosed_validation` | Per-node exit DNS fail-closed leak proof (six-artifact directory: firewall rules, block pcaps, active off-tunnel probe, tunnel positive control) | `stage/exit_dns_failclosed_validation.rs` |
+| 32 | `exit_nat_lifecycle_validation` | Two-phase exit NAT lifecycle check (snapshot during active exit → stop daemon → snapshot again → prove NAT gone) | `stage/exit_nat_lifecycle_validation.rs` |
+| 33 | `exit_demotion_residue_validation` | Two-phase exit→client demotion capture (NAT torn down, forwarding restored, daemon still running) | `stage/exit_demotion_residue_validation.rs` |
 | 34 | `blind_exit_dataplane_validation` | Per-node blind-exit dataplane proof (live nft ruleset capture, five hardened subchecks: ruleset captured, mesh-scoped forward, no NAT, no unrestricted forward, no own-egress) | `stage/blind_exit_dataplane_validation.rs` |
 | 35 | `live_anchor` | Live anchor role validation delegated to the proven `live_linux_anchor_test` binary | `stage/live_anchor.rs` |
 | 36 | `live_two_hop_validation` | Live two-hop dataplane proof (client→entry→exit chain: end-to-end reachability + per-hop TTL decrement) delegates to the proven cross-OS `live_linux_two_hop_test` binary | `stage/live_two_hop_validation.rs` |
@@ -2217,9 +2217,9 @@ mod tests {
             "role_switch_matrix",
             "exit_handoff",
             "active_exit",
-            "exit_demotion_residue_validation",
             "exit_dns_failclosed_validation",
             "exit_nat_lifecycle_validation",
+            "exit_demotion_residue_validation",
             "blind_exit_dataplane_validation",
             "live_anchor",
             "live_two_hop_validation",

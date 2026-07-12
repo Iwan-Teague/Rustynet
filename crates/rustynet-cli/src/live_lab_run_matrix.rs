@@ -3615,59 +3615,15 @@ mod registry_equivalence_tests {
     }
 
     fn oracle_is_rust_native(stage: &str) -> bool {
-        if stage.starts_with("chaos_") || stage.starts_with("cross_network_") {
-            return true;
-        }
-        matches!(
-            stage,
-            "preflight"
-                | "prepare_source_archive"
-                | "verify_ssh_reachability"
-                | "cleanup_hosts"
-                | "bootstrap_hosts"
-                | "collect_pubkeys"
-                | "membership_init"
-                | "distribute_membership"
-                | "anchor_validation"
-                | "admin_issue"
-                | "distribute_assignments"
-                | "distribute_traversal"
-                | "distribute_dns_zone"
-                | "enforce_baseline_runtime"
-                | "blind_exit"
-                | "validate_baseline_runtime"
-                | "security_audit_validation"
-                | "dns_failclosed_validation"
-                | "runtime_acls_validation"
-                | "service_hardening_validation"
-                | "key_custody_validation"
-                | "mesh_status_validation"
-                | "authenticode_validation"
-                | "ipv6_leak_validation"
-                | "exit_demotion_residue_validation"
-                | "exit_dns_failclosed_validation"
-                | "exit_nat_lifecycle_validation"
-                | "blind_exit_dataplane_validation"
-                | "live_anchor"
-                | "live_two_hop_validation"
-                | "live_managed_dns_validation"
-                | "live_network_flap_validation"
-                | "live_reboot_recovery_validation"
-                | "live_secrets_not_in_logs_validation"
-                | "live_key_custody_validation"
-                | "live_enrollment_restart_validation"
-                | "live_lan_toggle_validation"
-                | "live_mixed_topology_validation"
-                | "live_hello_limiter_flood_validation"
-                | "extended_soak"
-                | "deploy_relay_service"
-                | "relay_validation"
-                | "traffic_test_matrix"
-                | "role_switch_matrix"
-                | "exit_handoff"
-                | "active_exit"
-                | "cleanup"
-        )
+        // RNQ-16: the expected-membership oracle derives from the typed
+        // authority (`StageId`) instead of a hand-maintained historical copy
+        // that had to be edited in lockstep with every stage addition. The
+        // prefix fallback mirrors the registry's rule for unknown
+        // `chaos_`/`cross_network_` names.
+        use crate::vm_lab::orchestrator::stage::StageId;
+        StageId::try_from(stage).is_ok()
+            || stage.starts_with("chaos_")
+            || stage.starts_with("cross_network_")
     }
 
     fn oracle_cross_os_column(stage: &str) -> Option<&'static str> {
@@ -3822,6 +3778,45 @@ mod registry_equivalence_tests {
                 "logical_stage_name diverged for {bare}"
             );
         }
+    }
+
+    #[test]
+    fn rust_native_vocabulary_is_the_stage_id_authority() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        // RNQ-16 characterization: every typed stage is rust-native by
+        // definition (registry + oracle both derive from StageId now).
+        for id in StageId::ALL {
+            assert!(
+                live_lab_stage_registry::is_rust_native_stage_name(id.as_str()),
+                "StageId member must be rust-native: {}",
+                id.as_str()
+            );
+        }
+        // Independent negatives: bash-dialect-only names must NOT be claimed
+        // by the Rust vocabulary. These fail if someone adds the bash name to
+        // StageId instead of the canonical Rust name.
+        for bash_only in [
+            "membership_setup",
+            "distribute_membership_state",
+            "issue_and_distribute_assignments",
+            "prime_remote_access",
+            "local_full_gate_suite",
+            "fresh_install_os_matrix_report",
+            "live_relay",
+            "live_mixed_topology",
+            "upgrade_admin_node_membership",
+        ] {
+            assert!(
+                !live_lab_stage_registry::is_rust_native_stage_name(bash_only),
+                "bash-only stage must not be rust-native: {bash_only}"
+            );
+        }
+        // Prefix fallback preserved: unknown chaos_/cross_network_ names stay
+        // in the Rust suite families (incl. the bash-exclusive
+        // cross_network_daemon_path — historical behavior).
+        assert!(live_lab_stage_registry::is_rust_native_stage_name(
+            "cross_network_daemon_path"
+        ));
     }
 
     #[test]
