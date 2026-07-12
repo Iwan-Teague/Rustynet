@@ -1253,11 +1253,28 @@ fn system_info_internal() -> SystemInfo {
     }
 }
 
+/// Parse the kernel release token from `/proc/version` contents. The canonical
+/// form is a single line `Linux version <release> (builder@host) ...`; the
+/// release is the third whitespace-separated token of the first line. Returns
+/// `None` for empty input or a first line with fewer than three tokens. Shared
+/// by `get_kernel_version` and `kernel_info_internal`, which previously carried
+/// two subtly different near-duplicate readers (one split the whole content,
+/// one the first line); this unifies on the first-line form. `allow(dead_code)`
+/// because both callers are `target_os = "linux"`.
+#[allow(dead_code)]
+fn parse_proc_version_release(content: &str) -> Option<String> {
+    content
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(2))
+        .map(|token| token.to_owned())
+}
+
 #[cfg(target_os = "linux")]
 fn get_kernel_version() -> Option<String> {
     fs::read_to_string("/proc/version")
         .ok()
-        .and_then(|content| content.split_whitespace().nth(2).map(|s| s.to_string()))
+        .and_then(|content| parse_proc_version_release(&content))
 }
 
 #[cfg(target_os = "macos")]
@@ -3246,10 +3263,8 @@ fn kernel_info_internal() -> KernelInfo {
     let machine = std::env::consts::ARCH.to_string();
 
     if let Ok(content) = fs::read_to_string("/proc/version") {
-        if let Some(first_line) = content.lines().next() {
-            if let Some(part) = first_line.split_whitespace().nth(2) {
-                release = part.to_string();
-            }
+        if let Some(parsed) = parse_proc_version_release(&content) {
+            release = parsed;
         }
     }
 
@@ -6990,8 +7005,29 @@ mod tests {
     use super::parse_arp_n_row;
     use super::performance_regression_detection_internal;
     use super::{
-        parse_linux_operstate, parse_macos_ifconfig_interfaces, parse_windows_ipconfig_interfaces,
+        parse_linux_operstate, parse_macos_ifconfig_interfaces, parse_proc_version_release,
+        parse_windows_ipconfig_interfaces,
     };
+
+    #[test]
+    fn proc_version_release_extracts_third_token_of_first_line() {
+        assert_eq!(
+            parse_proc_version_release(
+                "Linux version 6.1.0-13-amd64 (builder@host) (gcc 12) #1 SMP"
+            ),
+            Some("6.1.0-13-amd64".to_owned())
+        );
+        // Only the first line is considered.
+        assert_eq!(
+            parse_proc_version_release("Linux version 5.10.0 (a)\nsecond line"),
+            Some("5.10.0".to_owned())
+        );
+        // Fewer than three tokens, empty, or whitespace-only -> None.
+        assert_eq!(parse_proc_version_release("Linux version"), None);
+        assert_eq!(parse_proc_version_release("Linux"), None);
+        assert_eq!(parse_proc_version_release(""), None);
+        assert_eq!(parse_proc_version_release("   "), None);
+    }
 
     #[test]
     fn linux_operstate_only_exact_up_is_up() {
