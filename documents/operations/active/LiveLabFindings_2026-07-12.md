@@ -1,5 +1,37 @@
 # Live Lab Findings — 2026-07-12 (managed_dns green + newly-exposed gaps)
 
+> **RESOLUTION UPDATE (2026-07-12, later same day).** All three findings are
+> now dispositioned; live re-verify pending in the next focused run:
+>
+> - **Finding A — FIXED (option a, skip-if-absent).**
+>   `force_local_assignment_refresh` now probes
+>   `/etc/rustynet/assignment-refresh.env` first: `test -f` exit 1 (absent) →
+>   `CheckResult::Skipped` (the focused lab deliberately does not provision the
+>   refresh timer); any other probe failure → `Fail`; transport error → `Err`.
+>   A present env file with a failing refresh remains a hard `Fail`. The report
+>   writer already excludes skipped checks from the verdict; new regression
+>   test `reboot_recovery_report_passes_when_dns_refresh_checks_are_skipped`
+>   pins PASS with both refresh checks skipped. Option (b)
+>   (provision-the-timer) stays a coverage-enhancement candidate.
+> - **Finding B — RESOLVED AS NOT-A-BUG (intent≠reality explained).** The
+>   verifying run's own evidence shows bootstrap set the exit's daemon role to
+>   **admin** as intended (`bootstrap_node_debian-headless-2.log`:
+>   `e2e bootstrap host complete: role=admin`), and `e2e-enforce-host` exports
+>   `RUSTYNET_NODE_ROLE` into `install-systemd`'s process env, which takes
+>   precedence over preserved unit env — the stale-env-preservation hypothesis
+>   was wrong. The observed `RUSTYNET_NODE_ROLE=client` is the **legitimate end
+>   state of the role lifecycle**: `role_switch_matrix` and `exit_handoff` both
+>   PASSED before the live suite in the verifying run, and the handoff harness
+>   leaves the exit demoted to `client`. The `role.rs` Exit→`admin` mapping is
+>   the correct **bootstrap intent**; the daemon's fail-closed alignment check
+>   then requires the exit's capability set to support every role the lifecycle
+>   puts it through — exactly what `a1e49c1`'s canonical admin-owner set
+>   (`client,relay_host,exit_server,anchor`) provides. (The `node_id=daemon-local`
+>   + `client` unit env observable on the guest between runs is post-cleanup
+>   baseline state, not in-run state.)
+> - **Finding C — FIXED.** `issue_two_node_traversal_artifacts` (ops_e2e.rs)
+>   exit-node metadata aligned to the canonical admin-owner capability set.
+
 Scope: findings from driving `live_managed_dns_validation` to green on the focused
 shared-plane Rust `--node` topology (`debian-headless-2:exit` + `debian-headless-4:client`).
 Two bugs were fixed and committed (`a1e49c1`); fixing them unmasked a third failure and

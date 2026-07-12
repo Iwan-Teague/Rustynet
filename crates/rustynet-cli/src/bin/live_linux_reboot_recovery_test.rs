@@ -460,11 +460,38 @@ impl TwoHopTopology {
     }
 }
 
+/// Path the assignment-refresh timer's environment file is installed to by
+/// `ops install-systemd` when refresh infrastructure is provisioned. The
+/// focused lab setup distributes a single signed bundle and deliberately does
+/// NOT provision the refresh timer (that is why the lab install pins
+/// `RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400`).
+const ASSIGNMENT_REFRESH_ENV_PATH: &str = "/etc/rustynet/assignment-refresh.env";
+
 fn force_local_assignment_refresh(
     ctx: &mut LiveLabContext,
     target: &str,
     logger: &Logger,
 ) -> Result<CheckResult, String> {
+    // Precondition probe: the post-reboot refresh check only applies where the
+    // assignment-refresh infrastructure exists on the node. `test -f` exit 1
+    // (file absent) → Skipped, mirroring run_two_hop_subcheck's
+    // incomplete-topology skip. Any OTHER nonzero exit is not "absent" and
+    // fails closed; a transport error propagates as Err.
+    let probe = ctx.run_root_allow_failure(target, &["test", "-f", ASSIGNMENT_REFRESH_ENV_PATH])?;
+    if !probe.status.success() {
+        if probe.status.code() == Some(1) {
+            logger.line(format!(
+                "[reboot-recovery] assignment refresh skipped on {target}: \
+                 {ASSIGNMENT_REFRESH_ENV_PATH} not provisioned by this lab setup"
+            ))?;
+            return Ok(CheckResult::Skipped);
+        }
+        logger.line(format!(
+            "[reboot-recovery] assignment refresh env probe failed on {target}: {}",
+            render_output(&probe)
+        ))?;
+        return Ok(CheckResult::Fail);
+    }
     logger.line(format!(
         "[reboot-recovery] forcing local assignment refresh on {target}"
     ))?;

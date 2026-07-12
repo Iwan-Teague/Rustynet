@@ -3362,7 +3362,19 @@ fn issue_two_node_traversal_artifacts(
             hostname: exit_node_id.to_owned(),
             os: "linux".to_owned(),
             tags: Vec::new(),
-            capabilities: vec![RoleCapability::Anchor, RoleCapability::ExitServer],
+            // Canonical admin-owner capability set (client,relay_host,
+            // exit_server,anchor). This helper feeds traversal-artifact
+            // issuance only, but any future path that issues an exit
+            // ASSIGNMENT from this metadata would fail the daemon's
+            // client-role auto-tunnel alignment without `Client` — the same
+            // fail-closed check live_managed_dns hit (LiveLabFindings
+            // 2026-07-12 Finding C).
+            capabilities: vec![
+                RoleCapability::Client,
+                RoleCapability::RelayHost,
+                RoleCapability::ExitServer,
+                RoleCapability::Anchor,
+            ],
             owner: exit_node_id.to_owned(),
             endpoint: exit_endpoint.to_owned(),
             last_seen_unix: now_unix,
