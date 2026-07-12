@@ -1740,6 +1740,33 @@ mod tests {
         write_encrypted_key_file,
     };
 
+    #[test]
+    fn hex_decode_accepts_valid_and_rejects_malformed() {
+        use super::hex_decode;
+        assert_eq!(hex_decode("00ff").unwrap(), vec![0x00, 0xff]);
+        assert_eq!(hex_decode("deadbeef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        // Digit decoding is case-insensitive.
+        assert_eq!(hex_decode("DeAdBeEf").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        // Empty and odd-length inputs are rejected.
+        assert!(matches!(
+            hex_decode(""),
+            Err(CryptoError::AttestationVerificationFailed)
+        ));
+        assert!(matches!(
+            hex_decode("abc"),
+            Err(CryptoError::AttestationVerificationFailed)
+        ));
+        // Even-length inputs containing a non-hex byte are rejected.
+        assert!(matches!(
+            hex_decode("zz"),
+            Err(CryptoError::AttestationVerificationFailed)
+        ));
+        assert!(matches!(
+            hex_decode("0x"),
+            Err(CryptoError::AttestationVerificationFailed)
+        ));
+    }
+
     /// Regression: `try_generate_key_custody_material` must (1) succeed on a
     /// healthy host, (2) yield distinct salts and nonces under repeated calls
     /// (catches a buggy fallback that returned a zeroed buffer), and (3) keep
