@@ -269,6 +269,27 @@ mod tests {
     }
 
     #[test]
+    fn anchor_and_interface_validators_enforce_allowlists() {
+        // PF anchor names: bounded, path-traversal-free, controlled charset.
+        assert!(validate_anchor_name("com.rustynet/nat").is_ok());
+        assert!(validate_anchor_name("rustynet.exit_nat-1").is_ok());
+        assert!(validate_anchor_name("").is_err());
+        assert!(validate_anchor_name("../evil").is_err()); // ".." traversal
+        assert!(validate_anchor_name("/abs").is_err()); // leading '/'
+        assert!(validate_anchor_name("trail/").is_err()); // trailing '/'
+        assert!(validate_anchor_name("has;semi").is_err()); // out-of-charset
+        assert!(validate_anchor_name(&"a".repeat(97)).is_err()); // too long
+
+        // PF interface names: bounded (<=31), controlled charset.
+        assert!(validate_interface_name("en0").is_ok());
+        assert!(validate_interface_name("utun9").is_ok());
+        assert!(validate_interface_name("").is_err());
+        assert!(validate_interface_name("en 0").is_err()); // space
+        assert!(validate_interface_name("en;0").is_err()); // ';'
+        assert!(validate_interface_name(&"a".repeat(32)).is_err()); // too long
+    }
+
+    #[test]
     fn builder_emits_reviewed_nat_rule() {
         let rules = build_macos_exit_nat_pf_rules(&config()).unwrap();
         assert_eq!(
