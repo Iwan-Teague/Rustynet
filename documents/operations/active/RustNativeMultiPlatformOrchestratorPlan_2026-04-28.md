@@ -236,6 +236,119 @@ Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4
 >   - **Evidence completeness:** `validate_baseline_runtime` now records per-node, per-op results to `<report-dir>/validator_results.json`, and `build_live_lab_run_report` reads them into `node_statuses.validator_results` (previously always empty, which also made the parity validator comparison a vacuous 0-vs-0 match).
 >   - **Efficiency (no security trade-off):** SSH `ControlMaster` connection reuse (per-process control dir, mode 0700; `StrictHostKeyChecking=yes` still enforced on master establishment).
 
+## 0.a) Functional-Parity Acceptance Spec — the W5.6 flip gate (Track B, 2026-07-12)
+
+**Status: DRAFT — PENDING OWNER SIGN-OFF.** This section is the precise,
+owner-approvable definition the 2026-07-04 parity-gate finding called for.
+Mechanical stage-ID parity (`overall_parity_pass`, `--mode strict`) is
+**unsatisfiable bash↔Rust by construction** (divergent stage-ID vocabularies;
+only 8 of ~67 IDs overlap) and is NOT the gate. The gate is **functional
+parity** as defined here. Once signed off, Track C measures every paired run
+against this spec, and W5.6 (default flip) may proceed only on pairs that pass
+it.
+
+### 0.a.1 Definitions
+
+- **Paired run.** One bash-engine run and one Rust `--node`-engine run that
+  share ALL of: (a) the same git commit with a **clean** tree (`dirty` runs do
+  not qualify); (b) the same inventory file digest; (c) the same logical
+  topology (same aliases, same role per alias — expressed as `--*-vm` flags on
+  the bash side and `--node alias:role` on the Rust side); (d) the same
+  profiles/suite selectors (chaos, cross-network, soak, skip-flags) modulo the
+  engine selector itself; (e) the same lab guests (no VM substitution between
+  the two runs).
+- **Pair evidence set.** For each side: the report dir, its
+  `parity_input.json` (the Rust engine writes it natively; bash-side dirs are
+  converted with `ops vm-lab-emit-parity-input`), and its appended
+  `live_lab_run_matrix.csv` row.
+- **Canonical stage.** A stage ID after `canonical_stage_id` normalization
+  (the 5 bash aliases map onto Rust names: `membership_setup→membership_init`,
+  `distribute_membership_state→distribute_membership`,
+  `issue_and_distribute_{assignments,traversal,dns_zone}→distribute_{…}`).
+
+### 0.a.2 Gate criteria (ALL must hold; failure/absence dominates)
+
+- **G1 — Mechanical functional diff passes.**
+  `vm-lab-diff-orchestrator-parity --mode functional` over the two
+  `parity_input.json` files reports `overall_functional_parity_pass=true`:
+  `shared_stage_count>0`, every shared canonical stage has the same outcome,
+  overall run status matches, node count matches. Validator pass/total counts
+  remain informational (the dialects run different validator sets by design).
+- **G2 — Role-cell equality.** For every role×OS cell the shared topology
+  exercises, the two run-matrix rows record the SAME cell verdict
+  (`pass=pass`, `fail=fail`, `not_run=not_run`). A cell exercised by only one
+  engine is a parity failure unless it appears in the §0.a.3 intentional-
+  difference table. Failure dominates pass; `blocked` (environment) must match
+  or be declared in §0.a.4.
+- **G3 — Cleanup equality + residue-free.** The canonical `cleanup` stage is
+  terminal `pass` on BOTH sides, and the Rust side's cleanup ran its
+  `assert_node_clean` postcondition (RNQ-02). A cleanup `fail`/`skipped` on
+  either side disqualifies the pair (no "parity of two dirty labs").
+- **G4 — Evidence completeness.** Both report dirs pass
+  `validate_live_lab_run_artifacts`; both runs appended a well-formed
+  run-matrix row (§10.9 — a run with no row is not evidence); the Rust side's
+  evidence finalization completed without recorder errors (RNQ-05 semantics:
+  an evidence failure is a run failure, not a warning).
+- **G5 — Provenance equality.** Both matrix rows record the same commit and
+  `dirty=false`-equivalent state; the report dirs' recorded inventory digest
+  and topology match the pair definition. Any mismatch disqualifies the pair.
+- **G6 — No cherry-picking.** A pair is (bash run, Rust run) executed against
+  the same lab state window. If either side is re-run, the pair is re-formed
+  from scratch — a fresh run may not be diffed against a stale opposite side
+  from an earlier lab state.
+- **Minimum shared set (vacuity guard).** For a comprehensive pair, the shared
+  canonical set must include at least: the 8 shared setup IDs (`preflight`,
+  `prepare_source_archive`, `verify_ssh_reachability`, `cleanup_hosts`,
+  `bootstrap_hosts`, `collect_pubkeys`, `enforce_baseline_runtime`,
+  `validate_baseline_runtime`), the 5 aliased distribution stages, and
+  `cleanup`. A focused pair must share, at minimum, its focused stage(s) plus
+  `cleanup`. G1's `shared_stage_count>0` alone is necessary but NOT sufficient.
+
+### 0.a.3 Intentional vocabulary differences (do not fail parity)
+
+- **Aliases (compared, via canonicalization):** the 5 listed in §0.a.1.
+- **bash-only stages (scoped out of the parity claim):**
+  `prime_remote_access` (Rust does it implicitly in readiness),
+  `macos_preflight_check` (soft, never fails), `upgrade_admin_node_membership`
+  (5-node topology only), `local_full_gate_suite` (host-side, not a lab
+  stage), `fresh_install_os_matrix_report` (reporting infra),
+  `cross_network_daemon_path` (single warn-level netns proof; the Rust
+  cross-network suite covers the substance).
+- **Rust-only stages (surfaced, not failing):** the granular per-surface
+  stages with no bash-side single equivalent (e.g. `traffic_test_matrix`
+  granularity, `exit_demotion_residue_validation`, per-validator stages). They
+  appear in `stages_only_in_right` for visibility and are covered by G2's
+  role-cell equality where they feed a role cell.
+
+### 0.a.4 Campaign surfaces (Track C) and environment blocks
+
+Qualifying pairs are required for: **Linux comprehensive**, **macOS role
+cells** (client/admin/anchor/relay/exit), **cross-OS mixed topology**,
+**security suite**, **chaos suite**, **cross-network suite**, and **Windows
+non-exit role cells** (client/admin/anchor/relay) once the Windows guest is
+mesh-capable. **Windows-exit (WinNAT)** is declared **blocked-by-environment**
+(WinNAT needs Hyper-V; Hyper-V needs nested virt; UTM/Apple-Silicon exposes no
+nested virt — physically impossible in this lab) and is proven on the physical
+Windows-on-ARM device when it arrives; `blocked ≠ failed`, and the block is
+recorded in the parity matrix rather than silently skipped.
+
+### 0.a.5 Verdict artifact + tooling
+
+Each pair produces: the functional diff JSON (from
+`vm-lab-diff-orchestrator-parity --mode functional`), plus a paired-parity
+summary recording G2–G6 (role-cell table from the two matrix rows, cleanup +
+artifact-validation verdicts, provenance fields) written next to the diff.
+A `vm-lab-verify-functional-parity` subcommand SHOULD mechanize G1–G6 in one
+invocation (fail-closed on any missing input) so Track C verdicts are
+single-command reproducible; until it lands, the G2–G6 fields are recorded in
+the pair summary by the operator/agent and cross-checked against the two rows.
+
+### 0.a.6 Sign-off
+
+- [ ] **Owner approval** (Iwan): this spec is the W5.6 flip gate. Approval is
+  recorded by checking this box in a commit authored by the owner-designated
+  flow; until then the default stays on bash regardless of pair results.
+
 ## 0) TL;DR
 
 Replace `scripts/e2e/live_linux_lab_orchestrator.sh` (~3000 LOC POSIX-bash, Linux-only) with a Rust-native orchestrator that:
