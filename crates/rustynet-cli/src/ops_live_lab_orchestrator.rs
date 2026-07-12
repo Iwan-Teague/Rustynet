@@ -4353,6 +4353,46 @@ mod tests {
     }
 
     #[test]
+    fn reboot_recovery_report_passes_when_dns_refresh_checks_are_skipped() {
+        // Finding A (LiveLabFindings_2026-07-12): the focused lab setup does
+        // not provision /etc/rustynet/assignment-refresh.env, so the
+        // post-reboot refresh checks report `skipped`. A skipped refresh with
+        // every executed check passing must yield a PASS report — skipped is
+        // excluded, not counted as pass, and the reboot core is still proven.
+        let report_path = temp_path("reboot-report-skip-refresh");
+        let observations_path = temp_path("reboot-observations-skip-refresh");
+        fs::write(observations_path.as_path(), "").expect("write obs");
+
+        let status = execute_ops_write_live_linux_reboot_recovery_report(
+            WriteLiveLinuxRebootRecoveryReportConfig {
+                report_path: report_path.clone(),
+                observations_path: observations_path.clone(),
+                exit_pre: "a".to_owned(),
+                exit_post: "b".to_owned(),
+                client_pre: "c".to_owned(),
+                client_post: "d".to_owned(),
+                exit_return: "pass".to_owned(),
+                exit_boot_change: "pass".to_owned(),
+                post_exit_dns_refresh: "skipped".to_owned(),
+                post_exit_twohop: "skipped".to_owned(),
+                client_return: "pass".to_owned(),
+                client_boot_change: "pass".to_owned(),
+                post_client_dns_refresh: "skipped".to_owned(),
+                post_client_twohop: "skipped".to_owned(),
+                salvage_twohop: "skipped".to_owned(),
+            },
+        )
+        .expect("skipped refresh checks must not fail the report");
+        assert_eq!(status, "pass");
+        let body = fs::read_to_string(report_path.as_path()).expect("report present");
+        assert!(body.contains("\"status\": \"pass\""));
+        assert!(body.contains("\"post_exit_reboot_managed_dns_refresh\": \"skipped\""));
+
+        let _ = fs::remove_file(report_path.as_path());
+        let _ = fs::remove_file(observations_path.as_path());
+    }
+
+    #[test]
     fn reboot_recovery_report_rejects_unknown_check_value() {
         let report_path = temp_path("reboot-report-invalid-check");
         let observations_path = temp_path("reboot-observations-invalid-check");

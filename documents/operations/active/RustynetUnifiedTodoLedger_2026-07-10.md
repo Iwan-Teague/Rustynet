@@ -263,20 +263,19 @@ Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](./RustNati
     refresh fail-closed (`assignment target intent lacks required local
     capability client`) — `role.rs` Exit caps now include `Client`. Intersects
     §8/§15 managed-DNS evidence (now satisfied for the focused Linux topology).
-  - OPEN (newly exposed once managed_dns passed; tracked in
+  - RESOLVED (2026-07-12, second pass; dispositions recorded in
     [LiveLabFindings_2026-07-12.md](./LiveLabFindings_2026-07-12.md)):
-    - `live_reboot_recovery_validation` fails on the focused Rust `--node`
-      topology — the reboot core passes, but the post-reboot
-      `force-local-assignment-refresh-now` needs
-      `/etc/rustynet/assignment-refresh.env`, which the focused setup does not
-      provision. Decide skip-if-absent vs provision-the-timer (Finding A).
-    - Exit daemon-role intent (`role.rs` maps Linux Exit → `admin`) disagrees
-      with the live node (`RUSTYNET_NODE_ROLE=client`); likely stale-env
-      preservation in `ops install-systemd`. The cap fix is safe under either
-      role, but intent≠reality should be reconciled (Finding B).
-    - Latent client-less exit spec at `ops_e2e.rs:3365`
-      (`issue_two_node_traversal_artifacts` → `[Anchor, ExitServer]`); align
-      with the canonical set if ever used to issue an exit assignment (Finding C).
+    - Finding A FIXED (skip-if-absent): `force_local_assignment_refresh`
+      probes `/etc/rustynet/assignment-refresh.env`; absent (exit 1) →
+      Skipped, other probe failure → Fail, transport error → Err. Regression
+      test pins a PASS report with skipped refresh checks. Live re-verify in
+      the next focused run.
+    - Finding B RESOLVED AS NOT-A-BUG: bootstrap set the exit role `admin` as
+      intended (run log evidence); the observed `client` is the legitimate
+      exit-handoff end state (`role_switch_matrix`+`exit_handoff` passed
+      earlier in the run); `a1e49c1`'s canonical cap set is the complete fix.
+    - Finding C FIXED: `issue_two_node_traversal_artifacts` exit metadata
+      aligned to the canonical admin-owner capability set.
   - Env note: the orchestrator needs `--utm-documents-root "<UTM images dir>"`
     when lab bundles live outside the default UTM documents root, or
     `discover_local_utm` reports only a stale bundle and fails alias selection.
