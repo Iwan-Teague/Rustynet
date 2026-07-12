@@ -87,6 +87,11 @@ cascade item (may be a gating artifact like `two_hop` was, or a real bug).
 - §5.2 platform-adapter gaps: macOS/Windows role evaluators partial; anchor
   bundle-pull gossip-seed + enrollment-endpoint on macOS/Windows; Windows
   authoritative port mapping.
+- **Environment (see §8):** the Windows **exit** role uses WinNAT, which needs
+  Hyper-V → nested virtualization → **cannot run in a UTM VM on Apple Silicon**;
+  it needs a physical Windows 11 Pro/Enterprise-on-ARM device (§8.1). The macOS
+  guest already exists and needs repair/verify, not a rebuild (§8.2). Fedora
+  passwordless-sudo + host-route sudo are operator-provided (§8.3–8.4).
 
 ---
 
@@ -259,33 +264,122 @@ Gotchas:
 
 ---
 
-## 8. Owner prerequisites — do these before the agent starts
+## 8. Platform infrastructure — stand up each OS (and owner prerequisites)
 
-The agent CANNOT self-serve these; they gate Track C and some of Track A:
+This section is how the Track-C live-evidence campaign gets an environment for
+every OS. Operator status as of handoff: **Fedora passwordless-sudo will be
+provided; the operator is available to type the sudo password on demand; a
+physical Windows device is being sourced.** The agent builds/repairs the rest.
 
-1. **Stop any other live-lab agent + confirm a clean tree.** A concurrent agent
-   editing `rustynet-cli`/`vm_lab` or running the lab will collide on the same
-   files and the same VMs. Ensure `git status` is clean (commit/park in-flight
-   work) before launch.
-2. **Sudo access for host-network fixes.** The agent can't `sudo` non-interactively.
-   Either (a) install the vmnet route-keeper launchd job so the
-   `192.168.64.0/24 → bridge100` route self-heals, or (b) be on hand to run
-   `sudo route -n add -net 192.168.64.0/24 -interface bridge100` when host→guest
-   SSH times out. Confirm host `pf` isn't blocking `bridge100`.
-3. **Fedora passwordless-sudo** (or an approved alternative bootstrap) — RNQ-20 /
-   cross-OS evidence is blocked without it. No persistent sudo-policy change
-   should be made silently.
-4. **A WinNAT/HNS-capable Windows guest** with working networking (windows-utm-1
-   networking has been broken at the UTM/host level) — required for cross-OS +
-   Windows role/exit/relay evidence.
-5. **A working macOS guest** (macos-utm-1) for macOS role cells.
-6. **Sign-off authority on the Track-B functional-parity acceptance spec** — this
-   is the release gate; the agent will draft it, but you own the accept/reject
-   decision and its expiry/review trigger.
-7. **Confirm push-to-main + author policy** (Iwan-Teague, no Claude co-author) and
-   that the agent may mutate the lab VMs freely.
-8. **DeepSeek API key** present (`~/Desktop/deepseek_api.md` or `DEEPSEEK_API_KEY`)
-   if you want the agent to use triage — else it proceeds without it.
+### 8.1 Windows exit — a KEY FINDING: it can NOT be a UTM VM on Apple Silicon
+
+**Finding (verified 2026-07-12).** Rustynet's Windows exit role runs `New-NetNat`
+/ `Get-NetNat` (WinNAT) — `windows_exit_nat_lifecycle.rs:250`. **WinNAT requires
+Hyper-V** (`winnat.sys` is a Hyper-V subsystem; without it you get
+`New-NetNat: Invalid class` / `Get-NetNat: Provider load failure`,
+0x80041010/0x80041013). **Hyper-V inside a Windows guest requires nested
+virtualization**, and **macOS's Virtualization/Hypervisor frameworks do NOT
+expose nested virt to Windows-on-ARM guests** in UTM/QEMU on Apple Silicon. So
+**no UTM Windows image — Pro, Enterprise, any build — can run WinNAT.** Editions
+matter only after you leave UTM: Hyper-V needs **Windows 11 Pro or Enterprise**
+(Home cannot enable it). This is an Apple-Silicon hardware/framework limit, not a
+networking or image problem. (Sources: MS Q&A on WinNAT/Hyper-V; UTM issue #6821
+nested-virt.)
+
+**Consequences + plan:**
+- The Windows **exit** role's NAT dataplane must be proven on a **physical
+  Windows-on-ARM device running Windows 11 Pro/Enterprise** (operator is
+  sourcing one) OR a cloud Windows VM with nested virt (Azure Dv5/Ev5). Or mark
+  the Windows-exit cell an honest **blocked-by-environment** in the parity matrix
+  (blocked ≠ failed) and prove it out-of-band.
+- **Every OTHER Windows role can run in the existing UTM Windows VM** once its
+  networking is fixed: client, admin, anchor, relay, DNS fail-closed, killswitch
+  (WFP), key custody (DPAPI), named-pipe ACL. (blind_exit is unsupported-by-design
+  on Windows.) So keep and repair `Windows.utm` for those cells.
+
+**Agent setup on the physical Windows device (once operator hands over IP+creds):**
+1. Enable the hypervisor features (admin PowerShell), then reboot:
+   `Enable-WindowsOptionalFeature -Online -All -FeatureName Microsoft-Hyper-V, HypervisorPlatform, VirtualMachinePlatform`
+   Verify: `Get-NetNat` returns cleanly (no "Provider load failure").
+2. Enable SSH: `Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0`;
+   `Start-Service sshd; Set-Service sshd -StartupType Automatic`; allow TCP 22 in
+   the firewall. Install the lab pubkey (`~/.ssh/rustynet_lab_ed25519.pub`).
+3. Install the Windows node via the `rustynet install` Windows path (it exists but
+   was runtime-pending for lack of a device — runtime-verify it now). Ensure the
+   Windows WireGuard backend / WFP killswitch is enabled (Windows dataplane is
+   opt-in per the platform matrix; the exit must actually forward).
+4. Add a `windows` inventory entry with `ssh_target = <device IP>`. It is a
+   PHYSICAL device, not a `local_utm` controller — run with `--trust-inventory-ready`
+   (SSH-only). `utmctl` power ops don't apply, so the `reboot_recovery` stage
+   needs a remote power method or is marked N/A for this node.
+
+### 8.2 macOS — the guest already EXISTS; repair-and-verify first
+
+A macOS guest is already present: UTM VM **`macOS`** (macOS 26.5, arm64), inventory
+alias `macos-utm-1`, SSH `mac@192.168.65.2` (Apple-Virt Shared → the `192.168.65.x`
+vmnet subnet, distinct from the QEMU Shared `192.168.64.x` plane — fine, the mesh
+overlays WireGuard). **First path: repair/verify it — do NOT rebuild unless it is
+unrecoverable:**
+1. `/Applications/UTM.app/Contents/MacOS/utmctl start "macOS"`; wait for boot.
+2. Refresh its live IP: `cargo run -q -p rustynet-cli -- ops
+   vm-lab-discover-local-utm-summary --inventory <inventory> --update-inventory-live-ips`.
+3. `ssh -i ~/.ssh/rustynet_lab_ed25519 mac@<ip> 'sw_vers; whoami'`; run a macOS
+   role smoke.
+4. If SSH is down: **macOS Apple-Virt guests do NOT support `utmctl exec`** (that
+   is QEMU-only). Recover via the UTM window / serial console using
+   **computer-use** (`mcp__computer-use__*`) and re-enable Remote Login
+   (`sudo systemsetup -setremotelogin on`, or System Settings → General →
+   Sharing → Remote Login).
+
+**Build a fresh macOS guest (only if the existing one is unrecoverable, or a 2nd
+is needed):** this is the one genuinely GUI-heavy task — drive it with
+**computer-use**.
+1. UTM → **Create a New Virtual Machine → Virtualize → macOS 12+**. Leave the IPSW
+   field empty to let UTM **download the latest macOS IPSW** automatically (or
+   supply one from ipsw.me).
+2. Resources: ≥4 CPU, 8 GB RAM, 64 GB disk, **Shared** network.
+3. Start → wait ~20–30 min for the Virtualization-framework restore.
+4. **Setup Assistant** (via computer-use): skip Apple ID / sign-in; create a
+   **local admin user matching the inventory `ssh_user`** (`mac`) with a known
+   password.
+5. **System Settings → General → Sharing → Remote Login = ON**; add
+   `~/.ssh/rustynet_lab_ed25519.pub` to `~mac/.ssh/authorized_keys` (0600).
+6. Verify SSH from the host; add/refresh the inventory entry (`--update-inventory-live-ips`).
+   Caveats: Apple's framework allows **at most ~2 macOS guests per host**;
+   optionally remove the virtual display for a headless run once SSH works.
+
+### 8.3 Fedora (RNQ-20)
+
+Operator sets passwordless sudo on the Fedora guest (via `visudo`:
+`fedora ALL=(ALL) NOPASSWD: ALL`, or scoped to the bootstrap commands). Then the
+agent runs the Fedora live bootstrap + residue proof. No persistent sudo-policy
+change is made silently by the agent.
+
+### 8.4 Host network / host sudo
+
+The `192.168.64.0/24 → bridge100` connected route can drop (symptom: `utmctl exec`
+works but host→guest SSH times out). The operator runs
+`sudo route -n add -net 192.168.64.0/24 -interface bridge100` on demand (or
+installs the vmnet route-keeper launchd job for self-heal). Confirm host `pf`
+isn't blocking `bridge100`. The agent cannot `sudo` non-interactively; it will
+pause and ask when a host-sudo action is required.
+
+### 8.5 Before-launch owner checklist
+
+- [ ] **Clean tree, single agent.** Commit or park the in-flight doc edits
+  (`README.md`, `RustynetUnifiedTodoLedger_2026-07-10.md`, `LiveLabFindings_2026-07-12.md`)
+  and confirm `git status` is clean — no second agent on `rustynet-cli`/`vm_lab`
+  or the lab VMs.
+- [ ] **Fedora passwordless sudo** set (§8.3).
+- [ ] **Reachable to type the host sudo password** on demand (§8.4).
+- [ ] **Physical Windows-on-ARM device**, Windows 11 **Pro/Enterprise**, on the
+  LAN and SSH-reachable — hand the agent its IP + credentials (§8.1).
+- [ ] **Authorize the agent** to build/repair the macOS guest via computer-use,
+  mutate all VMs freely, push directly to `main`, author **Iwan-Teague only**.
+- [ ] **Be available to sign off the Track-B functional-parity spec** when the
+  agent drafts it (§4 Track B) — the release gate.
+- [ ] (optional) **DeepSeek key** at `~/Desktop/deepseek_api.md` or
+  `DEEPSEEK_API_KEY` for triage; else the agent proceeds without it.
 
 ---
 
