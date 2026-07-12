@@ -2207,6 +2207,46 @@ mod tests {
     };
 
     #[test]
+    fn privileged_argv_token_validators_enforce_allowlists() {
+        use super::{
+            is_cidr_token, is_interface_name, is_owned_nft_table_token, is_wg_public_key_token,
+        };
+
+        // Interface names: non-empty, <=15 chars (IFNAMSIZ), alnum + '_' '-'.
+        assert!(is_interface_name("rustynet0"));
+        assert!(is_interface_name("eth0-1"));
+        assert!(!is_interface_name(""));
+        assert!(!is_interface_name(&"a".repeat(16)));
+        assert!(!is_interface_name("eth 0"));
+        assert!(!is_interface_name("eth;rm"));
+
+        // nft table tokens must be rustynet-owned (prefix anchored) and free of
+        // any character that could break the argv into a second command.
+        assert!(is_owned_nft_table_token("rustynet_g5"));
+        assert!(is_owned_nft_table_token("rustynet_nat_g12"));
+        assert!(!is_owned_nft_table_token("filter"));
+        assert!(!is_owned_nft_table_token("rustynet_g5; nft flush ruleset"));
+        assert!(!is_owned_nft_table_token("evil_rustynet_g5"));
+
+        // WireGuard public keys: base64 alphabet, non-empty, <=128.
+        assert!(is_wg_public_key_token("abcDEF123+/="));
+        assert!(!is_wg_public_key_token(""));
+        assert!(!is_wg_public_key_token(&"a".repeat(129)));
+        assert!(!is_wg_public_key_token("has space"));
+        assert!(!is_wg_public_key_token("semi;colon"));
+
+        // CIDR tokens: parseable base address + in-range family prefix.
+        assert!(is_cidr_token("10.0.0.0/8"));
+        assert!(is_cidr_token("::/0"));
+        assert!(is_cidr_token("fd00::/64"));
+        assert!(!is_cidr_token("10.0.0.0")); // no prefix
+        assert!(!is_cidr_token("10.0.0.0/33")); // v4 prefix out of range
+        assert!(!is_cidr_token("::1/129")); // v6 prefix out of range
+        assert!(!is_cidr_token("notanip/8"));
+        assert!(!is_cidr_token("10.0.0.0/x"));
+    }
+
+    #[test]
     fn peer_uid_reports_connected_socket_owner_uid() {
         // RN-17 gate primitive: the client re-checks `peer_uid(&stream) == Some(0)`
         // on the *connected* fd to reject a swapped, non-root socket. Verify the
