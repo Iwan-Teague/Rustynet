@@ -2247,6 +2247,56 @@ mod tests {
     }
 
     #[test]
+    fn privileged_argv_table_and_family_validators_enforce_allowlists() {
+        use super::{
+            is_loopback_dns_redirect_target, is_nft_daddr_family_token, is_nft_family_token,
+            is_owned_dns_redirect_table_token, is_owned_failclosed_table_token,
+            is_owned_nat_table_token, is_wg_endpoint_token,
+        };
+
+        // Fail-closed (killswitch) tables are anchored to the rustynet_g prefix;
+        // the NAT prefix is deliberately a different owner and must not match.
+        assert!(is_owned_failclosed_table_token("rustynet_g5"));
+        assert!(!is_owned_failclosed_table_token("rustynet_nat_g5"));
+        assert!(!is_owned_failclosed_table_token("filter"));
+        assert!(!is_owned_failclosed_table_token("rustynet_g5; x"));
+
+        // NAT tables require the rustynet_nat_g prefix.
+        assert!(is_owned_nat_table_token("rustynet_nat_g5"));
+        assert!(!is_owned_nat_table_token("rustynet_g5"));
+
+        // DNS-redirect tables require both the prefix and the _dns suffix.
+        assert!(is_owned_dns_redirect_table_token("rustynet_g5_dns"));
+        assert!(!is_owned_dns_redirect_table_token("rustynet_g5"));
+        assert!(!is_owned_dns_redirect_table_token("other_dns"));
+
+        // nft family allowlists (daddr excludes "inet").
+        assert!(is_nft_family_token("inet"));
+        assert!(is_nft_family_token("ip"));
+        assert!(is_nft_family_token("ip6"));
+        assert!(!is_nft_family_token("arp"));
+        assert!(!is_nft_family_token("IP"));
+        assert!(!is_nft_family_token(""));
+        assert!(is_nft_daddr_family_token("ip"));
+        assert!(is_nft_daddr_family_token("ip6"));
+        assert!(!is_nft_daddr_family_token("inet"));
+
+        // Loopback DNS-redirect target: ":<nonzero u16>".
+        assert!(is_loopback_dns_redirect_target(":53535"));
+        assert!(!is_loopback_dns_redirect_target(":0"));
+        assert!(!is_loopback_dns_redirect_target("53535"));
+        assert!(!is_loopback_dns_redirect_target(":99999"));
+
+        // WireGuard endpoints: non-empty host + in-range port.
+        assert!(is_wg_endpoint_token("1.2.3.4:51820"));
+        assert!(is_wg_endpoint_token("[fd00::1]:51820"));
+        assert!(!is_wg_endpoint_token("nocolon"));
+        assert!(!is_wg_endpoint_token(":51820"));
+        assert!(!is_wg_endpoint_token("host:notaport"));
+        assert!(!is_wg_endpoint_token("host:70000"));
+    }
+
+    #[test]
     fn peer_uid_reports_connected_socket_owner_uid() {
         // RN-17 gate primitive: the client re-checks `peer_uid(&stream) == Some(0)`
         // on the *connected* fd to reject a swapped, non-root socket. Verify the
