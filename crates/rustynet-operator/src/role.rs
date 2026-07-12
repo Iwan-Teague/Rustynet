@@ -220,6 +220,16 @@ pub fn enforce_role_policy_defaults(
 mod tests {
     use super::*;
 
+    #[test]
+    fn is_blind_exit_supported_host_only_linux_and_macos() {
+        // blind_exit is a Linux/macOS-only role; Windows is unsupported by
+        // design (and any Unsupported host likewise). Pin that posture.
+        assert!(is_blind_exit_supported_host(HostProfile::Linux));
+        assert!(is_blind_exit_supported_host(HostProfile::Macos));
+        assert!(!is_blind_exit_supported_host(HostProfile::Windows));
+        assert!(!is_blind_exit_supported_host(HostProfile::Unsupported));
+    }
+
     fn client_policy_state() -> RolePolicyState {
         RolePolicyState {
             node_role: NodeRole::Client,
