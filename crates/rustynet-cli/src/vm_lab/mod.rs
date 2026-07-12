@@ -35378,13 +35378,13 @@ mod tests {
                 "run-only plan must retain {setup_id:?} so it can be injected Passed"
             );
         }
-        for live_id in super::orchestrator::plan::PlanBuilder::LIVE_SUITE_STAGES {
+        for live_id in super::orchestrator::plan::PlanBuilder::live_suite_stages() {
             assert!(
                 ids.contains(&live_id),
                 "run-only plan must execute live stage {live_id:?}"
             );
         }
-        for soak_id in super::orchestrator::plan::PlanBuilder::SOAK_SUITE_STAGES {
+        for soak_id in super::orchestrator::plan::PlanBuilder::soak_suite_stages() {
             assert!(
                 ids.contains(&soak_id),
                 "run-only plan must execute soak stage {soak_id:?}"
