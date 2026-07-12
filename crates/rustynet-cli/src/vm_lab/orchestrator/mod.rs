@@ -4,6 +4,8 @@ pub mod connection;
 pub mod context;
 pub mod diagnostics;
 pub mod error;
+pub mod evidence;
+pub mod native;
 pub mod parallel;
 pub mod parity;
 pub mod plan;

@@ -117,6 +117,8 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 | Bounded node executor | `parallel.rs` | Deterministic, worker-capped, cancellation-aware per-node fanout |
 | Rust-native readiness gate | `readiness.rs` | Local-UTM discovery, selected-node readiness, targeted restart, and rediscovery before stage execution |
 | Rust-native failure diagnostics | `diagnostics.rs` | Fatal signal registration and pre-cleanup daemon/artifact capture |
+| `execute_rust_native_orchestration()` + plan glue | `native.rs` | The `--node` engine entry point: mode validation, context load/bind, platform-selector role election, stage-plan construction/filtering, network-profile record (RNQ-15 extraction from `vm_lab/mod.rs`) |
+| `RustNativeStageRecorder` + evidence finalization | `evidence.rs` | Realtime `stages.tsv` observer, per-stage logs, node-stage plan, `run_summary.json`/`nodes.tsv`, failure digest, report-state writers, reuse-evidence seal/validation (RNQ-15 extraction) |
 | `LinuxNodeAdapter` | `adapter/linux.rs` | Full Linux adapter |
 | `WindowsNodeAdapter` | `adapter/windows.rs` | Windows adapter (PowerShell-based) |
 | `MacosNodeAdapter` | `adapter/macos.rs` | macOS adapter |

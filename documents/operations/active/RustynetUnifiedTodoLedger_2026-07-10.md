@@ -221,8 +221,12 @@ Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](./RustNati
   Timed-out privileged work must stop before cleanup; no detached worker.
 - [ ] RNQ-09: real subprocess SIGTERM/SIGINT test proving diagnostics, cleanup,
   terminal evidence, and no post-signal mutation.
-- [ ] RNQ-15: extract native executor and evidence/finalization blocks from the
-  oversized `vm_lab/mod.rs` into narrow modules with explicit interfaces.
+- [x] RNQ-15 (2026-07-12): native executor and evidence/finalization extracted
+  from `vm_lab/mod.rs` into `orchestrator/native.rs` (executor + plan glue) and
+  `orchestrator/evidence.rs` (recorder, run summary, failure digest,
+  report-state, reuse seal). Behavior-preserving; `mod.rs` 49,731→47,972 lines;
+  full `rustynet-cli` suite 2,321/2,321 green. `build_allow_spec` remains in
+  `mod.rs` while the bash path consumes it (migrates at W5.7).
 - [ ] RNQ-16: make registry metadata, plan construction, validators, docs, MCP,
   and historical oracle generation derive from one typed authority.
 - [ ] RNQ-17: split lab robot/orchestrator from the product CLI crate and binary;
