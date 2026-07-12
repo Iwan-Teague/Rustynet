@@ -386,6 +386,31 @@ mod tests {
     }
 
     #[test]
+    fn blind_exit_pf_validators_enforce_allowlists() {
+        // CIDR: parseable base address + in-range family prefix.
+        assert!(validate_cidr("10.0.0.0/8").is_ok());
+        assert!(validate_cidr("fd00::/64").is_ok());
+        assert!(validate_cidr("10.0.0.0/33").is_err());
+        assert!(validate_cidr("::1/129").is_err());
+        assert!(validate_cidr("10.0.0.0").is_err()); // no prefix
+        assert!(validate_cidr("notanip/8").is_err());
+        assert!(validate_cidr("10.0.0.0/x").is_err());
+
+        // PF address family: inet / inet6 only (PF syntax, not nft ip/ip6).
+        assert!(validate_pf_family("inet").is_ok());
+        assert!(validate_pf_family("inet6").is_ok());
+        assert!(validate_pf_family("ip").is_err());
+        assert!(validate_pf_family("").is_err());
+
+        // PF interface name: <=31, alnum + '.' '_' '-'.
+        assert!(validate_interface_name("en0").is_ok());
+        assert!(validate_interface_name("utun9").is_ok());
+        assert!(validate_interface_name("").is_err());
+        assert!(validate_interface_name("en 0").is_err());
+        assert!(validate_interface_name(&"a".repeat(32)).is_err());
+    }
+
+    #[test]
     fn builder_emits_reviewed_final_hop_rules() {
         let rules = build_macos_blind_exit_pf_rules(&config()).unwrap();
         assert!(rules.contains("set block-policy drop\n"));
