@@ -577,6 +577,34 @@ mod tests {
     }
 
     #[test]
+    fn pf_load_spec_scalar_parsers() {
+        // Strict bool.
+        assert!(parse_bool("true", "k").unwrap());
+        assert!(!parse_bool("false", "k").unwrap());
+        assert!(parse_bool("True", "k").is_err());
+        assert!(parse_bool("1", "k").is_err());
+        assert!(parse_bool("", "k").is_err());
+
+        // Interface name (<=31, alnum + '.' '_' '-').
+        assert!(parse_interface("en0").is_ok());
+        assert!(parse_interface("").is_err());
+        assert!(parse_interface("en 0").is_err());
+        assert!(parse_interface(&"a".repeat(32)).is_err());
+
+        // Socket address requires host:port.
+        assert!(parse_socket_addr("1.2.3.4:51820").is_ok());
+        assert!(parse_socket_addr("[fd00::1]:51820").is_ok());
+        assert!(parse_socket_addr("1.2.3.4").is_err()); // no port
+        assert!(parse_socket_addr("notanaddr").is_err());
+
+        // PF family derived from a CIDR's base address.
+        assert_eq!(pf_family_for_cidr_str("10.0.0.0/8").unwrap(), "inet");
+        assert_eq!(pf_family_for_cidr_str("fd00::/64").unwrap(), "inet6");
+        assert!(pf_family_for_cidr_str("10.0.0.0").is_err()); // no '/'
+        assert!(pf_family_for_cidr_str("notanip/8").is_err());
+    }
+
+    #[test]
     fn killswitch_roundtrip_renders_identically() {
         let original = killswitch(rich_killswitch_spec(), 7, false);
         let encoded = original.encode();
