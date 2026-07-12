@@ -1767,6 +1767,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn valid_key_identifier_allowlist_blocks_path_and_namespace_confusion() {
+        use super::is_valid_key_identifier;
+        // Accepted: ASCII alphanumerics plus '-' and '_'.
+        assert!(is_valid_key_identifier("node-1"));
+        assert!(is_valid_key_identifier("Abc_123-XYZ"));
+        // Rejected: empty.
+        assert!(!is_valid_key_identifier(""));
+        // Rejected: separators / traversal that would escape the key namespace
+        // or fallback directory when interpolated into a path or keychain name.
+        assert!(!is_valid_key_identifier("../etc/shadow"));
+        assert!(!is_valid_key_identifier("key.enc"));
+        assert!(!is_valid_key_identifier("a/b"));
+        assert!(!is_valid_key_identifier("a\\b"));
+        // Rejected: whitespace, shell/format metacharacters, NUL, and non-ASCII.
+        assert!(!is_valid_key_identifier("a b"));
+        assert!(!is_valid_key_identifier("key$(rm)"));
+        assert!(!is_valid_key_identifier("k\0y"));
+        assert!(!is_valid_key_identifier("kéy"));
+    }
+
     /// Regression: `try_generate_key_custody_material` must (1) succeed on a
     /// healthy host, (2) yield distinct salts and nonces under repeated calls
     /// (catches a buggy fallback that returned a zeroed buffer), and (3) keep
