@@ -1914,21 +1914,34 @@ fn tunnel_status_internal() -> TunnelStatus {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn get_interface_bytes(interface: &str) -> (u64, u64) {
-    if let Ok(content) = fs::read_to_string("/proc/net/dev") {
-        for line in content.lines() {
-            if line.contains(interface) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 10 {
-                    let bytes_recv = parts[1].parse::<u64>().unwrap_or(0);
-                    let bytes_sent = parts[9].parse::<u64>().unwrap_or(0);
-                    return (bytes_sent, bytes_recv);
-                }
+/// Parse `/proc/net/dev` contents for one interface's `(tx_bytes, rx_bytes)`.
+/// On the matching line the whitespace fields are `<iface>: rx_bytes rx_packets
+/// … tx_bytes …` — field[1] is rx bytes and field[9] is tx bytes. A line with
+/// fewer than 10 fields or a non-numeric counter yields 0 for that value, and a
+/// missing interface yields `(0, 0)`. NOTE: interface matching is a substring
+/// test (behavior unchanged), so a query for `eth0` also matches `veth0` /
+/// `eth0.1` lines; the first match wins. Split out for cross-platform unit
+/// testing; only called under `target_os = "linux"`.
+#[allow(dead_code)]
+fn parse_proc_net_dev_bytes(content: &str, interface: &str) -> (u64, u64) {
+    for line in content.lines() {
+        if line.contains(interface) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 10 {
+                let bytes_recv = parts[1].parse::<u64>().unwrap_or(0);
+                let bytes_sent = parts[9].parse::<u64>().unwrap_or(0);
+                return (bytes_sent, bytes_recv);
             }
         }
     }
     (0, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn get_interface_bytes(interface: &str) -> (u64, u64) {
+    fs::read_to_string("/proc/net/dev")
+        .map(|content| parse_proc_net_dev_bytes(&content, interface))
+        .unwrap_or((0, 0))
 }
 
 #[cfg(target_os = "macos")]
@@ -1941,28 +1954,38 @@ fn get_interface_bytes(_interface: &str) -> (u64, u64) {
     (0, 0)
 }
 
+/// Parse `wg show <iface> latest-handshakes` stdout into the first peer's
+/// latest-handshake epoch-seconds timestamp. Each line is
+/// `<pubkey>\t<epoch_secs>`; returns the first line whose second whitespace
+/// field parses as a `u64` (a never-handshaked peer reports `0`, which is
+/// returned as-is). `None` when no line has a numeric second field. Kept pure
+/// (no clock) so the age computation stays in the caller and this stays
+/// testable; only called under `target_os = "linux"`.
+#[allow(dead_code)]
+fn parse_wg_latest_handshake_timestamp(stdout: &str) -> Option<u64> {
+    stdout.lines().find_map(|line| {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            parts[1].parse::<u64>().ok()
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn get_last_handshake() -> Option<u64> {
-    if let Ok(output) = std::process::Command::new("wg")
+    let output = std::process::Command::new("wg")
         .args(["show", "rustynet0", "latest-handshakes"])
         .output()
-    {
-        if let Ok(stdout) = String::from_utf8(output.stdout) {
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(handshake) = parts[1].parse::<u64>() {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        return Some(now.saturating_sub(handshake));
-                    }
-                }
-            }
-        }
-    }
-    None
+        .ok()?;
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let handshake = parse_wg_latest_handshake_timestamp(&stdout)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Some(now.saturating_sub(handshake))
 }
 
 #[cfg(target_os = "macos")]
@@ -7027,6 +7050,52 @@ mod tests {
         assert_eq!(parse_proc_version_release("Linux"), None);
         assert_eq!(parse_proc_version_release(""), None);
         assert_eq!(parse_proc_version_release("   "), None);
+    }
+
+    #[test]
+    fn proc_net_dev_bytes_parses_tx_rx() {
+        use super::parse_proc_net_dev_bytes;
+        let sample = "\
+Inter-|   Receive                                    |  Transmit
+ face |bytes packets errs drop fifo frame compressed multicast|bytes packets
+      wg0: 12345 100 0 0 0 0 0 0 67890 200
+    eth0: 999999 5000 0 0 0 0 0 0 888888 4000
+";
+        // Returns (tx_bytes, rx_bytes).
+        assert_eq!(parse_proc_net_dev_bytes(sample, "wg0"), (67890, 12345));
+        assert_eq!(parse_proc_net_dev_bytes(sample, "eth0"), (888888, 999999));
+        // Missing interface / empty input -> (0, 0).
+        assert_eq!(parse_proc_net_dev_bytes(sample, "tun9"), (0, 0));
+        assert_eq!(parse_proc_net_dev_bytes("", "wg0"), (0, 0));
+    }
+
+    #[test]
+    fn proc_net_dev_bytes_zero_on_short_or_nonnumeric() {
+        use super::parse_proc_net_dev_bytes;
+        // Fewer than 10 fields -> no counters -> (0, 0).
+        assert_eq!(parse_proc_net_dev_bytes("wg0: 1 2 3", "wg0"), (0, 0));
+        // Non-numeric counters fall back to 0 each.
+        assert_eq!(
+            parse_proc_net_dev_bytes("wg0: x b c d e f g h y j", "wg0"),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn wg_latest_handshake_first_numeric_second_field() {
+        use super::parse_wg_latest_handshake_timestamp;
+        assert_eq!(
+            parse_wg_latest_handshake_timestamp("PUBKEY1\t1700000000\nPUBKEY2\t1700000500\n"),
+            Some(1_700_000_000)
+        );
+        // A never-handshaked peer reports 0, returned as-is.
+        assert_eq!(parse_wg_latest_handshake_timestamp("PUBKEY\t0"), Some(0));
+        // Skips a non-numeric line, takes the next numeric one.
+        assert_eq!(parse_wg_latest_handshake_timestamp("BAD x\nGOOD 42"), Some(42));
+        // No numeric second field anywhere -> None.
+        assert_eq!(parse_wg_latest_handshake_timestamp("PUBKEY only"), None);
+        assert_eq!(parse_wg_latest_handshake_timestamp("PUBKEY notanumber"), None);
+        assert_eq!(parse_wg_latest_handshake_timestamp(""), None);
     }
 
     #[test]
