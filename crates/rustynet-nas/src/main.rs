@@ -427,6 +427,27 @@ mod tests {
         list.iter().map(|item| (*item).to_owned()).collect()
     }
 
+    #[test]
+    fn validate_tunnel_shaped_bind_rejects_public_and_unreachable() {
+        use super::validate_tunnel_shaped_bind;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        // A mesh (private) address is accepted.
+        assert!(validate_tunnel_shaped_bind(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))).is_ok());
+        assert!(
+            validate_tunnel_shaped_bind(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)))
+                .is_ok()
+        );
+        // Wildcard bind (0.0.0.0 / ::) is refused: it would expose the endpoint
+        // beyond the tunnel.
+        assert!(validate_tunnel_shaped_bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).is_err());
+        assert!(validate_tunnel_shaped_bind(IpAddr::V6(Ipv6Addr::UNSPECIFIED)).is_err());
+        // Loopback is refused (unreachable by mesh peers).
+        assert!(validate_tunnel_shaped_bind(IpAddr::V4(Ipv4Addr::LOCALHOST)).is_err());
+        assert!(validate_tunnel_shaped_bind(IpAddr::V6(Ipv6Addr::LOCALHOST)).is_err());
+        // Multicast is refused.
+        assert!(validate_tunnel_shaped_bind(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))).is_err());
+    }
+
     /// 32-byte 0600 key file at a unique temp path (std-only; the crate has
     /// no tempfile dev-dependency).
     fn write_key_file(tag: &str) -> PathBuf {

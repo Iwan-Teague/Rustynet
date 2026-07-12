@@ -641,6 +641,28 @@ mod tests {
     const PEER_A: &str = "peer-a";
     const PEER_B: &str = "peer-b";
 
+    #[test]
+    fn validate_snapshot_id_allows_safe_ids_and_rejects_unsafe() {
+        // Accepted: lowercase alnum plus '-', '_', and mid-string '.', up to 80.
+        assert!(validate_snapshot_id("snap-2026.07.12_final").is_ok());
+        assert!(validate_snapshot_id("a").is_ok());
+        assert!(validate_snapshot_id(&"a".repeat(80)).is_ok());
+        // Rejected: empty and over-length.
+        assert!(validate_snapshot_id("").is_err());
+        assert!(validate_snapshot_id(&"a".repeat(81)).is_err());
+        // Rejected: leading '.' (hidden / traversal) and the reserved
+        // ".deleted" tombstone suffix.
+        assert!(validate_snapshot_id(".hidden").is_err());
+        assert!(validate_snapshot_id("..").is_err());
+        assert!(validate_snapshot_id("snap.deleted").is_err());
+        // Rejected: path separators, uppercase, whitespace, and non-ASCII.
+        assert!(validate_snapshot_id("a/b").is_err());
+        assert!(validate_snapshot_id("a\\b").is_err());
+        assert!(validate_snapshot_id("Snap").is_err());
+        assert!(validate_snapshot_id("a b").is_err());
+        assert!(validate_snapshot_id("café").is_err());
+    }
+
     /// Unique private temp root per test (no external tempdir dep;
     /// same pattern as the `ops_install_systemd_relay` tests).
     fn test_root(label: &str) -> PathBuf {
