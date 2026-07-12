@@ -1280,6 +1280,65 @@ fn get_kernel_version() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Parse a Linux `/sys/class/net/<iface>/operstate` file's contents into the
+/// "is up" flag. Only the exact `up` operstate (after trimming) counts as up;
+/// `down`, `unknown`, `dormant`, `UP` (wrong case), empty, or malformed all
+/// read as not-up (fail-closed toward "down"). Split out from
+/// [`network_interfaces_internal`] so it is unit-testable on any host; only
+/// called under `target_os = "linux"`.
+#[allow(dead_code)]
+fn parse_linux_operstate(content: &str) -> bool {
+    content.trim() == "up"
+}
+
+/// Parse macOS/BSD `ifconfig` stdout into `(name, up)` interfaces. An interface
+/// header begins at column 0 with an alphabetic char (never a tab-indented
+/// detail line); the name is the text before the first `:`, and `UP` in the
+/// flags marks it up. Nameless or malformed header lines are skipped. Split out
+/// from [`network_interfaces_internal`] for cross-platform unit testing; only
+/// called under `target_os = "macos"`.
+#[allow(dead_code)]
+fn parse_macos_ifconfig_interfaces(stdout: &str) -> Vec<NetworkInterface> {
+    let mut interfaces = Vec::new();
+    for line in stdout.lines() {
+        if line.starts_with(char::is_alphabetic) && !line.starts_with('\t') {
+            let name = line.split(':').next().unwrap_or("").trim();
+            if !name.is_empty() {
+                interfaces.push(NetworkInterface {
+                    name: name.to_owned(),
+                    up: line.contains("UP"),
+                    addresses: vec![],
+                });
+            }
+        }
+    }
+    interfaces
+}
+
+/// Parse Windows `ipconfig` stdout into interface names. Adapter header lines
+/// contain "Ethernet adapter" or "Wireless LAN adapter"; the name is the text
+/// before the first `:`. `ipconfig` exposes no reliable operational state at
+/// this layer, so every listed adapter is reported `up` (behavior unchanged).
+/// Split out from [`network_interfaces_internal`] for cross-platform unit
+/// testing; only called under `target_os = "windows"`.
+#[allow(dead_code)]
+fn parse_windows_ipconfig_interfaces(stdout: &str) -> Vec<NetworkInterface> {
+    let mut interfaces = Vec::new();
+    for line in stdout.lines() {
+        if line.contains("Ethernet adapter") || line.contains("Wireless LAN adapter") {
+            let name = line.split(':').next().unwrap_or("").trim();
+            if !name.is_empty() {
+                interfaces.push(NetworkInterface {
+                    name: name.to_string(),
+                    up: true,
+                    addresses: vec![],
+                });
+            }
+        }
+    }
+    interfaces
+}
+
 fn network_interfaces_internal() -> Vec<NetworkInterface> {
     let mut interfaces = vec![];
 
@@ -1290,7 +1349,7 @@ fn network_interfaces_internal() -> Vec<NetworkInterface> {
                 if let Some(name) = entry.file_name().to_str() {
                     let name_str = name.to_string();
                     let up = fs::read_to_string(format!("/sys/class/net/{name_str}/operstate"))
-                        .map(|state| state.trim() == "up")
+                        .map(|state| parse_linux_operstate(&state))
                         .unwrap_or(false);
 
                     interfaces.push(NetworkInterface {
@@ -1306,21 +1365,9 @@ fn network_interfaces_internal() -> Vec<NetworkInterface> {
     #[cfg(target_os = "macos")]
     {
         if let Ok(output) = std::process::Command::new("ifconfig").output() {
-            let _ = String::from_utf8(output.stdout).ok().map(|stdout| {
-                for line in stdout.lines() {
-                    if line.starts_with(char::is_alphabetic) && !line.starts_with('\t') {
-                        let name = line.split(':').next().unwrap_or("").trim();
-                        if !name.is_empty() {
-                            let up = line.contains("UP");
-                            interfaces.push(NetworkInterface {
-                                name: name.to_owned(),
-                                up,
-                                addresses: vec![],
-                            });
-                        }
-                    }
-                }
-            });
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                interfaces.extend(parse_macos_ifconfig_interfaces(&stdout));
+            }
         }
     }
 
@@ -1328,18 +1375,7 @@ fn network_interfaces_internal() -> Vec<NetworkInterface> {
     {
         if let Ok(output) = std::process::Command::new("ipconfig").output() {
             if let Ok(stdout) = String::from_utf8(output.stdout) {
-                for line in stdout.lines() {
-                    if line.contains("Ethernet adapter") || line.contains("Wireless LAN adapter") {
-                        let name = line.split(':').next().unwrap_or("").trim();
-                        if !name.is_empty() {
-                            interfaces.push(NetworkInterface {
-                                name: name.to_string(),
-                                up: true,
-                                addresses: vec![],
-                            });
-                        }
-                    }
-                }
+                interfaces.extend(parse_windows_ipconfig_interfaces(&stdout));
             }
         }
     }
@@ -6953,6 +6989,78 @@ fn pkg_family_for(distro_id: Option<&str>, distro_like: &[String]) -> Option<Pkg
 mod tests {
     use super::parse_arp_n_row;
     use super::performance_regression_detection_internal;
+    use super::{
+        parse_linux_operstate, parse_macos_ifconfig_interfaces, parse_windows_ipconfig_interfaces,
+    };
+
+    #[test]
+    fn linux_operstate_only_exact_up_is_up() {
+        assert!(parse_linux_operstate("up"));
+        assert!(parse_linux_operstate("up\n"));
+        assert!(parse_linux_operstate("  up  "));
+        assert!(parse_linux_operstate("up\r\n"));
+        // Everything else fails closed toward "down".
+        assert!(!parse_linux_operstate("down"));
+        assert!(!parse_linux_operstate("unknown"));
+        assert!(!parse_linux_operstate("dormant"));
+        assert!(!parse_linux_operstate("lowerlayerdown"));
+        assert!(!parse_linux_operstate("UP")); // case-sensitive
+        assert!(!parse_linux_operstate(""));
+        assert!(!parse_linux_operstate("   "));
+        assert!(!parse_linux_operstate("up down"));
+    }
+
+    #[test]
+    fn macos_ifconfig_parses_headers_and_up_flag() {
+        let sample = "\
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.0.5 netmask 0xffffff00 broadcast 192.168.0.255
+gif0: flags=8010<POINTOPOINT,MULTICAST> mtu 1280
+";
+        let ifaces = parse_macos_ifconfig_interfaces(sample);
+        let by_name: std::collections::HashMap<_, _> =
+            ifaces.iter().map(|i| (i.name.as_str(), i.up)).collect();
+        assert_eq!(by_name.get("lo0"), Some(&true));
+        assert_eq!(by_name.get("en0"), Some(&true));
+        // gif0 header has no UP flag -> reported down.
+        assert_eq!(by_name.get("gif0"), Some(&false));
+        // Tab-indented detail lines never become interfaces.
+        assert_eq!(ifaces.len(), 3);
+        assert!(ifaces.iter().all(|i| i.addresses.is_empty()));
+    }
+
+    #[test]
+    fn macos_ifconfig_skips_malformed_and_empty() {
+        assert!(parse_macos_ifconfig_interfaces("").is_empty());
+        // A leading ':' yields an empty name -> skipped.
+        assert!(parse_macos_ifconfig_interfaces(": flags=<UP>").is_empty());
+        // Non-alphabetic / indented lines are ignored.
+        assert!(parse_macos_ifconfig_interfaces("\ten0: flags=<UP>\n123: x").is_empty());
+    }
+
+    #[test]
+    fn windows_ipconfig_parses_adapter_headers() {
+        let sample = "\
+Windows IP Configuration
+
+Ethernet adapter Ethernet:
+
+   Connection-specific DNS Suffix  . :
+   IPv4 Address. . . . . . . . . . . : 192.168.0.7
+Wireless LAN adapter Wi-Fi:
+
+   Media State . . . . . . . . . . . : Media disconnected
+Some unrelated line: value
+";
+        let ifaces = parse_windows_ipconfig_interfaces(sample);
+        let names: Vec<&str> = ifaces.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["Ethernet adapter Ethernet", "Wireless LAN adapter Wi-Fi"]);
+        assert!(ifaces.iter().all(|i| i.up)); // ipconfig layer reports all up
+        assert!(parse_windows_ipconfig_interfaces("").is_empty());
+        assert!(parse_windows_ipconfig_interfaces("No adapters here: x").is_empty());
+    }
 
     fn samples(name: &str, values: &[u64]) -> Vec<(String, u64)> {
         values.iter().map(|v| (name.to_owned(), *v)).collect()
