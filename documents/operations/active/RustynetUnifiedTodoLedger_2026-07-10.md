@@ -247,11 +247,32 @@ Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](./RustNati
     (`0cec075`); `live_two_hop_validation` skips a topology without an entry hop
     (`1f57564`); `live_managed_dns` arg + `--known-hosts-file` wiring
     (`1b33e84`/`4d04af5`).
-  - OPEN (well-characterized, tracked): `live_managed_dns_validation` still
-    fails — the pinned-known_hosts lookup uses a `host:22` candidate that
-    `ssh-keygen -F` will not match against the standard plain-host entry
-    (`target_address` in `live_lab_support` does not strip the `:22` port
-    suffix). Distinct SSH-pinning bug; intersects §8/§15 managed-DNS evidence.
+  - [x] RESOLVED (2026-07-12, `a1e49c1`): `live_managed_dns_validation` is
+    **green** — proven on run-matrix row `livelab-1783855257-798149c2e909`
+    (report `state/managed-dns-verify2-1783854488`, `debian-headless-2:exit` +
+    `debian-headless-4:client`). Two bugs, both fixed: (1) the pinned-known_hosts
+    lookup used a `host:22` candidate `ssh-keygen -F` would not match, and the
+    same unstripped `:22` also broke `ssh -G` and the real `ssh`/`scp` connect
+    (`LiveLabContext` in `live_lab_support` now strips the port and passes it via
+    `-p`/`-P`; affects every pinned live stage); (2) the exit role lacked the
+    `Client` capability its `client` daemon role requires, so the assignment
+    refresh fail-closed (`assignment target intent lacks required local
+    capability client`) — `role.rs` Exit caps now include `Client`. Intersects
+    §8/§15 managed-DNS evidence (now satisfied for the focused Linux topology).
+  - OPEN (newly exposed once managed_dns passed; tracked in
+    [LiveLabFindings_2026-07-12.md](./LiveLabFindings_2026-07-12.md)):
+    - `live_reboot_recovery_validation` fails on the focused Rust `--node`
+      topology — the reboot core passes, but the post-reboot
+      `force-local-assignment-refresh-now` needs
+      `/etc/rustynet/assignment-refresh.env`, which the focused setup does not
+      provision. Decide skip-if-absent vs provision-the-timer (Finding A).
+    - Exit daemon-role intent (`role.rs` maps Linux Exit → `admin`) disagrees
+      with the live node (`RUSTYNET_NODE_ROLE=client`); likely stale-env
+      preservation in `ops install-systemd`. The cap fix is safe under either
+      role, but intent≠reality should be reconciled (Finding B).
+    - Latent client-less exit spec at `ops_e2e.rs:3365`
+      (`issue_two_node_traversal_artifacts` → `[Anchor, ExitServer]`); align
+      with the canonical set if ever used to issue an exit assignment (Finding C).
   - Env note: the orchestrator needs `--utm-documents-root "<UTM images dir>"`
     when lab bundles live outside the default UTM documents root, or
     `discover_local_utm` reports only a stale bundle and fails alias selection.
