@@ -27,6 +27,28 @@ impl OrchestrationStage for LiveMixedTopologyValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        // Mixed-topology needs one node of EACH desktop platform (Linux +
+        // macOS + Windows). A single-platform topology cannot exercise it —
+        // skip rather than fail-closed, matching the two_hop /
+        // enrollment-restart / extended-soak incomplete-topology skips. With
+        // all three platforms assigned, any resolution error below remains a
+        // hard fail.
+        let all_platforms_assigned = [
+            VmGuestPlatform::Linux,
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+        ]
+        .iter()
+        .all(|platform| {
+            ctx.assignments.iter().any(|assignment| {
+                ctx.adapters
+                    .get(assignment.alias.as_str())
+                    .is_some_and(|adapter| adapter.platform() == *platform)
+            })
+        });
+        if !all_platforms_assigned {
+            return StageOutcome::Skipped;
+        }
         let linux = match find_platform_node(ctx, VmGuestPlatform::Linux) {
             Ok(p) => p,
             Err(e) => return StageOutcome::Failed(e),

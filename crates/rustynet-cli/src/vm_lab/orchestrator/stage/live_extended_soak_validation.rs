@@ -31,6 +31,18 @@ impl OrchestrationStage for LiveExtendedSoakValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        // The extended soak drives a five-node topology (exit + client +
+        // entry + aux + a second client). A smaller topology cannot exercise
+        // it — skip rather than fail-closed, matching the two_hop /
+        // enrollment-restart incomplete-topology skips. With all roles
+        // present, any error below remains a hard fail.
+        let complete = ["exit", "client", "entry", "aux"]
+            .iter()
+            .all(|label| ssh_params_for_role(ctx, label).is_ok())
+            && ssh_params_for_second_client(ctx).is_ok();
+        if !complete {
+            return StageOutcome::Skipped;
+        }
         match run_extended_soak(ctx) {
             Ok(()) => StageOutcome::Passed,
             Err(err) => StageOutcome::Failed(err),
