@@ -3176,6 +3176,89 @@ mod tests {
     }
 
     #[test]
+    fn decode_map_response_reject_paths_and_valid_decode() {
+        let nonce: [u8; PCP_NONCE_LEN] = [0xAB; PCP_NONCE_LEN];
+        let internal_port: u16 = 51820;
+
+        // A well-formed 60-byte PCP MAP success response for `internal_port`.
+        let build_valid = || {
+            let mut buf = [0u8; PCP_MAP_RESPONSE_LEN];
+            buf[0] = PCP_VERSION;
+            buf[1] = PCP_R_BIT_RESPONSE_MASK | PCP_OPCODE_MAP;
+            buf[3] = PCP_RESULT_SUCCESS;
+            buf[4..8].copy_from_slice(&7200u32.to_be_bytes()); // lifetime
+            buf[24..36].copy_from_slice(&nonce); // echoed mapping nonce
+            buf[36] = PCP_PROTOCOL_UDP;
+            buf[40..42].copy_from_slice(&internal_port.to_be_bytes()); // echoed internal port
+            buf[42..44].copy_from_slice(&53420u16.to_be_bytes()); // external port
+            // External address ::ffff:198.51.100.7 -> IPv4 198.51.100.7.
+            buf[54] = 0xff;
+            buf[55] = 0xff;
+            buf[56..60].copy_from_slice(&[198, 51, 100, 7]);
+            buf
+        };
+
+        // Happy path decodes all fields.
+        let ok = PcpClient::decode_map_response(&build_valid(), nonce, internal_port).unwrap();
+        assert_eq!(ok.external_port, 53420);
+        assert_eq!(ok.granted_lifetime_secs, 7200);
+        assert_eq!(ok.external_addr, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)));
+
+        // Each byte-level reject path fails closed.
+        assert!(
+            PcpClient::decode_map_response(
+                &[0u8; PCP_MAP_RESPONSE_LEN - 1],
+                nonce,
+                internal_port
+            )
+            .is_err(),
+            "short buffer"
+        );
+        let mut cases: Vec<[u8; PCP_MAP_RESPONSE_LEN]> = Vec::new();
+        {
+            let mut b = build_valid();
+            b[0] = PCP_VERSION + 1; // wrong version
+            cases.push(b);
+        }
+        {
+            let mut b = build_valid();
+            b[1] = PCP_OPCODE_MAP; // R-bit not set (looks like a request)
+            cases.push(b);
+        }
+        {
+            let mut b = build_valid();
+            b[1] = PCP_R_BIT_RESPONSE_MASK | 2; // wrong opcode
+            cases.push(b);
+        }
+        {
+            let mut b = build_valid();
+            b[3] = 2; // non-success result code
+            cases.push(b);
+        }
+        {
+            let mut b = build_valid();
+            b[24] ^= 0xFF; // nonce mismatch
+            cases.push(b);
+        }
+        {
+            let mut b = build_valid();
+            b[36] = 6; // protocol mismatch (TCP, not UDP)
+            cases.push(b);
+        }
+        {
+            let mut b = build_valid();
+            b[40..42].copy_from_slice(&9999u16.to_be_bytes()); // echoed internal-port mismatch
+            cases.push(b);
+        }
+        for (i, b) in cases.iter().enumerate() {
+            assert!(
+                PcpClient::decode_map_response(b, nonce, internal_port).is_err(),
+                "reject case {i} should fail"
+            );
+        }
+    }
+
+    #[test]
     fn pcp_response_nonce_mismatch_is_rejected_as_invalid_response() {
         // RFC 6887 §11.2: a response carrying a Mapping Nonce different
         // from the one in the request must be rejected — otherwise an
