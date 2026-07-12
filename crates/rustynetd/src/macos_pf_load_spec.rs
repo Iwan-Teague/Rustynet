@@ -605,6 +605,35 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_route_primitive_detection() {
+        // route-to / reply-to / dup-to redirect traffic and must never appear in
+        // a rendered pf ruleset. Detection is case-insensitive.
+        assert!(contains_forbidden_route_primitive(
+            "pass out on en0 route-to (en1 1.2.3.4)"
+        ));
+        assert!(contains_forbidden_route_primitive(
+            "pass in reply-to (en0 5.6.7.8) all"
+        ));
+        assert!(contains_forbidden_route_primitive(
+            "pass out dup-to (en0 9.9.9.9)"
+        ));
+        assert!(contains_forbidden_route_primitive("PASS OUT ROUTE-TO (EN1 X)"));
+        // Any offending line in a multi-line ruleset trips the guard.
+        assert!(contains_forbidden_route_primitive(
+            "pass out on en0 all\npass in route-to (x)"
+        ));
+        // A clean ruleset and empty input are fine.
+        assert!(!contains_forbidden_route_primitive(
+            "pass out on en0 from any to any\npass in on en0 all"
+        ));
+        assert!(!contains_forbidden_route_primitive(""));
+        // Detection is space-delimited, matching the surrounding-space form the
+        // rule builder emits; a bare token with no surrounding space is not
+        // matched (the builder always prefixes an action token).
+        assert!(!contains_forbidden_route_primitive("route-to(en0)"));
+    }
+
+    #[test]
     fn killswitch_roundtrip_renders_identically() {
         let original = killswitch(rich_killswitch_spec(), 7, false);
         let encoded = original.encode();
