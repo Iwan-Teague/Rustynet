@@ -722,6 +722,22 @@ fn append_line(out: &mut String, key: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_cidrs_tokenizes_on_whitespace_and_commas() {
+        // Empty / separator-only input yields no tokens.
+        assert!(parse_cidrs("").is_empty());
+        assert!(parse_cidrs("   ").is_empty());
+        assert!(parse_cidrs(", ,\t").is_empty());
+        assert_eq!(parse_cidrs("10.0.0.0/8"), vec!["10.0.0.0/8"]);
+        // Mixed comma + whitespace separators; empty tokens are dropped.
+        assert_eq!(
+            parse_cidrs("10.0.0.0/8, 192.168.0.0/16\t172.16.0.0/12,,"),
+            vec!["10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"]
+        );
+        // parse_cidrs only tokenizes; it does not validate CIDR syntax here.
+        assert_eq!(parse_cidrs("not-a-cidr"), vec!["not-a-cidr"]);
+    }
     use crate::config::parse::parse_wizard_env;
 
     fn build(text: &str, host: HostProfile) -> Result<(OperatorConfig, Vec<String>), ConfigError> {
