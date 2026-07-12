@@ -1139,6 +1139,45 @@ mod tests {
     // ─── Drain timing tests ───────────────────────────────────────
 
     #[test]
+    fn ledger_field_parsers_and_sanitizer() {
+        // parse_kv: splits key=value lines, skips blank lines, and errors on a
+        // line with no '='. split_once keeps '=' inside the value.
+        let kv = parse_kv("a=1\n\nb=hello=world\n").unwrap();
+        assert_eq!(
+            kv,
+            vec![
+                ("a".to_owned(), "1".to_owned()),
+                ("b".to_owned(), "hello=world".to_owned()),
+            ]
+        );
+        assert!(parse_kv("noequals").is_err());
+        assert_eq!(parse_kv("k=").unwrap(), vec![("k".to_owned(), String::new())]);
+
+        // parse_field<T>: parse a required field; missing or non-parseable both
+        // fail closed as LedgerCorrupt.
+        let fields = vec![
+            ("epoch".to_owned(), "42".to_owned()),
+            ("bad".to_owned(), "x".to_owned()),
+        ];
+        assert_eq!(parse_field::<u64>(&fields, "epoch").unwrap(), 42);
+        assert!(matches!(
+            parse_field::<u64>(&fields, "missing"),
+            Err(RotationError::LedgerCorrupt(_))
+        ));
+        assert!(matches!(
+            parse_field::<u64>(&fields, "bad"),
+            Err(RotationError::LedgerCorrupt(_))
+        ));
+
+        // sanitize_field: CR/LF become spaces so a field value cannot inject a
+        // second ledger line; other whitespace (tab) is untouched.
+        assert_eq!(sanitize_field("plain"), "plain");
+        assert_eq!(sanitize_field("a\nb"), "a b");
+        assert_eq!(sanitize_field("a\r\nb"), "a  b");
+        assert_eq!(sanitize_field("no=newline\there"), "no=newline\there");
+    }
+
+    #[test]
     fn rotation_drain_completes_immediately_when_no_inflight() {
         let drain = make_drain(Duration::from_secs(5));
         let outcome = drain.drain();
