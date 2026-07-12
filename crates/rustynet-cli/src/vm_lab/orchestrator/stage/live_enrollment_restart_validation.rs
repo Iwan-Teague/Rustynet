@@ -27,6 +27,15 @@ impl OrchestrationStage for LiveEnrollmentRestartValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        // Enrollment-restart requires a dedicated `aux` enrollee node (the
+        // admin enrolls it, restarts it, and proves the enrollment survives).
+        // A minimal topology (e.g. exit + single client) has no aux node and
+        // cannot exercise this — skip rather than fail-closed, matching the
+        // two_hop incomplete-topology skip and the role-gated live-suite
+        // stages. A missing `exit` (the enrolling admin) remains a hard fail.
+        if !ctx.assignments.iter().any(|a| a.role.as_str() == "aux") {
+            return StageOutcome::Skipped;
+        }
         let admin_params = match ssh_params_for_role(ctx, "exit") {
             Ok(p) => p,
             Err(e) => return StageOutcome::Failed(e),
