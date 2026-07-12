@@ -1848,6 +1848,15 @@ fn route_list_internal() -> Vec<Route> {
     routes
 }
 
+/// Whole days between `now_secs` and a file's `modified_secs` (Unix epoch
+/// seconds). Uses `saturating_sub` so a modified time in the future — from clock
+/// skew or a tampered mtime — reports 0 days instead of panicking on subtraction
+/// underflow in debug builds (§10.2 no-panic). Shared by all three platform
+/// branches of `key_expiry_internal`.
+fn key_age_days(now_secs: u64, modified_secs: u64) -> u64 {
+    now_secs.saturating_sub(modified_secs) / 86_400
+}
+
 fn key_expiry_internal() -> KeyExpiry {
     let mut key_details = vec![];
     let mut expiring_soon = false;
@@ -1866,7 +1875,7 @@ fn key_expiry_internal() -> KeyExpiry {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    let days_old = (now - since_epoch) / 86400;
+                    let days_old = key_age_days(now, since_epoch);
                     if days_old > 365 {
                         expiring_soon = true;
                         key_details.push(format!("{path}: {days_old} days old (>1yr)"));
@@ -1889,7 +1898,7 @@ fn key_expiry_internal() -> KeyExpiry {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let days_old = (now - since_epoch) / 86400;
+            let days_old = key_age_days(now, since_epoch);
             if days_old > 365 {
                 expiring_soon = true;
                 key_details.push(format!("~/.rustynet/keys: {days_old} days old (>1yr)"));
@@ -1914,7 +1923,7 @@ fn key_expiry_internal() -> KeyExpiry {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    let days_old = (now - since_epoch) / 86400;
+                    let days_old = key_age_days(now, since_epoch);
                     if days_old > 365 {
                         expiring_soon = true;
                         key_details.push(format!("{}: {} days old (>1yr)", path, days_old));
@@ -7186,6 +7195,19 @@ Inter-|   Receive                                    |  Transmit
             "rustynet0"
         ));
         assert!(!windows_ipconfig_mentions_interface("", "eth0"));
+    }
+
+    #[test]
+    fn key_age_days_saturates_future_mtime() {
+        use super::key_age_days;
+        assert_eq!(key_age_days(400 * 86_400, 0), 400);
+        assert_eq!(key_age_days(86_400, 0), 1);
+        // Sub-day age rounds down to 0.
+        assert_eq!(key_age_days(86_399, 0), 0);
+        // Future mtime (modified > now) saturates to 0 instead of panicking on
+        // subtraction underflow.
+        assert_eq!(key_age_days(100, 999_999), 0);
+        assert_eq!(key_age_days(0, u64::MAX), 0);
     }
 
     #[test]
