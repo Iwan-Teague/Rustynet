@@ -1541,6 +1541,21 @@ fn check_daemon_running(_msg: &mut str) -> bool {
         .unwrap_or(false)
 }
 
+/// Parse the `starttime` field (field 22, clock ticks since boot) from a
+/// `/proc/<pid>/stat` line. Uses raw whitespace splitting, which assumes the
+/// process comm (field 2) contains no embedded whitespace — true for
+/// `rustynetd`; a comm with spaces would shift the field index (documented
+/// limitation, behavior unchanged). Returns `None` for fewer than 22 fields or
+/// a non-numeric field 22. Split out for unit testing; only called under
+/// `target_os = "linux"`.
+#[allow(dead_code)]
+fn parse_proc_pid_stat_starttime_ticks(content: &str) -> Option<u64> {
+    content
+        .split_whitespace()
+        .nth(21)
+        .and_then(|field| field.parse::<u64>().ok())
+}
+
 #[cfg(target_os = "linux")]
 fn get_daemon_uptime() -> Option<u64> {
     std::process::Command::new("pgrep")
@@ -1554,10 +1569,7 @@ fn get_daemon_uptime() -> Option<u64> {
         .and_then(|pid| {
             fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
-                .and_then(|content| {
-                    let fields: Vec<&str> = content.split_whitespace().collect();
-                    fields.get(21).and_then(|s| s.parse::<u64>().ok())
-                })
+                .and_then(|content| parse_proc_pid_stat_starttime_ticks(&content))
         })
         .map(|start_time| {
             let ticks_per_sec = 100u64;
@@ -5490,39 +5502,40 @@ fn open_security_vulnerabilities_internal(advisory_db_path: &str) -> Vulnerabili
     }
 }
 
+/// Interpret a `/proc/sys` boolean toggle: any trimmed value other than "0"
+/// counts as enabled (matches the existing readers). NOTE: empty content also
+/// reads as enabled (`"" != "0"`) — `/proc/sys` entries are never empty in
+/// practice, and a MISSING file keeps the caller's default instead of hitting
+/// this. Split out for unit testing; only called under `target_os = "linux"`.
+#[allow(dead_code)]
+fn parse_sysctl_bool_enabled(content: &str) -> bool {
+    content.trim() != "0"
+}
+
+/// Interpret an unsigned `/proc/sys` integer, defaulting to 0 on non-numeric or
+/// garbage content (matches the existing `kptr_restrict` reader). Only called
+/// under `target_os = "linux"`.
+#[allow(dead_code)]
+fn parse_sysctl_u32(content: &str) -> u32 {
+    content.trim().parse().unwrap_or(0)
+}
+
 #[cfg(target_os = "linux")]
 fn kernel_security_parameters_internal() -> KernelSecurityParams {
-    let mut aslr_enabled = false;
-    if let Ok(content) = fs::read_to_string("/proc/sys/kernel/randomize_va_space") {
-        aslr_enabled = content.trim() != "0";
-    }
-
-    let mut kptr_restrict = 0u32;
-    if let Ok(content) = fs::read_to_string("/proc/sys/kernel/kptr_restrict") {
-        kptr_restrict = content.trim().parse().unwrap_or(0);
-    }
-
-    let mut dmesg_restrict = false;
-    if let Ok(content) = fs::read_to_string("/proc/sys/kernel/dmesg_restrict") {
-        dmesg_restrict = content.trim() != "0";
-    }
-
-    let mut panic_on_oops = false;
-    if let Ok(content) = fs::read_to_string("/proc/sys/kernel/panic_on_oops") {
-        panic_on_oops = content.trim() != "0";
-    }
-
-    let mut unprivileged_userns_clone = false;
-    if let Ok(content) = fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
-        unprivileged_userns_clone = content.trim() != "0";
-    }
+    let read_bool = |path: &str| {
+        fs::read_to_string(path)
+            .map(|content| parse_sysctl_bool_enabled(&content))
+            .unwrap_or(false)
+    };
 
     KernelSecurityParams {
-        aslr_enabled,
-        kptr_restrict,
-        dmesg_restrict,
-        panic_on_oops,
-        unprivileged_userns_clone,
+        aslr_enabled: read_bool("/proc/sys/kernel/randomize_va_space"),
+        kptr_restrict: fs::read_to_string("/proc/sys/kernel/kptr_restrict")
+            .map(|content| parse_sysctl_u32(&content))
+            .unwrap_or(0),
+        dmesg_restrict: read_bool("/proc/sys/kernel/dmesg_restrict"),
+        panic_on_oops: read_bool("/proc/sys/kernel/panic_on_oops"),
+        unprivileged_userns_clone: read_bool("/proc/sys/kernel/unprivileged_userns_clone"),
     }
 }
 
@@ -7096,6 +7109,39 @@ Inter-|   Receive                                    |  Transmit
         assert_eq!(parse_wg_latest_handshake_timestamp("PUBKEY only"), None);
         assert_eq!(parse_wg_latest_handshake_timestamp("PUBKEY notanumber"), None);
         assert_eq!(parse_wg_latest_handshake_timestamp(""), None);
+    }
+
+    #[test]
+    fn proc_pid_stat_starttime_extracts_field_22() {
+        use super::parse_proc_pid_stat_starttime_ticks;
+        // pid (comm) state ppid ... field 22 = starttime.
+        let stat =
+            "1234 (rustynetd) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9999 12345678";
+        assert_eq!(parse_proc_pid_stat_starttime_ticks(stat), Some(9999));
+        // Fewer than 22 fields -> None.
+        assert_eq!(parse_proc_pid_stat_starttime_ticks("1 (x) S 1 2 3"), None);
+        // Non-numeric field 22 -> None.
+        let bad = "1234 (rustynetd) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 notnum 12345";
+        assert_eq!(parse_proc_pid_stat_starttime_ticks(bad), None);
+        assert_eq!(parse_proc_pid_stat_starttime_ticks(""), None);
+    }
+
+    #[test]
+    fn sysctl_bool_and_u32_conventions() {
+        use super::{parse_sysctl_bool_enabled, parse_sysctl_u32};
+        // Any trimmed value other than "0" is enabled.
+        assert!(!parse_sysctl_bool_enabled("0"));
+        assert!(!parse_sysctl_bool_enabled(" 0 \n"));
+        assert!(parse_sysctl_bool_enabled("1"));
+        assert!(parse_sysctl_bool_enabled("2"));
+        // Documented quirk: empty / non-"0" garbage reads as enabled.
+        assert!(parse_sysctl_bool_enabled(""));
+        assert!(parse_sysctl_bool_enabled("false"));
+        // u32: trims + parses; 0 on garbage or empty.
+        assert_eq!(parse_sysctl_u32("2\n"), 2);
+        assert_eq!(parse_sysctl_u32(" 42 "), 42);
+        assert_eq!(parse_sysctl_u32("garbage"), 0);
+        assert_eq!(parse_sysctl_u32(""), 0);
     }
 
     #[test]
