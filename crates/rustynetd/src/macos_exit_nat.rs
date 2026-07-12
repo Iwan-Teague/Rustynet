@@ -290,6 +290,35 @@ mod tests {
     }
 
     #[test]
+    fn exit_nat_pf_config_validation_enforces_default_deny_and_private_source() {
+        let valid = || MacosExitNatPfConfig {
+            egress_interface: "en0".to_owned(),
+            mesh_cidrs: vec!["100.64.0.0/10".to_owned()],
+            anchor_name: "com.rustynet/nat".to_owned(),
+        };
+        assert!(validate_macos_exit_nat_pf_config(&valid()).is_ok());
+
+        // Default-deny: no mesh CIDR is an error, not a no-op anchor.
+        let mut c = valid();
+        c.mesh_cidrs.clear();
+        assert!(validate_macos_exit_nat_pf_config(&c).is_err());
+
+        // Malformed egress interface / anchor name are rejected.
+        let mut c = valid();
+        c.egress_interface = "en 0".to_owned();
+        assert!(validate_macos_exit_nat_pf_config(&c).is_err());
+        let mut c = valid();
+        c.anchor_name = "../evil".to_owned();
+        assert!(validate_macos_exit_nat_pf_config(&c).is_err());
+
+        // A global / default-route mesh source is refused so the exit cannot
+        // masquerade arbitrary non-mesh traffic.
+        let mut c = valid();
+        c.mesh_cidrs = vec!["0.0.0.0/0".to_owned()];
+        assert!(validate_macos_exit_nat_pf_config(&c).is_err());
+    }
+
+    #[test]
     fn builder_emits_reviewed_nat_rule() {
         let rules = build_macos_exit_nat_pf_rules(&config()).unwrap();
         assert_eq!(
