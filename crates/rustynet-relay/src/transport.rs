@@ -3298,6 +3298,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_nonce_hex_validates_length_and_hex() {
+        // Exactly 32 hex chars decode to 16 bytes (lower, upper, and mixed case).
+        assert_eq!(parse_nonce_hex(&"00".repeat(16)).unwrap(), [0u8; 16]);
+        assert_eq!(parse_nonce_hex(&"ff".repeat(16)).unwrap(), [0xffu8; 16]);
+        assert_eq!(parse_nonce_hex(&"Ab".repeat(16)).unwrap(), [0xabu8; 16]);
+        assert_eq!(
+            parse_nonce_hex("000102030405060708090a0b0c0d0e0f").unwrap(),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        // Any length other than 32 is rejected before decoding.
+        assert!(parse_nonce_hex("").is_err());
+        assert!(parse_nonce_hex(&"0".repeat(31)).is_err());
+        assert!(parse_nonce_hex(&"0".repeat(33)).is_err());
+        // Correct length but non-hex bytes are rejected.
+        assert!(parse_nonce_hex(&"gg".repeat(16)).is_err());
+        assert!(parse_nonce_hex(&"zz".repeat(16)).is_err());
+    }
+
+    #[test]
     fn set_max_total_sessions_refuses_to_shrink_below_live_count() {
         // Followup #3: an operator who shrinks the cap below the current
         // live session count must get a clear error rather than silent
