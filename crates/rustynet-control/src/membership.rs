@@ -1965,6 +1965,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_usize_field_rejects_missing_and_malformed() {
+        use super::parse_usize_field;
+        use std::collections::HashMap;
+        let mut fields: HashMap<&str, &str> = HashMap::new();
+        fields.insert("count", "42");
+        fields.insert("neg", "-1");
+        fields.insert("empty", "");
+        fields.insert("spaced", " 5 ");
+        fields.insert("huge", "99999999999999999999999999");
+        fields.insert("word", "twelve");
+
+        assert_eq!(parse_usize_field(&fields, "count").unwrap(), 42);
+        // Missing key, negative, empty, whitespace-padded, overflow, and
+        // non-numeric values are all rejected (fail-closed wire decode).
+        assert!(parse_usize_field(&fields, "absent").is_err());
+        assert!(parse_usize_field(&fields, "neg").is_err());
+        assert!(parse_usize_field(&fields, "empty").is_err());
+        assert!(parse_usize_field(&fields, "spaced").is_err());
+        assert!(parse_usize_field(&fields, "huge").is_err());
+        assert!(parse_usize_field(&fields, "word").is_err());
+    }
+
+    #[test]
     fn canonical_state_and_root_are_deterministic() {
         let mut first = base_state();
         first.nodes.push(active_node("node-b", 7));
