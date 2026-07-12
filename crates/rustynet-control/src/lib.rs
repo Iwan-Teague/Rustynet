@@ -4361,6 +4361,35 @@ mod tests {
     }
 
     #[test]
+    fn control_payload_validators_reject_unsafe_inputs() {
+        use super::{is_default_route_cidr, is_single_line_payload_value, is_valid_node_id_text};
+
+        // Node-id text is valid iff non-empty after trimming.
+        assert!(is_valid_node_id_text("node-1"));
+        assert!(is_valid_node_id_text("  node-1  "));
+        assert!(!is_valid_node_id_text(""));
+        assert!(!is_valid_node_id_text("   \t\n"));
+
+        // Default-route CIDR recognition: exact v4/v6, trimmed.
+        assert!(is_default_route_cidr("0.0.0.0/0"));
+        assert!(is_default_route_cidr("::/0"));
+        assert!(is_default_route_cidr("  0.0.0.0/0 "));
+        assert!(!is_default_route_cidr("0.0.0.0/1"));
+        assert!(!is_default_route_cidr("10.0.0.0/8"));
+        assert!(!is_default_route_cidr("::0/0"));
+        assert!(!is_default_route_cidr(""));
+
+        // Single-line payload value: non-empty and free of '\n', '\r', '=' so a
+        // value cannot break out of the key=value wire framing.
+        assert!(is_single_line_payload_value("plain-value"));
+        assert!(is_single_line_payload_value("has spaces and : colons"));
+        assert!(!is_single_line_payload_value(""));
+        assert!(!is_single_line_payload_value("has=equals"));
+        assert!(!is_single_line_payload_value("has\nnewline"));
+        assert!(!is_single_line_payload_value("has\rreturn"));
+    }
+
+    #[test]
     fn auth_rate_limit_enforces_per_ip_limits() {
         let mut guard = AuthSurfaceGuard::new(
             AuthRateLimitConfig {
