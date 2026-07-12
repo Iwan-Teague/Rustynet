@@ -2300,6 +2300,52 @@ mod tests {
     }
 
     #[test]
+    fn candidate_endpoint_filter_rejects_unroutable_and_own_addrs() {
+        use std::collections::BTreeSet;
+        let v6 = |s: &str, port: u16| SocketEndpoint {
+            addr: s.parse().unwrap(),
+            port,
+        };
+        let no_ifaces: BTreeSet<IpAddr> = BTreeSet::new();
+
+        // Routable v4/v6 on a nonzero port are allowed.
+        assert!(super::is_candidate_endpoint_allowed(
+            endpoint([203, 0, 113, 7], 51820),
+            &no_ifaces
+        ));
+        assert!(super::is_candidate_endpoint_allowed(
+            v6("2001:db8::1", 51820),
+            &no_ifaces
+        ));
+
+        // Cfg-invariant rejects. (Loopback is intentionally allowed under
+        // cfg(test) so tests can dial 127.0.0.1, so it is not asserted here.)
+        for bad in [
+            endpoint([203, 0, 113, 7], 0),           // port 0
+            endpoint([0, 0, 0, 0], 51820),           // unspecified
+            endpoint([224, 0, 0, 1], 51820),         // multicast
+            endpoint([169, 254, 1, 1], 51820),       // v4 link-local
+            endpoint([255, 255, 255, 255], 51820),   // broadcast
+        ] {
+            assert!(!super::is_candidate_endpoint_allowed(bad, &no_ifaces));
+        }
+        assert!(!super::is_candidate_endpoint_allowed(
+            v6("fe80::1", 51820),
+            &no_ifaces
+        )); // v6 link-local
+        assert!(!super::is_candidate_endpoint_allowed(v6("::", 51820), &no_ifaces)); // v6 unspecified
+
+        // Anti-reflection: an endpoint that is one of our own interface addrs
+        // is rejected.
+        let mut own: BTreeSet<IpAddr> = BTreeSet::new();
+        own.insert("203.0.113.7".parse::<IpAddr>().unwrap());
+        assert!(!super::is_candidate_endpoint_allowed(
+            endpoint([203, 0, 113, 7], 51820),
+            &own
+        ));
+    }
+
+    #[test]
     fn direct_plan_builds_simultaneous_rounds() {
         let engine = TraversalEngine::new(TraversalEngineConfig {
             max_candidates: 8,
