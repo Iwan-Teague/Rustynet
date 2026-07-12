@@ -582,8 +582,24 @@ NAS, or LLM hosting.
   floors as secondary drift checks, not coverage truth.
 - [ ] Expand coverage gates to control, policy, crypto, DNS, sysinfo, traversal,
   gossip, enrollment, key rotation, relay, and backend crates.
+  - 2026-07-12: direct unit/boundary tests added across several of these crates
+    (the llvm-cov ratchet gate above remains open — this only added tests, not a
+    coverage gate). control (node-id / default-route / payload-injection guards,
+    automation-scope + relay-token-key allowlists, `parse_usize_field`: 77690bf,
+    198cfa5, 5a77f9d), crypto (`hex_decode`, `is_valid_key_identifier`: 0b63db8,
+    5bcafbc), dns-zone (per-line bounds: 2c01cba), relay (`parse_nonce_hex`:
+    f59e331), nas + operator, and — highest value — the `rustynetd`
+    privileged-helper argv token allowlists (1ffcfed, 0a8b01c, 45aa0d2).
 - [ ] Extract pure parsers from `rustynet-sysinfo` IO; add malformed, missing,
   overflow, locale, encoding, and platform fixture tests.
+  - 2026-07-12: substantially done. 12 IO-coupled parsers extracted to pure,
+    cross-platform-testable functions with malformed/missing/overflow/first-line
+    and per-platform (linux operstate, macOS ifconfig, Windows ipconfig) fixture
+    tests (`rustynet-sysinfo` 38→51 tests; commits d8e084e, 3182c66, 84881fb,
+    2823161, a400175). Also fixed a real underflow panic: `key_expiry_internal`
+    `(now - since_epoch)` panicked on a future key-file mtime; now
+    `saturating_sub` via a tested `key_age_days` (9ba75d8). REMAINING: explicit
+    locale/encoding fixtures.
 - [ ] Add shared userspace/boringtun seam tests for handshake, anti-replay,
   cryptokey routing, unknown source, worker death, queue fairness, and errors.
 - [ ] Add key-rotation drain clock/boundary tests and finalize-persist failure
@@ -617,6 +633,11 @@ NAS, or LLM hosting.
   unbounded allocations, and format-specific signature ambiguity.
 - [ ] Add upgrade/downgrade, corrupt/truncated, oversized, unknown-version,
   duplicate-field, and canonical-byte tests for every schema.
+  - 2026-07-12: partial. `rustynet-dns-zone` per-line key/value/depth bounds now
+    have enforcement tests asserting the specific fail-closed reason (2c01cba;
+    the wire parser already had version/duplicate/oversized-line/never-panics
+    coverage). REMAINING: the other schemas (membership, relay-token, report
+    artifacts).
 
 ## 16. CI, builds, dependencies, and supply chain
 
