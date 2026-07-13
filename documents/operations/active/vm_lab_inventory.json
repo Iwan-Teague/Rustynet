@@ -110,28 +110,29 @@
     {
       "alias": "windows-utm-1",
       "controller": {
-        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/Windows.utm",
+        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/Windows11.utm",
         "type": "local_utm",
-        "utm_name": "Windows"
+        "utm_name": "Windows11"
       },
       "guest_exec_mode": "windows_powershell",
       "include_in_all": false,
       "lab_role": "windows_client",
-      "last_known_ip": "192.168.64.14",
-      "last_known_network": "lan-192.168.0.0/24",
+      "last_known_ip": "192.168.64.25",
+      "last_known_network": "utm-shared-192.168.64.0/24",
       "mesh_ip": "100.64.0.6",
-      "network_group": "lan-192.168.0.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
       "node_id": "windows-client-1",
-      "os": "Windows 11",
+      "os": "Windows 11 Pro",
       "parent_device": "iwan's MacBook Pro",
       "platform": "windows",
       "remote_shell": "powershell",
       "rustynet_src_dir": "C:\\Rustynet",
       "service_manager": "windows_service",
       "ssh_password": "tempo",
-      "ssh_target": "192.168.64.14",
+      "ssh_target": "192.168.64.25",
       "ssh_user": "windows",
-      "utm_staging_dir": "C:\\Users\\windows\\rustynet-utm-stage"
+      "utm_staging_dir": "C:\\Users\\windows\\rustynet-utm-stage",
+      "notes": "x86_64 (AMD64) emulated on Apple Silicon; Windows 11 Pro build 26200; rustup 1.88.0-x86_64-pc-windows-gnu installed; sshd via manual OpenSSH-Win64 install (no internet egress, host proxy 192.168.64.1:8736 for online installs). WinNAT/exit-role NOT supported (nested virt unavailable in emulated guest)."
     },
     {
       "alias": "fedora-utm-1",
