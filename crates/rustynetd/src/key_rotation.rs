@@ -1151,7 +1151,10 @@ mod tests {
             ]
         );
         assert!(parse_kv("noequals").is_err());
-        assert_eq!(parse_kv("k=").unwrap(), vec![("k".to_owned(), String::new())]);
+        assert_eq!(
+            parse_kv("k=").unwrap(),
+            vec![("k".to_owned(), String::new())]
+        );
 
         // parse_field<T>: parse a required field; missing or non-parseable both
         // fail closed as LedgerCorrupt.

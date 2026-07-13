@@ -617,7 +617,9 @@ mod tests {
         assert!(contains_forbidden_route_primitive(
             "pass out dup-to (en0 9.9.9.9)"
         ));
-        assert!(contains_forbidden_route_primitive("PASS OUT ROUTE-TO (EN1 X)"));
+        assert!(contains_forbidden_route_primitive(
+            "PASS OUT ROUTE-TO (EN1 X)"
+        ));
         // Any offending line in a multi-line ruleset trips the guard.
         assert!(contains_forbidden_route_primitive(
             "pass out on en0 all\npass in route-to (x)"

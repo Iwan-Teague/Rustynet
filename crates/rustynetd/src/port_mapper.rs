@@ -3206,12 +3206,8 @@ mod tests {
 
         // Each byte-level reject path fails closed.
         assert!(
-            PcpClient::decode_map_response(
-                &[0u8; PCP_MAP_RESPONSE_LEN - 1],
-                nonce,
-                internal_port
-            )
-            .is_err(),
+            PcpClient::decode_map_response(&[0u8; PCP_MAP_RESPONSE_LEN - 1], nonce, internal_port)
+                .is_err(),
             "short buffer"
         );
         let mut cases: Vec<[u8; PCP_MAP_RESPONSE_LEN]> = Vec::new();
