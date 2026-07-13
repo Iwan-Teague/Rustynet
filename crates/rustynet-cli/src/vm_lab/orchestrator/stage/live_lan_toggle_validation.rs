@@ -35,9 +35,15 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
             Ok(p) => p,
             Err(e) => return StageOutcome::Failed(e),
         };
+        // The LAN-toggle scenario drives THREE nodes: exit, client, and a
+        // Linux aux/extra/entry node it promotes to the blind_exit posture
+        // (the test binary requires --blind-exit-host). A 2-node topology
+        // cannot exercise it — skip rather than fail-closed, matching the
+        // two_hop / enrollment-restart / soak / mixed-topology
+        // incomplete-topology skips.
         let blind_exit_params = match find_blind_exit(ctx) {
             Ok(p) => p,
-            Err(e) => return StageOutcome::Failed(e),
+            Err(_) => return StageOutcome::Skipped,
         };
         let platform = platform_for_node(ctx, &exit_params.alias);
         let exit_node_id = node_id_for_alias(ctx, &exit_params.alias);
