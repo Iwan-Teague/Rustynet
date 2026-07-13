@@ -31,7 +31,7 @@ not claim a new live-lab role-cell result.
 | RNQ-04 | Code complete | Baseline no longer paints role cells green. Role cells now map only from their canonical role-proof stages; regression test pins baseline-only behavior. |
 | RNQ-05 | Substantially implemented; fsync transaction + fault-injection pending | Recorder/manifest/summary/parity/report-state/artifact/finalizer errors now block pass, and matrix append failure is fatal. Existing manifest/stage/context writers are atomic (context.rs does temp+fsync+dir-fsync). **2026-07-12 fix (`0cbf98d`):** a fully-green fresh full `--node` run failed finalization and appended NO matrix row — the reuse-evidence seal (attempted only when `candidate_pass`) digests `state/orchestration_context.json`, which a fresh full run never persisted (only `--setup-only` did; `--run-only` loaded it), so it failed `No such file or directory`; a *failing* run skipped the seal and therefore DID record a row, so only failing runs ever appeared in the matrix. Now the full-run path persists the context (atomic+fsync) before the seal; failure demotes via `evidence_errors`. Live-proven by a green run appending its row. Remaining: reorder so `report_state.json` run_passed=true is the LAST fsync'd write (single commit marker) + exhaustive per-writer fault injection. |
 | RNQ-06 | Code complete | Failure dominates contradictory report state; corrupt manifests and unknown terminal stages block proof; incomplete/reused/not-run conclusions are partial. Negative fixtures added. |
-| RNQ-07 | Immediate safe fix complete | Rust `--node` rejects nonzero stage timeout instead of pretending to enforce it. True cancellable process-isolated stage timeouts remain a separate large feature. |
+| RNQ-07 | Code complete (2026-07-13) | Real cancellable process-isolated per-stage deadlines landed in the Rust `--node` engine. Each stage runs on a scoped worker thread with a wall-clock watchdog; on expiry the stage's live subprocess tree is reaped (`ps` ppid-walk + `kill -KILL`, argv-only, pid≤1 fail-closed guard) so the never-detached worker unblocks and returns — no detached thread that keeps mutating after the runner moves on. A timeout is FAIL-CLOSED: the terminal outcome is `Failed`, recorded with the closed-taxonomy `timed_out` status (rc 124) through the existing recorder, so the run fails, skip-cascade blocks dependents, and always-run cleanup still executes. `--stage-timeout-secs=0` leaves the plan untouched (no deadline). SIGTERM/SIGINT fatal-signal handling is unchanged (deadlines are additive). Scoped unit tests prove over-deadline→cancelled+reaped+`timed_out`+run-fails (with always-run cleanup), under-deadline unaffected, timeout=0 unchanged, and the pure kill-set/exclusion/pid-guard logic. Not yet live-lab-proven. |
 | RNQ-08 | Code complete | Runner construction rejects duplicates, missing dependencies, and cycles before execution. Negative graph tests added. |
 | RNQ-09 | Code complete; subprocess signal proof pending | Fatal SIGTERM/SIGINT registration now precedes readiness/inventory mutation. Injectable registration-failure test proves following readiness work is not entered. A real subprocess SIGTERM cleanup test remains. |
 | RNQ-10 | Code complete | Context schema v3 uses deterministic payloads, SHA-256 binding, inventory/source/repo/report provenance, atomic mode-0600 write + fsync, permission validation, and tamper/binding tests. |
@@ -201,6 +201,21 @@ functional mesh result.
 - **Effort:** S for immediate rejection; L for full cancellation
 - **Verification:** Current CLI test rejects nonzero timeout. Future sleeping
   mock stage must time out, stop work, and still execute always-run cleanup.
+- **Resolution (2026-07-13):** Full cancellation implemented. The infrastructure
+  lives in `crates/rustynet-cli/src/vm_lab/orchestrator/diagnostics.rs`
+  (`DeadlineEnforcedStage` + the `run_stage_with_deadline` scoped-thread
+  watchdog, the `SubprocessTreeControl` seam with the production `ps`/`kill`
+  tree, the shared `StageTimeoutLedger`, and the `TimeoutAwareStageRecorder`
+  that emits the `timed_out` terminal row through the existing recorder), wired
+  in `crates/rustynet-cli/src/vm_lab/orchestrator/native.rs` where the former
+  nonzero rejection is replaced by `apply_stage_deadlines` (and
+  `stage_timeout_secs == 0` stays a no-op). The design explicitly avoids a
+  detached timed-out thread: cancellation reaps the stage's subprocess tree so
+  the never-detached worker returns before the runner advances. The sleeping
+  mock-stage test (over-deadline → cancelled → subprocess reaped → terminal
+  `timed_out` → run fails, with always-run cleanup still executed), the
+  under-deadline and timeout=0 cases, and the pure kill-set logic all pass under
+  `cargo test -p rustynet-cli`. Live-lab proof still pending.
 
 ### RNQ-08 — Invalid dependency graphs execute instead of failing
 
