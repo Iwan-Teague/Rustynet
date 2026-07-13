@@ -304,12 +304,24 @@ run records a `fail`/`timeout`/`abort` for it is resolved as FAIL.
   security-control stage that exists only on the Rust side is NOT waved through
   as a "Rust-only stage" — it is governed by G7. In other words, a security
   control is never "informational".
-- **G2 — Role-cell equality.** For every role×OS cell the shared topology
-  exercises, the two run-matrix rows record the SAME cell verdict
-  (`pass=pass`, `fail=fail`, `not_run=not_run`). A cell exercised by only one
-  engine is a parity failure unless it appears in the §0.a.3 intentional-
-  difference table. Failure dominates pass; `blocked` (environment) must match
-  or be declared in §0.a.4.
+- **G2 — Role-cell equality (from the normalized parity_input, NOT raw matrix
+  cells).** For every role×OS cell the shared topology exercises, both sides
+  record an equivalent cell verdict. **Source of truth: the dialect-normalized
+  `parity_input.json`** (the `emit-parity-input` output both sides already go
+  through for G1), NOT the raw `live_lab_run_matrix.csv` role-cell columns —
+  those are populated by the stage oracle from the Rust `StageId` vocabulary and
+  therefore MIS-label a bash-dialect run's role cells (a green bash run reads as
+  `aborted`/`not_run`; see BASH-DEF-3 in the Track-C bash-defect log). Comparing
+  raw matrix cells across dialects would spuriously fail every pair. Equivalence
+  is judged on the canonicalized role-proof outcomes: a role a topology actually
+  proved (its role-proof stages passed) must read proved on both; a role the
+  topology did not exercise reads not-exercised on both. **Rust legitimately
+  proving MORE for a role than bash (running + passing exit-lifecycle stages
+  bash skips) is NOT a G2 failure — it is Rust doing strictly more, and is
+  governed by G7's absolute floor.** A genuine divergence (a role bash proved
+  that Rust did not, or opposite pass/fail verdicts on a role both exercised)
+  fails G2; failure dominates pass; `blocked` (environment) must match or be
+  declared in §0.a.4.
 - **G3 — Cleanup equality + residue-free (both engines).** The canonical
   `cleanup` stage is terminal `pass` on BOTH sides. The Rust side's cleanup ran
   its `assert_node_clean` postcondition (RNQ-02) — daemon/service/interface/
