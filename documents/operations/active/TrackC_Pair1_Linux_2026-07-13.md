@@ -38,7 +38,32 @@ Rust preflight Skip (not Pass) when no cross-network substrate is present
 (matching bash and being more honest), or classify it as an intentional
 suite-level difference in §0.a.3. Prefer the Skip fix.
 
-## Finding P1-2 — `rustynet_boot` present after cleanup (residue) — HIGH
+## Finding P1-2 — `rustynet_boot` present after cleanup (residue) — HIGH — **RESOLVED 2026-07-13 (`20bca19`)**
+
+**Root cause (both a fail-open AND a no-op cleanup, one bug):** the Linux
+cleanup reset and the `assert_node_clean` probe both gate on `command -v nft`,
+evaluated in the SSH **user's** PATH. On Debian a non-login SSH shell's PATH is
+`/usr/local/bin:/usr/bin:/bin:/usr/games` — it OMITS `/usr/sbin`, where `nft`
+lives. So `command -v nft` returned NOT-FOUND: the reset **skipped its entire
+delete loop** (the boot killswitch table was never removed → residue every run),
+and the clean probe reported `nft=-` → `assert_node_clean` **FAILED OPEN**,
+passing a node that still carried a fail-closed killswitch table. The inner
+`sudo -n nft` calls worked (root's PATH has `/usr/sbin`) — only the user-context
+existence gate missed; `ip` is in `/usr/bin` so the iface dimension was fine
+(that's why only nft was the residue). The RNQ-02 `assert_node_clean` control
+was therefore not actually catching nft residue on this distro — a security-
+relevant fail-open.
+
+**Fix (`20bca19`, LIVE-PROVEN):** prepend `/usr/sbin:/sbin` to PATH in the
+reset / iface-reset / clean-probe commands; make the probe FAIL CLOSED (nft/ip
+present but unqueryable → `unknown` → dirty, never clean); same sbin-PATH
+prefix defensively on the `wg` handshake probes. Proven end-to-end on
+debian-headless-2: fake `rustynet_boot` table → fixed probe reports dirty →
+fixed reset removes it → re-probe clean; both guests confirmed clean. This
+un-blocks Pair 1's G3 on a re-run (the residue is now both detected and
+removed).
+
+### Original diagnosis (kept for the record)
 
 The independent residue probe found `table inet rustynet_boot` on both guests
 after pair2 completed (daemon inactive, tunnel iface absent, `ip_forward=0`, so
