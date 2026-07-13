@@ -75,22 +75,39 @@ fn payload_digest(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Atomic durable write shared by the persisted orchestration context and the
+/// `--node` evidence finalizer's commit marker (RNQ-05): unique temp file in
+/// the target's directory → write → fsync(file) → rename into place →
+/// fsync(directory). A reader can never observe a torn file, and after `Ok`
+/// the bytes are durable across a crash. `mode` (unix) is applied at
+/// temp-create time so the final file never transitions through a wider
+/// permission set; `None` keeps the process default (umask).
+pub(crate) fn atomic_write_fsync(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> Result<(), String> {
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let parent = path.parent().ok_or_else(|| {
-        format!(
-            "orchestration context path has no parent: {}",
-            path.display()
-        )
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("atomic write target has no parent: {}", path.display()))?;
     fs::create_dir_all(parent).map_err(|err| {
         format!(
-            "create orchestration context state dir '{}': {err}",
+            "create atomic write directory '{}': {err}",
             parent.display()
         )
     })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "atomic write target has no UTF-8 file name: {}",
+                path.display()
+            )
+        })?;
     let tmp = parent.join(format!(
-        ".orchestration_context.json.{}.{}.tmp",
+        ".{file_name}.{}.{}.tmp",
         std::process::id(),
         TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
@@ -99,19 +116,25 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        if let Some(mode) = mode {
+            options.mode(mode);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
     }
     let mut file = options
         .open(&tmp)
-        .map_err(|err| format!("create context temp '{}': {err}", tmp.display()))?;
+        .map_err(|err| format!("create atomic write temp '{}': {err}", tmp.display()))?;
     let write_result = (|| {
         file.write_all(bytes)
-            .map_err(|err| format!("write context temp '{}': {err}", tmp.display()))?;
+            .map_err(|err| format!("write atomic write temp '{}': {err}", tmp.display()))?;
         file.sync_all()
-            .map_err(|err| format!("sync context temp '{}': {err}", tmp.display()))?;
+            .map_err(|err| format!("sync atomic write temp '{}': {err}", tmp.display()))?;
         fs::rename(&tmp, path).map_err(|err| {
             format!(
-                "replace orchestration context '{}' from '{}': {err}",
+                "replace atomic write target '{}' from '{}': {err}",
                 path.display(),
                 tmp.display()
             )
@@ -120,7 +143,9 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
         {
             fs::File::open(parent)
                 .and_then(|directory| directory.sync_all())
-                .map_err(|err| format!("sync context directory '{}': {err}", parent.display()))?;
+                .map_err(|err| {
+                    format!("sync atomic write directory '{}': {err}", parent.display())
+                })?;
         }
         Ok(())
     })();
@@ -128,6 +153,10 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
     }
     write_result
+}
+
+fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write_fsync(path, bytes, Some(0o600))
 }
 
 /// Shared state threaded through all orchestration stages.
