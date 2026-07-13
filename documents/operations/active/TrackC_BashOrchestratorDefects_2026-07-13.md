@@ -44,6 +44,34 @@ passed. The Rust engine writes per-node collision-free staging
 (`write_secure_temp_file`, RNQ-18) and passed `validate_baseline_runtime` on the
 paired topology.
 
+## BASH-DEF-3 — run-matrix mislabels a green bash run as `aborted`
+
+**Run:** `state/pair-bash-1783936989` (the CLEAN 2-node re-run after the
+`lab_role` fix). The bash run is GREEN on its own evidence — `run_summary.json`
+`overall_status=pass`, `state/stages.tsv` = 22 pass / 31 skip / **0 fail / 0
+abort**. Yet its appended `live_lab_run_matrix.csv` row records
+`overall_result=aborted`, `linux_exit=aborted`, `linux_client=not_run`,
+`linux_anchor=aborted`. The equivalent 2-node **Rust** run
+(`green-row-1783931195`) records the accurate `overall_result=partial`,
+`linux_exit=pass`, `linux_client=pass`, `linux_anchor=skip`.
+
+**Cause.** The shared run-matrix appender resolves role cells + overall status
+by mapping the run's stage names through the stage oracle, which (post-RNQ-16)
+derives from the Rust `StageId` vocabulary. The **bash dialect's** stage names
+(`live_exit_handoff`, `membership_setup`, …) are not in that vocabulary, so the
+appender cannot map the bash run's exit/anchor proof stages to their cells and
+degrades them to `aborted`/`not_run`, which then dominates overall → `aborted`.
+This is the same dialect-divergence root cause that makes mechanical stage-ID
+parity unsatisfiable — surfaced in the role-cell layer. It is NOT a product
+abort and NOT a Rust regression (Rust classifies correctly).
+
+**Spec consequence (fixed 2026-07-13).** §0.a G2 originally compared *raw*
+matrix role cells across the two rows — unreliable, because the bash row's cells
+are dialect-mislabelled. G2 was corrected to derive role-cell outcomes from the
+dialect-**normalized** `parity_input.json` (the `emit-parity-input` output both
+sides already go through for G1), not from raw matrix cells. The raw bash matrix
+row is retained as evidence of BASH-DEF-3, not used as the G2 source of truth.
+
 ## Parity implication
 
 The bash `validate_baseline_runtime` failure is NOT a Rust regression — it is
