@@ -103,13 +103,24 @@ fn restore_terminal() {
     }
 }
 
+/// Resolve `--repo-root <path>` out of the process argv, falling back to the
+/// current directory when the flag is absent. Returns an explicit error
+/// (rather than panicking on an out-of-bounds index) when `--repo-root` is
+/// present but has no following value -- e.g. invoked as the very last
+/// argument from a hand-typed command or a malformed wrapper script.
+fn resolve_repo_root(args: &[String]) -> Result<PathBuf> {
+    match args.iter().position(|a| a == "--repo-root") {
+        Some(idx) => match args.get(idx + 1) {
+            Some(value) => Ok(PathBuf::from(value)),
+            None => anyhow::bail!("--repo-root requires a path argument"),
+        },
+        None => std::env::current_dir().context("getting current directory"),
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let repo_root = if let Some(idx) = args.iter().position(|a| a == "--repo-root") {
-        PathBuf::from(&args[idx + 1])
-    } else {
-        std::env::current_dir().context("getting current directory")?
-    };
+    let repo_root = resolve_repo_root(&args)?;
 
     init_logging(&repo_root)?;
 
@@ -160,4 +171,43 @@ fn main() -> Result<()> {
     restore_terminal();
     result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn repo_root_flag_with_a_value_is_used() {
+        let root = resolve_repo_root(&args(&["rustynet-lab-monitor", "--repo-root", "/some/dir"]))
+            .expect("resolves");
+        assert_eq!(root, PathBuf::from("/some/dir"));
+    }
+
+    #[test]
+    fn missing_repo_root_flag_falls_back_to_current_dir() {
+        let root =
+            resolve_repo_root(&args(&["rustynet-lab-monitor", "--snapshot"])).expect("resolves");
+        assert_eq!(root, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn repo_root_flag_as_the_last_argument_fails_loudly_not_a_panic() {
+        // Regression: a hand-typed or malformed-wrapper invocation with
+        // `--repo-root` as the final token used to index one past the end
+        // of argv and panic. It must now return a clear error instead.
+        let err = resolve_repo_root(&args(&["rustynet-lab-monitor", "--repo-root"]))
+            .expect_err("must fail, not panic, when the flag has no value");
+        assert!(err.to_string().contains("--repo-root"));
+    }
+
+    #[test]
+    fn empty_argv_falls_back_to_current_dir() {
+        let root = resolve_repo_root(&[]).expect("resolves");
+        assert_eq!(root, std::env::current_dir().unwrap());
+    }
 }

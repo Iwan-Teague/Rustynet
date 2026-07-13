@@ -208,4 +208,98 @@ mod tests {
         std::fs::write(orchestration.join("stage_manifest.json"), "not json").unwrap();
         assert!(read_stage_manifest(dir.path()).is_err());
     }
+
+    #[test]
+    fn a_report_dir_that_does_not_exist_at_all_is_missing_not_an_error() {
+        // Distinct from `missing_manifest_is_distinct_from_invalid_manifest`,
+        // which creates the report dir but omits the manifest file -- here
+        // the report dir itself was never created (e.g. queried before the
+        // orchestrator has made anything on disk yet).
+        let dir = tempfile::tempdir().unwrap();
+        let never_created = dir.path().join("does-not-exist-yet");
+        assert!(read_stage_manifest(&never_created).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_genuinely_empty_manifest_file_is_malformed_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestration = dir.path().join("orchestration");
+        std::fs::create_dir_all(&orchestration).unwrap();
+        std::fs::write(orchestration.join("stage_manifest.json"), "").unwrap();
+
+        assert!(read_stage_manifest(dir.path()).is_err());
+    }
+
+    #[test]
+    fn non_utf8_bytes_are_malformed_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestration = dir.path().join("orchestration");
+        std::fs::create_dir_all(&orchestration).unwrap();
+        std::fs::write(
+            orchestration.join("stage_manifest.json"),
+            [0x7b, 0xff, 0xfe, 0x00, 0x22],
+        )
+        .unwrap();
+
+        assert!(read_stage_manifest(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_manifest_torn_mid_write_is_malformed_not_a_panic() {
+        // Simulates a concurrently-writing orchestrator caught exactly
+        // mid-write: a syntactically valid JSON prefix that stops abruptly
+        // partway through the stages array, as if only part of the buffer
+        // had been flushed to disk when this read happened.
+        let dir = tempfile::tempdir().unwrap();
+        let orchestration = dir.path().join("orchestration");
+        std::fs::create_dir_all(&orchestration).unwrap();
+        std::fs::write(
+            orchestration.join("stage_manifest.json"),
+            r#"{"schema_version": 1, "run_mode": "full", "stages": [{"name": "preflight", "grou"#,
+        )
+        .unwrap();
+
+        assert!(read_stage_manifest(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_stage_missing_its_required_name_field_is_rejected_not_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestration = dir.path().join("orchestration");
+        std::fs::create_dir_all(&orchestration).unwrap();
+        std::fs::write(
+            orchestration.join("stage_manifest.json"),
+            r#"{"schema_version": 1, "stages": [{"group": "pre", "enabled": true}]}"#,
+        )
+        .unwrap();
+
+        assert!(read_stage_manifest(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_corrupt_write_followed_by_a_valid_write_recovers_on_the_next_read() {
+        // "Concurrently updated": the monitor polls every 2s, so a read that
+        // lands mid-write today must not poison anything for the NEXT read
+        // once the writer finishes. Each `read_stage_manifest` call is
+        // independent (no cached/sticky error state), so this is really
+        // exercising that property directly.
+        let dir = tempfile::tempdir().unwrap();
+        let orchestration = dir.path().join("orchestration");
+        std::fs::create_dir_all(&orchestration).unwrap();
+        let path = orchestration.join("stage_manifest.json");
+
+        std::fs::write(&path, r#"{"schema_version": 1, "stages": [{"nam"#).unwrap();
+        assert!(read_stage_manifest(dir.path()).is_err());
+
+        std::fs::write(
+            &path,
+            r#"{"schema_version": 1, "run_mode": "full", "stages": [{"name": "preflight", "enabled": true}]}"#,
+        )
+        .unwrap();
+        let manifest = read_stage_manifest(dir.path())
+            .expect("read succeeds once the write completes")
+            .expect("manifest present");
+        assert_eq!(manifest.stages.len(), 1);
+        assert_eq!(manifest.stages[0].name, "preflight");
+    }
 }
