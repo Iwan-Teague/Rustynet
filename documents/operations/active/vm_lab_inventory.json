@@ -39,7 +39,7 @@
         "utm_name": "debian-headless-4"
       },
       "exit_capable": false,
-      "lab_role": "aux",
+      "lab_role": "client",
       "last_known_ip": "192.168.64.10",
       "last_known_network": "lan-192.168.0.0/24",
       "live_ips": [
