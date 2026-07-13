@@ -20,6 +20,7 @@ members = [
   "crates/rustynet-operator",
   "crates/rustynet-mcp",
   "crates/rustynet-xtask",
+  "crates/rustynet-netns-probe",
 ]
 resolver = "2"
 

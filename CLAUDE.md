@@ -345,6 +345,11 @@ Platform + UX + tooling layer:
 - `rustynet-mcp` — MCP servers: `rustynet-mcp-repo-context`,
   `rustynet-mcp-gate-runner`, `rustynet-mcp-lab-state`.
 - `rustynet-xtask` — the `xtask` dev runner (see §7 / §12).
+- `rustynet-netns-probe` — LAB TOOLING (not shipped): the Rust-native STUN
+  responder + NAT mapping/filtering probes the `--node` cross-network netns
+  simulator runs on-guest, replacing the former python3 probe scripts so the
+  `--node` engine has no python3 dependency. `std`-only (offline-buildable on
+  no-egress guests). STUN wire is byte-pinned to `rustynetd`'s `stun_client.rs`.
 
 ### 11.3 Release Profile Note
 `[profile.release]`/`[profile.bench]` enable thin LTO and pin

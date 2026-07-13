@@ -1,0 +1,19 @@
+[package]
+name = "rustynet-netns-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# LAB TOOLING — not a shipped Rustynet product component. Rust-native replacement
+# for the former Python netns probes (stun_responder.py / nat_probe.py /
+# nat_filter_probe.py) so the `--node` cross-network suite has NO python3
+# dependency on lab guests. std-only (no external crates) so it builds offline
+# on no-egress guests with zero cargo-cache additions. Not built by release.yml.
+
+[[bin]]
+name = "rustynet-netns-probe"
+path = "src/main.rs"
+
+[lints]
+workspace = true
