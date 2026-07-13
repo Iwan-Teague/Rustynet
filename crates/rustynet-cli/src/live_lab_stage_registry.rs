@@ -1982,6 +1982,28 @@ pub const STAGES: &[StageSpec] = &[
         conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
+    // Bash-dialect-only cross-network stage. The legacy bash orchestrator emits
+    // `cross_network_daemon_path` (a single warn-level Linux netns daemon-path
+    // proof; the Rust cross-network suite covers the substance via the other
+    // cross_network_* stages). It is NOT a Rust `StageId`, but it MUST be in the
+    // registry: the run-matrix completeness gate rejects any terminal stage
+    // "outside the registry", and without this entry every bash run's matrix
+    // append fails, which forces the finalize verdict to `fail` (mod.rs `overall
+    // = Fail if matrix_error`) even for a fully-green bash run — breaking Track-C
+    // functional-parity comparison. Soft severity: it is warn-level.
+    StageSpec {
+        name: "cross_network_daemon_path",
+        logical: Some("cross_network"),
+        // AllPlatforms to match the historical `cross_network_*` prefix rule in
+        // the oracle (platforms_for_stage) — the drift gate requires registry
+        // and oracle agree. In practice this bash-dialect stage only runs on
+        // Linux, but the platform mapping is only used for column resolution.
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::CrossNetworkSuite,
+        severity: StageSeverity::Soft,
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "cross_network_controller_switch",
         logical: Some("cross_network"),
