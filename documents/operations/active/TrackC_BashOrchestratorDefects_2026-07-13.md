@@ -72,6 +72,34 @@ dialect-**normalized** `parity_input.json` (the `emit-parity-input` output both
 sides already go through for G1), not from raw matrix cells. The raw bash matrix
 row is retained as evidence of BASH-DEF-3, not used as the G2 source of truth.
 
+## TRACKC-FIX-1 — shared registry was missing the bash stage `cross_network_daemon_path`
+
+**Not a bash-script defect — a gap in the SHARED Rust registry, fixed.** The
+legacy bash orchestrator emits a terminal stage `cross_network_daemon_path` (a
+single warn-level Linux netns daemon-path proof). It was NOT in
+`live_lab_stage_registry.rs`. The run-matrix completeness gate
+(`live_lab_run_matrix.rs`: "run evidence contains terminal stages outside the
+registry") therefore rejected the matrix append for EVERY bash run, and the
+finalize forces `overall_status=Fail` whenever the matrix append errors
+(`mod.rs:5584` — `overall = Fail if matrix_error.is_some()`, independent of
+stage outcomes). So a fully-green bash run (23 pass / 59 skip / **0 fail**,
+`run_summary=pass`, `report_state.run_passed=true`) had its
+`orchestrate_result.json` `overall_status` forced to `fail`, which
+`emit-parity-input` reads → `parity_input.overall=Failed` → the functional diff
+reports `overall_status_match=false` against Rust's `Partial`. **This is why the
+first pair's G1 failed even though both engines ran green.**
+
+**Fix (2026-07-13):** registered `cross_network_daemon_path` as a bash-dialect
+StageSpec (`logical=cross_network`, `AllPlatforms` to satisfy the oracle drift
+gate, `Soft` severity — it is warn-level). The registry is the UNION of both
+engines' stage vocabularies; a bash-only stage must be registered so the
+completeness gate + finalize don't spuriously fail bash runs. 23 registry drift
+tests green. A fresh bash run now appends its matrix row and finalizes
+`overall` from real outcomes (`Partial`, matching Rust). Note: the finalize's
+"matrix-append-error ⇒ Fail" rule is correct fail-closed behaviour for the
+PROMOTED (Rust) engine (an evidence-recording failure must block a pass); the
+registry gap was the real bug, not that rule.
+
 ## Parity implication
 
 The bash `validate_baseline_runtime` failure is NOT a Rust regression — it is
