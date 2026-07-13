@@ -782,6 +782,26 @@ pub(crate) fn execute_rust_native_orchestration(
     if let Err(err) = validate_live_lab_run_artifacts(report_dir.as_path()) {
         evidence_errors.push(format!("artifact completeness check failed: {err}"));
     }
+    // Persist the run's orchestration context so (a) a later
+    // `--rerun-stage`/`--resume-from` can reload+reuse it and (b) the
+    // reuse-evidence seal below can bind it into the run's digest. A fresh
+    // full run never wrote it (only `--setup-only` did, at the earlier persist
+    // block; `--run-only` loaded it), so without this a fully-green full run
+    // fails the seal with "state/orchestration_context.json: No such file" and
+    // never records a matrix row — no green `--node` run could produce
+    // evidence. Failure demotes the run (evidence_errors), never a fake pass.
+    if !setup_only && !run_only {
+        match context_binding() {
+            Ok(binding) => {
+                if let Err(err) = ctx.save_bound(context_path.as_path(), &binding) {
+                    evidence_errors.push(format!("persist orchestration context failed: {err}"));
+                }
+            }
+            Err(err) => {
+                evidence_errors.push(format!("build orchestration context binding failed: {err}"));
+            }
+        }
+    }
     let has_not_run = results
         .iter()
         .any(|(_, outcome)| matches!(outcome, StageOutcome::NotRun));
