@@ -16,9 +16,11 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 │  rustynet-dns-zone (Magic DNS)                   │
 │  rustynet-crypto (signing, key types)            │
 ├─────────────────────────────────────────────────┤
-│  Daemon Layer                                    │
+│  Daemon + Services Layer                         │
 │  rustynetd (WG mgmt, STUN, gossip, killswitch)   │
 │  rustynet-relay (frame forwarding)               │
+│  rustynet-nas (storage, per-peer namespaces)     │
+│  rustynet-llm-gateway (inference identity auth)  │
 ├─────────────────────────────────────────────────┤
 │  Backend Abstraction Layer                       │
 │  rustynet-backend-api (Backend trait)            │
@@ -94,6 +96,19 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 | `Killswitch` | `src/killswitch.rs` | Pre-start + post-start killswitch (nftables/WFP/pf) |
 | `MacosPfLoadSpec` | `src/macos_pf_load_spec.rs` | Structured spec for the `macos-pf-load` privileged builtin — daemon sends params, root helper re-renders the `pf` rule text + owns the `pfctl -f` (closes the `pfctl -f` boundary) |
 | `ReconnectPolicy` + `next_reconnect_delay_jittered_ms` | `src/resilience.rs` | Shared backoff primitive (deterministic ceiling + AWS Full Jitter, FIS-0016). Adoption rule: any NEW reconnect loop with inter-attempt delays MUST use the jittered fn; existing spec-timed ladders / condition-polls / local-race retries stay independent per the FIS-0016 classification |
+
+### Service-Hosting Roles (`rustynet-nas`, `rustynet-llm-gateway`)
+
+| Type | Location | Purpose |
+|---|---|---|
+| `rustynet-nas` | `crates/rustynet-nas/` | NAS service-hosting role: tunnel-only storage exposure, per-peer namespace isolation via FUSE/chroot, at-rest encryption, RustyBackup client contract. Binary `rustynet-nas`. |
+| `rustynet-llm-gateway` | `crates/rustynet-llm-gateway/` | LLM service-hosting role: identity-from-tunnel gateway in front of a loopback inference engine. No API keys. gRPC/HTTP-2 token streaming as plaintext inside WireGuard tunnel. RustyAI client contract. Binary `rustynet-llm-gateway`. |
+
+### Lab Tooling (`rustynet-netns-probe`)
+
+| Type | Location | Purpose |
+|---|---|---|
+| `rustynet-netns-probe` | `crates/rustynet-netns-probe/` | LAB TOOLING (not shipped): Rust-native STUN responder + NAT mapping/filtering probes for the `--node` cross-network netns simulator. Replaces former python3 scripts. `std`-only (offline-buildable). STUN wire byte-pinned to `rustynetd`'s `stun_client.rs`. |
 
 ### Live-lab stage contract (`rustynet-cli/src/`)
 
