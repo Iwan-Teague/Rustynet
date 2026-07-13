@@ -4418,7 +4418,10 @@ mod tests {
             "nonce",
             "signature",
         ] {
-            assert!(is_allowed_relay_session_token_key(k), "{k} should be allowed");
+            assert!(
+                is_allowed_relay_session_token_key(k),
+                "{k} should be allowed"
+            );
         }
         // Unknown, mis-cased, trailing-space, or empty keys are rejected so an
         // attacker cannot smuggle extra fields into a relay session token.

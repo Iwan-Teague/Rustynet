@@ -1744,9 +1744,15 @@ mod tests {
     fn hex_decode_accepts_valid_and_rejects_malformed() {
         use super::hex_decode;
         assert_eq!(hex_decode("00ff").unwrap(), vec![0x00, 0xff]);
-        assert_eq!(hex_decode("deadbeef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            hex_decode("deadbeef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
         // Digit decoding is case-insensitive.
-        assert_eq!(hex_decode("DeAdBeEf").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            hex_decode("DeAdBeEf").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
         // Empty and odd-length inputs are rejected.
         assert!(matches!(
             hex_decode(""),

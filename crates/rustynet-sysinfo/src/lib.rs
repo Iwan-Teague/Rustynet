@@ -7130,10 +7130,16 @@ Inter-|   Receive                                    |  Transmit
         // A never-handshaked peer reports 0, returned as-is.
         assert_eq!(parse_wg_latest_handshake_timestamp("PUBKEY\t0"), Some(0));
         // Skips a non-numeric line, takes the next numeric one.
-        assert_eq!(parse_wg_latest_handshake_timestamp("BAD x\nGOOD 42"), Some(42));
+        assert_eq!(
+            parse_wg_latest_handshake_timestamp("BAD x\nGOOD 42"),
+            Some(42)
+        );
         // No numeric second field anywhere -> None.
         assert_eq!(parse_wg_latest_handshake_timestamp("PUBKEY only"), None);
-        assert_eq!(parse_wg_latest_handshake_timestamp("PUBKEY notanumber"), None);
+        assert_eq!(
+            parse_wg_latest_handshake_timestamp("PUBKEY notanumber"),
+            None
+        );
         assert_eq!(parse_wg_latest_handshake_timestamp(""), None);
     }
 
@@ -7141,8 +7147,7 @@ Inter-|   Receive                                    |  Transmit
     fn proc_pid_stat_starttime_extracts_field_22() {
         use super::parse_proc_pid_stat_starttime_ticks;
         // pid (comm) state ppid ... field 22 = starttime.
-        let stat =
-            "1234 (rustynetd) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9999 12345678";
+        let stat = "1234 (rustynetd) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9999 12345678";
         assert_eq!(parse_proc_pid_stat_starttime_ticks(stat), Some(9999));
         // Fewer than 22 fields -> None.
         assert_eq!(parse_proc_pid_stat_starttime_ticks("1 (x) S 1 2 3"), None);
@@ -7173,10 +7178,14 @@ Inter-|   Receive                                    |  Transmit
     #[test]
     fn macos_ifconfig_iface_up_requires_up_without_down() {
         use super::parse_macos_ifconfig_iface_up;
-        assert!(parse_macos_ifconfig_iface_up("flags=8863<UP,BROADCAST,RUNNING> mtu 1500"));
+        assert!(parse_macos_ifconfig_iface_up(
+            "flags=8863<UP,BROADCAST,RUNNING> mtu 1500"
+        ));
         // A DOWN flag anywhere wins (precedence documented).
         assert!(!parse_macos_ifconfig_iface_up("flags=8802<DOWN,BROADCAST>"));
-        assert!(!parse_macos_ifconfig_iface_up("flags=<UP,BROADCAST> ... DOWN"));
+        assert!(!parse_macos_ifconfig_iface_up(
+            "flags=<UP,BROADCAST> ... DOWN"
+        ));
         // No UP flag at all.
         assert!(!parse_macos_ifconfig_iface_up("flags=<BROADCAST,RUNNING>"));
         assert!(!parse_macos_ifconfig_iface_up(""));
@@ -7189,7 +7198,10 @@ Inter-|   Receive                                    |  Transmit
             "Ethernet adapter RustyNet0:",
             "rustynet0"
         ));
-        assert!(windows_ipconfig_mentions_interface("... WIRELESS lan ...", "wireless"));
+        assert!(windows_ipconfig_mentions_interface(
+            "... WIRELESS lan ...",
+            "wireless"
+        ));
         assert!(!windows_ipconfig_mentions_interface(
             "Ethernet adapter Ethernet:",
             "rustynet0"
@@ -7273,7 +7285,10 @@ Some unrelated line: value
 ";
         let ifaces = parse_windows_ipconfig_interfaces(sample);
         let names: Vec<&str> = ifaces.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, vec!["Ethernet adapter Ethernet", "Wireless LAN adapter Wi-Fi"]);
+        assert_eq!(
+            names,
+            vec!["Ethernet adapter Ethernet", "Wireless LAN adapter Wi-Fi"]
+        );
         assert!(ifaces.iter().all(|i| i.up)); // ipconfig layer reports all up
         assert!(parse_windows_ipconfig_interfaces("").is_empty());
         assert!(parse_windows_ipconfig_interfaces("No adapters here: x").is_empty());
