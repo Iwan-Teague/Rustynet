@@ -215,12 +215,19 @@ pub fn infer_active_stage(
     // pointer backward into an earlier phase. When it would regress, or
     // there's no log signal at all, fall through to the monotonic
     // pipeline-position fallback below.
+    //
+    // Reading either log is best-effort: a concurrently-written log can be
+    // caught mid-write (e.g. a torn multi-byte UTF-8 sequence at the buffer
+    // boundary makes the whole file briefly invalid UTF-8), and a crashed or
+    // rotated log can vanish between being listed and being read. None of
+    // that should disable active-stage tracking for the whole run -- an
+    // unreadable log is simply "no signal from this source", falling
+    // through to the pipeline-position fallback below, not a hard error.
     let mut candidate = None;
     let log_path = report_dir.join("orchestration").join("orchestrate.log");
-    if log_path.exists() {
-        let raw = std::fs::read_to_string(&log_path)
-            .with_context(|| format!("reading {}", log_path.display()))?;
-
+    if log_path.exists()
+        && let Ok(raw) = std::fs::read_to_string(&log_path)
+    {
         // Find the most recent line containing STAGE:
         for line in raw.lines().rev() {
             if let Some(idx) = line.find("STAGE:") {
@@ -234,7 +241,7 @@ pub fn infer_active_stage(
         }
     }
     if candidate.is_none() {
-        candidate = infer_active_stage_from_logs(report_dir)?;
+        candidate = infer_active_stage_from_logs(report_dir);
     }
 
     if let Some(stage) = candidate
@@ -349,33 +356,42 @@ fn read_live_stages_tsv(report_dir: &Path) -> Result<Vec<StageOutcome>> {
     Ok(outcomes)
 }
 
-fn infer_active_stage_from_logs(report_dir: &Path) -> Result<Option<String>> {
+/// Best-effort: a directory listing can race a concurrent writer (a log
+/// rotated or removed between being listed and being read, a `.log` name
+/// that is transiently a half-created directory, a metadata call on an
+/// entry that vanished a moment ago), and a log file can be caught mid-write
+/// with invalid-UTF-8 bytes at the tail. None of that is fatal to active-stage
+/// inference -- it just means this one candidate source has nothing to offer,
+/// so every fallible step here degrades to "skip this entry" / `None` instead
+/// of failing the whole scan.
+fn infer_active_stage_from_logs(report_dir: &Path) -> Option<String> {
     let logs_dir = report_dir.join("logs");
     if !logs_dir.exists() {
-        return Ok(None);
+        return None;
     }
     let mut logs = Vec::new();
-    for entry in
-        std::fs::read_dir(&logs_dir).with_context(|| format!("reading {}", logs_dir.display()))?
-    {
-        let entry = entry?;
+    let Ok(read_dir) = std::fs::read_dir(&logs_dir) else {
+        return None;
+    };
+    for entry in read_dir.flatten() {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
             continue;
         }
-        let modified = entry.metadata()?.modified().ok();
+        let modified = entry.metadata().ok().and_then(|meta| meta.modified().ok());
         logs.push((modified, path));
     }
     logs.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
 
     for (_, path) in logs {
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         if let Some(stage) = active_stage_from_log_text(&raw) {
-            return Ok(Some(stage));
+            return Some(stage);
         }
     }
-    Ok(None)
+    None
 }
 
 fn active_stage_from_log_text(raw: &str) -> Option<String> {
@@ -658,5 +674,172 @@ mod tests {
         assert_eq!(read.result.outcomes.len(), 1);
         assert_eq!(read.result.outcomes[0].stage, "new");
         assert_eq!(read.result.outcomes[0].status, "running");
+    }
+
+    #[test]
+    fn empty_stages_tsv_file_yields_no_outcomes_not_a_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(state.join("stages.tsv"), "").expect("empty stages.tsv");
+
+        let result = read_orchestrate_result(dir.path()).expect("result");
+
+        assert!(result.outcomes.is_empty());
+    }
+
+    #[test]
+    fn stages_tsv_mixed_wellformed_and_malformed_rows_keeps_only_wellformed() {
+        // A concurrently-appended stages.tsv can contain blank lines, short
+        // rows (an interrupted write with fewer tab-separated fields than
+        // the recorder's own 3-column minimum), and a genuinely torn last
+        // row with no trailing newline -- mixed in with real, complete rows.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(
+            state.join("stages.tsv"),
+            "preflight\thard\tpass\t0\t/tmp/preflight.log\tverify\n\
+             \n\
+             short\trow\n\
+             bootstrap_hosts\thard\trunning\t0\t/tmp/b.log\tin progress",
+        )
+        .expect("mixed stages.tsv");
+
+        let result = read_orchestrate_result(dir.path()).expect("result");
+
+        assert_eq!(result.outcomes.len(), 2, "{:?}", result.outcomes);
+        assert_eq!(result.outcomes[0].stage, "preflight");
+        assert_eq!(result.outcomes[0].status, "pass");
+        assert_eq!(result.outcomes[1].stage, "bootstrap_hosts");
+        assert_eq!(result.outcomes[1].status, "running");
+    }
+
+    #[test]
+    fn a_truncated_status_word_parses_as_unknown_never_a_false_pass_or_fail() {
+        // A torn write can leave a genuine prefix of a status word (e.g. the
+        // recorder was writing "pass" and got cut off after 3 bytes). That
+        // must never coincidentally read as terminal/satisfied -- it must
+        // render as the explicit Unknown state, not a false green (or red).
+        for truncated in ["pas", "fai", "runnin", "p", ""] {
+            if truncated.is_empty() {
+                // Empty parses as Pending by design (see StageStatus::parse);
+                // covered by its own dedicated arm, not Unknown.
+                assert_eq!(StageStatus::parse(truncated), StageStatus::Pending);
+                continue;
+            }
+            let status = StageStatus::parse(truncated);
+            assert_eq!(
+                status,
+                StageStatus::Unknown,
+                "truncated status {truncated:?} must not parse as anything decisive"
+            );
+            assert!(!status.is_terminal());
+            assert!(!status.is_satisfied());
+            assert!(!status.is_failure());
+        }
+    }
+
+    #[test]
+    fn corrupt_orchestrate_result_json_returns_err_not_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orchestration = dir.path().join("orchestration");
+        std::fs::create_dir_all(&orchestration).expect("orchestration dir");
+        std::fs::write(
+            orchestration.join("orchestrate_result.json"),
+            [0x7b, 0xff, 0xfe, 0x22],
+        )
+        .expect("corrupt result");
+
+        assert!(read_orchestrate_result(dir.path()).is_err());
+        assert!(read_completed_stage_state(dir.path()).is_err());
+    }
+
+    #[test]
+    fn empty_orchestrate_result_json_file_returns_err_not_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orchestration = dir.path().join("orchestration");
+        std::fs::create_dir_all(&orchestration).expect("orchestration dir");
+        std::fs::write(orchestration.join("orchestrate_result.json"), "").expect("empty result");
+
+        assert!(read_orchestrate_result(dir.path()).is_err());
+    }
+
+    #[test]
+    fn read_active_stage_state_degrades_to_err_on_corrupt_json_when_no_tsv_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orchestration = dir.path().join("orchestration");
+        std::fs::create_dir_all(&orchestration).expect("orchestration dir");
+        std::fs::write(orchestration.join("orchestrate_result.json"), "not json")
+            .expect("corrupt result");
+
+        // No panic; an explicit Err the caller (App::refresh_state) turns
+        // into a visible `data_errors` entry instead of a false-green
+        // "nothing running" or stale display.
+        assert!(read_active_stage_state(dir.path()).is_err());
+    }
+
+    #[test]
+    fn infer_active_stage_survives_non_utf8_orchestrate_log() {
+        // A concurrent writer can be caught mid-write on a multi-byte UTF-8
+        // boundary, making the whole file transiently invalid UTF-8. That
+        // must degrade to "no signal from this source" (falling through to
+        // the pipeline-position fallback), never a hard failure that freezes
+        // active-stage tracking.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orchestration = dir.path().join("orchestration");
+        std::fs::create_dir_all(&orchestration).expect("orchestration dir");
+        std::fs::write(
+            orchestration.join("orchestrate.log"),
+            [b'S', b'T', b'A', b'G', b'E', b':', 0xff, 0xfe],
+        )
+        .expect("non-utf8 log");
+        let ordered = vec!["preflight".to_owned(), "bootstrap_hosts".to_owned()];
+        let outcomes = vec![outcome("preflight", "pass")];
+
+        let stage = infer_active_stage(dir.path(), &ordered, &outcomes)
+            .expect("must not error on unreadable log content");
+
+        assert_eq!(
+            stage.as_deref(),
+            Some("bootstrap_hosts"),
+            "falls through to the pipeline-position fallback"
+        );
+    }
+
+    #[test]
+    fn infer_active_stage_survives_non_utf8_per_stage_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        std::fs::write(logs.join("bootstrap_hosts.log"), [0xff, 0xfe, 0x00, 0x01])
+            .expect("non-utf8 stage log");
+        let ordered = vec!["preflight".to_owned(), "bootstrap_hosts".to_owned()];
+        let outcomes = vec![outcome("preflight", "pass")];
+
+        let stage = infer_active_stage(dir.path(), &ordered, &outcomes)
+            .expect("must not error on an unreadable per-stage log");
+
+        assert_eq!(stage.as_deref(), Some("bootstrap_hosts"));
+    }
+
+    #[test]
+    fn infer_active_stage_skips_a_directory_shaped_log_entry() {
+        // A `.log`-suffixed path can transiently be a directory rather than
+        // a file (a half-created artifact). Listing it is fine; reading it
+        // errors (Is a directory) and must be skipped, not propagated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(logs.join("weird.log")).expect("dir shaped like a .log");
+        std::fs::write(
+            logs.join("bootstrap_hosts.log"),
+            "[stage:bootstrap_hosts] START fresh install\n",
+        )
+        .expect("real log");
+
+        let stage = infer_active_stage(dir.path(), &[], &[])
+            .expect("must not error on a directory-shaped .log entry");
+
+        assert_eq!(stage.as_deref(), Some("bootstrap_hosts"));
     }
 }

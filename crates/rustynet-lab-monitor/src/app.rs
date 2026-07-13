@@ -3565,6 +3565,74 @@ mod tests {
     }
 
     #[test]
+    fn inventory_loader_treats_a_missing_file_as_empty_not_an_error() {
+        // A missing inventory is a legitimate cold-start state, not a
+        // defect -- the VM panel just shows the host-only UTM VMs. It must
+        // NOT surface a `data_errors` entry for this case.
+        let dir = tempfile::tempdir().unwrap();
+        let entries = load_inventory_vms(&dir.path().join("nope.json")).expect("missing is ok");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn inventory_loader_fails_loud_on_corrupt_json_never_silently_empty() {
+        // A corrupt inventory must be a VISIBLE error (surfaced as a
+        // `data_errors` entry by the caller), never silently swallowed into
+        // an empty list that would look like "no VMs configured".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inventory.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+        assert!(load_inventory_vms(&path).is_err());
+
+        // Non-UTF8 bytes are equally a hard, visible error.
+        std::fs::write(&path, [0x7b, 0xff, 0xfe, 0x00]).unwrap();
+        assert!(load_inventory_vms(&path).is_err());
+    }
+
+    #[test]
+    fn inventory_loader_missing_entries_array_is_a_visible_error() {
+        // Valid JSON but the wrong shape (no `entries` array at all) is a
+        // schema defect the operator needs to see, not a silent empty read.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inventory.json");
+        std::fs::write(&path, r#"{"something_else": true}"#).unwrap();
+        assert!(load_inventory_vms(&path).is_err());
+    }
+
+    #[test]
+    fn inventory_loader_empty_entries_array_is_ok_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inventory.json");
+        std::fs::write(&path, r#"{"entries": []}"#).unwrap();
+        let entries = load_inventory_vms(&path).expect("empty entries is ok");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn inventory_loader_skips_entries_missing_required_fields_without_erroring() {
+        // A partially-written entry (added to the array before its `alias`
+        // was filled in) must be skipped, not abort the whole load or crash
+        // -- the other, complete entries still render.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inventory.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"entries": [
+                {"ssh_target": "no-alias.local",
+                 "controller": {"type": "local_utm", "utm_name": "No Alias"}},
+                {"alias": "good-vm", "ssh_target": "good.local",
+                 "controller": {"type": "local_utm", "utm_name": "Good"}}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+
+        let entries = load_inventory_vms(&path).expect("inventory");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].alias, "good-vm");
+    }
+
+    #[test]
     fn assigning_macos_exit_sets_promote_exit_and_rebuild_node() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         let vm = crate::data::vm_prober::VmStatus {

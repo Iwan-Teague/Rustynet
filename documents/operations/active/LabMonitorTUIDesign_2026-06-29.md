@@ -279,13 +279,65 @@ Add to workspace `Cargo.toml` members.
 
 ## 11. Gates
 
-Before merging:
-- `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo check --workspace --all-targets --all-features`
-- `cargo test --workspace --all-targets --all-features`
+**This crate is EXCLUDED from the main Cargo workspace** (root `Cargo.toml`
+`exclude = ["gui", "crates/rustynet-lab-monitor"]`), so the repo-wide
+`cargo … --workspace` gates do **not** touch it. Gate it **standalone**, from
+inside the crate directory (which has its own `Cargo.lock` and its own empty
+`[workspace]` table):
 
-No new security-sensitive logic — no gate script extension needed. The crate does not touch WireGuard, crypto, trust state, or ACL; it is an observer and a process launcher.
+```sh
+cd crates/rustynet-lab-monitor
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo check --all-targets --locked
+cargo test --locked
+```
+
+These four are wrapped by `scripts/ci/lab_monitor_gates.sh` and wired into
+`.github/workflows/cross-platform-ci.yml` as a dedicated **"Lab monitor
+standalone gates"** step on the **macOS** and **Debian (Linux)** legs — the two
+OSes this tool supports (macOS/Linux only; no Windows port, §10). That makes the
+excluded crate a **first-class gated target**: a fmt/clippy/check/test
+regression fails CI exactly as a workspace regression would, rather than being
+invisible to the `--workspace` gates. See also the crate `README.md`.
+
+No new security-sensitive logic — no security gate-script extension needed. The
+crate does not touch WireGuard, crypto, trust state, or ACL; it is an observer
+and a process launcher.
+
+### 11.1 Input robustness (2026-07-13)
+
+The monitor reads exclusively **untrusted, concurrently-written** state files
+(run manifest/result, `stages.tsv`, `report_state.json`, parallel `results.tsv`,
+`vm_lab_inventory.json`, `utmctl list`, run-matrix CSV). Every parser is
+hardened to **degrade gracefully** — never panic, never present a false-green or
+an incoherent count — on corrupt, missing, empty, stale, partially-written, and
+concurrently-updated input, with the failure surfaced as an explicit
+waiting/degraded/error state (or a silently-skipped bad record) rather than a
+plausible-looking guess. Regressions fixed in this pass:
+
+- **`utmctl list` parsing** returned `Result` and `?`-bubbled on the first
+  malformed row, blanking out discovery of **every** VM on the host; now
+  best-effort per row (one bad row skipped, the rest survive), and the command's
+  stdout is decoded lossily so a stray non-UTF8 byte in one VM name can't hide
+  the others.
+- **Job-state JSON scan** (`find_running_jobs_with_live_processes`)
+  `?`-propagated on the first unreadable/corrupt/non-UTF8/directory-shaped
+  `.json`, hiding a genuinely-running job sitting next to one stale file from a
+  past crash; now best-effort per directory and per entry.
+- **`truncate_session`** byte-sliced at `len() - 12` and panicked on any
+  multi-byte-UTF8 session id straddling the cut; now char-counted.
+- **`--repo-root` CLI parsing** indexed one past the end of argv when the flag
+  was the last token; now returns a clear error.
+- **Stage-log active-stage inference** `?`-errored on an unreadable/torn
+  `orchestrate.log` or per-stage `.log`, freezing active-stage tracking for the
+  whole run; now degrades to "no signal from this source" and falls through to
+  the pipeline-position fallback.
+
+Each fix ships with adversarial-input unit tests in the owning `src/data/*`
+module (and `src/app.rs` / `src/main.rs`); the truncated-status-word test pins
+that a torn status prefix like `"pas"` parses as `Unknown`, never a decisive
+false pass/fail.
 
 ---
 

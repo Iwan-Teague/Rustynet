@@ -1785,4 +1785,145 @@ mod tests {
         assert_eq!(matrix.cross_os[0].name, "dns");
         assert_eq!(matrix.cross_os[0].state, ParityState::Proven);
     }
+
+    fn write_matrix_csv_bytes(dir: &std::path::Path, content: &[u8]) {
+        let docs = dir.join("documents").join("operations");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("live_lab_run_matrix.csv"), content).unwrap();
+    }
+
+    /// A genuinely empty (0-byte) file is distinct from a MISSING file (the
+    /// `!path.exists()` early-return) -- it exists, but the `csv` crate has
+    /// no header row to read at all. Every loader must degrade to its empty
+    /// default, never panic.
+    #[test]
+    fn genuinely_empty_csv_file_does_not_panic_across_every_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv_bytes(dir.path(), b"");
+
+        let matrix = load_parity_matrix(dir.path()).expect("parity matrix");
+        assert!(matrix.values().all(|state| *state == ParityState::Unproven));
+
+        let progress = load_stage_progress(dir.path()).expect("stage progress");
+        assert_eq!(progress.total, 0);
+        assert_eq!(progress.passed, 0);
+
+        let runs = load_recent_runs(dir.path(), 3).expect("recent runs");
+        assert!(runs.is_empty());
+
+        let full = load_full_stage_matrix(dir.path()).expect("full stage matrix");
+        assert!(full.linux.is_empty());
+        assert!(full.macos.is_empty());
+        assert!(full.windows.is_empty());
+        assert!(full.cross_os.is_empty());
+
+        let sparklines = load_sparklines(dir.path(), 8).expect("sparklines");
+        assert!(
+            sparklines
+                .values()
+                .all(|history| history.iter().all(|o| *o == CellOutcome::NotRun))
+        );
+
+        let roles = load_latest_run_roles(dir.path()).expect("latest run roles");
+        assert!(roles.is_empty());
+    }
+
+    #[test]
+    fn a_csv_path_that_is_actually_a_directory_returns_err_not_panic() {
+        // A rare but possible shape: the expected CSV path is a directory
+        // (e.g. a botched `mkdir -p` upstream). Opening it must fail
+        // cleanly, exactly like any other unreadable file, not panic --
+        // never a false "all proven" / "0 runs" read presented as real data.
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("documents").join("operations");
+        std::fs::create_dir_all(docs.join("live_lab_run_matrix.csv")).unwrap();
+
+        // `load_parity_matrix` treats a header-read failure the same as "no
+        // matrix data at all" (`.headers().ok()`, not `?`) rather than a
+        // hard error -- still fail-safe (every cell reads Unproven, never a
+        // false Proven/Failed), just via a different, deliberately lenient
+        // path than the other loaders below.
+        let matrix = load_parity_matrix(dir.path()).expect("does not hard-error");
+        assert!(matrix.values().all(|state| *state == ParityState::Unproven));
+        assert!(load_stage_progress(dir.path()).is_err());
+        assert!(load_recent_runs(dir.path(), 3).is_err());
+        assert!(load_full_stage_matrix(dir.path()).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_bytes_in_a_data_row_are_skipped_not_erred() {
+        // A concurrently-appended CSV row caught mid-write can briefly
+        // contain a torn multi-byte UTF-8 sequence. The `csv` crate errors
+        // on that ONE record when materializing it as a `StringRecord`;
+        // every loader here must skip just that record; a header
+        // discovery / dedupe pass over the pass/fail history from remaining
+        // valid rows.
+        let dir = tempfile::tempdir().unwrap();
+        let mut content = b"overall_result,macos_stage_anchor\npass,pass\n".to_vec();
+        content.extend_from_slice(b"pass,\xff\xfe\n");
+        content.extend_from_slice(b"pass,fail\n");
+        write_matrix_csv_bytes(dir.path(), &content);
+
+        let matrix = load_parity_matrix(dir.path()).expect("parity matrix");
+        // Latest DECISIVE value among the valid rows is "fail" (the invalid
+        // row in between contributed nothing).
+        assert_eq!(
+            matrix.get(&(Role::Anchor, Os::Macos)),
+            Some(&ParityState::Failed)
+        );
+
+        let runs = load_recent_runs(dir.path(), 5).expect("recent runs");
+        assert_eq!(
+            runs.len(),
+            2,
+            "the one invalid-UTF8 row must be dropped, not crash the read"
+        );
+    }
+
+    #[test]
+    fn ragged_rows_with_fewer_or_more_columns_than_header_do_not_panic() {
+        // `flexible(true)` accepts rows that don't match the header's column
+        // count at all (a real-world source of ragged rows: a schema
+        // version bump that adds/removes a trailing column, or -- for the
+        // very last row -- a concurrent writer's row caught mid-append).
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv_bytes(
+            dir.path(),
+            b"overall_result,macos_stage_anchor,windows_stage_relay\n\
+              pass,pass\n\
+              pass,fail,not_run,extra_unexpected_column\n\
+              pass,pass,pass\n",
+        );
+
+        // Must not panic; every loader still produces a well-formed result.
+        let matrix = load_parity_matrix(dir.path()).expect("parity matrix");
+        assert!(matrix.contains_key(&(Role::Anchor, Os::Macos)));
+        let progress = load_stage_progress(dir.path()).expect("stage progress");
+        assert_eq!(progress.total, 2);
+        let runs = load_recent_runs(dir.path(), 5).expect("recent runs");
+        assert_eq!(runs.len(), 3);
+    }
+
+    #[test]
+    fn a_truncated_last_row_without_a_trailing_newline_does_not_corrupt_earlier_rows() {
+        // Simulates the exact "concurrently updated" moment: the CSV
+        // appender has flushed 2 complete rows and is partway through
+        // writing a 3rd when this read happens -- no trailing newline yet,
+        // and the row itself has fewer fields than the header.
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv_bytes(
+            dir.path(),
+            b"overall_result,macos_stage_anchor\n\
+              pass,pass\n\
+              fail,fail\n\
+              pass,pa",
+        );
+
+        let runs = load_recent_runs(dir.path(), 5).expect("recent runs");
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        // The earlier, complete rows must read exactly as written --
+        // untouched by the torn trailing row.
+        assert_eq!(runs[2].overall_result, "pass");
+        assert_eq!(runs[1].overall_result, "fail");
+    }
 }
