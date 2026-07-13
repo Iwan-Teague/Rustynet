@@ -67,6 +67,9 @@ pub struct CandidateObservation {
     /// Betweenness-centrality permille within the mesh graph. `None`
     /// until the (phase 3) Brandes collector lands.
     pub centrality: Option<u16>,
+    /// Observation timestamp, carried for the phase-2+ collectors and
+    /// freshness-window checks; the phase-1 scorer does not read it
+    /// (two observations differing only here score identically).
     pub observed_at_unix: u64,
 }
 
@@ -101,6 +104,12 @@ pub struct RoleRecommendation {
 
 /// Criterion weights: uptime 0.30, reachability stability 0.25, NAT class
 /// 0.20, bandwidth headroom 0.15, centrality 0.10.
+///
+/// Invariants (test-pinned here and in `tests/mcda_scorer_invariants.rs`):
+/// every weight is strictly positive (monotonicity depends on it) and the
+/// vector sums to exactly 1.0 in f64, so a perfect candidate scores
+/// exactly 1.0 and every score lies in [0.0, 1.0]. There is deliberately
+/// no runtime renormalization step that could hide a drifted edit.
 const WEIGHTS: [f64; 5] = [0.30, 0.25, 0.20, 0.15, 0.10];
 
 fn permille_normalized(value: Option<u16>) -> (f64, bool) {
@@ -171,6 +180,15 @@ pub fn compute_role_score(
 }
 
 /// Rank candidates for a role. Empty input recommends nobody.
+///
+/// Ranking follows the total order (score descending, then `node_id`
+/// ascending), so for unique node ids the output is deterministic and
+/// independent of input order. Callers supply one observation per node;
+/// if the same node id is passed twice with an identical score, the two
+/// entries keep their input order (stable sort) — the scorer neither
+/// dedupes nor rejects duplicates. A single candidate is still ranked (a
+/// list of one); `insufficient_data` reflects evidence quality and the
+/// empty set, never candidate count.
 pub fn recommend_role_placement(
     role: RoleType,
     observations: &[CandidateObservation],
@@ -243,8 +261,8 @@ pub fn render_recommendation(recommendation: &RoleRecommendation) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BandwidthHeadroom, CandidateObservation, NatClassCode, RoleType, compute_role_score,
-        recommend_role_placement,
+        BandwidthHeadroom, CandidateObservation, NatClassCode, RoleType, WEIGHTS,
+        compute_role_score, recommend_role_placement,
     };
 
     fn full_observation(node_id: &str) -> CandidateObservation {
@@ -256,6 +274,23 @@ mod tests {
             bandwidth_headroom: BandwidthHeadroom::High,
             centrality: Some(500),
             observed_at_unix: 1_000,
+        }
+    }
+
+    #[test]
+    fn weights_are_positive_and_sum_to_exactly_one() {
+        let sum: f64 = WEIGHTS.iter().sum();
+        assert_eq!(
+            sum, 1.0,
+            "criterion weights must sum to exactly 1.0 so scores stay in [0, 1] \
+             without a renormalization step"
+        );
+        for weight in WEIGHTS {
+            assert!(
+                weight > 0.0,
+                "every criterion weight must stay strictly positive or per-criterion \
+                 monotonicity breaks"
+            );
         }
     }
 
