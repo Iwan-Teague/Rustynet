@@ -2321,11 +2321,11 @@ mod tests {
         // Cfg-invariant rejects. (Loopback is intentionally allowed under
         // cfg(test) so tests can dial 127.0.0.1, so it is not asserted here.)
         for bad in [
-            endpoint([203, 0, 113, 7], 0),           // port 0
-            endpoint([0, 0, 0, 0], 51820),           // unspecified
-            endpoint([224, 0, 0, 1], 51820),         // multicast
-            endpoint([169, 254, 1, 1], 51820),       // v4 link-local
-            endpoint([255, 255, 255, 255], 51820),   // broadcast
+            endpoint([203, 0, 113, 7], 0),         // port 0
+            endpoint([0, 0, 0, 0], 51820),         // unspecified
+            endpoint([224, 0, 0, 1], 51820),       // multicast
+            endpoint([169, 254, 1, 1], 51820),     // v4 link-local
+            endpoint([255, 255, 255, 255], 51820), // broadcast
         ] {
             assert!(!super::is_candidate_endpoint_allowed(bad, &no_ifaces));
         }
@@ -2333,7 +2333,10 @@ mod tests {
             v6("fe80::1", 51820),
             &no_ifaces
         )); // v6 link-local
-        assert!(!super::is_candidate_endpoint_allowed(v6("::", 51820), &no_ifaces)); // v6 unspecified
+        assert!(!super::is_candidate_endpoint_allowed(
+            v6("::", 51820),
+            &no_ifaces
+        )); // v6 unspecified
 
         // Anti-reflection: an endpoint that is one of our own interface addrs
         // is rejected.
