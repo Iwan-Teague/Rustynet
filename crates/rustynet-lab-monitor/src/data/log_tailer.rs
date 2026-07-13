@@ -373,4 +373,87 @@ mod tests {
         assert!(!lines.iter().any(|line| line.contains("is running")));
         assert!(lines.iter().any(|line| line.contains("bootstrapped")));
     }
+
+    #[test]
+    fn a_short_parallel_result_row_is_skipped_not_panicked() {
+        // A concurrently-appended results.tsv row caught mid-write has
+        // fewer than the 9 required tab fields. Indexing it would panic;
+        // the length guard must skip it and return None instead.
+        let aliases = HashMap::new();
+        assert!(summarize_parallel_result_row("stage\tlabel\ttarget", "stage", &aliases).is_none());
+        assert!(summarize_parallel_result_row("", "stage", &aliases).is_none());
+    }
+
+    #[test]
+    fn a_non_numeric_return_code_is_treated_as_failure_never_a_false_success() {
+        // rc lives in field 5; a torn/garbage value there must default to
+        // "failed" (rc != 0), never be silently read as the success (rc==0)
+        // path -- a false green on a stage that may actually have failed.
+        let aliases = HashMap::new();
+        let row = "bootstrap_hosts\texit\tdebian@10.0.0.1\texit-1\tadmin\tNOT_A_NUMBER\ts\tf\t/tmp/x.log\t\t\t\t";
+        let summary = summarize_parallel_result_row(row, "bootstrap_hosts", &aliases)
+            .expect("a 9+-field row still summarizes");
+        assert!(
+            summary.contains("failed"),
+            "unparseable rc must read as failure, got: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_success_row_reads_as_success() {
+        let aliases = HashMap::new();
+        let row =
+            "bootstrap_hosts\texit\tdebian@10.0.0.1\texit-1\tadmin\t0\ts\tf\t/tmp/x.log\t\t\t\t";
+        let summary = summarize_parallel_result_row(row, "bootstrap_hosts", &aliases)
+            .expect("well-formed row summarizes");
+        assert!(
+            !summary.contains("failed"),
+            "rc 0 must not read as failure: {summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_stage_lines_on_a_missing_log_returns_empty_not_an_error() {
+        // No parallel dir and no per-stage log at all (queried before the
+        // stage wrote anything) -- must degrade to an empty summary, never
+        // error or panic.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let report = repo.join("state/report");
+        std::fs::create_dir_all(&report).unwrap();
+
+        let lines = summarize_stage_lines(repo, &report, "a_stage_with_no_log_yet")
+            .expect("missing log degrades cleanly");
+        // No parallel dir and no per-stage log content at all -> an empty
+        // summary (the log panel renders "No log output"), never an error
+        // or a panic.
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn corrupt_inventory_does_not_break_parallel_summarization() {
+        // load_inventory_aliases is best-effort here (.unwrap_or_default at
+        // the call site): a corrupt inventory JSON must simply mean "no
+        // alias enrichment", falling back to the raw node label -- never a
+        // failed or panicking stage summary.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let inventory = repo.join("documents/operations/active");
+        std::fs::create_dir_all(&inventory).unwrap();
+        std::fs::write(inventory.join("vm_lab_inventory.json"), "{ not json").unwrap();
+        let report = repo.join("state/report");
+        let parallel = report.join("state/parallel-bootstrap_hosts");
+        std::fs::create_dir_all(&parallel).unwrap();
+        std::fs::write(
+            parallel.join("results.tsv"),
+            "bootstrap_hosts\texit\tdebian@10.0.0.1\texit-1\tadmin\t0\ts\tf\t/tmp/x.log\t\t\t\t\n",
+        )
+        .unwrap();
+
+        let lines = summarize_stage_lines(repo, &report, "bootstrap_hosts")
+            .expect("corrupt inventory must not fail the summary");
+        // Falls back to the raw node label ("exit") since alias lookup found
+        // nothing -- and still produced a real summary line.
+        assert!(lines.iter().any(|line| line.contains("exit")), "{lines:?}");
+    }
 }
