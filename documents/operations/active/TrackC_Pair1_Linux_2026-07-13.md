@@ -16,7 +16,7 @@ First paired bash↔Rust functional-parity run scored against the §0.a G1–G8 
 |---|---|---|
 | G1 functional diff | **partial** | `overall_status_match=true` (both Partial — the TRACKC-FIX-1 registry fix resolved the first pair's false `Failed`), `node_count_match=true`. `pass=false` on ONE shared stage: `cross_network_preflight` (bash=skipped, Rust=passed). See Finding P1-1. |
 | G2 role-cell equality | **pass** | From normalized parity inputs: both proved client; Rust proved exit via the full lifecycle (`exit_handoff`/`active_exit`/`exit_dns_failclosed`/`exit_nat_lifecycle`/`exit_demotion_residue` all pass) where bash proved exit only via `validate_baseline_runtime` + skipped `live_exit_handoff`. Rust proving MORE for a role is not a G2 failure (governed by G7). No role bash proved that Rust did not. |
-| G3 cleanup + residue | **FAIL (follow-up)** | Both cleanups terminal `pass` and the Rust `assert_node_clean` passed, but the independent post-run probe found `table inet rustynet_boot` on BOTH guests. See Finding P1-2. |
+| G3 cleanup + residue | **PASS (confirmed by Pair-3 re-run 2026-07-13)** | In Pair-1/2 the independent post-run probe found `table inet rustynet_boot` on BOTH guests (Finding P1-2, a real fail-open). After the `20bca19` sbin-PATH fail-closed fix, the **Pair-3** re-run at `44c23ef` (bash `state/pair3-bash-1783951734` + Rust `state/pair3-rust-1783951735`, both matrix rows appended) left BOTH guests clean: independent out-of-band probe → `nft rustynet tables=(none)`, tunnel iface=none, `ip_forward=0`, daemon inactive on exit `debian-headless-2` AND client `debian-headless-4`. Residue now both detected (fail-closed) and removed. |
 | G4 evidence completeness | **pass** | Both artifacts present, both matrix rows well-formed, Rust finalize 0 errors. |
 | G5 provenance | **pass** | Both `982a6e2`, `dirty_state=clean`, same inventory/topology. |
 | G6 no cherry-picking | **pass** | Single lab-state window, chained bash→Rust, neither side re-run. |
@@ -62,6 +62,18 @@ debian-headless-2: fake `rustynet_boot` table → fixed probe reports dirty →
 fixed reset removes it → re-probe clean; both guests confirmed clean. This
 un-blocks Pair 1's G3 on a re-run (the residue is now both detected and
 removed).
+
+**Pair-3 confirmation (2026-07-13, `44c23ef`).** Full paired bash→Rust re-run
+at the fixed commit (bash `state/pair3-bash-1783951734`, Rust
+`state/pair3-rust-1783951735`; both appended a matrix row; Rust `cleanup` stage
+`pass`). The independent out-of-band residue probe found BOTH guests clean —
+`nft rustynet tables=(none)`, no tunnel iface, `ip_forward=0`, daemon inactive
+on exit `debian-headless-2` and client `debian-headless-4` — vs the persistent
+`rustynet_boot` table in Pair-1/2. **G3 now PASSES.** (Bonus: the Rust engine's
+`cross_network_nat_classification` stage passed with no `python` invocation,
+live-proving the Python→Rust netns-probe conversion.) The only remaining Pair-1
+item is P1-1 (`cross_network_preflight` skip-vs-pass), which folds into the
+cross-network Rust-native work.
 
 ### Original diagnosis (kept for the record)
 
