@@ -2632,6 +2632,21 @@ fn parse_proc_meminfo(content: &str) -> MemoryInfo {
     }
 }
 
+/// Extract the value portion of a macOS `sysctl <key>` line printed in the
+/// default `key: value` form (used for `hw.memsize`, `hw.ncpu`, and
+/// `machdep.cpu.brand_string`). Mirrors the historical `s.split(':').
+/// nth(1)` shape used at every one of those call sites: only the segment
+/// between the *first* and *second* colon is returned, so — exactly as
+/// before the split — a value that itself contains a colon would be
+/// truncated at the second one. Returns `None` when there is no second
+/// segment (no colon at all, e.g. empty stdout or a key `sysctl` printed
+/// with nothing after it), in which case callers keep their pre-set
+/// default.
+#[allow(dead_code)]
+fn parse_macos_sysctl_colon_value(output: &str) -> Option<&str> {
+    output.split(':').nth(1).map(str::trim)
+}
+
 #[cfg(target_os = "macos")]
 fn memory_info_internal() -> MemoryInfo {
     let mut total = 0u64;
@@ -2641,9 +2656,9 @@ fn memory_info_internal() -> MemoryInfo {
         .arg("hw.memsize")
         .output()
         && let Ok(s) = String::from_utf8(output.stdout)
-        && let Some(val) = s.split(':').nth(1)
+        && let Some(val) = parse_macos_sysctl_colon_value(&s)
     {
-        total = val.trim().parse::<u64>().unwrap_or(0) / 1024 / 1024;
+        total = val.parse::<u64>().unwrap_or(0) / 1024 / 1024;
     }
 
     if let Ok(output) = std::process::Command::new("vm_stat").output()
@@ -2860,18 +2875,18 @@ fn cpu_info_internal() -> CpuInfo {
 
     if let Ok(output) = std::process::Command::new("sysctl").arg("hw.ncpu").output()
         && let Ok(s) = String::from_utf8(output.stdout)
-        && let Some(val) = s.split(':').nth(1)
+        && let Some(val) = parse_macos_sysctl_colon_value(&s)
     {
-        cores = val.trim().parse::<usize>().unwrap_or(1);
+        cores = val.parse::<usize>().unwrap_or(1);
     }
 
     if let Ok(output) = std::process::Command::new("sysctl")
         .arg("machdep.cpu.brand_string")
         .output()
         && let Ok(s) = String::from_utf8(output.stdout)
-        && let Some(val) = s.split(':').nth(1)
+        && let Some(val) = parse_macos_sysctl_colon_value(&s)
     {
-        model = val.trim().to_owned();
+        model = val.to_owned();
     }
 
     CpuInfo {
@@ -2952,44 +2967,95 @@ fn parse_proc_net_tcp_states(content: &str) -> SocketStats {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn socket_stats_internal() -> SocketStats {
+/// Tally TCP socket states from macOS `netstat -an -p tcp` rows via
+/// substring `contains` matching — looser than the histogram parsers'
+/// exact last-field match: a line counts as `ESTABLISHED`/`LISTEN`/
+/// `TIME_WAIT` if that substring appears *anywhere* in it, checked in that
+/// precedence order via an if/else-if chain (so a line matching more than
+/// one substring is attributed to whichever is checked first). The header
+/// line is skipped.
+#[allow(dead_code)]
+fn parse_netstat_tcp_socket_states_macos(output: &str) -> SocketStats {
     let mut established = 0usize;
     let mut listening = 0usize;
     let mut time_wait = 0usize;
 
-    if let Ok(output) = std::process::Command::new("netstat")
-        .args(["-an", "-p", "tcp"])
-        .output()
-        && let Ok(s) = String::from_utf8(output.stdout)
-    {
-        for line in s.lines().skip(1) {
-            if line.contains("ESTABLISHED") {
-                established += 1;
-            } else if line.contains("LISTEN") {
-                listening += 1;
-            } else if line.contains("TIME_WAIT") {
-                time_wait += 1;
-            }
+    for line in output.lines().skip(1) {
+        if line.contains("ESTABLISHED") {
+            established += 1;
+        } else if line.contains("LISTEN") {
+            listening += 1;
+        } else if line.contains("TIME_WAIT") {
+            time_wait += 1;
         }
     }
-
-    let total = established + listening + time_wait;
 
     SocketStats {
         established,
         listening,
         time_wait,
-        total,
+        total: established + listening + time_wait,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn socket_stats_internal() -> SocketStats {
+    if let Ok(output) = std::process::Command::new("netstat")
+        .args(["-an", "-p", "tcp"])
+        .output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+    {
+        return parse_netstat_tcp_socket_states_macos(&s);
+    }
+
+    SocketStats {
+        established: 0,
+        listening: 0,
+        time_wait: 0,
+        total: 0,
+    }
+}
+
+/// Parse PowerShell `Get-NetTCPConnection | Group-Object State` output into
+/// [`SocketStats`]. The first two lines (`Name`/`Count` header + `----`
+/// underline) are skipped; each remaining `<state> <count>` row *sets*
+/// (not accumulates) the matching bucket, since `Group-Object` already
+/// aggregates per state — unlike the macOS per-connection-line tally
+/// above. State-name matching is case-insensitive substring (`established`
+/// / `listen` / `time_wait` or `timewait`); an unrecognized state name is
+/// silently ignored (it never had an `other` bucket in [`SocketStats`]).
+#[allow(dead_code)]
+fn parse_powershell_tcp_state_groups(output: &str) -> SocketStats {
+    let mut established = 0usize;
+    let mut listening = 0usize;
+    let mut time_wait = 0usize;
+
+    for line in output.lines().skip(2) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let state = parts[0].to_lowercase();
+            let count = parts[1].parse::<usize>().unwrap_or(0);
+
+            if state.contains("established") {
+                established = count;
+            } else if state.contains("listen") {
+                listening = count;
+            } else if state.contains("time_wait") || state.contains("timewait") {
+                time_wait = count;
+            }
+        }
+    }
+
+    SocketStats {
+        established,
+        listening,
+        time_wait,
+        total: established + listening + time_wait,
     }
 }
 
 #[cfg(target_os = "windows")]
 fn socket_stats_internal() -> SocketStats {
-    let mut established = 0usize;
-    let mut listening = 0usize;
-    let mut time_wait = 0usize;
-
     if let Ok(output) = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
@@ -2997,33 +3063,16 @@ fn socket_stats_internal() -> SocketStats {
             "Get-NetTCPConnection | Select-Object State | Group-Object State | Select-Object Name,Count",
         ])
         .output()
+        && let Ok(s) = String::from_utf8(output.stdout)
     {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            for line in s.lines().skip(2) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let state = parts[0].to_lowercase();
-                    let count = parts[1].parse::<usize>().unwrap_or(0);
-
-                    if state.contains("established") {
-                        established = count;
-                    } else if state.contains("listen") {
-                        listening = count;
-                    } else if state.contains("time_wait") || state.contains("timewait") {
-                        time_wait = count;
-                    }
-                }
-            }
-        }
+        return parse_powershell_tcp_state_groups(&s);
     }
 
-    let total = established + listening + time_wait;
-
     SocketStats {
-        established,
-        listening,
-        time_wait,
-        total,
+        established: 0,
+        listening: 0,
+        time_wait: 0,
+        total: 0,
     }
 }
 
@@ -3915,12 +3964,27 @@ fn measure_latency_to_host(host: &str) -> Option<f64> {
     None
 }
 
-#[cfg(target_os = "linux")]
+/// Decode a `/proc/net/tcp`-style hex IPv4 address (kernel-endian, e.g.
+/// `"0100007F"` -> `"127.0.0.1"`) into dotted-decimal. Returns `"unknown"`
+/// for anything that isn't (after lowercasing) at least 8 bytes long with
+/// each 2-byte chunk a valid hex pair.
+///
+/// Bug fix folded into this split: the original indexed the input
+/// (`&hex[i*2..i*2+2]`) directly, which panics if `hex` contains a
+/// multi-byte UTF-8 character whose bytes straddle one of those fixed
+/// offsets (`/proc/net/tcp` fields are always plain ASCII hex in practice,
+/// so this never fired in production, but it is exactly the kind of
+/// adversarial-input panic the parser-never-panics property test below is
+/// meant to catch). Switched to `str::get`, which returns `None` — falling
+/// through to `"unknown"` — instead of panicking on a non-char-boundary or
+/// out-of-range slice. Behavior is identical for every valid-hex input.
+#[allow(dead_code)]
 fn hex_to_ip(hex: &str) -> String {
     let hex = hex.to_lowercase();
     if hex.len() >= 8 {
         let bytes: Vec<u8> = (0..4)
-            .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+            .filter_map(|i| hex.get(i * 2..i * 2 + 2))
+            .filter_map(|byte_str| u8::from_str_radix(byte_str, 16).ok())
             .collect();
         if bytes.len() == 4 {
             return format!("{}.{}.{}.{}", bytes[3], bytes[2], bytes[1], bytes[0]);
@@ -3929,43 +3993,48 @@ fn hex_to_ip(hex: &str) -> String {
     "unknown".to_string()
 }
 
-#[cfg(target_os = "linux")]
-fn tcp_connections_internal() -> Vec<TcpConnection> {
+/// Parse `/proc/net/tcp` rows into [`TcpConnection`]s. The header line is
+/// skipped; each data row needs >=4 whitespace fields
+/// (`sl local_address rem_address st ...`), where `local_address` /
+/// `rem_address` are `<hex_addr>:<hex_port>`. A row is dropped — not
+/// defaulted — if either side is missing its `:` separator or either hex
+/// component fails to parse, preserved from the pre-split nested-`if let`
+/// implementation.
+#[allow(dead_code)]
+fn parse_proc_net_tcp_connections(content: &str) -> Vec<TcpConnection> {
     let mut connections = Vec::new();
-    if let Ok(content) = fs::read_to_string("/proc/net/tcp") {
-        for line in content.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 4 {
-                continue;
-            }
-            // /proc/net/tcp encodes each address as `<addr_hex>:<port_hex>`
-            // (8 hex chars + ':' + 4 hex chars for IPv4). split_once is the
-            // direct decoder. The earlier code split into a Vec, then called
-            // split_last (which returns a tuple of `(&last, rest)`), then
-            // tried to index `local_parts[0]` to access the original full
-            // string — that's a tuple-indexing type error
-            //   error[E0608]: cannot index into a value of type
-            //   `(&&str, &[&str])`
-            // and would have been semantically wrong even without the type
-            // error, since `local_parts.0` is the port, not the address+port
-            // string the slicing presumed.
-            if let Some((local_hex, local_port_hex)) = fields[1].split_once(':') {
-                let local_addr = hex_to_ip(local_hex);
-                if let Ok(port) = u16::from_str_radix(local_port_hex, 16) {
-                    let local = format!("{local_addr}:{port}");
+    for line in content.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        // /proc/net/tcp encodes each address as `<addr_hex>:<port_hex>`
+        // (8 hex chars + ':' + 4 hex chars for IPv4). split_once is the
+        // direct decoder. The earlier code split into a Vec, then called
+        // split_last (which returns a tuple of `(&last, rest)`), then
+        // tried to index `local_parts[0]` to access the original full
+        // string — that's a tuple-indexing type error
+        //   error[E0608]: cannot index into a value of type
+        //   `(&&str, &[&str])`
+        // and would have been semantically wrong even without the type
+        // error, since `local_parts.0` is the port, not the address+port
+        // string the slicing presumed.
+        if let Some((local_hex, local_port_hex)) = fields[1].split_once(':') {
+            let local_addr = hex_to_ip(local_hex);
+            if let Ok(port) = u16::from_str_radix(local_port_hex, 16) {
+                let local = format!("{local_addr}:{port}");
 
-                    if let Some((remote_hex, remote_port_hex)) = fields[2].split_once(':') {
-                        let remote_addr = hex_to_ip(remote_hex);
-                        if let Ok(port) = u16::from_str_radix(remote_port_hex, 16) {
-                            let remote = format!("{remote_addr}:{port}");
-                            let state = fields[3].to_string();
-                            connections.push(TcpConnection {
-                                local_addr: local,
-                                remote_addr: remote,
-                                state,
-                                pid: None,
-                            });
-                        }
+                if let Some((remote_hex, remote_port_hex)) = fields[2].split_once(':') {
+                    let remote_addr = hex_to_ip(remote_hex);
+                    if let Ok(port) = u16::from_str_radix(remote_port_hex, 16) {
+                        let remote = format!("{remote_addr}:{port}");
+                        let state = fields[3].to_string();
+                        connections.push(TcpConnection {
+                            local_addr: local,
+                            remote_addr: remote,
+                            state,
+                            pid: None,
+                        });
                     }
                 }
             }
@@ -3974,27 +4043,75 @@ fn tcp_connections_internal() -> Vec<TcpConnection> {
     connections
 }
 
+#[cfg(target_os = "linux")]
+fn tcp_connections_internal() -> Vec<TcpConnection> {
+    match fs::read_to_string("/proc/net/tcp") {
+        Ok(content) => parse_proc_net_tcp_connections(&content),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Parse macOS `netstat -an -p tcp` rows into [`TcpConnection`]s. The
+/// header line is skipped. RSA-0050: the parser indexes `fields[5]`
+/// (state), so the column-count guard is `>= 6`, not `>= 4`.
+#[allow(dead_code)]
+fn parse_netstat_tcp_connections_macos(output: &str) -> Vec<TcpConnection> {
+    let mut connections = Vec::new();
+    for line in output.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // RSA-0050: indexes fields[5] (state) ⇒ needs >= 6, not >= 4.
+        if fields.len() < 6 {
+            continue;
+        }
+        connections.push(TcpConnection {
+            local_addr: fields[3].to_owned(),
+            remote_addr: fields[4].to_owned(),
+            state: fields[5].to_owned(),
+            pid: None,
+        });
+    }
+    connections
+}
+
 #[cfg(target_os = "macos")]
 fn tcp_connections_internal() -> Vec<TcpConnection> {
-    let mut connections = Vec::new();
     if let Ok(output) = std::process::Command::new("netstat")
         .args(["-an", "-p", "tcp"])
         .output()
+        && let Ok(s) = String::from_utf8(output.stdout)
     {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            for line in s.lines().skip(1) {
-                let fields: Vec<&str> = line.split_whitespace().collect();
-                // RSA-0050: indexes fields[5] (state) ⇒ needs >= 6, not >= 4.
-                if fields.len() < 6 {
-                    continue;
-                }
-                connections.push(TcpConnection {
-                    local_addr: fields[3].to_owned(),
-                    remote_addr: fields[4].to_owned(),
-                    state: fields[5].to_owned(),
-                    pid: None,
-                });
-            }
+        return parse_netstat_tcp_connections_macos(&s);
+    }
+    Vec::new()
+}
+
+/// Parse `Get-NetTCPConnection | ... | ConvertTo-Csv` output into
+/// [`TcpConnection`]s. The CSV header row is skipped; each data row needs
+/// at least 5 comma-separated fields (`LocalAddress,LocalPort,
+/// RemoteAddress,RemotePort,State`); PowerShell CSV-quotes every value,
+/// unquoted here via `trim_matches('"')`.
+#[allow(dead_code)]
+fn parse_powershell_tcp_connections_csv(output: &str) -> Vec<TcpConnection> {
+    let mut connections = Vec::new();
+    for line in output.lines().skip(1) {
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() >= 5 {
+            let local = format!(
+                "{}:{}",
+                fields[0].trim_matches('"'),
+                fields[1].trim_matches('"')
+            );
+            let remote = format!(
+                "{}:{}",
+                fields[2].trim_matches('"'),
+                fields[3].trim_matches('"')
+            );
+            connections.push(TcpConnection {
+                local_addr: local,
+                remote_addr: remote,
+                state: fields[4].trim_matches('"').to_string(),
+                pid: None,
+            });
         }
     }
     connections
@@ -4002,28 +4119,14 @@ fn tcp_connections_internal() -> Vec<TcpConnection> {
 
 #[cfg(target_os = "windows")]
 fn tcp_connections_internal() -> Vec<TcpConnection> {
-    let mut connections = Vec::new();
     if let Ok(output) = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", "Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State | ConvertTo-Csv -NoTypeInformation"])
         .output()
+        && let Ok(s) = String::from_utf8(output.stdout)
     {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            for line in s.lines().skip(1) {
-                let fields: Vec<&str> = line.split(',').collect();
-                if fields.len() >= 5 {
-                    let local = format!("{}:{}", fields[0].trim_matches('"'), fields[1].trim_matches('"'));
-                    let remote = format!("{}:{}", fields[2].trim_matches('"'), fields[3].trim_matches('"'));
-                    connections.push(TcpConnection {
-                        local_addr: local,
-                        remote_addr: remote,
-                        state: fields[4].trim_matches('"').to_string(),
-                        pid: None,
-                    });
-                }
-            }
-        }
+        return parse_powershell_tcp_connections_csv(&s);
     }
-    connections
+    Vec::new()
 }
 
 #[cfg(target_os = "linux")]
@@ -4652,6 +4755,39 @@ fn bgp_route_announcements_internal() -> BgpStatus {
     }
 }
 
+/// Tally connection states from `ss -tan` rows. The header line is
+/// skipped; state is read from field 0 using `ss`'s hyphenated names
+/// (`ESTAB`, `TIME-WAIT`, `SYN-RECV`, `CLOSE-WAIT`, `FIN-WAIT-1`,
+/// `FIN-WAIT-2`) — anything else recognized falls into `other`. A blank
+/// line (no fields at all) is skipped rather than counted as `other`.
+#[allow(dead_code)]
+fn parse_ss_connection_states(output: &str) -> StateHistogram {
+    let mut histogram = StateHistogram {
+        established: 0,
+        time_wait: 0,
+        syn_recv: 0,
+        close_wait: 0,
+        fin_wait1: 0,
+        fin_wait2: 0,
+        other: 0,
+    };
+    for line in output.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if !parts.is_empty() {
+            match parts[0] {
+                "ESTAB" => histogram.established += 1,
+                "TIME-WAIT" => histogram.time_wait += 1,
+                "SYN-RECV" => histogram.syn_recv += 1,
+                "CLOSE-WAIT" => histogram.close_wait += 1,
+                "FIN-WAIT-1" => histogram.fin_wait1 += 1,
+                "FIN-WAIT-2" => histogram.fin_wait2 += 1,
+                _ => histogram.other += 1,
+            }
+        }
+    }
+    histogram
+}
+
 #[cfg(target_os = "linux")]
 fn connection_state_histogram_internal() -> StateHistogram {
     let mut histogram = StateHistogram {
@@ -4664,21 +4800,45 @@ fn connection_state_histogram_internal() -> StateHistogram {
         other: 0,
     };
 
-    if let Ok(output) = std::process::Command::new("ss").args(["-tan"]).output() {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            for line in s.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if !parts.is_empty() {
-                    match parts[0] {
-                        "ESTAB" => histogram.established += 1,
-                        "TIME-WAIT" => histogram.time_wait += 1,
-                        "SYN-RECV" => histogram.syn_recv += 1,
-                        "CLOSE-WAIT" => histogram.close_wait += 1,
-                        "FIN-WAIT-1" => histogram.fin_wait1 += 1,
-                        "FIN-WAIT-2" => histogram.fin_wait2 += 1,
-                        _ => histogram.other += 1,
-                    }
-                }
+    if let Ok(output) = std::process::Command::new("ss").args(["-tan"]).output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+    {
+        histogram = parse_ss_connection_states(&s);
+    }
+    histogram
+}
+
+/// Tally connection states from macOS `netstat -an` rows. The header line
+/// is skipped; state is read from the *last* whitespace field using
+/// `netstat`'s underscored names (`ESTABLISHED`, `TIME_WAIT`, `SYN_RECV`,
+/// `CLOSE_WAIT`, `FIN_WAIT_1`, `FIN_WAIT_2`) — anything else recognized
+/// falls into `other`. A blank line (`.last()` is `None`) is skipped, not
+/// counted as `other`. NOTE: macOS `netstat -an` output has a *second*
+/// (column-name) header line after the one `.skip(1)` removes; its last
+/// field is a state-summary label like `"(state)"`, which matches none of
+/// the recognized states and lands in `other` — a small, preserved,
+/// pre-existing miscount.
+#[allow(dead_code)]
+fn parse_netstat_connection_states_macos(output: &str) -> StateHistogram {
+    let mut histogram = StateHistogram {
+        established: 0,
+        time_wait: 0,
+        syn_recv: 0,
+        close_wait: 0,
+        fin_wait1: 0,
+        fin_wait2: 0,
+        other: 0,
+    };
+    for line in output.lines().skip(1) {
+        if let Some(state) = line.split_whitespace().last() {
+            match state {
+                "ESTABLISHED" => histogram.established += 1,
+                "TIME_WAIT" => histogram.time_wait += 1,
+                "SYN_RECV" => histogram.syn_recv += 1,
+                "CLOSE_WAIT" => histogram.close_wait += 1,
+                "FIN_WAIT_1" => histogram.fin_wait1 += 1,
+                "FIN_WAIT_2" => histogram.fin_wait2 += 1,
+                _ => histogram.other += 1,
             }
         }
     }
@@ -4697,20 +4857,41 @@ fn connection_state_histogram_internal() -> StateHistogram {
         other: 0,
     };
 
-    if let Ok(output) = std::process::Command::new("netstat").args(["-an"]).output() {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            for line in s.lines().skip(1) {
-                if let Some(state) = line.split_whitespace().last() {
-                    match state {
-                        "ESTABLISHED" => histogram.established += 1,
-                        "TIME_WAIT" => histogram.time_wait += 1,
-                        "SYN_RECV" => histogram.syn_recv += 1,
-                        "CLOSE_WAIT" => histogram.close_wait += 1,
-                        "FIN_WAIT_1" => histogram.fin_wait1 += 1,
-                        "FIN_WAIT_2" => histogram.fin_wait2 += 1,
-                        _ => histogram.other += 1,
-                    }
-                }
+    if let Ok(output) = std::process::Command::new("netstat").args(["-an"]).output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+    {
+        histogram = parse_netstat_connection_states_macos(&s);
+    }
+    histogram
+}
+
+/// Tally connection states from Windows `netstat -an` rows. No header line
+/// is skipped (a preserved asymmetry vs. the macOS variant above — its
+/// two header lines simply fall to `other` since neither matches a
+/// recognized state string). State is read from the last whitespace
+/// field; Windows `netstat` reports `SYN_RECEIVED` (not `SYN_RECV`) and
+/// this parser has no distinct `FIN_WAIT_1`/`FIN_WAIT_2` match arms, so
+/// both fall into `other` — preserved verbatim from the pre-split
+/// implementation.
+#[allow(dead_code)]
+fn parse_netstat_connection_states_windows(output: &str) -> StateHistogram {
+    let mut histogram = StateHistogram {
+        established: 0,
+        time_wait: 0,
+        syn_recv: 0,
+        close_wait: 0,
+        fin_wait1: 0,
+        fin_wait2: 0,
+        other: 0,
+    };
+    for line in output.lines() {
+        if let Some(state) = line.split_whitespace().last() {
+            match state {
+                "ESTABLISHED" => histogram.established += 1,
+                "TIME_WAIT" => histogram.time_wait += 1,
+                "SYN_RECEIVED" => histogram.syn_recv += 1,
+                "CLOSE_WAIT" => histogram.close_wait += 1,
+                _ => histogram.other += 1,
             }
         }
     }
@@ -4729,20 +4910,10 @@ fn connection_state_histogram_internal() -> StateHistogram {
         other: 0,
     };
 
-    if let Ok(output) = std::process::Command::new("netstat").args(["-an"]).output() {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            for line in s.lines() {
-                if let Some(state) = line.split_whitespace().last() {
-                    match state {
-                        "ESTABLISHED" => histogram.established += 1,
-                        "TIME_WAIT" => histogram.time_wait += 1,
-                        "SYN_RECEIVED" => histogram.syn_recv += 1,
-                        "CLOSE_WAIT" => histogram.close_wait += 1,
-                        _ => histogram.other += 1,
-                    }
-                }
-            }
-        }
+    if let Ok(output) = std::process::Command::new("netstat").args(["-an"]).output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+    {
+        histogram = parse_netstat_connection_states_windows(&s);
     }
     histogram
 }
@@ -4864,28 +5035,70 @@ fn parse_ss_listening_sockets(output: &str) -> Vec<ListeningSocket> {
     sockets
 }
 
+/// Parse macOS `netstat -tln` rows into [`ListeningSocket`]s. The header
+/// line is skipped; a row qualifies only if it has at least 4 whitespace
+/// fields and field 3 contains `"LISTEN"`. PRESERVED QUIRK: field 3 does
+/// double duty as *both* the `"LISTEN"` substring check *and* the
+/// `address.port` source (via `rfind('.')`, since macOS `netstat` renders
+/// `address.port` with a `.` separator rather than the Linux `ss` parser's
+/// `:`), so the field must simultaneously contain the literal text
+/// `"LISTEN"` and a `.`-delimited trailing segment for the row to be
+/// captured at all — an unusual, pre-existing column mapping, preserved
+/// verbatim rather than corrected. A non-numeric trailing segment degrades
+/// the port to 0 (the same `unwrap_or(0)` convention as the Linux parser).
+#[allow(dead_code)]
+fn parse_netstat_listening_sockets_macos(output: &str) -> Vec<ListeningSocket> {
+    let mut sockets = Vec::new();
+    for line in output.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 && parts[3].contains("LISTEN") {
+            if let Some(colon_idx) = parts[3].rfind('.') {
+                let port: u16 = parts[3][colon_idx + 1..].parse().unwrap_or(0);
+                sockets.push(ListeningSocket {
+                    protocol: parts[0].to_owned(),
+                    address: parts[3][..colon_idx].to_string(),
+                    port,
+                    pid: None,
+                    process_name: None,
+                });
+            }
+        }
+    }
+    sockets
+}
+
 #[cfg(target_os = "macos")]
 fn listening_sockets_summary_internal() -> Vec<ListeningSocket> {
-    let mut sockets = Vec::new();
     if let Ok(output) = std::process::Command::new("netstat")
         .args(["-tln"])
         .output()
+        && let Ok(s) = String::from_utf8(output.stdout)
     {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            for line in s.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 && parts[3].contains("LISTEN") {
-                    if let Some(colon_idx) = parts[3].rfind('.') {
-                        let port: u16 = parts[3][colon_idx + 1..].parse().unwrap_or(0);
-                        sockets.push(ListeningSocket {
-                            protocol: parts[0].to_owned(),
-                            address: parts[3][..colon_idx].to_string(),
-                            port,
-                            pid: None,
-                            process_name: None,
-                        });
-                    }
-                }
+        return parse_netstat_listening_sockets_macos(&s);
+    }
+    Vec::new()
+}
+
+/// Parse Windows `netstat -ano` rows into [`ListeningSocket`]s. No header
+/// line is skipped here (a preserved asymmetry vs. the Linux/macOS
+/// variants) — non-matching header/summary lines are filtered out solely
+/// by the `"LISTEN"` / field-count checks. A pid in field 4 is captured
+/// when present and numeric.
+#[allow(dead_code)]
+fn parse_netstat_listening_sockets_windows(output: &str) -> Vec<ListeningSocket> {
+    let mut sockets = Vec::new();
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 && parts[3].contains("LISTEN") {
+            if let Some(colon_idx) = parts[1].rfind(':') {
+                let port: u16 = parts[1][colon_idx + 1..].parse().unwrap_or(0);
+                sockets.push(ListeningSocket {
+                    protocol: parts[0].to_string(),
+                    address: parts[1][..colon_idx].to_string(),
+                    port,
+                    pid: parts.get(4).and_then(|p| p.parse().ok()),
+                    process_name: None,
+                });
             }
         }
     }
@@ -4894,30 +5107,14 @@ fn listening_sockets_summary_internal() -> Vec<ListeningSocket> {
 
 #[cfg(target_os = "windows")]
 fn listening_sockets_summary_internal() -> Vec<ListeningSocket> {
-    let mut sockets = Vec::new();
     if let Ok(output) = std::process::Command::new("netstat")
         .args(["-ano"])
         .output()
+        && let Ok(s) = String::from_utf8(output.stdout)
     {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            for line in s.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 && parts[3].contains("LISTEN") {
-                    if let Some(colon_idx) = parts[1].rfind(':') {
-                        let port: u16 = parts[1][colon_idx + 1..].parse().unwrap_or(0);
-                        sockets.push(ListeningSocket {
-                            protocol: parts[0].to_string(),
-                            address: parts[1][..colon_idx].to_string(),
-                            port,
-                            pid: parts.get(4).and_then(|p| p.parse().ok()),
-                            process_name: None,
-                        });
-                    }
-                }
-            }
-        }
+        return parse_netstat_listening_sockets_windows(&s);
     }
-    sockets
+    Vec::new()
 }
 
 #[cfg(target_os = "linux")]
@@ -5674,18 +5871,26 @@ fn memory_fragmentation_ratio_internal() -> MemFragmentation {
     }
 }
 
+/// Extract the value portion of a macOS `sysctl <key>` line printed in
+/// `key = value` form (used for `vm.swappiness`, distinct from the colon
+/// form other `sysctl` call sites use). Same first/second-`=` truncation
+/// caveat as [`parse_macos_sysctl_colon_value`]; `None` when there is no
+/// `=` at all.
+#[allow(dead_code)]
+fn parse_macos_sysctl_equals_value(output: &str) -> Option<&str> {
+    output.split('=').nth(1).map(str::trim)
+}
+
 #[cfg(target_os = "macos")]
 fn memory_fragmentation_ratio_internal() -> MemFragmentation {
     let mut swappiness = 60;
     if let Ok(output) = std::process::Command::new("sysctl")
         .arg("vm.swappiness")
         .output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+        && let Some(val) = parse_macos_sysctl_equals_value(&s)
     {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            if let Some(val) = s.split('=').nth(1) {
-                swappiness = val.trim().parse().unwrap_or(60);
-            }
-        }
+        swappiness = val.parse().unwrap_or(60);
     }
 
     MemFragmentation {
@@ -6611,43 +6816,62 @@ fn syslog_configuration_audit_internal() -> SyslogAudit {
     }
 }
 
+/// Parse `getfacl <path>` stdout into `(owner, group, extended ACL lines)`.
+/// A missing `# owner:`/`# group:` header comment defaults to `"unknown"`
+/// (mirroring the fallback used when the command itself fails); a *present*
+/// but value-less header (e.g. a bare `"# owner:"` line) yields an empty
+/// string instead — the `"unknown"` default only applies when the line is
+/// absent entirely.
+///
+/// Preserved quirk: `getfacl`'s baseline `user::`/`group::` entries also
+/// start with the literal prefixes `"user:"`/`"group:"`, so they are
+/// captured into the "extended" ACL list alongside genuine named
+/// `user:<name>:<perm>` / `group:<name>:<perm>` grants. Real `getfacl`
+/// output always includes the baseline entries, so a caller deriving
+/// `is_restrictive` from an empty extended-ACL list should not expect it to
+/// fire often. Extracted verbatim from the pre-split implementation; no
+/// behavior change.
+fn parse_getfacl_output(output: &str) -> (String, String, Vec<String>) {
+    let mut owner = "unknown".to_owned();
+    let mut group = "unknown".to_owned();
+    let mut extended_acl = Vec::new();
+
+    for line in output.lines() {
+        if line.starts_with("# owner:") {
+            owner = line
+                .strip_prefix("# owner:")
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+        }
+        if line.starts_with("# group:") {
+            group = line
+                .strip_prefix("# group:")
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+        }
+        if line.starts_with("user:") || line.starts_with("group:") {
+            extended_acl.push(line.to_owned());
+        }
+    }
+
+    (owner, group, extended_acl)
+}
+
 fn access_control_list_audit_internal(paths: &[&str]) -> Vec<AclInfo> {
     let mut results = Vec::new();
 
     for path in paths {
         if let Ok(output) = std::process::Command::new("getfacl").arg(path).output() {
             if let Ok(s) = String::from_utf8(output.stdout) {
-                let mut owner = "unknown".to_owned();
-                let mut group = "unknown".to_owned();
-                let mode = "0000".to_owned();
-                let mut extended_acl = Vec::new();
-
-                for line in s.lines() {
-                    if line.starts_with("# owner:") {
-                        owner = line
-                            .strip_prefix("# owner:")
-                            .unwrap_or("")
-                            .trim()
-                            .to_owned();
-                    }
-                    if line.starts_with("# group:") {
-                        group = line
-                            .strip_prefix("# group:")
-                            .unwrap_or("")
-                            .trim()
-                            .to_owned();
-                    }
-                    if line.starts_with("user:") || line.starts_with("group:") {
-                        extended_acl.push(line.to_owned());
-                    }
-                }
-
+                let (owner, group, extended_acl) = parse_getfacl_output(&s);
                 let is_restrictive = extended_acl.is_empty();
                 results.push(AclInfo {
                     path: path.to_string(),
                     owner,
                     group,
-                    mode,
+                    mode: "0000".to_owned(),
                     extended_acl,
                     is_restrictive,
                 });
@@ -7794,5 +8018,551 @@ short
         let facts = super::host_facts();
         assert!(!facts.arch.is_empty());
         assert_ne!(facts.family, super::OsFamily::Unsupported);
+    }
+
+    // ---- `getfacl` parser: golden-fixture coverage ----
+    //
+    // These parsers (and the sysctl / socket-enumeration ones below) are
+    // deliberately NOT `#[cfg(target_os = "...")]`-gated even though their
+    // production callers are — they are plain `&str -> T` string parsers
+    // with no OS-specific API dependency, so gating only the IO wrapper
+    // (matching the pre-existing `parse_macos_ifconfig_iface_up` /
+    // `parse_windows_ipconfig_interfaces` convention) lets every one of
+    // them be compiled and exercised on any dev/CI host, regardless of
+    // which OS variant would call it in production.
+
+    #[test]
+    fn getfacl_output_extracts_owner_group_and_documents_base_entry_quirk() {
+        let output = "\
+# file: secrets.key
+# owner: alice
+# group: staff
+user::rw-
+group::r--
+other::---
+user:bob:rwx
+";
+        let (owner, group, extended) = super::parse_getfacl_output(output);
+        assert_eq!(owner, "alice");
+        assert_eq!(group, "staff");
+        // Preserved quirk: the baseline `user::`/`group::` entries also
+        // start with the literal prefixes checked, so they land in
+        // "extended" ACL alongside the genuine named `user:bob:rwx` grant;
+        // `other::---` matches neither prefix and is excluded.
+        assert_eq!(
+            extended,
+            vec![
+                "user::rw-".to_owned(),
+                "group::r--".to_owned(),
+                "user:bob:rwx".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn getfacl_output_missing_headers_default_to_unknown() {
+        let (owner, group, extended) = super::parse_getfacl_output("user::rwx\n");
+        assert_eq!(owner, "unknown");
+        assert_eq!(group, "unknown");
+        assert_eq!(extended, vec!["user::rwx".to_owned()]);
+    }
+
+    #[test]
+    fn getfacl_output_present_but_valueless_header_yields_empty_not_unknown() {
+        // A present header line with nothing after the prefix yields an
+        // empty string — the "unknown" default only applies when the
+        // whole line is absent.
+        let (owner, group, extended) = super::parse_getfacl_output("# owner:\n# group:\n");
+        assert_eq!(owner, "");
+        assert_eq!(group, "");
+        assert!(extended.is_empty());
+    }
+
+    #[test]
+    fn getfacl_output_empty_input_is_safe() {
+        let (owner, group, extended) = super::parse_getfacl_output("");
+        assert_eq!(owner, "unknown");
+        assert_eq!(group, "unknown");
+        assert!(extended.is_empty());
+    }
+
+    // ---- macOS `sysctl` value parsers: golden-fixture coverage ----
+
+    #[test]
+    fn macos_sysctl_colon_value_extracts_trimmed_segment() {
+        assert_eq!(
+            super::parse_macos_sysctl_colon_value("hw.ncpu: 8\n"),
+            Some("8")
+        );
+        assert_eq!(
+            super::parse_macos_sysctl_colon_value("machdep.cpu.brand_string: Apple M1\n"),
+            Some("Apple M1")
+        );
+    }
+
+    #[test]
+    fn macos_sysctl_colon_value_truncates_at_second_colon() {
+        // Preserved quirk: `split(':').nth(1)` only ever returns the
+        // segment between the first and second colon, not "everything
+        // after the first colon" — a value containing its own colon is
+        // truncated.
+        assert_eq!(super::parse_macos_sysctl_colon_value("a:b:c"), Some("b"));
+    }
+
+    #[test]
+    fn macos_sysctl_colon_value_none_without_a_second_segment() {
+        assert_eq!(super::parse_macos_sysctl_colon_value("garbage"), None);
+        assert_eq!(super::parse_macos_sysctl_colon_value(""), None);
+        // A colon with nothing after it is a present-but-empty value.
+        assert_eq!(super::parse_macos_sysctl_colon_value("key:"), Some(""));
+    }
+
+    #[test]
+    fn macos_sysctl_equals_value_extracts_trimmed_segment() {
+        assert_eq!(
+            super::parse_macos_sysctl_equals_value("vm.swappiness = 60\n"),
+            Some("60")
+        );
+    }
+
+    #[test]
+    fn macos_sysctl_equals_value_truncates_at_second_equals_and_none_without_one() {
+        assert_eq!(super::parse_macos_sysctl_equals_value("a=b=c"), Some("b"));
+        assert_eq!(super::parse_macos_sysctl_equals_value("noequals"), None);
+        assert_eq!(super::parse_macos_sysctl_equals_value(""), None);
+    }
+
+    // ---- `hex_to_ip`: golden-fixture + panic-safety regression ----
+
+    #[test]
+    fn hex_to_ip_decodes_valid_kernel_endian_hex() {
+        assert_eq!(super::hex_to_ip("0100007F"), "127.0.0.1");
+        assert_eq!(super::hex_to_ip("0A0A0A0A"), "10.10.10.10");
+        // Case-insensitive.
+        assert_eq!(super::hex_to_ip("0100007f"), "127.0.0.1");
+    }
+
+    #[test]
+    fn hex_to_ip_unknown_on_short_or_non_hex_input() {
+        assert_eq!(super::hex_to_ip("01"), "unknown");
+        assert_eq!(super::hex_to_ip(""), "unknown");
+        assert_eq!(super::hex_to_ip("GGGGGGGG"), "unknown");
+    }
+
+    #[test]
+    fn hex_to_ip_never_panics_on_utf8_char_boundary_straddling_input() {
+        // Regression for a latent panic fixed in this split: the original
+        // indexed `&hex[i*2..i*2+2]` directly. `"a\u{e9}000000"` is 9 bytes
+        // (`a` = 1 byte, `é` = 2 bytes at offsets 1..3, then 6 ASCII
+        // bytes), so `hex.len() >= 8` is true, but slicing bytes 0..2 or
+        // 2..4 lands mid-`é` and used to panic ("byte index 2 is not a
+        // char boundary"). The `str::get`-based rewrite returns `None` for
+        // those chunks instead, degrading to "unknown" rather than
+        // panicking.
+        assert_eq!(super::hex_to_ip("a\u{e9}000000"), "unknown");
+    }
+
+    // ---- `/proc/net/tcp` connection parser (Linux): golden-fixture coverage ----
+
+    #[test]
+    fn proc_net_tcp_connections_extracts_local_remote_and_state() {
+        let fixture = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid
+   0: 0100007F:1F90 0A0A0A0A:01BB 01 00000000:00000000 00:00000000 00000000     0
+";
+        let conns = super::parse_proc_net_tcp_connections(fixture);
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].local_addr, "127.0.0.1:8080");
+        assert_eq!(conns[0].remote_addr, "10.10.10.10:443");
+        assert_eq!(conns[0].state, "01");
+        assert_eq!(conns[0].pid, None);
+    }
+
+    #[test]
+    fn proc_net_tcp_connections_drops_short_rows_and_missing_separators() {
+        let fixture = "\
+header line skipped regardless of content
+too short
+sl 0100007Fnocolon 0A0A0A0A:01BB 01
+";
+        // Row 2 has <4 fields; row 3's local field has no `:` separator —
+        // both dropped, not defaulted.
+        assert!(super::parse_proc_net_tcp_connections(fixture).is_empty());
+    }
+
+    #[test]
+    fn proc_net_tcp_connections_empty_and_header_only_are_safe() {
+        assert!(super::parse_proc_net_tcp_connections("").is_empty());
+        assert!(super::parse_proc_net_tcp_connections("header only\n").is_empty());
+    }
+
+    // ---- macOS/Windows TCP connection parsers: golden-fixture coverage ----
+
+    #[test]
+    fn netstat_tcp_connections_macos_extracts_row() {
+        let fixture = "\
+Active Internet connections
+tcp4       0      0  192.168.1.5.51820      93.184.216.34.443      ESTABLISHED
+";
+        let conns = super::parse_netstat_tcp_connections_macos(fixture);
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].local_addr, "192.168.1.5.51820");
+        assert_eq!(conns[0].remote_addr, "93.184.216.34.443");
+        assert_eq!(conns[0].state, "ESTABLISHED");
+    }
+
+    #[test]
+    fn netstat_tcp_connections_macos_requires_six_fields() {
+        // RSA-0050: the parser indexes fields[5]; a 5-field row is dropped.
+        let fixture = "header\ntcp4 0 0 a b\n";
+        assert!(super::parse_netstat_tcp_connections_macos(fixture).is_empty());
+        assert!(super::parse_netstat_tcp_connections_macos("").is_empty());
+    }
+
+    #[test]
+    fn powershell_tcp_connections_csv_unquotes_and_joins_host_port() {
+        let fixture = "\
+\"LocalAddress\",\"LocalPort\",\"RemoteAddress\",\"RemotePort\",\"State\"
+\"192.168.1.5\",\"51820\",\"93.184.216.34\",\"443\",\"Established\"
+";
+        let conns = super::parse_powershell_tcp_connections_csv(fixture);
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].local_addr, "192.168.1.5:51820");
+        assert_eq!(conns[0].remote_addr, "93.184.216.34:443");
+        assert_eq!(conns[0].state, "Established");
+    }
+
+    #[test]
+    fn powershell_tcp_connections_csv_skips_short_rows_and_empty() {
+        let fixture = "header\n\"a\",\"b\",\"c\",\"d\"\n";
+        assert!(super::parse_powershell_tcp_connections_csv(fixture).is_empty());
+        assert!(super::parse_powershell_tcp_connections_csv("").is_empty());
+    }
+
+    // ---- macOS/Windows listening-socket parsers: golden-fixture coverage ----
+
+    #[test]
+    fn netstat_listening_sockets_macos_extracts_when_field_has_dot_and_listen() {
+        // PRESERVED QUIRK: field 3 does double duty as both the "LISTEN"
+        // substring check and the `rfind('.')` address/port source, so a
+        // captured row's "address" can include stray text (here the
+        // literal "LISTEN") that happened to precede the last dot.
+        let fixture = "\
+Active Internet connections (only servers)
+tcp4       0      0  127.0.0.1.LISTEN.8080  *.*                    LISTEN
+";
+        let sockets = super::parse_netstat_listening_sockets_macos(fixture);
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0].protocol, "tcp4");
+        assert_eq!(sockets[0].address, "127.0.0.1.LISTEN");
+        assert_eq!(sockets[0].port, 8080);
+        assert_eq!(sockets[0].pid, None);
+    }
+
+    #[test]
+    fn netstat_listening_sockets_macos_malformed_trailing_segment_degrades_port_to_zero() {
+        let fixture = "header\ntcp4 0 0 127.0.0.1.LISTEN *.* LISTEN\n";
+        let sockets = super::parse_netstat_listening_sockets_macos(fixture);
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0].address, "127.0.0.1");
+        assert_eq!(sockets[0].port, 0);
+    }
+
+    #[test]
+    fn netstat_listening_sockets_macos_skips_non_listen_and_short_rows() {
+        let fixture = "header\ntcp4 0 0 127.0.0.1.80 *.* CLOSED\ntcp4 0 0\n";
+        assert!(super::parse_netstat_listening_sockets_macos(fixture).is_empty());
+        assert!(super::parse_netstat_listening_sockets_macos("").is_empty());
+    }
+
+    #[test]
+    fn netstat_listening_sockets_windows_extracts_row_with_pid_and_no_header_skip() {
+        // No explicit header skip: a header row is excluded only because
+        // it does not contain "LISTEN" in field 3, not by a `.skip(1)`.
+        let fixture = "\
+  Proto  Local Address          Foreign Address        State
+  TCP    0.0.0.0:135            host:0                 LISTENING          1234
+";
+        let sockets = super::parse_netstat_listening_sockets_windows(fixture);
+        assert_eq!(sockets.len(), 1, "only the LISTENING row qualifies");
+        assert_eq!(sockets[0].protocol, "TCP");
+        assert_eq!(sockets[0].address, "0.0.0.0");
+        assert_eq!(sockets[0].port, 135);
+        assert_eq!(sockets[0].pid, Some(1234));
+    }
+
+    #[test]
+    fn netstat_listening_sockets_windows_no_colon_skips_malformed_port_degrades() {
+        // No `:` in field 1 -> dropped entirely (not defaulted).
+        let no_colon = "TCP 1.2.3.4 5.6.7.8 LISTENING";
+        assert!(super::parse_netstat_listening_sockets_windows(no_colon).is_empty());
+        // A `:` present but non-numeric tail -> port degrades to 0.
+        let bad_port = "TCP 1.2.3.4:abc 5.6.7.8 LISTENING";
+        let sockets = super::parse_netstat_listening_sockets_windows(bad_port);
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0].port, 0);
+    }
+
+    // ---- connection-state histogram parsers: golden-fixture coverage ----
+
+    #[test]
+    fn ss_connection_states_tallies_each_recognized_state_and_skips_blank() {
+        let fixture = "\
+State Recv-Q Send-Q Local Peer
+ESTAB 0 0 a b
+TIME-WAIT 0 0 a b
+SYN-RECV 0 0 a b
+CLOSE-WAIT 0 0 a b
+FIN-WAIT-1 0 0 a b
+FIN-WAIT-2 0 0 a b
+UNKNOWN-STATE 0 0 a b
+
+";
+        let h = super::parse_ss_connection_states(fixture);
+        assert_eq!(h.established, 1);
+        assert_eq!(h.time_wait, 1);
+        assert_eq!(h.syn_recv, 1);
+        assert_eq!(h.close_wait, 1);
+        assert_eq!(h.fin_wait1, 1);
+        assert_eq!(h.fin_wait2, 1);
+        // Unrecognized state -> other; the trailing blank line has zero
+        // fields and is skipped rather than counted as other.
+        assert_eq!(h.other, 1);
+    }
+
+    #[test]
+    fn netstat_connection_states_macos_reads_last_field_and_skips_blank() {
+        let fixture = "\
+Active Internet connections
+tcp4 0 0 a b ESTABLISHED
+tcp4 0 0 a b TIME_WAIT
+tcp4 0 0 a b SYN_RECV
+tcp4 0 0 a b CLOSE_WAIT
+tcp4 0 0 a b FIN_WAIT_1
+tcp4 0 0 a b FIN_WAIT_2
+tcp4 0 0 a b UNKNOWNSTATE
+
+";
+        let h = super::parse_netstat_connection_states_macos(fixture);
+        assert_eq!(h.established, 1);
+        assert_eq!(h.time_wait, 1);
+        assert_eq!(h.syn_recv, 1);
+        assert_eq!(h.close_wait, 1);
+        assert_eq!(h.fin_wait1, 1);
+        assert_eq!(h.fin_wait2, 1);
+        assert_eq!(h.other, 1);
+    }
+
+    #[test]
+    fn netstat_connection_states_windows_has_no_fin_wait_arms_and_uses_syn_received() {
+        // Preserved cross-platform inconsistency: Windows matches
+        // `SYN_RECEIVED` (not `SYN_RECV`) and has no `FIN_WAIT_1`/
+        // `FIN_WAIT_2` arms at all, so both fall to `other` — unlike the
+        // macOS variant above.
+        let fixture = "\
+tcp4 0 0 a b ESTABLISHED
+tcp4 0 0 a b TIME_WAIT
+tcp4 0 0 a b SYN_RECEIVED
+tcp4 0 0 a b CLOSE_WAIT
+tcp4 0 0 a b FIN_WAIT_1
+tcp4 0 0 a b FIN_WAIT_2
+";
+        let h = super::parse_netstat_connection_states_windows(fixture);
+        assert_eq!(h.established, 1);
+        assert_eq!(h.time_wait, 1);
+        assert_eq!(h.syn_recv, 1);
+        assert_eq!(h.close_wait, 1);
+        assert_eq!(h.fin_wait1, 0);
+        assert_eq!(h.fin_wait2, 0);
+        assert_eq!(h.other, 2);
+    }
+
+    // ---- socket-stats (tally) parsers: golden-fixture coverage ----
+
+    #[test]
+    fn netstat_tcp_socket_states_macos_contains_match_with_precedence() {
+        let fixture = "\
+Active Internet connections
+foo ESTABLISHED bar
+foo LISTEN bar
+foo TIME_WAIT bar
+foo NOTHING bar
+";
+        let stats = super::parse_netstat_tcp_socket_states_macos(fixture);
+        assert_eq!(stats.established, 1);
+        assert_eq!(stats.listening, 1);
+        assert_eq!(stats.time_wait, 1);
+        assert_eq!(
+            stats.total, 3,
+            "the unmatched NOTHING row contributes nothing"
+        );
+    }
+
+    #[test]
+    fn netstat_tcp_socket_states_macos_precedence_favors_established() {
+        // A line matching more than one substring is attributed to
+        // whichever branch is checked first in the if/else-if chain.
+        let fixture = "header\nESTABLISHEDLISTEN\n";
+        let stats = super::parse_netstat_tcp_socket_states_macos(fixture);
+        assert_eq!(stats.established, 1);
+        assert_eq!(stats.listening, 0);
+    }
+
+    #[test]
+    fn netstat_tcp_socket_states_macos_header_only_and_empty_are_zero() {
+        assert_eq!(
+            super::parse_netstat_tcp_socket_states_macos("header\n").total,
+            0
+        );
+        assert_eq!(super::parse_netstat_tcp_socket_states_macos("").total, 0);
+    }
+
+    #[test]
+    fn powershell_tcp_state_groups_sets_not_accumulates() {
+        let fixture = "\
+Name                      Count
+----                      -----
+Established                  12
+Established                  99
+Listen                        4
+TimeWait                      2
+UnknownState                  9
+";
+        let stats = super::parse_powershell_tcp_state_groups(fixture);
+        // The second "Established" row *overwrites* the first (Group-Object
+        // already aggregates per state upstream) rather than accumulating.
+        assert_eq!(stats.established, 99);
+        assert_eq!(stats.listening, 4);
+        assert_eq!(stats.time_wait, 2);
+        assert_eq!(stats.total, 105);
+    }
+
+    #[test]
+    fn powershell_tcp_state_groups_skips_two_header_lines_and_short_rows() {
+        // Only one data line, but it must survive the `skip(2)` header
+        // removal; a short (1-field) row is ignored.
+        let fixture = "Name Count\n---- -----\nEstablishedOnly\nListen 7\n";
+        let stats = super::parse_powershell_tcp_state_groups(fixture);
+        assert_eq!(stats.listening, 7);
+        assert_eq!(stats.established, 0);
+        assert!(super::parse_powershell_tcp_state_groups("").total == 0);
+    }
+
+    // ---- property test: none of the newly-split parsers ever panic ----
+
+    /// A single probe parser: takes the raw captured-output text and
+    /// discards whatever typed result it produces. Named as a type alias
+    /// so the test below doesn't trip `clippy::type_complexity`.
+    type ProbeParser = Box<dyn Fn(&str)>;
+
+    #[test]
+    fn split_parsers_never_panic_on_adversarial_input() {
+        // Parser-never-panics invariant for every pure parser split out of
+        // an IO-fused `*_internal` fn in this batch (getfacl / sysctl /
+        // macOS+Windows socket enumeration, plus `hex_to_ip`). Each
+        // closure discards its result — only the absence of a panic is
+        // asserted; a real panic propagates and fails the test with a
+        // backtrace pointing at the offending parser and input.
+        let parsers: Vec<ProbeParser> = vec![
+            Box::new(|s| {
+                let _ = super::parse_getfacl_output(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_macos_sysctl_colon_value(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_macos_sysctl_equals_value(s);
+            }),
+            Box::new(|s| {
+                let _ = super::hex_to_ip(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_proc_net_tcp_connections(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_netstat_tcp_connections_macos(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_powershell_tcp_connections_csv(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_netstat_listening_sockets_macos(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_netstat_listening_sockets_windows(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_ss_connection_states(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_netstat_connection_states_macos(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_netstat_connection_states_windows(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_netstat_tcp_socket_states_macos(s);
+            }),
+            Box::new(|s| {
+                let _ = super::parse_powershell_tcp_state_groups(s);
+            }),
+        ];
+
+        // Structural-garbage probes: empty, whitespace, bare separators, a
+        // flood of a single separator, long lines, CRLF, multi-byte UTF-8,
+        // and near-miss golden fixtures.
+        let probes: Vec<String> = vec![
+            String::new(),
+            " ".to_owned(),
+            "\n".to_owned(),
+            "\t\t\t".to_owned(),
+            ":".to_owned(),
+            ".".to_owned(),
+            "=".to_owned(),
+            ",".to_owned(),
+            "\"".to_owned(),
+            ":".repeat(2000),
+            ".".repeat(2000),
+            "a".repeat(5000),
+            "\u{20ac}".repeat(500),
+            "a:b.c=d,e\"f\u{20ac}g\r\n".repeat(200),
+            "# owner:\n# group:\nuser:\ngroup:\n".repeat(100),
+            "\r\n".repeat(500),
+        ];
+        for probe in &probes {
+            for parser in &parsers {
+                parser(probe);
+            }
+        }
+
+        // Deterministic pseudo-random content (same LCG technique used by
+        // the gossip/DNS-zone wire-decoder never-panic batteries) across a
+        // range of lengths, biased toward the separator characters these
+        // parsers split on plus occasional multi-byte codepoints.
+        let mut seed = 0xA5A5_1234_ABCD_EF01u64;
+        for len in 0..400usize {
+            let mut s = String::with_capacity(len);
+            for _ in 0..len {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let bucket = (seed >> 60) & 0xF;
+                let ch = match bucket {
+                    0 => ':',
+                    1 => '.',
+                    2 => '=',
+                    3 => ',',
+                    4 => '"',
+                    5 => '\n',
+                    6 => '\u{20ac}',  // 3-byte UTF-8
+                    7 => '\u{1f600}', // 4-byte UTF-8 (emoji)
+                    _ => (0x20 + ((seed >> 40) as u8 % 0x5f)) as char,
+                };
+                s.push(ch);
+            }
+            for parser in &parsers {
+                parser(&s);
+            }
+        }
     }
 }

@@ -287,17 +287,95 @@ Status 2026-06-23 (parse/IO split batch 5): split `parse_proc_net_tcp_states`
 with 2 golden-fixture tests (now 27 total) — multi-state tally with
 unknown-state + short-line skipping, and empty/header-only safety.
 
-**Net P1.1 sysinfo progress: the crate went from 0 tests → 27**, with 9 pure
-parsers split from IO (`ss`, `/proc/net/dev`, `/proc/loadavg`, `/proc/meminfo`,
-`/proc/cpuinfo`, `/proc/uptime`, `ip addr`, `ip route`, `wg show`,
-`/proc/net/tcp`) plus the two analysis fns, and **2 real bugs fixed** (the
-perf-regression dead branch + the `/proc/net/dev` index-OOB panic). Crate is
-fully clippy-clean throughout.
+**Net P1.1 sysinfo progress (2026-07-13): the crate went from 0 tests → 61**,
+with 22 pure parsers split from IO (`ss`, `/proc/net/dev`, `/proc/loadavg`,
+`/proc/meminfo`, `/proc/cpuinfo`, `/proc/uptime`, `ip addr`, `ip route`,
+`wg show`, `/proc/net/tcp`, `getfacl`, macOS `sysctl` colon/equals forms,
+`/proc/net/tcp` connections, macOS/Windows `netstat`/PowerShell TCP
+connections, macOS/Windows listening-socket enumeration, Linux/macOS/Windows
+connection-state histograms, macOS/Windows socket-state tallies) plus the two
+analysis fns, and **3 real bugs fixed** (the perf-regression dead branch, the
+`/proc/net/dev` index-OOB panic, and a `hex_to_ip` UTF-8 char-boundary panic
+on adversarial non-ASCII input). Crate is fully clippy-clean throughout.
 
-Remaining for P1.1: more IO-fused parsers still to split (`getfacl`, `sysctl`,
-`df`/`systemctl`/`launchctl` and other non-Linux-gated variants — note those
-need building for their target to verify); the established pattern
+Remaining for P1.1: more IO-fused parsers still to split — `df`/`systemctl`/
+`launchctl`/`vm_stat`/`openssl`(cert + cipher-suite)/`stat`(permission checks)
+and other non-Linux-gated variants not yet touched (note those need building
+for their target to verify, except where the parser is plain string handling
+with no OS-specific API dependency, in which case gating only the IO wrapper —
+not the pure fn — lets it be compiled and tested on any host, per the
+`getfacl`/`sysctl`/socket-enumeration batch below). The established pattern
 (`parse_X(&str) -> T` + golden fixtures) applies to each.
+
+Status 2026-07-13 (parse/IO split batch 6 — getfacl + sysctl + macOS/Windows
+socket enumeration): closed out the three P1.1 candidates explicitly named as
+remaining (`getfacl`, `sysctl`, and the macOS/Windows socket-enumeration
+`*_internal` family), bringing all four socket-enumeration function families —
+`tcp_connections_internal`, `listening_sockets_summary_internal`,
+`connection_state_histogram_internal`, `socket_stats_internal` — to full
+3-OS parity. Two of those (`listening_sockets_summary_internal`,
+`socket_stats_internal`) already had their Linux branch split in an earlier
+batch and only needed macOS/Windows added; the other two
+(`tcp_connections_internal`, `connection_state_histogram_internal`) had zero
+prior split on any OS and needed all three branches extracted fresh. 13 new
+pure parsers extracted in total, none `#[cfg(target_os)]`-gated (only their
+IO-wrapper callers are) so every one compiles and is tested on any host,
+including this non-Linux dev sandbox:
+- `parse_getfacl_output` (`getfacl <path>`) — owner/group/extended-ACL lines.
+  Documents a preserved quirk: `getfacl`'s baseline `user::`/`group::` lines
+  also match the `"user:"`/`"group:"` prefixes used to detect *extended* ACL
+  entries, so they're captured alongside genuine named grants; a present-but-
+  empty `# owner:`/`# group:` header yields `""`, not the `"unknown"` default
+  (which only applies when the header line is absent entirely).
+- `parse_macos_sysctl_colon_value` / `parse_macos_sysctl_equals_value` (macOS
+  `sysctl <key>` colon- and equals-separated forms) — shared by `cpu_info_
+  internal` (`hw.ncpu`, `machdep.cpu.brand_string`), `memory_info_internal`
+  (`hw.memsize`), and `memory_fragmentation_ratio_internal` (`vm.swappiness`).
+  Documents the preserved `split(char).nth(1)` quirk: only the segment between
+  the *first and second* separator is returned, truncating a value that itself
+  contains one.
+- `parse_proc_net_tcp_connections` (Linux `/proc/net/tcp`, finishes the split
+  `tcp_connections_internal` only had macOS/Windows candidates for before),
+  `parse_netstat_tcp_connections_macos`, `parse_powershell_tcp_connections_csv`.
+- `parse_netstat_listening_sockets_macos`, `parse_netstat_listening_sockets_
+  windows` (Linux `ss` side was already split; these finish the family).
+  Documents a preserved macOS quirk: field 3 does double duty as both the
+  `"LISTEN"` substring check and the `rfind('.')` address/port source.
+- `parse_ss_connection_states`, `parse_netstat_connection_states_macos`,
+  `parse_netstat_connection_states_windows` (`connection_state_histogram_
+  internal` had zero prior split on any OS). Documents preserved cross-OS
+  inconsistencies: `ss` uses hyphenated state names and skips one header line,
+  macOS uses underscored names and skips one header line (with a second,
+  unremoved header line landing in `other`), Windows skips no header line and
+  has no `FIN_WAIT_1`/`FIN_WAIT_2` match arms at all (both fall to `other`).
+- `parse_netstat_tcp_socket_states_macos`, `parse_powershell_tcp_state_groups`
+  (`socket_stats_internal`'s macOS/Windows sides; Linux was already split).
+  Documents that the Windows variant *sets* each bucket from a pre-aggregated
+  `Group-Object` count rather than accumulating per-connection like the other
+  two.
+- **Bug #3 found + fixed**: `hex_to_ip` (used by the `/proc/net/tcp` decoder)
+  indexed its input directly (`&hex[i*2..i*2+2]`), which panics if the string
+  contains a multi-byte UTF-8 character straddling one of those fixed byte
+  offsets — unreachable via a real kernel-written `/proc/net/tcp` (always
+  ASCII hex) but a real hole against the parser-never-panics property below.
+  Switched to `str::get` (checked, boundary-safe indexing): identical output
+  for every valid-hex input, `"unknown"` instead of a panic otherwise. Pinned
+  by a direct regression test plus the property test.
+- **Property test**: `split_parsers_never_panic_on_adversarial_input` feeds
+  all 14 functions above (13 new parsers + `hex_to_ip`) a shared corpus —
+  empty/whitespace, bare separators, a 2000-char separator flood, 5000-char
+  lines, multi-byte UTF-8 (including 4-byte codepoints), CRLF, near-miss
+  golden fixtures, and ~400 lengths of a deterministic LCG-seeded pseudo-random
+  string (same technique as the `rustynetd`/`rustynet-dns-zone` wire-decoder
+  never-panic batteries) — asserting only the absence of a panic. No new
+  dependency added (no `proptest` in the workspace; this is a std-only
+  table/corpus battery per the task's fallback guidance).
+
+Evidence: `cargo test -p rustynet-sysinfo --lib` → 61/61 (up from 27); `cargo
+fmt --all -- --check` clean; `cargo clippy -p rustynet-sysinfo --all-targets
+--all-features -- -D warnings` → 0; `cargo check -p rustynet-sysinfo
+--all-targets` clean. No behavior change for any valid/real-world input on any
+touched function other than the `hex_to_ip` panic→fail-safe fix.
 
 Status 2026-06-23 (parse/IO split started): applied the split to the canonical
 example, the Linux `listening_sockets_summary_internal`. Extracted a pure
