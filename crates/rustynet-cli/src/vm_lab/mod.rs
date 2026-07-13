@@ -26923,7 +26923,7 @@ fn execute_vm_lab_status_for_targets(
         ("rustynet_netcheck", rustynet_netcheck_script.as_str()),
         (
             "latest_handshakes",
-            "if command -v wg >/dev/null 2>&1; then if sudo -n true >/dev/null 2>&1; then sudo -n wg show all latest-handshakes 2>&1; else wg show all latest-handshakes 2>&1; fi; else echo wg-not-installed; fi",
+            "export PATH=\"/usr/sbin:/sbin:$PATH\"; if command -v wg >/dev/null 2>&1; then if sudo -n true >/dev/null 2>&1; then sudo -n wg show all latest-handshakes 2>&1; else wg show all latest-handshakes 2>&1; fi; else echo wg-not-installed; fi",
         ),
         (
             "ip_addr",
@@ -27499,7 +27499,7 @@ fn execute_vm_lab_collect_artifacts_for_targets(
         ),
         (
             "latest_handshakes",
-            "if command -v wg >/dev/null 2>&1; then if sudo -n true >/dev/null 2>&1; then sudo -n wg show all latest-handshakes 2>&1; else wg show all latest-handshakes 2>&1; fi; else echo wg-not-installed; fi",
+            "export PATH=\"/usr/sbin:/sbin:$PATH\"; if command -v wg >/dev/null 2>&1; then if sudo -n true >/dev/null 2>&1; then sudo -n wg show all latest-handshakes 2>&1; else wg show all latest-handshakes 2>&1; fi; else echo wg-not-installed; fi",
         ),
         (
             "ip_addr",

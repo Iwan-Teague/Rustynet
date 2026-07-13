@@ -28,11 +28,19 @@ const PING_EXIT_MARKER: &str = "__RUSTYNET_PING_EXIT=";
 /// killswitch is installed at the daemon's `ExecStartPre` and survives teardown
 /// by design, and a daemon torn down mid-shutdown (or a restart that fires
 /// inside `RestartSec` right as cleanup disables it) can re-program a table
-/// after a single delete pass — observed live as `assert_node_clean` finding
-/// `rustynet_boot` after cleanup. Re-deleting until no `rustynet*` table remains
+/// after a single delete pass. Re-deleting until no `rustynet*` table remains
 /// converges once the daemon is actually down (nothing re-applies the table with
-/// the unit stopped, verified live).
-const LINUX_NFT_KILLSWITCH_RESET_COMMAND: &str = "if command -v nft >/dev/null 2>&1; then \
+/// the unit stopped).
+///
+/// PATH: `nft` lives in `/usr/sbin`, which a non-login SSH shell's PATH omits on
+/// Debian (`/usr/local/bin:/usr/bin:/bin:/usr/games`). The `command -v nft` gate
+/// therefore FAILED and the whole reset was silently skipped, leaving
+/// `rustynet_boot` behind on every run (found 2026-07-13 chasing the Pair-1 P1-2
+/// residue: the reset never ran, and the `assert_node_clean` probe fail-open hid
+/// it). The `sudo -n nft delete` calls worked (root's PATH has `/usr/sbin`) — only
+/// the user-context gate missed — so prepend the sbin dirs to PATH.
+const LINUX_NFT_KILLSWITCH_RESET_COMMAND: &str = "export PATH=\"/usr/sbin:/sbin:$PATH\"; \
+     if command -v nft >/dev/null 2>&1; then \
          for _ in $(seq 1 10); do \
              rn_tables=$(sudo -n nft list tables 2>/dev/null \
                  | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}'); \
@@ -53,7 +61,8 @@ const LINUX_NFT_KILLSWITCH_RESET_COMMAND: &str = "if command -v nft >/dev/null 2
 /// matching link is a no-op — and best-effort at every privileged step
 /// (`|| true`), so a node that never had an interface does not fail the reset.
 /// Runs AFTER the daemon-stop wait so nothing re-creates the device mid-delete.
-const LINUX_INTERFACE_RESET_COMMAND: &str = "if command -v ip >/dev/null 2>&1; then \
+const LINUX_INTERFACE_RESET_COMMAND: &str = "export PATH=\"/usr/sbin:/sbin:$PATH\"; \
+     if command -v ip >/dev/null 2>&1; then \
          rn_links=$(ip -o link show 2>/dev/null \
              | awk -F': ' '{print $2}' | awk -F'@' '{print $1}' \
              | awk '/^rustynet/ {print}'); \
@@ -70,19 +79,41 @@ const LINUX_INTERFACE_RESET_COMMAND: &str = "if command -v ip >/dev/null 2>&1; t
 ///   `iface=<names|->`  leftover `rustynet*` interface names, or `-` if none
 ///
 /// A node is clean only when all three are benign (`nft=-`, `daemon=down`,
-/// `iface=-`). Each sub-probe is independent and tolerates the relevant tool
-/// (`nft`, `pgrep`, `ip`) being absent: a missing tool yields the benign token,
-/// because a host without `nft` cannot carry a leftover nft table. Read-only —
-/// it mutates nothing, so it is safe to run repeatedly.
-const LINUX_NODE_CLEAN_PROBE: &str = "rn_nft=$(command -v nft >/dev/null 2>&1 && \
-         sudo -n nft list tables 2>/dev/null \
-         | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}' | tr '\\n' ',' || true); \
+/// `iface=-`). A tool genuinely absent yields the benign token (a host without
+/// `nft` cannot carry a leftover nft table); but a tool that IS present whose
+/// query fails (e.g. `sudo -n` denied) yields `unknown` → treated as DIRTY by
+/// [`parse_node_clean_probe`], NOT benign — the residue control fails CLOSED, so
+/// an unverifiable node is never passed as clean. Read-only.
+///
+/// PATH: prepend `/usr/sbin:/sbin` so `command -v nft` finds `/usr/sbin/nft`. A
+/// non-login SSH shell's PATH omits `/usr/sbin` on Debian, so the old
+/// `command -v nft` gate short-circuited and reported `nft=-` (clean) with the
+/// `rustynet_boot` killswitch still installed — a fail-OPEN that hid the Pair-1
+/// P1-2 residue (found + fixed 2026-07-13).
+const LINUX_NODE_CLEAN_PROBE: &str = "export PATH=\"/usr/sbin:/sbin:$PATH\"; \
+     if command -v nft >/dev/null 2>&1; then \
+         if rn_tbls=$(sudo -n nft list tables 2>/dev/null); then \
+             rn_nft=$(printf '%s\\n' \"$rn_tbls\" \
+                 | awk '$2==\"inet\" && $3 ~ /^rustynet/ {print $3}' | tr '\\n' ','); \
+         else \
+             rn_nft=unknown; \
+         fi; \
+     else \
+         rn_nft=; \
+     fi; \
      rn_daemon=$(if pgrep -x rustynetd >/dev/null 2>&1 \
          || pgrep -x rustynet-relay >/dev/null 2>&1; then echo up; else echo down; fi); \
-     rn_iface=$(command -v ip >/dev/null 2>&1 && \
-         ip -o link show 2>/dev/null \
-         | awk -F': ' '{print $2}' | awk -F'@' '{print $1}' \
-         | awk '/^rustynet/ {print}' | tr '\\n' ',' || true); \
+     if command -v ip >/dev/null 2>&1; then \
+         if rn_links=$(ip -o link show 2>/dev/null); then \
+             rn_iface=$(printf '%s\\n' \"$rn_links\" \
+                 | awk -F': ' '{print $2}' | awk -F'@' '{print $1}' \
+                 | awk '/^rustynet/ {print}' | tr '\\n' ','); \
+         else \
+             rn_iface=unknown; \
+         fi; \
+     else \
+         rn_iface=; \
+     fi; \
      printf 'nft=%s daemon=%s iface=%s\\n' \
          \"${rn_nft:--}\" \"$rn_daemon\" \"${rn_iface:--}\"";
 
@@ -1172,6 +1203,37 @@ mod tests {
         let err = parse_node_clean_probe("nft=- iface=-")
             .expect_err("missing daemon token must fail closed");
         assert!(err.to_string().contains("unrecognised") || err.to_string().contains("unknown"));
+    }
+
+    #[test]
+    fn parse_node_clean_probe_treats_unknown_nft_token_as_dirty() {
+        // The probe emits nft=unknown when nft IS present but the table query
+        // failed (e.g. sudo -n denied) — an UNVERIFIABLE nft state must fail
+        // closed, never pass as clean. (Regression for the Pair-1 P1-2 fix.)
+        let err = parse_node_clean_probe("nft=unknown daemon=down iface=-")
+            .expect_err("nft=unknown must fail closed");
+        assert!(err.to_string().contains("unknown"), "{err}");
+        let err = parse_node_clean_probe("nft=- daemon=down iface=unknown")
+            .expect_err("iface=unknown must fail closed");
+        assert!(err.to_string().contains("unknown"), "{err}");
+    }
+
+    #[test]
+    fn clean_probe_and_reset_commands_prepend_sbin_to_path() {
+        // Root cause of Pair-1 P1-2: `nft` is in /usr/sbin, which a non-login
+        // SSH shell's PATH omits, so the `command -v nft` gate short-circuited —
+        // the reset never ran and the clean probe fail-opened. Every command that
+        // gates on `command -v nft`/`ip` MUST first put the sbin dirs on PATH.
+        for cmd in [
+            super::LINUX_NODE_CLEAN_PROBE,
+            super::LINUX_NFT_KILLSWITCH_RESET_COMMAND,
+            super::LINUX_INTERFACE_RESET_COMMAND,
+        ] {
+            assert!(
+                cmd.contains("/usr/sbin:/sbin"),
+                "command must prepend sbin to PATH so `command -v nft` finds it: {cmd}"
+            );
+        }
     }
 
     #[test]
