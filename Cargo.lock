@@ -1464,6 +1464,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustynet-netns-probe"
+version = "0.1.0"
+
+[[package]]
 name = "rustynet-operator"
 version = "0.1.0"
 
