@@ -238,14 +238,38 @@ Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4
 
 ## 0.a) Functional-Parity Acceptance Spec — the W5.6 flip gate (Track B, 2026-07-12)
 
-**Status: DRAFT — PENDING OWNER SIGN-OFF.** This section is the precise,
-owner-approvable definition the 2026-07-04 parity-gate finding called for.
-Mechanical stage-ID parity (`overall_parity_pass`, `--mode strict`) is
-**unsatisfiable bash↔Rust by construction** (divergent stage-ID vocabularies;
-only 8 of ~67 IDs overlap) and is NOT the gate. The gate is **functional
-parity** as defined here. Once signed off, Track C measures every paired run
-against this spec, and W5.6 (default flip) may proceed only on pairs that pass
-it.
+**Status: DRAFT — agent security-first review applied 2026-07-13; PENDING OWNER
+SIGN-OFF.** This section is the precise, owner-approvable definition the
+2026-07-04 parity-gate finding called for. Mechanical stage-ID parity
+(`overall_parity_pass`, `--mode strict`) is **unsatisfiable bash↔Rust by
+construction** (divergent stage-ID vocabularies; only 8 of ~67 IDs overlap) and
+is NOT the gate. The gate is **functional parity PLUS an absolute security-
+posture floor on the engine being promoted** as defined here. Once signed off,
+Track C measures every paired run against this spec, and W5.6 (default flip) may
+proceed only on pairs that pass it.
+
+**Security-first framing (why this is not pure relative parity).** W5.6 flips the
+DEFAULT to the Rust engine, so Rust — not bash — becomes the engine that stands
+up every production-shaped lab and reports whether the security controls hold.
+Relative parity ("Rust matches bash") is necessary but NOT sufficient for a
+security-first project: bash is the LEGACY path being retired and may itself be
+weak, buggy (see the Track-C bash-defect log), or simply lack a control the Rust
+engine added. Matching a weak baseline is not a security argument. Therefore the
+gate has two independent halves that must BOTH hold: **(A) relative functional
+parity** (G1–G6: Rust does no less than bash on shared work) and **(B) an
+absolute security-control floor on the Rust run** (G7: every security-sensitive
+control the Rust plan includes is affirmatively proven on the Rust side,
+independent of whether bash has an equivalent). A control that regresses,
+fake-passes, or is silently skipped on Rust BLOCKS the flip even if bash never
+exercised it.
+
+**Global fail-closed rule (applies to every criterion below).** Any input a
+criterion needs that is missing, unreadable, malformed, ambiguous, or stale is
+evaluated as **FAIL**, never skipped and never "not-applicable-so-pass". A
+criterion may only read as met on explicit, well-formed, current evidence.
+Failure/abort/incomplete-evidence on either side dominates any contradictory
+pass field (RNQ-06): a stage recorded `pass` while other evidence in the same
+run records a `fail`/`timeout`/`abort` for it is resolved as FAIL.
 
 ### 0.a.1 Definitions
 
@@ -272,18 +296,30 @@ it.
   `vm-lab-diff-orchestrator-parity --mode functional` over the two
   `parity_input.json` files reports `overall_functional_parity_pass=true`:
   `shared_stage_count>0`, every shared canonical stage has the same outcome,
-  overall run status matches, node count matches. Validator pass/total counts
-  remain informational (the dialects run different validator sets by design).
+  overall run status matches, node count matches. **Distinguish two things the
+  original draft conflated:** validator *count* deltas (how MANY validators each
+  dialect ran) remain informational — the dialects legitimately run different
+  validator SETS; but any security-control *stage outcome* that overlaps both
+  dialects (e.g. a shared `validate_baseline_runtime`) MUST match, and every
+  security-control stage that exists only on the Rust side is NOT waved through
+  as a "Rust-only stage" — it is governed by G7. In other words, a security
+  control is never "informational".
 - **G2 — Role-cell equality.** For every role×OS cell the shared topology
   exercises, the two run-matrix rows record the SAME cell verdict
   (`pass=pass`, `fail=fail`, `not_run=not_run`). A cell exercised by only one
   engine is a parity failure unless it appears in the §0.a.3 intentional-
   difference table. Failure dominates pass; `blocked` (environment) must match
   or be declared in §0.a.4.
-- **G3 — Cleanup equality + residue-free.** The canonical `cleanup` stage is
-  terminal `pass` on BOTH sides, and the Rust side's cleanup ran its
-  `assert_node_clean` postcondition (RNQ-02). A cleanup `fail`/`skipped` on
-  either side disqualifies the pair (no "parity of two dirty labs").
+- **G3 — Cleanup equality + residue-free (both engines).** The canonical
+  `cleanup` stage is terminal `pass` on BOTH sides. The Rust side's cleanup ran
+  its `assert_node_clean` postcondition (RNQ-02) — daemon/service/interface/
+  route/firewall-NAT/DNS/relay/key-state residue affirmatively absent. Because
+  bash cleanup is best-effort and has NO equivalent postcondition, the pair
+  additionally requires an **independent post-run residue probe of the bash
+  side's guests** (the RNQ-02 fixtures, run out-of-band) — a stranded killswitch,
+  exit-NAT, or key-state leftover on either engine's lab is a release-blocker and
+  disqualifies the pair. A cleanup `fail`/`skipped` on either side, or any
+  detected residue, fails G3 (no "parity of two dirty labs").
 - **G4 — Evidence completeness.** Both report dirs pass
   `validate_live_lab_run_artifacts`; both runs appended a well-formed
   run-matrix row (§10.9 — a run with no row is not evidence); the Rust side's
@@ -296,6 +332,30 @@ it.
   the same lab state window. If either side is re-run, the pair is re-formed
   from scratch — a fresh run may not be diffed against a stale opposite side
   from an earlier lab state.
+- **G7 — Absolute security-control floor on the promoted (Rust) engine.**
+  Independent of bash, the Rust run in the pair must affirmatively PASS every
+  security-sensitive control its plan includes for the topology: the security-
+  audit suite (the Tier-0 daemon self-audits: membership-revoke, revoked-peer-
+  denied, membership-signature, privileged-helper-allowlist, policy-default-deny,
+  gossip-revoked-readmit, enrollment-replay, blind-exit-reversal) and the
+  per-node posture validators (`dns_failclosed`, `runtime_acls`,
+  `service_hardening`, `key_custody`, `mesh_status`, `authenticode`,
+  `ipv6_leak`), plus the exit-role security stages (`exit_dns_failclosed`,
+  `exit_nat_lifecycle`, `exit_demotion_residue`, `blind_exit_dataplane`) when an
+  exit/blind_exit is in the topology. A security control that is `fail`, or is
+  `skipped`/`not_run` when the topology SHOULD exercise it (a silent skip is a
+  fail-open and is treated as FAIL), blocks the flip — even if bash never ran an
+  equivalent. A `skipped` security control is only acceptable when its skip is
+  driven by a declared, topology-gated precondition (e.g. no exit node present),
+  and that precondition is recorded in the pair summary; an unexplained skip
+  fails G7. This criterion has no bash counterpart by design: it is the security
+  floor of the engine we are making default.
+- **G8 — No secrets in evidence; deployed source == committed source.** The Rust
+  run's `live_secrets_not_in_logs` control passes (no private key / passphrase /
+  token material in logs, journals, or the collected artifact archive — §10.6),
+  and the run's source-archive digest matches the committed tree at the pair's
+  commit (the guest built the reviewed source, not a mutated working tree). Both
+  fail closed on missing evidence.
 - **Minimum shared set (vacuity guard).** For a comprehensive pair, the shared
   canonical set must include at least: the 8 shared setup IDs (`preflight`,
   `prepare_source_archive`, `verify_ssh_reachability`, `cleanup_hosts`,
@@ -314,11 +374,16 @@ it.
   stage), `fresh_install_os_matrix_report` (reporting infra),
   `cross_network_daemon_path` (single warn-level netns proof; the Rust
   cross-network suite covers the substance).
-- **Rust-only stages (surfaced, not failing):** the granular per-surface
+- **Rust-only stages — surfaced, and NOT free passes.** Granular per-surface
   stages with no bash-side single equivalent (e.g. `traffic_test_matrix`
-  granularity, `exit_demotion_residue_validation`, per-validator stages). They
-  appear in `stages_only_in_right` for visibility and are covered by G2's
-  role-cell equality where they feed a role cell.
+  granularity, the per-validator security stages) appear in
+  `stages_only_in_right`. They do NOT fail *relative* parity (bash has no
+  counterpart to diff against) — but this is exactly why the original
+  "surfaced, not failing" framing was a security hole: a Rust-only SECURITY
+  control could regress and slip through. Those stages are therefore held to
+  the absolute floor in **G7** (security controls) and to **G2** role-cell
+  equality where they feed a role cell. Only genuinely non-security Rust-only
+  stages (e.g. `traffic_test_matrix` granularity) are informational.
 
 ### 0.a.4 Campaign surfaces (Track C) and environment blocks
 
@@ -336,15 +401,27 @@ recorded in the parity matrix rather than silently skipped.
 
 Each pair produces: the functional diff JSON (from
 `vm-lab-diff-orchestrator-parity --mode functional`), plus a paired-parity
-summary recording G2–G6 (role-cell table from the two matrix rows, cleanup +
-artifact-validation verdicts, provenance fields) written next to the diff.
-A `vm-lab-verify-functional-parity` subcommand SHOULD mechanize G1–G6 in one
-invocation (fail-closed on any missing input) so Track C verdicts are
-single-command reproducible; until it lands, the G2–G6 fields are recorded in
-the pair summary by the operator/agent and cross-checked against the two rows.
+summary recording **G1–G8** (role-cell table from the two matrix rows; cleanup +
+independent-residue verdicts for both engines; evidence/provenance fields; the
+G7 security-control roster with each control's Rust-side outcome and, for any
+skip, its declared topology precondition; the G8 secrets + source-digest
+checks) written next to the diff. A `vm-lab-verify-functional-parity` subcommand
+SHOULD mechanize **G1–G8** in one invocation (fail-closed on any missing input,
+per the global rule) so Track C verdicts are single-command reproducible; until
+it lands, the G1–G8 fields are recorded in the pair summary by the
+operator/agent and cross-checked against the two rows. A pair is a PASS only
+when **all of G1–G8 hold**; the summary states the verdict as the AND of the
+eight, not a majority.
 
 ### 0.a.6 Sign-off
 
+- [x] **Agent security-first review** (2026-07-13): reviewed against the
+  security-first mandate and strengthened — split the two halves (relative
+  parity G1–G6 + absolute Rust-side security floor G7 + secrets/source-integrity
+  G8), made the global fail-closed rule explicit, extended residue-free to both
+  engines (G3), and closed the "Rust-only security stage is a free pass" hole.
+  The verdict is the AND of G1–G8. This is the agent's recommendation; it does
+  not substitute for owner approval.
 - [ ] **Owner approval** (Iwan): this spec is the W5.6 flip gate. Approval is
   recorded by checking this box in a commit authored by the owner-designated
   flow; until then the default stays on bash regardless of pair results.
