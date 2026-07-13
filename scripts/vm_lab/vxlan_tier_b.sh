@@ -167,7 +167,9 @@ if [ -f "$STATE_ROOT/stun.pid" ]; then
   kill "\$old" 2>/dev/null || true
   rm -f "$STATE_ROOT/stun.pid"
 fi
-nohup python3 "$REMOTE_REPO/scripts/vm_lab/stun_responder.py" --bind 198.18.1.254 --port "$STUN_PORT" >"$STATE_ROOT/stun.log" 2>&1 &
+PROBE_BIN="$REMOTE_REPO/target/release/rustynet-netns-probe"
+[ -x "\$PROBE_BIN" ] || PROBE_BIN=/tmp/rustynet-netns-probe
+nohup "\$PROBE_BIN" stun-responder --bind 198.18.1.254 --port "$STUN_PORT" >"$STATE_ROOT/stun.log" 2>&1 &
 echo \$! > "$STATE_ROOT/stun.pid"
 EOF
 }

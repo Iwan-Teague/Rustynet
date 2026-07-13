@@ -7523,16 +7523,16 @@ stage_run_cross_network_preflight() {
 stage_run_cross_network_nat_classification() {
   local guest tool local_path
   guest="$(node_target_for_label exit)" || return 1
-  # The netns scripts need python3 (STUN responder + NAT probes), nft, and
-  # iproute2 netns. Lab guests have no internet egress, so a missing tool cannot
-  # be installed mid-run; fail fast with an actionable message rather than a
-  # cryptic mid-script "command not found".
-  if ! live_lab_run_root "$guest" "root python3 --version >/dev/null 2>&1 && root nft --version >/dev/null 2>&1 && root ip -V >/dev/null 2>&1"; then
-    printf 'cross_network_nat_classification: %s is missing python3/nft/iproute2 required by the netns substrate (no egress to install — bake into the guest image)\n' "$guest" >&2
+  # The netns scripts need nft + iproute2 netns. The STUN responder + NAT probes
+  # are now the Rust `rustynet-netns-probe` binary (built on-guest below), so
+  # python3 is no longer required. Lab guests have no internet egress, so a
+  # missing tool cannot be installed mid-run; fail fast with an actionable
+  # message rather than a cryptic mid-script "command not found".
+  if ! live_lab_run_root "$guest" "root nft --version >/dev/null 2>&1 && root ip -V >/dev/null 2>&1"; then
+    printf 'cross_network_nat_classification: %s is missing nft/iproute2 required by the netns substrate (no egress to install — bake into the guest image)\n' "$guest" >&2
     return 1
   fi
-  for tool in netns_internet_sim.sh netns_nat_classify.sh netns_nat_filter.sh \
-              stun_responder.py nat_probe.py nat_filter_probe.py; do
+  for tool in netns_internet_sim.sh netns_nat_classify.sh netns_nat_filter.sh; do
     local_path="$ROOT_DIR/scripts/vm_lab/$tool"
     if [[ ! -f "$local_path" ]]; then
       printf 'cross_network_nat_classification: missing tool %s\n' "$local_path" >&2
@@ -7540,6 +7540,12 @@ stage_run_cross_network_nat_classification() {
     fi
     live_lab_scp_to "$local_path" "$guest" "/tmp/$tool" || return 1
   done
+  # Build the Rust netns probe on-guest (std-only → offline) and stage it where
+  # the wrappers fall back to. Replaces the former python3 probe scripts.
+  if ! live_lab_run_root "$guest" 'bash -lc "cd \$HOME/Rustynet && cargo build --release -p rustynet-netns-probe && install -m 0755 target/release/rustynet-netns-probe /tmp/rustynet-netns-probe"'; then
+    printf 'cross_network_nat_classification: %s failed to build rustynet-netns-probe\n' "$guest" >&2
+    return 1
+  fi
   printf '[cross-network] netns NAT mapping classification (netns_nat_classify.sh) on %s\n' "$guest"
   live_lab_run_root "$guest" "root bash /tmp/netns_nat_classify.sh" || return 1
   printf '[cross-network] netns NAT filtering classification (netns_nat_filter.sh) on %s\n' "$guest"

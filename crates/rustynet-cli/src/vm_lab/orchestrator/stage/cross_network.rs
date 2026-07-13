@@ -14,13 +14,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PROFILE: &str = "baseline_lan";
 const DEFAULT_IMPAIRMENT_PROFILE: &str = "none";
+// Shell wrappers scp'd to the guest for the netns internet simulator. The STUN
+// responder + NAT probes they invoke are the Rust `rustynet-netns-probe` binary
+// (built on-guest below), NOT the former python3 stun_responder.py /
+// nat_probe.py / nat_filter_probe.py — the `--node` cross-network path is now
+// Python-free (no python3 dependency on lab guests).
 const NETNS_CLASSIFICATION_TOOLS: &[&str] = &[
     "netns_internet_sim.sh",
     "netns_nat_classify.sh",
     "netns_nat_filter.sh",
-    "stun_responder.py",
-    "nat_probe.py",
-    "nat_filter_probe.py",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,10 +334,28 @@ fn run_nat_classification(
     }
     let log_path = stage_dir.join("cross_network_nat_classification.log");
 
-    let dependency_check = "sudo -n bash -lc 'python3 --version >/dev/null 2>&1 && nft --version >/dev/null 2>&1 && ip -V >/dev/null 2>&1'";
+    // No python3 requirement any more — the netns probes are the Rust
+    // `rustynet-netns-probe` binary. Only nft + ip are needed by the wrappers.
+    let dependency_check =
+        "sudo -n bash -lc 'nft --version >/dev/null 2>&1 && ip -V >/dev/null 2>&1'";
     if let Some(outcome) =
         run_ssh_checked(&host, dependency_check, &log_path, "netns dependency check")
     {
+        return outcome;
+    }
+
+    // Build the Rust netns probe on-guest (std-only → offline, no new cargo-cache
+    // entries) from the deployed source, then stage it at the path the netns
+    // wrappers fall back to (`/tmp/rustynet-netns-probe`). Runs as the SSH user
+    // (cargo is on the user PATH from bootstrap); `chmod +x` keeps it executable
+    // by the root-run wrappers. This replaces scp-ing the former .py probes.
+    let build_probe = "bash -lc 'cd \"$HOME/Rustynet\" && cargo build --release -p rustynet-netns-probe && install -m 0755 target/release/rustynet-netns-probe /tmp/rustynet-netns-probe'";
+    if let Some(outcome) = run_ssh_checked(
+        &host,
+        build_probe,
+        &log_path,
+        "build+stage rustynet-netns-probe",
+    ) {
         return outcome;
     }
 

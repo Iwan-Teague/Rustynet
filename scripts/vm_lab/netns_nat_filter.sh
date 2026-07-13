@@ -5,12 +5,10 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROBE_BIN="${PROBE_BIN:-${SCRIPT_DIR}/rustynet-netns-probe}"
+[ -x "$PROBE_BIN" ] || PROBE_BIN="/tmp/rustynet-netns-probe"
 SIM="${SIM:-${SCRIPT_DIR}/netns_internet_sim.sh}"
-RESP="${RESP:-${SCRIPT_DIR}/stun_responder.py}"
-PROBE="${PROBE:-${SCRIPT_DIR}/nat_filter_probe.py}"
 [ -f "$SIM" ] || SIM="/tmp/netns_internet_sim.sh"
-[ -f "$RESP" ] || RESP="/tmp/stun_responder.py"
-[ -f "$PROBE" ] || PROBE="/tmp/nat_filter_probe.py"
 
 # Canonical simulated-transit service addresses (198.18.0.0/15); override
 # only for the explicit CGNAT collision profile.
@@ -62,7 +60,7 @@ wait_for_file() {
 }
 
 start_stun() {
-  ip netns exec rnsim-svc python3 "$RESP" --bind "$SVC_PRIMARY" --port "$STUN_PORT" \
+  ip netns exec rnsim-svc "$PROBE_BIN" stun-responder --bind "$SVC_PRIMARY" --port "$STUN_PORT" \
     >"${TMP_DIR}/stun.log" 2>&1 &
   PIDS+=("$!")
   sleep 0.4
@@ -100,7 +98,7 @@ run_scenario() {
   case "$scenario" in
     RETURN_EXACT)
       start_stun
-      ip netns exec rnsim-ep-A python3 "$PROBE" init \
+      ip netns exec rnsim-ep-A "$PROBE_BIN" nat-filter-init \
         --bind-port "$EP_WG_PORT" \
         --stun "${SVC_PRIMARY}:${STUN_PORT}" \
         --mapped-file "$mapped" \
@@ -110,7 +108,7 @@ run_scenario() {
       ;;
     UNSOLICITED_DIFF_PORT)
       start_stun
-      ip netns exec rnsim-ep-A python3 "$PROBE" init \
+      ip netns exec rnsim-ep-A "$PROBE_BIN" nat-filter-init \
         --bind-port "$EP_WG_PORT" \
         --stun "${SVC_PRIMARY}:${STUN_PORT}" \
         --mapped-file "$mapped" \
@@ -123,21 +121,21 @@ run_scenario() {
         return 1
       }
       target="$(tr -d '\r\n' < "$mapped")"
-      ip netns exec rnsim-svc python3 "$PROBE" probe \
+      ip netns exec rnsim-svc "$PROBE_BIN" nat-filter-probe \
         --bind "${SVC_SECONDARY}:${DIFF_PORT}" \
         --target "$target" \
         >"$probe_log" 2>&1
       wait "$init_pid" 2>/dev/null || true
       ;;
     COLD_INBOUND)
-      ip netns exec rnsim-ep-A python3 "$PROBE" init \
+      ip netns exec rnsim-ep-A "$PROBE_BIN" nat-filter-init \
         --bind-port "$EP_WG_PORT" \
         --listen-secs 2 \
         >"$init_log" 2>&1 &
       init_pid="$!"
       PIDS+=("$init_pid")
       sleep 0.3
-      ip netns exec rnsim-svc python3 "$PROBE" probe \
+      ip netns exec rnsim-svc "$PROBE_BIN" nat-filter-probe \
         --bind "${SVC_SECONDARY}:${COLD_PORT}" \
         --target "${EP_A_WAN}:${EP_WG_PORT}" \
         >"$probe_log" 2>&1

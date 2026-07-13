@@ -19,12 +19,10 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROBE_BIN="${PROBE_BIN:-${SCRIPT_DIR}/rustynet-netns-probe}"
+[ -x "$PROBE_BIN" ] || PROBE_BIN="/tmp/rustynet-netns-probe"
 SIM="${SIM:-${SCRIPT_DIR}/netns_internet_sim.sh}"
-RESP="${RESP:-${SCRIPT_DIR}/stun_responder.py}"
-PROBE="${PROBE:-${SCRIPT_DIR}/nat_probe.py}"
 [ -f "$SIM" ] || SIM="/tmp/netns_internet_sim.sh"
-[ -f "$RESP" ] || RESP="/tmp/stun_responder.py"
-[ -f "$PROBE" ] || PROBE="/tmp/nat_probe.py"
 # Canonical simulated-transit service addresses (198.18.0.0/15); override
 # only for the explicit CGNAT collision profile.
 SVC_PRIMARY="${SVC_PRIMARY:-198.18.0.254}"
@@ -64,13 +62,13 @@ run_profile() {
   bash "$SIM" build --site "A:${profile}" >/dev/null || { echo "build failed for $profile"; return 1; }
   # second STUN server address on the svc node (distinct destination)
   ip netns exec rnsim-svc ip addr add "${SVC_SECONDARY}/24" dev rnsim-svc-w 2>/dev/null
-  ip netns exec rnsim-svc python3 "$RESP" --bind "$SVC_PRIMARY" --port "$PORT" >"${TMP_DIR}/resp1.log" 2>&1 &
+  ip netns exec rnsim-svc "$PROBE_BIN" stun-responder --bind "$SVC_PRIMARY" --port "$PORT" >"${TMP_DIR}/resp1.log" 2>&1 &
   STUN_PIDS+=("$!")
-  ip netns exec rnsim-svc python3 "$RESP" --bind "$SVC_SECONDARY" --port "$PORT" >"${TMP_DIR}/resp2.log" 2>&1 &
+  ip netns exec rnsim-svc "$PROBE_BIN" stun-responder --bind "$SVC_SECONDARY" --port "$PORT" >"${TMP_DIR}/resp2.log" 2>&1 &
   STUN_PIDS+=("$!")
   sleep 1
   local out behaviour
-  out="$(ip netns exec rnsim-ep-A python3 "$PROBE" --stun "${SVC_PRIMARY}:${PORT}" --stun "${SVC_SECONDARY}:${PORT}" 2>&1)"
+  out="$(ip netns exec rnsim-ep-A "$PROBE_BIN" nat-classify --stun "${SVC_PRIMARY}:${PORT}" --stun "${SVC_SECONDARY}:${PORT}" 2>&1)"
   behaviour="$(printf '%s\n' "$out" | sed -n 's/^mapping=//p')"
   stop_stun_responders
   bash "$SIM" teardown >/dev/null 2>&1
