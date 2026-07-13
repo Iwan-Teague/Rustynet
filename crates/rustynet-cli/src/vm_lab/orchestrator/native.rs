@@ -58,6 +58,9 @@ pub(crate) fn execute_rust_native_orchestration(
     )?;
     let setup_only = config.setup_only;
     let run_only = config.run_only;
+    // RNQ-07: a nonzero per-stage deadline is now enforced (real cancellable
+    // process-isolated stages), not rejected. Zero = no deadline (unchanged).
+    let stage_timeout_secs = config.stage_timeout_secs;
 
     let resume_from_stage = config.resume_from.clone().filter(|s| !s.is_empty());
     let rerun_stage = config.rerun_stage.clone().filter(|s| !s.is_empty());
@@ -68,12 +71,6 @@ pub(crate) fn execute_rust_native_orchestration(
     }
     if resume_from_stage.is_some() && rerun_stage.is_some() {
         return Err("--resume-from and --rerun-stage are mutually exclusive".to_owned());
-    }
-    if config.stage_timeout_secs > 0 {
-        return Err(format!(
-            "--stage-timeout-secs={} is not supported by the in-process Rust --node runner; use --timeout-secs until cancellable process-isolated stages land",
-            config.stage_timeout_secs
-        ));
     }
     if let Some(ref stage) = resume_from_stage
         && !orchestrator::stage::StageId::ALL
@@ -316,6 +313,32 @@ pub(crate) fn execute_rust_native_orchestration(
         setup_only,
         run_only,
     );
+
+    // RNQ-07: wrap every stage in a real cancellable per-stage deadline. A
+    // stage that exceeds `stage_timeout_secs` is cancelled, its subprocess
+    // tree is reaped, and it records a terminal fail-closed `timed_out`
+    // outcome (never a pass; the run fails). `stage_timeout_secs == 0` leaves
+    // the plan untouched (no deadline). The wrapper forwards every plan-facing
+    // trait method, so plan validation, topo order, skip-cascade, evidence
+    // manifests, and always-run cleanup semantics are unchanged. The shared
+    // `timeout_ledger` lets the evidence observer relabel a cancelled stage's
+    // terminal row `timed_out` instead of a generic `fail`; deadlines are
+    // additive and never touch the SIGTERM/SIGINT shutdown flag above.
+    let stage_timeout_policy =
+        orchestrator::diagnostics::StageDeadlinePolicy::for_timeout_secs(stage_timeout_secs);
+    let subprocess_tree: std::sync::Arc<dyn orchestrator::diagnostics::SubprocessTreeControl> =
+        std::sync::Arc::new(
+            orchestrator::diagnostics::OrchestratorSubprocessTree::for_current_process(),
+        );
+    let timeout_ledger =
+        std::sync::Arc::new(orchestrator::diagnostics::StageTimeoutLedger::default());
+    let stages = orchestrator::diagnostics::apply_stage_deadlines(
+        stages,
+        stage_timeout_policy,
+        &subprocess_tree,
+        &timeout_ledger,
+    );
+
     let setup_stage_ids = rust_native_setup_stage_ids();
     let plan_stage_ids: Vec<orchestrator::stage::StageId> = stages.iter().map(|s| s.id()).collect();
     let reuse_binding: Option<(Vec<orchestrator::stage::StageId>, String)> = if run_only {
@@ -594,9 +617,18 @@ pub(crate) fn execute_rust_native_orchestration(
             config.collect_artifacts_on_failure,
         )
     };
+    // RNQ-07: the timeout-aware observer wraps the realtime recorder so a stage
+    // the deadline cancelled records its terminal row as `timed_out` (closed
+    // taxonomy) instead of the generic `fail` the recorder would derive from
+    // `StageOutcome::Failed`. With no deadline the ledger is empty and every
+    // event delegates verbatim to the inner recorder.
+    let timeout_recorder = orchestrator::diagnostics::TimeoutAwareStageRecorder::new(
+        &recorder,
+        std::sync::Arc::clone(&timeout_ledger),
+    );
     let mut results = runner.run_with_observer_and_pre_cleanup_hook(
         &mut ctx,
-        &recorder,
+        &timeout_recorder,
         Some(&pre_cleanup_diagnostics),
     )?;
     if shutdown_flag.load(std::sync::atomic::Ordering::Acquire) {
