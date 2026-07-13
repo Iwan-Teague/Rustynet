@@ -407,7 +407,12 @@ mesh-capable. **Windows-exit (WinNAT)** is declared **blocked-by-environment**
 (WinNAT needs Hyper-V; Hyper-V needs nested virt; UTM/Apple-Silicon exposes no
 nested virt — physically impossible in this lab) and is proven on the physical
 Windows-on-ARM device when it arrives; `blocked ≠ failed`, and the block is
-recorded in the parity matrix rather than silently skipped.
+recorded in the parity matrix rather than silently skipped. **Empirically
+confirmed on the actual lab Windows 11 Pro VM (2026-07-13):** `Get-NetNat` →
+"Invalid class"; CPU `virt-9.1` (QEMU) reports `VMMonitorModeExtensions=False`
+and `SecondLevelAddressTranslationExtensions=False`; Hyper-V mandatorily needs
+SLAT, so its hypervisor cannot start and WinNAT cannot load — enabling the
+Hyper-V feature would not change this. Assumption upgraded to measured fact.
 
 ### 0.a.5 Verdict artifact + tooling
 
