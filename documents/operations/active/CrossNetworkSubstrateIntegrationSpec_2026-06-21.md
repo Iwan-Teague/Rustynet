@@ -11,6 +11,60 @@ criteria. Never weaken a security control to make a stage pass (see §10).
 
 ---
 
+> ## ⚠️ OPEN RE-EVALUATION (owner directive, 2026-07-13) — cross-network must be FIRST-CLASS in the Rust `--node` engine, not bolted on
+>
+> **Status: PARKED pending a proper architecture brainstorm — do NOT build the redesign yet.** The
+> owner wants the `--node` engine to *own* the cross-network live-lab testing the same way it owns the
+> mesh/exit/relay stages — integrated, typed, in-process — rather than the current mix of shelled-out
+> bash and `cargo run` subprocesses. This section captures the CURRENT implementation (so the brainstorm
+> starts from fact) and the target to design toward. It supersedes nothing below yet; the phased plan
+> in §5 is the *old* integration approach and is itself part of what to re-evaluate.
+>
+> **Current implementation of the 11 `--node` `cross_network_*` stages (verified 2026-07-13,
+> `crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network.rs`):**
+> - **`Preflight`** — pure in-process Rust. ✓
+> - **`NatClassification`** — shells out: `scp` + `sudo -n bash` the netns **internet simulator**
+>   (`netns_internet_sim.sh` 244 ln + `netns_nat_classify.sh` 92 + `netns_nat_filter.sh` 168). Runs on a
+>   SINGLE host (Linux namespaces fake multiple networks — no 2nd machine needed). Its STUN/NAT probes are
+>   now the Rust `rustynet-netns-probe` binary (python removed 2026-07-13), but the *substrate
+>   orchestration is still bash*. **This is the main "bolted on" piece AND the only cross-network path
+>   runnable without a second network.**
+> - **`NatMatrix`** — `cargo run … ops validate-cross-network-nat-matrix` (Rust bin, but a subprocess).
+> - **8 remote-exit/roaming stages** (`DirectRemoteExit`, `NodeNetworkSwitch`, `RelayRemoteExit`,
+>   `FailbackRoaming`, `ControllerSwitch`, `TraversalAdversarial`, `RemoteExitDns`, `RemoteExitSoak`) —
+>   each `cargo run --bin live_linux_cross_network_*_test` (standalone Rust bins, invoked as SUBPROCESSES);
+>   **vxlan** substrate → needs a REAL second network (which the owner does not have right now).
+> - Separate, bash-only: **`cross_network_daemon_path`** (`netns_daemon_path.sh` 536 ln, still bash +
+>   inline `python3` hex/base64) — a legacy-orchestrator stage slated to die with bash at W5.7, NOT part
+>   of the Rust `--node` plan.
+>
+> **So the two "not first-class" symptoms are:** (a) the netns substrate is a scp'd bash script the Rust
+> stage shells into; (b) the 8 vxlan stages + nat_matrix are `cargo run` *subprocesses*, not in-process
+> engine stages sharing the runner's context/evidence/cancellation.
+>
+> **Hard constraint to design within:** there is NO pure-Rust way to build netns + nftables NAT — the
+> leaf ops must either shell to `ip`/`nft`/`ip netns` (what bash does, what Rust would do) or use raw
+> `netlink` via `unsafe` FFI, which the workspace **forbids** (`unsafe_code = "forbid"`). So "Rust-native"
+> realistically means: typed, tested, in-process Rust owns the topology / NAT profiles / classify-filter
+> sequence / errors / evidence / `StageOutcome`, running `ip`/`nft` as leaf commands — no scp'd script,
+> no subprocess-per-stage. Confirm this framing in the brainstorm before committing.
+>
+> **Brainstorm agenda (to resolve, then replace §4–§5 here):**
+> 1. A **substrate abstraction** in the engine (a `CrossNetworkSubstrate` trait?) with netns / vxlan /
+>    slirp impls, so a stage is written once and the substrate is swapped — the netns sim (single-host,
+>    runnable now) vs vxlan (real 2nd network) vs slirp (cross-OS smoke).
+> 2. **In-process stage integration**: fold the 8 `live_linux_cross_network_*_test` bins into engine
+>    stages (or a shared in-process library the bins also call) so they share context/evidence/cancel
+>    with the runner instead of `cargo run`.
+> 3. **Rust netns orchestration**: port `netns_internet_sim.sh` + classify/filter into a typed module
+>    (leaf ops = `ip`/`nft`), replacing the scp'd bash — the biggest de-bolt-on and the runnable-now part.
+> 4. **Provability**: netns runs on one host (provable now); vxlan/slirp need the owner's second network
+>    (defer live proof, build the code ready).
+> 5. **What to keep**: `rustynet-netns-probe` (already Rust), the NAT-profile vocabulary (§D5.1), the
+>    fail-closed evidence contract.
+
+---
+
 ## 1. Problem statement
 
 Everything cross-network is built **except the one thing that makes it run**: the orchestrator never
@@ -316,6 +370,11 @@ Windows/macOS behind slirp Shared NAT (one UTM relaunch). Cross-OS traversal + r
 5. **Anchor role surface (D11)** — `cold_enroll`/`double_nat_anchor` lean on anchor capabilities
    (port-mapping authority, enrollment endpoint). Confirm the anchor membership surface is present, or scope
    the first cut to what the current daemon exposes.
+6. **⚠️ FIRST-CLASS-IN-`--node` RE-EVALUATION (owner, 2026-07-13; PARKED — see the banner at the top).**
+   The whole netns-substrate-as-bash + vxlan-stages-as-`cargo run`-subprocess approach is itself up for
+   redesign so cross-network is integrated into the Rust `--node` engine, not bolted on. Brainstorm the
+   substrate abstraction + in-process stage integration BEFORE resuming §5's phased plan. This is the
+   highest-order open question and gates the shape of everything else in §4–§5.
 
 ---
 

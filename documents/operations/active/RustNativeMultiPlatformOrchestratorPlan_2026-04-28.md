@@ -528,7 +528,14 @@ wiring** for mac/win role cells. Status per stage family:
 - **Chaos suite** (9 stages) — **IN the Rust plan** (opt-in via
   `--enable-chaos-suite`).
 - **Cross-network suite** (11 stages) — **IN the Rust plan** (opt-out via
-  `--skip-cross-network`).
+  `--skip-cross-network`). ⚠️ **But "in the plan" ≠ "first-class": owner
+  directive 2026-07-13 to RE-EVALUATE how cross-network is done so it is
+  integrated into the `--node` engine, not bolted on.** Today: `NatClassification`
+  shells out to a bash netns simulator; `NatMatrix` + the 8 remote-exit stages
+  are Rust bins run as `cargo run` subprocesses (vxlan → real 2nd network).
+  PARKED pending an architecture brainstorm — see the ⚠️ banner in
+  `CrossNetworkSubstrateIntegrationSpec_2026-06-21.md` and §8 of the unified
+  ledger. Do not build the redesign before that brainstorm.
 - **Bash-exclusive stages** (6): `prime_remote_access` (Rust does it implicitly),
   `macos_preflight_check` (soft, never fails), `upgrade_admin_node_membership`
   (5-node topo only), `local_full_gate_suite` (by design, not a lab stage),

@@ -423,6 +423,18 @@ Owning ledger: [CrossPlatformRoleParityPlan_2026-06-21.md](./CrossPlatformRolePa
 
 ## 8. Cross-network dataplane, traversal, relay, and DNS
 
+- [ ] **⚠️ PARKED, owner directive 2026-07-13 — re-evaluate cross-network so it
+  is FIRST-CLASS in the Rust `--node` engine, not bolted on.** Today the 11
+  `cross_network_*` stages are a mix: `Preflight` in-process Rust; `NatClassification`
+  shells out to a bash netns simulator (`netns_internet_sim.sh` etc., the only
+  path runnable without a 2nd network); `NatMatrix` + 8 remote-exit stages are
+  Rust bins invoked as `cargo run` **subprocesses** (vxlan → needs a real 2nd
+  network). Target: typed, in-process engine stages over a substrate abstraction
+  (netns/vxlan/slirp), leaf ops = `ip`/`nft` (no pure-Rust netns; `unsafe`
+  netlink is forbidden). Brainstorm the architecture BEFORE building — the full
+  current-state map + agenda is the ⚠️ banner at the top of
+  [CrossNetworkSubstrateIntegrationSpec_2026-06-21.md](./CrossNetworkSubstrateIntegrationSpec_2026-06-21.md).
+  This gates the substrate-wiring item below.
 - [ ] Finish orchestrator substrate wiring for Tier A netns, Tier B VXLAN, and
   Tier C cross-OS/slirp smoke with typed setup/teardown and fail-closed cleanup.
 - [ ] Run NAT matrix: port-restricted cone, full cone, symmetric, double
