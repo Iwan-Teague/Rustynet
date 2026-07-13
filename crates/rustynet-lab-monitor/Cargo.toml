@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2024"
 description = "Terminal UI for the Rustynet live-lab loop"
 
+# This crate is deliberately excluded from the main Rustynet workspace (see
+# root Cargo.toml's `exclude` and this crate's README) and built/gated
+# standalone instead. An explicit empty `[workspace]` table makes that
+# self-containment robust: without it, cargo's ancestor search for an
+# enclosing workspace can walk PAST this directory's own would-be root and
+# find another, unrelated workspace further up the filesystem tree (e.g. a
+# checkout nested inside another checkout of the same repo, such as a git
+# worktree living under `.claude/worktrees/` inside the main clone) whose
+# `exclude` list does not match this crate's path relative to THAT root,
+# producing a confusing "believes it's in a workspace when it's not" error.
+# Declaring this table stops the search here unconditionally.
+[workspace]
+
 [[bin]]
 name = "rustynet-lab-monitor"
 path = "src/main.rs"

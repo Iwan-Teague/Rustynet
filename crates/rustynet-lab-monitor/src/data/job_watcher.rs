@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -112,15 +112,25 @@ fn find_running_jobs_with_live_processes(
         if !dir.exists() {
             continue;
         }
-        for entry in
-            std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
-        {
-            let entry = entry?;
+        // Best-effort per directory and per entry: this used to `?`-propagate
+        // on the FIRST unreadable directory, unreadable entry, or unreadable
+        // (or non-UTF8, or directory-shaped) `.json` file, which silently
+        // hid every OTHER job -- including a genuinely active one sitting
+        // right next to a single stale/corrupt file from a past crash -- for
+        // the whole tick, with no visible error (this fn's `Result` is
+        // consumed via `if let Ok(...)` at the call site). One bad entry
+        // must only drop that one entry, never the whole scan.
+        let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let raw = std::fs::read_to_string(&path)?;
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             match serde_json::from_str::<JobState>(&raw) {
                 Ok(job) => jobs.push(job),
                 Err(_) => continue,
@@ -565,6 +575,94 @@ mod tests {
         assert_eq!(running[0].pid, Some(std::process::id()));
     }
 
+    #[test]
+    fn one_corrupt_job_json_does_not_hide_a_genuinely_running_job() {
+        // Regression: a single unreadable/corrupt `.json` entry used to
+        // `?`-propagate an Err out of the whole scan (consumed via
+        // `if let Ok(...)` at every call site), making a GENUINELY active
+        // job -- sitting right next to the bad file -- invisible for the
+        // whole tick with no error surfaced anywhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jobs_dir = dir.path().join("state/deepseek-mcp-jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        std::fs::write(
+            jobs_dir.join("labrun-good.json"),
+            format!(
+                r#"{{"job_id":"labrun-good","state":"running","started_unix":1,"area":"x","report_dir":"state/tracked","orchestrator_pid":{}}}"#,
+                std::process::id()
+            ),
+        )
+        .expect("good job json");
+        // Garbage bytes, not even valid UTF-8.
+        std::fs::write(
+            jobs_dir.join("labrun-corrupt.json"),
+            [0xff, 0xfe, 0x00, 0x01],
+        )
+        .expect("corrupt job json");
+        // Syntactically valid JSON, but not the JobState shape at all.
+        std::fs::write(jobs_dir.join("labrun-wrong-shape.json"), r#"[1, 2, 3]"#)
+            .expect("wrong-shape job json");
+
+        let running = find_running_jobs_with_live_processes(dir.path(), Vec::new())
+            .expect("scan must not fail even with corrupt siblings present");
+
+        assert_eq!(running.len(), 1, "{running:?}");
+        assert_eq!(running[0].job_id, "labrun-good");
+    }
+
+    #[test]
+    fn a_json_named_entry_that_is_actually_a_directory_is_skipped_not_erred() {
+        // A `.json`-suffixed path can transiently be a directory (a
+        // half-completed `mkdir`, or a stray artifact) rather than a file.
+        // Reading it errors (Is a directory); that must be skipped, not
+        // propagated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jobs_dir = dir.path().join("state/deepseek-mcp-jobs");
+        std::fs::create_dir_all(jobs_dir.join("weird.json")).expect("dir shaped like a .json");
+        std::fs::write(
+            jobs_dir.join("labrun-good.json"),
+            format!(
+                r#"{{"job_id":"labrun-good","state":"running","started_unix":1,"area":"x","report_dir":"state/tracked","orchestrator_pid":{}}}"#,
+                std::process::id()
+            ),
+        )
+        .expect("good job json");
+
+        let running = find_running_jobs_with_live_processes(dir.path(), Vec::new())
+            .expect("scan must not fail on a directory-shaped .json entry");
+
+        assert_eq!(running.len(), 1, "{running:?}");
+        assert_eq!(running[0].job_id, "labrun-good");
+    }
+
+    #[test]
+    fn an_unreadable_jobs_directory_does_not_hide_the_other_jobs_directory() {
+        // `state/deepseek-mcp-jobs` is a FILE (not a directory) here, so
+        // `read_dir` on it errors. That must only skip THIS source, not
+        // abort before ever looking at `state/lab-monitor-jobs`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(state.join("deepseek-mcp-jobs"), "not a directory").expect("bogus file");
+
+        let jobs_dir = state.join("lab-monitor-jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        std::fs::write(
+            jobs_dir.join("monitor-good.json"),
+            format!(
+                r#"{{"job_id":"monitor-good","state":"running","started_unix":1,"area":"x","report_dir":"state/tracked","orchestrator_pid":{}}}"#,
+                std::process::id()
+            ),
+        )
+        .expect("good job json");
+
+        let running = find_running_jobs_with_live_processes(dir.path(), Vec::new())
+            .expect("scan must not fail when one jobs dir is unreadable");
+
+        assert_eq!(running.len(), 1, "{running:?}");
+        assert_eq!(running[0].job_id, "monitor-good");
+    }
+
     fn write_orphan_report_dir(repo_root: &Path, name: &str, stages_tsv_age: std::time::Duration) {
         let report_dir = repo_root.join("state").join(name);
         std::fs::create_dir_all(report_dir.join("state")).expect("state dir");
@@ -609,6 +707,60 @@ mod tests {
 
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].job_id, "live-lab-in-progress-run");
+    }
+
+    #[test]
+    fn a_corrupt_report_state_json_does_not_crash_the_scan_or_misclassify() {
+        // report_state.json feeds BOTH the completion check
+        // (read_report_complete_flag) and the start-time read
+        // (read_started_unix). A corrupt/garbage file must not panic and
+        // must not read as "run_complete: true" -- that would wrongly HIDE a
+        // genuinely in-progress orphan run. Fail-safe here means "treat the
+        // completion flag as false", so an actively-written run stays visible.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_orphan_report_dir(
+            dir.path(),
+            "live-lab-corrupt-state",
+            std::time::Duration::from_secs(30),
+        );
+        std::fs::write(
+            dir.path()
+                .join("state/live-lab-corrupt-state/state/report_state.json"),
+            "{ this is not valid json at all",
+        )
+        .expect("corrupt report_state.json");
+
+        let running = find_running_jobs_with_live_processes(dir.path(), Vec::new())
+            .expect("scan must not fail on a corrupt report_state.json");
+
+        assert_eq!(running.len(), 1, "{running:?}");
+        assert_eq!(running[0].job_id, "live-lab-corrupt-state");
+    }
+
+    #[test]
+    fn a_report_state_json_falsely_marked_complete_hides_the_orphan_as_expected() {
+        // The complement: a well-formed report_state.json with
+        // run_complete=true is a legitimate completion marker, so the orphan
+        // is correctly NOT shown as running. This pins that the corrupt-input
+        // fallback above (false) is the SAFE direction, not just "always
+        // running".
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_orphan_report_dir(
+            dir.path(),
+            "live-lab-genuinely-complete",
+            std::time::Duration::from_secs(30),
+        );
+        std::fs::write(
+            dir.path()
+                .join("state/live-lab-genuinely-complete/state/report_state.json"),
+            r#"{"run_complete": true}"#,
+        )
+        .expect("complete report_state.json");
+
+        let running =
+            find_running_jobs_with_live_processes(dir.path(), Vec::new()).expect("running jobs");
+
+        assert!(running.is_empty(), "{running:?}");
     }
 
     #[test]

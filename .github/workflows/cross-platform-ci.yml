@@ -23,6 +23,14 @@ jobs:
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
           cargo check --workspace --all-targets --all-features --locked
           cargo test --workspace --all-targets --all-features --locked
+      - name: Lab monitor standalone gates
+        # rustynet-lab-monitor is EXCLUDED from the workspace (see root
+        # Cargo.toml + crate README), so the workspace validation above never
+        # touches it. Gate the excluded crate explicitly here. It is
+        # macOS/Linux only, so it runs on this leg and the Debian leg, not
+        # the Windows leg.
+        run: |
+          ./scripts/ci/lab_monitor_gates.sh
       - name: Security gates
         run: |
           cargo audit --deny warnings
@@ -44,6 +52,11 @@ jobs:
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
           cargo check --workspace --all-targets --all-features --locked
           cargo test --workspace --all-targets --all-features --locked
+      - name: Lab monitor standalone gates
+        # Excluded from the workspace; gate it explicitly on the Linux leg
+        # too (macOS/Linux only crate). See scripts/ci/lab_monitor_gates.sh.
+        run: |
+          ./scripts/ci/lab_monitor_gates.sh
       - name: Security gates
         run: |
           cargo audit --deny warnings

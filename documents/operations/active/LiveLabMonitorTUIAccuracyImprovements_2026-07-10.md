@@ -72,3 +72,7 @@ The monitor no longer presents locally inferred data as authoritative for an act
 ## Remaining boundary
 
 The monitor polls stage state every 2 seconds. This is near-real-time, not event-stream real-time. File watching can reduce latency later, but polling remains the correctness fallback. UTM discovery requires host app access; a sandbox that denies UTM returns a visible `VM discovery` data error instead of silently showing an incomplete inventory list.
+
+## Follow-up: input robustness + first-class gating (2026-07-13)
+
+A dedicated input-robustness pass hardened every state-file parser to degrade gracefully (never panic, never false-green/incoherent) on corrupt, missing, empty, stale, partially-written, and concurrently-updated input, and made the workspace-excluded crate a first-class gated CI target. Full detail (the specific `?`-propagation/panic regressions fixed, the adversarial-input test coverage, and the `scripts/ci/lab_monitor_gates.sh` + `cross-platform-ci.yml` wiring) is in `LabMonitorTUIDesign_2026-06-29.md` §11 / §11.1 and the crate `README.md`.

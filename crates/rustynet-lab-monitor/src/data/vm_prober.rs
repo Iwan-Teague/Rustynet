@@ -302,27 +302,35 @@ pub async fn list_utm_vms() -> Result<Vec<UtmVm>> {
             String::from_utf8_lossy(&output.stdout).trim()
         );
     }
-    let stdout =
-        String::from_utf8(output.stdout).context("utmctl list returned non-UTF8 output")?;
-    parse_utmctl_list(&stdout)
+    // Lossy, not strict: a stray non-UTF8 byte in one VM's name (an unusual
+    // rename, a UTM quirk) must not blank out the discovery of every OTHER
+    // VM on the host.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_utmctl_list(&stdout))
 }
 
-fn parse_utmctl_list(raw: &str) -> Result<Vec<UtmVm>> {
+/// Best-effort: a malformed row (missing status, missing name -- e.g. a VM
+/// bundle mid-creation) is skipped, not fatal. One bad row must never blank
+/// out every OTHER VM's discovery for the whole host.
+fn parse_utmctl_list(raw: &str) -> Vec<UtmVm> {
     let mut vms = Vec::new();
     for (line_no, line) in raw.lines().enumerate() {
         if line_no == 0 && line.trim_start().starts_with("UUID") {
+            continue;
+        }
+        if line.trim().is_empty() {
             continue;
         }
         let mut fields = line.split_whitespace();
         let Some(uuid) = fields.next() else {
             continue;
         };
-        let power_state = fields
-            .next()
-            .with_context(|| format!("utmctl row missing status: {line}"))?;
+        let Some(power_state) = fields.next() else {
+            continue;
+        };
         let name = fields.collect::<Vec<_>>().join(" ");
         if name.is_empty() {
-            bail!("utmctl row missing VM name: {line}");
+            continue;
         }
         vms.push(UtmVm {
             uuid: uuid.to_owned(),
@@ -330,7 +338,7 @@ fn parse_utmctl_list(raw: &str) -> Result<Vec<UtmVm>> {
             name,
         });
     }
-    Ok(vms)
+    vms
 }
 
 async fn tcp_probe(host: &str, port: u16) -> bool {
@@ -355,12 +363,41 @@ mod tests {
     #[test]
     fn parses_all_utm_rows_and_preserves_names_with_spaces() {
         let raw = "UUID Status Name\nA started Debian\nB stopped Windows XP Harness\n";
-        let vms = parse_utmctl_list(raw).expect("parse");
+        let vms = parse_utmctl_list(raw);
         assert_eq!(vms.len(), 2);
         assert_eq!(vms[0].name, "Debian");
         assert_eq!(vms[0].power_state, "started");
         assert_eq!(vms[1].name, "Windows XP Harness");
         assert_eq!(vms[1].power_state, "stopped");
+    }
+
+    #[test]
+    fn one_malformed_row_does_not_drop_the_valid_rows_around_it() {
+        // Regression: a row missing its status/name field (a VM bundle
+        // caught mid-creation, or a truncated final line from a concurrent
+        // `utmctl` write) used to `?`-bubble an Err out of the whole parse,
+        // blanking out EVERY OTHER VM's discovery for the host. Malformed
+        // rows must be skipped individually, not abort the scan.
+        let raw = "UUID Status Name\n\
+                   A started Debian\n\
+                   \n\
+                   B-no-status-or-name\n\
+                   C stopped\n\
+                   D started Fedora\n";
+        let vms = parse_utmctl_list(raw);
+
+        // Only the two complete rows survive; the blank line, the
+        // status/name-less row, and the name-less row are all skipped.
+        assert_eq!(vms.len(), 2, "{vms:?}");
+        assert_eq!(vms[0].name, "Debian");
+        assert_eq!(vms[1].name, "Fedora");
+    }
+
+    #[test]
+    fn empty_utmctl_output_yields_no_vms_not_a_panic() {
+        assert!(parse_utmctl_list("").is_empty());
+        // Header-only output (no VMs registered at all) is also empty.
+        assert!(parse_utmctl_list("UUID Status Name\n").is_empty());
     }
 
     #[test]

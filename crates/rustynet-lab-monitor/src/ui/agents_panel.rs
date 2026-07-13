@@ -449,8 +449,15 @@ fn plural(n: usize) -> &'static str {
 
 fn truncate_session(s: &str) -> String {
     // Show the unique suffix (last 12 chars) — session IDs are long.
-    if s.len() > 14 {
-        format!("…{}", &s[s.len() - 12..])
+    // Character-based, not byte-based: `session_id` is external input (an
+    // opencode status JSON file, or an env var) that this crate does not
+    // control the shape of. Byte-slicing on `s.len()` would panic ("byte
+    // index N is not a char boundary") the moment a non-ASCII session id
+    // put a multi-byte UTF-8 character across the cut point.
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() > 14 {
+        let suffix: String = chars[chars.len() - 12..].iter().collect();
+        format!("…{suffix}")
     } else {
         s.to_owned()
     }
@@ -859,5 +866,119 @@ mod tests {
         let ledger = load_ledger(&dir.path().join("does-not-exist.json"));
         assert_eq!(ledger.patch.total_runs_ever, 0);
         assert_eq!(ledger.review.processed_run_ids.len(), 0);
+    }
+
+    #[test]
+    fn load_ledger_falls_back_to_default_on_corrupt_ledger_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        std::fs::write(&path, b"{not json at all \xff\xfe").unwrap();
+
+        let ledger = load_ledger(&path);
+
+        assert_eq!(ledger.patch.total_runs_ever, 0);
+        assert_eq!(ledger.patch.total_cost_usd, 0.0);
+        assert_eq!(ledger.review.processed_run_ids.len(), 0);
+    }
+
+    #[test]
+    fn reconcile_patch_ledger_survives_corrupt_and_partial_lines_mixed_with_good_ones() {
+        // A concurrently-appended runs.jsonl can be caught mid-write (the
+        // in-progress last line truncated) or contain a stray garbage line
+        // from a prior crash. Only the well-formed lines must fold in --
+        // never a panic, and never lost/duplicated totals for the good ones.
+        let dir = tempfile::tempdir().unwrap();
+        let runs_path = dir.path().join("runs.jsonl");
+        std::fs::write(
+            &runs_path,
+            "{\"cost\":0.01}\nnot json\n{\"cost\":0.02}\n{\"cost\": incomplete",
+        )
+        .unwrap();
+
+        let mut ledger = PatchLedger::default();
+        reconcile_patch_ledger(&mut ledger, &runs_path);
+
+        // Only the 2 well-formed lines count. `processed_run_lines` is a
+        // watermark over `read_jsonl`'s FILTERED (parseable-only) output,
+        // not a raw line count -- see the next test for why that is exactly
+        // what makes a later-completing torn write self-heal correctly.
+        assert_eq!(ledger.total_runs_ever, 2);
+        assert!((ledger.total_cost_usd - 0.03).abs() < 1e-9);
+        assert_eq!(ledger.processed_run_lines, 2);
+    }
+
+    #[test]
+    fn reconcile_patch_ledger_folds_in_a_torn_write_once_it_completes() {
+        // Simulates a concurrent writer: reconcile runs while the last line
+        // is still a truncated in-progress write (invisible / not yet
+        // folded in), then again after the write completes. The completed
+        // line must be folded in EXACTLY once -- not skipped forever
+        // (because it was invisible at the first reconcile) and not
+        // double-counted (because the watermark already advanced once).
+        let dir = tempfile::tempdir().unwrap();
+        let runs_path = dir.path().join("runs.jsonl");
+        std::fs::write(&runs_path, "{\"cost\":0.01}\n{\"cost\": incomple").unwrap();
+
+        let mut ledger = PatchLedger::default();
+        reconcile_patch_ledger(&mut ledger, &runs_path);
+        assert_eq!(ledger.total_runs_ever, 1);
+        assert!((ledger.total_cost_usd - 0.01).abs() < 1e-9);
+
+        // The writer finishes the line and appends a third one.
+        std::fs::write(
+            &runs_path,
+            "{\"cost\":0.01}\n{\"cost\":0.02}\n{\"cost\":0.03}\n",
+        )
+        .unwrap();
+        reconcile_patch_ledger(&mut ledger, &runs_path);
+
+        assert_eq!(ledger.total_runs_ever, 3);
+        assert!((ledger.total_cost_usd - 0.06).abs() < 1e-9);
+    }
+
+    #[test]
+    fn truncate_session_short_ascii_is_unchanged() {
+        assert_eq!(truncate_session(""), "");
+        assert_eq!(truncate_session("short-id"), "short-id");
+    }
+
+    #[test]
+    fn truncate_session_keeps_the_last_12_chars_of_a_long_ascii_id() {
+        let session = "ses_0123456789abcdef";
+        let truncated = truncate_session(session);
+        assert_eq!(truncated, "…456789abcdef");
+    }
+
+    #[test]
+    fn truncate_session_never_panics_on_a_multibyte_utf8_session_id() {
+        // Regression: `session_id` comes from an external opencode status
+        // JSON file (or an env var) this crate does not control the shape
+        // of. The old implementation byte-sliced at `s.len() - 12` (byte
+        // length), which panics ("byte index N is not a char boundary") the
+        // moment a multi-byte UTF-8 character straddles that cut point.
+        // This string is built so that cut point would have landed inside
+        // the 4-byte "🎉": 4 ASCII bytes, then the emoji (bytes 4..8), then
+        // 10 more ASCII bytes => 18 bytes total, old cut at byte 6 (inside
+        // the emoji's byte range). Char count is 15 (> 14), so the new
+        // char-counted implementation still truncates it.
+        let adversarial = "aaaa🎉aaaaaaaaaa";
+        assert_eq!(adversarial.len(), 18, "byte length backing the old bug");
+        assert_eq!(adversarial.chars().count(), 15);
+
+        // Must not panic, and must produce exactly "…" + the last 12 chars.
+        let truncated = truncate_session(adversarial);
+        assert_eq!(truncated, "…a🎉aaaaaaaaaa");
+        assert_eq!(truncated.chars().count(), 13);
+    }
+
+    #[test]
+    fn truncate_session_handles_a_session_id_made_entirely_of_wide_chars() {
+        // Every character is 3 bytes (byte length 42 for 14 chars), so a
+        // byte-based cut point would also misalign against char boundaries
+        // depending on the prefix — exercised here with a uniform string to
+        // pin the char-counted (not byte-counted) `> 14` threshold itself.
+        let session: String = "€".repeat(20);
+        let truncated = truncate_session(&session);
+        assert_eq!(truncated.chars().count(), 13); // '…' + 12 chars
     }
 }
