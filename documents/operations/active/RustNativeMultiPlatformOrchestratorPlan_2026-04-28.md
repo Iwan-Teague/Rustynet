@@ -422,9 +422,14 @@ eight, not a majority.
   engines (G3), and closed the "Rust-only security stage is a free pass" hole.
   The verdict is the AND of G1–G8. This is the agent's recommendation; it does
   not substitute for owner approval.
-- [ ] **Owner approval** (Iwan): this spec is the W5.6 flip gate. Approval is
-  recorded by checking this box in a commit authored by the owner-designated
-  flow; until then the default stays on bash regardless of pair results.
+- [x] **Owner approval** (Iwan, 2026-07-13): APPROVED as the W5.6 flip gate,
+  after the agent's security-first review pass strengthened it (G7 absolute Rust
+  security floor + G8 secrets/source-integrity + global fail-closed + both-engine
+  residue). Track C now measures every paired run against G1–G8. **This approves
+  the GATE DEFINITION only** — it does NOT pre-authorize the W5.6 default-flip or
+  W5.7 bash removal, which remain a separate explicit owner go/no-go after the
+  full campaign passes (incl. the Windows-exit cell). The default stays on bash
+  until that separate go-ahead.
 
 ## 0) TL;DR
 
