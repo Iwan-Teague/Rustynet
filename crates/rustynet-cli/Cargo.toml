@@ -25,6 +25,18 @@ name = "live_signed_bundle_forger"
 path = "src/bin/live_signed_bundle_forger.rs"
 required-features = ["chaos-forger"]
 
+# RNQ-09: the whole-file `#![cfg(feature = "vm-lab")]` gate on this bin is not
+# by itself sufficient to keep `cargo check -p rustynet-cli` (no features)
+# green — a cfg'd-out binary crate still has zero items, and `rustc` requires
+# a `fn main` even then. `required-features` is the mechanism that actually
+# makes Cargo skip building this target entirely under default features;
+# `tests/rnq09_signal_cleanup.rs` (which spawns it via
+# `env!("CARGO_BIN_EXE_rnq09_signal_harness")`) needs `--features vm-lab` too.
+[[bin]]
+name = "rnq09_signal_harness"
+path = "src/bin/rnq09_signal_harness.rs"
+required-features = ["vm-lab"]
+
 [dependencies]
 base64 = "0.22"
 rustynet-advisor = { path = "../rustynet-advisor" }
