@@ -1348,8 +1348,84 @@ fn observe_utm_vm(
     observation
 }
 
-fn observe_host(utmctl_available: bool) -> HostNetworkObservation {
-    let mut host = HostNetworkObservation::default();
+/// Parse `ip -j addr show` (iproute2 JSON) into interface observations,
+/// redacting non-private IPv4 addresses. The Linux run-on-host analogue of
+/// `parse_ifconfig`.
+pub fn parse_ip_json_addr(output: &str) -> Vec<HostInterfaceObservation> {
+    let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(output)
+    else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|iface| {
+            let name = iface.get("ifname")?.as_str()?.to_owned();
+            let mut ipv4 = Vec::new();
+            let mut ipv6_count = 0usize;
+            if let Some(addrs) = iface.get("addr_info").and_then(serde_json::Value::as_array) {
+                for addr in addrs {
+                    match addr.get("family").and_then(serde_json::Value::as_str) {
+                        Some("inet") => {
+                            if let Some(local) =
+                                addr.get("local").and_then(serde_json::Value::as_str)
+                            {
+                                ipv4.push(redact_ip_str(local));
+                            }
+                        }
+                        Some("inet6") => ipv6_count += 1,
+                        _ => {}
+                    }
+                }
+            }
+            Some(HostInterfaceObservation {
+                name,
+                ipv4,
+                ipv6_count,
+            })
+        })
+        .collect()
+}
+
+/// Parse `ip -j route show` (iproute2 JSON) into route observations. The Linux
+/// run-on-host analogue of `parse_netstat_routes`; `dst` is already a CIDR or
+/// the literal `default`.
+pub fn parse_ip_json_route(output: &str) -> Vec<HostRouteObservation> {
+    let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(output)
+    else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|route| {
+            let dst = route.get("dst").and_then(serde_json::Value::as_str)?;
+            let dev = route
+                .get("dev")
+                .and_then(serde_json::Value::as_str)?
+                .to_owned();
+            let destination = normalize_route_destination(dst)?;
+            Some(HostRouteObservation {
+                destination: redact_route_destination(&destination),
+                interface: dev,
+            })
+        })
+        .collect()
+}
+
+/// Resolve the iproute2 `ip` binary. A non-login/service PATH can omit
+/// `/usr/sbin`, so probe the standard locations before falling back to a bare
+/// PATH lookup.
+fn linux_ip_binary() -> String {
+    for candidate in ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"] {
+        if Path::new(candidate).is_file() {
+            return candidate.to_owned();
+        }
+    }
+    "ip".to_owned()
+}
+
+/// macOS/UTM host observation: UTM version from the app bundle plus the
+/// BSD-tool network collectors (`ifconfig`/`netstat`/`scutil`).
+fn observe_host_macos(host: &mut HostNetworkObservation, utmctl_available: bool) {
     if Path::new(UTM_APP_INFO_PLIST).is_file() {
         match plutil_extract(
             Path::new(UTM_APP_INFO_PLIST),
@@ -1374,6 +1450,34 @@ fn observe_host(utmctl_available: bool) -> HostNetworkObservation {
     match run_read_only("/usr/sbin/scutil", &["--proxy"]) {
         Ok(output) => host.proxy = parse_scutil_proxy(&output),
         Err(err) => host.observation_errors.push(err),
+    }
+}
+
+/// Linux (dedicated libvirt VM host, LinuxVmHostPlan) host observation via
+/// iproute2 JSON. Linux has no system-wide proxy configuration analogous to
+/// macOS `scutil --proxy`, so the proxy observation is left at its disabled
+/// default.
+fn observe_host_linux(host: &mut HostNetworkObservation) {
+    let ip_bin = linux_ip_binary();
+    match run_read_only(ip_bin.as_str(), &["-j", "addr", "show"]) {
+        Ok(output) => host.interfaces = parse_ip_json_addr(&output),
+        Err(err) => host.observation_errors.push(err),
+    }
+    match run_read_only(ip_bin.as_str(), &["-j", "route", "show"]) {
+        Ok(output) => host.routes = parse_ip_json_route(&output),
+        Err(err) => host.observation_errors.push(err),
+    }
+}
+
+fn observe_host(utmctl_available: bool) -> HostNetworkObservation {
+    let mut host = HostNetworkObservation::default();
+    // The lab robot runs either on the macOS/UTM host or, for the dedicated
+    // Linux libvirt VM host (LinuxVmHostPlan), on a Linux host. Collect host
+    // network state with the tools native to whichever OS it is running on.
+    if std::env::consts::OS == "macos" {
+        observe_host_macos(&mut host, utmctl_available);
+    } else {
+        observe_host_linux(&mut host);
     }
     host.default_route_interface = host
         .routes
@@ -1917,6 +2021,51 @@ mod tests {
         r#"[{"MacAddress": "32:6b:39:df:d7:4e", "Mode": "Shared"}]"#;
     const APPLE_BRIDGED_NIC_JSON: &str =
         r#"[{"MacAddress": "32:6b:39:df:d7:4f", "Mode": "Bridged", "BridgeInterface": "en5"}]"#;
+
+    #[test]
+    fn parse_ip_json_addr_reads_interfaces_and_redacts() {
+        let output = r#"[
+          {"ifname":"lo","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8},{"family":"inet6","local":"::1","prefixlen":128}]},
+          {"ifname":"br0","addr_info":[
+            {"family":"inet","local":"192.168.0.50","prefixlen":24},
+            {"family":"inet","local":"8.8.8.8","prefixlen":32},
+            {"family":"inet6","local":"fe80::5054:ff:fe12:3456","prefixlen":64}
+          ]}
+        ]"#;
+        let interfaces = parse_ip_json_addr(output);
+        assert_eq!(interfaces.len(), 2);
+        assert_eq!(interfaces[0].name, "lo");
+        assert_eq!(interfaces[0].ipv4, vec!["127.0.0.1".to_owned()]);
+        assert_eq!(interfaces[0].ipv6_count, 1);
+        assert_eq!(interfaces[1].name, "br0");
+        // Private IPv4 kept, public IPv4 redacted, IPv6 only counted.
+        assert_eq!(
+            interfaces[1].ipv4,
+            vec!["192.168.0.50".to_owned(), "public-redacted".to_owned()]
+        );
+        assert_eq!(interfaces[1].ipv6_count, 1);
+        // Non-JSON (e.g. an error line) or a non-array yields no interfaces.
+        assert!(parse_ip_json_addr("ip: command not found").is_empty());
+        assert!(parse_ip_json_addr("{}").is_empty());
+    }
+
+    #[test]
+    fn parse_ip_json_route_reads_default_and_cidr() {
+        let output = r#"[
+          {"dst":"default","gateway":"192.168.0.1","dev":"br0"},
+          {"dst":"192.168.0.0/24","dev":"br0","prefsrc":"192.168.0.50"},
+          {"dst":"8.8.8.0/24","dev":"wg0"}
+        ]"#;
+        let routes = parse_ip_json_route(output);
+        assert_eq!(routes.len(), 3);
+        assert_eq!(routes[0].destination, "default");
+        assert_eq!(routes[0].interface, "br0");
+        assert_eq!(routes[1].destination, "192.168.0.0/24");
+        // Public destination is redacted while the prefix is preserved.
+        assert_eq!(routes[2].destination, "public-redacted/24");
+        assert_eq!(routes[2].interface, "wg0");
+        assert!(parse_ip_json_route("not json").is_empty());
+    }
 
     fn observed_vm(alias: &str, backend: UtmBackend, nics_json: &str) -> UtmVmObservation {
         UtmVmObservation {
