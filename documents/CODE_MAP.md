@@ -186,6 +186,26 @@ init` / `key store-passphrase` verbs rather than reinventing them.
 | `ServiceHardening` check | linux/windows subcommands | Service unit/SCM hardening |
 | `DnsFailclosed` check | linux/windows subcommands | DNS leak prevention verification |
 
+### System Diagnostics (`rustynet-sysinfo`)
+
+PKG-G bounded, **observation-only** host diagnostics (routes/interfaces/
+DNS/listening-sockets/firewall/service), wired to the read-only CLI command
+`rustynet diagnostics` (alias `diag`). Read-only by construction: every
+external tool call is gated by a fixed `(program, argv)` read-only
+allowlist and spawned under a timeout watchdog; all parsers are pure and
+fail-safe. See the `diagnostics.rs` module doc-comment for the full
+observation-only + bounded-execution guarantee.
+
+| Type / fn | Location | Purpose |
+|---|---|---|
+| `observe_system_diagnostics()` | `src/diagnostics.rs` | Entry point: one bounded, observation-only snapshot → `DiagnosticsReport` (real subprocesses) |
+| `observe_with(&dyn CommandRunner)` + `render_report()` | `src/diagnostics.rs` | Seam-injectable observe (for tests/custom runners) + human-readable render for the CLI |
+| `DiagnosticsReport` | `src/diagnostics.rs` | Typed snapshot: interfaces+MTU, routes, DNS, listening sockets, firewall, Rustynet service |
+| `FirewallStatus` + `FirewallBackend` | `src/diagnostics.rs` | Typed firewall status (nftables/iptables/pf/Windows-firewall); `queried` distinguishes confirmed-inactive from could-not-confirm; never carries raw ruleset text |
+| `CommandRunner` + `SystemCommandRunner` + `CommandOutcome` | `src/diagnostics.rs` | Bounded command seam: `run_read_only` rejects any non-allowlisted `(program, argv)`; `Completed`/`TimedOut`/`Unavailable`/`RejectedNotAllowlisted` outcomes |
+| `DEFAULT_COMMAND_TIMEOUT` | `src/diagnostics.rs` | 3s per-invocation upper bound enforced by `spawn_bounded` |
+| `host_facts()` → `HostFacts` (`OsFamily`/`PkgFamily`) | `src/lib.rs` | Installer host detect: OS family / distro / pkg-manager / target-triple |
+
 ## Common Import Patterns
 
 ```rust
