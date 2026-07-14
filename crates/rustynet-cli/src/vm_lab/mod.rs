@@ -28238,29 +28238,53 @@ fn observe_local_utm_target_ready(
     known_hosts_path: Option<&Path>,
     timeout: Duration,
 ) -> LocalUtmReadyState {
-    let (process_present, live_ip) = match target.local_utm() {
-        Some((utm_name, bundle_path)) => {
+    let (process_present, live_ip) = match &target.controller {
+        VmController::LocalUtm {
+            utm_name,
+            bundle_path,
+        } => {
             let process_present = local_utm_process_present_with_probes(
                 utmctl_path,
                 Path::new("ps"),
-                utm_name,
-                bundle_path,
+                utm_name.as_str(),
+                bundle_path.as_path(),
                 timeout,
             )
             .unwrap_or(false);
             let live_ip = resolve_local_utm_live_host_by_name(
-                utm_name,
+                utm_name.as_str(),
                 target.last_known_ip.as_deref(),
                 target.mesh_ip.as_deref(),
                 utmctl_path,
-                Some(bundle_path),
+                Some(bundle_path.as_path()),
             );
             (process_present, live_ip)
         }
-        // libvirt readiness (virsh domstate + domifaddr) is increment 3; a
-        // libvirt target is not yet observable via the UTM readiness path, so it
-        // fails closed as not-ready here rather than being reported ready.
-        None => (false, None),
+        VmController::Libvirt {
+            domain,
+            connect_uri,
+        } => {
+            let virsh_path = Path::new(DEFAULT_VIRSH_BINARY);
+            let process_present =
+                libvirt_domain_running(virsh_path, connect_uri.as_str(), domain.as_str(), timeout)
+                    .unwrap_or(false);
+            // Only resolve the IP for a running domain: the ip-neigh/ARP rungs
+            // can serve a stale cache entry for a powered-off guest, and a
+            // stale IP must not be reported (or persisted to the inventory) as
+            // live evidence.
+            let live_ip = if process_present {
+                resolve_libvirt_live_host(
+                    virsh_path,
+                    connect_uri.as_str(),
+                    domain.as_str(),
+                    target.last_known_ip.as_deref(),
+                    target.mesh_ip.as_deref(),
+                )
+            } else {
+                None
+            };
+            (process_present, live_ip)
+        }
     };
     // SSH is only probed for Linux and macOS targets. Windows VMs may have SSH
     // firewalled or unconfigured; they are considered ready once powered + networked.
@@ -28740,29 +28764,39 @@ fn resolved_inventory_ssh_target_with_utmctl(
     entry: &VmInventoryEntry,
     utmctl_path: &Path,
 ) -> String {
-    resolve_local_utm_live_host(entry, utmctl_path).map_or_else(
+    resolve_controller_live_host(entry, utmctl_path).map_or_else(
         || entry.ssh_target.clone(),
         |host| rewrite_ssh_target_host(entry.ssh_target.as_str(), host.as_str()),
     )
 }
 
-fn resolve_local_utm_live_host(entry: &VmInventoryEntry, utmctl_path: &Path) -> Option<String> {
-    let (utm_name, bundle_path) = match entry.controller.as_ref()? {
+/// Resolve an inventory entry's live IP via its controller: utmctl+ARP for UTM
+/// guests, the virsh domifaddr/ip-neigh ladder for libvirt guests. `None` when
+/// the entry has no controller or discovery fails — callers keep the inventory
+/// ssh_target.
+fn resolve_controller_live_host(entry: &VmInventoryEntry, utmctl_path: &Path) -> Option<String> {
+    match entry.controller.as_ref()? {
         VmController::LocalUtm {
             utm_name,
             bundle_path,
-        } => (utm_name, bundle_path.as_path()),
-        // libvirt live-IP discovery (virsh domifaddr) is increment 3; until then a
-        // libvirt entry resolves to its inventory ssh_target/last_known_ip.
-        VmController::Libvirt { .. } => return None,
-    };
-    resolve_local_utm_live_host_by_name(
-        utm_name.as_str(),
-        entry.last_known_ip.as_deref(),
-        entry.mesh_ip.as_deref(),
-        utmctl_path,
-        Some(bundle_path),
-    )
+        } => resolve_local_utm_live_host_by_name(
+            utm_name.as_str(),
+            entry.last_known_ip.as_deref(),
+            entry.mesh_ip.as_deref(),
+            utmctl_path,
+            Some(bundle_path.as_path()),
+        ),
+        VmController::Libvirt {
+            domain,
+            connect_uri,
+        } => resolve_libvirt_live_host(
+            Path::new(DEFAULT_VIRSH_BINARY),
+            connect_uri.as_str(),
+            domain.as_str(),
+            entry.last_known_ip.as_deref(),
+            entry.mesh_ip.as_deref(),
+        ),
+    }
 }
 
 fn resolve_local_utm_live_host_by_name(
@@ -28888,6 +28922,132 @@ fn extract_ip_for_mac_from_arp_output(arp_output: &str, target_mac: &str) -> Opt
         }
     }
     None
+}
+
+/// Run a `virsh -c <uri> …` query and return its stdout, or `None` on spawn
+/// failure, timeout, non-zero exit, or non-UTF-8 output. Best-effort capture
+/// for the libvirt IP-discovery ladder (mirrors the utmctl ip-address shape).
+fn run_virsh_capture(
+    virsh_path: &Path,
+    connect_uri: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    let mut command = Command::new(virsh_path);
+    command.arg("-c").arg(connect_uri).args(args);
+    let output = run_output_with_timeout(&mut command, timeout).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Parse `virsh domifaddr` table output into IP candidates. Rows look like
+/// `vnet0  52:54:00:aa:bb:cc  ipv4  192.168.122.100/24` (continuation rows use
+/// `-` placeholders); the address is the last whitespace-separated token with
+/// an optional `/prefix` suffix. Header/separator/placeholder tokens simply
+/// fail to parse as IPs and are skipped.
+fn parse_libvirt_domifaddr_candidates(output: &str) -> Vec<IpAddr> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let last_token = line.split_whitespace().next_back()?;
+            let address = last_token.split('/').next()?;
+            address.parse::<IpAddr>().ok()
+        })
+        .collect()
+}
+
+/// Parse `virsh domiflist` table output into normalized guest MAC addresses.
+/// Rows look like `vnet0  bridge  br0  virtio  52:54:00:aa:bb:cc`; the MAC is
+/// the last token. Header/separator tokens fail MAC normalization and are
+/// skipped.
+fn parse_libvirt_domiflist_macs(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| normalize_mac_address(line.split_whitespace().next_back()?))
+        .collect()
+}
+
+/// Parse Linux `ip neigh show` output (`192.168.0.50 dev br0 lladdr
+/// 52:54:00:aa:bb:cc REACHABLE`) into the IP candidates whose `lladdr` matches
+/// one of `target_macs` (already normalized). FAILED/INCOMPLETE rows carry no
+/// `lladdr` and are skipped naturally. The Linux analogue of the macOS
+/// `arp -a` fallback.
+fn extract_ip_candidates_for_macs_from_ip_neigh_output(
+    neigh_output: &str,
+    target_macs: &[String],
+) -> Vec<IpAddr> {
+    neigh_output
+        .lines()
+        .filter_map(|line| {
+            let mut tokens = line.split_whitespace();
+            let ip = tokens.next()?.parse::<IpAddr>().ok()?;
+            let mut rest = tokens;
+            while let Some(token) = rest.next() {
+                if token == "lladdr" {
+                    let mac = normalize_mac_address(rest.next()?)?;
+                    if target_macs.contains(&mac) {
+                        return Some(ip);
+                    }
+                    return None;
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// Resolve a libvirt guest's live IP on the run-on-host Linux hypervisor, the
+/// virsh analogue of the utmctl `ip-address` + ARP-by-MAC ladder:
+/// 1. `virsh domifaddr <domain>` — the DHCP-lease source; authoritative for
+///    libvirt-managed NAT networks, typically empty for bridged guests.
+/// 2. `virsh domifaddr <domain> --source arp` — the host ARP view; covers
+///    bridged guests without requiring the qemu-guest-agent.
+/// 3. `virsh domiflist <domain>` MACs matched against `ip neigh show` — the
+///    dependency-free host-neighbour-table fallback.
+///
+/// Candidates from each rung go through the shared SSH-IP selector (viability
+/// filter, mesh-IP exclusion, last-known preference); the first rung yielding a
+/// selection wins. Returns `None` when every rung fails — callers fall back to
+/// the inventory ssh_target, exactly like the UTM path.
+fn resolve_libvirt_live_host(
+    virsh_path: &Path,
+    connect_uri: &str,
+    domain: &str,
+    last_known_ip: Option<&str>,
+    mesh_ip: Option<&str>,
+) -> Option<String> {
+    let timeout = Duration::from_secs(DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS);
+    for domifaddr_args in [
+        &["domifaddr", domain] as &[&str],
+        &["domifaddr", domain, "--source", "arp"],
+    ] {
+        if let Some(output) = run_virsh_capture(virsh_path, connect_uri, domifaddr_args, timeout) {
+            let candidates = parse_libvirt_domifaddr_candidates(output.as_str());
+            if let Some(ip) =
+                select_preferred_live_ssh_ip(candidates.as_slice(), last_known_ip, mesh_ip)
+            {
+                return Some(ip.to_string());
+            }
+        }
+    }
+    let domiflist = run_virsh_capture(virsh_path, connect_uri, &["domiflist", domain], timeout)?;
+    let macs = parse_libvirt_domiflist_macs(domiflist.as_str());
+    if macs.is_empty() {
+        return None;
+    }
+    let mut command = Command::new("ip");
+    command.args(["neigh", "show"]);
+    let output = run_output_with_timeout(&mut command, timeout).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let neigh_output = String::from_utf8(output.stdout).ok()?;
+    let candidates =
+        extract_ip_candidates_for_macs_from_ip_neigh_output(neigh_output.as_str(), &macs);
+    select_preferred_live_ssh_ip(candidates.as_slice(), last_known_ip, mesh_ip)
+        .map(|ip| ip.to_string())
 }
 
 fn matches_local_utm_inventory_entry(
@@ -35084,11 +35244,12 @@ mod tests {
         execute_ops_vm_lab_diff_live_lab_runs, execute_ops_vm_lab_discover_local_utm,
         execute_ops_vm_lab_discover_local_utm_summary,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
-        extract_ip_for_mac_from_arp_output, is_macos_metadata_artifact_name,
-        live_lab_stage_forensics_notes, load_inventory, load_live_lab_profile,
-        local_utm_process_present_in_ps_output, local_utm_process_present_with_ps,
-        mac_address_from_utm_config_plist, macos_peer_list_indicates_mesh_join,
-        materialize_orchestration_staging_dir, normalize_mac_address,
+        extract_ip_candidates_for_macs_from_ip_neigh_output, extract_ip_for_mac_from_arp_output,
+        is_macos_metadata_artifact_name, live_lab_stage_forensics_notes, load_inventory,
+        load_live_lab_profile, local_utm_process_present_in_ps_output,
+        local_utm_process_present_with_ps, mac_address_from_utm_config_plist,
+        macos_peer_list_indicates_mesh_join, materialize_orchestration_staging_dir,
+        normalize_mac_address, parse_libvirt_domifaddr_candidates, parse_libvirt_domiflist_macs,
         parse_libvirt_domstate_running, parse_live_lab_stage_records,
         parse_local_utm_list_started_status, parse_membership_active_nodes,
         parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
@@ -35814,6 +35975,72 @@ mod tests {
         assert_eq!(LibvirtPowerAction::Shutdown.verb(), "shutdown");
         assert!(LibvirtPowerAction::Start.expected_running());
         assert!(!LibvirtPowerAction::Shutdown.expected_running());
+    }
+
+    #[test]
+    fn parse_libvirt_domifaddr_candidates_reads_table_rows() {
+        let output = " Name       MAC address          Protocol     Address\n\
+             -------------------------------------------------------------------------------\n\
+             vnet0      52:54:00:aa:bb:cc    ipv4         192.168.122.100/24\n\
+             -          -                    ipv6         fd42:dead:beef::10/64\n\
+             vnet1      52:54:00:11:22:33    ipv4         -\n";
+        let candidates = parse_libvirt_domifaddr_candidates(output);
+        assert_eq!(
+            candidates,
+            vec![
+                "192.168.122.100".parse::<IpAddr>().unwrap(),
+                "fd42:dead:beef::10".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert!(parse_libvirt_domifaddr_candidates("").is_empty());
+        // Error text (e.g. "error: failed to get domain 'x'") has no IP-shaped
+        // final token and must produce zero candidates.
+        assert!(parse_libvirt_domifaddr_candidates("error: failed to get domain 'x'").is_empty());
+    }
+
+    #[test]
+    fn parse_libvirt_domiflist_macs_normalizes_and_skips_headers() {
+        let output = " Interface   Type     Source   Model    MAC\n\
+             -----------------------------------------------------------\n\
+             vnet0       bridge   br0      virtio   52:54:00:AA:BB:0C\n\
+             vnet1       network  default  virtio   52:54:0:1:2:3\n";
+        assert_eq!(
+            parse_libvirt_domiflist_macs(output),
+            vec![
+                "52:54:00:aa:bb:0c".to_owned(),
+                "52:54:00:01:02:03".to_owned()
+            ]
+        );
+        assert!(parse_libvirt_domiflist_macs("").is_empty());
+    }
+
+    #[test]
+    fn extract_ip_candidates_for_macs_from_ip_neigh_matches_and_skips() {
+        let neigh = "192.168.0.50 dev br0 lladdr 52:54:00:aa:bb:0c REACHABLE\n\
+             fe80::5054:ff:feaa:bb0c dev br0 lladdr 52:54:00:aa:bb:0c router STALE\n\
+             192.168.0.99 dev br0  FAILED\n\
+             192.168.0.77 dev br0 lladdr aa:bb:cc:dd:ee:ff DELAY\n";
+        let macs = vec!["52:54:00:aa:bb:0c".to_owned()];
+        let candidates = extract_ip_candidates_for_macs_from_ip_neigh_output(neigh, &macs);
+        assert_eq!(
+            candidates,
+            vec![
+                "192.168.0.50".parse::<IpAddr>().unwrap(),
+                "fe80::5054:ff:feaa:bb0c".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        // The shared selector then prefers the viable IPv4 over the
+        // link-local IPv6 and excludes the mesh IP.
+        let selected =
+            select_preferred_live_ssh_ip(candidates.as_slice(), Some("192.168.0.50"), None);
+        assert_eq!(selected, Some("192.168.0.50".parse::<IpAddr>().unwrap()));
+        assert!(
+            extract_ip_candidates_for_macs_from_ip_neigh_output(
+                neigh,
+                &["00:00:00:00:00:01".to_owned()]
+            )
+            .is_empty()
+        );
     }
 
     #[test]
