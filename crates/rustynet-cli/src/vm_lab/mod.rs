@@ -1602,6 +1602,11 @@ pub struct VmLabRunSuiteConfig {
 /// hypervisor connection a run-on-host orchestrator drives via `virsh`.
 const DEFAULT_LIBVIRT_CONNECT_URI: &str = "qemu:///system";
 
+/// The `virsh` binary is resolved from `PATH` on the Linux host the orchestrator
+/// runs on (unlike `utmctl`'s fixed macOS app-bundle path). The run-on-host model
+/// means `virsh` talks to the local libvirt daemon directly.
+const DEFAULT_VIRSH_BINARY: &str = "virsh";
+
 /// How the lab robot powers a VM on/off and resolves its live IP.
 ///
 /// `LocalUtm` is the macOS/UTM controller driven via `utmctl` (the original and
@@ -2016,12 +2021,33 @@ struct RemoteTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StartTarget {
     alias: String,
-    utm_name: String,
-    bundle_path: PathBuf,
+    controller: VmController,
     ssh_user: Option<String>,
     last_known_ip: Option<String>,
     mesh_ip: Option<String>,
     platform_profile: VmPlatformProfile,
+}
+
+impl StartTarget {
+    /// Operator-facing VM name: the UTM name or the libvirt domain.
+    fn display_name(&self) -> &str {
+        match &self.controller {
+            VmController::LocalUtm { utm_name, .. } => utm_name.as_str(),
+            VmController::Libvirt { domain, .. } => domain.as_str(),
+        }
+    }
+
+    /// UTM `(name, bundle_path)` when this target is UTM-backed; `None` for a
+    /// libvirt target (which the UTM readiness/discovery paths cannot observe).
+    fn local_utm(&self) -> Option<(&str, &Path)> {
+        match &self.controller {
+            VmController::LocalUtm {
+                utm_name,
+                bundle_path,
+            } => Some((utm_name.as_str(), bundle_path.as_path())),
+            VmController::Libvirt { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4140,7 +4166,9 @@ pub fn execute_ops_vm_lab_start(config: VmLabStartConfig) -> Result<String, Stri
         config.select_all,
     )?;
     let utmctl_path = config.utmctl_path;
-    if !utmctl_path.is_file() {
+    // utmctl is only required when at least one selected target is UTM-backed; a
+    // libvirt-only selection is powered via virsh and needs no utmctl.
+    if targets.iter().any(|target| target.local_utm().is_some()) && !utmctl_path.is_file() {
         return Err(format!(
             "utmctl binary is not present: {}",
             utmctl_path.display()
@@ -4149,21 +4177,45 @@ pub fn execute_ops_vm_lab_start(config: VmLabStartConfig) -> Result<String, Stri
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_START_TIMEOUT_SECS);
     let mut results = Vec::new();
     for target in &targets {
-        transition_local_utm_vm(
-            utmctl_path.as_path(),
-            target.utm_name.as_str(),
-            target.bundle_path.as_path(),
-            "start",
-            true,
-            timeout,
-        )
-        .map_err(|err| format!("{} start failed: {err}", target.alias))?;
-        results.push(format!(
-            "{} started via utm_name={} bundle_path={}",
-            target.alias,
-            target.utm_name,
-            target.bundle_path.display()
-        ));
+        match &target.controller {
+            VmController::LocalUtm {
+                utm_name,
+                bundle_path,
+            } => {
+                transition_local_utm_vm(
+                    utmctl_path.as_path(),
+                    utm_name.as_str(),
+                    bundle_path.as_path(),
+                    "start",
+                    true,
+                    timeout,
+                )
+                .map_err(|err| format!("{} start failed: {err}", target.alias))?;
+                results.push(format!(
+                    "{} started via utm_name={} bundle_path={}",
+                    target.alias,
+                    utm_name,
+                    bundle_path.display()
+                ));
+            }
+            VmController::Libvirt {
+                domain,
+                connect_uri,
+            } => {
+                transition_libvirt_vm(
+                    Path::new(DEFAULT_VIRSH_BINARY),
+                    connect_uri.as_str(),
+                    domain.as_str(),
+                    LibvirtPowerAction::Start,
+                    timeout,
+                )
+                .map_err(|err| format!("{} start failed: {err}", target.alias))?;
+                results.push(format!(
+                    "{} started via libvirt domain={domain} connect_uri={connect_uri}",
+                    target.alias
+                ));
+            }
+        }
         if target.platform_profile.platform == VmGuestPlatform::Windows {
             let bootstrap_target = remote_target_from_start_target(target);
             let host_key_line = bootstrap_windows_access_for_target(
@@ -27016,7 +27068,9 @@ pub fn execute_ops_vm_lab_stop(config: VmLabStopConfig) -> Result<String, String
         config.select_all,
     )?;
     let utmctl_path = config.utmctl_path;
-    if !utmctl_path.is_file() {
+    // utmctl is only required when at least one selected target is UTM-backed; a
+    // libvirt-only selection is powered via virsh and needs no utmctl.
+    if targets.iter().any(|target| target.local_utm().is_some()) && !utmctl_path.is_file() {
         return Err(format!(
             "utmctl binary is not present: {}",
             utmctl_path.display()
@@ -27025,21 +27079,45 @@ pub fn execute_ops_vm_lab_stop(config: VmLabStopConfig) -> Result<String, String
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_START_TIMEOUT_SECS);
     let mut results = Vec::new();
     for target in &targets {
-        transition_local_utm_vm(
-            utmctl_path.as_path(),
-            target.utm_name.as_str(),
-            target.bundle_path.as_path(),
-            "stop",
-            false,
-            timeout,
-        )
-        .map_err(|err| format!("{} stop failed: {err}", target.alias))?;
-        results.push(format!(
-            "{} stopped via utm_name={} bundle_path={}",
-            target.alias,
-            target.utm_name,
-            target.bundle_path.display()
-        ));
+        match &target.controller {
+            VmController::LocalUtm {
+                utm_name,
+                bundle_path,
+            } => {
+                transition_local_utm_vm(
+                    utmctl_path.as_path(),
+                    utm_name.as_str(),
+                    bundle_path.as_path(),
+                    "stop",
+                    false,
+                    timeout,
+                )
+                .map_err(|err| format!("{} stop failed: {err}", target.alias))?;
+                results.push(format!(
+                    "{} stopped via utm_name={} bundle_path={}",
+                    target.alias,
+                    utm_name,
+                    bundle_path.display()
+                ));
+            }
+            VmController::Libvirt {
+                domain,
+                connect_uri,
+            } => {
+                transition_libvirt_vm(
+                    Path::new(DEFAULT_VIRSH_BINARY),
+                    connect_uri.as_str(),
+                    domain.as_str(),
+                    LibvirtPowerAction::Shutdown,
+                    timeout,
+                )
+                .map_err(|err| format!("{} stop failed: {err}", target.alias))?;
+                results.push(format!(
+                    "{} stopped via libvirt domain={domain} connect_uri={connect_uri}",
+                    target.alias
+                ));
+            }
+        }
     }
     Ok(results.join("\n"))
 }
@@ -28078,28 +28156,14 @@ fn resolve_start_targets(
                 entry.alias
             ));
         };
-        match controller {
-            VmController::LocalUtm {
-                utm_name,
-                bundle_path,
-            } => {
-                results.push(StartTarget {
-                    alias: entry.alias,
-                    utm_name,
-                    bundle_path,
-                    ssh_user: entry.ssh_user,
-                    last_known_ip: entry.last_known_ip,
-                    mesh_ip: entry.mesh_ip,
-                    platform_profile,
-                });
-            }
-            VmController::Libvirt { domain, .. } => {
-                return Err(format!(
-                    "VM alias {} uses a libvirt controller (domain {domain}); virsh power control is not yet implemented (LinuxVmHostPlan increment 2). Until the libvirt backend lands, start the guest with virsh directly and run with --trust-inventory-ready.",
-                    entry.alias
-                ));
-            }
-        }
+        results.push(StartTarget {
+            alias: entry.alias,
+            controller,
+            ssh_user: entry.ssh_user,
+            last_known_ip: entry.last_known_ip,
+            mesh_ip: entry.mesh_ip,
+            platform_profile,
+        });
     }
     Ok(results)
 }
@@ -28174,21 +28238,30 @@ fn observe_local_utm_target_ready(
     known_hosts_path: Option<&Path>,
     timeout: Duration,
 ) -> LocalUtmReadyState {
-    let process_present = local_utm_process_present_with_probes(
-        utmctl_path,
-        Path::new("ps"),
-        target.utm_name.as_str(),
-        target.bundle_path.as_path(),
-        timeout,
-    )
-    .unwrap_or(false);
-    let live_ip = resolve_local_utm_live_host_by_name(
-        target.utm_name.as_str(),
-        target.last_known_ip.as_deref(),
-        target.mesh_ip.as_deref(),
-        utmctl_path,
-        Some(target.bundle_path.as_path()),
-    );
+    let (process_present, live_ip) = match target.local_utm() {
+        Some((utm_name, bundle_path)) => {
+            let process_present = local_utm_process_present_with_probes(
+                utmctl_path,
+                Path::new("ps"),
+                utm_name,
+                bundle_path,
+                timeout,
+            )
+            .unwrap_or(false);
+            let live_ip = resolve_local_utm_live_host_by_name(
+                utm_name,
+                target.last_known_ip.as_deref(),
+                target.mesh_ip.as_deref(),
+                utmctl_path,
+                Some(bundle_path),
+            );
+            (process_present, live_ip)
+        }
+        // libvirt readiness (virsh domstate + domifaddr) is increment 3; a
+        // libvirt target is not yet observable via the UTM readiness path, so it
+        // fails closed as not-ready here rather than being reported ready.
+        None => (false, None),
+    };
     // SSH is only probed for Linux and macOS targets. Windows VMs may have SSH
     // firewalled or unconfigured; they are considered ready once powered + networked.
     let requires_ssh = matches!(
@@ -28234,7 +28307,7 @@ fn observe_local_utm_target_ready(
     };
     LocalUtmReadyState {
         alias: target.alias.clone(),
-        utm_name: target.utm_name.clone(),
+        utm_name: target.display_name().to_owned(),
         process_present,
         live_ip,
         ssh_port_status,
@@ -28646,12 +28719,9 @@ fn remote_target_from_start_target(target: &StartTarget) -> RemoteTarget {
             .last_known_ip
             .clone()
             .or_else(|| target.mesh_ip.clone())
-            .unwrap_or_else(|| target.utm_name.clone()),
+            .unwrap_or_else(|| target.display_name().to_owned()),
         ssh_user: target.ssh_user.clone(),
-        controller: Some(VmController::LocalUtm {
-            utm_name: target.utm_name.clone(),
-            bundle_path: target.bundle_path.clone(),
-        }),
+        controller: Some(target.controller.clone()),
         platform_profile: target.platform_profile,
         rustynet_src_dir: None,
         remote_temp_dir: None,
@@ -32121,6 +32191,128 @@ fn transition_local_utm_vm_with_process_probe(
     )
 }
 
+/// Power actions the libvirt backend can drive via `virsh`. `utmctl` has no
+/// restart verb (restart is composed as stop+start) and neither does this — the
+/// two primitives are `start` and graceful `shutdown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibvirtPowerAction {
+    Start,
+    Shutdown,
+}
+
+impl LibvirtPowerAction {
+    fn verb(self) -> &'static str {
+        match self {
+            LibvirtPowerAction::Start => "start",
+            LibvirtPowerAction::Shutdown => "shutdown",
+        }
+    }
+
+    /// The domain state expected once the action has taken effect.
+    fn expected_running(self) -> bool {
+        matches!(self, LibvirtPowerAction::Start)
+    }
+}
+
+/// Parse `virsh domstate` stdout. libvirt reports one of `running`, `idle`,
+/// `paused`, `in shutdown`, `shut off`, `crashed`, `pmsuspended`. Only `running`
+/// counts as powered-on for the orchestrator; every other (or empty) state is
+/// treated as not-running.
+fn parse_libvirt_domstate_running(domstate_output: &str) -> bool {
+    domstate_output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| line.eq_ignore_ascii_case("running"))
+}
+
+/// Query whether a libvirt domain is running via `virsh -c <uri> domstate
+/// <domain>`. A non-zero exit or unreadable output is an `Err` so callers fail
+/// closed rather than assuming a state.
+fn libvirt_domain_running(
+    virsh_path: &Path,
+    connect_uri: &str,
+    domain: &str,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let mut command = Command::new(virsh_path);
+    command
+        .arg("-c")
+        .arg(connect_uri)
+        .arg("domstate")
+        .arg(domain);
+    let output = run_output_with_timeout(&mut command, timeout)?;
+    if !output.status.success() {
+        return Err(format!(
+            "virsh domstate {domain} exited with status {}",
+            status_code(output.status)
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| format!("virsh domstate returned non-UTF-8 output: {err}"))?;
+    Ok(parse_libvirt_domstate_running(stdout.as_str()))
+}
+
+/// Poll `virsh domstate` until the domain reaches the expected running state or
+/// the timeout elapses.
+fn wait_for_libvirt_domain_state(
+    virsh_path: &Path,
+    connect_uri: &str,
+    domain: &str,
+    expected_running: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let started_at = Instant::now();
+    loop {
+        if let Ok(running) = libvirt_domain_running(virsh_path, connect_uri, domain, timeout)
+            && running == expected_running
+        {
+            return Ok(());
+        }
+        if started_at.elapsed() >= timeout {
+            return Err(format!(
+                "libvirt domain {domain} did not reach running={expected_running} within {}s",
+                timeout.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MILLIS));
+    }
+}
+
+/// Power a libvirt domain on/off via `virsh`, the run-on-host analogue of
+/// `transition_local_utm_vm`. Fails closed if the current state cannot be read;
+/// no-ops when the domain is already in the desired state; otherwise runs
+/// `virsh -c <uri> start|shutdown <domain>` and polls `domstate` until the
+/// domain settles into the expected state.
+fn transition_libvirt_vm(
+    virsh_path: &Path,
+    connect_uri: &str,
+    domain: &str,
+    action: LibvirtPowerAction,
+    timeout: Duration,
+) -> Result<(), String> {
+    let expected_running = action.expected_running();
+    let observed = libvirt_domain_running(virsh_path, connect_uri, domain, timeout)?;
+    if observed == expected_running {
+        return Ok(());
+    }
+    let mut command = Command::new(virsh_path);
+    command
+        .arg("-c")
+        .arg(connect_uri)
+        .arg(action.verb())
+        .arg(domain);
+    let status = run_status_with_timeout(&mut command, timeout)?;
+    if !status.success() {
+        return Err(format!(
+            "virsh {} {domain} exited with status {}",
+            action.verb(),
+            status_code(status)
+        ));
+    }
+    wait_for_libvirt_domain_state(virsh_path, connect_uri, domain, expected_running, timeout)
+}
+
 fn wait_for_local_utm_process_state_with_probes(
     utmctl_path: &Path,
     ps_path: &Path,
@@ -34868,17 +35060,17 @@ fn execute_bootstrap_phase_for_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, LiveLabStageRecord, LiveLabStageSummary,
-        PortStatus, ProbeState, RemoteExec as _, RepoSyncDispatchKind, RepoSyncMode,
-        RestartUnreadyDecision, RuntimePaths as _, ServiceManager as _, StageOrchestrator as _,
-        UtmReadinessInputs, VmController, VmGuestExecMode, VmGuestPlatform, VmInventoryEntry,
-        VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep,
-        VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
-        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
-        VmServiceManager, WindowsSshReadinessProbe, append_unique_stage_outcomes_collect_new,
-        build_assignment_refresh_env, build_local_source_extract_script,
-        build_local_source_presync_cleanup_script, build_remote_argv_script,
-        build_remote_argv_script_for_target, build_repo_sync_script,
+        DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, LibvirtPowerAction, LiveLabStageRecord,
+        LiveLabStageSummary, PortStatus, ProbeState, RemoteExec as _, RepoSyncDispatchKind,
+        RepoSyncMode, RestartUnreadyDecision, RuntimePaths as _, ServiceManager as _,
+        StageOrchestrator as _, UtmReadinessInputs, VmController, VmGuestExecMode, VmGuestPlatform,
+        VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
+        VmLabIterationValidationStep, VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig,
+        VmLabStageOutcome, VmLabStageStatus, VmLabValidateLiveLabProfileConfig,
+        VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe,
+        append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
+        build_local_source_extract_script, build_local_source_presync_cleanup_script,
+        build_remote_argv_script, build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
         build_vm_lab_topology, build_windows_local_source_extract_result_script,
@@ -34896,7 +35088,8 @@ mod tests {
         live_lab_stage_forensics_notes, load_inventory, load_live_lab_profile,
         local_utm_process_present_in_ps_output, local_utm_process_present_with_ps,
         mac_address_from_utm_config_plist, macos_peer_list_indicates_mesh_join,
-        materialize_orchestration_staging_dir, normalize_mac_address, parse_live_lab_stage_records,
+        materialize_orchestration_staging_dir, normalize_mac_address,
+        parse_libvirt_domstate_running, parse_live_lab_stage_records,
         parse_local_utm_list_started_status, parse_membership_active_nodes,
         parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
         path_contains_macos_metadata_artifact, persist_local_utm_ready_states_to_inventory,
@@ -35560,10 +35753,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_start_targets_fails_closed_for_libvirt_controller() {
-        // Until the libvirt power backend lands (LinuxVmHostPlan increment 2),
-        // a libvirt-controlled VM must NOT be silently treated as
-        // un-startable or as UTM-startable — it must fail loudly.
+    fn resolve_start_targets_accepts_libvirt_controller() {
+        // Increment 2: a libvirt-controlled VM resolves to a start target that
+        // carries the Libvirt controller (powered via virsh, not utmctl) and
+        // must NOT masquerade as a UTM-backed target.
         let path = write_temp_inventory(
             r#"{
   "version": 1,
@@ -35582,13 +35775,45 @@ mod tests {
   ]
 }"#,
         );
-        let err = resolve_start_targets(path.as_path(), &["linux-x86-exit-1".to_owned()], false)
-            .expect_err("libvirt power control must fail closed until increment 2");
+        let targets =
+            resolve_start_targets(path.as_path(), &["linux-x86-exit-1".to_owned()], false)
+                .expect("libvirt entry should resolve to a start target");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].display_name(), "linux-x86-exit-1");
         assert!(
-            err.contains("libvirt controller") && err.contains("not yet implemented"),
-            "unexpected error: {err}"
+            targets[0].local_utm().is_none(),
+            "libvirt target must not masquerade as a UTM target"
         );
+        match &targets[0].controller {
+            VmController::Libvirt {
+                domain,
+                connect_uri,
+            } => {
+                assert_eq!(domain, "linux-x86-exit-1");
+                assert_eq!(connect_uri, DEFAULT_LIBVIRT_CONNECT_URI);
+            }
+            other => panic!("expected libvirt controller, got {other:?}"),
+        }
         cleanup_temp_inventory(path.as_path());
+    }
+
+    #[test]
+    fn libvirt_domstate_parse_and_power_action_mapping() {
+        // Only the exact "running" state (case/whitespace-insensitive) counts as
+        // powered-on; every other or empty domstate is treated as not-running.
+        assert!(parse_libvirt_domstate_running("running\n"));
+        assert!(parse_libvirt_domstate_running("  running  "));
+        assert!(parse_libvirt_domstate_running("RUNNING"));
+        assert!(!parse_libvirt_domstate_running("shut off\n"));
+        assert!(!parse_libvirt_domstate_running("paused"));
+        assert!(!parse_libvirt_domstate_running("in shutdown"));
+        assert!(!parse_libvirt_domstate_running("crashed"));
+        assert!(!parse_libvirt_domstate_running(""));
+        // The power actions map to the right virsh verb + expected end state.
+        assert_eq!(LibvirtPowerAction::Start.verb(), "start");
+        assert_eq!(LibvirtPowerAction::Shutdown.verb(), "shutdown");
+        assert!(LibvirtPowerAction::Start.expected_running());
+        assert!(!LibvirtPowerAction::Shutdown.expected_running());
     }
 
     #[test]
