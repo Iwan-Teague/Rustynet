@@ -1597,11 +1597,30 @@ pub struct VmLabRunSuiteConfig {
     pub timeout_secs: u64,
 }
 
+/// Default libvirt connection URI used when an inventory `libvirt` controller
+/// omits `connect_uri`. `qemu:///system` is the standard system-wide KVM/QEMU
+/// hypervisor connection a run-on-host orchestrator drives via `virsh`.
+const DEFAULT_LIBVIRT_CONNECT_URI: &str = "qemu:///system";
+
+/// How the lab robot powers a VM on/off and resolves its live IP.
+///
+/// `LocalUtm` is the macOS/UTM controller driven via `utmctl` (the original and
+/// only production backend). `Libvirt` is the dedicated-Linux-host backend
+/// driven via `virsh` against a local libvirt/QEMU/KVM hypervisor when the
+/// orchestrator runs on the Linux host itself. Both are power+discovery
+/// controllers only; the ship-source/compile/launch pipeline is SSH-throughout
+/// regardless of controller (see `documents/operations/active/LinuxVmHostPlan_2026-07-14.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VmController {
     LocalUtm {
         utm_name: String,
         bundle_path: PathBuf,
+    },
+    Libvirt {
+        /// libvirt domain name, as shown by `virsh list --all`.
+        domain: String,
+        /// libvirt connection URI, e.g. `qemu:///system`.
+        connect_uri: String,
     },
 }
 
@@ -1778,7 +1797,9 @@ pub struct VmPlatformProfile {
 fn controller_utm_name(controller: Option<&VmController>) -> Option<&str> {
     match controller {
         Some(VmController::LocalUtm { utm_name, .. }) => Some(utm_name.as_str()),
-        None => None,
+        // Libvirt has no UTM name; platform is inferred from os/alias/explicit
+        // fields instead. Not startable via the utmctl path.
+        Some(VmController::Libvirt { .. }) | None => None,
     }
 }
 
@@ -3196,6 +3217,10 @@ pub fn execute_ops_vm_lab_list(config: VmLabListConfig) -> Result<String, String
                 utm_name,
                 bundle_path.display()
             ),
+            Some(VmController::Libvirt {
+                ref domain,
+                ref connect_uri,
+            }) => format!("controller=libvirt domain={domain} connect_uri={connect_uri}"),
             None => "controller=none".to_owned(),
         };
         lines.push(format!(
@@ -3417,7 +3442,10 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             entry
                 .controller
                 .as_ref()
-                .map(|VmController::LocalUtm { bundle_path, .. }| bundle_path.clone())
+                .and_then(|controller| match controller {
+                    VmController::LocalUtm { bundle_path, .. } => Some(bundle_path.clone()),
+                    VmController::Libvirt { .. } => None,
+                })
         })
         .collect();
     inventory_bundle_paths.sort();
@@ -3511,10 +3539,14 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             authoritative_target_present = true;
             ssh_target_source = "inventory".to_owned();
             ssh_user = entry.ssh_user.clone();
-            let entry_bundle_path = entry
-                .controller
-                .as_ref()
-                .map(|VmController::LocalUtm { bundle_path, .. }| bundle_path.as_path());
+            let entry_bundle_path =
+                entry
+                    .controller
+                    .as_ref()
+                    .and_then(|controller| match controller {
+                        VmController::LocalUtm { bundle_path, .. } => Some(bundle_path.as_path()),
+                        VmController::Libvirt { .. } => None,
+                    });
             if let Some(ip) = resolve_local_utm_live_host_via_utmctl(
                 utm_name.as_str(),
                 entry.last_known_ip.as_deref(),
@@ -28061,6 +28093,12 @@ fn resolve_start_targets(
                     platform_profile,
                 });
             }
+            VmController::Libvirt { domain, .. } => {
+                return Err(format!(
+                    "VM alias {} uses a libvirt controller (domain {domain}); virsh power control is not yet implemented (LinuxVmHostPlan increment 2). Until the libvirt backend lands, start the guest with virsh directly and run with --trust-inventory-ready.",
+                    entry.alias
+                ));
+            }
         }
     }
     Ok(results)
@@ -28493,7 +28531,10 @@ fn resolve_role_target_from_inventory(
     let utm_name = entry
         .controller
         .as_ref()
-        .map(|VmController::LocalUtm { utm_name, .. }| utm_name.clone());
+        .and_then(|controller| match controller {
+            VmController::LocalUtm { utm_name, .. } => Some(utm_name.clone()),
+            VmController::Libvirt { .. } => None,
+        });
     Ok(RoleTarget {
         label: entry.alias,
         normalized_target,
@@ -28641,6 +28682,9 @@ fn resolve_local_utm_live_host(entry: &VmInventoryEntry, utmctl_path: &Path) -> 
             utm_name,
             bundle_path,
         } => (utm_name, bundle_path.as_path()),
+        // libvirt live-IP discovery (virsh domifaddr) is increment 3; until then a
+        // libvirt entry resolves to its inventory ssh_target/last_known_ip.
+        VmController::Libvirt { .. } => return None,
     };
     resolve_local_utm_live_host_by_name(
         utm_name.as_str(),
@@ -29399,6 +29443,29 @@ fn parse_controller(value: &Value) -> Result<VmController, String> {
             Ok(VmController::LocalUtm {
                 utm_name,
                 bundle_path,
+            })
+        }
+        "libvirt" => {
+            let domain = required_string_field(object, "domain")?;
+            ensure_no_control_chars("domain", domain.as_str())?;
+            let connect_uri = match object.get("connect_uri") {
+                None | Some(Value::Null) => DEFAULT_LIBVIRT_CONNECT_URI.to_owned(),
+                Some(value) => {
+                    let uri = value
+                        .as_str()
+                        .ok_or_else(|| "libvirt connect_uri must be a string".to_owned())?
+                        .trim()
+                        .to_owned();
+                    if uri.is_empty() {
+                        return Err("libvirt connect_uri must not be empty".to_owned());
+                    }
+                    ensure_no_control_chars("connect_uri", uri.as_str())?;
+                    uri
+                }
+            };
+            Ok(VmController::Libvirt {
+                domain,
+                connect_uri,
             })
         }
         _ => Err(format!("unsupported vm controller type: {controller_type}")),
@@ -30695,7 +30762,8 @@ fn remote_target_local_utm(target: &RemoteTarget) -> Option<(&str, &Path)> {
             utm_name,
             bundle_path,
         }) => Some((utm_name.as_str(), bundle_path.as_path())),
-        None => None,
+        // libvirt guests have no utmctl file-push/exec channel; SSH-only.
+        Some(VmController::Libvirt { .. }) | None => None,
     }
 }
 
@@ -34800,12 +34868,12 @@ fn execute_bootstrap_phase_for_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonProbe as _, LiveLabStageRecord, LiveLabStageSummary, PortStatus, ProbeState,
-        RemoteExec as _, RepoSyncDispatchKind, RepoSyncMode, RestartUnreadyDecision,
-        RuntimePaths as _, ServiceManager as _, StageOrchestrator as _, UtmReadinessInputs,
-        VmGuestExecMode, VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus,
-        VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep, VmLabRunLiveLabConfig,
-        VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
+        DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, LiveLabStageRecord, LiveLabStageSummary,
+        PortStatus, ProbeState, RemoteExec as _, RepoSyncDispatchKind, RepoSyncMode,
+        RestartUnreadyDecision, RuntimePaths as _, ServiceManager as _, StageOrchestrator as _,
+        UtmReadinessInputs, VmController, VmGuestExecMode, VmGuestPlatform, VmInventoryEntry,
+        VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep,
+        VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
         VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
         VmServiceManager, WindowsSshReadinessProbe, append_unique_stage_outcomes_collect_new,
         build_assignment_refresh_env, build_local_source_extract_script,
@@ -35430,6 +35498,96 @@ mod tests {
             Some("utm-shared-192.168.64.0/24")
         );
         assert_eq!(inventory[1].ssh_target, "debian@192.168.18.51");
+        cleanup_temp_inventory(path.as_path());
+    }
+
+    #[test]
+    fn load_inventory_accepts_libvirt_controller_entries() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "linux-x86-exit-1",
+      "ssh_target": "192.168.0.50",
+      "ssh_user": "debian",
+      "os": "Debian/Linux (x86_64)",
+      "platform": "linux",
+      "controller": {
+        "type": "libvirt",
+        "domain": "linux-x86-exit-1",
+        "connect_uri": "qemu:///system"
+      }
+    },
+    {
+      "alias": "linux-x86-client-1",
+      "ssh_target": "192.168.0.51",
+      "ssh_user": "debian",
+      "os": "Debian/Linux (x86_64)",
+      "platform": "linux",
+      "controller": {
+        "type": "libvirt",
+        "domain": "linux-x86-client-1"
+      }
+    }
+  ]
+}"#,
+        );
+        let inventory = load_inventory(path.as_path()).expect("inventory should load");
+        assert_eq!(inventory.len(), 2);
+        match inventory[0].controller.as_ref() {
+            Some(VmController::Libvirt {
+                domain,
+                connect_uri,
+            }) => {
+                assert_eq!(domain, "linux-x86-exit-1");
+                assert_eq!(connect_uri, "qemu:///system");
+            }
+            other => panic!("expected libvirt controller, got {other:?}"),
+        }
+        // `connect_uri` defaults to qemu:///system when omitted.
+        match inventory[1].controller.as_ref() {
+            Some(VmController::Libvirt {
+                domain,
+                connect_uri,
+            }) => {
+                assert_eq!(domain, "linux-x86-client-1");
+                assert_eq!(connect_uri, DEFAULT_LIBVIRT_CONNECT_URI);
+            }
+            other => panic!("expected libvirt controller, got {other:?}"),
+        }
+        cleanup_temp_inventory(path.as_path());
+    }
+
+    #[test]
+    fn resolve_start_targets_fails_closed_for_libvirt_controller() {
+        // Until the libvirt power backend lands (LinuxVmHostPlan increment 2),
+        // a libvirt-controlled VM must NOT be silently treated as
+        // un-startable or as UTM-startable — it must fail loudly.
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "linux-x86-exit-1",
+      "ssh_target": "192.168.0.50",
+      "ssh_user": "debian",
+      "os": "Debian/Linux (x86_64)",
+      "platform": "linux",
+      "controller": {
+        "type": "libvirt",
+        "domain": "linux-x86-exit-1"
+      }
+    }
+  ]
+}"#,
+        );
+        let err = resolve_start_targets(path.as_path(), &["linux-x86-exit-1".to_owned()], false)
+            .expect_err("libvirt power control must fail closed until increment 2");
+        assert!(
+            err.contains("libvirt controller") && err.contains("not yet implemented"),
+            "unexpected error: {err}"
+        );
         cleanup_temp_inventory(path.as_path());
     }
 

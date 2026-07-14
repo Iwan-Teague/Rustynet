@@ -235,6 +235,10 @@ pub(crate) fn platform_for_entry(entry: &VmInventoryEntry) -> Option<TopologyPla
 fn controller_utm_name(controller: &super::VmController) -> String {
     match controller {
         super::VmController::LocalUtm { utm_name, .. } => utm_name.clone(),
+        // For a libvirt controller the domain name is the operator-chosen
+        // identity analogous to the UTM name; used only as a platform-inference
+        // hint here.
+        super::VmController::Libvirt { domain, .. } => domain.clone(),
     }
 }
 
