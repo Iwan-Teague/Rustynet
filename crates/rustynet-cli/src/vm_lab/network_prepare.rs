@@ -1768,12 +1768,18 @@ fn render_dry_run_plan(
             current_desc.join(" "),
             target_desc.join(" "),
             if compliant {
-                " (already compliant; no change)"
+                " (attachment mode already compliant; no change)"
             } else {
                 " (WILL RECONFIGURE: stop -> rewrite -> restart)"
             }
         ));
     }
+    out.push_str(
+        "note: this plan reconfigures NIC attachment MODE only; it does not verify each node's live \
+         subnet / L2 reachability. A mode-compliant Shared NIC can still land on a different subnet \
+         (e.g. a real-LAN vmnet lease) and be unable to mesh — run `ops vm-lab-network-audit` to \
+         confirm each node is on the fleet plane.\n",
+    );
     out.push_str(
         "authorization: pass --approve-reconfigure to execute this plan through the atomic transaction\n",
     );
@@ -1809,19 +1815,26 @@ pub fn execute_ops_vm_lab_network_prepare(
     let config_paths: std::collections::BTreeMap<String, PathBuf> = entries
         .iter()
         .filter_map(|entry| {
-            entry.controller.as_ref().map(
-                |VmController::LocalUtm {
-                     utm_name,
-                     bundle_path,
-                 }| (utm_name.clone(), bundle_path.join("config.plist")),
-            )
+            entry
+                .controller
+                .as_ref()
+                .and_then(|controller| match controller {
+                    VmController::LocalUtm {
+                        utm_name,
+                        bundle_path,
+                    } => Some((utm_name.clone(), bundle_path.join("config.plist"))),
+                    VmController::Libvirt { .. } => None,
+                })
         })
         .collect();
     let transaction_id = new_transaction_id();
     let ssh_users: std::collections::BTreeMap<String, String> = entries
         .iter()
         .filter_map(|entry| {
-            let VmController::LocalUtm { utm_name, .. } = entry.controller.as_ref()?;
+            let utm_name = match entry.controller.as_ref()? {
+                VmController::LocalUtm { utm_name, .. } => utm_name,
+                VmController::Libvirt { .. } => return None,
+            };
             entry.ssh_user.clone().map(|user| (utm_name.clone(), user))
         })
         .collect();
@@ -1907,12 +1920,16 @@ pub fn execute_ops_vm_lab_network_restore(
     let config_paths: std::collections::BTreeMap<String, PathBuf> = entries
         .iter()
         .filter_map(|entry| {
-            entry.controller.as_ref().map(
-                |VmController::LocalUtm {
-                     utm_name,
-                     bundle_path,
-                 }| (utm_name.clone(), bundle_path.join("config.plist")),
-            )
+            entry
+                .controller
+                .as_ref()
+                .and_then(|controller| match controller {
+                    VmController::LocalUtm {
+                        utm_name,
+                        bundle_path,
+                    } => Some((utm_name.clone(), bundle_path.join("config.plist"))),
+                    VmController::Libvirt { .. } => None,
+                })
         })
         .collect();
     let mut port = LiveUtmMutationPort::new(

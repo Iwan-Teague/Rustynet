@@ -733,8 +733,9 @@ fn inventory_snapshot(entries: &[VmInventoryEntry]) -> Vec<InventoryEntrySnapsho
             let utm_name = entry
                 .controller
                 .as_ref()
-                .map(|controller| match controller {
-                    VmController::LocalUtm { utm_name, .. } => utm_name.clone(),
+                .and_then(|controller| match controller {
+                    VmController::LocalUtm { utm_name, .. } => Some(utm_name.clone()),
+                    VmController::Libvirt { .. } => None,
                 });
             InventoryEntrySnapshot {
                 alias: entry.alias.clone(),
@@ -744,7 +745,10 @@ fn inventory_snapshot(entries: &[VmInventoryEntry]) -> Vec<InventoryEntrySnapsho
                 network_group: entry.network_group.clone(),
                 mesh_ip: entry.mesh_ip.as_deref().map(redact_ip_str),
                 utm_name,
-                has_local_utm_controller: entry.controller.is_some(),
+                has_local_utm_controller: matches!(
+                    entry.controller,
+                    Some(VmController::LocalUtm { .. })
+                ),
             }
         })
         .collect()
@@ -827,6 +831,115 @@ pub fn detect_inventory_findings(entries: &[VmInventoryEntry]) -> Vec<AuditFindi
         }
     }
     findings
+}
+
+/// Cross-fleet L2 reachability check. [`detect_profile_drift_findings`] validates
+/// only the UTM attachment *mode*, and [`detect_inventory_findings`] validates a
+/// node's recorded IP against its *own* `network_group` label — neither notices a
+/// node that is mode-compliant (`Shared`) yet stranded on a different subnet than
+/// the rest of the fleet, so it cannot reach its peers at L2 and cannot mesh
+/// (observed with macOS `vmnet` handing a "Shared" NIC a real-LAN lease instead
+/// of the internal plane, on a config byte-identical to a working node).
+///
+/// The expected fleet plane is the modal `network_group` CIDR across the
+/// inventory (the plane most nodes declare). A reachable guest is flagged when its
+/// *live observed* underlay IPv4 is not inside that plane. Fail-safe: with fewer
+/// than two nodes agreeing on a plane there is no authoritative fleet, and nothing
+/// is flagged.
+pub fn detect_offfleet_subnet_findings(
+    guests: &[GuestNetworkObservation],
+    entries: &[VmInventoryEntry],
+) -> Vec<AuditFinding> {
+    let mut planes: Vec<(IpCidr, usize)> = Vec::new();
+    for entry in entries {
+        if let Some(group) = &entry.network_group
+            && let Some(cidr) = network_group_cidr(group)
+        {
+            if let Some(slot) = planes.iter_mut().find(|(existing, _)| *existing == cidr) {
+                slot.1 += 1;
+            } else {
+                planes.push((cidr, 1));
+            }
+        }
+    }
+    // Deterministic modal plane: most votes, then the lexicographically smallest
+    // CIDR string to break ties reproducibly.
+    planes.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
+    });
+    let (fleet_cidr, votes) = match planes.first() {
+        Some(&(cidr, votes)) if votes >= 2 => (cidr, votes),
+        _ => return Vec::new(),
+    };
+
+    let mesh = mesh_overlay_cidr();
+    let mut findings = Vec::new();
+    for guest in guests {
+        if guest.status != "collected" {
+            continue;
+        }
+        let Some(observed) = guest_underlay_ipv4(guest, &mesh) else {
+            continue;
+        };
+        if !fleet_cidr.contains_v4(observed) {
+            findings.push(AuditFinding::error(
+                "off_fleet_subnet",
+                guest.alias.clone(),
+                format!(
+                    "live underlay address {} is not on the fleet management plane {} (shared by \
+                     {votes} inventory nodes); the NIC is attachment-mode compliant but on a \
+                     different L2, so this node cannot reach its peers and cannot mesh. Repair: \
+                     regenerate this VM's MAC or re-create its NIC in the UTM app — the attachment \
+                     mode is already correct, so a mode rewrite (vm-lab-network-prepare) alone will \
+                     not move it onto the fleet plane.",
+                    redact_ip_str(&observed.to_string()),
+                    fleet_cidr,
+                ),
+            ));
+        }
+    }
+    findings
+}
+
+/// The guest's primary underlay IPv4: the first routable address on its
+/// default-route interface (falling back to any non-loopback interface),
+/// excluding loopback, link-local, and mesh-overlay addresses — i.e. the address
+/// that determines which L2 plane the node sits on.
+fn guest_underlay_ipv4(guest: &GuestNetworkObservation, mesh: &IpCidr) -> Option<Ipv4Addr> {
+    let ordered: Vec<&GuestInterfaceObservation> = match &guest.default_route_interface {
+        Some(default_iface) => {
+            let mut ifaces: Vec<&GuestInterfaceObservation> = guest
+                .interfaces
+                .iter()
+                .filter(|iface| &iface.name == default_iface)
+                .collect();
+            ifaces.extend(
+                guest
+                    .interfaces
+                    .iter()
+                    .filter(|iface| &iface.name != default_iface),
+            );
+            ifaces
+        }
+        None => guest.interfaces.iter().collect(),
+    };
+    for iface in ordered {
+        if iface.name == "lo" {
+            continue;
+        }
+        for raw in &iface.ipv4 {
+            let addr_part = raw.split('/').next().unwrap_or("");
+            let Ok(addr) = addr_part.parse::<Ipv4Addr>() else {
+                continue;
+            };
+            if addr.is_loopback() || addr.is_link_local() || mesh.contains_v4(addr) {
+                continue;
+            }
+            return Some(addr);
+        }
+    }
+    None
 }
 
 /// UTM attachment findings that apply regardless of any selected profile.
@@ -1548,6 +1661,7 @@ fn run_network_observation(
 
     let mut findings = Vec::new();
     findings.extend(detect_inventory_findings(&entries));
+    findings.extend(detect_offfleet_subnet_findings(&guests, &entries));
     findings.extend(detect_attachment_findings(&vms));
     if let Some(profile) = selected {
         findings.extend(detect_profile_drift_findings(profile, &vms));
@@ -2122,6 +2236,112 @@ mod tests {
                 .iter()
                 .any(|f| f.kind == "stale_network_group" && f.subject == "debian-headless-2")
         );
+    }
+
+    fn collected_guest_on(
+        alias: &str,
+        iface: &str,
+        ipv4: &str,
+        gateway: &str,
+    ) -> GuestNetworkObservation {
+        let raw = format!(
+            "2: {iface}    inet {ipv4}/24 brd 0.0.0.0 scope global dynamic {iface}\n\
+             __RUSTYNET_NET_AUDIT_SECTION__\n\
+             2: {iface}: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000\\    link/ether 3e:ae:a9:5a:61:82 brd ff:ff:ff:ff:ff:ff\n\
+             __RUSTYNET_NET_AUDIT_SECTION__\n\
+             default via {gateway} dev {iface} proto dhcp src {ipv4} metric 100\n\
+             __RUSTYNET_NET_AUDIT_SECTION__\n\
+             nameserver {gateway}\n"
+        );
+        parse_linux_guest_sections(alias, &raw)
+    }
+
+    #[test]
+    fn offfleet_subnet_flags_mode_compliant_node_on_wrong_l2() {
+        // Fleet consensus: two nodes declare the utm-shared .64 plane.
+        let mut debian = test_inventory_entry("debian-headless-2", "192.168.64.4");
+        debian.network_group = Some("utm-shared-192.168.64.0/24".to_owned());
+        let mut rocky = test_inventory_entry("rocky-utm-1", "192.168.64.105");
+        rocky.network_group = Some("utm-shared-192.168.64.0/24".to_owned());
+        let mut ubuntu = test_inventory_entry("ubuntu-utm-1", "10.230.76.57");
+        ubuntu.network_group = Some("lan-10.230.76.0/24".to_owned());
+
+        // Ubuntu is live on the host's real LAN — mode-compliant Shared, wrong L2.
+        let guests = vec![collected_guest_on(
+            "ubuntu-utm-1",
+            "enp0s1",
+            "10.230.76.57",
+            "10.230.76.1",
+        )];
+        let findings = detect_offfleet_subnet_findings(&guests, &[debian, rocky, ubuntu]);
+        assert_eq!(findings.len(), 1, "exactly one off-fleet node");
+        assert_eq!(findings[0].kind, "off_fleet_subnet");
+        assert_eq!(findings[0].severity, FindingSeverity::Error);
+        assert_eq!(findings[0].subject, "ubuntu-utm-1");
+        assert!(findings[0].detail.contains("192.168.64.0/24"));
+    }
+
+    #[test]
+    fn offfleet_subnet_passes_node_on_the_fleet_plane() {
+        let mut debian = test_inventory_entry("debian-headless-2", "192.168.64.4");
+        debian.network_group = Some("utm-shared-192.168.64.0/24".to_owned());
+        let mut rocky = test_inventory_entry("rocky-utm-1", "192.168.64.105");
+        rocky.network_group = Some("utm-shared-192.168.64.0/24".to_owned());
+        let guests = vec![collected_guest_on(
+            "rocky-utm-1",
+            "enp0s1",
+            "192.168.64.105",
+            "192.168.64.1",
+        )];
+        assert!(detect_offfleet_subnet_findings(&guests, &[debian, rocky]).is_empty());
+    }
+
+    #[test]
+    fn offfleet_subnet_no_finding_without_fleet_consensus() {
+        // Only one node declares a plane -> no authoritative fleet -> nothing flagged.
+        let mut ubuntu = test_inventory_entry("ubuntu-utm-1", "10.230.76.57");
+        ubuntu.network_group = Some("lan-10.230.76.0/24".to_owned());
+        let guests = vec![collected_guest_on(
+            "ubuntu-utm-1",
+            "enp0s1",
+            "10.230.76.57",
+            "10.230.76.1",
+        )];
+        assert!(detect_offfleet_subnet_findings(&guests, &[ubuntu]).is_empty());
+    }
+
+    #[test]
+    fn offfleet_subnet_uses_underlay_not_mesh_overlay() {
+        let mut debian = test_inventory_entry("debian-headless-2", "192.168.64.4");
+        debian.network_group = Some("utm-shared-192.168.64.0/24".to_owned());
+        let mut rocky = test_inventory_entry("rocky-utm-1", "192.168.64.105");
+        rocky.network_group = Some("utm-shared-192.168.64.0/24".to_owned());
+        // The node carries a mesh-overlay address (100.64/10) plus its real
+        // underlay on the fleet plane; the mesh address must be ignored.
+        let guest = GuestNetworkObservation {
+            alias: "rocky-utm-1".to_owned(),
+            status: "collected".to_owned(),
+            interfaces: vec![
+                GuestInterfaceObservation {
+                    name: "rustynet0".to_owned(),
+                    mac: None,
+                    ipv4: vec!["100.64.0.5/10".to_owned()],
+                    ipv6_count: 0,
+                    mtu: None,
+                },
+                GuestInterfaceObservation {
+                    name: "enp0s1".to_owned(),
+                    mac: None,
+                    ipv4: vec!["192.168.64.105/24".to_owned()],
+                    ipv6_count: 0,
+                    mtu: None,
+                },
+            ],
+            default_route_interface: Some("enp0s1".to_owned()),
+            dns_servers: Vec::new(),
+            error: None,
+        };
+        assert!(detect_offfleet_subnet_findings(&[guest], &[debian, rocky]).is_empty());
     }
 
     #[test]
