@@ -5,6 +5,55 @@ This document outlines 40 high-impact diagnostic functions that would significan
 
 ---
 
+## PKG-G status — bounded, observation-only diagnostics surface (LANDED)
+
+The high-value, low-risk subset from Phase 1/2 below is now shipped as a
+**hardened, bounded, observation-only** surface in
+`crates/rustynet-sysinfo/src/diagnostics.rs`, wired to the read-only CLI
+command `rustynet diagnostics` (alias `diag`). One
+`observe_system_diagnostics()` call returns a typed `DiagnosticsReport`
+(per-OS: interfaces+MTU, routes, DNS resolvers+search domains, listening
+sockets, firewall status, Rustynet daemon service status).
+
+This is distinct from — and does not replace — the broad, pre-existing
+`pub fn active_network_routes()`, `listening_sockets_summary()`,
+`selinux_status()`, … family (many of the 40 below already exist as
+thin, individually-spawning helpers). PKG-G adds the *hardened* path the
+Definition of Done requires: typed results, fail-safe parsing, a fixed
+read-only command allowlist, and bounded execution.
+
+Guarantees (see the module doc-comment for the full statement):
+
+- **Observation-only, by construction.** Every external tool call goes
+  through `run_read_only`, which rejects (never spawns) any `(program,
+  argv)` not in the fixed `READ_ONLY_COMMANDS` table — all read/list/
+  show/query verbs (`ip route show`, `ss -tlnp`, `nft list ruleset`,
+  `iptables -L -n`, `pfctl -s info`, `scutil --dns`, `netsh … show …`,
+  `systemctl is-active`, `launchctl list`, `sc query`, …). No add/set/
+  delete/flush/start/stop/restart verb is present, and no argv is built
+  from external input (the CLI surface takes no arguments). A test drives
+  a full report through a command-capture seam and asserts every issued
+  command is allowlisted; negative tests assert mutating verbs are
+  rejected before any spawn.
+- **Bounded execution.** `spawn_bounded` drains stdout/stderr on
+  background threads and polls `try_wait` against a
+  `DEFAULT_COMMAND_TIMEOUT` (3s) deadline, killing+reaping a hung child
+  and returning `TimedOut` — a wedged tool can never block the report,
+  the CLI, or a gate. Covered by a `sleep`-based timeout test.
+- **Fail-safe parsing.** Every `parse_*` is pure (`&str -> T`, no I/O)
+  and never panics: missing/truncated/garbage input degrades to an empty
+  `Vec`, a conservative default, or a `queried: false` marker. Covered by
+  per-parser malformed/empty tests plus an all-tools-unavailable report
+  test.
+
+New public types (also recorded in `documents/CODE_MAP.md`):
+`DiagnosticsReport`, `FirewallStatus`, `FirewallBackend`, `CommandOutcome`,
+`CommandRunner`, `SystemCommandRunner`, `DEFAULT_COMMAND_TIMEOUT`;
+entry points `observe_system_diagnostics()`, `observe_with()`,
+`render_report()`.
+
+---
+
 ## 1. Network Connectivity & Topology (8 functions)
 
 ### 1.1 `active_network_routes()`
