@@ -1698,10 +1698,19 @@ impl DeepSeekServer {
             let stale_count = stale_kills.len();
             let ssh = home_path(LAB_SSH_IDENTITY_REL);
             let kh = home_path(LAB_KNOWN_HOSTS_REL);
-            let mut cargo_args: Vec<String> = ["run", "--quiet", "-p", "rustynet-cli", "--", "ops"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            let mut cargo_args: Vec<String> = [
+                "run",
+                "--quiet",
+                "-p",
+                "rustynet-cli",
+                "--features",
+                "vm-lab",
+                "--",
+                "ops",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
             cargo_args.extend(recovery_orchestrator_args(
                 LAB_INVENTORY_PATH,
                 &ssh,
@@ -2046,10 +2055,19 @@ impl DeepSeekServer {
             } else {
                 Vec::new()
             };
-            let mut cargo_args: Vec<String> = ["run", "--quiet", "-p", "rustynet-cli", "--", "ops"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            let mut cargo_args: Vec<String> = [
+                "run",
+                "--quiet",
+                "-p",
+                "rustynet-cli",
+                "--features",
+                "vm-lab",
+                "--",
+                "ops",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
             cargo_args.extend(build_orchestrator_args(
                 LAB_INVENTORY_PATH,
                 &ssh,

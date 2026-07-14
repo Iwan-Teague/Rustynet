@@ -57,7 +57,7 @@ gating (every stage gates on `runtime_acls_passed`; mesh-status
 gates additionally on key-custody / hardening / dns-failclosed).
 
 ```sh
-cargo run -p rustynet-cli -- ops vm-lab-validate-linux-security \
+cargo run -p rustynet-cli --features vm-lab -- ops vm-lab-validate-linux-security \
   --inventory /path/to/inventory.json \
   --linux-vm debian-utm-1 \
   --ssh-identity-file ~/.ssh/id_ed25519 \
@@ -87,7 +87,7 @@ opt-in flag that runs the six validators against every selected
 Linux alias as a post-install validation phase:
 
 ```sh
-cargo run -p rustynet-cli -- ops vm-lab-orchestrate-live-lab \
+cargo run -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab \
   --inventory /path/to/inventory.json \
   --report-dir /tmp/rustynet-reports/$(date +%s) \
   --ssh-identity-file ~/.ssh/id_ed25519 \

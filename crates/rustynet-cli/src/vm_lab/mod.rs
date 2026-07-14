@@ -34663,7 +34663,7 @@ if [ -n \"$toolchain_bin\" ]; then \
   export PATH=\"$toolchain_bin:$PATH\"; \
   export RUSTC=\"$toolchain_bin/rustc\"; \
 fi; \
-TMPDIR={tmpdir} RUSTUP_SKIP_UPDATE_CHECK=yes exec \"$cargo_bin\" build --locked --release -p rustynetd -p rustynet-cli",
+TMPDIR={tmpdir} RUSTUP_SKIP_UPDATE_CHECK=yes exec \"$cargo_bin\" build --locked --release -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab",
                     workdir = shell_quote(context.workdir),
                     tmpdir = shell_quote(tmpdir.as_str()),
                 )

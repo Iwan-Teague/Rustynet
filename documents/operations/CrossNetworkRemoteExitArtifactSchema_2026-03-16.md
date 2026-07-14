@@ -6,7 +6,7 @@ Define the canonical measured artifact contract for the future cross-network rem
 This schema exists before the implementation is complete so the evidence contract can be stable, testable, and fail-closed.
 
 Primary validator command:
-- `cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports ...`
+- `cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-cross-network-remote-exit-reports ...`
 
 Shared Rust schema/validator implementation:
 - [ops_cross_network_reports.rs](../../crates/rustynet-cli/src/ops_cross_network_reports.rs)

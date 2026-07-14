@@ -50,7 +50,7 @@ USAGE
 write_report() {
   local status="$1"
   local args=(
-    cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops generate-cross-network-remote-exit-report
     --suite cross_network_traversal_adversarial
     --report-path "$REPORT_PATH"
     --log-path "$LOG_PATH"
@@ -136,7 +136,7 @@ if [[ -z "$NAT_PROFILE" || -z "$IMPAIRMENT_PROFILE" ]]; then
   exit 2
 fi
 
-cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$ROGUE_ENDPOINT_IP" >/dev/null
+cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$ROGUE_ENDPOINT_IP" >/dev/null
 if [[ -n "$KNOWN_HOSTS_FILE" ]]; then
   export LIVE_LAB_PINNED_KNOWN_HOSTS_FILE="$KNOWN_HOSTS_FILE"
 fi
@@ -200,7 +200,7 @@ main() {
     return 1
   fi
   mapfile -t endpoint_checks < <(
-    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops read-cross-network-report-fields \
       --report-path "$endpoint_report" \
       --check hijack_drives_fail_closed \
       --check rogue_endpoint_not_adopted \
@@ -228,7 +228,7 @@ main() {
     return 1
   fi
   mapfile -t control_checks < <(
-    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops read-cross-network-report-fields \
       --report-path "$control_report" \
       --check all_daemon_sockets_secure \
       --check all_helper_sockets_secure \

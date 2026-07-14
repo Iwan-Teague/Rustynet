@@ -512,7 +512,7 @@ index.crates.io" is EXPECTED and benign. zsh does NOT word-split — pass SSH op
 Standard CLI run shape (derive node aliases/roles from the parity roadmap for the current
 target cell):
 ```bash
-cargo run -q -p rustynet-cli --bin rustynet-cli -- ops vm-lab-orchestrate-live-lab \
+cargo run -q -p rustynet-cli --features vm-lab --bin rustynet-cli -- ops vm-lab-orchestrate-live-lab \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --report-dir state/<fresh-unique-dir> \
   --ssh-identity-file /Users/iwan/.ssh/rustynet_lab_ed25519 \

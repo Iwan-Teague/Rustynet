@@ -44,6 +44,8 @@ fn run() -> Result<(), i32> {
             "--quiet",
             "-p",
             "rustynet-cli",
+            "--features",
+            "vm-lab",
             "--",
             "ops",
             "verify-linux-fresh-install-os-matrix-readiness",

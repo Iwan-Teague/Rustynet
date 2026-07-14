@@ -68,6 +68,8 @@ fn run() -> Result<(), i32> {
             "--quiet",
             "-p",
             "rustynet-cli",
+            "--features",
+            "vm-lab",
             "--",
             "ops",
             "verify-no-leak-dataplane-report",

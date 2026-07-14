@@ -112,6 +112,21 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 
 ### Live-lab stage contract (`rustynet-cli/src/`)
 
+RNQ-17: everything in this section — plus `vm_lab/`, `ops_live_lab_orchestrator.rs`,
+`ops_cross_network_preflight.rs`, `ops_fresh_install_os_matrix.rs`,
+`ops_live_lab_failure_digest.rs`, `live_lab_coverage.rs`, `live_lab_results.rs`,
+the 120 lab `OpsCommand` variants, and the `zip`/`toml`/`socket2`/`signal-hook`
+deps — compiles only under the DEFAULT-OFF `vm-lab` cargo feature of
+`rustynet-cli`. The shipped release binary (no features) has no lab command
+surface; lab hosts/guests build with `--features vm-lab`. `ops_e2e.rs` and
+`ops_cross_network_reports.rs` stay unconditionally compiled (product paths call
+them: traversal-bundle refresh + Windows role-transition service actions, and
+the phase9/phase10 readiness validators respectively) but their lab-facing
+command surface is gated. Shared secret/nonce/time helpers live in
+`secret_material.rs` (moved verbatim out of `main.rs`). Under `vm-lab` the
+LIBRARY additionally compiles the vm_lab tree and re-exports the runner surface
+as `rustynet_cli::orchestrator_test_surface` (RNQ-09 integration-test hook).
+
 | Type | Location | Purpose |
 |---|---|---|
 | `StageSpec` + `STAGES` | `live_lab_stage_registry.rs` | Single owner of the live-lab stage vocabulary: names, aliases, groups, CSV column mappings, enablement rules, budgets, `proves` control-IDs |

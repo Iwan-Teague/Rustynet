@@ -40,7 +40,8 @@ RUSTYNET_BIN="${RUSTYNET_BIN:-"$REPO_ROOT/target/debug/rustynet-cli"}"
 
 if [ ! -x "$RUSTYNET_BIN" ]; then
   echo "error: rustynet-cli binary not found or not executable: $RUSTYNET_BIN" >&2
-  echo "       build it (cargo build -p rustynet-cli) or set RUSTYNET_BIN" >&2
+  echo "       build it (cargo build -p rustynet-cli --features vm-lab) or set RUSTYNET_BIN" >&2
+  echo "       (the vm-lab feature is required: the parity ops commands are compiled out of default builds)" >&2
   exit 2
 fi
 
