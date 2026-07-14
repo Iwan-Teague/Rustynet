@@ -191,3 +191,37 @@ per-role (daemon-role, capability-set) pairs — consumed by the adapters, the i
 e2e helpers — would make this class of drift structurally impossible rather than fixed-once. This is
 the same lesson as FINDING 1 of [LiveLabFindings_2026-07-03.md](./LiveLabFindings_2026-07-03.md) (one
 registry instead of hand-copied vocabulary), applied to role/capability data.
+
+## FINDING (2026-07-14) — First Ubuntu 26.04 `--node` run: engine works; three onboarding gaps; a network-tooling gap
+
+**Ubuntu 26.04 LTS (aarch64) is now `--node`-proven for the node lifecycle.** A single-node run
+(`ubuntu-utm-1:exit`, report dir `state/ubuntu-node-1784034920`) passed `preflight`, `cleanup_hosts`,
+**`bootstrap_hosts`** (deploy + build + install rustynet on Ubuntu through the engine), `collect_pubkeys`,
+and `membership_init` (9 pass / 1 fail / 48 skip; matrix row appended). It failed only at
+`distribute_assignments` with `assignment env file key ALLOW_SPEC must not be empty` — a **degenerate
+single-node artifact** (a lone node has no peer pairs → empty ACL allow-spec → default-deny fail-closes
+correctly), NOT an Ubuntu incompatibility. Separately, `rustynetd` compiles cleanly on both Ubuntu 26.04
+and Rocky 10.2 aarch64 (manual `cargo build`, same day). Distro matrix now: Debian (deep reference),
+Rocky 10.2 (`active_exit` + traffic live-proven 2026-07-10), Ubuntu 26.04 (bootstrap/lifecycle proven
+2026-07-14), Fedora 44 (compile-ready, never run).
+
+**Three onboarding gaps had to be closed by hand before preflight passed — each is something a proper
+enrollment / the uniform tooling should own:**
+1. Host key not pinned in `known_hosts_lab` (bridged node, new IP) → the strict-checked OS-version probe
+   failed with an umbrella `linux` non-attribution. Fixed via `ssh-keyscan`.
+2. No passwordless sudo → preflight's clock probe died on `sudo: interactive authentication is required`.
+   `prime_remote_access` primes sudo, but `preflight` runs first — chicken-and-egg. Set NOPASSWD to match
+   the debian/rocky lab posture.
+3. Clock skew ~4.9 days → RNQ-21 correctly fail-closed (>90s tolerance). Force-synced to host time.
+
+**TOOLING GAP — `vm-lab-network-prepare` validates attachment MODE, not L2/subnet reachability.**
+`ubuntu-utm-1` and `debian-headless-2` have **byte-identical UTM Network configs** (`Mode=Shared`,
+`Hardware=virtio-net-pci`, `IsolateFromHost=false`; only the MAC differs), yet macOS `vmnet` placed
+debian on the shared `.64` plane (gateway `192.168.64.1`) and ubuntu on the **host's real LAN**
+(`10.230.76.x`; host en0 = `10.230.76.56`). ubuntu cannot reach `192.168.64.4`/`.1`, so a 2-node mesh
+cannot form. But `vm-lab-network-prepare --profile mgmt_shared_smoke_v1 --vm ubuntu-utm-1` reports
+`current=[nic0=shared] … already compliant; no change` — it green-lights a node that is mode-`Shared`
+but on a non-meshable subnet, and a reboot does not re-lease it onto the vmnet. **Recommendation:** the
+audit/prepare path should verify the *observed subnet / gateway reachability against the rest of the
+fleet*, not just the attachment-mode string, and flag (or repair) a same-mode-wrong-L2 node. The actual
+fix is UTM-attachment-level (recreate/re-toggle the NIC in the UTM app).
