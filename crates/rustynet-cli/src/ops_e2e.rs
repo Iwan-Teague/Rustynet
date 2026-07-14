@@ -26,7 +26,7 @@ use rustynet_control::{
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use zeroize::Zeroize;
 
-use crate::{env_file::format_env_assignment, unix_now};
+use crate::{env_file::format_env_assignment, secret_material::unix_now};
 
 const MEMBERSHIP_STATE_OWNER: &str = "rustynetd";
 const MEMBERSHIP_STATE_GROUP: &str = "rustynetd";
@@ -2624,7 +2624,7 @@ pub fn execute_ops_e2e_issue_assignments(
             "issuing client assignment failed",
         )?;
 
-        let signing_secret = crate::load_assignment_signing_secret(
+        let signing_secret = crate::secret_material::load_assignment_signing_secret(
             Path::new("/etc/rustynet/assignment.signing.secret"),
             passphrase_pathbuf.as_path(),
         )?;
@@ -2789,7 +2789,7 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
             Path::new("/etc/rustynet/assignment.signing.secret"),
             "assignment signing secret",
         )?;
-        let signing_secret = crate::load_assignment_signing_secret(
+        let signing_secret = crate::secret_material::load_assignment_signing_secret(
             Path::new("/etc/rustynet/assignment.signing.secret"),
             passphrase_path.as_path(),
         )?;
@@ -2899,7 +2899,7 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
             Path::new("/etc/rustynet/assignment.signing.secret"),
             "assignment signing secret",
         )?;
-        let signing_secret = crate::load_assignment_signing_secret(
+        let signing_secret = crate::secret_material::load_assignment_signing_secret(
             Path::new("/etc/rustynet/assignment.signing.secret"),
             passphrase_path.as_path(),
         )?;
@@ -3043,7 +3043,7 @@ pub fn execute_ops_e2e_issue_dns_zone_bundles_from_env(
             Path::new("/etc/rustynet/membership.owner.key"),
             "membership owner signing key",
         )?;
-        let signing_secret = crate::load_assignment_signing_secret(
+        let signing_secret = crate::secret_material::load_assignment_signing_secret(
             Path::new("/etc/rustynet/membership.owner.key"),
             passphrase_path.as_path(),
         )?;
@@ -3497,7 +3497,8 @@ fn issue_assignment_bundle_artifacts(
                     node_id: assignment.target_node_id.clone(),
                     generated_at_unix,
                     ttl_secs,
-                    nonce: crate::generate_assignment_nonce().saturating_add(index as u64),
+                    nonce: crate::secret_material::generate_assignment_nonce()
+                        .saturating_add(index as u64),
                     mesh_cidr: "100.64.0.0/10".to_owned(),
                     exit_node_id: assignment.exit_node_id.clone(),
                     lan_routes: Vec::new(),
@@ -3686,7 +3687,8 @@ fn issue_dns_zone_bundle_artifacts(
                     subject_node_id: subject.node_id.clone(),
                     generated_at_unix,
                     ttl_secs,
-                    nonce: crate::generate_assignment_nonce().saturating_add(index as u64),
+                    nonce: crate::secret_material::generate_assignment_nonce()
+                        .saturating_add(index as u64),
                     records,
                 })
                 .map_err(|err| format!("issue dns zone bundle failed: {err}"))?;
@@ -6360,7 +6362,7 @@ if ! "${toolchain_rustc}" --version >/dev/null 2>&1 || ! "${toolchain_cargo}" --
   exit 1
 fi
 
-"${toolchain_cargo}" build --release --manifest-path "${SRC_DIR}/Cargo.toml" -p rustynetd -p rustynet-cli
+"${toolchain_cargo}" build --release --manifest-path "${SRC_DIR}/Cargo.toml" -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab
 install -m 0755 "${SRC_DIR}/target/release/rustynetd" /usr/local/bin/rustynetd
 install -m 0755 "${SRC_DIR}/target/release/rustynet-cli" /usr/local/bin/rustynet
 getent group rustynetd >/dev/null 2>&1 || groupadd --system rustynetd

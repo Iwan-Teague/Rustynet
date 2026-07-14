@@ -2175,7 +2175,7 @@ Each artifact must be:
 
 Canonical schema reference:
 - [CrossNetworkRemoteExitArtifactSchema_2026-03-16.md](../../../documents/operations/CrossNetworkRemoteExitArtifactSchema_2026-03-16.md)
-- `cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports ...`
+- `cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-cross-network-remote-exit-reports ...`
 
 ### 9.3 Required checks inside those artifacts
 The measured reports must prove all of the following checks as `pass`:
@@ -2204,10 +2204,10 @@ The measured reports must prove all of the following checks as `pass`:
 The repo should add or extend gate entry points so this evidence is enforced automatically:
 1. Add a dedicated gate bundle:
    - [phase10_cross_network_exit_gates.sh](../../../scripts/ci/phase10_cross_network_exit_gates.sh)
-   - include `cargo run --quiet -p rustynet-cli -- ops validate-cross-network-nat-matrix ...` as a hard-fail matrix coverage check
+   - include `cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-cross-network-nat-matrix ...` as a hard-fail matrix coverage check
 2. Keep `scripts/ci/phase10_hp2_gates.sh` for traversal engine correctness, but do not treat it as sufficient evidence for remote exit-node readiness.
 3. Extend [check_phase10_readiness.sh](../../../scripts/ci/check_phase10_readiness.sh) to require every cross-network remote-exit artifact and its mandatory checks.
-   - that readiness path must invoke `cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports ...` before interpreting pass/fail checks
+   - that readiness path must invoke `cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-cross-network-remote-exit-reports ...` before interpreting pass/fail checks
 4. Extend [live_linux_lab_orchestrator.sh](../../../scripts/e2e/live_linux_lab_orchestrator.sh) so the cross-network exit suite is a distinct hard-fail stage.
 5. Extend the Rustynet security auditor skill so coverage promotion only happens when those measured reports pass schema validation and required checks.
 

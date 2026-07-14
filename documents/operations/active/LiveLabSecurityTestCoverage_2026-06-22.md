@@ -346,7 +346,7 @@ the artifact, then run the Linux daemon validators:
 sudo bash scripts/e2e/capture_linux_ipv6_leak.sh \
     --output "<report_dir>/linux_exit_evidence/linux_ipv6_leak.json"
 # then, from the host, the validate-linux-security pass picks it up:
-cargo run -p rustynet-cli -- ops vm-lab-validate-linux-security \
+cargo run -p rustynet-cli --features vm-lab -- ops vm-lab-validate-linux-security \
     --linux-vm debian-headless-1 --ssh-identity-file <id_ed25519> \
     --report-dir <report_dir>
 # stage validate_linux_ipv6_leak → Pass (0 leaks, probe blocked, containment present)
@@ -359,7 +359,7 @@ Runs as part of the standard Linux daemon-validator chain — no artifact needed
 it invokes `rustynetd privileged-helper-allowlist-audit` on the guest:
 
 ```
-cargo run -p rustynet-cli -- ops vm-lab-validate-linux-security \
+cargo run -p rustynet-cli --features vm-lab -- ops vm-lab-validate-linux-security \
     --linux-vm debian-headless-1 --ssh-identity-file <id_ed25519> \
     --report-dir <report_dir>
 # stage validate_linux_privileged_helper_allowlist → Pass when the shipped
@@ -510,7 +510,7 @@ The signature-forgery stage (`rustynetd membership-signature-audit`) drives the
 REAL `apply_signed_update`/`decode_signed_update` funnel with an 11-case forgery
 battery + a must-accept valid baseline, including the **malleable non-canonical
 S** case (`S' = S + ℓ`) — the RN-22 / Nebula-CRL-bypass defense. How to run live:
-`cargo run -p rustynet-cli -- ops vm-lab-validate-linux-security --linux-vm
+`cargo run -p rustynet-cli --features vm-lab -- ops vm-lab-validate-linux-security --linux-vm
 <alias> --ssh-identity-file <id> --report-dir <dir>` → stages
 `validate_linux_membership_signature_forgery` + `validate_linux_privileged_helper_allowlist`
 run the shipped daemon's in-binary audits over the public CLI (no artifact needed).

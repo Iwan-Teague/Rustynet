@@ -346,13 +346,13 @@ if [[ "$CLIENT_NETWORK_ID" == "$EXIT_NETWORK_ID" || "$CLIENT_NETWORK_ID" == "$RE
 fi
 
 if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
-  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CLIENT_UNDERLAY_IP" >/dev/null
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$CLIENT_UNDERLAY_IP" >/dev/null
 fi
 if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
-  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
 fi
 if [[ -n "$RELAY_UNDERLAY_IP" ]]; then
-  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$RELAY_UNDERLAY_IP" >/dev/null
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$RELAY_UNDERLAY_IP" >/dev/null
 fi
 
 validate_positive_integer "controller outage seconds" "$CONTROLLER_OUTAGE_SECS"
@@ -422,7 +422,7 @@ main() {
   fi
 
   mapfile -t relay_results < <(
-    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops read-cross-network-report-fields \
       --report-path "$RELAY_REPORT_PATH" \
       --include-status \
       --check relay_remote_exit_success \

@@ -566,6 +566,8 @@ fn write_json_report(
             "--quiet",
             "-p",
             "rustynet-cli",
+            "--features",
+            "vm-lab",
             "--",
             "ops",
             "write-real-wireguard-no-leak-under-load-report",

@@ -87,7 +87,7 @@ validate_positive_integer() {
 write_report() {
   local status="$1"
   local args=(
-    cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops generate-cross-network-remote-exit-report
     --suite cross_network_remote_exit_soak
     --report-path "$REPORT_PATH"
     --log-path "$LOG_PATH"
@@ -189,10 +189,10 @@ if [[ "$CLIENT_NETWORK_ID" == "$EXIT_NETWORK_ID" ]]; then
 fi
 
 if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
-  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CLIENT_UNDERLAY_IP" >/dev/null
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$CLIENT_UNDERLAY_IP" >/dev/null
 fi
 if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
-  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
 fi
 
 validate_positive_integer "soak duration seconds" "$SOAK_DURATION_SECS"
@@ -275,7 +275,7 @@ main() {
   fi
 
   mapfile -t direct_results < <(
-    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops read-cross-network-report-fields \
       --report-path "$DIRECT_REPORT_PATH" \
       --include-status \
       --check direct_remote_exit_success \
@@ -512,7 +512,7 @@ main() {
   fi
 
   mapfile -t bypass_results < <(
-    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops read-cross-network-report-fields \
       --report-path "$BYPASS_REPORT_PATH" \
       --include-status \
       --check internet_route_via_rustynet0 \
@@ -554,7 +554,7 @@ main() {
     CHECK_LONG_SOAK_STABLE="pass"
   fi
 
-  cargo run --quiet -p rustynet-cli -- ops write-cross-network-soak-monitor-summary \
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops write-cross-network-soak-monitor-summary \
     --path "$MONITOR_SUMMARY_PATH" \
     --samples "$samples" \
     --failing-samples "$failing_samples" \

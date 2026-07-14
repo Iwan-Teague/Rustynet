@@ -55,14 +55,14 @@ If you are on a local machine with UTM-backed lab VMs, start by discovering the
 available bundles and reading the compact summary:
 
 ```bash
-cargo run --quiet -p rustynet-cli -- ops vm-lab-discover-local-utm-summary --inventory documents/operations/active/vm_lab_inventory.json
+cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-discover-local-utm-summary --inventory documents/operations/active/vm_lab_inventory.json
 ```
 
 Use the full discovery report when you need the underlying bundle, live IP, SSH,
 and readiness details:
 
 ```bash
-cargo run --quiet -p rustynet-cli -- ops vm-lab-discover-local-utm --inventory documents/operations/active/vm_lab_inventory.json
+cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-discover-local-utm --inventory documents/operations/active/vm_lab_inventory.json
 ```
 
 Add `--update-inventory-live-ips` when you want a fully ready discovery pass to
@@ -87,7 +87,7 @@ are known but the host-to-guest SSH path is still not usable end to end. Use
 the local restart wrapper and wait for readiness before continuing:
 
 ```bash
-cargo run --quiet -p rustynet-cli -- ops vm-lab-restart \
+cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-restart \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --all \
   --wait-ready \
@@ -105,7 +105,7 @@ If you want the CLI to make that restart decision and then continue through the
 usual setup, run, and diagnose-on-failure path automatically, use:
 
 ```bash
-cargo run --quiet -p rustynet-cli -- ops vm-lab-orchestrate-live-lab \
+cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --report-dir artifacts/live_lab/$(date -u +%Y%m%dT%H%M%SZ)_orchestrated \
   --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
