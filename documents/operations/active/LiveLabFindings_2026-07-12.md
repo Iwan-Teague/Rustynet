@@ -235,3 +235,62 @@ won't move it). It runs on both `vm-lab-network-audit` and `vm-lab-network-prefl
 attachment **mode only**, not L2/subnet, and points to the audit. 4 unit tests incl. the negative (mode
 `Shared` + observed subnet ≠ fleet plane ⇒ Error, not compliant). Fail-safe: no fleet consensus ⇒
 nothing flagged.
+
+---
+
+## 2026-07-14 (cont.) — Ubuntu `.64` IP RESOLVED: root cause was a netplan MAC-pin, recovered over link-local IPv6
+
+After the operator switched `ubuntu-utm-1` to `Mode=Shared` **and regenerated its MAC**, `ip -4 addr`
+returned only loopback. Full diagnosis + fix:
+
+**True root cause (correcting the earlier "vmnet segment split" framing):** the guest WAS on the `.64`
+vmnet L2 the whole time (its link-local `fe80::…` shows up on the host's `bridge100` neighbor cache, and
+it pulled a vmnet IPv6 RA). It had **no IPv4** because `/etc/netplan/00-installer-config.yaml` (written by
+subiquity at install) pinned the **old** NIC:
+```yaml
+    enp0s1:
+      match: { macaddress: a2:dc:f9:9b:0c:8a }   # OLD MAC
+      set-name: enp0s1
+      dhcp4: true
+```
+After the MAC regen to `1a:e6:25:c2:a7:c1`, netplan's `match:` no longer matched any NIC ⇒ `enp0s1`
+**unmanaged** (`networkctl` SETUP=`unmanaged`) ⇒ no DHCP client ran ⇒ no IPv4 lease. A reboot did **not**
+fix it (the stale match is persistent). So the earlier "identical config, different subnet" note was a
+mis-attribution: the mode/subnet were fine; the DHCP-client *config* was stale. Ubuntu 26.04 also ships
+**no `dhclient`** (`command not found`) — systemd-networkd is the only DHCP client, and it only manages
+what netplan matches.
+
+**Why no orchestrator/MCP function could reach it:** every lab function needs either SSH-over-IPv4 (none)
+or `utmctl exec` via qemu-guest-agent (**not installed** — `utmctl ip-address` errors "guest agent not
+running"). Rediscovery hangs SSH-probing the dead IPv4. Confirmed: a no-IPv4 + no-agent guest is a blind
+spot for the whole toolset.
+
+**The UTM text console is NOT a usable fallback for a config fix:** computer-use `type` floods the QEMU
+console with `a`; the `key` action enters one keystroke at a time BUT silently **drops `.` `/` `=`**
+(period/slash/equal keysyms) — so you cannot type an IP, a path, or an INI/`key=value` line. Fine for
+`sudo ip link set enp0s1 up` (letters/digits/space only), useless for editing netplan.
+
+**RECOVERY TECHNIQUE THAT WORKED (reusable) — SSH over link-local IPv6 through the host bridge:** a vmnet
+guest with no IPv4 still has an RFC-4291 link-local `fe80::` address on the same L2 as the host bridge.
+Read it straight from the host neighbor cache and SSH to it with a zone id:
+```
+ndp -an | grep -i <nic-mac>            # -> fe80::18e6:25ff:fec2:a7c1%bridge100  <mac>  bridge100
+ping6 -c1 'fe80::18e6:25ff:fec2:a7c1%bridge100'
+ssh -6 -i <lab-key> ubuntu@'fe80::18e6:25ff:fec2:a7c1%bridge100'   # full shell, no IPv4/agent needed
+```
+Needs no guest agent, no IPv4, no internet — only shared L2 (always true for a vmnet guest). From that
+shell the fix is trivial: rewrite netplan to match by **name** (drop the MAC pin so it survives future
+regens) and `netplan apply`:
+```yaml
+network: { version: 2, ethernets: { enp0s1: { dhcp4: true, dhcp6: true } } }
+```
+Result: `enp0s1` → `routable/configured`, **`192.168.64.21/24`** (DHCP), reaches `.1` gateway and `.4`
+exit at 0% loss, clock skew 2s (in-tolerance). Inventory `ubuntu-utm-1` updated `10.230.76.57 → .21`
+(`utm-shared-192.168.64.0/24`). **Persistent** — name-based match survives MAC changes. Ubuntu is now
+2-node-mesh ready (`debian-headless-2:exit + ubuntu-utm-1:client`).
+
+**FOLLOW-UP (reusable function, in progress):** wrap this into a lab primitive
+`ops vm-lab-recover-guest-network --vm <name>` (must run from Bash — the macOS MCP LNP sandbox blocks the
+link-local SSH): resolve `fe80::…%bridgeN` from `ndp` by the VM's MAC → SSH over link-local → distro-aware
+DHCP-config repair (netplan name-match / networkd drop-in) → report + inventory-update the recovered IPv4.
+Also: lab guests should carry **qemu-guest-agent** so `utmctl exec` is a second agentless recovery path.
