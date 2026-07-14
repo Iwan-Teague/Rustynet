@@ -225,3 +225,13 @@ but on a non-meshable subnet, and a reboot does not re-lease it onto the vmnet. 
 audit/prepare path should verify the *observed subnet / gateway reachability against the rest of the
 fleet*, not just the attachment-mode string, and flag (or repair) a same-mode-wrong-L2 node. The actual
 fix is UTM-attachment-level (recreate/re-toggle the NIC in the UTM app).
+
+**RESOLVED (tooling, 2026-07-14).** `detect_offfleet_subnet_findings` (network_audit.rs) now derives the
+fleet's consensus management plane (the modal `network_group` CIDR across the inventory, requiring ≥2
+nodes) and emits an `off_fleet_subnet` **Error** for any reachable guest whose *live observed* underlay
+IPv4 is not on that plane — with a repair hint (regenerate MAC / re-create NIC; a mode rewrite alone
+won't move it). It runs on both `vm-lab-network-audit` and `vm-lab-network-preflight` (via
+`run_network_observation`), and `vm-lab-network-prepare`'s dry-run gained a footer clarifying it rewrites
+attachment **mode only**, not L2/subnet, and points to the audit. 4 unit tests incl. the negative (mode
+`Shared` + observed subnet ≠ fleet plane ⇒ Error, not compliant). Fail-safe: no fleet consensus ⇒
+nothing flagged.
