@@ -1786,9 +1786,25 @@ fn render_dry_run_plan(
     Ok(out)
 }
 
+/// The dual-plane network prepare/restore transaction mutates UTM bundle
+/// `config.plist` files, which exist only on a macOS/UTM host. Fail closed on
+/// any other OS rather than emitting a confusing missing-`plutil` error:
+/// libvirt guest networking is configured via virsh / domain XML, not this
+/// command.
+fn ensure_utm_host_for_network_mutation(command: &str) -> Result<(), String> {
+    if std::env::consts::OS == "macos" {
+        return Ok(());
+    }
+    Err(format!(
+        "{command} mutates UTM bundle config.plist and is only supported on a macOS/UTM host; \
+         configure libvirt guest networking via virsh / domain XML instead"
+    ))
+}
+
 pub fn execute_ops_vm_lab_network_prepare(
     config: VmLabNetworkPrepareConfig,
 ) -> Result<String, String> {
+    ensure_utm_host_for_network_mutation("vm-lab-network-prepare")?;
     let profile_dir = config
         .profile_dir
         .unwrap_or_else(|| PathBuf::from(DEFAULT_NETWORK_PROFILE_DIR));
@@ -1908,6 +1924,7 @@ pub fn execute_ops_vm_lab_network_restore(
         }
         return Ok(out);
     }
+    ensure_utm_host_for_network_mutation("vm-lab-network-restore")?;
     let transaction_id = config
         .transaction_id
         .ok_or_else(|| "vm-lab-network-restore requires --transaction <id> or --list".to_owned())?;
