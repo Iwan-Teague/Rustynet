@@ -379,18 +379,20 @@ and can be sidestepped with out-of-band (cloud-init/unattend) provisioning.
 
 | # | Scope | Status |
 | --- | --- | --- |
-| 1 | `VmController::Libvirt { domain, connect_uri }` variant + `parse_controller` `"libvirt"` arm (default `connect_uri = qemu:///system`) + Libvirt arms on all 12 compiler-flagged match sites (display echoes the domain; UTM-reconcile closures skip Libvirt; **power gate `resolve_start_targets` + IP-resolution `resolve_local_utm_live_host` FAIL CLOSED** with an explicit "not yet (increment 2/3)" error) + 2 unit tests | **DONE** (uncommitted) — `check`/`fmt`/`clippy -D warnings`/tests green |
-| 2 | `transition_libvirt_vm` (virsh `start`/`shutdown`/`destroy` + `domstate` reconcile); generalize `StartTarget`/`resolve_start_targets`; branch the utmctl-presence checks + default paths on controller kind | TODO |
-| 3 | virsh discovery + IP resolution (`virsh domifaddr` + MAC-from-domain-XML + `ip neigh` fallback) wired into `readiness.rs` restart-recovery | TODO (live part needs the box) |
+| 1 | `VmController::Libvirt { domain, connect_uri }` variant + `parse_controller` `"libvirt"` arm (default `connect_uri = qemu:///system`) + Libvirt arms on all 12 compiler-flagged match sites (display echoes the domain; UTM-reconcile closures skip Libvirt; power/IP gates fail closed) + unit tests | **DONE** — `f3352b0` |
+| 2 | virsh **power control**: `transition_libvirt_vm` (`virsh start`/`shutdown` + `domstate` poll; fails closed when state is unreadable; graceful shutdown — force/`destroy` escalation is a small follow-up) + `LibvirtPowerAction`. `StartTarget` now carries the real `VmController` (not the flattened UTM `utm_name`/`bundle_path`) with `display_name()`/`local_utm()` accessors; `resolve_start_targets` resolves libvirt targets; `execute_ops_vm_lab_start`/`_stop` dispatch per controller and only require `utmctl` when a UTM target is present. IP-resolution + readiness still fail closed for libvirt → increment 3. +3 unit tests | **DONE** — `check --all-targets`/`fmt`/`clippy -D warnings`/tests green |
+| 3 | virsh discovery + IP resolution (`virsh domifaddr` + MAC-from-domain-XML + `ip neigh` fallback) wired into `readiness.rs` restart-recovery + `observe_local_utm_target_ready` (libvirt currently fails closed as not-ready there) | TODO (live part needs the box) |
 | 4 | cfg-isolate the macOS-only host observers (`plutil`/`scutil`/`ifconfig`/`netstat`/`arp`) in `network_audit.rs`/`network_prepare.rs` so those stages skip/adapt on Linux instead of failing | TODO |
 | 5 | MCP surface: branch `lab_state.rs` `alias_to_utm`/`utm_power_status`/power tools/`recover_stuck_vms` on controller kind (virsh `domstate` + a virsh recover) | TODO |
 | 0 / 6 | Linux-host build check (`cargo check … --target x86_64-unknown-linux-gnu` on the box) + interim `--trust-inventory-ready` run; then a full live `--node` run driving libvirt guests → `live_lab_run_matrix.csv` row (**the DoD**) | BLOCKED on hardware |
 
-Increment 1 files touched: `crates/rustynet-cli/src/vm_lab/mod.rs` (enum + const
-`DEFAULT_LIBVIRT_CONNECT_URI` + parser + gate/IP fail-closed arms + 2 tests),
-`network_audit.rs`, `network_prepare.rs`, `topology.rs`. **`LocalUtm` behaviour
-is byte-identical** (one hardened path, §3); libvirt entries now parse and are
-represented everywhere but fail closed on power/discovery until increments 2–3.
+Increment 1 (`f3352b0`) touched `mod.rs` (enum + const `DEFAULT_LIBVIRT_CONNECT_URI`
++ parser + fail-closed arms) plus the `network_audit.rs`/`network_prepare.rs`
+Libvirt arms (landed in the concurrent `e5ba1b1`) and `topology.rs`. Increment 2
+is `mod.rs`-only (the virsh power layer + `StartTarget` generalization +
+start/stop dispatch + 3 tests). **`LocalUtm` behaviour is byte-identical** across
+both (one hardened path, §3); a libvirt VM can now be powered on/off via `virsh`,
+but IP discovery + readiness still fail closed until increment 3.
 
 **Intersection watch:** all of this lives in the 49k-line `vm_lab/mod.rs`, which
 RNQ-15 is extracting and RNQ-17 is splitting out. Keep the libvirt code cohesive
