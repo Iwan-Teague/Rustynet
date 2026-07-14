@@ -23,6 +23,16 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 
+// PKG-G: bounded, observation-only diagnostics (route/interface/DNS/MTU,
+// listening sockets, firewall status, service status) behind a fixed
+// read-only command allowlist. See `diagnostics.rs` module docs for the
+// observation-only + bounded-execution guarantees.
+mod diagnostics;
+pub use diagnostics::{
+    CommandOutcome, CommandRunner, DEFAULT_COMMAND_TIMEOUT, DiagnosticsReport, FirewallBackend,
+    FirewallStatus, SystemCommandRunner, observe_system_diagnostics, observe_with, render_report,
+};
+
 /// System information queries without external tool dependencies.
 ///
 pub fn git_version() -> Option<String> {
@@ -388,6 +398,7 @@ pub struct InterfaceInfo {
     pub is_up: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceStatus {
     pub running: bool,
     pub status_message: String,
@@ -430,6 +441,7 @@ pub struct ConfigValidation {
     pub issues: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     pub destination: String,
     pub gateway: String,
@@ -541,6 +553,7 @@ pub struct ProcessListEntry {
     pub uptime_seconds: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceDetail {
     pub name: String,
     pub up: bool,
@@ -633,6 +646,7 @@ pub struct TcpConnection {
     pub pid: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsResolverInfo {
     pub resolvers: Vec<String>,
     pub search_domains: Vec<String>,
@@ -707,6 +721,7 @@ pub struct ArpEntry {
     pub is_permanent: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListeningSocket {
     pub protocol: String,
     pub address: String,

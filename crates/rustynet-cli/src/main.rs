@@ -286,6 +286,11 @@ enum CliCommand {
     SystemStateSnapshot,
     CompareToBaseline,
     PerformanceRegressionDetection,
+    /// PKG-G — `rustynet diagnostics`: bounded, observation-only host
+    /// diagnostics (routes/interfaces/DNS/listening-sockets/firewall/
+    /// service). Read-only by construction; see
+    /// `rustynet_sysinfo::observe_system_diagnostics`.
+    Diagnostics,
     Help,
 }
 
@@ -1821,6 +1826,10 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "system-snapshot" => CliCommand::SystemStateSnapshot,
         [cmd] if cmd == "compare-baseline" => CliCommand::CompareToBaseline,
         [cmd] if cmd == "perf-regression" => CliCommand::PerformanceRegressionDetection,
+        // PKG-G — bounded, observation-only host diagnostics. Takes no
+        // arguments (nothing to influence the fixed read-only command
+        // allowlist); read-only by construction.
+        [cmd] if cmd == "diagnostics" || cmd == "diag" => CliCommand::Diagnostics,
         [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
         [cmd, rest @ ..] if cmd == "logs" => {
             let mut follow = false;
@@ -5842,6 +5851,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::SystemStateSnapshot => execute_system_snapshot(),
         CliCommand::CompareToBaseline => execute_compare_baseline(),
         CliCommand::PerformanceRegressionDetection => execute_perf_regression(),
+        CliCommand::Diagnostics => execute_diagnostics(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_owned()),
         CliCommand::OperatorMenu { args } => execute_operator_menu(args),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -15623,6 +15633,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::SystemStateSnapshot
         | CliCommand::CompareToBaseline
         | CliCommand::PerformanceRegressionDetection
+        | CliCommand::Diagnostics
         | CliCommand::OperatorMenu { .. }
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -17732,6 +17743,17 @@ fn execute_perf_regression() -> Result<String, String> {
         ));
     }
     Ok(output.join("\n"))
+}
+
+/// PKG-G — `rustynet diagnostics`. Runs the bounded, observation-only host
+/// diagnostics snapshot and renders it. This is read-only by construction:
+/// `observe_system_diagnostics` only ever issues commands from
+/// `rustynet-sysinfo`'s fixed read-only allowlist, each spawned under a
+/// timeout watchdog, and performs zero writes/config changes. See the
+/// `rustynet_sysinfo::diagnostics` module docs for the full guarantee.
+fn execute_diagnostics() -> Result<String, String> {
+    let report = rustynet_sysinfo::observe_system_diagnostics();
+    Ok(rustynet_sysinfo::render_report(&report))
 }
 
 fn execute_exit_node_list() -> Result<String, String> {
@@ -20989,6 +21011,37 @@ mod tests {
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
     use std::fs;
+
+    // PKG-G — bounded, observation-only host diagnostics CLI surface.
+    #[test]
+    fn diagnostics_command_parses_and_is_read_only() {
+        // Both the canonical name and the short alias parse to the same
+        // read-only variant, and neither takes any argument (nothing can
+        // influence the fixed read-only command allowlist).
+        assert_eq!(
+            parse_command(&["diagnostics".to_owned()]),
+            CliCommand::Diagnostics
+        );
+        assert_eq!(parse_command(&["diag".to_owned()]), CliCommand::Diagnostics);
+
+        // The diagnostics command never maps to a daemon IPC command that
+        // mutates state — it resolves to the inert "unsupported" IPC form,
+        // exactly like its sibling read-only sysinfo commands. This is the
+        // CLI-layer half of the observation-only guarantee (the by-
+        // construction allowlist is enforced+tested in
+        // `rustynet_sysinfo::diagnostics`).
+        assert_eq!(
+            to_ipc_command(CliCommand::Diagnostics),
+            IpcCommand::Unknown("unsupported".to_owned())
+        );
+
+        // End-to-end: dispatch succeeds and renders the observation-only
+        // report (runs real read-only tools on the test host; asserts only
+        // the stable banner so it is not host-dependent/flaky).
+        let rendered = execute(CliCommand::Diagnostics).expect("diagnostics dispatch");
+        assert!(rendered.contains("observation-only"));
+        assert!(rendered.contains("firewall:"));
+    }
 
     #[test]
     fn cli_enrollment_admit_redeems_token_exactly_once_under_race() {
