@@ -8,6 +8,13 @@ default-run = "rustynet-cli"
 
 [features]
 chaos-forger = []
+# RNQ-17 — the lab robot (UTM `vm-lab` fleet control, live-lab orchestrator,
+# e2e bootstrap/report command surface, cross-network lab tooling, fresh-install
+# OS matrix) is DEFAULT-OFF so the shipped product binary carries none of that
+# attack surface (release.yml builds `-p rustynet-cli --bin rustynet-cli` with
+# no features). CI gates run `--all-features`, so the lab code stays compiled
+# and tested. Lab-driving hosts/guests must build with `--features vm-lab`.
+vm-lab = ["dep:zip", "dep:toml", "dep:socket2", "dep:signal-hook"]
 
 [lib]
 name = "rustynet_cli"
@@ -36,13 +43,13 @@ rand.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
-socket2 = { version = "0.6", features = [] }
+socket2 = { version = "0.6", features = [], optional = true }
 tar = "0.4"
-toml = "0.8"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+toml = { version = "0.8", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 zeroize = "1"
 tempfile = "3"
-signal-hook = { version = "0.3", default-features = false }
+signal-hook = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
 

@@ -1111,7 +1111,7 @@ cross_network_stages_applicable() {
   }
   set +e
   local topology_result
-  topology_result="$(cargo run --quiet -p rustynet-cli -- ops classify-cross-network-topology --ip-a "$client_addr" --ip-b "$exit_addr" --ipv4-prefix 24 --ipv6-prefix 64 2>/dev/null)"
+  topology_result="$(cargo run --quiet -p rustynet-cli --features vm-lab -- ops classify-cross-network-topology --ip-a "$client_addr" --ip-b "$exit_addr" --ipv4-prefix 24 --ipv6-prefix 64 2>/dev/null)"
   same_prefix_rc=$?
   set -e
   if [[ "$same_prefix_rc" -eq 0 ]]; then
@@ -1174,7 +1174,7 @@ ensure_password_file() {
     printf 'path must not be a symlink: %s\n' "$selected_path" >&2
     return 1
   fi
-  if ! cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+  if ! cargo run --quiet -p rustynet-cli --features vm-lab -- ops check-local-file-mode \
     --path "$selected_path" \
     --policy owner-only \
     --label file >/dev/null
@@ -1401,7 +1401,7 @@ stage_requires_forensics_bundle() {
 }
 
 redact_forensics_text() {
-  cargo run --quiet -p rustynet-cli -- ops redact-forensics-text
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops redact-forensics-text
 }
 
 capture_forensics_user() {
@@ -1606,7 +1606,7 @@ live_lab_collect_forensics_bundle() {
 
   manifest_path="$stage_dir/manifest.json"
   local _manifest_rc=0
-  cargo run --quiet -p rustynet-cli -- ops write-cross-network-forensics-manifest \
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops write-cross-network-forensics-manifest \
     --stage "$stage_name" \
     --collected-at-utc "$collected_at" \
     --stage-dir "$stage_dir" \
@@ -1646,7 +1646,7 @@ live_lab_collect_stage_artifact_index() {
   local stage_name="$1"
   local stage_dir="$2"
   local output_path="${3:-$stage_dir/artifact_index.json}"
-  cargo run --quiet -p rustynet-cli -- ops write-live-lab-stage-artifact-index \
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops write-live-lab-stage-artifact-index \
     --stage-name "$stage_name" \
     --stage-dir "$stage_dir" \
     --output "$output_path"
@@ -1656,7 +1656,7 @@ live_lab_assert_forensics_bundle_complete() {
   local stage_name="$1"
   local stage_dir="$2"
   local output_path="${3:-$stage_dir/bundle_validation.json}"
-  cargo run --quiet -p rustynet-cli -- ops validate-cross-network-forensics-bundle \
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-cross-network-forensics-bundle \
     --stage-name "$stage_name" \
     --nodes-tsv "$NODES_TSV" \
     --stage-dir "$stage_dir" \
@@ -2298,7 +2298,7 @@ run_root pkill -f '/usr/lib/apt/methods/' >/dev/null 2>&1 || true
 run_root pkill -f 'dpkg' >/dev/null 2>&1 || true
 run_root pkill -f 'dnf install -y' >/dev/null 2>&1 || true
 run_root pkill -f 'cargo build --release -p rustynetd' >/dev/null 2>&1 || true
-run_root pkill -f 'cargo build --release -p rustynet-cli --bin rustynet-cli' >/dev/null 2>&1 || true
+run_root pkill -f 'cargo build --release -p rustynet-cli --features vm-lab --bin rustynet-cli' >/dev/null 2>&1 || true
 
 run_root_timed 30 systemctl stop \
   rustynetd.service \
@@ -2764,7 +2764,7 @@ fi
 rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 
 run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd
-run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-cli --bin rustynet-cli
+run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-cli --features vm-lab --bin rustynet-cli
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
 # Co-deploy the sibling relay daemon binary on every Linux node. Role stages
@@ -5237,7 +5237,7 @@ refresh_phase6_linux_parity_probe_from_lab() {
 
   live_lab_run_root "$target" "root rustynet ops secure-remove --path '${remote_probe_path}' >/dev/null 2>&1 || root rm -f '${remote_probe_path}'; root rustynet ops secure-remove --path '${remote_leak_report}' >/dev/null 2>&1 || root rm -f '${remote_leak_report}'; root rustynet ops secure-remove --path '${remote_raw_dir}/platform_parity_linux.json' >/dev/null 2>&1 || root rm -f '${remote_raw_dir}/platform_parity_linux.json'; root rmdir '${remote_raw_dir}' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
 
-  cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops check-local-file-mode \
     --path "$local_inbox" \
     --policy no-group-world-write \
     --label 'phase6 linux parity inbox probe' >/dev/null
@@ -5750,7 +5750,7 @@ assert_json_report_status_pass() {
     printf '%s report missing: %s\n' "$label" "$report_path" >&2
     return 1
   fi
-  status="$(cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+  status="$(cargo run --quiet -p rustynet-cli --features vm-lab -- ops read-cross-network-report-fields \
     --report-path "$report_path" \
     --include-status \
     --default-value fail)"
@@ -7444,7 +7444,7 @@ cross_network_preflight_worker() {
     --require-daemon-active \
     --require-socket-present \
     --output "$discovery_validation_path"
-  discovery_hash="$(cargo run --quiet -p rustynet-cli -- ops sha256-file --path "$discovery_local_path")"
+  discovery_hash="$(cargo run --quiet -p rustynet-cli --features vm-lab -- ops sha256-file --path "$discovery_local_path")"
 
   set +e
   route_policy_snapshot="$(live_lab_collect_route_policy "$target" 2>&1)"
@@ -7503,7 +7503,7 @@ stage_run_cross_network_preflight() {
 
   stage_dir="$(parallel_stage_dir cross_network_preflight)"
   report_path="$REPORT_DIR/cross_network_preflight_report.json"
-  cargo run --quiet -p rustynet-cli -- ops write-cross-network-preflight-report \
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops write-cross-network-preflight-report \
     --nodes-tsv "$NODES_TSV" \
     --stage-dir "$stage_dir" \
     --output "$report_path" \
@@ -7587,7 +7587,7 @@ stage_run_cross_network_daemon_path() {
 
 stage_run_cross_network_nat_matrix() {
   local output_path="$REPORT_DIR/cross_network_remote_exit_nat_matrix_validation.md"
-  cargo run --quiet -p rustynet-cli -- ops validate-cross-network-nat-matrix \
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-cross-network-nat-matrix \
     --artifact-dir "$REPORT_DIR" \
     --required-nat-profiles "$CROSS_NETWORK_REQUIRED_NAT_PROFILES" \
     --expected-git-commit "$(current_run_git_commit)" \
@@ -7608,7 +7608,7 @@ stage_generate_fresh_install_os_matrix_report() {
   role_report="$REPORT_DIR/role_switch_matrix_report_${commit_short}.json"
   canonical_report="$ROOT_DIR/artifacts/phase10/fresh_install_os_matrix_report.json"
   canonical_source_dir="$ROOT_DIR/artifacts/phase10/source/fresh_install_os_matrix"
-  cargo run --quiet -p rustynet-cli -- ops rebind-linux-fresh-install-os-matrix-inputs \
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops rebind-linux-fresh-install-os-matrix-inputs \
     --dest-dir "$canonical_source_dir" \
     --bootstrap-log "$LOG_DIR/bootstrap_hosts.log" \
     --baseline-log "$LOG_DIR/validate_baseline_runtime.log" \
@@ -7634,7 +7634,7 @@ stage_generate_fresh_install_os_matrix_report() {
       return 1
     fi
   done
-  cargo run --quiet -p rustynet-cli -- ops generate-linux-fresh-install-os-matrix-report \
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops generate-linux-fresh-install-os-matrix-report \
     --output "$canonical_report" \
     --environment "linux-live-lab-orchestrator:${NETWORK_ID}" \
     --source-mode "$SOURCE_MODE" \
@@ -8011,7 +8011,7 @@ stage_run_reboot_recovery_report() {
     client_boot_change="fail"
     printf 'client_reboot_wait=fail\n' | tee -a "$observations_file"
     arp -an | rg "$(printf '%s' "$(live_lab_resolved_target_address "$client_target")" | sed 's/\./\\./g')" | tee -a "$observations_file" || true
-    cargo run --quiet -p rustynet-cli -- ops scan-ipv4-port-range \
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops scan-ipv4-port-range \
       --network-prefix 192.168.18 \
       --start-host 1 \
       --end-host 254 \
@@ -8098,7 +8098,7 @@ stage_run_reboot_recovery_report() {
     salvage_twohop="skipped"
   fi
 
-  cargo run --quiet -p rustynet-cli -- ops write-live-linux-reboot-recovery-report \
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops write-live-linux-reboot-recovery-report \
     --report-path "$reboot_report" \
     --observations-path "$observations_file" \
     --exit-pre "$exit_pre" \
@@ -8124,7 +8124,7 @@ write_run_summary() {
   elapsed_secs=$((finished_at_unix - RUN_STARTED_AT_UNIX))
   elapsed_human="$(format_elapsed_duration "$elapsed_secs")"
   local _rc=0
-  cargo run --quiet -p rustynet-cli -- ops write-live-linux-lab-run-summary \
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops write-live-linux-lab-run-summary \
     --nodes-tsv "$NODES_TSV" \
     --stages-tsv "$STAGE_TSV" \
     --summary-json "$SUMMARY_JSON" \
@@ -8153,7 +8153,7 @@ refresh_failure_digest() {
   if [[ ! -f "$NODES_TSV" || ! -f "$STAGE_TSV" ]]; then
     return 0
   fi
-  if ! cargo run --quiet -p rustynet-cli -- ops generate-live-linux-lab-failure-digest \
+  if ! cargo run --quiet -p rustynet-cli --features vm-lab -- ops generate-live-linux-lab-failure-digest \
     --nodes-tsv "$NODES_TSV" \
     --stages-tsv "$STAGE_TSV" \
     --report-dir "$REPORT_DIR" \
@@ -8214,7 +8214,7 @@ emit_stage_manifest_best_effort() {
   [[ "${ENABLE_CHAOS_SUITE:-0}" -eq 1 ]] && _args+=(--chaos-suite)
   [[ "${RUN_SOAK:-0}" -eq 1 ]] && _args+=(--soak-suite)
   [[ "${RUN_LOCAL_GATES:-0}" -eq 1 ]] && _args+=(--local-gate-suite)
-  cargo run --quiet -p rustynet-cli -- ops emit-stage-manifest "${_args[@]}" >/dev/null 2>&1 || true
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops emit-stage-manifest "${_args[@]}" >/dev/null 2>&1 || true
 }
 
 orchestrator_cleanup() {
@@ -8223,7 +8223,7 @@ orchestrator_cleanup() {
   if [[ -f "$SUMMARY_JSON" ]]; then
     local _matrix_args=(--report-dir "$REPORT_DIR")
     [[ -n "${PROFILE_PATH:-}" ]] && _matrix_args+=(--profile "$PROFILE_PATH")
-    cargo run --quiet -p rustynet-cli -- ops append-orchestrator-run-to-matrix \
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops append-orchestrator-run-to-matrix \
       "${_matrix_args[@]}" 2>/dev/null || true
   fi
   live_lab_cleanup
@@ -8421,7 +8421,7 @@ ensure_known_hosts_input() {
     printf 'pinned SSH known_hosts file must not be a symlink: %s\n' "$SSH_KNOWN_HOSTS_FILE" >&2
     exit 2
   fi
-  if ! cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+  if ! cargo run --quiet -p rustynet-cli --features vm-lab -- ops check-local-file-mode \
     --path "$SSH_KNOWN_HOSTS_FILE" \
     --policy no-group-world-write \
     --label 'pinned SSH known_hosts file' >/dev/null
@@ -8526,16 +8526,16 @@ main() {
     exit 2
   fi
   if [[ -n "$CROSS_NETWORK_CLIENT_UNDERLAY_IP" ]]; then
-    cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CROSS_NETWORK_CLIENT_UNDERLAY_IP" >/dev/null
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$CROSS_NETWORK_CLIENT_UNDERLAY_IP" >/dev/null
   fi
   if [[ -n "$CROSS_NETWORK_EXIT_UNDERLAY_IP" ]]; then
-    cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CROSS_NETWORK_EXIT_UNDERLAY_IP" >/dev/null
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$CROSS_NETWORK_EXIT_UNDERLAY_IP" >/dev/null
   fi
   if [[ -n "$CROSS_NETWORK_RELAY_UNDERLAY_IP" ]]; then
-    cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CROSS_NETWORK_RELAY_UNDERLAY_IP" >/dev/null
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$CROSS_NETWORK_RELAY_UNDERLAY_IP" >/dev/null
   fi
   if [[ -n "$CROSS_NETWORK_PROBE_UNDERLAY_IP" ]]; then
-    cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CROSS_NETWORK_PROBE_UNDERLAY_IP" >/dev/null
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$CROSS_NETWORK_PROBE_UNDERLAY_IP" >/dev/null
   fi
   prepare_cross_network_profile_config
   if (( TRAVERSAL_TTL_SECS > 86400 )); then
@@ -8570,7 +8570,7 @@ main() {
     while IFS= read -r _sn; do
       [[ -n "$_sn" ]] || continue
       PASSED_STAGES+=("$_sn")
-    done < <(cargo run --quiet -p rustynet-cli -- ops list-run-stages \
+    done < <(cargo run --quiet -p rustynet-cli --features vm-lab -- ops list-run-stages \
       --run-summary "$_prev_summary" --status pass 2>/dev/null || true)
     local _setup_stages=(
       preflight prepare_source_archive verify_ssh_reachability prime_remote_access

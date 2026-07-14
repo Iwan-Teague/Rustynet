@@ -78,7 +78,7 @@ log() {
 write_report() {
   local status="$1"
   local args=(
-    cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops generate-cross-network-remote-exit-report
     --suite live_linux_path_handoff_under_load
     --report-path "$REPORT_PATH"
     --log-path "$LOG_PATH"

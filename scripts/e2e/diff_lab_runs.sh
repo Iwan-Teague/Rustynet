@@ -11,6 +11,6 @@ fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-exec cargo run --quiet -p rustynet-cli -- ops diff-run-summaries \
+exec cargo run --quiet -p rustynet-cli --features vm-lab -- ops diff-run-summaries \
   --run-a "${1}/run_summary.json" \
   --run-b "${2}/run_summary.json"

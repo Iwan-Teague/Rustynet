@@ -1326,7 +1326,7 @@ The code exists. What is needed is a successful dry-run in the lab to prove the 
 
 ```bash
 # On a Linux machine with both lab nodes reachable:
-cargo run -p rustynet-cli -- ops run-debian-two-node-e2e \
+cargo run -p rustynet-cli --features vm-lab -- ops run-debian-two-node-e2e \
   --client-host debian@192.168.18.51 \
   --exit-host mint@192.168.18.53 \
   --ssh-identity-file ~/.ssh/rustynet_lab \
@@ -1408,7 +1408,7 @@ bash scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh \
 # 6. Soak (minimum 30 minutes)
 
 # Then validate all reports:
-cargo run -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
+cargo run -p rustynet-cli --features vm-lab -- ops validate-cross-network-remote-exit-reports \
   --artifact-dir artifacts/phase10 \
   --require-pass-status
 

@@ -3,16 +3,34 @@
 mod anchor_init;
 mod env_file;
 mod install;
+#[cfg(feature = "vm-lab")]
 mod live_lab_coverage;
+#[cfg(feature = "vm-lab")]
 mod live_lab_results;
+#[cfg(feature = "vm-lab")]
 mod live_lab_run_matrix;
+#[cfg(feature = "vm-lab")]
 mod live_lab_stage_manifest;
+#[cfg(feature = "vm-lab")]
 mod live_lab_stage_recorder;
+#[cfg(feature = "vm-lab")]
 mod live_lab_stage_registry;
 mod llm_cli;
+#[cfg(feature = "vm-lab")]
 mod ops_cross_network_preflight;
+// Stays compiled without `vm-lab`: `ops_phase9`'s phase10 readiness
+// verifier calls its cross-network validators (gating would silently weaken
+// a release-readiness check). Its lab-facing `OpsCommand` surface IS gated,
+// so most items are dead in default builds.
+#[cfg_attr(not(feature = "vm-lab"), allow(dead_code))]
 mod ops_cross_network_reports;
+// Stays compiled without `vm-lab`: product paths call into it
+// (`refresh_local_traversal_bundle_from_specs` bundle issuance and the
+// Windows relay/exit role-transition service actions). Its lab-facing
+// `OpsCommand` surface IS gated, so most items are dead in default builds.
+#[cfg_attr(not(feature = "vm-lab"), allow(dead_code))]
 mod ops_e2e;
+#[cfg(feature = "vm-lab")]
 mod ops_fresh_install_os_matrix;
 mod ops_install_macos_anchor;
 mod ops_install_macos_exit;
@@ -21,18 +39,31 @@ mod ops_install_systemd;
 mod ops_install_systemd_exit;
 mod ops_install_systemd_relay;
 mod ops_install_systemd_service;
+#[cfg(feature = "vm-lab")]
 mod ops_live_lab_failure_digest;
+#[cfg(feature = "vm-lab")]
 mod ops_live_lab_orchestrator;
 mod ops_network_discovery;
 mod ops_peer_store;
 mod ops_phase1;
 mod ops_phase9;
 mod ops_release_manifest;
+// Product security-audit tooling; its live-lab-flavored `OpsCommand`
+// surface is gated behind `vm-lab`, leaving some items dead by default.
+#[cfg_attr(not(feature = "vm-lab"), allow(dead_code))]
 mod ops_security_audit;
+// Product security-audit tooling; its live-lab-flavored `OpsCommand`
+// surface is gated behind `vm-lab`, leaving some items dead by default.
+#[cfg_attr(not(feature = "vm-lab"), allow(dead_code))]
 mod ops_security_audit_workflows;
 mod ops_write_daemon_env;
 mod release_manifest;
+mod secret_material;
+// Product security-audit tooling; its live-lab-flavored `OpsCommand`
+// surface is gated behind `vm-lab`, leaving some items dead by default.
+#[cfg_attr(not(feature = "vm-lab"), allow(dead_code))]
 mod security_audit_catalog;
+#[cfg(feature = "vm-lab")]
 mod vm_lab;
 
 use std::collections::{HashMap, HashSet};
@@ -52,6 +83,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::anchor_init::{AnchorInitConfig, build_anchor_init_plan, render_anchor_init_plan};
 use crate::env_file::{format_env_assignment, parse_env_value};
+use crate::secret_material::{
+    encrypted_secret_permission_policy, generate_assignment_nonce, load_assignment_signing_secret,
+    load_encrypted_secret_material, unix_now, validate_encrypted_secret_file_security,
+};
 use ed25519_dalek::{Signer, SigningKey};
 use nix::unistd::{Gid, Group, Uid, User, chown};
 use rand::{TryRngCore, rngs::OsRng};
@@ -72,9 +107,7 @@ use rustynet_control::{
     AutoTunnelBundleRequest, ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate,
     EndpointHintCandidateType, NodeMetadata,
 };
-use rustynet_crypto::{
-    KeyCustodyPermissionPolicy, read_encrypted_key_file, write_encrypted_key_file,
-};
+use rustynet_crypto::write_encrypted_key_file;
 use rustynet_dns_zone::{
     canonicalize_dns_relative_name, canonicalize_dns_zone_name, parse_dns_zone_verifying_key,
     parse_signed_dns_zone_bundle_wire, verify_signed_dns_zone_bundle as verify_dns_zone_bundle,
@@ -707,18 +740,23 @@ enum OpsCommand {
     GenerateAssessmentFromMatrix {
         config: ops_security_audit::GenerateAssessmentFromMatrixConfig,
     },
+    #[cfg(feature = "vm-lab")]
     ValidateLiveLabReports {
         config: ops_security_audit::ValidateLiveLabReportsConfig,
     },
+    #[cfg(feature = "vm-lab")]
     EvaluateLiveCoveragePromotion {
         config: ops_security_audit::EvaluateLiveCoveragePromotionConfig,
     },
+    #[cfg(feature = "vm-lab")]
     GenerateLiveLabFindings {
         config: ops_security_audit_workflows::GenerateLiveLabFindingsConfig,
     },
+    #[cfg(feature = "vm-lab")]
     GenerateComparativeExploitCoverage {
         config: ops_security_audit_workflows::GenerateComparativeExploitCoverageConfig,
     },
+    #[cfg(feature = "vm-lab")]
     RunLiveLabValidations {
         config: ops_security_audit_workflows::RunLiveLabValidationsConfig,
     },
@@ -756,263 +794,349 @@ enum OpsCommand {
     /// `mixed_nat_could_work` / `relay_required` / `stun_broken` /
     /// `no_stun_configured`). See `ops_cross_network_preflight`
     /// module docs for the heuristic.
+    #[cfg(feature = "vm-lab")]
     CrossNetworkPreflight {
         config: ops_cross_network_preflight::CrossNetworkPreflightConfig,
     },
+    #[cfg(feature = "vm-lab")]
     GenerateCrossNetworkRemoteExitReport {
         config: ops_cross_network_reports::GenerateCrossNetworkRemoteExitReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     ValidateCrossNetworkRemoteExitReports {
         config: ops_cross_network_reports::ValidateCrossNetworkRemoteExitReportsConfig,
     },
+    #[cfg(feature = "vm-lab")]
     ValidateCrossNetworkNatMatrix {
         config: ops_cross_network_reports::ValidateCrossNetworkNatMatrixConfig,
     },
+    #[cfg(feature = "vm-lab")]
     ReadCrossNetworkReportFields {
         config: ops_cross_network_reports::ReadCrossNetworkReportFieldsConfig,
     },
+    #[cfg(feature = "vm-lab")]
     ClassifyCrossNetworkTopology {
         config: ops_cross_network_reports::ClassifyCrossNetworkTopologyConfig,
     },
+    #[cfg(feature = "vm-lab")]
     ChooseCrossNetworkRoamAlias {
         config: ops_cross_network_reports::ChooseCrossNetworkRoamAliasConfig,
     },
+    #[cfg(feature = "vm-lab")]
     ValidateIpv4Address {
         config: ops_cross_network_reports::ValidateIpv4AddressConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteCrossNetworkSoakMonitorSummary {
         config: ops_cross_network_reports::WriteCrossNetworkSoakMonitorSummaryConfig,
     },
+    #[cfg(feature = "vm-lab")]
     CheckLocalFileMode {
         config: ops_live_lab_orchestrator::CheckLocalFileModeConfig,
     },
+    #[cfg(feature = "vm-lab")]
     RedactForensicsText,
+    #[cfg(feature = "vm-lab")]
     WriteCrossNetworkForensicsManifest {
         config: ops_live_lab_orchestrator::WriteCrossNetworkForensicsManifestConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteLiveLabStageArtifactIndex {
         config: ops_live_lab_orchestrator::WriteLiveLabStageArtifactIndexConfig,
     },
+    #[cfg(feature = "vm-lab")]
     Sha256File {
         config: ops_live_lab_orchestrator::Sha256FileConfig,
     },
+    #[cfg(feature = "vm-lab")]
     ValidateCrossNetworkForensicsBundle {
         config: ops_live_lab_orchestrator::ValidateCrossNetworkForensicsBundleConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteCrossNetworkPreflightReport {
         config: ops_live_lab_orchestrator::WriteCrossNetworkPreflightReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteLiveLinuxRebootRecoveryReport {
         config: ops_live_lab_orchestrator::WriteLiveLinuxRebootRecoveryReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteLiveLinuxLabRunSummary {
         config: ops_live_lab_orchestrator::WriteLiveLinuxLabRunSummaryConfig,
     },
+    #[cfg(feature = "vm-lab")]
     ScanIpv4PortRange {
         config: ops_live_lab_orchestrator::ScanIpv4PortRangeConfig,
     },
+    #[cfg(feature = "vm-lab")]
     UpdateRoleSwitchHostResult {
         config: ops_live_lab_orchestrator::UpdateRoleSwitchHostResultConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteRoleSwitchMatrixReport {
         config: ops_live_lab_orchestrator::WriteRoleSwitchMatrixReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteLiveLinuxServerIpBypassReport {
         config: ops_live_lab_orchestrator::WriteLiveLinuxServerIpBypassReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteLiveLinuxControlSurfaceReport {
         config: ops_live_lab_orchestrator::WriteLiveLinuxControlSurfaceReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     RewriteAssignmentPeerEndpointIp {
         config: ops_live_lab_orchestrator::RewriteAssignmentPeerEndpointIpConfig,
     },
+    #[cfg(feature = "vm-lab")]
     RewriteAssignmentMeshCidr {
         config: ops_live_lab_orchestrator::RewriteAssignmentMeshCidrConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteLiveLinuxEndpointHijackReport {
         config: ops_live_lab_orchestrator::WriteLiveLinuxEndpointHijackReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteLiveLinuxKeyCustodyReport {
         config: ops_live_lab_orchestrator::WriteLiveLinuxKeyCustodyReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteLiveLinuxSecretsNotInLogsReport {
         config: ops_live_lab_orchestrator::WriteLiveLinuxSecretsNotInLogsReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteLiveLinuxEnrollmentRestartReport {
         config: ops_live_lab_orchestrator::WriteLiveLinuxEnrollmentRestartReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteLiveLinuxNetworkFlapReport {
         config: ops_live_lab_orchestrator::WriteLiveLinuxNetworkFlapReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteRealWireguardExitnodeE2eReport {
         config: ops_live_lab_orchestrator::WriteRealWireguardExitnodeE2eReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteRealWireguardNoLeakUnderLoadReport {
         config: ops_live_lab_orchestrator::WriteRealWireguardNoLeakUnderLoadReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VerifyNoLeakDataplaneReport {
         config: ops_live_lab_orchestrator::VerifyNoLeakDataplaneReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     E2eDnsQuery {
         config: ops_live_lab_orchestrator::E2eDnsQueryConfig,
     },
+    #[cfg(feature = "vm-lab")]
     E2eHttpProbeServer {
         config: ops_live_lab_orchestrator::E2eHttpProbeServerConfig,
     },
+    #[cfg(feature = "vm-lab")]
     E2eHttpProbeClient {
         config: ops_live_lab_orchestrator::E2eHttpProbeClientConfig,
     },
+    #[cfg(feature = "vm-lab")]
     ReadJsonField {
         config: ops_live_lab_orchestrator::ReadJsonFieldConfig,
     },
+    #[cfg(feature = "vm-lab")]
     ExtractManagedDnsExpectedIp {
         config: ops_live_lab_orchestrator::ExtractManagedDnsExpectedIpConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteActiveNetworkSignedStateTamperReport {
         config: ops_live_lab_orchestrator::WriteActiveNetworkSignedStateTamperReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteActiveNetworkRoguePathHijackReport {
         config: ops_live_lab_orchestrator::WriteActiveNetworkRoguePathHijackReportConfig,
     },
     ValidateNetworkDiscoveryBundle {
         config: ops_network_discovery::ValidateNetworkDiscoveryBundleConfig,
     },
+    #[cfg(feature = "vm-lab")]
     GenerateLiveLinuxLabFailureDigest {
         config: ops_live_lab_failure_digest::GenerateLiveLinuxLabFailureDigestConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabList {
         config: vm_lab::VmLabListConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabDiagnose {
         config: vm_lab::VmLabDiagnoseConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabDiscoverLocalUtm {
         config: vm_lab::VmLabDiscoverLocalUtmConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabDiscoverLocalUtmSummary {
         config: vm_lab::VmLabDiscoverLocalUtmConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabNetworkAudit {
         config: vm_lab::network_audit::VmLabNetworkAuditConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabNetworkPreflight {
         config: vm_lab::network_audit::VmLabNetworkPreflightConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabNetworkPrepare {
         config: vm_lab::network_prepare::VmLabNetworkPrepareConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabNetworkRestore {
         config: vm_lab::network_prepare::VmLabNetworkRestoreConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabStart {
         config: vm_lab::VmLabStartConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabSyncRepo {
         config: vm_lab::VmLabSyncRepoConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabSyncBootstrap {
         config: vm_lab::VmLabSyncBootstrapConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabRun {
         config: vm_lab::VmLabExecConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabBootstrap {
         config: vm_lab::VmLabExecConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabWriteLiveLabProfile {
         config: vm_lab::VmLabWriteLiveLabProfileConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabSetupLiveLab {
         config: vm_lab::VmLabSetupLiveLabConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabOrchestrateLiveLab {
         config: Box<vm_lab::VmLabOrchestrateLiveLabConfig>,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabOvernight {
         config: vm_lab::VmLabOvernightConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabValidateWindowsSecurity {
         config: vm_lab::VmLabValidateWindowsSecurityConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabValidateLinuxSecurity {
         config: vm_lab::VmLabValidateLinuxSecurityConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabDistributeWindowsState {
         config: vm_lab::VmLabDistributeWindowsStateConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabPullWindowsStateFromLinuxExit {
         config: vm_lab::VmLabPullWindowsStateFromLinuxExitConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabValidateLiveLabProfile {
         config: vm_lab::VmLabValidateLiveLabProfileConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabDiagnoseLiveLabFailure {
         config: vm_lab::VmLabDiagnoseLiveLabFailureConfig,
     },
     /// FIS-0006: SPRT/CUSUM flake-vs-regression report over the run matrix.
+    #[cfg(feature = "vm-lab")]
     LiveLabFlakeReport {
         matrix_path: PathBuf,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabDiffLiveLabRuns {
         config: vm_lab::VmLabDiffLiveLabRunsConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabDiffOrchestratorParity {
         config: vm_lab::VmLabDiffOrchestratorParityConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabEmitParityInput {
         config: vm_lab::VmLabEmitParityInputConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabIterateLiveLab {
         config: vm_lab::VmLabIterateLiveLabConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabRunLiveLab {
         config: vm_lab::VmLabRunLiveLabConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabCheckKnownHosts {
         config: vm_lab::VmLabCheckKnownHostsConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabPreflight {
         config: vm_lab::VmLabPreflightConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabReadinessCheck {
         config: vm_lab::VmLabReadinessCheckConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabStatus {
         config: vm_lab::VmLabStatusConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabStop {
         config: vm_lab::VmLabStopConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabRestart {
         config: vm_lab::VmLabRestartConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabCollectArtifacts {
         config: vm_lab::VmLabCollectArtifactsConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabWriteTopology {
         config: vm_lab::VmLabWriteTopologyConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabIssueAndDistributeState {
         config: vm_lab::VmLabIssueDistributeStateConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabRunSuite {
         config: vm_lab::VmLabRunSuiteConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabBootstrapPhase {
         config: vm_lab::VmLabBootstrapPhaseConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabReportCapabilities {
         config: vm_lab::capability::VmLabReportCapabilitiesConfig,
     },
+    #[cfg(feature = "vm-lab")]
     RebindLinuxFreshInstallOsMatrixInputs {
         config: ops_fresh_install_os_matrix::RebindLinuxFreshInstallOsMatrixInputsConfig,
     },
+    #[cfg(feature = "vm-lab")]
     GenerateLinuxFreshInstallOsMatrixReport {
         config: ops_fresh_install_os_matrix::GenerateLinuxFreshInstallOsMatrixReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VerifyLinuxFreshInstallOsMatrixReadiness {
         config: ops_fresh_install_os_matrix::VerifyLinuxFreshInstallOsMatrixReadinessConfig,
     },
+    #[cfg(feature = "vm-lab")]
     WriteFreshInstallOsMatrixReadinessFixtures {
         config: ops_fresh_install_os_matrix::WriteFreshInstallOsMatrixReadinessFixturesConfig,
     },
@@ -1057,14 +1181,19 @@ enum OpsCommand {
     InstallMacosExit {
         config: ops_install_macos_exit::InstallMacosExitConfig,
     },
+    #[cfg(feature = "vm-lab")]
     InstallWindowsService,
+    #[cfg(feature = "vm-lab")]
     InstallWindowsRelayService,
+    #[cfg(feature = "vm-lab")]
     UninstallWindowsRelayService,
     /// Track B Step 3 (B1.4) — install / uninstall the
     /// Windows exit-mode preflight (IPv4 forwarding enable/disable).
     /// Used by the role-transition orchestrator when entering / leaving
     /// the `exit` preset on Windows.
+    #[cfg(feature = "vm-lab")]
     InstallWindowsExitService,
+    #[cfg(feature = "vm-lab")]
     UninstallWindowsExitService,
     /// Track B Step 7 (B1.2) — non-Linux genesis driver for macOS.
     /// Runs `rustynetd membership init` against the canonical macOS
@@ -1072,6 +1201,7 @@ enum OpsCommand {
     /// stages the owner-signing-key passphrase file separately; this
     /// verb consumes it via the same `--passphrase-file` flag the
     /// Linux variant uses.
+    #[cfg(feature = "vm-lab")]
     E2eBootstrapMacos {
         node_id: String,
         network_id: String,
@@ -1080,12 +1210,14 @@ enum OpsCommand {
     /// Seed ONLY the macOS anchor bundle-pull token (decoupled from
     /// genesis), so a joined macOS node elected as anchor can serve its
     /// loopback bundle-pull listener without re-minting membership.
+    #[cfg(feature = "vm-lab")]
     SeedMacosAnchorToken,
     /// Track B Step 7 (B1.2) — non-Linux genesis driver for Windows.
     /// Runs `rustynetd membership init` against the canonical
     /// `C:\ProgramData\RustyNet\membership\` paths. Operator runs
     /// `Install-RustyNetWindowsService.ps1` first to lay down the
     /// state tree + ACLs.
+    #[cfg(feature = "vm-lab")]
     E2eBootstrapWindows {
         node_id: String,
         network_id: String,
@@ -1161,9 +1293,11 @@ enum OpsCommand {
         role: Option<String>,
         node_id: Option<String>,
     },
+    #[cfg(feature = "vm-lab")]
     RunDebianTwoNodeE2e {
         config: ops_e2e::DebianTwoNodeE2eConfig,
     },
+    #[cfg(feature = "vm-lab")]
     E2eBootstrapHost {
         role: String,
         node_id: String,
@@ -1172,27 +1306,32 @@ enum OpsCommand {
         ssh_allow_cidrs: String,
         skip_apt: bool,
     },
+    #[cfg(feature = "vm-lab")]
     E2eEnforceHost {
         role: String,
         node_id: String,
         src_dir: PathBuf,
         ssh_allow_cidrs: String,
     },
+    #[cfg(feature = "vm-lab")]
     E2eWorkerRefreshTrustEvidence {
         label: String,
         target: String,
         node_id: String,
     },
+    #[cfg(feature = "vm-lab")]
     E2eWorkerRefreshRuntimeState {
         label: String,
         target: String,
         node_id: String,
     },
+    #[cfg(feature = "vm-lab")]
     E2eWorkerRefreshSignedState {
         label: String,
         target: String,
         node_id: String,
     },
+    #[cfg(feature = "vm-lab")]
     E2eWorkerEnforceRuntime {
         label: String,
         target: String,
@@ -1201,17 +1340,20 @@ enum OpsCommand {
         src_dir: PathBuf,
         ssh_allow_cidrs: String,
     },
+    #[cfg(feature = "vm-lab")]
     E2eMembershipAdd {
         client_node_id: String,
         client_pubkey_hex: String,
         capabilities: String,
         owner_approver_id: String,
     },
+    #[cfg(feature = "vm-lab")]
     E2eMembershipSetCapabilities {
         node_id: String,
         capabilities: String,
         owner_approver_id: String,
     },
+    #[cfg(feature = "vm-lab")]
     E2eIssueAssignments {
         exit_node_id: String,
         client_node_id: String,
@@ -1221,39 +1363,50 @@ enum OpsCommand {
         client_pubkey_hex: String,
         artifact_dir: Option<PathBuf>,
     },
+    #[cfg(feature = "vm-lab")]
     E2eIssueAssignmentBundlesFromEnv {
         config: ops_e2e::E2eIssueAssignmentBundlesFromEnvConfig,
     },
+    #[cfg(feature = "vm-lab")]
     E2eIssueTraversalBundlesFromEnv {
         config: ops_e2e::E2eIssueTraversalBundlesFromEnvConfig,
     },
+    #[cfg(feature = "vm-lab")]
     E2eIssueDnsZoneBundlesFromEnv {
         config: ops_e2e::E2eIssueDnsZoneBundlesFromEnvConfig,
     },
+    #[cfg(feature = "vm-lab")]
     AppendLiveLabMatrixRow {
         stage: String,
         status: String,
         report_path: String,
         report_dir: PathBuf,
     },
+    #[cfg(feature = "vm-lab")]
     ListRunStages {
         config: ops_live_lab_orchestrator::ListRunStagesConfig,
     },
+    #[cfg(feature = "vm-lab")]
     DiffRunSummaries {
         config: ops_live_lab_orchestrator::DiffRunSummariesConfig,
     },
+    #[cfg(feature = "vm-lab")]
     EmitStageManifest {
         config: live_lab_stage_manifest::EmitStageManifestConfig,
     },
+    #[cfg(feature = "vm-lab")]
     RecordStageStart {
         config: live_lab_stage_recorder::RecordStageStartConfig,
     },
+    #[cfg(feature = "vm-lab")]
     RecordStageFinish {
         config: live_lab_stage_recorder::RecordStageFinishConfig,
     },
+    #[cfg(feature = "vm-lab")]
     LiveLabCoverageReport {
         config: live_lab_coverage::LiveLabCoverageReportConfig,
     },
+    #[cfg(feature = "vm-lab")]
     AppendOrchestratorRunToMatrix {
         config: live_lab_run_matrix::AppendOrchestratorRunToMatrixConfig,
     },
@@ -2157,6 +2310,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .unwrap_or_else(|| "[yes/no]".to_owned()),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "validate-live-lab-reports" => Ok(OpsCommand::ValidateLiveLabReports {
             config: ops_security_audit::ValidateLiveLabReportsConfig {
                 reports: parser
@@ -2174,6 +2328,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 output: parser.optional_path("--output"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "evaluate-live-coverage-promotion" => Ok(OpsCommand::EvaluateLiveCoveragePromotion {
             config: ops_security_audit::EvaluateLiveCoveragePromotionConfig {
                 reports: parser
@@ -2194,6 +2349,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 output: parser.required_path("--output")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "generate-live-lab-findings" => Ok(OpsCommand::GenerateLiveLabFindings {
             config: ops_security_audit_workflows::GenerateLiveLabFindingsConfig {
                 reports: parser
@@ -2211,6 +2367,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 output: parser.required_path("--output")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "generate-comparative-exploit-coverage" => {
             Ok(OpsCommand::GenerateComparativeExploitCoverage {
                 config: ops_security_audit_workflows::GenerateComparativeExploitCoverageConfig {
@@ -2240,6 +2397,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "run-live-lab-validations" => Ok(OpsCommand::RunLiveLabValidations {
             config: ops_security_audit_workflows::RunLiveLabValidationsConfig {
                 repo_root: parser.required_path("--repo-root")?,
@@ -2379,6 +2537,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 test_filter: parser.required("--test-filter")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "cross-network-preflight" => {
             // Lever 2 — parse STUN servers + optional relay endpoint
             // and turn them into a `CrossNetworkPreflightConfig`. The
@@ -2403,6 +2562,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "generate-cross-network-remote-exit-report" => {
             let source_artifacts = collect_repeated_option_values(&args[1..], "--source-artifact")
                 .into_iter()
@@ -2447,6 +2607,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "validate-cross-network-remote-exit-reports" => {
             let reports = parser
                 .value("--reports")
@@ -2469,6 +2630,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "validate-cross-network-nat-matrix" => {
             let reports = parser
                 .value("--reports")
@@ -2495,6 +2657,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "read-cross-network-report-fields" => {
             let checks = collect_repeated_option_values(&args[1..], "--check");
             let network_fields = collect_repeated_option_values(&args[1..], "--network-field");
@@ -2510,6 +2673,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "classify-cross-network-topology" => {
             let ipv4_prefix = parser
                 .value("--ipv4-prefix")
@@ -2538,6 +2702,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "choose-cross-network-roam-alias" => {
             let used_ips = collect_repeated_option_values(&args[1..], "--used-ip");
             let ipv4_prefix = parser
@@ -2567,11 +2732,13 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "validate-ipv4-address" => Ok(OpsCommand::ValidateIpv4Address {
             config: ops_cross_network_reports::ValidateIpv4AddressConfig {
                 ip: parser.required("--ip")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "write-cross-network-soak-monitor-summary" => {
             let parse_u64 = |key: &str| -> Result<u64, String> {
                 parser
@@ -2618,6 +2785,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "check-local-file-mode" => Ok(OpsCommand::CheckLocalFileMode {
             config: ops_live_lab_orchestrator::CheckLocalFileModeConfig {
                 path: parser.required_path("--path")?,
@@ -2625,12 +2793,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 label: parser.value("--label").unwrap_or_else(|| "file".to_owned()),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "redact-forensics-text" => {
             if args.len() != 1 {
                 return Err("ops redact-forensics-text does not accept options".to_owned());
             }
             Ok(OpsCommand::RedactForensicsText)
         }
+        #[cfg(feature = "vm-lab")]
         "write-cross-network-forensics-manifest" => {
             Ok(OpsCommand::WriteCrossNetworkForensicsManifest {
                 config: ops_live_lab_orchestrator::WriteCrossNetworkForensicsManifestConfig {
@@ -2641,6 +2811,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-live-lab-stage-artifact-index" => Ok(OpsCommand::WriteLiveLabStageArtifactIndex {
             config: ops_live_lab_orchestrator::WriteLiveLabStageArtifactIndexConfig {
                 stage_name: parser.required("--stage-name")?,
@@ -2648,11 +2819,13 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 output: parser.required_path("--output")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "sha256-file" => Ok(OpsCommand::Sha256File {
             config: ops_live_lab_orchestrator::Sha256FileConfig {
                 path: parser.required_path("--path")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "validate-cross-network-forensics-bundle" => {
             Ok(OpsCommand::ValidateCrossNetworkForensicsBundle {
                 config: ops_live_lab_orchestrator::ValidateCrossNetworkForensicsBundleConfig {
@@ -2663,6 +2836,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-cross-network-preflight-report" => {
             let parse_u64 = |key: &str| -> Result<u64, String> {
                 parser
@@ -2682,6 +2856,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-live-linux-reboot-recovery-report" => {
             Ok(OpsCommand::WriteLiveLinuxRebootRecoveryReport {
                 config: ops_live_lab_orchestrator::WriteLiveLinuxRebootRecoveryReportConfig {
@@ -2703,6 +2878,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-live-linux-lab-run-summary" => {
             let parse_u64 = |key: &str| -> Result<u64, String> {
                 parser
@@ -2740,6 +2916,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "scan-ipv4-port-range" => {
             let parse_u8_or_default = |key: &str, default: u8| -> Result<u8, String> {
                 parser
@@ -2787,6 +2964,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "update-role-switch-host-result" => Ok(OpsCommand::UpdateRoleSwitchHostResult {
             config: ops_live_lab_orchestrator::UpdateRoleSwitchHostResultConfig {
                 hosts_json_path: parser.required_path("--hosts-json-path")?,
@@ -2798,6 +2976,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 least_privilege_preserved: parser.required("--least-privilege-preserved")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "write-role-switch-matrix-report" => {
             let captured_at_unix = parser
                 .required("--captured-at-unix")?
@@ -2814,6 +2993,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-live-linux-server-ip-bypass-report" => {
             let probe_port = parser
                 .required("--probe-port")?
@@ -2846,6 +3026,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-live-linux-control-surface-report" => {
             let captured_at_unix = parser
                 .value("--captured-at-unix")
@@ -2870,18 +3051,21 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "rewrite-assignment-peer-endpoint-ip" => Ok(OpsCommand::RewriteAssignmentPeerEndpointIp {
             config: ops_live_lab_orchestrator::RewriteAssignmentPeerEndpointIpConfig {
                 assignment_path: parser.required_path("--assignment-path")?,
                 endpoint_ip: parser.required("--endpoint-ip")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "rewrite-assignment-mesh-cidr" => Ok(OpsCommand::RewriteAssignmentMeshCidr {
             config: ops_live_lab_orchestrator::RewriteAssignmentMeshCidrConfig {
                 assignment_path: parser.required_path("--assignment-path")?,
                 mesh_cidr: parser.required("--mesh-cidr")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "write-live-linux-endpoint-hijack-report" => {
             let captured_at_unix = parser
                 .value("--captured-at-unix")
@@ -2909,6 +3093,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-live-linux-key-custody-report" => Ok(OpsCommand::WriteLiveLinuxKeyCustodyReport {
             config: ops_live_lab_orchestrator::WriteLiveLinuxKeyCustodyReportConfig {
                 report_path: parser.required_path("--report-path")?,
@@ -2921,6 +3106,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 overall_status: parser.required("--overall-status")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "write-live-linux-secrets-not-in-logs-report" => {
             let parse_u64 = |key: &str| -> Result<u64, String> {
                 parser
@@ -2941,6 +3127,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-live-linux-enrollment-restart-report" => {
             let kill_timing_ms = parser
                 .value("--kill-timing-ms")
@@ -2961,6 +3148,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-live-linux-network-flap-report" => {
             let parse_u64 = |key: &str| -> Result<u64, String> {
                 parser
@@ -2983,6 +3171,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-real-wireguard-exitnode-e2e-report" => {
             let captured_at_unix = parser
                 .value("--captured-at-unix")
@@ -3010,6 +3199,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-real-wireguard-no-leak-under-load-report" => {
             let captured_at_unix = parser
                 .value("--captured-at-unix")
@@ -3036,11 +3226,13 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "verify-no-leak-dataplane-report" => Ok(OpsCommand::VerifyNoLeakDataplaneReport {
             config: ops_live_lab_orchestrator::VerifyNoLeakDataplaneReportConfig {
                 report_path: parser.required_path("--report-path")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-dns-query" => Ok(OpsCommand::E2eDnsQuery {
             config: ops_live_lab_orchestrator::E2eDnsQueryConfig {
                 server: parser.required("--server")?,
@@ -3053,6 +3245,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 fail_on_no_response: parser.has_flag("--fail-on-no-response"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-http-probe-server" => Ok(OpsCommand::E2eHttpProbeServer {
             config: ops_live_lab_orchestrator::E2eHttpProbeServerConfig {
                 bind_ip: parser.required("--bind-ip")?,
@@ -3065,6 +3258,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .unwrap_or_else(|| "probe-ok".to_owned()),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-http-probe-client" => Ok(OpsCommand::E2eHttpProbeClient {
             config: ops_live_lab_orchestrator::E2eHttpProbeClientConfig {
                 host: parser.required("--host")?,
@@ -3078,18 +3272,21 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .unwrap_or_else(|| "probe-ok".to_owned()),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "read-json-field" => Ok(OpsCommand::ReadJsonField {
             config: ops_live_lab_orchestrator::ReadJsonFieldConfig {
                 payload: parser.required("--payload")?,
                 field: parser.required("--field")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "extract-managed-dns-expected-ip" => Ok(OpsCommand::ExtractManagedDnsExpectedIp {
             config: ops_live_lab_orchestrator::ExtractManagedDnsExpectedIpConfig {
                 fqdn: parser.required("--fqdn")?,
                 inspect_output: parser.required("--inspect-output")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "write-active-network-signed-state-tamper-report" => {
             let captured_at_unix = parser
                 .value("--captured-at-unix")
@@ -3120,6 +3317,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-active-network-rogue-path-hijack-report" => {
             let captured_at_unix = parser
                 .value("--captured-at-unix")
@@ -3181,6 +3379,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "generate-live-linux-lab-failure-digest" => {
             Ok(OpsCommand::GenerateLiveLinuxLabFailureDigest {
                 config: ops_live_lab_failure_digest::GenerateLiveLinuxLabFailureDigestConfig {
@@ -3195,12 +3394,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-list" => Ok(OpsCommand::VmLabList {
             config: vm_lab::VmLabListConfig {
                 inventory_path: parser
                     .path_or_default("--inventory", vm_lab::default_inventory_path()),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-diagnose" => Ok(OpsCommand::VmLabDiagnose {
             config: vm_lab::VmLabDiagnoseConfig {
                 inventory_path: parser
@@ -3218,6 +3419,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_owned())?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-discover-local-utm" => Ok(OpsCommand::VmLabDiscoverLocalUtm {
             config: vm_lab::VmLabDiscoverLocalUtmConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -3238,6 +3440,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 report_dir: parser.optional_path("--report-dir"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-discover-local-utm-summary" => Ok(OpsCommand::VmLabDiscoverLocalUtmSummary {
             config: vm_lab::VmLabDiscoverLocalUtmConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -3258,6 +3461,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 report_dir: parser.optional_path("--report-dir"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-network-audit" => Ok(OpsCommand::VmLabNetworkAudit {
             config: vm_lab::network_audit::VmLabNetworkAuditConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -3271,6 +3475,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 repo_root: parser.optional_path("--repo-root"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-network-preflight" => Ok(OpsCommand::VmLabNetworkPreflight {
             config: vm_lab::network_audit::VmLabNetworkPreflightConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -3286,6 +3491,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 repo_root: parser.optional_path("--repo-root"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-network-prepare" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -3308,6 +3514,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-network-restore" => Ok(OpsCommand::VmLabNetworkRestore {
             config: vm_lab::network_prepare::VmLabNetworkRestoreConfig {
                 transaction_id: parser.value("--transaction"),
@@ -3317,6 +3524,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 state_dir: parser.optional_path("--state-dir"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-start" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -3334,6 +3542,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-sync-repo" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -3366,6 +3575,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-sync-bootstrap" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -3407,6 +3617,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-run" | "vm-lab-bootstrap" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -3438,6 +3649,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 Ok(OpsCommand::VmLabBootstrap { config })
             }
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-write-live-lab-profile" => {
             Ok(OpsCommand::VmLabWriteLiveLabProfile {
                 config: vm_lab::VmLabWriteLiveLabProfileConfig {
@@ -3483,6 +3695,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-setup-live-lab" => Ok(OpsCommand::VmLabSetupLiveLab {
             config: vm_lab::VmLabSetupLiveLabConfig {
                 inventory_path: parser
@@ -3520,6 +3733,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 orchestrated: false,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-orchestrate-live-lab" => Ok(OpsCommand::VmLabOrchestrateLiveLab {
             config: Box::new(vm_lab::VmLabOrchestrateLiveLabConfig {
                 inventory_path: parser
@@ -3607,6 +3821,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 rerun_stage: parser.value("--rerun-stage"),
             }),
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-overnight" => Ok(OpsCommand::VmLabOvernight {
             config: vm_lab::VmLabOvernightConfig {
                 inventory_path: parser
@@ -3639,6 +3854,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 dry_run: parser.has_flag("--dry-run"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-validate-windows-security" => Ok(OpsCommand::VmLabValidateWindowsSecurity {
             config: vm_lab::VmLabValidateWindowsSecurityConfig {
                 inventory_path: parser
@@ -3667,6 +3883,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .optional_path("--distribute-windows-dns-zone-bundle"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-validate-linux-security" => Ok(OpsCommand::VmLabValidateLinuxSecurity {
             config: vm_lab::VmLabValidateLinuxSecurityConfig {
                 inventory_path: parser
@@ -3697,6 +3914,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-distribute-windows-state" => Ok(OpsCommand::VmLabDistributeWindowsState {
             config: vm_lab::VmLabDistributeWindowsStateConfig {
                 inventory_path: parser
@@ -3714,6 +3932,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 dns_zone_bundle: parser.optional_path("--dns-zone-bundle"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-pull-windows-state-from-linux-exit" => {
             Ok(OpsCommand::VmLabPullWindowsStateFromLinuxExit {
                 config: vm_lab::VmLabPullWindowsStateFromLinuxExitConfig {
@@ -3730,6 +3949,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-validate-live-lab-profile" => Ok(OpsCommand::VmLabValidateLiveLabProfile {
             config: vm_lab::VmLabValidateLiveLabProfileConfig {
                 profile_path: parser.required_path("--profile")?,
@@ -3738,12 +3958,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 require_five_node: parser.has_flag("--require-five-node"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "live-lab-flake-report" => Ok(OpsCommand::LiveLabFlakeReport {
             matrix_path: parser.value("--matrix").map_or_else(
                 || PathBuf::from("documents/operations/live_lab_run_matrix.csv"),
                 PathBuf::from,
             ),
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-diagnose-live-lab-failure" => Ok(OpsCommand::VmLabDiagnoseLiveLabFailure {
             config: vm_lab::VmLabDiagnoseLiveLabFailureConfig {
                 inventory_path: parser
@@ -3756,12 +3978,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 300)?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-diff-live-lab-runs" => Ok(OpsCommand::VmLabDiffLiveLabRuns {
             config: vm_lab::VmLabDiffLiveLabRunsConfig {
                 old_report_dir: parser.required_path("--old-report-dir")?,
                 new_report_dir: parser.required_path("--new-report-dir")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-diff-orchestrator-parity" => Ok(OpsCommand::VmLabDiffOrchestratorParity {
             config: vm_lab::VmLabDiffOrchestratorParityConfig {
                 left_path: parser.required_path("--left")?,
@@ -3782,12 +4006,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-emit-parity-input" => Ok(OpsCommand::VmLabEmitParityInput {
             config: vm_lab::VmLabEmitParityInputConfig {
                 report_dir: parser.required_path("--report-dir")?,
                 output_path: parser.required_path("--output")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-iterate-live-lab" => {
             let validation_steps = collect_repeated_option_values(&args[1..], "--validation-step")
                 .into_iter()
@@ -3842,6 +4068,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-run-live-lab" => Ok(OpsCommand::VmLabRunLiveLab {
             config: vm_lab::VmLabRunLiveLabConfig {
                 profile_path: parser.required_path("--profile")?,
@@ -3861,6 +4088,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 orchestrated: false,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-check-known-hosts" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -3882,6 +4110,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-preflight" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -3913,6 +4142,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-readiness-check" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -3939,6 +4169,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-status" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -3962,6 +4193,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-stop" | "vm-lab-shutdown" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -3979,6 +4211,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-restart" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -4012,6 +4245,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-collect-artifacts" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -4036,6 +4270,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-write-topology" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -4053,6 +4288,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-issue-and-distribute-state" => Ok(OpsCommand::VmLabIssueAndDistributeState {
             config: vm_lab::VmLabIssueDistributeStateConfig {
                 inventory_path: parser
@@ -4065,6 +4301,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 1800)?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-run-suite" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -4088,6 +4325,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-bootstrap-phase" => {
             let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv_vms) = parser.value("--vms") {
@@ -4122,6 +4360,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-report-capabilities" => {
             let scope_arg = parser.required("--scope")?;
             let platform_arg = parser.required("--platform")?;
@@ -4154,6 +4393,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "rebind-linux-fresh-install-os-matrix-inputs" => {
             Ok(OpsCommand::RebindLinuxFreshInstallOsMatrixInputs {
                 config: ops_fresh_install_os_matrix::RebindLinuxFreshInstallOsMatrixInputsConfig {
@@ -4167,6 +4407,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "generate-linux-fresh-install-os-matrix-report" => {
             Ok(OpsCommand::GenerateLinuxFreshInstallOsMatrixReport {
                 config:
@@ -4203,6 +4444,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "verify-linux-fresh-install-os-matrix-readiness" => {
             Ok(OpsCommand::VerifyLinuxFreshInstallOsMatrixReadiness {
                 config:
@@ -4219,6 +4461,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "write-fresh-install-os-matrix-readiness-fixtures" => {
             let now_unix_raw = parser.required("--now-unix")?;
             let now_unix = now_unix_raw
@@ -4447,18 +4690,21 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             };
             Ok(OpsCommand::InstallMacosExit { config })
         }
+        #[cfg(feature = "vm-lab")]
         "install-windows-service" => {
             if args.len() != 1 {
                 return Err("ops install-windows-service does not accept options".to_owned());
             }
             Ok(OpsCommand::InstallWindowsService)
         }
+        #[cfg(feature = "vm-lab")]
         "install-windows-relay-service" => {
             if args.len() != 1 {
                 return Err("ops install-windows-relay-service does not accept options".to_owned());
             }
             Ok(OpsCommand::InstallWindowsRelayService)
         }
+        #[cfg(feature = "vm-lab")]
         "uninstall-windows-relay-service" => {
             if args.len() != 1 {
                 return Err(
@@ -4467,18 +4713,21 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::UninstallWindowsRelayService)
         }
+        #[cfg(feature = "vm-lab")]
         "install-windows-exit-service" => {
             if args.len() != 1 {
                 return Err("ops install-windows-exit-service does not accept options".to_owned());
             }
             Ok(OpsCommand::InstallWindowsExitService)
         }
+        #[cfg(feature = "vm-lab")]
         "uninstall-windows-exit-service" => {
             if args.len() != 1 {
                 return Err("ops uninstall-windows-exit-service does not accept options".to_owned());
             }
             Ok(OpsCommand::UninstallWindowsExitService)
         }
+        #[cfg(feature = "vm-lab")]
         "e2e-bootstrap-macos" => {
             // Track B Step 7 (B1.2) — non-Linux genesis driver on macOS.
             let node_id = parser
@@ -4494,7 +4743,9 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 passphrase_file,
             })
         }
+        #[cfg(feature = "vm-lab")]
         "seed-macos-anchor-token" => Ok(OpsCommand::SeedMacosAnchorToken),
+        #[cfg(feature = "vm-lab")]
         "e2e-bootstrap-windows" => {
             // Track B Step 7 (B1.2) — non-Linux genesis driver on Windows.
             let node_id = parser
@@ -4725,6 +4976,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             role: parser.value("--role"),
             node_id: parser.value("--node-id"),
         }),
+        #[cfg(feature = "vm-lab")]
         "run-debian-two-node-e2e" => Ok(OpsCommand::RunDebianTwoNodeE2e {
             config: ops_e2e::DebianTwoNodeE2eConfig {
                 exit_host: parser.required("--exit-host")?,
@@ -4768,6 +5020,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 }),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-bootstrap-host" => Ok(OpsCommand::E2eBootstrapHost {
             role: parser.required("--role")?,
             node_id: parser.required("--node-id")?,
@@ -4776,27 +5029,32 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             ssh_allow_cidrs: parser.required("--ssh-allow-cidrs")?,
             skip_apt: parser.has_flag("--skip-apt"),
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-enforce-host" => Ok(OpsCommand::E2eEnforceHost {
             role: parser.required("--role")?,
             node_id: parser.required("--node-id")?,
             src_dir: parser.required_path("--src-dir")?,
             ssh_allow_cidrs: parser.required("--ssh-allow-cidrs")?,
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-worker-refresh-trust-evidence" => Ok(OpsCommand::E2eWorkerRefreshTrustEvidence {
             label: parser.required("--label")?,
             target: parser.required("--target")?,
             node_id: parser.required("--node-id")?,
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-worker-refresh-runtime-state" => Ok(OpsCommand::E2eWorkerRefreshRuntimeState {
             label: parser.required("--label")?,
             target: parser.required("--target")?,
             node_id: parser.required("--node-id")?,
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-worker-refresh-signed-state" => Ok(OpsCommand::E2eWorkerRefreshSignedState {
             label: parser.required("--label")?,
             target: parser.required("--target")?,
             node_id: parser.required("--node-id")?,
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-worker-enforce-runtime" => Ok(OpsCommand::E2eWorkerEnforceRuntime {
             label: parser.required("--label")?,
             target: parser.required("--target")?,
@@ -4805,6 +5063,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             src_dir: parser.required_path("--src-dir")?,
             ssh_allow_cidrs: parser.required("--ssh-allow-cidrs")?,
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-membership-add" => Ok(OpsCommand::E2eMembershipAdd {
             client_node_id: parser.required("--client-node-id")?,
             client_pubkey_hex: parser.required("--client-pubkey-hex")?,
@@ -4813,11 +5072,13 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 .unwrap_or_else(|| "client".to_owned()),
             owner_approver_id: parser.required("--owner-approver-id")?,
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-membership-set-capabilities" => Ok(OpsCommand::E2eMembershipSetCapabilities {
             node_id: parser.required("--node-id")?,
             capabilities: parser.required("--capabilities")?,
             owner_approver_id: parser.required("--owner-approver-id")?,
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-issue-assignments" => Ok(OpsCommand::E2eIssueAssignments {
             exit_node_id: parser.required("--exit-node-id")?,
             client_node_id: parser.required("--client-node-id")?,
@@ -4827,6 +5088,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             client_pubkey_hex: parser.required("--client-pubkey-hex")?,
             artifact_dir: parser.optional_path("--artifact-dir"),
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-issue-assignment-bundles-from-env" => {
             Ok(OpsCommand::E2eIssueAssignmentBundlesFromEnv {
                 config: ops_e2e::E2eIssueAssignmentBundlesFromEnvConfig {
@@ -4837,6 +5099,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "e2e-issue-traversal-bundles-from-env" => Ok(OpsCommand::E2eIssueTraversalBundlesFromEnv {
             config: ops_e2e::E2eIssueTraversalBundlesFromEnvConfig {
                 env_file: parser.required_path("--env-file")?,
@@ -4845,6 +5108,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .unwrap_or_else(|| PathBuf::from("/run/rustynet/traversal-issue")),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "e2e-issue-dns-zone-bundles-from-env" => Ok(OpsCommand::E2eIssueDnsZoneBundlesFromEnv {
             config: ops_e2e::E2eIssueDnsZoneBundlesFromEnvConfig {
                 env_file: parser.required_path("--env-file")?,
@@ -4853,29 +5117,34 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .unwrap_or_else(|| PathBuf::from("/run/rustynet/dns-zone-issue")),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "append-live-lab-matrix-row" => Ok(OpsCommand::AppendLiveLabMatrixRow {
             stage: parser.required("--stage")?,
             status: parser.required("--status")?,
             report_path: parser.required("--report-path")?,
             report_dir: parser.required_path("--report-dir")?,
         }),
+        #[cfg(feature = "vm-lab")]
         "list-run-stages" => Ok(OpsCommand::ListRunStages {
             config: ops_live_lab_orchestrator::ListRunStagesConfig {
                 run_summary: parser.required_path("--run-summary")?,
                 status_filter: parser.value("--status").as_deref().map(str::to_owned),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "diff-run-summaries" => Ok(OpsCommand::DiffRunSummaries {
             config: ops_live_lab_orchestrator::DiffRunSummariesConfig {
                 run_a: parser.required_path("--run-a")?,
                 run_b: parser.required_path("--run-b")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "live-lab-coverage-report" => Ok(OpsCommand::LiveLabCoverageReport {
             config: live_lab_coverage::LiveLabCoverageReportConfig {
                 matrix_path: parser.optional_path("--matrix"),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "emit-stage-manifest" => Ok(OpsCommand::EmitStageManifest {
             config: live_lab_stage_manifest::EmitStageManifestConfig {
                 report_dir: parser.required_path("--report-dir")?,
@@ -4905,6 +5174,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "record-stage-start" => Ok(OpsCommand::RecordStageStart {
             config: live_lab_stage_recorder::RecordStageStartConfig {
                 report_dir: parser.required_path("--report-dir")?,
@@ -4919,6 +5189,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 started_at: parser.value("--started-at").unwrap_or_default(),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "record-stage-finish" => Ok(OpsCommand::RecordStageFinish {
             config: live_lab_stage_recorder::RecordStageFinishConfig {
                 report_dir: parser.required_path("--report-dir")?,
@@ -4938,6 +5209,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 finished_at: parser.value("--finished-at").unwrap_or_default(),
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "append-orchestrator-run-to-matrix" => Ok(OpsCommand::AppendOrchestratorRunToMatrix {
             config: live_lab_run_matrix::AppendOrchestratorRunToMatrixConfig {
                 report_dir: parser.required_path("--report-dir")?,
@@ -7409,20 +7681,25 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::GenerateAssessmentFromMatrix { config } => {
             ops_security_audit::execute_ops_generate_assessment_from_matrix(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ValidateLiveLabReports { config } => {
             ops_security_audit::execute_ops_validate_live_lab_reports(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::EvaluateLiveCoveragePromotion { config } => {
             ops_security_audit::execute_ops_evaluate_live_coverage_promotion(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::GenerateLiveLabFindings { config } => {
             ops_security_audit_workflows::execute_ops_generate_live_lab_findings(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::GenerateComparativeExploitCoverage { config } => {
             ops_security_audit_workflows::execute_ops_generate_comparative_exploit_coverage(
                 config,
             )
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::RunLiveLabValidations { config } => {
             ops_security_audit_workflows::execute_ops_run_live_lab_validations(config)
         }
@@ -7461,133 +7738,173 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::VerifyRequiredTestOutput { config } => {
             ops_phase9::execute_ops_verify_required_test_output(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::CrossNetworkPreflight { config } => {
             ops_cross_network_preflight::execute_cross_network_preflight(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::GenerateCrossNetworkRemoteExitReport { config } => {
             ops_cross_network_reports::execute_ops_generate_cross_network_remote_exit_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ValidateCrossNetworkRemoteExitReports { config } => {
             ops_cross_network_reports::execute_ops_validate_cross_network_remote_exit_reports(
                 config,
             )
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ValidateCrossNetworkNatMatrix { config } => {
             ops_cross_network_reports::execute_ops_validate_cross_network_nat_matrix(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ReadCrossNetworkReportFields { config } => {
             ops_cross_network_reports::execute_ops_read_cross_network_report_fields(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ClassifyCrossNetworkTopology { config } => {
             ops_cross_network_reports::execute_ops_classify_cross_network_topology(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ChooseCrossNetworkRoamAlias { config } => {
             ops_cross_network_reports::execute_ops_choose_cross_network_roam_alias(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ValidateIpv4Address { config } => {
             ops_cross_network_reports::execute_ops_validate_ipv4_address(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteCrossNetworkSoakMonitorSummary { config } => {
             ops_cross_network_reports::execute_ops_write_cross_network_soak_monitor_summary(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::CheckLocalFileMode { config } => {
             ops_live_lab_orchestrator::execute_ops_check_local_file_mode(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::RedactForensicsText => {
             ops_live_lab_orchestrator::execute_ops_redact_forensics_text()
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteCrossNetworkForensicsManifest { config } => {
             ops_live_lab_orchestrator::execute_ops_write_cross_network_forensics_manifest(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteLiveLabStageArtifactIndex { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_lab_stage_artifact_index(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::Sha256File { config } => {
             ops_live_lab_orchestrator::execute_ops_sha256_file(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ValidateCrossNetworkForensicsBundle { config } => {
             ops_live_lab_orchestrator::execute_ops_validate_cross_network_forensics_bundle(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteCrossNetworkPreflightReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_cross_network_preflight_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteLiveLinuxRebootRecoveryReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_linux_reboot_recovery_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteLiveLinuxLabRunSummary { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_linux_lab_run_summary(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ScanIpv4PortRange { config } => {
             ops_live_lab_orchestrator::execute_ops_scan_ipv4_port_range(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::UpdateRoleSwitchHostResult { config } => {
             ops_live_lab_orchestrator::execute_ops_update_role_switch_host_result(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteRoleSwitchMatrixReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_role_switch_matrix_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteLiveLinuxServerIpBypassReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_linux_server_ip_bypass_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteLiveLinuxControlSurfaceReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_linux_control_surface_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::RewriteAssignmentPeerEndpointIp { config } => {
             ops_live_lab_orchestrator::execute_ops_rewrite_assignment_peer_endpoint_ip(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::RewriteAssignmentMeshCidr { config } => {
             ops_live_lab_orchestrator::execute_ops_rewrite_assignment_mesh_cidr(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteLiveLinuxEndpointHijackReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_linux_endpoint_hijack_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteLiveLinuxKeyCustodyReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_linux_key_custody_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteLiveLinuxSecretsNotInLogsReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_linux_secrets_not_in_logs_report(
                 config,
             )
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteLiveLinuxEnrollmentRestartReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_linux_enrollment_restart_report(
                 config,
             )
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteLiveLinuxNetworkFlapReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_linux_network_flap_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteRealWireguardExitnodeE2eReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_real_wireguard_exitnode_e2e_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteRealWireguardNoLeakUnderLoadReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_real_wireguard_no_leak_under_load_report(
                 config,
             )
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VerifyNoLeakDataplaneReport { config } => {
             ops_live_lab_orchestrator::execute_ops_verify_no_leak_dataplane_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eDnsQuery { config } => {
             ops_live_lab_orchestrator::execute_ops_e2e_dns_query(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eHttpProbeServer { config } => {
             ops_live_lab_orchestrator::execute_ops_e2e_http_probe_server(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eHttpProbeClient { config } => {
             ops_live_lab_orchestrator::execute_ops_e2e_http_probe_client(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ReadJsonField { config } => {
             ops_live_lab_orchestrator::execute_ops_read_json_field(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ExtractManagedDnsExpectedIp { config } => {
             ops_live_lab_orchestrator::execute_ops_extract_managed_dns_expected_ip(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteActiveNetworkSignedStateTamperReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_active_network_signed_state_tamper_report(
                 config,
             )
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteActiveNetworkRoguePathHijackReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_active_network_rogue_path_hijack_report(
                 config,
@@ -7596,123 +7913,169 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::ValidateNetworkDiscoveryBundle { config } => {
             ops_network_discovery::execute_ops_validate_network_discovery_bundle(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::GenerateLiveLinuxLabFailureDigest { config } => {
             ops_live_lab_failure_digest::execute_ops_generate_live_linux_lab_failure_digest(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabList { config } => vm_lab::execute_ops_vm_lab_list(config),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabDiagnose { config } => vm_lab::execute_ops_vm_lab_diagnose(config),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabDiscoverLocalUtm { config } => {
             vm_lab::execute_ops_vm_lab_discover_local_utm(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabDiscoverLocalUtmSummary { config } => {
             vm_lab::execute_ops_vm_lab_discover_local_utm_summary(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabNetworkAudit { config } => {
             vm_lab::network_audit::execute_ops_vm_lab_network_audit(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabNetworkPreflight { config } => {
             vm_lab::network_audit::execute_ops_vm_lab_network_preflight(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabNetworkPrepare { config } => {
             vm_lab::network_prepare::execute_ops_vm_lab_network_prepare(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabNetworkRestore { config } => {
             vm_lab::network_prepare::execute_ops_vm_lab_network_restore(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabStart { config } => vm_lab::execute_ops_vm_lab_start(config),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabSyncRepo { config } => vm_lab::execute_ops_vm_lab_sync_repo(config),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabSyncBootstrap { config } => {
             vm_lab::execute_ops_vm_lab_sync_bootstrap(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabRun { config } => vm_lab::execute_ops_vm_lab_run(config, "ran"),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabBootstrap { config } => {
             vm_lab::execute_ops_vm_lab_run(config, "bootstrapped")
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabWriteLiveLabProfile { config } => {
             vm_lab::execute_ops_vm_lab_write_live_lab_profile(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabSetupLiveLab { config } => {
             vm_lab::execute_ops_vm_lab_setup_live_lab(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabOrchestrateLiveLab { config } => {
             vm_lab::execute_ops_vm_lab_orchestrate_live_lab(*config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabOvernight { config } => vm_lab::execute_ops_vm_lab_overnight(config),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabValidateWindowsSecurity { config } => {
             vm_lab::run_validate_windows_security(&config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabValidateLinuxSecurity { config } => {
             vm_lab::run_validate_linux_security(&config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabDistributeWindowsState { config } => {
             vm_lab::run_distribute_windows_state(&config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabPullWindowsStateFromLinuxExit { config } => {
             vm_lab::run_pull_windows_state_from_linux_exit(&config).map(|(summary, _)| summary)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabValidateLiveLabProfile { config } => {
             vm_lab::execute_ops_vm_lab_validate_live_lab_profile(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabDiagnoseLiveLabFailure { config } => {
             vm_lab::execute_ops_vm_lab_diagnose_live_lab_failure(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::LiveLabFlakeReport { matrix_path } => {
             vm_lab::run_history::render_flake_report(&matrix_path)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabDiffLiveLabRuns { config } => {
             vm_lab::execute_ops_vm_lab_diff_live_lab_runs(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabDiffOrchestratorParity { config } => {
             vm_lab::execute_ops_vm_lab_diff_orchestrator_parity(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabEmitParityInput { config } => {
             vm_lab::execute_ops_vm_lab_emit_parity_input(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabIterateLiveLab { config } => {
             vm_lab::execute_ops_vm_lab_iterate_live_lab(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabRunLiveLab { config } => vm_lab::execute_ops_vm_lab_run_live_lab(config),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabCheckKnownHosts { config } => {
             vm_lab::execute_ops_vm_lab_check_known_hosts(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabPreflight { config } => vm_lab::execute_ops_vm_lab_preflight(config),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabReadinessCheck { config } => {
             vm_lab::execute_ops_vm_lab_readiness_check(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabStatus { config } => vm_lab::execute_ops_vm_lab_status(config),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabStop { config } => vm_lab::execute_ops_vm_lab_stop(config),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabRestart { config } => vm_lab::execute_ops_vm_lab_restart(config),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabCollectArtifacts { config } => {
             vm_lab::execute_ops_vm_lab_collect_artifacts(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabWriteTopology { config } => {
             vm_lab::execute_ops_vm_lab_write_topology(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabIssueAndDistributeState { config } => {
             vm_lab::execute_ops_vm_lab_issue_and_distribute_state(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabRunSuite { config } => vm_lab::execute_ops_vm_lab_run_suite(config),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabBootstrapPhase { config } => {
             vm_lab::execute_ops_vm_lab_bootstrap_phase(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabReportCapabilities { config } => {
             vm_lab::capability::execute_ops_vm_lab_report_capabilities(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::RebindLinuxFreshInstallOsMatrixInputs { config } => {
             ops_fresh_install_os_matrix::execute_ops_rebind_linux_fresh_install_os_matrix_inputs(
                 config,
             )
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::GenerateLinuxFreshInstallOsMatrixReport { config } => {
             ops_fresh_install_os_matrix::execute_ops_generate_linux_fresh_install_os_matrix_report(
                 config,
             )
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::VerifyLinuxFreshInstallOsMatrixReadiness { config } => {
             ops_fresh_install_os_matrix::execute_ops_verify_linux_fresh_install_os_matrix_readiness(
                 config,
             )
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::WriteFreshInstallOsMatrixReadinessFixtures { config } => {
             ops_fresh_install_os_matrix::execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
                 config,
@@ -7745,25 +8108,33 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::InstallMacosExit { config } => {
             ops_install_macos_exit::execute_install_macos_exit(config).map(|report| report.summary())
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::InstallWindowsService => ops_e2e::execute_ops_install_windows_service(),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::InstallWindowsRelayService => {
             ops_e2e::execute_ops_install_windows_relay_service()
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::UninstallWindowsRelayService => {
             ops_e2e::execute_ops_uninstall_windows_relay_service()
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::InstallWindowsExitService => {
             ops_e2e::execute_ops_install_windows_exit_service()
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::UninstallWindowsExitService => {
             ops_e2e::execute_ops_uninstall_windows_exit_service()
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eBootstrapMacos {
             node_id,
             network_id,
             passphrase_file,
         } => ops_e2e::execute_ops_e2e_bootstrap_macos(node_id, network_id, passphrase_file),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::SeedMacosAnchorToken => ops_e2e::execute_ops_seed_macos_anchor_token(),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eBootstrapWindows {
             node_id,
             network_id,
@@ -7869,9 +8240,11 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             role,
             node_id,
         } => ops_peer_store::execute_ops_peer_store_list(config_dir, peers_file, role, node_id),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::RunDebianTwoNodeE2e { config } => {
             ops_e2e::execute_ops_run_debian_two_node_e2e(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eBootstrapHost {
             role,
             node_id,
@@ -7887,27 +8260,32 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             ssh_allow_cidrs,
             skip_apt,
         ),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eEnforceHost {
             role,
             node_id,
             src_dir,
             ssh_allow_cidrs,
         } => ops_e2e::execute_ops_e2e_enforce_host(role, node_id, src_dir, ssh_allow_cidrs),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eWorkerRefreshTrustEvidence {
             label,
             target,
             node_id,
         } => ops_e2e::execute_ops_e2e_worker_refresh_trust_evidence(label, target, node_id),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eWorkerRefreshRuntimeState {
             label,
             target,
             node_id,
         } => ops_e2e::execute_ops_e2e_worker_refresh_runtime_state(label, target, node_id),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eWorkerRefreshSignedState {
             label,
             target,
             node_id,
         } => ops_e2e::execute_ops_e2e_worker_refresh_signed_state(label, target, node_id),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eWorkerEnforceRuntime {
             label,
             target,
@@ -7916,6 +8294,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             src_dir,
             ssh_allow_cidrs,
         } => ops_e2e::execute_ops_e2e_worker_enforce_runtime(label, target, node_id, role, src_dir, ssh_allow_cidrs),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eMembershipAdd {
             client_node_id,
             client_pubkey_hex,
@@ -7927,6 +8306,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             capabilities,
             owner_approver_id,
         ),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eMembershipSetCapabilities {
             node_id,
             capabilities,
@@ -7936,6 +8316,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             capabilities,
             owner_approver_id,
         ),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eIssueAssignments {
             exit_node_id,
             client_node_id,
@@ -7953,15 +8334,19 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             client_pubkey_hex,
             artifact_dir,
         ),
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eIssueAssignmentBundlesFromEnv { config } => {
             ops_e2e::execute_ops_e2e_issue_assignment_bundles_from_env(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eIssueTraversalBundlesFromEnv { config } => {
             ops_e2e::execute_ops_e2e_issue_traversal_bundles_from_env(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eIssueDnsZoneBundlesFromEnv { config } => {
             ops_e2e::execute_ops_e2e_issue_dns_zone_bundles_from_env(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::AppendLiveLabMatrixRow { stage, status, report_path, report_dir } => {
             let outcome = live_lab_run_matrix::LiveLabRunMatrixStageOutcome {
                 stage,
@@ -7981,30 +8366,37 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             live_lab_run_matrix::append_live_lab_run_matrix_row(config)
                 .map(|r| format!("appended row run_id={}", r.run_id))
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::ListRunStages { config } => {
             ops_live_lab_orchestrator::execute_ops_list_run_stages(config).map(|s| {
                 print!("{s}");
                 String::new()
             })
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::DiffRunSummaries { config } => {
             ops_live_lab_orchestrator::execute_ops_diff_run_summaries(config).map(|s| {
                 print!("{s}");
                 String::new()
             })
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::EmitStageManifest { config } => {
             live_lab_stage_manifest::execute_ops_emit_stage_manifest(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::RecordStageStart { config } => {
             live_lab_stage_recorder::execute_ops_record_stage_start(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::RecordStageFinish { config } => {
             live_lab_stage_recorder::execute_ops_record_stage_finish(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::LiveLabCoverageReport { config } => {
             live_lab_coverage::execute_ops_live_lab_coverage_report(config)
         }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::AppendOrchestratorRunToMatrix { config } => {
             live_lab_run_matrix::execute_ops_append_orchestrator_run_to_matrix(config)
                 .map(|r| format!("appended orchestrator run row run_id={}", r.run_id))
@@ -14707,22 +15099,6 @@ fn write_bytes_file(path: &Path, body: &[u8]) -> Result<(), String> {
     fs::write(path, body).map_err(|err| format!("write file failed: {err}"))
 }
 
-fn encrypted_secret_permission_policy(path: &Path) -> KeyCustodyPermissionPolicy {
-    let mut policy = KeyCustodyPermissionPolicy::default();
-    if matches!(
-        path.parent(),
-        Some(parent)
-            if parent == Path::new("/etc/rustynet")
-                || parent == Path::new("/usr/local/etc/rustynet")
-    ) {
-        // Encrypted signing artifacts coexist with daemon-readable verifier
-        // material under the config root (/etc/rustynet on Linux,
-        // /usr/local/etc/rustynet on macOS), which is 0750 root:rustynetd.
-        policy.required_directory_mode = 0o750;
-    }
-    policy
-}
-
 fn load_signing_key(path: &Path, passphrase_path: &Path) -> Result<SigningKey, String> {
     let secret = load_encrypted_secret_material(path, passphrase_path, "signing key")?;
     if secret.len() != 32 {
@@ -14733,60 +15109,6 @@ fn load_signing_key(path: &Path, passphrase_path: &Path) -> Result<SigningKey, S
     let key = SigningKey::from_bytes(&bytes);
     bytes.zeroize();
     Ok(key)
-}
-
-fn validate_encrypted_secret_file_security(path: &Path, label: &str) -> Result<(), String> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|err| format!("inspect {label} failed: {err}"))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!("{label} path must not be a symlink"));
-    }
-    if !metadata.file_type().is_file() {
-        return Err(format!("{label} path must reference a regular file"));
-    }
-
-    let mode = metadata.mode() & 0o777;
-    if (mode & 0o077) != 0 {
-        return Err(format!(
-            "{label} file permissions must be owner-only (0600); found {mode:03o}",
-        ));
-    }
-
-    let expected_uid = Uid::effective().as_raw();
-    let owner_uid = metadata.uid();
-    if owner_uid != expected_uid {
-        return Err(format!(
-            "{label} file owner mismatch: expected uid {expected_uid}, found {owner_uid}"
-        ));
-    }
-    Ok(())
-}
-
-fn load_encrypted_secret_material(
-    path: &Path,
-    passphrase_path: &Path,
-    label: &str,
-) -> Result<Zeroizing<Vec<u8>>, String> {
-    if !passphrase_path.is_absolute() {
-        return Err(format!(
-            "{label} passphrase file path must be absolute: {}",
-            passphrase_path.display()
-        ));
-    }
-    validate_encrypted_secret_file_security(path, label)?;
-    let passphrase = read_passphrase_file_explicit(passphrase_path).map_err(|err| {
-        format!(
-            "{label} passphrase source invalid ({}): {err}",
-            passphrase_path.display()
-        )
-    })?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{label} path has no parent: {}", path.display()))?;
-    let permission_policy = encrypted_secret_permission_policy(path);
-    let secret = read_encrypted_key_file(parent, path, passphrase.as_str(), permission_policy)
-        .map_err(|err| format!("decrypt {label} failed ({}): {err}", path.display()))?;
-    Ok(Zeroizing::new(secret))
 }
 
 fn persist_encrypted_secret_material(
@@ -14898,6 +15220,7 @@ fn collect_repeated_option_values(args: &[String], key: &str) -> Vec<String> {
     values
 }
 
+#[cfg(feature = "vm-lab")]
 fn collect_repeated_option_values_allow_leading_dash(
     args: &[String],
     key: &str,
@@ -15373,36 +15696,12 @@ fn validate_assignment_issue_config(
     Ok(())
 }
 
-fn load_assignment_signing_secret(path: &Path, passphrase_path: &Path) -> Result<Vec<u8>, String> {
-    let secret =
-        load_encrypted_secret_material(path, passphrase_path, "assignment signing secret")?;
-    if secret.len() < 32 {
-        return Err("assignment signing secret must be at least 32 bytes".to_owned());
-    }
-    Ok(secret.to_vec())
-}
-
 fn generate_update_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     format!("update-{nanos}-{}", std::process::id())
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-fn generate_assignment_nonce() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    (nanos & u128::from(u64::MAX)) as u64
 }
 
 trait MembershipOperationName {
@@ -18854,7 +19153,11 @@ fn resolve_domain(domain: &str) -> Result<Vec<String>, String> {
 }
 
 fn help_text() -> String {
-    [
+    // Product command surface. Lab-robot commands (the `vm-lab` cargo
+    // feature) are appended below only when compiled in, so the shipped
+    // default-feature binary advertises no lab surface (RNQ-17).
+    #[cfg_attr(not(feature = "vm-lab"), allow(unused_mut))]
+    let mut lines: Vec<&str> = vec![
         "commands:",
         "  status [--json]",
         "  login",
@@ -18931,11 +19234,6 @@ fn help_text() -> String {
         "  ops run-phase1-baseline",
         "  ops generate-attack-matrix --attacks <csv> --nodes <csv> --output <path> [--format <md|json>]",
         "  ops generate-assessment-from-matrix --project <name> --matrix-json <path> --output <path> [--topology <text>] [--authorization <text>]",
-        "  ops validate-live-lab-reports [--reports <path[,path...]>] [--report-dir <path>] [--output <path>]",
-        "  ops evaluate-live-coverage-promotion [--reports <path[,path...]>] [--report-dir <path>] --output <path> [--targets <all|csv>]",
-        "  ops generate-live-lab-findings [--reports <path[,path...]>] [--report-dir <path>] --output <path>",
-        "  ops generate-comparative-exploit-coverage --output <path> [--workspace <path>] [--format <md|json>] [--projects <all|csv>] [--attack-families <all|csv>] [--run-local-tests] [--max-output-chars <n>]",
-        "  ops run-live-lab-validations --repo-root <path> --ssh-password-file <path> --sudo-password-file <path> [--ssh-known-hosts-file <path>] [--validations <all|csv>] [--report-dir <path>] [--findings-output <path>] [--schema-output <path>] [--promotion-output <path>] [--summary-output <path>] [--dry-run] [--skip-ssh-reachability-preflight] [--exit-host <user@host>] [--client-host <user@host>] [--entry-host <user@host>] [--aux-host <user@host>] [--extra-host <user@host>] [--probe-host <user@host>] [--dns-bind-addr <host:port>] [--ssh-allow-cidrs <cidr[,cidr...]>] [--probe-port <port>] [--rogue-endpoint-ip <ipv4>] [--socket-path <path>] [--assignment-path <path>] [--connect-timeout-secs <secs>]",
         "  ops check-no-unsafe-rust-sources [--root <path>]",
         "  ops check-dependency-exceptions [--path <path>]",
         "  ops check-perf-regression [--phase1-report <path>] [--phase3-report <path>]",
@@ -18951,6 +19249,47 @@ fn help_text() -> String {
         "  ops verify-phase6-platform-readiness",
         "  ops verify-phase6-parity-evidence",
         "  ops verify-required-test-output --output <path> --package <name> --test-filter <pattern>",
+        "  ops validate-network-discovery-bundle [--bundle <path>]... [--bundles <path[,path...]>] [--max-age-seconds <secs>] [--require-verifier-keys] [--require-daemon-active] [--require-socket-present] [--output <path>]",
+        "  ops write-unsigned-release-provenance --input <path> --output <path>",
+        "  ops sign-release-artifact",
+        "  ops verify-release-artifact",
+        "  ops collect-platform-probe",
+        "  ops generate-platform-parity-report",
+        "  ops collect-platform-parity-bundle",
+        "  ops install-systemd",
+        "  ops prepare-system-dirs",
+        "  ops restart-runtime-service",
+        "  ops stop-runtime-service",
+        "  ops show-runtime-service-status",
+        "  ops start-assignment-refresh-service",
+        "  ops check-assignment-refresh-availability",
+        "  ops install-trust-material --verifier-source <absolute-path> --trust-source <absolute-path> --verifier-dest <absolute-path> --trust-dest <absolute-path> [--daemon-group <group>]",
+        "  ops create-release-manifest --artifact <name>:<target>:<path> [--artifact ...] --signing-seed-file <path> --output <path> [--release-track <track>] [--key-id <id>] [--generated-at-unix <secs>]",
+        "  ops verify-release-manifest --manifest <path> (--pinned-verifier-key-hex <hex> | --pinned-verifier-key-file <path>) [--artifacts-dir <dir>]",
+        "  ops apply-managed-dns-routing",
+        "  ops clear-managed-dns-routing",
+        "  ops disconnect-cleanup",
+        "  ops apply-blind-exit-lockdown",
+        "  ops init-membership",
+        "  ops secure-remove --path <absolute-path>",
+        "  ops ensure-signing-passphrase-material",
+        "  ops ensure-local-trust-material --signing-key-passphrase-file <absolute-path>",
+        "  ops materialize-signing-passphrase --output <absolute-path>",
+        "  ops materialize-signing-passphrase-temp",
+        "  ops set-assignment-refresh-exit-node [--env-path <absolute-path>] [--exit-node-id <id>]",
+        "  ops force-local-assignment-refresh-now",
+        "  ops apply-lan-access-coupling --enable <true|false> [--lan-routes <cidr[,cidr...]>] [--env-path <absolute-path>]",
+        "  ops apply-role-coupling --target-role <admin|client> [--preferred-exit-node-id <id>] [--enable-exit-advertise <true|false>] [--env-path <absolute-path>] [--skip-client-exit-route-convergence-wait]",
+        "  ops peer-store-validate --config-dir <absolute-path> --peers-file <absolute-path>",
+        "  ops peer-store-list --config-dir <absolute-path> --peers-file <absolute-path> [--role <role>] [--node-id <id>]",
+    ];
+    #[cfg(feature = "vm-lab")]
+    lines.extend_from_slice(&[
+        "  ops validate-live-lab-reports [--reports <path[,path...]>] [--report-dir <path>] [--output <path>]",
+        "  ops evaluate-live-coverage-promotion [--reports <path[,path...]>] [--report-dir <path>] --output <path> [--targets <all|csv>]",
+        "  ops generate-live-lab-findings [--reports <path[,path...]>] [--report-dir <path>] --output <path>",
+        "  ops generate-comparative-exploit-coverage --output <path> [--workspace <path>] [--format <md|json>] [--projects <all|csv>] [--attack-families <all|csv>] [--run-local-tests] [--max-output-chars <n>]",
+        "  ops run-live-lab-validations --repo-root <path> --ssh-password-file <path> --sudo-password-file <path> [--ssh-known-hosts-file <path>] [--validations <all|csv>] [--report-dir <path>] [--findings-output <path>] [--schema-output <path>] [--promotion-output <path>] [--summary-output <path>] [--dry-run] [--skip-ssh-reachability-preflight] [--exit-host <user@host>] [--client-host <user@host>] [--entry-host <user@host>] [--aux-host <user@host>] [--extra-host <user@host>] [--probe-host <user@host>] [--dns-bind-addr <host:port>] [--ssh-allow-cidrs <cidr[,cidr...]>] [--probe-port <port>] [--rogue-endpoint-ip <ipv4>] [--socket-path <path>] [--assignment-path <path>] [--connect-timeout-secs <secs>]",
         "  ops generate-cross-network-remote-exit-report --suite <suite> --report-path <path> --log-path <path> --status <pass|fail> [--failure-summary <text>] [--environment <label>] [--implementation-state <label>] [--source-artifact <path>]... [--log-artifact <path>]... [--client-host <host>] [--exit-host <host>] [--relay-host <host>] [--probe-host <host>] [--client-network-id <id>] [--exit-network-id <id>] [--relay-network-id <id>] [--nat-profile <profile>] [--impairment-profile <profile>] [--path-status-line <status-text>] [--path-evidence-report <path>] [--check <name=pass|fail>]...",
         "  ops validate-cross-network-remote-exit-reports [--reports <path[,path...]>] [--artifact-dir <path>] [--output <path>] [--max-evidence-age-seconds <secs>] [--expected-git-commit <sha>] [--require-pass-status]",
         "  ops validate-cross-network-nat-matrix [--reports <path[,path...]>] [--artifact-dir <path>] [--required-nat-profiles <profile[,profile...]>] [--output <path>] [--max-evidence-age-seconds <secs>] [--expected-git-commit <sha>] [--require-pass-status]",
@@ -18984,7 +19323,6 @@ fn help_text() -> String {
         "  ops extract-managed-dns-expected-ip --fqdn <name> --inspect-output <text>",
         "  ops write-active-network-signed-state-tamper-report --report-path <path> --baseline-status <pass|fail> --tamper-reject-status <pass|fail> --fail-closed-status <pass|fail> --netcheck-fail-closed-status <pass|fail> --recovery-status <pass|fail> --exit-host <host> --client-host <host> --status-after-tamper <text> --netcheck-after-tamper <text> --status-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops write-active-network-rogue-path-hijack-report --report-path <path> --baseline-status <pass|fail> --hijack-reject-status <pass|fail> --fail-closed-status <pass|fail> --netcheck-fail-closed-status <pass|fail> --no-rogue-endpoint-status <pass|fail> --recovery-status <pass|fail> --recovery-endpoint-status <pass|fail> --rogue-endpoint-ip <ipv4> --exit-host <host> --client-host <host> --endpoints-before <text> --endpoints-after-hijack <text> --endpoints-after-recovery <text> --status-after-hijack <text> --netcheck-after-hijack <text> --status-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
-        "  ops validate-network-discovery-bundle [--bundle <path>]... [--bundles <path[,path...]>] [--max-age-seconds <secs>] [--require-verifier-keys] [--require-daemon-active] [--require-socket-present] [--output <path>]",
         "  ops generate-live-linux-lab-failure-digest --nodes-tsv <path> --stages-tsv <path> --report-dir <path> --run-id <id> --network-id <id> --overall-status <status> --output-json <path> --output-md <path>",
         "  ops vm-lab-list [--inventory <path>]",
         "  ops vm-lab-diagnose --vm <alias> [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>]",
@@ -19032,41 +19370,9 @@ fn help_text() -> String {
         "  ops generate-linux-fresh-install-os-matrix-report --output <path> --environment <label> --source-mode <mode> --expected-git-commit-file <path> --git-status-file <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path> --exit-node-id <id> --client-node-id <id> --ubuntu-node-id <id> --fedora-node-id <id> --mint-node-id <id> [--debian-os-version <label>] [--ubuntu-os-version <label>] [--fedora-os-version <label>] [--mint-os-version <label>]",
         "  ops verify-linux-fresh-install-os-matrix-readiness --report-path <path> [--max-age-seconds <secs>] [--profile <cross_platform|linux>] [--expected-git-commit <sha>]",
         "  ops write-fresh-install-os-matrix-readiness-fixtures --output-dir <path> --head-commit <sha> --stale-commit <sha> --now-unix <unix>",
-        "  ops write-unsigned-release-provenance --input <path> --output <path>",
-        "  ops sign-release-artifact",
-        "  ops verify-release-artifact",
-        "  ops collect-platform-probe",
-        "  ops generate-platform-parity-report",
-        "  ops collect-platform-parity-bundle",
-        "  ops install-systemd",
         "  ops install-windows-service",
         "  ops install-windows-relay-service",
         "  ops uninstall-windows-relay-service",
-        "  ops prepare-system-dirs",
-        "  ops restart-runtime-service",
-        "  ops stop-runtime-service",
-        "  ops show-runtime-service-status",
-        "  ops start-assignment-refresh-service",
-        "  ops check-assignment-refresh-availability",
-        "  ops install-trust-material --verifier-source <absolute-path> --trust-source <absolute-path> --verifier-dest <absolute-path> --trust-dest <absolute-path> [--daemon-group <group>]",
-        "  ops create-release-manifest --artifact <name>:<target>:<path> [--artifact ...] --signing-seed-file <path> --output <path> [--release-track <track>] [--key-id <id>] [--generated-at-unix <secs>]",
-        "  ops verify-release-manifest --manifest <path> (--pinned-verifier-key-hex <hex> | --pinned-verifier-key-file <path>) [--artifacts-dir <dir>]",
-        "  ops apply-managed-dns-routing",
-        "  ops clear-managed-dns-routing",
-        "  ops disconnect-cleanup",
-        "  ops apply-blind-exit-lockdown",
-        "  ops init-membership",
-        "  ops secure-remove --path <absolute-path>",
-        "  ops ensure-signing-passphrase-material",
-        "  ops ensure-local-trust-material --signing-key-passphrase-file <absolute-path>",
-        "  ops materialize-signing-passphrase --output <absolute-path>",
-        "  ops materialize-signing-passphrase-temp",
-        "  ops set-assignment-refresh-exit-node [--env-path <absolute-path>] [--exit-node-id <id>]",
-        "  ops force-local-assignment-refresh-now",
-        "  ops apply-lan-access-coupling --enable <true|false> [--lan-routes <cidr[,cidr...]>] [--env-path <absolute-path>]",
-        "  ops apply-role-coupling --target-role <admin|client> [--preferred-exit-node-id <id>] [--enable-exit-advertise <true|false>] [--env-path <absolute-path>] [--skip-client-exit-route-convergence-wait]",
-        "  ops peer-store-validate --config-dir <absolute-path> --peers-file <absolute-path>",
-        "  ops peer-store-list --config-dir <absolute-path> --peers-file <absolute-path> [--role <role>] [--node-id <id>]",
         "  ops run-debian-two-node-e2e --exit-host <host|user@host> --client-host <host|user@host> --ssh-allow-cidrs <cidr[,cidr...]> [--ssh-user <user>] [--ssh-sudo <auto|always|never>] [--sudo-password-file <path>] [--ssh-port <port>] [--ssh-identity <path>] [--ssh-known-hosts-file <path>] [--exit-node-id <id>] [--client-node-id <id>] [--network-id <id>] [--remote-root <abs-path>] [--repo-ref <git-ref>] [--skip-apt] [--report-path <path>]",
         "  ops e2e-bootstrap-host --role <role> --node-id <id> --network-id <id> --src-dir <absolute-path> --ssh-allow-cidrs <cidr[,cidr...]> [--skip-apt]",
         "  ops e2e-bootstrap-macos --node-id <id> --network-id <id> --passphrase-file <absolute-path>",
@@ -19080,8 +19386,8 @@ fn help_text() -> String {
         "  ops e2e-issue-traversal-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  ops e2e-issue-dns-zone-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  Windows UTM targets use PowerShell helper scripts for access bootstrap, repo sync, build, and diagnostics; the Windows bootstrap-phase surface is only partially implemented on the current branch, and install/restart/verify/all must not be treated as runtime-capable proof; the Linux live-lab setup/run/orchestrate/iterate, suite, and diagnose wrappers are intentionally fail-closed for Windows targets before any live_linux_* stage runs; Linux UTM targets continue to use the existing shell path.",
-    ]
-    .join("\n")
+    ]);
+    lines.join("\n")
 }
 
 // ============================================================================
@@ -22189,75 +22495,6 @@ mod tests {
             format!("{generate_assessment_from_matrix:?}").contains("GenerateAssessmentFromMatrix")
         );
 
-        let validate_live_lab_reports = parse_command(&[
-            "ops".to_owned(),
-            "validate-live-lab-reports".to_owned(),
-            "--reports".to_owned(),
-            "artifacts/live_lab/report-a.json,artifacts/live_lab/report-b.json".to_owned(),
-            "--output".to_owned(),
-            "/tmp/live_lab_schema_validation.md".to_owned(),
-        ]);
-        assert!(format!("{validate_live_lab_reports:?}").contains("ValidateLiveLabReports"));
-
-        let evaluate_live_coverage_promotion = parse_command(&[
-            "ops".to_owned(),
-            "evaluate-live-coverage-promotion".to_owned(),
-            "--report-dir".to_owned(),
-            "artifacts/live_lab".to_owned(),
-            "--targets".to_owned(),
-            "control_surface_exposure,endpoint_hijack".to_owned(),
-            "--output".to_owned(),
-            "/tmp/live_lab_coverage_promotion.md".to_owned(),
-        ]);
-        assert!(
-            format!("{evaluate_live_coverage_promotion:?}")
-                .contains("EvaluateLiveCoveragePromotion")
-        );
-
-        let generate_live_lab_findings = parse_command(&[
-            "ops".to_owned(),
-            "generate-live-lab-findings".to_owned(),
-            "--report-dir".to_owned(),
-            "artifacts/live_lab".to_owned(),
-            "--output".to_owned(),
-            "/tmp/live_lab_findings.md".to_owned(),
-        ]);
-        assert!(format!("{generate_live_lab_findings:?}").contains("GenerateLiveLabFindings"));
-
-        let generate_comparative_exploit_coverage = parse_command(&[
-            "ops".to_owned(),
-            "generate-comparative-exploit-coverage".to_owned(),
-            "--workspace".to_owned(),
-            ".".to_owned(),
-            "--output".to_owned(),
-            "/tmp/comparative.md".to_owned(),
-            "--projects".to_owned(),
-            "tailscale".to_owned(),
-            "--attack-families".to_owned(),
-            "route-hijack".to_owned(),
-            "--run-local-tests".to_owned(),
-        ]);
-        assert!(
-            format!("{generate_comparative_exploit_coverage:?}")
-                .contains("GenerateComparativeExploitCoverage")
-        );
-
-        let run_live_lab_validations = parse_command(&[
-            "ops".to_owned(),
-            "run-live-lab-validations".to_owned(),
-            "--repo-root".to_owned(),
-            "/tmp/rustynet".to_owned(),
-            "--ssh-password-file".to_owned(),
-            "/tmp/ssh.pass".to_owned(),
-            "--sudo-password-file".to_owned(),
-            "/tmp/sudo.pass".to_owned(),
-            "--dry-run".to_owned(),
-            "--skip-ssh-reachability-preflight".to_owned(),
-            "--client-host".to_owned(),
-            "debian@192.0.2.10".to_owned(),
-        ]);
-        assert!(format!("{run_live_lab_validations:?}").contains("RunLiveLabValidations"));
-
         let prepare_advisory_db = parse_command(&[
             "ops".to_owned(),
             "prepare-advisory-db".to_owned(),
@@ -22366,6 +22603,347 @@ mod tests {
             "daemon::tests::sample".to_owned(),
         ]);
         assert!(format!("{verify_required_test_output:?}").contains("VerifyRequiredTestOutput"));
+
+        let validate_network_discovery_bundle = parse_command(&[
+            "ops".to_owned(),
+            "validate-network-discovery-bundle".to_owned(),
+            "--bundle".to_owned(),
+            "artifacts/phase10/discovery-a.json".to_owned(),
+            "--bundle".to_owned(),
+            "artifacts/phase10/discovery-b.json".to_owned(),
+            "--bundles".to_owned(),
+            "artifacts/phase10/discovery-c.json,artifacts/phase10/discovery-b.json".to_owned(),
+            "--max-age-seconds".to_owned(),
+            "600".to_owned(),
+            "--require-verifier-keys".to_owned(),
+            "--require-daemon-active".to_owned(),
+            "--require-socket-present".to_owned(),
+            "--output".to_owned(),
+            "artifacts/phase10/discovery-validation.md".to_owned(),
+        ]);
+        assert!(
+            format!("{validate_network_discovery_bundle:?}")
+                .contains("ValidateNetworkDiscoveryBundle")
+        );
+
+        let write_unsigned_release_provenance = parse_command(&[
+            "ops".to_owned(),
+            "write-unsigned-release-provenance".to_owned(),
+            "--input".to_owned(),
+            "artifacts/release/rustynetd.provenance.json".to_owned(),
+            "--output".to_owned(),
+            "artifacts/release/unsigned.provenance.json".to_owned(),
+        ]);
+        assert!(
+            format!("{write_unsigned_release_provenance:?}")
+                .contains("WriteUnsignedReleaseProvenance")
+        );
+
+        let sign_release_artifact =
+            parse_command(&["ops".to_owned(), "sign-release-artifact".to_owned()]);
+        assert!(format!("{sign_release_artifact:?}").contains("SignReleaseArtifact"));
+
+        let verify_release_artifact =
+            parse_command(&["ops".to_owned(), "verify-release-artifact".to_owned()]);
+        assert!(format!("{verify_release_artifact:?}").contains("VerifyReleaseArtifact"));
+
+        let installer = parse_command(&["ops".to_owned(), "install-systemd".to_owned()]);
+        assert!(format!("{installer:?}").contains("InstallSystemd"));
+
+        let systemd_relay_installer =
+            parse_command(&["ops".to_owned(), "install-systemd-relay".to_owned()]);
+        assert!(format!("{systemd_relay_installer:?}").contains("InstallSystemdRelay"));
+
+        let macos_relay_installer =
+            parse_command(&["ops".to_owned(), "install-macos-relay".to_owned()]);
+        assert!(format!("{macos_relay_installer:?}").contains("InstallMacosRelay"));
+
+        let macos_anchor_installer =
+            parse_command(&["ops".to_owned(), "install-macos-anchor".to_owned()]);
+        assert!(format!("{macos_anchor_installer:?}").contains("InstallMacosAnchor"));
+
+        let macos_anchor_uninstaller = parse_command(&[
+            "ops".to_owned(),
+            "install-macos-anchor".to_owned(),
+            "--uninstall".to_owned(),
+            "--dry-run".to_owned(),
+        ]);
+        assert!(format!("{macos_anchor_uninstaller:?}").contains("DisableAndRemove"));
+
+        // Track B Step 3 (B1.4) — exit-service install/uninstall verbs
+        // for Linux (systemd), macOS (launchd), and Windows (PS1
+        // preflight). All three dispatch from the planner's
+        // `ConcreteAction::{Deploy,Undeploy}ExitService` actions when
+        // entering/leaving an exit-bearing preset on the target host.
+        let systemd_exit_installer =
+            parse_command(&["ops".to_owned(), "install-systemd-exit".to_owned()]);
+        assert!(format!("{systemd_exit_installer:?}").contains("InstallSystemdExit"));
+        let systemd_exit_uninstaller = parse_command(&[
+            "ops".to_owned(),
+            "install-systemd-exit".to_owned(),
+            "--uninstall".to_owned(),
+        ]);
+        assert!(format!("{systemd_exit_uninstaller:?}").contains("DisableAndRemove"));
+
+        let macos_exit_installer =
+            parse_command(&["ops".to_owned(), "install-macos-exit".to_owned()]);
+        assert!(format!("{macos_exit_installer:?}").contains("InstallMacosExit"));
+        let macos_exit_uninstaller = parse_command(&[
+            "ops".to_owned(),
+            "install-macos-exit".to_owned(),
+            "--uninstall".to_owned(),
+        ]);
+        assert!(format!("{macos_exit_uninstaller:?}").contains("DisableAndRemove"));
+
+        let prepare_dirs = parse_command(&["ops".to_owned(), "prepare-system-dirs".to_owned()]);
+        assert!(format!("{prepare_dirs:?}").contains("PrepareSystemDirs"));
+
+        let restart_runtime =
+            parse_command(&["ops".to_owned(), "restart-runtime-service".to_owned()]);
+        assert!(format!("{restart_runtime:?}").contains("RestartRuntimeService"));
+
+        let stop_runtime = parse_command(&["ops".to_owned(), "stop-runtime-service".to_owned()]);
+        assert!(format!("{stop_runtime:?}").contains("StopRuntimeService"));
+
+        let runtime_status =
+            parse_command(&["ops".to_owned(), "show-runtime-service-status".to_owned()]);
+        assert!(format!("{runtime_status:?}").contains("ShowRuntimeServiceStatus"));
+
+        let start_assignment_refresh = parse_command(&[
+            "ops".to_owned(),
+            "start-assignment-refresh-service".to_owned(),
+        ]);
+        assert!(format!("{start_assignment_refresh:?}").contains("StartAssignmentRefreshService"));
+
+        let check_assignment_refresh = parse_command(&[
+            "ops".to_owned(),
+            "check-assignment-refresh-availability".to_owned(),
+        ]);
+        assert!(
+            format!("{check_assignment_refresh:?}").contains("CheckAssignmentRefreshAvailability")
+        );
+
+        let install_trust_material = parse_command(&[
+            "ops".to_owned(),
+            "install-trust-material".to_owned(),
+            "--verifier-source".to_owned(),
+            "/tmp/trust.pub".to_owned(),
+            "--trust-source".to_owned(),
+            "/tmp/rustynetd.trust".to_owned(),
+            "--verifier-dest".to_owned(),
+            "/etc/rustynet/trust-evidence.pub".to_owned(),
+            "--trust-dest".to_owned(),
+            "/var/lib/rustynet/rustynetd.trust".to_owned(),
+            "--daemon-group".to_owned(),
+            "rustynetd".to_owned(),
+        ]);
+        assert!(format!("{install_trust_material:?}").contains("InstallTrustMaterial"));
+
+        let apply_managed_dns =
+            parse_command(&["ops".to_owned(), "apply-managed-dns-routing".to_owned()]);
+        assert!(format!("{apply_managed_dns:?}").contains("ApplyManagedDnsRouting"));
+
+        let clear_managed_dns =
+            parse_command(&["ops".to_owned(), "clear-managed-dns-routing".to_owned()]);
+        assert!(format!("{clear_managed_dns:?}").contains("ClearManagedDnsRouting"));
+
+        let disconnect_cleanup =
+            parse_command(&["ops".to_owned(), "disconnect-cleanup".to_owned()]);
+        assert!(format!("{disconnect_cleanup:?}").contains("DisconnectCleanup"));
+
+        let blind_exit_lockdown =
+            parse_command(&["ops".to_owned(), "apply-blind-exit-lockdown".to_owned()]);
+        assert!(format!("{blind_exit_lockdown:?}").contains("ApplyBlindExitLockdown"));
+
+        let init_membership = parse_command(&["ops".to_owned(), "init-membership".to_owned()]);
+        assert!(format!("{init_membership:?}").contains("InitMembership"));
+
+        let secure_remove = parse_command(&[
+            "ops".to_owned(),
+            "secure-remove".to_owned(),
+            "--path".to_owned(),
+            "/tmp/secret.txt".to_owned(),
+        ]);
+        assert!(format!("{secure_remove:?}").contains("SecureRemove"));
+
+        let ensure_signing = parse_command(&[
+            "ops".to_owned(),
+            "ensure-signing-passphrase-material".to_owned(),
+        ]);
+        assert!(format!("{ensure_signing:?}").contains("EnsureSigningPassphraseMaterial"));
+
+        let ensure_local_trust = parse_command(&[
+            "ops".to_owned(),
+            "ensure-local-trust-material".to_owned(),
+            "--signing-key-passphrase-file".to_owned(),
+            "/tmp/signing-passphrase".to_owned(),
+        ]);
+        assert!(format!("{ensure_local_trust:?}").contains("EnsureLocalTrustMaterial"));
+
+        let materialize_signing = parse_command(&[
+            "ops".to_owned(),
+            "materialize-signing-passphrase".to_owned(),
+            "--output".to_owned(),
+            "/tmp/signing-passphrase".to_owned(),
+        ]);
+        assert!(format!("{materialize_signing:?}").contains("MaterializeSigningPassphrase"));
+
+        let materialize_signing_temp = parse_command(&[
+            "ops".to_owned(),
+            "materialize-signing-passphrase-temp".to_owned(),
+        ]);
+        assert!(
+            format!("{materialize_signing_temp:?}").contains("MaterializeSigningPassphraseTemp")
+        );
+
+        let set_exit = parse_command(&[
+            "ops".to_owned(),
+            "set-assignment-refresh-exit-node".to_owned(),
+            "--env-path".to_owned(),
+            "/etc/rustynet/assignment-refresh.env".to_owned(),
+            "--exit-node-id".to_owned(),
+            "exit-40".to_owned(),
+        ]);
+        assert!(format!("{set_exit:?}").contains("SetAssignmentRefreshExitNode"));
+
+        let force_assignment_refresh = parse_command(&[
+            "ops".to_owned(),
+            "force-local-assignment-refresh-now".to_owned(),
+        ]);
+        assert!(format!("{force_assignment_refresh:?}").contains("ForceLocalAssignmentRefreshNow"));
+
+        let state_refresh_if_socket_present = parse_command(&[
+            "ops".to_owned(),
+            "state-refresh-if-socket-present".to_owned(),
+        ]);
+        assert!(
+            format!("{state_refresh_if_socket_present:?}").contains("StateRefreshIfSocketPresent")
+        );
+
+        let lan_coupling = parse_command(&[
+            "ops".to_owned(),
+            "apply-lan-access-coupling".to_owned(),
+            "--enable".to_owned(),
+            "true".to_owned(),
+            "--lan-routes".to_owned(),
+            "192.168.1.0/24".to_owned(),
+        ]);
+        assert!(format!("{lan_coupling:?}").contains("ApplyLanAccessCoupling"));
+
+        let role_coupling = parse_command(&[
+            "ops".to_owned(),
+            "apply-role-coupling".to_owned(),
+            "--target-role".to_owned(),
+            "client".to_owned(),
+            "--preferred-exit-node-id".to_owned(),
+            "exit-40".to_owned(),
+            "--enable-exit-advertise".to_owned(),
+            "false".to_owned(),
+            "--skip-client-exit-route-convergence-wait".to_owned(),
+        ]);
+        assert!(format!("{role_coupling:?}").contains("ApplyRoleCoupling"));
+        assert!(
+            format!("{role_coupling:?}").contains("skip_client_exit_route_convergence_wait: true")
+        );
+
+        let peer_store_validate = parse_command(&[
+            "ops".to_owned(),
+            "peer-store-validate".to_owned(),
+            "--config-dir".to_owned(),
+            "/tmp/rustynet-config".to_owned(),
+            "--peers-file".to_owned(),
+            "/tmp/rustynet-config/peers.db".to_owned(),
+        ]);
+        assert!(format!("{peer_store_validate:?}").contains("PeerStoreValidate"));
+
+        let peer_store_list = parse_command(&[
+            "ops".to_owned(),
+            "peer-store-list".to_owned(),
+            "--config-dir".to_owned(),
+            "/tmp/rustynet-config".to_owned(),
+            "--peers-file".to_owned(),
+            "/tmp/rustynet-config/peers.db".to_owned(),
+            "--role".to_owned(),
+            "admin".to_owned(),
+            "--node-id".to_owned(),
+            "exit-1".to_owned(),
+        ]);
+        assert!(format!("{peer_store_list:?}").contains("PeerStoreList"));
+    }
+
+    /// Lab-robot ops parsing lives behind the `vm-lab` feature (RNQ-17);
+    /// the default-feature binary treats these commands as unknown.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn parse_supports_live_lab_ops_commands() {
+        let validate_live_lab_reports = parse_command(&[
+            "ops".to_owned(),
+            "validate-live-lab-reports".to_owned(),
+            "--reports".to_owned(),
+            "artifacts/live_lab/report-a.json,artifacts/live_lab/report-b.json".to_owned(),
+            "--output".to_owned(),
+            "/tmp/live_lab_schema_validation.md".to_owned(),
+        ]);
+        assert!(format!("{validate_live_lab_reports:?}").contains("ValidateLiveLabReports"));
+
+        let evaluate_live_coverage_promotion = parse_command(&[
+            "ops".to_owned(),
+            "evaluate-live-coverage-promotion".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab".to_owned(),
+            "--targets".to_owned(),
+            "control_surface_exposure,endpoint_hijack".to_owned(),
+            "--output".to_owned(),
+            "/tmp/live_lab_coverage_promotion.md".to_owned(),
+        ]);
+        assert!(
+            format!("{evaluate_live_coverage_promotion:?}")
+                .contains("EvaluateLiveCoveragePromotion")
+        );
+
+        let generate_live_lab_findings = parse_command(&[
+            "ops".to_owned(),
+            "generate-live-lab-findings".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab".to_owned(),
+            "--output".to_owned(),
+            "/tmp/live_lab_findings.md".to_owned(),
+        ]);
+        assert!(format!("{generate_live_lab_findings:?}").contains("GenerateLiveLabFindings"));
+
+        let generate_comparative_exploit_coverage = parse_command(&[
+            "ops".to_owned(),
+            "generate-comparative-exploit-coverage".to_owned(),
+            "--workspace".to_owned(),
+            ".".to_owned(),
+            "--output".to_owned(),
+            "/tmp/comparative.md".to_owned(),
+            "--projects".to_owned(),
+            "tailscale".to_owned(),
+            "--attack-families".to_owned(),
+            "route-hijack".to_owned(),
+            "--run-local-tests".to_owned(),
+        ]);
+        assert!(
+            format!("{generate_comparative_exploit_coverage:?}")
+                .contains("GenerateComparativeExploitCoverage")
+        );
+
+        let run_live_lab_validations = parse_command(&[
+            "ops".to_owned(),
+            "run-live-lab-validations".to_owned(),
+            "--repo-root".to_owned(),
+            "/tmp/rustynet".to_owned(),
+            "--ssh-password-file".to_owned(),
+            "/tmp/ssh.pass".to_owned(),
+            "--sudo-password-file".to_owned(),
+            "/tmp/sudo.pass".to_owned(),
+            "--dry-run".to_owned(),
+            "--skip-ssh-reachability-preflight".to_owned(),
+            "--client-host".to_owned(),
+            "debian@192.0.2.10".to_owned(),
+        ]);
+        assert!(format!("{run_live_lab_validations:?}").contains("RunLiveLabValidations"));
 
         let generate_cross_network_report = parse_command(&[
             "ops".to_owned(),
@@ -23101,28 +23679,6 @@ mod tests {
                 .contains("WriteActiveNetworkRoguePathHijackReport")
         );
 
-        let validate_network_discovery_bundle = parse_command(&[
-            "ops".to_owned(),
-            "validate-network-discovery-bundle".to_owned(),
-            "--bundle".to_owned(),
-            "artifacts/phase10/discovery-a.json".to_owned(),
-            "--bundle".to_owned(),
-            "artifacts/phase10/discovery-b.json".to_owned(),
-            "--bundles".to_owned(),
-            "artifacts/phase10/discovery-c.json,artifacts/phase10/discovery-b.json".to_owned(),
-            "--max-age-seconds".to_owned(),
-            "600".to_owned(),
-            "--require-verifier-keys".to_owned(),
-            "--require-daemon-active".to_owned(),
-            "--require-socket-present".to_owned(),
-            "--output".to_owned(),
-            "artifacts/phase10/discovery-validation.md".to_owned(),
-        ]);
-        assert!(
-            format!("{validate_network_discovery_bundle:?}")
-                .contains("ValidateNetworkDiscoveryBundle")
-        );
-
         let generate_live_lab_failure_digest = parse_command(&[
             "ops".to_owned(),
             "generate-live-linux-lab-failure-digest".to_owned(),
@@ -23246,50 +23802,6 @@ mod tests {
                 .contains("WriteFreshInstallOsMatrixReadinessFixtures")
         );
 
-        let write_unsigned_release_provenance = parse_command(&[
-            "ops".to_owned(),
-            "write-unsigned-release-provenance".to_owned(),
-            "--input".to_owned(),
-            "artifacts/release/rustynetd.provenance.json".to_owned(),
-            "--output".to_owned(),
-            "artifacts/release/unsigned.provenance.json".to_owned(),
-        ]);
-        assert!(
-            format!("{write_unsigned_release_provenance:?}")
-                .contains("WriteUnsignedReleaseProvenance")
-        );
-
-        let sign_release_artifact =
-            parse_command(&["ops".to_owned(), "sign-release-artifact".to_owned()]);
-        assert!(format!("{sign_release_artifact:?}").contains("SignReleaseArtifact"));
-
-        let verify_release_artifact =
-            parse_command(&["ops".to_owned(), "verify-release-artifact".to_owned()]);
-        assert!(format!("{verify_release_artifact:?}").contains("VerifyReleaseArtifact"));
-
-        let installer = parse_command(&["ops".to_owned(), "install-systemd".to_owned()]);
-        assert!(format!("{installer:?}").contains("InstallSystemd"));
-
-        let systemd_relay_installer =
-            parse_command(&["ops".to_owned(), "install-systemd-relay".to_owned()]);
-        assert!(format!("{systemd_relay_installer:?}").contains("InstallSystemdRelay"));
-
-        let macos_relay_installer =
-            parse_command(&["ops".to_owned(), "install-macos-relay".to_owned()]);
-        assert!(format!("{macos_relay_installer:?}").contains("InstallMacosRelay"));
-
-        let macos_anchor_installer =
-            parse_command(&["ops".to_owned(), "install-macos-anchor".to_owned()]);
-        assert!(format!("{macos_anchor_installer:?}").contains("InstallMacosAnchor"));
-
-        let macos_anchor_uninstaller = parse_command(&[
-            "ops".to_owned(),
-            "install-macos-anchor".to_owned(),
-            "--uninstall".to_owned(),
-            "--dry-run".to_owned(),
-        ]);
-        assert!(format!("{macos_anchor_uninstaller:?}").contains("DisableAndRemove"));
-
         let windows_installer =
             parse_command(&["ops".to_owned(), "install-windows-service".to_owned()]);
         assert!(format!("{windows_installer:?}").contains("InstallWindowsService"));
@@ -23303,31 +23815,6 @@ mod tests {
             "uninstall-windows-relay-service".to_owned(),
         ]);
         assert!(format!("{windows_relay_uninstaller:?}").contains("UninstallWindowsRelayService"));
-
-        // Track B Step 3 (B1.4) — exit-service install/uninstall verbs
-        // for Linux (systemd), macOS (launchd), and Windows (PS1
-        // preflight). All three dispatch from the planner's
-        // `ConcreteAction::{Deploy,Undeploy}ExitService` actions when
-        // entering/leaving an exit-bearing preset on the target host.
-        let systemd_exit_installer =
-            parse_command(&["ops".to_owned(), "install-systemd-exit".to_owned()]);
-        assert!(format!("{systemd_exit_installer:?}").contains("InstallSystemdExit"));
-        let systemd_exit_uninstaller = parse_command(&[
-            "ops".to_owned(),
-            "install-systemd-exit".to_owned(),
-            "--uninstall".to_owned(),
-        ]);
-        assert!(format!("{systemd_exit_uninstaller:?}").contains("DisableAndRemove"));
-
-        let macos_exit_installer =
-            parse_command(&["ops".to_owned(), "install-macos-exit".to_owned()]);
-        assert!(format!("{macos_exit_installer:?}").contains("InstallMacosExit"));
-        let macos_exit_uninstaller = parse_command(&[
-            "ops".to_owned(),
-            "install-macos-exit".to_owned(),
-            "--uninstall".to_owned(),
-        ]);
-        assert!(format!("{macos_exit_uninstaller:?}").contains("DisableAndRemove"));
 
         let windows_exit_installer =
             parse_command(&["ops".to_owned(), "install-windows-exit-service".to_owned()]);
@@ -23364,181 +23851,6 @@ mod tests {
             "/tmp/passphrase".to_owned(),
         ]);
         assert!(format!("{windows_genesis:?}").contains("E2eBootstrapWindows"));
-
-        let prepare_dirs = parse_command(&["ops".to_owned(), "prepare-system-dirs".to_owned()]);
-        assert!(format!("{prepare_dirs:?}").contains("PrepareSystemDirs"));
-
-        let restart_runtime =
-            parse_command(&["ops".to_owned(), "restart-runtime-service".to_owned()]);
-        assert!(format!("{restart_runtime:?}").contains("RestartRuntimeService"));
-
-        let stop_runtime = parse_command(&["ops".to_owned(), "stop-runtime-service".to_owned()]);
-        assert!(format!("{stop_runtime:?}").contains("StopRuntimeService"));
-
-        let runtime_status =
-            parse_command(&["ops".to_owned(), "show-runtime-service-status".to_owned()]);
-        assert!(format!("{runtime_status:?}").contains("ShowRuntimeServiceStatus"));
-
-        let start_assignment_refresh = parse_command(&[
-            "ops".to_owned(),
-            "start-assignment-refresh-service".to_owned(),
-        ]);
-        assert!(format!("{start_assignment_refresh:?}").contains("StartAssignmentRefreshService"));
-
-        let check_assignment_refresh = parse_command(&[
-            "ops".to_owned(),
-            "check-assignment-refresh-availability".to_owned(),
-        ]);
-        assert!(
-            format!("{check_assignment_refresh:?}").contains("CheckAssignmentRefreshAvailability")
-        );
-
-        let install_trust_material = parse_command(&[
-            "ops".to_owned(),
-            "install-trust-material".to_owned(),
-            "--verifier-source".to_owned(),
-            "/tmp/trust.pub".to_owned(),
-            "--trust-source".to_owned(),
-            "/tmp/rustynetd.trust".to_owned(),
-            "--verifier-dest".to_owned(),
-            "/etc/rustynet/trust-evidence.pub".to_owned(),
-            "--trust-dest".to_owned(),
-            "/var/lib/rustynet/rustynetd.trust".to_owned(),
-            "--daemon-group".to_owned(),
-            "rustynetd".to_owned(),
-        ]);
-        assert!(format!("{install_trust_material:?}").contains("InstallTrustMaterial"));
-
-        let apply_managed_dns =
-            parse_command(&["ops".to_owned(), "apply-managed-dns-routing".to_owned()]);
-        assert!(format!("{apply_managed_dns:?}").contains("ApplyManagedDnsRouting"));
-
-        let clear_managed_dns =
-            parse_command(&["ops".to_owned(), "clear-managed-dns-routing".to_owned()]);
-        assert!(format!("{clear_managed_dns:?}").contains("ClearManagedDnsRouting"));
-
-        let disconnect_cleanup =
-            parse_command(&["ops".to_owned(), "disconnect-cleanup".to_owned()]);
-        assert!(format!("{disconnect_cleanup:?}").contains("DisconnectCleanup"));
-
-        let blind_exit_lockdown =
-            parse_command(&["ops".to_owned(), "apply-blind-exit-lockdown".to_owned()]);
-        assert!(format!("{blind_exit_lockdown:?}").contains("ApplyBlindExitLockdown"));
-
-        let init_membership = parse_command(&["ops".to_owned(), "init-membership".to_owned()]);
-        assert!(format!("{init_membership:?}").contains("InitMembership"));
-
-        let secure_remove = parse_command(&[
-            "ops".to_owned(),
-            "secure-remove".to_owned(),
-            "--path".to_owned(),
-            "/tmp/secret.txt".to_owned(),
-        ]);
-        assert!(format!("{secure_remove:?}").contains("SecureRemove"));
-
-        let ensure_signing = parse_command(&[
-            "ops".to_owned(),
-            "ensure-signing-passphrase-material".to_owned(),
-        ]);
-        assert!(format!("{ensure_signing:?}").contains("EnsureSigningPassphraseMaterial"));
-
-        let ensure_local_trust = parse_command(&[
-            "ops".to_owned(),
-            "ensure-local-trust-material".to_owned(),
-            "--signing-key-passphrase-file".to_owned(),
-            "/tmp/signing-passphrase".to_owned(),
-        ]);
-        assert!(format!("{ensure_local_trust:?}").contains("EnsureLocalTrustMaterial"));
-
-        let materialize_signing = parse_command(&[
-            "ops".to_owned(),
-            "materialize-signing-passphrase".to_owned(),
-            "--output".to_owned(),
-            "/tmp/signing-passphrase".to_owned(),
-        ]);
-        assert!(format!("{materialize_signing:?}").contains("MaterializeSigningPassphrase"));
-
-        let materialize_signing_temp = parse_command(&[
-            "ops".to_owned(),
-            "materialize-signing-passphrase-temp".to_owned(),
-        ]);
-        assert!(
-            format!("{materialize_signing_temp:?}").contains("MaterializeSigningPassphraseTemp")
-        );
-
-        let set_exit = parse_command(&[
-            "ops".to_owned(),
-            "set-assignment-refresh-exit-node".to_owned(),
-            "--env-path".to_owned(),
-            "/etc/rustynet/assignment-refresh.env".to_owned(),
-            "--exit-node-id".to_owned(),
-            "exit-40".to_owned(),
-        ]);
-        assert!(format!("{set_exit:?}").contains("SetAssignmentRefreshExitNode"));
-
-        let force_assignment_refresh = parse_command(&[
-            "ops".to_owned(),
-            "force-local-assignment-refresh-now".to_owned(),
-        ]);
-        assert!(format!("{force_assignment_refresh:?}").contains("ForceLocalAssignmentRefreshNow"));
-
-        let state_refresh_if_socket_present = parse_command(&[
-            "ops".to_owned(),
-            "state-refresh-if-socket-present".to_owned(),
-        ]);
-        assert!(
-            format!("{state_refresh_if_socket_present:?}").contains("StateRefreshIfSocketPresent")
-        );
-
-        let lan_coupling = parse_command(&[
-            "ops".to_owned(),
-            "apply-lan-access-coupling".to_owned(),
-            "--enable".to_owned(),
-            "true".to_owned(),
-            "--lan-routes".to_owned(),
-            "192.168.1.0/24".to_owned(),
-        ]);
-        assert!(format!("{lan_coupling:?}").contains("ApplyLanAccessCoupling"));
-
-        let role_coupling = parse_command(&[
-            "ops".to_owned(),
-            "apply-role-coupling".to_owned(),
-            "--target-role".to_owned(),
-            "client".to_owned(),
-            "--preferred-exit-node-id".to_owned(),
-            "exit-40".to_owned(),
-            "--enable-exit-advertise".to_owned(),
-            "false".to_owned(),
-            "--skip-client-exit-route-convergence-wait".to_owned(),
-        ]);
-        assert!(format!("{role_coupling:?}").contains("ApplyRoleCoupling"));
-        assert!(
-            format!("{role_coupling:?}").contains("skip_client_exit_route_convergence_wait: true")
-        );
-
-        let peer_store_validate = parse_command(&[
-            "ops".to_owned(),
-            "peer-store-validate".to_owned(),
-            "--config-dir".to_owned(),
-            "/tmp/rustynet-config".to_owned(),
-            "--peers-file".to_owned(),
-            "/tmp/rustynet-config/peers.db".to_owned(),
-        ]);
-        assert!(format!("{peer_store_validate:?}").contains("PeerStoreValidate"));
-
-        let peer_store_list = parse_command(&[
-            "ops".to_owned(),
-            "peer-store-list".to_owned(),
-            "--config-dir".to_owned(),
-            "/tmp/rustynet-config".to_owned(),
-            "--peers-file".to_owned(),
-            "/tmp/rustynet-config/peers.db".to_owned(),
-            "--role".to_owned(),
-            "admin".to_owned(),
-            "--node-id".to_owned(),
-            "exit-1".to_owned(),
-        ]);
-        assert!(format!("{peer_store_list:?}").contains("PeerStoreList"));
 
         let remote_e2e = parse_command(&[
             "ops".to_owned(),
@@ -24222,6 +24534,7 @@ mod tests {
         assert_eq!(ipc, IpcCommand::StateRefresh);
     }
 
+    #[cfg(feature = "vm-lab")]
     #[test]
     fn help_text_lists_vm_lab_setup_and_skip_setup() {
         let help = help_text();
@@ -24236,6 +24549,12 @@ mod tests {
         let help = help_text();
         assert!(help.contains("ops generate-attack-matrix --attacks <csv> --nodes <csv>"));
         assert!(help.contains("ops generate-assessment-from-matrix --project <name>"));
+    }
+
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn help_text_lists_live_lab_security_audit_ops_commands() {
+        let help = help_text();
         assert!(help.contains("ops validate-live-lab-reports"));
         assert!(help.contains("ops evaluate-live-coverage-promotion"));
         assert!(help.contains("ops generate-live-lab-findings"));
@@ -24243,6 +24562,7 @@ mod tests {
         assert!(help.contains("ops run-live-lab-validations"));
     }
 
+    #[cfg(feature = "vm-lab")]
     #[test]
     fn parse_reboot_recovery_report_requires_dns_refresh_checks() {
         let missing_dns_refresh_checks = parse_command(&[

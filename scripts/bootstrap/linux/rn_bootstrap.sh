@@ -540,7 +540,7 @@ pin_regular_resolv_conf 1.1.1.1 8.8.8.8
 # state. Mirrors the macOS bootstrap's existing `cargo build --offline` path.
 if wait_for_cargo_registry_endpoint; then
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd
-  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-cli --bin rustynet-cli
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-cli --features vm-lab --bin rustynet-cli
   # rustynet-relay is a separate binary whose bin target requires the `daemon`
   # feature, so it builds as its own invocation. Built on every node (cheap —
   # its deps are already compiled for rustynetd) so a node assigned, or later
@@ -552,7 +552,7 @@ if wait_for_cargo_registry_endpoint; then
 else
   echo "[bootstrap] cargo registry unreachable; falling back to offline build from cargo cache" >&2
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynetd
-  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-cli --bin rustynet-cli
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-cli --features vm-lab --bin rustynet-cli
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-relay --features daemon
 fi
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd

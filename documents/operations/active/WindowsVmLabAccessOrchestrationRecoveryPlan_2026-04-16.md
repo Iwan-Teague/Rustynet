@@ -55,13 +55,13 @@ Validation run on 2026-05-30:
   passed.
 - `cargo test -p rustynet-cli --all-features windows_utm_readiness -- --nocapture`
   passed.
-- `cargo run --quiet -p rustynet-cli -- ops vm-lab-discover-local-utm-summary --inventory documents/operations/active/vm_lab_inventory.json`
+- `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-discover-local-utm-summary --inventory documents/operations/active/vm_lab_inventory.json`
   returned `windows-utm-1` with `ssh_port_status=closed`,
   `readiness.execution_ready=false`, reason code `ssh-firewall-not-open`, and
   `windows_ssh_probe.kind=ok` with `openssh_installed=true`,
   `service_running=true`, `firewall_rule_enabled=true`,
   `host_key_present=true`, and `listener_ready=true`.
-- `cargo run --quiet -p rustynet-cli -- ops vm-lab-bootstrap-phase --phase install-release --inventory documents/operations/active/vm_lab_inventory.json --vm windows-utm-1 --dest-dir 'C:\Rustynet' --ssh-identity-file /Users/iwan/.ssh/rustynet_lab_ed25519 --known-hosts-file /Users/iwan/.ssh/known_hosts --timeout-secs 20`
+- `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-bootstrap-phase --phase install-release --inventory documents/operations/active/vm_lab_inventory.json --vm windows-utm-1 --dest-dir 'C:\Rustynet' --ssh-identity-file /Users/iwan/.ssh/rustynet_lab_ed25519 --known-hosts-file /Users/iwan/.ssh/known_hosts --timeout-secs 20`
   failed closed before install with
   `Windows phase install-release requires proven access ... ssh-firewall-not-open`
   and produced a Windows diagnostics root:

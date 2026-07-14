@@ -2107,9 +2107,9 @@ Commands run:
   - `cargo check -p rustynet-cli --bin rustynet-cli`
   - `cargo test -p rustynet-cli --bin rustynet-cli rustynetd_service_template_preserves_backend_env_and_tun_device_access -- --nocapture`
   - `cargo test -p rustynet-cli --bin rustynet-cli privileged_helper_service_template_preserves_tun_device_access_for_helper_owned_setup -- --nocapture`
-  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-write-live-lab-profile --inventory documents/operations/active/vm_lab_inventory.json --output profiles/live_lab/generated_vm_lab_5node.env --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --source-mode local-head --repo-ref HEAD`
-  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-preflight --inventory documents/operations/active/vm_lab_inventory.json --all --known-hosts-file /Users/iwanteague/.ssh/known_hosts --require-command git --require-command cargo --require-command systemctl --timeout-secs 120`
-  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node.env --skip-gates --skip-soak --skip-cross-network`
+  - `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-write-live-lab-profile --inventory documents/operations/active/vm_lab_inventory.json --output profiles/live_lab/generated_vm_lab_5node.env --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --source-mode local-head --repo-ref HEAD`
+  - `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-preflight --inventory documents/operations/active/vm_lab_inventory.json --all --known-hosts-file /Users/iwanteague/.ssh/known_hosts --require-command git --require-command cargo --require-command systemctl --timeout-secs 120`
+  - `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node.env --skip-gates --skip-soak --skip-cross-network`
   - `ssh debian-headless-1 'sudo -n systemctl status rustynetd-managed-dns.service --no-pager -l ...'`
   - `ssh debian-headless-1 'sudo -n /usr/local/bin/rustynet status ...'`
   - `ssh debian-headless-3 'sudo -n systemctl status rustynetd-managed-dns.service --no-pager -l ...'`
@@ -2173,7 +2173,7 @@ Commands run:
   - `cargo test -p rustynet-cli --bin live_linux_role_switch_matrix_test -- --nocapture`
   - `cargo test -p rustynet-cli --bin live_linux_managed_dns_test -- --nocapture`
   - `cargo fmt --all -- --check`
-  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_phase3_replayfix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --timeout-secs 7200`
+  - `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_phase3_replayfix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --timeout-secs 7200`
   - `ssh ... debian@debian-headless-1 'sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status'`
   - `ssh ... debian@debian-headless-1 'sudo -n journalctl -u rustynetd.service -n 80 --no-pager --output=short-iso | tail -n 80'`
   - `ssh ... debian@debian-headless-1 'sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh && rustynet status'`
@@ -2225,7 +2225,7 @@ Files changed:
     - Added this public evidence entry for the completed Delta Phase 3 rerun.
 Commands run:
   - `bash -n scripts/e2e/live_linux_lab_orchestrator.sh`
-  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_phase3_replayfix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --timeout-secs 7200`
+  - `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_phase3_replayfix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --timeout-secs 7200`
   - `ssh ... debian-headless-{1,2,4} 'sudo env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status'`
   - `ssh ... debian-headless-{1,2,4} 'sudo env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet netcheck'`
   - `ssh ... debian-headless-{1,2} 'sudo env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh && rustynet status && rustynet netcheck'`
@@ -2284,7 +2284,7 @@ Commands run:
   - `cargo test -p rustynetd daemon_runtime_relay_session_endpoint_mismatch_is_not_live -- --nocapture`
   - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_health_uses_live_handshake_without_forced_reprobe -- --nocapture`
   - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay -- --nocapture`
-  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_phase3_replayfix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --timeout-secs 7200`
+  - `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_phase3_replayfix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --timeout-secs 7200`
 Validation and live-lab outcomes:
   - The new phase10 regression passed and now proves that valid signed host-only traversal with coordination and no relay keeps the peer on a signed `direct_programmed` path without fabricating liveness.
   - The new daemon regression passed and proves the runtime no longer enters restricted-safe mode just because host-only signed direct probes exhaust without a relay fallback.
@@ -2413,9 +2413,9 @@ Commands run:
   - `cargo fmt --all -- --check`
   - `cargo check -p rustynet-cli --bin live_linux_lan_toggle_test`
   - `cargo test -p rustynet-cli --bin live_linux_lan_toggle_test -- --nocapture`
-  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-write-live-lab-profile --inventory documents/operations/active/vm_lab_inventory.json --output profiles/live_lab/generated_vm_lab_5node_20260403_lantogglefix.env --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --source-mode working-tree`
-  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-preflight --inventory documents/operations/active/vm_lab_inventory.json --all --known-hosts-file /Users/iwanteague/.ssh/known_hosts --require-same-network --require-command git --require-command cargo --require-rustynet-installed`
-  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_20260403_lantogglefix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --report-dir artifacts/live_lab/20260403T212500Z_lantogglefix --timeout-secs 7200`
+  - `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-write-live-lab-profile --inventory documents/operations/active/vm_lab_inventory.json --output profiles/live_lab/generated_vm_lab_5node_20260403_lantogglefix.env --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --source-mode working-tree`
+  - `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-preflight --inventory documents/operations/active/vm_lab_inventory.json --all --known-hosts-file /Users/iwanteague/.ssh/known_hosts --require-same-network --require-command git --require-command cargo --require-rustynet-installed`
+  - `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_20260403_lantogglefix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --report-dir artifacts/live_lab/20260403T212500Z_lantogglefix --timeout-secs 7200`
 Validation and live-lab outcomes:
   - Targeted CLI formatting, check, and unit tests passed after the LAN-toggle refresh patch.
   - The fresh reduced five-node rerun at `artifacts/live_lab/20260403T212500Z_lantogglefix` now passes:
@@ -2785,7 +2785,7 @@ Files changed:
   - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
     - Added this evidence entry.
 Commands run:
-  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-iterate-live-lab --inventory documents/operations/active/vm_lab_inventory.json --profile-output profiles/live_lab/generated_vm_lab_20260404_runtime_recovery.env --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --source-mode working-tree --report-dir artifacts/live_lab/20260404_runtime_recovery --validation-step fmt --validation-step check:rustynet-backend-wireguard --validation-step check:rustynetd --validation-step test-bin:rustynet-cli:live_linux_exit_handoff_test --collect-failure-diagnostics`
+  - `cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-iterate-live-lab --inventory documents/operations/active/vm_lab_inventory.json --profile-output profiles/live_lab/generated_vm_lab_20260404_runtime_recovery.env --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --source-mode working-tree --report-dir artifacts/live_lab/20260404_runtime_recovery --validation-step fmt --validation-step check:rustynet-backend-wireguard --validation-step check:rustynetd --validation-step test-bin:rustynet-cli:live_linux_exit_handoff_test --collect-failure-diagnostics`
 Validation outcomes:
   - `overall_status=pass`
   - `first_failed_stage=none`

@@ -575,8 +575,10 @@ mod tests {
         // The lab installs only target/release/rustynet-cli, so building helper
         // bins on every node is dead work and made no-egress bootstrap much slower.
         assert!(
-            BOOTSTRAP_SCRIPT.contains("-p rustynet-cli --bin rustynet-cli"),
-            "bootstrap must compile only the installed rustynet-cli binary"
+            BOOTSTRAP_SCRIPT.contains("-p rustynet-cli --features vm-lab --bin rustynet-cli"),
+            "bootstrap must compile only the installed rustynet-cli binary, \
+             with the vm-lab feature so guests serve the `ops e2e-*` \
+             lab-protocol commands (RNQ-17 gates them out of default builds)"
         );
         assert!(
             !BOOTSTRAP_SCRIPT.contains("-p rustynetd -p rustynet-cli"),

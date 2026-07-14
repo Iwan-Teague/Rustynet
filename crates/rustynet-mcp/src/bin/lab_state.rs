@@ -147,7 +147,15 @@ impl LabStateServer {
     // ── Synchronous command helpers (short ops) ──────────────────────
 
     fn run_cli(&self, cli_args: &[&str], title: &str, timeout_secs: u64) -> ToolCallResult {
-        let mut full: Vec<&str> = vec!["run", "--quiet", "-p", "rustynet-cli", "--"];
+        let mut full: Vec<&str> = vec![
+            "run",
+            "--quiet",
+            "-p",
+            "rustynet-cli",
+            "--features",
+            "vm-lab",
+            "--",
+        ];
         full.extend_from_slice(cli_args);
         match run_with_timeout(
             "cargo",
@@ -5043,10 +5051,19 @@ impl LabStateServer {
         let ssh = default_ssh_identity();
         let kh = default_known_hosts();
 
-        let mut cli: Vec<String> = ["run", "--quiet", "-p", "rustynet-cli", "--", "ops"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let mut cli: Vec<String> = [
+            "run",
+            "--quiet",
+            "-p",
+            "rustynet-cli",
+            "--features",
+            "vm-lab",
+            "--",
+            "ops",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         match mode {
             "orchestrate" => {
                 cli.push("vm-lab-orchestrate-live-lab".into());

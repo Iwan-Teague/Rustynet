@@ -58,7 +58,7 @@ Same command as any windows:exit run (working-tree builds the new stage on the
 host orchestrator):
 
 ```bash
-cargo run -p rustynet-cli -- ops vm-lab-orchestrate-live-lab \
+cargo run -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab \
   --inventory /tmp/lab_inv_live.json --report-dir /private/tmp/rn_live_win_exit \
   --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 --known-hosts-file ~/.ssh/known_hosts \
   --node windows-utm-1:exit --node debian-headless-1:client \

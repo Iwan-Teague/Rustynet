@@ -111,7 +111,7 @@ join_existing_artifacts() {
 
 choose_alias() {
   mapfile -t alias_values < <(
-    cargo run --quiet -p rustynet-cli -- ops choose-cross-network-roam-alias \
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops choose-cross-network-roam-alias \
       --exit-ip "$CLIENT_ADDR" \
       --used-ip "$CLIENT_ADDR" \
       --used-ip "$EXIT_ADDR"
@@ -374,10 +374,10 @@ if [[ "$CLIENT_NETWORK_ID" == "$EXIT_NETWORK_ID" ]]; then
 fi
 
 if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
-  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CLIENT_UNDERLAY_IP" >/dev/null
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$CLIENT_UNDERLAY_IP" >/dev/null
 fi
 if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
-  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
 fi
 
 validate_positive_integer "reconnect slo seconds" "$RECONNECT_SLO_SECS"
@@ -443,7 +443,7 @@ main() {
   fi
 
   mapfile -t direct_results < <(
-    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops read-cross-network-report-fields \
       --report-path "$DIRECT_REPORT_PATH" \
       --include-status \
       --check direct_remote_exit_success \

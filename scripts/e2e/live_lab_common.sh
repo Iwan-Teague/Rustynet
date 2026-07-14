@@ -34,7 +34,7 @@ live_lab_init() {
     echo "ssh identity file must not be a symlink: $LIVE_LAB_SSH_IDENTITY_FILE" >&2
     exit 1
   fi
-  if ! cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+  if ! cargo run --quiet -p rustynet-cli --features vm-lab -- ops check-local-file-mode \
     --path "$LIVE_LAB_SSH_IDENTITY_FILE" \
     --policy owner-only \
     --label 'ssh identity file' >/dev/null
@@ -157,7 +157,7 @@ live_lab_require_known_hosts_file() {
     echo "pinned known_hosts file must not be a symlink: $path" >&2
     exit 1
   fi
-  if ! cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+  if ! cargo run --quiet -p rustynet-cli --features vm-lab -- ops check-local-file-mode \
     --path "$path" \
     --policy no-group-world-write \
     --label 'pinned known_hosts file' >/dev/null
