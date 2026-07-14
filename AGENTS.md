@@ -339,9 +339,13 @@ Platform + UX + tooling layer:
   scorer over per-candidate observations (`rustynet role recommend`). Domain
   layer; collectors live in the CLI.
 - `rustynet-cli` — the main `rustynet` binary (`default-run = "rustynet-cli"`):
-  `ops`, `vm-lab`, live-lab orchestrator, role/anchor/llm subcommands. Its
-  `src/bin/` also holds the large family of `live_*`, `*_gates`, `phase*`, and
-  `check_*` evidence/gate binaries that the `scripts/ci/` wrappers dispatch to.
+  `ops`, role/anchor/llm subcommands. The lab robot — `vm-lab`, the live-lab
+  orchestrator, and the e2e/cross-network/fresh-install `ops` command surface —
+  compiles only under the DEFAULT-OFF `vm-lab` cargo feature (RNQ-17): the
+  shipped release binary carries none of it, CI gates run `--all-features`, and
+  lab hosts/guests build with `--features vm-lab`. Its `src/bin/` also holds
+  the large family of `live_*`, `*_gates`, `phase*`, and `check_*`
+  evidence/gate binaries that the `scripts/ci/` wrappers dispatch to.
 - `rustynet-mcp` — MCP servers: `rustynet-mcp-repo-context`,
   `rustynet-mcp-gate-runner`, `rustynet-mcp-lab-state`.
 - `rustynet-xtask` — the `xtask` dev runner (see §7 / §12).
@@ -381,7 +385,9 @@ Authoritative gate definitions live in §7. This section is the fast-path map.
 
 ### 12.3 Live Lab
 - Inventory summary first: `rustynet ops vm-lab-discover-local-utm-summary
-  --inventory documents/operations/active/vm_lab_inventory.json`.
+  --inventory documents/operations/active/vm_lab_inventory.json` (the `rustynet`
+  binary must be built with `--features vm-lab`; the default-feature build has
+  no `vm-lab` commands — RNQ-17).
 - If a guest is stuck (SSH timeout but visible in `arp -a`):
   `scripts/vm_lab/probe_and_recover_local_utm.sh` before retrying.
 - Never hand-edit `vm_lab_inventory.json` — refresh with
@@ -407,8 +413,10 @@ Fedora/Ubuntu/Rocky), so do NOT chase it per-VM or "fix" it in the inventory.
   container) and reaches the lab LAN fine. Do reachability, SSH, scp, deploy,
   and live-lab orchestration **from Bash**, e.g.:
   - probe: `nc -z -G5 <ip> 22`, or `ssh` / `sshpass -p <pw> ssh …`
-  - full toolset unsandboxed: `cargo run -q -p rustynet-cli -- ops vm-lab-…`
-    (reaches guests where the sandboxed MCP wrappers can't).
+  - full toolset unsandboxed: `cargo run -q -p rustynet-cli --features vm-lab
+    -- ops vm-lab-…` (reaches guests where the sandboxed MCP wrappers can't;
+    the `vm-lab` feature is required — lab commands are compiled out of
+    default builds).
 - The host login shell is **zsh**: an unquoted `$VAR` does NOT word-split — pass
   multi-flag SSH options inline, or use `${=VAR}` / an array, or the probe will
   error `keyword stricthostkeychecking extra arguments`.

@@ -90,7 +90,7 @@ parse_positive_integer() {
 write_report() {
   local status="$1"
   local args=(
-    cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops generate-cross-network-remote-exit-report
     --suite cross_network_failback_roaming
     --report-path "$REPORT_PATH"
     --log-path "$LOG_PATH"
@@ -201,13 +201,13 @@ if [[ "$CLIENT_HOST" == "$EXIT_HOST" || "$CLIENT_HOST" == "$RELAY_HOST" || "$EXI
 fi
 
 if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
-  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CLIENT_UNDERLAY_IP" >/dev/null
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$CLIENT_UNDERLAY_IP" >/dev/null
 fi
 if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
-  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
 fi
 if [[ -n "$RELAY_UNDERLAY_IP" ]]; then
-  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$RELAY_UNDERLAY_IP" >/dev/null
+  cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-ipv4-address --ip "$RELAY_UNDERLAY_IP" >/dev/null
 fi
 if [[ -n "$KNOWN_HOSTS_FILE" ]]; then
   export LIVE_LAB_PINNED_KNOWN_HOSTS_FILE="$KNOWN_HOSTS_FILE"
@@ -289,7 +289,7 @@ main() {
     RELAY_ADDR="$(live_lab_resolved_target_address "$RELAY_HOST")"
   fi
 
-  topology_result="$(cargo run --quiet -p rustynet-cli -- ops classify-cross-network-topology --ip-a "$CLIENT_ADDR" --ip-b "$EXIT_ADDR")" || return 1
+  topology_result="$(cargo run --quiet -p rustynet-cli --features vm-lab -- ops classify-cross-network-topology --ip-a "$CLIENT_ADDR" --ip-b "$EXIT_ADDR")" || return 1
   if [[ "$topology_result" == "pass" ]]; then
     CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC="pass"
   else
@@ -364,7 +364,7 @@ main() {
     reconvergence_secs=-1
   fi
 
-  relay_ready_check="$(cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields --report-path "$RELAY_REPORT_PATH" --check relay_remote_exit_success)" || return 1
+  relay_ready_check="$(cargo run --quiet -p rustynet-cli --features vm-lab -- ops read-cross-network-report-fields --report-path "$RELAY_REPORT_PATH" --check relay_remote_exit_success)" || return 1
   if [[ "$relay_ready_check" == 'pass' && "$CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC" == 'pass' && "$reconvergence_secs" -ge 0 && "$reconvergence_secs" -le "$FAILBACK_RECOVERY_SLO_SECS" ]]; then
     CHECK_FAILBACK_RECOVERY_SLO="pass"
   fi
@@ -402,7 +402,7 @@ EOF
 
   FAILURE_SUMMARY="computing endpoint roam alias and issuing updated signed assignments"
   mapfile -t roam_values < <(
-    cargo run --quiet -p rustynet-cli -- ops choose-cross-network-roam-alias \
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops choose-cross-network-roam-alias \
       --exit-ip "$EXIT_ADDR" \
       --used-ip "$EXIT_ADDR" \
       --used-ip "$CLIENT_ADDR" \
@@ -515,7 +515,7 @@ EOF
   fi
 
   mapfile -t bypass_results < <(
-    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+    cargo run --quiet -p rustynet-cli --features vm-lab -- ops read-cross-network-report-fields \
       --report-path "$BYPASS_REPORT_PATH" \
       --check internet_route_via_rustynet0 \
       --check probe_service_blocked_from_client

@@ -626,6 +626,8 @@ fn write_json_report(
             "--quiet",
             "-p",
             "rustynet-cli",
+            "--features",
+            "vm-lab",
             "--",
             "ops",
             "write-real-wireguard-exitnode-e2e-report",

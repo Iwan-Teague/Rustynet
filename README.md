@@ -58,17 +58,19 @@ rustynet operator menu
 ```
 
 If you are starting from local UTM VMs and want the fastest first-pass inventory,
-use the compact discovery summary first:
+use the compact discovery summary first (all `ops vm-lab-*` commands live behind
+the default-off `vm-lab` cargo feature — the shipped release binary
+intentionally has no lab surface):
 
 ```bash
-cargo run --quiet -p rustynet-cli -- ops vm-lab-discover-local-utm-summary --inventory documents/operations/active/vm_lab_inventory.json
+cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-discover-local-utm-summary --inventory documents/operations/active/vm_lab_inventory.json
 ```
 
 Use the full JSON discovery report when you need the raw bundle, IP, SSH, and
 readiness details:
 
 ```bash
-cargo run --quiet -p rustynet-cli -- ops vm-lab-discover-local-utm --inventory documents/operations/active/vm_lab_inventory.json
+cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-discover-local-utm --inventory documents/operations/active/vm_lab_inventory.json
 ```
 
 Add `--update-inventory-live-ips` when you want a fully ready discovery pass to

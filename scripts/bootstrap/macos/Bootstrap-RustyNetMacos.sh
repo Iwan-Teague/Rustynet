@@ -770,12 +770,12 @@ build_rustynet() {
   # falls through to the online path, which requires the registry and fetches.
   # This keeps fresh-VM provisioning working while no longer making a transient
   # or absent upstream route a hard bootstrap failure when the cache suffices.
-  if as_user "${brew_rustup}" run stable cargo build --release --offline -p rustynetd -p rustynet-cli; then
+  if as_user "${brew_rustup}" run stable cargo build --release --offline -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab; then
     echo "[bootstrap] built rustynetd + rustynet-cli from warm cargo cache (offline)"
   else
     echo "[bootstrap] offline build unavailable (cold cache or new dependency); fetching from registry" >&2
     wait_for_cargo_registry_endpoint || exit 1
-    as_user "${brew_rustup}" run stable cargo build --release -p rustynetd -p rustynet-cli
+    as_user "${brew_rustup}" run stable cargo build --release -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab
   fi
 
   # rustynet-relay (sibling relay datapath binary) needs the `daemon` feature

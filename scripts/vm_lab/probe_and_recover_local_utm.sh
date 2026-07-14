@@ -14,7 +14,7 @@
 #     baseline before launching an orchestrator run.
 #
 # WHAT IT DOES
-#   1. Calls `cargo run --quiet --bin rustynet-cli -- ops
+#   1. Calls `cargo run --quiet -p rustynet-cli --features vm-lab --bin rustynet-cli -- ops
 #      vm-lab-discover-local-utm` (JSON) to enumerate every registered UTM
 #      VM, its DHCP-assigned IP, and its current SSH port status.
 #   2. Prints a per-VM table: name, platform, live IP, SSH port status.
@@ -63,7 +63,7 @@ fi
 cd "$REPO_ROOT"
 
 printf '== Discovering UTM VMs (cargo run ops vm-lab-discover-local-utm) ==\n'
-discovery_json="$(cargo run --quiet --bin rustynet-cli -- ops vm-lab-discover-local-utm 2>/dev/null)"
+discovery_json="$(cargo run --quiet -p rustynet-cli --features vm-lab --bin rustynet-cli -- ops vm-lab-discover-local-utm 2>/dev/null)"
 
 # Parse: TSV rows of "name<TAB>platform<TAB>live_ip<TAB>ssh_status".
 # We substitute "_" for empty fields because macOS bash 3.2's `read` with a
