@@ -68,6 +68,12 @@ mod vm_lab;
 /// Orchestrator surface for integration tests (RNQ-09). Everything here is
 /// already `pub` inside the vm_lab tree; this only makes it reachable from
 /// a `tests/` target when the crate is built with `--features vm-lab`.
+///
+/// `OrchestrationStage` + `StageFanout` are included alongside `StageId` so a
+/// `tests/` target or `src/bin/` harness can define its OWN synthetic stages
+/// (e.g. the RNQ-09 real-subprocess signal-cleanup harness) and hand them to
+/// `StateMachineRunner::new` without reimplementing the trait or reaching
+/// into a private module path.
 #[cfg(feature = "vm-lab")]
 pub mod orchestrator_test_surface {
     pub use crate::vm_lab::orchestrator::context::OrchestrationContext;
@@ -77,5 +83,5 @@ pub mod orchestrator_test_surface {
     pub use crate::vm_lab::orchestrator::error::StageOutcome;
     pub use crate::vm_lab::orchestrator::role::NodeRole;
     pub use crate::vm_lab::orchestrator::runner::{StageObserver, StateMachineRunner};
-    pub use crate::vm_lab::orchestrator::stage::StageId;
+    pub use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 }

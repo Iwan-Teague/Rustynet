@@ -466,6 +466,104 @@ mod tests {
         );
     }
 
+    // ── RNQ-09: shutdown-flag skip-cascade (in-process, deterministic) ───────
+    //
+    // `with_shutdown_flag` (used by the production `--node` path in
+    // `orchestrator/native.rs` and exercised end-to-end with a REAL
+    // SIGTERM/SIGINT by `tests/rnq09_signal_cleanup.rs`) had no coverage at
+    // any level before this test: nothing proved the runner's own
+    // between-stage shutdown check (`run_with_observer_and_pre_cleanup_hook`'s
+    // `flag.load(Ordering::Acquire) && !stage.always_run()` branch) actually
+    // skips a pending non-`always_run` stage while still running `always_run`
+    // cleanup. This test pre-sets the flag BEFORE the run starts, so the
+    // outcome is fully deterministic — no signal, no timing, no thread
+    // scheduling — complementing the subprocess test's proof that a real OS
+    // signal reaches this same flag in the first place.
+    #[test]
+    fn shutdown_flag_skips_pending_non_always_run_stage_but_always_run_cleanup_still_executes() {
+        use std::sync::atomic::AtomicUsize;
+
+        /// Counts real `execute` invocations so the assertions below prove
+        /// the skipped stage's body never ran — not merely that its outcome
+        /// happens to equal `Skipped` (which a different bug could also
+        /// produce).
+        struct CountingStage {
+            id: StageId,
+            deps: Vec<StageId>,
+            always_run: bool,
+            executed: Arc<AtomicUsize>,
+        }
+        impl OrchestrationStage for CountingStage {
+            fn id(&self) -> StageId {
+                self.id.clone()
+            }
+            fn name(&self) -> &str {
+                "counting"
+            }
+            fn dependencies(&self) -> &[StageId] {
+                &self.deps
+            }
+            fn applies_to_roles(&self) -> &[NodeRole] {
+                &[]
+            }
+            fn fanout(&self) -> StageFanout {
+                StageFanout::Once
+            }
+            fn always_run(&self) -> bool {
+                self.always_run
+            }
+            fn execute(&self, _ctx: &mut OrchestrationContext) -> StageOutcome {
+                self.executed.fetch_add(1, Ordering::SeqCst);
+                StageOutcome::Passed
+            }
+        }
+
+        let shutdown_flag = Arc::new(AtomicBool::new(true));
+        let pending_runs = Arc::new(AtomicUsize::new(0));
+        let cleanup_runs = Arc::new(AtomicUsize::new(0));
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            Box::new(CountingStage {
+                id: StageId::Preflight,
+                deps: vec![],
+                always_run: false,
+                executed: Arc::clone(&pending_runs),
+            }),
+            Box::new(CountingStage {
+                id: StageId::Cleanup,
+                deps: vec![StageId::Preflight],
+                always_run: true,
+                executed: Arc::clone(&cleanup_runs),
+            }),
+        ];
+        let runner = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .with_shutdown_flag(Arc::clone(&shutdown_flag));
+        let results = runner.run(&mut make_ctx()).expect("run");
+        let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
+
+        assert_eq!(
+            pending_runs.load(Ordering::SeqCst),
+            0,
+            "a pre-set shutdown flag must prevent a non-always_run stage's execute() from \
+             ever being called"
+        );
+        assert_eq!(
+            outcome_of(&StageId::Preflight),
+            Some(&StageOutcome::Skipped),
+            "a pending stage must be recorded Skipped once the shutdown flag is observed"
+        );
+        assert_eq!(
+            cleanup_runs.load(Ordering::SeqCst),
+            1,
+            "always_run cleanup must still execute exactly once despite the shutdown flag"
+        );
+        assert_eq!(
+            outcome_of(&StageId::Cleanup),
+            Some(&StageOutcome::Passed),
+            "always_run cleanup MUST run despite the shutdown flag"
+        );
+    }
+
     #[test]
     fn panicking_stage_becomes_failed_and_always_run_cleanup_still_executes() {
         // A stage that panics must be caught as Failed (not abort the runner),
