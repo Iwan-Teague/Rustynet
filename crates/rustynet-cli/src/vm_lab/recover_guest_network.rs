@@ -134,15 +134,22 @@ pub(crate) fn derive_link_local_from_mac(mac: &str) -> Option<String> {
 pub(crate) fn find_link_local_by_mac(ndp_output: &str, mac: &str) -> Option<LinkLocalTarget> {
     let target_mac = super::normalize_mac_address(mac)?;
     for line in ndp_output.lines() {
-        let mut cols = line.split_whitespace();
-        let (Some(neighbor), Some(row_mac)) = (cols.next(), cols.next()) else {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let (Some(neighbor), Some(row_mac)) = (cols.first().copied(), cols.get(1).copied()) else {
             continue;
         };
         if super::normalize_mac_address(row_mac).as_deref() != Some(target_mac.as_str()) {
             continue;
         }
-        let Some((address, zone)) = neighbor.split_once('%') else {
-            continue;
+        // Prefer the `%zone` scope in the Neighbor column; fall back to the
+        // Netif column (index 2) for ndp variants that omit it, so a reachable
+        // guest is not falsely reported as not-found.
+        let (address, zone) = match neighbor.split_once('%') {
+            Some((address, zone)) => (address, zone),
+            None => match cols.get(2).copied() {
+                Some(netif) => (neighbor, netif),
+                None => continue,
+            },
         };
         if !address.to_ascii_lowercase().starts_with("fe80:") {
             continue;
@@ -682,6 +689,12 @@ fe80::18e6:25ff:fec2:a7c1%bridge100  1a:e6:25:c2:a7:c1  bridge100 permanent R
         assert!(find_link_local_by_mac(ndp, "aa:bb:cc:dd:ee:ff").is_none());
         // The IPv4 row has no %zone → never matched as link-local.
         assert!(find_link_local_by_mac(ndp, "88:66:5a:11:22:33").is_none());
+        // A variant that omits %zone in the Neighbor column → zone from Netif.
+        let ndp_no_zone = "fe80::18e6:25ff:fec2:a7c1  1a:e6:25:c2:a7:c1  bridge100 permanent R\n";
+        let found2 = find_link_local_by_mac(ndp_no_zone, "1a:e6:25:c2:a7:c1")
+            .expect("should fall back to the Netif column for the zone");
+        assert_eq!(found2.address, "fe80::18e6:25ff:fec2:a7c1");
+        assert_eq!(found2.zone, "bridge100");
     }
 
     #[test]
