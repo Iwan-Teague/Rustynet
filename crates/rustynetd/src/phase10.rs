@@ -7843,6 +7843,17 @@ mod tests {
                 socket_path.display()
             )
         });
+        // bind() applies the process umask, which on some hosts leaves the
+        // socket group/other-writable; validate_owner_only_socket_facts (the
+        // same check the real client applies) requires owner-only, so pin it
+        // explicitly instead of depending on the host's umask.
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "test helper socket permissions should be settable at {}: {err}",
+                    socket_path.display()
+                )
+            });
         listener
             .set_nonblocking(true)
             .expect("test helper socket should be non-blocking");
@@ -7911,6 +7922,17 @@ mod tests {
                 socket_path.display()
             )
         });
+        // bind() applies the process umask, which on some hosts leaves the
+        // socket group/other-writable; validate_owner_only_socket_facts (the
+        // same check the real client applies) requires owner-only, so pin it
+        // explicitly instead of depending on the host's umask.
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "test helper socket permissions should be settable at {}: {err}",
+                    socket_path.display()
+                )
+            });
         listener
             .set_nonblocking(true)
             .expect("test helper socket should be non-blocking");
@@ -7987,6 +8009,17 @@ mod tests {
                 socket_path.display()
             )
         });
+        // bind() applies the process umask, which on some hosts leaves the
+        // socket group/other-writable; validate_owner_only_socket_facts (the
+        // same check the real client applies) requires owner-only, so pin it
+        // explicitly instead of depending on the host's umask.
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "test helper socket permissions should be settable at {}: {err}",
+                    socket_path.display()
+                )
+            });
         listener
             .set_nonblocking(true)
             .expect("test helper socket should be non-blocking");

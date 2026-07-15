@@ -579,7 +579,10 @@ pub(crate) fn read_request(stream: &mut UnixStream) -> Result<HelperRequest, Str
 }
 
 #[cfg(not(windows))]
-pub(crate) fn write_response(stream: &mut UnixStream, response: HelperResponse) -> Result<(), String> {
+pub(crate) fn write_response(
+    stream: &mut UnixStream,
+    response: HelperResponse,
+) -> Result<(), String> {
     let response_bytes = encode_helper_response(&response)
         .map_err(|err| format!("encode response failed: {err}"))?;
     write_frame(stream, HELPER_FRAME_TYPE_RESPONSE, &response_bytes)
