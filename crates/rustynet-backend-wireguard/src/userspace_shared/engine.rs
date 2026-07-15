@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::prelude::*;
-use boringtun::noise::{Tunn, TunnResult};
+use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use rustynet_backend_api::{BackendError, NodeId, PeerConfig, SocketEndpoint};
 use zeroize::{Zeroize, Zeroizing};
@@ -84,6 +84,16 @@ struct PeerEngineState {
     endpoint: SocketAddr,
     allowed_ips: Vec<AllowedIpNetwork>,
     tunnel: Tunn,
+    /// Local session index handed to `Tunn::new` (boringtun stores it as
+    /// `index << 8`). Inbound handshake responses, cookie replies, and data
+    /// packets echo it back in their `receiver_idx` (`receiver_idx >> 8 ==
+    /// tunnel_index`), so it is the canonical WireGuard demux key: it routes a
+    /// peer's reply to the tunnel that initiated the handshake regardless of the
+    /// datagram source address. Matching on source address alone silently drops
+    /// a handshake response whenever the peer's stored endpoint does not exactly
+    /// equal the datagram source, which stalls every tunnel whose endpoint is
+    /// not authoritatively pinned (e.g. non-exit mesh peers).
+    tunnel_index: u32,
 }
 
 /// FIS-0004: engine-local per-peer path-quality estimator. The rich state
@@ -232,12 +242,13 @@ impl UserspaceEngine {
             .iter()
             .map(|cidr| AllowedIpNetwork::parse(cidr))
             .collect::<Result<Vec<_>, _>>()?;
+        let tunnel_index = self.allocate_tunnel_index()?;
         let tunnel = Tunn::new(
             self.local_static_private.clone(),
             peer_static_public,
             None,
             None,
-            self.allocate_tunnel_index()?,
+            tunnel_index,
             None,
         );
 
@@ -253,6 +264,7 @@ impl UserspaceEngine {
                 endpoint,
                 allowed_ips,
                 tunnel,
+                tunnel_index,
             },
         );
         Ok(disposition)
@@ -323,7 +335,15 @@ impl UserspaceEngine {
         payload: &[u8],
         transport_generation: u64,
     ) -> Result<EngineProcessingOutcome, BackendError> {
-        let matched_node_id = self.find_node_id_by_endpoint(remote_addr);
+        // Dispatch by the canonical WireGuard receiver index first (handshake
+        // responses, cookie replies, and data packets carry it) and fall back to
+        // the source-address/endpoint match for handshake inits (which carry no
+        // receiver index) and any packet whose index has no live tunnel. This is
+        // what lets a non-exit peer's handshake response reach the tunnel that
+        // initiated it even before that peer's endpoint is authoritatively pinned.
+        let matched_node_id = self
+            .find_node_id_by_receiver_index(payload)
+            .or_else(|| self.find_node_id_by_endpoint(remote_addr));
         // Unbounded-growth guard: `recorded_peer_ciphertext_ingress` is a test-only
         // observability buffer; persisting every datagram in production would let an
         // attacker exhaust memory via a packet flood and would also retain a
@@ -510,6 +530,29 @@ impl UserspaceEngine {
         self.peer_states
             .iter()
             .find(|(_node_id, peer_state)| peer_state.endpoint == remote_addr)
+            .map(|(node_id, _peer_state)| node_id.clone())
+    }
+
+    /// Canonical WireGuard inbound demux: handshake responses, cookie replies,
+    /// and data packets echo our local session index back in `receiver_idx`
+    /// (`receiver_idx >> 8 == tunnel_index`, mirroring boringtun's own
+    /// `peers_by_idx` dispatch). Resolving the peer by that index — rather than
+    /// by the datagram source address — routes a reply to the tunnel that
+    /// initiated the handshake even before the peer's endpoint is confirmed,
+    /// which is required for tunnels whose endpoint is not authoritatively
+    /// pinned. Handshake inits carry no receiver index and unparsable/foreign
+    /// datagrams return `None`, both of which fall back to the endpoint match.
+    fn find_node_id_by_receiver_index(&self, payload: &[u8]) -> Option<NodeId> {
+        let receiver_idx = match Tunn::parse_incoming_packet(payload).ok()? {
+            Packet::HandshakeResponse(packet) => packet.receiver_idx,
+            Packet::PacketCookieReply(packet) => packet.receiver_idx,
+            Packet::PacketData(packet) => packet.receiver_idx,
+            Packet::HandshakeInit(_) => return None,
+        };
+        let tunnel_index = receiver_idx >> 8;
+        self.peer_states
+            .iter()
+            .find(|(_node_id, peer_state)| peer_state.tunnel_index == tunnel_index)
             .map(|(node_id, _peer_state)| node_id.clone())
     }
 
@@ -841,6 +884,87 @@ mod tests {
         tracker.ingest_window(0.0, Some(120));
         assert_eq!(tracker.srtt_ms, Some(50));
         assert_eq!(tracker.rttvar_ms, Some(35)); // 0.75*20 + 0.25*80
+    }
+
+    #[test]
+    fn inbound_dispatch_uses_receiver_index_independent_of_source_address() {
+        use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
+        use std::net::SocketAddr;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg.key");
+        std::fs::write(&path, BASE64_STANDARD.encode([7u8; 32])).expect("write key");
+        let mut engine = UserspaceEngine::from_private_key_file(&path).expect("engine");
+
+        let configure = |engine: &mut UserspaceEngine, name: &str, last_octet: u8, pubkey: u8| {
+            let node_id = NodeId::new(name).expect("node id");
+            engine
+                .configure_peer(&PeerConfig {
+                    node_id: node_id.clone(),
+                    endpoint: SocketEndpoint {
+                        addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, last_octet)),
+                        port: 51820,
+                    },
+                    public_key: [pubkey; 32],
+                    allowed_ips: vec![format!("100.64.{last_octet}.0/24")],
+                    persistent_keepalive_secs: None,
+                })
+                .expect("peer configures");
+            node_id
+        };
+        let peer_a = configure(&mut engine, "peer-a", 10, 0x22);
+        let peer_b = configure(&mut engine, "peer-b", 20, 0x33);
+
+        // Each peer's inbound data/response packets echo `tunnel_index << 8`
+        // back in `receiver_idx`, mirroring boringtun's `peers_by_idx` demux.
+        let idx_a = engine
+            .peer_states
+            .get(&peer_a)
+            .expect("peer a")
+            .tunnel_index;
+        let idx_b = engine
+            .peer_states
+            .get(&peer_b)
+            .expect("peer b")
+            .tunnel_index;
+        assert_ne!(idx_a, idx_b, "each peer gets a distinct tunnel index");
+
+        // A minimal WireGuard DATA message (type 4) carrying a given receiver idx.
+        let data_packet = |tunnel_index: u32| {
+            let mut pkt = vec![4u8, 0, 0, 0];
+            pkt.extend_from_slice(&(tunnel_index << 8).to_le_bytes());
+            pkt.extend_from_slice(&[0u8; 60]);
+            pkt
+        };
+
+        // The datagram source matches NEITHER peer's configured endpoint, so the
+        // legacy endpoint-only dispatch would have dropped it — the regression
+        // that stalled every non-exit mesh tunnel.
+        let foreign_src: SocketAddr = "198.51.100.7:41000".parse().expect("addr");
+        assert!(engine.find_node_id_by_endpoint(foreign_src).is_none());
+
+        // Index dispatch still routes each packet to the correct peer.
+        assert_eq!(
+            engine.find_node_id_by_receiver_index(&data_packet(idx_b)),
+            Some(peer_b.clone())
+        );
+        assert_eq!(
+            engine.find_node_id_by_receiver_index(&data_packet(idx_a)),
+            Some(peer_a.clone())
+        );
+
+        // An index with no live tunnel falls through to the endpoint fallback.
+        assert!(
+            engine
+                .find_node_id_by_receiver_index(&data_packet(0xFF_FF))
+                .is_none()
+        );
+
+        // A handshake init (type 1, no receiver index) also falls through so the
+        // responder resolves it by the initiator's endpoint as before.
+        let mut init = vec![1u8, 0, 0, 0];
+        init.extend_from_slice(&[0u8; 112]); // pad to HANDSHAKE_INIT_SZ (116)
+        assert!(engine.find_node_id_by_receiver_index(&init).is_none());
     }
 
     #[test]
