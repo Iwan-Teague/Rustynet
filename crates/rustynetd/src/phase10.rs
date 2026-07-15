@@ -1072,12 +1072,34 @@ impl LinuxCommandSystem {
         if output.success() {
             return Ok(output.stdout);
         }
+        if Self::is_empty_fib_table_error(&output) {
+            // iproute2 >= 6.19 (e.g. ubuntu 26.04) exits 2 with
+            // "Error: ipv4/ipv6: FIB table does not exist." instead of the
+            // older behavior of printing nothing and exiting 0 for a table
+            // that has no routes yet. That is the legitimate pre-WireGuard
+            // state (table 51820 not created until the first route is
+            // added), not a reconcile failure — treat it as an empty table.
+            return Ok(String::new());
+        }
         Err(SystemError::KillSwitchAssertionFailed(format!(
             "{} failed: status={} stderr={}",
             args.join(" "),
             output.status,
             output.stderr.trim()
         )))
+    }
+
+    /// Narrow, fail-closed-preserving match for the iproute2 6.19+ "empty
+    /// FIB table" CLI regression: only exit code 2 with a stderr containing
+    /// the exact `FIB table does not exist` phrase (case-insensitive) is
+    /// treated as an empty table. Every other exit code or stderr text
+    /// (e.g. permission errors) remains a hard failure.
+    fn is_empty_fib_table_error(output: &PrivilegedCommandOutput) -> bool {
+        output.status == 2
+            && output
+                .stderr
+                .to_ascii_lowercase()
+                .contains("fib table does not exist")
     }
 
     fn nft_table_output(
@@ -11580,6 +11602,76 @@ mod tests {
             .join()
             .expect("helper thread should join cleanly");
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // iproute2 >= 6.19 (e.g. ubuntu 26.04) exits 2 with "Error: ipv4: FIB
+    // table does not exist." on `ip route show table 51820` when the table
+    // has no routes yet, instead of the pre-6.19 behavior of printing
+    // nothing and exiting 0. Confirmed by direct A/B on live lab guests
+    // (ubuntu-utm-1 iproute2 6.19.0 vs debian-2 iproute2 6.15.0); see
+    // documents/operations/active/LiveLabFindings_2026-07-12.md
+    // ("iproute2-6.19 FIB-table regression"). `route_table_output` must
+    // interpret this exact condition as an empty table, not a killswitch
+    // reconcile failure. Pin the matching predicate directly (no privileged-
+    // helper transport involved) so the test is fast, portable, and exercises
+    // exactly the security-relevant fail-closed boundary described in the
+    // finding: only exit code 2 with this specific stderr text is forgiven.
+    #[test]
+    fn is_empty_fib_table_error_matches_iproute2_6_19_ipv4_message() {
+        let output = PrivilegedCommandOutput {
+            status: 2,
+            stdout: String::new(),
+            stderr: "Error: ipv4: FIB table does not exist.\n".to_string(),
+        };
+        assert!(LinuxCommandSystem::is_empty_fib_table_error(&output));
+    }
+
+    // Same handling applies to the IPv6 show path's stderr wording.
+    #[test]
+    fn is_empty_fib_table_error_matches_iproute2_6_19_ipv6_message() {
+        let output = PrivilegedCommandOutput {
+            status: 2,
+            stdout: String::new(),
+            stderr: "Error: ipv6: FIB table does not exist.\n".to_string(),
+        };
+        assert!(LinuxCommandSystem::is_empty_fib_table_error(&output));
+    }
+
+    // Matching is case-insensitive on the message text.
+    #[test]
+    fn is_empty_fib_table_error_is_case_insensitive() {
+        let output = PrivilegedCommandOutput {
+            status: 2,
+            stdout: String::new(),
+            stderr: "ERROR: IPV4: FIB TABLE DOES NOT EXIST.\n".to_string(),
+        };
+        assert!(LinuxCommandSystem::is_empty_fib_table_error(&output));
+    }
+
+    // Negative/fail-closed pin: a different exit-2 stderr (e.g. a permissions
+    // error) must NOT be treated as an empty table — only the exact
+    // FIB-table-missing condition is forgiven, every other stderr stays a
+    // hard failure.
+    #[test]
+    fn is_empty_fib_table_error_rejects_other_exit_2_errors() {
+        let output = PrivilegedCommandOutput {
+            status: 2,
+            stdout: String::new(),
+            stderr: "RTNETLINK answers: Operation not permitted\n".to_string(),
+        };
+        assert!(!LinuxCommandSystem::is_empty_fib_table_error(&output));
+    }
+
+    // Negative/fail-closed pin: the FIB-missing wording at any *other* exit
+    // code must not be forgiven either — only exit code 2 qualifies.
+    #[test]
+    fn is_empty_fib_table_error_rejects_matching_text_at_other_exit_codes() {
+        let output = PrivilegedCommandOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "Error: ipv4: FIB table does not exist.\n".to_string(),
+        };
+        assert!(!LinuxCommandSystem::is_empty_fib_table_error(&output));
     }
 
     #[cfg(target_os = "linux")]
