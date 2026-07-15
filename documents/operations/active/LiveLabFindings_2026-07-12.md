@@ -289,8 +289,60 @@ exit at 0% loss, clock skew 2s (in-tolerance). Inventory `ubuntu-utm-1` updated 
 (`utm-shared-192.168.64.0/24`). **Persistent** — name-based match survives MAC changes. Ubuntu is now
 2-node-mesh ready (`debian-headless-2:exit + ubuntu-utm-1:client`).
 
-**FOLLOW-UP (reusable function, in progress):** wrap this into a lab primitive
-`ops vm-lab-recover-guest-network --vm <name>` (must run from Bash — the macOS MCP LNP sandbox blocks the
-link-local SSH): resolve `fe80::…%bridgeN` from `ndp` by the VM's MAC → SSH over link-local → distro-aware
-DHCP-config repair (netplan name-match / networkd drop-in) → report + inventory-update the recovered IPv4.
-Also: lab guests should carry **qemu-guest-agent** so `utmctl exec` is a second agentless recovery path.
+**FOLLOW-UP (reusable function — BUILT 2026-07-14):** this recovery is now a lab primitive,
+`rustynet ops vm-lab-recover-guest-network --vm <alias>` (implemented in
+`crates/rustynet-cli/src/vm_lab/recover_guest_network.rs`, behind the `vm-lab` feature). It resolves the
+NIC MAC (`--mac`, else the UTM bundle `config.plist`), resolves `fe80::…%bridgeN` from the host `ndp`
+neighbor cache (or derives the modified-EUI-64 link-local and pings each `bridge*` to warm the cache),
+SSHes over link-local IPv6, applies a distro-aware DHCP-config repair (netplan name-match /
+NetworkManager / systemd-networkd drop-in), polls for the recovered IPv4, and — with `--update-inventory`
+— writes it back. `--dry-run` resolves and prints the link-local target **without touching the guest**
+(the safe validation path). **Must be run from a real shell** — the macOS MCP LNP sandbox blocks the
+link-local socket. Pure recovery logic (MAC→link-local, `ndp` parse, plist MAC scan, interface pick,
+netplan render, IPv4 parse) is unit-tested. Also: lab guests should carry **qemu-guest-agent** so
+`utmctl exec` is a second agentless recovery path (optional `--via-agent` mode is a future addition).
+
+---
+
+## 2026-07-14 (cont.) — First 2-node ubuntu mesh run: control plane fully proven; runtime blocked by an iproute2-6.19 FIB-table regression in rustynetd's killswitch reconcile
+
+Ran `vm-lab-orchestrate-live-lab` (rust `--node`, `--source-mode local-head`) with
+`--node debian-headless-2:exit --node ubuntu-utm-1:client` (invocation gotcha: lab bundles live under
+`~/Desktop/OS_images/UTM images`, not UTM's documents root, so pass `--utm-documents-root` or discovery
+matches nothing; and an explicit `--network-profile` *enforces* fleet-wide and trips on unrelated nodes'
+stale `network_group` labels — omit it to let it derive advisory, as the single-node run did).
+
+**Ubuntu 26.04 as a 2-node CLIENT passed the ENTIRE control plane — 14 stages green:** discover, preflight,
+prepare_source_archive, verify_ssh_reachability, cleanup_hosts, **bootstrap_hosts**, collect_pubkeys,
+membership_init, distribute_membership, **distribute_assignments** (passes now — 2 nodes give real peer
+pairs, so no more single-node empty-ALLOW_SPEC), distribute_traversal, distribute_dns_zone,
+enforce_baseline_runtime, cleanup. The one failure: **`validate_baseline_runtime: ubuntu-utm-1/MeshStatus`**
+(everything downstream — active_exit, traffic_test_matrix — skipped as a result). Consistent across 3 runs;
+debian-2's MeshStatus passes.
+
+**Drill-down (definitive, evidence-cited):**
+- MeshStatus (`rustynetd linux-mesh-status-check`) reads the ephemeral session snapshot
+  `/var/lib/rustynet/rustynetd.state` and fails if it's missing. Live capture: **debian-2 writes it**
+  (`peer_ids=` *empty*, refreshed repeatedly → passes — the check is weak, passes with zero peers);
+  **ubuntu never writes it at all** (daemon `active` but no state file → "missing" drift → fail).
+  Observability gap: `validate_baseline_runtime` keeps only the pass-bool and **discards `drift_reasons`**,
+  so the stage log only says "validation not passed".
+- Why ubuntu never persists state — the ubuntu `rustynetd` journal:
+  `restrict_permanent: reconcile failure threshold exceeded: 14…23` →
+  `backend error: NotRunning: linux wireguard backend is not running` →
+  `inspect route table 51820 failed: Error: ipv4: FIB table does not exist`. The killswitch/routing
+  reconcile fails repeatedly until the daemon gives up (so it never reaches the healthy state that writes
+  `rustynetd.state`).
+- **ROOT CAUSE (confirmed by direct A/B):** `ip route show table 51820` on an *empty* table —
+  **ubuntu 26.04 = iproute2 6.19.0 → `Error: ipv4: FIB table does not exist` exit 2**; debian-2 =
+  iproute2 6.15.0 → empty, exit 0. iproute2 **6.19** started erroring on a nonexistent/empty routing
+  table. `rustynetd`'s `inspect route table 51820` treats that exit-2 as a hard reconcile failure. The
+  kernel WireGuard stack on ubuntu is fully healthy (`modprobe wireguard` OK, `wg` present,
+  `ip link add … type wireguard` succeeds) — this is purely an iproute2 CLI-behavior regression.
+
+**This is a forward-compat bug for the WHOLE Linux fleet, not ubuntu-specific** — Fedora/Rocky/newer-Debian
+will hit it as they cross iproute2 6.19. **Fix (security-sensitive — killswitch reconcile, needs the §13.2
+flow):** in `rustynetd`'s route-table inspection, treat the specific stderr `FIB table does not exist` (with
+exit 2) as an **empty table (no routes yet)**, NOT a reconcile failure — while keeping every *other* error
+fail-closed. Add a negative test pinning the 6.19 message. Then re-run the 2-node ubuntu mesh to green
+(ubuntu is fully lab-ready at `192.168.64.21`). Tracked as a spawned fix task.
