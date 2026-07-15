@@ -174,6 +174,9 @@ observation, drift detection, redacted evidence. No mutation path exists here.
 | `NetworkMutationPort` (`LiveUtmMutationPort` + test mock) | `network_prepare.rs` | Side-effect seam: utmctl stop/start, stopped-VM-only plist rewrite, restore-bytes, management readiness; fully fault-injectable |
 | `LeaseStore` + `NetworkLease` + `ProcessProbe` | `network_prepare.rs` | Atomic network lease: overlapping transactions refused, disjoint allowed, stale recovery via pid+command identity (never pid alone) |
 | `execute_ops_vm_lab_network_prepare` / `..._restore` | `network_prepare.rs` | `ops vm-lab-network-prepare` (dry-run plan by default; `--approve-reconfigure` is the explicit mutation boundary) and `ops vm-lab-network-restore` (verified idempotent rollback) |
+| `execute_ops_vm_lab_recover_guest_network` | `recover_guest_network.rs` | `ops vm-lab-recover-guest-network`: recover a vmnet guest that lost its IPv4 lease (stale netplan MAC-pin) with no IPv4/agent — resolve `fe80::…%bridgeN` from the NIC MAC via `ndp`/modified-EUI-64, SSH over link-local IPv6, distro-aware DHCP repair (netplan name-match / NetworkManager / systemd-networkd), report + optional inventory-update. `--dry-run` resolves the target without touching the guest. Proven by hand in `LiveLabFindings_2026-07-12.md` |
+| `derive_link_local_from_mac` / `find_link_local_by_mac` / `parse_nic_mac_from_config_plist` / `pick_primary_interface` / `corrected_netplan_yaml` / `parse_ipv4_for_interface` | `recover_guest_network.rs` | Pure, unit-tested recovery primitives (MAC→EUI-64 link-local, `ndp -an` parse, plist MAC scan, interface pick, name-matched DHCP netplan render, `ip -4 addr` parse) |
+| `write_inventory_live_ips` | `mod.rs` | Shared inventory live-IP writer (atomic + reload-verify) reused by the local-UTM readiness persister and guest-network recovery |
 
 ### Installer engine (`rustynet-cli/src/install/`)
 
