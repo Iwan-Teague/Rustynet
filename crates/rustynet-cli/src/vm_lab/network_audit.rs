@@ -16,8 +16,8 @@ use std::fs;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -1294,12 +1294,74 @@ fn run_read_only(program: &str, args: &[&str]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|_| format!("{program} produced non-UTF-8 output"))
 }
 
+/// Deadline for a single `plutil` read of a UTM `config.plist`. A healthy read
+/// is sub-millisecond; the bound only exists to survive a config file whose
+/// *content* read blocks indefinitely (observed after a host power loss left a
+/// UTM bundle on a wedged APFS inode — `stat` still worked so enumeration
+/// reached the file, but every `open`+`read` hung). Discovery enumerates every
+/// registered VM, so one unreadable bundle must not wedge the whole run.
+const PLUTIL_READ_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// `run_read_only` with a hard wall-clock bound. `Command::output()` blocks
+/// until the child exits, so a `plutil` that hangs on an unreadable file would
+/// hang the caller forever. Spawn, poll `try_wait`, and SIGKILL past the
+/// deadline, surfacing a timeout error the caller records as an observation
+/// error (the VM is skipped) rather than propagating the hang.
+fn run_read_only_bounded(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("{program} invocation failed: {err}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{program} timed out after {}s (unreadable config?)",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(format!("{program} wait failed: {err}")),
+        }
+    }
+    // The child has exited; `wait_with_output` returns immediately and drains
+    // the (tiny) captured stdout/stderr.
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("{program} output collection failed: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{program} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|_| format!("{program} produced non-UTF-8 output"))
+}
+
 fn plutil_extract(config_path: &Path, key: &str, format: &str) -> Result<String, String> {
     let path_str = config_path
         .to_str()
         .ok_or_else(|| format!("non-UTF-8 path {}", config_path.display()))?;
-    run_read_only(PLUTIL_PATH, &["-extract", key, format, "-o", "-", path_str])
-        .map(|out| out.trim().to_owned())
+    run_read_only_bounded(
+        PLUTIL_PATH,
+        &["-extract", key, format, "-o", "-", path_str],
+        PLUTIL_READ_TIMEOUT,
+    )
+    .map(|out| out.trim().to_owned())
 }
 
 fn observe_utm_vm(
