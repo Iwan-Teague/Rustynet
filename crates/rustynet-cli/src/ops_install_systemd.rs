@@ -49,6 +49,27 @@ const ASSIGNMENT_REFRESH_SERVICE_DST: &str =
 const ASSIGNMENT_REFRESH_TIMER_DST: &str = "/etc/systemd/system/rustynetd-assignment-refresh.timer";
 const MANAGED_DNS_SERVICE_DST: &str = "/etc/systemd/system/rustynetd-managed-dns.service";
 
+/// Some distros (confirmed: Ubuntu 26.04's `wireguard-tools` package; NOT
+/// present on Debian 13) ship an enforcing AppArmor profile for `/usr/bin/wg`
+/// scoped to `/etc/wireguard/**`. rustynetd deliberately keeps its
+/// runtime-decrypted private key on tmpfs at `/run/rustynet/wireguard.key`
+/// (0600, owned by the daemon service user) rather than persisting it to
+/// disk, so the vendor profile does not cover it.
+const WG_APPARMOR_VENDOR_PROFILE_PATH: &str = "/etc/apparmor.d/wg";
+const WG_APPARMOR_LOCAL_OVERRIDE_PATH: &str = "/etc/apparmor.d/local/wg";
+const WG_APPARMOR_LOCAL_OVERRIDE_CONTENTS: &str = "\
+# rustynetd: allow wg to read the runtime-decrypted WireGuard private key at
+# /run/rustynet/wireguard.key (0600, owned by the rustynetd service user),
+# which the vendor profile does not cover (it only allows /etc/wireguard/).
+# wg runs as root via the privileged helper, which grants CAP_DAC_OVERRIDE in
+# its Linux capability set, but AppArmor gates USE of that capability
+# independently of the kernel capability set, so it must also be granted here
+# for the fopen() of a file owned by a different uid to succeed.
+capability dac_override,
+capability dac_read_search,
+file rw /run/rustynet/{,**},
+";
+
 fn fill_os_random_bytes(bytes: &mut [u8], label: &str) -> Result<(), String> {
     OsRng
         .try_fill_bytes(bytes)
@@ -178,6 +199,7 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         Gid::from_raw(0),
         "rustynetd-managed-dns.service",
     )?;
+    ensure_wireguard_apparmor_override()?;
 
     let socket_path = env_path_or_existing_default(
         "RUSTYNET_SOCKET",
@@ -1246,6 +1268,29 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     Ok(format!(
         "systemd installer completed: role={node_role} wireguard_listen_port={wireguard_listen_port} egress_interface={egress_interface} timeout_ms={privileged_helper_timeout_ms}",
     ))
+}
+
+/// No-op when the host has no `wg` AppArmor profile (e.g. Debian). When one
+/// is present, install a local policy override rather than editing the
+/// vendor-owned profile file directly — the vendor profile explicitly
+/// supports this via `include if exists <local/wg>`, so a package upgrade
+/// cannot silently drop the fix — then reload it so the change takes effect
+/// immediately without a reboot.
+fn ensure_wireguard_apparmor_override() -> Result<(), String> {
+    if !Path::new(WG_APPARMOR_VENDOR_PROFILE_PATH).is_file() {
+        return Ok(());
+    }
+    write_atomic_text_file(
+        Path::new(WG_APPARMOR_LOCAL_OVERRIDE_PATH),
+        WG_APPARMOR_LOCAL_OVERRIDE_CONTENTS,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o644,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o755,
+    )?;
+    run_command_checked("apparmor_parser", &["-r", WG_APPARMOR_VENDOR_PROFILE_PATH])
 }
 
 fn require_root_execution() -> Result<(), String> {
