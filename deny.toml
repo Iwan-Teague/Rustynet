@@ -84,6 +84,8 @@ allow = [
   #   CDLA-Permissive-2.0  -> webpki-roots (Mozilla CA root bundle)
   "ISC",
   "CDLA-Permissive-2.0",
+  # Blocked: MPL-2.0 is copyleft (RN-15).
+  # "MPL-2.0",
 ]
 
 [sources]
