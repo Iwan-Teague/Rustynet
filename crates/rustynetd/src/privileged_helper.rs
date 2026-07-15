@@ -1906,6 +1906,7 @@ fn validate_ip_args(args: &[&str]) -> Result<(), String> {
             Ok(())
         }
         ["-4", "route", "show", "table", "51820"] => Ok(()),
+        ["-6", "route", "show", "table", "51820"] => Ok(()),
         [
             "-6",
             "route",
@@ -2871,6 +2872,20 @@ mod tests {
             &["-4", "route", "get", "1.1.1.1"],
         )
         .expect("ip -4 route get schema should be accepted");
+    }
+
+    // Mirrors validate_request_accepts_phase1_route_truth_probe_schemas' -4
+    // case: assert_expected_bypass_routes' RouteTableFamily::V6 path (used
+    // whenever a peer endpoint is IPv6) sends this exact argv, so it must be
+    // allowlisted symmetrically with -4, not just the -6 replace/flush/get
+    // variants already covered above.
+    #[test]
+    fn validate_request_accepts_ipv6_route_show_table_schema() {
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["-6", "route", "show", "table", "51820"],
+        )
+        .expect("ip -6 route show table 51820 schema should be accepted");
     }
 
     #[test]
