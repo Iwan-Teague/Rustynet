@@ -58,6 +58,7 @@ pub(crate) struct EngineStats {
 
 pub(crate) struct UserspaceEngine {
     local_static_private: StaticSecret,
+    #[allow(dead_code)]
     local_static_public: PublicKey,
     next_tunnel_index: u32,
     peer_states: BTreeMap<NodeId, PeerEngineState>,
@@ -78,6 +79,7 @@ pub(crate) struct UserspaceEngine {
 }
 
 struct PeerEngineState {
+    #[allow(dead_code)]
     peer_static_public: PublicKey,
     endpoint: SocketAddr,
     allowed_ips: Vec<AllowedIpNetwork>,
@@ -773,7 +775,7 @@ impl fmt::Debug for UserspaceEngine {
         };
         f.debug_struct("UserspaceEngine")
             .field("has_local_static_private", &has_local_static_private)
-            .field("local_static_public", self.local_static_public.as_bytes())
+            .field("local_static_public", &"[REDACTED]")
             .field("peer_count", &self.peer_states.len())
             .field(
                 "recorded_peer_ciphertext_ingress_count",
@@ -790,7 +792,7 @@ impl fmt::Debug for UserspaceEngine {
 impl fmt::Debug for PeerEngineState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PeerEngineState")
-            .field("peer_static_public", self.peer_static_public.as_bytes())
+            .field("peer_static_public", &"[REDACTED]")
             .field("endpoint", &self.endpoint)
             .field("allowed_ips", &self.allowed_ips)
             .finish()

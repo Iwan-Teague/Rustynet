@@ -315,6 +315,19 @@ mod tests {
         assert!(status.success(), "git {args:?} failed in {repo:?}");
     }
 
+    /// Run `git <args>` in `repo`, assert it succeeds, and return its trimmed
+    /// stdout. For read-only queries (`rev-parse`, `cat-file`) where the output
+    /// is the value under test.
+    fn git_capture(repo: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed in {repo:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
     /// Build an *uncompressed* tar for `mode` (so the test can scan the bytes
     /// for file content without an extraction step) using the same tree-ish
     /// resolution the real `.tar.gz` path uses.
@@ -420,18 +433,38 @@ mod tests {
         git(repo, &["commit", "-q", "-m", "initial"]);
 
         std::fs::write(&tracked, b"dirty\n").unwrap();
+
+        // `git stash create` snapshots the working tree into a *dangling*
+        // commit whose SHA folds in the committer timestamp at second
+        // granularity. The archive marker is produced by a second, independent
+        // `git stash create` inside `build_source_tarball`, so the two commit
+        // SHAs disagree whenever the two calls straddle a one-second boundary
+        // (easy under parallel test load) — asserting on the raw short SHA is
+        // therefore flaky. Assert on the commit's *tree* instead: the
+        // working-tree snapshot is byte-identical across both calls, so its
+        // tree object id is content-addressed and timestamp-independent.
         let tree_ish = resolve_source_tree_ish(repo, ArchiveSourceMode::WorkingTree).unwrap();
-        assert_ne!(tree_ish, "HEAD");
-        let expected = Command::new("git")
-            .args(["rev-parse", "--short", &tree_ish])
-            .current_dir(repo)
-            .output()
-            .unwrap();
-        assert!(expected.status.success());
-        let expected = String::from_utf8(expected.stdout).unwrap();
+        assert_ne!(
+            tree_ish, "HEAD",
+            "dirty tracked tree must snapshot via git stash create, not fall back to HEAD"
+        );
+        let expected_tree = git_capture(repo, &["rev-parse", &format!("{tree_ish}^{{tree}}")]);
 
         let marker = marker_from_built_archive(repo, ArchiveSourceMode::WorkingTree);
+        let marker = marker.trim();
 
-        assert_eq!(marker.trim(), expected.trim());
+        // The marker embedded in the archive must be a real commit object …
+        assert_eq!(
+            git_capture(repo, &["cat-file", "-t", marker]),
+            "commit",
+            "archive marker {marker:?} must resolve to a commit object"
+        );
+        // … whose tree is exactly the working-tree snapshot the archive
+        // packages (proving production recorded the stash snapshot, not HEAD).
+        let marker_tree = git_capture(repo, &["rev-parse", &format!("{marker}^{{tree}}")]);
+        assert_eq!(
+            marker_tree, expected_tree,
+            "archive marker commit tree must equal the working-tree snapshot tree"
+        );
     }
 }
