@@ -527,16 +527,21 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
 
 // The request/response value types are the in-memory form of the unix helper
 // wire protocol; Windows never constructs them (its IPC path fails closed).
+// pub(crate): the phase10.rs test-only mock helper server reuses these plus
+// read_request/write_response below (rather than hand-rolling its own copy of
+// the wire format) so the mock can never drift from the real codec again —
+// see the iproute2-6.19-fib-table-fix triage that found the mock speaking a
+// stale pre-framing JSON-line protocol.
 #[cfg(not(windows))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct HelperRequest {
-    program: String,
-    args: Vec<String>,
+pub(crate) struct HelperRequest {
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
 }
 
 #[cfg(not(windows))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct HelperResponse {
+pub(crate) struct HelperResponse {
     ok: bool,
     status: Option<i32>,
     stdout: Option<String>,
@@ -546,7 +551,7 @@ struct HelperResponse {
 
 #[cfg(not(windows))]
 impl HelperResponse {
-    fn error(message: String) -> Self {
+    pub(crate) fn error(message: String) -> Self {
         Self {
             ok: false,
             status: None,
@@ -556,7 +561,7 @@ impl HelperResponse {
         }
     }
 
-    fn success(status: i32, stdout: String, stderr: String) -> Self {
+    pub(crate) fn success(status: i32, stdout: String, stderr: String) -> Self {
         Self {
             ok: true,
             status: Some(status),
@@ -568,13 +573,16 @@ impl HelperResponse {
 }
 
 #[cfg(not(windows))]
-fn read_request(stream: &mut UnixStream) -> Result<HelperRequest, String> {
+pub(crate) fn read_request(stream: &mut UnixStream) -> Result<HelperRequest, String> {
     let request_bytes = read_frame(stream, HELPER_FRAME_TYPE_REQUEST)?;
     decode_helper_request(&request_bytes).map_err(|err| format!("request decode failed: {err}"))
 }
 
 #[cfg(not(windows))]
-fn write_response(stream: &mut UnixStream, response: HelperResponse) -> Result<(), String> {
+pub(crate) fn write_response(
+    stream: &mut UnixStream,
+    response: HelperResponse,
+) -> Result<(), String> {
     let response_bytes = encode_helper_response(&response)
         .map_err(|err| format!("encode response failed: {err}"))?;
     write_frame(stream, HELPER_FRAME_TYPE_RESPONSE, &response_bytes)

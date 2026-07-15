@@ -6861,9 +6861,9 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout), "hello");
     }
 
-    #[cfg(target_os = "linux")]
-    use std::io::{BufRead, BufReader, Write};
     use std::net::IpAddr;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt;
     #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixListener;
     #[cfg(target_os = "linux")]
@@ -7793,16 +7793,27 @@ mod tests {
         }
     }
 
+    // A world-writable sticky /tmp (the Unix default) fails
+    // validate_owner_only_socket_facts' parent-directory check, so the test
+    // socket needs its own owner-only directory rather than /tmp directly.
     #[cfg(target_os = "linux")]
-    fn parse_helper_request_command(line: &str) -> Option<String> {
-        let payload: serde_json::Value = serde_json::from_str(line).ok()?;
-        let program = payload.get("program")?.as_str()?;
-        let args = payload.get("args")?.as_array()?;
-        let parts = args
-            .iter()
-            .map(|value| value.as_str())
-            .collect::<Option<Vec<_>>>()?;
-        Some(format!("{program} {}", parts.join(" ")))
+    fn phase10_test_socket_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rn10-sockets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
+            panic!(
+                "test helper socket dir should be creatable at {}: {err}",
+                dir.display()
+            )
+        });
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap_or_else(
+            |err| {
+                panic!(
+                    "test helper socket dir permissions should be settable at {}: {err}",
+                    dir.display()
+                )
+            },
+        );
+        dir
     }
 
     #[cfg(target_os = "linux")]
@@ -7812,10 +7823,7 @@ mod tests {
             .expect("clock should be valid")
             .as_nanos();
         // Keep socket paths short enough for UNIX domain limits, especially on macOS.
-        PathBuf::from("/tmp").join(format!(
-            "rn10-{prefix}-{}-{unique:x}.sock",
-            std::process::id()
-        ))
+        phase10_test_socket_dir().join(format!("rn10-{prefix}-{unique:x}.sock"))
     }
 
     #[cfg(target_os = "linux")]
@@ -7835,6 +7843,17 @@ mod tests {
                 socket_path.display()
             )
         });
+        // bind() applies the process umask, which on some hosts leaves the
+        // socket group/other-writable; validate_owner_only_socket_facts (the
+        // same check the real client applies) requires owner-only, so pin it
+        // explicitly instead of depending on the host's umask.
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "test helper socket permissions should be settable at {}: {err}",
+                    socket_path.display()
+                )
+            });
         listener
             .set_nonblocking(true)
             .expect("test helper socket should be non-blocking");
@@ -7851,45 +7870,28 @@ mod tests {
                         if stream.set_nonblocking(false).is_err() {
                             continue;
                         }
-                        let reader_stream = match stream.try_clone() {
-                            Ok(value) => value,
-                            Err(_) => continue,
-                        };
-                        let mut reader = BufReader::new(reader_stream);
-                        let mut line = String::new();
-                        match reader.read_line(&mut line) {
-                            Ok(read) if read > 0 => {
-                                if let Some(command) = parse_helper_request_command(line.trim_end())
-                                {
-                                    commands_clone
-                                        .lock()
-                                        .expect("test helper command log should lock")
-                                        .push(command);
-                                } else {
-                                    let _ = stream.write_all(
-                                        b"{\"ok\":false,\"error\":\"invalid helper request\"}\n",
-                                    );
-                                    let _ = stream.flush();
-                                    continue;
-                                }
-                            }
-                            _ => {
-                                let _ = stream.write_all(
-                                    b"{\"ok\":false,\"error\":\"helper request read failed\"}\n",
+                        let request = match crate::privileged_helper::read_request(&mut stream) {
+                            Ok(request) => request,
+                            Err(err) => {
+                                let _ = crate::privileged_helper::write_response(
+                                    &mut stream,
+                                    crate::privileged_helper::HelperResponse::error(err),
                                 );
-                                let _ = stream.flush();
                                 continue;
                             }
-                        }
-                        if stream
-                            .write_all(
-                                b"{\"ok\":true,\"status\":0,\"stdout\":\"\",\"stderr\":\"\"}\n",
-                            )
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        let _ = stream.flush();
+                        };
+                        commands_clone
+                            .lock()
+                            .expect("test helper command log should lock")
+                            .push(format!("{} {}", request.program, request.args.join(" ")));
+                        let _ = crate::privileged_helper::write_response(
+                            &mut stream,
+                            crate::privileged_helper::HelperResponse::success(
+                                0,
+                                String::new(),
+                                String::new(),
+                            ),
+                        );
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -7920,6 +7922,17 @@ mod tests {
                 socket_path.display()
             )
         });
+        // bind() applies the process umask, which on some hosts leaves the
+        // socket group/other-writable; validate_owner_only_socket_facts (the
+        // same check the real client applies) requires owner-only, so pin it
+        // explicitly instead of depending on the host's umask.
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "test helper socket permissions should be settable at {}: {err}",
+                    socket_path.display()
+                )
+            });
         listener
             .set_nonblocking(true)
             .expect("test helper socket should be non-blocking");
@@ -7937,59 +7950,35 @@ mod tests {
                         if stream.set_nonblocking(false).is_err() {
                             continue;
                         }
-                        let reader_stream = match stream.try_clone() {
-                            Ok(value) => value,
-                            Err(_) => continue,
-                        };
-                        let mut reader = BufReader::new(reader_stream);
-                        let mut line = String::new();
-                        let command = match reader.read_line(&mut line) {
-                            Ok(read) if read > 0 => {
-                                let Some(parsed) = parse_helper_request_command(line.trim_end())
-                                else {
-                                    let _ = stream.write_all(
-                                        b"{\"ok\":false,\"error\":\"invalid helper request\"}\n",
-                                    );
-                                    let _ = stream.flush();
-                                    continue;
-                                };
-                                commands_clone
-                                    .lock()
-                                    .expect("test helper command log should lock")
-                                    .push(parsed.clone());
-                                parsed
-                            }
-                            _ => {
-                                let _ = stream.write_all(
-                                    b"{\"ok\":false,\"error\":\"helper request read failed\"}\n",
+                        let request = match crate::privileged_helper::read_request(&mut stream) {
+                            Ok(request) => request,
+                            Err(err) => {
+                                let _ = crate::privileged_helper::write_response(
+                                    &mut stream,
+                                    crate::privileged_helper::HelperResponse::error(err),
                                 );
-                                let _ = stream.flush();
                                 continue;
                             }
                         };
+                        let command = format!("{} {}", request.program, request.args.join(" "));
+                        commands_clone
+                            .lock()
+                            .expect("test helper command log should lock")
+                            .push(command.clone());
 
-                        let response = if command.contains("nft list tables") {
-                            serde_json::json!({
-                                "ok": true,
-                                "status": 0,
-                                "stdout": tables_output,
-                                "stderr": ""
-                            })
+                        let stdout = if command.contains("nft list tables") {
+                            tables_output.clone()
                         } else {
-                            serde_json::json!({
-                                "ok": true,
-                                "status": 0,
-                                "stdout": "",
-                                "stderr": ""
-                            })
+                            String::new()
                         };
-                        if stream
-                            .write_all(format!("{response}\n").as_bytes())
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        let _ = stream.flush();
+                        let _ = crate::privileged_helper::write_response(
+                            &mut stream,
+                            crate::privileged_helper::HelperResponse::success(
+                                0,
+                                stdout,
+                                String::new(),
+                            ),
+                        );
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -8020,6 +8009,17 @@ mod tests {
                 socket_path.display()
             )
         });
+        // bind() applies the process umask, which on some hosts leaves the
+        // socket group/other-writable; validate_owner_only_socket_facts (the
+        // same check the real client applies) requires owner-only, so pin it
+        // explicitly instead of depending on the host's umask.
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "test helper socket permissions should be settable at {}: {err}",
+                    socket_path.display()
+                )
+            });
         listener
             .set_nonblocking(true)
             .expect("test helper socket should be non-blocking");
@@ -8037,36 +8037,21 @@ mod tests {
                         if stream.set_nonblocking(false).is_err() {
                             continue;
                         }
-                        let reader_stream = match stream.try_clone() {
-                            Ok(value) => value,
-                            Err(_) => continue,
-                        };
-                        let mut reader = BufReader::new(reader_stream);
-                        let mut line = String::new();
-                        let command = match reader.read_line(&mut line) {
-                            Ok(read) if read > 0 => {
-                                let Some(parsed) = parse_helper_request_command(line.trim_end())
-                                else {
-                                    let _ = stream.write_all(
-                                        b"{\"ok\":false,\"error\":\"invalid helper request\"}\n",
-                                    );
-                                    let _ = stream.flush();
-                                    continue;
-                                };
-                                commands_clone
-                                    .lock()
-                                    .expect("test helper command log should lock")
-                                    .push(parsed.clone());
-                                parsed
-                            }
-                            _ => {
-                                let _ = stream.write_all(
-                                    b"{\"ok\":false,\"error\":\"helper request read failed\"}\n",
+                        let request = match crate::privileged_helper::read_request(&mut stream) {
+                            Ok(request) => request,
+                            Err(err) => {
+                                let _ = crate::privileged_helper::write_response(
+                                    &mut stream,
+                                    crate::privileged_helper::HelperResponse::error(err),
                                 );
-                                let _ = stream.flush();
                                 continue;
                             }
                         };
+                        let command = format!("{} {}", request.program, request.args.join(" "));
+                        commands_clone
+                            .lock()
+                            .expect("test helper command log should lock")
+                            .push(command.clone());
 
                         let scripted = responses
                             .iter()
@@ -8077,19 +8062,14 @@ mod tests {
                                 stdout: String::new(),
                                 stderr: String::new(),
                             });
-                        let response = serde_json::json!({
-                            "ok": true,
-                            "status": scripted.status,
-                            "stdout": scripted.stdout,
-                            "stderr": scripted.stderr,
-                        });
-                        if stream
-                            .write_all(format!("{response}\n").as_bytes())
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        let _ = stream.flush();
+                        let _ = crate::privileged_helper::write_response(
+                            &mut stream,
+                            crate::privileged_helper::HelperResponse::success(
+                                scripted.status,
+                                scripted.stdout,
+                                scripted.stderr,
+                            ),
+                        );
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
