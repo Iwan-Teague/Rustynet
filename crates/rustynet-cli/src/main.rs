@@ -992,6 +992,10 @@ enum OpsCommand {
         config: vm_lab::network_prepare::VmLabNetworkRestoreConfig,
     },
     #[cfg(feature = "vm-lab")]
+    VmLabRecoverGuestNetwork {
+        config: vm_lab::recover_guest_network::VmLabRecoverGuestNetworkConfig,
+    },
+    #[cfg(feature = "vm-lab")]
     VmLabStart {
         config: vm_lab::VmLabStartConfig,
     },
@@ -3522,6 +3526,19 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 inventory_path: parser.optional_path("--inventory"),
                 utmctl_path: parser.optional_path("--utmctl-path"),
                 state_dir: parser.optional_path("--state-dir"),
+            },
+        }),
+        #[cfg(feature = "vm-lab")]
+        "vm-lab-recover-guest-network" => Ok(OpsCommand::VmLabRecoverGuestNetwork {
+            config: vm_lab::recover_guest_network::VmLabRecoverGuestNetworkConfig {
+                vm_alias: parser.value("--vm").ok_or_else(|| {
+                    "vm-lab-recover-guest-network requires --vm <alias>".to_owned()
+                })?,
+                inventory_path: parser.optional_path("--inventory"),
+                mac: parser.value("--mac"),
+                ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                update_inventory: parser.has_flag("--update-inventory"),
+                dry_run: parser.has_flag("--dry-run"),
             },
         }),
         #[cfg(feature = "vm-lab")]
@@ -7944,6 +7961,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabNetworkRestore { config } => {
             vm_lab::network_prepare::execute_ops_vm_lab_network_restore(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabRecoverGuestNetwork { config } => {
+            vm_lab::recover_guest_network::execute_ops_vm_lab_recover_guest_network(config)
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabStart { config } => vm_lab::execute_ops_vm_lab_start(config),

@@ -7,6 +7,7 @@ pub mod network_prepare;
 pub mod network_profile;
 pub mod orchestrator;
 pub mod overnight;
+pub mod recover_guest_network;
 pub mod run_history;
 pub mod topology;
 
@@ -28382,6 +28383,33 @@ fn persist_local_utm_ready_states_to_inventory(
     inventory_path: &Path,
     states: &[LocalUtmReadyState],
 ) -> Result<String, String> {
+    let updates = states
+        .iter()
+        .filter_map(|state| {
+            state
+                .live_ip
+                .as_ref()
+                .map(|live_ip| (state.alias.as_str(), live_ip.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    write_inventory_live_ips(inventory_path, &updates)
+}
+
+/// Write observed/recovered live IPs into the inventory: for each
+/// `alias -> live_ip`, rewrite the `ssh_target` host, set `last_known_ip`, and
+/// front the address onto `live_ips`. Atomic write + reload-verify. Shared by
+/// the local-UTM readiness persister and the guest-network recovery command so
+/// neither hand-rolls inventory JSON.
+pub(crate) fn write_inventory_live_ips(
+    inventory_path: &Path,
+    updates: &BTreeMap<&str, &str>,
+) -> Result<String, String> {
+    if updates.is_empty() {
+        return Ok(format!(
+            "inventory not updated because no authoritative live IPs were observed in {}",
+            inventory_path.display()
+        ));
+    }
     let original = fs::read_to_string(inventory_path).map_err(|err| {
         format!(
             "read vm inventory for live IP update failed ({}): {err}",
@@ -28410,25 +28438,9 @@ fn persist_local_utm_ready_states_to_inventory(
             )
         })?;
 
-    let updates = states
-        .iter()
-        .filter_map(|state| {
-            state
-                .live_ip
-                .as_ref()
-                .map(|live_ip| (state.alias.as_str(), live_ip.as_str()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    if updates.is_empty() {
-        return Ok(format!(
-            "inventory not updated because no authoritative live IPs were observed in {}",
-            inventory_path.display()
-        ));
-    }
-
     let mut updated_aliases = Vec::new();
     let mut missing_aliases = Vec::new();
-    for (alias, live_ip) in &updates {
+    for (alias, live_ip) in updates {
         let Some(entry_value) = entries.iter_mut().find(|entry| {
             entry
                 .as_object()
