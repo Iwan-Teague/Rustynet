@@ -4917,13 +4917,9 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 "--env-path",
                 PathBuf::from(DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH),
             ),
-            exit_node_id: parser.value("--exit-node-id").and_then(|value| {
-                if value.trim().is_empty() {
-                    None
-                } else {
-                    Some(value)
-                }
-            }),
+            exit_node_id: parser
+                .value("--exit-node-id")
+                .filter(|v| !v.trim().is_empty()),
         }),
         "force-local-assignment-refresh-now" => {
             if args.len() != 1 {
@@ -4962,13 +4958,9 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         }
         "apply-role-coupling" => Ok(OpsCommand::ApplyRoleCoupling {
             target_role: parser.required("--target-role")?,
-            preferred_exit_node_id: parser.value("--preferred-exit-node-id").and_then(|value| {
-                if value.trim().is_empty() {
-                    None
-                } else {
-                    Some(value)
-                }
-            }),
+            preferred_exit_node_id: parser
+                .value("--preferred-exit-node-id")
+                .filter(|v| !v.trim().is_empty()),
             enable_exit_advertise: parse_bool_value(
                 "--enable-exit-advertise",
                 parser
