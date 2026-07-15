@@ -227,13 +227,19 @@ mod tests {
     use super::*;
 
     fn temp_matrix(rows: &[&str]) -> PathBuf {
+        // A process-wide counter guarantees a unique path per call: these tests
+        // run in parallel in one process, and a timestamp alone can collide when
+        // two of them build a fixture inside the same clock tick, letting one
+        // test clobber another's matrix and fail intermittently.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "coverage_matrix_{}_{}.csv",
+            "coverage_matrix_{}_{}_{}.csv",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let header =
             "run_id,run_started_utc,row_role,linux_hello_limiter_flood,windows_enrollment_replay";
