@@ -2203,11 +2203,9 @@ fn set_owner_mode_on_key_custody_artifacts(
 }
 
 fn is_private_key_custody_artifact_name(file_name: &str) -> bool {
-    const PREFIX: [u8; 11] = [
-        b'w', b'g', b'-', b'p', b'r', b'i', b'v', b'a', b't', b'e', b'-',
-    ];
+    const PREFIX: &[u8] = b"wg-private-";
     let bytes = file_name.as_bytes();
-    bytes.len() >= PREFIX.len() && bytes[..PREFIX.len()] == PREFIX && file_name.ends_with(".enc")
+    bytes.starts_with(PREFIX) && file_name.ends_with(".enc")
 }
 
 fn secure_remove_file(path: &Path) -> Result<(), String> {

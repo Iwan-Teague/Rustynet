@@ -470,7 +470,7 @@ mod daemon {
                     }
                     self.handle_hello(data, from_addr).await
                 }
-                _ => Err(format!("unknown message type: {:#02x}", data[0])),
+                _ => Err(format!("unknown message type: {:#04x}", data[0])),
             }
         }
 

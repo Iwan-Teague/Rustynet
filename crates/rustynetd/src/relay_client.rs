@@ -1037,7 +1037,7 @@ fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
             };
             Err(reason)
         }
-        other => Err(format!("unexpected message type: {other:#02x}")),
+        other => Err(format!("unexpected message type: {other:#04x}")),
     }
 }
 
