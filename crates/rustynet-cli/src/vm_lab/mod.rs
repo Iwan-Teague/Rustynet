@@ -151,6 +151,13 @@ pub struct VmLabHostRunStatusConfig {
     pub host_id: String,
     /// Which run to report. Absent ⇒ the newest recorded on that host.
     pub run_id: Option<String>,
+    /// Report only stages whose name contains this (case-insensitive substring).
+    ///
+    /// A substring rather than an exact name, and ONE filter rather than a
+    /// function per stage: there are ~36 stage triples and the set changes, so a
+    /// wrapper each would be near-identical code that drifts from the catalogue
+    /// the moment a stage is added. A filter over the generic reader cannot drift.
+    pub stage: Option<String>,
     pub ssh_identity_file: Option<PathBuf>,
     pub known_hosts_path: Option<PathBuf>,
     pub timeout_secs: u64,
@@ -170,6 +177,9 @@ pub struct VmLabRunMatrixCompareConfig {
     /// Compare runs whose worktree was dirty (their evidence does not match the
     /// commit it names). Off by default.
     pub allow_dirty: bool,
+    /// Restrict to stages whose name contains this (case-insensitive substring) —
+    /// "how did THIS stage do across both machines?".
+    pub stage: Option<String>,
     pub json: bool,
 }
 
@@ -3748,7 +3758,25 @@ pub fn execute_ops_vm_lab_host_run_status(
         .map(|row| row.run_id.clone())
         .unwrap_or_default();
     let selected = config.run_id.clone().unwrap_or(latest_run);
-    let run_rows: Vec<_> = rows.iter().filter(|row| row.run_id == selected).collect();
+    let mut run_rows: Vec<_> = rows.iter().filter(|row| row.run_id == selected).collect();
+    if let Some(needle) = config.stage.as_deref() {
+        let needle = needle.to_ascii_lowercase();
+        let before = run_rows.len();
+        run_rows.retain(|row| row.stage.to_ascii_lowercase().contains(needle.as_str()));
+        if run_rows.is_empty() {
+            // Fail closed: an empty filter result must not read as "nothing wrong".
+            let known: BTreeSet<&str> = rows
+                .iter()
+                .filter(|row| row.run_id == selected)
+                .map(|row| row.stage.as_str())
+                .collect();
+            return Err(format!(
+                "no stage matching {needle:?} in run {selected} on host {} ({before} stage row(s) exist).                  Stages recorded in that run:\n  {}",
+                host.host_id,
+                known.into_iter().collect::<Vec<_>>().join("\n  ")
+            ));
+        }
+    }
 
     let mut passed: Vec<&str> = Vec::new();
     let mut failed: Vec<(&str, &str, &str)> = Vec::new();
@@ -3843,10 +3871,7 @@ pub fn execute_ops_vm_lab_run_matrix_compare(
     // Match on a prefix: run_ids and ledgers carry abbreviated commits in places.
     let matching: Vec<_> = rows
         .into_iter()
-        .filter(|row| {
-            let recorded = row.git_commit.trim().to_ascii_lowercase();
-            !recorded.is_empty() && (commit.starts_with(&recorded) || recorded.starts_with(&commit))
-        })
+        .filter(|row| commit_matches(commit.as_str(), row.git_commit.as_str()))
         .collect();
 
     if matching.is_empty() {
@@ -3876,6 +3901,22 @@ pub fn execute_ops_vm_lab_run_matrix_compare(
             dirty.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
+
+    let matching: Vec<_> = match config.stage.as_deref() {
+        None => matching,
+        Some(needle) => {
+            let lowered = needle.to_ascii_lowercase();
+            let filtered: Vec<_> = matching
+                .into_iter()
+                .filter(|row| row.stage.to_ascii_lowercase().contains(lowered.as_str()))
+                .collect();
+            if filtered.is_empty() {
+                // An empty filter result is not a pass.
+                return Err(format!("no stage matching {needle:?} recorded at {commit}"));
+            }
+            filtered
+        }
+    };
 
     let alias_hosts = alias_to_host_map(inventory_path.as_path())?;
 
@@ -5144,8 +5185,12 @@ fn sync_remote_host(
     })
 }
 
-/// Run `git -C <repo_dir> <args>` on a host over SSH, argv-only (§4: never build
-/// a shell string with untrusted values).
+/// Run `git -C <repo_dir> <args>` on a host over SSH.
+///
+/// Delegates to [`run_host_cmd`] rather than rebuilding the SSH invocation: two
+/// copies of the transport options is exactly the second-weaker-path problem this
+/// module argues against elsewhere, and it is how one copy quietly loses a
+/// hardening flag the other keeps.
 fn run_host_git(
     endpoint: &str,
     repo_dir: &str,
@@ -5153,50 +5198,30 @@ fn run_host_git(
     config: &VmLabSyncHostConfig,
     timeout: Duration,
 ) -> Result<String, String> {
-    let mut command = Command::new("ssh");
-    command.args([
-        "-n",
-        "-F",
-        "/dev/null",
-        "-o",
-        "LogLevel=ERROR",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        "ConnectTimeout=15",
-        "-o",
-        "IdentitiesOnly=yes",
-    ]);
-    let identity = config
-        .ssh_identity_file
-        .clone()
-        .unwrap_or_else(default_lab_ssh_identity_path);
-    let known_hosts = config
-        .known_hosts_path
-        .clone()
-        .unwrap_or_else(default_known_hosts_path);
-    append_ssh_transport_options(
-        &mut command,
-        Some(identity.as_path()),
-        Some(known_hosts.as_path()),
-    )?;
-    command.arg("--").arg(endpoint);
-    command.arg("git").arg("-C").arg(repo_dir);
-    for arg in args {
-        command.arg(arg);
+    let mut full: Vec<&str> = vec!["git", "-C", repo_dir];
+    full.extend_from_slice(args);
+    run_host_cmd(endpoint, full.as_slice(), config, timeout)
+}
+
+/// Does a recorded `git_commit` refer to the commit under comparison?
+///
+/// Ledgers record either a full 40-char SHA or a git-style abbreviation, so a
+/// prefix match is required — but an UNBOUNDED prefix match is a hazard: a
+/// truncated or malformed field like `"ab"` would match a great many commits and
+/// silently pull a foreign run into a comparison. Evidence must not be attributed
+/// by coincidence, so anything shorter than git's own minimum abbreviation (7) is
+/// rejected outright rather than matched loosely.
+fn commit_matches(target: &str, recorded: &str) -> bool {
+    const MIN_ABBREV: usize = 7;
+    let recorded = recorded.trim().to_ascii_lowercase();
+    let target = target.trim().to_ascii_lowercase();
+    if recorded.len() < MIN_ABBREV || target.len() < MIN_ABBREV {
+        return false;
     }
-    let output = run_output_with_timeout(&mut command, timeout)?;
-    if !output.status.success() {
-        return Err(format!(
-            "ssh git {} on {endpoint} exited {}: {}",
-            args.join(" "),
-            status_code(output.status),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    if !recorded.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return false;
     }
-    String::from_utf8(output.stdout).map_err(|err| format!("git output was not UTF-8: {err}"))
+    target.starts_with(&recorded) || recorded.starts_with(&target)
 }
 
 /// Resolve a ref to a full 40-char lowercase SHA, failing closed on anything else.
@@ -37760,14 +37785,14 @@ mod tests {
         build_vm_lab_topology, build_windows_local_source_extract_result_script,
         build_windows_local_source_extract_script,
         build_windows_local_source_presync_cleanup_script, collect_live_lab_stage_local_bundle,
-        create_orchestration_staging_dir, decide_restart_unready, default_inventory_path,
-        default_live_lab_iteration_profile_path, default_live_lab_iteration_report_dir,
-        default_live_lab_orchestrator_path, default_platform_profile, default_utmctl_path,
-        discover_local_utm_bundle_paths, discover_local_utm_bundle_paths_bounded,
-        encode_powershell_command, ensure_inventory_entries_share_network,
-        ensure_provision_guest_name, ensure_provision_image_name,
-        execute_ops_vm_lab_diff_live_lab_runs, execute_ops_vm_lab_discover_local_utm,
-        execute_ops_vm_lab_discover_local_utm_summary,
+        commit_matches, create_orchestration_staging_dir, decide_restart_unready,
+        default_inventory_path, default_live_lab_iteration_profile_path,
+        default_live_lab_iteration_report_dir, default_live_lab_orchestrator_path,
+        default_platform_profile, default_utmctl_path, discover_local_utm_bundle_paths,
+        discover_local_utm_bundle_paths_bounded, encode_powershell_command,
+        ensure_inventory_entries_share_network, ensure_provision_guest_name,
+        ensure_provision_image_name, execute_ops_vm_lab_diff_live_lab_runs,
+        execute_ops_vm_lab_discover_local_utm, execute_ops_vm_lab_discover_local_utm_summary,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
         extract_ip_candidates_for_macs_from_ip_neigh_output, extract_ip_for_mac_from_arp_output,
         is_macos_metadata_artifact_name, live_lab_stage_forensics_notes, load_inventory,
@@ -38651,6 +38676,39 @@ mod tests {
         // a LOCAL uri has no ssh endpoint — must not be guessed
         assert_eq!(host(Some("qemu:///system")).ssh_endpoint(), None);
         assert_eq!(host(None).ssh_endpoint(), None);
+    }
+
+    /// Ledgers record full SHAs or git-style abbreviations, so compare must match
+    /// on a prefix — but an UNBOUNDED prefix match would let a truncated or
+    /// corrupt field pull a foreign run into a comparison. Evidence must never be
+    /// attributed by coincidence.
+    #[test]
+    fn commit_matching_refuses_to_attribute_evidence_by_coincidence() {
+        let full = "2c004782fb2f0950aecf5430fa00adac244d24ee";
+        let other = "b8304a1ae5007524fab9f3088c8dfe0b45d09410";
+
+        // full == full, and the 12-char abbreviation the ledger actually records
+        assert!(commit_matches(full, full));
+        assert!(commit_matches(full, "2c004782fb2f"));
+        assert!(commit_matches("2c004782fb2f", full));
+        assert!(commit_matches(full, "2C004782FB2F"), "case-insensitive");
+
+        // a different commit must never match
+        assert!(!commit_matches(full, other));
+
+        // DANGEROUS: a truncated/corrupt field would match many commits — reject
+        for too_short in ["2", "2c", "2c0", "2c00", "2c004", "2c0047", ""] {
+            assert!(
+                !commit_matches(full, too_short),
+                "{too_short:?} is shorter than git's minimum abbreviation and must not match"
+            );
+        }
+        // non-hex garbage is not a commit
+        assert!(!commit_matches(full, "not-a-sha-at-all"));
+        assert!(
+            !commit_matches("short", full),
+            "short target must not match"
+        );
     }
 
     /// The load-bearing safety property: an ABSENT result must never be rendered

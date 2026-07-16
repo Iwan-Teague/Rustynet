@@ -773,6 +773,20 @@ SHA its evidence claims, and step 6 would catch it — which is the point).
 **Accepted risk:** a patch that fixes Windows can regress macOS. Re-running both
 from the new SHA is what catches it — that is the argument *for* the loop.
 
+### 6.7.4e Self-review of the multi-host commands (2026-07-16)
+
+Reviewed the six commands built this session against each other. Findings, all fixed:
+
+| # | Finding | Fix |
+| --- | --- | --- |
+| 1 | 🚨 **`sync-host` destroyed box-side evidence.** `reset --hard` ran *before* any host dirty check, and the ledgers are tracked → a run's rows were reverted, then the post-reset check reported `clean` because it had just deleted what made it dirty. | Read host status **first**; refuse a dirty host with its diff; name evidence ledgers explicitly; `--discard-host-changes` to opt in (§6.7.4c). |
+| 2 | 🚩 **Compare's commit match was unbounded.** `!recorded.is_empty() && target.starts_with(recorded)` — a truncated/corrupt `git_commit` like `"ab"` would match many commits and pull a **foreign run** into a comparison. Evidence attributed by coincidence. | `commit_matches()`: require ≥ 7 hex chars (git's own minimum abbreviation) on **both** sides, reject non-hex. Tested against `"2"`…`"2c0047"` and garbage. |
+| 3 | 🚩 **The SSH invocation was duplicated.** `run_host_git` and `run_host_cmd` each rebuilt the same transport options — the second-weaker-path problem this plan argues against at the MCP (§6.8.2), committed here. That is how one copy quietly loses a hardening flag the other keeps. | `run_host_git` now delegates to `run_host_cmd`. One builder. |
+| 4 | Compare/status could not answer "how did *this* stage do?" | `--stage <substring>` on both. **One filter, not ~36 per-stage wrappers**: the stage set changes, so a wrapper each would be near-identical code drifting from the catalogue the moment a stage is added. A filter over the generic reader cannot drift. Fails closed listing the run's real stages if nothing matches, so a typo never reads as "nothing wrong". |
+
+Live on real data: `--stage two_hop` at `2c004782` → `linux 0 pass / 5 fail / 0 no-verdict`,
+naming exactly the five nodes.
+
 ### 6.7.4c 🚨 EACH MACHINE KEEPS ITS OWN EVIDENCE — and that nearly ate it
 
 **The evidence ledgers are per-host.** A run writes to
