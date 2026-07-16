@@ -12,6 +12,8 @@ mod live_lab_run_matrix;
 #[cfg(feature = "vm-lab")]
 mod live_lab_stage_manifest;
 #[cfg(feature = "vm-lab")]
+mod live_lab_stage_triage;
+#[cfg(feature = "vm-lab")]
 mod live_lab_stage_recorder;
 #[cfg(feature = "vm-lab")]
 mod live_lab_stage_registry;
