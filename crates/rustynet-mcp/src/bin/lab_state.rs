@@ -4120,6 +4120,19 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "host_run_status".into(),
+                description: "Ask a REMOTE lab host what it is doing and what its last run found — without going there. Reports whether an orchestrator process is IN FLIGHT, then reads that host's OWN evidence ledger over SSH and returns which stages passed, which failed (with alias + error_detail), the no-verdict count, the commit + dirty state the run recorded, and its report_dir. IMPORTANT: each machine keeps its own ledger — a run writes to the host that ran it — so the local ledger CANNOT see the box's runs and this is the only way to read them. Read-only. `ops vm-lab-host-run-status`.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "host": {"type": "string", "description": "host_id of a remote host from hosts[]."},
+                        "run_id": {"type": "string", "description": "Which run to report. Default: the newest recorded on that host."},
+                        "format": {"type": "string", "enum": ["table", "json"], "description": "json gives full error_detail per failed stage."},
+                        "ssh_identity_file": {"type": "string"}
+                    }),
+                    vec!["host"],
+                ),
+            },
+            Tool {
                 name: "compare_runs_at_commit".into(),
                 description: "STEP 6 of the multi-machine loop: collapse every run recorded at ONE commit into a single verdict, so you read a conclusion instead of two report trees. Per-platform pass/fail/no-verdict rollup + the failing stages + which machine each run came from (alias -> host_id join). SURFACES CONFLICTS: the same node+stage answering differently across runs at one commit invalidates the comparison and is reported loudly, never silently resolved. An absent result (skip/not_run/reused/unknown) is NEVER counted as pass — that is how a two-machine split would otherwise manufacture parity that was never tested. Refuses runs recorded from a dirty worktree, and refuses to call one run a comparison (--expect-runs, default 2). `ops vm-lab-run-matrix-compare`.".into(),
                 input_schema: json_schema_object(
@@ -4704,6 +4717,35 @@ impl McpServer for LabStateServer {
                     extra.push(&identity_owned);
                 }
                 self.run_ops("vm-lab-sync-host", &extra, DISCOVERY_TIMEOUT_SECS)
+            }
+
+            "host_run_status" => {
+                let Some(host) = arg_str(args, "host") else {
+                    return tool_error("host_run_status requires `host` (a remote host_id)");
+                };
+                let mut extra: Vec<&str> = vec!["--host", host];
+                let run_owned;
+                if let Some(run) = arg_str(args, "run_id") {
+                    run_owned = run.to_owned();
+                    extra.push("--run-id");
+                    extra.push(&run_owned);
+                }
+                let format_owned;
+                if let Some(format) = arg_str(args, "format") {
+                    if !matches!(format, "table" | "json") {
+                        return tool_error("format must be `table` or `json`");
+                    }
+                    format_owned = format.to_owned();
+                    extra.push("--format");
+                    extra.push(&format_owned);
+                }
+                let identity_owned;
+                if let Some(identity) = arg_str(args, "ssh_identity_file") {
+                    identity_owned = identity.to_owned();
+                    extra.push("--ssh-identity-file");
+                    extra.push(&identity_owned);
+                }
+                self.run_ops("vm-lab-host-run-status", &extra, DISCOVERY_TIMEOUT_SECS)
             }
 
             "compare_runs_at_commit" => {
