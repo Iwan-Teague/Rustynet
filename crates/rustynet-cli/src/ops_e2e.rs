@@ -5256,6 +5256,11 @@ fn ensure_running_as_root() -> Result<(), String> {
 /// The logical name a spawn helper uses to mean "re-invoke myself".
 pub(crate) const RUSTYNET_SELF: &str = "rustynet";
 
+/// Where the CLI is installed on a managed host — the fallback used when the
+/// running image cannot be located (see [`resolve_self_program`]). Matches
+/// `main.rs`'s `PINNED_RUNTIME_RUSTYNET_BIN` and the installer's own target.
+pub(crate) const RUSTYNET_INSTALL_PATH: &str = "/usr/local/bin/rustynet";
+
 /// Resolve the program a spawn helper should exec, re-execing the *currently
 /// running* binary whenever the caller names [`RUSTYNET_SELF`].
 ///
@@ -5274,16 +5279,34 @@ pub(crate) const RUSTYNET_SELF: &str = "rustynet";
 /// also the stricter choice: a PATH lookup could resolve to a *different*
 /// `rustynet` than the one already running.
 ///
-/// Fails closed rather than falling back to PATH: if the running binary cannot
-/// be identified, silently exec'ing some other `rustynet` is precisely the
-/// behaviour worth preventing.
+/// Never falls back to a PATH lookup: PATH is the thing `sudo` breaks, and
+/// silently exec'ing some other `rustynet` is the behaviour worth preventing.
+///
+/// `current_exe()` is preferred but NOT trusted blindly. On Linux it reads
+/// `/proc/self/exe`, which yields a literal `"<path> (deleted)"` once the
+/// running image has been replaced — and the e2e bootstrap does exactly that,
+/// installing a fresh binary over `/usr/local/bin/rustynet` while running from
+/// it (`install -m 0755 <cli> /usr/local/bin/rustynet`). Spawning that string
+/// fails with `No such file or directory`. So only a `current_exe()` that
+/// still resolves to a real file is used; otherwise fall back to the install
+/// path, which after a replacement holds the newly-installed binary — the one
+/// we want anyway.
 pub(crate) fn resolve_self_program(program: &str) -> Result<String, String> {
     if program != RUSTYNET_SELF {
         return Ok(program.to_owned());
     }
-    let exe = std::env::current_exe()
-        .map_err(|err| format!("resolve the running rustynet executable failed: {err}"))?;
-    Ok(exe.to_string_lossy().into_owned())
+    if let Ok(exe) = std::env::current_exe()
+        && exe.is_file()
+    {
+        return Ok(exe.to_string_lossy().into_owned());
+    }
+    if Path::new(RUSTYNET_INSTALL_PATH).is_file() {
+        return Ok(RUSTYNET_INSTALL_PATH.to_owned());
+    }
+    Err(format!(
+        "cannot locate the rustynet binary to re-invoke: the running image is \
+         unavailable (replaced or deleted) and {RUSTYNET_INSTALL_PATH} does not exist"
+    ))
 }
 
 fn run_status(
@@ -7654,6 +7677,27 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
     /// die with "failed to spawn rustynet: No such file or directory" on
     /// Rocky/Fedora while passing on Debian/Ubuntu, whose secure_path
     /// includes /usr/local/bin — so a Debian-only topology could not see it.
+    /// Regression: the first cut of this resolver returned `current_exe()`
+    /// verbatim and broke the e2e bootstrap on every distro. The bootstrap
+    /// installs a fresh binary over /usr/local/bin/rustynet *while running
+    /// from it*, after which Linux's /proc/self/exe reads
+    /// "/usr/local/bin/rustynet (deleted)" — a literal path that does not
+    /// exist — and the spawn died with "failed to spawn /usr/local/bin/
+    /// rustynet (deleted): No such file or directory". Whatever this returns
+    /// must therefore be a path that actually exists.
+    #[test]
+    fn self_program_never_returns_a_stale_or_deleted_image_path() {
+        let resolved = resolve_self_program(RUSTYNET_SELF).expect("resolve self");
+        assert!(
+            !resolved.ends_with(" (deleted)"),
+            "must not hand a replaced-image path to Command::new: {resolved:?}"
+        );
+        assert!(
+            std::path::Path::new(&resolved).is_file(),
+            "the resolved program must exist on disk, got {resolved:?}"
+        );
+    }
+
     #[test]
     fn self_program_resolves_to_the_running_binary_not_a_path_lookup() {
         let resolved = resolve_self_program(RUSTYNET_SELF).expect("resolve self");
