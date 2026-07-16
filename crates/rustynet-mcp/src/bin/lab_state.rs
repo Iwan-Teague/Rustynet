@@ -871,6 +871,8 @@ impl LabStateServer {
         out.push_str(
             "\n_started + SSH-reachable = ready. started + unreachable = network/killswitch (recover_stuck_vms / update_inventory), NOT a power issue. stopped = power_on_vm._\n",
         );
+        // Never let a UTM-only listing read as "the whole lab".
+        out.push_str(&self.utm_scope_note());
         tool_success(&out)
     }
 
@@ -909,6 +911,55 @@ impl LabStateServer {
     }
 
     /// Resolve an inventory alias → (utm_name, platform, ip, ssh_port).
+    /// Host_ids of every declared **non-UTM** host, if any.
+    ///
+    /// Used to stop the UTM-only tools from lying **by omission**: a tool that
+    /// answers "all VMs" from `utmctl list` gives a confident, complete-looking
+    /// answer that silently excludes every guest on another machine. A partial
+    /// answer that looks total is worse than an error.
+    fn non_utm_hosts(&self) -> Vec<String> {
+        let Ok(body) = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)) else {
+            return Vec::new();
+        };
+        let Ok(inv) = serde_json::from_str::<Value>(&body) else {
+            return Vec::new();
+        };
+        inv.get("hosts")
+            .and_then(|hosts| hosts.as_array())
+            .map(|hosts| {
+                hosts
+                    .iter()
+                    .filter(|host| {
+                        host.get("kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("local_utm")
+                            != "local_utm"
+                    })
+                    .filter_map(|host| {
+                        host.get("host_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Footer naming the hosts a UTM-only answer does NOT cover.
+    fn utm_scope_note(&self) -> String {
+        let others = self.non_utm_hosts();
+        if others.is_empty() {
+            return String::new();
+        }
+        format!(
+            "\n\n> **Scope: this lists UTM guests only.** The inventory also declares \
+             non-UTM host(s): **{}**. Their VMs are NOT shown above. \
+             Use `discover_hosts` for every machine's VMs (state, IP, ready), or \
+             `host_preflight` for multi-machine readiness.\n",
+            others.join(", ")
+        )
+    }
+
     /// The precise reason an alias did not resolve to a UTM controller.
     ///
     /// `alias_to_utm` returns `None` both when the alias is absent AND when it is
@@ -4116,7 +4167,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "get_vm_power_state".into(),
-                description: "Raw VM power state from `utmctl list` (started/stopped/paused), annotated with inventory aliases — distinct from SSH reachability. 'started but unreachable' = network/killswitch issue (recover_stuck_vms/update_inventory); 'stopped' = power_on_vm. Pass alias to filter.".into(),
+                description: "Raw VM power state from `utmctl list` (started/stopped/paused), annotated with inventory aliases — distinct from SSH reachability. 'started but unreachable' = network/killswitch issue (recover_stuck_vms/update_inventory); 'stopped' = power_on_vm. Pass alias to filter. SCOPE: UTM guests only (drives `utmctl list`) — it does NOT list guests on other hosts; use discover_hosts for every machine.".into(),
                 input_schema: json_schema_object(
                     json!({"alias": json_schema_string("Optional: only show this VM (alias or utm_name)")}),
                     vec![],
@@ -4132,7 +4183,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "reset_vm_network".into(),
-                description: "Reset a Linux VM's networking OUT-OF-BAND via utmctl exec (no SSH needed) when it's up but unreachable: flush the nft killswitch, stop rustynetd, restart systemd-networkd/networking, then re-probe TCP/22. Use when check_vm_reachable says UP-but-UNREACHABLE. (macOS Apple-Virt has no utmctl exec; Windows: use restart_vm.)".into(),
+                description: "Reset a Linux VM's networking OUT-OF-BAND via utmctl exec (no SSH needed) when it's up but unreachable: flush the nft killswitch, stop rustynetd, restart systemd-networkd/networking, then re-probe TCP/22. Use when check_vm_reachable says UP-but-UNREACHABLE. (macOS Apple-Virt has no utmctl exec; Windows: use restart_vm.) SCOPE: UTM guests only.".into(),
                 input_schema: json_schema_object(
                     json!({"alias": json_schema_string("VM alias (Linux guest)")}),
                     vec!["alias"],
@@ -4140,7 +4191,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "get_vm_network_info".into(),
-                description: "Out-of-band Linux guest network diagnostics via utmctl exec (no SSH): ip addr, ip route, the nft killswitch ruleset, rustynetd active-state, and the daemon's recent journal. The triage companion to reset_vm_network — run it when check_vm_reachable says UP-but-UNREACHABLE to see WHY (stale killswitch? wrong NAT subnet? daemon crashed?) before resetting. (macOS Apple-Virt / Windows: use get_vm_diagnostics over SSH.)".into(),
+                description: "Out-of-band Linux guest network diagnostics via utmctl exec (no SSH): ip addr, ip route, the nft killswitch ruleset, rustynetd active-state, and the daemon's recent journal. The triage companion to reset_vm_network — run it when check_vm_reachable says UP-but-UNREACHABLE to see WHY (stale killswitch? wrong NAT subnet? daemon crashed?) before resetting. (macOS Apple-Virt / Windows: use get_vm_diagnostics over SSH.) SCOPE: UTM guests only.".into(),
                 input_schema: json_schema_object(
                     json!({"alias": json_schema_string("VM alias (Linux guest)")}),
                     vec!["alias"],
@@ -4512,7 +4563,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "host_disk_status".into(),
-                description: "Host disk free space + the lab's biggest consumers (state/, target-livelab/, target/). Check periodically over a long run — a full disk fails builds/runs. Reclaim with prune_jobs.".into(),
+                description: "Host disk free space + the lab's biggest consumers (state/, target-livelab/, target/). Check periodically over a long run — a full disk fails builds/runs. Reclaim with prune_jobs. SCOPE: THIS machine's disk only — it does not report a remote lab host's disk.".into(),
                 input_schema: json_schema_object(json!({}), vec![]),
             },
             Tool {
@@ -8733,6 +8784,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert_eq!(ip, "192.168.0.200");
         assert_eq!(port, 22);
         assert!(srv.alias_to_utm("nope").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A UTM-only listing must never read as "the whole lab" once a second host
+    /// is declared: a partial answer that looks total is worse than an error.
+    #[test]
+    fn utm_scope_note_names_uncovered_hosts_and_is_silent_when_single_host() {
+        let tmp = std::env::temp_dir().join(format!("mcp-scope-{}", std::process::id()));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+
+        // single-host lab: no note, no noise
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"hosts":[{"host_id":"mac-utm-1","kind":"local_utm"}],
+                "entries":[{"alias":"deb-1"}],"version":1}"#,
+        )
+        .unwrap();
+        assert_eq!(test_server(&tmp).utm_scope_note(), "");
+
+        // second, non-UTM host: the note must name it
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"hosts":[{"host_id":"mac-utm-1","kind":"local_utm"},
+                         {"host_id":"ubuntu-kvm-1","kind":"libvirt"}],
+                "entries":[{"alias":"deb-1"}],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+        let note = srv.utm_scope_note();
+        assert!(note.contains("ubuntu-kvm-1"), "{note}");
+        assert!(note.contains("discover_hosts"), "{note}");
+        assert_eq!(srv.non_utm_hosts(), vec!["ubuntu-kvm-1".to_owned()]);
+
+        // an inventory with no hosts[] at all must not panic or invent hosts
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[{"alias":"deb-1"}],"version":1}"#,
+        )
+        .unwrap();
+        assert_eq!(test_server(&tmp).utm_scope_note(), "");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

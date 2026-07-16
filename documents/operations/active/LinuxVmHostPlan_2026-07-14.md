@@ -432,6 +432,41 @@ instead of remembering an order:
 Each **delegates to the CLI** via the existing `run_ops` helper — no logic is
 re-implemented in the MCP.
 
+### 6.8.1a MCP coverage matrix — what already works on the box (audited 2026-07-16)
+
+**Most VM-lifecycle tools already work on `ubuntu-kvm-1` and needed no work.** The
+rule is simply *which path the tool takes*: tools that shell out to the CLI inherit
+increment 2's controller dispatch for free; tools that call `utmctl` directly are
+macOS-only. Audited, not assumed:
+
+| Tool | Path | Works on the box? |
+| --- | --- | --- |
+| `power_on_vm` | → `ops vm-lab-start` | **✅ yes** (CLI dispatches per controller) |
+| `power_off_vm` | → `ops vm-lab-stop` | **✅ yes** |
+| `restart_vm` | → `ops vm-lab-restart` | **✅ yes** |
+| `get_vm_diagnostics` | → `ops vm-lab-status` | **✅ yes** |
+| `sync_repo_to_vm` | → `ops vm-lab-sync-repo` | **✅ yes** |
+| `bootstrap_vm` | → `ops …` | **✅ yes** |
+| `discover_hosts` / `sync_host` / `host_preflight` | → `ops …` (new, §6.8.1) | **✅ yes** |
+| `get_vm_power_state` | `utmctl list` | ❌ **UTM only** — superseded by `discover_hosts` |
+| `get_vm_network_info` | `utmctl` | ❌ UTM only |
+| `reset_vm_network` | `utmctl`/plist | ❌ UTM only (ADR-004 makes network mutation a UTM-only transaction anyway — §6.5.4) |
+| `host_disk_status` | local `df` | ❌ **THIS machine only** — never a remote host's disk |
+| `recover_stuck_vms` | → `ops …`, but UTM/`arp`-shaped internally | ⚠️ unverified on libvirt |
+
+So "turn VMs on/off on the box" **already works**; the real gap was **listing and
+status**, which `discover_hosts` now covers for both host kinds uniformly.
+
+**🚩 The dangerous one — fixed.** `get_vm_power_state` is *the* "show me all VMs"
+tool and it answers from `utmctl list`, so once a second host exists it **silently
+omitted every guest on the box** — a confident, complete-looking answer missing half
+the lab. A partial answer that looks total is worse than an error. It now appends a
+scope footer naming the uncovered host(s) and pointing at `discover_hosts`, and the
+UTM-only tools carry an explicit `SCOPE:` in their descriptions. Tests:
+`utm_scope_note_names_uncovered_hosts_and_is_silent_when_single_host` (silent on a
+single-host lab, names the host once a second is declared, no panic when `hosts[]`
+is absent).
+
 ### 6.8.2 🚩 The original increment-5 scope was wrong — do NOT build it
 
 The tracker said: *"branch `lab_state.rs` … on controller kind (virsh `domstate` +
