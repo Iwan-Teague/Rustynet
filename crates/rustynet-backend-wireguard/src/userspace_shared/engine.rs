@@ -557,16 +557,31 @@ impl UserspaceEngine {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    /// Pick the outbound peer by LONGEST-PREFIX match over `allowed_ips`, the
+    /// rule WireGuard itself uses for its allowed-ips routing table.
+    ///
+    /// A first-match scan is not equivalent: an exit peer carries the
+    /// `0.0.0.0/0` default route, so it matches *every* destination. Because
+    /// `peer_states` is a `BTreeMap` keyed by node id, whichever peer sorts
+    /// first wins the scan — and once that is the exit, every mesh packet is
+    /// encapsulated to the exit instead of to the peer that owns the
+    /// destination's `/32`. Client-to-exit traffic still looks healthy (the exit
+    /// *is* the right peer for its own address) while every client-to-client
+    /// flow is silently blackholed through the exit.
     fn select_peer_for_destination(&self, dst_addr: IpAddr) -> Option<NodeId> {
         self.peer_states
             .iter()
-            .find(|(_node_id, peer_state)| {
+            .filter_map(|(node_id, peer_state)| {
                 peer_state
                     .allowed_ips
                     .iter()
-                    .any(|allowed_ip| allowed_ip.contains(dst_addr))
+                    .filter(|allowed_ip| allowed_ip.contains(dst_addr))
+                    .map(|allowed_ip| allowed_ip.prefix_len)
+                    .max()
+                    .map(|prefix_len| (prefix_len, node_id))
             })
-            .map(|(node_id, _peer_state)| node_id.clone())
+            .max_by_key(|(prefix_len, _node_id)| *prefix_len)
+            .map(|(_prefix_len, node_id)| node_id.clone())
     }
 }
 
@@ -965,6 +980,65 @@ mod tests {
         let mut init = vec![1u8, 0, 0, 0];
         init.extend_from_slice(&[0u8; 112]); // pad to HANDSHAKE_INIT_SZ (116)
         assert!(engine.find_node_id_by_receiver_index(&init).is_none());
+    }
+
+    #[test]
+    fn outbound_peer_selection_prefers_longest_prefix_over_exit_default_route() {
+        use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg.key");
+        std::fs::write(&path, BASE64_STANDARD.encode([5u8; 32])).expect("write key");
+        let mut engine = UserspaceEngine::from_private_key_file(&path).expect("engine");
+
+        // Mirror what the control plane issues: the exit peer gets its own mesh
+        // /32 *plus* the 0.0.0.0/0 default route. Name it so it sorts FIRST in
+        // the node-id-keyed map — the order that made a first-match scan hand it
+        // every destination.
+        let exit = NodeId::new("aaa-exit").expect("node id");
+        engine
+            .configure_peer(&PeerConfig {
+                node_id: exit.clone(),
+                endpoint: SocketEndpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(192, 168, 64, 4)),
+                    port: 51820,
+                },
+                public_key: [0x11; 32],
+                allowed_ips: vec!["100.80.169.183/32".to_owned(), "0.0.0.0/0".to_owned()],
+                persistent_keepalive_secs: None,
+            })
+            .expect("exit configures");
+        let peer = NodeId::new("zzz-peer").expect("node id");
+        engine
+            .configure_peer(&PeerConfig {
+                node_id: peer.clone(),
+                endpoint: SocketEndpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(192, 168, 64, 20)),
+                    port: 51820,
+                },
+                public_key: [0x22; 32],
+                allowed_ips: vec!["100.123.159.114/32".to_owned()],
+                persistent_keepalive_secs: None,
+            })
+            .expect("peer configures");
+
+        // The mesh peer's /32 must beat the exit's default route, or every
+        // client-to-client packet is encapsulated to the exit and blackholed.
+        assert_eq!(
+            engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(100, 123, 159, 114))),
+            Some(peer),
+            "a peer's /32 must win over the exit's 0.0.0.0/0"
+        );
+        // The exit still owns its own mesh address...
+        assert_eq!(
+            engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(100, 80, 169, 183))),
+            Some(exit.clone())
+        );
+        // ...and still catches off-mesh traffic via the default route.
+        assert_eq!(
+            engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            Some(exit)
+        );
     }
 
     #[test]
