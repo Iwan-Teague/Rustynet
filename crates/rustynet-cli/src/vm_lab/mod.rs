@@ -143,6 +143,20 @@ pub struct VmLabDiscoverLocalUtmConfig {
     pub report_dir: Option<PathBuf>,
 }
 
+/// Config for `ops vm-lab-host-run-status`: read a REMOTE lab host's run state and
+/// its own evidence ledger over SSH.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabHostRunStatusConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub host_id: String,
+    /// Which run to report. Absent ⇒ the newest recorded on that host.
+    pub run_id: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+    pub json: bool,
+}
+
 /// Config for `ops vm-lab-run-matrix-compare`: collapse every run at one commit
 /// into a single cross-machine verdict.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -217,6 +231,12 @@ pub struct VmLabSyncHostConfig {
     pub allow_dirty: bool,
     /// Assert host state without changing anything.
     pub verify_only: bool,
+    /// Throw away uncommitted changes on the HOST before syncing.
+    ///
+    /// Off by default and deliberately explicit: the live-lab evidence ledgers are
+    /// tracked files that a run on that host appends to, so `reset --hard` would
+    /// destroy a run's results. Losing evidence must be a decision, not a default.
+    pub discard_host_changes: bool,
     /// SSH identity for reaching the host. Defaults to the lab identity; must be
     /// overridable so the tool is not welded to one key.
     pub ssh_identity_file: Option<PathBuf>,
@@ -3655,6 +3675,149 @@ fn resolve_discovery_bundle_paths(
     }
 }
 
+/// Report what a lab host is doing and what its runs found — without going there.
+///
+/// Each machine keeps its **own** evidence: a run writes to
+/// `<repo_dir>/documents/operations/live_lab_node_stage_results.csv` **on the host
+/// that ran it**. So the Mac's ledger cannot see the box's runs, and vice versa.
+/// This reads a host's ledger over SSH so the two can be compared at all.
+///
+/// Read-only. It never syncs, powers, or mutates.
+pub fn execute_ops_vm_lab_host_run_status(
+    config: VmLabHostRunStatusConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host_id == config.host_id)
+        .ok_or_else(|| format!("unknown host_id: {}", config.host_id))?;
+    let endpoint = host
+        .ssh_endpoint()
+        .ok_or_else(|| format!("host {} is local; read its ledger directly", host.host_id))?;
+    let repo_dir = host
+        .repo_dir
+        .as_ref()
+        .ok_or_else(|| format!("host {} has no repo_dir declared", host.host_id))?
+        .display()
+        .to_string();
+    let timeout = timeout_or_default(config.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
+    let ssh = VmLabSyncHostConfig {
+        ssh_identity_file: config.ssh_identity_file.clone(),
+        known_hosts_path: config.known_hosts_path.clone(),
+        ..VmLabSyncHostConfig::default()
+    };
+
+    // --- is a run in flight? -------------------------------------------------
+    // `pgrep -f` exits 1 when nothing matches, which is a legitimate answer, not
+    // an error — so a non-zero exit here must not be mistaken for "cannot tell".
+    let running = match run_host_cmd(
+        endpoint.as_str(),
+        &["pgrep", "-af", "vm-lab-orchestrate-live-lab"],
+        &ssh,
+        timeout,
+    ) {
+        Ok(out) if !out.trim().is_empty() => Some(out.trim().to_owned()),
+        _ => None,
+    };
+
+    // --- read the host's own stage ledger ------------------------------------
+    let ledger = format!("{repo_dir}/documents/operations/live_lab_node_stage_results.csv");
+    let body = run_host_cmd(endpoint.as_str(), &["cat", ledger.as_str()], &ssh, timeout)
+        .map_err(|err| format!("host {}: cannot read {ledger}: {err}", host.host_id))?;
+
+    let rows = crate::live_lab_run_matrix::parse_stage_result_csv(body.as_str())?;
+    if rows.is_empty() {
+        return Ok(format!(
+            "host {} — no runs recorded yet{}\n",
+            host.host_id,
+            match running.as_deref() {
+                Some(proc) => format!(" (a run IS in flight: {proc})"),
+                None => String::new(),
+            }
+        ));
+    }
+
+    // newest run first
+    let latest_run = rows
+        .iter()
+        .max_by(|a, b| a.run_id.cmp(&b.run_id))
+        .map(|row| row.run_id.clone())
+        .unwrap_or_default();
+    let selected = config.run_id.clone().unwrap_or(latest_run);
+    let run_rows: Vec<_> = rows.iter().filter(|row| row.run_id == selected).collect();
+
+    let mut passed: Vec<&str> = Vec::new();
+    let mut failed: Vec<(&str, &str, &str)> = Vec::new();
+    let mut absent = 0usize;
+    for row in &run_rows {
+        match row.status.trim().to_ascii_lowercase().as_str() {
+            "pass" => passed.push(row.stage.as_str()),
+            "fail" => failed.push((
+                row.stage.as_str(),
+                row.alias.as_str(),
+                row.error_detail.as_str(),
+            )),
+            other if crate::live_lab_run_matrix::stage_status_has_no_verdict(other) => absent += 1,
+            _ => {}
+        }
+    }
+
+    if config.json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "host_id": host.host_id,
+            "run_in_flight": running,
+            "run_id": selected,
+            "git_commit": run_rows.first().map(|row| row.git_commit.clone()),
+            "git_dirty_state": run_rows.first().map(|row| row.git_dirty_state.clone()),
+            "report_dir": run_rows.first().map(|row| row.report_dir.clone()),
+            "passed": passed,
+            "no_verdict_count": absent,
+            "failed": failed.iter().map(|(stage, alias, detail)| serde_json::json!({
+                "stage": stage, "alias": alias, "error_detail": detail,
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap_or_else(|_| "{}".to_owned()));
+    }
+
+    let mut out = format!("=== host {} ===\n", host.host_id);
+    match running.as_deref() {
+        Some(proc) => out.push_str(&format!("  run IN FLIGHT: {proc}\n")),
+        None => out.push_str("  no orchestrator process running\n"),
+    }
+    if let Some(first) = run_rows.first() {
+        out.push_str(&format!(
+            "  run {selected}\n  commit {} (tree {})\n  report_dir {}\n",
+            first.git_commit, first.git_dirty_state, first.report_dir
+        ));
+    }
+    out.push_str(&format!(
+        "\n  {} passed, {} failed, {} no-verdict\n",
+        passed.len(),
+        failed.len(),
+        absent
+    ));
+    if failed.is_empty() {
+        out.push_str("\n  FAILURES: none\n");
+    } else {
+        out.push_str("\n  FAILURES:\n");
+        for (stage, alias, detail) in &failed {
+            out.push_str(&format!("    {stage} on {alias}\n"));
+            if !detail.trim().is_empty() {
+                out.push_str(&format!("      {}\n", detail.trim()));
+            }
+        }
+        out.push_str(
+            "\n  Drill in: `ops vm-lab-host-run-status --host <id> --format json` for full detail, \
+             or fetch the report_dir above from that host.\n",
+        );
+    }
+    Ok(out)
+}
+
 /// Compare every run recorded at one commit, across machines.
 ///
 /// Step 6 of the multi-host pipeline (§6.7.4a) — the last step that otherwise
@@ -4850,6 +5013,47 @@ fn sync_remote_host(
         .to_string();
 
     if !config.verify_only {
+        // ---- CHECK THE HOST BEFORE TOUCHING IT --------------------------------
+        // `reset --hard` below reverts TRACKED files, and the live-lab evidence
+        // ledgers (documents/operations/live_lab_node_*.csv) ARE tracked. A run on
+        // this host appends its results to them, so resetting a host that has just
+        // run would DESTROY that evidence — silently, and the post-reset check
+        // would then cheerfully report "clean" because it had just deleted the
+        // thing that made it dirty. Refuse first; discarding must be explicit.
+        let pre_status = run_host_git(
+            endpoint.as_str(),
+            repo_dir.as_str(),
+            &["status", "--porcelain"],
+            config,
+            timeout,
+        )?;
+        if !pre_status.trim().is_empty() && !config.discard_host_changes {
+            let evidence: Vec<&str> = pre_status
+                .lines()
+                .filter(|line| {
+                    line.contains("live_lab_node_") || line.contains("documents/operations/")
+                })
+                .collect();
+            let mut message = format!(
+                "host {}: REFUSING to sync — its worktree has uncommitted changes, and `git reset --hard` \
+                 would destroy them. Nothing has been changed.\n{}",
+                host.host_id,
+                pre_status.trim()
+            );
+            if !evidence.is_empty() {
+                message.push_str(
+                    "\n\nSome of those are live-lab EVIDENCE ledgers (tracked files that a run on this \
+                     host appends to). Fetch the evidence before syncing, or you will lose that run's \
+                     results. Pass --discard-host-changes only if you are certain they are worthless.",
+                );
+            } else {
+                message.push_str(
+                    "\n\nCommit or fetch them first, or pass --discard-host-changes to throw them away.",
+                );
+            }
+            return Err(message);
+        }
+
         // Fetch the exact pinned SHA. Shallow: a lab host needs the tree, not
         // the history, and the full history is orders of magnitude larger.
         run_host_git(

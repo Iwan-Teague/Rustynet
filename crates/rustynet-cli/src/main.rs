@@ -998,6 +998,10 @@ enum OpsCommand {
         config: vm_lab::VmLabRunMatrixCompareConfig,
     },
     #[cfg(feature = "vm-lab")]
+    VmLabHostRunStatus {
+        config: vm_lab::VmLabHostRunStatusConfig,
+    },
+    #[cfg(feature = "vm-lab")]
     VmLabNetworkAudit {
         config: vm_lab::network_audit::VmLabNetworkAuditConfig,
     },
@@ -3516,6 +3520,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 commit: parser.value("--commit"),
                 allow_dirty: parser.has_flag("--allow-dirty"),
                 verify_only: parser.has_flag("--verify-only"),
+                discard_host_changes: parser.has_flag("--discard-host-changes"),
                 ssh_identity_file: parser.optional_path("--ssh-identity-file"),
                 known_hosts_path: parser.optional_path("--known-hosts-file"),
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 120)?,
@@ -3602,6 +3607,28 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 expect_runs: usize::try_from(parser.parse_u64_or_default("--expect-runs", 2)?)
                     .map_err(|_| "invalid value for --expect-runs".to_owned())?,
                 allow_dirty: parser.has_flag("--allow-dirty"),
+                json: match parser.value("--format").as_deref() {
+                    None | Some("table") => false,
+                    Some("json") => true,
+                    Some(other) => {
+                        return Err(format!(
+                            "invalid value for --format: {other} (expected table|json)"
+                        ));
+                    }
+                },
+            },
+        }),
+        #[cfg(feature = "vm-lab")]
+        "vm-lab-host-run-status" => Ok(OpsCommand::VmLabHostRunStatus {
+            config: vm_lab::VmLabHostRunStatusConfig {
+                inventory_path: parser.optional_path("--inventory"),
+                host_id: parser
+                    .value("--host")
+                    .ok_or_else(|| "vm-lab-host-run-status requires --host <host_id>".to_owned())?,
+                run_id: parser.value("--run-id"),
+                ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 120)?,
                 json: match parser.value("--format").as_deref() {
                     None | Some("table") => false,
                     Some("json") => true,
@@ -8103,6 +8130,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabRunMatrixCompare { config } => {
             vm_lab::execute_ops_vm_lab_run_matrix_compare(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabHostRunStatus { config } => {
+            vm_lab::execute_ops_vm_lab_host_run_status(config)
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabNetworkAudit { config } => {
@@ -19508,10 +19539,11 @@ fn help_text() -> String {
         "  ops vm-lab-discover-local-utm [--inventory <path>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>] [--timeout-secs <secs>] [--update-inventory-live-ips] [--report-dir <path>]",
         "  ops vm-lab-discover-local-utm-summary [--inventory <path>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>] [--timeout-secs <secs>] [--update-inventory-live-ips] [--report-dir <path>]",
         "  ops vm-lab-discover-hosts [--inventory <path>] [--host <host_id>] [--virsh-path <path>] [--timeout-secs <secs>] [--format table|json] [--report-dir <path>]",
-        "  ops vm-lab-sync-host --host <host_id> [--inventory <path>] [--commit <ref|sha>] [--allow-dirty] [--verify-only] [--timeout-secs <secs>] [--format table|json]",
+        "  ops vm-lab-sync-host --host <host_id> [--inventory <path>] [--commit <ref|sha>] [--allow-dirty] [--verify-only] [--discard-host-changes] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-host-preflight [--inventory <path>] [--hosts <id,id>] [--commit <ref|sha>] [--allow-dirty] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-provision-guest --host <host_id> --name <guest> --image <base.qcow2> [--ram-mb <mb>] [--vcpus <n>] [--disk-gb <gb>] [--pool <path>] [--dry-run] [--format table|json]",
         "  ops vm-lab-run-matrix-compare [--commit <ref|sha>] [--inventory <path>] [--stage-results <path>] [--expect-runs <n>] [--allow-dirty] [--format table|json]",
+        "  ops vm-lab-host-run-status --host <host_id> [--run-id <id>] [--inventory <path>] [--ssh-identity-file <path>] [--format table|json]",
         "  ops vm-lab-network-audit [--inventory <path>] [--profile-dir <path>] [--profile <id>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only: observes UTM/host/guest network state, validates profile manifests, writes redacted evidence; never mutates)",
         "  ops vm-lab-network-preflight --profile <id> [--inventory <path>] [--profile-dir <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only fail-closed gate: errors unless the observed fleet satisfies the profile)",
         "  ops vm-lab-network-prepare --profile <id> [--inventory <path>] [--profile-dir <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--state-dir <path>] [--dry-run] [--approve-reconfigure]  (the ONLY VM network mutation path; without --approve-reconfigure prints the plan and changes nothing; atomic lease + stopped-VM-only apply + verified rollback)",

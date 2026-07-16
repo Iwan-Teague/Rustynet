@@ -773,6 +773,54 @@ SHA its evidence claims, and step 6 would catch it — which is the point).
 **Accepted risk:** a patch that fixes Windows can regress macOS. Re-running both
 from the new SHA is what catches it — that is the argument *for* the loop.
 
+### 6.7.4c 🚨 EACH MACHINE KEEPS ITS OWN EVIDENCE — and that nearly ate it
+
+**The evidence ledgers are per-host.** A run writes to
+`<repo_dir>/documents/operations/live_lab_node_stage_results.csv` **on the machine
+that ran it**. The Mac's ledger therefore **cannot see the box's runs**, and vice
+versa. Two consequences, both load-bearing:
+
+**1. `vm-lab-run-matrix-compare` only sees the ledger it is pointed at.** For a
+genuine two-machine comparison the box's rows must be fetched first
+(`vm-lab-host-run-status`, below) or `--stage-results` aimed at a merged file.
+Compare is not wrong — it just cannot invent rows it was never shown.
+
+**2. 🚨 `vm-lab-sync-host` was silently destroying that evidence — FIXED
+2026-07-16.** The ledgers are **git-tracked**, so a box-side run leaves the box's
+worktree dirty. `sync_remote_host` ran `git reset --hard <sha>` **before** any
+dirty check on the host, which reverted the tracked ledgers and **deleted the
+run's results** — then the post-reset check reported `clean`, because it had just
+deleted the thing that made it dirty. Run a lab on the box, sync to the next
+commit, evidence gone, no message.
+
+Fixed: the host's `git status --porcelain` is now read **before** anything is
+touched, and a dirty host is **refused** with its actual diff. If any dirty path
+looks like an evidence ledger the error says so explicitly and tells you to fetch
+it first. Discarding requires `--discard-host-changes`, because losing evidence
+must be a decision rather than a default.
+
+### 6.7.4d ✅ BUILT — `ops vm-lab-host-run-status` (MCP: `host_run_status`)
+
+```
+rustynet ops vm-lab-host-run-status --host <host_id> [--run-id <id>]
+    [--ssh-identity-file <p>] [--format table|json]
+```
+
+Ask a remote host what it is doing and what its last run found, without going
+there. Read-only.
+
+- **Is a run in flight?** `pgrep -af vm-lab-orchestrate-live-lab` on the host.
+  A non-zero exit means *nothing matched* — a legitimate answer, not an error, so
+  it is not reported as "cannot tell".
+- **Which stages passed / failed**, read from that host's **own** ledger over SSH,
+  with `alias` and `error_detail` per failure.
+- The **commit + dirty state** the run recorded, and its **report_dir**, so you can
+  drill into the failing area.
+- `--format json` carries the full `error_detail` per failed stage.
+
+Local hosts are refused (`read its ledger directly`) rather than pretending to SSH
+to themselves.
+
 ### 6.7.4b ✅ BUILT — `ops vm-lab-run-matrix-compare` (step 6; MCP: `compare_runs_at_commit`)
 
 ```

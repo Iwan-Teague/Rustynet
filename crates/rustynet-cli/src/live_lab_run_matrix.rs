@@ -2492,6 +2492,7 @@ pub(crate) struct StageResultRow {
     pub(crate) stage: String,
     pub(crate) status: String,
     pub(crate) report_dir: String,
+    pub(crate) error_detail: String,
 }
 
 /// Read the normalised stage-results ledger.
@@ -2501,9 +2502,15 @@ pub(crate) struct StageResultRow {
 pub(crate) fn read_stage_result_rows(path: &Path) -> Result<Vec<StageResultRow>, String> {
     let body = fs::read_to_string(path)
         .map_err(|err| format!("read stage results failed ({}): {err}", path.display()))?;
+    parse_stage_result_csv(body.as_str())
+}
+
+/// Parse the stage ledger from memory — the same ledger fetched from a REMOTE
+/// host over SSH must parse identically to a local file, so both share this.
+pub(crate) fn parse_stage_result_csv(body: &str) -> Result<Vec<StageResultRow>, String> {
     let mut lines = body.lines();
     let Some(header_line) = lines.next() else {
-        return Err(format!("stage results file is empty: {}", path.display()));
+        return Err("stage results is empty (no header row)".to_owned());
     };
     let header = parse_csv_record(header_line)?;
     let index_of = |name: &str| -> Result<usize, String> {
@@ -2523,6 +2530,7 @@ pub(crate) fn read_stage_result_rows(path: &Path) -> Result<Vec<StageResultRow>,
         index_of("status")?,
         index_of("report_dir")?,
     );
+    let i_error = index_of("error_detail")?;
 
     let mut rows = Vec::new();
     for line in lines {
@@ -2541,6 +2549,7 @@ pub(crate) fn read_stage_result_rows(path: &Path) -> Result<Vec<StageResultRow>,
             stage: get(i_stage),
             status: get(i_status),
             report_dir: get(i_report),
+            error_detail: get(i_error),
         });
     }
     Ok(rows)
