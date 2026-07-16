@@ -279,8 +279,36 @@ pub fn target_user(target: &str) -> &str {
     target.split_once('@').map_or(target, |(user, _)| user)
 }
 
+/// Strip a trailing `:port` suffix and unwrap a bracketed IPv6 literal from a
+/// bare `host` / `host:port` fragment. Mirrors `live_lab_support`'s helper of
+/// the same name. Unbracketed IPv6 literals (multiple colons) are left intact.
+fn strip_host_port(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return &rest[..end];
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port))
+            if !host.is_empty()
+                && !host.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            host
+        }
+        _ => addr,
+    }
+}
+
+/// The bare host for `target`, with both `user@` and any `:port` suffix
+/// removed. The port travels separately (an `-p`/`-P` flag, or `ssh -G`'s
+/// resolved `port` for known_hosts lookups); leaving it glued to the host makes
+/// OpenSSH treat `192.168.64.4:22` as a literal hostname and makes
+/// `ssh-keygen -F` miss the (bare) known_hosts entry.
 pub fn target_address(target: &str) -> &str {
-    target.split_once('@').map_or(target, |(_, host)| host)
+    let addr = target.split_once('@').map_or(target, |(_, host)| host);
+    strip_host_port(addr)
 }
 
 fn target_home(target: &str) -> String {
@@ -1636,8 +1664,25 @@ mod tests {
     use super::{
         LiveLabPlatform, enforce_linux_only_until_validator_lands, env_flag_truthy,
         known_hosts_lookup_host, resolved_known_hosts_candidates,
-        resolved_target_address_from_ssh_g,
+        resolved_target_address_from_ssh_g, target_address,
     };
+
+    #[test]
+    fn target_address_strips_default_port_suffix() {
+        // Regression: SshConnectionParams-derived targets carry a `:22` suffix
+        // (`format!("{host}:{port}")`). The known_hosts candidate must see the
+        // bare host: default-port entries are stored unqualified, so a
+        // "192.168.64.4:22" candidate makes `ssh-keygen -F` miss the entry and
+        // every pinned-host check fails ("lacks host key"). The sibling
+        // live_lab_support module pins the same invariant.
+        assert_eq!(target_address("debian@192.168.64.4:22"), "192.168.64.4");
+        assert_eq!(target_address("debian@192.168.64.4:2222"), "192.168.64.4");
+        assert_eq!(target_address("debian@192.168.64.4"), "192.168.64.4");
+        assert_eq!(target_address("192.168.64.4:22"), "192.168.64.4");
+        // Bracketed IPv6 yields the literal; a bare IPv6 literal is untouched.
+        assert_eq!(target_address("debian@[fd00::1]:2222"), "fd00::1");
+        assert_eq!(target_address("debian@fd00::1"), "fd00::1");
+    }
 
     #[test]
     fn live_lab_platform_parser_accepts_canonical_strings() {
