@@ -258,14 +258,16 @@ fn run_substep(label: &str, mut command: Command) -> Result<(), String> {
 }
 
 fn format_substep_failure(label: &str, output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let detail = if stderr.trim().is_empty() {
-        stdout.trim()
-    } else {
-        stderr.trim()
-    };
-    format!("{label}: command failed ({}): {detail}", output.status)
+    // Was: stdout only when stderr is empty. That is not enough — the guest's
+    // cause arrives on stdout while the wrapper's terse message goes to
+    // stderr, so a non-empty stderr (the common case) hid the cause. Surface
+    // both; see `format_stage_binary_failure`.
+    crate::vm_lab::orchestrator::stage::format_stage_binary_failure(
+        label,
+        output.status,
+        &output.stdout,
+        &output.stderr,
+    )
 }
 
 fn target(params: &ResolvedParams) -> String {

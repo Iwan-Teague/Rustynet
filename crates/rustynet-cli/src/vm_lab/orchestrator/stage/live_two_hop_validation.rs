@@ -135,12 +135,14 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
                 if output.status.success() {
                     StageOutcome::Passed
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    StageOutcome::Failed(format!(
-                        "live_two_hop binary failed (exit {}): {}",
-                        output.status,
-                        stderr.trim()
-                    ))
+                    StageOutcome::Failed(
+                        crate::vm_lab::orchestrator::stage::format_stage_binary_failure(
+                            "live_two_hop binary",
+                            output.status,
+                            &output.stdout,
+                            &output.stderr,
+                        ),
+                    )
                 }
             }
             Err(e) => StageOutcome::Failed(format!("live_two_hop binary invocation failed: {e}")),
