@@ -77,7 +77,53 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
         let report_path = ctx.report_dir.join(REPORT_FILENAME);
         let log_path = ctx.report_dir.join("live_two_hop.log");
 
-        let ssh_allow_cidrs = "0.0.0.0/0";
+        // Honour the run's `--ssh-allow-cidrs` rather than hardcoding a
+        // default-route bypass.
+        //
+        // The management-SSH bypass installs one route per allow-CIDR into
+        // table 51820 on the UNDERLAY interface
+        // (`apply_fail_closed_management_bypass_routes`). With `0.0.0.0/0`
+        // that route is `0.0.0.0/0 dev <underlay>` — the same destination the
+        // exit's own policy routing installs as `0.0.0.0/0 dev rustynet0`, in
+        // the same table. `ip route replace` is last-writer-wins, so the two
+        // clobber each other and the killswitch then fails its own assertion
+        // every reconcile:
+        //
+        //   missing owned bypass route in table 51820:
+        //     expected=0.0.0.0/0 dev enp0s1 output=default dev rustynet0
+        //
+        // which restricts the daemon and makes `route advertise` impossible on
+        // the very node this stage needs to advertise. The legacy bash
+        // orchestrator always passed a real management CIDR
+        // (SSH_ALLOW_CIDRS="192.168.18.0/24") and never hit this — which is a
+        // large part of why two-hop passed there and never here.
+        //
+        // A /0 management bypass is not merely unlucky: it means "send
+        // everything over the underlay", which is incoherent on a node that is
+        // also serving a tunnel. Fail closed and say so rather than install a
+        // route that fights the exit.
+        let ssh_allow_cidrs = ctx.ssh_allow_cidrs.trim();
+        if ssh_allow_cidrs.is_empty() {
+            return StageOutcome::Failed(
+                "two-hop needs --ssh-allow-cidrs set to the lab's management CIDR (e.g. \
+                 192.168.64.0/24); it installs a management bypass route per CIDR and a \
+                 default-route bypass collides with the exit's own 0.0.0.0/0 route in table \
+                 51820"
+                    .to_owned(),
+            );
+        }
+        if ssh_allow_cidrs
+            .split(',')
+            .any(|cidr| matches!(cidr.trim(), "0.0.0.0/0" | "::/0"))
+        {
+            return StageOutcome::Failed(format!(
+                "--ssh-allow-cidrs {ssh_allow_cidrs:?} contains a default route; the management \
+                 bypass would collide with the exit's own 0.0.0.0/0 route in table 51820 and \
+                 wedge the daemon in restricted-safe mode. Pass the management CIDR instead."
+            ));
+        }
+        let ssh_allow_cidrs = ssh_allow_cidrs.to_owned();
+        let ssh_allow_cidrs = ssh_allow_cidrs.as_str();
 
         let exit_target = format!("{}@{}", exit_params.user, exit_params.host);
         let client_target = format!("{}@{}", client_params.user, client_params.host);
