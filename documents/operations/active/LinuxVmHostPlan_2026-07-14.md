@@ -412,6 +412,71 @@ those. Wired would also cure the intermittent SSH auth flake seen over `wlp7s0`.
 
 ---
 
+## 6.8 MCP surface — increment 5 re-scoped (2026-07-16)
+
+**Yes, there is an MCP server: `rustynet-mcp-lab-state`** (`crates/rustynet-mcp/src/bin/lab_state.rs`).
+It is how an agent drives the lab without memorising CLI flags. It was **UTM-only**
+while the CLI became multi-host, so the two had drifted.
+
+### 6.8.1 ✅ DONE — the multi-host tools are exposed
+
+Three tools added, mirroring the §6.7.4a pipeline so an agent calls functions
+instead of remembering an order:
+
+| Tool | Wraps | Notes |
+| --- | --- | --- |
+| `host_preflight` | `ops vm-lab-host-preflight` | **START HERE** for any multi-machine run. Ordered gates, GO/NO-GO, each failure names its fix. |
+| `sync_host` | `ops vm-lab-sync-host` | Pins a host to a commit and proves it by read-back. |
+| `discover_hosts` | `ops vm-lab-discover-hosts` | What VMs each machine has, and which are ready. |
+
+Each **delegates to the CLI** via the existing `run_ops` helper — no logic is
+re-implemented in the MCP.
+
+### 6.8.2 🚩 The original increment-5 scope was wrong — do NOT build it
+
+The tracker said: *"branch `lab_state.rs` … on controller kind (virsh `domstate` +
+a virsh recover)"*. **That would add a THIRD implementation of power control.**
+Verified 2026-07-16:
+
+- The **CLI is already controller-aware** (increment 2). `execute_ops_vm_lab_start`:
+  ```rust
+  // utmctl is only required when at least one selected target is UTM-backed; a
+  // libvirt-only selection is powered via virsh and needs no utmctl.
+  if targets.iter().any(|target| target.local_utm().is_some()) && !utmctl_path.is_file() {
+  ```
+  So `ops vm-lab-start|stop|restart` already dispatch per controller.
+- The **MCP bypasses that** and shells out to `utmctl` **directly at 5 sites**:
+  `get_vm_power_state`, `utm_power_status`, `reset_vm_network`,
+  `get_vm_network_info`, `utm_status_map`. That duplication **is** the defect —
+  a second, weaker path (§3: one hardened execution path per workflow).
+
+**Re-scoped increment 5 = DELEGATION, not duplication:** make those five tools
+call the controller-aware CLI instead of `utmctl`. libvirt support then arrives
+for free, the duplicate path disappears, and there is nothing new to keep in sync.
+Adding virsh to the MCP would make the drift permanent.
+
+### 6.8.3 ✅ DONE — a misleading error that would have cost real time
+
+`alias_to_utm` returns `None` **both** when an alias is absent **and** when it is
+present but non-UTM-backed (a libvirt controller has no `utm_name`). All five
+callers reported the same thing:
+
+```rust
+return tool_error(&format!("Unknown alias '{alias}' (not in inventory)"));   // a LIE for libvirt guests
+```
+
+A libvirt guest **is** in the inventory, so this sends an operator hunting a
+phantom inventory bug. Added `utm_resolution_error()`, which distinguishes the two
+and, for a non-UTM alias, names the controller kind + `host_id` and points at the
+controller-aware CLI. All 5 call sites updated; test
+`utm_resolution_error_distinguishes_absent_from_non_utm_backed` asserts it never
+claims a present alias is missing. **Fail-loud, not fail-silent.**
+
+**Remaining (needs the box to verify):** the §6.8.2 delegation refactor, and
+`recover_stuck_vms` (currently UTM/`arp`-shaped).
+
+---
+
 ## 6.7 Parallel per-machine labs + the commit-sync mechanic (DESIGN, 2026-07-16)
 
 **Status: SPEC, NOT IMPLEMENTED.** Owner idea 2026-07-16, assessed and accepted.
@@ -1296,7 +1361,7 @@ and can be sidestepped with out-of-band (cloud-init/unattend) provisioning.
 | 2 | virsh **power control**: `transition_libvirt_vm` (`virsh start`/`shutdown` + `domstate` poll; fails closed when state is unreadable; graceful shutdown — force/`destroy` escalation is a small follow-up) + `LibvirtPowerAction`. `StartTarget` now carries the real `VmController` (not the flattened UTM `utm_name`/`bundle_path`) with `display_name()`/`local_utm()` accessors; `resolve_start_targets` resolves libvirt targets; `execute_ops_vm_lab_start`/`_stop` dispatch per controller and only require `utmctl` when a UTM target is present. IP-resolution + readiness still fail closed for libvirt → increment 3. +3 unit tests | **DONE** — `check --all-targets`/`fmt`/`clippy -D warnings`/tests green |
 | 3 | virsh **IP discovery + readiness observation**: `resolve_libvirt_live_host` three-rung ladder — `virsh domifaddr` (lease) → `domifaddr --source arp` (bridged) → `domiflist` MACs × `ip neigh show` — candidates through the shared `select_preferred_live_ssh_ip` selector (viability, mesh-IP exclusion, last-known preference). Entry resolver generalized (`resolve_local_utm_live_host` → `resolve_controller_live_host`) so `resolved_inventory_ssh_target*` rewrites SSH hosts for libvirt entries; `observe_local_utm_target_ready` observes libvirt via `virsh domstate` + the ladder (IP deliberately gated on domain-running to keep stale neigh-cache IPs out of ready states/inventory persistence), making `--wait-ready` restart recovery work for libvirt targets. +3 parser tests. NOTE: the `execute_ops_vm_lab_discover_local_utm` bundle-scan remains UTM-only — libvirt entries rely on per-run/per-target resolution (a `virsh list --all` discovery analogue is optional follow-up). Live proof on the box pending (§ 0/6) | **DONE (code)** — gates green |
 | 4 | **runtime-OS-dispatch the host network observers** so the launch audit (which the `--node` orchestrator runs at `native.rs:1095`, host-only, and which hard-stops an *enforced*-profile run) produces real evidence on the Linux host instead of empty+`plutil`/`ifconfig`-not-found noise. `observe_host` now branches on `std::env::consts::OS`: `observe_host_macos` keeps the existing BSD-tool collectors byte-identical; new `observe_host_linux` uses iproute2 JSON (`ip -j addr`/`ip -j route`) via new pure parsers `parse_ip_json_addr`/`parse_ip_json_route` (private-IP kept, public redacted, best-effort empty on bad input) + a `linux_ip_binary()` PATH-safe resolver (guards the non-login `/usr/sbin` gap). The UTM-bundle-mutating `network_prepare`/`_restore` fail closed on non-macOS via `ensure_utm_host_for_network_mutation` (clear "use virsh/domain XML" error, not a missing-`plutil` crash; `--list` still works anywhere). +2 parser tests. KNOWN GAP: the `vpn_utun_interfaces`/`full_tunnel_vpn_suspected` heuristic stays utun-specific (won't flag a Linux WireGuard full-tunnel) — a follow-up refinement | **DONE (code)** — gates green |
-| 5 | MCP surface: branch `lab_state.rs` `alias_to_utm`/`utm_power_status`/power tools/`recover_stuck_vms` on controller kind (virsh `domstate` + a virsh recover) | TODO |
+| 5 | MCP surface (`rustynet-mcp-lab-state`) | **PARTIAL 2026-07-16 — and the original scope was WRONG; see §6.8** |
 | 0 / 6 | Linux-host build check (`cargo check … --target x86_64-unknown-linux-gnu` on the box) + interim `--trust-inventory-ready` run; then a full live `--node` run driving libvirt guests → `live_lab_run_matrix.csv` row (**the DoD**) | **UNBLOCKED 2026-07-16 — NEXT.** Host is live and verified (§6.1): Ryzen 7700X, 61 GiB, `kvm_amd nested = 1` already on, 427 G free on `/dev/sdb`. Not yet installed on the box: the §6 virt stack (`qemu-kvm`/`libvirt-daemon-system`/`virtinst`/`bridge-utils`/`cpu-checker`) and a Rust toolchain (run-on-host needs `cargo` to build `rustynet-cli --features vm-lab`). Gated on the §6.1 bridging blocker (`eno1` has no carrier — WiFi cannot bridge) |
 
 Increment 1 (`f3352b0`) touched `mod.rs` (enum + const `DEFAULT_LIBVIRT_CONNECT_URI`
