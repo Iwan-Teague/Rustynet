@@ -1568,7 +1568,10 @@ fn refresh_signed_state(identity: &Path, known_hosts: &Path, target: &str) -> Re
         identity,
         known_hosts,
         target,
-        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh",
+        &format!(
+            "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock {} state refresh",
+            live_lab_support::REMOTE_RUSTYNET_BIN
+        ),
     )
 }
 
@@ -1577,7 +1580,10 @@ fn refresh_trust_evidence(identity: &Path, known_hosts: &Path, target: &str) -> 
         identity,
         known_hosts,
         target,
-        "rustynet ops refresh-signed-trust",
+        &format!(
+            "{} ops refresh-signed-trust",
+            live_lab_support::REMOTE_RUSTYNET_BIN
+        ),
     )
 }
 

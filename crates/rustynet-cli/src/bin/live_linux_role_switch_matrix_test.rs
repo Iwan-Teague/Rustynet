@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use live_lab_bin_support as live_lab_support;
 
 use live_lab_support::{
-    Logger, apply_role_coupling, assignment_bundle_path_for_platform,
+    Logger, REMOTE_RUSTYNET_BIN, apply_role_coupling, assignment_bundle_path_for_platform,
     assignment_refresh_env_path_for_platform, assignment_watermark_path_for_platform,
     capture_daemon_status_for_platform, capture_remote_stdout, capture_root, create_workspace,
     daemon_socket_path_for_platform, enforce_host, field_value, git_head_commit,
@@ -1254,7 +1254,7 @@ fn refresh_traversal_bundles_for_transition(
         known_hosts,
         refresh.exit_host.as_str(),
         format!(
-            "rustynet ops e2e-issue-traversal-bundles-from-env --env-file '{remote_env_path}' --issue-dir '{remote_issue_dir}'"
+            "{REMOTE_RUSTYNET_BIN} ops e2e-issue-traversal-bundles-from-env --env-file '{remote_env_path}' --issue-dir '{remote_issue_dir}'"
         )
         .as_str(),
     ) {
@@ -1423,7 +1423,7 @@ fn refresh_assignment_bundles_for_transition(
         known_hosts,
         refresh.exit_host.as_str(),
         format!(
-            "rustynet ops e2e-issue-assignment-bundles-from-env --env-file '{remote_env_path}' --issue-dir '{remote_issue_dir}'"
+            "{REMOTE_RUSTYNET_BIN} ops e2e-issue-assignment-bundles-from-env --env-file '{remote_env_path}' --issue-dir '{remote_issue_dir}'"
         )
         .as_str(),
     ) {
@@ -1538,7 +1538,7 @@ fn refresh_dns_zone_bundles_for_transition(
         known_hosts,
         refresh.exit_host.as_str(),
         format!(
-            "rustynet ops e2e-issue-dns-zone-bundles-from-env --env-file '{remote_env_path}' --issue-dir '{remote_issue_dir}'"
+            "{REMOTE_RUSTYNET_BIN} ops e2e-issue-dns-zone-bundles-from-env --env-file '{remote_env_path}' --issue-dir '{remote_issue_dir}'"
         )
         .as_str(),
     ) {
@@ -1676,16 +1676,18 @@ fn refresh_trust_evidence(
     // refresh-signed-trust fails closed. Linux uses its default file/systemd
     // credential custody and needs no extra env.
     let macos_cmd;
+    let linux_cmd;
     let cmd = if platform == "macos" {
         macos_cmd = format!(
             "env RUSTYNET_TRUST_SIGNER_KEY='/usr/local/etc/rustynet/trust-evidence.key' \
              RUSTYNET_TRUST_EVIDENCE='/usr/local/var/rustynet/trust/rustynetd.trust' \
              RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT='trust-passphrase-{node_id}' \
-             rustynet ops refresh-signed-trust"
+             {REMOTE_RUSTYNET_BIN} ops refresh-signed-trust"
         );
         macos_cmd.as_str()
     } else {
-        "rustynet ops refresh-signed-trust"
+        linux_cmd = format!("{REMOTE_RUSTYNET_BIN} ops refresh-signed-trust");
+        linux_cmd.as_str()
     };
     run_root(identity, known_hosts, host, cmd)
 }
@@ -1702,7 +1704,7 @@ fn refresh_signed_state(
         identity,
         known_hosts,
         host,
-        &format!("env RUSTYNET_DAEMON_SOCKET={socket} rustynet state refresh"),
+        &format!("env RUSTYNET_DAEMON_SOCKET={socket} {REMOTE_RUSTYNET_BIN} state refresh"),
     )
 }
 
@@ -1717,7 +1719,7 @@ fn force_runtime_state_refresh(
             identity,
             known_hosts,
             host,
-            "rustynet ops force-local-assignment-refresh-now",
+            &format!("{REMOTE_RUSTYNET_BIN} ops force-local-assignment-refresh-now"),
         )?;
     }
     wait_for_daemon_socket(
@@ -1974,7 +1976,7 @@ fn lan_toggle_denied(
     platform: &str,
 ) -> Result<bool, String> {
     let posix_command = format!(
-        "env RUSTYNET_SOCKET={} RUSTYNET_AUTO_TUNNEL_BUNDLE={} RUSTYNET_AUTO_TUNNEL_WATERMARK={} rustynet ops apply-lan-access-coupling --enable true --env-path {} --lan-routes 192.168.1.0/24 >/dev/null 2>&1 && exit 1 || exit 0",
+        "env RUSTYNET_SOCKET={} RUSTYNET_AUTO_TUNNEL_BUNDLE={} RUSTYNET_AUTO_TUNNEL_WATERMARK={} {REMOTE_RUSTYNET_BIN} ops apply-lan-access-coupling --enable true --env-path {} --lan-routes 192.168.1.0/24 >/dev/null 2>&1 && exit 1 || exit 0",
         daemon_socket_path_for_platform(platform),
         assignment_bundle_path_for_platform(platform),
         assignment_watermark_path_for_platform(platform),

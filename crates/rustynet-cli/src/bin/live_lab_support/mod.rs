@@ -79,6 +79,17 @@ pub fn enforce_linux_only_until_validator_lands(
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Absolute path to the deployed `rustynet` binary on a managed guest
+/// (identical on Linux and macOS).
+///
+/// Never invoke the binary by bare name in a remote command: `sudo` does not
+/// inherit the caller's PATH, it uses `secure_path` from `/etc/sudoers`, and
+/// the RHEL family ships `secure_path = /sbin:/bin:/usr/sbin:/usr/bin` --
+/// which omits `/usr/local/bin`. A bare name therefore works on Debian and
+/// Ubuntu and fails on Rocky/Fedora with `command not found` (status 127).
+/// Mirrors `live_lab_bin_support::REMOTE_RUSTYNET_BIN`.
+pub const REMOTE_RUSTYNET_BIN: &str = "/usr/local/bin/rustynet";
+
 const PROCESS_POLL_INTERVAL_MILLIS: u64 = 100;
 const UTM_EXEC_TIMEOUT_SECS: u64 = 120;
 const UTM_FILE_TIMEOUT_SECS: u64 = 120;

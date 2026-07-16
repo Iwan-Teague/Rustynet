@@ -59,10 +59,10 @@ use std::path::{Path, PathBuf};
 
 use live_lab_bin_support as live_lab_support;
 use live_lab_support::{
-    capture_daemon_status_for_platform, capture_remote_stdout, capture_root, create_workspace,
-    ensure_pinned_known_hosts_file, ensure_safe_token, git_head_commit, load_home_known_hosts_path,
-    repo_root, require_command, seed_known_hosts, verify_passwordless_sudo, verify_sudo,
-    verify_windows_admin, write_file,
+    REMOTE_RUSTYNET_BIN, capture_daemon_status_for_platform, capture_remote_stdout, capture_root,
+    create_workspace, ensure_pinned_known_hosts_file, ensure_safe_token, git_head_commit,
+    load_home_known_hosts_path, repo_root, require_command, seed_known_hosts,
+    verify_passwordless_sudo, verify_sudo, verify_windows_admin, write_file,
 };
 use serde::Serialize;
 
@@ -134,7 +134,7 @@ fn run() -> Result<(), String> {
         )
         .map_err(|err| {
             format!(
-                "rustynet membership status capture failed for {} ({}): {err}",
+                "membership status capture failed for {} ({}): {err}",
                 host.label,
                 host.platform.as_str()
             )
@@ -554,7 +554,9 @@ fn capture_membership_status(
 ) -> Result<String, String> {
     match platform {
         HostPlatform::Linux | HostPlatform::Macos => {
-            let command = "command -v rustynet >/dev/null && rustynet membership status";
+            let command = &format!(
+                "command -v {REMOTE_RUSTYNET_BIN} >/dev/null && {REMOTE_RUSTYNET_BIN} membership status"
+            );
             capture_root(identity, known_hosts, host, command)
         }
         HostPlatform::Windows => {

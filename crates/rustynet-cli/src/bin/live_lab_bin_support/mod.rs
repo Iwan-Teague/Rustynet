@@ -1509,7 +1509,7 @@ pub fn apply_role_coupling(
     platform: &str,
 ) -> Result<(), String> {
     let mut command = format!(
-        "sudo -n env RUSTYNET_SOCKET={} RUSTYNET_AUTO_TUNNEL_BUNDLE={} RUSTYNET_AUTO_TUNNEL_WATERMARK={} rustynet ops apply-role-coupling --target-role {} --enable-exit-advertise {} --env-path {}",
+        "sudo -n env RUSTYNET_SOCKET={} RUSTYNET_AUTO_TUNNEL_BUNDLE={} RUSTYNET_AUTO_TUNNEL_WATERMARK={} {REMOTE_RUSTYNET_BIN} ops apply-role-coupling --target-role {} --enable-exit-advertise {} --env-path {}",
         daemon_socket_path_for_platform(platform),
         assignment_bundle_path_for_platform(platform),
         assignment_watermark_path_for_platform(platform),
@@ -1555,7 +1555,7 @@ pub fn apply_lan_access_coupling(
     platform: &str,
 ) -> Result<(), String> {
     let mut command = format!(
-        "sudo -n env RUSTYNET_SOCKET={} RUSTYNET_AUTO_TUNNEL_BUNDLE={} RUSTYNET_AUTO_TUNNEL_WATERMARK={} rustynet ops apply-lan-access-coupling --enable {} --env-path {}",
+        "sudo -n env RUSTYNET_SOCKET={} RUSTYNET_AUTO_TUNNEL_BUNDLE={} RUSTYNET_AUTO_TUNNEL_WATERMARK={} {REMOTE_RUSTYNET_BIN} ops apply-lan-access-coupling --enable {} --env-path {}",
         daemon_socket_path_for_platform(platform),
         assignment_bundle_path_for_platform(platform),
         assignment_watermark_path_for_platform(platform),
@@ -1979,6 +1979,114 @@ port 22
         );
     }
 
+    /// Does this line invoke `rustynet` by an unqualified name?
+    ///
+    /// Matching only `sudo -n rustynet` — the first cut of this detector — was
+    /// too narrow and let the defect through twice: the binary is also named
+    /// AFTER an `env` prefix (`sudo -n env VAR=... rustynet ops ...`) and
+    /// inside root shell strings with no `sudo` token at all
+    /// (`run_root(.., "rustynet ops refresh-signed-trust")`), which failed on
+    /// Rocky with `sh: line 1: rustynet: command not found` (status 127). So
+    /// look for the binary token itself, wherever it sits in the command.
+    ///
+    /// A path-qualified use (`/usr/local/bin/rustynet ops`) and the
+    /// `{REMOTE_RUSTYNET_BIN}` placeholder are correct and must not match;
+    /// nor may `rustynetd`, or a directory such as `/run/rustynet/`. The
+    /// needle is built at runtime so this detector's own source cannot match
+    /// itself.
+    fn bare_rustynet_invocation(line: &str) -> bool {
+        // Subcommand vocabulary: the token must actually start a rustynet
+        // invocation, not merely appear in prose or a path.
+        const SUBCOMMANDS: [&str; 8] = [
+            "ops",
+            "state",
+            "role",
+            "assignment",
+            "trust",
+            "membership",
+            "key",
+            "anchor",
+        ];
+        let needle = ["rusty", "net "].concat();
+        let mut from = 0usize;
+        while let Some(offset) = line[from..].find(needle.as_str()) {
+            let at = from + offset;
+            // Preceded by `/` => path-qualified, which is the correct form.
+            // Preceded by a backtick => prose quoting a command inside a
+            // description string, e.g. "Captures `rustynet anchor list` on ...".
+            let preceding = (at > 0).then(|| line.as_bytes()[at - 1]);
+            let not_an_invocation = matches!(preceding, Some(b'/') | Some(b'`'));
+            let rest = &line[at + needle.len()..];
+            let invokes = SUBCOMMANDS
+                .iter()
+                .any(|subcommand| rest.starts_with(subcommand));
+            if !not_an_invocation && invokes {
+                return true;
+            }
+            from = at + 1;
+        }
+        false
+    }
+
+    /// The detector above has been too narrow twice, each time costing a live
+    /// lab cycle, so pin its behaviour directly rather than only through the
+    /// source scan.
+    #[test]
+    fn bare_rustynet_detector_catches_every_form_that_reached_the_lab() {
+        let sudo = "sudo -n";
+        let bin = "rusty".to_owned() + "net";
+        // Forms that actually failed on Rocky/Fedora:
+        assert!(bare_rustynet_invocation(&format!(
+            "{sudo} {bin} ops e2e-enforce-host --role x"
+        )));
+        assert!(
+            bare_rustynet_invocation(&format!(
+                "{sudo} env RUSTYNET_SOCKET=/x {bin} ops apply-role-coupling"
+            )),
+            "the binary named after an `env` prefix is the form the first detector missed"
+        );
+        assert!(
+            bare_rustynet_invocation(&format!(
+                "env RUSTYNET_DAEMON_SOCKET=/x {bin} state refresh"
+            )),
+            "a root shell string with no sudo token is still a PATH-dependent invocation"
+        );
+        assert!(
+            bare_rustynet_invocation(&format!("{bin} ops refresh-signed-trust")),
+            "sh: line 1: rustynet: command not found (status 127)"
+        );
+
+        // Correct, path-qualified forms must NOT be flagged.
+        assert!(!bare_rustynet_invocation(&format!(
+            "{sudo} /usr/local/bin/{bin} ops e2e-enforce-host"
+        )));
+        assert!(!bare_rustynet_invocation(&format!(
+            "{sudo} env A=1 /usr/local/bin/{bin} ops apply-role-coupling"
+        )));
+        assert!(
+            !bare_rustynet_invocation("sudo -n {REMOTE_RUSTYNET_BIN} ops e2e-enforce-host"),
+            "the format placeholder is fed the absolute path"
+        );
+
+        // Near-misses that must not trip it.
+        assert!(
+            !bare_rustynet_invocation(&format!("{bin}d --version")),
+            "rustynetd is a different binary"
+        );
+        assert!(
+            !bare_rustynet_invocation(&format!("RUSTYNET_DAEMON_SOCKET=/run/{bin}/{bin}d.sock")),
+            "a directory component is not an invocation"
+        );
+        assert!(
+            !bare_rustynet_invocation(&format!("the {bin} binary is installed by the lab")),
+            "prose is not an invocation"
+        );
+        assert!(
+            !bare_rustynet_invocation(&format!("Captures `{bin} anchor list` on Linux + macOS")),
+            "a backtick-quoted command inside a description string is prose"
+        );
+    }
+
     /// `sudo` resolves the command through `secure_path` from `/etc/sudoers`,
     /// NOT the caller's PATH. The RHEL family ships
     /// `Defaults secure_path = /sbin:/bin:/usr/sbin:/usr/bin`, which omits
@@ -2000,11 +2108,6 @@ port 22
         let bin_dir = root.join("crates/rustynet-cli/src/bin");
         let mut offenders = Vec::new();
         let mut scanned = 0usize;
-        // The bare form is `sudo` + optional flags + the unqualified binary
-        // name. Build the needles at runtime so this detector's own source
-        // does not match itself.
-        let bare = ["sudo", "-n", "rustynet "].join(" ");
-        let bare_no_flag = ["sudo", "rustynet "].join(" ");
         let mut scan = |path: &std::path::Path| {
             let Ok(body) = std::fs::read_to_string(path) else {
                 return;
@@ -2014,31 +2117,45 @@ port 22
             // in a fixture or an assertion message.
             let production = body.split("#[cfg(test)]").next().unwrap_or(&body);
             for (index, line) in production.lines().enumerate() {
-                // Only the bare, PATH-dependent form is a defect; an absolute
-                // path (or a `{}`/`{VAR}` placeholder fed one) is correct.
-                if line.contains(bare.as_str()) || line.contains(bare_no_flag.as_str()) {
+                // Prose describing a command is not a command. Doc comments
+                // reference `rustynet state refresh` when explaining behaviour.
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                    continue;
+                }
+                if bare_rustynet_invocation(line) {
                     offenders.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
                 }
             }
         };
         scan(bin_dir.join("live_lab_bin_support/mod.rs").as_path());
+        // Scope: the `live_*` binaries, which are the ones that construct
+        // commands to run ON A GUEST. Host-side tooling (e.g. phase*_gates)
+        // carries human-readable step DESCRIPTIONS like
+        // "run rustynet ops generate-release-sbom" next to the real argv, and
+        // those are prose, not invocations.
         if let Ok(entries) = std::fs::read_dir(bin_dir.as_path()) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "rs") {
+                let is_live_bin = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("live_"));
+                if is_live_bin && path.extension().is_some_and(|ext| ext == "rs") {
                     scan(path.as_path());
                 }
             }
         }
         assert!(
-            scanned > 0,
-            "scanned no sources; the bin directory layout moved: {}",
+            scanned > 1,
+            "scanned no live_* sources; the bin directory layout moved: {}",
             bin_dir.display()
         );
         assert!(
             offenders.is_empty(),
-            "sudo must name the binary by absolute path (REMOTE_RUSTYNET_BIN); \
-             a bare `sudo -n rustynet` fails on Rocky/Fedora secure_path:\n{}",
+            "name the rustynet binary by absolute path (REMOTE_RUSTYNET_BIN); \
+             a PATH-dependent invocation fails on Rocky/Fedora, where sudo's \
+             secure_path omits /usr/local/bin:\n{}",
             offenders.join("\n")
         );
     }

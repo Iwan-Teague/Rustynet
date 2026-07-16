@@ -5,7 +5,9 @@ mod live_lab_support;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use live_lab_support::{LiveLabContext, Logger, parse_ipv4, repo_root, run_cargo_ops};
+use live_lab_support::{
+    LiveLabContext, Logger, REMOTE_RUSTYNET_BIN, parse_ipv4, repo_root, run_cargo_ops,
+};
 
 fn main() {
     if let Err(err) = run() {
@@ -358,7 +360,7 @@ fn start_probe_server(
     probe_log_path: &str,
 ) -> Result<(), String> {
     let shell_command = format!(
-        "nohup rustynet ops e2e-http-probe-server --bind-ip {} --port {} --response-body {} >{} 2>&1 </dev/null & echo $! > {}",
+        "nohup {REMOTE_RUSTYNET_BIN} ops e2e-http-probe-server --bind-ip {} --port {} --response-body {} >{} 2>&1 </dev/null & echo $! > {}",
         live_lab_support::shell_single_quote(probe_ip),
         live_lab_support::shell_single_quote(probe_port),
         live_lab_support::shell_single_quote("probe-ok"),

@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use live_lab_bin_support as live_lab_support;
 use live_lab_support::{
-    LiveLabPlatform, Logger, RemoteShellHost, capture_remote_stdout, capture_root,
-    create_workspace, ensure_pinned_known_hosts_file, ensure_safe_token, git_head_commit,
-    load_home_known_hosts_path, new_remote_shell_host, repo_root, require_command,
+    LiveLabPlatform, Logger, REMOTE_RUSTYNET_BIN, RemoteShellHost, capture_remote_stdout,
+    capture_root, create_workspace, ensure_pinned_known_hosts_file, ensure_safe_token,
+    git_head_commit, load_home_known_hosts_path, new_remote_shell_host, repo_root, require_command,
     seed_known_hosts, shell_quote, unix_now, verify_passwordless_sudo, verify_sudo,
     verify_windows_admin, write_file,
 };
@@ -371,7 +371,9 @@ fn capture_anchor_list_from_host(
 ) -> Result<String, String> {
     match platform {
         AnchorPlatform::Linux => {
-            let command = "command -v rustynet >/dev/null; rustynet anchor list";
+            let command = &format!(
+                "command -v {REMOTE_RUSTYNET_BIN} >/dev/null; {REMOTE_RUSTYNET_BIN} anchor list"
+            );
             capture_root(identity, known_hosts, host, command)
                 .map_err(|err| format!("anchor list failed on {host}: {err}"))
         }
@@ -379,7 +381,9 @@ fn capture_anchor_list_from_host(
             // macOS installs membership state under membership/ subdir, not /var/lib/rustynet.
             // Pass both --snapshot and --log explicitly; the CLI defaults to the Linux paths
             // which do not exist on macOS.
-            let command = "command -v rustynet >/dev/null; rustynet anchor list --snapshot /usr/local/var/rustynet/membership/membership.snapshot --log /usr/local/var/rustynet/membership/membership.log";
+            let command = &format!(
+                "command -v {REMOTE_RUSTYNET_BIN} >/dev/null; {REMOTE_RUSTYNET_BIN} anchor list --snapshot /usr/local/var/rustynet/membership/membership.snapshot --log /usr/local/var/rustynet/membership/membership.log"
+            );
             capture_root(identity, known_hosts, host, command)
                 .map_err(|err| format!("anchor list failed on {host}: {err}"))
         }
@@ -596,7 +600,7 @@ fn set_membership_capabilities_linux_ops_verb(
     owner_approver_id: &str,
 ) -> Result<String, String> {
     let command = format!(
-        "command -v rustynet >/dev/null && rustynet ops e2e-membership-set-capabilities --node-id {node_id} --capabilities {capabilities} --owner-approver-id {owner}",
+        "command -v {REMOTE_RUSTYNET_BIN} >/dev/null && {REMOTE_RUSTYNET_BIN} ops e2e-membership-set-capabilities --node-id {node_id} --capabilities {capabilities} --owner-approver-id {owner}",
         node_id = shell_quote(node_id),
         capabilities = shell_quote(capabilities),
         owner = shell_quote(owner_approver_id),
@@ -653,19 +657,19 @@ fn set_membership_capabilities_three_step(
         r#"set -eu
 work="$(/usr/bin/mktemp -d {work_dir})"
 trap '/bin/rm -rf -- "$work"' EXIT
-rustynet membership propose-set-capabilities \
+{REMOTE_RUSTYNET_BIN} membership propose-set-capabilities \
   --node-id {node_id} \
   --capabilities {capabilities} \
   --output "$work/record.bin" \
   --snapshot {snapshot} \
   --log {log_path}
-rustynet membership sign-update \
+{REMOTE_RUSTYNET_BIN} membership sign-update \
   --record "$work/record.bin" \
   --approver-id {approver} \
   --signing-key {signing_key} \
   --signing-key-passphrase-file {passphrase} \
   --output "$work/signed.bin"
-rustynet membership apply-update \
+{REMOTE_RUSTYNET_BIN} membership apply-update \
   --signed-update "$work/signed.bin" \
   --snapshot {snapshot} \
   --log {log_path}
