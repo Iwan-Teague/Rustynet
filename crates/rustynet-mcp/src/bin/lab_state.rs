@@ -2848,6 +2848,130 @@ impl LabStateServer {
 
     /// Read back the loop journal (last N notes) — the agent's memory across
     /// context compaction over a long run.
+    /// Every attempt already made against a failing stage, so an agent picking
+    /// it up does not re-derive or repeat one.
+    ///
+    /// Joins two sources and derives the outcome rather than storing it:
+    /// `live_lab_stage_triage.jsonl` (what failed + what was tried) and
+    /// `live_lab_node_stage_results.csv` (the engine's own per-run status).
+    /// A patch that worked turns the stage green in the next run; one that did
+    /// not opens a new stub against a new commit. Reading the chain therefore
+    /// cannot drift from what the runs actually did.
+    fn stage_triage_history(&self, args: Option<&Value>) -> ToolCallResult {
+        let stage = arg_str(args, "stage").unwrap_or("").trim().to_owned();
+        if stage.is_empty() {
+            return tool_error("stage is required, e.g. stage=live_two_hop_validation");
+        }
+        let os_filter = arg_str(args, "os").map(|s| s.trim().to_ascii_lowercase());
+
+        let path = self.abs_path("documents/operations/live_lab_stage_triage.jsonl");
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut records: Vec<Value> = Vec::new();
+        for line in body.lines().filter(|l| !l.trim().is_empty()) {
+            match serde_json::from_str::<Value>(line) {
+                Ok(v) => records.push(v),
+                // A corrupt line must not silently read as "nothing tried".
+                Err(err) => {
+                    return tool_error(&format!(
+                        "stage triage ledger is malformed ({}): {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
+        let field = |v: &Value, k: &str| -> String {
+            v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_owned()
+        };
+        let mut hits: Vec<&Value> = records
+            .iter()
+            .filter(|r| field(r, "stage") == stage)
+            .filter(|r| match &os_filter {
+                None => true,
+                Some(os) => r
+                    .get("os_family")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .any(|x| x.eq_ignore_ascii_case(os))
+                    }),
+            })
+            .collect();
+        hits.sort_by_key(|r| field(r, "ts_utc"));
+
+        if hits.is_empty() {
+            return tool_success(&format!(
+                "# Stage triage history — {stage}\n\nNo attempts recorded{}.\n\nEither this stage has \
+                 never failed under the `--node` engine, or the ledger predates it. Check \
+                 `documents/operations/live_lab_node_stage_results.csv` for raw run history.\n\n\
+                 NOTE: this ledger is `--node` only. The legacy bash archive uses a different stage \
+                 vocabulary (`linux_stage_two_hop` vs `live_two_hop_validation`), so its results are \
+                 not evidence here.\n",
+                os_filter
+                    .as_deref()
+                    .map(|os| format!(" for os={os}"))
+                    .unwrap_or_default()
+            ));
+        }
+
+        let unfilled = hits.iter().filter(|r| field(r, "patch").is_empty()).count();
+        let mut out = format!(
+            "# Stage triage history — {stage}\n\n{} attempt(s) recorded{}. Oldest first.\n",
+            hits.len(),
+            os_filter
+                .as_deref()
+                .map(|os| format!(" for os={os}"))
+                .unwrap_or_default()
+        );
+        out.push_str(
+            "\n**Read the chain, not the rows.** A new stub against a NEW commit means the \
+             preceding patch did not fix it — that is how outcome is evidenced here, so there is \
+             no outcome field to trust or maintain.\n\n",
+        );
+        for (index, record) in hits.iter().enumerate() {
+            let patch = field(record, "patch");
+            out.push_str(&format!(
+                "## {}. run {} @ {}\n- when: {}\n- os: {}\n- error: {}\n- **patch tried**: {}\n\n",
+                index + 1,
+                field(record, "run_id"),
+                &field(record, "run_commit")
+                    .chars()
+                    .take(12)
+                    .collect::<String>(),
+                field(record, "ts_utc"),
+                record
+                    .get("os_family")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a
+                        .iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "))
+                    .unwrap_or_default(),
+                field(record, "error").replace('\n', " ").chars().take(400).collect::<String>(),
+                if patch.is_empty() {
+                    "(NOT YET RECORDED — fill this before the verification run)".to_owned()
+                } else {
+                    patch
+                },
+            ));
+        }
+        if unfilled > 0 {
+            out.push_str(&format!(
+                "---\n\n**{unfilled} stub(s) have no patch recorded.** Fill each with the patch you \
+                 are about to test, BEFORE the verification run, so the ledger row's own commit is \
+                 the patch commit. A deliberate decision not to patch is a filled value \
+                 (`\"none: <reason>\"`), never blank — blank reads as forgotten.\n",
+            ));
+        }
+        out.push_str(
+            "\n**Do not repeat a patch listed above.** If the same error recurs after one of these, \
+             that approach is refuted — say so in the next stub rather than trying it again.\n",
+        );
+        tool_success(&out)
+    }
+
     fn get_loop_journal(&self, args: Option<&Value>) -> ToolCallResult {
         let limit = args
             .and_then(|a| a.get("limit"))
@@ -4636,6 +4760,17 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "stage_triage_history".into(),
+                description: "Every fix already ATTEMPTED against a failing live-lab stage, oldest first — read this BEFORE debugging a stage failure so you do not re-derive or repeat a patch someone already tried. Pass stage (e.g. live_two_hop_validation) and optionally os (debian/rocky/ubuntu/fedora/macos/windows). Each entry pairs the run's verbatim error with the patch that was tried against it. There is deliberately no outcome field: a patch that worked turns the stage green in the next run, and one that did not opens a NEW stub against a NEW commit — so read the chain. Because the patch is recorded before the verification run, the ledger row's own commit IS the patch commit (git log the ledger). `--node` engine only: the legacy bash archive uses a different stage vocabulary, so its results are not evidence here.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "stage": json_schema_string("Stage name, e.g. live_two_hop_validation"),
+                        "os": json_schema_string("Optional OS family filter: debian|rocky|ubuntu|fedora|macos|windows"),
+                    }),
+                    vec!["stage"],
+                ),
+            },
+            Tool {
                 name: "get_loop_journal".into(),
                 description: "Read back the loop journal (last N notes, default 30) — what past iterations tried and concluded. Call this after a context compaction, or at the start of an iteration, to recover continuity instead of repeating work.".into(),
                 input_schema: json_schema_object(
@@ -5310,6 +5445,7 @@ impl McpServer for LabStateServer {
                 }
             }
             "write_loop_note" => self.write_loop_note(args),
+            "stage_triage_history" => self.stage_triage_history(args),
             "get_loop_journal" => self.get_loop_journal(args),
             "prune_jobs" => self.prune_jobs(args),
 
