@@ -265,13 +265,27 @@ pub(crate) fn format_stage_binary_failure(
     stdout: &[u8],
     stderr: &[u8],
 ) -> String {
+    /// Keep the **tail**, not the head.
+    ///
+    /// A failing CLI dumps its whole usage text (11.5 KB) and prints the actual
+    /// error last, so clipping the head yields a screenful of help and hides
+    /// the one line worth reading — which is exactly what happened on the first
+    /// run of this formatter. The existing enforce_runtime reporter already
+    /// says "(stdout tail)" for the same reason.
     fn clip(raw: &[u8]) -> String {
         let text = String::from_utf8_lossy(raw);
         let text = text.trim();
-        match text.char_indices().nth(STAGE_FAILURE_STREAM_BUDGET) {
-            Some((cut, _)) => format!("{}… ({} bytes total)", &text[..cut], raw.len()),
-            None => text.to_owned(),
+        let total = text.chars().count();
+        if total <= STAGE_FAILURE_STREAM_BUDGET {
+            return text.to_owned();
         }
+        let skip = total - STAGE_FAILURE_STREAM_BUDGET;
+        let tail: String = text.chars().skip(skip).collect();
+        format!(
+            "…(clipped {} of {} bytes; tail follows)\n{tail}",
+            raw.len().saturating_sub(tail.len()),
+            raw.len()
+        )
     }
     let out = clip(stdout);
     let err = clip(stderr);
@@ -326,11 +340,20 @@ mod failure_format_tests {
     }
 
     #[test]
-    fn oversized_output_is_clipped_but_flagged() {
-        let huge = vec![b'x'; STAGE_FAILURE_STREAM_BUDGET * 2];
+    fn oversized_output_keeps_the_tail_where_the_error_is() {
+        // A failing CLI dumps its whole usage text and prints the real error
+        // LAST. Clipping the head hid it behind 11.5 KB of help on this
+        // formatter's first live run, which is the whole reason it clips the
+        // tail instead.
+        let mut noisy = vec![b'x'; STAGE_FAILURE_STREAM_BUDGET * 2];
+        noisy.extend_from_slice(b"THE ACTUAL ERROR");
         let summary =
-            format_stage_binary_failure("live_two_hop", exit_status_failure(), &huge, b"");
-        assert!(summary.contains("bytes total"), "{summary}");
+            format_stage_binary_failure("live_two_hop", exit_status_failure(), &noisy, b"");
+        assert!(
+            summary.contains("THE ACTUAL ERROR"),
+            "the tail carries the error and must survive clipping"
+        );
+        assert!(summary.contains("clipped"), "clipping must be disclosed");
         assert!(
             summary.len() < STAGE_FAILURE_STREAM_BUDGET * 2,
             "a runaway log must not swallow the summary"
