@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use live_lab_bin_support as live_lab_support;
 
 use live_lab_support::{
-    Logger, append_env_assignment, capture_root, create_workspace, enforce_host,
-    ensure_pinned_known_hosts_file, ensure_safe_token, git_head_commit,
+    Logger, REMOTE_RUSTYNET_BIN, append_env_assignment, capture_root, create_workspace,
+    enforce_host, ensure_pinned_known_hosts_file, ensure_safe_token, git_head_commit,
     issue_assignment_bundles_from_env, issue_traversal_bundles_from_env,
     load_home_known_hosts_path, read_file, remote_src_dir, require_command,
     resolved_target_address, run_root, scp_to, seed_known_hosts, shell_quote, status, unix_now,
@@ -485,7 +485,7 @@ fn run() -> Result<(), String> {
     .trim()
     .to_owned();
     let materialize_dns_passphrase_cmd = format!(
-        "rustynet ops materialize-signing-passphrase --output {}",
+        "{REMOTE_RUSTYNET_BIN} ops materialize-signing-passphrase --output {}",
         shell_quote(dns_passphrase_remote.as_str())
     );
     run_root(
@@ -1562,7 +1562,9 @@ fn refresh_signed_state(identity: &Path, known_hosts: &Path, target: &str) -> Re
         identity,
         known_hosts,
         target,
-        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh",
+        &format!(
+            "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock {REMOTE_RUSTYNET_BIN} state refresh"
+        ),
     )
 }
 
@@ -1571,7 +1573,7 @@ fn refresh_trust_evidence(identity: &Path, known_hosts: &Path, target: &str) -> 
         identity,
         known_hosts,
         target,
-        "rustynet ops refresh-signed-trust",
+        &format!("{REMOTE_RUSTYNET_BIN} ops refresh-signed-trust"),
     )
 }
 
@@ -1777,7 +1779,7 @@ fn pin_client_to_expected_exit(
         identity,
         known_hosts,
         client_host,
-        "rustynet ops force-local-assignment-refresh-now",
+        &format!("{REMOTE_RUSTYNET_BIN} ops force-local-assignment-refresh-now"),
     )
 }
 
