@@ -960,7 +960,7 @@ fn ssh_base_command(identity: &Path, known_hosts: &Path, target: &str) -> Comman
     command
 }
 
-fn scp_base_command(identity: &Path, known_hosts: &Path) -> Command {
+fn scp_base_command(identity: &Path, known_hosts: &Path, target: &str) -> Command {
     let mut command = Command::new("scp");
     command.args([
         "-q",
@@ -985,6 +985,12 @@ fn scp_base_command(identity: &Path, known_hosts: &Path) -> Command {
         "-i",
     ]);
     command.arg(identity);
+    if let Some(port) = target_port(target) {
+        // scp spells the port `-P`, unlike ssh's `-p`. It must precede the `--`
+        // end-of-options marker, or scp parses it as a local source path
+        // (`stat local "-P": No such file or directory`).
+        command.arg("-P").arg(port.to_string());
+    }
     command.arg("--");
     command
 }
@@ -1049,11 +1055,7 @@ pub fn scp_to(
         return utm_file_push(&transport, src, dst);
     }
     require_pinned_host_entry(known_hosts, target)?;
-    let mut scp = scp_base_command(identity, known_hosts);
-    if let Some(port) = target_port(target) {
-        // scp spells the port `-P`, unlike ssh's `-p`.
-        scp.arg("-P").arg(port.to_string());
-    }
+    let mut scp = scp_base_command(identity, known_hosts, target);
     scp.arg(src);
     scp.arg(format!("{}:{dst}", ssh_destination(target)));
     let status = scp
@@ -1082,8 +1084,8 @@ pub fn scp_from(
         return utm_file_pull(&transport, src, dst);
     }
     require_pinned_host_entry(known_hosts, target)?;
-    let mut scp = scp_base_command(identity, known_hosts);
-    scp.arg(format!("{target}:{src}"));
+    let mut scp = scp_base_command(identity, known_hosts, target);
+    scp.arg(format!("{}:{src}", ssh_destination(target)));
     scp.arg(dst);
     let status = scp
         .stdin(Stdio::null())
@@ -1771,6 +1773,41 @@ mod tests {
     }
 
     #[test]
+    fn scp_base_command_places_port_before_the_end_of_options_marker() {
+        // Regression: scp spells the port `-P` and it must precede the `--`
+        // end-of-options marker. Appended after it, scp parses `-P` as a local
+        // source path and dies with `stat local "-P": No such file or directory`.
+        let identity = std::path::Path::new("/tmp/id");
+        let known_hosts = std::path::Path::new("/tmp/kh");
+        let args: Vec<String> =
+            super::scp_base_command(identity, known_hosts, "debian@192.168.64.4:2222")
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+        let port_at = args
+            .iter()
+            .position(|arg| arg == "-P")
+            .expect("-P is emitted for an explicit port");
+        let marker_at = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("-- marker is emitted");
+        assert!(port_at < marker_at, "-P must precede --, got {args:?}");
+        assert_eq!(args[port_at + 1], "2222");
+
+        // No explicit port -> no -P at all (fall back to the ssh default).
+        let default_args: Vec<String> =
+            super::scp_base_command(identity, known_hosts, "debian@192.168.64.4")
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+        assert!(
+            !default_args.iter().any(|arg| arg == "-P"),
+            "no -P without an explicit port, got {default_args:?}"
+        );
+    }
+
+    #[test]
     fn live_lab_platform_parser_accepts_canonical_strings() {
         assert_eq!(
             LiveLabPlatform::parse("linux").unwrap(),
@@ -1915,10 +1952,11 @@ port 22
             "ssh must not mutate the seeded known_hosts file"
         );
 
-        let scp_args: Vec<String> = super::scp_base_command(identity, known_hosts)
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let scp_args: Vec<String> =
+            super::scp_base_command(identity, known_hosts, "debian@192.168.64.4")
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
         assert!(
             scp_args.iter().any(|arg| arg == "UpdateHostKeys=no"),
             "scp must not mutate the seeded known_hosts file"
