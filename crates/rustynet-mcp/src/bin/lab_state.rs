@@ -4120,6 +4120,19 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "compare_runs_at_commit".into(),
+                description: "STEP 6 of the multi-machine loop: collapse every run recorded at ONE commit into a single verdict, so you read a conclusion instead of two report trees. Per-platform pass/fail/no-verdict rollup + the failing stages + which machine each run came from (alias -> host_id join). SURFACES CONFLICTS: the same node+stage answering differently across runs at one commit invalidates the comparison and is reported loudly, never silently resolved. An absent result (skip/not_run/reused/unknown) is NEVER counted as pass — that is how a two-machine split would otherwise manufacture parity that was never tested. Refuses runs recorded from a dirty worktree, and refuses to call one run a comparison (--expect-runs, default 2). `ops vm-lab-run-matrix-compare`.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "commit": {"type": "string", "description": "Ref/SHA to compare at. Default HEAD."},
+                        "expect_runs": {"type": "integer", "description": "Minimum runs required. Default 2 — one machine reporting is not agreement."},
+                        "allow_dirty": {"type": "boolean", "description": "Compare runs whose worktree was dirty (their evidence does not match the commit it names)."},
+                        "format": {"type": "string", "enum": ["table", "json"]}
+                    }),
+                    vec![],
+                ),
+            },
+            Tool {
                 name: "provision_guest".into(),
                 description: "Create a headless cloud-image guest on a libvirt lab host (e.g. ubuntu-kvm-1) from a base image already in its pool. Bakes in the lessons that are NOT obvious: --video vga (virt-install --graphics none attaches no video device, and Debian cloud images boot-loop forever in GRUB's gfxterm without one — no kernel output at all), --cpu host-passthrough (so nested virt reaches inside the guest), and a backing-file overlay so guests share one read-only base. Verifies the pool's disk BY MODEL before writing anything if the host declares pool_disk_model. ALWAYS run with dry_run first to see the plan. libvirt hosts only — UTM guests are created in the UTM app. `ops vm-lab-provision-guest`.".into(),
                 input_schema: json_schema_object(
@@ -4691,6 +4704,38 @@ impl McpServer for LabStateServer {
                     extra.push(&identity_owned);
                 }
                 self.run_ops("vm-lab-sync-host", &extra, DISCOVERY_TIMEOUT_SECS)
+            }
+
+            "compare_runs_at_commit" => {
+                let mut extra: Vec<&str> = Vec::new();
+                let commit_owned;
+                if let Some(commit) = arg_str(args, "commit") {
+                    commit_owned = commit.to_owned();
+                    extra.push("--commit");
+                    extra.push(&commit_owned);
+                }
+                let expect_owned;
+                if let Some(n) = args
+                    .and_then(|a| a.get("expect_runs"))
+                    .and_then(|v| v.as_u64())
+                {
+                    expect_owned = n.to_string();
+                    extra.push("--expect-runs");
+                    extra.push(&expect_owned);
+                }
+                if arg_bool(args, "allow_dirty") {
+                    extra.push("--allow-dirty");
+                }
+                let format_owned;
+                if let Some(format) = arg_str(args, "format") {
+                    if !matches!(format, "table" | "json") {
+                        return tool_error("format must be `table` or `json`");
+                    }
+                    format_owned = format.to_owned();
+                    extra.push("--format");
+                    extra.push(&format_owned);
+                }
+                self.run_ops("vm-lab-run-matrix-compare", &extra, DISCOVERY_TIMEOUT_SECS)
             }
 
             "provision_guest" => {

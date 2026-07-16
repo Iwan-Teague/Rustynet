@@ -2465,6 +2465,87 @@ fn neutralize_csv_formula(value: String) -> String {
     }
 }
 
+/// A stage status that produced no verdict.
+///
+/// Reuses the recorder's own grouping (see `stage_status_is_absent`, and the
+/// `"skip" | "not_run" | "reused" | "unknown"` set already used in this module)
+/// rather than inventing a second, parallel notion of "did not run". **None of
+/// these is `pass`** — promoting an absent result to a passing one is exactly how
+/// a two-machine split would manufacture false parity: host A skips Windows, host
+/// B skips macOS, and a naive union reports everything green.
+pub(crate) fn stage_status_has_no_verdict(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "skip" | "skipped" | "not_run" | "reused" | "unknown" | ""
+    )
+}
+
+/// One node's result for one stage, as recorded by a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StageResultRow {
+    pub(crate) run_id: String,
+    pub(crate) git_commit: String,
+    pub(crate) git_dirty_state: String,
+    pub(crate) alias: String,
+    pub(crate) platform: String,
+    pub(crate) role: String,
+    pub(crate) stage: String,
+    pub(crate) status: String,
+    pub(crate) report_dir: String,
+}
+
+/// Read the normalised stage-results ledger.
+///
+/// Header is matched **by name**, not by position: the ledger is append-only and
+/// column order is not a contract worth betting evidence on.
+pub(crate) fn read_stage_result_rows(path: &Path) -> Result<Vec<StageResultRow>, String> {
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("read stage results failed ({}): {err}", path.display()))?;
+    let mut lines = body.lines();
+    let Some(header_line) = lines.next() else {
+        return Err(format!("stage results file is empty: {}", path.display()));
+    };
+    let header = parse_csv_record(header_line)?;
+    let index_of = |name: &str| -> Result<usize, String> {
+        header
+            .iter()
+            .position(|column| column == name)
+            .ok_or_else(|| format!("stage results is missing the {name} column"))
+    };
+    let (i_run, i_commit, i_dirty, i_alias, i_platform, i_role, i_stage, i_status, i_report) = (
+        index_of("run_id")?,
+        index_of("git_commit")?,
+        index_of("git_dirty_state")?,
+        index_of("alias")?,
+        index_of("platform")?,
+        index_of("role")?,
+        index_of("stage")?,
+        index_of("status")?,
+        index_of("report_dir")?,
+    );
+
+    let mut rows = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = parse_csv_record(line)?;
+        let get = |index: usize| record.get(index).cloned().unwrap_or_default();
+        rows.push(StageResultRow {
+            run_id: get(i_run),
+            git_commit: get(i_commit),
+            git_dirty_state: get(i_dirty),
+            alias: get(i_alias),
+            platform: get(i_platform),
+            role: get(i_role),
+            stage: get(i_stage),
+            status: get(i_status),
+            report_dir: get(i_report),
+        });
+    }
+    Ok(rows)
+}
+
 pub(crate) fn parse_csv_record(line: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut field = String::new();
