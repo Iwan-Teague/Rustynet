@@ -2438,14 +2438,20 @@ fn run_command_capture_with_env(
     args: &[&str],
     env_vars: &[(&str, &str)],
 ) -> Result<String, String> {
-    let mut command_builder = Command::new(command);
+    // `rustynet` here means "re-invoke myself"; resolve it to the running
+    // binary instead of letting PATH decide. Under `sudo` the child gets
+    // `secure_path` from /etc/sudoers, which on the RHEL family omits
+    // /usr/local/bin — so a bare spawn fails there and only there. See
+    // `ops_e2e::resolve_self_program`.
+    let resolved = crate::ops_e2e::resolve_self_program(command)?;
+    let mut command_builder = Command::new(resolved.as_str());
     command_builder.args(args);
     for (key, value) in env_vars {
         command_builder.env(key, value);
     }
     let output = command_builder
         .output()
-        .map_err(|err| format!("execute {} failed: {err}", format_command(command, args)))?;
+        .map_err(|err| format!("execute {} failed: {err}", format_command(&resolved, args)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
