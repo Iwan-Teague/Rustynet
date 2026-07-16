@@ -4120,6 +4120,23 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "provision_guest".into(),
+                description: "Create a headless cloud-image guest on a libvirt lab host (e.g. ubuntu-kvm-1) from a base image already in its pool. Bakes in the lessons that are NOT obvious: --video vga (virt-install --graphics none attaches no video device, and Debian cloud images boot-loop forever in GRUB's gfxterm without one — no kernel output at all), --cpu host-passthrough (so nested virt reaches inside the guest), and a backing-file overlay so guests share one read-only base. Verifies the pool's disk BY MODEL before writing anything if the host declares pool_disk_model. ALWAYS run with dry_run first to see the plan. libvirt hosts only — UTM guests are created in the UTM app. `ops vm-lab-provision-guest`.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "host": {"type": "string", "description": "host_id of a libvirt host from hosts[]."},
+                        "name": {"type": "string", "description": "Guest/domain name. ASCII alphanumeric, '-' or '_' only — it becomes a libvirt domain name AND a filename."},
+                        "image": {"type": "string", "description": "Base image filename inside the host's pool (bare name, no path). Use discover_hosts / host_disk_status to see what is there."},
+                        "ram_mb": {"type": "integer", "description": "Default 4096."},
+                        "vcpus": {"type": "integer", "description": "Default 2."},
+                        "disk_gb": {"type": "integer", "description": "Overlay size. Default 40."},
+                        "dry_run": {"type": "boolean", "description": "Print the plan and change nothing. Do this first."},
+                        "ssh_identity_file": {"type": "string"}
+                    }),
+                    vec!["host", "name", "image"],
+                ),
+            },
+            Tool {
                 name: "discover_hosts".into(),
                 description: "Point at the lab's MACHINES and get the VMs each actually has, and which are ready to join a run. Covers both host kinds uniformly: libvirt/KVM (probes `virsh version`, enumerates `virsh list --all`) and macOS/UTM (delegates to the UTM bundle scan). ready = domain running AND an IP resolved — running-without-IP is deliberately NOT ready, because the SSH plane would have nowhere to connect. Unregistered VMs are reported, not hidden. An unreachable host reports probe=FAILED and contributes no guests, so 'no VMs' never looks like 'could not ask'. `ops vm-lab-discover-hosts`.".into(),
                 input_schema: json_schema_object(
@@ -4674,6 +4691,49 @@ impl McpServer for LabStateServer {
                     extra.push(&identity_owned);
                 }
                 self.run_ops("vm-lab-sync-host", &extra, DISCOVERY_TIMEOUT_SECS)
+            }
+
+            "provision_guest" => {
+                let Some(host) = arg_str(args, "host") else {
+                    return tool_error("provision_guest requires `host` (a libvirt host_id)");
+                };
+                let Some(name) = arg_str(args, "name") else {
+                    return tool_error("provision_guest requires `name`");
+                };
+                let Some(image) = arg_str(args, "image") else {
+                    return tool_error(
+                        "provision_guest requires `image` (a base image filename in the host's pool)",
+                    );
+                };
+                let mut extra: Vec<&str> = vec!["--host", host, "--name", name, "--image", image];
+                let ram_owned;
+                if let Some(ram) = args.and_then(|a| a.get("ram_mb")).and_then(|v| v.as_u64()) {
+                    ram_owned = ram.to_string();
+                    extra.push("--ram-mb");
+                    extra.push(&ram_owned);
+                }
+                let vcpus_owned;
+                if let Some(vcpus) = args.and_then(|a| a.get("vcpus")).and_then(|v| v.as_u64()) {
+                    vcpus_owned = vcpus.to_string();
+                    extra.push("--vcpus");
+                    extra.push(&vcpus_owned);
+                }
+                let disk_owned;
+                if let Some(disk) = args.and_then(|a| a.get("disk_gb")).and_then(|v| v.as_u64()) {
+                    disk_owned = disk.to_string();
+                    extra.push("--disk-gb");
+                    extra.push(&disk_owned);
+                }
+                if arg_bool(args, "dry_run") {
+                    extra.push("--dry-run");
+                }
+                let identity_owned;
+                if let Some(identity) = arg_str(args, "ssh_identity_file") {
+                    identity_owned = identity.to_owned();
+                    extra.push("--ssh-identity-file");
+                    extra.push(&identity_owned);
+                }
+                self.run_ops("vm-lab-provision-guest", &extra, DISCOVERY_TIMEOUT_SECS)
             }
 
             "discover_hosts" => {

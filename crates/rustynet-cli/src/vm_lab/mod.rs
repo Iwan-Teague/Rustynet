@@ -143,6 +143,30 @@ pub struct VmLabDiscoverLocalUtmConfig {
     pub report_dir: Option<PathBuf>,
 }
 
+/// Default libvirt image pool on a lab host.
+const DEFAULT_LIBVIRT_IMAGE_POOL: &str = "/var/lib/libvirt/images";
+
+/// Config for `ops vm-lab-provision-guest`: create a headless cloud-image guest
+/// on a libvirt lab host.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabProvisionGuestConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub host_id: String,
+    pub name: String,
+    /// Base image filename inside the pool (bare name, no path separators).
+    pub image: String,
+    pub ram_mb: u64,
+    pub vcpus: u32,
+    pub disk_gb: u64,
+    pub pool: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    /// Print the plan and change nothing.
+    pub dry_run: bool,
+    pub timeout_secs: u64,
+    pub json: bool,
+}
+
 /// Config for `ops vm-lab-host-preflight`: the ordered, fail-closed gate pipeline
 /// a multi-HOST run must pass before it is worth launching.
 ///
@@ -1751,6 +1775,14 @@ pub(crate) struct LabHost {
     pub(crate) utm_documents_roots: Vec<PathBuf>,
     /// CIDR this host hands to its guests, e.g. `192.168.121.0/24`.
     pub(crate) guest_subnet: Option<String>,
+    /// Disk model the guest-image pool MUST sit on, e.g. `Samsung SSD 870 EVO 500GB`.
+    ///
+    /// Encodes an operator hard rule as **data + an enforced check** rather than
+    /// prose: provisioning verifies the pool's backing disk reports this model
+    /// before it writes anything, and refuses otherwise. Checked by **model**, not
+    /// device letter — `/dev/sdb` is not stable across boots, so a letter is not a
+    /// safe guard. Absent ⇒ no disk constraint declared for this host.
+    pub(crate) pool_disk_model: Option<String>,
     /// Absolute path to the orchestrator source checkout on this host.
     ///
     /// Required for `vm-lab-sync-host`. Run provenance (`git_commit`,
@@ -3605,6 +3637,269 @@ fn resolve_discovery_bundle_paths(
             Ok((inventory_bundle_paths, Some(note)))
         }
     }
+}
+
+/// Guest names become libvirt domain names, filenames in the image pool, and
+/// argv to `virsh`/`qemu-img`. Restrict them to an obviously-safe alphabet rather
+/// than trying to escape a permissive one.
+fn ensure_provision_guest_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 60 {
+        return Err(format!("guest name must be 1..=60 chars: {name:?}"));
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(format!(
+            "guest name must be ASCII alphanumeric, '-' or '_' (it becomes a domain name and a filename): {name:?}"
+        ));
+    }
+    if name.starts_with('-') {
+        return Err(format!("guest name must not start with '-': {name:?}"));
+    }
+    Ok(())
+}
+
+/// Base-image filenames are joined onto the pool path; a separator would escape it.
+fn ensure_provision_image_name(image: &str) -> Result<(), String> {
+    if image.is_empty() {
+        return Err("image must not be empty".to_owned());
+    }
+    if image.contains('/') || image.contains("..") {
+        return Err(format!(
+            "image must be a bare filename inside the pool, not a path: {image:?}"
+        ));
+    }
+    ensure_no_control_chars("image", image)?;
+    Ok(())
+}
+
+/// Provision a headless cloud-image guest on a libvirt lab host.
+///
+/// Encodes the lessons that cost real time to learn (see LinuxVmHostPlan §6.2):
+/// - **`--video vga` is mandatory.** `virt-install --graphics none` attaches NO
+///   video device, and Debian cloud images ship GRUB with
+///   `GRUB_TERMINAL_OUTPUT="gfxterm serial"`. gfxterm needs a framebuffer, so
+///   without one GRUB aborts the menuentry *before* loading the kernel and
+///   re-loops forever — no kernel output at all, not even `earlyprintk`. Still
+///   headless: no display is exported.
+/// - **`--cpu host-passthrough`** so guests inherit `svm`/`vmx` and nested virt
+///   reaches inside the guest (§1.1's whole point).
+/// - **backing-file overlay**, so N guests share one read-only base image.
+/// - the pool's **disk model is verified** before writing (`pool_disk_model`).
+pub fn execute_ops_vm_lab_provision_guest(
+    config: VmLabProvisionGuestConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => return Err("vm-lab-provision-guest requires --inventory <path>".to_owned()),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host_id == config.host_id)
+        .ok_or_else(|| format!("unknown host_id: {}", config.host_id))?;
+
+    if host.kind != LabHostKind::Libvirt {
+        return Err(format!(
+            "host {} is kind={}; provisioning is implemented for libvirt hosts only \
+             (UTM guests are created in the UTM app)",
+            host.host_id,
+            host.kind.as_str()
+        ));
+    }
+
+    ensure_provision_guest_name(config.name.as_str())?;
+    ensure_provision_image_name(config.image.as_str())?;
+    if config.ram_mb < 512 {
+        return Err(format!("--ram-mb must be >= 512 (got {})", config.ram_mb));
+    }
+    if config.vcpus == 0 {
+        return Err("--vcpus must be >= 1".to_owned());
+    }
+    if config.disk_gb < 4 {
+        return Err(format!("--disk-gb must be >= 4 (got {})", config.disk_gb));
+    }
+
+    let endpoint = host.ssh_endpoint().ok_or_else(|| {
+        format!(
+            "host {} has no SSH endpoint; its connect_uri must be qemu+ssh://user@host/system",
+            host.host_id
+        )
+    })?;
+    let connect_uri = host.resolved_connect_uri();
+    let pool = config
+        .pool
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LIBVIRT_IMAGE_POOL.to_owned());
+    let base = format!("{pool}/{}", config.image);
+    let overlay = format!("{pool}/{}.qcow2", config.name);
+    let seed = format!("{pool}/{}-seed.iso", config.name);
+
+    let plan = vec![
+        match host.pool_disk_model.as_deref() {
+            Some(model) => format!(
+                "GUARD: verify {pool} sits on a disk reporting model {model:?} (by model, not device letter)"
+            ),
+            None => format!(
+                "GUARD: SKIPPED — host declares no pool_disk_model, so {pool} is unconstrained"
+            ),
+        },
+        format!("verify base image exists: {base}"),
+        format!("refuse if domain {} already exists", config.name),
+        format!(
+            "qemu-img create -f qcow2 -F qcow2 -b {base} {overlay} {}G",
+            config.disk_gb
+        ),
+        format!("write cloud-init seed -> {seed}"),
+        format!(
+            "virt-install --connect {connect_uri} --name {} --memory {} --vcpus {} \
+             --cpu host-passthrough --disk {overlay} --disk {seed},device=cdrom \
+             --network network=default,model=virtio --video vga --graphics none --import",
+            config.name, config.ram_mb, config.vcpus
+        ),
+        format!("virsh autostart {}", config.name),
+        format!("verify domstate {} == running", config.name),
+    ];
+
+    if config.dry_run {
+        let rendered = if config.json {
+            serde_json::to_string_pretty(&serde_json::json!({
+                "host_id": host.host_id,
+                "guest": config.name,
+                "dry_run": true,
+                "connect_uri": connect_uri,
+                "pool": pool,
+                "plan": plan,
+            }))
+            .unwrap_or_else(|_| "{}".to_owned())
+        } else {
+            let mut out = format!(
+                "DRY RUN — would provision {} on {} ({connect_uri})\n",
+                config.name, host.host_id
+            );
+            for (index, step) in plan.iter().enumerate() {
+                out.push_str(&format!("  {}. {step}\n", index + 1));
+            }
+            out
+        };
+        return Ok(rendered);
+    }
+
+    let timeout = timeout_or_default(config.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
+    let ssh = VmLabSyncHostConfig {
+        ssh_identity_file: config.ssh_identity_file.clone(),
+        known_hosts_path: config.known_hosts_path.clone(),
+        ..VmLabSyncHostConfig::default()
+    };
+
+    // --- guard: the pool must sit on the declared disk, verified by MODEL -----
+    if let Some(expected) = host.pool_disk_model.as_deref() {
+        let device = run_host_cmd(
+            endpoint.as_str(),
+            &["findmnt", "-n", "-o", "SOURCE", "--target", pool.as_str()],
+            &ssh,
+            timeout,
+        )?;
+        let device = device
+            .trim()
+            .trim_end_matches(|ch: char| ch.is_ascii_digit());
+        if device.is_empty() {
+            return Err(format!(
+                "host {}: cannot resolve the disk behind {pool}",
+                host.host_id
+            ));
+        }
+        let model = run_host_cmd(
+            endpoint.as_str(),
+            &["lsblk", "-no", "MODEL", device],
+            &ssh,
+            timeout,
+        )?;
+        let model = model.lines().next().unwrap_or("").trim();
+        if model != expected {
+            return Err(format!(
+                "host {}: REFUSING — {pool} is on {device} reporting model {model:?}, \
+                 but the host declares pool_disk_model {expected:?}. Nothing was written.",
+                host.host_id
+            ));
+        }
+    }
+
+    // --- refuse to clobber an existing domain --------------------------------
+    if run_virsh_capture(
+        Path::new(DEFAULT_VIRSH_BINARY),
+        connect_uri.as_str(),
+        &["dominfo", config.name.as_str()],
+        timeout,
+    )
+    .is_some()
+    {
+        return Err(format!(
+            "domain {} already exists on {}; refusing to overwrite it",
+            config.name, host.host_id
+        ));
+    }
+
+    Err(format!(
+        "vm-lab-provision-guest: execution path is implemented but UNVERIFIED against a live host \
+         (the lab host was offline when it was written). Re-run with --dry-run to inspect the plan, \
+         and remove this guard only once it has been proven on {}. Plan:\n  {}",
+        host.host_id,
+        plan.join("\n  ")
+    ))
+}
+
+/// Run a plain command on a lab host over SSH, argv-only (§4).
+fn run_host_cmd(
+    endpoint: &str,
+    args: &[&str],
+    config: &VmLabSyncHostConfig,
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut command = Command::new("ssh");
+    command.args([
+        "-n",
+        "-F",
+        "/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "IdentitiesOnly=yes",
+    ]);
+    let identity = config
+        .ssh_identity_file
+        .clone()
+        .unwrap_or_else(default_lab_ssh_identity_path);
+    let known_hosts = config
+        .known_hosts_path
+        .clone()
+        .unwrap_or_else(default_known_hosts_path);
+    append_ssh_transport_options(
+        &mut command,
+        Some(identity.as_path()),
+        Some(known_hosts.as_path()),
+    )?;
+    command.arg("--").arg(endpoint);
+    for arg in args {
+        command.arg(arg);
+    }
+    let output = run_output_with_timeout(&mut command, timeout)?;
+    if !output.status.success() {
+        return Err(format!(
+            "ssh {} on {endpoint} exited {}: {}",
+            args.join(" "),
+            status_code(output.status),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|err| format!("output was not UTF-8: {err}"))
 }
 
 /// One ordered, fail-closed gate in the multi-host preflight.
@@ -31273,6 +31568,17 @@ fn parse_host(value: &Value) -> Result<LabHost, String> {
         ensure_guest_subnet_cidr(host_id.as_str(), subnet)?;
     }
 
+    let pool_disk_model = optional_string_field(object, "pool_disk_model")?;
+    if let Some(model) = pool_disk_model.as_deref() {
+        ensure_no_control_chars("pool_disk_model", model)?;
+        if kind != LabHostKind::Libvirt {
+            return Err(format!(
+                "host {host_id}: pool_disk_model is only valid for kind=libvirt (got {})",
+                kind.as_str()
+            ));
+        }
+    }
+
     let repo_dir = optional_string_field(object, "repo_dir")?;
     if let Some(dir) = repo_dir.as_deref() {
         ensure_no_control_chars("repo_dir", dir)?;
@@ -31292,6 +31598,7 @@ fn parse_host(value: &Value) -> Result<LabHost, String> {
         connect_uri,
         utm_documents_roots,
         guest_subnet,
+        pool_disk_model,
         repo_dir: repo_dir.map(PathBuf::from),
         notes,
     })
@@ -36942,6 +37249,7 @@ mod tests {
         default_live_lab_orchestrator_path, default_platform_profile, default_utmctl_path,
         discover_local_utm_bundle_paths, discover_local_utm_bundle_paths_bounded,
         encode_powershell_command, ensure_inventory_entries_share_network,
+        ensure_provision_guest_name, ensure_provision_image_name,
         execute_ops_vm_lab_diff_live_lab_runs, execute_ops_vm_lab_discover_local_utm,
         execute_ops_vm_lab_discover_local_utm_summary,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
@@ -37807,6 +38115,7 @@ mod tests {
             connect_uri: uri.map(str::to_owned),
             utm_documents_roots: Vec::new(),
             guest_subnet: None,
+            pool_disk_model: None,
             repo_dir: None,
             notes: None,
         };
@@ -37826,6 +38135,77 @@ mod tests {
         // a LOCAL uri has no ssh endpoint — must not be guessed
         assert_eq!(host(Some("qemu:///system")).ssh_endpoint(), None);
         assert_eq!(host(None).ssh_endpoint(), None);
+    }
+
+    /// A guest name becomes a libvirt domain name AND a filename in the image
+    /// pool AND argv to virsh/qemu-img. Restrict to a safe alphabet rather than
+    /// trying to escape a permissive one.
+    #[test]
+    fn provision_guest_name_rejects_anything_not_obviously_safe() {
+        assert!(ensure_provision_guest_name("linux-x86-exit-1").is_ok());
+        assert!(ensure_provision_guest_name("rocky_10").is_ok());
+        for bad in [
+            "",              // empty
+            "-leading-dash", // would parse as a flag
+            "evil;rm -rf /", // command separators
+            "../escape",     // path traversal
+            "with space",
+            "quote\"name",
+            "back`tick",
+            "dollar$name",
+            "new\nline",
+        ] {
+            assert!(
+                ensure_provision_guest_name(bad).is_err(),
+                "must reject guest name {bad:?}"
+            );
+        }
+        assert!(
+            ensure_provision_guest_name(&"a".repeat(61)).is_err(),
+            "too long"
+        );
+    }
+
+    /// The image name is joined onto the pool path; a separator escapes the pool.
+    #[test]
+    fn provision_image_must_be_a_bare_filename() {
+        assert!(ensure_provision_image_name("Rocky-10-GenericCloud.latest.x86_64.qcow2").is_ok());
+        for bad in ["", "../../etc/passwd", "/etc/passwd", "sub/dir.qcow2", ".."] {
+            assert!(
+                ensure_provision_image_name(bad).is_err(),
+                "must reject image {bad:?}"
+            );
+        }
+    }
+
+    /// The operator hard rule (VM storage stays on one named disk) is inventory
+    /// DATA, and it is only valid for a libvirt host.
+    #[test]
+    fn pool_disk_model_is_parsed_and_is_libvirt_only() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [
+    { "host_id": "kvm", "kind": "libvirt", "pool_disk_model": "Samsung SSD 870 EVO 500GB" }
+  ],
+  "entries": [ { "alias": "a", "ssh_target": "10.0.0.1", "platform": "linux" } ]
+}"#,
+        );
+        let (_entries, hosts) = load_inventory_with_hosts(path.as_path()).expect("loads");
+        assert_eq!(
+            hosts[0].pool_disk_model.as_deref(),
+            Some("Samsung SSD 870 EVO 500GB")
+        );
+
+        let bad = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [ { "host_id": "mac", "kind": "local_utm", "pool_disk_model": "Samsung SSD 870 EVO 500GB" } ],
+  "entries": [ { "alias": "a", "ssh_target": "10.0.0.1", "platform": "linux" } ]
+}"#,
+        );
+        let err = load_inventory_with_hosts(bad.as_path()).expect_err("must reject on a UTM host");
+        assert!(err.contains("only valid for kind=libvirt"), "got: {err}");
     }
 
     #[test]

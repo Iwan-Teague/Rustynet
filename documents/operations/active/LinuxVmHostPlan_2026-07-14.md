@@ -432,6 +432,47 @@ instead of remembering an order:
 Each **delegates to the CLI** via the existing `run_ops` helper — no logic is
 re-implemented in the MCP.
 
+### 6.8.1b `provision_guest` — creating VMs is now a command (2026-07-16)
+
+`ops vm-lab-provision-guest --host <id> --name <guest> --image <base.qcow2>
+[--ram-mb 4096] [--vcpus 2] [--disk-gb 40] [--pool <path>] [--dry-run]
+[--format table|json]`, exposed as the MCP tool **`provision_guest`** (delegating,
+per §6.8.2). Creating a VM was a scratchpad shell script; now it is a function,
+and the hard-won details are compiled in rather than remembered:
+
+- **`--video vga` is not optional.** `virt-install --graphics none` attaches **no
+  video device**, and Debian cloud images ship `GRUB_TERMINAL_OUTPUT="gfxterm
+  serial"`. gfxterm needs a framebuffer, so with none GRUB aborts the menuentry
+  **before** loading the kernel and re-loops forever — no kernel output at all,
+  not even `earlyprintk`, and the overlay frozen at ~197 KB. Cost hours to find
+  (§6.2). Still headless: no display is exported.
+- **`--cpu host-passthrough`** so the guest inherits `svm` and nested virt reaches
+  *inside* it — §1.1's entire purpose.
+- **backing-file overlay** so N guests share one read-only base image.
+
+**The operator hard rule is now inventory DATA, not prose:** `hosts[].pool_disk_model`
+(e.g. `"Samsung SSD 870 EVO 500GB"`). Before writing anything, provisioning
+resolves the pool's backing disk and compares the **model** — never the device
+letter, because `/dev/sdb` is not stable across boots and a letter is not a safe
+guard. Mismatch ⇒ refuse, nothing written. `--dry-run` states plainly whether the
+guard is **armed** or **SKIPPED (no pool_disk_model declared)**, so an inert guard
+can never be mistaken for a passing one.
+
+Input validation is deliberately allow-list, because a guest name becomes a
+libvirt domain name **and** a pool filename **and** argv to `virsh`/`qemu-img`:
+ASCII alphanumeric / `-` / `_`, 1..=60, no leading `-`. Images must be **bare
+filenames** (no `/`, no `..`) so they cannot escape the pool. `local_utm` hosts are
+refused (UTM guests are made in the UTM app). Tests cover
+`evil;rm -rf /`, `../escape`, `-flag`, quotes/backticks/`$`/newlines, over-length,
+and `../../etc/passwd`.
+
+> **UNVERIFIED — deliberate guard.** The execution path was written while the lab
+> host was **offline**, so after the pre-flight checks it **returns an error
+> rather than provisioning**, printing the plan. `--dry-run` is fully usable now.
+> **Remove that guard only once it is proven live on `ubuntu-kvm-1`** — shipping an
+> unproven VM-creating path as if it worked is exactly the "dry-run-as-pass"
+> failure the parity roadmap forbids.
+
 ### 6.8.1a MCP coverage matrix — what already works on the box (audited 2026-07-16)
 
 **Most VM-lifecycle tools already work on `ubuntu-kvm-1` and needed no work.** The
