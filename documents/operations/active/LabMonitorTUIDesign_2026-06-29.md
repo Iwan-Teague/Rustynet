@@ -160,10 +160,10 @@ Use Unicode block fill: `█` (full), `▓` (⅔), `░` (⅓), space (empty). R
 - Update ETA as stages complete and remaining set shrinks.
 
 ### 6.5 Parity matrix
-`documents/operations/live_lab_run_matrix.csv`
-- 150+ columns. Key columns: `overall_result`, `macos_present`, `windows_present`, and per-role-per-OS columns e.g. `macos_stage_anchor` (`pass`|`fail`|`not_run`|`na`).
-- Load last 200 rows on startup. For each role × OS cell, find the most recent row where `overall_result = "pass"` and the role-OS stage column = `"pass"` → mark PROVEN.
-- Refresh: on any new row (file watcher).
+Reads whichever of two ledgers currently exists (`run_matrix_csv_path`, preferring the newer one when both are present — see `documents/operations/LiveLabRunMatrix.md`): `documents/operations/live_lab_node_run_matrix.csv` (the Rust `--node` engine's ACTIVE ledger) if present, else `documents/operations/live_lab_run_matrix.csv` (the legacy bash orchestrator's now-frozen archive). The two are deliberately non-interchangeable — never merge them — so once the node ledger exists it is read exclusively, not blended with the legacy history.
+- 150+ columns, resolved by header name (never a hardcoded numeric index). Key columns: `overall_result`, `macos_present`, `windows_present`, and per-role-per-OS columns e.g. `macos_stage_anchor` (`pass`|`fail`|`not_run`|`na`).
+- Each role×OS cell is classified from its own recent decisive (pass/fail) history via a CUSUM-style recent-history classifier (`classify_recent_history`; a 10-sample window, minimum 4 samples before flagging), not a literal "most recent row where `overall_result = pass` AND the stage column = pass" rule — a role's own check can legitimately pass even when the overall run fails elsewhere for an unrelated reason, and the windowed classifier lets a later regression flip a PROVEN cell back down. States: `Proven`, `Failed`, `Flaky` (elevated recent failure rate without being consistently broken), `Unproven` (column exists, no decisive data yet), and `NotInSchema` (none of this cell's candidate columns exist in the CSV header at all — e.g. `nas`/`llm`, mid-rollout — rendered distinctly from `Unproven` so schema-lag is never mistaken for "never tested").
+- Refresh: re-read from disk on every 2-second tick (poll, not a file watcher — no `notify` watch is actually wired for this file despite the crate declaring the `notify` dependency).
 
 ### 6.6 VM status
 Fetch the complete host VM registry with `utmctl list`, then enrich matches from `documents/operations/active/vm_lab_inventory.json`.
@@ -198,6 +198,8 @@ on each state refresh:
 ```
 
 `all_expected_stages` is the active/held run's manifest-enabled, non-synthetic stage list. No outcome-count or local-catalog inference is used for a selected report.
+
+Once `active_elapsed` exceeds a stage's own estimate, the remaining-time term does not float back down toward (or below) zero and does not stay silently floored at a small positive number forever — it renders explicitly as `OVERDUE +<how far past budget>` (`active_stage_overdue_secs` / `stage_timer_labels`) instead of a plausible-looking-but-frozen countdown that would otherwise read as healthy no matter how many minutes past budget the stage runs.
 
 ---
 

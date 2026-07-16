@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -91,6 +91,14 @@ pub enum ParityState {
     /// without being consistently broken -- don't fully trust either color.
     Flaky,
     Unproven,
+    /// None of this role×OS cell's candidate columns exist in the run-matrix
+    /// CSV header at all (e.g. `nas`/`llm` service-hosting roles, mid-rollout
+    /// per the roadmap, whose columns the writer hasn't started emitting
+    /// yet). This is a SCHEMA-LAG condition, not "never tested" -- collapsing
+    /// it into `Unproven` made a role the writer doesn't even track yet look
+    /// identical to one that genuinely has zero runs, with no way for an
+    /// operator to tell "not wired up" from "not proven".
+    NotInSchema,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,8 +123,32 @@ pub struct StageProgress {
     pub flaky: usize,
 }
 
+/// `documents/operations/live_lab_run_matrix.csv` (the legacy bash
+/// orchestrator's ledger) and `documents/operations/live_lab_node_run_matrix.csv`
+/// (the Rust `--node` engine's ledger, routed automatically by
+/// `append_live_lab_run_matrix_row` per `documents/operations/LiveLabRunMatrix.md`)
+/// are DELIBERATELY split, non-interchangeable ledgers -- the doc's own
+/// motivating incident is a blended file making the bash archive's 52
+/// historical `two_hop` passes look like `--node` engine evidence, when that
+/// engine has never once passed it. The node ledger is documented as
+/// "ACTIVE... the default source for coverage/tooling" the moment it exists;
+/// this crate must read it in preference to the frozen legacy path once it's
+/// there, or every panel backed by this file (Parity Matrix, Prev Runs,
+/// Stage Matrix) would silently keep reading the legacy file after it stops
+/// being the one either engine actually appends to -- the same "reading a
+/// file nothing writes to anymore" bug class this whole crate is built to
+/// avoid. Prefers the node ledger only when it actually exists on disk, so
+/// behavior is unchanged on a checkout that predates it.
+fn run_matrix_csv_path(repo_root: &Path) -> PathBuf {
+    let node_ledger = repo_root.join("documents/operations/live_lab_node_run_matrix.csv");
+    if node_ledger.exists() {
+        return node_ledger;
+    }
+    repo_root.join("documents/operations/live_lab_run_matrix.csv")
+}
+
 pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), ParityState>> {
-    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    let path = run_matrix_csv_path(repo_root);
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -143,13 +175,30 @@ pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), Parity
             .as_ref()
             .and_then(|h| h.iter().position(|header| header == name))
     };
+    // Distinguishes "we have a real, non-empty header row, and this cell's
+    // columns just aren't in it" (schema-lag, see NotInSchema below) from
+    // "we couldn't read a header at all" (missing/corrupt/directory-shaped
+    // file) -- the latter degrades every cell to the existing lenient
+    // Unproven-from-empty-history behavior, not a wall of misleading
+    // NotInSchema cells that would look like every role lacks schema
+    // support when the real problem is an unreadable file.
+    let headers_present = headers.as_ref().is_some_and(|h| !h.is_empty());
 
     for role in Role::all() {
         for os in Os::all() {
-            let col_indices: Vec<usize> = role_stage_columns(role, os)
+            let candidate_columns = role_stage_columns(role, os);
+            let col_indices: Vec<usize> = candidate_columns
                 .iter()
                 .filter_map(|col| header_index(col))
                 .collect();
+            if headers_present && col_indices.is_empty() {
+                // None of this cell's candidate columns exist in the CSV
+                // header at all -- a schema-lag condition, not a role with
+                // zero runs (which would still have its column present,
+                // just no decisive value in any row).
+                matrix.insert((role, os), ParityState::NotInSchema);
+                continue;
+            }
             // Per row (oldest first, matching decisive_history's
             // convention), the same "first decisive of this role's
             // representative columns wins" rule as before -- just now
@@ -172,7 +221,7 @@ pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), Parity
 }
 
 pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
-    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    let path = run_matrix_csv_path(repo_root);
     if !path.exists() {
         return Ok(StageProgress::default());
     }
@@ -441,7 +490,7 @@ fn dedupe_same_invocation_rows(
 }
 
 pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
-    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    let path = run_matrix_csv_path(repo_root);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -606,7 +655,7 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
 /// Reads the newest row that has ANY alias column populated (older schema
 /// rows, and the narrow Linux-only writer's role-less row, are skipped).
 pub fn load_latest_run_roles(repo_root: &Path) -> Result<HashMap<String, String>> {
-    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    let path = run_matrix_csv_path(repo_root);
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -664,7 +713,7 @@ pub fn load_sparklines(
     repo_root: &Path,
     n: usize,
 ) -> Result<HashMap<(Role, Os), Vec<CellOutcome>>> {
-    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    let path = run_matrix_csv_path(repo_root);
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -792,7 +841,7 @@ fn discover_oneoff_columns(headers: &csv::StringRecord, os: Os) -> Vec<(String, 
 /// parity view; this loads every individual stage check for the full
 /// matrix view.
 pub fn load_full_stage_matrix(repo_root: &Path) -> Result<FullStageMatrix> {
-    let path = repo_root.join("documents/operations/live_lab_run_matrix.csv");
+    let path = run_matrix_csv_path(repo_root);
     if !path.exists() {
         return Ok(FullStageMatrix::default());
     }
@@ -1052,6 +1101,55 @@ mod tests {
         let docs = dir.join("documents").join("operations");
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("live_lab_run_matrix.csv"), content).unwrap();
+    }
+
+    fn write_node_matrix_csv(dir: &std::path::Path, content: &str) {
+        let docs = dir.join("documents").join("operations");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("live_lab_node_run_matrix.csv"), content).unwrap();
+    }
+
+    #[test]
+    fn node_ledger_is_preferred_over_the_legacy_ledger_when_both_exist() {
+        // Regression / future-proofing: documents/operations/LiveLabRunMatrix.md
+        // documents live_lab_node_run_matrix.csv as the ACTIVE, --node-engine
+        // ledger and live_lab_run_matrix.csv as a FROZEN legacy archive the
+        // --node engine never appends to again. Once the node ledger exists,
+        // every loader must read it, not the now-stale legacy file -- reading
+        // the wrong one is exactly the "info stopped updating because nothing
+        // writes here anymore" bug class this crate exists to prevent.
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "overall_result,macos_stage_anchor\nfail,fail\n", // stale legacy content
+        );
+        write_node_matrix_csv(
+            dir.path(),
+            "overall_result,macos_stage_anchor\npass,pass\n", // current node-engine content
+        );
+
+        let matrix = load_parity_matrix(dir.path()).unwrap();
+
+        assert_eq!(
+            matrix.get(&(Role::Anchor, Os::Macos)),
+            Some(&ParityState::Proven),
+            "must read the node ledger's content, not the stale legacy file's"
+        );
+    }
+
+    #[test]
+    fn legacy_ledger_is_still_used_when_no_node_ledger_exists() {
+        // On a checkout that predates the node ledger (or hasn't run the
+        // --node engine yet), behavior must be unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(dir.path(), "overall_result,macos_stage_anchor\npass,pass\n");
+
+        let matrix = load_parity_matrix(dir.path()).unwrap();
+
+        assert_eq!(
+            matrix.get(&(Role::Anchor, Os::Macos)),
+            Some(&ParityState::Proven)
+        );
     }
 
     #[test]
@@ -1383,6 +1481,34 @@ mod tests {
         assert_eq!(
             matrix.get(&(Role::Anchor, Os::Macos)),
             Some(&ParityState::Unproven)
+        );
+    }
+
+    #[test]
+    fn parity_reports_not_in_schema_for_a_role_with_no_matching_column_at_all() {
+        // Regression: nas/llm (service-hosting roles, mid-rollout) have no
+        // column in the CSV yet -- their cell used to collapse into the same
+        // Unproven state as a role that genuinely has zero runs, giving an
+        // operator no way to tell "this role isn't wired into the
+        // run-matrix schema yet" from "this role has never been tested".
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(dir.path(), "overall_result,macos_stage_anchor\npass,pass\n");
+        let matrix = load_parity_matrix(dir.path()).unwrap();
+
+        assert_eq!(
+            matrix.get(&(Role::Nas, Os::Linux)),
+            Some(&ParityState::NotInSchema),
+            "a role with no candidate column in the header must read NotInSchema, not Unproven"
+        );
+        assert_eq!(
+            matrix.get(&(Role::Llm, Os::Windows)),
+            Some(&ParityState::NotInSchema)
+        );
+        // A role whose column genuinely exists (with data) is unaffected --
+        // NotInSchema must not leak onto tracked roles.
+        assert_eq!(
+            matrix.get(&(Role::Anchor, Os::Macos)),
+            Some(&ParityState::Proven)
         );
     }
 

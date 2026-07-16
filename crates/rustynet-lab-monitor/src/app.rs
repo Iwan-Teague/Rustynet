@@ -506,15 +506,46 @@ impl App {
                 .map(|name| (timer_short_name(name), "0s".to_owned()))
                 .collect();
         }
+        let overdue_secs = self.active_stage_overdue_secs();
         ["PRE", "BOOTSTRAP", "LIVE LAB"]
             .into_iter()
             .map(|name| {
-                (
-                    timer_short_name(name),
-                    format_duration(self.estimated_group_remaining_secs(name)),
-                )
+                let label = match overdue_secs {
+                    // Once the active stage has genuinely run past its own
+                    // estimated budget, say so explicitly instead of the
+                    // group total, whose active-stage term was otherwise
+                    // floored at a flat 60s no matter how far past the
+                    // estimate elapsed climbed -- silently showing "~1m
+                    // left" forever on a stage stuck for 20+ minutes past
+                    // its budget.
+                    Some(over) if self.group_contains_active_stage(name) => {
+                        format!("OVERDUE +{}", format_duration(over))
+                    }
+                    _ => format_duration(self.estimated_group_remaining_secs(name)),
+                };
+                (timer_short_name(name), label)
             })
             .collect()
+    }
+
+    /// How far past its own estimated budget the currently active stage has
+    /// run, or `None` while it's within budget (or there's no active stage /
+    /// no elapsed-time signal yet).
+    fn active_stage_overdue_secs(&self) -> Option<u64> {
+        let stage = self.active_stage.as_deref()?;
+        let estimate = self.estimate_stage_secs(stage);
+        let elapsed = self.active_stage_start?.elapsed().as_secs();
+        elapsed.checked_sub(estimate).filter(|over| *over > 0)
+    }
+
+    fn group_contains_active_stage(&self, group_name: &str) -> bool {
+        let Some(active) = self.active_stage.as_deref() else {
+            return false;
+        };
+        self.planned_stage_groups()
+            .into_iter()
+            .find(|group| group.name == group_name)
+            .is_some_and(|group| group.stages.iter().any(|stage| stage == active))
     }
 
     /// Terminal pipeline stages over this run's manifest-enabled plan.
@@ -734,6 +765,12 @@ impl App {
         self.active_stage = None;
         self.active_stage_start = None;
         self.orchestrator_pgid = None;
+        // A scroll offset left over from reading this now-finished run's
+        // log must not silently carry into whatever the log panel shows
+        // next (the idle catch-up read just below, or the next run to
+        // start) -- same reasoning as the is_new_job reset in refresh_state.
+        self.log_scroll = 0;
+        self.log_scroll_anchor = 0;
     }
 
     /// The stage name under the stage-grid cursor, per `stage_grid_col` /
@@ -1276,6 +1313,24 @@ impl App {
             Ok(Some(job)) => {
                 let is_new_job = self.active_job.as_ref().map(|j| j.report_dir.as_str())
                     != Some(job.report_dir.as_str());
+                if is_new_job {
+                    // A job launched THROUGH this monitor (handle_start)
+                    // already reset these at launch time and sets
+                    // active_job optimistically, so is_new_job is false by
+                    // the time the next poll picks it up here. This branch
+                    // is what actually fires for a job discovered for the
+                    // FIRST time -- overwhelmingly a run launched OUTSIDE
+                    // this monitor (raw CLI, another session), which is how
+                    // the live-lab orchestrator is normally started. Without
+                    // this, an operator who had scrolled up in the Log
+                    // panel while reading a prior/idle-held run keeps that
+                    // same scroll offset once a brand-new externally-
+                    // launched run starts, so the log panel silently stops
+                    // following the new run's tail instead of auto-jumping
+                    // back to it.
+                    self.log_scroll = 0;
+                    self.log_scroll_anchor = 0;
+                }
                 if let Some(args) = &job.request_args {
                     let mut config = self.config.clone();
                     config.apply_request_args(args);
@@ -1358,17 +1413,19 @@ impl App {
             }
             Ok(None) => {
                 if let Some(prev_job) = self.active_job.take() {
-                    // The job left the active scan. If its JSON still says
-                    // `running`, the PID died without the worker recording
-                    // an ending — crashed/abandoned, not done.
-                    self.last_run_crashed = crate::data::job_watcher::job_state_by_id(
+                    // The job left the active scan — decide crashed vs.
+                    // cleanly-done from the report dir's own completion
+                    // marker (authoritative regardless of discovery source),
+                    // not just the job-state JSON (absent entirely for a job
+                    // launched outside this monitor).
+                    let report_dir = self.repo_root.join(&prev_job.report_dir);
+                    self.last_run_crashed = crate::data::job_watcher::job_ended_crashed(
                         &self.repo_root,
-                        &prev_job.job_id,
-                    )
-                    .is_some_and(|job| job.state == "running");
+                        &prev_job,
+                        &report_dir,
+                    );
                     // Do one final read to replace any synthetic "running" entries
                     // with the definitive pass/fail outcomes before going idle.
-                    let report_dir = self.repo_root.join(&prev_job.report_dir);
                     match crate::data::stage_reader::read_completed_stage_state(&report_dir) {
                         Ok(read) if !read.result.outcomes.is_empty() => {
                             self.stage_outcomes = read.result.outcomes;
@@ -4130,6 +4187,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_newly_discovered_externally_launched_job_resets_log_scroll() {
+        // Regression: a run launched OUTSIDE this monitor (raw CLI, another
+        // session -- the normal way the live-lab orchestrator is started)
+        // is picked up via the `is_new_job` branch in refresh_state, not
+        // handle_start (which only resets log_scroll for a run launched
+        // THROUGH this monitor). Before this fix, an operator who had
+        // scrolled up in the Log panel while reading a prior/idle-held run
+        // kept that same offset once a brand-new externally-launched run
+        // started, so the log panel silently stopped following the new
+        // run's tail.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let report_dir = repo.join("state/rn_role_linux_client_scroll_test");
+        std::fs::create_dir_all(report_dir.join("state")).unwrap();
+        std::fs::create_dir_all(report_dir.join("logs")).unwrap();
+        std::fs::write(
+            report_dir.join("state/stages.tsv"),
+            "preflight\thard\tpass\t0\t\t\t2026-01-01T00:00:00Z\t2026-01-01T00:00:01Z\n",
+        )
+        .unwrap();
+        // An absurdly-future created_at_unix guarantees this fixture sorts
+        // as the single most-recently-started job in find_active_job's
+        // "most recent wins" pick, regardless of any real, unrelated
+        // orchestrator process that happens to also be running on the host
+        // this test executes on (find_live_orchestrator_report_dirs scans
+        // the REAL system process table, not anything scoped to this
+        // tempdir) -- without this, the test would be flaky in exactly the
+        // kind of environment this crate is built for.
+        std::fs::write(
+            report_dir.join("state/report_state.json"),
+            r#"{"created_at_unix": 9999999999}"#,
+        )
+        .unwrap();
+
+        let mut app = App::new(repo.to_path_buf()).expect("app");
+        app.log_scroll = 5;
+        app.log_scroll_anchor = 3;
+
+        app.refresh_state().await;
+
+        assert!(
+            app.active_job.is_some(),
+            "the fixture report dir must be discovered as the active job"
+        );
+        assert_eq!(
+            app.log_scroll, 0,
+            "log_scroll must reset when a newly-discovered job appears"
+        );
+        assert_eq!(
+            app.log_scroll_anchor, 0,
+            "log_scroll_anchor must reset when a newly-discovered job appears"
+        );
+    }
+
     #[test]
     fn linux_oneoff_security_stages_are_listed_and_gated_with_linux_live_suite() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
@@ -4301,9 +4413,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let docs = dir.path().join("documents").join("operations");
         std::fs::create_dir_all(&docs).unwrap();
+        // Exit's real parity column is "{os}_stage_exit_handoff" (see
+        // role_stage_columns) -- this fixture used to say
+        // "macos_stage_exit", which isn't a column any role actually reads,
+        // so every role tied at Unproven for macOS and the test only ever
+        // passed because Exit happens to sort first in auto_select's role
+        // list. Now that a column absent from the header reads as the
+        // distinct NotInSchema state (see ParityState::NotInSchema) instead
+        // of folding into the same Unproven bucket as "no data yet", that
+        // coincidence no longer holds -- use the real column name so this
+        // fixture actually exercises "Exit failed on macOS".
         std::fs::write(
             docs.join("live_lab_run_matrix.csv"),
-            "overall_result,macos_stage_exit\npass,fail\n",
+            "overall_result,macos_stage_exit_handoff\npass,fail\n",
         )
         .unwrap();
 
@@ -4926,6 +5048,46 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!enabled.contains(&"validate_macos_exit_nat_lifecycle".to_owned()));
         assert!(enabled.contains(&"validate_macos_blind_exit".to_owned()));
+    }
+
+    #[test]
+    fn overdue_active_stage_shows_overdue_not_a_flat_floored_remaining_time() {
+        // Regression: the active stage's contribution to its group's ETA
+        // used to be `estimate.saturating_sub(elapsed).max(60)` -- once a
+        // stage ran longer than its own estimated budget, this floor meant
+        // the label stayed pinned at a plausible-looking "1m" forever, no
+        // matter how far past the estimate it actually was (20+ minutes
+        // overdue would render identically to 1 second overdue).
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.run_manifest = Some(crate::data::stage_manifest::RunStageManifest {
+            schema_version: 2,
+            stages: vec![crate::data::stage_manifest::ManifestStage {
+                name: "preflight".to_owned(),
+                group: "pre".to_owned(),
+                enabled: true,
+                budget_secs: 1,
+                counts_as_check: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app.active_stage = Some("preflight".to_owned());
+        // 5s elapsed against a 1s budget: solidly overdue, but still a tiny,
+        // safe subtraction from Instant::now() (no underflow risk).
+        app.active_stage_start =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+
+        let labels = app.stage_timer_labels();
+
+        assert!(
+            labels[0].1.starts_with("OVERDUE"),
+            "PRE group label must show OVERDUE once its active stage exceeds its budget, got: {:?}",
+            labels[0]
+        );
+        assert_ne!(
+            labels[0].1, "1m",
+            "must not silently render the old floored-at-60s value"
+        );
     }
 
     #[test]

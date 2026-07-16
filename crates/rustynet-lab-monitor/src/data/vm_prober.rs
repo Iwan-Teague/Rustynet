@@ -174,16 +174,34 @@ pub async fn probe_lab_readiness(
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_preflight_readiness(&stdout, aliases).unwrap_or_else(|| {
+        let detail = fallback_unreadable_preflight_detail(&stdout);
         aliases
             .iter()
-            .map(|alias| {
-                (
-                    alias.clone(),
-                    LabReadiness::unknown("preflight returned unreadable data"),
-                )
-            })
+            .map(|alias| (alias.clone(), LabReadiness::unknown(detail.clone())))
             .collect()
     })
+}
+
+/// `rustynet-cli`'s entire `ops vm-lab-*` command surface (including
+/// `vm-lab-preflight`) compiles only under the DEFAULT-OFF `vm-lab` cargo
+/// feature (RNQ-17) -- a release/default `cargo build`/`cargo test` of the
+/// workspace (or of just `rustynet-cli`) silently produces a binary at the
+/// exact path this module invokes that has no `vm-lab-preflight` command at
+/// all. Invoking it then just falls through to the generic top-level
+/// command list, which never mentions "vm-lab" anywhere -- a reliable,
+/// distinct signature from "the command ran but returned malformed/garbled
+/// JSON" (a genuinely vm-lab-featured binary that's merely broken would
+/// still echo back the subcommand it was asked to run in its error output).
+/// Surfacing this distinctly means an operator sees an actionable "rebuild
+/// with --features vm-lab" instead of a generic, permanently-unexplained
+/// "unreadable data" that can never resolve on its own no matter how long
+/// the monitor keeps polling.
+fn fallback_unreadable_preflight_detail(stdout: &str) -> String {
+    if !stdout.contains("vm-lab") {
+        "rustynet-cli was built without --features vm-lab (no vm-lab-preflight command available); rebuild with: cargo build -p rustynet-cli --features vm-lab".to_owned()
+    } else {
+        "preflight returned unreadable data".to_owned()
+    }
 }
 
 fn rustynet_cli_binary(repo_root: &Path) -> Option<PathBuf> {
@@ -420,5 +438,40 @@ mod tests {
             assert!(parsed["blocked-vm"].detail.contains("passwordless admin"));
             assert!(parsed["blocked-vm"].detail.contains("rustup"));
         }
+    }
+
+    #[test]
+    fn missing_vm_lab_feature_stdout_is_diagnosed_distinctly_from_generic_garbage() {
+        // Regression: a rustynet-cli binary built WITHOUT --features vm-lab
+        // (the default feature set) has no `ops vm-lab-preflight` command at
+        // all -- invoking it just prints the generic top-level command list
+        // (captured verbatim from a real such binary) and exits 0. Before
+        // this fix, that fell through to the same permanently-unexplained
+        // "preflight returned unreadable data" as any other parse failure,
+        // with no way for an operator to tell "the tool isn't built right"
+        // from "something is generically broken".
+        let real_generic_help_dump = "commands:\n  \
+            status [--json]\n  login\n  netcheck [--json]\n  version\n  info\n  doctor\n  \
+            logs [--follow] [--level <level>] [--lines <n>]\n  config show\n  debug\n  \
+            peer-list\n  tunnel-info\n  exit-node-list\n  role [show|set <admin|client|blind_exit>]\n";
+
+        assert!(
+            parse_preflight_readiness(real_generic_help_dump, &["some-vm".to_owned()]).is_none()
+        );
+        let detail = fallback_unreadable_preflight_detail(real_generic_help_dump);
+        assert!(
+            detail.contains("--features vm-lab"),
+            "must name the actual actionable cause, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn genuinely_unreadable_preflight_output_still_gets_the_generic_message() {
+        // A vm-lab-featured binary whose output is simply garbled (not the
+        // no-such-command shape) must not be misdiagnosed as a feature gap.
+        let detail = fallback_unreadable_preflight_detail(
+            "error running vm-lab-preflight: some garbled {not json",
+        );
+        assert_eq!(detail, "preflight returned unreadable data");
     }
 }

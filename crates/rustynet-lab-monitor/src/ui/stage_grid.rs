@@ -248,7 +248,7 @@ fn render_planned_with_statuses(
 /// user toggled it off) stays white so it still reads as "could run", just
 /// not right now; `disabled` (impossible for this config -- wrong
 /// platform/role) is the only grayed-out state.
-fn cell_for_status(status: &str) -> (&'static str, Style) {
+pub(crate) fn cell_for_status(status: &str) -> (&'static str, Style) {
     if status == "active" {
         return (
             spinner_glyph(),

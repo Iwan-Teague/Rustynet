@@ -28,6 +28,7 @@ fn evidence_for_vm(app: &App, vm: &VmStatus) -> (&'static str, Color) {
         ParityState::Failed => ("FAILED", Color::Red),
         ParityState::Flaky => ("FLAKY", Color::Yellow),
         ParityState::Unproven => ("UNPROVEN", Color::Gray),
+        ParityState::NotInSchema => ("N/A", Color::Magenta),
     }
 }
 
