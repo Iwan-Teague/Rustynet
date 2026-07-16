@@ -42,7 +42,7 @@ Current lab-reference assets:
 - `documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md` (includes probe-and-recover runbook for unsticking lab guests whose nft killswitch is blocking SSH after a network reconfig)
 - `documents/operations/active/vm_lab_inventory.json`
 - `scripts/vm_lab/probe_and_recover_local_utm.sh` — call before retrying a failed orchestrator run when one or more lab VMs show TCP/22 timeout but are visible in `arp -a`
-- `documents/operations/LiveLabRunMatrix.md` and `documents/operations/live_lab_run_matrix.csv` — standard live-lab wrappers append a row automatically; verify the row exists after every run or focused live-lab stage used as evidence, including commit, dirty state, report directory, OS/role/stage statuses, node identity per role, and regression reference when applicable
+- `documents/operations/LiveLabRunMatrix.md`, `documents/operations/live_lab_node_run_matrix.csv` (the Rust `--node` engine's evidence ledger — **the live one: current work appends here and tooling reads here**), and `documents/operations/live_lab_run_matrix.csv` (the **legacy bash-orchestrator archive** — frozen; `--node` no longer appends to it) — standard live-lab wrappers append a row automatically; verify the row exists after every run or focused live-lab stage used as evidence, including commit, dirty state, report directory, OS/role/stage statuses, node identity per role, and regression reference when applicable. **Never read a stage result from one ledger as evidence for the other engine.** They diverge: the bash archive records 52 `two_hop` passes that the `--node` engine has never achieved.
 
 Rules:
 - If ambiguity exists, choose the strictest secure practical default and document that choice.
@@ -258,7 +258,7 @@ Key rules:
 - Check lab state first: ops vm-lab-discover-local-utm-summary
 - If VMs stuck (SSH timeout): scripts/vm_lab/probe_and_recover_local_utm.sh
 - Never hand-edit vm_lab_inventory.json — use --update-inventory-live-ips
-- After every evidence run, verify the row in live_lab_run_matrix.csv
+- After every evidence run, verify the row in live_lab_node_run_matrix.csv (the `--node` ledger; live_lab_run_matrix.csv is the frozen bash archive)
 
 ### 10.10 Commit Hygiene
 
@@ -393,7 +393,7 @@ Authoritative gate definitions live in §7. This section is the fast-path map.
 - Never hand-edit `vm_lab_inventory.json` — refresh with
   `--update-inventory-live-ips`.
 - After every evidence run, verify the appended row in
-  `documents/operations/live_lab_run_matrix.csv` (§2, §10.9).
+  `documents/operations/live_lab_node_run_matrix.csv` (§2, §10.9).
 
 ### 12.3.1 macOS MCP LAN Sandbox — do reachability/SSH from Bash, not MCP
 On the macOS host, the Claude desktop app launches the MCP servers through a
@@ -585,7 +585,7 @@ Per patch inside a live-lab loop:
 3. Live-lab: check state first (`get_lab_status` / `vm-lab-discover-local-utm-summary`),
    then `start_live_lab_run` → `wait_for_job` (`rustynet-mcp-lab-state` MCP
    tools; §12.3).
-4. Verify the appended row in `documents/operations/live_lab_run_matrix.csv`
+4. Verify the appended row in `documents/operations/live_lab_node_run_matrix.csv`
    (§2, §10.9).
 5. If a guest shows SSH timeout but is visible in `arp -a`:
    `scripts/vm_lab/probe_and_recover_local_utm.sh` (§10.9) before retrying.
