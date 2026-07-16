@@ -124,34 +124,30 @@ pub struct StageProgress {
 }
 
 /// `documents/operations/live_lab_run_matrix.csv` (the legacy bash
-/// orchestrator's ledger) and `documents/operations/live_lab_node_run_matrix.csv`
-/// (the Rust `--node` engine's ledger, routed automatically by
-/// `append_live_lab_run_matrix_row` per `documents/operations/LiveLabRunMatrix.md`)
-/// are DELIBERATELY split, non-interchangeable ledgers -- the doc's own
-/// motivating incident is a blended file making the bash archive's 52
-/// historical `two_hop` passes look like `--node` engine evidence, when that
-/// engine has never once passed it. The node ledger is documented as
-/// "ACTIVE... the default source for coverage/tooling" the moment it exists;
-/// this crate must read it in preference to the frozen legacy path once it's
-/// there, or every panel backed by this file (Parity Matrix, Prev Runs,
-/// Stage Matrix) would silently keep reading the legacy file after it stops
-/// being the one either engine actually appends to -- the same "reading a
-/// file nothing writes to anymore" bug class this whole crate is built to
-/// avoid. Prefers the node ledger only when it actually exists on disk, so
-/// behavior is unchanged on a checkout that predates it.
-fn run_matrix_csv_path(repo_root: &Path) -> PathBuf {
+/// orchestrator's ledger) is a **FROZEN ARCHIVE** per
+/// `documents/operations/LiveLabRunMatrix.md` -- the `--node` engine never
+/// appends to it again, and it is committed to `main` alongside the split
+/// (`b8304a1`) precisely so a blended read can't make its 52 historical
+/// `two_hop` passes look like `--node`-engine evidence, which has never once
+/// passed two-hop. `documents/operations/live_lab_node_run_matrix.csv` is the
+/// ONLY current ledger this crate may read. There is deliberately no
+/// fallback to the legacy path: on a current checkout the node ledger always
+/// exists, so a fallback branch would be dead code that could only ever fire
+/// on a stale/pre-migration checkout -- and if it did fire, it would render
+/// the frozen archive as if it were current, exactly the "unknown/stale
+/// rendered as current" class this crate exists to eliminate. Every caller
+/// treats `None` (node ledger absent) identically to how it already treats
+/// "file doesn't exist" -- an explicit empty/`n/a` default, never a read of
+/// the archive.
+fn run_matrix_csv_path(repo_root: &Path) -> Option<PathBuf> {
     let node_ledger = repo_root.join("documents/operations/live_lab_node_run_matrix.csv");
-    if node_ledger.exists() {
-        return node_ledger;
-    }
-    repo_root.join("documents/operations/live_lab_run_matrix.csv")
+    node_ledger.exists().then_some(node_ledger)
 }
 
 pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), ParityState>> {
-    let path = run_matrix_csv_path(repo_root);
-    if !path.exists() {
+    let Some(path) = run_matrix_csv_path(repo_root) else {
         return Ok(HashMap::new());
-    }
+    };
 
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
@@ -221,10 +217,9 @@ pub fn load_parity_matrix(repo_root: &Path) -> Result<HashMap<(Role, Os), Parity
 }
 
 pub fn load_stage_progress(repo_root: &Path) -> Result<StageProgress> {
-    let path = run_matrix_csv_path(repo_root);
-    if !path.exists() {
+    let Some(path) = run_matrix_csv_path(repo_root) else {
         return Ok(StageProgress::default());
-    }
+    };
 
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
@@ -490,10 +485,9 @@ fn dedupe_same_invocation_rows(
 }
 
 pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
-    let path = run_matrix_csv_path(repo_root);
-    if !path.exists() {
+    let Some(path) = run_matrix_csv_path(repo_root) else {
         return Ok(Vec::new());
-    }
+    };
 
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
@@ -655,10 +649,9 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
 /// Reads the newest row that has ANY alias column populated (older schema
 /// rows, and the narrow Linux-only writer's role-less row, are skipped).
 pub fn load_latest_run_roles(repo_root: &Path) -> Result<HashMap<String, String>> {
-    let path = run_matrix_csv_path(repo_root);
-    if !path.exists() {
+    let Some(path) = run_matrix_csv_path(repo_root) else {
         return Ok(HashMap::new());
-    }
+    };
 
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
@@ -713,10 +706,9 @@ pub fn load_sparklines(
     repo_root: &Path,
     n: usize,
 ) -> Result<HashMap<(Role, Os), Vec<CellOutcome>>> {
-    let path = run_matrix_csv_path(repo_root);
-    if !path.exists() {
+    let Some(path) = run_matrix_csv_path(repo_root) else {
         return Ok(HashMap::new());
-    }
+    };
 
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
@@ -841,10 +833,9 @@ fn discover_oneoff_columns(headers: &csv::StringRecord, os: Os) -> Vec<(String, 
 /// parity view; this loads every individual stage check for the full
 /// matrix view.
 pub fn load_full_stage_matrix(repo_root: &Path) -> Result<FullStageMatrix> {
-    let path = run_matrix_csv_path(repo_root);
-    if !path.exists() {
+    let Some(path) = run_matrix_csv_path(repo_root) else {
         return Ok(FullStageMatrix::default());
-    }
+    };
 
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
@@ -1097,16 +1088,23 @@ fn classify_recent_history(history: &[bool]) -> ParityState {
 mod tests {
     use super::*;
 
+    // The crate's ONLY ledger read at runtime is now
+    // documents/operations/live_lab_node_run_matrix.csv (see
+    // run_matrix_csv_path) -- every generic fixture in this module writes
+    // there so tests keep exercising the real parsing code paths. The
+    // legacy path is written ONLY by the two ledger-selection tests below,
+    // which specifically need "legacy content" as a distinct concept from
+    // "node-ledger content".
     fn write_matrix_csv(dir: &std::path::Path, content: &str) {
         let docs = dir.join("documents").join("operations");
         std::fs::create_dir_all(&docs).unwrap();
-        std::fs::write(docs.join("live_lab_run_matrix.csv"), content).unwrap();
+        std::fs::write(docs.join("live_lab_node_run_matrix.csv"), content).unwrap();
     }
 
-    fn write_node_matrix_csv(dir: &std::path::Path, content: &str) {
+    fn write_legacy_matrix_csv(dir: &std::path::Path, content: &str) {
         let docs = dir.join("documents").join("operations");
         std::fs::create_dir_all(&docs).unwrap();
-        std::fs::write(docs.join("live_lab_node_run_matrix.csv"), content).unwrap();
+        std::fs::write(docs.join("live_lab_run_matrix.csv"), content).unwrap();
     }
 
     #[test]
@@ -1119,11 +1117,11 @@ mod tests {
         // the wrong one is exactly the "info stopped updating because nothing
         // writes here anymore" bug class this crate exists to prevent.
         let dir = tempfile::tempdir().unwrap();
-        write_matrix_csv(
+        write_legacy_matrix_csv(
             dir.path(),
             "overall_result,macos_stage_anchor\nfail,fail\n", // stale legacy content
         );
-        write_node_matrix_csv(
+        write_matrix_csv(
             dir.path(),
             "overall_result,macos_stage_anchor\npass,pass\n", // current node-engine content
         );
@@ -1138,18 +1136,33 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ledger_is_still_used_when_no_node_ledger_exists() {
-        // On a checkout that predates the node ledger (or hasn't run the
-        // --node engine yet), behavior must be unchanged.
+    fn node_ledger_absent_returns_the_missing_default_never_the_legacy_archive() {
+        // The legacy ledger is a FROZEN ARCHIVE (documents/operations/
+        // LiveLabRunMatrix.md) the --node engine never appends to again --
+        // there is deliberately NO fallback to it anymore. When the node
+        // ledger is absent, every loader must return its explicit
+        // empty/missing default, never silently substitute the archive's
+        // content (which would render stale history as if it were current,
+        // exactly the class this crate exists to eliminate). Written with a
+        // DECISIVE "pass" in the legacy file specifically so this test would
+        // fail loudly (Proven instead of the missing default) if a fallback
+        // were ever reintroduced.
         let dir = tempfile::tempdir().unwrap();
-        write_matrix_csv(dir.path(), "overall_result,macos_stage_anchor\npass,pass\n");
+        write_legacy_matrix_csv(dir.path(), "overall_result,macos_stage_anchor\npass,pass\n");
 
-        let matrix = load_parity_matrix(dir.path()).unwrap();
-
-        assert_eq!(
-            matrix.get(&(Role::Anchor, Os::Macos)),
-            Some(&ParityState::Proven)
+        assert!(
+            load_parity_matrix(dir.path()).unwrap().is_empty(),
+            "parity matrix must be empty (explicit missing), not populated from the legacy archive"
         );
+        assert_eq!(
+            load_stage_progress(dir.path()).unwrap(),
+            StageProgress::default()
+        );
+        assert!(load_recent_runs(dir.path(), 3).unwrap().is_empty());
+        assert!(load_latest_run_roles(dir.path()).unwrap().is_empty());
+        assert!(load_sparklines(dir.path(), 8).unwrap().is_empty());
+        let full = load_full_stage_matrix(dir.path()).unwrap();
+        assert!(full.linux.is_empty() && full.macos.is_empty() && full.windows.is_empty());
     }
 
     #[test]
@@ -1915,7 +1928,7 @@ mod tests {
     fn write_matrix_csv_bytes(dir: &std::path::Path, content: &[u8]) {
         let docs = dir.join("documents").join("operations");
         std::fs::create_dir_all(&docs).unwrap();
-        std::fs::write(docs.join("live_lab_run_matrix.csv"), content).unwrap();
+        std::fs::write(docs.join("live_lab_node_run_matrix.csv"), content).unwrap();
     }
 
     /// A genuinely empty (0-byte) file is distinct from a MISSING file (the
@@ -1962,7 +1975,7 @@ mod tests {
         // never a false "all proven" / "0 runs" read presented as real data.
         let dir = tempfile::tempdir().unwrap();
         let docs = dir.path().join("documents").join("operations");
-        std::fs::create_dir_all(docs.join("live_lab_run_matrix.csv")).unwrap();
+        std::fs::create_dir_all(docs.join("live_lab_node_run_matrix.csv")).unwrap();
 
         // `load_parity_matrix` treats a header-read failure the same as "no
         // matrix data at all" (`.headers().ok()`, not `?`) rather than a

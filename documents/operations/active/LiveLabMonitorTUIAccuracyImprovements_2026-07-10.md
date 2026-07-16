@@ -114,9 +114,24 @@ The root Cargo.toml exclusion is **not** the enabler of these bugs. `scripts/ci/
 
 ## OPEN TODO — point the monitor at the `--node` run matrix only (2026-07-16)
 
-**Done** — see item 8 above. `run_matrix.rs`'s 6 production read sites now
-resolve through `run_matrix_csv_path`, which prefers
-`documents/operations/live_lab_node_run_matrix.csv` when present and falls back
-to the legacy `documents/operations/live_lab_run_matrix.csv` otherwise, pinned
-by `node_ledger_is_preferred_over_the_legacy_ledger_when_both_exist` and
-`legacy_ledger_is_still_used_when_no_node_ledger_exists`.
+**Done**, landed in two steps (see item 8 above for the first). `run_matrix.rs`'s
+6 production read sites first resolved through `run_matrix_csv_path`, which
+preferred `documents/operations/live_lab_node_run_matrix.csv` when present and
+fell back to the legacy `documents/operations/live_lab_run_matrix.csv`
+otherwise. That fallback has since been **removed**: the node ledger landed on
+`main` (`b8304a1`), making the fallback branch unreachable on any current
+checkout and, per this doc's own "unknown/stale rendered as current" rule, a
+latent hazard if it ever *did* fire (a stale/pre-migration checkout silently
+rendering the frozen archive as if it were current). `run_matrix_csv_path` now
+returns `Option<PathBuf>` — `Some` only when the node ledger exists, `None`
+otherwise, with **no** legacy path in the function at all. Every loader treats
+`None` exactly as it already treated "file doesn't exist" — its existing
+explicit empty/`n/a` default — never a read of the archive. Pinned by
+`node_ledger_is_preferred_over_the_legacy_ledger_when_both_exist` (kept
+unchanged — the node ledger still wins whenever it exists) and the new
+`node_ledger_absent_returns_the_missing_default_never_the_legacy_archive`
+(writes a decisive `pass` into the legacy file specifically so the test fails
+loudly if a fallback is ever reintroduced). Every other test fixture in the
+module was repointed from the legacy filename to the node-ledger filename so
+they keep exercising the real parsing code instead of silently short-circuiting
+on the now-permanently-absent legacy read.

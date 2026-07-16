@@ -4424,7 +4424,7 @@ mod tests {
         // coincidence no longer holds -- use the real column name so this
         // fixture actually exercises "Exit failed on macOS".
         std::fs::write(
-            docs.join("live_lab_run_matrix.csv"),
+            docs.join("live_lab_node_run_matrix.csv"),
             "overall_result,macos_stage_exit_handoff\npass,fail\n",
         )
         .unwrap();
@@ -4459,7 +4459,7 @@ mod tests {
         let docs = dir.path().join("documents").join("operations");
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(
-            docs.join("live_lab_run_matrix.csv"),
+            docs.join("live_lab_node_run_matrix.csv"),
             "overall_result,macos_stage_exit\npass,fail\n",
         )
         .unwrap();
@@ -4515,7 +4515,7 @@ mod tests {
         let docs = dir.path().join("documents").join("operations");
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(
-            docs.join("live_lab_run_matrix.csv"),
+            docs.join("live_lab_node_run_matrix.csv"),
             "overall_result,windows_stage_exit_handoff\npass,fail\n",
         )
         .unwrap();
