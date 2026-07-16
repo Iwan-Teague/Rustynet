@@ -1,12 +1,30 @@
 # LiveLab Run Matrix
 
-Status: active evidence ledger. The CSV at
-[`live_lab_run_matrix.csv`](./live_lab_run_matrix.csv) is the append-only table
-for LiveLab attempts.
+## The ledgers — and which one is evidence
+
+There are **two run matrices, one per orchestrator engine**. They share a schema
+but are **not interchangeable**:
+
+| ledger | engine | status |
+| --- | --- | --- |
+| [`live_lab_node_run_matrix.csv`](./live_lab_node_run_matrix.csv) | Rust `--node` | **ACTIVE** — appended by every `--node` run; the default source for coverage/tooling |
+| [`live_lab_run_matrix.csv`](./live_lab_run_matrix.csv) | legacy bash orchestrator | **FROZEN ARCHIVE** — historical only; `--node` never appends here |
+
+**Never read a stage result from one ledger as evidence for the other engine.**
+The engines genuinely diverge. The archive records **52 `linux_stage_two_hop`
+passes** (June 10–24, all bash) while the `--node` engine has **never once**
+passed two-hop — a single blended file made those indistinguishable, and the
+blend was read as "two-hop works" when the shipped engine had never proven it.
+Splitting the ledgers makes the engine unambiguous by construction rather than
+by footnote.
+
+Routing is automatic and needs no flag: only the `--node` engine writes a node
+stage plan into its report dir, and `append_live_lab_run_matrix_row`
+(`crates/rustynet-cli/src/live_lab_run_matrix.rs`) routes on that marker.
 
 [`live_lab_node_stage_results.csv`](./live_lab_node_stage_results.csv) is the
-normalized node-level companion ledger. It records one row per
-run × node × stage with fetched exact OS/version evidence. Use it—not the
+normalized node-level companion ledger for the `--node` engine. It records one
+row per run × node × stage with fetched exact OS/version evidence. Use it—not the
 Linux umbrella columns—to prove Debian, Rocky, Ubuntu, and Fedora separately.
 
 ## Purpose

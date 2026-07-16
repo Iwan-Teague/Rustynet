@@ -162,9 +162,15 @@ pub fn build_coverage_cells(matrix_path: &Path) -> Result<Vec<CoverageCell>, Str
 pub fn execute_ops_live_lab_coverage_report(
     config: LiveLabCoverageReportConfig,
 ) -> Result<String, String> {
+    // Default to the Rust `--node` matrix: coverage claims must reflect the
+    // engine we actually ship. The legacy bash matrix is a frozen archive — its
+    // stage results are not evidence for the `--node` engine (they diverged, and
+    // reading them as such is what made two-hop look proven when the `--node`
+    // engine had never passed it). Pass `--matrix-path` explicitly to report on
+    // the archive.
     let matrix_path = config
         .matrix_path
-        .unwrap_or_else(crate::live_lab_run_matrix::default_live_lab_run_matrix_path);
+        .unwrap_or_else(crate::live_lab_run_matrix::default_live_lab_node_run_matrix_path);
     let cells = build_coverage_cells(matrix_path.as_path())?;
     Ok(render_coverage_report(&cells))
 }

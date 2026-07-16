@@ -11,7 +11,7 @@ The monitor is a **read-only observer + process launcher**. It reads the same
 state files the orchestrator and MCP server write (per-run
 `stage_manifest.json`, `orchestrate_result.json`, `state/stages.tsv`,
 `state/report_state.json`, the parallel `results.tsv`, `vm_lab_inventory.json`,
-`utmctl list`, and `live_lab_run_matrix.csv` rows) and drives the same
+`utmctl list`, and run-matrix rows) and drives the same
 orchestrator binary the live-lab loop uses. It touches no WireGuard, crypto,
 trust-state, ACL, killswitch, exit-NAT, or DNS code — it is non-security tooling.
 
@@ -91,3 +91,21 @@ silently substituted with a plausible-looking local guess. These properties are
 pinned by the adversarial-input unit tests in each `src/data/*` module (corrupt
 JSON, torn writes, non-UTF8 bytes, ragged CSV rows, one bad file not hiding its
 siblings, and truncated status words never reading as a decisive pass/fail).
+
+## ⚠️ OPEN TODO — read the `--node` run matrix, not the legacy archive
+
+The run matrix is **split by engine** (see
+[`LiveLabRunMatrix.md`](../../documents/operations/LiveLabRunMatrix.md)):
+`documents/operations/live_lab_node_run_matrix.csv` is the **active** Rust
+`--node` ledger; `documents/operations/live_lab_run_matrix.csv` is a **frozen
+legacy bash archive**.
+
+`src/data/run_matrix.rs` still reads the **legacy** path. Until it is repointed,
+the TUI shows the frozen archive and **will not show any `--node` run** — a stale
+historical record rendered as if current.
+
+Repoint every read site to `live_lab_node_run_matrix.csv`. Do **not** merge the
+ledgers: the engines diverge, and blending them is what let the archive's 52
+`linux_stage_two_hop` passes read as proof for the `--node` engine, which has
+never passed two-hop. Details + rationale:
+[`LiveLabMonitorTUIAccuracyImprovements_2026-07-10.md`](../../documents/operations/active/LiveLabMonitorTUIAccuracyImprovements_2026-07-10.md).

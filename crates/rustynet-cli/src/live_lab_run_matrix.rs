@@ -416,8 +416,23 @@ struct NodeStagePlanEntry {
     roles: Vec<String>,
 }
 
+/// The **legacy (bash orchestrator)** run matrix. Frozen historical archive:
+/// the Rust `--node` engine no longer appends here and no tooling reads it for
+/// current coverage. See [`default_live_lab_node_run_matrix_path`].
 pub fn default_live_lab_run_matrix_path() -> PathBuf {
     workspace_root_path().join("documents/operations/live_lab_run_matrix.csv")
+}
+
+/// The **Rust `--node` engine** run matrix — the live evidence ledger.
+///
+/// The two engines get separate files because a single blended matrix is
+/// actively misleading: a stage column reads `pass` without saying *which*
+/// engine proved it. Concretely, `linux_stage_two_hop` showed 52 passes while
+/// the `--node` engine had never once passed two-hop — every one of those
+/// passes was the legacy bash orchestrator. Splitting the ledgers makes the
+/// engine unambiguous by construction rather than by footnote.
+pub fn default_live_lab_node_run_matrix_path() -> PathBuf {
+    workspace_root_path().join("documents/operations/live_lab_node_run_matrix.csv")
 }
 
 pub fn execute_ops_append_orchestrator_run_to_matrix(
@@ -495,15 +510,22 @@ pub fn execute_ops_append_orchestrator_run_to_matrix(
 pub fn append_live_lab_run_matrix_row(
     config: LiveLabRunMatrixAppendConfig<'_>,
 ) -> Result<LiveLabRunMatrixAppendResult, String> {
-    let matrix_path = default_live_lab_run_matrix_path();
+    // Only the Rust `--node` engine writes a node stage plan into its report
+    // dir, so its presence is the engine signal — the same one the node stage
+    // ledger write below already relies on. Route each engine's rows to its own
+    // matrix: a blended file lets a bash-era `pass` be read as a `--node` pass.
+    let is_node_run = config
+        .report_dir
+        .join(NODE_STAGE_PLAN_RELATIVE_PATH)
+        .is_file();
+    let matrix_path = if is_node_run {
+        default_live_lab_node_run_matrix_path()
+    } else {
+        default_live_lab_run_matrix_path()
+    };
     let schema = ensure_matrix_schema(matrix_path.as_path())?;
     let values = build_live_lab_run_matrix_values(&schema, &config)?;
-    if config.row_role == LiveLabRunMatrixRowRole::Final
-        && config
-            .report_dir
-            .join(NODE_STAGE_PLAN_RELATIVE_PATH)
-            .is_file()
-    {
+    if config.row_role == LiveLabRunMatrixRowRole::Final && is_node_run {
         write_node_stage_result_ledgers(config.report_dir, &values)?;
     }
     let written = upsert_csv_row(matrix_path.as_path(), &schema, &values, config.row_role)?;
@@ -2456,6 +2478,7 @@ mod tests {
         populate_role_result_values, populate_stage_values, render_csv_row,
         set_special_stage_values, validate_target_evidence,
     };
+    use super::{default_live_lab_node_run_matrix_path, default_live_lab_run_matrix_path};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
@@ -4366,4 +4389,26 @@ mod conclusion_barrier_tests {
         assert!(body.contains("rocky-utm-1") && body.contains(",pass,"));
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn node_and_legacy_run_matrices_are_distinct_ledgers() {
+    // The engines must never share a ledger. A blended matrix reports a
+    // stage column as `pass` without saying which engine proved it: the
+    // legacy bash orchestrator passed two-hop 52 times while the Rust
+    // --node engine had never passed it once, and a single file made those
+    // indistinguishable.
+    let legacy = default_live_lab_run_matrix_path();
+    let node = default_live_lab_node_run_matrix_path();
+    assert_ne!(legacy, node, "engines must not share a run matrix");
+    assert!(
+        legacy.ends_with("documents/operations/live_lab_run_matrix.csv"),
+        "legacy archive path moved: {}",
+        legacy.display()
+    );
+    assert!(
+        node.ends_with("documents/operations/live_lab_node_run_matrix.csv"),
+        "--node ledger path moved: {}",
+        node.display()
+    );
 }
