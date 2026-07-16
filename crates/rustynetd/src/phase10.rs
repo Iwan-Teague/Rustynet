@@ -1193,6 +1193,25 @@ impl LinuxCommandSystem {
         }
     }
 
+    /// Does a rendered `ip route show` destination denote the CIDR we asked
+    /// the kernel to install?
+    ///
+    /// iproute2 does not echo destinations back verbatim, so a literal string
+    /// compare is wrong in two ways:
+    ///
+    /// - a host route drops its prefix: `10.0.0.1/32` renders as `10.0.0.1`;
+    /// - **the default route renders as `default`**, never as `0.0.0.0/0` or
+    ///   `::/0`.
+    ///
+    /// The second case was unhandled, and it is reachable in production: the
+    /// management-SSH bypass installs one route per
+    /// `fail_closed_ssh_allow_cidrs` entry, so allowing SSH from anywhere
+    /// (`0.0.0.0/0`) made `assert_expected_bypass_routes` compare "0.0.0.0/0"
+    /// against a table containing "default dev enp0s1" and fail every time.
+    /// The killswitch then failed its own assertion on every reconcile, which
+    /// restricted the daemon and made every mutating command (`route
+    /// advertise`, exit setup) impossible. The direction is at least safe --
+    /// a false assertion failure fails closed -- but the node is unusable.
     fn route_destination_matches_rendered(expected: &str, rendered: &str) -> bool {
         if rendered == expected {
             return true;
@@ -1200,6 +1219,9 @@ impl LinuxCommandSystem {
         let Some((address, prefix)) = expected.split_once('/') else {
             return false;
         };
+        if prefix == "0" && matches!(address, "0.0.0.0" | "::") {
+            return rendered == "default";
+        }
         let host_prefix = if address.contains(':') { "128" } else { "32" };
         prefix == host_prefix && rendered == address
     }
@@ -11185,6 +11207,73 @@ mod tests {
         assert!(perf.contains("\"captured_at_unix\": "));
         let _ = std::fs::remove_file(&audit_path);
         let _ = std::fs::remove_file(&perf_path);
+    }
+
+    /// iproute2 renders the default route as `default`, so the killswitch's
+    /// own bypass-route assertion could never match a `0.0.0.0/0` management
+    /// allow-CIDR. It failed on every reconcile, restricting the daemon until
+    /// every mutating command (route advertise, exit setup) was refused.
+    ///
+    /// The `output=` strings below are the verbatim `ip route show table
+    /// 51820` output from a lab guest after
+    /// `ip route replace 0.0.0.0/0 dev enp0s1 table 51820`.
+    #[test]
+    fn expected_bypass_route_matches_the_default_route_iproute2_actually_renders() {
+        let route =
+            LinuxCommandSystem::expected_bypass_route("0.0.0.0/0".to_owned(), "enp0s1".to_owned());
+        assert!(
+            LinuxCommandSystem::line_matches_expected_bypass_route(
+                "default dev enp0s1 scope link ",
+                &route
+            ),
+            "we install 0.0.0.0/0 and the kernel renders it back as `default`"
+        );
+        // The v6 default renders the same way.
+        let v6 = LinuxCommandSystem::expected_bypass_route("::/0".to_owned(), "enp0s1".to_owned());
+        assert!(LinuxCommandSystem::line_matches_expected_bypass_route(
+            "default dev enp0s1 metric 1024 pref medium",
+            &v6
+        ));
+
+        // `default` must still be matched against the RIGHT interface, so the
+        // assertion cannot be satisfied by an unrelated default route.
+        assert!(
+            !LinuxCommandSystem::line_matches_expected_bypass_route(
+                "default dev eth9 scope link",
+                &route
+            ),
+            "a default route on another interface is not our owned bypass route"
+        );
+        // And a non-default destination must not be satisfied by `default`.
+        let lan = LinuxCommandSystem::expected_bypass_route(
+            "192.168.64.0/24".to_owned(),
+            "enp0s1".to_owned(),
+        );
+        assert!(!LinuxCommandSystem::line_matches_expected_bypass_route(
+            "default dev enp0s1 scope link",
+            &lan
+        ));
+        assert!(LinuxCommandSystem::line_matches_expected_bypass_route(
+            "192.168.64.0/24 dev enp0s1 scope link",
+            &lan
+        ));
+    }
+
+    /// The other rendering quirk, already handled: a host route drops its /32.
+    #[test]
+    fn expected_bypass_route_matches_a_host_route_rendered_without_its_prefix() {
+        let route = LinuxCommandSystem::expected_bypass_route(
+            "10.0.0.7/32".to_owned(),
+            "enp0s1".to_owned(),
+        );
+        assert!(LinuxCommandSystem::line_matches_expected_bypass_route(
+            "10.0.0.7 dev enp0s1 scope link",
+            &route
+        ));
+        assert!(!LinuxCommandSystem::line_matches_expected_bypass_route(
+            "10.0.0.8 dev enp0s1 scope link",
+            &route
+        ));
     }
 
     #[test]
