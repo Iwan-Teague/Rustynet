@@ -829,13 +829,19 @@ fn run() -> Result<(), String> {
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.final_exit_host,
-        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0",
+        &format!(
+            "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock {} route advertise 0.0.0.0/0",
+            live_lab_support::REMOTE_RUSTYNET_BIN
+        ),
     )?;
     run_root(
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.entry_host,
-        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0",
+        &format!(
+            "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock {} route advertise 0.0.0.0/0",
+            live_lab_support::REMOTE_RUSTYNET_BIN
+        ),
     )?;
     refresh_signed_state(
         &config.ssh_identity_file,

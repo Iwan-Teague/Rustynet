@@ -1927,7 +1927,7 @@ fn route_advertise_denied(
     platform: &str,
 ) -> Result<bool, String> {
     let posix_command = format!(
-        "env RUSTYNET_DAEMON_SOCKET={} rustynet route advertise 10.250.0.0/16 >/dev/null 2>&1 && exit 1 || exit 0",
+        "env RUSTYNET_DAEMON_SOCKET={} {REMOTE_RUSTYNET_BIN} route advertise 10.250.0.0/16 >/dev/null 2>&1 && exit 1 || exit 0",
         daemon_socket_path_for_platform(platform)
     );
     run_denial_probe(
@@ -1951,7 +1951,7 @@ fn exit_select_denied(
         return Ok(false);
     }
     let posix_command = format!(
-        "env RUSTYNET_DAEMON_SOCKET={} rustynet exit-node select {} >/dev/null 2>&1 && exit 1 || exit 0",
+        "env RUSTYNET_DAEMON_SOCKET={} {REMOTE_RUSTYNET_BIN} exit-node select {} >/dev/null 2>&1 && exit 1 || exit 0",
         daemon_socket_path_for_platform(platform),
         shell_quote(baseline_exit)
     );

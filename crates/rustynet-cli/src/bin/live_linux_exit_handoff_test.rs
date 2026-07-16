@@ -620,13 +620,17 @@ fn run() -> Result<(), String> {
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.exit_a_host,
-        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0",
+        &format!(
+            "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock {REMOTE_RUSTYNET_BIN} route advertise 0.0.0.0/0"
+        ),
     )?;
     run_root(
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.exit_b_host,
-        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0",
+        &format!(
+            "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock {REMOTE_RUSTYNET_BIN} route advertise 0.0.0.0/0"
+        ),
     )?;
     pin_client_to_expected_exit(
         &config.ssh_identity_file,
@@ -1669,7 +1673,7 @@ fn refresh_dns_bundles(
             records_remote.as_str(),
         )?;
         let issue_cmd = format!(
-            "rustynet dns zone issue --signing-secret /etc/rustynet/membership.owner.key --signing-secret-passphrase-file {} --subject-node-id {} --nodes {} --allow {} --zone-name {} --records-manifest {} --output {} --verifier-key-output {}",
+            "{REMOTE_RUSTYNET_BIN} dns zone issue --signing-secret /etc/rustynet/membership.owner.key --signing-secret-passphrase-file {} --subject-node-id {} --nodes {} --allow {} --zone-name {} --records-manifest {} --output {} --verifier-key-output {}",
             shell_quote(passphrase_remote),
             shell_quote(target.node_id.as_str()),
             shell_quote(nodes_spec),
