@@ -230,3 +230,110 @@ pub trait OrchestrationStage: Send + Sync {
         false
     }
 }
+
+/// How much of each captured stream reaches the stage summary. Enough to carry
+/// a guest's error and a little context; the rest stays in the report dir.
+const STAGE_FAILURE_STREAM_BUDGET: usize = 4000;
+
+/// Render a failed live-lab binary's output for the stage summary.
+///
+/// These stages shell out to a `live_*` binary which SSHes to the guests. The
+/// guest's own diagnostic arrives on the binary's **stdout**, while the
+/// binary's terse wrapper message goes to stderr. Reporting only stderr — as
+/// every one of these stages did — throws the actual cause away and leaves a
+/// summary like
+///
+/// ```text
+/// enforce-host failed for debian@192.168.64.10:22 with status 1
+///   hint: unclassified failure; check the error message above
+/// ```
+///
+/// where nothing is "above": `.output()` captured the guest's explanation and
+/// the stage dropped it. The real cause of that failure —
+/// `assignment exit node rocky-utm-1-bootstrap lacks signed membership
+/// capability exit_server` — existed only in the guest's journal and had to be
+/// recovered by reproducing the command by hand over SSH. That cost a
+/// live-lab cycle three times over.
+///
+/// So surface BOTH streams, labelled. Note stdout is not merely a fallback for
+/// an empty stderr: the two carry different halves of the story, and it is
+/// exactly when stderr is non-empty (the wrapper message) that stdout (the
+/// cause) matters most.
+pub(crate) fn format_stage_binary_failure(
+    label: &str,
+    status: std::process::ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> String {
+    fn clip(raw: &[u8]) -> String {
+        let text = String::from_utf8_lossy(raw);
+        let text = text.trim();
+        match text.char_indices().nth(STAGE_FAILURE_STREAM_BUDGET) {
+            Some((cut, _)) => format!("{}… ({} bytes total)", &text[..cut], raw.len()),
+            None => text.to_owned(),
+        }
+    }
+    let out = clip(stdout);
+    let err = clip(stderr);
+    let mut detail = String::new();
+    if !err.is_empty() {
+        detail.push_str(&format!("\nstderr: {err}"));
+    }
+    if !out.is_empty() {
+        detail.push_str(&format!("\nstdout: {out}"));
+    }
+    if detail.is_empty() {
+        detail.push_str(" (the binary produced no output on either stream)");
+    }
+    format!("{label} failed (exit {status}):{detail}")
+}
+
+#[cfg(test)]
+mod failure_format_tests {
+    use super::*;
+
+    fn exit_status_failure() -> std::process::ExitStatus {
+        // A real ExitStatus is only constructible by running something.
+        std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .status()
+            .expect("spawn sh")
+    }
+
+    #[test]
+    fn both_streams_are_surfaced_when_both_are_present() {
+        // The regression: stderr held the useless wrapper line while stdout
+        // held the cause, so a stderr-only summary (or a stdout-as-fallback
+        // one) discarded exactly the half worth reading.
+        let summary = format_stage_binary_failure(
+            "live_two_hop",
+            exit_status_failure(),
+            b"selected exit node rocky-utm-1-bootstrap lacks capability exit_server",
+            b"enforce-host failed for debian@192.168.64.10:22 with status 1",
+        );
+        assert!(summary.contains("enforce-host failed"), "{summary}");
+        assert!(
+            summary.contains("lacks capability exit_server"),
+            "the guest's cause arrives on stdout and must not be dropped: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_silent_binary_says_so_rather_than_looking_like_a_clean_failure() {
+        let summary =
+            format_stage_binary_failure("live_two_hop", exit_status_failure(), b"", b"   ");
+        assert!(summary.contains("no output on either stream"), "{summary}");
+    }
+
+    #[test]
+    fn oversized_output_is_clipped_but_flagged() {
+        let huge = vec![b'x'; STAGE_FAILURE_STREAM_BUDGET * 2];
+        let summary =
+            format_stage_binary_failure("live_two_hop", exit_status_failure(), &huge, b"");
+        assert!(summary.contains("bytes total"), "{summary}");
+        assert!(
+            summary.len() < STAGE_FAILURE_STREAM_BUDGET * 2,
+            "a runaway log must not swallow the summary"
+        );
+    }
+}

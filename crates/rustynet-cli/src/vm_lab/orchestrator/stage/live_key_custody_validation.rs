@@ -70,12 +70,14 @@ impl OrchestrationStage for LiveKeyCustodyValidationStage {
                 if output.status.success() {
                     StageOutcome::Passed
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    StageOutcome::Failed(format!(
-                        "live_key_custody binary failed (exit {}): {}",
-                        output.status,
-                        stderr.trim()
-                    ))
+                    StageOutcome::Failed(
+                        crate::vm_lab::orchestrator::stage::format_stage_binary_failure(
+                            "live_key_custody binary",
+                            output.status,
+                            &output.stdout,
+                            &output.stderr,
+                        ),
+                    )
                 }
             }
             Err(e) => {

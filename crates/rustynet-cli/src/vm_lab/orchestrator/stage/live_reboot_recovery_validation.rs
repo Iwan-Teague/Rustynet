@@ -88,12 +88,14 @@ impl OrchestrationStage for LiveRebootRecoveryValidationStage {
                 if output.status.success() {
                     StageOutcome::Passed
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    StageOutcome::Failed(format!(
-                        "live_reboot_recovery binary failed (exit {}): {}",
-                        output.status,
-                        stderr.trim()
-                    ))
+                    StageOutcome::Failed(
+                        crate::vm_lab::orchestrator::stage::format_stage_binary_failure(
+                            "live_reboot_recovery binary",
+                            output.status,
+                            &output.stdout,
+                            &output.stderr,
+                        ),
+                    )
                 }
             }
             Err(e) => StageOutcome::Failed(format!(
