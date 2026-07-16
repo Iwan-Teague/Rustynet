@@ -5253,20 +5253,54 @@ fn ensure_running_as_root() -> Result<(), String> {
     Err("this operation requires Administrator privileges on Windows".to_string())
 }
 
+/// The logical name a spawn helper uses to mean "re-invoke myself".
+pub(crate) const RUSTYNET_SELF: &str = "rustynet";
+
+/// Resolve the program a spawn helper should exec, re-execing the *currently
+/// running* binary whenever the caller names [`RUSTYNET_SELF`].
+///
+/// Several ops subcommands re-invoke `rustynet`. Letting that resolve through
+/// PATH is a portability defect, because `sudo` does not pass the caller's
+/// PATH to the child — it substitutes `secure_path` from `/etc/sudoers`, and
+/// the RHEL family ships
+/// `Defaults secure_path = /sbin:/bin:/usr/sbin:/usr/bin`, which omits
+/// `/usr/local/bin`, the install prefix. So `sudo rustynet ops
+/// e2e-enforce-host` dies partway through with `failed to spawn rustynet: No
+/// such file or directory (os error 2)` on Rocky/Fedora, while Debian and
+/// Ubuntu — whose `secure_path` includes `/usr/local/bin` — pass. The
+/// asymmetry hides the defect on a Debian-only topology.
+///
+/// Re-execing `current_exe()` is correct regardless of install prefix, and is
+/// also the stricter choice: a PATH lookup could resolve to a *different*
+/// `rustynet` than the one already running.
+///
+/// Fails closed rather than falling back to PATH: if the running binary cannot
+/// be identified, silently exec'ing some other `rustynet` is precisely the
+/// behaviour worth preventing.
+pub(crate) fn resolve_self_program(program: &str) -> Result<String, String> {
+    if program != RUSTYNET_SELF {
+        return Ok(program.to_owned());
+    }
+    let exe = std::env::current_exe()
+        .map_err(|err| format!("resolve the running rustynet executable failed: {err}"))?;
+    Ok(exe.to_string_lossy().into_owned())
+}
+
 fn run_status(
     program: &str,
     args: &[&str],
     envs: &[(&str, &str)],
     context: &str,
 ) -> Result<(), String> {
-    let mut command = Command::new(program);
+    let resolved = resolve_self_program(program)?;
+    let mut command = Command::new(resolved.as_str());
     command.args(args);
     for (key, value) in envs {
         command.env(key, value);
     }
     let output = command
         .output()
-        .map_err(|err| format!("{context}: failed to spawn {program}: {err}"))?;
+        .map_err(|err| format!("{context}: failed to spawn {resolved}: {err}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -5349,14 +5383,15 @@ fn ensure_system_user(user_name: &str, group_name: &str) -> Result<(), String> {
 }
 
 fn capture_stdout(program: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
-    let mut command = Command::new(program);
+    let resolved = resolve_self_program(program)?;
+    let mut command = Command::new(resolved.as_str());
     command.args(args);
     for (key, value) in envs {
         command.env(key, value);
     }
     let output = command
         .output()
-        .map_err(|err| format!("failed to spawn {program}: {err}"))?;
+        .map_err(|err| format!("failed to spawn {resolved}: {err}"))?;
     if !output.status.success() {
         return Err(format!(
             "{} exited unsuccessfully: {}",
@@ -7060,12 +7095,13 @@ mod tests {
     use std::fs;
 
     use super::{
-        AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, assignment_verifier_key_hex, decode_base64,
-        decode_hex_32, ensure_safe_token, extract_last_assignment_generated,
+        AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, RUSTYNET_SELF, assignment_verifier_key_hex,
+        decode_base64, decode_hex_32, ensure_safe_token, extract_last_assignment_generated,
         issue_assignment_bundle_artifacts, issue_dns_zone_bundle_artifacts,
         issue_traversal_bundle_artifacts, issue_two_node_traversal_artifacts,
         parse_generic_allow_specs, parse_generic_assignment_specs, parse_generic_nodes,
-        system_useradd_args, traversal_verifier_key_hex, write_assignment_refresh_env,
+        resolve_self_program, system_useradd_args, traversal_verifier_key_hex,
+        write_assignment_refresh_env,
     };
     use rustynet_control::ControlPlaneCore;
     use rustynet_policy::PolicySet;
@@ -7609,6 +7645,46 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             err.contains("only supported on Windows"),
             "unexpected error: {err}"
         );
+    }
+    /// `rustynet` re-invokes itself for several ops subcommands. Resolving
+    /// that through PATH fails under `sudo`, which substitutes `secure_path`
+    /// from /etc/sudoers for the caller's PATH; the RHEL family's
+    /// `secure_path = /sbin:/bin:/usr/sbin:/usr/bin` omits /usr/local/bin,
+    /// the install prefix. That made `sudo rustynet ops e2e-enforce-host`
+    /// die with "failed to spawn rustynet: No such file or directory" on
+    /// Rocky/Fedora while passing on Debian/Ubuntu, whose secure_path
+    /// includes /usr/local/bin — so a Debian-only topology could not see it.
+    #[test]
+    fn self_program_resolves_to_the_running_binary_not_a_path_lookup() {
+        let resolved = resolve_self_program(RUSTYNET_SELF).expect("resolve self");
+        assert_ne!(
+            resolved, RUSTYNET_SELF,
+            "the bare name must not survive: PATH lookup is what breaks under sudo secure_path"
+        );
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "must resolve to an absolute path, got {resolved:?}"
+        );
+        let expected = std::env::current_exe().expect("current exe");
+        assert_eq!(
+            std::path::Path::new(&resolved),
+            expected.as_path(),
+            "must re-exec the running binary, not any other rustynet on PATH"
+        );
+    }
+
+    /// The resolver must rewrite ONLY the self sentinel. Every other spawn in
+    /// these helpers (`systemctl`, `wg`, ...) is a genuine PATH lookup and
+    /// must pass through untouched.
+    #[test]
+    fn self_program_leaves_other_programs_untouched() {
+        for program in ["systemctl", "wg", "ip", "install", "/usr/bin/env"] {
+            assert_eq!(
+                resolve_self_program(program).expect("resolve"),
+                program,
+                "only {RUSTYNET_SELF:?} is the self sentinel"
+            );
+        }
     }
 }
 
