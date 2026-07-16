@@ -16,7 +16,7 @@ pub use overnight::{VmLabOvernightConfig, execute_ops_vm_lab_overnight};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -141,6 +141,96 @@ pub struct VmLabDiscoverLocalUtmConfig {
     pub timeout_secs: u64,
     pub update_inventory_live_ips: bool,
     pub report_dir: Option<PathBuf>,
+}
+
+/// Config for `ops vm-lab-host-preflight`: the ordered, fail-closed gate pipeline
+/// a multi-HOST run must pass before it is worth launching.
+///
+/// Distinct from `vm-lab-preflight`, which gates individual **guests** (reachable
+/// / SSH-auth / platform identity). This one gates the **machines**: pinned
+/// commit, host agreement, ready-guest rollup. They compose — host gates first,
+/// then guest gates.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabHostPreflightConfig {
+    pub inventory_path: Option<PathBuf>,
+    /// Restrict to these host_ids. Empty ⇒ every declared host.
+    pub hosts: Vec<String>,
+    /// Ref/SHA every host must be on. Absent ⇒ HEAD.
+    pub commit: Option<String>,
+    pub allow_dirty: bool,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+    pub json: bool,
+}
+
+/// Config for `ops vm-lab-sync-host`: put a host's orchestrator source onto a
+/// named commit and prove it, so its run evidence is attributable.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabSyncHostConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub host_id: String,
+    /// Ref or SHA to pin. Absent ⇒ `HEAD`. Resolved ONCE locally.
+    pub commit: Option<String>,
+    /// Permit syncing/attesting a dirty tree. Off by default: a dirty tree is
+    /// not reproducible from a SHA.
+    pub allow_dirty: bool,
+    /// Assert host state without changing anything.
+    pub verify_only: bool,
+    /// SSH identity for reaching the host. Defaults to the lab identity; must be
+    /// overridable so the tool is not welded to one key.
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+    pub json: bool,
+}
+
+/// Config for `ops vm-lab-discover-hosts`: enumerate the VMs a declared host
+/// actually has, and report which are ready to take part in a run.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabDiscoverHostsConfig {
+    pub inventory_path: Option<PathBuf>,
+    /// Restrict discovery to one `host_id`. Absent ⇒ every declared host.
+    pub host_id: Option<String>,
+    pub virsh_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+    /// Emit machine-readable JSON instead of the human table.
+    pub json: bool,
+    pub report_dir: Option<PathBuf>,
+}
+
+/// One VM as the host actually reports it, joined to inventory registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscoveredGuest {
+    pub(crate) domain: String,
+    pub(crate) running: bool,
+    pub(crate) ip: Option<String>,
+    /// Inventory alias if this domain is registered, else `None` (unregistered
+    /// VMs are reported, not hidden — you cannot adopt what you cannot see).
+    pub(crate) alias: Option<String>,
+}
+
+impl DiscoveredGuest {
+    /// A guest is usable by a run only when the host says it is running AND an
+    /// IP resolved. Running-without-IP is deliberately NOT ready: the SSH plane
+    /// has nowhere to connect, so claiming readiness would fail later and worse.
+    pub(crate) fn ready(&self) -> bool {
+        self.running && self.ip.is_some()
+    }
+}
+
+/// Discovery result for one declared host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscoveredHost {
+    pub(crate) host_id: String,
+    pub(crate) kind: LabHostKind,
+    pub(crate) endpoint: String,
+    pub(crate) guest_subnet: Option<String>,
+    /// `Ok` ⇒ capability probe verified the declared kind; `Err` ⇒ host is
+    /// unreachable or is not what it claims. Guests are not enumerated in that
+    /// case — an unverifiable host contributes nothing rather than a guess.
+    pub(crate) probe: Result<String, String>,
+    pub(crate) guests: Vec<DiscoveredGuest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1603,10 +1693,102 @@ pub struct VmLabRunSuiteConfig {
 /// hypervisor connection a run-on-host orchestrator drives via `virsh`.
 const DEFAULT_LIBVIRT_CONNECT_URI: &str = "qemu:///system";
 
-/// The `virsh` binary is resolved from `PATH` on the Linux host the orchestrator
-/// runs on (unlike `utmctl`'s fixed macOS app-bundle path). The run-on-host model
-/// means `virsh` talks to the local libvirt daemon directly.
+/// The `virsh` binary is resolved from `PATH`. With a local `connect_uri`
+/// (`qemu:///system`) it drives the libvirt daemon on this machine; with a
+/// remote one (`qemu+ssh://user@host/system`) libvirt's native remote transport
+/// drives another machine over SSH, which is how a single orchestrator reaches
+/// VM hosts across networks. The transport is a property of the URI, not of the
+/// code path — the same `virsh -c <uri> …` calls serve both.
 const DEFAULT_VIRSH_BINARY: &str = "virsh";
+
+/// How a lab VM host is reached. Declared per host in the inventory's `hosts[]`
+/// array and **verified** by a capability probe — never sniffed from the OS.
+/// An undeclared or mismatched host kind fails closed (§3 default-deny).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LabHostKind {
+    /// macOS host running UTM guests, driven by `utmctl`.
+    LocalUtm,
+    /// Linux host running libvirt/QEMU/KVM guests, driven by `virsh`.
+    Libvirt,
+}
+
+impl LabHostKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LabHostKind::LocalUtm => "local_utm",
+            LabHostKind::Libvirt => "libvirt",
+        }
+    }
+}
+
+/// A machine that hosts lab VMs.
+///
+/// Gives a multi-host / cross-machine fleet a first-class representation instead
+/// of implying the host via `parent_device` (LinuxVmHostPlan §4 Tier-2.5, §8 #5).
+/// Guests reference a host by `host_id` from their controller; the host record
+/// owns the transport (`connect_uri`) so a host can be re-pointed — LAN IP to
+/// tailnet name, local to remote — by editing one record instead of every guest.
+///
+/// `guest_subnet` is recorded per host because every libvirt host ships the same
+/// default `192.168.122.0/24`; two hosts advertising that to one tailnet collide,
+/// so each host owns a distinct subnet (LinuxVmHostPlan §6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LabHost {
+    pub(crate) host_id: String,
+    pub(crate) kind: LabHostKind,
+    /// libvirt only: the `virsh -c` URI. Absent ⇒ `qemu:///system` (local).
+    pub(crate) connect_uri: Option<String>,
+    /// `local_utm` only: where this Mac's `.utm` bundles live.
+    ///
+    /// A **list**, because a real fleet is split across roots: the UTM container
+    /// path (`~/Library/Containers/com.utmapp.UTM/Data/Documents`) and wherever
+    /// bundles were actually stored. Scanning only one silently loses the rest,
+    /// so every root is scanned and the results merged. Declaring them here also
+    /// removes the recurring `--utm-documents-root` footgun — forgetting the flag
+    /// makes a run discover almost nothing, and look like it succeeded.
+    /// Empty ⇒ the default UTM container root.
+    pub(crate) utm_documents_roots: Vec<PathBuf>,
+    /// CIDR this host hands to its guests, e.g. `192.168.121.0/24`.
+    pub(crate) guest_subnet: Option<String>,
+    /// Absolute path to the orchestrator source checkout on this host.
+    ///
+    /// Required for `vm-lab-sync-host`. Run provenance (`git_commit`,
+    /// `git_dirty_state`) is computed by shelling out to git **in this
+    /// directory on that host** — so a host without a real git checkout cannot
+    /// produce attributable evidence at all.
+    pub(crate) repo_dir: Option<PathBuf>,
+    pub(crate) notes: Option<String>,
+}
+
+impl LabHost {
+    /// Resolved libvirt connection URI for this host, defaulting to the local
+    /// system hypervisor. Meaningless for `LocalUtm`.
+    pub(crate) fn resolved_connect_uri(&self) -> String {
+        self.connect_uri
+            .clone()
+            .unwrap_or_else(|| DEFAULT_LIBVIRT_CONNECT_URI.to_owned())
+    }
+
+    /// SSH endpoint (`user@host` or `host`) derived from a remote libvirt
+    /// `connect_uri`, or `None` when the host is local.
+    ///
+    /// Derived rather than configured separately so the endpoint has a **single
+    /// source of truth**: a host re-pointed by editing `connect_uri` cannot end
+    /// up with a stale second copy of its address that silently disagrees.
+    /// `qemu+ssh://user@host/system` → `user@host`; `qemu:///system` → `None`.
+    pub(crate) fn ssh_endpoint(&self) -> Option<String> {
+        let uri = self.connect_uri.as_deref()?;
+        let rest = uri.split_once("+ssh://").map(|(_, rest)| rest)?;
+        let authority = rest.split('/').next()?;
+        // strip any ?query the URI carries (e.g. ?keyfile=…)
+        let authority = authority.split('?').next()?;
+        if authority.is_empty() {
+            return None;
+        }
+        Some(authority.to_owned())
+    }
+}
 
 /// How the lab robot powers a VM on/off and resolves its live IP.
 ///
@@ -3423,6 +3605,1234 @@ fn resolve_discovery_bundle_paths(
             Ok((inventory_bundle_paths, Some(note)))
         }
     }
+}
+
+/// One ordered, fail-closed gate in the multi-host preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreflightGate {
+    pub(crate) name: &'static str,
+    pub(crate) status: PreflightStatus,
+    pub(crate) detail: String,
+    /// The exact command that fixes this gate. The whole point: an operator or
+    /// agent must never need to *remember* the next step — the failure states it.
+    pub(crate) next: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreflightStatus {
+    Pass,
+    Fail,
+    /// Ordering is load-bearing: gates after a failure are NOT evaluated, and are
+    /// reported as not-run rather than silently omitted or assumed green.
+    NotRun,
+}
+
+impl PreflightStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            PreflightStatus::Pass => "PASS",
+            PreflightStatus::Fail => "FAIL",
+            PreflightStatus::NotRun => "not_run",
+        }
+    }
+}
+
+/// Ordered preflight for a multi-host live-lab run.
+///
+/// Enforces the §6.7.4 order in code instead of prose: resolve a pinned commit →
+/// prove it is pushed → prove EVERY host is on it → prove the hosts AGREE with
+/// each other → prove guests are ready → prove the host network is sane. It stops
+/// at the first failure (mirroring `xtask gates`) because a later gate's result is
+/// meaningless once an earlier invariant is broken.
+///
+/// Read-only: it never syncs, powers, or mutates. It only tells you the truth and
+/// what to run next.
+pub fn execute_ops_vm_lab_host_preflight(
+    config: VmLabHostPreflightConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => return Err("vm-lab-host-preflight requires --inventory <path>".to_owned()),
+    };
+    let timeout = timeout_or_default(config.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
+    let mut gates: Vec<PreflightGate> = Vec::new();
+
+    // ---- gate 1: inventory + host declarations -----------------------------
+    let loaded = load_inventory_with_hosts(inventory_path.as_path());
+    let (entries, hosts) = match loaded {
+        Ok(pair) => pair,
+        Err(err) => {
+            gates.push(PreflightGate {
+                name: "inventory",
+                status: PreflightStatus::Fail,
+                detail: err,
+                next: Some("fix the inventory JSON, then re-run preflight".to_owned()),
+            });
+            return Ok(render_preflight(gates.as_slice(), config.json, None));
+        }
+    };
+    let selected: Vec<&LabHost> = if config.hosts.is_empty() {
+        hosts.iter().collect()
+    } else {
+        let mut picked = Vec::new();
+        for id in &config.hosts {
+            match hosts.iter().find(|host| &host.host_id == id) {
+                Some(host) => picked.push(host),
+                None => {
+                    gates.push(PreflightGate {
+                        name: "inventory",
+                        status: PreflightStatus::Fail,
+                        detail: format!("unknown host_id: {id}"),
+                        next: Some("check hosts[] in the inventory".to_owned()),
+                    });
+                    return Ok(render_preflight(gates.as_slice(), config.json, None));
+                }
+            }
+        }
+        picked
+    };
+    let missing_repo: Vec<&str> = selected
+        .iter()
+        .filter(|host| host.repo_dir.is_none())
+        .map(|host| host.host_id.as_str())
+        .collect();
+    if !missing_repo.is_empty() {
+        gates.push(PreflightGate {
+            name: "inventory",
+            status: PreflightStatus::Fail,
+            detail: format!("host(s) without repo_dir: {}", missing_repo.join(", ")),
+            next: Some("declare repo_dir (absolute) for each host in hosts[]".to_owned()),
+        });
+        return Ok(render_preflight(gates.as_slice(), config.json, None));
+    }
+    gates.push(PreflightGate {
+        name: "inventory",
+        status: PreflightStatus::Pass,
+        detail: format!("{} host(s) declared with repo_dir", selected.len()),
+        next: None,
+    });
+
+    // ---- gate 2: pin the commit -------------------------------------------
+    let requested = config.commit.as_deref().unwrap_or("HEAD");
+    let sha = match git_resolve_ref(requested) {
+        Ok(sha) => sha,
+        Err(err) => {
+            gates.push(PreflightGate {
+                name: "commit_pinned",
+                status: PreflightStatus::Fail,
+                detail: err,
+                next: Some(format!("check that {requested} names a real commit")),
+            });
+            return Ok(render_preflight(gates.as_slice(), config.json, None));
+        }
+    };
+    gates.push(PreflightGate {
+        name: "commit_pinned",
+        status: PreflightStatus::Pass,
+        detail: sha.clone(),
+        next: None,
+    });
+
+    // ---- gate 3: local tree clean -----------------------------------------
+    match git_local_dirty() {
+        Ok(true) if !config.allow_dirty => {
+            gates.push(PreflightGate {
+                name: "local_clean",
+                status: PreflightStatus::Fail,
+                detail:
+                    "local worktree is dirty; its evidence would not match the commit it claims"
+                        .to_owned(),
+                next: Some("commit your changes (or re-run with --allow-dirty)".to_owned()),
+            });
+            push_not_run(
+                &mut gates,
+                &[
+                    "commit_pushed",
+                    "hosts_on_commit",
+                    "hosts_agree",
+                    "guests_ready",
+                ],
+            );
+            return Ok(render_preflight(
+                gates.as_slice(),
+                config.json,
+                Some(sha.as_str()),
+            ));
+        }
+        Ok(dirty) => gates.push(PreflightGate {
+            name: "local_clean",
+            status: PreflightStatus::Pass,
+            detail: if dirty {
+                "dirty (allowed)".to_owned()
+            } else {
+                "clean".to_owned()
+            },
+            next: None,
+        }),
+        Err(err) => {
+            gates.push(PreflightGate {
+                name: "local_clean",
+                status: PreflightStatus::Fail,
+                detail: err,
+                next: None,
+            });
+            return Ok(render_preflight(
+                gates.as_slice(),
+                config.json,
+                Some(sha.as_str()),
+            ));
+        }
+    }
+
+    // ---- gate 4: the commit must be PUSHED --------------------------------
+    // Hosts fetch from the shared origin. An unpushed SHA cannot reach them, and
+    // catching it here costs a second instead of failing mid-sync.
+    match git_commit_on_origin(sha.as_str()) {
+        Ok(true) => gates.push(PreflightGate {
+            name: "commit_pushed",
+            status: PreflightStatus::Pass,
+            detail: "reachable on origin".to_owned(),
+            next: None,
+        }),
+        Ok(false) => {
+            gates.push(PreflightGate {
+                name: "commit_pushed",
+                status: PreflightStatus::Fail,
+                detail: format!("{sha} is not on origin; hosts cannot fetch it"),
+                next: Some("git push origin HEAD:main".to_owned()),
+            });
+            push_not_run(
+                &mut gates,
+                &["hosts_on_commit", "hosts_agree", "guests_ready"],
+            );
+            return Ok(render_preflight(
+                gates.as_slice(),
+                config.json,
+                Some(sha.as_str()),
+            ));
+        }
+        Err(err) => {
+            gates.push(PreflightGate {
+                name: "commit_pushed",
+                status: PreflightStatus::Fail,
+                detail: err,
+                next: Some("check network access to origin".to_owned()),
+            });
+            push_not_run(
+                &mut gates,
+                &["hosts_on_commit", "hosts_agree", "guests_ready"],
+            );
+            return Ok(render_preflight(
+                gates.as_slice(),
+                config.json,
+                Some(sha.as_str()),
+            ));
+        }
+    }
+
+    // ---- gate 5: every host is ON the pinned commit ------------------------
+    let mut host_heads: Vec<(String, Result<(String, bool), String>)> = Vec::new();
+    for host in &selected {
+        host_heads.push((
+            host.host_id.clone(),
+            host_head_and_dirty(host, &config, timeout),
+        ));
+    }
+    let mut off_commit: Vec<String> = Vec::new();
+    let mut dirty_hosts: Vec<String> = Vec::new();
+    let mut unreachable: Vec<String> = Vec::new();
+    for (id, result) in &host_heads {
+        match result {
+            Ok((head, dirty)) => {
+                if head != &sha {
+                    off_commit.push(format!("{id}={}", &head[..std::cmp::min(8, head.len())]));
+                }
+                if *dirty {
+                    dirty_hosts.push(id.clone());
+                }
+            }
+            Err(err) => unreachable.push(format!("{id}: {err}")),
+        }
+    }
+    if !unreachable.is_empty() {
+        gates.push(PreflightGate {
+            name: "hosts_on_commit",
+            status: PreflightStatus::Fail,
+            detail: format!("unreachable host(s): {}", unreachable.join("; ")),
+            next: Some("check SSH reachability / --ssh-identity-file".to_owned()),
+        });
+        push_not_run(&mut gates, &["hosts_agree", "guests_ready"]);
+        return Ok(render_preflight(
+            gates.as_slice(),
+            config.json,
+            Some(sha.as_str()),
+        ));
+    }
+    if !off_commit.is_empty() || (!dirty_hosts.is_empty() && !config.allow_dirty) {
+        let mut detail = String::new();
+        if !off_commit.is_empty() {
+            detail.push_str(&format!("off-commit: {}", off_commit.join(", ")));
+        }
+        if !dirty_hosts.is_empty() && !config.allow_dirty {
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str(&format!("dirty: {}", dirty_hosts.join(", ")));
+        }
+        gates.push(PreflightGate {
+            name: "hosts_on_commit",
+            status: PreflightStatus::Fail,
+            detail,
+            next: Some(format!(
+                "rustynet ops vm-lab-sync-host --host <id> --commit {sha}   (for each host above)"
+            )),
+        });
+        push_not_run(&mut gates, &["hosts_agree", "guests_ready"]);
+        return Ok(render_preflight(
+            gates.as_slice(),
+            config.json,
+            Some(sha.as_str()),
+        ));
+    }
+    gates.push(PreflightGate {
+        name: "hosts_on_commit",
+        status: PreflightStatus::Pass,
+        detail: format!("{} host(s) at {}", selected.len(), &sha[..8]),
+        next: None,
+    });
+
+    // ---- gate 6: the hosts AGREE with each other ---------------------------
+    // Redundant with gate 5 today, but stated separately on purpose: it is the
+    // invariant the whole parallel-lab comparison rests on, so it is asserted
+    // explicitly rather than inferred.
+    let heads: HashSet<&str> = host_heads
+        .iter()
+        .filter_map(|(_, result)| result.as_ref().ok().map(|(head, _)| head.as_str()))
+        .collect();
+    if heads.len() > 1 {
+        gates.push(PreflightGate {
+            name: "hosts_agree",
+            status: PreflightStatus::Fail,
+            detail: format!("hosts are on DIFFERENT commits: {:?}", heads),
+            next: Some("sync every host to one pinned SHA before comparing runs".to_owned()),
+        });
+        push_not_run(&mut gates, &["guests_ready"]);
+        return Ok(render_preflight(
+            gates.as_slice(),
+            config.json,
+            Some(sha.as_str()),
+        ));
+    }
+    gates.push(PreflightGate {
+        name: "hosts_agree",
+        status: PreflightStatus::Pass,
+        detail: "all hosts on one commit; run rows are comparable".to_owned(),
+        next: None,
+    });
+
+    // ---- gate 7: each host has at least one READY guest --------------------
+    let virsh_path = PathBuf::from(DEFAULT_VIRSH_BINARY);
+    let mut starved: Vec<String> = Vec::new();
+    let mut ready_summary: Vec<String> = Vec::new();
+    for host in &selected {
+        let discovered = discover_one_host(
+            host,
+            entries.as_slice(),
+            inventory_path.as_path(),
+            virsh_path.as_path(),
+            timeout,
+        );
+        match discovered.probe {
+            Ok(_) => {
+                let ready = discovered
+                    .guests
+                    .iter()
+                    .filter(|guest| guest.ready())
+                    .count();
+                ready_summary.push(format!("{}={ready}", host.host_id));
+                if ready == 0 {
+                    starved.push(host.host_id.clone());
+                }
+            }
+            Err(err) => starved.push(format!("{} (probe failed: {err})", host.host_id)),
+        }
+    }
+    if !starved.is_empty() {
+        gates.push(PreflightGate {
+            name: "guests_ready",
+            status: PreflightStatus::Fail,
+            detail: format!("host(s) with no ready guest: {}", starved.join(", ")),
+            next: Some(
+                "rustynet ops vm-lab-discover-hosts --inventory <path>   (then power on / fix the guests)"
+                    .to_owned(),
+            ),
+        });
+        return Ok(render_preflight(
+            gates.as_slice(),
+            config.json,
+            Some(sha.as_str()),
+        ));
+    }
+    gates.push(PreflightGate {
+        name: "guests_ready",
+        status: PreflightStatus::Pass,
+        detail: format!("ready guests: {}", ready_summary.join(", ")),
+        next: None,
+    });
+
+    Ok(render_preflight(
+        gates.as_slice(),
+        config.json,
+        Some(sha.as_str()),
+    ))
+}
+
+fn push_not_run(gates: &mut Vec<PreflightGate>, names: &[&'static str]) {
+    for name in names {
+        gates.push(PreflightGate {
+            name,
+            status: PreflightStatus::NotRun,
+            detail: "not evaluated (an earlier gate failed)".to_owned(),
+            next: None,
+        });
+    }
+}
+
+/// HEAD + dirty for a host, local or remote.
+fn host_head_and_dirty(
+    host: &LabHost,
+    config: &VmLabHostPreflightConfig,
+    timeout: Duration,
+) -> Result<(String, bool), String> {
+    match host.kind {
+        LabHostKind::LocalUtm => Ok((git_resolve_ref("HEAD")?, git_local_dirty()?)),
+        LabHostKind::Libvirt => {
+            let endpoint = host
+                .ssh_endpoint()
+                .ok_or_else(|| "no ssh endpoint in connect_uri".to_owned())?;
+            let repo_dir = host
+                .repo_dir
+                .as_ref()
+                .ok_or_else(|| "no repo_dir".to_owned())?
+                .display()
+                .to_string();
+            let sync_cfg = VmLabSyncHostConfig {
+                ssh_identity_file: config.ssh_identity_file.clone(),
+                known_hosts_path: config.known_hosts_path.clone(),
+                ..VmLabSyncHostConfig::default()
+            };
+            let head = run_host_git(
+                endpoint.as_str(),
+                repo_dir.as_str(),
+                &["rev-parse", "HEAD"],
+                &sync_cfg,
+                timeout,
+            )?
+            .trim()
+            .to_ascii_lowercase();
+            let status = run_host_git(
+                endpoint.as_str(),
+                repo_dir.as_str(),
+                &["status", "--porcelain"],
+                &sync_cfg,
+                timeout,
+            )?;
+            Ok((head, !status.trim().is_empty()))
+        }
+    }
+}
+
+/// Is this commit reachable on `origin`? Hosts fetch from there, so an unpushed
+/// SHA is a dead end — cheaper to catch here than mid-sync.
+fn git_commit_on_origin(sha: &str) -> Result<bool, String> {
+    let mut command = Command::new("git");
+    command.current_dir(workspace_root_path());
+    command.args(["branch", "-r", "--contains", sha]);
+    let output = run_output_with_timeout(
+        &mut command,
+        timeout_or_default(60, DEFAULT_RUN_TIMEOUT_SECS),
+    )?;
+    if !output.status.success() {
+        // `--contains` errors when the object is unknown locally; treat as not pushed.
+        return Ok(false);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim().starts_with("origin/")))
+}
+
+fn render_preflight(gates: &[PreflightGate], json: bool, sha: Option<&str>) -> String {
+    let failed = gates
+        .iter()
+        .any(|gate| gate.status == PreflightStatus::Fail);
+    if json {
+        return serde_json::to_string_pretty(&serde_json::json!({
+            "commit": sha,
+            "verdict": if failed { "NO-GO" } else { "GO" },
+            "gates": gates.iter().map(|gate| serde_json::json!({
+                "name": gate.name,
+                "status": gate.status.as_str(),
+                "detail": gate.detail,
+                "next": gate.next,
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap_or_else(|_| "{}".to_owned());
+    }
+    let total = gates.len();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "=== vm-lab preflight — commit {} ===\n",
+        sha.map(|sha| &sha[..std::cmp::min(8, sha.len())])
+            .unwrap_or("<unresolved>")
+    ));
+    for (index, gate) in gates.iter().enumerate() {
+        out.push_str(&format!(
+            "[{}/{}] {:<16} {:<8} {}\n",
+            index + 1,
+            total,
+            gate.name,
+            gate.status.as_str(),
+            gate.detail
+        ));
+        if let Some(next) = gate.next.as_deref() {
+            out.push_str(&format!("        next: {next}\n"));
+        }
+    }
+    out.push_str(if failed {
+        "\nVERDICT: NO-GO — fix the FAIL above and re-run preflight.\n"
+    } else {
+        "\nVERDICT: GO — hosts agree on one commit and have ready guests.\n"
+    });
+    out
+}
+
+/// Put a lab host's orchestrator source onto a named commit, and **prove** it.
+///
+/// Two runs are only comparable if both run-matrix rows carry the same real
+/// `git_commit`. Provenance is computed by each host shelling out to git in its
+/// own checkout (`live_lab_run_matrix.rs` → `git rev-parse HEAD`), so a host
+/// without a real checkout cannot produce attributable evidence at all — this
+/// command is what makes a second machine's evidence trustworthy.
+///
+/// The SHA is resolved **once, locally** and pinned: this repo has concurrent
+/// sessions committing, so "sync both hosts to main" can land two *different*
+/// commits and yield two rows that look comparable and are not.
+pub fn execute_ops_vm_lab_sync_host(config: VmLabSyncHostConfig) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => return Err("vm-lab-sync-host requires --inventory <path>".to_owned()),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host_id == config.host_id)
+        .ok_or_else(|| format!("unknown host_id: {}", config.host_id))?;
+
+    let timeout = timeout_or_default(config.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
+
+    // 1. Resolve the requested ref locally, once, to a full 40-char SHA.
+    let requested = config.commit.as_deref().unwrap_or("HEAD");
+    let sha = git_resolve_ref(requested)?;
+
+    // 2. Dirty gate. A dirty local tree cannot be reproduced on another machine
+    //    from a SHA, so syncing it would let two hosts silently diverge while
+    //    both claim the same commit.
+    let local_dirty = git_local_dirty()?;
+    if local_dirty && !config.allow_dirty {
+        return Err(format!(
+            "local worktree is dirty; refusing to sync {sha} (a dirty tree is not reproducible from a SHA). \
+             Commit first, or pass --allow-dirty to record the divergence explicitly."
+        ));
+    }
+
+    let outcome = match host.kind {
+        // The macOS/UTM host IS the dev machine: there is nothing to transport,
+        // only something to assert.
+        LabHostKind::LocalUtm => sync_local_host(host, sha.as_str(), config.allow_dirty),
+        LabHostKind::Libvirt => sync_remote_host(host, sha.as_str(), &config, timeout),
+    };
+
+    let record = match outcome {
+        Ok(record) => record,
+        Err(err) => return Err(err),
+    };
+
+    let rendered = if config.json {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "host_id": record.host_id,
+            "commit": record.commit,
+            "branch": record.branch,
+            "dirty": record.dirty,
+            "repo_dir": record.repo_dir,
+            "verified": record.verified,
+            "action": record.action,
+        }))
+        .unwrap_or_else(|_| "{}".to_owned())
+    } else {
+        format!(
+            "host {} {} commit={} branch={} dirty={} repo_dir={} verified={}\n",
+            record.host_id,
+            record.action,
+            record.commit,
+            record.branch,
+            record.dirty,
+            record.repo_dir,
+            record.verified,
+        )
+    };
+    Ok(rendered)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostSyncRecord {
+    pub(crate) host_id: String,
+    pub(crate) commit: String,
+    pub(crate) branch: String,
+    pub(crate) dirty: bool,
+    pub(crate) repo_dir: String,
+    pub(crate) verified: bool,
+    pub(crate) action: String,
+}
+
+/// The local (dev-machine) host: assert it is on the requested SHA. Never
+/// mutates the operator's working tree — checking out under them would be a
+/// hostile surprise, and the dev machine is the source of truth by definition.
+fn sync_local_host(host: &LabHost, sha: &str, allow_dirty: bool) -> Result<HostSyncRecord, String> {
+    let head = git_resolve_ref("HEAD")?;
+    if head != sha {
+        return Err(format!(
+            "host {} is local and its HEAD is {head}, not the requested {sha}; \
+             check out {sha} on this machine yourself (this command will not move your working tree)",
+            host.host_id
+        ));
+    }
+    let dirty = git_local_dirty()?;
+    if dirty && !allow_dirty {
+        return Err(format!("host {} local worktree is dirty", host.host_id));
+    }
+    Ok(HostSyncRecord {
+        host_id: host.host_id.clone(),
+        commit: head,
+        branch: git_current_branch().unwrap_or_else(|_| "<detached>".to_owned()),
+        dirty,
+        repo_dir: workspace_root_path().display().to_string(),
+        verified: true,
+        action: "verified(local)".to_owned(),
+    })
+}
+
+/// A remote libvirt host: fetch the pinned SHA from the public origin, check it
+/// out, then **read back** its HEAD and prove it matches.
+fn sync_remote_host(
+    host: &LabHost,
+    sha: &str,
+    config: &VmLabSyncHostConfig,
+    timeout: Duration,
+) -> Result<HostSyncRecord, String> {
+    let endpoint = host.ssh_endpoint().ok_or_else(|| {
+        format!(
+            "host {} has no SSH endpoint; its connect_uri must be qemu+ssh://user@host/system to be syncable",
+            host.host_id
+        )
+    })?;
+    let repo_dir = host
+        .repo_dir
+        .as_ref()
+        .ok_or_else(|| format!("host {} has no repo_dir declared", host.host_id))?
+        .display()
+        .to_string();
+
+    if !config.verify_only {
+        // Fetch the exact pinned SHA. Shallow: a lab host needs the tree, not
+        // the history, and the full history is orders of magnitude larger.
+        run_host_git(
+            endpoint.as_str(),
+            repo_dir.as_str(),
+            &["fetch", "--depth=1", "origin", sha],
+            config,
+            timeout,
+        )
+        .map_err(|err| {
+            format!(
+                "host {}: could not fetch {sha} from origin ({err}). \
+                 If {sha} is not pushed, push it first — this command deliberately \
+                 syncs only commits that exist on the shared remote, so the host's \
+                 evidence refers to a commit others can fetch.",
+                host.host_id
+            )
+        })?;
+        // reset --hard fixes tracked files; it deliberately does NOT clean
+        // untracked output, because that would delete the target/ build cache
+        // and turn every run into a cold build.
+        run_host_git(
+            endpoint.as_str(),
+            repo_dir.as_str(),
+            &["reset", "--hard", sha],
+            config,
+            timeout,
+        )
+        .map_err(|err| format!("host {}: reset to {sha} failed: {err}", host.host_id))?;
+    }
+
+    // VERIFY — the entire point. Reporting "synced" from the sending side is how
+    // two machines silently diverge while their evidence claims they agree.
+    let head = run_host_git(
+        endpoint.as_str(),
+        repo_dir.as_str(),
+        &["rev-parse", "HEAD"],
+        config,
+        timeout,
+    )?
+    .trim()
+    .to_ascii_lowercase();
+    if head != sha {
+        return Err(format!(
+            "host {}: VERIFY FAILED — HEAD is {head}, expected {sha}; the host is NOT on the requested commit",
+            host.host_id
+        ));
+    }
+
+    let status = run_host_git(
+        endpoint.as_str(),
+        repo_dir.as_str(),
+        &["status", "--porcelain"],
+        config,
+        timeout,
+    )?;
+    let dirty = !status.trim().is_empty();
+    if dirty && !config.allow_dirty {
+        return Err(format!(
+            "host {}: VERIFY FAILED — worktree is dirty at {sha}, so its evidence would not match the commit it claims:\n{}",
+            host.host_id,
+            status.trim()
+        ));
+    }
+
+    let branch = run_host_git(
+        endpoint.as_str(),
+        repo_dir.as_str(),
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        config,
+        timeout,
+    )
+    .map(|out| out.trim().to_owned())
+    .unwrap_or_else(|_| "<detached>".to_owned());
+
+    Ok(HostSyncRecord {
+        host_id: host.host_id.clone(),
+        commit: head,
+        branch,
+        dirty,
+        repo_dir,
+        verified: true,
+        action: if config.verify_only {
+            "verified".to_owned()
+        } else {
+            "synced".to_owned()
+        },
+    })
+}
+
+/// Run `git -C <repo_dir> <args>` on a host over SSH, argv-only (§4: never build
+/// a shell string with untrusted values).
+fn run_host_git(
+    endpoint: &str,
+    repo_dir: &str,
+    args: &[&str],
+    config: &VmLabSyncHostConfig,
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut command = Command::new("ssh");
+    command.args([
+        "-n",
+        "-F",
+        "/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "IdentitiesOnly=yes",
+    ]);
+    let identity = config
+        .ssh_identity_file
+        .clone()
+        .unwrap_or_else(default_lab_ssh_identity_path);
+    let known_hosts = config
+        .known_hosts_path
+        .clone()
+        .unwrap_or_else(default_known_hosts_path);
+    append_ssh_transport_options(
+        &mut command,
+        Some(identity.as_path()),
+        Some(known_hosts.as_path()),
+    )?;
+    command.arg("--").arg(endpoint);
+    command.arg("git").arg("-C").arg(repo_dir);
+    for arg in args {
+        command.arg(arg);
+    }
+    let output = run_output_with_timeout(&mut command, timeout)?;
+    if !output.status.success() {
+        return Err(format!(
+            "ssh git {} on {endpoint} exited {}: {}",
+            args.join(" "),
+            status_code(output.status),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|err| format!("git output was not UTF-8: {err}"))
+}
+
+/// Resolve a ref to a full 40-char lowercase SHA, failing closed on anything else.
+fn git_resolve_ref(reference: &str) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.current_dir(workspace_root_path());
+    command.args(["rev-parse", "--verify", "--end-of-options"]);
+    command.arg(format!("{reference}^{{commit}}"));
+    let output = run_output_with_timeout(
+        &mut command,
+        timeout_or_default(30, DEFAULT_RUN_TIMEOUT_SECS),
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse {reference} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let commit = String::from_utf8(output.stdout)
+        .map_err(|err| format!("git rev-parse returned non-UTF-8: {err}"))?
+        .trim()
+        .to_ascii_lowercase();
+    if commit.len() != 40 || !commit.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!(
+            "git rev-parse {reference} returned invalid commit: {commit}"
+        ));
+    }
+    Ok(commit)
+}
+
+fn git_local_dirty() -> Result<bool, String> {
+    let mut command = Command::new("git");
+    command.current_dir(workspace_root_path());
+    command.args(["status", "--porcelain"]);
+    let output = run_output_with_timeout(
+        &mut command,
+        timeout_or_default(30, DEFAULT_RUN_TIMEOUT_SECS),
+    )?;
+    if !output.status.success() {
+        return Err("git status --porcelain failed".to_owned());
+    }
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn git_current_branch() -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.current_dir(workspace_root_path());
+    command.args(["rev-parse", "--abbrev-ref", "HEAD"]);
+    let output = run_output_with_timeout(
+        &mut command,
+        timeout_or_default(30, DEFAULT_RUN_TIMEOUT_SECS),
+    )?;
+    if !output.status.success() {
+        return Err("git rev-parse --abbrev-ref HEAD failed".to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Discover the VMs each declared lab host actually has, and report which are
+/// ready to join a run.
+///
+/// This is the multi-host entry point: point it at the inventory (optionally one
+/// `--host`), and it probes every declared host, enumerates its domains, resolves
+/// live IPs, and joins the result to inventory registration. It is the
+/// hypervisor-neutral analogue of the UTM bundle scan — the piece that lets an
+/// orchestrator ask a machine "what have you got?" instead of an operator hand-
+/// maintaining the answer.
+///
+/// Read-only: it never powers, mutates, or writes VMs. An unreachable or
+/// wrong-kind host is reported as a failed probe and contributes no guests,
+/// rather than silently dropping to zero (LinuxVmHostPlan §4 Tier-2.5).
+pub fn execute_ops_vm_lab_discover_hosts(
+    config: VmLabDiscoverHostsConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => return Err("vm-lab-discover-hosts requires --inventory <path>".to_owned()),
+    };
+    let (entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+
+    if hosts.is_empty() {
+        return Err(format!(
+            "vm inventory declares no hosts[]: {}",
+            inventory_path.display()
+        ));
+    }
+
+    let selected: Vec<&LabHost> = match config.host_id.as_deref() {
+        Some(id) => {
+            let host = hosts
+                .iter()
+                .find(|host| host.host_id == id)
+                .ok_or_else(|| format!("unknown host_id: {id}"))?;
+            vec![host]
+        }
+        None => hosts.iter().collect(),
+    };
+
+    let virsh_path = config
+        .virsh_path
+        .as_deref()
+        .map(resolve_path)
+        .transpose()?
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_VIRSH_BINARY));
+    let timeout = timeout_or_default(config.timeout_secs, DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS);
+
+    let mut discovered = Vec::with_capacity(selected.len());
+    for host in selected {
+        discovered.push(discover_one_host(
+            host,
+            entries.as_slice(),
+            inventory_path.as_path(),
+            virsh_path.as_path(),
+            timeout,
+        ));
+    }
+
+    let rendered = if config.json {
+        render_discovered_hosts_json(discovered.as_slice())
+    } else {
+        render_discovered_hosts_table(discovered.as_slice())
+    };
+
+    let report = render_discovered_hosts_json(discovered.as_slice());
+    maybe_write_report_artifact(
+        config.report_dir.as_deref(),
+        "vm_lab_discover_hosts.json",
+        report.as_str(),
+    )?;
+
+    Ok(rendered)
+}
+
+/// Probe one host and enumerate its guests. Never returns Err: a host-level
+/// failure is captured in `probe` so a multi-host sweep reports every host's
+/// state instead of aborting on the first unreachable one.
+fn discover_one_host(
+    host: &LabHost,
+    entries: &[VmInventoryEntry],
+    inventory_path: &Path,
+    virsh_path: &Path,
+    timeout: Duration,
+) -> DiscoveredHost {
+    match host.kind {
+        // macOS/UTM discovery DELEGATES to the existing bundle scan rather than
+        // reimplementing it: one hardened path per workflow (§3). This command
+        // only normalises its report into the cross-host shape, so `local_utm`
+        // and `libvirt` answer the same question in the same words.
+        LabHostKind::LocalUtm => {
+            let (probe, guests) = discover_local_utm_host(host, inventory_path);
+            DiscoveredHost {
+                host_id: host.host_id.clone(),
+                kind: host.kind,
+                endpoint: if host.utm_documents_roots.is_empty() {
+                    "local (default UTM documents root)".to_owned()
+                } else {
+                    host.utm_documents_roots
+                        .iter()
+                        .map(|root| root.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+                guest_subnet: host.guest_subnet.clone(),
+                probe,
+                guests,
+            }
+        }
+        LabHostKind::Libvirt => {
+            let connect_uri = host.resolved_connect_uri();
+            let probe = probe_libvirt_host(virsh_path, connect_uri.as_str(), timeout);
+            let guests = match probe {
+                Ok(_) => discover_libvirt_guests(
+                    host,
+                    connect_uri.as_str(),
+                    entries,
+                    virsh_path,
+                    timeout,
+                ),
+                Err(_) => Vec::new(),
+            };
+            DiscoveredHost {
+                host_id: host.host_id.clone(),
+                kind: host.kind,
+                endpoint: connect_uri,
+                guest_subnet: host.guest_subnet.clone(),
+                probe,
+                guests,
+            }
+        }
+    }
+}
+
+/// Run the macOS/UTM bundle scan for this host and normalise it into the
+/// cross-host shape. Returns the probe verdict plus the guests it found.
+///
+/// The probe here is "the bundle scan ran and produced a report" — the macOS
+/// analogue of `virsh version` proving a libvirt host is what it claims.
+fn discover_local_utm_host(
+    host: &LabHost,
+    inventory_path: &Path,
+) -> (Result<String, String>, Vec<DiscoveredGuest>) {
+    // Empty ⇒ scan the default UTM container root (None). Otherwise scan every
+    // declared root: a split fleet must not be silently half-discovered.
+    let roots: Vec<Option<PathBuf>> = if host.utm_documents_roots.is_empty() {
+        vec![None]
+    } else {
+        host.utm_documents_roots.iter().cloned().map(Some).collect()
+    };
+
+    let mut guests: Vec<DiscoveredGuest> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut scanned: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for root in roots {
+        let label = root
+            .as_ref()
+            .map(|root| root.display().to_string())
+            .unwrap_or_else(|| "default UTM documents root".to_owned());
+        match scan_one_utm_root(root, inventory_path) {
+            Ok(found) => {
+                scanned.push(label);
+                for guest in found {
+                    if seen.insert(guest.domain.clone()) {
+                        guests.push(guest);
+                    }
+                }
+            }
+            Err(err) => errors.push(format!("{label}: {err}")),
+        }
+    }
+
+    guests.sort_by(|a, b| a.domain.cmp(&b.domain));
+
+    // Fail closed: if NO root scanned cleanly we cannot claim the host is
+    // healthy-with-no-VMs. A partial failure is surfaced, not swallowed.
+    if scanned.is_empty() {
+        return (
+            Err(format!(
+                "local_utm bundle scan failed: {}",
+                errors.join("; ")
+            )),
+            Vec::new(),
+        );
+    }
+    let mut probe = format!("UTM bundle scan ({})", scanned.join(", "));
+    if !errors.is_empty() {
+        probe.push_str(&format!(" [PARTIAL: {}]", errors.join("; ")));
+    }
+    (Ok(probe), guests)
+}
+
+/// Scan one UTM documents root via the existing hardened bundle scan and
+/// normalise its report into the cross-host guest shape.
+fn scan_one_utm_root(
+    utm_documents_root: Option<PathBuf>,
+    inventory_path: &Path,
+) -> Result<Vec<DiscoveredGuest>, String> {
+    let config = VmLabDiscoverLocalUtmConfig {
+        inventory_path: Some(inventory_path.to_path_buf()),
+        utm_documents_root,
+        utmctl_path: None,
+        ssh_identity_file: Some(default_lab_ssh_identity_path()),
+        known_hosts_path: Some(default_known_hosts_path()),
+        ssh_port: 22,
+        timeout_secs: 5,
+        update_inventory_live_ips: false,
+        report_dir: None,
+    };
+    let report = execute_ops_vm_lab_discover_local_utm(config)?;
+    let value: Value = serde_json::from_str(report.as_str())
+        .map_err(|err| format!("report was not valid JSON: {err}"))?;
+    let entries = value
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "report had no entries array".to_owned())?;
+
+    Ok(entries
+        .iter()
+        .map(|entry| {
+            let domain = entry
+                .get("utm_name")
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("alias").and_then(Value::as_str))
+                .unwrap_or("<unknown>")
+                .to_owned();
+            // UTM's "the VM process is actually up" signal — the analogue of
+            // libvirt `domstate` == running.
+            let running = entry
+                .get("utm_process_present")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            // Gate the IP on running, exactly as the libvirt ladder does: a
+            // stale ARP/last-known address for a stopped VM must never be
+            // reported as a live one.
+            let ip = if running {
+                entry
+                    .get("live_ip")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            let alias = if entry
+                .get("inventory_match")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                entry
+                    .get("inventory_alias")
+                    .and_then(Value::as_str)
+                    .or_else(|| entry.get("alias").and_then(Value::as_str))
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            DiscoveredGuest {
+                domain,
+                running,
+                ip,
+                alias,
+            }
+        })
+        .collect())
+}
+
+fn discover_libvirt_guests(
+    host: &LabHost,
+    connect_uri: &str,
+    entries: &[VmInventoryEntry],
+    virsh_path: &Path,
+    timeout: Duration,
+) -> Vec<DiscoveredGuest> {
+    let domains = match list_libvirt_domains(virsh_path, connect_uri, timeout) {
+        Ok(domains) => domains,
+        Err(_) => return Vec::new(),
+    };
+
+    domains
+        .into_iter()
+        .map(|domain| {
+            let entry = entries.iter().find(|entry| {
+                matches!(
+                    entry.controller.as_ref(),
+                    Some(VmController::Libvirt {
+                        domain: entry_domain,
+                        connect_uri: entry_uri,
+                    }) if entry_domain == &domain && entry_uri == connect_uri
+                )
+            });
+            let running = libvirt_domain_running(virsh_path, connect_uri, domain.as_str(), timeout)
+                .unwrap_or(false);
+            // Only ask for an IP when the host says the domain is running:
+            // a stale neighbour-cache entry for a stopped domain must not be
+            // reported as a live address (same rule as the readiness gate).
+            let ip = if running {
+                resolve_libvirt_live_host(
+                    virsh_path,
+                    connect_uri,
+                    domain.as_str(),
+                    entry.and_then(|entry| entry.last_known_ip.as_deref()),
+                    entry.and_then(|entry| entry.mesh_ip.as_deref()),
+                )
+            } else {
+                None
+            };
+            let _ = host;
+            DiscoveredGuest {
+                domain,
+                running,
+                ip,
+                alias: entry.map(|entry| entry.alias.clone()),
+            }
+        })
+        .collect()
+}
+
+fn render_discovered_hosts_table(hosts: &[DiscoveredHost]) -> String {
+    let mut out = String::new();
+    for host in hosts {
+        out.push_str(&format!(
+            "host {} kind={} endpoint={}",
+            host.host_id,
+            host.kind.as_str(),
+            host.endpoint
+        ));
+        if let Some(subnet) = host.guest_subnet.as_deref() {
+            out.push_str(&format!(" guest_subnet={subnet}"));
+        }
+        match host.probe.as_ref() {
+            Ok(hypervisor) => out.push_str(&format!(" probe=ok ({hypervisor})\n")),
+            Err(err) => {
+                out.push_str(&format!(" probe=FAILED ({err})\n"));
+                continue;
+            }
+        }
+        if host.guests.is_empty() {
+            out.push_str("  (no domains)\n");
+            continue;
+        }
+        out.push_str("  DOMAIN                          STATE      IP                 ALIAS                      READY\n");
+        for guest in &host.guests {
+            out.push_str(&format!(
+                "  {:<31} {:<10} {:<18} {:<26} {}\n",
+                guest.domain,
+                if guest.running { "running" } else { "shut off" },
+                guest.ip.as_deref().unwrap_or("-"),
+                guest.alias.as_deref().unwrap_or("(unregistered)"),
+                if guest.ready() { "yes" } else { "no" }
+            ));
+        }
+        let ready = host.guests.iter().filter(|guest| guest.ready()).count();
+        out.push_str(&format!(
+            "  {} domain(s), {} ready\n",
+            host.guests.len(),
+            ready
+        ));
+    }
+    out
+}
+
+fn render_discovered_hosts_json(hosts: &[DiscoveredHost]) -> String {
+    let payload: Vec<Value> = hosts
+        .iter()
+        .map(|host| {
+            serde_json::json!({
+                "host_id": host.host_id,
+                "kind": host.kind.as_str(),
+                "endpoint": host.endpoint,
+                "guest_subnet": host.guest_subnet,
+                "probe_ok": host.probe.is_ok(),
+                "hypervisor": host.probe.as_ref().ok(),
+                "probe_error": host.probe.as_ref().err(),
+                "guests": host.guests.iter().map(|guest| serde_json::json!({
+                    "domain": guest.domain,
+                    "running": guest.running,
+                    "ip": guest.ip,
+                    "alias": guest.alias,
+                    "registered": guest.alias.is_some(),
+                    "ready": guest.ready(),
+                })).collect::<Vec<_>>(),
+                "ready_count": host.guests.iter().filter(|guest| guest.ready()).count(),
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({ "hosts": payload }))
+        .unwrap_or_else(|_| "{\"hosts\":[]}".to_owned())
 }
 
 pub fn execute_ops_vm_lab_discover_local_utm(
@@ -29023,6 +30433,90 @@ fn extract_ip_candidates_for_macs_from_ip_neigh_output(
 /// filter, mesh-IP exclusion, last-known preference); the first rung yielding a
 /// selection wins. Returns `None` when every rung fails — callers fall back to
 /// the inventory ssh_target, exactly like the UTM path.
+/// Parse `virsh list --all --name` output into domain names.
+///
+/// The `--name` form prints one domain per line with blank lines interleaved
+/// (libvirt pads the list), so blanks are skipped and entries trimmed. Any
+/// control characters mean the output is not something we should feed onward as
+/// a domain name, so such lines are dropped rather than trusted.
+fn parse_libvirt_list_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.chars().any(char::is_control))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Enumerate every domain a libvirt host defines (running or not).
+///
+/// Fails closed: a spawn failure, timeout, non-zero exit, or non-UTF-8 output is
+/// an error, never an empty list. "No VMs" and "could not ask" must not look the
+/// same to a caller deciding what a host can contribute to a run.
+fn list_libvirt_domains(
+    virsh_path: &Path,
+    connect_uri: &str,
+    timeout: Duration,
+) -> Result<Vec<String>, String> {
+    let mut command = Command::new(virsh_path);
+    command
+        .arg("-c")
+        .arg(connect_uri)
+        .arg("list")
+        .arg("--all")
+        .arg("--name");
+    let output = run_output_with_timeout(&mut command, timeout)
+        .map_err(|err| format!("virsh list failed for {connect_uri}: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "virsh list exited {} for {connect_uri}: {}",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_owned()),
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| format!("virsh list produced non-UTF-8 output for {connect_uri}"))?;
+    Ok(parse_libvirt_list_names(stdout.as_str()))
+}
+
+/// Verify a host is reachable AND is the hypervisor kind it was declared to be.
+///
+/// The declared `kind` is trusted only after this probe agrees with it — the
+/// inventory declares, the probe verifies, and a mismatch or unreachable host
+/// fails closed (§3). Returns the hypervisor identity string on success.
+fn probe_libvirt_host(
+    virsh_path: &Path,
+    connect_uri: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let output = run_virsh_capture(virsh_path, connect_uri, &["version"], timeout)
+        .ok_or_else(|| format!("libvirt probe failed: cannot reach {connect_uri}"))?;
+    let hypervisor = output
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("Running hypervisor:"))
+        .map(|line| {
+            line.trim_start_matches("Running hypervisor:")
+                .trim()
+                .to_owned()
+        })
+        .ok_or_else(|| {
+            format!("libvirt probe reached {connect_uri} but reported no running hypervisor")
+        })?;
+    if hypervisor.is_empty() {
+        return Err(format!(
+            "libvirt probe reached {connect_uri} but the hypervisor identity was empty"
+        ));
+    }
+    Ok(hypervisor)
+}
+
 fn resolve_libvirt_live_host(
     virsh_path: &Path,
     connect_uri: &str,
@@ -29498,7 +30992,18 @@ fn ensure_role_targets_share_network(targets: &[Option<RoleTarget>]) -> Result<S
         .ok_or_else(|| "same-network validation requires at least one resolved target".to_owned())
 }
 
+/// Load inventory entries only. Thin wrapper over [`load_inventory_with_hosts`]
+/// for the many call sites that never need the host records.
 fn load_inventory(path: &Path) -> Result<Vec<VmInventoryEntry>, String> {
+    load_inventory_with_hosts(path).map(|(entries, _hosts)| entries)
+}
+
+/// Load inventory entries **and** the declared `hosts[]` records.
+///
+/// Host resolution happens here: a guest controller's `host_id` is resolved into
+/// a concrete `connect_uri` at parse time, so the runtime `VmController` shape is
+/// unchanged and every downstream call site keeps working untouched.
+fn load_inventory_with_hosts(path: &Path) -> Result<(Vec<VmInventoryEntry>, Vec<LabHost>), String> {
     let body = fs::read_to_string(path)
         .map_err(|err| format!("read vm inventory failed ({}): {err}", path.display()))?;
     let value = serde_json::from_str::<Value>(body.as_str())
@@ -29522,6 +31027,8 @@ fn load_inventory(path: &Path) -> Result<Vec<VmInventoryEntry>, String> {
             path.display()
         ));
     }
+    let hosts = parse_hosts(object).map_err(|err| format!("{err} ({})", path.display()))?;
+
     let entries = object
         .get("entries")
         .and_then(Value::as_array)
@@ -29533,7 +31040,7 @@ fn load_inventory(path: &Path) -> Result<Vec<VmInventoryEntry>, String> {
     let mut parsed = Vec::with_capacity(entries.len());
     let mut seen_aliases = HashSet::new();
     for entry in entries {
-        let parsed_entry = parse_inventory_entry(entry)?;
+        let parsed_entry = parse_inventory_entry(entry, hosts.as_slice())?;
         if !seen_aliases.insert(parsed_entry.alias.clone()) {
             return Err(format!(
                 "vm inventory contains duplicate alias: {}",
@@ -29542,10 +31049,10 @@ fn load_inventory(path: &Path) -> Result<Vec<VmInventoryEntry>, String> {
         }
         parsed.push(parsed_entry);
     }
-    Ok(parsed)
+    Ok((parsed, hosts))
 }
 
-fn parse_inventory_entry(value: &Value) -> Result<VmInventoryEntry, String> {
+fn parse_inventory_entry(value: &Value, hosts: &[LabHost]) -> Result<VmInventoryEntry, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "vm inventory entry must be an object".to_owned())?;
@@ -29636,7 +31143,7 @@ fn parse_inventory_entry(value: &Value) -> Result<VmInventoryEntry, String> {
     };
     let controller = match object.get("controller") {
         None | Some(Value::Null) => None,
-        Some(value) => Some(parse_controller(value)?),
+        Some(value) => Some(parse_controller(value, hosts)?),
     };
     Ok(VmInventoryEntry {
         alias,
@@ -29665,7 +31172,151 @@ fn parse_inventory_entry(value: &Value) -> Result<VmInventoryEntry, String> {
     })
 }
 
-fn parse_controller(value: &Value) -> Result<VmController, String> {
+/// Parse the optional inventory `hosts[]` array. Absent ⇒ no declared hosts,
+/// which keeps every pre-`hosts[]` inventory valid (controllers carry their own
+/// transport inline).
+fn parse_hosts(object: &serde_json::Map<String, Value>) -> Result<Vec<LabHost>, String> {
+    let Some(value) = object.get("hosts") else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let array = value
+        .as_array()
+        .ok_or_else(|| "vm inventory hosts must be an array".to_owned())?;
+    let mut hosts = Vec::with_capacity(array.len());
+    let mut seen = HashSet::new();
+    for item in array {
+        let host = parse_host(item)?;
+        if !seen.insert(host.host_id.clone()) {
+            return Err(format!(
+                "vm inventory contains duplicate host_id: {}",
+                host.host_id
+            ));
+        }
+        hosts.push(host);
+    }
+    Ok(hosts)
+}
+
+fn parse_host(value: &Value) -> Result<LabHost, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "vm inventory host must be an object".to_owned())?;
+    let host_id = required_string_field(object, "host_id")?;
+    ensure_no_control_chars("host_id", host_id.as_str())?;
+    if host_id.trim().is_empty() {
+        return Err("vm inventory host_id must not be empty".to_owned());
+    }
+
+    let kind_raw = required_string_field(object, "kind")?;
+    let kind = match kind_raw.as_str() {
+        "local_utm" => LabHostKind::LocalUtm,
+        "libvirt" => LabHostKind::Libvirt,
+        other => return Err(format!("unsupported lab host kind: {other}")),
+    };
+
+    let connect_uri = optional_string_field(object, "connect_uri")?;
+    if let Some(uri) = connect_uri.as_deref() {
+        ensure_no_control_chars("connect_uri", uri)?;
+        if uri.trim().is_empty() {
+            return Err(format!("host {host_id}: connect_uri must not be empty"));
+        }
+        if kind != LabHostKind::Libvirt {
+            return Err(format!(
+                "host {host_id}: connect_uri is only valid for kind=libvirt (got {})",
+                kind.as_str()
+            ));
+        }
+    }
+
+    // Accept either `utm_documents_roots: [..]` or the single-value
+    // `utm_documents_root: ".."` for ergonomics; both normalise to a list.
+    let mut utm_documents_roots: Vec<PathBuf> = Vec::new();
+    if let Some(single) = optional_string_field(object, "utm_documents_root")? {
+        ensure_no_control_chars("utm_documents_root", single.as_str())?;
+        utm_documents_roots.push(PathBuf::from(single));
+    }
+    if let Some(value) = object.get("utm_documents_roots") {
+        let array = value.as_array().ok_or_else(|| {
+            format!("host {host_id}: utm_documents_roots must be an array of paths")
+        })?;
+        for item in array {
+            let root = item.as_str().ok_or_else(|| {
+                format!("host {host_id}: utm_documents_roots entries must be strings")
+            })?;
+            ensure_no_control_chars("utm_documents_roots", root)?;
+            utm_documents_roots.push(PathBuf::from(root));
+        }
+    }
+    if !utm_documents_roots.is_empty() {
+        if kind != LabHostKind::LocalUtm {
+            return Err(format!(
+                "host {host_id}: utm_documents_root(s) is only valid for kind=local_utm (got {})",
+                kind.as_str()
+            ));
+        }
+        for root in &utm_documents_roots {
+            if !root.is_absolute() {
+                return Err(format!(
+                    "host {host_id}: utm_documents_root must be absolute: {}",
+                    root.display()
+                ));
+            }
+        }
+    }
+
+    let guest_subnet = optional_string_field(object, "guest_subnet")?;
+    if let Some(subnet) = guest_subnet.as_deref() {
+        ensure_no_control_chars("guest_subnet", subnet)?;
+        ensure_guest_subnet_cidr(host_id.as_str(), subnet)?;
+    }
+
+    let repo_dir = optional_string_field(object, "repo_dir")?;
+    if let Some(dir) = repo_dir.as_deref() {
+        ensure_no_control_chars("repo_dir", dir)?;
+        if !Path::new(dir).is_absolute() {
+            return Err(format!("host {host_id}: repo_dir must be absolute: {dir}"));
+        }
+    }
+
+    let notes = optional_string_field(object, "notes")?;
+    if let Some(value) = notes.as_deref() {
+        ensure_no_control_chars("notes", value)?;
+    }
+
+    Ok(LabHost {
+        host_id,
+        kind,
+        connect_uri,
+        utm_documents_roots,
+        guest_subnet,
+        repo_dir: repo_dir.map(PathBuf::from),
+        notes,
+    })
+}
+
+/// Validate a host's `guest_subnet` as an IPv4 CIDR. Kept strict so a typo
+/// cannot silently produce a subnet that overlaps another host's.
+fn ensure_guest_subnet_cidr(host_id: &str, value: &str) -> Result<(), String> {
+    let (addr, prefix) = value.split_once('/').ok_or_else(|| {
+        format!("host {host_id}: guest_subnet must be CIDR (a.b.c.d/len): {value}")
+    })?;
+    addr.parse::<Ipv4Addr>()
+        .map_err(|_| format!("host {host_id}: guest_subnet has invalid IPv4 address: {value}"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| format!("host {host_id}: guest_subnet has invalid prefix length: {value}"))?;
+    if prefix > 32 {
+        return Err(format!(
+            "host {host_id}: guest_subnet prefix length must be <= 32: {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_controller(value: &Value, hosts: &[LabHost]) -> Result<VmController, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "vm controller must be an object".to_owned())?;
@@ -29690,11 +31341,46 @@ fn parse_controller(value: &Value) -> Result<VmController, String> {
         "libvirt" => {
             let domain = required_string_field(object, "domain")?;
             ensure_no_control_chars("domain", domain.as_str())?;
-            let connect_uri = match object.get("connect_uri") {
-                None | Some(Value::Null) => DEFAULT_LIBVIRT_CONNECT_URI.to_owned(),
-                Some(value) => {
-                    let uri = value
-                        .as_str()
+
+            // A libvirt controller gets its transport from EITHER a `host_id`
+            // reference into `hosts[]` (preferred: one record owns the endpoint
+            // for every guest on that machine) OR an inline `connect_uri`
+            // (legacy/self-contained). Setting both is ambiguous about which
+            // wins, so it is rejected rather than silently preferring one.
+            let host_id = optional_string_field(object, "host_id")?;
+            if let Some(id) = host_id.as_deref() {
+                ensure_no_control_chars("host_id", id)?;
+            }
+            let inline_uri = object.get("connect_uri");
+            let has_inline = !matches!(inline_uri, None | Some(Value::Null));
+
+            let connect_uri = match (host_id.as_deref(), has_inline) {
+                (Some(id), true) => {
+                    return Err(format!(
+                        "libvirt controller for domain {domain} sets both host_id ({id}) and connect_uri; set exactly one"
+                    ));
+                }
+                (Some(id), false) => {
+                    // Fail closed: an unresolvable or wrong-kind host reference is
+                    // an error, never a fallback to the local hypervisor — that
+                    // would silently drive the WRONG machine.
+                    let host = hosts.iter().find(|host| host.host_id == id).ok_or_else(|| {
+                        format!(
+                            "libvirt controller for domain {domain} references unknown host_id: {id}"
+                        )
+                    })?;
+                    if host.kind != LabHostKind::Libvirt {
+                        return Err(format!(
+                            "libvirt controller for domain {domain} references host_id {id} of kind {}; expected libvirt",
+                            host.kind.as_str()
+                        ));
+                    }
+                    host.resolved_connect_uri()
+                }
+                (None, false) => DEFAULT_LIBVIRT_CONNECT_URI.to_owned(),
+                (None, true) => {
+                    let uri = inline_uri
+                        .and_then(Value::as_str)
                         .ok_or_else(|| "libvirt connect_uri must be a string".to_owned())?
                         .trim()
                         .to_owned();
@@ -29705,6 +31391,7 @@ fn parse_controller(value: &Value) -> Result<VmController, String> {
                     uri
                 }
             };
+
             Ok(VmController::Libvirt {
                 domain,
                 connect_uri,
@@ -35233,17 +36920,18 @@ fn execute_bootstrap_phase_for_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, LibvirtPowerAction, LiveLabStageRecord,
-        LiveLabStageSummary, PortStatus, ProbeState, RemoteExec as _, RepoSyncDispatchKind,
-        RepoSyncMode, RestartUnreadyDecision, RuntimePaths as _, ServiceManager as _,
-        StageOrchestrator as _, UtmReadinessInputs, VmController, VmGuestExecMode, VmGuestPlatform,
-        VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
-        VmLabIterationValidationStep, VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig,
-        VmLabStageOutcome, VmLabStageStatus, VmLabValidateLiveLabProfileConfig,
-        VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe,
-        append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
-        build_local_source_extract_script, build_local_source_presync_cleanup_script,
-        build_remote_argv_script, build_remote_argv_script_for_target, build_repo_sync_script,
+        DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, DiscoveredGuest, LabHost, LabHostKind,
+        LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary, PortStatus, PreflightGate,
+        PreflightStatus, ProbeState, RemoteExec as _, RepoSyncDispatchKind, RepoSyncMode,
+        RestartUnreadyDecision, RuntimePaths as _, ServiceManager as _, StageOrchestrator as _,
+        UtmReadinessInputs, VmController, VmGuestExecMode, VmGuestPlatform, VmInventoryEntry,
+        VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep,
+        VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
+        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
+        VmServiceManager, WindowsSshReadinessProbe, append_unique_stage_outcomes_collect_new,
+        build_assignment_refresh_env, build_local_source_extract_script,
+        build_local_source_presync_cleanup_script, build_remote_argv_script,
+        build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
         build_vm_lab_topology, build_windows_local_source_extract_result_script,
@@ -35259,21 +36947,22 @@ mod tests {
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
         extract_ip_candidates_for_macs_from_ip_neigh_output, extract_ip_for_mac_from_arp_output,
         is_macos_metadata_artifact_name, live_lab_stage_forensics_notes, load_inventory,
-        load_live_lab_profile, local_utm_process_present_in_ps_output,
+        load_inventory_with_hosts, load_live_lab_profile, local_utm_process_present_in_ps_output,
         local_utm_process_present_with_ps, mac_address_from_utm_config_plist,
         macos_peer_list_indicates_mesh_join, materialize_orchestration_staging_dir,
         normalize_mac_address, parse_libvirt_domifaddr_candidates, parse_libvirt_domiflist_macs,
-        parse_libvirt_domstate_running, parse_live_lab_stage_records,
+        parse_libvirt_domstate_running, parse_libvirt_list_names, parse_live_lab_stage_records,
         parse_local_utm_list_started_status, parse_membership_active_nodes,
         parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
         path_contains_macos_metadata_artifact, persist_local_utm_ready_states_to_inventory,
         privileged_rustynet_cli_script, remote_copy_destination_for_target,
         remote_script_for_ssh_transport, render_live_lab_iteration_summary,
         render_live_lab_stage_forensics_review, render_local_utm_discovery_summary,
-        render_vm_lab_progress_complete_line, render_vm_lab_progress_outcome_line,
-        repo_sync_dispatch_kind_for_target, resolve_discovery_bundle_paths,
-        resolve_iteration_source_selection, resolve_live_lab_vm_aliases, resolve_remote_targets,
-        resolve_repo_sync_source, resolve_start_targets, resolve_utm_documents_root,
+        render_preflight, render_vm_lab_progress_complete_line,
+        render_vm_lab_progress_outcome_line, repo_sync_dispatch_kind_for_target,
+        resolve_discovery_bundle_paths, resolve_iteration_source_selection,
+        resolve_live_lab_vm_aliases, resolve_remote_targets, resolve_repo_sync_source,
+        resolve_start_targets, resolve_utm_documents_root,
         resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
         select_inventory_entries, select_live_ssh_host_from_utm_output,
         select_preferred_live_ssh_ip, selected_local_utm_readiness_from_report,
@@ -35866,6 +37555,395 @@ mod tests {
         );
         assert_eq!(inventory[1].ssh_target, "debian@192.168.18.51");
         cleanup_temp_inventory(path.as_path());
+    }
+
+    /// A guest referencing a declared host_id inherits that host's transport, so
+    /// one record re-points every guest on that machine.
+    #[test]
+    fn hosts_declaration_resolves_controller_connect_uri_by_host_id() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [
+    {
+      "host_id": "ubuntu-kvm-1",
+      "kind": "libvirt",
+      "connect_uri": "qemu+ssh://ubuntu-server@ubuntu-headless/system",
+      "guest_subnet": "192.168.121.0/24"
+    },
+    { "host_id": "mac-utm-1", "kind": "local_utm" }
+  ],
+  "entries": [
+    {
+      "alias": "linux-x86-client-1",
+      "ssh_target": "192.168.121.137",
+      "ssh_user": "debian",
+      "platform": "linux",
+      "controller": {
+        "type": "libvirt",
+        "domain": "linux-x86-client-1",
+        "host_id": "ubuntu-kvm-1"
+      }
+    }
+  ]
+}"#,
+        );
+        let (entries, hosts) = load_inventory_with_hosts(path.as_path()).expect("inventory loads");
+        assert_eq!(hosts.len(), 2);
+        let kvm = hosts
+            .iter()
+            .find(|host| host.host_id == "ubuntu-kvm-1")
+            .expect("host present");
+        assert_eq!(kvm.kind, LabHostKind::Libvirt);
+        assert_eq!(kvm.guest_subnet.as_deref(), Some("192.168.121.0/24"));
+        match entries[0].controller.as_ref().expect("controller") {
+            VmController::Libvirt {
+                domain,
+                connect_uri,
+            } => {
+                assert_eq!(domain, "linux-x86-client-1");
+                // resolved from hosts[], not the qemu:///system default
+                assert_eq!(
+                    connect_uri,
+                    "qemu+ssh://ubuntu-server@ubuntu-headless/system"
+                );
+            }
+            other => panic!("expected libvirt controller, got {other:?}"),
+        }
+    }
+
+    /// Fail closed: an unknown host_id must error, never silently fall back to
+    /// the local hypervisor — that would drive the WRONG machine.
+    #[test]
+    fn unknown_host_id_is_rejected_rather_than_defaulting_local() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [{ "host_id": "ubuntu-kvm-1", "kind": "libvirt" }],
+  "entries": [
+    {
+      "alias": "ghost",
+      "ssh_target": "192.168.121.9",
+      "platform": "linux",
+      "controller": { "type": "libvirt", "domain": "ghost", "host_id": "does-not-exist" }
+    }
+  ]
+}"#,
+        );
+        let err =
+            load_inventory_with_hosts(path.as_path()).expect_err("must reject unknown host_id");
+        assert!(err.contains("unknown host_id"), "unexpected error: {err}");
+        assert!(err.contains("does-not-exist"), "unexpected error: {err}");
+    }
+
+    /// A libvirt controller pointing at a local_utm host is a category error.
+    #[test]
+    fn host_id_of_wrong_kind_is_rejected() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [{ "host_id": "mac-utm-1", "kind": "local_utm" }],
+  "entries": [
+    {
+      "alias": "confused",
+      "ssh_target": "192.168.121.9",
+      "platform": "linux",
+      "controller": { "type": "libvirt", "domain": "confused", "host_id": "mac-utm-1" }
+    }
+  ]
+}"#,
+        );
+        let err = load_inventory_with_hosts(path.as_path()).expect_err("must reject kind mismatch");
+        assert!(err.contains("expected libvirt"), "unexpected error: {err}");
+    }
+
+    /// host_id + inline connect_uri is ambiguous about which wins → reject.
+    #[test]
+    fn host_id_and_inline_connect_uri_together_are_rejected() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [{ "host_id": "ubuntu-kvm-1", "kind": "libvirt" }],
+  "entries": [
+    {
+      "alias": "both",
+      "ssh_target": "192.168.121.9",
+      "platform": "linux",
+      "controller": {
+        "type": "libvirt",
+        "domain": "both",
+        "host_id": "ubuntu-kvm-1",
+        "connect_uri": "qemu:///system"
+      }
+    }
+  ]
+}"#,
+        );
+        let err = load_inventory_with_hosts(path.as_path()).expect_err("must reject both");
+        assert!(err.contains("set exactly one"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn duplicate_host_ids_are_rejected() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [
+    { "host_id": "dup", "kind": "libvirt" },
+    { "host_id": "dup", "kind": "libvirt" }
+  ],
+  "entries": [
+    { "alias": "a", "ssh_target": "10.0.0.1", "platform": "linux" }
+  ]
+}"#,
+        );
+        let err = load_inventory_with_hosts(path.as_path()).expect_err("must reject duplicates");
+        assert!(err.contains("duplicate host_id"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn malformed_guest_subnet_is_rejected() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [{ "host_id": "h", "kind": "libvirt", "guest_subnet": "192.168.121.0" }],
+  "entries": [
+    { "alias": "a", "ssh_target": "10.0.0.1", "platform": "linux" }
+  ]
+}"#,
+        );
+        let err = load_inventory_with_hosts(path.as_path()).expect_err("must reject non-CIDR");
+        assert!(err.contains("must be CIDR"), "unexpected error: {err}");
+    }
+
+    /// Inventories written before hosts[] existed must keep loading unchanged.
+    #[test]
+    fn inventory_without_hosts_array_still_loads() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "legacy",
+      "ssh_target": "10.0.0.1",
+      "platform": "linux",
+      "controller": { "type": "libvirt", "domain": "legacy" }
+    }
+  ]
+}"#,
+        );
+        let (entries, hosts) = load_inventory_with_hosts(path.as_path()).expect("legacy loads");
+        assert!(hosts.is_empty());
+        match entries[0].controller.as_ref().expect("controller") {
+            VmController::Libvirt { connect_uri, .. } => {
+                assert_eq!(connect_uri, DEFAULT_LIBVIRT_CONNECT_URI);
+            }
+            other => panic!("expected libvirt controller, got {other:?}"),
+        }
+    }
+
+    /// Ordering is the feature: once a gate fails, later gates MUST report
+    /// not_run rather than being silently dropped or assumed green.
+    #[test]
+    fn preflight_render_marks_downstream_gates_not_run_and_says_no_go() {
+        let gates = vec![
+            PreflightGate {
+                name: "inventory",
+                status: PreflightStatus::Pass,
+                detail: "2 host(s)".to_owned(),
+                next: None,
+            },
+            PreflightGate {
+                name: "local_clean",
+                status: PreflightStatus::Fail,
+                detail: "dirty".to_owned(),
+                next: Some("commit your changes".to_owned()),
+            },
+            PreflightGate {
+                name: "hosts_agree",
+                status: PreflightStatus::NotRun,
+                detail: "not evaluated (an earlier gate failed)".to_owned(),
+                next: None,
+            },
+        ];
+        let table = render_preflight(gates.as_slice(), false, Some("abcdef1234567890"));
+        assert!(table.contains("NO-GO"), "{table}");
+        assert!(table.contains("not_run"), "{table}");
+        // a failing gate MUST tell the operator what to run next
+        assert!(table.contains("next: commit your changes"), "{table}");
+
+        let json = render_preflight(gates.as_slice(), true, Some("abcdef1234567890"));
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(value["verdict"], "NO-GO");
+        assert_eq!(value["gates"][2]["status"], "not_run");
+    }
+
+    #[test]
+    fn preflight_all_pass_renders_go() {
+        let gates = vec![PreflightGate {
+            name: "hosts_agree",
+            status: PreflightStatus::Pass,
+            detail: "one commit".to_owned(),
+            next: None,
+        }];
+        let table = render_preflight(gates.as_slice(), false, Some("abcdef1234567890"));
+        assert!(table.contains("VERDICT: GO"), "{table}");
+        let value: serde_json::Value = serde_json::from_str(&render_preflight(
+            gates.as_slice(),
+            true,
+            Some("abcdef1234567890"),
+        ))
+        .expect("valid json");
+        assert_eq!(value["verdict"], "GO");
+    }
+
+    /// The SSH endpoint is DERIVED from connect_uri so a re-pointed host cannot
+    /// keep a stale second copy of its address that silently disagrees.
+    #[test]
+    fn ssh_endpoint_is_derived_from_connect_uri() {
+        let host = |uri: Option<&str>| LabHost {
+            host_id: "h".to_owned(),
+            kind: LabHostKind::Libvirt,
+            connect_uri: uri.map(str::to_owned),
+            utm_documents_roots: Vec::new(),
+            guest_subnet: None,
+            repo_dir: None,
+            notes: None,
+        };
+        assert_eq!(
+            host(Some("qemu+ssh://ubuntu-server@ubuntu-headless/system")).ssh_endpoint(),
+            Some("ubuntu-server@ubuntu-headless".to_owned())
+        );
+        assert_eq!(
+            host(Some("qemu+ssh://ubuntu-server@10.230.76.5/system")).ssh_endpoint(),
+            Some("ubuntu-server@10.230.76.5".to_owned())
+        );
+        // query params (e.g. ?keyfile=…) must not leak into the endpoint
+        assert_eq!(
+            host(Some("qemu+ssh://u@h/system?keyfile=/tmp/k&no_verify=1")).ssh_endpoint(),
+            Some("u@h".to_owned())
+        );
+        // a LOCAL uri has no ssh endpoint — must not be guessed
+        assert_eq!(host(Some("qemu:///system")).ssh_endpoint(), None);
+        assert_eq!(host(None).ssh_endpoint(), None);
+    }
+
+    #[test]
+    fn repo_dir_must_be_absolute() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [{ "host_id": "h", "kind": "libvirt", "repo_dir": "relative/Rustynet" }],
+  "entries": [
+    { "alias": "a", "ssh_target": "10.0.0.1", "platform": "linux" }
+  ]
+}"#,
+        );
+        let err = load_inventory_with_hosts(path.as_path()).expect_err("must reject");
+        assert!(err.contains("repo_dir must be absolute"), "got: {err}");
+    }
+
+    /// A real Mac fleet is split across UTM roots; both forms normalise to a
+    /// list so neither half is silently lost.
+    #[test]
+    fn utm_documents_roots_accepts_list_and_single_value() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [
+    {
+      "host_id": "mac-a",
+      "kind": "local_utm",
+      "utm_documents_roots": ["/Users/iwan/Desktop/OS_images/UTM images",
+                              "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents"]
+    },
+    { "host_id": "mac-b", "kind": "local_utm", "utm_documents_root": "/Users/iwan/UTM" }
+  ],
+  "entries": [
+    { "alias": "a", "ssh_target": "10.0.0.1", "platform": "linux" }
+  ]
+}"#,
+        );
+        let (_entries, hosts) = load_inventory_with_hosts(path.as_path()).expect("loads");
+        let mac_a = hosts.iter().find(|h| h.host_id == "mac-a").expect("mac-a");
+        assert_eq!(mac_a.utm_documents_roots.len(), 2);
+        let mac_b = hosts.iter().find(|h| h.host_id == "mac-b").expect("mac-b");
+        assert_eq!(mac_b.utm_documents_roots.len(), 1);
+        assert_eq!(
+            mac_b.utm_documents_roots[0],
+            PathBuf::from("/Users/iwan/UTM")
+        );
+    }
+
+    #[test]
+    fn utm_documents_root_on_a_libvirt_host_is_rejected() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [{ "host_id": "kvm", "kind": "libvirt", "utm_documents_root": "/Users/iwan/UTM" }],
+  "entries": [
+    { "alias": "a", "ssh_target": "10.0.0.1", "platform": "linux" }
+  ]
+}"#,
+        );
+        let err = load_inventory_with_hosts(path.as_path()).expect_err("must reject");
+        assert!(err.contains("only valid for kind=local_utm"), "got: {err}");
+    }
+
+    #[test]
+    fn relative_utm_documents_root_is_rejected() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [{ "host_id": "mac", "kind": "local_utm", "utm_documents_root": "relative/path" }],
+  "entries": [
+    { "alias": "a", "ssh_target": "10.0.0.1", "platform": "linux" }
+  ]
+}"#,
+        );
+        let err = load_inventory_with_hosts(path.as_path()).expect_err("must reject");
+        assert!(err.contains("must be absolute"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_libvirt_list_names_skips_blanks_and_control_chars() {
+        let output = "linux-x86-client-1\n\nlinux-x86-exit-1\n   \nwindows-x86-1\n";
+        assert_eq!(
+            parse_libvirt_list_names(output),
+            vec![
+                "linux-x86-client-1".to_owned(),
+                "linux-x86-exit-1".to_owned(),
+                "windows-x86-1".to_owned()
+            ]
+        );
+        // empty listing is a legitimate "host has no domains"
+        assert!(parse_libvirt_list_names("\n\n").is_empty());
+    }
+
+    /// running-without-IP must not read as ready: the SSH plane needs an address.
+    #[test]
+    fn discovered_guest_ready_requires_running_and_ip() {
+        let base = DiscoveredGuest {
+            domain: "d".to_owned(),
+            running: true,
+            ip: Some("192.168.121.137".to_owned()),
+            alias: Some("d".to_owned()),
+        };
+        assert!(base.ready());
+        assert!(
+            !DiscoveredGuest {
+                running: false,
+                ..base.clone()
+            }
+            .ready()
+        );
+        assert!(
+            !DiscoveredGuest {
+                ip: None,
+                ..base.clone()
+            }
+            .ready()
+        );
     }
 
     #[test]
