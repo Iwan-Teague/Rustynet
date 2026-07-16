@@ -163,6 +163,7 @@ fn glyph(state: ParityState) -> &'static str {
         ParityState::Failed => "■",
         ParityState::Flaky => "▲",
         ParityState::Unproven => "□",
+        ParityState::NotInSchema => "?",
     }
 }
 
@@ -172,6 +173,7 @@ fn color_style(state: ParityState) -> Style {
         ParityState::Failed => Color::Red,
         ParityState::Flaky => Color::Yellow,
         ParityState::Unproven => Color::DarkGray,
+        ParityState::NotInSchema => Color::Magenta,
     })
 }
 

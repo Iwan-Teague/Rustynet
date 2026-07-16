@@ -84,6 +84,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 /// - Flaky   → yellow fill (pass ratio) + yellow dim remainder — elevated recent
 ///   failure rate without being consistently broken (see `classify_recent_history`)
 /// - Unproven → gray fill (pass ratio) + dark-gray remainder
+/// - NotInSchema → `[ n/a  ]` in magenta — this role×OS cell has no column
+///   in the run-matrix CSV at all (schema-lag), distinct from a role that
+///   genuinely has zero runs yet
 fn progress_bar(state: ParityState, history: &[CellOutcome]) -> Line<'static> {
     let relevant = history
         .iter()
@@ -99,6 +102,10 @@ fn progress_bar(state: ParityState, history: &[CellOutcome]) -> Line<'static> {
         ParityState::Failed => build_bar(passes, relevant, Color::Red, Color::Red),
         ParityState::Flaky => build_bar(passes, relevant, Color::Yellow, Color::Yellow),
         ParityState::Unproven => build_bar(passes, relevant, Color::Gray, Color::DarkGray),
+        ParityState::NotInSchema => Line::from(Span::styled(
+            format!("[{:^width$}]", "n/a", width = BAR_WIDTH),
+            Style::default().fg(Color::Magenta),
+        )),
     }
 }
 

@@ -392,12 +392,18 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
             .borrow_mut()
             .insert(name.to_owned(), now.clone());
         let log_path = self.stage_log_path(name);
+        // record_stage_start's positional args are (.., log_path, summary, ..)
+        // -- these two used to be swapped here, so every `running` row wrote
+        // an empty log_path and put the log path itself into the summary
+        // column instead. Any reader positionally trusting column 4 as
+        // log_path (the recorder's own documented 8-column contract) saw
+        // garbage for whichever stage was actively running.
         if let Err(err) = crate::live_lab_stage_recorder::record_stage_start(
             self.report_dir,
             name,
             registry_severity_str(name),
-            "",
             &log_path.to_string_lossy(),
+            "",
             &now,
         ) {
             self.record_error("record start", name, err);
@@ -1041,6 +1047,50 @@ mod finalize_tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, HashSet};
     use tempfile::tempdir;
+
+    #[test]
+    fn stage_started_writes_log_path_not_summary_in_the_running_row() {
+        // Regression: record_stage_start's positional args are
+        // (.., log_path, summary, ..). The call site here used to pass them
+        // swapped -- every `running` row wrote an empty log_path (column 4
+        // of the recorder's documented 8-column contract) and put the real
+        // log path into the summary column (column 5) instead. Any
+        // positional reader (the monitor's stage_reader.rs, get_stage_log,
+        // diagnose) trusting column 4 as log_path saw garbage for whichever
+        // stage was actively running.
+        let dir = tempdir().expect("tempdir");
+        let report_dir = dir.path();
+        let recorder = RustNativeStageRecorder {
+            report_dir,
+            started_at: RefCell::new(HashMap::new()),
+            errors: RefCell::new(Vec::new()),
+        };
+        let id = StageId::Preflight;
+
+        recorder.stage_started(&id);
+
+        assert!(
+            recorder.take_errors().is_empty(),
+            "stage_started must record cleanly"
+        );
+        let tsv = fs::read_to_string(report_dir.join("state/stages.tsv"))
+            .expect("stages.tsv must exist after stage_started");
+        let line = tsv.lines().next().expect("one row");
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols[2], "running", "status column reads running");
+        assert!(
+            !cols[4].is_empty(),
+            "log_path column (4) must hold the real per-stage log path, got: {cols:?}"
+        );
+        assert!(
+            cols[4].ends_with("preflight.log") || cols[4].contains("preflight"),
+            "log_path column must name this stage's log file, got: {cols:?}"
+        );
+        assert_eq!(
+            cols[5], "",
+            "summary column (5) must be empty for a just-started stage, got: {cols:?}"
+        );
+    }
 
     /// Emit a terminal stage row (+ its per-stage log) through the real
     /// recorder so `stages.tsv`, the logs, and the reuse-seal inputs are all

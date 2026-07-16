@@ -81,28 +81,25 @@ pub fn render(f: &mut Frame, full_area: Rect, app: &App) {
     );
 }
 
+// Both of these used to re-implement their own literal "pass"/"fail"/
+// "running"/"skipped" match instead of going through the crate's one
+// canonical status parser (`StageStatus::parse`, dispatched via
+// `stage_grid::cell_for_status` — the same function the Stage Grid itself
+// uses). That meant a real terminal status the orchestrator actually emits
+// but this match didn't literally spell out -- `aborted`, `timed_out`,
+// `reused`, or any of `StageStatus::parse`'s other recognized aliases --
+// fell through to the neutral/pending-looking default here, in the one view
+// meant to explain a stage's outcome in detail. Delegating closes that gap
+// and keeps color/symbol pinned to a single source of truth.
 fn status_color(status: &str) -> Color {
-    match status {
-        "pass" => Color::Green,
-        "fail" => Color::Red,
-        "running" | "active" => Color::Yellow,
-        "skipped" => Color::DarkGray,
-        _ => Color::White,
-    }
+    super::stage_grid::cell_for_status(status)
+        .1
+        .fg
+        .unwrap_or(Color::White)
 }
 
 fn status_symbol(status: &str) -> &'static str {
-    match status {
-        "pass" => "[██]",
-        "fail" => "[✗✗]",
-        // Same animation as the Stage Grid's own active-stage cell -- this
-        // overlay can show the currently-running stage too (Enter on it
-        // from the grid), and previously fell back to a static glyph here,
-        // the one place that stage's box would stop looking "in progress".
-        "running" | "active" => super::stage_grid::spinner_glyph(),
-        "skipped" => "[  ]",
-        _ => "[░░]",
-    }
+    super::stage_grid::cell_for_status(status).0
 }
 
 #[cfg(test)]
@@ -113,5 +110,32 @@ mod tests {
     fn running_and_active_use_the_stage_grid_spinner_not_a_static_glyph() {
         assert!(super::super::stage_grid::SPINNER_FRAMES.contains(&status_symbol("running")));
         assert!(super::super::stage_grid::SPINNER_FRAMES.contains(&status_symbol("active")));
+    }
+
+    #[test]
+    fn aborted_and_timed_out_render_red_not_the_neutral_default() {
+        // Regression: this overlay used to match "pass"/"fail"/"running"/
+        // "skipped" literally and fall everything else -- including real
+        // terminal statuses the orchestrator actually emits, like
+        // "aborted" and "timed_out" -- through to the neutral default
+        // (Color::White, "[░░]"), masking a failure as merely pending in
+        // the one view meant to explain it. They must render exactly like
+        // "fail" now that both route through the canonical StageStatus
+        // parser.
+        assert_eq!(status_color("aborted"), Color::Red);
+        assert_eq!(status_color("timed_out"), Color::Red);
+        assert_eq!(status_symbol("aborted"), "[✗✗]");
+        assert_eq!(status_symbol("timed_out"), "[✗✗]");
+    }
+
+    #[test]
+    fn reused_renders_distinctly_not_as_a_plain_pass() {
+        assert_eq!(status_color("reused"), Color::Cyan);
+        assert_eq!(status_symbol("reused"), "[↺↺]");
+    }
+
+    #[test]
+    fn unknown_status_never_renders_as_a_pass_like_green() {
+        assert_ne!(status_color("totally-not-a-real-status"), Color::Green);
     }
 }

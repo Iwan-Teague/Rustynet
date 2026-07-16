@@ -168,11 +168,7 @@ fn find_running_jobs_with_live_processes(
                 continue;
             }
             // Active = orchestrate_result.json missing AND report_state.json not run_complete
-            let has_final_result = dir_path
-                .join("orchestration/orchestrate_result.json")
-                .exists()
-                || read_report_complete_flag(&dir_path);
-            if has_final_result {
+            if has_completion_marker(&dir_path) {
                 continue;
             }
             // No completion marker alone doesn't mean running -- most report
@@ -236,6 +232,22 @@ fn find_running_jobs_with_live_processes(
     jobs.retain(JobState::is_running);
     jobs.sort_by_key(|j| std::cmp::Reverse(j.started_unix.unwrap_or(0)));
     Ok(jobs)
+}
+
+/// Whether a report dir shows a definitive, clean-finish marker: either the
+/// final `orchestrate_result.json` was written, or `report_state.json` says
+/// `run_complete: true`. This is the ONE signal that means "this run ended
+/// on its own terms" regardless of how the job was discovered -- a
+/// job-state JSON's own `state` field is a weaker proxy (it belongs to
+/// whatever launched the run, and a job launched outside this monitor never
+/// has one at all, see `job_state_by_id`). Callers use the absence of this
+/// marker, once a job has left the active scan, as the crashed/killed/
+/// abandoned signal.
+pub fn has_completion_marker(report_dir: &Path) -> bool {
+    report_dir
+        .join("orchestration/orchestrate_result.json")
+        .exists()
+        || read_report_complete_flag(report_dir)
 }
 
 /// Check if report_state.json exists and has run_complete: true
@@ -339,6 +351,32 @@ fn extract_arg_value(command: &str, flag: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Given a job that has just left the active scan, decide whether it
+/// crashed/was killed/was abandoned (`true`) or finished cleanly (`false`).
+///
+/// The report dir's own completion marker (see [`has_completion_marker`]) is
+/// authoritative regardless of how the job was discovered. A job-state
+/// JSON's `state` field is a weaker, secondary signal: it belongs to
+/// whatever launched the run, and a job launched OUTSIDE this monitor (raw
+/// CLI, another user's session -- the normal way the live-lab orchestrator
+/// is actually started) never has one at all, so `job_state_by_id` can
+/// never find it. Deciding crash-vs-done from the JSON alone left that
+/// entire class of job permanently unable to show CRASHED, no matter how it
+/// actually ended -- it would just silently read as idle.
+pub fn job_ended_crashed(repo_root: &Path, prev_job: &JobState, report_dir: &Path) -> bool {
+    match job_state_by_id(repo_root, &prev_job.job_id) {
+        // A tracked job's own JSON is the authoritative record of what its
+        // owner (this monitor, the deepseek MCP worker, ...) determined
+        // happened -- trust it directly, exactly as before this fix.
+        Some(job) => job.state == "running",
+        // No job-state JSON exists at all -- this job was launched outside
+        // this monitor (raw CLI, another session) and nothing ever recorded
+        // an ending for it. Fall back to the report dir's own completion
+        // marker instead of assuming "not crashed" by default.
+        None => !has_completion_marker(report_dir),
+    }
 }
 
 /// Best-effort parse of the run's creation timestamp
@@ -817,5 +855,116 @@ mod tests {
             .expect("running jobs");
 
         assert_eq!(running.len(), 1, "{running:?}");
+    }
+
+    fn externally_launched_job(report_dir: &Path) -> JobState {
+        // Exactly what a job discovered via the orphan-report-dir or
+        // live-process-table scan looks like: no job-state JSON anywhere,
+        // so `job_state_by_id` can never find it by `job_id`.
+        JobState {
+            job_id: "rn_role_linux_client_orphan_run".to_owned(),
+            state: "running".to_owned(),
+            pid: None,
+            started_unix: Some(1),
+            area: "linux client".to_owned(),
+            report_dir: report_dir.display().to_string(),
+            request_args: None,
+        }
+    }
+
+    #[test]
+    fn job_ended_crashed_is_true_for_an_externally_launched_job_with_no_completion_marker() {
+        // Regression: a job launched OUTSIDE this monitor (raw CLI, another
+        // session -- exactly how the real live-lab orchestrator is normally
+        // started) never gets a job-state JSON record. Before this fix,
+        // crash detection consulted ONLY job_state_by_id, so this entire
+        // class of job could vanish from the active scan after crashing or
+        // being killed and still be reported as NOT crashed.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let report_dir = repo.path().join("state/rn_role_linux_client_orphan_run");
+        std::fs::create_dir_all(&report_dir).expect("report dir");
+        let job = externally_launched_job(&report_dir);
+
+        assert!(
+            job_ended_crashed(repo.path(), &job, &report_dir),
+            "no completion marker and no job-state JSON must report crashed"
+        );
+    }
+
+    #[test]
+    fn job_ended_crashed_is_false_for_an_externally_launched_job_that_finished_cleanly() {
+        // Complement: once the report dir has a genuine completion marker,
+        // it must NOT be reported as crashed just because it has no
+        // job-state JSON.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let report_dir = repo.path().join("state/rn_role_linux_client_orphan_done");
+        std::fs::create_dir_all(report_dir.join("state")).expect("report dir");
+        std::fs::write(
+            report_dir.join("state/report_state.json"),
+            r#"{"run_complete": true}"#,
+        )
+        .expect("report_state.json");
+        let job = externally_launched_job(&report_dir);
+
+        assert!(
+            !job_ended_crashed(repo.path(), &job, &report_dir),
+            "a clean completion marker must never be reported as crashed, even with no job-state JSON"
+        );
+    }
+
+    #[test]
+    fn job_ended_crashed_is_true_when_tracked_json_still_says_running() {
+        // A monitor-tracked job (has a job-state JSON) whose PID died
+        // without the worker ever recording an ending: no completion
+        // marker AND the JSON still says "running".
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let report_dir = repo.path().join("state/tracked-run");
+        std::fs::create_dir_all(&report_dir).expect("report dir");
+        let jobs_dir = repo.path().join("state/deepseek-mcp-jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        std::fs::write(
+            jobs_dir.join("labrun-1.json"),
+            r#"{"job_id":"labrun-1","state":"running","started_unix":1,"area":"x","report_dir":"state/tracked-run"}"#,
+        )
+        .expect("job json");
+        let job = JobState {
+            job_id: "labrun-1".to_owned(),
+            state: "running".to_owned(),
+            pid: Some(999_999_999),
+            started_unix: Some(1),
+            area: "x".to_owned(),
+            report_dir: report_dir.display().to_string(),
+            request_args: None,
+        };
+
+        assert!(job_ended_crashed(repo.path(), &job, &report_dir));
+    }
+
+    #[test]
+    fn job_ended_crashed_is_false_when_tracked_json_recorded_a_clean_ending() {
+        // The worker itself updated the job-state JSON to a terminal,
+        // non-"running" state (e.g. "done") even though no completion
+        // marker exists in the report dir yet -- trust the explicit state.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let report_dir = repo.path().join("state/tracked-run-done");
+        std::fs::create_dir_all(&report_dir).expect("report dir");
+        let jobs_dir = repo.path().join("state/deepseek-mcp-jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        std::fs::write(
+            jobs_dir.join("labrun-2.json"),
+            r#"{"job_id":"labrun-2","state":"done","started_unix":1,"area":"x","report_dir":"state/tracked-run-done"}"#,
+        )
+        .expect("job json");
+        let job = JobState {
+            job_id: "labrun-2".to_owned(),
+            state: "running".to_owned(),
+            pid: Some(999_999_999),
+            started_unix: Some(1),
+            area: "x".to_owned(),
+            report_dir: report_dir.display().to_string(),
+            request_args: None,
+        };
+
+        assert!(!job_ended_crashed(repo.path(), &job, &report_dir));
     }
 }
