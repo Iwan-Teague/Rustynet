@@ -4126,6 +4126,7 @@ impl McpServer for LabStateServer {
                     json!({
                         "host": {"type": "string", "description": "host_id of a remote host from hosts[]."},
                         "run_id": {"type": "string", "description": "Which run to report. Default: the newest recorded on that host."},
+                        "stage": {"type": "string", "description": "Report only stages whose name CONTAINS this (case-insensitive), e.g. 'two_hop' or 'dns'. One filter rather than a function per stage — the stage set changes, a filter cannot drift from it. Errors (listing the run's real stages) if nothing matches, so a typo never reads as 'nothing wrong'."},
                         "format": {"type": "string", "enum": ["table", "json"], "description": "json gives full error_detail per failed stage."},
                         "ssh_identity_file": {"type": "string"}
                     }),
@@ -4140,6 +4141,7 @@ impl McpServer for LabStateServer {
                         "commit": {"type": "string", "description": "Ref/SHA to compare at. Default HEAD."},
                         "expect_runs": {"type": "integer", "description": "Minimum runs required. Default 2 — one machine reporting is not agreement."},
                         "allow_dirty": {"type": "boolean", "description": "Compare runs whose worktree was dirty (their evidence does not match the commit it names)."},
+                        "stage": {"type": "string", "description": "Restrict to stages whose name CONTAINS this — 'how did THIS stage do across both machines?'."},
                         "format": {"type": "string", "enum": ["table", "json"]}
                     }),
                     vec![],
@@ -4730,6 +4732,12 @@ impl McpServer for LabStateServer {
                     extra.push("--run-id");
                     extra.push(&run_owned);
                 }
+                let stage_owned;
+                if let Some(stage) = arg_str(args, "stage") {
+                    stage_owned = stage.to_owned();
+                    extra.push("--stage");
+                    extra.push(&stage_owned);
+                }
                 let format_owned;
                 if let Some(format) = arg_str(args, "format") {
                     if !matches!(format, "table" | "json") {
@@ -4767,6 +4775,12 @@ impl McpServer for LabStateServer {
                 }
                 if arg_bool(args, "allow_dirty") {
                     extra.push("--allow-dirty");
+                }
+                let stage_owned;
+                if let Some(stage) = arg_str(args, "stage") {
+                    stage_owned = stage.to_owned();
+                    extra.push("--stage");
+                    extra.push(&stage_owned);
                 }
                 let format_owned;
                 if let Some(format) = arg_str(args, "format") {
