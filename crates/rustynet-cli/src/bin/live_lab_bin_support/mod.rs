@@ -311,6 +311,53 @@ pub fn target_address(target: &str) -> &str {
     strip_host_port(addr)
 }
 
+/// Explicit TCP port carried by a `[user@]host:port` target, if any. `None`
+/// means "no explicit suffix; use the SSH default". Handles bracketed IPv6
+/// literals. Mirrors `live_lab_support::target_port`.
+fn target_port(target: &str) -> Option<u16> {
+    let addr = target.split_once('@').map_or(target, |(_, addr)| addr);
+    let port_str = if let Some(rest) = addr.strip_prefix('[') {
+        rest.split_once(']')
+            .and_then(|(_, tail)| tail.strip_prefix(':'))?
+    } else {
+        let (host, port) = addr.rsplit_once(':')?;
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        port
+    };
+    if port_str.is_empty() || !port_str.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    port_str.parse().ok()
+}
+
+/// The SSH/scp destination for `target` with any `:port` suffix removed from
+/// the host. The port travels separately as an `-p` (ssh) / `-P` (scp) flag —
+/// see [`target_port`]. Leaving it glued to the host makes OpenSSH treat
+/// `192.168.64.4:22` as a literal hostname ("could not resolve hostname").
+/// Mirrors `live_lab_support`'s `ssh_destination`.
+fn ssh_destination(target: &str) -> String {
+    match target.split_once('@') {
+        Some((user, _)) => format!("{user}@{}", target_address(target)),
+        None => target_address(target).to_owned(),
+    }
+}
+
+/// `ssh -G <destination>` for `target`, with the port passed as `-p` rather
+/// than glued to the host. Handing OpenSSH `host:22` makes it echo back
+/// `hostname host:22`, which then poisons every value derived from the resolved
+/// config (the target address and the known_hosts lookup candidates).
+fn ssh_resolve_command(target: &str) -> Command {
+    let mut command = Command::new("ssh");
+    command.arg("-G");
+    if let Some(port) = target_port(target) {
+        command.arg("-p").arg(port.to_string());
+    }
+    command.arg(ssh_destination(target));
+    command
+}
+
 fn target_home(target: &str) -> String {
     match target_user(target) {
         "root" => "/root".to_owned(),
@@ -577,8 +624,7 @@ fn resolved_target_address_from_ssh_g(target: &str, resolved: &str) -> String {
 }
 
 pub fn resolved_target_address(target: &str) -> Result<String, String> {
-    let resolved = Command::new("ssh")
-        .args(["-G", target])
+    let resolved = ssh_resolve_command(target)
         .stdin(Stdio::null())
         .output()
         .map_err(|err| format!("failed resolving SSH target address for {target}: {err}"))?;
@@ -839,8 +885,7 @@ pub fn require_pinned_host_entry(pinned_known_hosts: &Path, target: &str) -> Res
     if utm_transport_for_target(target).is_some() {
         return Ok(());
     }
-    let resolved = Command::new("ssh")
-        .args(["-G", target])
+    let resolved = ssh_resolve_command(target)
         .stdin(Stdio::null())
         .output()
         .map_err(|err| {
@@ -907,8 +952,11 @@ fn ssh_base_command(identity: &Path, known_hosts: &Path, target: &str) -> Comman
         "-i",
     ]);
     command.arg(identity);
+    if let Some(port) = target_port(target) {
+        command.arg("-p").arg(port.to_string());
+    }
     command.arg("--");
-    command.arg(target);
+    command.arg(ssh_destination(target));
     command
 }
 
@@ -1002,8 +1050,12 @@ pub fn scp_to(
     }
     require_pinned_host_entry(known_hosts, target)?;
     let mut scp = scp_base_command(identity, known_hosts);
+    if let Some(port) = target_port(target) {
+        // scp spells the port `-P`, unlike ssh's `-p`.
+        scp.arg("-P").arg(port.to_string());
+    }
     scp.arg(src);
-    scp.arg(format!("{target}:{dst}"));
+    scp.arg(format!("{}:{dst}", ssh_destination(target)));
     let status = scp
         .stdin(Stdio::null())
         .status()
@@ -1664,7 +1716,7 @@ mod tests {
     use super::{
         LiveLabPlatform, enforce_linux_only_until_validator_lands, env_flag_truthy,
         known_hosts_lookup_host, resolved_known_hosts_candidates,
-        resolved_target_address_from_ssh_g, target_address,
+        resolved_target_address_from_ssh_g, ssh_destination, target_address, target_port,
     };
 
     #[test]
@@ -1682,6 +1734,40 @@ mod tests {
         // Bracketed IPv6 yields the literal; a bare IPv6 literal is untouched.
         assert_eq!(target_address("debian@[fd00::1]:2222"), "fd00::1");
         assert_eq!(target_address("debian@fd00::1"), "fd00::1");
+    }
+
+    #[test]
+    fn ssh_destination_rebuilds_user_and_bare_host() {
+        // The destination handed to ssh/scp must never carry the port: OpenSSH
+        // treats "192.168.64.4:22" as a literal hostname and fails with
+        // "could not resolve hostname". The port travels as -p/-P instead.
+        assert_eq!(
+            ssh_destination("debian@192.168.64.4:22"),
+            "debian@192.168.64.4"
+        );
+        assert_eq!(
+            ssh_destination("debian@192.168.64.4:2222"),
+            "debian@192.168.64.4"
+        );
+        assert_eq!(
+            ssh_destination("debian@192.168.64.4"),
+            "debian@192.168.64.4"
+        );
+        assert_eq!(ssh_destination("192.168.64.4:22"), "192.168.64.4");
+        assert_eq!(ssh_destination("debian@[fd00::1]:2222"), "debian@fd00::1");
+    }
+
+    #[test]
+    fn target_port_extracts_explicit_suffix_only() {
+        assert_eq!(target_port("debian@192.168.64.4:22"), Some(22));
+        assert_eq!(target_port("debian@192.168.64.4:2222"), Some(2222));
+        assert_eq!(target_port("debian@[fd00::1]:2222"), Some(2222));
+        // No explicit suffix -> None (use the SSH default), and a bare IPv6
+        // literal's colons must not be mistaken for a port.
+        assert_eq!(target_port("debian@192.168.64.4"), None);
+        assert_eq!(target_port("debian@fd00::1"), None);
+        assert_eq!(target_port("debian@192.168.64.4:"), None);
+        assert_eq!(target_port("debian@192.168.64.4:ssh"), None);
     }
 
     #[test]
