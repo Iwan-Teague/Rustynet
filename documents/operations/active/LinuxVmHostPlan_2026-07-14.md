@@ -289,9 +289,711 @@ KVM**. Trade a little weight for a management UI/API → **Proxmox**.
 > available — a dual-boot to a dedicated Linux drive is enough. Confirm whether
 > the Windows install must be preserved before flashing.
 
+### 6.1 As-built host record + disk-scope HARD RULE (2026-07-16)
+
+The host is stood up and live. As-built, verified on the box:
+
+| Property | Value |
+| --- | --- |
+| CPU | AMD Ryzen 7 7700X, 8C/16T, `svm` present |
+| RAM | 61 GiB (closes §8 #6) |
+| Nested virt | **`kvm_amd nested = 1` — already on by default** (§1.1 unblocked) |
+| OS | Ubuntu 24.04 LTS, headless, `multi-user.target` |
+| Root | `/dev/sdb2` ext4 464.8 G (427 G free), ESP `/dev/sdb1` 1 G, 4 G swapfile |
+| Network | WiFi `wlp7s0` up (DHCP 10.230.76.5); wired `eno1` **DOWN / NO-CARRIER** |
+
+**DISK SCOPE — HARD RULE (closes §8 #7, non-negotiable):**
+
+| Disk | Device | Contents | Rule |
+| --- | --- | --- | --- |
+| 0 | Samsung 860 EVO 500G | NTFS data | **OFF LIMITS** |
+| 1 | Samsung 870 EVO 500G | `/dev/sdb` — this Ubuntu VM host | **only writable target** |
+| 2 | Samsung 980 NVMe 932G | **Windows 11 boot** | **NEVER TOUCH** |
+
+Enforcement:
+- Every destructive disk op (`dd`/`mkfs`/`parted`/`sgdisk`/`wipefs`, installer
+  targets, libvirt storage pools) targets **`/dev/sdb` only**.
+- **Verify by model/serial, never a bare device letter** — SATA enumeration can
+  shift across boots. Check `lsblk -o NAME,SIZE,MODEL,SERIAL` (expect
+  `Samsung SSD 870 EVO`) or pin via `/dev/disk/by-id/` before writing.
+- libvirt's default pool `/var/lib/libvirt/images` is on sdb → compliant by
+  default. Do **not** add pools on Disk 0 or the NVMe.
+- Never propose reclaiming Disk 0 or the NVMe for VM capacity; if space runs
+  short, ask. Windows must remain bootable from the UEFI boot menu.
+
+**Deviation from the §6 lead recommendation — logged, accepted:** the host runs
+**Ubuntu 24.04**, not the recommended Debian minimal, and §6 lists "Avoid: Ubuntu
+Server (snap overhead)". The build is a minimal debootstrap with **no `snapd`
+installed** and no desktop, so the stated objection does not apply — it is
+functionally the Debian-minimal profile §6 asked for (same `apt` workflow, same
+KVM stack). Recorded here rather than silently diverging; revisit only if snap or
+footprint problems actually materialize.
+
+**As-installed (2026-07-16) — §6's `apt` line does NOT work verbatim on Ubuntu
+24.04.** `qemu-kvm` has **no candidate** on noble (it was a transitional stub and
+is gone); the real package is `qemu-system-x86`. Actually installed and verified:
+
+```bash
+sudo apt install -y qemu-system-x86 qemu-utils libvirt-daemon-system \
+  libvirt-clients virtinst bridge-utils cpu-checker ovmf swtpm swtpm-tools \
+  dnsmasq-base cloud-image-utils git build-essential pkg-config libssl-dev curl
+sudo usermod -aG libvirt,kvm "$USER"      # re-login to take effect
+# Rust (run-on-host build; distro rustc 1.75 is too old for edition 2024):
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+  sh -s -- -y --profile minimal --default-toolchain 1.88.0 -c rustfmt -c clippy
+```
+
+Beyond §6's list, `ovmf` (UEFI, incl. `OVMF_CODE_4M.secboot.fd`) and `swtpm`
+(TPM 2.0) are **required for the Windows 11 guest** that motivates this host
+(§1.1) — Win11 will not install without UEFI + TPM 2.0. `cloud-image-utils`
+supports the §4 Tier-2.6 cloud-init provisioning path.
+
+Verified state: QEMU 8.2.2 / libvirt 10.0.0 / virt-install 4.1.0; `kvm-ok` →
+"KVM acceleration can be used"; `domcapabilities` → `<domain>kvm</domain>` (real
+KVM, not TCG); `virsh` works **unprivileged** as `ubuntu-server` (libvirt group);
+`libvirtd` enabled+active; net `default` active+autostart; Rust 1.88.0 matching
+`rust-toolchain.toml`, host triple **`x86_64-unknown-linux-gnu`** (so a plain
+`cargo check` on the box *is* increment 0/6's target build).
+
+**Storage pool:** Ubuntu's libvirt ships the default *network* but **no default
+*pool*** — it was defined manually as `default` → `/var/lib/libvirt/images`,
+built/started/autostart. Verified on-rule: that path resolves to `/dev/sdb2` →
+`Samsung SSD 870 EVO 500GB`.
+
+### 6.2 Guest provisioning — cloud-image + cloud-init (works; one hard gotcha)
+
+Guests are provisioned from Debian cloud images + cloud-init (§4 Tier-2.6), not
+interactive ISO installs: `qemu-img` overlay on a shared read-only base +
+`cloud-localds` seed ISO + `virt-install --import`. Fast, headless, repeatable.
+Script: `provision_guest.sh <name> [ram] [vcpus] [disk]` (carries a hard-rule
+guard that aborts unless the pool's backing disk model is the 870 EVO).
+
+> **GOTCHA — `virt-install --graphics none` creates a VM with NO video device,
+> and that makes Debian 13 cloud images boot-loop forever.** The image's GRUB is
+> built with `GRUB_TERMINAL_OUTPUT="gfxterm serial"`; **gfxterm requires a video
+> device**. With no VGA, gfxterm init fails, the menuentry aborts *before*
+> reaching `linux`/`initrd`, GRUB re-renders and auto-boots again — an endless
+> ``Booting `Debian GNU/Linux'`` loop, **no kernel output at all** (not even
+> `earlyprintk`), and the qcow2 overlay stays frozen at ~197 KB.
+>
+> **Fix: add `--video vga`** (stays headless — no display is exported; it just
+> gives GRUB a framebuffer to init against).
+>
+> Diagnosis notes for next time — the symptom points at everything except the
+> real cause. Ruled out by bisection: image is valid (`qemu-img check` clean),
+> q35 is fine (boots under plain QEMU), the 40 G-over-3 G overlay is fine, the
+> seed CDROM is fine, 4 GiB RAM is fine, AppArmor is not even confining libvirt.
+> Reproduce the fault on demand with plain QEMU by adding **`-vga none`**; note
+> `-nographic` alone does **not** reproduce it (it still leaves a VGA device
+> attached). Also: a running domain holds a write-lock on its qcow2, so a plain
+> `qemu-system-x86_64` test against a live domain's disk silently produces no
+> output — `virsh destroy` first or the test is meaningless.
+
+Proven live 2026-07-16 on guest `linux-x86-client-1` (Debian 13 trixie,
+6.12.95+deb13-cloud-amd64): `domstate` → running (incr 2), **`virsh domifaddr` →
+192.168.122.137 (incr 3 ladder rung 1)**, cloud-init `status: done`, host→guest
+SSH via key auth OK, passwordless sudo OK, and **`svm` visible inside the guest**
+(nested virt reaches the guest via `--cpu host-passthrough`) — the §1.1
+Windows/WinNAT prerequisite.
+
+**Networking — bridging is NOT required for the box-local milestone.** §7's `br0`
+**cannot run over WiFi** (802.11 station mode will not forward the 4-address
+frames a bridge needs), and `eno1` currently has **no carrier**. But under the
+ratified **run-on-host** architecture the orchestrator lives *on this box*, and
+the host is the gateway for libvirt's NAT `default` net (192.168.122.0/24) — so
+it can SSH NAT'd guests, and guests can mesh with each other, **without a
+bridge**. That is enough for increment 0/6's build check + a box-local `--node`
+run.
+
+A wired `br0` is still required for: the **Mac** reaching these guests directly
+(Tier-1 `debian-lan-11` pattern, Mac-side MCP/lab tooling) and any
+**cross-host mesh** with the macOS/UTM fleet. **Plug `eno1` into the LAN** before
+those. Wired would also cure the intermittent SSH auth flake seen over `wlp7s0`.
+
+---
+
+## 6.7 Parallel per-machine labs + the commit-sync mechanic (DESIGN, 2026-07-16)
+
+**Status: SPEC, NOT IMPLEMENTED.** Owner idea 2026-07-16, assessed and accepted.
+
+### 6.7.1 Two capabilities, deliberately separated
+
+| | What | Needs | Status |
+| --- | --- | --- | --- |
+| **A. Parallel per-machine labs** | Each machine runs a **self-contained** lab; one agent drives both | commit-sync + per-machine guests | **available once §6.7.3 lands** |
+| **B. One lab spanning machines** | Guests on *different* hosts mesh with each other | guest↔guest reachability, dual-NIC, ADR-004 scenario plane, the §6.5.2 collision | **blocked on §6.5** |
+
+**A is not a stepping stone to B.** It is a separate win, and critically **A needs
+none of §6.5's unsolved networking**: no mesh, no subnet routes, no dual-NIC, no
+Tailscale dependency. In A the only things crossing machines are the **commit**
+(in), the **results** (out), and the agent's **SSH**. Bank A now; leave B parked.
+
+### 6.7.2 The machine split is forced by hardware, not chosen
+
+- **Windows / WinNAT-exit needs x86 nested virt** → only `ubuntu-kvm-1`
+  (`kvm_amd nested=1`, §6.1). Apple Silicon structurally cannot — that is §1.1's
+  entire motivation.
+- **macOS guests need Apple hardware** → only `mac-utm-1`.
+
+The hosts are **complementary and non-substitutable**, so "Windows-focused run on
+the box, macOS run on the Mac, concurrently" is the only assignment physics
+allows — not load balancing. Each side also carries its own Linux arch (x86-64 on
+the box, aarch64 on the Mac), which is extra coverage, not duplication.
+
+### 6.7.3 ✅ BUILT — `ops vm-lab-sync-host` (implemented + live-proven 2026-07-16)
+
+```
+rustynet ops vm-lab-sync-host --host <host_id> [--inventory <path>]
+    [--commit <ref|sha>] [--allow-dirty] [--verify-only]
+    [--ssh-identity-file <path>] [--known-hosts-file <path>]
+    [--timeout-secs <n>] [--format table|json]
+```
+
+Live-proven against `ubuntu-kvm-1`, every guard rail firing:
+
+| Behaviour | Observed |
+| --- | --- |
+| Read-back verify catches divergence | `VERIFY FAILED — HEAD is b8304a1…, expected 18ad7b11…; the host is NOT on the requested commit` |
+| Sync + verify | `{commit: b8304a1…, branch: main, dirty: false, verified: true, action: synced}` |
+| Dirty gate (default) | `refusing to sync … a dirty tree is not reproducible from a SHA` |
+| Local host never moved | `this command will not move your working tree` |
+| Unpushed SHA | git's `upload-pack: not our ref` → `push it first — this command deliberately syncs only commits that exist on the shared remote` |
+
+Design decisions, each with the reason (do not "simplify" these away):
+- **Verify by read-back, never by assertion.** The tool runs `git rev-parse HEAD`
+  *on the host* and requires equality. Reporting success from the sending side is
+  precisely how two machines run different code while both rows claim one commit.
+- **Refuse a dirty tree by default** — not reproducible from a SHA.
+- **Resolve the SHA once, locally, and pin it.** "Sync both to main" can land two
+  *different* commits: this repo has concurrent sessions committing (local HEAD
+  moved mid-session on 2026-07-16 and sat 6 commits ahead of `origin/main`).
+- **`reset --hard`, never `git clean -xdff`** — clean would delete the untracked
+  `target/` cache (925 M on the box) and make every run a cold build.
+- **`--ssh-identity-file` is overridable.** `default_lab_ssh_identity_path()` is
+  `~/.ssh/rustynet_lab_ed25519`, which does **not exist** on this Mac; with
+  `IdentitiesOnly=yes` a hardcoded default simply fails. Argv-only exec,
+  `StrictHostKeyChecking=yes`, pinned `known_hosts` (§5).
+- **SSH endpoint is DERIVED** from `connect_uri` (`LabHost::ssh_endpoint()`), not
+  configured separately — one source of truth, so a re-pointed host cannot keep a
+  stale address.
+
+**Transport = fetch from the PUBLIC GitHub origin** (`https://github.com/Iwan-Teague/Rustynet.git`,
+verified public: unauthenticated API → 200). **No credentials, no deploy key, no
+secrets on any host.** Consequence, by design: **only pushed commits can be
+synced** — a host's evidence then refers to a commit anyone can fetch. For an
+unpushed tight loop, push first (matches the repo's direct-to-main convention).
+
+**New `hosts[]` field:** `repo_dir` (absolute, validated).
+
+### 6.7.3.1 Host readiness — `ubuntu-kvm-1` (2026-07-16)
+
+| Item | State |
+| --- | --- |
+| Toolchain | rustup, cargo/rustc **1.88.0** (matches `rust-toolchain.toml`), clippy **0.1.88** (the pinned one this Mac cannot produce) |
+| Repo | **real git checkout** at `/home/ubuntu-server/Rustynet`, `origin` = public GitHub, **shallow** (`.git` = 6.7 M vs 2.7 G full) |
+| Provenance | `git_commit=b8304a1…`, `git_branch=main`, `git_dirty_state=clean` ✅ |
+| Binary | `cargo build -p rustynet-cli --features vm-lab` → **BUILD_EXIT=0**, 162 MB |
+| Build cache | `target/` 925 M preserved across syncs |
+
+> **GOTCHA — macOS `tar` poisons provenance with AppleDouble.** The earlier
+> `tar -cf - … | ssh 'tar x'` sync from the Mac created `._main.rs`,
+> `._mod.rs`, `._vm_lab_inventory.json` on the box. They are **untracked**, so
+> `git status --porcelain` was non-empty and **every run's `git_dirty_state`
+> would have read DIRTY** for reasons unrelated to the code. Purged. This is a
+> repeat offender in this repo (see the historical "AppleDouble Windows brick").
+> **Use `vm-lab-sync-host` (git) — never `tar` from macOS.** If tar is
+> unavoidable, `COPYFILE_DISABLE=1 tar …`.
+
+### 6.7.3.2 Original spec (retained for rationale)
+
+**Why it is mandatory, not convenience (verified):** run provenance is computed by
+**shelling out to git at run time** — `live_lab_run_matrix.rs:1267`
+`git_stdout(["rev-parse","HEAD"])`, and `vm_lab/mod.rs:2669` which *errors* when
+`rev-parse` fails. The box's `~/Rustynet` is currently a **`git archive` tar with
+no `.git`** (`fatal: not a git repository`), so a box-side run **cannot produce
+attributable evidence**. Two runs are only comparable if both rows carry a real
+`git_commit`, and each host must compute that **from its own checkout** rather
+than have the syncing agent assert it.
+
+```
+rustynet ops vm-lab-sync-host \
+  --inventory <path> --host <host_id> \
+  [--commit <ref|sha>]   # default HEAD; resolved ONCE locally, pinned for all hosts
+  [--allow-dirty]        # default: refuse
+  [--verify-only]        # assert host state; change nothing
+  [--format table|json]
+```
+
+Steps, each fail-closed:
+1. **Resolve locally** — `git rev-parse <ref>` → full 40-char SHA. Unresolvable ref → error.
+2. **Dirty gate** — local tree dirty and no `--allow-dirty` → **refuse**. A dirty
+   tree cannot be reproduced on another machine from a SHA; syncing it would let
+   the two hosts silently diverge while both claim the same commit.
+3. **Ensure host repo** — `git init` at the host's `repo_dir` if absent.
+4. **Transport** — `git bundle create` for the SHA, stream over the existing SSH
+   channel, `git bundle unbundle` host-side. Chosen over `git fetch` from GitHub
+   because it needs **no credentials on the host**, works for **unpushed** commits
+   (the tight loop tests before pushing), and rides the key auth we already have.
+5. **Checkout** — `git checkout --detach <sha>` + `git reset --hard <sha>`.
+   **Do NOT `git clean -xdff`** — it would delete the untracked `target/` build
+   cache (~42 G on the Mac) and turn every run into a cold build. `reset --hard`
+   already fixes tracked files and leaves build output alone.
+6. **VERIFY — mandatory, the whole point.** Read back the host's
+   `git rev-parse HEAD` and assert it **equals** the requested SHA; assert
+   `git status --porcelain` is empty (unless `--allow-dirty`). **Mismatch → error.**
+   Never report "synced" from the sending side: unverified sync is exactly how two
+   machines silently diverge while the evidence claims they agree.
+7. **Record** — emit `{host_id, commit, branch, dirty, synced_at, verified}`;
+   `--format json` for callers.
+
+**Pin the SHA, never "latest main".** This repo has **concurrent sessions
+committing** (an interleaved stash was hit on 2026-07-16); "sync both hosts to
+main" can land two *different* commits and produce two run-matrix rows that look
+comparable and are not. Resolve once, pin everywhere.
+
+**New `hosts[]` field:** `repo_dir` (absolute) — where the orchestrator source
+lives on that host. `mac-utm-1` → the working repo; `ubuntu-kvm-1` →
+`/home/ubuntu-server/Rustynet`.
+
+### 6.7.4a ✅ THE PIPELINE — call these, in this order. Do not improvise.
+
+**Nothing here is the agent's to remember.** Each step is a command that verifies
+its own preconditions and **fails closed with the exact next command**. If you
+find yourself relying on memory or on prose in this document, that is a bug in
+the tooling — fix the tooling.
+
+```
+1.  git push origin HEAD:main                      # hosts fetch from the shared origin
+2.  rustynet ops vm-lab-sync-host   --host <id> --commit <sha>   # per host; verifies by read-back
+3.  rustynet ops vm-lab-host-preflight --commit <sha>            # ordered gates; must say GO
+4.  rustynet ops vm-lab-preflight   --select-all                 # per-GUEST readiness (pre-existing)
+5.  <launch the per-OS runs>                                     # only after GO
+6.  <BOTH runs finish>  → read both run-matrix rows (same git_commit)
+7.  patch → commit → push → back to 1
+```
+
+`ops vm-lab-host-preflight [--inventory <p>] [--hosts <id,id>] [--commit <ref|sha>]
+[--allow-dirty] [--ssh-identity-file <p>] [--timeout-secs <n>] [--format table|json]`
+
+Gates run **in order and stop at the first failure** (mirroring `xtask gates`),
+because a later gate's answer is meaningless once an earlier invariant is broken.
+Skipped gates report **`not_run`** — never silently omitted, never assumed green.
+
+| # | Gate | Fails when | It tells you |
+| --- | --- | --- | --- |
+| 1 | `inventory` | hosts[] missing / no `repo_dir` | declare `repo_dir` |
+| 2 | `commit_pinned` | ref does not resolve | check the ref |
+| 3 | `local_clean` | dev tree dirty | `commit your changes (or --allow-dirty)` |
+| 4 | `commit_pushed` | SHA not on origin | **`git push origin HEAD:main`** |
+| 5 | `hosts_on_commit` | any host off-commit/dirty | `vm-lab-sync-host --host <id> --commit <sha>` |
+| 6 | `hosts_agree` | hosts on different commits | sync all to one pinned SHA |
+| 7 | `guests_ready` | a host has 0 ready guests | `vm-lab-discover-hosts` |
+
+Verdict is `GO` / `NO-GO`; `--format json` for a calling pipeline.
+
+Live-proven 2026-07-16, each gate catching a real condition:
+
+```
+[3/7] local_clean      FAIL  local worktree is dirty; its evidence would not match the commit it claims
+        next: commit your changes (or re-run with --allow-dirty)
+[4/7] commit_pushed    FAIL  18ad7b11… is not on origin; hosts cannot fetch it
+        next: git push origin HEAD:main
+[5/7] hosts_on_commit  FAIL  off-commit: mac-utm-1=18ad7b11
+        next: rustynet ops vm-lab-sync-host --host <id> --commit b8304a1ae…
+…and with a pushed SHA:  VERDICT: GO — hosts agree on one commit and have ready guests.
+```
+
+**Gate 4 is the cheapest win:** an unpushed commit is caught in ~1 s instead of
+failing minutes into a sync. **Gate 6 is the one the whole parallel-lab
+comparison rests on** — it is asserted explicitly rather than inferred from gate 5,
+because "both rows say the same commit" is the claim the evidence makes.
+
+> **NAMING — two different preflights, both real:**
+> `vm-lab-preflight` (pre-existing) gates **guests**: reachable, SSH-auth, platform
+> identity, required commands, free space. `vm-lab-host-preflight` (new) gates
+> **machines**: pinned commit, host agreement, ready-guest rollup. They **compose**
+> — hosts first, then guests (steps 3 then 4). Do not merge them.
+
+### 6.7.4 The loop, and the discipline that makes it valid
+
+```
+resolve SHA  →  sync+verify both hosts  →  launch both runs (async)
+             →  BOTH complete  →  read both run-matrix rows (same git_commit)
+             →  patch + commit  →  new SHA  →  repeat
+```
+
+**You cannot patch while either run is live.** Editing orchestrator source mid-run
+trips the setup-manifest provenance check and fails the run, and it dirties
+`git_dirty_state` on any row still being written. The agent genuinely idles while
+runs are in flight — that is correct, not waste. Patch on the **dev machine**,
+commit, then sync; never hand-patch a host's checkout (it would desync from the
+SHA its evidence claims, and step 6 would catch it — which is the point).
+
+**Accepted risk:** a patch that fixes Windows can regress macOS. Re-running both
+from the new SHA is what catches it — that is the argument *for* the loop.
+
+### 6.7.4b 🔧 SPEC — `ops vm-lab-run-matrix-compare` (step 6 of the pipeline)
+
+**Purpose:** collapse the driving agent's job from "read two report trees and
+work out what differs" to "read one verdict". Today step 6 is the only step still
+requiring judgement; this removes it.
+
+#### The schema gap that must be closed first
+
+Verified 2026-07-16 against `live_lab_node_run_matrix.csv`:
+
+- **266 columns**, and every stage is already a per-OS **triple** —
+  `linux_stage_<name>` / `macos_stage_<name>` / `windows_stage_<name>` — all in
+  **one row**. The schema assumes **one orchestrator drives every OS**.
+- **There is NO host/machine column.** `operator` is a *username* (`iwan`), not a
+  machine. So with two machines writing rows, **a row cannot be attributed to the
+  host that produced it**.
+
+**Required schema addition (do this first):**
+- `runner_hostname` — from `hostname` on the machine writing the row. Always
+  available, needs no config, so it can never be silently absent.
+- `host_id` — optional, from a new `--host-id <id>` on the run command, mapping
+  the row to `hosts[]`. Optional because a row must never be *unwritable* just
+  because someone forgot a flag; `runner_hostname` is the fallback identity.
+
+Append-only: existing rows keep the columns blank (the run matrix already
+tolerates blank legacy columns — see ADR-004 Consequences).
+
+#### The command
+
+```
+rustynet ops vm-lab-run-matrix-compare --commit <sha>
+    [--matrix <path>]        # default: the node engine's matrix
+    [--expect-hosts <n>]     # default 2; fail if fewer rows than this
+    [--format table|json]
+```
+
+Behaviour:
+1. Select rows where `git_commit == <sha>`. **Fewer than `--expect-hosts` → error**,
+   never a green: "only one machine reported" must not read as agreement.
+2. Refuse to compare rows whose `git_dirty_state` is dirty (their evidence does
+   not correspond to the commit they name).
+3. For each stage triple, **merge across rows per OS**, then report:
+   - the OS/stage results that actually ran,
+   - **conflicts**: the same OS+stage with **different** results in two rows from
+     one commit — reported **loudly** as a finding. That is nondeterminism or a
+     misconfigured overlap, and it invalidates the comparison; the tool must not
+     silently pick a winner.
+4. Report `first_failed_stage` per row, plus each row's `report_dir` so the agent
+   can drill in without hunting.
+5. Verdict: per-OS pass/fail rollup + the merged parity view.
+
+**Vocabulary rule (ADR-004 §6):** the statuses are
+`pass` / `fail` / `not_run` / `not_supported` / `expected_fail`. **`not_run` is not
+`pass`.** A merge must never promote an absent result to a passing one — that is
+exactly how a two-machine split would manufacture false parity (host A skips
+Windows, host B skips macOS, and a naive merge shows everything green).
+
+> **The REAL vocabulary is narrower than ADR-004's, and compare must use the
+> implemented one.** Measured on the newest `live_lab_node_run_matrix.csv` row: of
+> 110 stage cells, **`not_run`×77, `pass`×19, `skip`×13, `fail`×1**.
+>
+> ADR-004 §6 names `pass`/`fail`/`not_run`/`not_supported`/`expected_fail` and says
+> `skipped` is internal-only. The engine, however, implements only:
+> ```rust
+> pub(crate) enum VmLabStageStatus { Pass, Fail, Skipped }   // mod.rs:2295
+> ```
+> and the recorder deliberately normalises it:
+> ```rust
+> "skipped" | "skip" => "skip"                        // live_lab_run_matrix.rs:1995
+> "skip" | "not_run" | "reused" | "unknown"           // grouped, :2039
+> ```
+> So `skip` in the matrix is **designed behaviour, not a leak** — and crucially the
+> recorder **already groups `skip` with `not_run`, never with `pass`**.
+> (An earlier revision of this section called it a defect; that was wrong and is
+> retracted. `not_supported` / `expected_fail` are simply **not implemented** —
+> that documentation-vs-implementation gap is worth closing, but it is not a bug
+> in the recorder.)
+>
+> **Rule for compare:** reuse the recorder's existing grouping —
+> `{skip, not_run, reused, unknown}` = **"produced no verdict"**, never `pass`.
+> Do not invent a second, parallel notion of "didn't run"; align with :2039.
+>
+> The `not_run`×77 count also **confirms the merge design**: a single-host run
+> already leaves the other OSes' triples `not_run`, so two focused runs populate
+> **disjoint** columns and the merge is mostly a union.
+
+**Why this is the right shape:** because the schema already carries per-OS triples,
+two focused runs (box = `--windows-only`-ish, Mac = macOS) naturally populate
+**disjoint** columns. The merge is then mostly a union, and the *only* interesting
+case is the overlap — which is precisely what conflict detection surfaces.
+
+Depends on: the `runner_hostname` / `host_id` columns above. Without them the
+compare works (rows are keyed by commit) but cannot say **which machine** produced
+a result — so it can report *what* differs, not *where*. Close the schema gap first.
+
+### 6.7.5 Prerequisites before A can run
+
+- **`vm-lab-sync-host`** (§6.7.3) + `hosts[].repo_dir` — not built.
+- **Box guests**: Windows 11 guest (ISO needs owner registration, §6.2) + the
+  x86 Linux images (downloading 2026-07-16: Ubuntu 24.04 ✅, Rocky 10, Fedora 42,
+  openSUSE Leap 16.0, Arch, virtio-win).
+- **Mac audit failure** (§6.6.3) must clear before any macOS **enforced-profile**
+  evidence run.
+- Per-OS run selectors already exist (`--windows-only`, `--exit-platform`,
+  `--relay-platform`, `--anchor-platform`, `--admin-platform`,
+  `--blind-exit-platform`, `--macos-promote-exit`, `--skip-linux-live-suite`) —
+  no new scoping work needed.
+
+---
+
+## 6.6 Transport exit plan — how to drop Tailscale WITHOUT touching the engine
+
+**Owner decision 2026-07-16: stay on LAN for now.** Cross-network is deferred, the
+ZeroTier swap is parked (§6.5.2 keeps it priced), and Tailscale stays as the
+current transport. This section exists so that decision stays cheap to reverse.
+
+### 6.6.1 The engine is already transport-agnostic — verified
+
+`grep -rni "tailscale|tailnet|magicdns" crates/ --include=*.rs` → **zero transport
+code**. (The only hits are an unrelated `rustynet-dns-zone` test name about
+100.64/10 *address format*, and CVE/project strings in the security auditor.)
+
+The transport is expressed entirely as **data**:
+
+| What | Where | Today's value |
+| --- | --- | --- |
+| Host endpoint | `hosts[].connect_uri` | `qemu+ssh://ubuntu-server@ubuntu-headless/system` |
+| Guest address | entry `ssh_target` / `last_known_ip`, or resolved live by the incr-3 ladder | `192.168.121.137` |
+
+Only the hostname `ubuntu-headless` (Tailscale MagicDNS) is Tailscale-specific.
+Everything else is a plain URI/IP. **Dropping Tailscale is a network-config
+change, not a code change** — no `--node` engine rewrite, by construction. Keep it
+that way: never let a transport name reach a Rust constant; it belongs in
+`hosts[]`.
+
+### 6.6.2 The exit is TWO parts, not one (measured)
+
+An earlier claim that the swap is "one string" was **wrong**. Measured on the Mac:
+
+```
+route -n get 10.230.76.5      → interface: en0      ← host: LAN-reachable ✅
+route -n get 192.168.121.137  → interface: utun10   ← guest: TAILSCALE ONLY ❌
+```
+
+1. **Host endpoint — trivial.** `connect_uri` host part
+   `ubuntu-headless` → `10.230.76.5`. One string in one record; the LAN already
+   carries it. Re-pointing every guest on that machine is this single edit,
+   because `host_id` resolves to `connect_uri` at parse time (§6.4).
+2. **Guest-subnet reach — the real work.** `192.168.121.0/24` lives behind the
+   box's libvirt NAT and is **not** LAN-reachable. The Mac reaches it *solely*
+   via Tailscale's approved subnet route. Drop Tailscale and Mac→guest dies,
+   which kills the `--node` SSH plane for libvirt guests.
+
+Replacements for part 2, cheapest first:
+- **(a) Static route on the Mac** — `route add 192.168.121.0/24 10.230.76.5` plus
+  a forward/MASQUERADE rule on the box (libvirt's default rules do not accept
+  inbound forwarding from `wlp7s0`). No VPN at all. Cheap, but it is ambient host
+  routing state — the exact class ADR-004 dislikes.
+- **(b) Bridge guests onto the LAN** (the unplugged `eno1` + a libvirt bridged
+  network) — guests get real `10.230.76.x` addresses, the Mac reaches them
+  directly, no routes and no VPN. **This is the real exit**, and it also moves
+  toward ADR-004's scenario plane (§6.5.3) instead of away from it.
+- **(c) Run the orchestrator on the box** — guest reach becomes local (`virbr0`);
+  no Mac→guest path needed. Works only for a Linux-guests-only run, since
+  `utmctl` is local-only.
+
+**Therefore: the `eno1` cable is the strategic exit from Tailscale**, not just a
+performance nicety — it removes the VPN dependency for guest reach *and* is a
+prerequisite for the dual-NIC scenario plane. Prioritise it over any transport
+swap.
+
+### 6.6.3 Known accepted state while on LAN
+
+Tailscale remains **up on the Mac**, so `vm-lab-network-audit` reports
+`overall_status=fail` with the §6.5.2 `host_route_collision` errors. This blocks
+**enforced-profile** runs. Accepted for now because the libvirt guest is not yet a
+dataplane-evidence node (§6.5.3) — there is no enforced-profile run to block.
+**Before the first enforced-profile / dataplane-evidence run on the Mac, this must
+be resolved** (`tailscale down`, or the ZeroTier swap). Do not let it become
+ambient: it is a live audit failure, recorded here on purpose.
+
+---
+
+## 6.5 Cross-host networking — VERIFIED design findings (2026-07-16)
+
+**Status: DESIGN, NOT IMPLEMENTED.** Owner directive 2026-07-16: nail and verify
+the design before implementing further. Scope is **Linux + macOS hosts only**; a
+Windows *host* driver is out of scope (Windows stays a lab **guest**). Everything
+below was checked against the code/live hosts, not assumed. **Read this before
+touching cross-host networking.**
+
+### 6.5.1 The governing authority is ADR-004, not this plan
+
+`documents/operations/adr/ADR-004-dual-plane-live-lab-network.md` (Accepted,
+2026-07-10) already decides the lab's network architecture. §7 of this plan
+predates it and is **superseded** where they disagree. Load-bearing points:
+
+1. **Four planes, never conflated** — `management_ip` / `scenario_ip` /
+   `mesh_ip` / `observed_egress_ip`. **"Management reachability is never
+   dataplane proof."**
+2. **Dual-NIC target** — NIC 0 = narrow management/recovery plane (Shared or
+   Host-Only; **no Rustynet endpoint advertisement**; no default internet route
+   in security-evidence stages). NIC 1 = controlled scenario plane carrying all
+   Rustynet traffic on a lab-owned subnet.
+3. **Evidence ladder** — Tier 0 pure Rust → Tier 1 `crossnet_netns_v1` → **Tier 2
+   `isolated_multivm_v1` (routine default)** → Tier 3 `dedicated_physical_lab_v1`
+   → Tier 4 `remote_wild_v1`. **No lower tier may be promoted into a higher
+   tier's claim.**
+4. **Mutation boundary** — attachments change ONLY via the typed
+   `vm-lab-network-prepare` / `-restore` transaction (`--approve-reconfigure`,
+   atomic lease, stopped-VM-only, verified rollback).
+5. **Address plan** — mesh overlay `100.64.0.0/10`; scenario sites
+   `172.20.0.0/16`; simulated transit `198.18.0.0/15`. Underlay use of
+   `100.64.0.0/10` is **reserved for the deliberate `cgnat_collision_v1`
+   adversarial profile with its own oracle**. Never auto-bridge to `en0`.
+
+ADR-004's Context names the exact failure mode this plan must not reintroduce:
+run meaning depending on *"the selected VM, the current physical LAN, **host VPN
+state**, and prior MCP actions."*
+
+### 6.5.2 🚨 VERIFIED DEFECT — Tailscale collides with the Rustynet overlay
+
+**Tailscale hands out `100.64.0.0/10` addresses — byte-for-byte the Rustynet mesh
+overlay.** Enabling it on the macOS host (done 2026-07-16, §6.3) put the
+orchestrator host into the `cgnat_collision_v1` condition **by accident**.
+
+Verified live on the macOS host:
+
+```
+$ netstat -rn -f inet | grep 100.64
+100.64/10          link#43        UCS       utun10        ← Tailscale claims the WHOLE /10
+$ route -n get 100.64.0.2         → interface: utun10     ← debian-headless-2's MESH IP
+$ rustynet ops vm-lab-network-audit --skip-guests
+overall_status=fail reason="8 error finding(s)"
+  [ERROR] host_route_collision (utun10): host route 100.64.0.0/10 via utun10 (VPN) overlaps mesh (100.64.0.0/10)
+  [ERROR] host_route_collision (utun10): host route 100.86.234.84/32  via utun10 (VPN) overlaps mesh
+  [ERROR] host_route_collision (utun10): host route 100.100.100.100/32 via utun10 (VPN) overlaps mesh
+  [ERROR] host_route_collision (utun10): host route 100.123.146.3/32  via utun10 (VPN) overlaps mesh
+```
+
+The guardrail already existed and worked: `network_audit.rs`
+`detect_host_route_findings` protects `mesh_overlay_cidr()` and emits an
+**error**, even annotating `(VPN)` — someone anticipated this. **Consequence: the
+network audit now FAILS on the macOS host, so enforced-profile runs are blocked
+there until this is resolved.** This is a live regression introduced by adopting
+Tailscale, not a theoretical one.
+
+Nuance worth keeping: guest↔guest mesh traffic is WireGuard **encapsulated to
+underlay endpoints** (`192.168.64.x`), so a host route for `100.64/10` does not
+obviously hijack it — the practical blast radius may be small. But ADR-004 makes
+it an **error by design**, the audit fails closed, and "probably harmless" is
+exactly the ambient-state reasoning the ADR exists to kill. Treat it as blocking.
+
+#### macOS ↔ Linux asymmetry (verified 2026-07-16) — severity differs enormously
+
+The collision is **not** symmetric across the two supported host OSes:
+
+| Host | What Tailscale installs | Rustynet mesh IP `100.64.0.2` resolves to | Practical hijack |
+| --- | --- | --- | --- |
+| **macOS** | one blanket route: `100.64/10 → utun10` | `route -n get 100.64.0.2` → **`utun10`** | **Total** — every mesh address on the host is swallowed |
+| **Linux** | per-node `/32`s only, in table 52 (`100.86.234.84 dev tailscale0`, …) | `ip route get 100.64.0.2` → **`via 10.230.76.157 dev wlp7s0`** (normal) | **None**, unless a tailnet node is assigned an address that *exactly equals* a live mesh IP |
+
+Both still fail the audit — a `/32` mathematically overlaps the `/10`, so
+`detect_host_route_findings` flags it — but the real-world danger is very
+different. On the **Linux** host the finding is close to pedantic; on **macOS**
+it is a genuine hijack. Do not treat the two hosts as equally affected.
+
+#### Why it is an ERROR and not a warning
+
+For a security product a host whose routing table hijacks the range under test
+makes evidence **ambiguous**. The case that matters: a killswitch/leak stage where
+an *untunneled* mesh packet MUST be dropped. If the host silently swallows it into
+Tailscale instead, "correctly blocked" and "leaked into a VPN" are
+indistinguishable and a green result is unearned. ADR-004 therefore reserves the
+condition for `cgnat_collision_v1` — legitimate to test, but *chosen*, not ambient.
+
+#### Escape routes — priced, with two dead ends (researched 2026-07-16)
+
+**❌ DEAD END — Headscale (and NetBird-on-Tailscale-clients).** Swapping the
+control server does **not** help, because the **Tailscale clients hardcode the
+range**. `headscale`'s own `config-example.yaml` says verbatim:
+
+> *"WARNING: These prefixes MUST be subsets of the standard Tailscale ranges: —
+> IPv4: 100.64.0.0/10 (CGNAT range) — IPv6: fd7a:115c:a1e0::/48 (Tailscale ULA
+> range)"* … *"Using ranges OUTSIDE of CGNAT/ULA is NOT supported and will cause
+> undefined behaviour."*
+
+Headscale replaces the control plane, not the client → same hardcoded `/10` route
+→ same collision. **An earlier revision of this section recommended Headscale;
+that recommendation was wrong and is retracted.**
+
+**❌ DEAD END — Tailscale "IP Pool".** Restricting assigned addresses to a subset
+does *not* narrow the installed route.
+[tailscale/tailscale#12828](https://github.com/tailscale/tailscale/issues/12828)
+("Tailscale adds a hardcoded route encompassing the whole space, even if a subset
+of IPs has been defined using the IP Pool feature") — reported 2024-07-16, **still
+open, no fix, no workaround**. This is exactly the blanket `100.64/10 → utun10`
+route measured on the Mac.
+
+| Option | Cost | Collision? | Notes |
+| --- | --- | --- | --- |
+| **ZeroTier** (leading candidate) | **£0** — free tier: **10 devices, 1 network, hosted controller included** | **None** — you choose the IPv4 auto-assign range (`Advanced → Managed Routes and IP Assignment`); nothing is hardcoded | Only **hosts** join the overlay (2 today), so 10 devices is ample. Different client/UX from Tailscale. Pick a range avoiding the whole ADR-004 plan **and** the lab LANs: not `100.64/10`, `172.20.0.0/16`, `198.18.0.0/15`, `192.168.121.0/24`, `192.168.64/65.x`, `10.230.76.0/24` — e.g. `10.99.0.0/24` |
+| **Tailscale IPv6-only** (`disable-ipv4` node attr, tailnet-wide or per-tag) | £0 | Probably none — no IPv4 addressing at all | **UNVERIFIED on two counts:** (1) whether the hardcoded `/10` route disappears when IPv4 is off (#12828 suggests it may be unconditional); (2) whether **IPv4 subnet routing survives** — advertising `192.168.121.0/24` is our entire guest-reach mechanism, and Tailscale's docs do not address subnet routers with IPv4 disabled. **Test before trusting.** |
+| **Toggle Tailscale** (`tailscale down` before evidence runs) | £0 | Removed while down | Zero setup — and exactly the ambient host-VPN-state trap ADR-004 exists to kill. The audit catches a forgotten toggle, but only if the audit is run. |
+| **Nebula** | VPS for the lighthouse (~£4–5/mo; Oracle free tier possible) | None — CIDR fully yours | Lightweight, but a lighthouse needs a public endpoint and it is more assembly |
+| **Plain WireGuard hub** | VPS (~£4–5/mo) | None | Total control, no NAT-traversal service, most manual |
+| **No overlay — LAN only** | £0 | None | Mac reaches the box at `10.230.76.5`; loses the cross-network property entirely |
+
+**Recommendation: ZeroTier free tier.** It is the only option that is £0, needs no
+self-hosted server, and lets you actually choose a non-colliding range. Second
+choice: keep Tailscale but **only on the Linux box** (where the collision is
+`/32`-only) and reach it over the LAN from the Mac, accepting no cross-network
+reach from the Mac.
+
+**OWNER DECISION REQUIRED.** Do not implement cross-host runs until settled —
+every run on the Mac currently audits `fail`.
+
+### 6.5.3 The provisioned guest violates the dual-NIC target
+
+`linux-x86-client-1` has **one NIC** on libvirt NAT (`192.168.121.137`), serving
+as management *and* would-be scenario plane. ADR-004 §2 requires NIC 0
+management + NIC 1 scenario-on-a-lab-owned-subnet, and `192.168.121.0/24` is
+**not in the address plan** (scenario sites are `172.20.0.0/16`). So the current
+guest is a valid *management-plane* node and **not** a valid dataplane-evidence
+node. `provision_guest.sh` must grow a second NIC on a `172.20.0.0/16` site
+subnet before any dataplane claim.
+
+### 6.5.4 Corrections to earlier assumptions (checked, not assumed)
+
+- **Bootstrap is NOT same-LAN-only.** `RustynetDataplaneExecutionPlan` §2.5: a
+  new device bootstraps *"from any network where the home server is reachable …
+  any network that has cone-type NAT and outbound UDP allowed."* Same-LAN is the
+  **fallback** when both ends are symmetric-NAT. So Mac-NAT ↔ libvirt-NAT guests
+  meshing is a **supported, and more realistic, topology** — not a blocker.
+- **Cross-host is an asset, not a problem.** Today's single-host fleet is all on
+  `192.168.64.x` (one L2 segment, no NAT boundary). Mac-NAT ↔ Ubuntu-NAT is a
+  genuine two-NAT hole-punching topology — closer to what D2–D13 wants to prove.
+  It needs a mutually-reachable anchor for gossip/rendezvous.
+- **`full_tunnel_vpn_suspected` is TRUE on this Mac** (`utun0…utun10`), contrary
+  to a split-tunnel prediction — but it is a **warning**, not an error, and does
+  not by itself stop a run.
+- **The mutation boundary has no Linux implementation.** `network_prepare` /
+  `_restore` **fail closed on non-macOS** (increment 4: "use virsh/domain XML").
+  So ADR-004's approval-gated attachment transaction — the *only* sanctioned way
+  to change a VM's network — **does not exist for libvirt hosts**. Any dual-NIC
+  work on `ubuntu-kvm-1` needs a libvirt arm of that transaction first, or it
+  bypasses the ratified boundary. **This is the biggest unimplemented gap.**
+
+### 6.5.5 Pre-existing findings surfaced (not caused here)
+
+`stale_network_group` errors for `debian-headless-4` (`lan-192.168.0.0/24` vs
+recorded `192.168.64.10`), `fedora-utm-1` (`lan-10.230.76.0/24` vs
+`192.168.64.20`), `macos-utm-1` (`lan-192.168.0.0/24` vs `192.168.65.101`) — the
+Bridged→Shared migration left stale labels. Also 4 `unmanaged_utm_vm` (CentOS,
+Rocky, Windows XP, Windows XP Harness) known to UTM but absent from inventory.
+
 ---
 
 ## 7. Networking model
+
+> **SUPERSEDED in part by ADR-004 and §6.5.** This section predates the
+> dual-plane decision; where they disagree, ADR-004 governs.
 
 For the orchestrator (running on the Mac, or on the Linux box) to reach guests
 over SSH, guests need routable IPs:
@@ -308,6 +1010,193 @@ over SSH, guests need routable IPs:
 
 ---
 
+### 6.3 Cross-machine transport — Tailscale (proven 2026-07-16)
+
+The multi-host vision ("point the orchestrator at any host, get its ready VMs,
+orchestrate across machines, across networks") needs a transport. **Ratified:
+Tailscale**, carrying the **control plane only**.
+
+**Rejected: Rustynet itself.** It is the system under test; a control plane that
+rides it dies exactly when the lab breaks it (killswitch, DNS fail-closed, exit
+NAT teardown, chaos stages). Precedent: the G9 killswitch lockout runbook and
+`probe_and_recover_local_utm.sh` already exist for guests that fenced themselves
+off. The harness must survive the failure of what it tests. Dogfooding is fine —
+not for the channel you need most when Rustynet is down.
+
+**Control plane vs data plane — do not blur.** Tailscale carries orchestration
+(Mac→host `virsh`; Mac→guest SSH). Rustynet's guest-to-guest mesh must **not**
+ride the tailnet: guests reachable only via a SNAT'd WireGuard overlay make every
+path look like a well-behaved NAT'd LAN, so STUN/ICE/traversal/relay results
+(D2–D13, `CrossNetworkSubstrateIntegrationSpec`) would be measuring Rustynet over
+a VPN and prove nothing. Real topology stays on the data plane.
+
+Proven live from the macOS host, 2026-07-16:
+
+| Step | Result |
+| --- | --- |
+| Host on tailnet | `ubuntu-kvm-1` / MagicDNS `ubuntu-headless.tail3413b7.ts.net` @ `100.117.1.47` |
+| Path | `active; direct 10.230.76.5:41641` (direct WireGuard, not DERP); `netcheck` UDP:true |
+| Subnet route | `192.168.121.0/24` advertised **and approved** → guests reachable tailnet-wide |
+| Mac → guest | `REACHED: linux-x86-client-1` @ `192.168.121.137` from the Mac, across the tailnet |
+| Mac → host virsh | `virsh list --all` + `domifaddr` driven remotely over SSH, unattended |
+
+**Guest subnet renumbered per host.** Every libvirt host ships the same default
+`192.168.122.0/24`, which collides the moment two hosts advertise routes to one
+tailnet. This host is now **`192.168.121.0/24`** (`host_id: ubuntu-kvm-1`); record
+`guest_subnet` per host in `hosts[]` and allocate a distinct /24 to each new host.
+
+> **GOTCHA — Tailscale SSH is incompatible with unattended orchestration.**
+> `tailscale set --ssh` makes tailscaled intercept **port 22 for all tailnet
+> traffic**, so key-auth never reaches real `sshd`. With the default policy rule
+> (`action: "check"`) every session demands an interactive browser re-auth —
+> an orchestrator hangs forever on a check nobody clicks. Proven on the box:
+> `nc 10.230.76.5 22` → `SSH-2.0-OpenSSH_9.6p1 Ubuntu` but `nc 100.117.1.47 22`
+> → `SSH-2.0-Tailscale`. **Resolution: Tailscale SSH OFF** (`tailscale set
+> --ssh=false`); tailnet `:22` falls through to real `sshd`, and key auth works
+> cross-network — which is what §5 mandates anyway (key-auth,
+> `StrictHostKeyChecking=yes`, pinned `known_hosts`). Tailscale supplies
+> *addressing*, not authentication. (`action: "accept"` would also unblock it,
+> at the cost of pinning Tailscale's host key instead of sshd's and making lab
+> SSH depend on the policy file.)
+
+**Known network defect (not ours):** this network blackholes
+**`pkgs.tailscale.com`** — TCP connects and TLS verifies, but zero bytes return
+on every CloudFront edge, over HTTP and HTTPS. `tailscale.com`,
+`login.tailscale.com`, `controlplane.tailscale.com`, GitHub, Google and the
+Debian/Ubuntu mirrors are all fine, and both the Mac and the box are affected
+identically → it is the shared gateway `10.230.76.157`, not the host. Tailscale
+was therefore **built from upstream source** (`GOTOOLCHAIN=auto go install
+tailscale.com/cmd/tailscale{,d}@latest`, checksum-verified via `sum.golang.org`).
+Consequence: **this install does not auto-update via `apt`**. A deliberate
+anti-VPN policy would have blocked `controlplane.tailscale.com` (the endpoint
+that makes Tailscale work), so this reads as a broken CDN route, not a rule.
+
+**DEFERRED RISK — tailnet ACLs are allow-all.** The lab host joined an existing
+personal tailnet shared with other (owner-trusted, non-technical) devices, and
+Tailscale defaults to allow-all between nodes; the approved subnet route now also
+exposes **lab guests**. Owner accepted this 2026-07-16 on the basis that the
+tailnet is private and trusted. Revisit (`tag:lab` + a restricting ACL, or a
+separate lab tailnet) before the lab carries anything sensitive — a host that
+deliberately enters broken security states is a poor neighbour. Also recommended:
+**disable key expiry** on the headless node, or its node key expires (~180 days)
+and a keyboard-less host silently drops off the tailnet.
+
+---
+
+### 6.4 `hosts[]` + host discovery — implemented 2026-07-16
+
+The multi-host surface is command-driven, not operator-driven: a second machine
+joins the lab by editing one record and calling one command.
+
+**Inventory `hosts[]`** (optional; absent ⇒ every pre-existing inventory still
+loads unchanged):
+
+```jsonc
+"hosts": [
+  { "host_id": "mac-utm-1",    "kind": "local_utm" },
+  { "host_id": "ubuntu-kvm-1", "kind": "libvirt",
+    "connect_uri": "qemu+ssh://ubuntu-server@ubuntu-headless/system",
+    "guest_subnet": "192.168.121.0/24" }
+],
+"entries": [
+  { "alias": "linux-x86-client-1", "ssh_target": "192.168.121.137",
+    "controller": { "type": "libvirt", "domain": "linux-x86-client-1",
+                    "host_id": "ubuntu-kvm-1" } }
+]
+```
+
+`host_id` resolves to `connect_uri` **at parse time**
+(`load_inventory_with_hosts` → `parse_hosts` → `parse_controller`), so the
+runtime `VmController::Libvirt { domain, connect_uri }` is unchanged and no
+downstream call site was touched. Re-pointing a host (LAN IP → tailnet name,
+local → remote) is now a **one-record edit**, not a per-guest edit.
+
+Fail-closed rules, each with a test:
+- unknown `host_id` → error (never a silent fall back to `qemu:///system`, which
+  would drive the **wrong machine**)
+- `host_id` naming a `local_utm` host from a libvirt controller → error
+- both `host_id` and inline `connect_uri` → error (ambiguous precedence)
+- duplicate `host_id` → error; malformed `guest_subnet` → error (a typo must not
+  silently overlap another host's subnet)
+
+**Discovery:** `ops vm-lab-discover-hosts [--inventory <path>] [--host <host_id>]
+[--virsh-path <path>] [--timeout-secs <n>] [--format table|json] [--report-dir <path>]`
+
+Read-only. Per declared host it runs a **capability probe** (`virsh version` →
+the hypervisor identity, verifying the *declared* kind rather than sniffing the
+OS), then `virsh list --all --name`, then per domain `domstate` and — only when
+running — the existing increment-3 IP ladder. Output joins each domain to its
+inventory alias; unregistered domains are **reported, not hidden** (you cannot
+adopt what you cannot see). `ready = running && ip.is_some()` — running-without-IP
+is deliberately not ready, because the SSH plane would have nowhere to connect.
+An unreachable/wrong-kind host reports `probe=FAILED` and contributes no guests,
+rather than a silent empty list ("no VMs" must not look like "could not ask").
+`--format json` and `--report-dir` make it machine-consumable.
+
+**macOS is a first-class host kind, not a stub.** `local_utm` hosts **delegate**
+to `execute_ops_vm_lab_discover_local_utm` and normalise its report into the same
+cross-host shape — one hardened macOS path (§3), no second/weaker scan. So one
+command answers "what VMs does this machine have, and which are ready" for **both**
+supported host OSes identically. Scope is Linux + macOS by owner decision
+(2026-07-16); a Windows *host* driver is explicitly out of scope (Windows remains
+a lab **guest**).
+
+`utm_documents_roots` is a **list**, because the Mac fleet is split across roots:
+`Windows11.utm` lives under the UTM container path while the rest live under
+`~/Desktop/OS_images/UTM images`. Scanning one root silently loses the other
+(observed: 9 domains vs 10, `windows-utm-1` invisible). Every declared root is
+scanned and merged, deduped by domain; if **no** root scans cleanly the host
+fails closed, and a partial failure is surfaced as `[PARTIAL: …]` rather than
+swallowed. Declaring the roots here also retires the recurring
+`--utm-documents-root` footgun — forgetting that flag made a run discover almost
+nothing *and look like it worked*.
+
+Both kinds apply the same **IP-gated-on-running** rule: a stale ARP / last-known
+address for a stopped VM is never reported as live (observed and fixed: `macOS`
+was showing `192.168.65.101` while shut off).
+
+Proven live — one command, both machines:
+
+```
+host mac-utm-1 kind=local_utm endpoint=/Users/iwan/Desktop/OS_images/UTM images,
+     /Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents probe=ok (UTM bundle scan)
+  DOMAIN               STATE      IP                ALIAS               READY
+  CentOS               shut off   -                 (unregistered)      no
+  Fedora               running    192.168.64.20     fedora-utm-1        yes
+  Windows11            shut off   -                 windows-utm-1       no
+  debian-headless-2    running    192.168.64.4      debian-headless-2   yes
+  …
+  10 domain(s), 5 ready
+host ubuntu-kvm-1 kind=libvirt endpoint=qemu+ssh://ubuntu-server@ubuntu-headless/system
+                  guest_subnet=192.168.121.0/24 probe=ok (QEMU 8.2.2)
+  DOMAIN               STATE     IP                ALIAS               READY
+  linux-x86-client-1   running   192.168.121.137   linux-x86-client-1  yes
+  1 domain(s), 1 ready
+```
+
+> **GOTCHA — `--json` is swallowed globally.** `extract_json_flag` strips `--json`
+> from argv before any `ops` parser sees it, and only `status`/`netcheck` honour
+> it (it converts `key=value` daemon lines). So `ops <anything> --json` is a
+> silent no-op across the whole ops surface. This command therefore uses
+> **`--format table|json`**, which the interceptor does not touch.
+
+Gates: `fmt` clean; 9 new unit tests (host resolution + every fail-closed path +
+the `virsh list` parser + the ready rule); **1959 tests pass, 0 fail**. Clippy
+must be run with the **pinned** toolchain — see the toolchain note below.
+
+> **TOOLCHAIN — local clippy cannot gate this repo.** `rust-toolchain.toml` pins
+> 1.88.0, but Homebrew's cargo/clippy (1.97) shadows rustup in `PATH`, and even
+> `rustup run 1.88.0 cargo clippy` reports **clippy 0.1.97** — the documented
+> "clippy poison". 1.97 invents an `unused_imports` error in
+> `live_lab_run_matrix.rs` that **pinned clippy 0.1.88 does not flag** (verified),
+> so "fixing" it would have been wrong. **The Ubuntu host has a clean rustup
+> 1.88.0 with clippy 0.1.88** and is now the authoritative local gate runner —
+> a concrete payoff of the second host. Under it, this increment adds **zero**
+> clippy errors; the 11 `uninlined_format_args` errors it reports are all
+> pre-existing on `HEAD` in files this change never touched.
+
+---
+
 ## 8. Open decisions (owner-decision queue)
 
 1. **Is a dedicated Linux VM host actually the goal, or is the real need just a
@@ -316,16 +1205,40 @@ over SSH, guests need routable IPs:
    host, which the alternatives do not.)
 2. **Hypervisor stack for the Tier-2 driver:** libvirt/QEMU/KVM via `virsh`, or
    Proxmox (REST/`qm`)? Sets what `VmController::*` targets.
-3. **Execution locus:** orchestrator runs **on** the Linux box (driver shells out
+3. ~~**Execution locus:** orchestrator runs **on** the Linux box (driver shells out
    locally) or **on the Mac** SSHing to the Linux host to run `virsh` (driver
-   wraps every command in an SSH hop)? Decide before writing the abstraction.
+   wraps every command in an SSH hop)? Decide before writing the abstraction.~~
+   **DISSOLVED 2026-07-16 — this was a false fork.** Every libvirt call is built
+   as `virsh -c <connect_uri> …` (`mod.rs` `run_virsh_capture` /
+   `libvirt_domain_running` / `transition_libvirt_vm`), and `connect_uri` is a
+   free-form string on the controller. `qemu:///system` drives the local daemon;
+   `qemu+ssh://user@host/system` drives a remote one over libvirt's **native**
+   remote transport — no SSH-wrapping layer, no second code path. **Locus is a
+   config value, not an architecture**, so the driver is locus-agnostic and the
+   decision reduces to "where do you run the binary today". Proven live from the
+   macOS host against `ubuntu-kvm-1` over the tailnet (§6.3). Run-on-host remains
+   valid; it is no longer a constraint.
 4. **Is lifecycle management needed at all,** or is SSH-only orchestration of
    already-running guests (Tier 1, `debian-lan-11` pattern) sufficient for the
    intended use? If Tier 1 suffices, Tier 2 can be deferred indefinitely.
-5. **First-class host record** in the inventory schema (§4 Tier 2.5) — adopt now,
-   or keep implying the host via `parent_device`?
-6. **Confirm the RAM figure** (§1 hardware note) before committing to ~10 VMs.
-7. **Preserve the existing Windows install** (dual-boot to a spare drive) or wipe?
+5. ~~**First-class host record** in the inventory schema (§4 Tier 2.5) — adopt now,
+   or keep implying the host via `parent_device`?~~
+   **RESOLVED 2026-07-16 — ADOPTED and implemented (§6.4).** Guests reference a
+   machine by `host_id`, resolved to a `connect_uri` **at parse time**, so the
+   runtime `VmController` shape is unchanged and all 12 existing match sites, the
+   power layer and the discovery ladder needed no edits.
+6. ~~**Confirm the RAM figure** (§1 hardware note) before committing to ~10 VMs.~~
+   **RESOLVED 2026-07-16 — 61 GiB system RAM** measured on the live host
+   (AMD Ryzen 7 7700X, 8C/16T). Comfortable for the ~10-guest target.
+7. ~~**Preserve the existing Windows install** (dual-boot to a spare drive) or wipe?~~
+   **RESOLVED 2026-07-16 — PRESERVE. This is a HARD RULE, not a preference:**
+   the Windows 11 install (Samsung 980 NVMe, Disk 2) is **never** to be wiped,
+   reinstalled, repartitioned, or otherwise modified. The Samsung 860 EVO
+   (Disk 0, NTFS data) is likewise **out of scope**. **All VM hosting is
+   confined to the Samsung 870 EVO (Disk 1, `/dev/sdb`)** — the drive that
+   already held the prior Debian install and now runs the Ubuntu VM host.
+   Nothing outside that disk. This decision is **closed**; do not re-open it or
+   offer "wipe" as an option. See §6.1 for the enforcement rules.
 
 ---
 
@@ -384,7 +1297,7 @@ and can be sidestepped with out-of-band (cloud-init/unattend) provisioning.
 | 3 | virsh **IP discovery + readiness observation**: `resolve_libvirt_live_host` three-rung ladder — `virsh domifaddr` (lease) → `domifaddr --source arp` (bridged) → `domiflist` MACs × `ip neigh show` — candidates through the shared `select_preferred_live_ssh_ip` selector (viability, mesh-IP exclusion, last-known preference). Entry resolver generalized (`resolve_local_utm_live_host` → `resolve_controller_live_host`) so `resolved_inventory_ssh_target*` rewrites SSH hosts for libvirt entries; `observe_local_utm_target_ready` observes libvirt via `virsh domstate` + the ladder (IP deliberately gated on domain-running to keep stale neigh-cache IPs out of ready states/inventory persistence), making `--wait-ready` restart recovery work for libvirt targets. +3 parser tests. NOTE: the `execute_ops_vm_lab_discover_local_utm` bundle-scan remains UTM-only — libvirt entries rely on per-run/per-target resolution (a `virsh list --all` discovery analogue is optional follow-up). Live proof on the box pending (§ 0/6) | **DONE (code)** — gates green |
 | 4 | **runtime-OS-dispatch the host network observers** so the launch audit (which the `--node` orchestrator runs at `native.rs:1095`, host-only, and which hard-stops an *enforced*-profile run) produces real evidence on the Linux host instead of empty+`plutil`/`ifconfig`-not-found noise. `observe_host` now branches on `std::env::consts::OS`: `observe_host_macos` keeps the existing BSD-tool collectors byte-identical; new `observe_host_linux` uses iproute2 JSON (`ip -j addr`/`ip -j route`) via new pure parsers `parse_ip_json_addr`/`parse_ip_json_route` (private-IP kept, public redacted, best-effort empty on bad input) + a `linux_ip_binary()` PATH-safe resolver (guards the non-login `/usr/sbin` gap). The UTM-bundle-mutating `network_prepare`/`_restore` fail closed on non-macOS via `ensure_utm_host_for_network_mutation` (clear "use virsh/domain XML" error, not a missing-`plutil` crash; `--list` still works anywhere). +2 parser tests. KNOWN GAP: the `vpn_utun_interfaces`/`full_tunnel_vpn_suspected` heuristic stays utun-specific (won't flag a Linux WireGuard full-tunnel) — a follow-up refinement | **DONE (code)** — gates green |
 | 5 | MCP surface: branch `lab_state.rs` `alias_to_utm`/`utm_power_status`/power tools/`recover_stuck_vms` on controller kind (virsh `domstate` + a virsh recover) | TODO |
-| 0 / 6 | Linux-host build check (`cargo check … --target x86_64-unknown-linux-gnu` on the box) + interim `--trust-inventory-ready` run; then a full live `--node` run driving libvirt guests → `live_lab_run_matrix.csv` row (**the DoD**) | BLOCKED on hardware |
+| 0 / 6 | Linux-host build check (`cargo check … --target x86_64-unknown-linux-gnu` on the box) + interim `--trust-inventory-ready` run; then a full live `--node` run driving libvirt guests → `live_lab_run_matrix.csv` row (**the DoD**) | **UNBLOCKED 2026-07-16 — NEXT.** Host is live and verified (§6.1): Ryzen 7700X, 61 GiB, `kvm_amd nested = 1` already on, 427 G free on `/dev/sdb`. Not yet installed on the box: the §6 virt stack (`qemu-kvm`/`libvirt-daemon-system`/`virtinst`/`bridge-utils`/`cpu-checker`) and a Rust toolchain (run-on-host needs `cargo` to build `rustynet-cli --features vm-lab`). Gated on the §6.1 bridging blocker (`eno1` has no carrier — WiFi cannot bridge) |
 
 Increment 1 (`f3352b0`) touched `mod.rs` (enum + const `DEFAULT_LIBVIRT_CONNECT_URI`
 + parser + fail-closed arms) plus the `network_audit.rs`/`network_prepare.rs`

@@ -1,4 +1,25 @@
 {
+  "version": 1,
+  "hosts": [
+    {
+      "host_id": "mac-utm-1",
+      "kind": "local_utm",
+      "notes": "iwan's MacBook Pro; UTM guests; discovery via vm-lab-discover-local-utm",
+      "utm_documents_roots": [
+        "/Users/iwan/Desktop/OS_images/UTM images",
+        "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents"
+      ],
+      "repo_dir": "/Users/iwan/Desktop/Rustynet"
+    },
+    {
+      "host_id": "ubuntu-kvm-1",
+      "kind": "libvirt",
+      "connect_uri": "qemu+ssh://ubuntu-server@ubuntu-headless/system",
+      "guest_subnet": "192.168.121.0/24",
+      "notes": "AMD Ryzen 7 7700X, 61GiB, nested virt on; reached over tailnet (100.117.1.47)",
+      "repo_dir": "/home/ubuntu-server/Rustynet"
+    }
+  ],
   "entries": [
     {
       "alias": "debian-headless-2",
@@ -213,7 +234,26 @@
       "ssh_password": "password",
       "ssh_target": "192.168.64.105",
       "ssh_user": "rocky"
+    },
+    {
+      "alias": "linux-x86-client-1",
+      "include_in_all": false,
+      "ssh_target": "192.168.121.137",
+      "ssh_user": "debian",
+      "os": "Debian GNU/Linux 13 (trixie) (x86_64)",
+      "platform": "linux",
+      "last_known_ip": "192.168.121.137",
+      "last_known_network": "192.168.121.0/24",
+      "network_group": "libvirt-192.168.121.0/24",
+      "node_id": "linux-x86-client-1",
+      "lab_role": "linux_client",
+      "parent_device": "ubuntu-kvm-1 (x86_64 KVM host)",
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "libvirt",
+        "domain": "linux-x86-client-1",
+        "host_id": "ubuntu-kvm-1"
+      }
     }
-  ],
-  "version": 1
+  ]
 }
