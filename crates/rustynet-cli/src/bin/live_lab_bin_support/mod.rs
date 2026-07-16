@@ -1292,7 +1292,9 @@ pub fn status(identity: &Path, known_hosts: &Path, target: &str) -> Result<Strin
         identity,
         known_hosts,
         target,
-        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status",
+        &format!(
+            "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock {REMOTE_RUSTYNET_BIN} status"
+        ),
     )
 }
 
@@ -1321,7 +1323,9 @@ pub fn capture_daemon_status_for_platform(
             identity,
             known_hosts,
             target,
-            "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status",
+            &format!(
+                "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock {REMOTE_RUSTYNET_BIN} status"
+            ),
         ),
         "macos" | "darwin" => capture_root(
             identity,
@@ -1335,7 +1339,9 @@ pub fn capture_daemon_status_for_platform(
             // not the IPC socket dir — first Phase 13 commit had
             // that wrong and every macOS status capture would have
             // failed to connect.
-            "env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock rustynet status",
+            &format!(
+                "env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock {REMOTE_RUSTYNET_BIN} status"
+            ),
         ),
         "windows" | "win32" => {
             // Use `if (-not (Get-Command ...))` so a missing
@@ -1995,30 +2001,55 @@ port 22
     /// needle is built at runtime so this detector's own source cannot match
     /// itself.
     fn bare_rustynet_invocation(line: &str) -> bool {
-        // Subcommand vocabulary: the token must actually start a rustynet
-        // invocation, not merely appear in prose or a path.
+        // The CLI's top-level verb vocabulary, taken verbatim from the
+        // binary's own usage banner rather than guessed:
         //
-        // Keep this list complete for the verbs that appear in REMOTE command
-        // strings. An omission is not a harmless gap — it is a silent hole:
-        // `route` was missing, so `rustynet route advertise 0.0.0.0/0` sailed
-        // past a green detector and then failed on Rocky with
-        // `env: 'rustynet': No such file or directory` (status 127), because
-        // root's login PATH there excludes /usr/local/bin while Debian's
-        // includes it.
-        const SUBCOMMANDS: [&str; 13] = [
-            "ops",
-            "state",
-            "role",
-            "assignment",
-            "trust",
-            "membership",
-            "key",
+        //     ./target/debug/rustynet-cli 2>&1 | grep -E '^  [a-z][a-z-]+' \
+        //       | awk '{print $1}' | sort -u
+        //
+        // An omission here is not a harmless gap, it is a silent hole, and a
+        // hand-written list has already leaked this bug THREE times: `route`
+        // missing let `rustynet route advertise` through (Rocky: `env:
+        // 'rustynet': No such file or directory`, status 127), and `status`
+        // missing let the shared `status()` helper through the same way. Both
+        // passed a green detector. Derive the list; do not curate it.
+        //
+        // `anchor` is retained though absent from the default banner: it is
+        // used in remote commands and gated behind a feature.
+        const SUBCOMMANDS: &[&str] = &[
             "anchor",
-            "route",
+            "assignment",
+            "bandwidth",
+            "config",
+            "connectivity-test",
+            "debug",
             "dns",
+            "dns-test",
+            "doctor",
             "exit-node",
+            "exit-node-list",
+            "info",
+            "install",
+            "key",
             "lan-access",
+            "llm",
+            "login",
+            "logs",
+            "membership",
+            "metrics",
+            "netcheck",
+            "operator",
+            "ops",
+            "peer-list",
+            "peer-stats",
+            "role",
+            "route",
+            "state",
+            "status",
             "traversal",
+            "trust",
+            "tunnel-info",
+            "version",
         ];
         let needle = ["rusty", "net "].concat();
         let mut from = 0usize;
@@ -2030,9 +2061,16 @@ port 22
             let preceding = (at > 0).then(|| line.as_bytes()[at - 1]);
             let not_an_invocation = matches!(preceding, Some(b'/') | Some(b'`'));
             let rest = &line[at + needle.len()..];
-            let invokes = SUBCOMMANDS
-                .iter()
-                .any(|subcommand| rest.starts_with(subcommand));
+            // The verb must end at a word boundary, so `info` cannot match
+            // "information" and `state` cannot match "statement" in prose.
+            let invokes = SUBCOMMANDS.iter().any(|subcommand| {
+                rest.strip_prefix(subcommand).is_some_and(|after| {
+                    after
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                })
+            });
             if !not_an_invocation && invokes {
                 return true;
             }

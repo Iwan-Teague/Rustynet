@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use live_chaos_support::{ChaosConfig, ChaosStage, git_head_commit, repo_root, run_category};
 use live_lab_bin_support::{
-    Logger, capture_root, ensure_pinned_known_hosts_file, ensure_safe_token,
+    Logger, REMOTE_RUSTYNET_BIN, capture_root, ensure_pinned_known_hosts_file, ensure_safe_token,
     load_home_known_hosts_path, shell_quote, unix_now, verify_sudo, wait_for_daemon_socket,
     write_file,
 };
@@ -537,7 +537,7 @@ keystore_empty_after="$(keystore_empty_files)"
 # on failure => parse_mesh_converged returns false (fail-closed).
 mesh_status_line=""
 if [ "$recovered" = true ]; then
-  mesh_status_line="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" rustynet status 2>/dev/null | tr '\n' ' ' | head -c 8192 || true)"
+  mesh_status_line="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {REMOTE_RUSTYNET_BIN} status 2>/dev/null | tr '\n' ' ' | head -c 8192 || true)"
 fi
 printf 'recovered=%s\n' "$recovered"
 printf 'measured_recovery_secs=%s\n' "$measured_recovery_secs"
