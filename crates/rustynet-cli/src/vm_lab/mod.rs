@@ -35081,6 +35081,7 @@ fn execute_legacy_posix_bootstrap_phase_for_target(
                 context.known_hosts_path,
                 format!(
                     "set -eu; cd {workdir}; mkdir -p {tmpdir}; \
+find crates third_party -name '*.rs' -exec touch {{}} + 2>/dev/null || true; \
 toolchain_name=''; \
 if command -v rustup >/dev/null 2>&1; then \
   toolchain_name=\"$(rustup toolchain list 2>/dev/null | awk 'NR==1 {{ print $1; exit }}' | sed 's/ (default)$//')\"; \
