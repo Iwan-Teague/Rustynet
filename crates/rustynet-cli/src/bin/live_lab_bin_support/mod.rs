@@ -58,6 +58,22 @@ const PROCESS_POLL_INTERVAL_MILLIS: u64 = 100;
 const UTM_EXEC_TIMEOUT_SECS: u64 = 120;
 const UTM_FILE_TIMEOUT_SECS: u64 = 120;
 
+/// Absolute path to the deployed `rustynet` binary on a Linux guest.
+///
+/// Every `sudo` invocation MUST name the binary by this path rather than
+/// relying on `sudo -n rustynet` resolving through PATH. `sudo` does not
+/// inherit the caller's PATH; it uses the `secure_path` from `/etc/sudoers`,
+/// and the RHEL family ships
+/// `Defaults secure_path = /sbin:/bin:/usr/sbin:/usr/bin` — which omits
+/// `/usr/local/bin`, where the lab installs `rustynet`. Debian and Ubuntu
+/// include `/usr/local/bin` in `secure_path`, so a bare `sudo -n rustynet`
+/// works there and fails ONLY on Rocky/Fedora with `sudo: rustynet: command
+/// not found`. That asymmetry hides the bug on a Debian-only topology and
+/// surfaces it as an opaque stage failure the moment a RHEL-family guest takes
+/// a role. The orchestrator's own membership adapter already hardcodes this
+/// path for the same reason (linux_membership.rs).
+pub const REMOTE_RUSTYNET_BIN: &str = "/usr/local/bin/rustynet";
+
 /// Track B dispatcher fabric — the target platform that the
 /// orchestrator picked for the live-lab stage. Bin-level entrypoints
 /// re-export this type and gate their `run()` body on it so a
@@ -1361,7 +1377,7 @@ pub fn issue_assignment_bundles_from_env(
 ) -> Result<(), String> {
     scp_to(identity, known_hosts, env_local, target, remote_env_path)?;
     let command = format!(
-        "sudo -n rustynet ops e2e-issue-assignment-bundles-from-env --env-file {}",
+        "sudo -n {REMOTE_RUSTYNET_BIN} ops e2e-issue-assignment-bundles-from-env --env-file {}",
         shell_quote(remote_env_path)
     );
     let status = ssh_status(identity, known_hosts, target, &command)?;
@@ -1394,7 +1410,7 @@ pub fn issue_traversal_bundles_from_env(
 ) -> Result<(), String> {
     scp_to(identity, known_hosts, env_local, target, remote_env_path)?;
     let command = format!(
-        "sudo -n rustynet ops e2e-issue-traversal-bundles-from-env --env-file {}",
+        "sudo -n {REMOTE_RUSTYNET_BIN} ops e2e-issue-traversal-bundles-from-env --env-file {}",
         shell_quote(remote_env_path)
     );
     let status = ssh_status(identity, known_hosts, target, &command)?;
@@ -1464,7 +1480,7 @@ pub fn enforce_host(
     ssh_allow_cidrs: &str,
 ) -> Result<(), String> {
     let command = format!(
-        "sudo -n rustynet ops e2e-enforce-host --role {} --node-id {} --src-dir {} --ssh-allow-cidrs {}",
+        "sudo -n {REMOTE_RUSTYNET_BIN} ops e2e-enforce-host --role {} --node-id {} --src-dir {} --ssh-allow-cidrs {}",
         shell_quote(role),
         shell_quote(node_id),
         shell_quote(src_dir),
@@ -1960,6 +1976,70 @@ port 22
         assert!(
             scp_args.iter().any(|arg| arg == "UpdateHostKeys=no"),
             "scp must not mutate the seeded known_hosts file"
+        );
+    }
+
+    /// `sudo` resolves the command through `secure_path` from `/etc/sudoers`,
+    /// NOT the caller's PATH. The RHEL family ships
+    /// `Defaults secure_path = /sbin:/bin:/usr/sbin:/usr/bin`, which omits
+    /// `/usr/local/bin` where the lab installs the binary, while Debian and
+    /// Ubuntu include it. So a bare `sudo -n rustynet` passes on Debian and
+    /// fails on Rocky/Fedora with `sudo: rustynet: command not found` —
+    /// invisible on a Debian-only topology, and surfacing only as an opaque
+    /// stage failure once a RHEL-family guest takes a role (it cost a full
+    /// live-lab cycle on the two-hop entry node). Scan the source so a new
+    /// call site cannot reintroduce the whole class.
+    #[test]
+    fn sudo_invocations_name_the_rustynet_binary_by_absolute_path() {
+        assert!(
+            super::REMOTE_RUSTYNET_BIN.starts_with('/'),
+            "the remote binary must be an absolute path, got {:?}",
+            super::REMOTE_RUSTYNET_BIN
+        );
+        let root = super::repo_root().expect("repo root");
+        let bin_dir = root.join("crates/rustynet-cli/src/bin");
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        // The bare form is `sudo` + optional flags + the unqualified binary
+        // name. Build the needles at runtime so this detector's own source
+        // does not match itself.
+        let bare = ["sudo", "-n", "rustynet "].join(" ");
+        let bare_no_flag = ["sudo", "rustynet "].join(" ");
+        let mut scan = |path: &std::path::Path| {
+            let Ok(body) = std::fs::read_to_string(path) else {
+                return;
+            };
+            scanned += 1;
+            // Production code only: a test may legitimately name the bare form
+            // in a fixture or an assertion message.
+            let production = body.split("#[cfg(test)]").next().unwrap_or(&body);
+            for (index, line) in production.lines().enumerate() {
+                // Only the bare, PATH-dependent form is a defect; an absolute
+                // path (or a `{}`/`{VAR}` placeholder fed one) is correct.
+                if line.contains(bare.as_str()) || line.contains(bare_no_flag.as_str()) {
+                    offenders.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+                }
+            }
+        };
+        scan(bin_dir.join("live_lab_bin_support/mod.rs").as_path());
+        if let Ok(entries) = std::fs::read_dir(bin_dir.as_path()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "rs") {
+                    scan(path.as_path());
+                }
+            }
+        }
+        assert!(
+            scanned > 0,
+            "scanned no sources; the bin directory layout moved: {}",
+            bin_dir.display()
+        );
+        assert!(
+            offenders.is_empty(),
+            "sudo must name the binary by absolute path (REMOTE_RUSTYNET_BIN); \
+             a bare `sudo -n rustynet` fails on Rocky/Fedora secure_path:\n{}",
+            offenders.join("\n")
         );
     }
 }

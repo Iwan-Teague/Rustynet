@@ -1520,7 +1520,8 @@ fn issue_dns_zone_bundles_from_env(
 ) -> Result<(), String> {
     scp_to(identity, known_hosts, env_local, target, remote_env_path)?;
     let command = format!(
-        "sudo -n rustynet ops e2e-issue-dns-zone-bundles-from-env --env-file {}",
+        "sudo -n {} ops e2e-issue-dns-zone-bundles-from-env --env-file {}",
+        live_lab_support::REMOTE_RUSTYNET_BIN,
         shell_quote(remote_env_path)
     );
     let status = ssh_status(identity, known_hosts, target, &command)?;
