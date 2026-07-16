@@ -1997,7 +1997,15 @@ port 22
     fn bare_rustynet_invocation(line: &str) -> bool {
         // Subcommand vocabulary: the token must actually start a rustynet
         // invocation, not merely appear in prose or a path.
-        const SUBCOMMANDS: [&str; 8] = [
+        //
+        // Keep this list complete for the verbs that appear in REMOTE command
+        // strings. An omission is not a harmless gap — it is a silent hole:
+        // `route` was missing, so `rustynet route advertise 0.0.0.0/0` sailed
+        // past a green detector and then failed on Rocky with
+        // `env: 'rustynet': No such file or directory` (status 127), because
+        // root's login PATH there excludes /usr/local/bin while Debian's
+        // includes it.
+        const SUBCOMMANDS: [&str; 13] = [
             "ops",
             "state",
             "role",
@@ -2006,6 +2014,11 @@ port 22
             "membership",
             "key",
             "anchor",
+            "route",
+            "dns",
+            "exit-node",
+            "lan-access",
+            "traversal",
         ];
         let needle = ["rusty", "net "].concat();
         let mut from = 0usize;
