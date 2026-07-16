@@ -131,7 +131,7 @@ fn run() -> Result<(), String> {
         ],
     )?;
     let current_exit_node = parse_status_field(&client_status_before, "exit_node")
-        .ok_or_else(|| "unable to parse exit_node from client rustynet status".to_owned())?;
+        .ok_or_else(|| "unable to parse exit_node from the client daemon status".to_owned())?;
     logger.line(
         format!(
             "[managed-dns] client runtime exit selection before bundle refresh: exit_node={current_exit_node}"

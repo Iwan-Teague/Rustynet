@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 
 use live_chaos_support::{ChaosConfig, ChaosStage, git_head_commit, repo_root, run_category};
 use live_lab_bin_support::{
-    Logger, capture_root, ensure_pinned_known_hosts_file, ensure_safe_token,
+    Logger, REMOTE_RUSTYNET_BIN, capture_root, ensure_pinned_known_hosts_file, ensure_safe_token,
     load_home_known_hosts_path, shell_quote, unix_now, verify_sudo, wait_for_daemon_socket,
     write_file,
 };
@@ -462,7 +462,7 @@ printf 'faketime_lib_present=true\n'
 systemctl is-active --quiet "$service" || {{ printf 'baseline_service_active=false\n'; exit 1; }}
 test -S "$socket_path" || {{ printf 'baseline_socket_present=false\n'; exit 1; }}
 status_field() {{
-  env RUSTYNET_DAEMON_SOCKET="$socket_path" rustynet status 2>/dev/null \
+  env RUSTYNET_DAEMON_SOCKET="$socket_path" {REMOTE_RUSTYNET_BIN} status 2>/dev/null \
     | tr ' ' '\n' \
     | awk -F= -v k="$1" '$1==k {{ print $2; exit }}'
 }}

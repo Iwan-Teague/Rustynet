@@ -148,7 +148,7 @@ fn run() -> Result<(), String> {
         )
         .map_err(|err| {
             format!(
-                "rustynet status capture failed for {} ({}): {err}",
+                "daemon status capture failed for {} ({}): {err}",
                 host.label,
                 host.platform.as_str()
             )
