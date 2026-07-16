@@ -779,7 +779,31 @@ from the new SHA is what catches it — that is the argument *for* the loop.
 work out what differs" to "read one verdict". Today step 6 is the only step still
 requiring judgement; this removes it.
 
-#### The schema gap that must be closed first
+> **⚠️ REVISED 2026-07-16 — there is NO schema gap; build on the STAGE ledger.**
+> The section below was written against `live_lab_node_run_matrix.csv` (266 cols,
+> per-**run** rows, no host column). But the sibling ledger
+> **`live_lab_node_stage_results.csv` is already normalised**:
+> ```
+> run_id, run_started_utc, run_finished_utc, git_commit, git_dirty_state, report_dir,
+> alias, node_id, platform, os_family, os_version, role, stage, stage_scope, status,
+> evidence_path, error_detail
+> ```
+> One row per **stage per node**, carrying `alias`, `platform`, `role`, `stage`,
+> `status`. And **`alias` → `host_id` is a join through the inventory**
+> (`entries[].controller.host_id`; aliases are uniqueness-enforced by
+> `load_inventory`), so a stage result **can already be attributed to a machine**.
+>
+> **Therefore: do NOT add `runner_hostname`/`host_id` columns.** Besides being
+> unnecessary, `live_lab_run_matrix.rs:801` enforces an exact header
+> (`if header != NODE_STAGE_COLUMNS.join(",")`), so widening the schema would
+> invalidate every existing file. Build compare on the stage ledger + the inventory
+> join, and leave both schemas untouched.
+>
+> Caveat: a controller-less entry (e.g. `debian-lan-11`, the SSH-only off-host
+> guest) joins to **no host** — report it as `host=<unattributed>`, never silently
+> bucket it under a machine it does not belong to.
+
+#### The schema gap that must be closed first (SUPERSEDED — see the note above)
 
 Verified 2026-07-16 against `live_lab_node_run_matrix.csv`:
 
