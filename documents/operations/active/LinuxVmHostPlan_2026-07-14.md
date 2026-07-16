@@ -794,10 +794,21 @@ naming exactly the five nodes.
 that ran it**. The Mac's ledger therefore **cannot see the box's runs**, and vice
 versa. Two consequences, both load-bearing:
 
-**1. `vm-lab-run-matrix-compare` only sees the ledger it is pointed at.** For a
-genuine two-machine comparison the box's rows must be fetched first
-(`vm-lab-host-run-status`, below) or `--stage-results` aimed at a merged file.
-Compare is not wrong — it just cannot invent rows it was never shown.
+**1. `vm-lab-run-matrix-compare` only sees the ledger it is pointed at — CLOSED
+2026-07-16 via `--include-hosts`.** Each machine writes to its own ledger, so
+without fetching the remote one a "two-machine comparison" would silently examine
+**one** machine: a confident verdict over half the evidence, which is the worst
+failure this command could have. `--include-hosts <id,id>` (MCP: `include_hosts`)
+fetches each named host's ledger over SSH and merges it, deduping identical rows.
+
+Fail-closed, verified: an unknown host errors; naming the **local** host errors
+(`its ledger is already the one being read` — a mistake, not a no-op); and a host
+that **cannot be read** errors rather than comparing without it —
+*"a verdict over half the evidence is worse than no verdict."* Observed live with
+the box offline.
+
+**Until a run is launched on the box, this is untested end-to-end** — the merge
+path itself is proven only by its failure modes.
 
 **2. 🚨 `vm-lab-sync-host` was silently destroying that evidence — FIXED
 2026-07-16.** The ledgers are **git-tracked**, so a box-side run leaves the box's
@@ -998,6 +1009,22 @@ case is the overlap — which is precisely what conflict detection surfaces.
 Depends on: the `runner_hostname` / `host_id` columns above. Without them the
 compare works (rows are keyed by commit) but cannot say **which machine** produced
 a result — so it can report *what* differs, not *where*. Close the schema gap first.
+
+### 6.7.4f Remaining gaps in the agent-facing surface (2026-07-16)
+
+Audited against the pipeline. What an agent still cannot do by calling a function:
+
+| Gap | Why it matters | Status |
+| --- | --- | --- |
+| **Launch a run ON a remote host** (step 5) | `start_live_lab_run` / `vm-lab-orchestrate-live-lab` run **locally only** — none takes a `--host`. So the parallel-lab loop's central action is still a manual SSH. **This is the biggest remaining hole.** Needs: detached launch on the host (own process group, log file, survives the SSH dropping — the pattern already used for `nohup setsid` runs), returning a run_id to poll with `host_run_status`. | **NOT BUILT** |
+| **Fetch a report artifact from a host** | `host_run_status` hands back a `report_dir` on the box, but nothing can read files out of it, so drilling into a failure still means logging in. | **NOT BUILT** |
+| **Stop a runaway remote run** | No way to cancel a hung box-side run. | **NOT BUILT** |
+| `host_disk_status --host <id>` | Always reports **this** machine's disk (§6.8.1a). With six images + qcow2 overlays accruing, "how much room is left on the 870?" is a real question. | **NOT BUILT** |
+| `sync_host --all` | Pipeline step 2 is per-host; syncing every declared host in one call is a small ergonomic win. | **NOT BUILT** |
+
+Deliberately **not** doing: a function per stage (~36 wrappers that drift from the
+catalogue — `--stage` covers it, §6.7.4e), and a libvirt `recover_stuck_vms`
+(§6.8.2's delegation would subsume it — do not build it twice).
 
 ### 6.7.5 Prerequisites before A can run
 

@@ -4142,6 +4142,7 @@ impl McpServer for LabStateServer {
                         "expect_runs": {"type": "integer", "description": "Minimum runs required. Default 2 — one machine reporting is not agreement."},
                         "allow_dirty": {"type": "boolean", "description": "Compare runs whose worktree was dirty (their evidence does not match the commit it names)."},
                         "stage": {"type": "string", "description": "Restrict to stages whose name CONTAINS this — 'how did THIS stage do across both machines?'."},
+                        "include_hosts": {"type": "string", "description": "Comma-separated remote host_ids whose ledgers should be FETCHED and merged. REQUIRED for a genuine cross-machine comparison: each machine writes results to its OWN ledger, so without this you are comparing only the local one. If a named host cannot be read it errors rather than quietly comparing half the evidence."},
                         "format": {"type": "string", "enum": ["table", "json"]}
                     }),
                     vec![],
@@ -4781,6 +4782,12 @@ impl McpServer for LabStateServer {
                     stage_owned = stage.to_owned();
                     extra.push("--stage");
                     extra.push(&stage_owned);
+                }
+                let include_owned;
+                if let Some(hosts) = arg_str(args, "include_hosts") {
+                    include_owned = hosts.to_owned();
+                    extra.push("--include-hosts");
+                    extra.push(&include_owned);
                 }
                 let format_owned;
                 if let Some(format) = arg_str(args, "format") {

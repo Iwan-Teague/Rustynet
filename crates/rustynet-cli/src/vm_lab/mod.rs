@@ -180,6 +180,17 @@ pub struct VmLabRunMatrixCompareConfig {
     /// Restrict to stages whose name contains this (case-insensitive substring) —
     /// "how did THIS stage do across both machines?".
     pub stage: Option<String>,
+    /// Also fetch these hosts' ledgers over SSH and merge them in.
+    ///
+    /// **Required for a genuine cross-machine comparison.** Each machine writes its
+    /// results to its OWN `<repo_dir>/documents/operations/live_lab_node_stage_results.csv`,
+    /// so without this compare only ever sees the ledger it was pointed at — and a
+    /// two-machine comparison that silently examined one machine would be the worst
+    /// possible failure: a confident verdict over half the evidence.
+    pub include_hosts: Vec<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
     pub json: bool,
 }
 
@@ -3866,7 +3877,57 @@ pub fn execute_ops_vm_lab_run_matrix_compare(
     };
 
     let commit = git_resolve_ref(config.commit.as_deref().unwrap_or("HEAD"))?;
-    let rows = crate::live_lab_run_matrix::read_stage_result_rows(ledger_path.as_path())?;
+    let mut rows = crate::live_lab_run_matrix::read_stage_result_rows(ledger_path.as_path())?;
+
+    // Merge each requested host's OWN ledger. Fail closed: if a host was asked for
+    // and cannot be read, stop — silently comparing without it would present a
+    // verdict over half the evidence as though it were whole.
+    if !config.include_hosts.is_empty() {
+        let (_e, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+        let timeout = timeout_or_default(config.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
+        let ssh = VmLabSyncHostConfig {
+            ssh_identity_file: config.ssh_identity_file.clone(),
+            known_hosts_path: config.known_hosts_path.clone(),
+            ..VmLabSyncHostConfig::default()
+        };
+        for host_id in &config.include_hosts {
+            let host = hosts
+                .iter()
+                .find(|host| &host.host_id == host_id)
+                .ok_or_else(|| format!("unknown host_id: {host_id}"))?;
+            let endpoint = host.ssh_endpoint().ok_or_else(|| {
+                format!("host {host_id} is local; its ledger is already the one being read")
+            })?;
+            let repo_dir = host
+                .repo_dir
+                .as_ref()
+                .ok_or_else(|| format!("host {host_id} has no repo_dir declared"))?
+                .display()
+                .to_string();
+            let remote_ledger =
+                format!("{repo_dir}/documents/operations/live_lab_node_stage_results.csv");
+            let body = run_host_cmd(
+                endpoint.as_str(),
+                &["cat", remote_ledger.as_str()],
+                &ssh,
+                timeout,
+            )
+            .map_err(|err| {
+                format!(
+                    "host {host_id}: cannot read its ledger ({remote_ledger}): {err}.                      Refusing to compare without it — a verdict over half the evidence is worse                      than no verdict."
+                )
+            })?;
+            let mut remote = crate::live_lab_run_matrix::parse_stage_result_csv(body.as_str())
+                .map_err(|err| format!("host {host_id}: ledger did not parse: {err}"))?;
+            rows.append(&mut remote);
+        }
+        // The same run_id could arrive twice if a ledger is shared or copied; the
+        // rows are identical, so dedupe rather than double-count them.
+        rows.sort_by(|a, b| (&a.run_id, &a.alias, &a.stage).cmp(&(&b.run_id, &b.alias, &b.stage)));
+        rows.dedup_by(|a, b| {
+            a.run_id == b.run_id && a.alias == b.alias && a.stage == b.stage && a.status == b.status
+        });
+    }
 
     // Match on a prefix: run_ids and ledgers carry abbreviated commits in places.
     let matching: Vec<_> = rows
