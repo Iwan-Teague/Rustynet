@@ -909,6 +909,54 @@ impl LabStateServer {
     }
 
     /// Resolve an inventory alias → (utm_name, platform, ip, ssh_port).
+    /// The precise reason an alias did not resolve to a UTM controller.
+    ///
+    /// `alias_to_utm` returns `None` both when the alias is absent AND when it is
+    /// present but backed by a non-UTM controller (libvirt has no `utm_name`).
+    /// Reporting the second case as "not in inventory" is a **lie** that sends an
+    /// operator hunting a phantom inventory bug, so the two are told apart here.
+    ///
+    /// These tools are UTM-only by construction (they drive `utmctl`). The
+    /// controller-aware path is the CLI — `ops vm-lab-start|stop|restart` already
+    /// dispatch per controller (LinuxVmHostPlan §11 increment 2) — so the error
+    /// points there rather than inviting a second, weaker virsh implementation
+    /// inside the MCP (§3: one hardened path per workflow).
+    fn utm_resolution_error(&self, alias: &str) -> String {
+        let Ok(body) = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)) else {
+            return format!("Unknown alias '{alias}' (inventory unreadable)");
+        };
+        let Ok(inv) = serde_json::from_str::<Value>(&body) else {
+            return format!("Unknown alias '{alias}' (inventory unparseable)");
+        };
+        let entry = inv
+            .get("entries")
+            .and_then(|entries| entries.as_array())
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.get("alias").and_then(|v| v.as_str()) == Some(alias))
+            });
+        let Some(entry) = entry else {
+            return format!("Unknown alias '{alias}' (not in inventory)");
+        };
+        let kind = entry
+            .get("controller")
+            .and_then(|controller| controller.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("<none>");
+        let host = entry
+            .get("controller")
+            .and_then(|controller| controller.get("host_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unset>");
+        format!(
+            "alias '{alias}' IS in the inventory but is not UTM-backed (controller.type={kind}, host_id={host}). \
+             This tool drives utmctl and only serves local_utm guests. For a {kind} guest use the \
+             controller-aware CLI (`ops vm-lab-start` / `vm-lab-stop` / `vm-lab-restart`), or the \
+             discover_hosts / host_preflight tools for multi-host state."
+        )
+    }
+
     fn alias_to_utm(&self, alias: &str) -> Option<(String, String, String, u16)> {
         let s = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)).ok()?;
         let inv: Value = serde_json::from_str(&s).ok()?;
@@ -966,7 +1014,7 @@ impl LabStateServer {
             return tool_error("Missing required parameter: alias");
         }
         let Some((utm_name, _platform, ip, port)) = self.alias_to_utm(alias) else {
-            return tool_error(&format!("Unknown alias '{alias}' (not in inventory)"));
+            return tool_error(&self.utm_resolution_error(alias));
         };
         let power = self
             .utm_power_status(&utm_name)
@@ -1028,7 +1076,7 @@ impl LabStateServer {
             return tool_error("Missing required parameter: alias");
         }
         let Some((utm_name, platform, ip, port)) = self.alias_to_utm(alias) else {
-            return tool_error(&format!("Unknown alias '{alias}' (not in inventory)"));
+            return tool_error(&self.utm_resolution_error(alias));
         };
         match platform.as_str() {
             "macos" => {
@@ -1128,7 +1176,7 @@ impl LabStateServer {
             return tool_error("Missing required parameter: alias");
         }
         let Some((utm_name, platform, ip, port)) = self.alias_to_utm(alias) else {
-            return tool_error(&format!("Unknown alias '{alias}' (not in inventory)"));
+            return tool_error(&self.utm_resolution_error(alias));
         };
         match platform.as_str() {
             "macos" => {
@@ -1473,7 +1521,7 @@ impl LabStateServer {
             .iter()
             .find(|e| e.get("alias").and_then(|v| v.as_str()) == Some(alias))
         else {
-            return tool_error(&format!("Unknown alias '{alias}' (not in inventory)"));
+            return tool_error(&self.utm_resolution_error(alias));
         };
         let platform = entry
             .get("platform")
@@ -1775,7 +1823,7 @@ impl LabStateServer {
             .iter()
             .find(|e| e.get("alias").and_then(|v| v.as_str()) == Some(alias))
         else {
-            return tool_error(&format!("Unknown alias '{alias}' (not in inventory)"));
+            return tool_error(&self.utm_resolution_error(alias));
         };
         let ssh_target = entry
             .get("last_known_ip")
@@ -3988,6 +4036,49 @@ impl McpServer for LabStateServer {
                 description: "Compare the stored inventory against live discovery; flag stale IPs / unreachable hosts.".into(),
                 input_schema: json_schema_object(json!({}), vec![]),
             },
+
+            // ---- multi-host lab (LinuxVmHostPlan §6.7) --------------------
+            // The lab spans more than one MACHINE (macOS/UTM + x86-64 KVM). These
+            // three answer "are the machines comparable, and what can they run?"
+            // so a driving agent never has to remember the order or the checks.
+            Tool {
+                name: "host_preflight".into(),
+                description: "START HERE for any multi-machine run. Ordered, fail-closed gates over every declared host: inventory -> commit_pinned -> local_clean -> commit_pushed -> hosts_on_commit -> hosts_agree -> guests_ready. Stops at the first failure and NAMES THE COMMAND that fixes it; skipped gates report not_run (never assumed green). Verdict GO/NO-GO. `ops vm-lab-host-preflight`. This is the MACHINE-level gate; vm-lab-preflight (preflight_check) gates individual GUESTS — run this first, that second.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "commit": {"type": "string", "description": "Ref/SHA every host must be on. Default HEAD. Pin an explicit SHA for a multi-host comparison: this repo has concurrent sessions committing, so 'main' can resolve differently per host."},
+                        "hosts": {"type": "string", "description": "Comma-separated host_ids to check. Default: every declared host."},
+                        "allow_dirty": {"type": "boolean", "description": "Permit a dirty worktree. Off by default: a dirty tree is not reproducible from a SHA, so its evidence does not match the commit it claims."},
+                        "ssh_identity_file": {"type": "string", "description": "SSH identity for reaching remote hosts. Defaults to the lab identity."}
+                    }),
+                    vec![],
+                ),
+            },
+            Tool {
+                name: "sync_host".into(),
+                description: "Put a lab host's orchestrator source on a named commit and PROVE it by reading back that host's own `git rev-parse HEAD`. Required before a host's run evidence means anything: run provenance (git_commit/git_dirty_state) is computed by shelling out to git in each host's OWN checkout, so a host that is not really on the commit produces evidence that lies. Fetches from the public origin (no credentials) — so the commit MUST be pushed first. Refuses a dirty tree; never moves your local working tree. `ops vm-lab-sync-host`.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "host": {"type": "string", "description": "host_id from the inventory's hosts[] (e.g. ubuntu-kvm-1)."},
+                        "commit": {"type": "string", "description": "Ref/SHA to pin. Default HEAD. Must exist on origin."},
+                        "verify_only": {"type": "boolean", "description": "Assert the host's state without changing it."},
+                        "allow_dirty": {"type": "boolean"},
+                        "ssh_identity_file": {"type": "string"}
+                    }),
+                    vec!["host"],
+                ),
+            },
+            Tool {
+                name: "discover_hosts".into(),
+                description: "Point at the lab's MACHINES and get the VMs each actually has, and which are ready to join a run. Covers both host kinds uniformly: libvirt/KVM (probes `virsh version`, enumerates `virsh list --all`) and macOS/UTM (delegates to the UTM bundle scan). ready = domain running AND an IP resolved — running-without-IP is deliberately NOT ready, because the SSH plane would have nowhere to connect. Unregistered VMs are reported, not hidden. An unreachable host reports probe=FAILED and contributes no guests, so 'no VMs' never looks like 'could not ask'. `ops vm-lab-discover-hosts`.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "host": {"type": "string", "description": "Restrict to one host_id. Default: every declared host."},
+                        "format": {"type": "string", "enum": ["table", "json"], "description": "json for machine consumption."}
+                    }),
+                    vec![],
+                ),
+            },
             Tool {
                 name: "update_inventory".into(),
                 description: "Safely refresh the inventory's live IPs via `ops vm-lab-discover-local-utm-summary --update-inventory-live-ips`. The ONLY supported way to update IPs — never hand-edit the inventory.".into(),
@@ -4479,6 +4570,79 @@ impl McpServer for LabStateServer {
                     extra.push(&report_dir_owned);
                 }
                 self.run_ops("vm-lab-discover-local-utm", &extra, DISCOVERY_TIMEOUT_SECS)
+            }
+
+            // ---- multi-host lab (LinuxVmHostPlan §6.7) --------------------
+            "host_preflight" => {
+                let mut extra: Vec<&str> = Vec::new();
+                let commit_owned;
+                if let Some(commit) = arg_str(args, "commit") {
+                    commit_owned = commit.to_owned();
+                    extra.push("--commit");
+                    extra.push(&commit_owned);
+                }
+                let hosts_owned;
+                if let Some(hosts) = arg_str(args, "hosts") {
+                    hosts_owned = hosts.to_owned();
+                    extra.push("--hosts");
+                    extra.push(&hosts_owned);
+                }
+                if arg_bool(args, "allow_dirty") {
+                    extra.push("--allow-dirty");
+                }
+                let identity_owned;
+                if let Some(identity) = arg_str(args, "ssh_identity_file") {
+                    identity_owned = identity.to_owned();
+                    extra.push("--ssh-identity-file");
+                    extra.push(&identity_owned);
+                }
+                self.run_ops("vm-lab-host-preflight", &extra, DISCOVERY_TIMEOUT_SECS)
+            }
+
+            "sync_host" => {
+                let Some(host) = arg_str(args, "host") else {
+                    return tool_error("sync_host requires `host` (a host_id from hosts[])");
+                };
+                let mut extra: Vec<&str> = vec!["--host", host];
+                let commit_owned;
+                if let Some(commit) = arg_str(args, "commit") {
+                    commit_owned = commit.to_owned();
+                    extra.push("--commit");
+                    extra.push(&commit_owned);
+                }
+                if arg_bool(args, "verify_only") {
+                    extra.push("--verify-only");
+                }
+                if arg_bool(args, "allow_dirty") {
+                    extra.push("--allow-dirty");
+                }
+                let identity_owned;
+                if let Some(identity) = arg_str(args, "ssh_identity_file") {
+                    identity_owned = identity.to_owned();
+                    extra.push("--ssh-identity-file");
+                    extra.push(&identity_owned);
+                }
+                self.run_ops("vm-lab-sync-host", &extra, DISCOVERY_TIMEOUT_SECS)
+            }
+
+            "discover_hosts" => {
+                let mut extra: Vec<&str> = Vec::new();
+                let host_owned;
+                if let Some(host) = arg_str(args, "host") {
+                    host_owned = host.to_owned();
+                    extra.push("--host");
+                    extra.push(&host_owned);
+                }
+                let format_owned;
+                if let Some(format) = arg_str(args, "format") {
+                    if !matches!(format, "table" | "json") {
+                        return tool_error("format must be `table` or `json`");
+                    }
+                    format_owned = format.to_owned();
+                    extra.push("--format");
+                    extra.push(&format_owned);
+                }
+                self.run_ops("vm-lab-discover-hosts", &extra, DISCOVERY_TIMEOUT_SECS)
             }
 
             "get_lab_topology" => self.get_lab_topology(),
@@ -8569,6 +8733,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert_eq!(ip, "192.168.0.200");
         assert_eq!(port, 22);
         assert!(srv.alias_to_utm("nope").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A libvirt guest IS in the inventory; saying "not in inventory" would send
+    /// an operator hunting a phantom inventory bug. The two cases must differ.
+    #[test]
+    fn utm_resolution_error_distinguishes_absent_from_non_utm_backed() {
+        let tmp = std::env::temp_dir().join(format!("mcp-ure-{}", std::process::id()));
+        let inv_dir = tmp.join("documents/operations/active");
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        std::fs::write(
+            inv_dir.join("vm_lab_inventory.json"),
+            r#"{"entries":[
+                 {"alias":"deb-1","controller":{"type":"local_utm","utm_name":"debian-headless-1"}},
+                 {"alias":"kvm-1","controller":{"type":"libvirt","domain":"linux-x86-client-1","host_id":"ubuntu-kvm-1"}}
+               ],"version":1}"#,
+        )
+        .unwrap();
+        let srv = test_server(&tmp);
+
+        // genuinely absent
+        let absent = srv.utm_resolution_error("nope");
+        assert!(absent.contains("not in inventory"), "{absent}");
+
+        // present, but libvirt-backed: must NOT claim it is missing, must name the
+        // controller kind + host, and must point at the controller-aware path.
+        let libvirt = srv.utm_resolution_error("kvm-1");
+        assert!(
+            !libvirt.contains("not in inventory"),
+            "must not lie about a present alias: {libvirt}"
+        );
+        assert!(libvirt.contains("IS in the inventory"), "{libvirt}");
+        assert!(libvirt.contains("libvirt"), "{libvirt}");
+        assert!(libvirt.contains("ubuntu-kvm-1"), "{libvirt}");
+        assert!(libvirt.contains("vm-lab-start"), "{libvirt}");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
