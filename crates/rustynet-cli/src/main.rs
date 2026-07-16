@@ -988,6 +988,10 @@ enum OpsCommand {
         config: vm_lab::VmLabHostPreflightConfig,
     },
     #[cfg(feature = "vm-lab")]
+    VmLabProvisionGuest {
+        config: vm_lab::VmLabProvisionGuestConfig,
+    },
+    #[cfg(feature = "vm-lab")]
     VmLabNetworkAudit {
         config: vm_lab::network_audit::VmLabNetworkAuditConfig,
     },
@@ -3539,6 +3543,39 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 ssh_identity_file: parser.optional_path("--ssh-identity-file"),
                 known_hosts_path: parser.optional_path("--known-hosts-file"),
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 120)?,
+                json: match parser.value("--format").as_deref() {
+                    None | Some("table") => false,
+                    Some("json") => true,
+                    Some(other) => {
+                        return Err(format!(
+                            "invalid value for --format: {other} (expected table|json)"
+                        ));
+                    }
+                },
+            },
+        }),
+        #[cfg(feature = "vm-lab")]
+        "vm-lab-provision-guest" => Ok(OpsCommand::VmLabProvisionGuest {
+            config: vm_lab::VmLabProvisionGuestConfig {
+                inventory_path: parser.optional_path("--inventory"),
+                host_id: parser
+                    .value("--host")
+                    .ok_or_else(|| "vm-lab-provision-guest requires --host <host_id>".to_owned())?,
+                name: parser
+                    .value("--name")
+                    .ok_or_else(|| "vm-lab-provision-guest requires --name <guest>".to_owned())?,
+                image: parser.value("--image").ok_or_else(|| {
+                    "vm-lab-provision-guest requires --image <base.qcow2>".to_owned()
+                })?,
+                ram_mb: parser.parse_u64_or_default("--ram-mb", 4096)?,
+                vcpus: u32::try_from(parser.parse_u64_or_default("--vcpus", 2)?)
+                    .map_err(|_| "invalid value for --vcpus".to_owned())?,
+                disk_gb: parser.parse_u64_or_default("--disk-gb", 40)?,
+                pool: parser.value("--pool"),
+                ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                dry_run: parser.has_flag("--dry-run"),
+                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 600)?,
                 json: match parser.value("--format").as_deref() {
                     None | Some("table") => false,
                     Some("json") => true,
@@ -8032,6 +8069,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabHostPreflight { config } => {
             vm_lab::execute_ops_vm_lab_host_preflight(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabProvisionGuest { config } => {
+            vm_lab::execute_ops_vm_lab_provision_guest(config)
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabNetworkAudit { config } => {
@@ -19439,6 +19480,7 @@ fn help_text() -> String {
         "  ops vm-lab-discover-hosts [--inventory <path>] [--host <host_id>] [--virsh-path <path>] [--timeout-secs <secs>] [--format table|json] [--report-dir <path>]",
         "  ops vm-lab-sync-host --host <host_id> [--inventory <path>] [--commit <ref|sha>] [--allow-dirty] [--verify-only] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-host-preflight [--inventory <path>] [--hosts <id,id>] [--commit <ref|sha>] [--allow-dirty] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
+        "  ops vm-lab-provision-guest --host <host_id> --name <guest> --image <base.qcow2> [--ram-mb <mb>] [--vcpus <n>] [--disk-gb <gb>] [--pool <path>] [--dry-run] [--format table|json]",
         "  ops vm-lab-network-audit [--inventory <path>] [--profile-dir <path>] [--profile <id>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only: observes UTM/host/guest network state, validates profile manifests, writes redacted evidence; never mutates)",
         "  ops vm-lab-network-preflight --profile <id> [--inventory <path>] [--profile-dir <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only fail-closed gate: errors unless the observed fleet satisfies the profile)",
         "  ops vm-lab-network-prepare --profile <id> [--inventory <path>] [--profile-dir <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--state-dir <path>] [--dry-run] [--approve-reconfigure]  (the ONLY VM network mutation path; without --approve-reconfigure prints the plan and changes nothing; atomic lease + stopped-VM-only apply + verified rollback)",
