@@ -677,7 +677,29 @@ fn write_node_stage_result_ledgers(
         &run_id,
         &report_dir_value,
         &rows,
-    )
+    )?;
+
+    // Open a triage stub for every stage that failed, carrying this run's
+    // `error_detail` verbatim. The agent fills in the patch it is about to
+    // test before the next run; see
+    // `documents/operations/active/LiveLabStageTriageLedgerPlan_2026-07-16.md`.
+    //
+    // This is the right hook precisely because of where it sits: it already
+    // has the run id, commit, per-node status and error, and it is reached
+    // only for a FINAL row of a `--node` run — so the once-per-run and
+    // engine-only scoping come for free rather than needing a second check.
+    //
+    // A triage-ledger problem must never fail a run whose evidence is already
+    // written: the ledger is a diagnostic aid, not evidence. Report and carry
+    // on.
+    let triage_path =
+        crate::live_lab_stage_triage::default_triage_ledger_path(workspace_root_path().as_path());
+    if let Err(err) =
+        crate::live_lab_stage_triage::append_stubs_for_failed_stages(triage_path.as_path(), &rows)
+    {
+        eprintln!("warning: stage triage stub append failed: {err}");
+    }
+    Ok(())
 }
 
 fn node_stage_scope(planned: &NodeStagePlanEntry) -> Result<&'static str, String> {
