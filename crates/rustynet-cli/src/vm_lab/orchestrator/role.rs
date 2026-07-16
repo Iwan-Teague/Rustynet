@@ -211,7 +211,41 @@ impl NodeRole {
                 NodeRole::Client | NodeRole::Aux | NodeRole::Extra => {
                     Ok(vec![RoleCapability::Client])
                 }
-                NodeRole::Entry => Ok(vec![RoleCapability::Client, RoleCapability::EntryRelay]),
+                // Entry is the first hop of a two-hop chain
+                // (client -> entry -> final exit), which makes it an exit
+                // PROVIDER from the client's point of view, not merely a
+                // relay. `client,entry_relay` alone is not a serviceable
+                // entry, and the two ways it fails are both fail-closed
+                // rejections deep inside a later stage:
+                //
+                // - The client's assignment names the entry as its exit
+                //   (`RUSTYNET_ASSIGNMENT_EXIT_NODE_ID`), and the daemon
+                //   requires any node named that way to hold `exit_server`
+                //   in SIGNED MEMBERSHIP
+                //   (`validate_exit_provider_membership`, daemon.rs:1589).
+                //   Without it the daemon denies the bundle, so
+                //   `/var/lib/rustynet/rustynetd.assignment` is never
+                //   persisted and the next `install-systemd` fails with the
+                //   confusing "selected exit node is set but assignment
+                //   bundle is missing".
+                // - The two-hop harness enforces the entry as the `admin`
+                //   primary role (live_linux_two_hop_test.rs:632), and the
+                //   daemon requires `anchor` for NodeRole::Admin
+                //   (daemon.rs:1395), so `role set admin` fails closed
+                //   without it.
+                //
+                // So the entry takes the same canonical admin-owner set as a
+                // Linux exit (`client,relay_host,exit_server,anchor` — see the
+                // Exit arm above for why `client` is REQUIRED), plus the
+                // `entry_relay` marker that distinguishes it from a terminal
+                // exit.
+                NodeRole::Entry => Ok(vec![
+                    RoleCapability::Client,
+                    RoleCapability::Anchor,
+                    RoleCapability::ExitServer,
+                    RoleCapability::RelayHost,
+                    RoleCapability::EntryRelay,
+                ]),
                 // Admin and Anchor advertise the canonical anchor capability
                 // set: the Anchor marker + relay_host + the five composable
                 // anchor sub-capabilities, exactly matching
@@ -507,11 +541,21 @@ mod tests {
                 .unwrap(),
             vec![RoleCapability::BlindExit, RoleCapability::ExitServer]
         );
+        // An entry serves as the client's exit (see
+        // `entry_grant_covers_serving_as_the_clients_exit`), so it carries the
+        // canonical admin-owner set plus the entry_relay marker. The mapping is
+        // platform-independent for this role.
         assert_eq!(
             NodeRole::Entry
                 .product_capabilities_for_platform(&VmGuestPlatform::Windows)
                 .unwrap(),
-            vec![RoleCapability::Client, RoleCapability::EntryRelay]
+            vec![
+                RoleCapability::Client,
+                RoleCapability::Anchor,
+                RoleCapability::ExitServer,
+                RoleCapability::RelayHost,
+                RoleCapability::EntryRelay,
+            ]
         );
     }
 
@@ -584,6 +628,62 @@ mod tests {
                 .unwrap(),
             vec![RoleCapability::BlindExit, RoleCapability::ExitServer]
         );
+    }
+
+    /// An Entry is the first hop of `client -> entry -> final exit`, so the
+    /// client's assignment names it as the client's EXIT. Two daemon checks
+    /// fail closed if its signed-membership grant is merely
+    /// `client,entry_relay`:
+    ///
+    /// - `validate_exit_provider_membership` (daemon.rs:1589) requires
+    ///   `exit_server` on any node an assignment names as the exit; without it
+    ///   the daemon denies the bundle, the assignment file is never persisted,
+    ///   and the following `install-systemd` dies with "selected exit node is
+    ///   set but assignment bundle is missing".
+    /// - `NodeRole::Admin => [RoleCapability::Anchor]` (daemon.rs:1395) gates
+    ///   the `role set admin` the two-hop harness performs on the entry
+    ///   (live_linux_two_hop_test.rs:632).
+    ///
+    /// Both surfaced only as an opaque two-hop failure several stages deep, so
+    /// pin the grant here.
+    #[test]
+    fn entry_grant_covers_serving_as_the_clients_exit() {
+        let capabilities = NodeRole::Entry
+            .product_capabilities_for_platform(&VmGuestPlatform::Linux)
+            .unwrap();
+        assert!(
+            capabilities.contains(&RoleCapability::ExitServer),
+            "an entry is named as the client's assignment exit; without \
+             exit_server the daemon denies the bundle: {capabilities:?}"
+        );
+        assert!(
+            capabilities.contains(&RoleCapability::Anchor),
+            "the two-hop harness enforces the entry as the admin primary role, \
+             which the daemon gates on anchor: {capabilities:?}"
+        );
+        assert!(
+            capabilities.contains(&RoleCapability::Client),
+            "an entry runs the client daemon role and validates its own \
+             auto-tunnel intent against it: {capabilities:?}"
+        );
+        assert!(
+            capabilities.contains(&RoleCapability::EntryRelay),
+            "the entry_relay marker distinguishes an entry from a terminal \
+             exit: {capabilities:?}"
+        );
+        // The entry serves the client exactly as a Linux exit does, so it
+        // carries that same canonical admin-owner set; only the entry_relay
+        // marker is additional.
+        let exit = NodeRole::Exit
+            .product_capabilities_for_platform(&VmGuestPlatform::Linux)
+            .unwrap();
+        for capability in exit {
+            assert!(
+                capabilities.contains(&capability),
+                "entry must cover the Linux exit grant ({capability:?} missing): \
+                 {capabilities:?}"
+            );
+        }
     }
 
     // ── Anchor + Relay: first-class cross-OS roles ──────────────────────────
