@@ -143,6 +143,22 @@ pub struct VmLabDiscoverLocalUtmConfig {
     pub report_dir: Option<PathBuf>,
 }
 
+/// Config for `ops vm-lab-run-matrix-compare`: collapse every run at one commit
+/// into a single cross-machine verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabRunMatrixCompareConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub stage_results_path: Option<PathBuf>,
+    /// Ref/SHA to compare at. Absent ⇒ HEAD.
+    pub commit: Option<String>,
+    /// Minimum runs required. Default 2: one machine reporting is not agreement.
+    pub expect_runs: usize,
+    /// Compare runs whose worktree was dirty (their evidence does not match the
+    /// commit it names). Off by default.
+    pub allow_dirty: bool,
+    pub json: bool,
+}
+
 /// Default libvirt image pool on a lab host.
 const DEFAULT_LIBVIRT_IMAGE_POOL: &str = "/var/lib/libvirt/images";
 
@@ -3637,6 +3653,302 @@ fn resolve_discovery_bundle_paths(
             Ok((inventory_bundle_paths, Some(note)))
         }
     }
+}
+
+/// Compare every run recorded at one commit, across machines.
+///
+/// Step 6 of the multi-host pipeline (§6.7.4a) — the last step that otherwise
+/// needs an agent to read two report trees and work out what differs. Built on the
+/// **normalised stage ledger** (one row per stage per node, carrying `alias`,
+/// `platform`, `role`, `stage`, `status`) and the inventory's `alias → host_id`
+/// join, so no schema change was needed to attribute a result to a machine.
+pub fn execute_ops_vm_lab_run_matrix_compare(
+    config: VmLabRunMatrixCompareConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let ledger_path = match config.stage_results_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => crate::live_lab_run_matrix::default_live_lab_node_stage_matrix_path(),
+    };
+
+    let commit = git_resolve_ref(config.commit.as_deref().unwrap_or("HEAD"))?;
+    let rows = crate::live_lab_run_matrix::read_stage_result_rows(ledger_path.as_path())?;
+
+    // Match on a prefix: run_ids and ledgers carry abbreviated commits in places.
+    let matching: Vec<_> = rows
+        .into_iter()
+        .filter(|row| {
+            let recorded = row.git_commit.trim().to_ascii_lowercase();
+            !recorded.is_empty() && (commit.starts_with(&recorded) || recorded.starts_with(&commit))
+        })
+        .collect();
+
+    if matching.is_empty() {
+        return Err(format!(
+            "no stage results recorded at commit {commit} in {}. \
+             A comparison with nothing to compare is not a pass.",
+            ledger_path.display()
+        ));
+    }
+
+    // Fail closed on dirty evidence: a row whose tree was dirty does not
+    // correspond to the commit it names, so it cannot be compared against one
+    // that does.
+    let dirty: BTreeSet<&str> = matching
+        .iter()
+        .filter(|row| {
+            let state = row.git_dirty_state.trim().to_ascii_lowercase();
+            !state.is_empty() && state != "clean"
+        })
+        .map(|row| row.run_id.as_str())
+        .collect();
+    if !dirty.is_empty() && !config.allow_dirty {
+        return Err(format!(
+            "run(s) {} recorded a dirty worktree at {commit}; their evidence does not correspond to \
+             the commit they name, so comparing them would be meaningless. Re-run from a clean tree, \
+             or pass --allow-dirty to compare anyway.",
+            dirty.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    let alias_hosts = alias_to_host_map(inventory_path.as_path())?;
+
+    let runs: BTreeSet<&str> = matching.iter().map(|row| row.run_id.as_str()).collect();
+    if runs.len() < config.expect_runs {
+        return Err(format!(
+            "only {} run(s) recorded at {commit} ({}), but --expect-runs is {}. \
+             One machine reporting is not agreement — refusing to present it as a comparison.",
+            runs.len(),
+            runs.iter().copied().collect::<Vec<_>>().join(", "),
+            config.expect_runs
+        ));
+    }
+
+    // --- conflicts: the same node+stage answered differently at one commit ----
+    // This is the only case a union cannot resolve, and it invalidates the
+    // comparison, so it is surfaced loudly rather than silently picking a winner.
+    let mut by_node_stage: BTreeMap<(String, String), BTreeMap<String, BTreeSet<String>>> =
+        BTreeMap::new();
+    for row in &matching {
+        by_node_stage
+            .entry((row.alias.clone(), row.stage.clone()))
+            .or_default()
+            .entry(row.status.trim().to_ascii_lowercase())
+            .or_default()
+            .insert(row.run_id.clone());
+    }
+    let conflicts: Vec<String> = by_node_stage
+        .iter()
+        .filter(|(_, statuses)| statuses.len() > 1)
+        .map(|((alias, stage), statuses)| {
+            let detail = statuses
+                .iter()
+                .map(|(status, runs)| {
+                    format!(
+                        "{status}({})",
+                        runs.iter().cloned().collect::<Vec<_>>().join("+")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" vs ");
+            format!("{alias} / {stage}: {detail}")
+        })
+        .collect();
+
+    // --- per-platform rollup -------------------------------------------------
+    let mut platforms: BTreeMap<String, PlatformRollup> = BTreeMap::new();
+    for row in &matching {
+        let entry = platforms.entry(row.platform.clone()).or_default();
+        match row.status.trim().to_ascii_lowercase().as_str() {
+            "pass" => entry.pass += 1,
+            "fail" => {
+                entry.fail += 1;
+                entry
+                    .failing
+                    .insert(format!("{} ({})", row.stage, row.alias));
+            }
+            other if crate::live_lab_run_matrix::stage_status_has_no_verdict(other) => {
+                entry.no_verdict += 1;
+            }
+            other => {
+                entry.other += 1;
+                entry.other_statuses.insert(other.to_owned());
+            }
+        }
+    }
+
+    // --- which machine did each run come from? (alias -> host_id join) -------
+    let mut run_hosts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for row in &matching {
+        let host = alias_hosts
+            .get(row.alias.as_str())
+            .cloned()
+            .unwrap_or_else(|| "<unattributed>".to_owned());
+        run_hosts
+            .entry(row.run_id.clone())
+            .or_default()
+            .insert(host);
+    }
+
+    let verdict = if !conflicts.is_empty() {
+        "CONFLICT"
+    } else if platforms.values().any(|rollup| rollup.fail > 0) {
+        "FAIL"
+    } else if platforms.values().all(|rollup| rollup.pass == 0) {
+        // Every cell absent is NOT a pass.
+        "NO-VERDICT"
+    } else {
+        "PASS"
+    };
+
+    Ok(render_matrix_compare(
+        commit.as_str(),
+        &run_hosts,
+        &platforms,
+        conflicts.as_slice(),
+        verdict,
+        config.json,
+    ))
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PlatformRollup {
+    pub(crate) pass: usize,
+    pub(crate) fail: usize,
+    pub(crate) no_verdict: usize,
+    pub(crate) other: usize,
+    pub(crate) other_statuses: BTreeSet<String>,
+    pub(crate) failing: BTreeSet<String>,
+}
+
+/// Map each inventory alias to the machine that hosts it.
+///
+/// A libvirt entry names its host directly (`controller.host_id`). A `local_utm`
+/// entry predates `hosts[]` and names no host, so it is attributed to the single
+/// declared `local_utm` host — and **only** when exactly one exists. With two Macs
+/// declared the attribution would be a guess, so it is left unattributed instead.
+fn alias_to_host_map(inventory_path: &Path) -> Result<BTreeMap<String, String>, String> {
+    let (entries, hosts) = load_inventory_with_hosts(inventory_path)?;
+    let sole_utm_host: Option<&str> = {
+        let utm: Vec<&LabHost> = hosts
+            .iter()
+            .filter(|host| host.kind == LabHostKind::LocalUtm)
+            .collect();
+        if utm.len() == 1 {
+            Some(utm[0].host_id.as_str())
+        } else {
+            None
+        }
+    };
+
+    let mut map = BTreeMap::new();
+    for entry in &entries {
+        let host = match entry.controller.as_ref() {
+            Some(VmController::Libvirt { connect_uri, .. }) => hosts
+                .iter()
+                .find(|host| {
+                    host.kind == LabHostKind::Libvirt && &host.resolved_connect_uri() == connect_uri
+                })
+                .map(|host| host.host_id.clone()),
+            Some(VmController::LocalUtm { .. }) => sole_utm_host.map(str::to_owned),
+            None => None,
+        };
+        if let Some(host) = host {
+            map.insert(entry.alias.clone(), host);
+        }
+    }
+    Ok(map)
+}
+
+fn render_matrix_compare(
+    commit: &str,
+    run_hosts: &BTreeMap<String, BTreeSet<String>>,
+    platforms: &BTreeMap<String, PlatformRollup>,
+    conflicts: &[String],
+    verdict: &str,
+    json: bool,
+) -> String {
+    if json {
+        return serde_json::to_string_pretty(&serde_json::json!({
+            "commit": commit,
+            "verdict": verdict,
+            "runs": run_hosts.iter().map(|(run, hosts)| serde_json::json!({
+                "run_id": run,
+                "hosts": hosts.iter().collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "platforms": platforms.iter().map(|(platform, rollup)| serde_json::json!({
+                "platform": platform,
+                "pass": rollup.pass,
+                "fail": rollup.fail,
+                "no_verdict": rollup.no_verdict,
+                "other": rollup.other,
+                "other_statuses": rollup.other_statuses.iter().collect::<Vec<_>>(),
+                "failing_stages": rollup.failing.iter().collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "conflicts": conflicts,
+        }))
+        .unwrap_or_else(|_| "{}".to_owned());
+    }
+
+    let mut out = format!(
+        "=== run compare — commit {} — {} run(s) ===\n",
+        &commit[..std::cmp::min(8, commit.len())],
+        run_hosts.len()
+    );
+    for (run, hosts) in run_hosts {
+        out.push_str(&format!(
+            "  run {run}  host(s): {}\n",
+            hosts.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out.push_str("\nPER-PLATFORM\n  PLATFORM   PASS  FAIL  NO-VERDICT  FAILING STAGES\n");
+    for (platform, rollup) in platforms {
+        out.push_str(&format!(
+            "  {:<10} {:<5} {:<5} {:<11} {}\n",
+            platform,
+            rollup.pass,
+            rollup.fail,
+            rollup.no_verdict,
+            if rollup.failing.is_empty() {
+                "-".to_owned()
+            } else {
+                rollup
+                    .failing
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        if !rollup.other_statuses.is_empty() {
+            out.push_str(&format!(
+                "  {:<10} (unrecognised status: {})\n",
+                "",
+                rollup
+                    .other_statuses
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    out.push_str("\nCONFLICTS (same node+stage, different status at this commit)\n");
+    if conflicts.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for conflict in conflicts {
+            out.push_str(&format!("  ⚠️  {conflict}\n"));
+        }
+    }
+    out.push_str(&format!("\nVERDICT: {verdict}\n"));
+    if verdict == "NO-VERDICT" {
+        out.push_str("  (every cell was skip/not_run — absent is NOT pass)\n");
+    }
+    out
 }
 
 /// Guest names become libvirt domain names, filenames in the image pool, and
@@ -37228,17 +37540,17 @@ fn execute_bootstrap_phase_for_target(
 mod tests {
     use super::{
         DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, DiscoveredGuest, LabHost, LabHostKind,
-        LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary, PortStatus, PreflightGate,
-        PreflightStatus, ProbeState, RemoteExec as _, RepoSyncDispatchKind, RepoSyncMode,
-        RestartUnreadyDecision, RuntimePaths as _, ServiceManager as _, StageOrchestrator as _,
-        UtmReadinessInputs, VmController, VmGuestExecMode, VmGuestPlatform, VmInventoryEntry,
-        VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep,
-        VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
-        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
-        VmServiceManager, WindowsSshReadinessProbe, append_unique_stage_outcomes_collect_new,
-        build_assignment_refresh_env, build_local_source_extract_script,
-        build_local_source_presync_cleanup_script, build_remote_argv_script,
-        build_remote_argv_script_for_target, build_repo_sync_script,
+        LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary, PlatformRollup, PortStatus,
+        PreflightGate, PreflightStatus, ProbeState, RemoteExec as _, RepoSyncDispatchKind,
+        RepoSyncMode, RestartUnreadyDecision, RuntimePaths as _, ServiceManager as _,
+        StageOrchestrator as _, UtmReadinessInputs, VmController, VmGuestExecMode, VmGuestPlatform,
+        VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
+        VmLabIterationValidationStep, VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig,
+        VmLabStageOutcome, VmLabStageStatus, VmLabValidateLiveLabProfileConfig,
+        VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe,
+        alias_to_host_map, append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
+        build_local_source_extract_script, build_local_source_presync_cleanup_script,
+        build_remote_argv_script, build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
         build_vm_lab_topology, build_windows_local_source_extract_result_script,
@@ -37266,7 +37578,7 @@ mod tests {
         privileged_rustynet_cli_script, remote_copy_destination_for_target,
         remote_script_for_ssh_transport, render_live_lab_iteration_summary,
         render_live_lab_stage_forensics_review, render_local_utm_discovery_summary,
-        render_preflight, render_vm_lab_progress_complete_line,
+        render_matrix_compare, render_preflight, render_vm_lab_progress_complete_line,
         render_vm_lab_progress_outcome_line, repo_sync_dispatch_kind_for_target,
         resolve_discovery_bundle_paths, resolve_iteration_source_selection,
         resolve_live_lab_vm_aliases, resolve_remote_targets, resolve_repo_sync_source,
@@ -38135,6 +38447,125 @@ mod tests {
         // a LOCAL uri has no ssh endpoint — must not be guessed
         assert_eq!(host(Some("qemu:///system")).ssh_endpoint(), None);
         assert_eq!(host(None).ssh_endpoint(), None);
+    }
+
+    /// The load-bearing safety property: an ABSENT result must never be rendered
+    /// as a passing one. A two-machine split naturally leaves the other OS's cells
+    /// absent, so a union that promoted absent→pass would manufacture parity that
+    /// was never tested.
+    #[test]
+    fn compare_never_treats_an_absent_result_as_pass() {
+        for absent in ["skip", "skipped", "not_run", "reused", "unknown", "", "  "] {
+            assert!(
+                crate::live_lab_run_matrix::stage_status_has_no_verdict(absent),
+                "{absent:?} must count as no-verdict"
+            );
+        }
+        for verdict in ["pass", "fail", "PASS", "Fail"] {
+            assert!(
+                !crate::live_lab_run_matrix::stage_status_has_no_verdict(verdict),
+                "{verdict:?} is a real verdict"
+            );
+        }
+
+        // every cell absent => NO-VERDICT, never PASS
+        let mut platforms = std::collections::BTreeMap::new();
+        platforms.insert(
+            "windows".to_owned(),
+            PlatformRollup {
+                no_verdict: 36,
+                ..PlatformRollup::default()
+            },
+        );
+        let rendered = render_matrix_compare(
+            "abcdef1234567890",
+            &std::collections::BTreeMap::new(),
+            &platforms,
+            &[],
+            "NO-VERDICT",
+            false,
+        );
+        assert!(rendered.contains("VERDICT: NO-VERDICT"), "{rendered}");
+        assert!(rendered.contains("absent is NOT pass"), "{rendered}");
+    }
+
+    /// Two runs at one commit disagreeing about the same node+stage invalidates
+    /// the comparison — it must be shouted about, not silently resolved.
+    #[test]
+    fn compare_surfaces_conflicts_loudly_and_in_json() {
+        let conflicts = vec!["debian-1 / live_two_hop: pass(runA) vs fail(runB)".to_owned()];
+        let table = render_matrix_compare(
+            "abcdef1234567890",
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            conflicts.as_slice(),
+            "CONFLICT",
+            false,
+        );
+        assert!(table.contains("VERDICT: CONFLICT"), "{table}");
+        assert!(table.contains("pass(runA) vs fail(runB)"), "{table}");
+
+        let json = render_matrix_compare(
+            "abcdef1234567890",
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            conflicts.as_slice(),
+            "CONFLICT",
+            true,
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(value["verdict"], "CONFLICT");
+        assert_eq!(value["conflicts"][0], conflicts[0].as_str());
+    }
+
+    /// A `local_utm` entry names no host (it predates hosts[]), so it is
+    /// attributed to the SOLE declared UTM host — and only when exactly one
+    /// exists. With two Macs the attribution would be a guess, so it must be left
+    /// unattributed rather than guessed.
+    #[test]
+    fn alias_host_attribution_refuses_to_guess_when_ambiguous() {
+        let one = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [
+    { "host_id": "mac-utm-1", "kind": "local_utm" },
+    { "host_id": "kvm-1", "kind": "libvirt", "connect_uri": "qemu+ssh://u@h/system" }
+  ],
+  "entries": [
+    { "alias": "deb-1", "ssh_target": "10.0.0.1", "platform": "linux",
+      "controller": { "type": "local_utm", "utm_name": "d", "bundle_path": "/tmp/d.utm" } },
+    { "alias": "kvm-guest", "ssh_target": "10.0.0.2", "platform": "linux",
+      "controller": { "type": "libvirt", "domain": "g", "host_id": "kvm-1" } },
+    { "alias": "ssh-only", "ssh_target": "10.0.0.3", "platform": "linux" }
+  ]
+}"#,
+        );
+        let map = alias_to_host_map(one.as_path()).expect("maps");
+        assert_eq!(map.get("deb-1").map(String::as_str), Some("mac-utm-1"));
+        assert_eq!(map.get("kvm-guest").map(String::as_str), Some("kvm-1"));
+        // a controller-less entry belongs to no declared host — never invent one
+        assert_eq!(map.get("ssh-only"), None);
+
+        // TWO utm hosts => attribution would be a guess => leave it unattributed
+        let two = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [
+    { "host_id": "mac-a", "kind": "local_utm" },
+    { "host_id": "mac-b", "kind": "local_utm" }
+  ],
+  "entries": [
+    { "alias": "deb-1", "ssh_target": "10.0.0.1", "platform": "linux",
+      "controller": { "type": "local_utm", "utm_name": "d", "bundle_path": "/tmp/d.utm" } }
+  ]
+}"#,
+        );
+        let ambiguous = alias_to_host_map(two.as_path()).expect("maps");
+        assert_eq!(
+            ambiguous.get("deb-1"),
+            None,
+            "must not guess between two UTM hosts"
+        );
     }
 
     /// A guest name becomes a libvirt domain name AND a filename in the image

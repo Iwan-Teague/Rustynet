@@ -773,7 +773,52 @@ SHA its evidence claims, and step 6 would catch it — which is the point).
 **Accepted risk:** a patch that fixes Windows can regress macOS. Re-running both
 from the new SHA is what catches it — that is the argument *for* the loop.
 
-### 6.7.4b 🔧 SPEC — `ops vm-lab-run-matrix-compare` (step 6 of the pipeline)
+### 6.7.4b ✅ BUILT — `ops vm-lab-run-matrix-compare` (step 6; MCP: `compare_runs_at_commit`)
+
+```
+rustynet ops vm-lab-run-matrix-compare [--commit <ref|sha>] [--inventory <p>]
+    [--stage-results <p>] [--expect-runs <n>] [--allow-dirty] [--format table|json]
+```
+
+Collapses every run recorded at one commit into **one verdict**, so step 6 stops
+requiring an agent to read two report trees. Built on the **normalised stage
+ledger** + the **`alias → host_id` inventory join** — no schema change (see the
+revision note below).
+
+Live-proven against real recorded data (a run landed at `2c004782`):
+
+```
+=== run compare — commit 2c004782 — 1 run(s) ===
+  run livelab-1784213609-2c004782fb2f  host(s): mac-utm-1
+PER-PLATFORM
+  PLATFORM   PASS  FAIL  NO-VERDICT  FAILING STAGES
+  linux      129   5     45          live_two_hop_validation (debian-headless-2), … ×5 nodes
+CONFLICTS  (none)
+VERDICT: FAIL
+```
+
+179 stage rows → one line, correctly attributed to `mac-utm-1`, naming the known
+client↔client full-mesh failure.
+
+Load-bearing rules, each with a test:
+- **Absent is NEVER pass.** `{skip, skipped, not_run, reused, unknown, ""}` count
+  as *no verdict*, reusing the recorder's own grouping rather than inventing a
+  parallel one. All-absent ⇒ verdict **`NO-VERDICT`**, never `PASS`. This is *the*
+  safety property: a two-machine split leaves the other OS's cells absent, so a
+  union that promoted absent→pass would manufacture parity that was never tested.
+- **Conflicts are shouted, not resolved.** Same node+stage answering differently
+  across runs at one commit ⇒ verdict `CONFLICT`. That is nondeterminism or a
+  misconfigured overlap; picking a winner would launder it.
+- **Dirty evidence is refused** by default — a run recorded from a dirty tree does
+  not correspond to the commit it names. (This fired on the very first live run.)
+- **One run is not a comparison** — `--expect-runs` defaults to 2.
+- **Attribution never guesses.** A `local_utm` entry predates `hosts[]` and names
+  no host, so it is attributed to the *sole* declared UTM host — and only when
+  exactly one exists; with two Macs it is left unattributed. A controller-less
+  entry (`debian-lan-11`) is `<unattributed>`, never bucketed under a machine it
+  does not belong to.
+
+### 6.7.4b-spec — original spec (retained for rationale)
 
 **Purpose:** collapse the driving agent's job from "read two report trees and
 work out what differs" to "read one verdict". Today step 6 is the only step still
