@@ -453,6 +453,19 @@ If the MCP server is down, proceed without it. The API key lives at
 `/Users/iwan/Desktop/deepseek_api.md` (fallback only — never commit, log, or write the key
 into the repo or any artifact; prefer the MCP).
 
+**Provider is configurable, not hardcoded.** "DeepSeek" is the built-in default, not the only
+option — `crates/rustynet-mcp/src/bin/deepseek.rs` resolves the `"flash"`/`"pro"` model ids and
+API endpoint from an `LlmProvider`, overridable via an optional, non-secret registry at
+`~/.config/rustynet/llm_providers.json` (path override: `RUSTYNET_LLM_PROVIDERS_FILE`; active
+provider override: `RUSTYNET_LLM_PROVIDER=<name>`). Adding another OpenAI-Chat-Completions-
+compatible provider (Groq, Together, Fireworks, OpenAI, a local Ollama shim, ...) is a registry
+entry, not a code change. Full mechanism + example registry JSON:
+`CLAUDE.md`/`AGENTS.md` §12.5. This doesn't change how you call the tools — `model: "flash"|"pro"`
+stays the same regardless of which provider is active; only the underlying model ids and endpoint
+move. If a `deepseek_read`/`deepseek_agent`/etc. call errors "unknown LLM provider," someone set
+`RUSTYNET_LLM_PROVIDER` to a name that isn't `"deepseek"` and isn't in the registry — check
+`RUSTYNET_LLM_PROVIDER`'s value and the registry file before assuming the MCP server is broken.
+
 **When to fan DeepSeek proactively:**
 - After every lab failure: paste the daemon journal + recent diff → flash → candidate root
   causes. Verify each against real code before acting.

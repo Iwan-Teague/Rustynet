@@ -52,10 +52,162 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Parsed run-matrix CSV: (header, rows).
 type RunMatrixRows = (Vec<String>, Vec<Vec<String>>);
 
-const FLASH_MODEL: &str = "deepseek-v4-flash";
-const PRO_MODEL: &str = "deepseek-v4-pro";
-const API_URL: &str = "https://api.deepseek.com/chat/completions";
+const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/chat/completions";
+const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
+const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
+/// DeepSeek-v4-pro honors an OpenAI-incompatible `reasoning_effort` field
+/// (docs: high|max). Pro is only ever used for hard reasoning, so always
+/// drive it at the highest level.
+const DEEPSEEK_PRO_REASONING_EFFORT: &str = "max";
 const REQUEST_TIMEOUT_SECS: u64 = 180;
+
+/// One configured LLM provider — DeepSeek by default, or any other
+/// OpenAI-Chat-Completions-compatible API (Groq, Together, Fireworks, OpenAI
+/// itself, a local Ollama OpenAI shim, ...). Only the base URL, the two
+/// model-tier IDs, and DeepSeek's `reasoning_effort` quirk vary between
+/// providers; the request/response shape in `DeepSeekServer::chat` is shared
+/// by all of them, so adding a provider is a registry entry, not a code
+/// change — see `load_provider` and `documents/operations/active/
+/// DeepSeekMultiProviderPlan_*` (if present) for the full design.
+#[derive(Debug, Clone)]
+struct LlmProvider {
+    name: String,
+    base_url: String,
+    api_key: String,
+    flash_model: String,
+    pro_model: String,
+    /// Empty = omit `reasoning_effort` from the request body for this
+    /// provider's pro-tier calls (most OpenAI-compatible APIs don't have it).
+    pro_reasoning_effort: String,
+}
+
+impl LlmProvider {
+    /// The hardcoded, zero-configuration default — exactly today's behavior.
+    /// Used both as the true default and as the graceful fallback when the
+    /// optional provider registry is absent, unreadable, or malformed.
+    fn deepseek_default(api_key: String) -> Self {
+        Self {
+            name: "deepseek".to_string(),
+            base_url: DEEPSEEK_BASE_URL.to_string(),
+            api_key,
+            flash_model: DEEPSEEK_FLASH_MODEL.to_string(),
+            pro_model: DEEPSEEK_PRO_MODEL.to_string(),
+            pro_reasoning_effort: DEEPSEEK_PRO_REASONING_EFFORT.to_string(),
+        }
+    }
+}
+
+/// On-disk provider registry shape. NON-SECRET metadata only — an API key
+/// value is never stored here, only the name of the env var that holds one
+/// (mirroring how the DeepSeek key itself is resolved: env var first, see
+/// `load_api_key`). Optional and additive: an absent file means DeepSeek-only,
+/// today's hardcoded behavior, completely unchanged.
+#[derive(serde::Deserialize, Default)]
+struct ProviderRegistryFile {
+    #[serde(default)]
+    active: Option<String>,
+    #[serde(default)]
+    providers: HashMap<String, ProviderEntry>,
+}
+
+#[derive(serde::Deserialize, Clone)]
+struct ProviderEntry {
+    base_url: String,
+    /// Env var holding this provider's API key. Defaults to
+    /// `{NAME}_API_KEY` (uppercased) when omitted.
+    #[serde(default)]
+    api_key_env: Option<String>,
+    flash_model: String,
+    pro_model: String,
+    #[serde(default)]
+    pro_reasoning_effort: String,
+}
+
+/// Path to the optional provider registry. Override with
+/// `RUSTYNET_LLM_PROVIDERS_FILE`; default `~/.config/rustynet/
+/// llm_providers.json`. Example file adding a second, OpenAI-compatible
+/// provider alongside the built-in DeepSeek default:
+/// ```json
+/// {
+///   "active": "deepseek",
+///   "providers": {
+///     "groq": {
+///       "base_url": "https://api.groq.com/openai/v1/chat/completions",
+///       "api_key_env": "GROQ_API_KEY",
+///       "flash_model": "llama-3.3-70b-versatile",
+///       "pro_model": "llama-3.3-70b-versatile"
+///     }
+///   }
+/// }
+/// ```
+/// Switch providers without editing the file via `RUSTYNET_LLM_PROVIDER=groq`.
+fn provider_registry_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("RUSTYNET_LLM_PROVIDERS_FILE")
+        && !p.trim().is_empty()
+    {
+        return Some(PathBuf::from(p));
+    }
+    let home = std::env::var("HOME").ok()?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".config/rustynet/llm_providers.json"))
+}
+
+fn read_provider_registry() -> ProviderRegistryFile {
+    provider_registry_path()
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Resolve the active LLM provider: `RUSTYNET_LLM_PROVIDER` env var, else the
+/// registry file's `active` field, else `"deepseek"`. A registry entry named
+/// `"deepseek"` overrides the built-in default (e.g. to repoint at a new
+/// model generation without a rebuild); no entry at all falls back to the
+/// hardcoded default so the system works with zero configuration, exactly as
+/// it always has. Any other unresolvable provider name is a hard error — a
+/// typo in `RUSTYNET_LLM_PROVIDER` should fail loudly, not silently reuse
+/// DeepSeek's key against DeepSeek's URL under the wrong name.
+fn load_provider() -> Result<LlmProvider, String> {
+    let file = read_provider_registry();
+
+    let active_name = std::env::var("RUSTYNET_LLM_PROVIDER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| file.active.clone())
+        .unwrap_or_else(|| "deepseek".to_string());
+
+    match file.providers.get(&active_name) {
+        Some(entry) => {
+            let api_key_env = entry
+                .api_key_env
+                .clone()
+                .unwrap_or_else(|| format!("{}_API_KEY", active_name.to_uppercase()));
+            let api_key = load_api_key(&active_name, &api_key_env)?;
+            Ok(LlmProvider {
+                name: active_name,
+                base_url: entry.base_url.clone(),
+                api_key,
+                flash_model: entry.flash_model.clone(),
+                pro_model: entry.pro_model.clone(),
+                pro_reasoning_effort: entry.pro_reasoning_effort.clone(),
+            })
+        }
+        None if active_name == "deepseek" => {
+            let api_key = load_api_key("deepseek", "DEEPSEEK_API_KEY")?;
+            Ok(LlmProvider::deepseek_default(api_key))
+        }
+        None => Err(format!(
+            "unknown LLM provider '{active_name}' (from RUSTYNET_LLM_PROVIDER or the registry's \
+             \"active\" field) — not \"deepseek\" and not defined in {}",
+            provider_registry_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<no HOME>".to_string())
+        )),
+    }
+}
 
 /// Hard cap on bytes returned from any single agent tool result, so one tool
 /// call (e.g. a huge file or grep dump) can never blow up the model's context
@@ -190,7 +342,7 @@ const DOC_SYNC_TOOL_NAMES: &[&str] = &[
 
 #[derive(Clone)]
 struct DeepSeekServer {
-    api_key: String,
+    provider: LlmProvider,
     agent: ureq::Agent,
     repo_root: PathBuf,
     /// Async triage jobs keyed by job id. Shared (Arc) so a clone handed to a
@@ -208,16 +360,16 @@ struct DeepSeekServer {
 
 impl DeepSeekServer {
     fn new() -> Self {
-        let api_key = load_api_key().unwrap_or_else(|e| {
+        let provider = load_provider().unwrap_or_else(|e| {
             eprintln!("DeepSeek MCP: {e}");
-            String::new()
+            LlmProvider::deepseek_default(String::new())
         });
         let agent = ureq::AgentBuilder::new()
             .timeout_read(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .timeout_write(Duration::from_secs(30))
             .build();
         Self {
-            api_key,
+            provider,
             agent,
             repo_root: repo_root(),
             jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -406,38 +558,45 @@ impl DeepSeekServer {
     /// OpenAI-compatible); when `Some`, the request advertises the tools so the
     /// model may answer with `tool_calls`.
     fn chat(&self, messages: Value, tools: Option<&Value>, model: &str) -> Result<Value, String> {
-        if self.api_key.is_empty() {
-            return Err("DeepSeek API key not configured. \
-                Set DEEPSEEK_API_KEY env var, or create ~/Desktop/deepseek_api.md \
-                or ~/.deepseek_api_key with the key as the only content."
-                .into());
+        if self.provider.api_key.is_empty() {
+            return Err(format!(
+                "No API key configured for LLM provider '{}'. For the default 'deepseek' \
+                 provider: set DEEPSEEK_API_KEY env var, or create ~/Desktop/deepseek_api.md \
+                 or ~/.deepseek_api_key with the key as the only content. For any other \
+                 provider: set its api_key_env (see ~/.config/rustynet/llm_providers.json).",
+                self.provider.name
+            ));
         }
         let mut body = json!({
             "model": model,
             "messages": messages,
             "max_tokens": 8192,
         });
-        // V4 Pro honors `reasoning_effort`; "max" is the highest level (docs:
-        // high|max — max is for the hardest planning / multi-step coding agents).
-        // Flash ignores it. Pro is only ever used for hard reasoning, so always
-        // drive it at max.
-        if model == PRO_MODEL {
-            body["reasoning_effort"] = json!("max");
+        // Some providers' pro-tier model honors an OpenAI-incompatible
+        // `reasoning_effort` field (DeepSeek-v4-pro does, at "max" — the
+        // highest level, since pro is only ever used for hard reasoning).
+        // Empty pro_reasoning_effort = the provider doesn't have this knob;
+        // omit the field entirely rather than send a meaningless value.
+        if !self.provider.pro_reasoning_effort.is_empty() && model == self.provider.pro_model {
+            body["reasoning_effort"] = json!(self.provider.pro_reasoning_effort);
         }
         if let Some(tools) = tools {
             body["tools"] = tools.clone();
         }
         let response = self
             .agent
-            .post(API_URL)
-            .set("Authorization", &format!("Bearer {}", self.api_key))
+            .post(&self.provider.base_url)
+            .set(
+                "Authorization",
+                &format!("Bearer {}", self.provider.api_key),
+            )
             .set("Content-Type", "application/json")
             .send_json(body)
-            .map_err(|e| format!("DeepSeek API request failed: {e}"))?;
+            .map_err(|e| format!("{} API request failed: {e}", self.provider.name))?;
 
         response
             .into_json()
-            .map_err(|e| format!("DeepSeek response parse failed: {e}"))
+            .map_err(|e| format!("{} response parse failed: {e}", self.provider.name))
     }
 
     // ── Autonomous read-only research agent ──────────────────────────────
@@ -673,7 +832,7 @@ impl DeepSeekServer {
                 "research",
                 RESEARCH_SYSTEM,
                 &format!("Live-lab failure to triage:\n\n{failure_context}"),
-                FLASH_MODEL,
+                &self.provider.flash_model,
                 max_steps,
                 AgentToolset::Full,
             )
@@ -688,7 +847,7 @@ impl DeepSeekServer {
                     "Original failure context:\n\n{failure_context}\n\n\
                      ## Draft research report to scrutinize\n\n{research}"
                 ),
-                FLASH_MODEL,
+                &self.provider.flash_model,
                 max_steps,
                 AgentToolset::Full,
             )
@@ -704,13 +863,19 @@ impl DeepSeekServer {
                      ## Draft research\n\n{research}\n\n\
                      ## Independent verification pass\n\n{verified}"
                 ),
-                PRO_MODEL,
+                &self.provider.pro_model,
                 max_steps,
                 AgentToolset::Full,
             )
             .unwrap_or_else(|e| format!("(review step failed: {e})"));
 
-        assemble_triage_report(&research, &verified, &final_review)
+        assemble_triage_report(
+            &research,
+            &verified,
+            &final_review,
+            &self.provider.flash_model,
+            &self.provider.pro_model,
+        )
     }
 
     /// Entry point for the `deepseek_live_lab` tool. v1 runs the rigid triage
@@ -943,7 +1108,7 @@ impl DeepSeekServer {
             .filter(|s| !s.is_empty())
             .unwrap_or("(none — survey the active ledgers + indexes yourself)")
             .to_string();
-        let model = resolve_model(get_str(args, "model").unwrap_or("flash"));
+        let model = self.resolve_model(get_str(args, "model").unwrap_or("flash"));
         let max_steps = args
             .get("max_steps")
             .and_then(|v| v.as_u64())
@@ -990,7 +1155,7 @@ impl DeepSeekServer {
 
         let worker = self.clone();
         let jid = job_id.clone();
-        let model_owned = model.to_string();
+        let model_owned = model.clone();
         std::thread::spawn(move || {
             let report = worker
                 .run_doc_sync(&user_prompt, &model_owned, max_steps)
@@ -3974,29 +4139,43 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     fields
 }
 
-fn load_api_key() -> Result<String, String> {
-    if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
+/// Resolve `provider_name`'s API key via its `api_key_env` var. For the
+/// built-in `"deepseek"` provider specifically, preserves the original
+/// resolution order by also falling back to the two legacy file locations —
+/// every other provider is env-var-only (consistent with how a Keychain- or
+/// secret-manager-backed launch wrapper is expected to inject the var, rather
+/// than a provider-specific file convention proliferating per provider).
+fn load_api_key(provider_name: &str, api_key_env: &str) -> Result<String, String> {
+    if let Ok(key) = std::env::var(api_key_env) {
         let key = key.trim().to_string();
         if !key.is_empty() {
             return Ok(key);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    if !home.is_empty() {
-        for rel in &["Desktop/deepseek_api.md", ".deepseek_api_key"] {
-            let p = PathBuf::from(&home).join(rel);
-            if p.exists() {
-                let key = std::fs::read_to_string(&p)
-                    .map_err(|e| format!("cannot read {}: {e}", p.display()))?
-                    .trim()
-                    .to_string();
-                if !key.is_empty() {
-                    return Ok(key);
+    if provider_name == "deepseek" {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            for rel in &["Desktop/deepseek_api.md", ".deepseek_api_key"] {
+                let p = PathBuf::from(&home).join(rel);
+                if p.exists() {
+                    let key = std::fs::read_to_string(&p)
+                        .map_err(|e| format!("cannot read {}: {e}", p.display()))?
+                        .trim()
+                        .to_string();
+                    if !key.is_empty() {
+                        return Ok(key);
+                    }
                 }
             }
         }
+        return Err(format!(
+            "No DeepSeek API key found (checked {api_key_env}, ~/Desktop/deepseek_api.md, \
+             ~/.deepseek_api_key)"
+        ));
     }
-    Err("No DeepSeek API key found (checked DEEPSEEK_API_KEY, ~/Desktop/deepseek_api.md, ~/.deepseek_api_key)".into())
+    Err(format!(
+        "No API key found for LLM provider '{provider_name}' (checked env var {api_key_env})"
+    ))
 }
 
 /// Strip DeepSeek-native tool-call markup (`<｜｜DSML｜｜…>`) that leaks into the
@@ -4014,15 +4193,23 @@ fn strip_dsml_markup(s: &str) -> String {
 
 /// Assemble the three triage-pipeline step outputs into the final multi-section
 /// report. Pure (no I/O) so the report shape is unit-testable offline.
-fn assemble_triage_report(research: &str, verified: &str, final_review: &str) -> String {
+/// `flash_model`/`pro_model` are the ACTUAL models the active provider used —
+/// never hardcoded, so the report stays accurate under a non-DeepSeek provider.
+fn assemble_triage_report(
+    research: &str,
+    verified: &str,
+    final_review: &str,
+    flash_model: &str,
+    pro_model: &str,
+) -> String {
     format!(
         "# Live-lab failure triage\n\
-         _Rigid pipeline: Flash research -> Flash verify -> v4-pro review (max reasoning). \
-         All steps read-only + grounded; no code changes. UNTRUSTED — the main agent verifies \
-         every claim before acting._\n\n\
-         ## 1. Research — deepseek-v4-flash\n\n{research}\n\n\
-         ## 2. Verification — deepseek-v4-flash\n\n{verified}\n\n\
-         ## 3. Final review — deepseek-v4-pro (max reasoning)\n\n{final_review}\n"
+         _Rigid pipeline: {flash_model} research -> {flash_model} verify -> {pro_model} review \
+         (max reasoning). All steps read-only + grounded; no code changes. UNTRUSTED — the main \
+         agent verifies every claim before acting._\n\n\
+         ## 1. Research — {flash_model}\n\n{research}\n\n\
+         ## 2. Verification — {flash_model}\n\n{verified}\n\n\
+         ## 3. Final review — {pro_model} (max reasoning)\n\n{final_review}\n"
     )
 }
 
@@ -4628,10 +4815,20 @@ fn resolve_cargo_target(s: Option<&str>) -> Result<Option<&'static str>, String>
     }
 }
 
-fn resolve_model(model_str: &str) -> &'static str {
-    match model_str.to_lowercase().as_str() {
-        "pro" | "reasoner" | "deepseek-reasoner" | "deepseek-v4-pro" => PRO_MODEL,
-        _ => FLASH_MODEL,
+impl DeepSeekServer {
+    /// Resolve a caller-supplied tier name to the ACTIVE provider's model id
+    /// for that tier. `"pro"` and its DeepSeek-historical aliases
+    /// (`"reasoner"`/`"deepseek-reasoner"`/`"deepseek-v4-pro"` — every caller
+    /// in this repo only ever passes `"flash"`/`"pro"`, but the aliases are
+    /// kept for anyone calling the tool surface directly) mean the pro tier
+    /// regardless of which provider is active; anything else means flash.
+    fn resolve_model(&self, model_str: &str) -> String {
+        match model_str.to_lowercase().as_str() {
+            "pro" | "reasoner" | "deepseek-reasoner" | "deepseek-v4-pro" => {
+                self.provider.pro_model.clone()
+            }
+            _ => self.provider.flash_model.clone(),
+        }
     }
 }
 
@@ -5130,11 +5327,18 @@ fn fn_tool(name: &str, description: &str, properties: Value, required: &[&str]) 
     })
 }
 
-fn model_schema() -> Value {
+/// Tool-schema description for the `model` parameter — reflects the ACTIVE
+/// provider's actual model ids (never hardcoded), so the schema shown to a
+/// calling agent stays accurate when a non-DeepSeek provider is configured.
+fn model_schema(provider: &LlmProvider) -> Value {
     json!({
         "type": "string",
         "enum": ["flash", "pro"],
-        "description": "'flash' = deepseek-v4-flash (fast, low cost, default). 'pro' = deepseek-v4-pro (chain-of-thought at max reasoning effort, slower, for hard reasoning tasks).",
+        "description": format!(
+            "'flash' = {} (fast, low cost, default). 'pro' = {} (chain-of-thought at max \
+             reasoning effort, slower, for hard reasoning tasks). Provider: {}.",
+            provider.flash_model, provider.pro_model, provider.name
+        ),
     })
 }
 
@@ -5166,7 +5370,7 @@ impl McpServer for DeepSeekServer {
                 input_schema: json_schema_object(
                     json!({
                         "prompt":  json_schema_string("The question or analysis request."),
-                        "model":   model_schema(),
+                        "model":   model_schema(&self.provider),
                         "context": context_schema(),
                     }),
                     vec!["prompt"],
@@ -5184,7 +5388,7 @@ impl McpServer for DeepSeekServer {
                 input_schema: json_schema_object(
                     json!({
                         "prompt":  json_schema_string("The generation instruction — what to write and any constraints."),
-                        "model":   model_schema(),
+                        "model":   model_schema(&self.provider),
                         "context": context_schema(),
                     }),
                     vec!["prompt"],
@@ -5202,7 +5406,7 @@ impl McpServer for DeepSeekServer {
                 input_schema: json_schema_object(
                     json!({
                         "prompt":  json_schema_string("Combined instruction — what to analyze and what to produce."),
-                        "model":   model_schema(),
+                        "model":   model_schema(&self.provider),
                         "context": context_schema(),
                     }),
                     vec!["prompt"],
@@ -5228,7 +5432,7 @@ impl McpServer for DeepSeekServer {
                 input_schema: json_schema_object(
                     json!({
                         "prompt":    json_schema_string("The research question to investigate against the local repo/lab."),
-                        "model":     model_schema(),
+                        "model":     model_schema(&self.provider),
                         "max_steps": json!({
                             "type": "integer",
                             "description": "Max tool-calling steps before forcing a final answer (default 12, cap 20).",
@@ -5404,7 +5608,7 @@ impl McpServer for DeepSeekServer {
                             "Optional verifying lab run id / run-matrix row / stage that proves the fix."),
                         "doc_hints": json_schema_string(
                             "Optional hint at which docs are likely affected, e.g. 'CrossPlatformRoleParityPlan'."),
-                        "model": model_schema(),
+                        "model": model_schema(&self.provider),
                         "max_steps": json!({
                             "type": "integer",
                             "description": "Max tool-calling steps before forcing the proposal (default 12, cap 20).",
@@ -5475,7 +5679,7 @@ impl McpServer for DeepSeekServer {
             _ => return tool_error("'prompt' is required and must not be empty"),
         };
         let model_str = get_str(&args, "model").unwrap_or("flash");
-        let model = resolve_model(model_str);
+        let model = self.resolve_model(model_str);
 
         // The autonomous agent has its own loop + system prompt.
         if name == "deepseek_agent" {
@@ -5484,7 +5688,7 @@ impl McpServer for DeepSeekServer {
                 .and_then(|v| v.as_u64())
                 .map(|n| n.clamp(1, AGENT_HARD_MAX_STEPS))
                 .unwrap_or(AGENT_DEFAULT_MAX_STEPS);
-            return match self.run_agent(prompt, model, max_steps) {
+            return match self.run_agent(prompt, &model, max_steps) {
                 Ok(answer) => {
                     let header = format!("[deepseek/{model} | AGENT | budget={max_steps}]\n\n");
                     ToolCallResult {
@@ -5530,7 +5734,7 @@ impl McpServer for DeepSeekServer {
 
         let user_prompt = build_user_prompt(intent_label, prompt, context);
 
-        match self.call(system, &user_prompt, model) {
+        match self.call(system, &user_prompt, &model) {
             Ok(response) => {
                 let header = format!("[deepseek/{model} | {intent_label}]\n\n");
                 ToolCallResult {
@@ -6358,7 +6562,13 @@ mod tests {
 
     #[test]
     fn triage_report_has_all_three_sections_in_order() {
-        let r = assemble_triage_report("RESEARCH_BODY", "VERIFY_BODY", "REVIEW_BODY");
+        let r = assemble_triage_report(
+            "RESEARCH_BODY",
+            "VERIFY_BODY",
+            "REVIEW_BODY",
+            "TEST_FLASH_MODEL",
+            "TEST_PRO_MODEL",
+        );
         assert!(
             r.contains("RESEARCH_BODY") && r.contains("VERIFY_BODY") && r.contains("REVIEW_BODY")
         );
@@ -6372,8 +6582,10 @@ mod tests {
             ir < iv && iv < ire,
             "sections must be research -> verify -> review"
         );
-        // Labels the models + the read-only/untrusted posture.
-        assert!(r.contains("deepseek-v4-flash") && r.contains("deepseek-v4-pro"));
+        // Labels reflect the ACTUAL model ids passed in (never hardcoded —
+        // this is what keeps the report accurate under a non-DeepSeek
+        // provider), plus the read-only/untrusted posture.
+        assert!(r.contains("TEST_FLASH_MODEL") && r.contains("TEST_PRO_MODEL"));
         assert!(r.to_lowercase().contains("untrusted"));
     }
 
@@ -6787,7 +6999,7 @@ mod tests {
     fn server_rooted(root: &Path) -> DeepSeekServer {
         let agent = ureq::AgentBuilder::new().build();
         DeepSeekServer {
-            api_key: String::new(),
+            provider: LlmProvider::deepseek_default(String::new()),
             agent,
             repo_root: root.to_path_buf(),
             jobs: Arc::new(Mutex::new(HashMap::new())),
