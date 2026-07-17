@@ -1901,9 +1901,24 @@ These make every other result untrustworthy, so they come before new features.
       cannot report a dead pid as live. Live-proven: `alive before stop: 1` → stop →
       `alive after stop: 0` (bracket-trick `ps` to avoid the pgrep self-match that
       briefly made it look like a proc survived). 3 unit tests.
-- [ ] Fetch a report artifact off a host (`host_run_status` returns a `report_dir`
-      and nothing can read it).
-- [ ] `sync_host --all`.
+- [x] **DONE 2026-07-17 — `ops vm-lab-fetch-host-artifact` (MCP `fetch_host_artifact`).**
+      The missing half of `host_run_status`, which returned a `report_dir` nothing
+      could then read. Reads one file relative to the host's repo_dir (a report
+      file, a launch log, a stage ledger), inline or to a local `--out`. Read-only,
+      size-capped (5MB default) so a stray huge path can't be streamed back,
+      relative + no-traversal + no-metacharacter so it can't reach outside the
+      checkout. Text-oriented (a trailing newline may be dropped) — for reading
+      evidence, not byte-exact binary copy. Live-proven on the box (inline + `--out`
+      both fetched Cargo.toml; size/missing/traversal/absolute guards all fire).
+      2 unit tests.
+- [x] **DONE 2026-07-17 — `sync_host --all` (MCP `sync_host {all:true}`).** Syncs
+      every declared host to the same resolved commit in one call, reusing the
+      single-host path per host. Reports each host's outcome and **fails if any host
+      failed** — a "synced" that skipped a broken host would be a lie the compare
+      step later trips over. `--all` and `--host` are mutually exclusive. Live-proven:
+      correctly synced the Mac (`[ok] ... verified(local)`) and failed loud on the
+      box (`not our ref` — because that commit was not yet pushed), with a clean
+      "1 of 2 host(s) failed" aggregate.
 
 ### 12.8 Step 5 — setup / reset
 
