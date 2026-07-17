@@ -1935,15 +1935,42 @@ These make every other result untrustworthy, so they come before new features.
 
 ### 12.8 Step 5 — setup / reset
 
-- [ ] **`provision_guest`'s create steps are not implemented** — only validation and
-      guards exist. Clean route: `virsh vol-create-as` + `vol-upload` +
-      `virt-install --connect` (no sudo, now that the pool is group-writable).
-- [ ] Its cloud-init seeds the **box's** key, not the fleet's lab key
-      (`~/.ssh/rustynet_lab_ed25519`) — the root fix that removes the
-      `authorize_*.sh` scratchpad workarounds.
-- [ ] Port `renumber_net.sh` (per-host subnet collision avoidance).
-- [ ] Both guests have `mesh_ip` unset and `include_in_all: false` — present in the
-      inventory, in no run's topology. Config, not code.
+- [x] **DONE 2026-07-17 — `provision_guest` create steps implemented + live-proven.**
+      The privilege blocker the old error described is gone (the pool is
+      group-writable to `kvm` and the host user is in `libvirt`, from the §6.1
+      remediation), so the create runs with **no sudo**: `qemu-img` copy-on-write
+      overlay on the base → `cloud-localds` seed → `virt-install --connect
+      qemu:///system --import`. Guards run first (disk-model, collision) and a
+      failed `virt-install` cleans up the half-made domain + disks. Every
+      interpolated value is single-quoted with the single-quote escape closed.
+      **Live-proven on the box:** created `provtest-1` from the debian-13 base
+      (running, IP 192.168.121.122 via discover_hosts), then destroyed it —
+      the two production guests untouched. Bug found by running it: modern
+      `virt-install` makes `--osinfo` **fatal** if absent; fixed with
+      `--osinfo detect=on,require=off` (auto-detect, generic fallback, works across
+      debian/ubuntu/rocky bases). 3 unit tests on the injection/rendering boundary.
+- [x] **DONE 2026-07-17 — cloud-init seeds the PROVISIONING HOST's key.** The §12.8
+      note said "the box's key, not the fleet lab key" — but §12.7 established the
+      box reaches its guests with `~/.ssh/id_ed25519`, not `rustynet_lab_ed25519`.
+      So the correct fix is to seed the host's OWN public key
+      (default `$HOME/.ssh/id_ed25519.pub`, override with `--authorized-key`), so a
+      freshly provisioned guest trusts the machine that made it with **no
+      `authorize_*.sh` follow-up**. Proven: the box SSHed straight into `provtest-1`
+      (`hostname=provtest-1, whoami=debian`) with its own key.
+- [x] **DONE 2026-07-17 — `renumber_net.sh` ported as `ops
+      vm-lab-renumber-guest-network`.** Two improvements over the scratchpad: **no
+      sudo** (a libvirt-group member drives `net-define`/`destroy`/`start` on
+      `qemu:///system` directly — verified), and **idempotent** — it reads the
+      network's current prefix and no-ops if already on the target, so the guest
+      restart only happens on an actual change. Derives the target `/24` prefix from
+      the host's declared `guest_subnet`. Live-proven on the box: reported "already
+      on 192.168.121.0/24 — no change, guests untouched", both guests still running.
+      3 unit tests (prefix parse + malformed rejection + sudoless/idempotent script).
+- [x] **DONE 2026-07-17 — config.** `linux-x86-client-1` → mesh_ip 100.64.0.11,
+      `linux-x86-exit-1` → 100.64.0.12, both `include_in_all: true`. (Note
+      `include_in_all` has two consumers with opposite unset-defaults — `unwrap_or(false)`
+      for provision-toolchain `--all`, `unwrap_or(true)` elsewhere — so `true`
+      includes them uniformly.) Verified: inventory loads, 0 mesh_ip collisions.
 
 ### 12.9 Prerequisites that will bite
 

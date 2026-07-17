@@ -4394,7 +4394,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "provision_guest".into(),
-                description: "Create a headless cloud-image guest on a libvirt lab host (e.g. ubuntu-kvm-1) from a base image already in its pool. Bakes in the lessons that are NOT obvious: --video vga (virt-install --graphics none attaches no video device, and Debian cloud images boot-loop forever in GRUB's gfxterm without one — no kernel output at all), --cpu host-passthrough (so nested virt reaches inside the guest), and a backing-file overlay so guests share one read-only base. Verifies the pool's disk BY MODEL before writing anything if the host declares pool_disk_model. ALWAYS run with dry_run first to see the plan. libvirt hosts only — UTM guests are created in the UTM app. `ops vm-lab-provision-guest`.".into(),
+                description: "Create a headless cloud-image guest on a libvirt lab host (e.g. ubuntu-kvm-1) from a base image already in its pool. Bakes in the lessons that are NOT obvious: --video vga (virt-install --graphics none attaches no video device, and Debian cloud images boot-loop forever in GRUB's gfxterm without one — no kernel output at all), --cpu host-passthrough (so nested virt reaches inside the guest), and a backing-file overlay so guests share one read-only base. Verifies the pool's disk BY MODEL before writing anything if the host declares pool_disk_model. ALWAYS run with dry_run first to see the plan. It seeds cloud-init with the provisioning HOST's own public key (default $HOME/.ssh/id_ed25519.pub, override with authorized_key) so the host can SSH into the new guest immediately — no follow-up authorize step. Cleans up a half-made guest if virt-install fails. libvirt hosts only — UTM guests are created in the UTM app. `ops vm-lab-provision-guest`.".into(),
                 input_schema: json_schema_object(
                     json!({
                         "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
@@ -4405,6 +4405,7 @@ impl McpServer for LabStateServer {
                         "vcpus": {"type": "integer", "description": "Default 2."},
                         "disk_gb": {"type": "integer", "description": "Overlay size. Default 40."},
                         "pool": {"type": "string", "description": "libvirt image pool path on the host. Default /var/lib/libvirt/images. The host's declared pool_disk_model guard still applies to whatever you pass."},
+                        "authorized_key": {"type": "string", "description": "Path ON THE HOST to the public key seeded into the guest. Default $HOME/.ssh/id_ed25519.pub (the key the host reaches its guests with)."},
                         "dry_run": {"type": "boolean", "description": "Print the plan and change nothing. Do this first."},
                         "ssh_identity_file": {"type": "string"}
                     }),
@@ -5324,6 +5325,12 @@ impl McpServer for LabStateServer {
                     pool_owned = pool.to_owned();
                     extra.push("--pool");
                     extra.push(&pool_owned);
+                }
+                let key_owned;
+                if let Some(key) = arg_str(args, "authorized_key") {
+                    key_owned = key.to_owned();
+                    extra.push("--authorized-key");
+                    extra.push(&key_owned);
                 }
                 if arg_bool(args, "dry_run") {
                     extra.push("--dry-run");
