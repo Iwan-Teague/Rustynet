@@ -28,7 +28,7 @@ Exit code 0 on a delivered result; non-zero on transport/timeout failure.
 import argparse, json, os, re, select, subprocess, sys, time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-JOB_RE = re.compile(r"\b(?:triage|labrun|docsync|recover)-\d+(?:-\d+)*\b")  # AI-agent async job ids (incl. -millis-pid-seq)
+JOB_RE = re.compile(r"\b(?:triage|labrun|docsync|recover|edit)-\d+(?:-\d+)*\b")  # AI-agent async job ids (incl. -millis-pid-seq)
 LIVE_LAB_LAUNCH_TOOLS = {
     "ai_lab_run",
     "ai_autonomous_live_lab_loop",
@@ -150,6 +150,20 @@ def main() -> int:
             return 0
 
         jid = job.group(0)
+        # Delegated-edit jobs (edit-*) can't be auto-polled: RESTRICTED mode
+        # pauses for approvals this loop can't answer, and their result tool is
+        # ai_edit_result, not ai_live_lab_result. Return the job id and let the
+        # caller drive ai_edit_result / ai_edit_approve / ai_edit_deny.
+        if jid.startswith("edit-"):
+            print(text)
+            print(
+                f"[async] {a.tool} -> edit job {jid}. Poll with "
+                f"--tool ai_edit_result --args '{{\"job_id\":\"{jid}\"}}'; approve/deny "
+                "with ai_edit_approve / ai_edit_deny (not auto-polled — approvals are interactive).",
+                file=sys.stderr,
+            )
+            return 0
+
         print(f"[async] {a.tool} -> job {jid}; polling ai_live_lab_result...", file=sys.stderr)
         t0 = time.time()
         pid = 10
