@@ -823,84 +823,176 @@ impl LabStateServer {
         tool_success(&out)
     }
 
-    /// Map UTM `utm_name` → inventory `alias` (Windows/macOS utm_names differ
-    /// from their aliases, e.g. "Windows" vs "windows-utm-1").
-    fn utm_name_alias_map(&self) -> BTreeMap<String, String> {
-        let mut m = BTreeMap::new();
-        if let Ok(s) = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY))
-            && let Ok(inv) = serde_json::from_str::<Value>(&s)
-            && let Some(entries) = inv.get("entries").and_then(|v| v.as_array())
-        {
-            for e in entries {
-                if let (Some(name), Some(alias)) = (
-                    e.get("controller")
-                        .and_then(|c| c.get("utm_name"))
-                        .and_then(|v| v.as_str()),
-                    e.get("alias").and_then(|v| v.as_str()),
-                ) {
-                    m.insert(name.to_string(), alias.to_string());
-                }
-            }
+    /// "Show me every VM and whether it is on."
+    ///
+    /// Delegates to the controller-aware CLI (`ops vm-lab-discover-hosts`) rather
+    /// than shelling `utmctl list` itself. It used to do the latter, which made it
+    /// **structurally incapable of seeing a second host**: once the Linux/KVM box
+    /// joined the lab, *the* "show me all VMs" tool silently omitted every guest on
+    /// it and still read as a complete answer. A partial answer that looks total is
+    /// worse than an error. Delegating also removes the duplicate power-state path
+    /// (§3: one hardened execution path per workflow) — libvirt support arrives for
+    /// free and there is nothing to keep in sync.
+    /// Every declared host with its guests, via the controller-aware CLI.
+    ///
+    /// The one place that asks "what VMs exist and are they on?", shared by every
+    /// tool that needs the answer. Both host kinds are covered because the CLI
+    /// dispatches per controller; nothing here knows what a hypervisor is.
+    fn discovered_hosts_json(&self) -> Result<Vec<Value>, String> {
+        let outcome = run_with_timeout(
+            "cargo",
+            &[
+                "run",
+                "--quiet",
+                "-p",
+                "rustynet-cli",
+                "--features",
+                "vm-lab",
+                "--",
+                "ops",
+                "vm-lab-discover-hosts",
+                "--inventory",
+                DEFAULT_INVENTORY,
+                "--format",
+                "json",
+            ],
+            &self.repo_root,
+            &[("CARGO_TERM_COLOR", "never")],
+            Duration::from_secs(120),
+        )
+        .map_err(|e| format!("could not run vm-lab-discover-hosts: {e}"))?;
+        if !outcome.success {
+            return Err(format!(
+                "vm-lab-discover-hosts failed: {}",
+                outcome.stderr.trim()
+            ));
         }
-        m
+        let parsed: Value = serde_json::from_str(outcome.stdout.trim())
+            .map_err(|e| format!("could not parse vm-lab-discover-hosts JSON: {e}"))?;
+        parsed
+            .get("hosts")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| "vm-lab-discover-hosts JSON has no hosts array".to_owned())
     }
 
-    fn get_vm_power_state(&self, filter: Option<&str>) -> ToolCallResult {
-        let utmctl = utmctl_path();
-        let outcome = match run_with_timeout(
-            &utmctl,
-            &["list"],
-            &self.repo_root,
-            &[],
-            Duration::from_secs(30),
-        ) {
-            Ok(o) => o,
-            Err(e) => {
-                return tool_error(&format!(
-                    "Cannot run utmctl ({utmctl}): {e}. Set RUSTYNET_UTMCTL_PATH if UTM is elsewhere."
-                ));
-            }
+    /// `alias -> "started" | "stopped"` across EVERY host.
+    ///
+    /// Replaces a `utmctl list` map that could only answer for UTM guests, so a
+    /// libvirt guest came back `power=unknown` even though virsh knows perfectly
+    /// well. That is honest but useless exactly when it matters: a STOPPED box
+    /// guest showed `power=unknown, TCP=false`, which reads as a network fault and
+    /// hides the fact that the fix is `power_on_vm`.
+    ///
+    /// A host that could not be probed contributes nothing, so its guests stay
+    /// `unknown` rather than being claimed stopped — absence of evidence is not
+    /// evidence of absence.
+    fn controller_status_map(&self) -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        let Ok(hosts) = self.discovered_hosts_json() else {
+            return map;
         };
-        if !outcome.success {
-            return tool_error(&format!("utmctl list failed: {}", outcome.stderr.trim()));
-        }
-        let map = self.utm_name_alias_map();
-        let mut out = String::from(
-            "# VM power state (utmctl list)\n\n| alias | utm_name | status |\n|---|---|---|\n",
-        );
-        let mut rows = 0;
-        for line in outcome.stdout.lines() {
-            let t = line.trim();
-            if t.is_empty() || t.starts_with("UUID") {
-                continue;
-            }
-            // Columns: UUID  Status  Name (mirror of the CLI's own parser).
-            let status = match t.split_whitespace().nth(1) {
-                Some(s) => s,
-                None => continue,
-            };
-            let name = match t.find(status) {
-                Some(i) => t[i + status.len()..].trim(),
-                None => continue,
-            };
-            let alias = map.get(name).cloned().unwrap_or_else(|| "-".into());
-            if let Some(f) = filter
-                && f != name
-                && f != alias
+        for host in &hosts {
+            if !host
+                .get("probe_ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
             {
                 continue;
             }
-            out.push_str(&format!("| {alias} | {name} | {status} |\n"));
-            rows += 1;
+            let Some(guests) = host.get("guests").and_then(Value::as_array) else {
+                continue;
+            };
+            for guest in guests {
+                let running = guest
+                    .get("running")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let status = if running { "started" } else { "stopped" };
+                if let Some(alias) = guest.get("alias").and_then(Value::as_str) {
+                    map.insert(alias.to_owned(), status.to_owned());
+                }
+                if let Some(domain) = guest.get("domain").and_then(Value::as_str) {
+                    map.entry(domain.to_owned())
+                        .or_insert_with(|| status.to_owned());
+                }
+            }
+        }
+        map
+    }
+
+    fn get_vm_power_state(&self, filter: Option<&str>) -> ToolCallResult {
+        let hosts = match self.discovered_hosts_json() {
+            Ok(h) => h,
+            Err(e) => return tool_error(&e),
+        };
+        let hosts = &hosts;
+
+        let mut out = String::from("# VM power state (all hosts)\n\n");
+        out.push_str("| alias | domain | host | status | ip |\n|---|---|---|---|---|\n");
+        let mut rows = 0usize;
+        // A host we could not probe is reported, never skipped: "no VMs" must not
+        // be indistinguishable from "could not ask".
+        let mut unprobed: Vec<String> = Vec::new();
+
+        for host in hosts {
+            let host_id = host
+                .get("host_id")
+                .and_then(Value::as_str)
+                .unwrap_or("(unknown)");
+            if !host
+                .get("probe_ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                unprobed.push(format!(
+                    "- **{host_id}**: {}",
+                    host.get("probe_error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("probe failed")
+                ));
+                continue;
+            }
+            let Some(guests) = host.get("guests").and_then(Value::as_array) else {
+                continue;
+            };
+            for guest in guests {
+                let domain = guest.get("domain").and_then(Value::as_str).unwrap_or("-");
+                let alias = guest.get("alias").and_then(Value::as_str).unwrap_or("-");
+                if let Some(f) = filter
+                    && f != domain
+                    && f != alias
+                {
+                    continue;
+                }
+                let status = if guest
+                    .get("running")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "started"
+                } else {
+                    "stopped"
+                };
+                let ip = guest.get("ip").and_then(Value::as_str).unwrap_or("-");
+                out.push_str(&format!(
+                    "| {alias} | {domain} | {host_id} | {status} | {ip} |\n"
+                ));
+                rows += 1;
+            }
         }
         if rows == 0 {
-            out.push_str("| (none matched) | | |\n");
+            out.push_str("| (none matched) | | | | |\n");
         }
         out.push_str(
             "\n_started + SSH-reachable = ready. started + unreachable = network/killswitch (recover_stuck_vms / update_inventory), NOT a power issue. stopped = power_on_vm._\n",
         );
-        // Never let a UTM-only listing read as "the whole lab".
-        out.push_str(&self.utm_scope_note());
+        if !unprobed.is_empty() {
+            out.push_str(&format!(
+                "\n## ⚠️ Hosts that could NOT be probed — their VMs are NOT listed above\n{}\n",
+                unprobed.join("\n")
+            ));
+        }
         tool_success(&out)
     }
 
@@ -938,56 +1030,7 @@ impl LabStateServer {
         tool_success(&out)
     }
 
-    /// Resolve an inventory alias → (utm_name, platform, ip, ssh_port).
-    /// Host_ids of every declared **non-UTM** host, if any.
-    ///
-    /// Used to stop the UTM-only tools from lying **by omission**: a tool that
-    /// answers "all VMs" from `utmctl list` gives a confident, complete-looking
-    /// answer that silently excludes every guest on another machine. A partial
-    /// answer that looks total is worse than an error.
-    fn non_utm_hosts(&self) -> Vec<String> {
-        let Ok(body) = std::fs::read_to_string(self.repo_root.join(DEFAULT_INVENTORY)) else {
-            return Vec::new();
-        };
-        let Ok(inv) = serde_json::from_str::<Value>(&body) else {
-            return Vec::new();
-        };
-        inv.get("hosts")
-            .and_then(|hosts| hosts.as_array())
-            .map(|hosts| {
-                hosts
-                    .iter()
-                    .filter(|host| {
-                        host.get("kind")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("local_utm")
-                            != "local_utm"
-                    })
-                    .filter_map(|host| {
-                        host.get("host_id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_owned)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     /// Footer naming the hosts a UTM-only answer does NOT cover.
-    fn utm_scope_note(&self) -> String {
-        let others = self.non_utm_hosts();
-        if others.is_empty() {
-            return String::new();
-        }
-        format!(
-            "\n\n> **Scope: this lists UTM guests only.** The inventory also declares \
-             non-UTM host(s): **{}**. Their VMs are NOT shown above. \
-             Use `discover_hosts` for every machine's VMs (state, IP, ready), or \
-             `host_preflight` for multi-machine readiness.\n",
-            others.join(", ")
-        )
-    }
-
     /// The precise reason an alias did not resolve to a UTM controller.
     ///
     /// `alias_to_utm` returns `None` both when the alias is absent AND when it is
@@ -2605,36 +2648,6 @@ impl LabStateServer {
         )
     }
 
-    /// Parse `utmctl list` once → utm_name → power status. Mirrors the parse in
-    /// utm_power_status but returns the whole fleet in one call.
-    fn utm_status_map(&self) -> BTreeMap<String, String> {
-        let mut m = BTreeMap::new();
-        if let Ok(o) = run_with_timeout(
-            &utmctl_path(),
-            &["list"],
-            &self.repo_root,
-            &[],
-            Duration::from_secs(30),
-        ) && o.success
-        {
-            for line in o.stdout.lines() {
-                let t = line.trim();
-                if t.is_empty() || t.starts_with("UUID") {
-                    continue;
-                }
-                if let Some(status) = t.split_whitespace().nth(1)
-                    && let Some(idx) = t.find(status)
-                {
-                    let name = t[idx + status.len()..].trim().to_string();
-                    if !name.is_empty() {
-                        m.insert(name, status.to_string());
-                    }
-                }
-            }
-        }
-        m
-    }
-
     /// Consolidated loop-start readiness: one go/no-go over host tools, ssh
     /// material, the inventory, disk, the working-tree deploy set, and every
     /// node's power+TCP. Replaces ~6 separate calls at the top of the loop.
@@ -2769,7 +2782,7 @@ impl LabStateServer {
         }
 
         out.push_str("\n## Nodes (power + TCP)\n");
-        let status_map = self.utm_status_map();
+        let status_map = self.controller_status_map();
         let (mut nodes_ok, mut nodes_total) = (0u32, 0u32);
         for e in &inv_entries {
             let alias = e.get("alias").and_then(|v| v.as_str()).unwrap_or("");
@@ -2792,8 +2805,21 @@ impl LabStateServer {
                 .or_else(|| e.get("ssh_target").and_then(|v| v.as_str()))
                 .unwrap_or("");
             let port = e.get("ssh_port").and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+            // Look up by ALIAS first: it is the one identity that spans both
+            // controller kinds. `controller.utm_name` is empty for a libvirt guest
+            // (it has a domain, not a utm_name), so keying on it reported every box
+            // guest as power=unknown — which reads as a network fault and hides
+            // that a stopped guest just needs power_on_vm. utm_name stays as a
+            // fallback for anything the discovery keys only by domain.
             let power = status_map
-                .get(utm_name)
+                .get(alias)
+                .or_else(|| {
+                    if utm_name.is_empty() {
+                        None
+                    } else {
+                        status_map.get(utm_name)
+                    }
+                })
                 .map(|s| s.as_str())
                 .unwrap_or("unknown");
             let reachable = tcp_reachable(ip, port, Duration::from_secs(2));
@@ -4389,7 +4415,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "get_vm_power_state".into(),
-                description: "Raw VM power state from `utmctl list` (started/stopped/paused), annotated with inventory aliases — distinct from SSH reachability. 'started but unreachable' = network/killswitch issue (recover_stuck_vms/update_inventory); 'stopped' = power_on_vm. Pass alias to filter. SCOPE: UTM guests only (drives `utmctl list`) — it does NOT list guests on other hosts; use discover_hosts for every machine.".into(),
+                description: "VM power state across EVERY declared host (started/stopped), annotated with inventory aliases and the owning host_id — distinct from SSH reachability. 'started but unreachable' = network/killswitch issue (recover_stuck_vms/update_inventory); 'stopped' = power_on_vm. Pass alias to filter (matches alias or domain). Delegates to the controller-aware CLI (`ops vm-lab-discover-hosts`), so libvirt/KVM guests and macOS/UTM guests are both covered — it used to drive `utmctl list` directly and therefore could not see a second host at all. A host that could not be probed is listed under an explicit warning rather than contributing nothing, so \"no VMs\" never reads as \"could not ask\".".into(),
                 input_schema: json_schema_object(
                     json!({"alias": json_schema_string("Optional: only show this VM (alias or utm_name)")}),
                     vec![],
@@ -9342,27 +9368,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
     }
 
     #[test]
-    fn utm_name_alias_map_maps_controller_names() {
-        let tmp = std::env::temp_dir().join(format!("mcp-utmmap-{}", std::process::id()));
-        let inv_dir = tmp.join("documents/operations/active");
-        std::fs::create_dir_all(&inv_dir).unwrap();
-        std::fs::write(
-            inv_dir.join("vm_lab_inventory.json"),
-            r#"{"entries":[{"alias":"deb-1","controller":{"utm_name":"debian-headless-1"}},{"alias":"win-1","platform":"windows","controller":{"utm_name":"Windows"}}],"version":1}"#,
-        )
-        .unwrap();
-        let srv = test_server(&tmp);
-        let m = srv.utm_name_alias_map();
-        // utm_name differs from alias for Windows — the annotation must bridge it.
-        assert_eq!(m.get("Windows").map(|s| s.as_str()), Some("win-1"));
-        assert_eq!(
-            m.get("debian-headless-1").map(|s| s.as_str()),
-            Some("deb-1")
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
     fn alias_to_utm_resolves_fields() {
         let tmp = std::env::temp_dir().join(format!("mcp-a2u-{}", std::process::id()));
         let inv_dir = tmp.join("documents/operations/active");
@@ -9384,45 +9389,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
     /// A UTM-only listing must never read as "the whole lab" once a second host
     /// is declared: a partial answer that looks total is worse than an error.
-    #[test]
-    fn utm_scope_note_names_uncovered_hosts_and_is_silent_when_single_host() {
-        let tmp = std::env::temp_dir().join(format!("mcp-scope-{}", std::process::id()));
-        let inv_dir = tmp.join("documents/operations/active");
-        std::fs::create_dir_all(&inv_dir).unwrap();
-
-        // single-host lab: no note, no noise
-        std::fs::write(
-            inv_dir.join("vm_lab_inventory.json"),
-            r#"{"hosts":[{"host_id":"mac-utm-1","kind":"local_utm"}],
-                "entries":[{"alias":"deb-1"}],"version":1}"#,
-        )
-        .unwrap();
-        assert_eq!(test_server(&tmp).utm_scope_note(), "");
-
-        // second, non-UTM host: the note must name it
-        std::fs::write(
-            inv_dir.join("vm_lab_inventory.json"),
-            r#"{"hosts":[{"host_id":"mac-utm-1","kind":"local_utm"},
-                         {"host_id":"ubuntu-kvm-1","kind":"libvirt"}],
-                "entries":[{"alias":"deb-1"}],"version":1}"#,
-        )
-        .unwrap();
-        let srv = test_server(&tmp);
-        let note = srv.utm_scope_note();
-        assert!(note.contains("ubuntu-kvm-1"), "{note}");
-        assert!(note.contains("discover_hosts"), "{note}");
-        assert_eq!(srv.non_utm_hosts(), vec!["ubuntu-kvm-1".to_owned()]);
-
-        // an inventory with no hosts[] at all must not panic or invent hosts
-        std::fs::write(
-            inv_dir.join("vm_lab_inventory.json"),
-            r#"{"entries":[{"alias":"deb-1"}],"version":1}"#,
-        )
-        .unwrap();
-        assert_eq!(test_server(&tmp).utm_scope_note(), "");
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
 
     /// A libvirt guest IS in the inventory; saying "not in inventory" would send
     /// an operator hunting a phantom inventory bug. The two cases must differ.
