@@ -1017,8 +1017,16 @@ mod tests {
         // kept the plaintext runtime key at rest (the pre-relocation behaviour
         // this test previously asserted) would fail here.
         assert!(
-            BOOTSTRAP_SCRIPT.contains("rm -f \"${runtime_key}\""),
+            BOOTSTRAP_SCRIPT.contains("secure_remove_file \"${runtime_key}\""),
             "macOS bootstrap must remove the plaintext runtime key from the persistent keys/ dir (no plaintext private key at rest)"
+        );
+        // Stronger than the `rm -f` this asserted until 2026-07-17 (RSA-0080):
+        // removal must go through secure_remove_file, which refuses to scrub
+        // through a planted symlink and zeroes the bytes before unlinking. A plain
+        // `rm -f` on this path is now a secrets-hygiene gate failure.
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("rm -f \"${runtime_key}\""),
+            "the runtime key must not be removed with a plain rm -f"
         );
         assert!(
             !BOOTSTRAP_SCRIPT.contains("chown rustynetd:rustynetd \"${runtime_key}\""),
