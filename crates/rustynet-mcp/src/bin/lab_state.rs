@@ -4497,6 +4497,21 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "provision_guest_toolchain".into(),
+                description: "Install everything a fresh Linux lab guest needs BEFORE Rustynet can be built on it — run this before bootstrap_vm on any new guest. rn_bootstrap.sh VERIFIES prerequisites and fails if absent; it does not install them, so a fresh cloud image needs this first. Installs the apt set (clang/llvm, build-essential, nftables, wireguard-tools, openssl+sqlite3 dev, tcpdump...) plus rustup PINNED to the repo's rust-toolchain.toml channel, and links the rustup shims into /usr/local/bin — without that `ssh guest cargo build` dies with 127 because a NON-LOGIN ssh shell never sources ~/.profile, which is exactly the shell the orchestrator uses. Idempotent; verify_only reports the prerequisite state and changes nothing. Takes a LIST of aliases. Debian-family Linux only. `ops vm-lab-provision-toolchain`.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "aliases": {"type": "array", "items": {"type": "string"}, "description": "Guest aliases to provision, e.g. [\"linux-x86-exit-1\",\"linux-x86-client-1\"]."},
+                        "select_all": {"type": "boolean", "description": "Every include_in_all VM instead of a list."},
+                        "verify_only": {"type": "boolean", "description": "Report prerequisite state, install nothing."},
+                        "timeout_secs": {"type": "integer", "description": "Default 1800; apt+rustup on a slow link can take a while."},
+                        "ssh_identity_file": {"type": "string"},
+                        "format": {"type": "string", "enum": ["table", "json"]}
+                    }),
+                    vec![],
+                ),
+            },
+            Tool {
                 name: "bootstrap_vm".into(),
                 description: "Install/build Rustynet on one or MORE lab VMs. Phases: sync-source (ship the source), build-release (cargo build ON the guest), install-release, restart-runtime, verify-runtime, tunnel-smoke, killswitch-smoke, dns-smoke, ipv6-smoke, or `all` for the full chain. Pass `aliases` for several VMs in one call (they are handled by the same run, so a pair stays on identical source) or `select_all` for every include_in_all VM. Works for any inventory VM regardless of host — libvirt guests on a remote KVM box and local UTM guests alike, because the whole path is SSH. The guest must already have the toolchain rn_bootstrap verifies (rustup+cargo, clang/llvm, nft, wg, pkg-config openssl+sqlite3, passwordless sudo). SLOW: build-release compiles the workspace on the guest. `ops vm-lab-bootstrap-phase`.".into(),
                 input_schema: json_schema_object(
@@ -5347,6 +5362,53 @@ impl McpServer for LabStateServer {
                     return tool_error("Missing required parameter: alias");
                 }
                 self.run_ops("vm-lab-sync-repo", &["--vm", alias], 900)
+            }
+
+            "provision_guest_toolchain" => {
+                let aliases = string_array(args, "aliases");
+                let select_all = arg_bool(args, "select_all");
+                if aliases.is_empty() && !select_all {
+                    return tool_error(
+                        "Provide `aliases` (e.g. [\"linux-x86-exit-1\"]) or select_all:true",
+                    );
+                }
+                if !aliases.is_empty() && select_all {
+                    return tool_error("Pass either `aliases` or select_all, not both");
+                }
+                let mut extra: Vec<&str> = Vec::new();
+                for alias in &aliases {
+                    extra.push("--vm");
+                    extra.push(alias.as_str());
+                }
+                if select_all {
+                    extra.push("--all");
+                }
+                if arg_bool(args, "verify_only") {
+                    extra.push("--verify-only");
+                }
+                let identity_owned;
+                if let Some(identity) = arg_str(args, "ssh_identity_file") {
+                    identity_owned = identity.to_owned();
+                    extra.push("--ssh-identity-file");
+                    extra.push(&identity_owned);
+                }
+                let format_owned;
+                if let Some(format) = arg_str(args, "format") {
+                    if !matches!(format, "table" | "json") {
+                        return tool_error("format must be `table` or `json`");
+                    }
+                    format_owned = format.to_owned();
+                    extra.push("--format");
+                    extra.push(&format_owned);
+                }
+                let timeout = args
+                    .and_then(|a| a.get("timeout_secs"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1800);
+                let timeout_owned = timeout.to_string();
+                extra.push("--timeout-secs");
+                extra.push(&timeout_owned);
+                self.run_ops("vm-lab-provision-toolchain", &extra, timeout + 120)
             }
 
             "bootstrap_vm" => {

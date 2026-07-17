@@ -143,6 +143,20 @@ pub struct VmLabDiscoverLocalUtmConfig {
     pub report_dir: Option<PathBuf>,
 }
 
+/// Config for `ops vm-lab-provision-toolchain`: install what rn_bootstrap verifies.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabProvisionToolchainConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub vm_aliases: Vec<String>,
+    pub select_all: bool,
+    /// Report the prerequisite state and install nothing.
+    pub verify_only: bool,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+    pub json: bool,
+}
+
 /// Config for `ops vm-lab-host-net-status`: is a host reachable, and has its
 /// address drifted from what the inventory declares?
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -3746,6 +3760,361 @@ fn classify_ssh_probe_failure(err: &str) -> &'static str {
         "unresolved:dns"
     } else {
         "failed:other"
+    }
+}
+
+/// The toolchain a Debian-family lab guest needs before `rn_bootstrap.sh` will run.
+///
+/// `rn_bootstrap` **verifies** prerequisites and fails when they are missing — it
+/// does not install them — so a fresh cloud image needs this first. Shipped over
+/// SSH on **stdin**, never argv, and it interpolates exactly one value (the pinned
+/// toolchain channel, validated before use).
+///
+/// Every non-obvious line here is a lesson that cost real time; see the inline
+/// comments before "simplifying" any of them.
+const GUEST_TOOLCHAIN_SCRIPT: &str = r#"#!/bin/bash
+set -uo pipefail
+echo "[toolchain] $(. /etc/os-release; echo "$PRETTY_NAME") on $(uname -m)"
+
+# rn_bootstrap runs `sudo -n`, so passwordless sudo is a hard prerequisite, not a
+# nicety. Fail here with the reason rather than deep inside a build.
+if ! sudo -n true 2>/dev/null; then
+  echo "[toolchain] FATAL: passwordless sudo is required (rn_bootstrap uses 'sudo -n')" >&2
+  exit 1
+fi
+echo "[toolchain] passwordless sudo: ok"
+
+export DEBIAN_FRONTEND=noninteractive
+
+# Retry apt rather than pinning a mirror. An update was observed to stall on a
+# connection that never delivered, while EVERY mirror edge served a full payload
+# in <0.25s when probed directly — including the exact IP apt was stuck on. That
+# is a transient stall on a flaky link, not a broken mirror. The last attempt is
+# verbose because `-qq` is what hid the explanation the first time.
+apt_update() {
+  for attempt in 1 2 3; do
+    if sudo -n timeout 180 apt-get update -qq >/dev/null 2>&1; then
+      echo "[toolchain] apt-get update ok (attempt $attempt)"; return 0
+    fi
+    echo "[toolchain] apt-get update stalled/failed (attempt $attempt), retrying"
+  done
+  echo "[toolchain] apt-get update failing — verbose attempt:" >&2
+  sudo -n timeout 180 apt-get update 2>&1 | tail -5 >&2
+  return 1
+}
+if [ "${VERIFY_ONLY:-0}" != "1" ]; then
+  apt_update || exit 1
+  # nft=nftables, wg=wireguard-tools, ping=iputils-ping; clang+llvm for bindgen
+  sudo -n timeout 1200 apt-get install -y -qq \
+    curl git make pkg-config clang llvm libclang-dev \
+    build-essential \
+    nftables wireguard-tools iproute2 \
+    tar gzip tcpdump iputils-ping \
+    libssl-dev libsqlite3-dev ca-certificates \
+    >/dev/null 2>&1
+  echo "[toolchain] apt packages installed"
+
+  # rustup pinned to the repo's rust-toolchain.toml channel, so the guest builds
+  # with the same compiler as CI instead of whatever is newest.
+  if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+    sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain __CHANNEL__ \
+      -c rustfmt -c clippy >/dev/null 2>&1
+    echo "[toolchain] rustup installed (__CHANNEL__)"
+  else
+    echo "[toolchain] rustup already present"
+  fi
+
+  # Put the rustup shims on the DEFAULT PATH.
+  #
+  # rustup installs into ~/.cargo/bin and only adds it via ~/.profile, which a
+  # NON-LOGIN ssh shell never sources — and that is exactly the shell the
+  # orchestrator drives guests over. So `ssh guest cargo build` dies with 127
+  # (command not found) while cargo is sitting there installed. The working UTM
+  # fleet has its shims on /usr/bin for this reason. /usr/local/bin is already on
+  # the default PATH, so link there — keeping rustup, and therefore
+  # rust-toolchain.toml's pin, rather than a distro cargo that would ignore it.
+  for shim in cargo rustc rustup rustfmt cargo-clippy clippy-driver rustdoc; do
+    if [ -x "$HOME/.cargo/bin/$shim" ]; then
+      sudo -n ln -sf "$HOME/.cargo/bin/$shim" "/usr/local/bin/$shim"
+    fi
+  done
+  echo "[toolchain] rustup shims linked into /usr/local/bin (non-login PATH)"
+fi
+
+# Verify with rn_bootstrap's OWN path. A non-login ssh shell has
+# PATH=/usr/local/bin:/usr/bin:/bin:/usr/games — no /usr/sbin — so `command -v nft`
+# reports MISSING for a binary sitting at /usr/sbin/nft. That is this repo's
+# documented "sbin PATH fail-open": checking with a narrower PATH than the consumer
+# uses yields a confident false negative. rn_bootstrap prepends the sbin dirs, so a
+# checker that does not is stricter AND wronger than the thing it checks for.
+export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+echo "--- rn_bootstrap prerequisite check (its list, its PATH) ---"
+missing=0
+for cmd in curl git make pkg-config clang nft wg rustup tar gzip tcpdump ping; do
+  if command -v "$cmd" >/dev/null 2>&1; then printf "  %-12s ok\n" "$cmd"
+  else printf "  %-12s MISSING\n" "$cmd"; missing=1; fi
+done
+if command -v gcc >/dev/null 2>&1 || command -v cc >/dev/null 2>&1; then echo "  C compiler   ok"; else echo "  C compiler   MISSING"; missing=1; fi
+if command -v g++ >/dev/null 2>&1 || command -v c++ >/dev/null 2>&1; then echo "  C++ compiler ok"; else echo "  C++ compiler MISSING"; missing=1; fi
+if command -v llvm-config >/dev/null 2>&1 || ls /usr/bin/llvm-config-* >/dev/null 2>&1; then echo "  llvm-config  ok"; else echo "  llvm-config  MISSING"; missing=1; fi
+if pkg-config --exists openssl; then echo "  pkgcfg openssl  ok"; else echo "  pkgcfg openssl  MISSING"; missing=1; fi
+if pkg-config --exists sqlite3; then echo "  pkgcfg sqlite3  ok"; else echo "  pkgcfg sqlite3  MISSING"; missing=1; fi
+echo "  rust:        $(rustc --version 2>/dev/null || echo MISSING)"
+echo "  cargo:       $(cargo --version 2>/dev/null || echo MISSING)"
+if [ "$missing" -eq 0 ]; then
+  echo "[toolchain] ALL PREREQUISITES SATISFIED"
+  exit 0
+fi
+echo "[toolchain] PREREQUISITES MISSING — rn_bootstrap would fail" >&2
+exit 1
+"#;
+
+/// The toolchain channel pinned by `rust-toolchain.toml`.
+///
+/// Read from the repo rather than hardcoded, so a guest can never be provisioned
+/// with a compiler the workspace does not build with. Validated before it is
+/// interpolated into the guest script.
+fn pinned_toolchain_channel() -> Result<String, String> {
+    let path = workspace_root_path().join("rust-toolchain.toml");
+    let body = fs::read_to_string(&path)
+        .map_err(|err| format!("read {} failed: {err}", path.display()))?;
+    let channel = body
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            let rest = line
+                .strip_prefix("channel")?
+                .trim_start()
+                .strip_prefix('=')?;
+            Some(rest.trim().trim_matches('"').to_owned())
+        })
+        .ok_or_else(|| format!("no channel in {}", path.display()))?;
+    // It is interpolated into a shell script, so accept only an obviously-safe
+    // shape rather than trusting the file to be well-formed.
+    if channel.is_empty()
+        || !channel
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_')
+    {
+        return Err(format!("refusing unsafe toolchain channel: {channel:?}"));
+    }
+    Ok(channel)
+}
+
+/// Install the toolchain a Linux lab guest needs before Rustynet can be built on it.
+///
+/// Idempotent, and `--verify-only` reports the prerequisite state without changing
+/// anything. Debian-family only: it installs via `apt`.
+pub fn execute_ops_vm_lab_provision_toolchain(
+    config: VmLabProvisionToolchainConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let (entries, _hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+
+    let selected: Vec<&VmInventoryEntry> = if config.select_all {
+        entries
+            .iter()
+            .filter(|entry| entry.include_in_all.unwrap_or(false))
+            .collect()
+    } else {
+        let mut picked = Vec::new();
+        for alias in &config.vm_aliases {
+            picked.push(
+                entries
+                    .iter()
+                    .find(|entry| &entry.alias == alias)
+                    .ok_or_else(|| format!("unknown alias: {alias}"))?,
+            );
+        }
+        picked
+    };
+    if selected.is_empty() {
+        return Err(
+            "no VMs selected: pass --vm <alias> (repeatable), --vms a,b, or --all".to_owned(),
+        );
+    }
+
+    let channel = pinned_toolchain_channel()?;
+    let script = GUEST_TOOLCHAIN_SCRIPT.replace("__CHANNEL__", channel.as_str());
+    let timeout = timeout_or_default(config.timeout_secs, 1800);
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut rendered = String::new();
+    let mut any_failed = false;
+
+    for entry in selected {
+        // apt-only: refuse rather than half-provision a platform this does not serve.
+        if !matches!(entry.platform, Some(VmGuestPlatform::Linux) | None) {
+            return Err(format!(
+                "{}: provision-toolchain is Debian-family Linux only (platform={:?})",
+                entry.alias, entry.platform
+            ));
+        }
+        let target = entry.ssh_target.as_str();
+        let user = entry.ssh_user.as_deref();
+
+        let output = run_guest_script(
+            target,
+            user,
+            script.as_str(),
+            config.verify_only,
+            config.ssh_identity_file.as_deref(),
+            config.known_hosts_path.as_deref(),
+            timeout,
+        );
+        match output {
+            Ok(text) => {
+                rendered.push_str(&format!("=== {} — OK ===\n{text}\n", entry.alias));
+                results.push(serde_json::json!({
+                    "alias": entry.alias, "ok": true, "output": text,
+                }));
+            }
+            Err(err) => {
+                any_failed = true;
+                rendered.push_str(&format!("=== {} — FAILED ===\n{err}\n", entry.alias));
+                results.push(serde_json::json!({
+                    "alias": entry.alias, "ok": false, "error": err,
+                }));
+            }
+        }
+    }
+
+    if config.json {
+        let payload = serde_json::json!({
+            "toolchain_channel": channel,
+            "verify_only": config.verify_only,
+            "all_ok": !any_failed,
+            "results": results,
+        });
+        return Ok(serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned()));
+    }
+    if any_failed {
+        return Err(rendered);
+    }
+    Ok(rendered)
+}
+
+/// Run a fixed script on a guest by piping it to `bash -s` over SSH.
+///
+/// The script goes over **stdin**, not argv: it is a constant, and stdin keeps it
+/// out of the command line entirely (§4 — never build a shell string with values).
+fn run_guest_script(
+    target: &str,
+    ssh_user: Option<&str>,
+    script: &str,
+    verify_only: bool,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut command = Command::new("ssh");
+    command.args([
+        "-F",
+        "/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=20",
+        "-o",
+        "IdentitiesOnly=yes",
+    ]);
+    let identity = ssh_identity_file
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_lab_ssh_identity_path);
+    let known_hosts = known_hosts_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_known_hosts_path);
+    append_ssh_transport_options(
+        &mut command,
+        Some(identity.as_path()),
+        Some(known_hosts.as_path()),
+    )?;
+    if let Some(user) = ssh_user {
+        command.arg("-l").arg(user);
+    }
+    command.arg("--").arg(target);
+    command
+        .arg("env")
+        .arg(format!("VERIFY_ONLY={}", u8::from(verify_only)))
+        .arg("bash")
+        .arg("-s");
+
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("spawn ssh failed: {err}"))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "ssh stdin unavailable".to_owned())?;
+        std::io::Write::write_all(&mut stdin, script.as_bytes())
+            .map_err(|err| format!("write script to ssh stdin failed: {err}"))?;
+    }
+    // stdin dropped here => EOF => the remote `bash -s` runs.
+    let started = Instant::now();
+    let stdout_reader = child.stdout.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
+            buffer
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
+            buffer
+        })
+    });
+    let collect = |reader: Option<thread::JoinHandle<Vec<u8>>>| -> String {
+        reader
+            .map(|handle| handle.join().unwrap_or_default())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
+    };
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("wait failed: {err}"))?
+        {
+            let stdout = collect(stdout_reader);
+            let stderr = collect(stderr_reader);
+            if status.success() {
+                return Ok(stdout.trim_end().to_owned());
+            }
+            return Err(format!(
+                "exited {}: {}{}",
+                status_code(status),
+                stdout.trim_end(),
+                if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", stderr.trim_end())
+                }
+            ));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = collect(stdout_reader);
+            let _ = collect(stderr_reader);
+            return Err(format!("timed out after {} seconds", timeout.as_secs()));
+        }
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MILLIS));
     }
 }
 
@@ -38138,16 +38507,17 @@ fn execute_bootstrap_phase_for_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, DiscoveredGuest, LabHost, LabHostKind,
-        LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary, PlatformRollup, PortStatus,
-        PreflightGate, PreflightStatus, ProbeState, RemoteExec as _, RepoSyncDispatchKind,
-        RepoSyncMode, RestartUnreadyDecision, RuntimePaths as _, ServiceManager as _,
-        StageOrchestrator as _, UtmReadinessInputs, VmController, VmGuestExecMode, VmGuestPlatform,
-        VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
-        VmLabIterationValidationStep, VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig,
-        VmLabStageOutcome, VmLabStageStatus, VmLabValidateLiveLabProfileConfig,
-        VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe,
-        alias_to_host_map, append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
+        DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, DiscoveredGuest, GUEST_TOOLCHAIN_SCRIPT,
+        LabHost, LabHostKind, LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary,
+        PlatformRollup, PortStatus, PreflightGate, PreflightStatus, ProbeState, RemoteExec as _,
+        RepoSyncDispatchKind, RepoSyncMode, RestartUnreadyDecision, RuntimePaths as _,
+        ServiceManager as _, StageOrchestrator as _, UtmReadinessInputs, VmController,
+        VmGuestExecMode, VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus,
+        VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep, VmLabRunLiveLabConfig,
+        VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
+        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
+        VmServiceManager, WindowsSshReadinessProbe, alias_to_host_map,
+        append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
         build_local_source_extract_script, build_local_source_presync_cleanup_script,
         build_remote_argv_script, build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
@@ -38174,14 +38544,14 @@ mod tests {
         parse_local_utm_list_started_status, parse_membership_active_nodes,
         parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
         path_contains_macos_metadata_artifact, persist_local_utm_ready_states_to_inventory,
-        privileged_rustynet_cli_script, remote_copy_destination_for_target,
-        remote_script_for_ssh_transport, render_live_lab_iteration_summary,
-        render_live_lab_stage_forensics_review, render_local_utm_discovery_summary,
-        render_matrix_compare, render_preflight, render_vm_lab_progress_complete_line,
-        render_vm_lab_progress_outcome_line, repo_sync_dispatch_kind_for_target,
-        resolve_discovery_bundle_paths, resolve_iteration_source_selection,
-        resolve_live_lab_vm_aliases, resolve_remote_targets, resolve_repo_sync_source,
-        resolve_start_targets, resolve_utm_documents_root,
+        pinned_toolchain_channel, privileged_rustynet_cli_script,
+        remote_copy_destination_for_target, remote_script_for_ssh_transport,
+        render_live_lab_iteration_summary, render_live_lab_stage_forensics_review,
+        render_local_utm_discovery_summary, render_matrix_compare, render_preflight,
+        render_vm_lab_progress_complete_line, render_vm_lab_progress_outcome_line,
+        repo_sync_dispatch_kind_for_target, resolve_discovery_bundle_paths,
+        resolve_iteration_source_selection, resolve_live_lab_vm_aliases, resolve_remote_targets,
+        resolve_repo_sync_source, resolve_start_targets, resolve_utm_documents_root,
         resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
         select_inventory_entries, select_live_ssh_host_from_utm_output,
         select_preferred_live_ssh_ip, selected_local_utm_readiness_from_report,
@@ -39198,6 +39568,61 @@ mod tests {
             ambiguous.get("deb-1"),
             None,
             "must not guess between two UTM hosts"
+        );
+    }
+
+    /// The channel is interpolated into a shell script that runs on a guest, so it
+    /// must come from the repo's pin and be validated — never trusted as-is.
+    #[test]
+    fn pinned_toolchain_channel_matches_the_repo_and_is_shell_safe() {
+        let channel = pinned_toolchain_channel().expect("rust-toolchain.toml must parse");
+        // it is the repo's actual pin, not a guess
+        let body = std::fs::read_to_string(workspace_root_path().join("rust-toolchain.toml"))
+            .expect("read pin");
+        assert!(
+            body.contains(&format!("\"{channel}\"")),
+            "channel {channel:?} must appear in rust-toolchain.toml"
+        );
+        // and it cannot smuggle shell metacharacters into the guest script
+        assert!(
+            channel
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_'),
+            "channel {channel:?} must be shell-safe"
+        );
+    }
+
+    /// The guest script encodes lessons that each cost real time. Assert the
+    /// non-obvious ones survive refactoring.
+    #[test]
+    fn guest_toolchain_script_keeps_the_hard_won_fixes() {
+        let script = GUEST_TOOLCHAIN_SCRIPT;
+        // 127: rustup's shims are invisible to the non-login shell the orchestrator uses
+        assert!(
+            script.contains("/usr/local/bin/$shim"),
+            "must link rustup shims onto the default PATH or `ssh guest cargo build` returns 127"
+        );
+        // the sbin PATH fail-open: nft lives in /usr/sbin, absent from a non-login PATH
+        assert!(
+            script.contains("/usr/sbin"),
+            "the prereq check must use rn_bootstrap's PATH or it false-reports nft MISSING"
+        );
+        // rn_bootstrap runs `sudo -n`
+        assert!(
+            script.contains("sudo -n true"),
+            "must assert passwordless sudo up front"
+        );
+        // the apt stall was transient; retry rather than pin a mirror
+        assert!(script.contains("apt_update"), "apt must be retried");
+        // verify_only must be able to change nothing
+        assert!(
+            script.contains("VERIFY_ONLY"),
+            "must support a no-change verify pass"
+        );
+        // the channel placeholder must still be there to be substituted
+        assert!(
+            script.contains("__CHANNEL__"),
+            "toolchain channel must be interpolated"
         );
     }
 
