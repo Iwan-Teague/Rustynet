@@ -1870,13 +1870,39 @@ These make every other result untrustworthy, so they come before new features.
 
 ### 12.7 Step 4 — run labs on the box (the point of the whole program)
 
-- [ ] **`--host` on `orchestrate-live-lab` / `start_live_lab_run`** — detached
-      launch (own process group, log file, survives the SSH dropping — the
-      `nohup setsid` pattern already used elsewhere), returning a run_id to poll
-      with `host_run_status`. **The biggest hole**; today this is a manual SSH.
+- [x] **DONE 2026-07-17 — `ops vm-lab-launch-on-host` (MCP `launch_live_lab_on_host`).**
+      Not `--host` bolted onto the 40-flag orchestrator parser (that would make the
+      orchestrator re-exec itself remotely); a dedicated launcher that SSHes to the
+      host and starts the run **detached**, returning in ~1.6s with a pid. Mechanics
+      that make it correct:
+  - A tiny **runner** writes its own `$$` to a pidfile and then `exec`s the
+        orchestrator, so the recorded pid IS the orchestrator's (an `exec` keeps the
+        pid). `$!` is unusable because `setsid` forks and the parent exits.
+  - `setsid` → new session/group (survives SSH close AND lets `stop` signal the
+        whole group), `nohup` + all fds off the SSH channel → the call returns in
+        ~1.6s instead of blocking for the 30-45 min run.
+  - Refuses a second concurrent run (they would fight over guests + ledger).
+  - Injection boundary: every forwarded orchestrator arg is single-quoted and a
+        literal single quote / shell metacharacter is refused; `report_dir` must be
+        relative, non-traversing, metachar-free.
+      **Live-proven on the box:** launch returns in 1.65s with a real pid; the
+      detached orchestrator runs its own `--dry-run` to the network-profile stage;
+      the concurrent guard rejects a second launch ("already in flight"). 6 unit
+      tests on the rendering/injection boundary.
+      Bugs found by running it, not by reading it: (1) the orchestrator's guest key
+      on the box is `~/.ssh/id_ed25519`, not `rustynet_lab_ed25519` — made it a
+      `--host-ssh-identity` flag with that default; (2) the launch log seeded the
+      report dir, which the orchestrator then refused as non-empty — moved the log
+      to `state/host-lab-runs/`.
+- [x] **DONE 2026-07-17 — `ops vm-lab-stop-host-run` (MCP `stop_host_run`).** Signals
+      the whole **process group** (a plain `kill <pid>` would orphan the guest-SSH
+      children), TERM then KILL after a grace period, using the recorded pid with a
+      pgrep fallback, idempotent, and retires the handle files so a later status
+      cannot report a dead pid as live. Live-proven: `alive before stop: 1` → stop →
+      `alive after stop: 0` (bracket-trick `ps` to avoid the pgrep self-match that
+      briefly made it look like a proc survived). 3 unit tests.
 - [ ] Fetch a report artifact off a host (`host_run_status` returns a `report_dir`
       and nothing can read it).
-- [ ] Stop a runaway remote run.
 - [ ] `sync_host --all`.
 
 ### 12.8 Step 5 — setup / reset

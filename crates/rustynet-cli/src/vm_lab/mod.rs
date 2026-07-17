@@ -4901,6 +4901,401 @@ pub fn execute_ops_vm_lab_host_run_status(
     Ok(out)
 }
 
+/// Launcher shipped to a host to start a live-lab run **detached**.
+///
+/// The problem it solves: `vm-lab-orchestrate-live-lab` runs for 30–45 minutes,
+/// but an SSH invocation that waited for it would die the moment the connection
+/// dropped — and this is the one action the whole multi-host program exists to
+/// remove from manual SSH. So the run must outlive the launching connection.
+///
+/// How it stays alive and stays killable:
+/// - A tiny **runner** script writes its own `$$` to a pidfile and then `exec`s
+///   the orchestrator, so the pid we record IS the orchestrator's pid (an `exec`
+///   keeps the pid). `$!` cannot be used because `setsid` forks and the parent
+///   exits immediately, leaving `$!` pointing at a corpse.
+/// - `setsid` puts the orchestrator in a **new session/process group**, so it is
+///   not killed when this SSH session closes AND `vm-lab-stop-host-run` can signal
+///   the whole group by the recorded pid.
+/// - `nohup` + redirecting all three fds off the SSH channel means the launcher
+///   returns in ~1s (it only waits for the pidfile, written before the slow
+///   `cargo` compile/exec) instead of blocking for the whole run.
+///
+/// Every interpolated value is single-quoted here and the caller forbids a literal
+/// single quote in any of them, so the quoting cannot be escaped — this text
+/// becomes a shell script on the host.
+const HOST_LAUNCH_SCRIPT: &str = r#"#!/bin/bash
+set -uo pipefail
+cd '__REPO_DIR__' || { echo "LAUNCH-ERROR: repo_dir not found: __REPO_DIR__" >&2; exit 1; }
+
+# Refuse a second concurrent run: two orchestrators would fight over the same
+# guests and the same stage ledger. host_run_status reports the one already going.
+if pgrep -f 'vm-lab-orchestrate-live-lab' >/dev/null 2>&1; then
+  echo "LAUNCH-ERROR: a vm-lab-orchestrate-live-lab run is already in flight on this host" >&2
+  exit 2
+fi
+
+# Only the run-handle dir is created here. The report dir is left for the
+# orchestrator, which refuses to start into a NON-EMPTY one — so the launcher must
+# not seed it (an earlier version put the log inside it and the run refused itself).
+mkdir -p 'state/host-lab-runs' || { echo "LAUNCH-ERROR: cannot create state/host-lab-runs" >&2; exit 1; }
+RUNNER='state/host-lab-runs/__LAUNCH_ID__.run.sh'
+PIDFILE='state/host-lab-runs/__LAUNCH_ID__.pid'
+LOG='state/host-lab-runs/__LAUNCH_ID__.log'
+
+# Quoted heredoc: the shell writes this verbatim, so $$ and $HOME survive to
+# runtime rather than expanding now. The __PLACEHOLDERS__ were already substituted
+# in Rust before the script was sent.
+cat > "$RUNNER" <<'RUNNER_EOF'
+#!/bin/bash
+cd '__REPO_DIR__' || exit 1
+echo $$ > 'state/host-lab-runs/__LAUNCH_ID__.pid'
+exec cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab --report-dir '__REPORT_DIR__' --ssh-identity-file __ORCH_IDENTITY__ __ORCH_ARGS__
+RUNNER_EOF
+
+setsid nohup bash "$RUNNER" > "$LOG" 2>&1 < /dev/null &
+
+# The runner writes its pid before exec'ing cargo, so this appears within a moment
+# even though the compile/run that follows takes far longer.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  [ -s "$PIDFILE" ] && break
+  sleep 0.3
+done
+PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+if [ -z "${PID:-}" ]; then
+  echo "LAUNCH-ERROR: runner did not report a pid within ~4.5s (see $LOG)" >&2
+  exit 3
+fi
+echo "LAUNCHED launch_id=__LAUNCH_ID__ pid=$PID log=$LOG"
+"#;
+
+/// Config for `ops vm-lab-launch-on-host`: start a detached live-lab run on a host.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabLaunchOnHostConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub host_id: String,
+    /// Report directory ON the host, relative to its repo_dir.
+    pub report_dir: String,
+    /// Orchestrator arguments forwarded verbatim (node selectors, platform/skip
+    /// flags, …). Each is single-quoted into the remote script.
+    pub orchestrator_args: Vec<String>,
+    /// Path ON THE HOST to the SSH key the orchestrator uses to reach ITS guests.
+    /// Absent ⇒ `$HOME/.ssh/id_ed25519`, the standard OpenSSH key name a Linux lab
+    /// host uses to reach its libvirt guests (verified on `ubuntu-kvm-1`). This is
+    /// distinct from the key the launcher uses to reach the host itself.
+    pub host_ssh_identity: Option<String>,
+    /// Render the launcher + runner and return them without launching.
+    pub dry_run: bool,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+    pub json: bool,
+}
+
+/// A pass-through orchestrator argument is single-quoted into the remote script,
+/// so it must contain no single quote (there is no safe way to embed one inside a
+/// single-quoted shell word) and no shell metacharacter that `ensure_script_safe_value`
+/// already rejects. This is the injection boundary for the forwarded args.
+fn ensure_orchestrator_arg_safe(value: &str) -> Result<(), String> {
+    ensure_script_safe_value("orchestrator arg", value)?;
+    if value.contains('\'') {
+        return Err(format!(
+            "orchestrator arg contains a single quote and is refused (it is single-quoted into the remote script): {value:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Script shipped to a host to stop an in-flight live-lab run.
+///
+/// Signals the run's **process group**, not just the leader, so the whole tree
+/// (`cargo` → `rustynet-cli` → the guest-SSH children) goes down together — a plain
+/// `kill <pid>` would orphan the children to keep running against the guests. The
+/// recorded pid IS the session-leader/pgid (the runner wrote it before `exec`), so
+/// `kill -- -<pid>` reaches the group. `pgrep` is a fallback for a run whose handle
+/// file was lost. TERM first, then KILL after a grace period.
+const HOST_STOP_SCRIPT: &str = r#"#!/bin/bash
+set -uo pipefail
+cd '__REPO_DIR__' 2>/dev/null || true
+
+# Recorded handles first (reload-proof), then anything pgrep still sees.
+pids=""
+for f in state/host-lab-runs/*.pid; do
+  [ -f "$f" ] || continue
+  p="$(cat "$f" 2>/dev/null || true)"
+  [ -n "$p" ] && pids="$pids $p"
+done
+pgrep_pids="$(pgrep -f 'vm-lab-orchestrate-live-lab' 2>/dev/null || true)"
+pids="$pids $pgrep_pids"
+
+# de-dup + drop blanks
+pids="$(printf '%s\n' $pids | sort -u | tr '\n' ' ')"
+pids="$(echo $pids)"
+
+if [ -z "$pids" ]; then
+  echo "STOP-RESULT: no run in flight (no recorded pid, nothing matched pgrep)"
+  exit 0
+fi
+
+echo "STOP-RESULT: signaling: $pids"
+for p in $pids; do kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true; done
+
+# grace period, then escalate any survivor
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  alive=""
+  for p in $pids; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+  [ -z "$alive" ] && break
+  sleep 0.5
+done
+survivors=""
+for p in $pids; do kill -0 "$p" 2>/dev/null && survivors="$survivors $p"; done
+if [ -n "$survivors" ]; then
+  echo "STOP-RESULT: escalating to KILL:$survivors"
+  for p in $survivors; do kill -KILL -- "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null || true; done
+fi
+
+# retire the handle files so a later status does not report a dead pid as live
+rm -f state/host-lab-runs/*.pid 2>/dev/null || true
+echo "STOP-RESULT: stopped"
+"#;
+
+/// Config for `ops vm-lab-stop-host-run`: stop a detached run on a host.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabStopHostRunConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub host_id: String,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+    pub json: bool,
+}
+
+/// Stop an in-flight `vm-lab-orchestrate-live-lab` run on a remote host.
+pub fn execute_ops_vm_lab_stop_host_run(config: VmLabStopHostRunConfig) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host_id == config.host_id)
+        .ok_or_else(|| format!("unknown host_id: {}", config.host_id))?;
+    let endpoint = host
+        .ssh_endpoint()
+        .ok_or_else(|| format!("host {} is local; stop its run directly", host.host_id))?;
+    let repo_dir = host
+        .repo_dir
+        .as_ref()
+        .ok_or_else(|| format!("host {} has no repo_dir declared", host.host_id))?
+        .display()
+        .to_string();
+    ensure_script_safe_value("repo_dir", repo_dir.as_str())?;
+    if repo_dir.contains('\'') {
+        return Err("host repo_dir must not contain a single quote".to_owned());
+    }
+
+    let script = HOST_STOP_SCRIPT.replace("__REPO_DIR__", repo_dir.as_str());
+    let timeout = timeout_or_default(config.timeout_secs, 60);
+    let out = run_guest_script(
+        endpoint.as_str(),
+        None,
+        script.as_str(),
+        false,
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        timeout,
+    )?;
+
+    let result = out
+        .lines()
+        .filter(|line| line.trim_start().starts_with("STOP-RESULT:"))
+        .map(|line| line.trim())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stopped_nothing = result.contains("no run in flight");
+
+    if config.json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "host_id": host.host_id,
+            "stopped": !stopped_nothing,
+            "detail": result,
+        }))
+        .unwrap_or_else(|_| "{}".to_owned()));
+    }
+    Ok(format!("host {} — {result}\n", host.host_id))
+}
+
+/// Render the host launcher with every value substituted.
+///
+/// Pure so the injection boundary is directly testable: `orch_args` are each
+/// single-quoted, and the caller guarantees no single quote is present, so a
+/// single-quoted word cannot be escaped. `orch_identity` is pre-rendered (either
+/// `"$HOME/.ssh/id_ed25519"` or a single-quoted override).
+fn render_host_launch_script(
+    repo_dir: &str,
+    report_dir: &str,
+    launch_id: &str,
+    orch_identity: &str,
+    orch_args: &[String],
+) -> String {
+    let joined = orch_args
+        .iter()
+        .map(|arg| format!("'{arg}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    HOST_LAUNCH_SCRIPT
+        .replace("__REPO_DIR__", repo_dir)
+        .replace("__REPORT_DIR__", report_dir)
+        .replace("__LAUNCH_ID__", launch_id)
+        .replace("__ORCH_IDENTITY__", orch_identity)
+        .replace("__ORCH_ARGS__", joined.as_str())
+}
+
+/// Start a detached `vm-lab-orchestrate-live-lab` run on a remote host.
+pub fn execute_ops_vm_lab_launch_on_host(
+    config: VmLabLaunchOnHostConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host_id == config.host_id)
+        .ok_or_else(|| format!("unknown host_id: {}", config.host_id))?;
+    let endpoint = host.ssh_endpoint().ok_or_else(|| {
+        format!(
+            "host {} is local — run the orchestrator directly, this command launches on a REMOTE host",
+            host.host_id
+        )
+    })?;
+    let repo_dir = host
+        .repo_dir
+        .as_ref()
+        .ok_or_else(|| format!("host {} has no repo_dir declared", host.host_id))?
+        .display()
+        .to_string();
+
+    // The report dir is host-relative and lands in a shell script: it must be a
+    // relative path with no metacharacters and no traversal.
+    if config.report_dir.trim().is_empty() {
+        return Err("--report-dir is required (relative to the host's repo_dir)".to_owned());
+    }
+    if config.report_dir.starts_with('/') {
+        return Err(format!(
+            "--report-dir must be relative to the host's repo_dir, got absolute: {}",
+            config.report_dir
+        ));
+    }
+    if config.report_dir.split('/').any(|seg| seg == "..") {
+        return Err(format!(
+            "--report-dir must not contain '..': {}",
+            config.report_dir
+        ));
+    }
+    ensure_script_safe_value("report_dir", config.report_dir.as_str())?;
+    if config.report_dir.contains('\'') {
+        return Err("--report-dir must not contain a single quote".to_owned());
+    }
+    ensure_script_safe_value("repo_dir", repo_dir.as_str())?;
+    if repo_dir.contains('\'') {
+        return Err("host repo_dir must not contain a single quote".to_owned());
+    }
+    for arg in &config.orchestrator_args {
+        ensure_orchestrator_arg_safe(arg)?;
+    }
+
+    let launch_id = format!(
+        "launch-{}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        std::process::id()
+    );
+    // Default expands $HOME on the host (double-quoted). An override is a literal
+    // host path, single-quoted and validated, so it cannot inject.
+    let orch_identity = match config.host_ssh_identity.as_deref() {
+        None => "\"$HOME/.ssh/id_ed25519\"".to_owned(),
+        Some(path) => {
+            ensure_script_safe_value("host_ssh_identity", path)?;
+            if path.contains('\'') {
+                return Err("--host-ssh-identity must not contain a single quote".to_owned());
+            }
+            format!("'{path}'")
+        }
+    };
+
+    let script = render_host_launch_script(
+        repo_dir.as_str(),
+        config.report_dir.as_str(),
+        launch_id.as_str(),
+        orch_identity.as_str(),
+        config.orchestrator_args.as_slice(),
+    );
+
+    if config.dry_run {
+        if config.json {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "host_id": host.host_id,
+                "launch_id": launch_id,
+                "endpoint": endpoint,
+                "dry_run": true,
+                "script": script,
+            }))
+            .unwrap_or_else(|_| "{}".to_owned()));
+        }
+        return Ok(format!(
+            "[dry-run] would launch on {endpoint} (host {}):\n\n{script}\n",
+            host.host_id
+        ));
+    }
+
+    let timeout = timeout_or_default(config.timeout_secs, 90);
+    let out = run_guest_script(
+        endpoint.as_str(),
+        None,
+        script.as_str(),
+        false,
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        timeout,
+    )?;
+
+    // The launcher prints exactly one LAUNCHED line on success.
+    let launched = out
+        .lines()
+        .find(|line| line.trim_start().starts_with("LAUNCHED "))
+        .ok_or_else(|| {
+            format!(
+                "host {}: launcher did not confirm a launch:\n{out}",
+                host.host_id
+            )
+        })?;
+    let pid = launched
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("pid="))
+        .unwrap_or("unknown")
+        .to_owned();
+
+    if config.json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "host_id": host.host_id,
+            "launch_id": launch_id,
+            "pid": pid,
+            "report_dir": config.report_dir,
+            "poll_with": "ops vm-lab-host-run-status --host <id>",
+            "stop_with": "ops vm-lab-stop-host-run --host <id>",
+        }))
+        .unwrap_or_else(|_| "{}".to_owned()));
+    }
+    Ok(format!(
+        "host {} — live-lab run LAUNCHED (detached)\n  launch_id={launch_id}\n  pid={pid}\n  report_dir={}\n  poll:  ops vm-lab-host-run-status --host {}\n  stop:  ops vm-lab-stop-host-run --host {}\n",
+        host.host_id, config.report_dir, host.host_id, host.host_id
+    ))
+}
+
 /// Compare every run recorded at one commit, across machines.
 ///
 /// Step 6 of the multi-host pipeline (§6.7.4a) — the last step that otherwise
@@ -53588,5 +53983,118 @@ mod host_locality_tests {
         // newline must not silently turn "I am this host" into "I am not".
         let host = libvirt_host("ubuntu-kvm-1", Some("qemu+ssh://u@192.0.2.1/system"));
         assert!(host_is_this_machine_given(&host, Some(" ubuntu-kvm-1\n")));
+    }
+}
+
+#[cfg(test)]
+mod launch_on_host_tests {
+    use super::{ensure_orchestrator_arg_safe, render_host_launch_script};
+
+    fn render(args: &[&str]) -> String {
+        render_host_launch_script(
+            "/home/u/Rustynet",
+            "artifacts/live_lab/x",
+            "launch-1-2",
+            "\"$HOME/.ssh/id_ed25519\"",
+            &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn each_orchestrator_arg_is_single_quoted() {
+        let script = render(&["--macos-vm", "debian-headless-2", "--skip-cross-network"]);
+        assert!(script.contains("'--macos-vm' 'debian-headless-2' '--skip-cross-network'"));
+    }
+
+    #[test]
+    fn runtime_shell_expansions_survive_into_the_runner() {
+        // $$ (the runner's pid → the pgid we record) and $HOME must NOT be expanded
+        // when Rust renders the template; they belong to the host at runtime.
+        let script = render(&["--dry-run"]);
+        assert!(
+            script.contains("echo $$ >"),
+            "runner must record its own pid"
+        );
+        assert!(
+            script.contains("\"$HOME/.ssh/id_ed25519\""),
+            "identity must expand $HOME on the host"
+        );
+    }
+
+    #[test]
+    fn the_detach_primitives_are_present() {
+        let script = render(&[]);
+        // setsid = new session/group so it survives ssh close and stop can signal
+        // the whole group; nohup = ignore SIGHUP; </>/2> take the fds off the
+        // channel so ssh returns immediately.
+        assert!(script.contains("setsid nohup bash"));
+        assert!(script.contains("< /dev/null &"));
+        assert!(script.contains("> \"$LOG\" 2>&1"));
+    }
+
+    #[test]
+    fn a_second_concurrent_run_is_refused() {
+        let script = render(&[]);
+        assert!(script.contains("pgrep -f 'vm-lab-orchestrate-live-lab'"));
+        assert!(script.contains("already in flight"));
+    }
+
+    #[test]
+    fn the_log_lives_outside_the_report_dir() {
+        // The orchestrator refuses a non-empty report dir, so the launcher's log
+        // must not be seeded inside it (that made a run refuse itself once).
+        let script = render(&[]);
+        assert!(script.contains("LOG='state/host-lab-runs/launch-1-2.log'"));
+        assert!(!script.contains("mkdir -p 'state/host-lab-runs' 'artifacts"));
+    }
+
+    #[test]
+    fn orchestrator_arg_safety_is_the_injection_boundary() {
+        // Anything that could break out of the single-quoted word it becomes.
+        assert!(ensure_orchestrator_arg_safe("--skip-cross-network").is_ok());
+        assert!(ensure_orchestrator_arg_safe("debian-headless-2").is_ok());
+        assert!(ensure_orchestrator_arg_safe("linux:client").is_ok());
+        for hostile in [
+            "--x'; rm -rf / ; '",
+            "$(id)",
+            "`id`",
+            "a\"b",
+            "a\\b",
+            "a\nb",
+        ] {
+            assert!(
+                ensure_orchestrator_arg_safe(hostile).is_err(),
+                "must reject {hostile:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod stop_host_run_tests {
+    use super::HOST_STOP_SCRIPT;
+
+    #[test]
+    fn stop_signals_the_process_group_not_just_the_leader() {
+        let script = HOST_STOP_SCRIPT.replace("__REPO_DIR__", "/home/u/Rustynet");
+        // Negative pid = whole group. A plain `kill <pid>` would orphan the
+        // guest-SSH children to keep running.
+        assert!(script.contains(r#"kill -TERM -- "-$p""#));
+        assert!(script.contains(r#"kill -KILL -- "-$p""#));
+    }
+
+    #[test]
+    fn stop_reads_recorded_pids_then_falls_back_to_pgrep() {
+        let script = HOST_STOP_SCRIPT.replace("__REPO_DIR__", "/home/u/Rustynet");
+        assert!(script.contains("state/host-lab-runs/*.pid"));
+        assert!(script.contains("pgrep -f 'vm-lab-orchestrate-live-lab'"));
+    }
+
+    #[test]
+    fn stop_is_idempotent_and_retires_stale_handles() {
+        let script = HOST_STOP_SCRIPT.replace("__REPO_DIR__", "/home/u/Rustynet");
+        assert!(script.contains("no run in flight"));
+        // Handle files removed so a later status cannot report a dead pid as live.
+        assert!(script.contains("rm -f state/host-lab-runs/*.pid"));
     }
 }

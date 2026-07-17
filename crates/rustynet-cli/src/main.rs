@@ -1009,6 +1009,12 @@ enum OpsCommand {
     VmLabHostRunStatus {
         config: vm_lab::VmLabHostRunStatusConfig,
     },
+    VmLabLaunchOnHost {
+        config: vm_lab::VmLabLaunchOnHostConfig,
+    },
+    VmLabStopHostRun {
+        config: vm_lab::VmLabStopHostRunConfig,
+    },
     #[cfg(feature = "vm-lab")]
     VmLabHostNetStatus {
         config: vm_lab::VmLabHostNetStatusConfig,
@@ -2175,7 +2181,11 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
     let parser = match OptionParser::parse(&args[1..]) {
         Ok(parser) => parser,
         Err(err) => {
-            if subcommand == "prepare-advisory-db" {
+            // vm-lab-launch-on-host re-parses its own flags from the slice before
+            // `--` and forwards everything after verbatim, so the whole-slice parse
+            // here (which rejects the bare positionals an orchestrator passthrough
+            // can contain) must not block it.
+            if subcommand == "prepare-advisory-db" || subcommand == "vm-lab-launch-on-host" {
                 OptionParser::empty()
             } else {
                 return Err(err);
@@ -3663,6 +3673,63 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             },
         }),
         #[cfg(feature = "vm-lab")]
+        "vm-lab-launch-on-host" => {
+            // Split at the first `--`: the launch command's own flags precede it,
+            // the orchestrator's follow and are forwarded verbatim.
+            let rest = &args[1..];
+            let (own, passthrough) = match rest.iter().position(|a| a == "--") {
+                Some(i) => (&rest[..i], rest[i + 1..].to_vec()),
+                None => (rest, Vec::new()),
+            };
+            let own = OptionParser::parse(own)?;
+            Ok(OpsCommand::VmLabLaunchOnHost {
+                config: vm_lab::VmLabLaunchOnHostConfig {
+                    inventory_path: own.optional_path("--inventory"),
+                    host_id: own.value("--host").ok_or_else(|| {
+                        "vm-lab-launch-on-host requires --host <host_id>".to_owned()
+                    })?,
+                    report_dir: own.value("--report-dir").ok_or_else(|| {
+                        "vm-lab-launch-on-host requires --report-dir <host-relative path>"
+                            .to_owned()
+                    })?,
+                    orchestrator_args: passthrough,
+                    host_ssh_identity: own.value("--host-ssh-identity"),
+                    dry_run: own.has_flag("--dry-run"),
+                    ssh_identity_file: own.optional_path("--ssh-identity-file"),
+                    known_hosts_path: own.optional_path("--known-hosts-file"),
+                    timeout_secs: own.parse_u64_or_default("--timeout-secs", 90)?,
+                    json: match own.value("--format").as_deref() {
+                        None | Some("table") => false,
+                        Some("json") => true,
+                        Some(other) => {
+                            return Err(format!(
+                                "invalid value for --format: {other} (expected table|json)"
+                            ));
+                        }
+                    },
+                },
+            })
+        }
+        "vm-lab-stop-host-run" => Ok(OpsCommand::VmLabStopHostRun {
+            config: vm_lab::VmLabStopHostRunConfig {
+                inventory_path: parser.optional_path("--inventory"),
+                host_id: parser
+                    .value("--host")
+                    .ok_or_else(|| "vm-lab-stop-host-run requires --host <host_id>".to_owned())?,
+                ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 60)?,
+                json: match parser.value("--format").as_deref() {
+                    None | Some("table") => false,
+                    Some("json") => true,
+                    Some(other) => {
+                        return Err(format!(
+                            "invalid value for --format: {other} (expected table|json)"
+                        ));
+                    }
+                },
+            },
+        }),
         "vm-lab-host-run-status" => Ok(OpsCommand::VmLabHostRunStatus {
             config: vm_lab::VmLabHostRunStatusConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -8262,6 +8329,14 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabHostRunStatus { config } => {
             vm_lab::execute_ops_vm_lab_host_run_status(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabLaunchOnHost { config } => {
+            vm_lab::execute_ops_vm_lab_launch_on_host(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabStopHostRun { config } => {
+            vm_lab::execute_ops_vm_lab_stop_host_run(config)
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabHostNetStatus { config } => {
@@ -19687,6 +19762,8 @@ fn help_text() -> String {
         "  ops vm-lab-provision-guest --host <host_id> --name <guest> --image <base.qcow2> [--ram-mb <mb>] [--vcpus <n>] [--disk-gb <gb>] [--pool <path>] [--dry-run] [--format table|json]",
         "  ops vm-lab-run-matrix-compare [--commit <ref|sha>] [--inventory <path>] [--stage-results <path>] [--expect-runs <n>] [--allow-dirty] [--stage <substring>] [--include-hosts <id,id>] [--ssh-identity-file <path>] [--format table|json]",
         "  ops vm-lab-host-run-status --host <host_id> [--run-id <id>] [--stage <substring>] [--inventory <path>] [--ssh-identity-file <path>] [--format table|json]",
+        "  ops vm-lab-launch-on-host --host <host_id> --report-dir <host-relative path> [--host-ssh-identity <host path>] [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>] [--dry-run] [--format table|json] -- <orchestrate-live-lab args...>",
+        "  ops vm-lab-stop-host-run --host <host_id> [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-host-net-status [--host <host_id>] [--inventory <path>] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-provision-toolchain [--inventory <path>] [--vm <alias>]... [--vms <a,b>] [--all] [--verify-only] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-fetch-image --host <host_id> --name <file> --url <https://...> [--sha256 <hex>] [--pool <path>] [--inventory <path>] [--timeout-secs <secs>]",
