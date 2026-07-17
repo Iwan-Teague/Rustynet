@@ -18,7 +18,10 @@
       "guest_subnet": "192.168.121.0/24",
       "notes": "AMD Ryzen 7 7700X, 61GiB, nested virt on; reached over tailnet (100.117.1.47)",
       "repo_dir": "/home/ubuntu-server/Rustynet",
-      "pool_disk_model": "Samsung SSD 870 EVO 500GB"
+      "pool_disk_model": "Samsung SSD 870 EVO 500GB",
+      "alt_ssh_endpoints": [
+        "ubuntu-server@10.230.76.5"
+      ]
     }
   ],
   "entries": [

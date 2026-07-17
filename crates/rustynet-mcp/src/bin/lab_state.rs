@@ -2949,7 +2949,11 @@ impl LabStateServer {
                         .collect::<Vec<_>>()
                         .join(", "))
                     .unwrap_or_default(),
-                field(record, "error").replace('\n', " ").chars().take(400).collect::<String>(),
+                field(record, "error")
+                    .replace('\n', " ")
+                    .chars()
+                    .take(400)
+                    .collect::<String>(),
                 if patch.is_empty() {
                     "(NOT YET RECORDED — fill this before the verification run)".to_owned()
                 } else {
@@ -4244,6 +4248,18 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "host_net_status".into(),
+                description: "Answer 'why can't I reach this host, and has its address drifted?'. Probes the DECLARED connect_uri endpoint first, then any declared alt_ssh_endpoints, and — over whichever path answers — asks the machine what addresses it ACTUALLY has. Distinguishes the three cases you would otherwise guess between: DOWN (nothing answered), PATH-DRIFT (declared endpoint dead but the machine is alive on an alternate — the inventory is stale), and UP-BUT-UNUSABLE (the machine ANSWERED but SSH could not complete). Probe states are classified, never flattened: up:host-key-not-pinned / up:auth-failed / up:ssh-refused mean the box is UP and it is a trust/auth problem, NOT a network fault — chasing it as one wastes real time. Never rewrites connect_uri: silent failover would hide the drift worth reporting. `ops vm-lab-host-net-status`.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "host": {"type": "string", "description": "Restrict to one host_id. Default: every declared host."},
+                        "format": {"type": "string", "enum": ["table", "json"]},
+                        "ssh_identity_file": {"type": "string"}
+                    }),
+                    vec![],
+                ),
+            },
+            Tool {
                 name: "host_run_status".into(),
                 description: "Ask a REMOTE lab host what it is doing and what its last run found — without going there. Reports whether an orchestrator process is IN FLIGHT, then reads that host's OWN evidence ledger over SSH and returns which stages passed, which failed (with alias + error_detail), the no-verdict count, the commit + dirty state the run recorded, and its report_dir. IMPORTANT: each machine keeps its own ledger — a run writes to the host that ran it — so the local ledger CANNOT see the box's runs and this is the only way to read them. Read-only. `ops vm-lab-host-run-status`.".into(),
                 input_schema: json_schema_object(
@@ -4855,6 +4871,32 @@ impl McpServer for LabStateServer {
                     extra.push(&identity_owned);
                 }
                 self.run_ops("vm-lab-sync-host", &extra, DISCOVERY_TIMEOUT_SECS)
+            }
+
+            "host_net_status" => {
+                let mut extra: Vec<&str> = Vec::new();
+                let host_owned;
+                if let Some(host) = arg_str(args, "host") {
+                    host_owned = host.to_owned();
+                    extra.push("--host");
+                    extra.push(&host_owned);
+                }
+                let format_owned;
+                if let Some(format) = arg_str(args, "format") {
+                    if !matches!(format, "table" | "json") {
+                        return tool_error("format must be `table` or `json`");
+                    }
+                    format_owned = format.to_owned();
+                    extra.push("--format");
+                    extra.push(&format_owned);
+                }
+                let identity_owned;
+                if let Some(identity) = arg_str(args, "ssh_identity_file") {
+                    identity_owned = identity.to_owned();
+                    extra.push("--ssh-identity-file");
+                    extra.push(&identity_owned);
+                }
+                self.run_ops("vm-lab-host-net-status", &extra, DISCOVERY_TIMEOUT_SECS)
             }
 
             "host_run_status" => {
