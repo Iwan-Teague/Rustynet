@@ -294,6 +294,11 @@ pub struct VmLabProvisionGuestConfig {
     pub vcpus: u32,
     pub disk_gb: u64,
     pub pool: Option<String>,
+    /// Path ON THE HOST to the public key seeded into the guest's authorized_keys.
+    /// Absent ⇒ `$HOME/.ssh/id_ed25519.pub`, the key the host itself uses to reach
+    /// its guests (§12.7) — so a freshly provisioned guest trusts the machine that
+    /// provisioned it, with no follow-up `authorize_*.sh` step.
+    pub authorized_key: Option<String>,
     pub ssh_identity_file: Option<PathBuf>,
     pub known_hosts_path: Option<PathBuf>,
     /// Print the plan and change nothing.
@@ -5008,6 +5013,169 @@ fn ensure_orchestrator_arg_safe(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Renumber a host's libvirt `default` network off the shared libvirt default
+/// (`192.168.122.0/24`) onto the host's declared `guest_subnet`, so several KVM
+/// hosts can each advertise their guest subnet to the tailnet without colliding.
+///
+/// Two deliberate improvements over the scratchpad it replaces:
+/// - **No sudo.** The scratchpad piped a password into `sudo -S`; a libvirt-group
+///   member can drive `net-define`/`destroy`/`start` on `qemu:///system` directly
+///   (verified on `ubuntu-kvm-1`), so no credential is needed or embedded.
+/// - **Idempotent.** It reads the network's CURRENT prefix and no-ops if it already
+///   matches the target — so re-running it does NOT needlessly destroy the network
+///   and restart every guest. The restart (guests must re-lease) only happens on an
+///   actual change.
+const HOST_RENUMBER_NET_SCRIPT: &str = r#"#!/bin/bash
+set -uo pipefail
+NET=default
+TARGET_PREFIX='__TARGET_PREFIX__'
+
+XML="$(virsh -c qemu:///system net-dumpxml "$NET" 2>/dev/null)" || {
+  echo "RENUMBER-ERROR: cannot read libvirt network '$NET' (is $(id -un) in the libvirt group?)" >&2
+  exit 1
+}
+CUR_IP="$(printf '%s' "$XML" | grep -oE "<ip address='[0-9.]+'" | head -1 | grep -oE '[0-9.]+' | head -1)"
+if [ -z "$CUR_IP" ]; then
+  echo "RENUMBER-ERROR: could not find the current IPv4 in the '$NET' network XML" >&2
+  exit 1
+fi
+CUR_PREFIX="${CUR_IP%.*}."
+
+if [ "$CUR_PREFIX" = "$TARGET_PREFIX" ]; then
+  echo "RENUMBER-RESULT: already on ${TARGET_PREFIX}0/24 — no change, guests untouched"
+  exit 0
+fi
+
+echo "RENUMBER-RESULT: renumbering ${CUR_PREFIX}0/24 -> ${TARGET_PREFIX}0/24"
+TMP="$(mktemp)"
+printf '%s' "$XML" | sed "s/${CUR_PREFIX//./\\.}/${TARGET_PREFIX}/g" > "$TMP"
+virsh -c qemu:///system net-destroy "$NET" >/dev/null 2>&1 || true
+virsh -c qemu:///system net-undefine "$NET" >/dev/null 2>&1 || true
+virsh -c qemu:///system net-define "$TMP" || { echo "RENUMBER-ERROR: net-define failed" >&2; rm -f "$TMP"; exit 1; }
+virsh -c qemu:///system net-start "$NET" || { echo "RENUMBER-ERROR: net-start failed" >&2; rm -f "$TMP"; exit 1; }
+virsh -c qemu:///system net-autostart "$NET" >/dev/null 2>&1 || true
+rm -f "$TMP"
+
+# Running guests must be bounced to pick up a lease on the new subnet.
+for d in $(virsh -c qemu:///system list --name --all | grep -v '^$'); do
+  st="$(virsh -c qemu:///system domstate "$d" 2>/dev/null || echo unknown)"
+  if [ "$st" = "running" ]; then
+    virsh -c qemu:///system destroy "$d" >/dev/null 2>&1 || true
+  fi
+  virsh -c qemu:///system start "$d" >/dev/null 2>&1 || true
+  echo "  restarted: $d"
+done
+echo "RENUMBER-RESULT: done"
+"#;
+
+/// Config for `ops vm-lab-renumber-guest-network`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabRenumberGuestNetworkConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub host_id: String,
+    pub dry_run: bool,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+    pub json: bool,
+}
+
+/// Derive the `A.B.C.` prefix from a `A.B.C.0/24` guest subnet.
+fn guest_subnet_prefix(subnet: &str) -> Result<String, String> {
+    let network = subnet.split('/').next().unwrap_or(subnet);
+    let octets: Vec<&str> = network.split('.').collect();
+    if octets.len() != 4 {
+        return Err(format!("guest_subnet {subnet:?} is not a dotted-quad CIDR"));
+    }
+    for octet in &octets {
+        if octet.is_empty() || !octet.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!("guest_subnet {subnet:?} has a non-numeric octet"));
+        }
+        match octet.parse::<u16>() {
+            Ok(v) if v <= 255 => {}
+            _ => return Err(format!("guest_subnet {subnet:?} has an octet out of range")),
+        }
+    }
+    Ok(format!("{}.{}.{}.", octets[0], octets[1], octets[2]))
+}
+
+/// Renumber a host's libvirt default network onto its declared guest subnet.
+pub fn execute_ops_vm_lab_renumber_guest_network(
+    config: VmLabRenumberGuestNetworkConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host_id == config.host_id)
+        .ok_or_else(|| format!("unknown host_id: {}", config.host_id))?;
+    let endpoint = host.ssh_endpoint().ok_or_else(|| {
+        format!(
+            "host {} is local; renumber its network directly",
+            host.host_id
+        )
+    })?;
+    let subnet = host.guest_subnet.as_deref().ok_or_else(|| {
+        format!(
+            "host {} declares no guest_subnet; nothing to renumber onto",
+            host.host_id
+        )
+    })?;
+    let prefix = guest_subnet_prefix(subnet)?;
+
+    let script = HOST_RENUMBER_NET_SCRIPT.replace("__TARGET_PREFIX__", prefix.as_str());
+
+    if config.dry_run {
+        if config.json {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "host_id": host.host_id,
+                "guest_subnet": subnet,
+                "target_prefix": prefix,
+                "dry_run": true,
+                "script": script,
+            }))
+            .unwrap_or_else(|_| "{}".to_owned()));
+        }
+        return Ok(format!(
+            "[dry-run] would renumber {}'s default network onto {}0/24:\n\n{script}\n",
+            host.host_id, prefix
+        ));
+    }
+
+    let timeout = timeout_or_default(config.timeout_secs, 300);
+    let out = run_guest_script(
+        endpoint.as_str(),
+        None,
+        script.as_str(),
+        false,
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        timeout,
+    )?;
+    let result = out
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("RENUMBER-RESULT:") || t.starts_with("restarted:")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if config.json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "host_id": host.host_id,
+            "target_prefix": prefix,
+            "changed": !result.contains("no change"),
+            "detail": result,
+        }))
+        .unwrap_or_else(|_| "{}".to_owned()));
+    }
+    Ok(format!("host {} — {result}\n", host.host_id))
+}
+
 /// Read one file out of a host's checkout — the missing half of `host_run_status`,
 /// which hands back a `report_dir` nothing could then read.
 ///
@@ -5995,27 +6163,129 @@ pub fn execute_ops_vm_lab_provision_guest(
         ));
     }
 
-    Err(format!(
-        "vm-lab-provision-guest: the CREATE steps are NOT IMPLEMENTED yet — only the checks are.\n\
-         \n\
-         What DID run just now (and passed) against {}:\n  \
-         - the disk guard: resolved the pool's backing disk and matched the declared model\n  \
-         - the collision check: no domain named {} exists\n  \
-         - name/image validation\n\
-         \n\
-         What is still missing: qemu-img overlay create, the cloud-init seed, and virt-install.\n\
-         Those need a privilege decision first — the image pool is root-owned, and this command \
-         will NOT embed a sudo password. The clean route is libvirt's own APIs over the existing \
-         connection (`virsh vol-create-as` + `vol-upload`, then `virt-install --connect`), which \
-         work through the libvirt group with no sudo at all.\n\
-         \n\
-         Until then use `--dry-run` for the plan, or the scratchpad `provision_guest.sh`.\n\
-         Plan:\n  {}",
-        host.host_id,
-        config.name,
-        plan.join("\n  ")
+    // --- create -------------------------------------------------------------
+    // The Rust-side guards above (disk model + collision) have passed. The pool is
+    // group-writable to `kvm` and the host user is in `libvirt`, so the overlay,
+    // the cloud-init seed and the domain are all created with NO sudo.
+    let auth_key = match config.authorized_key.as_deref() {
+        None => "\"$HOME/.ssh/id_ed25519.pub\"".to_owned(),
+        Some(path) => {
+            ensure_script_safe_value("authorized_key", path)?;
+            if path.contains('\'') {
+                return Err("--authorized-key must not contain a single quote".to_owned());
+            }
+            format!("'{path}'")
+        }
+    };
+    let script = HOST_PROVISION_GUEST_SCRIPT
+        .replace("__POOL__", pool.as_str())
+        .replace("__NAME__", config.name.as_str())
+        .replace("__IMAGE__", config.image.as_str())
+        .replace("__DISK_GB__", config.disk_gb.to_string().as_str())
+        .replace("__RAM_MB__", config.ram_mb.to_string().as_str())
+        .replace("__VCPUS__", config.vcpus.to_string().as_str())
+        .replace("__AUTH_KEY__", auth_key.as_str());
+
+    let out = run_guest_script(
+        endpoint.as_str(),
+        None,
+        script.as_str(),
+        false,
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        timeout,
+    )?;
+    let result = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("PROVISION-RESULT:"))
+        .map(str::trim)
+        .ok_or_else(|| format!("host {}: provision did not confirm:\n{out}", host.host_id))?;
+
+    if config.json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "host_id": host.host_id,
+            "guest": config.name,
+            "connect_uri": connect_uri,
+            "detail": result,
+            "next": "resolve its IP with discover_hosts, then bootstrap_vm / provision_guest_toolchain",
+        }))
+        .unwrap_or_else(|_| "{}".to_owned()));
+    }
+    Ok(format!(
+        "host {} — {result}\n  next: discover_hosts to get its IP, then provision_guest_toolchain + bootstrap_vm\n",
+        host.host_id
     ))
 }
+
+/// Create a libvirt guest on a host: qemu-img overlay + cloud-init seed +
+/// virt-install --import. Runs entirely unprivileged — the pool is group-writable
+/// to `kvm` and the host user is in `libvirt` (see the pool remediation in the
+/// LinuxVmHostPlan). Each interpolated value is single-quoted and the caller
+/// forbids a literal single quote, so the quoting cannot be escaped.
+const HOST_PROVISION_GUEST_SCRIPT: &str = r##"#!/bin/bash
+set -uo pipefail
+POOL='__POOL__'
+NAME='__NAME__'
+IMAGE='__IMAGE__'
+DISK_GB='__DISK_GB__'
+RAM_MB='__RAM_MB__'
+VCPUS='__VCPUS__'
+BASE="$POOL/$IMAGE"
+OVERLAY="$POOL/$NAME.qcow2"
+SEED="$POOL/$NAME-seed.iso"
+
+# TOCTOU re-checks on the box, which is the source of truth for what exists.
+[ -f "$BASE" ] || { echo "PROVISION-ERROR: base image not found: $BASE" >&2; exit 1; }
+if virsh -c qemu:///system dominfo "$NAME" >/dev/null 2>&1; then
+  echo "PROVISION-ERROR: domain $NAME already exists — refusing to overwrite" >&2; exit 2
+fi
+[ -e "$OVERLAY" ] && { echo "PROVISION-ERROR: overlay already exists: $OVERLAY" >&2; exit 3; }
+PUBKEY="$(cat __AUTH_KEY__ 2>/dev/null || true)"
+[ -n "$PUBKEY" ] || { echo "PROVISION-ERROR: no readable public key at __AUTH_KEY__" >&2; exit 4; }
+
+# Copy-on-write overlay on the base image (pool group-writable — no sudo).
+qemu-img create -f qcow2 -F qcow2 -b "$BASE" "$OVERLAY" "${DISK_GB}G" >/dev/null 2>&1 \
+  || { echo "PROVISION-ERROR: qemu-img create failed" >&2; exit 5; }
+
+# cloud-init seed: hostname + the provisioning host's key on the image's default
+# user, so the host can SSH in immediately with no follow-up authorize step.
+WORK="$(mktemp -d)"
+{
+  echo "#cloud-config"
+  echo "hostname: $NAME"
+  echo "ssh_authorized_keys:"
+  echo "  - $PUBKEY"
+} > "$WORK/user-data"
+{
+  echo "instance-id: $NAME"
+  echo "local-hostname: $NAME"
+} > "$WORK/meta-data"
+if ! cloud-localds "$SEED" "$WORK/user-data" "$WORK/meta-data" >/dev/null 2>&1; then
+  echo "PROVISION-ERROR: cloud-localds failed (is cloud-image-utils installed?)" >&2
+  rm -rf "$WORK"; rm -f "$OVERLAY"; exit 6
+fi
+rm -rf "$WORK"
+
+# Create + boot. --noautoconsole so virt-install returns instead of attaching a
+# console; --video vga because a headless Debian cloud image's GRUB needs a
+# framebuffer (a documented lab gotcha).
+# --osinfo is mandatory in modern virt-install; detect=on,require=off auto-detects
+# from the image and falls back to a generic profile (a perf warning, not a fatal
+# error) rather than requiring a per-image OS name.
+if ! virt-install --connect qemu:///system --name "$NAME" \
+     --memory "$RAM_MB" --vcpus "$VCPUS" --cpu host-passthrough \
+     --disk "$OVERLAY" --disk "$SEED",device=cdrom \
+     --network network=default,model=virtio --video vga --graphics none \
+     --osinfo detect=on,require=off --import --noautoconsole >/dev/null 2>&1; then
+  echo "PROVISION-ERROR: virt-install failed (re-run the virt-install by hand for the reason)" >&2
+  virsh -c qemu:///system undefine "$NAME" >/dev/null 2>&1 || true
+  rm -f "$OVERLAY" "$SEED"; exit 7
+fi
+virsh -c qemu:///system autostart "$NAME" >/dev/null 2>&1 || true
+
+st="$(virsh -c qemu:///system domstate "$NAME" 2>/dev/null || echo unknown)"
+echo "PROVISION-RESULT: created domain $NAME (state=$st, overlay=$OVERLAY, seed=$SEED)"
+"##;
 
 /// Run a plain command on a lab host over SSH, argv-only (§4).
 fn run_host_cmd(
@@ -54340,5 +54610,95 @@ mod fetch_host_artifact_tests {
         let begin = s.find("FETCH-BODY-BEGIN").expect("sentinel");
         let cat = s.find("cat \"$P\"").expect("cat");
         assert!(begin < cat, "the body sentinel must precede the cat");
+    }
+}
+
+#[cfg(test)]
+mod renumber_guest_network_tests {
+    use super::{HOST_RENUMBER_NET_SCRIPT, guest_subnet_prefix};
+
+    #[test]
+    fn derives_the_prefix_from_a_cidr() {
+        assert_eq!(
+            guest_subnet_prefix("192.168.121.0/24").unwrap(),
+            "192.168.121."
+        );
+        assert_eq!(guest_subnet_prefix("10.0.5.0/24").unwrap(), "10.0.5.");
+        // The mask is irrelevant to the /24 prefix we renumber onto.
+        assert_eq!(guest_subnet_prefix("172.20.30.0").unwrap(), "172.20.30.");
+    }
+
+    #[test]
+    fn rejects_malformed_subnets() {
+        for bad in [
+            "192.168.121",        // too few octets
+            "192.168.121.0.5/24", // too many
+            "192.168.x.0/24",     // non-numeric
+            "192.168.300.0/24",   // out of range
+            "",
+        ] {
+            assert!(guest_subnet_prefix(bad).is_err(), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_script_is_idempotent_and_sudoless() {
+        let s = HOST_RENUMBER_NET_SCRIPT.replace("__TARGET_PREFIX__", "192.168.121.");
+        // No-op when already on target — the guest restart must be gated on a change.
+        assert!(s.contains("already on ${TARGET_PREFIX}0/24 — no change"));
+        // Every virsh call is on qemu:///system with no sudo.
+        assert!(s.contains("virsh -c qemu:///system net-define"));
+        assert!(!s.contains("sudo"), "the port must not shell out to sudo");
+    }
+}
+
+#[cfg(test)]
+mod provision_guest_create_tests {
+    use super::HOST_PROVISION_GUEST_SCRIPT;
+
+    fn render(auth_key: &str) -> String {
+        HOST_PROVISION_GUEST_SCRIPT
+            .replace("__POOL__", "/var/lib/libvirt/images")
+            .replace("__NAME__", "provtest")
+            .replace("__IMAGE__", "debian-13.qcow2")
+            .replace("__DISK_GB__", "6")
+            .replace("__RAM_MB__", "1024")
+            .replace("__VCPUS__", "1")
+            .replace("__AUTH_KEY__", auth_key)
+    }
+
+    #[test]
+    fn values_are_single_quoted_and_the_default_key_expands_home() {
+        let s = render("\"$HOME/.ssh/id_ed25519.pub\"");
+        assert!(s.contains("POOL='/var/lib/libvirt/images'"));
+        assert!(s.contains("NAME='provtest'"));
+        // Default key path expands $HOME on the host.
+        assert!(s.contains("cat \"$HOME/.ssh/id_ed25519.pub\""));
+    }
+
+    #[test]
+    fn it_refuses_before_it_writes_and_cleans_up_on_failure() {
+        let s = render("\"$HOME/.ssh/id_ed25519.pub\"");
+        // Collision + base-missing checks precede qemu-img create.
+        let dominfo = s.find("dominfo").expect("collision check");
+        let create = s.find("qemu-img create").expect("overlay create");
+        assert!(
+            dominfo < create,
+            "collision check must precede the overlay create"
+        );
+        // A failed virt-install must not leave a half-made domain or disks behind.
+        assert!(s.contains("undefine \"$NAME\""));
+        assert!(s.contains("rm -f \"$OVERLAY\" \"$SEED\""));
+        // --osinfo is mandatory in modern virt-install.
+        assert!(s.contains("--osinfo detect=on,require=off"));
+    }
+
+    #[test]
+    fn the_seeded_key_lands_on_the_default_user() {
+        let s = render("\"$HOME/.ssh/id_ed25519.pub\"");
+        // Top-level ssh_authorized_keys adds the key to the image's default user,
+        // which works uniformly across debian/ubuntu/rocky bases.
+        assert!(s.contains("ssh_authorized_keys:"));
+        assert!(s.contains("- $PUBKEY"));
     }
 }

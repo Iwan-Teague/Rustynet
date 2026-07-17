@@ -1018,6 +1018,9 @@ enum OpsCommand {
     VmLabFetchHostArtifact {
         config: vm_lab::VmLabFetchHostArtifactConfig,
     },
+    VmLabRenumberGuestNetwork {
+        config: vm_lab::VmLabRenumberGuestNetworkConfig,
+    },
     #[cfg(feature = "vm-lab")]
     VmLabHostNetStatus {
         config: vm_lab::VmLabHostNetStatusConfig,
@@ -3641,6 +3644,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .map_err(|_| "invalid value for --vcpus".to_owned())?,
                 disk_gb: parser.parse_u64_or_default("--disk-gb", 40)?,
                 pool: parser.value("--pool"),
+                authorized_key: parser.value("--authorized-key"),
                 ssh_identity_file: parser.optional_path("--ssh-identity-file"),
                 known_hosts_path: parser.optional_path("--known-hosts-file"),
                 dry_run: parser.has_flag("--dry-run"),
@@ -3728,6 +3732,27 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        "vm-lab-renumber-guest-network" => Ok(OpsCommand::VmLabRenumberGuestNetwork {
+            config: vm_lab::VmLabRenumberGuestNetworkConfig {
+                inventory_path: parser.optional_path("--inventory"),
+                host_id: parser.value("--host").ok_or_else(|| {
+                    "vm-lab-renumber-guest-network requires --host <host_id>".to_owned()
+                })?,
+                dry_run: parser.has_flag("--dry-run"),
+                ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 300)?,
+                json: match parser.value("--format").as_deref() {
+                    None | Some("table") => false,
+                    Some("json") => true,
+                    Some(other) => {
+                        return Err(format!(
+                            "invalid value for --format: {other} (expected table|json)"
+                        ));
+                    }
+                },
+            },
+        }),
         "vm-lab-fetch-host-artifact" => Ok(OpsCommand::VmLabFetchHostArtifact {
             config: vm_lab::VmLabFetchHostArtifactConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -8375,6 +8400,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabFetchHostArtifact { config } => {
             vm_lab::execute_ops_vm_lab_fetch_host_artifact(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabRenumberGuestNetwork { config } => {
+            vm_lab::execute_ops_vm_lab_renumber_guest_network(config)
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabHostNetStatus { config } => {
@@ -19797,12 +19826,13 @@ fn help_text() -> String {
         "  ops vm-lab-discover-hosts [--inventory <path>] [--host <host_id>] [--virsh-path <path>] [--timeout-secs <secs>] [--format table|json] [--report-dir <path>]",
         "  ops vm-lab-sync-host (--host <host_id> | --all) [--inventory <path>] [--commit <ref|sha>] [--allow-dirty] [--verify-only] [--discard-host-changes] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-host-preflight [--inventory <path>] [--hosts <id,id>] [--commit <ref|sha>] [--allow-dirty] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
-        "  ops vm-lab-provision-guest --host <host_id> --name <guest> --image <base.qcow2> [--ram-mb <mb>] [--vcpus <n>] [--disk-gb <gb>] [--pool <path>] [--dry-run] [--format table|json]",
+        "  ops vm-lab-provision-guest --host <host_id> --name <guest> --image <base.qcow2> [--ram-mb <mb>] [--vcpus <n>] [--disk-gb <gb>] [--pool <path>] [--authorized-key <host path>] [--dry-run] [--format table|json]",
         "  ops vm-lab-run-matrix-compare [--commit <ref|sha>] [--inventory <path>] [--stage-results <path>] [--expect-runs <n>] [--allow-dirty] [--stage <substring>] [--include-hosts <id,id>] [--ssh-identity-file <path>] [--format table|json]",
         "  ops vm-lab-host-run-status --host <host_id> [--run-id <id>] [--stage <substring>] [--inventory <path>] [--ssh-identity-file <path>] [--format table|json]",
         "  ops vm-lab-launch-on-host --host <host_id> --report-dir <host-relative path> [--host-ssh-identity <host path>] [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>] [--dry-run] [--format table|json] -- <orchestrate-live-lab args...>",
         "  ops vm-lab-stop-host-run --host <host_id> [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-fetch-host-artifact --host <host_id> --path <host-relative path> [--out <local path>] [--max-bytes <n>] [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
+        "  ops vm-lab-renumber-guest-network --host <host_id> [--dry-run] [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-host-net-status [--host <host_id>] [--inventory <path>] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-provision-toolchain [--inventory <path>] [--vm <alias>]... [--vms <a,b>] [--all] [--verify-only] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-fetch-image --host <host_id> --name <file> --url <https://...> [--sha256 <hex>] [--pool <path>] [--inventory <path>] [--timeout-secs <secs>]",
