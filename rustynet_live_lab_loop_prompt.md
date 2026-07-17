@@ -310,11 +310,14 @@ every stage green, not to "finish."
 
 **Outsourcing rule (this is how you spend tokens well):** dumb *reading/summarizing* → DeepSeek flash
 (cheap, read-only, safe). Dumb *deterministic ops* (clean / deploy / seed / recover) → the orchestrator +
-lab-state MCP functions (zero LLM tokens, deterministic, safe). Code, security decisions, and driving the
-lab → you (the expensive, trusted tokens, reserved for judgment). **NEVER put an LLM — even cheap DeepSeek
-— in a mutate / deploy / cleanup path: that work needs determinism and trust, not intelligence, and the
-deepseek tooling is untrusted + read-only by design. If a deterministic op is missing a one-call helper,
-the fix is to add the MCP function, not to point an LLM at it.**
+lab-state MCP functions (zero LLM tokens, deterministic, safe). *Code work itself* → a Claude sub-agent,
+Sonnet for simple/well-scoped, Opus for complex/security-sensitive (§8.1) — parallelizes real work off
+your own context. *Security decisions and driving the lab* → you alone, always (the one thing that never
+delegates — you review every sub-agent diff, make every security call, and are the only one calling
+`deepseek_lab_run`). **NEVER put an LLM — even cheap DeepSeek — in a mutate / deploy / cleanup path:
+that work needs determinism and trust, not intelligence, and the deepseek tooling is untrusted +
+read-only by design. If a deterministic op is missing a one-call helper, the fix is to add the MCP
+function, not to point an LLM at it.**
 
 ═══════════════════════════════════════════
 2) SESSION START — ORIENT BEFORE ACTING
@@ -1005,16 +1008,81 @@ confirm with `git status --porcelain` — pre-existing lints are CI-irrelevant. 
 to CI when versions diverge.
 
 ═══════════════════════════════════════════
-8) SUB-AGENTS, COMMITS, AND COMMIT HYGIENE
+8) SUB-AGENTS — MODEL-TIERED DELEGATION, COMMITS, AND COMMIT HYGIENE
 ═══════════════════════════════════════════
-**Claude sub-agents are for parallel CODE patches ONLY** — one defect/crate each, git worktrees for
-parallel edits. They are NOT for the live lab (you drive that yourself — §0, §5) and NOT a substitute for
-DeepSeek on research/info-gathering (use the DeepSeek MCP for that — §3). **You are the reviewer of record**
-— read every diff, re-run gates yourself,
+**Claude sub-agents are for CODE WORK and trusted verification** — patches, one defect/crate each,
+git worktrees for parallel edits, and "confirm/refute this against the real code" checks you want a
+second set of hands on. They are NOT for the live lab (you drive that yourself — §0, §5): you are
+almost certainly running as Sonnet, and the sub-agents you spawn are a DIFFERENT resource from
+DeepSeek — DeepSeek is cheap/external/UNTRUSTED and read-only-or-propose-only (§3); Claude sub-agents
+are trusted (same provider, same review bar) and can actually touch files. Use DeepSeek for breadth
+and first-pass triage; use a Claude sub-agent when the task needs real judgment applied to the
+codebase, or when you want to parallelize actual work. **You are always the reviewer of record**,
+regardless of which tier produced the diff — read every diff yourself, re-run gates yourself,
 adversarially verify every security change: still fail-closed? default-deny preserved?
-signature-before-apply intact? no backend boundary leakage? no new `unwrap()`/fallback?
-For hard calls, fan 3–5 DeepSeek flash calls all asked to REFUTE the patch; disagreement =
-dig deeper before committing.
+signature-before-apply intact? no backend boundary leakage? no new `unwrap()`/fallback? For hard
+calls, fan 3–5 DeepSeek flash calls all asked to REFUTE the patch too; disagreement = dig deeper
+before committing. Delegating the WORK is fine and encouraged; delegating the JUDGMENT is not.
+
+**8.1 — Model tier: match the sub-agent's model to the task's difficulty, don't default to one
+tier for everything.**
+
+| Task shape | Model | Why |
+|---|---|---|
+| Verify a specific claim against the real code ("does fn X actually do Y — cite file:line, confirm or refute") | **Sonnet** | Well-scoped, low-ambiguity, single clear question — Sonnet-tier reasoning is enough and it's cheaper/faster, so run several concurrently if you have several claims to check. |
+| Fetch/summarize a bounded set of files or a log/diff you'll act on yourself | **Sonnet** | Mechanical; the value is parallelism and keeping the read out of your own context, not depth of reasoning. |
+| A scoped, single-crate patch that matches an already-established pattern in the codebase (e.g. "add this test following the shape of the three next to it," "extract this parser the way the last five extractions did") | **Sonnet** | The shape of the fix is already known; Sonnet is fully capable of pattern-matched, low-ambiguity implementation work. |
+| Confirm a DeepSeek triage report's claims against the real repo before you act on them | **Sonnet** | This is exactly a verification task — cheap, trusted, parallelizable. (This is a Claude sub-agent doing the "verify" half of §3's DeepSeek-verifies-DeepSeek chain when you want a Claude-trusted check rather than the grounded `deepseek_agent`.) |
+| A patch touching crypto, trust-state, the privileged-helper boundary, policy/ACL evaluation, or any control in the §8 (companion doc) security controls catalog | **Opus** | Security-sensitive; the cost of a subtle mistake here is much higher than the cost of a slower/pricier sub-agent. Reserve the expensive tier for where correctness actually matters most. |
+| A multi-file root-cause investigation where the cause is NOT yet known (as opposed to a fix whose shape is already clear) | **Opus** | Genuine multi-step reasoning across an unfamiliar interaction, not pattern-matching — the shape of hard cases in this repo's own journal (§R14): the exit-demotion-residue bug took two root-cause iterations across `phase10.rs`'s NAT-forwarding capture logic before the real cause was found. |
+| Adversarial review of a patch before it lands — "find the reason this is wrong" | **Opus**, `subagent_type: "code-reviewer"` if available, else `general-purpose` with an explicit refute-first prompt | A second, harder-to-fool opinion before a security-sensitive commit; pairs with the DeepSeek flash REFUTE fan-out above rather than replacing it — Opus catches a different class of mistake than 3-5 flash calls do. |
+| A design/architecture call not already resolved by the §9 Hard Decision Protocol's own research | **Opus** | Same reasoning-depth logic as the root-cause case. |
+
+If a task doesn't clearly fit a row, default to **Sonnet first** — escalate to Opus only when Sonnet's
+output looks shallow, wrong, or the task is already known up front to be security-sensitive or
+open-ended. Don't reflexively reach for Opus "to be safe" on a mechanical task; that's the same waste
+§0a exists to eliminate, just paid at a different tier.
+
+Concrete shape (the `Agent` tool's `model` parameter overrides the sub-agent's default for that one
+call):
+```
+Agent({
+  description: "Verify RSA-0009 fix claim",
+  subagent_type: "general-purpose",
+  model: "sonnet",
+  prompt: "Read rustynet_repo_context_prompt.md first for repo context. Then verify: does
+           apply_signed_update in crates/rustynet-control/src/membership.rs now handle
+           concurrent revoke+key-rotation deterministically? Cite the exact function and
+           reasoning; confirm or refute — do not guess."
+})
+
+Agent({
+  description: "Patch Linux exit-demotion residue bug",
+  subagent_type: "general-purpose",
+  model: "opus",
+  isolation: "worktree",
+  prompt: "Read rustynet_repo_context_prompt.md first for repo context. Then: <concrete task,
+           exact file paths and line numbers, the failing stage, what 'fixed' looks like>."
+})
+```
+Use `isolation: "worktree"` whenever more than one sub-agent will patch code concurrently — it's
+the mechanism behind "git worktrees for parallel edits" above, and prevents two sub-agents' edits
+from clobbering each other on the same working tree. Sub-agents run in the background by default;
+don't block on one if you have other work queued (§0a) — the Agent tool notifies you on completion.
+
+**8.2 — Feed sub-agents the repo-context doc when the task is worth it.** A fresh sub-agent has NO
+memory of this conversation and no repo grounding beyond what its prompt gives it. For anything
+beyond a single named-file mechanical fetch, start the sub-agent's prompt with **"Read
+`rustynet_repo_context_prompt.md` first for full repo context"** — mission, constraints, security
+baseline, crate map, domain types, security controls, engineering patterns, the CLI surface, current
+security posture. This is strictly better than trying to summarize those constraints yourself inline:
+it's the SAME grounding you have (not an approximation you reconstruct from memory), and it costs the
+sub-agent one file read, not you any extra tokens to write out. Skip it for genuinely trivial,
+single-file, single-fact tasks — the doc's ~850 lines aren't worth the read for "does this exact
+string appear in this exact file." **Do NOT feed sub-agents the live-lab-loop doc (this one)** — it's
+the autonomous-loop operating doctrine, which is your job alone (§0's division of labor); a sub-agent
+that reads it may try to "help" drive the lab, which is exactly the blurred responsibility §0
+forbids. Sub-agents get the repo-context doc only, never this one.
 
 **Commit hygiene (non-negotiable):**
 - Author = `Iwan-Teague <teague.iwan@outlook.com>` ONLY

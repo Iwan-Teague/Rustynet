@@ -851,3 +851,37 @@ probe-and-recover runbook), `../LiveLabRunMatrix.md` + the two CSVs (aggregate r
 companion doc §5.6/R11 for the two-ledger split), `vm_lab_inventory.json` (VM topology — companion doc
 §5.6 has the live snapshot), and several dated JSON evidence files (rule: these are point-in-time,
 add a new dated file for new evidence, never edit one in place).
+
+═══════════════════════════════════════════
+18) SUB-AGENT DELEGATION — MODEL-TIERED, FOR ANY TASK IN THIS REPO (not just the live-lab loop)
+═══════════════════════════════════════════
+You (the agent reading this doc) are most likely running as Sonnet. When a task is too large for one
+pass, or benefits from parallelism, or needs a second trusted opinion, delegate to a Claude sub-agent
+rather than doing everything inline — but pick the model tier deliberately instead of defaulting to
+one for everything:
+
+- **Sonnet sub-agent** for well-scoped, low-ambiguity work: verifying a specific claim against the
+  real code ("does fn X actually do Y — cite file:line"), fetching/summarizing a bounded set of
+  files, or a mechanical patch whose shape already matches an established pattern elsewhere in the
+  codebase. Cheap enough to run several concurrently.
+- **Opus sub-agent** for genuinely hard work: anything touching crypto, trust-state, the
+  privileged-helper boundary, or policy/ACL evaluation (§8's controls catalog); a multi-file
+  root-cause investigation where the cause isn't known yet (as opposed to a fix whose shape is
+  already clear); adversarial review of a patch before it lands; a design/architecture call not
+  already resolved by precedent. Reserve the expensive tier for where a mistake is expensive.
+- **You always stay the reviewer of record**, whichever tier did the work — read every diff, re-run
+  gates yourself, verify security properties yourself. Delegating the WORK is fine; delegating the
+  JUDGMENT is not.
+- **Feed a sub-agent this very doc** (`rustynet_repo_context_prompt.md`) at the start of its prompt —
+  "Read rustynet_repo_context_prompt.md first for full repo context" — whenever its task needs more
+  grounding than one or two named files give it. A fresh sub-agent has none of your conversation
+  history; this is the cheapest way to give it the same footing you have. Skip it for a genuinely
+  trivial single-file fetch.
+- Use `isolation: "worktree"` on the `Agent` tool call whenever more than one sub-agent will patch
+  code concurrently, so their edits can't collide on the same working tree.
+
+**If you are running the live-lab loop specifically**, the fuller version of this policy — with a
+task-shape → model-tier table and concrete `Agent` call examples — lives in the companion
+`rustynet_live_lab_loop_prompt.md` §8. That doc also has a stricter rule worth knowing even outside
+the loop: never feed a sub-agent the live-lab-loop doc itself unless it is actually driving the loop
+— it's operating doctrine for one job, not general repo context.
