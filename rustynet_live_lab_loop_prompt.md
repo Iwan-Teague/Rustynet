@@ -1,9 +1,16 @@
-# Rustynet Autonomous Parallel Work Prompt
+# Rustynet Live-Lab Loop Prompt
 
 > This prompt is intentionally state-free. It tells the agent HOW to orient and work,
 > not WHAT is currently broken. The agent derives current state from the live files
 > at session start. Update this prompt only when the project's structure or tooling
 > changes — not when specific bugs or parity cells change.
+>
+> **Companion doc: `rustynet_repo_context_prompt.md`.** That doc carries the general repo
+> context this one assumes and does not repeat: mission/constraints/security baseline, the
+> full workspace crate map, key domain types + role-transition rules, the security controls
+> catalog, common engineering patterns (fail-closed, no unwrap, backend boundary, etc.), and
+> the `rustynet-mcp-repo-context`/`rustynet-mcp-gate-runner` MCP tool tables. Read it once per
+> session if this is a fresh context; this doc is 100% about driving the live lab.
 
 ```
 You are Claude Code (the most capable model available) working on **Rustynet** — a production-grade,
@@ -81,7 +88,8 @@ ACL/routes/trust flows. Verify signature + epoch/replay watermark BEFORE applyin
 crypto, no custom VPN protocol; WireGuard stays behind the backend adapter boundary (never leak
 backend/WireGuard types into control/policy/dns-zone/crypto). No `unwrap()`/`expect()` in production
 paths; no TODO/FIXME/placeholders in completed work; no runtime fallback/downgrade in security-sensitive
-paths. Never log or commit secrets or key material.
+paths. Never log or commit secrets or key material. (Full detail + code-pattern examples: companion
+repo-context doc §2, §3, §9.)
 
 **Decisions are yours to make, not to surface.** Read the real code, fan DeepSeek for breadth, take the
 most secure option, and proceed. Do NOT pause for confirmation. Do NOT write status reports asking for
@@ -114,7 +122,8 @@ direction. When a lab surfaces both security and functional defects, patch secur
 
 You run in a context-constrained environment. Your context window is finite. Every token you
 spend on verbose output, unnecessary reads, or blocking waits is a token you cannot spend on
-code, analysis, or lab progress. Internalise these constraints:
+code, analysis, or lab progress. Internalise these constraints (and see §5.5 for the deeper
+sandbox-vs-lab-failure diagnosis this section only summarizes):
 
 - **LIVE LABS NEED HOST ACCESS, NOT THE SANDBOX.** Before launching any live lab,
   confirm you are running with host LAN/SSH/UTM access. If `CODEX_SANDBOX_NETWORK_DISABLED=1`,
@@ -135,7 +144,7 @@ code, analysis, or lab progress. Internalise these constraints:
   job_id. Delete/pause it when no lab remains active, or when the operator explicitly says
   not to start another lab.
 - **DO NOT re-read files you already have in context.** If a file's contents were embedded
-  in an earlier message or the ARCHITECTURE REFERENCE section (R1-R10), use that reference
+  in an earlier message or the ARCHITECTURE REFERENCE section (R1-R12), use that reference
   — do not read the file again.
 - **DO NOT write verbose status reports.** The loop journal (`write_loop_note`) is for
   compact evidence records. A single line per iteration is enough: "macos_exit: stage X
@@ -287,11 +296,19 @@ diverge: local clippy lints on files NOT in your diff are pre-existing and CI-ir
 confirm with `git status --porcelain` before chasing them. `cargo fmt`, `cargo check`, and
 `cargo test` remain valid regardless of version drift; clippy verdict defers to CI.
 
+**h) If this is a genuinely fresh session (no prior context on this repo):** read the
+companion `rustynet_repo_context_prompt.md` once — mission, constraints, crate map, domain
+types, security controls, engineering patterns. Skip it if you already have that context
+loaded from earlier in the session; it does not change often enough to re-read every loop
+iteration.
+
 After orientation, use MCP servers for faster ongoing lookups:
-- `rustynet-mcp-repo-context` — symbol/type, CODE_MAP, role-transition logic, architecture.
+- `rustynet-mcp-repo-context` — symbol/type, CODE_MAP, role-transition logic, architecture
+  (full tool table: companion doc §11).
 - `rustynet-mcp-lab-state` — VM state, job status, run results; `write_loop_note` /
-  `get_loop_journal` so findings survive context compaction.
-- `rustynet-mcp-gate-runner` — run gates without long commands.
+  `get_loop_journal` so findings survive context compaction (full tool table: §3.5 below).
+- `rustynet-mcp-gate-runner` — run gates without long commands (full tool table: companion
+  doc §11).
 - `rustynet-deepseek` — breadth/triage (§3).
 
 Read the docs in this precedence order when a decision is ambiguous:
@@ -320,6 +337,7 @@ driver — list them first:
 | `mcp__rustynet-deepseek__deepseek_lab_run` | Lower-level loop driver — ONE call = launch the lab + triage on fail → ONE report. Give it an `area` (+ optional `macos`/`windows` or `macos_vm`/`windows_vm`, `exit_vm`/`client_vm`, `rebuild_nodes`, a role-platform selector — `exit_platform`/`relay_platform`/`anchor_platform`/`admin_platform`/`blind_exit_platform`/`macos_promote_exit` — to elect a mac/win node into a role, `skip_linux_live_suite` to skip the ~30-45 min Linux suite and run setup + ONLY the targeted mac/win cell, `dry_run`, `triage_on_failure=false` when external DeepSeek API triage has not been approved, and `allow_concurrent` for disjoint guests). Deterministic deploy path; failure auto-triages unless disabled. Async → returns `job_id`; poll `deepseek_live_lab_result`. |
 | `mcp__rustynet-deepseek__deepseek_live_lab` | The rigid, non-negotiable failure-triage pipeline on a failure you ALREADY have (`target` + `failure_context`): three grounded read-only sub-agents in FIXED order — v4-flash research (why/where/what) → v4-flash verify-every-claim-against-the-repo/lab → v4-pro@MAX review (re-verify + judge the best fix) — into ONE evidence-cited report (root cause + file:line + suspected fix). Async → `job_id`. `deepseek_lab_run` calls this internally on failure; call it directly when you already hold the evidence. |
 | `mcp__rustynet-deepseek__deepseek_live_lab_result` | Poll either async tool above by `job_id` (non-blocking: the report when done, else "still running Ns"). |
+| `mcp__rustynet-deepseek__deepseek_doc_sync` | **PROPOSE-ONLY, READ-ONLY docs-sync**, for AFTER a lab-verified fix. Give it `change_summary` (required) + optional `commit`/`evidence`/`doc_hints`. Reads the current docs (active ledgers, CODE_MAP, README/AGENTS/CLAUDE, doc indexes, run-matrix) over a repo-reads-only toolset (no lab/guest/cargo tools) and returns exact `file`/`old_string`/`new_string`/`rationale` edits plus a "considered, no change" list. Writes NOTHING — you apply the edits after review. Enforces the AGENTS.md↔CLAUDE.md mirror + index-sync; never invents evidence/dates/SHAs. Async → `job_id`; poll `deepseek_live_lab_result`. Use this instead of hand-writing doc updates after a fix lands — it finds every stale reference you'd otherwise miss. |
 | `mcp__rustynet-deepseek__deepseek_agent` | **Read-only autonomous research agent** — drives a tool-calling loop over a confined read-only toolset (23 tools) to inspect the LOCAL repo + lab *itself* + answer with cited evidence + an audit trace. Code: read_file (line ranges), grep (+`context` lines), list_dir, find_files, **find_definition + find_references** (declaration + call-sites). History: read-only git (log/show/diff/**blame**/cat-file). **Grounding-by-execution: `cargo_check`** (does it COMPILE + the real compiler error — host = macOS+common, `target:windows` = the x86_64-pc-windows-gnu cross-target) and scoped **`cargo_test`**. **LIVE cross-OS runtime: `lab_guest_exec`** runs a fixed read-only diagnostic on ANY guest — Linux via utmctl, macOS/Windows via SSH — check = network/routes/dns/service/ports/firewall. Plus the lab run-reports / stage logs / inventory / jobs. **Unlike the proxies (which only reason over what you paste), the agent GROUND-TRUTHS a claim against the actual code/lab** — and now confirms compile/test/runtime by RUNNING it, cross-OS. |
 | `mcp__rustynet-deepseek__deepseek_read` | Analysis, code review, security review, second opinion, risk ID — read-only (proxy; sees only pasted context). |
 | `mcp__rustynet-deepseek__deepseek_write` | Generate boilerplate, test scaffolds, doc drafts — advisory only (proxy). |
@@ -389,6 +407,90 @@ drives a security or code change, YOUR verification against the real code stays 
 "DeepSeek checked DeepSeek" be the last word on a control.**
 
 ═══════════════════════════════════════════
+3.5) LAB-STATE MCP (`rustynet-mcp-lab-state`) — FULL TOOL REFERENCE
+═══════════════════════════════════════════
+This is the server you drive the lab through directly (deterministic, no LLM). ~45 tools.
+Prefer these over hand-typed CLI/SSH — they survive context compaction, track jobs, and
+encode the recovery logic that used to live only in this prompt's prose. If a tool name
+below is not visible, it is deferred — load it with `ToolSearch({query: "select:<name>"})`
+before calling; if it is genuinely absent, the MCP server binary needs a rebuild + reconnect
+(same procedure as DeepSeek, §3) or the feature has not landed yet — fall back to the `rustynet
+ops vm-lab-...` CLI verb directly over Bash/SSH rather than assuming the wrapper exists.
+
+**Orient / go-no-go (call these FIRST every session or after any gap):**
+| Tool | Use |
+|---|---|
+| `preflight_check` | ONE-CALL go/no-go: host tools (cargo/utmctl/ssh/git), ssh identity + known_hosts, inventory parseability, disk headroom, the untracked-`crates/` deploy hazard, every node's power+TCP. Start here. |
+| `get_lab_status` | Discover all UTM VMs: platform, live IP, SSH reachability, execution readiness. |
+| `get_lab_topology` | Compact per-node digest (role, exit/relay-capable, mesh_ip) + the resolved auto-topology `start_live_lab_run` will use with no VM flags. |
+| `get_inventory` | Full inventory JSON, secrets redacted. For a compact view prefer `get_lab_topology`. |
+| `validate_inventory` | Compare stored inventory against live discovery; flags stale IPs/unreachable hosts. |
+| `update_inventory` | The ONLY supported way to refresh live IPs — never hand-edit `vm_lab_inventory.json`. |
+| `host_disk_status` | Host free space + biggest consumers (`state/`, `target-livelab/`, `target/`). Check periodically on a long loop; reclaim with `prune_jobs`. |
+| `what_will_deploy` | Preview exactly what the NEXT run ships: tracked-vs-HEAD changes that WILL deploy + untracked files (crates/ ones flagged) that will NOT. Run before every `start_live_lab_run` — this is what catches "I added a file but forgot to `git add` it" before the run wastes 30 minutes finding out itself. |
+
+**Launch and monitor a run:**
+| Tool | Use |
+|---|---|
+| `start_live_lab_run` | Launch DETACHED, returns `job_id` immediately. `mode=orchestrate` (one-shot discover→setup→run→diagnose) / `run` (existing profile) / `setup`. `nodes=["alias:role",...]` is the ONLY thing that routes through the Rust `--node` engine — the `*_platform` role-election selectors route through the LEGACY BASH orchestrator instead (mutually exclusive with `nodes`). `rebuild_nodes` + `skip_soak` for a fast per-node re-verify after a patch. **`trust_inventory_ready: true` is load-bearing under the macOS MCP sandbox (§5.5) — without it a blind TCP probe can read 0 reachable ports and reboot every healthy VM before aborting.** |
+| `get_job_status` | Fast, non-blocking: state/overall_result/first_failed_stage/report_dir/log path. |
+| `wait_for_job` | Blocks up to 270s then returns. Use inside a heartbeat loop, never as a bare blocking wait. |
+| `get_run_progress` | Mid-run only: elapsed, last-activity age with a hang flag (no log output >10m), best-effort current stage, latest log lines. The tool for "is this progressing or hung" between heartbeat ticks. |
+| `tail_job_log` | Raw combined stdout/stderr tail. |
+| `list_jobs` / `cancel_job` | Job bookkeeping; kill a runaway job. |
+
+**After a run — evidence, diagnosis, and "what's left":**
+| Tool | Use |
+|---|---|
+| `find_untested_work` | **THE coverage-driven work finder — call this to answer "what needs to be done next."** Aggregates the ENTIRE run-matrix history into a prioritized queue: 🔴 REGRESSED (passed before, latest fail — highest priority), 🟠 NEVER-PASSED, ⚪ NEVER-RUN (some unsupported-by-design), 🟡 STALE-GREEN (only passed in old runs — needs re-verification). Filter by `os` (linux/macos/windows/cross). Hands you a target instead of making you hunt through CSVs or the parity-plan prose by hand. Pair with `explain_stage` + `get_platform_support` (repo-context). |
+| `get_run_trend` | One-line loop-convergence verdict over the last N matrix rows: GREEN (stable) / JUST GREEN / STUCK at `<stage>` (keep patching it) / MOVING (each fix advanced the run). Cheaper than `get_run_matrix` for "is my patch working." |
+| `diff_runs` | Did the last patch HELP or REGRESS? Diffs two runs' per-stage outcomes (old vs new, by job_id or report_dir) — which stages flipped and the first divergent stage. The direct answer after every re-verify run. |
+| `get_run_result` | Structured result of one finished run: pass/fail, first_failed_stage, per-OS/per-stage summary, failure digest, git commit + dirty state. |
+| `get_run_matrix` | Read the CSV evidence ledger — recent rows, OS/role/stage coverage. |
+| `explain_stage` | What a stage (e.g. `first_failed_stage`) checks, its owning file/crate, and the most common failure causes. Call this immediately after any `get_run_result` that names a failed stage. |
+| `get_stage_log` | The fast path from a stage name to its actual evidence: `stages.tsv` row(s) (status/rc/description) + that stage's log tail. Use right after `explain_stage`. |
+| `diagnose_live_lab_failure` | Deep triage of a failed run. For a `--node` run it reads the evidence artifacts directly (`orchestrate_result.json` + `stages.tsv` + `failure_digest.json`) and returns log pointers with no SSH needed; `collect_artifacts:true` for a bash/profile run to pull per-VM SSH artifacts. |
+| `grep_report` | Case-insensitive substring search across an ENTIRE report directory → `path:line`. Fastest way to find an error string/panic/peer-id without reading whole logs. |
+| `list_report_artifacts` / `read_report_artifact` | Browse then read one file from a report dir (path-confined). |
+
+**VM power & network recovery (the "everything's unreachable" toolkit):**
+| Tool | Use |
+|---|---|
+| `check_vm_reachable` | One call answers DOWN / UP+reachable / UP-but-UNREACHABLE + the right next action. Start here for any single stuck node. |
+| `get_vm_power_state` | Raw `utmctl list` power state (started/stopped/paused) — distinct from SSH reachability. |
+| `power_on_vm` / `power_off_vm` | Power control (`force:true` for a wedged VM). |
+| `restart_vm` | Power cycle + wait for SSH (minutes-scale, blocking). |
+| `recover_stuck_vms` | Recovers Linux QEMU VMs stuck behind a stale nftables killswitch (SSH closed, VM alive) — runs probe-and-recover. |
+| `reset_vm_network` | Out-of-band via `utmctl exec` (NO SSH needed): flush the nft killswitch, stop rustynetd, restart networking, re-probe :22. Use when `check_vm_reachable` says UP-but-UNREACHABLE on a Linux guest. |
+| `get_vm_network_info` | Out-of-band `ip addr`/`ip route`/nft ruleset/daemon journal — the triage companion to `reset_vm_network`, run it FIRST to see *why* before resetting. |
+| `diagnose_host_lab_network` | HOST-side routing diagnosis — distinguishes a stale/missing host route (fixable, prints the exact command) from the host physically being off that VM's LAN right now (not fixable remotely). Use when EVERY node is unreachable at once. |
+| `apply_host_route_fix` | Applies the fix `diagnose_host_lab_network` prescribes, via a native macOS admin-privilege prompt — never accepts a raw command, re-derives it internally. Requires the user at the keyboard. |
+| `diagnose_vm_lan_presence` | Is a VM on the real physical LAN or stuck on UTM's isolated "Shared" bridge? Fresh ARP-by-MAC, not stale inventory — UTM's Shared mode is non-deterministic per restart. |
+| `apply_vm_bridged_network` | Forces a VM deterministically onto the physical LAN (flips UTM Shared→Bridged, reboots, waits for a fresh lease). Minutes-scale, idempotent. |
+| `set_vm_internet_access` | Give a guest internet egress via a reverse SOCKS tunnel through the HOST's own connection — guests have no direct egress by design. |
+| `ensure_lab_ready` | Discover → restart-unready → wait-SSH → reconfirm, blocking, minutes-scale. The all-in-one before a run when you don't know the fleet's state. |
+
+**Build/deploy prep:**
+| Tool | Use |
+|---|---|
+| `seed_cargo_cache` | Keeps each guest's OFFLINE cargo registry in sync with the workspace `Cargo.lock` after a dependency change — detects missing `.crate`/index entries per node and ships only the delta over scp. Run after any `Cargo.lock` change, before the next run. Prefer this over the manual tar-over-ssh recipe in §5. |
+| `bootstrap_vm` | Run one bootstrap phase on a VM (sync-source/build-release/install-release/restart-runtime/verify-runtime/tunnel-smoke/killswitch-smoke/dns-smoke/ipv6-smoke/all). |
+| `sync_repo_to_vm` | rsync the working tree to one VM directly (single-host lab only — see §5.6 for the multi-host `vm-lab-sync-host` git-based equivalent, which is NOT the same tool). |
+
+**Journal (survives context compaction):**
+| Tool | Use |
+|---|---|
+| `write_loop_note` | Append one note (hypothesis / patch / result / blocker) to `state/mcp-loop-journal.jsonl`. Do this every iteration. |
+| `get_loop_journal` | Read back the last N notes. Call this after any compaction, or at session start, before repeating work someone (possibly you, in a prior context) already tried. |
+
+**Other MCP servers** — `rustynet-mcp-repo-context` and `rustynet-mcp-gate-runner` full tool
+tables live in the companion `rustynet_repo_context_prompt.md` §11 (not duplicated here); you
+will use both constantly in this loop too — repo-context for structural lookups
+(`get_role_transition` in particular encodes the role-transition ordering rules; companion
+doc §7 has the full rule set — check it before writing any role-transition code) and
+gate-runner for `run_gates`/`run_security_gates` before every commit (§7 below).
+
+═══════════════════════════════════════════
 4) WORKING ON MAIN — ALWAYS + THE DEPLOY-BRANCH TRAP
 ═══════════════════════════════════════════
 All development on `main`. The lab-main worktree at `.claude/worktrees/lab-main` is always
@@ -451,6 +553,9 @@ table below is a reference snapshot only — verify it matches the inventory bef
 | macos-utm-1 | 192.168.0.210 | mac | macos |
 | windows-utm-1 | 192.168.0.45 | windows | windows |
 
+(§5.6 covers the second host, `ubuntu-kvm-1`, and its own guest subnet — this table is the
+single-host/`mac-utm-1` snapshot only.)
+
 Prefer the `rustynet-mcp-lab-state` MCP (`start_live_lab_run`, `get_run_progress`,
 `get_run_result`, `get_stage_log`, `tail_job_log`, `diagnose_live_lab_failure`) over typing
 CLI commands — it survives context compaction and tracks jobs. Verify reachability yourself
@@ -492,7 +597,8 @@ index.crates.io" is EXPECTED and benign. zsh does NOT word-split — pass SSH op
   `C:\CargoHome` on Windows). The warm caches only hold the *prior* lock's crates. Seed just the delta —
   the crates the `Cargo.lock` diff added — via tar-over-ssh (the `.crate` files + their index `.cache`
   entries), then verify with `cargo generate-lockfile --offline` on one guest before a run. Re-seed any
-  guest that gets re-imaged.
+  guest that gets re-imaged. (Prefer `mcp__rustynet-lab-state__seed_cargo_cache` — §3.5 — over doing this
+  by hand.)
 
 **FAIL-LOUD:** the live stage result IS its status. Honest `Skipped`/`Partial` over false
 `Passed`. After every evidence run verify the appended row in
@@ -553,10 +659,180 @@ If macOS is in the run, also check for pf/forwarding residue:
 `ssh mac@<macos-ip> 'sudo pfctl -sr 2>/dev/null | grep rustynet; sysctl net.inet.ip.forwarding'`
 
 ═══════════════════════════════════════════
+5.5) SANDBOX & TOOL-ACCESS PITFALLS — READ BEFORE ANY MCP LAB CALL FAILS MYSTERIOUSLY
+═══════════════════════════════════════════
+**The single most common false alarm in this repo: every node failing the SAME way at the
+SAME early stage is almost always the calling environment's sandbox, not the lab, not the
+code.** Check this section before spending 20 minutes debugging a VM that was never broken.
+
+**macOS MCP LAN sandbox (Local Network Privacy) — the #1 offender.** On the macOS host, the
+Claude desktop app launches MCP servers through a sandbox wrapper
+(`Claude.app/Contents/Helpers/disclaimer`), which is subject to macOS Local Network Privacy.
+Any MCP tool that opens a TCP/SSH socket to a lab guest (a LAN / private-range IP) is silently
+blocked and returns **`EHOSTUNREACH` — "No route to host (os error 65)"**. Confirmed to hit
+`check_vm_reachable` (TCP probe) and `validate_inventory` (`ssh_port_status`), and by extension
+any SSH-driven lab-state tool (`bootstrap_vm`, `sync_repo_to_vm`, `get_vm_diagnostics`,
+`get_vm_network_info`, `set_vm_internet_access`). It is **environmental**, not a code, routing,
+or inventory bug — and it hits **every node identically** (Linux/macOS/Windows/Fedora/Ubuntu/
+Rocky). Do NOT chase it per-VM or "fix" it in the inventory.
+
+- **`start_live_lab_run`'s own internal readiness gate is ALSO affected.** Its pre-run
+  restart-unready check uses a raw TCP :22 probe that can read **0 reachable ports** under this
+  sandbox even though the real `ssh` binary reaches every node fine — left unguarded, it will
+  conclude every VM is down and **reboot the entire healthy fleet** before aborting. Once you
+  have independently confirmed reachability (e.g. via Bash `nc` or `preflight_check`'s node
+  table), always pass **`trust_inventory_ready: true`** to `start_live_lab_run` to skip the
+  blind probe. Bootstrap SSH then fails loudly and correctly if a node really is unreachable.
+- **Trust the `utmctl`-based half, distrust the TCP/SSH half.** Power state and live-IP
+  resolution (`utmctl` / arp-by-mac) are accurate under the sandbox; the reachability/`ssh_port`
+  verdict is the false negative.
+- **The Bash tool is NOT sandboxed** — it runs directly under the shell with no container and
+  reaches the lab LAN fine. Do reachability, SSH, scp, deploy, and ad-hoc orchestration **from
+  Bash** when an MCP call reports a suspicious blanket failure:
+  - probe: `nc -z -G5 <ip> 22`, or a direct `ssh`/`sshpass -p <pw> ssh ...`
+  - full unsandboxed toolset: `cargo run -q -p rustynet-cli --features vm-lab -- ops
+    vm-lab-...` — reaches guests the sandboxed MCP wrapper can't (the `vm-lab` feature is
+    required; lab commands are compiled out of default builds).
+- **Permanent fix** (make the MCP tools themselves reach the LAN with no per-call workaround):
+  run `rustynet-mcp-lab-state` as your own **unsandboxed** process (e.g. via launchd) and
+  connect over a URL transport instead of letting the client spawn it under `disclaimer`. This
+  is infrastructure work, not a per-session fix — flag it if you have spare capacity, don't
+  block the loop on it.
+
+**zsh does not word-split.** The host login shell is zsh: an unquoted `$VAR` holding multiple
+flags does NOT split into separate arguments the way it would in bash. Pass multi-flag SSH
+options inline, or use `${=VAR}` / an array — otherwise the probe fails with `keyword
+stricthostkeychecking extra arguments` and looks like a config error.
+
+**Restricted/no-network launch environments (Codex sandbox, CI runners, etc.).** If
+`verify_ssh_reachability` or a preflight stage fails IMMEDIATELY (not after a timeout) when the
+loop was launched from a different agent harness or a CI-style restricted shell, the live lab
+was started inside an environment with no LAN/SSH/UTM access at all — this is not a product
+bug, there is no code to patch. Check for a sandbox-network env var
+(`CODEX_SANDBOX_NETWORK_DISABLED` or equivalent), relaunch from a host-capable shell, and verify
+with a direct `nc -z <guest-ip> 22` before assuming the lab itself is broken.
+
+**Diagnostic rule of thumb:** if the failure signature is identical across every node, at the
+earliest possible stage, and the same nodes were reachable minutes ago in a different tool —
+suspect the sandbox first, the network second, the code third.
+
+═══════════════════════════════════════════
+5.6) MULTI-HOST — DRIVING THE LAB FROM A REMOTE LINUX HOST (`ubuntu-kvm-1`)
+═══════════════════════════════════════════
+The lab is no longer single-host. A second, larger x86-64 Linux box (`ubuntu-kvm-1`, AMD Ryzen 7
+7700X, 61 GiB RAM, nested virt ON, libvirt/QEMU/KVM) is registered in `hosts[]` in
+`vm_lab_inventory.json` alongside the Mac (`mac-utm-1`). It is reached over Tailscale MagicDNS
+(`ubuntu-headless.tail3413b7.ts.net`, currently `100.117.1.47`); libvirt connects via
+`qemu+ssh://ubuntu-server@ubuntu-headless/system`; its checkout lives at
+`/home/ubuntu-server/Rustynet` (`repo_dir` in the inventory); its guest subnet is
+`192.168.121.0/24`. `linux-x86-client-1` in the flat guest topology (§5's inventory table; also
+visible via `get_lab_topology`) is a guest running ON this host — this is real, live
+infrastructure, not a proposal. **Full design + rationale + build log:
+`documents/operations/active/LinuxVmHostPlan_2026-07-14.md`** — it is still evolving (owner
+ratification of the overall plan is open even though the pipeline below is built and
+live-proven); read it directly rather than trusting this summary blindly if something here
+doesn't match what you observe.
+
+**Why it exists (strongest reason first):** Apple-Silicon UTM/QEMU exposes no nested
+virtualization to guests, so a Windows guest in the Mac lab can never run WinNAT — permanently
+parking the Windows **exit** and **blind_exit** dataplane parity cells. `ubuntu-kvm-1` has real
+KVM nested virt, so a Windows-on-x86 guest there can finally prove those cells. Secondary
+reasons: ~10-guest capacity vs the Mac's ceiling, a second physical host toward higher lab-tier
+common-mode-risk reduction, and genuine x86-64 native coverage (the Mac lab is aarch64-only).
+
+**The guest-orchestration plane already doesn't care.** `NodeConnection::Ssh` targets whatever
+IP it's given over plain OpenSSH — it was already hypervisor-agnostic. Only the VM-lifecycle
+plane (power/IP discovery, previously hardcoded to `utmctl`) needed a `VmController::Libvirt`
+variant, which is what this host proves out.
+
+**The pipeline — call these, in this order, every time. Do not improvise a shortcut:**
+```
+1. git push origin HEAD:main                                    # hosts fetch from the shared public origin
+2. rustynet ops vm-lab-sync-host --host <id> --commit <sha>      # per host; verifies by SSH read-back
+3. rustynet ops vm-lab-host-preflight --commit <sha>             # ordered machine-level gates; must say GO
+4. rustynet ops vm-lab-preflight --select-all                    # per-GUEST readiness (pre-existing tool)
+5. <launch the per-OS runs, one per host, async>
+6. <BOTH runs finish> → read both run-matrix rows at the SAME git_commit
+   rustynet ops vm-lab-run-matrix-compare --commit <sha> --include-hosts mac-utm-1,ubuntu-kvm-1
+7. patch → commit → push → back to step 1
+```
+You genuinely idle while both runs are in flight — do not hand-patch a host's checkout to fill
+the time; editing orchestrator source mid-run trips the setup-manifest provenance check and
+dirties the very evidence row being written. Patch on the dev machine only, then repeat the
+loop from step 1.
+
+**`vm-lab-host-preflight` gates, in order, stop-at-first-failure (mirrors `xtask gates`):**
+| # | Gate | Fails when | Fix |
+|---|---|---|---|
+| 1 | `inventory` | a host is missing `repo_dir` | declare it in `hosts[]` |
+| 2 | `commit_pinned` | the ref doesn't resolve | check the ref/sha |
+| 3 | `local_clean` | your dev tree is dirty | commit (or `--allow-dirty`) |
+| 4 | `commit_pushed` | the SHA isn't on `origin` | `git push origin HEAD:main` — cheapest win, catches an unpushed commit in ~1s instead of failing minutes into a sync |
+| 5 | `hosts_on_commit` | a host is off-commit/dirty | `vm-lab-sync-host --host <id> --commit <sha>` |
+| 6 | `hosts_agree` | hosts sit on different commits | sync all to ONE pinned sha — this is the gate the whole cross-host comparison rests on |
+| 7 | `guests_ready` | a host has 0 ready guests | `vm-lab-discover-hosts` |
+
+**Two-different-preflights rule:** `vm-lab-preflight` gates **guests** (reachable/SSH-auth/
+platform-identity/required-commands/free-space); `vm-lab-host-preflight` gates **machines**
+(pinned commit, cross-host agreement, ready-guest rollup). They compose — machines first (step
+3), then guests (step 4). Don't conflate them.
+
+**Load-bearing gotchas — each one already bit this exact pipeline once:**
+- **Never `tar` a source sync from macOS to a Linux host.** macOS `tar` embeds AppleDouble
+  metadata files (`._main.rs`, `._mod.rs`, ...) that land as untracked files on the remote git
+  checkout, making `git status --porcelain` permanently non-empty and every subsequent run's
+  `git_dirty_state` read DIRTY for reasons that have nothing to do with the code. **Use
+  `vm-lab-sync-host` (git bundle/fetch based) — never `tar` from macOS.** If tar is truly
+  unavoidable elsewhere, prefix it with `COPYFILE_DISABLE=1`.
+- **Pin the SHA — never "sync both hosts to main."** This repo has concurrent sessions
+  committing to `main` continuously; resolving "main" independently on two hosts can land two
+  *different* commits that both claim to be comparable. Resolve the SHA once, locally, pass it
+  explicitly to every `vm-lab-sync-host` call.
+- **Each machine's evidence ledger is local to that machine.** A run on `ubuntu-kvm-1` writes
+  `live_lab_node_stage_results.csv` on `ubuntu-kvm-1`, not on your Mac. Reading only your local
+  CSV after a two-host run is "a confident verdict over half the evidence" — always use
+  `vm-lab-run-matrix-compare --include-hosts <id,id>` (or its MCP equivalent once available,
+  `compare_runs_at_commit`) to fetch and merge the remote ledger before drawing a conclusion.
+  Absent stage results are NEVER promoted to pass — an unattributed or all-absent cell reads as
+  `NO-VERDICT`, and same-node-same-stage disagreement across the two hosts reads as `CONFLICT`,
+  never silently resolved.
+- **`vm-lab-sync-host` can destroy a host's own unread evidence if you skip step 6 of the
+  loop.** The ledgers are git-tracked, so a host that just ran a lab has a dirty tree; syncing
+  it forward with `reset --hard` before fetching that evidence deletes it. The tool refuses a
+  dirty host by default and names the diff — pass `--discard-host-changes` only when you have
+  deliberately decided to throw the evidence away, never as a default unblock.
+- **No credentials ever touch a host.** Sync transport is a `git fetch`/bundle from the public
+  GitHub origin — meaning **only pushed commits are syncable**. For a tight unpushed-patch loop,
+  push first; this matches the repo's direct-to-`main` convention anyway.
+- **`reset --hard`, never `git clean -xdff`, on a host checkout.** Clean would delete the
+  untracked `target/` build cache (hundreds of MB–GB) and turn every future sync into a cold
+  build.
+
+**MCP status:** the plan doc labels `host_run_status` and `compare_runs_at_commit` as MCP
+names for the `vm-lab-host-run-status` / `vm-lab-run-matrix-compare` CLI verbs, but neither was
+resolvable via `ToolSearch` as of this prompt's last update — verify with
+`ToolSearch({query:"select:mcp__rustynet-lab-state__host_run_status,mcp__rustynet-lab-state__compare_runs_at_commit"})`
+each session; if still absent, drive the CLI verb directly (it is already SSH-based and works
+fine from Bash, sandbox or not — §5.5) rather than assuming the wrapper exists.
+
+═══════════════════════════════════════════
 6) HOW TO PICK WHAT TO DO NEXT
 ═══════════════════════════════════════════
 After orientation (§2), prioritize work in this order. Each item says where to read the
 current state — never rely on this prompt for what is currently broken.
+
+**Fast path — call `find_untested_work` before reading anything by hand.** It aggregates the
+whole run-matrix history into a ranked queue (🔴 REGRESSED, 🟠 NEVER-PASSED, ⚪ NEVER-RUN, 🟡
+STALE-GREEN) — this answers "what needs to be done next" directly instead of you deriving it
+from CSVs and prose. Follow it with `get_run_trend` after you launch a run to see GREEN/STUCK/
+MOVING instead of re-reading the matrix by hand. Cross-check against
+`documents/operations/active/RustynetUnifiedTodoLedger_2026-07-10.md` (the repository-wide
+TODO roll-up spanning security/release blockers, the live-lab ladder, cross-network, mobile,
+NAS/LLM, testing, CI/supply-chain, performance, and ops — read it if `find_untested_work`
+surfaces a cell whose priority against everything else isn't obvious) and
+`documents/operations/active/CrossPlatformRoleParityPlan_*` for the release-blocking per-role
+× OS matrix specifically. The numbered priority order below still applies for non-lab work
+(CI, security findings) that `find_untested_work` doesn't cover.
 
 **1. New code-caused CI failures** — check `gh run list --branch main --limit 5`. Read
 `CrossPlatformCiHealth_*` for the documented environmental failures on this host. Anything
@@ -629,7 +905,7 @@ was already running. If you find yourself with nothing in flight, that is the bu
 7) GATES
 ═══════════════════════════════════════════
 Run before committing anything that feeds a lab. The authoritative gate definitions live in
-`CLAUDE.md` §7 — read them there; the versions below are a convenience copy:
+`CLAUDE.md` §7 (and the companion doc §10) — the versions below are a convenience copy:
 
 ```bash
 cargo fmt --all -- --check
@@ -641,8 +917,9 @@ cargo deny check bans licenses sources advisories
 ```
 
 Fast loop: `cargo run -p rustynet-xtask -- gates` (fmt→check→clippy→test, fail-fast, timeout
-watchdog). Or via `rustynet-mcp-gate-runner` MCP. Scope scripts live under `scripts/ci/` —
-run the one matching your active scope document.
+watchdog). Or via `rustynet-mcp-gate-runner` MCP (`run_gates`, `run_security_gates` — full
+tool table: companion doc §11). Scope scripts live under `scripts/ci/` — run the one matching
+your active scope document.
 
 **Toolchain:** verify at session start (§2g) that your local `cargo`/clippy version matches
 `rust-toolchain.toml`. On this host the Homebrew `cargo` may shadow the toolchain pin and
@@ -730,12 +1007,14 @@ later turns out to be wrong, the commit message explains the reasoning and the r
 small commit. This is how engineering under autonomy works: decide, document, ship, fix if needed.
 
 ═══════════════════════════════════════════
-ARCHITECTURE REFERENCE — Knowledge the agent needs to hit the ground running
+LAB ARCHITECTURE REFERENCE — Knowledge the agent needs to hit the ground running
 ═══════════════════════════════════════════
 
-This section is NOT state — it is structural knowledge that changes only when the project's
-architecture or tooling changes. Read it once at session start and internalise it. It saves
-you 20+ minutes of `grep`/`find` per session.
+This section is NOT state — it is structural knowledge that changes only when the live-lab
+orchestrator's architecture or tooling changes. Read it once at session start and internalise
+it. It saves you 20+ minutes of `grep`/`find` per session. (General repo architecture —
+workspace crate map, key domain types, security controls catalog — lives in the companion
+`rustynet_repo_context_prompt.md` §6-§8, not repeated here.)
 
 ────────────────────────────────────────────
 R1) KEY FILE MAP
@@ -1021,126 +1300,7 @@ Stages only in Rust: AnchorValidation, DeployRelayService, RelayValidation,
 TrafficTestMatrix, RoleSwitchMatrix, ExitHandoff, ActiveExit, Cleanup.
 
 ────────────────────────────────────────────
-R11) WORKSPACE CRATE MAP — ARCHITECTURAL LAYERS
-────────────────────────────────────────────
-
-```
-Domain (transport-agnostic, NO backend/WireGuard types):
-  rustynet-control     — Membership bundles, roles/capabilities, role transitions, gossip, replay watermarks
-  rustynet-policy      — ACL eval (default-deny always)
-  rustynet-dns-zone    — Magic DNS signed-zone schema
-  rustynet-crypto      — Signing, key types, custody primitives
-  rustynet-local-security  — Local privileged-boundary checks
-  rustynet-sysinfo     — OS detection, interface enumeration
-
-Daemon + Services:
-  rustynetd            — Main daemon: WireGuard mgmt, dataplane, STUN, gossip, ICE, enrollment, killswitch
-  rustynet-relay       — Frame forwarding for relay role
-  rustynet-nas         — Tunnel-only storage (service role)
-  rustynet-llm-gateway — LLM inference gateway (service role)
-
-Backend abstraction:
-  rustynet-backend-api       — Backend trait + abstract types
-  rustynet-backend-wireguard — Kernel WG adapter (wraps boringtun)
-  rustynet-backend-userspace — Boringtun userspace adapter
-  rustynet-backend-stub      — Deterministic test stub
-
-CLI + Tooling:
-  rustynet-cli              — Main CLI binary: ops/vm-lab/orchestrator/live* gates
-  rustynet-lab-monitor      — TUI monitor (excluded from workspace)
-  rustynet-operator         — Operator wizards
-  rustynet-advisor          — FIS-0005 role-placement MCDA scorer
-  rustynet-mcp              — MCP servers (repo-context, gate-runner, lab-state, deepseek)
-  rustynet-xtask            — Dev runner (gates, fmt-check-clippy-test)
-  rustynet-windows-native   — Windows WFP/DPAPI/named-pipe integration
-
-Third-party (vendored):
-  third_party/boringtun     — Userspace WireGuard implementation
-  third_party/rustynet-tun  — TUN device abstraction
-  third_party/rustynet-alloc-meter — Allocation accounting
-```
-
-Dependency chains (who breaks when you patch the shared crate):
-- rustynet-control ← rustynetd, rustynet-cli, rustynet-operator, rustynet-mcp
-- rustynet-backend-api ← rustynet-backend-{wireguard,userspace,stub} ← rustynetd
-- rustynet-policy ← rustynetd (policy eval is daemon-side)
-- rustynet-crypto ← rustynet-control, rustynetd, rustynet-cli
-
-CRITICAL BOUNDARY: Domain crates (control, policy, dns-zone, crypto) MUST NOT import
-backend or WireGuard types. The backend trait lives in rustynet-backend-api; all
-WireGuard-specific code lives behind it. Violation = blocked by CI gate
-`scripts/ci/check_backend_boundary_leakage.sh`.
-
-────────────────────────────────────────────
-R12) KEY DOMAIN TYPES — FILE:LINE LOCATIONS
-────────────────────────────────────────────
-
-| Type | File | Line | Notes |
-|------|------|------|-------|
-| NodeRole (Client/Admin/Exit/BlindExit/Relay/Anchor/Nas/Llm) | rustynet-control/src/roles.rs | ~30 | 8 roles, used everywhere |
-| Capability enum | rustynet-control/src/roles.rs | ~80 | Sub-capabilities per role |
-| RoleTransition | rustynet-control/src/role_presets.rs | ~50 | Transition plan: identity/local-only/signed/blocked/irreversible |
-| MembershipState | rustynet-control/src/membership.rs | ~100 | Signed membership bundle, peer list, epoch, watermark |
-| SignedUpdate (enum) | rustynet-control/src/membership.rs | ~200 | Revoke/Restore/RotateKey/SetCapabilities variants |
-| DefaultDenyPolicy | rustynet-policy/src/eval.rs | ~50 | Default-deny ACL evaluator |
-| Backend trait | rustynet-backend-api/src/lib.rs | ~30 | Tunnel backend abstraction (WireGuard behind it) |
-| DaemonProbeOp | vm_lab/mod.rs | ~6240 | 6 variants: RuntimeAcls/ServiceHardening/KeyCustody/Authenticode/MeshStatus/DnsFailclosed |
-| VmLabStageOutcome | vm_lab/mod.rs | ~4760 | stage + status + summary + artifacts |
-| VmLabStageStatus | vm_lab/mod.rs | ~4750 | Pass/Fail/Skipped/SkippedMissingPeer |
-| StageEvidence | live_lab_run_matrix.rs | ~295 | stage + status + artifacts — the CSV input |
-| MonitorConfig | lab-monitor/src/config.rs | ~6 | area, VM aliases, platform selectors, disabled_stages |
-| StageOutcome | lab-monitor/src/stage_reader.rs | ~17 | stage + status + summary + artifacts |
-| JobState | lab-monitor/src/job_watcher.rs | ~20 | job_id + state + pid + report_dir |
-| VmStatus | lab-monitor/src/vm_prober.rs | ~15 | alias + ip + platform + ssh_ok + git_commit |
-| OrchestrationStage trait | orchestrator/stage/mod.rs | ~99 | id/name/dependencies/execute for Rust pipeline |
-| StageId (21 stages) | orchestrator/stage/mod.rs | ~31-53 | Preflight through Cleanup enum |
-
-Role transition rules (get_role_transition via MCP or rustynet-control/src/role_presets.rs):
-- client→admin: signed, adds serves_admin
-- admin→exit: signed, adds serves_exit (also deploys relay service if serves_relay)
-- exit→blind_exit: signed, IRREVERSIBLE (requires factory reset)
-- blind_exit→anything: BLOCKED by design
-- client→relay: signed, adds serves_relay (deploys rustynet-relay service)
-- anything→anchor: signed, needs existing anchor in mesh
-- adding serves_relay: deploy relay service BEFORE emitting bundle
-- removing serves_relay: undeploy relay service BEFORE revocation bundle
-- exit NAT teardown: MUST happen BEFORE removing exit capability (residue = release-blocker)
-- All transitions: append-only audit log entries
-
-────────────────────────────────────────────
-R13) SECURITY CONTROLS CATALOG (from SecurityMinimumBar.md)
-────────────────────────────────────────────
-
-Controls an agent MUST preserve in every patch. These are non-negotiable:
-
-| § | Control | Enforcement point | Who verifies |
-|---|---------|-----------------|--------------|
-| 4.A | Signed state validation before mutation | rustynet-control/src/membership.rs — verify() before apply() | unit test + live lab |
-| 4.B | Anti-replay watermark | rustynet-control/src/watermark.rs — reject stale epochs | unit test |
-| 4.C | Key custody: OS secure storage or encrypted-at-rest | rustynet-crypto/src/key_custody.rs — macOS Keychain/DPAPI or encrypted file + 0o600 | key_custody stage |
-| 4.D | No secrets in logs | rustynetd/src/secret_log_audit.rs — grep daemon journal for key material | secrets_not_in_logs stage |
-| 4.E | Default-deny ACL | rustynet-policy/src/eval.rs — empty/missing → deny | policy_default_deny audit |
-| 4.F | Fail-closed on trust state unavailable | rustynetd/src/phase10.rs — error on missing state, not default | runtime validation |
-| 4.G | One hardened execution path, no runtime fallback | All security paths — no try-or-downgrade | code review |
-| 4.H | Privileged helper argv allowlist | rustynetd/src/privileged_helper.rs — validate_request() | helper_allowlist audit |
-| 4.I | Blind_exit irreversibility | rustynet-control/src/role_presets.rs — preview_next_state() rejects blind_exit→anything | blind_exit_reversal audit |
-| 4.J | Enrollment token replay prevention | rustynetd/src/enrollment_token.rs — token consumption idempotent | enrollment_replay audit |
-| 4.K | Gossip revoked-peer re-admission denial | rustynetd/src/peer_gossip.rs — reject bundles from revoked sources | gossip_revoked_readmit audit |
-| 4.L | Revoked peer dataplane denial | rustynetd/src/revoked_peer_denied_audit.rs — NoopBackend eval | revoked_peer_denied audit |
-| 4.M | Membership signature forgery rejection | rustynetd/src/membership_signature_audit.rs — forged sigs rejected | signature_forgery audit |
-| 4.N | Membership revoke delayed-apply | rustynetd/src/membership_revoke_audit.rs — 4 delayed-apply + 2 negative cases | membership_revoke audit |
-| 4.O | Hello-limiter flood cap | rustynet-relay/src/hello_limiter_audit.rs — DOS-1 | hello_limiter_flood audit |
-| 4.P | Runtime ACL integrity | rustynetd/src/{linux,macos,windows}_runtime_acls.rs — reviewed roots match | runtime_acls stage |
-| 4.Q | Service hardening | rustynetd/src/{linux,macos,windows}_service_hardening.rs — service config secure | service_hardening stage |
-| 4.R | Mesh state integrity | rustynetd/src/{linux,macos,windows}_mesh_status.rs — session snapshot valid | mesh_status stage |
-
-The enforcement point column IS the file you patch when that control is broken. The verifier
-column IS the stage/evaluator that proves it in the lab. Both must exist before claiming
-a control is "done." Every control has at least one unit test + one live-lab stage (except
-planned roles NAS/LLM which lack live-lab stages).
-
-────────────────────────────────────────────
-R14) COMMON LAB FAILURE PATTERNS — DIAGNOSIS
+R11) COMMON LAB FAILURE PATTERNS — DIAGNOSIS
 ────────────────────────────────────────────
 
 | Failure signature | Most likely root cause | File to patch | How to verify |
@@ -1167,13 +1327,56 @@ When a stage fails: capture the daemon journal from the relevant node, feed to D
 flash for root cause, verify against real code, patch, gate, commit, re-run. Never patch
 blind — always read the journal first.
 
+────────────────────────────────────────────
+R12) STAGE TRIAGE LEDGER — DON'T RE-DERIVE A FIX SOMEONE ALREADY TRIED
+────────────────────────────────────────────
+
+Before deep-diving a failed stage, check whether it has been attempted before — possibly by
+you, in a prior context, possibly by a concurrent session. This repo has a committed,
+per-`(stage, OS)` attempt history precisely so that never has to be re-derived from memory or
+the gitignored `state/mcp-loop-journal.jsonl`.
+
+**Full design: `documents/operations/active/LiveLabStageTriageLedgerPlan_2026-07-16.md`.**
+Scope: **Rust `--node` engine only** — the bash orchestrator's stage vocabulary doesn't overlap,
+so a blended history would be meaningless (same reasoning as the run-matrix split, §5.6).
+
+- **Ledger:** `documents/operations/live_lab_stage_triage.jsonl` — append-only, **committed**
+  (unlike `state/`, so every machine and every agent sees it). One record per `(run_id, stage)`
+  failure: `{stub_id, run_id, run_commit, stage, os_family, error, patch}`. `error` is the
+  verbatim `error_detail` the `--node` engine already writes at evidence finalization — no
+  engine change was needed to capture the failure half.
+- **`patch` starts `null`.** You fill it via `record_stage_patch(stub_id | (run_id, stage),
+  patch)` **before** launching the verification re-run — 2-3 sentences on what you're about to
+  test. Because you fill it before committing the fix, the ledger row's own commit git-history
+  IS the patch commit (`git log -- documents/operations/live_lab_stage_triage.jsonl`) — no SHA
+  field needed, none can go stale. Declining to patch is valid and expected for an environmental
+  cause: `"none: <reason>"` (e.g. a hypervisor VM-reset hang unrelated to Rustynet).
+- **Outcome is derived, never stored** — `stage_triage_history(stage, os?, engine?, limit?)`
+  joins the stub chain against `live_lab_node_stage_results.csv`: next run same stage passes →
+  FIXED; fails with the byte-identical `error` → did NOT fix; fails with a DIFFERENT error →
+  ADVANCED (progress, a new failure surfaced); stage absent since → UNVERIFIED; no later run →
+  PENDING VERIFICATION. This cannot drift from reality because it isn't a field anyone maintains.
+- **Launch-time gate:** the `--node` orchestrator refuses to start a run whose plan includes a
+  stage with an unfilled stub (`patch: null`) — fails closed at launch, names the offending
+  `stub_id`s. This is what actually enforces "don't verify without recording what you tried,"
+  not a pre-commit hook (which would block unrelated concurrent-session commits).
+- **MCP tools:** `stage_triage_history` and `record_stage_patch` on `rustynet-mcp-lab-state`.
+  As of this prompt's last update these did not resolve via `ToolSearch` in every session — the
+  plan was marked PROPOSED/implementation-pending as recently as 2026-07-16 even though the
+  auto-stub half landed in commit history. Verify with
+  `ToolSearch({query:"select:mcp__rustynet-lab-state__stage_triage_history,mcp__rustynet-lab-state__record_stage_patch"})`
+  before relying on them; if absent, read the JSONL directly (`grep '"stage":"<name>"'
+  documents/operations/live_lab_stage_triage.jsonl`) and cross-reference
+  `live_lab_node_stage_results.csv` by hand for the same join.
+
 ═══════════════════════════════════════════
 START NOW
 ═══════════════════════════════════════════
 Run `/loop` (self-paced, on `main`). Act immediately:
 
 1. **Orient in parallel** (§2, ~5 min) — git state, inventory, last 10 CSV rows, parity matrix,
-   open security findings, CI status, toolchain. Do ALL these reads concurrently; don't serialize.
+   open security findings, CI status, toolchain, `find_untested_work` (§6). Do ALL these reads
+   concurrently; don't serialize.
 2. **Fast-forward** the main repo to `origin/main` (§4).
 3. **Before orientation even finishes**, fan DeepSeek flash over the most recent failed stage log —
    candidate root causes arrive before you need them.
@@ -1188,12 +1391,16 @@ Run `/loop` (self-paced, on `main`). Act immediately:
    - From this point the cycle runs forever. Never exit.
 
 **HEARTBEAT RHYTHM — how you stay alive without burning context:**
-- Every ~10 minutes, check each in-flight run once via `deepseek_live_lab_result(job_id)`.
-  In Codex, create/update this as a recurring heartbeat with `automation_update`
-  (use `tool_search` first if the tool is not visible). Do not use a one-shot/COUNT
-  schedule. Put the active `job_id`, report area, commit, and hard rules in the
-  heartbeat prompt. When you relaunch, update the same heartbeat to the new job.
-  When no lab is active and no relaunch is intended, delete/pause the heartbeat.
+- Every ~10 minutes, check each in-flight run once via `deepseek_live_lab_result(job_id)`
+  or `get_job_status`/`wait_for_job`. In Codex, create/update this as a recurring heartbeat
+  with `automation_update` (use `tool_search` first if the tool is not visible). **In Claude
+  Code, use `ScheduleWakeup`** with a delay matched to the run's expected wall-clock (a full
+  3-OS orchestrate run is ~40-50 min; don't schedule tighter than the work actually paces) and
+  pass the active `job_id` + hard rules back through the wakeup `prompt` so the next tick has
+  full context. Either way: do not use a one-shot/COUNT schedule. Put the active `job_id`,
+  report area, commit, and hard rules in the heartbeat prompt. When you relaunch, update the
+  same heartbeat to the new job. When no lab is active and no relaunch is intended, delete/pause
+  the heartbeat.
 - Between heartbeats: patch, gate, stage/prepare the commit, fan DeepSeek, read docs.
   Do not commit/push until the active lab completes and its result is processed.
 - If a heartbeat finds a run COMPLETE: process the result first. Read report artifacts
