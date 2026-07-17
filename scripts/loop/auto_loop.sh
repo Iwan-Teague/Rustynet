@@ -4,13 +4,17 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && /bin/pwd -P)"
-DRIVER="$REPO/scripts/mcp/drive_deepseek.py"
+DRIVER="$REPO/scripts/mcp/drive_ai_agent.py"
 if [ -n "${RUSTYNET_MCP_BIN:-}" ]; then
     BIN="$RUSTYNET_MCP_BIN"
-elif [ -x "$REPO/target/debug/rustynet-mcp-deepseek" ]; then
-    BIN="$REPO/target/debug/rustynet-mcp-deepseek"
+elif [ -x "$REPO/target/debug/rustynet-mcp-ai-agent" ]; then
+    # Development-time direct path: no Keychain injection here, so the
+    # provider's API key must already be exported in this shell.
+    BIN="$REPO/target/debug/rustynet-mcp-ai-agent"
 else
-    BIN="$REPO/bin/rustynet-mcp-deepseek"
+    # Installed path: prefer the Keychain-aware launcher over the raw binary
+    # so this works with no key exported in the shell.
+    BIN="$REPO/bin/rustynet-mcp-ai-agent-launcher.sh"
 fi
 PROMPT="$REPO/state/loop-cycle-prompt.md"
 HISTORY="$REPO/state/loop-cycle-history.jsonl"
@@ -30,7 +34,7 @@ log() { printf '[AUTO %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 git_sha() { git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo "unknown"; }
 
-# ── build deepseek_lab_run args JSON ──────────────────────────────────
+# ── build ai_lab_run args JSON ──────────────────────────────────
 build_args() {
     local area="$1"; shift
     python3 - "$area" "$@" <<'PY'
@@ -160,10 +164,10 @@ append_opencode_review_to_report() {
 }
 
 # ── classify report ──────────────────────────────────────────────────
-# Anchor on the deepseek_lab_run report HEADER markers (unambiguous) rather than
+# Anchor on the ai_lab_run report HEADER markers (unambiguous) rather than
 # grepping the body — a FAIL triage report contains the words "pass"/"fail" in
 # its per-stage prose, which a loose body grep misclassifies. The headers come
-# from deepseek.rs: "— PASS\n\nThe orchestration completed successfully",
+# from ai_agent.rs: "— PASS\n\nThe orchestration completed successfully",
 # "— FAIL → triage", "— TIMED OUT after", "— DRY-RUN wiring check".
 classify() {
     local report="$1"
@@ -257,7 +261,7 @@ write_prompt() {
         printf -- '- Area: `%s`\n' "$area"
         printf -- '- Job record: `%s`\n' "$(job_record_path "$jid")"
         if [ -n "${CURRENT_ARGS_JSON:-}" ]; then
-            echo "- Original deepseek_lab_run args:"
+            echo "- Original ai_lab_run args:"
             printf '```json\n%s\n```\n' "$(printf '%s' "$CURRENT_ARGS_JSON" | python3 -m json.tool 2>/dev/null || printf '%s' "$CURRENT_ARGS_JSON")"
         fi
         echo ""
@@ -266,7 +270,7 @@ write_prompt() {
         recent_history 5
         echo ""
 
-        echo "## DeepSeek Report"
+        echo "## AI-Agent Report"
         printf '%s\n' "$report"
         echo ""
         echo "---"
@@ -280,22 +284,22 @@ write_prompt() {
 1. VERIFY the evidence (you, ~30s): confirm the row exists in
    live_lab_run_matrix.csv with overall_status + THIS cell PASS. Do not trust a
    green report without the matrix row.
-2. SYNC docs: deepseek_doc_sync(change_summary="<role> proven live on <OS>",
+2. SYNC docs: ai_doc_sync(change_summary="<role> proven live on <OS>",
    evidence="<run id / matrix row>"). Apply the reviewed edits only. Keep
    AGENTS.md and CLAUDE.md byte-mirrored; update the parity matrix cell
    (CrossPlatformRoleParityPlan) from ❌/🟡 to ✅.
 3. PICK the next unproven cell: choose a role×OS still
-   ❌/🟡 in the parity matrix. Prefer `deepseek_next_live_lab_target` because it
-   returns exact supported `deepseek_lab_run` JSON. Do not re-run a green cell.
+   ❌/🟡 in the parity matrix. Prefer `ai_next_live_lab_target` because it
+   returns exact supported `ai_lab_run` JSON. Do not re-run a green cell.
 4. LAUNCH it — TEST ONLY THAT CELL, do not pay for the whole Linux lab:
    - mac/win cell:
-       deepseek_lab_run(area="<role> <OS>", <OS>=true, <role>_platform=<OS>,
+       ai_lab_run(area="<role> <OS>", <OS>=true, <role>_platform=<OS>,
            <OS>_vm=..., exit_vm=..., client_vm=..., entry_vm=...,
            skip_linux_live_suite=true)
      skip_linux_live_suite=true runs setup + ONLY that mac/win cell, skipping the
      ~30-45min Linux live suite (already proven; re-running it is wasted time).
    - Linux cell:
-       deepseek_lab_run(area="<role> linux", exit_platform=linux, ...)
+       ai_lab_run(area="<role> linux", exit_platform=linux, ...)
      WITHOUT skip_linux_live_suite — there the Linux suite IS the cell.
    See scripts/loop/README.md for per-cell launch examples.
 5. The auto_loop detects your launch and shepherds the next report. NEVER idle —
@@ -310,9 +314,9 @@ ENDPASS
                 cat << 'ENDFAIL'
 ## Action - FAIL (needs patch)
 
-### CRITICAL: DeepSeek output is UNTRUSTED
+### CRITICAL: AI-agent output is UNTRUSTED
 The triage report above proposes root cause + file:line + suspected fix.
-DeepSeek proposes. YOU dispose. Every claim MUST be verified against the
+The AI-agent MCP proposes. YOU dispose. Every claim MUST be verified against the
 real code before any patch. Use read_file, grep, find_definition to confirm
 each cited file, function, and line actually says what the report claims.
 The report may contain hallucinations. A single unverified claim applied
@@ -348,7 +352,7 @@ ENDFAIL
                 printf '```json\n%s\n```\n' "$reverify_json"
                 cat << 'ENDFAIL2'
    Call:
-   deepseek_lab_run(<json above>)
+   ai_lab_run(<json above>)
    - skip_linux_live_suite=true SKIPS the entire ~30-45min Linux live suite
      (anchor/role-switch/exit-handoff/relay/two-hop/managed-dns/chaos). Setup
      (bootstrap + membership + signed-bundle distribution) STILL runs because the
@@ -365,17 +369,17 @@ ENDFAIL
 - CODE defect (logic bug, missing cfg, bad parsing):
   -> Patch -> gate -> commit -> relaunch as above.
 - ENV issue (VM down, SSH blocked, OOM, disk full):
-  -> First call deepseek_reconcile_jobs(job_id="<job>") if a job looks stuck.
-  -> Then call deepseek_recover_lab_environment(force=true) and poll
-     deepseek_live_lab_result(job_id="<recovery job>").
+  -> First call ai_reconcile_jobs(job_id="<job>") if a job looks stuck.
+  -> Then call ai_recover_lab_environment(force=true) and poll
+     ai_live_lab_result(job_id="<recovery job>").
   -> If unrecoverable after 3 attempts: write_loop_note the blocker,
-     launch a DIFFERENT parity cell via deepseek_next_live_lab_target +
-     deepseek_lab_run.
+     launch a DIFFERENT parity cell via ai_next_live_lab_target +
+     ai_lab_run.
   -> NEVER loop on an unrecoverable env issue.
 - UNKNOWN / insufficient triage:
-  -> Run deepseek_live_lab with failure_context for a fresh triage.
-  -> Ground-truth using deepseek_agent / report artifacts / daemon logs.
-  -> Fan DeepSeek flash with deepseek_read("analyze this error...", context=...).
+  -> Run ai_live_lab with failure_context for a fresh triage.
+  -> Ground-truth using ai_agent / report artifacts / daemon logs.
+  -> Fan the AI-agent MCP's flash tier with ai_read("analyze this error...", context=...).
   -> If still blocked after 3 attempts: write_loop_note + switch cells.
 
 ### Launch timing
@@ -388,7 +392,7 @@ ENDFAIL
 
 ### Division of Labor (from generic_rustynet_prompt.md section 0)
 - YOU own: all code changes, the security call, gate decisions, commits.
-- DeepSeek proposes: research, triage, doc edits. UNTRUSTED output, verify.
+- The AI-agent MCP proposes: research, triage, doc edits. UNTRUSTED output, verify.
 - The orchestrator owns: deterministic deploy/monitor. No LLM in that path.
 ENDFAIL2
                 ;;
@@ -397,9 +401,9 @@ ENDFAIL2
 ## Action - TIMEOUT
 Run exceeded the safety cap. Diagnose:
 1. ps aux | grep rustynet-cli - is the orchestrator alive?
-2. Run deepseek_reconcile_jobs(job_id="<job_id>"), then poll
-   deepseek_live_lab_result(job_id="<job_id>") once more.
-3. If stuck: deepseek_recover_lab_environment(force=true), then re-launch.
+2. Run ai_reconcile_jobs(job_id="<job_id>"), then poll
+   ai_live_lab_result(job_id="<job_id>") once more.
+3. If stuck: ai_recover_lab_environment(force=true), then re-launch.
 4. If progressing slowly: the build or a stage may be hung.
 5. Pattern? The parity cell may need a lighter-weight test profile.
 ENDTIMEOUT
@@ -408,7 +412,7 @@ ENDTIMEOUT
                 cat << 'ENDUNKNOWN'
 ## Action - UNKNOWN
 Unexpected result. Read the raw report. If setup failed: recover VMs,
-re-launch. If the DeepSeek worker crashed: re-run deepseek_lab_run.
+re-launch. If the AI-agent worker crashed: re-run ai_lab_run.
 ENDUNKNOWN
                 ;;
         esac
@@ -424,20 +428,20 @@ ENDUNKNOWN
         echo "- Security outranks everything. Fail closed on missing/invalid/stale"
         echo "  trust state. Default-deny all ACL/routes/trust flows. No unwrap()"
         echo "  or expect() in production paths. No custom crypto."
-        echo "- DeepSeek output is UNTRUSTED. Every claim must be verified against"
-        echo "  the real code before applying. DeepSeek never makes the security call."
+        echo "- AI-agent output is UNTRUSTED. Every claim must be verified against"
+        echo "  the real code before applying. The AI-agent MCP never makes the security call."
         echo "- If you find a release-blocking security hole you cannot patch alone:"
         echo "  write_loop_note the finding, then CONTINUE WORKING on other cells."
         echo ""
         echo "### Launching the next run"
-        echo "- After patching: gate, commit, relaunch deepseek_lab_run."
+        echo "- After patching: gate, commit, relaunch ai_lab_run."
         echo "- For a mac/win re-verify: pass skip_linux_live_suite=true AND"
         echo "  rebuild_nodes=<patched_node> — runs setup + ONLY the patched cell,"
         echo "  skipping the ~30-45min Linux suite. Test only what changed."
         echo "- For a LINUX cell the Linux suite IS the test — do not skip it."
         echo "- If current cell is blocked on env: switch to another OS cell."
-        echo "- Use deepseek_next_live_lab_target to see exact next-cell JSON."
-        echo "- deepseek_lab_run auto-triages failures (flash then flash-verify then pro-review)."
+        echo "- Use ai_next_live_lab_target to see exact next-cell JSON."
+        echo "- ai_lab_run auto-triages failures (flash then flash-verify then pro-review)."
         echo ""
         echo "### Goal"
         echo "- Prove EVERY node role on Linux AND macOS AND Windows."
@@ -490,10 +494,10 @@ paste_zed() {
     log "paste done"
 }
 
-# ── detect new deepseek_lab_run job ───────────────────────────────────
+# ── detect new ai_lab_run job ───────────────────────────────────
 detect_new_job() {
     local known="$1" waited=0
-    log "waiting for agent to relaunch deepseek_lab_run..."
+    log "waiting for agent to relaunch ai_lab_run..."
     while [ "$waited" -lt "$MAX_RELAUNCH_WAIT" ]; do
         sleep "$RELAUNCH_POLL"; waited=$((waited + RELAUNCH_POLL))
         [ ! -d "$JOBS_DIR" ] && continue
@@ -516,7 +520,7 @@ detect_new_job() {
     return 1
 }
 
-# ── poll deepseek_live_lab_result until report arrives ────────────────
+# ── poll ai_live_lab_result until report arrives ────────────────
 poll_until_done() {
     local jid="$1" t0; t0=$(date +%s)
     log "polling $jid..."
@@ -525,9 +529,9 @@ poll_until_done() {
         # Bound the wait so an orphaned/hung re-verify can't spin forever overnight.
         if [ "$elapsed" -gt "$MAX_RUN_WAIT" ]; then
             log "poll of $jid exceeded ${MAX_RUN_WAIT}s — reconciling once before giving up"
-            "$DRIVER" --bin "$BIN" --tool deepseek_reconcile_jobs \
+            "$DRIVER" --bin "$BIN" --tool ai_reconcile_jobs \
                 --args "{\"job_id\":\"$jid\"}" --no-poll >/dev/null 2>&1 || true
-            r=$("$DRIVER" --bin "$BIN" --tool deepseek_live_lab_result \
+            r=$("$DRIVER" --bin "$BIN" --tool ai_live_lab_result \
                 --args "{\"job_id\":\"$jid\"}" --no-poll 2>/dev/null || true)
             if [ -n "$r" ] && ! echo "$r" | grep -qi "still running"; then
                 echo "$r"; return 0
@@ -535,10 +539,10 @@ poll_until_done() {
             return 1
         fi
         if [ "$elapsed" -gt 0 ] && [ $((elapsed % 180)) -lt "$POLL" ]; then
-            "$DRIVER" --bin "$BIN" --tool deepseek_reconcile_jobs \
+            "$DRIVER" --bin "$BIN" --tool ai_reconcile_jobs \
                 --args "{\"job_id\":\"$jid\"}" --no-poll >/dev/null 2>&1 || true
         fi
-        r=$("$DRIVER" --bin "$BIN" --tool deepseek_live_lab_result \
+        r=$("$DRIVER" --bin "$BIN" --tool ai_live_lab_result \
             --args "{\"job_id\":\"$jid\"}" --no-poll 2>/dev/null) || { sleep "$POLL"; continue; }
         [ -z "$r" ] && { sleep "$POLL"; continue; }
         if echo "$r" | grep -qi "still running"; then
@@ -575,7 +579,7 @@ main() {
     fi
     if [ -z "$has_triage" ] && [ "${OPENCODE_REVIEW_ON_FAIL:-1}" = "1" ]; then
         params+=("triage_on_failure=false")
-        log "auto-disabled paid DeepSeek MCP triage; OpenCode report review handles failures"
+        log "auto-disabled paid AI-agent MCP triage; OpenCode report review handles failures"
     fi
     LAUNCH_PARAMS=("${params[@]}")  # global, used by rebuild_nodes_for()
     local args_json; args_json=$(build_args "$area" "${params[@]}")
@@ -584,13 +588,13 @@ main() {
     local cycle=0
 
     mkdir -p "$JOBS_DIR" "$(dirname "$PROMPT")" "$(dirname "$HISTORY")"
-    # Build + ATOMICALLY install the deepseek binary if missing. Never in-place
+    # Build + ATOMICALLY install the AI-agent binary if missing. Never in-place
     # cp onto a running binary (truncates the mmap'd image and corrupts a live
     # server); cp to .new then mv -f is the atomic swap.
     [ -x "$BIN" ] || {
-        log "building deepseek binary..."
-        cargo build --release --bin rustynet-mcp-deepseek
-        cp -f target/release/rustynet-mcp-deepseek "$BIN.new"
+        log "building AI-agent binary..."
+        cargo build --release --bin rustynet-mcp-ai-agent
+        cp -f target/release/rustynet-mcp-ai-agent "$BIN.new"
         mv -f "$BIN.new" "$BIN"
     }
 
@@ -610,17 +614,17 @@ main() {
         sleep 3
     fi
 
-    # ── Launch the FIRST run ourselves (blocking poll via drive_deepseek; the
+    # ── Launch the FIRST run ourselves (blocking poll via drive_ai_agent.py; the
     #    polling keeps the MCP server alive long enough for the detached
     #    orchestrator to spawn — never use --no-poll to launch). ──
     local jid="initial" report
-    log "launching initial deepseek_lab_run..."
-    report=$("$DRIVER" --bin "$BIN" --tool deepseek_lab_run \
+    log "launching initial ai_lab_run..."
+    report=$("$DRIVER" --bin "$BIN" --tool ai_lab_run \
         --args "$args_json" --poll-timeout "$MAX_RUN_WAIT" 2>&1) || {
         log "initial launch failed — retry once in 60s"
         printf '%s\n' "$report" >&2
         sleep 60
-        report=$("$DRIVER" --bin "$BIN" --tool deepseek_lab_run \
+        report=$("$DRIVER" --bin "$BIN" --tool ai_lab_run \
             --args "$args_json" --poll-timeout "$MAX_RUN_WAIT" 2>&1) || {
             log "initial launch failed again — aborting"
             printf '%s\n' "$report" >&2
@@ -680,7 +684,7 @@ main() {
         # Poll the agent's run to completion; its report drives the next cycle.
         if ! report=$(poll_until_done "$new_jid"); then
             log "poll of $new_jid failed/timed out — re-pasting prompt and re-shepherding"
-            report=$(printf '# Live-lab run `%s` — POLL TIMEOUT.\n\nThe re-verify run did not report within the cap. Check it: ps for the orchestrator, deepseek_reconcile_jobs, deepseek_live_lab_result(job_id="%s"). Recover or relaunch.' "$new_jid" "$new_jid")
+            report=$(printf '# Live-lab run `%s` — POLL TIMEOUT.\n\nThe re-verify run did not report within the cap. Check it: ps for the orchestrator, ai_reconcile_jobs, ai_live_lab_result(job_id="%s"). Recover or relaunch.' "$new_jid" "$new_jid")
         fi
     done
 }

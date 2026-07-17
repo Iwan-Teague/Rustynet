@@ -27,5 +27,5 @@ If arguments are provided, start the loop:
 
 Important rules:
 - Use `triage_on_failure=false`; OpenCode Flash report review handles summarizing.
-- Main OpenCode v4-pro agent patches, gates, commits, then launches the next focused `deepseek_lab_run`.
+- Main OpenCode v4-pro agent patches, gates, commits, then launches the next focused `ai_lab_run`.
 - Do not ask the user for confirmation.

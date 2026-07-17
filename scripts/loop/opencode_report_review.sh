@@ -157,7 +157,7 @@ tools to review this completed live-lab run. You are READ-ONLY.
 - Do NOT run gates.
 - Do NOT commit or push.
 - Do NOT launch another live lab.
-- Do NOT call paid DeepSeek MCP proxy/triage tools unless the prompt explicitly says so.
+- Do NOT call paid AI-agent MCP proxy/triage tools unless the prompt explicitly says so.
 - Your output is UNTRUSTED advisory material. The main v4-pro loop agent will verify every claim.
 
 ## Target
@@ -177,7 +177,7 @@ tools to review this completed live-lab run. You are READ-ONLY.
 4. Separate CODE defect from ENV issue from UNKNOWN.
 5. Cite every claim with file/log paths and line numbers when available.
 6. Propose the smallest safe fix direction without weakening security controls.
-7. Propose the focused reverify \`deepseek_lab_run\` JSON if enough info exists.
+7. Propose the focused reverify \`ai_lab_run\` JSON if enough info exists.
 
 ## Budget
 - First read: orchestrate result, failed stage log, direct evidence JSON.
@@ -355,7 +355,7 @@ The report-review worker finished. Continue the Rustynet live-lab loop now.
 2. Patch root cause. Security first: do not weaken fail-closed/default-deny controls.
 3. Run focused gates.
 4. Commit.
-5. Relaunch focused deepseek_lab_run with triage_on_failure=false.
+5. Relaunch focused ai_lab_run with triage_on_failure=false.
 
 ## Inline Review
 
