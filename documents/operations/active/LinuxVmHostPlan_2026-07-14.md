@@ -1728,8 +1728,21 @@ predates the fix.
       hand-built binaries in `bin/`, since nothing rebuilds them:
       `gate-runner` bin 2026-06-12 vs src 2026-06-26; `repo-context` bin 2026-06-12
       vs src **2026-07-12** (a month). All rebuilt + installed 2026-07-17.
-      **Worth a follow-up:** a staleness check (bin mtime vs src, or a `--version`
-      the client asserts) so this cannot rot silently again.
+- [x] **Follow-up DONE 2026-07-17 — staleness is now a loud failure.**
+      `scripts/ci/check_mcp_binaries_fresh.sh` (Rust bin `check_mcp_binaries_fresh`)
+      exits 78 if any `bin/rustynet-mcp-*` is older than its source under
+      `crates/rustynet-mcp/` — each server's own `src/bin/<x>.rs` plus the crate's
+      shared source/manifest/lockfile, and bins are independent units so editing
+      `lab_state.rs` does not falsely flag `repo_context` — or absent (the
+      fresh-clone case). It names the newer file and prints the atomic
+      rebuild+install; `--fix` performs it. **Deliberately NOT a workspace CI gate:**
+      CI never builds these gitignored binaries, so it would always report
+      "missing"; it belongs where the servers are installed (run after a pull, or
+      the moment a tool seems missing). Documented in CLAUDE.md/AGENTS.md §12.5.
+      5 unit tests; live-verified fresh→0, source-newer→78, missing→78,
+      `--fix`→rebuilt+PASS. It caught a real one on first run: the final `rustfmt`
+      of `lab_state.rs` postdated the last install (a no-op format still bumps
+      mtime — the documented, safe mtime false-positive), which `--fix` cleared.
 - [x] Verified over **stdio** (`state/mcp_call.sh`, which needs no client
       reconnect): all 8 tools present in the new binary and absent from the old;
       `discover_hosts` probes **both** hosts for real —

@@ -611,7 +611,17 @@ Operational: the servers run pre-built binaries at `bin/rustynet-mcp-*` (config 
 rebuild (`cargo build --release --bin rustynet-mcp-ai-agent`) and install via an
 atomic **`mv`, NOT in-place `cp`** — the client keeps the running binary mmap'd,
 so `cp` truncates it in place and CORRUPTS it (symptom: the server starts but
-emits nothing). Use `cp … bin/x.new && mv -f bin/x.new bin/x`. Then reconnect the
+emits nothing). Use `cp … bin/x.new && mv -f bin/x.new bin/x`. **`bin/` is
+gitignored and nothing rebuilds it on checkout or in CI, so these binaries rot
+silently** — on 2026-07-17 a running lab-state server was 8 days behind its source
+and 8 multi-host tools were simply absent, surfacing as tools missing / a wrong
+`check_vm_reachable` "not in inventory". Detect it before it bites:
+`scripts/ci/check_mcp_binaries_fresh.sh` fails (exit 78) if any `bin/rustynet-mcp-*`
+is older than its source under `crates/rustynet-mcp/` (or absent), naming the
+newer file; `--fix` rebuilds and atomically installs the stale ones. Run it after
+a pull, or the moment an MCP tool seems missing. It is NOT a workspace CI gate —
+CI never builds these gitignored binaries, so it only makes sense where the
+servers are installed. Then reconnect the
 server (`/mcp` → reconnect, or restart the client — killing the process does NOT
 auto-respawn, and there is no `claude mcp` reconnect subcommand). When you can't
 reconnect (e.g. a remote client), drive the freshly built binary **directly over
