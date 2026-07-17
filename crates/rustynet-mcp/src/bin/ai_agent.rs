@@ -1895,13 +1895,32 @@ impl AiAgentServer {
         &self,
         job_id: &str,
         base_ref: &str,
-    ) -> Result<(PathBuf, String), String> {
+    ) -> Result<(PathBuf, String, String), String> {
         let dir = self.edit_worktrees_dir();
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("cannot create worktree dir {}: {e}", dir.display()))?;
         let path = dir.join(job_id);
         let branch = format!("{EDIT_BRANCH_PREFIX}/{job_id}");
         let path_str = path.to_string_lossy().to_string();
+        // Resolve the base to a concrete commit SHA FIRST. Diffs must compare
+        // against this fixed commit, not the symbolic "HEAD" — once the agent
+        // commits inside the worktree, that worktree's HEAD moves to the new
+        // commit, so `git diff HEAD` there would compare HEAD to itself and show
+        // nothing. Pinning the SHA keeps the diff anchored to the real base.
+        let sha_outcome = run_with_timeout(
+            "git",
+            &["rev-parse", base_ref],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(30),
+        )?;
+        if !sha_outcome.success {
+            return Err(format!(
+                "could not resolve base_ref '{base_ref}': {}",
+                sha_outcome.stderr.trim()
+            ));
+        }
+        let base_sha = sha_outcome.stdout.trim().to_string();
         let outcome = run_with_timeout(
             "git",
             &["worktree", "add", "-b", &branch, &path_str, base_ref],
@@ -1920,7 +1939,7 @@ impl AiAgentServer {
                 }
             ));
         }
-        Ok((path, branch))
+        Ok((path, branch, base_sha))
     }
 
     /// Spawn a detached `opencode serve` whose cwd is the job's worktree, and
@@ -2110,7 +2129,8 @@ impl AiAgentServer {
             .to_string();
 
         let job_id = self.new_job_id("edit");
-        // Initial record so a poll arriving before setup finishes sees "launching".
+        // Initial record so a crash mid-setup leaves a findable "launching"
+        // record rather than nothing.
         self.write_job_record(
             &job_id,
             &json!({
@@ -2127,20 +2147,36 @@ impl AiAgentServer {
             }),
         );
 
-        let worker = self.clone();
-        let jid = job_id.clone();
-        let base_ref_thread = base_ref.clone();
-        std::thread::spawn(move || {
-            worker.run_edit_setup(
-                &jid,
-                mode,
-                agent,
-                &provider_id,
-                &model_id,
-                &base_ref_thread,
-                &task,
-            );
-        });
+        // Setup runs SYNCHRONOUSLY, not on a background thread. The stdio driver
+        // (drive_ai_agent.py) spawns this binary, makes one call, and exits —
+        // which would kill any background thread before it created the worktree.
+        // Everything setup produces (the on-disk worktree, the DETACHED serve
+        // process, the session inside it) outlives this process, so only the
+        // orchestration needs to finish before we return. The serve-boot wait is
+        // bounded (OPENCODE_SERVE_BOOT_TIMEOUT_SECS), so this blocks a few
+        // seconds, not indefinitely.
+        self.run_edit_setup(
+            &job_id,
+            mode,
+            agent,
+            &provider_id,
+            &model_id,
+            &base_ref,
+            &task,
+        );
+
+        let rec = self.read_job_record(&job_id);
+        let state = rec
+            .as_ref()
+            .and_then(|r| r["state"].as_str())
+            .unwrap_or("failed");
+        if state == "failed" {
+            let err = rec
+                .as_ref()
+                .and_then(|r| r["error"].as_str())
+                .unwrap_or("(no detail)");
+            return tool_error(&format!("delegated-edit launch failed: {err}"));
+        }
 
         ToolCallResult {
             content: text_content(format!(
@@ -2165,7 +2201,8 @@ impl AiAgentServer {
         }
     }
 
-    /// Background setup for an edit job: worktree → serve → session → prompt.
+    /// Setup for an edit job: worktree → serve → session → prompt. Runs inline
+    /// in `call_edit_run` (see the note there on why it is not backgrounded).
     /// Any failure marks the record `failed` with the reason.
     #[allow(clippy::too_many_arguments)]
     fn run_edit_setup(
@@ -2190,7 +2227,7 @@ impl AiAgentServer {
             self.write_job_record(job_id, &rec);
         };
 
-        let (worktree, branch) = match self.create_edit_worktree(job_id, base_ref) {
+        let (worktree, branch, base_sha) = match self.create_edit_worktree(job_id, base_ref) {
             Ok(v) => v,
             Err(e) => return fail(format!("worktree setup failed: {e}")),
         };
@@ -2255,6 +2292,7 @@ impl AiAgentServer {
             o.insert("mode".into(), json!(mode));
             o.insert("worktree".into(), json!(worktree.to_string_lossy()));
             o.insert("branch".into(), json!(branch));
+            o.insert("base_sha".into(), json!(base_sha));
             o.insert("serve_pid".into(), json!(serve_pid));
             o.insert("serve_port".into(), json!(serve_port));
             o.insert("session_id".into(), json!(session_id));
@@ -2303,7 +2341,15 @@ impl AiAgentServer {
         let session_id = rec["session_id"].as_str().unwrap_or("").to_string();
         let serve_pid = rec["serve_pid"].as_u64().unwrap_or(0) as u32;
         let worktree = PathBuf::from(rec["worktree"].as_str().unwrap_or(""));
-        let base_ref = rec["base_ref"].as_str().unwrap_or("HEAD").to_string();
+        // The resolved base commit — diffs anchor here, NOT the symbolic
+        // "base_ref", so a committed change inside the worktree is still visible
+        // (its HEAD has moved). Fall back to base_ref only for legacy records.
+        let base_ref = rec["base_sha"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| rec["base_ref"].as_str())
+            .unwrap_or("HEAD")
+            .to_string();
         let started = rec["started_unix"].as_u64().unwrap_or_else(now_unix);
 
         // Overall wall-clock cap — independent of the approval watchdog.
