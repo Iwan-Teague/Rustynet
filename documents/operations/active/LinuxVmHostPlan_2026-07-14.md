@@ -1985,26 +1985,7 @@ These make every other result untrustworthy, so they come before new features.
 
 ### 12.9 Prerequisites that will bite
 
-- [ ] **Push the commits.** `sync_remote_host` runs `git fetch --depth=1 origin
-      <sha>` **on the box**, so it physically cannot advance a host to an unpushed
-      SHA. As of 2026-07-17 the box is pinned at `49f5f9f` while `2c306b4`,
-      `02deff8`, `5b814c3`, `3d950d1` are local-only. This is deliberate (evidence
-      must name a commit others can fetch), not a bug — but it gates §12.7.
-- [x] **SETTLED 2026-07-17 — the sandbox is NOT blocking anything, and §12.3.1 was
-      stale.** This mattered more than a checklist tick: §12.3.1 told every agent to
-      do reachability/SSH from Bash rather than the MCP, and a whole session was
-      driven that way before it was re-tested. Four probes through the
-      Desktop-spawned server say otherwise — `check_vm_reachable` → `192.168.64.20:22`
-      **in-process TCP** `reachable: true`; `host_net_status` → LAN `172.23.56.5`
-      reachable; `discover_hosts` → `qemu+ssh` `probe=ok`; `validate_inventory`'s
-      only failure is `connection timed out` against a **powered-off** VM, which is
-      the correct answer. The `EHOSTUNREACH` / "No route to host (os error 65)"
-      signature appears nowhere. Both halves work — in-process sockets AND
-      shelled-out children, over LAN AND Tailscale. No launchd workaround needed.
-      **CLAUDE.md/AGENTS.md §12.3.1 rewritten** (mirrored per §14) to lead with
-      "use the MCP", keeping the original finding as a recurrence guide — Local
-      Network Privacy is a *permission*, so it can be revoked as easily as granted;
-      `EHOSTUNREACH` against a private-range IP is the tell that it is back.
+- [x] **Push discipline established (2026-07-17).** `sync_remote_host` does `git fetch --depth=1 origin <sha>` ON the box, so a host can only be advanced to a PUSHED commit — this is deliberate (evidence must name a fetchable commit). Every §12 increment was pushed and the box re-synced; as of `1e5fd34` the box is current. Keep pushing before `sync_host`.
 - [ ] `eno1` is `NO-CARRIER` (box is on WiFi; WiFi cannot bridge), so guests are
       NAT-only behind `virbr0` — fine for a box-local lab, but it violates ADR-004's
       dual-NIC target (§6.5.3) and keeps cross-machine on Tailscale.
