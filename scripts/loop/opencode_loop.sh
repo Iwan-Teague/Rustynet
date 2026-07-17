@@ -11,13 +11,13 @@ DRIVER="$REPO/scripts/mcp/drive_ai_agent.py"
 if [ -n "${RUSTYNET_MCP_BIN:-}" ]; then
     BIN="$RUSTYNET_MCP_BIN"
 elif [ -x "$REPO/target/debug/rustynet-mcp-ai-agent" ]; then
-    # Development-time direct path: no Keychain injection here, so the
-    # provider's API key must already be exported in this shell.
+    # Development-time direct path. The binary reads its provider's API key
+    # from macOS Keychain itself (in-process); an exported env var still
+    # overrides it if set.
     BIN="$REPO/target/debug/rustynet-mcp-ai-agent"
 else
-    # Installed path: prefer the Keychain-aware launcher over the raw binary
-    # so this works with no key exported in the shell.
-    BIN="$REPO/bin/rustynet-mcp-ai-agent-launcher.sh"
+    # Installed path — same Keychain-or-env-var key resolution, in-process.
+    BIN="$REPO/bin/rustynet-mcp-ai-agent"
 fi
 JOBS_DIR="$REPO/state/deepseek-mcp-jobs"
 STATE_DIR="$REPO/state/opencode-loop"

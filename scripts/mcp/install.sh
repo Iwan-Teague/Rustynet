@@ -62,7 +62,7 @@ fi
 RC="${BIN_DIR}/rustynet-mcp-repo-context"
 GR="${BIN_DIR}/rustynet-mcp-gate-runner"
 LS="${BIN_DIR}/rustynet-mcp-lab-state"
-AA="${BIN_DIR}/rustynet-mcp-ai-agent-launcher.sh"
+AA="${BIN_DIR}/rustynet-mcp-ai-agent"
 
 cat <<EOF
 ========================================
@@ -139,14 +139,17 @@ cat <<EOF
 The repo root is baked into each binary (build.rs); no working_directory needed.
 Override with RUSTYNET_REPO_ROOT if running a binary built from a different checkout.
 
-The printed configs above point rustynet-ai-agent at the LAUNCHER script
-(${AA}), not the raw binary — the launcher reads each
-provider's API key from macOS Keychain and exports it before exec'ing the
-real binary (CLAUDE.md/AGENTS.md §12.5). This install script builds and
-atomically installs the raw binary only; the launcher is a small,
-hand-authored, gitignored wrapper that must already exist at that path (or
-be recreated) for the printed configs to work — it does not itself need
-rebuilding when the binary changes.
+rustynet-mcp-ai-agent reads its configured provider's API key from macOS
+Keychain itself (in-process, via /usr/bin/security — CLAUDE.md/AGENTS.md
+§12.5), or from the env var if already exported. Point the client config at
+the raw binary directly, same as the other three servers above — do NOT
+route it through a shell-script wrapper: a client that spawns MCP servers
+under a macOS sandbox (Claude Desktop does) exec-approves only the literal
+configured command path, and a shebang-interpreted script re-execs
+/bin/bash as a second, unapproved process image, which fails closed with
+"Operation not permitted" before the script's first line runs (observed
+live — this is why an earlier Keychain-launcher-script approach was
+abandoned in favor of reading Keychain in-process).
 
 ========================================
  IMPORTANT: reconnect after reinstalling
